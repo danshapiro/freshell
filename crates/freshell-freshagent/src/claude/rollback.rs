@@ -9,6 +9,7 @@
 
 use super::*;
 
+use crate::claude_handshake::{FORK_GUARD_REFUSED_CODE, RESUME_POINT_NOT_FOUND_CODE};
 use crate::claude_launch::{ClaudeBoot, ClaudeGenesis, ClaudeLaunchSpec};
 use crate::claude_snapshot as snap;
 use crate::rollback_record::*;
@@ -16,6 +17,7 @@ use crate::rollback_record::*;
 use super::establish::{
     EstablishError, EstablishLane, EstablishPlan, InheritedRuntime, RegisterUnder,
 };
+use super::history::EffectiveTranscriptError;
 
 /// Decision 2: the CLI refused the fork's drops-turn guard because the turn
 /// being undone absorbed another message (a send made during a tool call, a
@@ -26,10 +28,6 @@ pub(crate) const ROLLBACK_FOLDED_TURN_MESSAGE: &str =
 /// The CLI no longer has the point the rollback forks at.
 pub(crate) const ROLLBACK_POINT_GONE_MESSAGE: &str =
     "That point is no longer in Claude's copy of the conversation, so it can't be undone to.";
-
-/// The `create.failed` codes of a fork the CLI refused (`claude-sidecar/boot.mjs`).
-const FORK_GUARD_REFUSED_CODE: &str = "FORK_GUARD_REFUSED";
-const RESUME_POINT_NOT_FOUND_CODE: &str = "RESUME_POINT_NOT_FOUND";
 
 /// What a rollback replaces the session's conversation with, from the reads.
 struct RollbackPlan {
@@ -46,30 +44,6 @@ struct RollbackPlan {
     /// The conversation whose transcript the fork reads, and where it is.
     source: String,
     source_path: Option<PathBuf>,
-}
-
-/// A session's effective transcript (design §4.5): what it holds now, and the
-/// real transcript a fork of it reads.
-struct EffectiveTranscript {
-    /// The conversation as the session holds it.
-    text: String,
-    /// The session a fork of it reads: itself, or, for a pending fork, its
-    /// parent (source collapse).
-    source: String,
-    /// That source's own transcript text and path (empty / `None` for a
-    /// `Fresh` session, which has none).
-    source_text: String,
-    source_path: Option<PathBuf>,
-}
-
-/// Why a session's effective transcript could not be read.
-enum EffectiveTranscriptError {
-    /// No transcript and no genesis: nothing the store knows.
-    Missing,
-    /// The store could not be checked (G28: never "empty").
-    Unreadable(snap::LocateError),
-    /// A located transcript (or a pending fork's parent) could not be read.
-    Read(String),
 }
 
 impl EffectiveTranscriptError {
@@ -589,7 +563,7 @@ impl FreshClaudeState {
 
         let plan = match op.direction {
             RollbackDirection::Undo => {
-                let current = match self.effective_transcript(&durable_id) {
+                let current = match self.effective_transcript(&durable_id).await {
                     Ok(current) => current,
                     Err(EffectiveTranscriptError::Missing) => {
                         reply_sink(rollback_error_frame(
@@ -738,7 +712,7 @@ impl FreshClaudeState {
                 // transcript: empty after a first-turn undo, the kept prefix of
                 // a pending fork. A real read error is a loud INTERNAL_ERROR,
                 // never a silent empty chain yielding a false `redone` ack.
-                let current_text = match self.effective_transcript(&durable_id) {
+                let current_text = match self.effective_transcript(&durable_id).await {
                     Ok(current) => current.text,
                     Err(EffectiveTranscriptError::Missing) => {
                         reply_sink(rollback_error_frame(
@@ -1169,6 +1143,7 @@ impl FreshClaudeState {
                         turn_tracker: turn_tracker.clone(),
                         last_synthesized_complete_at: Arc::clone(&last_synthesized_complete_at),
                     }),
+                    genesis: Some(genesis.clone()),
                 },
                 &mut lease_guard,
                 &mut own_ticket,
@@ -1328,90 +1303,6 @@ impl FreshClaudeState {
             record.can_redo(),
             Some(&replacement),
         ));
-    }
-
-    /// The session's effective transcript (design §4.5): its transcript when
-    /// the CLI wrote one; before that, what its genesis holds (a pending fork
-    /// holds its parent's chain through the fork point, a fresh session
-    /// nothing).
-    fn effective_transcript(
-        &self,
-        session_id: &str,
-    ) -> Result<EffectiveTranscript, EffectiveTranscriptError> {
-        match self.locate_transcript(session_id) {
-            snap::TranscriptLocation::Found(path) => {
-                let text = std::fs::read_to_string(&path)
-                    .map_err(|e| EffectiveTranscriptError::Read(e.to_string()))?;
-                Ok(EffectiveTranscript {
-                    source_text: text.clone(),
-                    text,
-                    source: session_id.to_string(),
-                    source_path: Some(path),
-                })
-            }
-            snap::TranscriptLocation::Unreadable(error) => {
-                Err(EffectiveTranscriptError::Unreadable(error))
-            }
-            snap::TranscriptLocation::Absent => {
-                let genesis = self
-                    .identity_sink()
-                    .and_then(|sink| sink.load_genesis(PROVIDER, session_id))
-                    .map(|recorded| recorded.genesis);
-                match genesis {
-                    None => Err(EffectiveTranscriptError::Missing),
-                    Some(ClaudeGenesis::Fresh) => Ok(EffectiveTranscript {
-                        text: String::new(),
-                        source: session_id.to_string(),
-                        source_text: String::new(),
-                        source_path: None,
-                    }),
-                    Some(ClaudeGenesis::Fork { parent, at, .. }) => {
-                        let path = match self.locate_transcript(&parent) {
-                            snap::TranscriptLocation::Found(path) => path,
-                            snap::TranscriptLocation::Absent => {
-                                return Err(EffectiveTranscriptError::Read(format!(
-                                    "the conversation this one was forked from ({parent}) is gone"
-                                )))
-                            }
-                            snap::TranscriptLocation::Unreadable(error) => {
-                                return Err(EffectiveTranscriptError::Unreadable(error))
-                            }
-                        };
-                        let parent_text = std::fs::read_to_string(&path)
-                            .map_err(|e| EffectiveTranscriptError::Read(e.to_string()))?;
-                        let text = snap::fork_prefix_transcript(&parent_text, at.as_deref())
-                            .ok_or_else(|| {
-                                EffectiveTranscriptError::Read(format!(
-                                    "the point this conversation was forked at is no longer in {parent}"
-                                ))
-                            })?;
-                        Ok(EffectiveTranscript {
-                            text,
-                            source: parent,
-                            source_text: parent_text,
-                            source_path: Some(path),
-                        })
-                    }
-                }
-            }
-        }
-    }
-
-    /// `session_id`'s transcript text, when the store has one (`Ok(None)`
-    /// when it has none).
-    fn read_located_transcript(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<String>, EffectiveTranscriptError> {
-        match self.locate_transcript(session_id) {
-            snap::TranscriptLocation::Found(path) => std::fs::read_to_string(&path)
-                .map(Some)
-                .map_err(|e| EffectiveTranscriptError::Read(e.to_string())),
-            snap::TranscriptLocation::Absent => Ok(None),
-            snap::TranscriptLocation::Unreadable(error) => {
-                Err(EffectiveTranscriptError::Unreadable(error))
-            }
-        }
     }
 
     /// The replacement takes the original's place (design §4.6, the rollback

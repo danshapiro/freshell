@@ -28,6 +28,15 @@ pub(crate) const CREATE_FAILED_CODE: &str = "CLAUDE_CREATE_FAILED";
 /// The code of a `created` that speaks another protocol.
 pub(crate) const PROTOCOL_MISMATCH_CODE: &str = "SIDECAR_PROTOCOL_MISMATCH";
 
+/// The `create.failed` code of a fork whose point the parent conversation does
+/// not hold (`claude-sidecar/boot.mjs`, T5).
+pub(crate) const RESUME_POINT_NOT_FOUND_CODE: &str = "RESUME_POINT_NOT_FOUND";
+
+/// The `create.failed` code of a fork the CLI refused because the turn its
+/// drops-turn guard names absorbed another message (`claude-sidecar/boot.mjs`,
+/// T5, decision 2).
+pub(crate) const FORK_GUARD_REFUSED_CODE: &str = "FORK_GUARD_REFUSED";
+
 /// The sidecar's `created`: the CLI booted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SidecarCreated {

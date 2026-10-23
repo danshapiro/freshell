@@ -27,9 +27,9 @@
  *     Resume with no reload), a second crash recovered by a page reload, and
  *     restart recovery, all on the SAME durable id, never a fabricated
  *     completion.
- *   Plus the capability-gate pin: /fork is NOT offered for claude/kilroy
- *     (snapshot capabilities.fork=false) — so AGENT-05/06 surfaces never
- *     expose a fork affordance that would hit the refusal table.
+ *   Plus the capability-gate pin: /fork IS offered for claude (snapshot
+ *     capabilities.fork=true since C14; the fork itself is pinned end to end
+ *     by freshclaude-fork-rust.spec.ts).
  *
  * RESIDUAL HONESTY (also recorded in the checklist note): these fakes pin the
  * CONTRACT SHAPE + server/client wiring. Real-provider semantic fidelity of
@@ -1060,7 +1060,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
     }
   })
 
-  test('capability gate: /fork is not offered for claude', async ({ page }) => {
+  test('capability gate: /fork is offered for claude', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -1075,8 +1075,8 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
       await expect(menu.getByRole('menuitem', { name: /^\/compact/ })).toBeVisible()
       await expect(
         menu.getByRole('menuitem', { name: /^\/fork/ }),
-        'claude capabilities.fork=false hides /fork from the menu',
-      ).toHaveCount(0)
+        'claude capabilities.fork=true offers /fork in the menu (C14)',
+      ).toBeVisible()
       await page.keyboard.press('Escape')
     } finally {
       await lane.server.stop().catch(() => {})

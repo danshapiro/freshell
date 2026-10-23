@@ -253,6 +253,11 @@ pub struct FreshClaudeState {
     /// polls its membership (task 4 review C1) to PARK a send that resolves
     /// inside the rollback's teardown→respawn window rather than refuse it.
     rollback_in_flight: crate::InFlightRegistry,
+    /// Fork-vs-fork single-flight (C14), keyed by the parent's sessions-map
+    /// key: a second Fork click on the same pane while the first one boots its
+    /// child is refused, never a second child the pane cannot adopt (the
+    /// codex `fork_in_flight` rule).
+    fork_in_flight: crate::InFlightRegistry,
     /// Focused-ep5-r1 Finding 1 (retire-on-kill round 2): retained ALIAS
     /// tombstones. When a session's `cli_index` aliases are evicted (consumer
     /// exit, kill, a lease-revoked/rollback teardown), the mapping is DEMOTED
@@ -697,6 +702,12 @@ struct ClaudeSession {
     /// the hardcoded "idle" that used to wedge stale-busy/stale-idle panes.
     /// Starts "idle" — a fresh/just-resumed session has announced nothing else.
     last_status: Arc<std::sync::Mutex<String>>,
+    /// The genesis this runtime was launched from when it had no transcript yet
+    /// (an undo's replacement, a fork's child; design §4.1), stamped with the
+    /// launch time. The snapshot serves it when the ledger records none: a lane
+    /// with no ledger (the hosted session host) still shows a pending session's
+    /// conversation. A transcript on disk always wins over it.
+    launch_genesis: Option<crate::identity_sink::RecordedGenesis>,
 }
 
 /// The sidecar's signed answer to a `rollback.quiesce` probe (ep4-r3). All
@@ -796,6 +807,7 @@ impl FreshClaudeState {
             ownership_stamps: Arc::new(std::sync::Mutex::new(HashMap::new())),
             terminal_liveness: Arc::new(|_, _| false),
             rollback_in_flight: crate::InFlightRegistry::new(),
+            fork_in_flight: crate::InFlightRegistry::new(),
             alias_tombstones: Arc::new(std::sync::Mutex::new(AliasTombstones::default())),
             close_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
             naming: crate::naming::NamingSink::default(),
@@ -2448,6 +2460,7 @@ impl FreshClaudeState {
                     partial_runtime_key: resume_sid.clone().or_else(|| fresh_claim_key.clone()),
                     start_pid_slot: &start_pid_slot,
                     inherit: None,
+                    genesis: None,
                 },
                 &mut lease_guard,
                 &mut own_ticket,
@@ -5789,6 +5802,7 @@ impl FreshClaudeState {
                 partial_runtime_key: Some(durable.to_string()),
                 start_pid_slot: &start_pid_slot,
                 inherit: None,
+                genesis: None,
             },
             lease_guard,
             own_ticket,
@@ -8557,7 +8571,9 @@ mod create_outcome;
 pub use create_outcome::ClaudeCreateOutcome;
 
 mod establish;
+mod fork;
 mod genesis;
+mod history;
 mod rollback;
 use establish::{DurableClaim, EstablishLane, EstablishPlan, RegisterUnder};
 
@@ -8673,6 +8689,7 @@ pub(crate) mod tests {
                 turn_lock: Arc::new(TokioMutex::new(())),
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
                 last_status: Arc::new(std::sync::Mutex::new("idle".to_string())),
+                launch_genesis: None,
             },
         );
     }
@@ -17834,6 +17851,7 @@ rl.on('line', (line) => {
                 turn_lock: Arc::new(TokioMutex::new(())),
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
                 last_status: Arc::new(std::sync::Mutex::new("idle".to_string())),
+                launch_genesis: None,
             },
         );
     }
@@ -19703,6 +19721,7 @@ rl.on('line', (line) => {
                 turn_lock,
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
                 last_status,
+                launch_genesis: None,
             },
         );
         st.cli_index
@@ -19754,6 +19773,7 @@ rl.on('line', (line) => {
                 turn_lock: Arc::new(TokioMutex::new(())),
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
                 last_status: Arc::new(std::sync::Mutex::new("idle".to_string())),
+                launch_genesis: None,
             },
         );
         st.cli_index
@@ -19848,6 +19868,7 @@ rl.on('line', (line) => {
                 turn_lock,
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
                 last_status,
+                launch_genesis: None,
             },
         );
         st.cli_index

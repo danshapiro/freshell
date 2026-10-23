@@ -18,7 +18,9 @@
 //! An undo or redo establishes its replacement runtime here too (C13): it boots
 //! the replacement under the id the rollback minted, registered as already
 //! adopted, while the original is still live; the rollback then moves
-//! ownership and stops the original (`claude/rollback.rs`).
+//! ownership and stops the original (`claude/rollback.rs`). A fork establishes
+//! its child the same way, beside the parent, which it never touches
+//! (`claude/fork.rs`, C14).
 
 use super::*;
 
@@ -32,6 +34,8 @@ pub(super) enum EstablishLane {
     AttachResume,
     /// An undo or redo's replacement runtime.
     Rollback,
+    /// A fork's child runtime.
+    Fork,
 }
 
 impl EstablishLane {
@@ -40,6 +44,7 @@ impl EstablishLane {
             Self::Create => "create",
             Self::AttachResume => "attach-resume",
             Self::Rollback => "rollback",
+            Self::Fork => "fork",
         }
     }
 }
@@ -105,6 +110,11 @@ pub(super) struct EstablishPlan<'a> {
     pub(super) start_pid_slot: &'a crate::ownership_lane::SidecarPidSlot,
     /// The state a replacement takes over (a rollback); `None` starts afresh.
     pub(super) inherit: Option<InheritedRuntime>,
+    /// The genesis a launch that mints a session with no transcript yet boots
+    /// (an undo's replacement, a fork's child): the session keeps it, so its
+    /// snapshot shows the conversation before the transcript exists, also on a
+    /// lane with no ledger. `None` for every other launch.
+    pub(super) genesis: Option<crate::claude_launch::ClaudeGenesis>,
 }
 
 /// A runtime that is registered and committed.
@@ -384,6 +394,7 @@ impl FreshClaudeState {
             partial_runtime_key,
             start_pid_slot,
             inherit,
+            genesis,
         } = plan;
         let start = StartWatch {
             pid_slot: start_pid_slot,
@@ -571,6 +582,10 @@ impl FreshClaudeState {
                     turn_lock,
                     rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
                     last_status,
+                    launch_genesis: genesis.map(|genesis| crate::identity_sink::RecordedGenesis {
+                        genesis,
+                        updated_at_ms: crate::rollback_record::now_ms(),
+                    }),
                 },
             );
             // C09: a resumed session is live again, so it is no longer an ended
@@ -678,7 +693,7 @@ impl FreshClaudeState {
             if let Err(outcome) = self.commit_lane_claim_at(own_ticket, &map_key, sidecar_pid) {
                 let event = match lane {
                     EstablishLane::Create => "freshagent.claude.create_commit_stale",
-                    EstablishLane::AttachResume | EstablishLane::Rollback => {
+                    EstablishLane::AttachResume | EstablishLane::Rollback | EstablishLane::Fork => {
                         "freshagent.claude.attach_commit_stale"
                     }
                 };

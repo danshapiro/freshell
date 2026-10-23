@@ -124,12 +124,24 @@ impl FreshClaudeState {
         }
     }
 
-    /// The genesis the binding row of the session `any_id` names records, if
-    /// any (memory-only).
+    /// The genesis the session `any_id` names came from, if any (memory-only):
+    /// what its binding row records, else what its live runtime was launched
+    /// from (a lane with no ledger, such as the hosted session host, records
+    /// nothing).
     pub(crate) async fn load_genesis(&self, any_id: &str) -> Option<RecordedGenesis> {
         let durable = self.durable_session_id(any_id).await;
-        self.identity_sink()
+        if let Some(recorded) = self
+            .identity_sink()
             .and_then(|sink| sink.load_genesis(PROVIDER, &durable))
+        {
+            return Some(recorded);
+        }
+        let key = self.resolve_session_key(any_id).await?;
+        self.sessions
+            .lock()
+            .await
+            .get(&key)
+            .and_then(|session| session.launch_genesis.clone())
     }
 
     /// The session's snapshot from disk, read from this lane's transcript store:

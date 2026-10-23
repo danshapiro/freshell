@@ -2213,8 +2213,8 @@ async fn handle_client_text(
         // `freshAgent.forked` (or a failure `freshAgent.error`, e.g.
         // INVALID_SESSION_ID / INTERNAL_ERROR) ON THE REQUESTING CONNECTION
         // (`conn_sink`, same shape as `create_gate.rs`'s `CreateOutput::Channel(&sink)`),
-        // so a Fork click never dies silently. The refusal table already answered the
-        // remaining unsupported cells (claude permanently, amplifier unconditionally).
+        // so a Fork click never dies silently. C14 added the claude arm; the refusal
+        // table already answered the one remaining unsupported cell (amplifier).
         // Detached task, same shape as the FreshAgentCompact arm (the fork RPC chain
         // never blocks the select loop).
         //
@@ -2246,6 +2246,20 @@ async fn handle_client_text(
                 tokio::spawn(
                     async move {
                         fresh_codex
+                            .handle_fork(fork, Some(provenance), conn_sink)
+                            .await
+                    }
+                    .instrument(tracing::Span::current()),
+                );
+            } else if fork.provider == freshell_protocol::AgentProvider::Claude {
+                // C14 (G09): claude x fork (freshclaude AND kilroy) boots a
+                // verified lazy-fork child beside the live parent
+                // (`FreshClaudeState::handle_fork`); same request/response shape.
+                let fresh_claude = state.fresh_claude.clone();
+                let conn_sink = conn_sink.clone();
+                tokio::spawn(
+                    async move {
+                        fresh_claude
                             .handle_fork(fork, Some(provenance), conn_sink)
                             .await
                     }
@@ -9525,8 +9539,8 @@ fn session_type_wire(session_type: SessionType) -> &'static str {
 /// the genuinely unsupported provider x op cells, with the legacy `runtime-manager.ts`
 /// wording (`"Approvals are not supported for <sessionType>"`, `"Questions are …"`,
 /// `"Fork is …"`, `"Compact is …"`): approvals/questions support Claude and Codex, fork is
-/// refused for claude (permanently — the claude path has no fork) and amplifier
-/// (always); the opencode fork arm landed in Task 5 and the codex arm in Task 6.
+/// refused for amplifier only (the opencode fork arm landed in Task 5, the codex arm in
+/// Task 6 and the claude arm in C14).
 /// Compact is refused ONLY for amplifier (every other provider has a real
 /// arm since Task 4). There is no amplifier
 /// FRESH-AGENT runtime at all, so the amplifier x op cells are unconditional
@@ -9550,11 +9564,11 @@ pub(crate) fn fresh_agent_control_refusal(message: &ClientMessage) -> Option<Ser
             m.session_id.as_str(),
             m.session_type,
         ),
-        // Fork has NO claude arm (permanent — capabilities fork:false) and there is
-        // no amplifier fresh-agent runtime at all; the opencode arm landed in Task 5
-        // and codex's in Task 6, so only the claude + amplifier cells refuse here.
+        // There is no amplifier fresh-agent runtime at all; opencode (Task 5),
+        // codex (Task 6) and claude (C14) each have a fork arm, so only the
+        // amplifier cell refuses here.
         ClientMessage::FreshAgentFork(m) => (
-            matches!(m.provider, AgentProvider::Claude | AgentProvider::Amplifier),
+            m.provider == AgentProvider::Amplifier,
             "Fork is",
             m.provider,
             m.session_id.as_str(),

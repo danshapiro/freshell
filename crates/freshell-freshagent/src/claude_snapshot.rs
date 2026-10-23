@@ -1554,6 +1554,60 @@ pub(crate) fn resolve_resume_point(
     })
 }
 
+/// Why a fork of a conversation has no point to keep through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ForkPointError {
+    /// The conversation holds no chain lines: there is nothing to fork.
+    Empty,
+    /// The turn the fork was asked to start from is not in the conversation.
+    TurnNotFound,
+}
+
+/// Where a fork of `transcript` keeps through (core design §4.5 `handle_fork`):
+/// the last raw-chain entry of the step holding `at_turn_id`, so the fork keeps
+/// that whole turn (its answer and tool round trips), or the chain's tip when no
+/// turn is named. `at_turn_id` is a snapshot turn id (a line uuid); a client
+/// split-row id (`<turn>:row-<n>`) names its turn. A line before the first step
+/// keeps the lines before that step.
+pub(crate) fn fork_point(
+    transcript: &str,
+    at_turn_id: Option<&str>,
+) -> Result<String, ForkPointError> {
+    let chain = raw_chain(transcript);
+    let Some(tip) = chain.last() else {
+        return Err(ForkPointError::Empty);
+    };
+    let Some(at) = at_turn_id else {
+        return Ok(tip.uuid.clone());
+    };
+    let at = strip_split_row_suffix(at);
+    let pos = chain
+        .iter()
+        .position(|line| line.uuid == at)
+        .ok_or(ForkPointError::TurnNotFound)?;
+    let anchors = rollback_anchor_positions(&chain);
+    let end = match anchors.iter().rposition(|&anchor| anchor <= pos) {
+        Some(step) => step_group_end(chain.len(), &anchors, step),
+        None => anchors
+            .first()
+            .map(|first| first.saturating_sub(1))
+            .unwrap_or(chain.len() - 1),
+    };
+    Ok(chain[end].uuid.clone())
+}
+
+/// A turn id without the client's split-row suffix (`<turn>:row-<digits>`).
+fn strip_split_row_suffix(turn_id: &str) -> &str {
+    match turn_id.rsplit_once(":row-") {
+        Some((turn, digits))
+            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            turn
+        }
+        _ => turn_id,
+    }
+}
+
 /// The restored slice's display turns + the composer-refill prompt: the display
 /// projection of the original's chain range strictly-after-the-current-prefix
 /// through `resume_at` (inclusive), with the prompt of the first restored step.
@@ -1754,7 +1808,9 @@ pub(crate) fn build_claude_snapshot_from_projection(
             "interrupt": true,
             "approvals": false,
             "questions": false,
-            "fork": false,
+            // C14 (G09): a conversation forks (`FreshClaudeState::handle_fork`).
+            // The server refuses a fork while a turn runs (BUSY_TURN).
+            "fork": true,
             // The changed-files panel shows when the transcript edited files.
             "diffs": !diffs.is_empty(),
             // Kata 1wxv Task 5: STATIC stamps (freshclaude AND kilroy — no SDK
@@ -2018,7 +2074,8 @@ pub(crate) mod tests {
             assert_eq!(snapshot["sessionType"], session_type);
             assert_eq!(snapshot["capabilities"]["send"], true);
             assert_eq!(snapshot["capabilities"]["interrupt"], true);
-            assert_eq!(snapshot["capabilities"]["fork"], false);
+            // C14 (G09): a claude conversation forks (`FreshClaudeState::handle_fork`).
+            assert_eq!(snapshot["capabilities"]["fork"], true);
             assert_eq!(snapshot["capabilities"]["undo"], true);
             assert_eq!(snapshot["capabilities"]["redo"], true);
         }
@@ -2774,7 +2831,7 @@ pub(crate) mod tests {
         // Untouched gates and fields.
         assert_eq!(built["capabilities"]["send"], json!(true));
         assert_eq!(built["capabilities"]["interrupt"], json!(true));
-        assert_eq!(built["capabilities"]["fork"], json!(false));
+        assert_eq!(built["capabilities"]["fork"], json!(true));
         assert_eq!(built["sessionType"], json!("freshclaude"));
         assert_eq!(built["revision"], json!(7));
     }
@@ -3175,6 +3232,55 @@ pub(crate) mod tests {
             None,
             "two prompted turns: one guard declares one turn"
         );
+    }
+
+    /// A fork keeps through the last chain entry of the step holding the turn it
+    /// was asked to fork at: a prompt, an answer, or a line inside the step (a
+    /// tool-result carrier) all keep the whole step.
+    #[test]
+    fn a_fork_at_a_turn_keeps_through_the_end_of_that_turns_step() {
+        let transcript = uuid_transcript_with_carriers();
+        for at in ["u1", "c1", "a1", "tr1"] {
+            assert_eq!(
+                fork_point(&transcript, Some(at)).as_deref(),
+                Ok("tr1"),
+                "fork at {at}"
+            );
+        }
+        assert_eq!(fork_point(&transcript, Some("u2")).as_deref(), Ok("a2"));
+        assert_eq!(fork_point(&transcript, Some("a2")).as_deref(), Ok("a2"));
+    }
+
+    /// With no turn named, a fork keeps the whole conversation (its chain tip).
+    #[test]
+    fn a_fork_with_no_turn_keeps_through_the_tip() {
+        assert_eq!(
+            fork_point(&uuid_transcript_with_carriers(), None).as_deref(),
+            Ok("a2")
+        );
+    }
+
+    /// The client's split-row ids (`<turn>:row-<n>`) name their turn.
+    #[test]
+    fn a_fork_at_a_split_row_id_forks_at_its_turn() {
+        assert_eq!(
+            fork_point(&uuid_transcript_with_carriers(), Some("u1:row-1")).as_deref(),
+            Ok("tr1")
+        );
+    }
+
+    #[test]
+    fn a_fork_at_a_turn_the_conversation_does_not_hold_is_refused() {
+        assert_eq!(
+            fork_point(&uuid_transcript(), Some("gone")),
+            Err(ForkPointError::TurnNotFound)
+        );
+    }
+
+    #[test]
+    fn an_empty_conversation_has_nothing_to_fork() {
+        assert_eq!(fork_point("", None), Err(ForkPointError::Empty));
+        assert_eq!(fork_point("", Some("u1")), Err(ForkPointError::Empty));
     }
 
     #[test]

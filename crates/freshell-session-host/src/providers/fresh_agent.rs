@@ -66,6 +66,11 @@ struct HostedTransport {
     session_id: Mutex<Option<String>>,
     created_rx: Mutex<watch::Receiver<Option<Result<String, ()>>>>,
     native_rx: Mutex<watch::Receiver<Option<String>>>,
+    /// The native identity's writer, shared with the bridge: a claude fork
+    /// points it at the child the moment the transition is known (the bridge
+    /// announces only an id it has not recorded, so the child's first turn
+    /// announces nothing new).
+    native_tx: watch::Sender<Option<String>>,
     send_outcomes: broadcast::Sender<(String, bool)>,
     kill_outcomes: broadcast::Sender<(String, bool)>,
     suppressed_kills: Arc<std::sync::Mutex<HashSet<String>>>,
@@ -239,7 +244,7 @@ impl HostedTransport {
             broadcast_rx,
             BroadcastBridgeOutputs {
                 created: created_tx,
-                native: native_tx,
+                native: native_tx.clone(),
                 events: event_tx.clone(),
                 send_outcomes: send_outcomes.clone(),
                 kill_outcomes: kill_outcomes.clone(),
@@ -254,6 +259,7 @@ impl HostedTransport {
             session_id: Mutex::new(None),
             created_rx: Mutex::new(created_rx),
             native_rx: Mutex::new(native_rx),
+            native_tx,
             send_outcomes,
             kill_outcomes,
             suppressed_kills,
@@ -604,15 +610,16 @@ impl FreshAgentTransport for HostedTransport {
                 message: "fresh-agent session is not started".into(),
                 acceptance_ambiguous: false,
             })?;
-        if current != parent_session_id {
+        // The actor names the parent by its native id. A claude session's own
+        // id here is the sidecar's (`created.sessionId`), so the parent is the
+        // owned session when either names it.
+        let claude = matches!(self.provider, FreshProvider::Claude | FreshProvider::Kilroy);
+        let owned = current == parent_session_id
+            || (claude
+                && self.current_native_id().await.ok().as_deref() == Some(parent_session_id));
+        if !owned {
             return Err(DispatchFailure {
                 message: "provider-native fork parent no longer matches the owned session".into(),
-                acceptance_ambiguous: false,
-            });
-        }
-        if matches!(self.provider, FreshProvider::Claude | FreshProvider::Kilroy) {
-            return Err(DispatchFailure {
-                message: "provider-native conversation fork is unsupported".into(),
                 acceptance_ambiguous: false,
             });
         }
@@ -641,11 +648,11 @@ impl FreshAgentTransport for HostedTransport {
             }
         });
         match &self.state {
+            ProviderState::Claude(state) => state.handle_fork(message, None, sink).await,
             ProviderState::Codex(state) => state.handle_fork(message, None, sink).await,
             ProviderState::Opencode { runtime, .. } => {
                 runtime.handle_fork(message, None, sink).await
             }
-            ProviderState::Claude(_) => unreachable!("unsupported providers returned above"),
         }
         let forked = match tokio::time::timeout(FORK_TIMEOUT, receiver).await {
             Ok(Ok(ServerMessage::FreshAgentForked(forked))) => forked,
@@ -699,8 +706,13 @@ impl FreshAgentTransport for HostedTransport {
             });
         }
         *self.session_id.lock().await = Some(child.clone());
+        if claude {
+            // The child is the native session from here: snapshots, captures and
+            // a later fork address it before its first turn names it.
+            let _ = self.native_tx.send(Some(child.clone()));
+        }
         Ok(ForkTransition {
-            parent_session_id: current,
+            parent_session_id: parent_session_id.to_string(),
             child_session_id: child,
             parent_retired_by_runtime: true,
         })
@@ -1155,9 +1167,9 @@ fn spawn_broadcast_bridge(
     // (design §7.3). `freshAgent.created` names a resumed conversation (the CLI
     // booted it before the sidecar answered); a fresh one is named by its first
     // turn's init or by `materialized`. Every later turn's init repeats the same
-    // id and announces nothing.
+    // id and announces nothing. The identity watch records the id last
+    // announced (a fork's transport records its child there, C14).
     let claude = matches!(provider, FreshProvider::Claude | FreshProvider::Kilroy);
-    let mut announced: Option<String> = None;
     tokio::spawn(async move {
         let mut dropped = 0u64;
         loop {
@@ -1197,7 +1209,7 @@ fn spawn_broadcast_bridge(
                 if let Some(session_id) = value.get("sessionId").and_then(Value::as_str) {
                     if claude {
                         if let Some(native_id) = claude_session_ref_id(&value) {
-                            if !announce_native(&mut announced, native_id, &native, &events).await {
+                            if !announce_native(native_id, &native, &events).await {
                                 break;
                             }
                         }
@@ -1215,7 +1227,7 @@ fn spawn_broadcast_bridge(
             {
                 if let Some(session_id) = value.get("sessionId").and_then(Value::as_str) {
                     if claude {
-                        if !announce_native(&mut announced, session_id, &native, &events).await {
+                        if !announce_native(session_id, &native, &events).await {
                             break;
                         }
                     } else {
@@ -1245,8 +1257,7 @@ fn spawn_broadcast_bridge(
                         .and_then(Value::as_str)
                     {
                         if claude {
-                            if !announce_native(&mut announced, session_id, &native, &events).await
-                            {
+                            if !announce_native(session_id, &native, &events).await {
                                 break;
                             }
                         } else {
@@ -1320,15 +1331,13 @@ fn claude_session_ref_id(created: &Value) -> Option<&str> {
 /// `AgentEvent::Started` for it, unless it is the id last announced. False once
 /// the event receiver is gone.
 async fn announce_native(
-    announced: &mut Option<String>,
     native_id: &str,
     native: &watch::Sender<Option<String>>,
     events: &mpsc::Sender<AgentEvent>,
 ) -> bool {
-    if announced.as_deref() == Some(native_id) {
+    if native.borrow().as_deref() == Some(native_id) {
         return true;
     }
-    *announced = Some(native_id.to_string());
     let _ = native.send(Some(native_id.to_string()));
     events
         .send(AgentEvent::Started {
@@ -1810,6 +1819,126 @@ lines.on('line', line=>{
         .await
         .expect("the turn completes");
         assert_eq!(announced, vec![conversation.to_string()]);
+        Arc::clone(&claude.transport).stop().await.unwrap();
+    }
+
+    /// C14 (G09): a hosted claude fork routes to `FreshClaudeState::handle_fork`. The
+    /// transition arrives once the CLI booted the child as a lazy fork of the parent
+    /// (no prompt), keyed by the native ids the actor holds; the runtime retires the
+    /// parent; from then on the transport addresses the child: its snapshot is the
+    /// child's, and the next turn runs in the child under the child's id with no
+    /// second identity announcement (the actor records the child at the fork).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claude_fork_boots_the_child_retires_the_parent_and_runs_the_next_turn_there() {
+        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let conversation = "6d1f0a2b-3c4d-4e5f-8a6b-7c8d9e0f1a2b";
+        let claude = SimulatedClaude::start(&[conversation]).await;
+        let mut events = claude.transport.take_event_stream().expect("event stream");
+        let profile = claude.profile(Some(conversation));
+        tokio::time::timeout(Duration::from_secs(20), claude.transport.start(&profile))
+            .await
+            .expect("the resume start answers")
+            .expect("the resume start succeeds");
+
+        let transition = tokio::time::timeout(
+            Duration::from_secs(20),
+            claude
+                .transport
+                .fork(&RequestId::parse("fork-1").unwrap(), conversation, None),
+        )
+        .await
+        .expect("a claude fork must not wait for a prompt")
+        .expect("the fork succeeds");
+        assert_eq!(transition.parent_session_id, conversation);
+        assert!(transition.parent_retired_by_runtime);
+        let child = transition.child_session_id.clone();
+        assert!(
+            uuid::Uuid::parse_str(&child).is_ok() && child != conversation,
+            "{child}"
+        );
+        let boot = claude
+            .ledger_rows("query")
+            .into_iter()
+            .map(|row| row["options"].clone())
+            .find(|options| options["sessionId"] == child.as_str())
+            .expect("the CLI booted the child");
+        assert_eq!(boot["forkSession"], true, "{boot}");
+        assert_eq!(boot["resume"], conversation, "{boot}");
+        assert!(
+            claude.ledger_rows("prompt").is_empty(),
+            "no prompt was needed"
+        );
+        assert!(
+            !claude
+                .transport
+                .provider_session_is_live(conversation)
+                .await
+        );
+        assert!(claude.transport.provider_session_is_live(&child).await);
+        let snapshot = claude.transport.snapshot().await.expect("a snapshot");
+        assert_eq!(snapshot["sessionId"], child.as_str(), "{snapshot}");
+
+        // The child has no transcript yet; a fork of it forks the parent at the
+        // same point (source collapse), with no ledger to record the child's
+        // genesis on this lane.
+        let second = tokio::time::timeout(
+            Duration::from_secs(20),
+            claude
+                .transport
+                .fork(&RequestId::parse("fork-2").unwrap(), &child, None),
+        )
+        .await
+        .expect("the second fork answers")
+        .expect("a pending child forks");
+        assert_eq!(second.parent_session_id, child);
+        let grandchild = second.child_session_id.clone();
+        let boot = claude
+            .ledger_rows("query")
+            .into_iter()
+            .map(|row| row["options"].clone())
+            .find(|options| options["sessionId"] == grandchild.as_str())
+            .expect("the CLI booted the second child");
+        assert_eq!(boot["resume"], conversation, "{boot}");
+        let child = grandchild;
+
+        let mut child_profile = profile.clone();
+        child_profile.native_session_id = Some(child.clone());
+        claude
+            .transport
+            .dispatch(
+                &RequestId::parse("fork-turn").unwrap(),
+                "after the fork",
+                &child_profile,
+            )
+            .await
+            .expect("the send is accepted");
+        let mut announced = Vec::new();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(event) = events.recv().await {
+                match event {
+                    AgentEvent::Started { native_session_id } => announced.push(native_session_id),
+                    AgentEvent::Provider { payload }
+                        if payload["event"]["type"] == "freshAgent.turn.complete" =>
+                    {
+                        break
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the child's turn completes");
+        assert_eq!(
+            announced,
+            vec![conversation.to_string()],
+            "only the resumed parent is announced by the bridge"
+        );
+        let prompt = claude
+            .ledger_rows("prompt")
+            .into_iter()
+            .find(|row| row["text"] == "after the fork")
+            .expect("the turn ran");
+        assert_eq!(prompt["sessionId"], child.as_str(), "{prompt}");
         Arc::clone(&claude.transport).stop().await.unwrap();
     }
 
@@ -2642,8 +2771,7 @@ lines.on('line', line=>{{
         fn unsupported(&self, operation: &str) -> bool {
             matches!(
                 (self.provider.clone(), operation),
-                (FreshProvider::Claude, "fork")
-                    | (FreshProvider::Opencode, "approval" | "question")
+                (FreshProvider::Opencode, "approval" | "question")
             )
         }
     }
@@ -2770,18 +2898,7 @@ lines.on('line', line=>{{
             parent_session_id: &str,
             input: Option<Value>,
         ) -> Result<ForkTransition, DispatchFailure> {
-            let unsupported = self.unsupported("fork");
-            if unsupported {
-                self.trace.record(
-                    "fork",
-                    json!({"requestId":request_id.as_str(),"parentSessionId":parent_session_id,"input":input}),
-                    "unsupported",
-                );
-                return Err(DispatchFailure {
-                    message: "fixture provider-native fork is unsupported".into(),
-                    acceptance_ambiguous: false,
-                });
-            }
+            // Every provider forks natively (claude since C14).
             let child = format!("{parent_session_id}-fork");
             self.trace.record(
                 "fork",
@@ -3225,10 +3342,11 @@ lines.on('line', line=>{{
                 Some(json!({"atTurnId":"turn-1"})),
             )
             .await;
+        let transition = fork.expect("every provider forks natively (claude since C14)");
         assert_eq!(
-            fork.is_err(),
-            fixture.provider == FreshProvider::Claude,
-            "Claude keeps its provider-native unsupported fork result"
+            actor.profile().await.native_session_id.as_deref(),
+            Some(transition.child_session_id.as_str()),
+            "the actor follows the fork to its child"
         );
         let resumed_profile = actor.profile().await;
         let expected_native = resumed_profile.native_session_id.clone();
@@ -3366,17 +3484,11 @@ lines.on('line', line=>{{
                 create_rows[0].input["nativeSessionId"],
                 format!("native-{}", provider.as_str())
             );
-            let resumed_native = if provider == FreshProvider::Claude {
-                format!("native-{}", provider.as_str())
-            } else {
-                format!("native-{}-fork", provider.as_str())
-            };
-            assert_eq!(create_rows[1].input["nativeSessionId"], resumed_native);
-            if provider == FreshProvider::Claude {
-                assert!(direct_rows
-                    .iter()
-                    .any(|row| row.operation == "fork" && row.result == "unsupported"));
-            }
+            let resumed_native = format!("native-{}-fork", provider.as_str());
+            assert_eq!(
+                create_rows[1].input["nativeSessionId"], resumed_native,
+                "the restart resumes the fork's child"
+            );
             if provider == FreshProvider::Opencode {
                 assert!(direct_rows
                     .iter()

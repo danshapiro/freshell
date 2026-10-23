@@ -416,8 +416,101 @@ async fn undo_send_redo_and_two_undos_without_a_send(kind: RigKind) {
     conn.kill(&f2).await;
 }
 
+/// The snapshot turn id of the user turn `text` starts.
+async fn prompt_turn_id(rig: &ClaudeRig, session_id: &str, text: &str) -> String {
+    let snapshot = rig
+        .fresh_claude
+        .get_snapshot(freshell_protocol::SessionType::Freshclaude, session_id)
+        .await
+        .unwrap_or_else(|error| panic!("a snapshot of {session_id}: {error:?}"));
+    snapshot["turns"]
+        .as_array()
+        .expect("turns")
+        .iter()
+        .find(|turn| turn["role"] == "user" && turn["items"][0]["text"] == text)
+        .and_then(|turn| turn["turnId"].as_str())
+        .unwrap_or_else(|| panic!("no turn for {text:?}: {snapshot}"))
+        .to_string()
+}
+
+/// Design §11.5 item 6 (C14, G09): fork at a turn, then send. The fork answers
+/// once the CLI booted the child (no init is awaited), on the requesting
+/// connection, naming a new child that holds the parent's conversation through
+/// that turn. After the pane closes the parent (as the client does), the child's
+/// first send runs under the child's own id (the CLI reports it) and the parent's
+/// transcript is untouched.
+async fn fork_at_a_turn_then_send(kind: RigKind) {
+    let rig = ClaudeRig::start_with_options(
+        kind,
+        RigOptions {
+            durable_ledger: true,
+            ..RigOptions::default()
+        },
+    )
+    .await;
+    let mut conn = rig.connect().await;
+    let pane = conn.create("create-1").await;
+    turn(&rig, &mut conn, &pane, "send-1", "first prompt").await;
+    turn(&rig, &mut conn, &pane, "send-2", "second prompt").await;
+    let a = conn.init_session_id(&pane);
+    let a_path = rig.wait_for_transcript(&a).await;
+    let a_before = std::fs::read_to_string(&a_path).expect("read the parent's transcript");
+    let at = prompt_turn_id(&rig, &a, "first prompt").await;
+
+    let (epoch, generation) = conn.owner_pair(&a).expect("an owner record");
+    conn.send(json!({
+        "type": "freshAgent.fork",
+        "provider": "claude",
+        "sessionType": "freshclaude",
+        "sessionId": pane,
+        "requestId": "fork-1",
+        "input": { "atTurnId": at },
+        "observedEpoch": epoch,
+        "observedGeneration": generation,
+    }))
+    .await;
+    let forked = conn
+        .wait_for("the answer to fork-1", |v| {
+            (v["type"] == "freshAgent.forked" && v["requestId"] == "fork-1")
+                || (v["type"] == "freshAgent.event" && v["event"]["type"] == "freshAgent.error")
+        })
+        .await;
+    assert_eq!(forked["type"], "freshAgent.forked", "{forked}");
+    assert_eq!(forked["parentSessionId"], pane.as_str(), "{forked}");
+    let c = forked["sessionId"].as_str().expect("the child").to_string();
+    assert_ne!(c, a);
+    assert_eq!(prompts_of(&rig, &c).await, ["first prompt"]);
+    assert_eq!(
+        std::fs::read_to_string(&a_path).expect("read the parent's transcript"),
+        a_before,
+        "the fork wrote nothing to the parent's transcript"
+    );
+
+    // The pane closes the parent. The real CLI then records its own `last-prompt`
+    // bookkeeping line in the parent's transcript as it shuts down, so the
+    // parent's file is compared from here on.
+    conn.kill(&pane).await;
+    let a_closed = std::fs::read_to_string(&a_path).expect("read the parent's transcript");
+    turn(&rig, &mut conn, &c, "send-3", "a different second prompt").await;
+    assert_eq!(conn.init_session_id(&c), c, "the send ran under the child");
+    assert_eq!(
+        prompts_of(&rig, &c).await,
+        ["first prompt", "a different second prompt"]
+    );
+    assert_eq!(
+        std::fs::read_to_string(&a_path).expect("read the parent's transcript"),
+        a_closed,
+        "the child's turn wrote nothing to the parent's transcript"
+    );
+}
+
 mod sim {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fork_at_a_turn_then_send() {
+        super::fork_at_a_turn_then_send(RigKind::Sim).await;
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn undo_send_redo_and_two_undos_without_a_send() {
@@ -491,6 +584,11 @@ mod sim {
 
 mod cli {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fork_at_a_turn_then_send() {
+        super::fork_at_a_turn_then_send(RigKind::Cli).await;
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn undo_send_redo_and_two_undos_without_a_send() {
