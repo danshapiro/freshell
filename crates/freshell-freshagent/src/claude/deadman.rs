@@ -19,12 +19,18 @@ impl Default for QuietWatch {
     }
 }
 
-impl Drop for QuietWatch {
-    fn drop(&mut self) {
+impl QuietWatch {
+    pub(super) fn cancel(&mut self) {
         self.state.lock().expect("quiet deadman lock").disarm();
         if let Some(waiter) = self.waiter.take() {
             waiter.abort();
         }
+    }
+}
+
+impl Drop for QuietWatch {
+    fn drop(&mut self) {
+        self.cancel();
     }
 }
 

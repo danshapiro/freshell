@@ -275,7 +275,7 @@ export function handleFreshAgentMessage(
     }
     case 'freshAgent.recovery.stopped': {
       const stopped = msg as FreshAgentRecoveryStoppedMessage
-      if (stopped.success) {
+      if (stopped.success && stopped.provider !== 'amplifier') {
         // Stream events queued for the session land before it goes, so no
         // later flush re-creates a tail for a session that is gone.
         streamBatcherFor(dispatch).flush({

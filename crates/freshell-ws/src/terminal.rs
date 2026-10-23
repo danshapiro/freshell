@@ -2139,11 +2139,19 @@ async fn handle_client_text(
             true
         }
         ClientMessage::FreshAgentRecoveryStop(stop) => {
-            let fresh_codex = state.fresh_codex.clone();
-            tokio::spawn(
-                async move { fresh_codex.handle_recovery_stop(stop).await }
-                    .instrument(tracing::Span::current()),
-            );
+            if stop.provider == freshell_protocol::AgentProvider::Claude {
+                let fresh_claude = state.fresh_claude.clone();
+                tokio::spawn(
+                    async move { fresh_claude.handle_recovery_stop(stop).await }
+                        .instrument(tracing::Span::current()),
+                );
+            } else {
+                let fresh_codex = state.fresh_codex.clone();
+                tokio::spawn(
+                    async move { fresh_codex.handle_recovery_stop(stop).await }
+                        .instrument(tracing::Span::current()),
+                );
+            }
             true
         }
         // freshAgent.approval.respond / question.respond / compact (approval-respond
@@ -9517,6 +9525,31 @@ fn session_type_wire(session_type: SessionType) -> &'static str {
 /// refusal is a visible pane error (`fresh-agent-ws.ts` -- any code other than
 /// `INVALID_SESSION_ID` dispatches `sessionError`).
 pub(crate) fn fresh_agent_control_refusal(message: &ClientMessage) -> Option<ServerMessage> {
+    if let ClientMessage::FreshAgentRecoveryStop(stop) = message {
+        let supported = matches!(
+            (stop.provider, stop.session_type),
+            (AgentProvider::Codex, SessionType::Freshcodex)
+                | (
+                    AgentProvider::Claude,
+                    SessionType::Freshclaude | SessionType::Kilroy
+                )
+        );
+        if !supported {
+            return Some(ServerMessage::FreshAgentRecoveryStopped(
+                freshell_protocol::FreshAgentRecoveryStopped {
+                    request_id: stop.request_id.clone(),
+                    provider: agent_provider_wire(stop.provider).into(),
+                    session_id: stop.session_id.clone(),
+                    session_type: session_type_wire(stop.session_type).into(),
+                    success: false,
+                    code: Some("UNSUPPORTED_CAPABILITY".into()),
+                    message: Some(
+                        "Recovery stop is unavailable for this provider and session type.".into(),
+                    ),
+                },
+            ));
+        }
+    }
     let (refused, wording, provider, session_id, session_type) = match message {
         ClientMessage::FreshAgentApprovalRespond(m) => (
             !matches!(m.provider, AgentProvider::Claude | AgentProvider::Codex),
