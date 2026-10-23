@@ -216,12 +216,24 @@ pub async fn bind_terminal_naming_from_identity(
                 // binding lets the verified bind transfer the record once the
                 // transcript materializes. Without a persisted handle the
                 // durable binding stands, unnamed until the normal paths name
-                // the session.
-                if persisted_handle(&hint).is_none() {
+                // the session — and so it does when the handle turns out to
+                // be spent on another session (see `bind_pending_path`).
+                let Some(handle) = persisted_handle(&hint).map(str::to_string) else {
                     present_unnamed(registry, terminal_id, &target, &hint.fallback_title);
                     log_bound(terminal_id, &binding, "durable_no_record");
                     return NamingBindOutcome::BoundNoRecord { binding };
-                }
+                };
+                return bind_pending_path(
+                    sink.as_ref(),
+                    registry,
+                    binder,
+                    terminal_id,
+                    provider,
+                    handle,
+                    Some(&target),
+                    &hint,
+                )
+                .await;
             }
             Err(error) => {
                 // "Read failed" is not "no record": the durable binding is
@@ -242,6 +254,7 @@ pub async fn bind_terminal_naming_from_identity(
         terminal_id,
         provider,
         handle,
+        None,
         &hint,
     )
     .await
@@ -743,6 +756,14 @@ async fn refresh_existing_binding(
 /// pending ref, so the tick can admit the record later. A row whose binding
 /// moved while the admission was in flight (a switch onto a new session) is
 /// left to that move.
+///
+/// `record_less_target` is the durable session this bind first targeted when
+/// its read answered "no record" (a recovery create's fallback to the
+/// persisted handle). Then only the handle's OWN record, or the target's,
+/// is accepted: a handle the store resolves to any other session was spent
+/// on an earlier conversation, and binding it would show (and rename) that
+/// session's name on this row. The row keeps the durable binding instead.
+#[allow(clippy::too_many_arguments)]
 async fn bind_pending_path(
     sink: &dyn SessionNaming,
     registry: &TerminalRegistry,
@@ -750,6 +771,7 @@ async fn bind_pending_path(
     terminal_id: &str,
     provider: NamedProvider,
     handle: String,
+    record_less_target: Option<&SessionNameRef>,
     hint: &NamingBindHint,
 ) -> NamingBindOutcome {
     let input = PendingNameInput {
@@ -791,6 +813,18 @@ async fn bind_pending_path(
     }
     match admitted {
         Ok(update) => {
+            if let Some(target) = record_less_target.filter(|target| {
+                update.record.name_ref != pending && &update.record.name_ref != *target
+            }) {
+                return keep_record_less_target(
+                    registry,
+                    terminal_id,
+                    target,
+                    &pending,
+                    &update.record.name_ref,
+                    &hint.fallback_title,
+                );
+            }
             // `ensure_pending` resolves a handle already bound to a durable
             // session onto that session's record; the row follows it.
             let binding = NameBinding {
@@ -821,6 +855,35 @@ async fn bind_pending_path(
             );
             deferred(terminal_id, binding, &error)
         }
+    }
+}
+
+/// The recovery fallback's persisted handle was spent on another session:
+/// the row stays on its record-less durable target (both homes already hold
+/// it — the caller checked nothing moved) and presents `fallback_title`
+/// until the normal naming paths name the target.
+fn keep_record_less_target(
+    registry: &TerminalRegistry,
+    terminal_id: &str,
+    target: &SessionNameRef,
+    spent: &SessionNameRef,
+    resolved_to: &SessionNameRef,
+    fallback_title: &str,
+) -> NamingBindOutcome {
+    present_unnamed(registry, terminal_id, target, fallback_title);
+    tracing::info!(
+        target: "freshell_freshagent::naming",
+        terminal_id = %terminal_id,
+        name_ref = %name_ref_debug_key(target),
+        handle = %name_ref_debug_key(spent),
+        resolved_to = %name_ref_debug_key(resolved_to),
+        "session_names.terminal_binding_spent_handle: the persisted handle names another session; the row keeps its own"
+    );
+    NamingBindOutcome::BoundNoRecord {
+        binding: NameBinding {
+            name_ref: target.clone(),
+            naming_handle: None,
+        },
     }
 }
 

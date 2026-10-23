@@ -902,6 +902,200 @@ async fn a_pending_fallback_superseded_by_a_switch_never_rebinds_the_row() {
     );
 }
 
+/// Move `handle` onto `target` (a materialization's verified transfer) and
+/// name the target `name`.
+async fn spend_handle_onto(
+    sink: &dyn SessionNaming,
+    handle: &str,
+    target: &SessionNameRef,
+    name: &str,
+) {
+    sink.ensure_pending(PendingNameInput {
+        handle: handle.to_string(),
+        provider: NamedProvider::Codex,
+        cwd: None,
+    })
+    .await
+    .unwrap();
+    sink.bind_pending(BindNameInput {
+        pending: SessionNameRef::Pending {
+            id: handle.to_string(),
+        },
+        target: target.clone(),
+        acquisition: verified_claude_acquisition("spend"),
+    })
+    .await
+    .unwrap();
+    sink.rename(RenameNameInput {
+        target: target.clone(),
+        name: name.to_string(),
+        intent: NameIntent::User,
+        if_revision: None,
+        cwd: None,
+    })
+    .await
+    .unwrap();
+}
+
+/// A restore create for a record-less durable session T2 whose persisted
+/// handle was already SPENT (moved onto T1 when T1 materialized) keeps the
+/// row bound to T2: the handle now resolves to T1's record, and on this arm
+/// that is always another session (a handle moved onto T2 itself would have
+/// answered the durable read). The row shows the mode label; no record is
+/// created or changed.
+#[tokio::test(start_paused = true)]
+async fn a_record_less_resume_target_never_binds_through_a_spent_handle() {
+    let sink = FaultySink::new();
+    let t1 = session(NamedProvider::Codex, "thread-T1");
+    let t2 = session(NamedProvider::Codex, "thread-T2");
+    spend_handle_onto(sink.as_ref(), "nh-spent", &t1, "First thread").await;
+    let registry = TerminalRegistry::new();
+    headless_row(&registry, "T-restore", "codex");
+    let binder = FakeBinder::default();
+
+    let outcome = bind_terminal_naming_from_identity(
+        dyn_sink(&sink).as_ref(),
+        &registry,
+        &binder,
+        "T-restore",
+        hint("codex", Some("thread-T2"), Some("nh-spent")),
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        NamingBindOutcome::BoundNoRecord {
+            binding: NameBinding {
+                name_ref: t2.clone(),
+                naming_handle: None,
+            }
+        }
+    );
+    assert_eq!(registry.name_ref_of("T-restore"), Some(t2.clone()));
+    assert_eq!(binder.name_ref_of("T-restore"), Some(t2.clone()));
+    assert!(
+        registry.session_name_of("T-restore").is_none(),
+        "the other session's name is never cached on the row"
+    );
+    assert_eq!(
+        registry.title_of("T-restore").as_deref(),
+        Some("codex-label")
+    );
+    let reads = sink.inner.get(vec![t1.clone(), t2]).await.unwrap();
+    assert_eq!(reads.len(), 1, "no record was created for T2: {reads:?}");
+    assert_eq!(reads[0].record.name_ref, t1);
+    assert_eq!(reads[0].record.name, "First thread", "T1 is untouched");
+}
+
+/// The same arm with a STILL-pending persisted handle (a zero-turn pane whose
+/// server restarted) takes the pending path: the row binds the handle's own
+/// record, which the verified bind lane later transfers.
+#[tokio::test(start_paused = true)]
+async fn a_record_less_resume_target_rejoins_its_still_pending_handle() {
+    let sink = FaultySink::new();
+    let pending = SessionNameRef::Pending {
+        id: "nh-zero-turn".into(),
+    };
+    sink.ensure_pending(PendingNameInput {
+        handle: "nh-zero-turn".into(),
+        provider: NamedProvider::Codex,
+        cwd: None,
+    })
+    .await
+    .unwrap();
+    sink.rename(RenameNameInput {
+        target: pending.clone(),
+        name: "Billing".into(),
+        intent: NameIntent::User,
+        if_revision: None,
+        cwd: None,
+    })
+    .await
+    .unwrap();
+    let registry = TerminalRegistry::new();
+    headless_row(&registry, "T-zero-turn", "codex");
+    let binder = FakeBinder::default();
+
+    let outcome = bind_terminal_naming_from_identity(
+        dyn_sink(&sink).as_ref(),
+        &registry,
+        &binder,
+        "T-zero-turn",
+        hint("codex", Some("thread-prospective"), Some("nh-zero-turn")),
+    )
+    .await;
+
+    match &outcome {
+        NamingBindOutcome::Bound { binding, record } => {
+            assert_eq!(
+                binding,
+                &NameBinding {
+                    name_ref: pending.clone(),
+                    naming_handle: Some("nh-zero-turn".into()),
+                }
+            );
+            assert_eq!(record.name, "Billing");
+        }
+        other => panic!("expected a pending binding, got {other:?}"),
+    }
+    assert_eq!(registry.name_ref_of("T-zero-turn"), Some(pending.clone()));
+    assert_eq!(
+        binder.binding("T-zero-turn"),
+        Some((pending, Some("nh-zero-turn".into())))
+    );
+    assert_eq!(registry.title_of("T-zero-turn").as_deref(), Some("Billing"));
+}
+
+/// The same arm when the persisted handle moves onto the TARGET itself
+/// between the durable read ("no record") and the pending admission (the
+/// session materialized in between): the admission answers the target's own
+/// record, so the row binds it.
+#[tokio::test(start_paused = true)]
+async fn a_record_less_resume_target_accepts_its_handle_moving_onto_it() {
+    let sink = FaultySink::new();
+    let target = session(NamedProvider::Codex, "thread-materializing");
+    sink.ensure_pending(PendingNameInput {
+        handle: "nh-moving".into(),
+        provider: NamedProvider::Codex,
+        cwd: None,
+    })
+    .await
+    .unwrap();
+    let registry = TerminalRegistry::new();
+    headless_row(&registry, "T-moving", "codex");
+    let binder = FakeBinder::default();
+    let (entered, release) = sink.hold_next_read_of(&target);
+    let naming = dyn_sink(&sink);
+
+    let create = bind_terminal_naming_from_identity(
+        naming.as_ref(),
+        &registry,
+        &binder,
+        "T-moving",
+        hint("codex", Some("thread-materializing"), Some("nh-moving")),
+    );
+    let materialize = async {
+        entered.notified().await;
+        spend_handle_onto(sink.inner.as_ref(), "nh-moving", &target, "Materialized").await;
+        release.notify_one();
+    };
+    let (outcome, ()) = tokio::join!(create, materialize);
+
+    match &outcome {
+        NamingBindOutcome::Bound { binding, record } => {
+            assert_eq!(binding.name_ref, target);
+            assert_eq!(record.name, "Materialized");
+        }
+        other => panic!("expected the target's own record, got {other:?}"),
+    }
+    assert_eq!(registry.name_ref_of("T-moving"), Some(target.clone()));
+    assert_eq!(binder.name_ref_of("T-moving"), Some(target));
+    assert_eq!(
+        registry.title_of("T-moving").as_deref(),
+        Some("Materialized")
+    );
+}
+
 /// A switch onto a session whose read answered "no record" keeps the record
 /// the naming publisher wrote onto the row meanwhile (the session was named
 /// between the store's answer and the follow acting on it) — only the OLD
