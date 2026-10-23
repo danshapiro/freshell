@@ -27,10 +27,12 @@
 //!   no active process AND every process the guard saw in it has exited (its
 //!   handle is signaled, as node's is once reaped). The job stops counting a
 //!   process as soon as it starts to exit, a few milliseconds (more for a
-//!   large process) before Windows has finished that exit, and stops listing
-//!   it then too, so the guard records the job's members when a stop begins
-//!   and at every check (`freshell_platform::process_job::JobMembers`). If
-//!   the job cannot be created or assigned, the child runs unguarded and
+//!   large process) before Windows has finished that exit, and may stop
+//!   listing it then too. So when a stop begins the guard records the job's members
+//!   and has the job report every process that joins it from then on, and
+//!   at every check it watches the members reported since, even one already
+//!   exiting (`freshell_platform::process_job::JobMembers`). If the job
+//!   cannot be created or assigned, the child runs unguarded and
 //!   `freshagent.claude.tree_guard_unavailable` is logged.
 //! - Dropping the guard (an early-return path, a panic, a dropped session)
 //!   kills whatever is left of the tree (Windows: closing the job handle does
@@ -621,8 +623,9 @@ impl SidecarTreeGuard {
         (status, tree)
     }
 
-    /// Windows: start watching every process in the job not watched yet
-    /// (see the module docs). Nothing to do elsewhere: the process group is
+    /// Windows: start watching every process in the job not watched yet,
+    /// and (the first time) every process that joins it from now on (see
+    /// the module docs). Nothing to do elsewhere: the process group is
     /// checked as a whole.
     fn watch_members(&mut self) {
         #[cfg(windows)]

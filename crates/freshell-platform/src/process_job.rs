@@ -7,12 +7,15 @@
 //! job handle (dropping [`KillOnCloseJob`]) terminates every process still in
 //! the job (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`).
 //!
-//! A job stops counting a process as active (and stops listing it) the
-//! moment the process starts to exit, but Windows signals the process (it
-//! has exited) only once that exit is done: on windows-2022 about 4 ms later
+//! A job stops counting a process as active the moment the process starts
+//! to exit (and stops listing it around then), but Windows signals the
+//! process (it has exited) only once that exit is done: on windows-2022 about 4 ms later
 //! for an idle node and 25-30 ms later for one holding 768 MB, every time.
 //! An owner that must know the whole tree has exited therefore watches the
-//! members' own handles too ([`JobMembers`]).
+//! members' own handles too ([`JobMembers`]), learning of each member from
+//! the job's list and from the job's completion port, which reports every
+//! process that joins the job, even one that has started to exit by the
+//! time the report is read.
 //!
 //! This crate is tokio-free and does no logging: the blocking wait
 //! ([`KillOnCloseJob::wait_signaled`]) is meant to run on a blocking thread,
@@ -326,26 +329,37 @@ impl Drop for ProcessExitWatch {
     }
 }
 
-/// Handles on the processes seen running in a job, for an owner that must
-/// know when every one of them has exited, not just stopped being counted
-/// (see the module docs).
+/// Handles on the processes in a job, for an owner that must know when
+/// every one of them has exited, not just stopped being counted (see the
+/// module docs).
 ///
-/// A member is seen only while the job still lists it, that is before it
-/// starts to exit, so [`Self::record`] belongs before anything that ends
-/// the members (a shutdown request, [`KillOnCloseJob::terminate`]) and at
-/// every check after it.
+/// The first [`Self::record`] watches the processes the job lists and
+/// subscribes to the job's reports of every process that joins it from
+/// then on. A process that started to exit before that first call may not
+/// be listed any more, so the first call belongs before anything that ends
+/// the members (a shutdown request, [`KillOnCloseJob::terminate`]); each
+/// later call, at every check, also watches every process that joined
+/// since, including one already exiting.
 #[derive(Default)]
 pub struct JobMembers {
     watched: Vec<(u32, ProcessExitWatch)>,
+    joined: Option<JoinedProcesses>,
 }
 
 impl JobMembers {
-    /// Start watching every process `job` lists that is not watched yet.
+    /// Start watching every process in `job` that is not watched yet: those
+    /// it lists and those it reported joining.
     pub fn record(&mut self, job: &KillOnCloseJob) -> io::Result<()> {
         // A watched member keeps its id taken until its watch is closed, so
-        // once the exited ones are forgotten an id listed again is new.
+        // once the exited ones are forgotten an id seen again is new.
         self.forget_exited()?;
-        for process_id in job.process_ids()? {
+        let joined = match &self.joined {
+            Some(joined) => joined,
+            None => self.joined.insert(JoinedProcesses::subscribe(job)?),
+        };
+        let mut process_ids = joined.take()?;
+        process_ids.extend(job.process_ids()?);
+        for process_id in process_ids {
             if self
                 .watched
                 .iter()
@@ -377,6 +391,89 @@ impl JobMembers {
                 }
             });
         failure.map_or(Ok(()), Err)
+    }
+}
+
+/// A job's completion port, which the job posts a report to for every
+/// process that joins it (and, when the port is attached, for every process
+/// already in it). Unlike the job's process list, a report stays readable
+/// after its process has started to exit.
+struct JoinedProcesses {
+    port: HANDLE,
+}
+
+// SAFETY: a completion port handle is a kernel object handle; dequeuing from
+// it is thread-safe, and it is closed exactly once (in `Drop`).
+unsafe impl Send for JoinedProcesses {}
+unsafe impl Sync for JoinedProcesses {}
+
+impl JoinedProcesses {
+    /// Attach a new completion port to `job` (a job takes only one).
+    fn subscribe(job: &KillOnCloseJob) -> io::Result<Self> {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::JobObjects::{
+            JobObjectAssociateCompletionPortInformation, SetInformationJobObject,
+            JOBOBJECT_ASSOCIATE_COMPLETION_PORT,
+        };
+        use windows_sys::Win32::System::IO::CreateIoCompletionPort;
+
+        let port =
+            unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1) };
+        if port.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let joined = Self { port };
+        let association = JOBOBJECT_ASSOCIATE_COMPLETION_PORT {
+            CompletionKey: std::ptr::null_mut(),
+            CompletionPort: joined.port,
+        };
+        let associated = unsafe {
+            SetInformationJobObject(
+                job.handle,
+                JobObjectAssociateCompletionPortInformation,
+                std::ptr::addr_of!(association).cast(),
+                std::mem::size_of::<JOBOBJECT_ASSOCIATE_COMPLETION_PORT>() as u32,
+            )
+        };
+        if associated == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(joined)
+    }
+
+    /// The ids of the processes reported joining since the last call. Other
+    /// reports (a process exiting, the job emptying) are dropped.
+    fn take(&self) -> io::Result<Vec<u32>> {
+        use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+        use windows_sys::Win32::System::SystemServices::JOB_OBJECT_MSG_NEW_PROCESS;
+        use windows_sys::Win32::System::IO::{GetQueuedCompletionStatus, OVERLAPPED};
+
+        let mut joined = Vec::new();
+        loop {
+            let mut message = 0u32;
+            let mut key = 0usize;
+            // A job report carries its process id in place of an OVERLAPPED.
+            let mut process_id: *mut OVERLAPPED = std::ptr::null_mut();
+            let dequeued = unsafe {
+                GetQueuedCompletionStatus(self.port, &mut message, &mut key, &mut process_id, 0)
+            };
+            if dequeued == 0 {
+                let error = io::Error::last_os_error();
+                if process_id.is_null() && error.raw_os_error() == Some(WAIT_TIMEOUT as i32) {
+                    return Ok(joined);
+                }
+                return Err(error);
+            }
+            if message == JOB_OBJECT_MSG_NEW_PROCESS {
+                joined.push(process_id as usize as u32);
+            }
+        }
+    }
+}
+
+impl Drop for JoinedProcesses {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.port) };
     }
 }
 
@@ -500,6 +597,100 @@ mod tests {
             );
         }
         child.wait().expect("reap the child");
+    }
+
+    /// A long `ping`, spawned suspended into `job` and then resumed.
+    fn spawn_ping_in(job: &KillOnCloseJob) -> std::process::Child {
+        use std::os::windows::process::CommandExt;
+        let child = Command::new("ping")
+            .args(["-n", "120", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_SUSPENDED)
+            .spawn()
+            .expect("spawn ping suspended");
+        job.assign_suspended_process(child.id())
+            .expect("assign the suspended ping and resume it");
+        child
+    }
+
+    #[test]
+    fn the_job_reports_the_processes_in_it_and_every_one_that_joins() {
+        let job = KillOnCloseJob::new().expect("create the job");
+        let mut tree = spawn_tree_in(&job);
+        let listed = job.process_ids().expect("list the job's processes");
+
+        let joined = JoinedProcesses::subscribe(&job).expect("subscribe to the job");
+        let present = joined.take().expect("read the reports");
+        let mut later = spawn_ping_in(&job);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let reported_later = loop {
+            let reported = joined.take().expect("read the reports");
+            if !reported.is_empty() || std::time::Instant::now() >= deadline {
+                break reported;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        job.terminate().expect("terminate the job");
+        tree.wait().expect("reap the tree's root");
+        later.wait().expect("reap the later process");
+        for id in &listed {
+            assert!(
+                present.contains(id),
+                "a process already in the job is reported: {id} of {listed:?}, reported {present:?}"
+            );
+        }
+        assert_eq!(
+            reported_later,
+            [later.id()],
+            "a process that joins later is reported once"
+        );
+    }
+
+    #[test]
+    fn a_member_the_job_no_longer_lists_is_still_watched_once_it_was_reported() {
+        let job = KillOnCloseJob::new().expect("create the job");
+        let mut members = JobMembers::default();
+        members.record(&job).expect("record the (empty) job");
+        let mut member = spawn_ping_in(&job);
+        // Kept open, this keeps the exited process (and its id) around, as
+        // a process still finishing its exit is.
+        let watch = ProcessExitWatch::open(member.id()).expect("watch the member");
+        member.kill().expect("kill the member");
+        assert!(
+            watch
+                .wait(Duration::from_secs(5))
+                .expect("wait on the member"),
+            "the member exits"
+        );
+        // The job drops an exiting process from its list, sometimes only
+        // just after the process is signaled.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while job
+            .process_ids()
+            .expect("list the job's processes")
+            .contains(&member.id())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the job stops listing a member that has exited"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        members.record(&job).expect("record the members");
+
+        assert!(
+            members.watched.iter().any(|(id, _)| *id == member.id()),
+            "the member the job reported joining is watched"
+        );
+        assert!(
+            !members.any_running().expect("check the members"),
+            "and it has exited"
+        );
+        member.wait().expect("reap the member");
     }
 
     #[test]

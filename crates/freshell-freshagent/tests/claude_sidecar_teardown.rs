@@ -636,6 +636,77 @@ async fn an_abnormal_exit_is_confirmed_only_once_a_slow_exiting_grandchild_has_e
     );
 }
 
+/// Starts nothing until the shutdown line. Then it starts a grandchild like
+/// [`FAKE_CRASHES_LEAVING_A_SLOW_EXITING_GRANDCHILD`]'s, writes its pid to
+/// the record file once it holds its memory, and exits 1 as soon as the
+/// test creates `<record>.go`.
+const FAKE_STARTS_A_SLOW_EXITING_GRANDCHILD_ON_SHUTDOWN_THEN_CRASHES: &str = r#"
+const fs = require('fs')
+const { spawn } = require('child_process')
+const out = process.argv[1]
+require('readline').createInterface({ input: process.stdin }).on('line', (line) => {
+  if (JSON.parse(line).type !== 'shutdown') return
+  const grandchild = spawn(process.execPath, ['-e', "const held = Buffer.alloc(512 * 1024 * 1024, 1); setInterval(() => held[0]++, 1000); console.log('holding')"], { stdio: ['ignore', 'pipe', 'ignore'] })
+  grandchild.stdout.once('data', () => {
+    fs.writeFileSync(`${out}.tmp`, String(grandchild.pid))
+    fs.renameSync(`${out}.tmp`, out)
+    setInterval(() => { if (fs.existsSync(`${out}.go`)) process.exit(1) }, 5)
+  })
+})
+setInterval(() => {}, 1000)
+process.stdout.write('ready\n')
+"#;
+
+/// The guard also watches a process that joins the tree after the stop has
+/// begun, not only those running when it began: here node starts the
+/// slow-exiting grandchild after the shutdown line and then crashes. On
+/// Windows that crash is what kills the grandchild (node's own kill-on-close
+/// job), so it may already be exiting when the guard first looks.
+#[tokio::test]
+async fn an_abnormal_exit_is_confirmed_only_once_a_grandchild_started_during_the_stop_has_exited() {
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("record.txt");
+    let fake = spawn_fake(
+        FAKE_STARTS_A_SLOW_EXITING_GRANDCHILD_ON_SHUTDOWN_THEN_CRASHES,
+        &record,
+    )
+    .await;
+    // Ample, so a slow machine's grandchild holds its memory well inside it;
+    // the crash ends the wait as soon as the test lets it.
+    let grace = Duration::from_secs(20);
+    let stop = tokio::spawn(graceful_then_kill(
+        fake.child, fake.stdin, fake.guard, grace,
+    ));
+    let deadline = std::time::Instant::now() + grace;
+    let pid: u32 = loop {
+        if let Some(pid) = std::fs::read_to_string(&record)
+            .ok()
+            .and_then(|pid| pid.trim().parse().ok())
+        {
+            break pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fake started its grandchild"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let grandchild = ProcessProbe::open(pid);
+    assert!(grandchild.running());
+
+    let mut go = record.into_os_string();
+    go.push(".go");
+    std::fs::write(go, "").expect("let the fake crash");
+    let exit = stop.await.expect("the stop task");
+
+    assert_eq!(exit.stop, SidecarStop::AbnormalExit, "{exit:?}");
+    assert_eq!(exit.tree, TreeConfirmation::Confirmed, "{exit:?}");
+    assert!(
+        grandchild.exited(),
+        "the grandchild had exited when the tree was confirmed gone: {exit:?}"
+    );
+}
+
 /// As above, for a tree the guard itself kills while all of it runs.
 #[tokio::test]
 async fn terminating_the_guard_is_confirmed_only_once_a_slow_exiting_grandchild_has_exited() {
