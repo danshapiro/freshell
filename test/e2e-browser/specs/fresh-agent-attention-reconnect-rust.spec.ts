@@ -68,6 +68,8 @@ for (const flavour of ['freshclaude', 'kilroy'] as const) {
         FRESHELL_CLAUDE_SIDECAR: sidecar,
         FRESHELL_CLAUDE_NODE: process.execPath,
         FRESHELL_CLAUDE_SDK_QUERY_MODULE: simulator,
+        // Kilroy is hidden unless its server-side feature flag is enabled.
+        ...(flavour === 'kilroy' ? { KILROY_ENABLED: '1' } : {}),
       },
       setupHome: async (home) => {
         await fs.mkdir(path.join(home, '.freshell'), { recursive: true })
@@ -105,13 +107,17 @@ for (const flavour of ['freshclaude', 'kilroy'] as const) {
       if (await shellPicker.isVisible().catch(() => false)) {
         await shellPicker.getByRole('button', { name: /^(Shell|Bash|WSL|CMD|PowerShell)$/i }).first().click()
       }
+      // The boot picker remains mounted while it fades out. Wait for the
+      // selected shell to render before openPanePicker looks for an existing
+      // picker, or it can return the fading boot picker and miss the click.
+      await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
       await page.evaluate(() => (window as any).__FRESHELL_TEST_HARNESS__.dispatch({
         type: 'connection/setAvailableClis', payload: { claude: true },
       }))
       const tabId = (await harness.getActiveTabId())!
       const picker = await openPanePicker(page)
       const label = flavour === 'kilroy' ? 'Kilroy' : 'Freshclaude'
-      await picker.getByRole('button', { name: new RegExp(`^${label}$`) }).click()
+      await picker.getByRole('button', { name: new RegExp(`^${label}$`) }).click({ force: true })
       const cwd = page.getByLabel(new RegExp(`^Starting directory for ${label}$`, 'i'))
       await cwd.fill(project)
       await cwd.press('Enter')
@@ -149,7 +155,25 @@ for (const flavour of ['freshclaude', 'kilroy'] as const) {
 
       await harness.forceDisconnect()
       await harness.waitForConnection()
-      expect((await completion()).seq).toBe(2)
+      const reconnectState = await completion()
+      const received = await harness.getReceivedWsMessages() as Array<Record<string, any>>
+      const evidence = {
+        seq: reconnectState.seq,
+        freshAgentBaselines: reconnectState.lastAtByTerminalId,
+        terminalIdleBaselines: reconnectState.lastIdleAtByTerminalId,
+        pendingEvents: reconnectState.pendingEvents,
+        turnEdges: received
+          .filter((message) => message.type === 'freshAgent.event'
+            && message.event?.type === 'freshAgent.turn.complete')
+          .map((message) => ({ sessionId: message.sessionId, event: message.event })),
+        readyAttention: received
+          .filter((message) => message.type === 'ready')
+          .map((message) => message.freshAgentAttention),
+        terminalIdle: received
+          .filter((message) => message.type === 'terminal.idle')
+          .map((message) => ({ terminalId: message.terminalId, at: message.at, reason: message.reason })),
+      }
+      expect(reconnectState.seq, JSON.stringify(evidence)).toBe(2)
       await page.reload()
       await harness.waitForHarness()
       await harness.waitForConnection()
