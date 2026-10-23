@@ -27,12 +27,12 @@ function hasLiveContent(tail: FreshAgentLiveSession | undefined): boolean {
 /**
  * Keeps a pane's live tail in step with the snapshots it commits. On every
  * committed snapshot (`landed`, derived once per snapshot): the blocks and
- * announced lines it holds are landed; an
- * announced line still missing earns a bounded re-poll; and once nothing is
- * awaited and the turn is over, the tail is cleared — after its lines are on
- * screen, so the text never blinks out between the result and the snapshot.
- * A turn that ends with live content left asks for one more snapshot, so the
- * clear never waits on an unrelated refresh.
+ * announced lines it holds are landed; an announced line still missing earns
+ * a bounded re-poll; and once nothing is awaited and the turn is over, the
+ * tail is cleared — after its lines are on screen, so the text never blinks
+ * out between the result and the snapshot. A turn that ends with live content
+ * left asks for one more snapshot, so the clear never waits on an unrelated
+ * refresh.
  */
 export function useTranscriptLandings({
   sessionKey,
