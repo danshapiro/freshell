@@ -1002,7 +1002,7 @@ async fn main() -> ExitCode {
     let session_name_auth =
         ai_title::GeminiSessionNameAuth::from_environment(ai_key.clone(), &gemini_base_url);
     let session_name_http = std::sync::Arc::new(ai_title::GeminiSessionNameHttp::new(
-        reqwest::Client::new(),
+        reqwest::Client::builder(),
         session_name_auth.clone(),
         gemini_base_url,
     ));

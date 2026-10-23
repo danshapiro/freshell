@@ -32,7 +32,7 @@ use crate::session_names::{
 };
 use crate::test_trace_capture::{scoped_trace_capture, CapturedTraceEvent};
 
-const GENERATION_TARGET: &str = "freshell_server::session_name_generation";
+pub(super) const GENERATION_TARGET: &str = "freshell_server::session_name_generation";
 const GEMINI_URL: &str = "http://generativelanguage.googleapis.com/v1beta";
 
 fn capability(code: &str) -> GeminiFailure {
@@ -43,18 +43,18 @@ fn throttled() -> GeminiFailure {
     classify_gemini_failure(429, b"")
 }
 
-fn windows(capability_ms: u64, throttle_ms: u64) -> LatchWindows {
+pub(super) fn windows(capability_ms: u64, throttle_ms: u64) -> LatchWindows {
     LatchWindows {
         capability: Duration::from_millis(capability_ms),
         throttle_base: Duration::from_millis(throttle_ms),
     }
 }
 
-fn keyed_auth(key: &str) -> GeminiSessionNameAuth {
+pub(super) fn keyed_auth(key: &str) -> GeminiSessionNameAuth {
     GeminiSessionNameAuth::direct_for_test(AiKeyCell::init(Some(key.to_string()), None))
 }
 
-fn generator(
+pub(super) fn generator(
     dir: &std::path::Path,
     auth: GeminiSessionNameAuth,
     transport: Arc<dyn SessionNameTransport>,
@@ -91,7 +91,11 @@ fn attempt_starts_len(doc: &Value, target: &SessionNameRef) -> usize {
         .map_or(0, Vec::len)
 }
 
-async fn armed_target(store: &Arc<SessionNames>, handle: &str, message: &str) -> SessionNameRef {
+pub(super) async fn armed_target(
+    store: &Arc<SessionNames>,
+    handle: &str,
+    message: &str,
+) -> SessionNameRef {
     let target = pending(handle);
     ensure_pending(store, handle, NamedProvider::Claude, Some("/w/capability"))
         .await
@@ -751,7 +755,10 @@ async fn no_credential_means_no_claims() {
 // Logs
 // ---------------------------------------------------------------------------
 
-fn named<'a>(events: &'a [CapturedTraceEvent], name: &str) -> Vec<&'a CapturedTraceEvent> {
+pub(super) fn named<'a>(
+    events: &'a [CapturedTraceEvent],
+    name: &str,
+) -> Vec<&'a CapturedTraceEvent> {
     events
         .iter()
         .filter(|event| event.message.split(':').next() == Some(name))

@@ -192,7 +192,10 @@ pub fn classify_gemini_failure(status: u16, body: &[u8]) -> GeminiFailure {
 /// `proxy_tls` through a proxy and `tls_untrusted` otherwise; any other
 /// connect failure is Capability `proxy_unreachable` through a proxy (a
 /// refused CONNECT, a proxy that is down) and `direct_unreachable`
-/// otherwise; a timeout and anything else are Transient.
+/// otherwise, including a connect that ran out the session-name clients'
+/// connect bound ([`crate::ai_title::SESSION_NAME_CONNECT_TIMEOUT`]: a
+/// firewall that drops packets); any other timeout and anything else are
+/// Transient.
 pub fn classify_transport_error(
     chain: &(dyn std::error::Error + 'static),
     is_connect: bool,

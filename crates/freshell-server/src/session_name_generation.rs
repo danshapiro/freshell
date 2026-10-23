@@ -76,12 +76,22 @@ mod tests;
 #[path = "session_name_generation_capability_tests.rs"]
 mod capability_tests;
 
+#[cfg(test)]
+#[path = "session_name_generation_pause_tests.rs"]
+mod pause_tests;
+
 /// The per-request bound for one generation attempt ("each request bounded
 /// to 20 seconds"). A timeout consumes the attempt exactly once (the start
 /// was already persisted by the claim) and schedules the remaining retry
 /// delay; it does not cancel anything the provider may still answer late —
 /// a late answer folds through the same series/fingerprint guards.
 pub const GENERATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+// A dropped connect must fail as a connect error (a pause that uses no
+// attempt) before this bound charges the attempt as a timeout.
+const _: () = assert!(
+    ai_title::SESSION_NAME_CONNECT_TIMEOUT.as_millis() < GENERATION_REQUEST_TIMEOUT.as_millis()
+);
 
 // ---------------------------------------------------------------------------
 // Store-facing work shapes (produced/consumed by the session_names seams)

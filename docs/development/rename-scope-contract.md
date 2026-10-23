@@ -95,7 +95,9 @@ message, and a session that is opened or resumed). Three attempts that
 end in an empty or unusable answer or an ordinary request failure (a
 timeout, a server error) are the limit; then the series stays exhausted
 and keeps its fallback name. A credential, permission, proxy, certificate
-or quota failure uses no attempt: AI naming pauses for every session — 15
+or quota failure uses no attempt, and neither does an unreachable Google or
+proxy (a connection that is refused, or not made within 10 seconds, as
+when a firewall drops it): AI naming pauses for every session — 15
 minutes, or for a quota answer a re-probe that starts at 60 s and doubles
 up to 15 minutes — and resumes after the pause or as soon as the Gemini
 key changes. While paused, no AI naming request starts; the pause is logged

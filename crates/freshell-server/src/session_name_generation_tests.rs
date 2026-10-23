@@ -394,7 +394,7 @@ async fn start_gated_http_gemini(reply: &str) -> GatedHttpGemini {
 impl GatedHttpGemini {
     fn transport(&self, key: &str) -> Arc<GeminiSessionNameHttp> {
         Arc::new(GeminiSessionNameHttp::new(
-            reqwest::Client::builder().no_proxy().build().unwrap(),
+            reqwest::Client::builder().no_proxy(),
             GeminiSessionNameAuth::direct_for_test(AiKeyCell::init(Some(key.to_string()), None)),
             self.base_url.clone(),
         ))
