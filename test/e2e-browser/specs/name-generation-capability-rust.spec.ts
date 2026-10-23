@@ -12,6 +12,7 @@ import {
   type FakeOneCliGeminiProxy,
 } from '../helpers/unified-agent-names.js'
 import { bootJourney, connect, resolveSessionId, type Journey } from '../helpers/unified-agent-names-modes.js'
+import { writeClaudeTranscript, writeSessionNamesDocument } from '../helpers/session-names-fixture.js'
 
 /**
  * Name-reliability Task 6 (D5 as amended): AI naming that is refused —
@@ -119,6 +120,58 @@ async function saveKeyInSettings(page: Page, key: string): Promise<void> {
 }
 
 test.describe('AI naming pauses on refused credentials', () => {
+  test('sending to a historical fresh conversation names it from the stored first message', async ({ browser }) => {
+    const sessionId = 'a113a113-0000-4000-8000-000000000001'
+    const ref: SessionNameRef = { kind: 'session', provider: 'claude', sessionId }
+    const gemini = await startFakeGemini(AI_NAME)
+    const journey = await bootJourney('freshclaude', {
+      gemini,
+      setupHome: async (homeDir) => {
+        const cwd = path.join(homeDir, 'work', 'historical-sardines')
+        await fs.mkdir(cwd, { recursive: true })
+        await writeClaudeTranscript(homeDir, {
+          sessionId, cwd, prompts: [FIRST_MESSAGE, 'Add regression coverage'],
+        })
+        await writeSessionNamesDocument(homeDir, [{
+          provider: 'claude', sessionId, name: FIRST_MESSAGE, source: 'first_message',
+          restingGenerationInput: FIRST_MESSAGE,
+        }])
+      },
+    })
+    try {
+      const { page, harness, context } = await connect(journey, browser)
+      const tabId = 'historical-naming-tab'
+      const paneId = 'historical-naming-pane'
+      // The same durable resume content as a sidebar-opened fresh pane:
+      // no pending naming handle exists to activate the absorbed series.
+      await page.evaluate(({ tabId, paneId, sessionId, cwd }) => {
+        const dispatch = window.__FRESHELL_TEST_HARNESS__!.dispatch
+        dispatch({ type: 'tabs/addTab', payload: { id: tabId, mode: 'claude' } })
+        dispatch({ type: 'panes/initLayout', payload: {
+          tabId, paneId, content: {
+            kind: 'fresh-agent', provider: 'claude', sessionType: 'freshclaude',
+            sessionId, resumeSessionId: sessionId, sessionRef: { provider: 'claude', sessionId },
+            cwd, status: 'idle',
+          },
+        } })
+      }, { tabId, paneId, sessionId, cwd: path.join(journey.server.info.homeDir, 'work', 'historical-sardines') })
+      const pane = page.locator(`[data-pane-id="${paneId}"] [data-context="fresh-agent"], [data-pane-id="${paneId}"][data-context="fresh-agent"]`).first()
+      await expect(pane.getByRole('button', { name: 'Send', exact: true })).toBeEnabled({ timeout: 30_000 })
+      expect(gemini.requests, 'resting historical input is not background work').toEqual([])
+      await sendFirstMessage(page, harness, { tabId, paneId, nameRef: ref, sessionId }, 'freshclaude', 'Second turn must never be title input')
+      await expect.poll(() => gemini.requests.length, { timeout: 30_000 }).toBeGreaterThan(0)
+      for (const request of gemini.requests) {
+        expect(request.body).toContain(FIRST_MESSAGE)
+        expect(request.body).not.toContain('Second turn must never be title input')
+      }
+      await expect.poll(() => readName(journey, ref), { timeout: 30_000 }).toEqual({ name: AI_NAME, source: 'freshell_ai' })
+      await expect(page.locator(`[data-context="tab"][data-tab-id="${tabId}"]`)).toContainText(AI_NAME)
+      await context.close()
+    } finally {
+      await journey.cleanup()
+    }
+  })
+
   test('a later fresh-agent message does not replace the first naming input while paused', async ({ browser }) => {
     const proxy = await startFakeOneCliGeminiProxy(AI_NAME, FIRST_MESSAGE, { mode: 'access_restricted' })
     const journey = await bootJourney('freshclaude', {

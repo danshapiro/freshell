@@ -914,10 +914,60 @@ async fn later_accepted_messages_preserve_the_first_generation_input() {
             after.input_fingerprint, before.input_fingerprint,
             "{status:?}"
         );
-        assert_eq!(after.status, before.status, "{status:?}");
+        assert_eq!(
+            after.status,
+            if status == GenerationStatus::Idle {
+                GenerationStatus::Eligible
+            } else {
+                before.status
+            },
+            "{status:?}: an explicit send activates resting input"
+        );
         assert_eq!(after.consumed, before.consumed, "{status:?}");
         assert_eq!(get_one(&store, &target).await.name, SARDINE);
     }
+}
+
+/// A resumed fresh conversation has no new pending handle to arm the
+/// boot-absorbed series. Its next accepted turn activates naming using the
+/// historical first message, never that new turn's text.
+#[tokio::test]
+async fn sending_to_a_historical_session_arms_its_stored_first_message() {
+    let dir = temp_dir();
+    let store = open(dir.path());
+    let target = session(NamedProvider::Claude, "historical-first-input");
+    seed(
+        &store,
+        indexed(
+            NamedProvider::Claude,
+            "historical-first-input",
+            Some("/w/work"),
+            None,
+            Some(SARDINE),
+        ),
+        true,
+    )
+    .await;
+    assert!(
+        !armed(&store, &target),
+        "boot absorption never starts paid naming"
+    );
+
+    activity(
+        &store,
+        &target,
+        NameActivityReason::AcceptedUserMessage,
+        Some("continue"),
+    )
+    .await;
+
+    let work = store.generation_work_snapshot();
+    let pending = work
+        .iter()
+        .find(|item| item.target == target)
+        .expect("an explicit send activates naming");
+    assert_eq!(pending.excerpt.as_deref(), Some(SARDINE));
+    assert_eq!(get_one(&store, &target).await.name, SARDINE);
 }
 
 // The sweep (one pass at a time, against the real store) lives in a child

@@ -174,10 +174,26 @@ pub(super) fn plan_series(
     // turns, pauses and in-flight requests: otherwise "continue" becomes
     // the input for a protected AI name. Refused old wrapper input may
     // still be replaced by the first real message.
-    if reason == NameActivityReason::AcceptedUserMessage
-        && series.excerpt.as_deref().is_some_and(is_generation_input)
-    {
-        return None;
+    if reason == NameActivityReason::AcceptedUserMessage {
+        if let Some(first) = series
+            .excerpt
+            .as_deref()
+            .filter(|text| is_generation_input(text))
+        {
+            // A historical session's boot-absorbed input rests until an
+            // explicit open or send. Resumed fresh panes have no pending
+            // handle whose bind could activate it, so the send does that
+            // here using the stored first message, never the current turn.
+            return (series.status == GenerationStatus::Idle && series.consumed == 0).then(|| {
+                SeriesPlan::Arm {
+                    fingerprint: series
+                        .input_fingerprint
+                        .clone()
+                        .unwrap_or_else(|| fingerprint_message(first)),
+                    excerpt: first.to_string(),
+                }
+            });
+        }
     }
     if series.status == GenerationStatus::Exhausted {
         return None;
