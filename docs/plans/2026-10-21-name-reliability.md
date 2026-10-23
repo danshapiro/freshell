@@ -692,6 +692,12 @@ pub async fn bind_terminal_naming_from_identity(
   pending handle was already bound to A, so falling back to it would show
   A's name again. The retarget itself creates or changes no record, and A's
   record is untouched.
+- Association/materialization notifications carry the authoritative
+  `nameRef`. The client adopts it together with the session identity and
+  releases a spent pending handle when the conversation changes, even
+  immediately after a reload before redirect records have loaded. A
+  zero-turn pane whose authoritative ref is still pending keeps that ref
+  and its pre-durable saved name.
 
 ### Store reads (Task 11)
 - `Adopted` gains `stamp: DocumentStamp { len: u64, mtime_ns: i128, file_id: Option<(u64, u64)> }`.
@@ -1942,9 +1948,10 @@ their rename protection, exactly as the Task 9 new-window rebuild does.
   from the display title) follows the display: all four agree.
 - **The rule.** A stored title heals when all of these hold: the tab has no
   `titleSetByUser`; it has a layout; the title is not already the unnamed
-  placeholder (`Tab N`); the Task 7 mirror does not own it (a session-owned
-  tab whose saved record is cached keeps the mirrored saved name, so the two
-  never fight); the title differs from the tab's derived label
+  placeholder (`Tab N`); the tab is legacy-owned (every session-owned tab
+  keeps its stored display copy, including before its saved record is
+  cached, so the Task 7 mirror and the heal never fight); the title differs
+  from the tab's derived label
   (`deriveTabName`; a create-time label equal to it is already no title to
   every display and stays); and
   `isDefaultOrDerivedName(title, { mode, provider })` holds with the tab's
