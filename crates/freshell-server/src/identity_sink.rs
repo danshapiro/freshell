@@ -889,9 +889,6 @@ mod tests {
         );
     }
 
-    /// Claude core design §4.1: the genesis rides the binding write, survives
-    /// a restart, is kept by a later settings write, and is dropped by the
-    /// lazy clear once the transcript is on disk.
     /// Claude core design §4.5 (C13): a send that waited behind an undo
     /// finds the replacement through the durable supersession chain. The
     /// chain follows every hop to the live end, survives a restart (it is
@@ -942,6 +939,9 @@ mod tests {
         );
     }
 
+    /// Claude core design §4.1: the genesis rides the binding write, survives
+    /// a restart, is kept by a later settings write, and is dropped by the
+    /// lazy clear once the transcript is on disk.
     #[tokio::test(flavor = "multi_thread")]
     async fn genesis_writes_through_reads_back_and_clears() {
         let tmp = tempfile::tempdir().unwrap();
