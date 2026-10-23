@@ -8,7 +8,10 @@
 //!   this an open terminal pane kept its folder name whenever AI naming
 //!   failed). Text the shared classifier recognizes as a default or derived
 //!   label — tool wrapper text above all, "171 saved names are
-//!   `<recommended_plugins>`" — is never a fallback.
+//!   `<recommended_plugins>`" — is never a fallback. An accepted send
+//!   carries the message just sent, so its fallback heals a junk name only
+//!   while the store has no input for the session
+//!   ([`fallback_may_self_heal`]); later sends only raise the rank.
 //! - **Re-absorb at rest.** A real first message never changes; an indexed
 //!   one changes only when the extraction rules change (Task 5 re-derives
 //!   the cached rows whose message was wrapper text). So a changed message
@@ -40,6 +43,30 @@ use super::{
     excerpt_of, fingerprint_message, source_is_protected, source_rank, GenerationState,
     GenerationStatus, StoredDocument,
 };
+
+/// Whether an activity's first-message fallback may heal a junk name —
+/// replace a self-heal record at equal or lower rank — or may only raise
+/// the rank. The sweep's activities (indexed, opened) carry the session
+/// index's first user message. An accepted send carries the message the
+/// user just sent, which is the session's first only while the store holds
+/// no AI-naming input for the session (no series, or one without input):
+/// every real user message the store learns for an unprotected record is
+/// stored as that input. So a later send only raises a name below
+/// `first_message`, and the index heals a junk name with the true first
+/// message. Otherwise "continue", sent to a resumed session the sweep had
+/// not reached yet, would replace its junk name for good: the true first
+/// message no longer outranks it, and it is no longer junk.
+pub(super) fn fallback_may_self_heal(
+    document: &StoredDocument,
+    key: &str,
+    reason: NameActivityReason,
+) -> bool {
+    reason != NameActivityReason::AcceptedUserMessage
+        || document
+            .generation
+            .get(key)
+            .is_none_or(|series| series.input_fingerprint.is_none())
+}
 
 /// The first-message fallback title (the existing 50-character extraction
 /// of the message's first line), or `None` when it is empty or a default or
