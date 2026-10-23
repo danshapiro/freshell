@@ -41,6 +41,7 @@ pub(crate) mod claude_dead_sessions;
 pub(crate) mod claude_handshake;
 pub(crate) mod claude_launch;
 pub(crate) mod claude_live_events;
+pub(crate) mod claude_permission_update;
 pub(crate) mod claude_projection;
 pub(crate) mod claude_projection_cache;
 pub(crate) mod claude_sidecar_exit;
