@@ -81,7 +81,8 @@ pub(super) fn holds_refused_input(series: &GenerationState) -> bool {
 /// What one activity does to the session's generation series.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SeriesPlan {
-    /// (Re)arm with this input: the series becomes Eligible.
+    /// (Re)arm with this input: the series becomes Eligible (one with a
+    /// start in flight takes the input and stays in flight).
     Arm {
         fingerprint: String,
         excerpt: String,
@@ -194,7 +195,12 @@ pub(super) fn apply_series_plan(
             if series.status == GenerationStatus::Exhausted {
                 return false;
             }
-            series.status = GenerationStatus::Eligible;
+            // A claimed start stays in flight until its fold settles it
+            // (refund, retry, or exhaustion at the cap) and boot recovery
+            // can still find it; the newer input waits for that settle.
+            if series.status != GenerationStatus::InFlight {
+                series.status = GenerationStatus::Eligible;
+            }
             series.input_fingerprint = Some(fingerprint);
             series.excerpt = Some(excerpt);
             series.next_due = None;

@@ -365,6 +365,226 @@ async fn interrupted_start_at_the_cap_still_exhausts_at_recovery() {
 }
 
 // ---------------------------------------------------------------------------
+// A newer first message arrives while a claimed request is in flight
+// ---------------------------------------------------------------------------
+
+async fn claim_named(
+    store: &Arc<SessionNames>,
+    target: &SessionNameRef,
+    attempt_id: &str,
+) -> super::GenerationClaim {
+    store
+        .claim_generation_start(target.clone(), attempt_id.to_string())
+        .await
+        .expect("claim runs")
+        .expect("the series is claimable")
+}
+
+async fn fold(
+    store: &Arc<SessionNames>,
+    claim: &super::GenerationClaim,
+    outcome: GenerationOutcome,
+) {
+    store
+        .fold_generation_outcome(
+            claim.target.clone(),
+            claim.series_id.clone(),
+            claim.input_fingerprint.clone(),
+            outcome,
+        )
+        .await
+        .expect("the outcome folds");
+}
+
+fn refused(attempt_id: &str) -> GenerationOutcome {
+    GenerationOutcome::CapabilityUnavailable {
+        attempt_id: attempt_id.to_string(),
+    }
+}
+
+/// The re-arm makes the in-flight request's input stale, but its start was
+/// still charged: a refusal gives it back.
+#[tokio::test]
+async fn a_refused_start_is_refunded_after_a_rearm_during_the_request() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = armed_target(&store, "h-rearm-refund", "The message the request carried").await;
+    let claim = claim_named(&store, &target, "attempt-rearm-refund").await;
+    assert_eq!(claim.consumed, 1);
+    arm_with_message(
+        &store,
+        target.clone(),
+        "freshclaude",
+        "A newer first message",
+    )
+    .await;
+
+    fold(&store, &claim, refused("attempt-rearm-refund")).await;
+    let doc = document_json(dir.path());
+    assert_eq!(
+        generation_consumed(&doc, &target),
+        0,
+        "the refused start is refunded"
+    );
+    assert_eq!(
+        generation_status(&doc, &target).as_deref(),
+        Some("eligible")
+    );
+    assert!(attempt_ids_of(&doc, &target).is_empty());
+    assert_eq!(attempt_starts_len(&doc, &target), 0);
+
+    let next = claim_named(&store, &target, "attempt-after-refund").await;
+    assert_eq!(next.consumed, 1);
+    assert_eq!(
+        next.excerpt.as_deref(),
+        Some("A newer first message"),
+        "the next claim sends the newer input"
+    );
+}
+
+/// At the cap, a counted outcome exhausts the series even when a newer
+/// first message re-armed it during the last request (the fold's input
+/// guard must not leave it Eligible at three consumed with its input kept);
+/// a late refund for that start and later messages never revive it.
+#[tokio::test]
+async fn a_rearm_during_the_last_start_still_exhausts_on_failure() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = armed_target(&store, "h-rearm-last-failed", "The original first message").await;
+    consume_failed_starts(&store, dir.path(), &target, 2).await;
+    let claim = claim_named(&store, &target, "attempt-last").await;
+    assert_eq!(claim.consumed, MAX_GENERATION_STARTS);
+    arm_with_message(
+        &store,
+        target.clone(),
+        "freshclaude",
+        "A newer first message during the last start",
+    )
+    .await;
+
+    fold(
+        &store,
+        &claim,
+        GenerationOutcome::Failed("gemini http 500 Internal Server Error".to_string()),
+    )
+    .await;
+    let doc = document_json(dir.path());
+    assert_eq!(
+        generation_status(&doc, &target).as_deref(),
+        Some("exhausted")
+    );
+    assert_eq!(
+        generation_consumed(&doc, &target),
+        u64::from(MAX_GENERATION_STARTS)
+    );
+    assert!(
+        excerpt_of(&doc, &target).is_null(),
+        "exhaustion drops the newer input too"
+    );
+    assert!(generation_entry(&doc, &target)
+        .and_then(|entry| entry.get("exhaustedAt"))
+        .is_some_and(Value::is_i64));
+
+    // A second fold for the same start, then another message: still spent.
+    fold(&store, &claim, refused("attempt-last")).await;
+    arm_with_message(
+        &store,
+        target.clone(),
+        "freshclaude",
+        "Yet another first message",
+    )
+    .await;
+    let doc = document_json(dir.path());
+    assert_eq!(
+        generation_status(&doc, &target).as_deref(),
+        Some("exhausted")
+    );
+    assert_eq!(
+        generation_consumed(&doc, &target),
+        u64::from(MAX_GENERATION_STARTS)
+    );
+    assert!(excerpt_of(&doc, &target).is_null());
+    let beyond = store
+        .claim_generation_start(target.clone(), "attempt-beyond".to_string())
+        .await
+        .expect("claim runs");
+    assert!(beyond.is_none());
+    clear_test_hooks(dir.path());
+}
+
+/// At the cap, a refused last start is given back after a re-arm during the
+/// request, and the series then tries the newer input.
+#[tokio::test]
+async fn a_rearm_during_the_last_start_keeps_the_refund_and_the_newer_input() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = armed_target(&store, "h-rearm-last-refused", "The original first message").await;
+    consume_failed_starts(&store, dir.path(), &target, 2).await;
+    let claim = claim_named(&store, &target, "attempt-last-refused").await;
+    arm_with_message(
+        &store,
+        target.clone(),
+        "freshclaude",
+        "The newer first message",
+    )
+    .await;
+
+    fold(&store, &claim, refused("attempt-last-refused")).await;
+    let doc = document_json(dir.path());
+    assert_eq!(
+        generation_consumed(&doc, &target),
+        2,
+        "the refused last start is refunded"
+    );
+    assert_eq!(
+        generation_status(&doc, &target).as_deref(),
+        Some("eligible")
+    );
+
+    let next = claim_named(&store, &target, "attempt-last-again").await;
+    assert_eq!(next.consumed, MAX_GENERATION_STARTS);
+    assert_eq!(next.excerpt.as_deref(), Some("The newer first message"));
+    clear_test_hooks(dir.path());
+}
+
+/// A crash after a re-arm during the last start: boot recovery still sees
+/// the interrupted start and exhausts the series.
+#[tokio::test]
+async fn a_rearm_during_the_last_start_still_exhausts_at_recovery() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = armed_target(&store, "h-rearm-last-crash", "The original first message").await;
+    consume_failed_starts(&store, dir.path(), &target, 2).await;
+    claim_named(&store, &target, "attempt-last-interrupted").await;
+    arm_with_message(
+        &store,
+        target.clone(),
+        "freshclaude",
+        "A newer first message",
+    )
+    .await;
+
+    // Restart: the start was persisted, never folded.
+    let store = open_store(dir.path());
+    store
+        .recover_interrupted_generation()
+        .await
+        .expect("recovery runs");
+    let doc = document_json(dir.path());
+    assert_eq!(
+        generation_status(&doc, &target).as_deref(),
+        Some("exhausted")
+    );
+    assert!(excerpt_of(&doc, &target).is_null());
+    let beyond = store
+        .claim_generation_start(target.clone(), "attempt-beyond".to_string())
+        .await
+        .expect("claim runs");
+    assert!(beyond.is_none());
+    clear_test_hooks(dir.path());
+}
+
+// ---------------------------------------------------------------------------
 // The worker under a pause
 // ---------------------------------------------------------------------------
 
@@ -849,4 +1069,163 @@ async fn saved_key_clears_the_latch() {
     );
     assert_eq!(proxy.recorded().len(), 1);
     assert_eq!(generator.latch().pause_kind(), None);
+}
+
+/// A scripted transport whose FIRST request waits until the test releases
+/// it (a request still in flight when the key changes).
+struct HoldFirstRequest {
+    script: Arc<ScriptedTransport>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl SessionNameTransport for HoldFirstRequest {
+    fn generate_content(
+        &self,
+        prompt: String,
+        max_output_tokens: u32,
+    ) -> crate::ai_title::BoxFuture<Result<String, GeminiFailure>> {
+        let first = self.script.calls() == 0;
+        let answer = self.script.generate_content(prompt, max_output_tokens);
+        let release = Arc::clone(&self.release);
+        Box::pin(async move {
+            if first {
+                release
+                    .acquire()
+                    .await
+                    .expect("the release gate stays open")
+                    .forget();
+            }
+            answer.await
+        })
+    }
+}
+
+/// A refusal of the OLD key that lands after a new key was saved (a partial
+/// key saved while the user typed, or the refused OneCLI route) must not
+/// pause naming: the new key is tried at the next poll, and the refused
+/// attempt is still refunded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refusal_from_before_a_key_change_does_not_pause_naming() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = armed_target(&store, "h-stale-refusal", "Outlive the old key").await;
+    let script = ScriptedTransport::new(vec![
+        Err(capability("API_KEY_INVALID")),
+        Ok("Name from the saved key".to_string()),
+    ]);
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let transport = Arc::new(HoldFirstRequest {
+        script: script.clone(),
+        release: Arc::clone(&release),
+    });
+    let key_cell = AiKeyCell::init(Some("partial-key-typed".to_string()), None);
+    let generator = generator(
+        dir.path(),
+        GeminiSessionNameAuth::direct_for_test(key_cell.clone()),
+        transport,
+        windows(600_000, 600_000),
+    );
+    let worker = SessionNameWorker::start(
+        Arc::clone(&store),
+        Arc::new(NoRouteNative),
+        Arc::clone(&generator),
+    );
+    wait_for(
+        Duration::from_secs(5),
+        "the old key's request is in flight",
+        || script.calls() == 1,
+    )
+    .await;
+
+    // The full key is saved while that request is still out.
+    let log_secrets = freshell_runtime_observability::LiveSecrets::default();
+    assert!(crate::session_name_capability::apply_saved_gemini_key(
+        &key_cell,
+        &log_secrets,
+        Some(generator.as_ref()),
+        Some("full-saved-key-value"),
+    ));
+    release.add_permits(1);
+
+    let until = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(update) = get_one(&store, target.clone()).await {
+            if update.record.source == NameSource::FreshellAi {
+                assert_eq!(update.record.name, "Name from the saved key");
+                break;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < until,
+            "the old key's refusal paused naming: the saved key was never tried (pause {:?})",
+            generator.latch().pause_kind()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    worker.abort();
+    assert_eq!(script.calls(), 2);
+    assert_eq!(generator.latch().pause_kind(), None);
+    assert_eq!(
+        generation_consumed(&document_json(dir.path()), &target),
+        1,
+        "the old key's refused attempt was refunded; only the answered one counts"
+    );
+}
+
+/// The superseded refusal says once, at INFO and without the keys, why
+/// naming did not pause; no pause WARN is logged.
+#[tokio::test]
+async fn a_superseded_refusal_logs_why_naming_is_not_paused() {
+    let (_guard, events) = scoped_trace_capture(GENERATION_TARGET);
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = armed_target(&store, "h-stale-log", "Explain the ignored refusal").await;
+    let script = ScriptedTransport::new(vec![Err(capability("API_KEY_INVALID"))]);
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let transport = Arc::new(HoldFirstRequest {
+        script: script.clone(),
+        release: Arc::clone(&release),
+    });
+    let key_cell = AiKeyCell::init(Some("stale-log-old-key".to_string()), None);
+    let generator = generator(
+        dir.path(),
+        GeminiSessionNameAuth::direct_for_test(key_cell.clone()),
+        transport,
+        windows(600_000, 600_000),
+    );
+    let items = store.generation_work_snapshot();
+    let log_secrets = freshell_runtime_observability::LiveSecrets::default();
+    let save_during_the_request = async {
+        wait_for(Duration::from_secs(5), "the request is in flight", || {
+            script.calls() == 1
+        })
+        .await;
+        crate::session_name_capability::apply_saved_gemini_key(
+            &key_cell,
+            &log_secrets,
+            Some(generator.as_ref()),
+            Some("stale-log-new-key"),
+        );
+        release.add_permits(1);
+    };
+    tokio::join!(
+        generator.run_due_attempt(&store, &items[0]),
+        save_during_the_request
+    );
+
+    let events = events.snapshot();
+    let superseded = named(&events, "session_names.generation_outcome_superseded");
+    assert_eq!(superseded.len(), 1, "{events:#?}");
+    assert_eq!(superseded[0].level, tracing::Level::INFO);
+    assert_eq!(
+        superseded[0].fields.get("code").map(String::as_str),
+        Some("API_KEY_INVALID")
+    );
+    assert!(
+        named(&events, "session_names.generation_capability_unavailable").is_empty(),
+        "no pause is announced: {events:#?}"
+    );
+    assert_no_leak(&events, &["stale-log-old-key", "stale-log-new-key"]);
+    assert_eq!(generator.latch().pause_kind(), None);
+    assert_eq!(generation_consumed(&document_json(dir.path()), &target), 0);
 }

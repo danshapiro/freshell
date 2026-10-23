@@ -470,7 +470,7 @@ fn a_capability_failure_pauses_until_the_reprobe_time() {
     let t0 = Instant::now();
     assert!(latch.ready(t0));
     assert_eq!(
-        latch.record_failure(&capability("access_restricted"), t0),
+        latch.record_failure(&capability("access_restricted"), t0, latch.epoch()),
         LatchTransition::Paused {
             kind: PauseKind::Capability,
             code: "access_restricted".to_string(),
@@ -490,13 +490,13 @@ fn a_capability_failure_pauses_until_the_reprobe_time() {
     // The probe fails the same way: no new transition, a new window.
     let t1 = t0 + Duration::from_millis(50);
     assert_eq!(
-        latch.record_failure(&capability("access_restricted"), t1),
+        latch.record_failure(&capability("access_restricted"), t1, latch.epoch()),
         LatchTransition::Unchanged
     );
     assert!(!latch.ready(t1 + Duration::from_millis(49)));
     // A different code is a new transition.
     assert_eq!(
-        latch.record_failure(&capability("API_KEY_INVALID"), t1),
+        latch.record_failure(&capability("API_KEY_INVALID"), t1, latch.epoch()),
         LatchTransition::Paused {
             kind: PauseKind::Capability,
             code: "API_KEY_INVALID".to_string(),
@@ -512,19 +512,25 @@ fn a_capability_failure_pauses_until_the_reprobe_time() {
         false,
     );
     assert_eq!(
-        latch.record_failure(&timeout, t2),
+        latch.record_failure(&timeout, t2, latch.epoch()),
         LatchTransition::Unchanged
     );
     assert!(!latch.ready(t2 + Duration::from_millis(10)));
     // A probe that reaches the provider restores naming.
-    assert_eq!(latch.record_reachable(), LatchTransition::Restored);
+    assert_eq!(
+        latch.record_reachable(latch.epoch()),
+        LatchTransition::Restored
+    );
     assert!(latch.ready(t2));
     assert_eq!(latch.pause_kind(), None);
-    assert_eq!(latch.record_reachable(), LatchTransition::Unchanged);
-    // An HTTP answer that is neither refused nor throttled also restores.
-    latch.record_failure(&capability("access_restricted"), t2);
     assert_eq!(
-        latch.record_failure(&classify_gemini_failure(500, b""), t2),
+        latch.record_reachable(latch.epoch()),
+        LatchTransition::Unchanged
+    );
+    // An HTTP answer that is neither refused nor throttled also restores.
+    latch.record_failure(&capability("access_restricted"), t2, latch.epoch());
+    assert_eq!(
+        latch.record_failure(&classify_gemini_failure(500, b""), t2, latch.epoch()),
         LatchTransition::Restored
     );
 }
@@ -534,7 +540,7 @@ fn throttle_reprobe_doubles_caps_and_resets() {
     let latch = CapabilityLatch::new(windows(50, 20));
     let mut now = Instant::now();
     assert_eq!(
-        latch.record_failure(&throttled(), now),
+        latch.record_failure(&throttled(), now, latch.epoch()),
         LatchTransition::Paused {
             kind: PauseKind::Throttled,
             code: "throttled".to_string(),
@@ -547,31 +553,89 @@ fn throttle_reprobe_doubles_caps_and_resets() {
         now += window;
         assert!(latch.ready(now));
         assert_eq!(
-            latch.record_failure(&throttled(), now),
+            latch.record_failure(&throttled(), now, latch.epoch()),
             LatchTransition::Unchanged
         );
     }
     assert_eq!(expected, vec![20, 40, 80, 160]);
     // One success resets the base.
-    assert_eq!(latch.record_reachable(), LatchTransition::Restored);
-    latch.record_failure(&throttled(), now);
+    assert_eq!(
+        latch.record_reachable(latch.epoch()),
+        LatchTransition::Restored
+    );
+    latch.record_failure(&throttled(), now, latch.epoch());
     assert_eq!(latch.reprobe_in(now), Some(Duration::from_millis(20)));
     // A key change clears the pause and the streak.
     assert!(latch.clear());
     assert!(latch.ready(now));
     assert!(!latch.clear());
-    latch.record_failure(&throttled(), now);
+    latch.record_failure(&throttled(), now, latch.epoch());
     assert_eq!(latch.reprobe_in(now), Some(Duration::from_millis(20)));
 
     // The window never exceeds the cap.
     let capped = CapabilityLatch::new(windows(50, 400_000));
     let mut now = Instant::now();
     for _ in 0..4 {
-        capped.record_failure(&throttled(), now);
+        capped.record_failure(&throttled(), now, capped.epoch());
         now += capped.reprobe_in(now).unwrap();
     }
-    capped.record_failure(&throttled(), now);
+    capped.record_failure(&throttled(), now, capped.epoch());
     assert_eq!(capped.reprobe_in(now), Some(THROTTLE_REPROBE_CAP));
+}
+
+/// An attempt that began before a key change says nothing about the new
+/// key: its refusal does not pause naming, its timeout does not re-arm a
+/// pause, and its answer does not lift one.
+#[test]
+fn an_outcome_from_before_a_key_change_leaves_the_pause_alone() {
+    let latch = CapabilityLatch::new(windows(600_000, 600_000));
+    let now = Instant::now();
+    let old_key = latch.epoch();
+    assert!(!latch.clear(), "the key changes while nothing is paused");
+    let new_key = latch.epoch();
+    assert_ne!(old_key, new_key);
+
+    assert_eq!(
+        latch.record_failure(&capability("access_restricted"), now, old_key),
+        LatchTransition::Superseded
+    );
+    assert_eq!(
+        latch.record_failure(&throttled(), now, old_key),
+        LatchTransition::Superseded
+    );
+    assert!(latch.ready(now), "the new key is tried at once");
+    assert_eq!(latch.pause_kind(), None);
+
+    // A pause the new key earned is not touched by the old key's outcomes.
+    assert_eq!(
+        latch.record_failure(&capability("API_KEY_INVALID"), now, new_key),
+        LatchTransition::Paused {
+            kind: PauseKind::Capability,
+            code: "API_KEY_INVALID".to_string(),
+        }
+    );
+    assert_eq!(latch.record_reachable(old_key), LatchTransition::Superseded);
+    let later = now + Duration::from_secs(600);
+    let timeout = crate::gemini_failure::classify_transport_error(
+        &std::io::Error::other("timed out"),
+        false,
+        true,
+        false,
+    );
+    assert_eq!(
+        latch.record_failure(&timeout, later, old_key),
+        LatchTransition::Superseded
+    );
+    assert!(
+        latch.ready(later),
+        "the old key's timeout did not re-arm the window"
+    );
+    assert_eq!(latch.pause_kind(), Some(PauseKind::Capability));
+    assert_eq!(
+        latch.record_reachable(new_key),
+        LatchTransition::Restored,
+        "the new key's own answer still restores naming"
+    );
 }
 
 /// A counting transport for tests: answers come from a script, one per call

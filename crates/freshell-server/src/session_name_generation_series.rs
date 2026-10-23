@@ -9,10 +9,17 @@
 //! schedules the bounded retry. An interrupted start (a crash between claim
 //! and fold) is still settled as consumed by boot recovery.
 //!
+//! A newer first message can re-arm the series while its request is in
+//! flight: the series takes the new input but stays in flight, and the fold
+//! of the old request ([`settle_superseded_start`]) still settles the
+//! charged start — refunded, or counted (exhausting at the cap) — before the
+//! newer input is tried.
+//!
 //! A child module of the store so it reads the series internals without
 //! widening their visibility.
 
 use super::{generation_retry_delay_ms, GenerationState, GenerationStatus, MAX_GENERATION_STARTS};
+use crate::session_name_generation::GenerationOutcome;
 
 /// Charge one start for `attempt_id` at `now`: consumed +1, the attempt
 /// recorded, the series in flight. Returns the consumed count.
@@ -58,12 +65,46 @@ pub(super) fn refund_start(series: &mut GenerationState, attempt_id: &str) -> bo
 /// is scheduled from `now`.
 pub(super) fn settle_consumed_start(series: &mut GenerationState, now: i64) {
     if series.status == GenerationStatus::Exhausted || series.consumed >= MAX_GENERATION_STARTS {
-        series.status = GenerationStatus::Exhausted;
-        series.exhausted_at.get_or_insert(now);
-        series.next_due = None;
-        series.excerpt = None;
+        exhaust(series, now);
     } else {
         series.status = GenerationStatus::Eligible;
         series.next_due = Some(now + generation_retry_delay_ms(series.consumed).unwrap_or(0));
     }
+}
+
+/// Settle the in-flight start of a request built from input that a newer
+/// first message has since replaced. The old answer is never accepted, but
+/// the start it was charged still resolves: a refusal (`CapabilityUnavailable`
+/// / `Throttled`) gives it back by its attempt id; any other outcome counted
+/// it, which exhausts the series at the cap (dropping the newer input too)
+/// and otherwise leaves the series Eligible with the newer input due at
+/// once (it has never been tried). `false` (nothing changed) when the series
+/// has no start in flight.
+pub(super) fn settle_superseded_start(
+    series: &mut GenerationState,
+    outcome: &GenerationOutcome,
+    now: i64,
+) -> bool {
+    match outcome {
+        GenerationOutcome::CapabilityUnavailable { attempt_id }
+        | GenerationOutcome::Throttled { attempt_id } => refund_start(series, attempt_id),
+        GenerationOutcome::Answer(_) | GenerationOutcome::Empty | GenerationOutcome::Failed(_) => {
+            if series.status != GenerationStatus::InFlight {
+                return false;
+            }
+            if series.consumed >= MAX_GENERATION_STARTS {
+                exhaust(series, now);
+            } else {
+                series.status = GenerationStatus::Eligible;
+            }
+            true
+        }
+    }
+}
+
+fn exhaust(series: &mut GenerationState, now: i64) {
+    series.status = GenerationStatus::Exhausted;
+    series.exhausted_at.get_or_insert(now);
+    series.next_due = None;
+    series.excerpt = None;
 }

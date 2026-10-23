@@ -27,7 +27,10 @@
 //! test seam `FRESHELL_NAMING_THROTTLE_REPROBE_MS` sets the base). While
 //! paused the worker claims nothing; one probe runs per window. Both kinds
 //! refund the attempt, so a paused series keeps its allowance and its
-//! naming input.
+//! naming input. A key change starts a new latch epoch: an attempt that was
+//! already in flight on the old key still has its refusal refunded, but its
+//! outcome neither pauses, re-arms nor restores naming, so the new key is
+//! tried at the next poll.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -209,7 +212,14 @@ pub enum LatchTransition {
     Paused { kind: PauseKind, code: String },
     /// A probe reached the provider: naming runs again.
     Restored,
+    /// The attempt began before a key change: its outcome says nothing
+    /// about the current key, so the pause is left as it is.
+    Superseded,
 }
+
+/// Which key change an attempt began under (see [`CapabilityLatch::epoch`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LatchEpoch(u64);
 
 /// The in-memory naming pause (see the module doc). Tokio's clock, so the
 /// worker's sleeps and the windows agree.
@@ -223,6 +233,8 @@ struct LatchState {
     pause: Option<Pause>,
     /// Consecutive throttled outcomes (sets the next throttle window).
     throttle_streak: u32,
+    /// Bumped by every [`CapabilityLatch::clear`] (a key change).
+    epoch: u64,
 }
 
 struct Pause {
@@ -262,20 +274,36 @@ impl CapabilityLatch {
             .map(|pause| pause.until.saturating_duration_since(now))
     }
 
+    /// The key change in force now. Read it before an attempt builds its
+    /// request and hand it back with the outcome.
+    pub fn epoch(&self) -> LatchEpoch {
+        LatchEpoch(self.state().epoch)
+    }
+
     /// The pause in force, if any.
     #[cfg(test)]
     pub fn pause_kind(&self) -> Option<PauseKind> {
         self.state().pause.as_ref().map(|pause| pause.kind)
     }
 
-    /// Record a failed attempt. A capability failure pauses for the
-    /// capability window; a quota answer pauses for the throttle window,
-    /// doubling per consecutive throttled outcome up to the cap. A failure
-    /// that still got an HTTP answer reached the provider and restores
-    /// naming; one with no answer (a timeout, a broken connection) proves
-    /// nothing and only re-arms a pause already in force.
-    pub fn record_failure(&self, failure: &GeminiFailure, now: Instant) -> LatchTransition {
+    /// Record a failed attempt that began under `began`. A capability
+    /// failure pauses for the capability window; a quota answer pauses for
+    /// the throttle window, doubling per consecutive throttled outcome up to
+    /// the cap. A failure that still got an HTTP answer reached the provider
+    /// and restores naming; one with no answer (a timeout, a broken
+    /// connection) proves nothing and only re-arms a pause already in force.
+    /// An attempt that began before a key change changes nothing
+    /// ([`LatchTransition::Superseded`]): it was judged on the old key.
+    pub fn record_failure(
+        &self,
+        failure: &GeminiFailure,
+        now: Instant,
+        began: LatchEpoch,
+    ) -> LatchTransition {
         let mut state = self.state();
+        if state.epoch != began.0 {
+            return LatchTransition::Superseded;
+        }
         match failure.class {
             GeminiFailureClass::Capability => {
                 state.throttle_streak = 0;
@@ -315,15 +343,23 @@ impl CapabilityLatch {
         }
     }
 
-    /// Record an attempt whose request reached the provider and was not
-    /// refused (an answer, an empty answer).
-    pub fn record_reachable(&self) -> LatchTransition {
-        Self::restore(&mut self.state())
+    /// Record an attempt that began under `began` and whose request reached
+    /// the provider without being refused (an answer, an empty answer). One
+    /// that began before a key change changes nothing.
+    pub fn record_reachable(&self, began: LatchEpoch) -> LatchTransition {
+        let mut state = self.state();
+        if state.epoch != began.0 {
+            return LatchTransition::Superseded;
+        }
+        Self::restore(&mut state)
     }
 
-    /// A key change: clear both pauses. `true` when one was in force.
+    /// A key change: clear both pauses and start a new epoch, so outcomes of
+    /// attempts already in flight no longer count. `true` when a pause was
+    /// in force.
     pub fn clear(&self) -> bool {
         let mut state = self.state();
+        state.epoch = state.epoch.wrapping_add(1);
         state.throttle_streak = 0;
         state.pause.take().is_some()
     }
