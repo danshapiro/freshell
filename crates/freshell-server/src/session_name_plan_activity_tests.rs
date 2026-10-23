@@ -706,6 +706,112 @@ async fn needs_first_message_input_follows_the_folder() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// An accepted send heals a junk name only as the first message
+// ---------------------------------------------------------------------------
+
+/// An accepted send carries the message the user just sent, not the
+/// session's first message. Once the store holds the session's AI-naming
+/// input — the post-deploy shapes: an exhausted series, or one the boot
+/// snapshot absorbed at rest — a later send such as "continue" must not
+/// replace a junk "Tab 4" at equal or lower rank: it would stay the name,
+/// because the real first message no longer outranks it and the record no
+/// longer counts as junk. The session index's first message heals it.
+#[tokio::test]
+async fn an_accepted_send_heals_a_junk_name_only_as_the_first_message() {
+    for (id, status, consumed) in [
+        (
+            "s-continue-exhausted",
+            GenerationStatus::Exhausted,
+            MAX_GENERATION_STARTS,
+        ),
+        ("s-continue-resting", GenerationStatus::Idle, 0),
+    ] {
+        let dir = temp_dir();
+        let store = open(dir.path());
+        let target = session(NamedProvider::Claude, id);
+        let seeded = seed(
+            &store,
+            indexed(
+                NamedProvider::Claude,
+                id,
+                Some("/w/work"),
+                Some("Tab 4"),
+                None,
+            ),
+            false,
+        )
+        .await;
+        assert_eq!(seeded.record.name, "Tab 4");
+        assert_eq!(seeded.record.source, NameSource::ProviderAi);
+        rewrite(dir.path(), |document| {
+            document.generation.insert(
+                name_ref_key(&target),
+                series_with_input(SARDINE, status, consumed),
+            );
+        });
+        let store = open(dir.path());
+
+        let send = activity(
+            &store,
+            &target,
+            NameActivityReason::AcceptedUserMessage,
+            Some("continue"),
+        )
+        .await;
+        assert_eq!(
+            send.record.name, "Tab 4",
+            "{id}: a later send is not the session's first message"
+        );
+        assert_eq!(send.record.source, NameSource::ProviderAi);
+
+        let healed = activity(
+            &store,
+            &target,
+            NameActivityReason::IndexUserMessage,
+            Some(SARDINE),
+        )
+        .await;
+        assert_eq!(
+            healed.record.name, SARDINE,
+            "{id}: the index's first message heals it"
+        );
+        assert_eq!(healed.record.source, NameSource::FirstMessage);
+    }
+}
+
+/// The other side: while the store holds no input for the session, the
+/// accepted send is the first user message the store learns (a pane's
+/// first send before the session is durable), so it heals the junk name.
+#[tokio::test]
+async fn an_accepted_send_heals_a_junk_name_while_no_input_is_stored() {
+    let dir = temp_dir();
+    let store = open(dir.path());
+    let target = session(NamedProvider::Claude, "s-first-send");
+    seed(
+        &store,
+        indexed(
+            NamedProvider::Claude,
+            "s-first-send",
+            Some("/w/work"),
+            Some("Tab 4"),
+            None,
+        ),
+        false,
+    )
+    .await;
+    assert!(series_of(dir.path(), &target).is_none(), "no input stored");
+    let healed = activity(
+        &store,
+        &target,
+        NameActivityReason::AcceptedUserMessage,
+        Some(SARDINE),
+    )
+    .await;
+    assert_eq!(healed.record.name, SARDINE);
+    assert_eq!(healed.record.source, NameSource::FirstMessage);
+}
+
 // The sweep (one pass at a time, against the real store) lives in a child
 // module so this file stays under the 1000-line cap; its tests are still
 // selected by `plan_activity`.

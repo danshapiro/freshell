@@ -3140,7 +3140,9 @@ impl ActivityPlan {
 ///   text, RC12), and only when the automatic-offer rule accepts it
 ///   (`session_name_policy`): it RAISES a real name's rank, or it replaces a
 ///   self-heal record (a junk default label, classified with the activity's
-///   own `cwd`) — Task 4;
+///   own `cwd`) — Task 4 — the latter only when the message can be the
+///   session's first (`session_name_first_message::fallback_may_self_heal`:
+///   an accepted send carries the current message, not the first);
 /// - the series plan (`session_name_first_message::plan_series`) is skipped
 ///   for protected sources; it arms on new input or an explicit open of an
 ///   unattempted series, re-absorbs a re-derived indexed message at rest,
@@ -3161,13 +3163,13 @@ fn plan_activity(
         return plan;
     };
     if let Some(fallback) = first_user_message.and_then(first_message_fallback) {
+        let applies = if session_name_first_message::fallback_may_self_heal(document, key, reason) {
+            session_name_policy::automatic_offer_applies
+        } else {
+            session_name_policy::rank_raise_applies
+        };
         if validate_name(&fallback).is_ok()
-            && session_name_policy::automatic_offer_applies(
-                record,
-                &fallback,
-                NameSource::FirstMessage,
-                cwd,
-            )
+            && applies(record, &fallback, NameSource::FirstMessage, cwd)
         {
             plan.offer_heals = source_rank(NameSource::FirstMessage) <= source_rank(record.source);
             plan.offer_fallback = Some(fallback);

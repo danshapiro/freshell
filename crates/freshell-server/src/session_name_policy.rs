@@ -119,13 +119,24 @@ pub(super) fn automatic_offer_applies(
     offer_source: NameSource,
     cwd: Option<&str>,
 ) -> bool {
-    if offer_name == record.name || source_is_protected(record.source) {
-        return false;
-    }
-    if self_heal_offer_applies(record, offer_name, offer_source, cwd) {
-        return true;
-    }
-    !is_default_label_for(record, offer_name, cwd)
+    self_heal_offer_applies(record, offer_name, offer_source, cwd)
+        || rank_raise_applies(record, offer_name, offer_source, cwd)
+}
+
+/// The strict half of [`automatic_offer_applies`]: a real name (not a
+/// default or derived label under the known folder) that outranks the saved
+/// one. Never the same text, never over a protected name. The fallback of
+/// an accepted send that is not the session's first message gets only this
+/// half (`session_name_first_message::fallback_may_self_heal`).
+pub(super) fn rank_raise_applies(
+    record: &SessionNameRecord,
+    offer_name: &str,
+    offer_source: NameSource,
+    cwd: Option<&str>,
+) -> bool {
+    offer_name != record.name
+        && !source_is_protected(record.source)
+        && !is_default_label_for(record, offer_name, cwd)
         && source_rank(offer_source) > source_rank(record.source)
 }
 

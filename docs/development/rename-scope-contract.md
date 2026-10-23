@@ -74,9 +74,13 @@ exceptions (the rules live in
   `freshell_ai` names are never healed. Healing happens on the
   session-index sweep (every pass offers each indexed session's first
   message and re-checks its index row, applying at most 25 records'
-  changes per pass), on live native titles and on accepted user messages,
-  so existing junk names heal without a repair step; a session the index
-  no longer lists heals only when it is seen again. A name the classifier
+  changes per pass), on live native titles and on an accepted user message
+  that can be the session's first — one sent while Freshell has stored no
+  message for the session yet. A later message (a "continue" typed into a
+  resumed session) only replaces a name below `first_message`, so a junk
+  name it finds waits for the session index's real first message. Existing
+  junk names therefore heal without a repair step; a session the index no
+  longer lists heals only when it is seen again. A name the classifier
   does not recognize stays until someone renames it.
 
 The user-facing control is **Rename** only. There is no "generate a new
