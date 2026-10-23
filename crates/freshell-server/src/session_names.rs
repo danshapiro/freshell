@@ -119,7 +119,11 @@ mod session_name_generation_series;
 // view, and the cheap cross-process stamp peek.
 #[path = "session_name_store_view.rs"]
 mod session_name_store_view;
-use session_name_apply::{indexed_key, replace_automatic, replace_heal, wire_source, with_outcome};
+// Name-reliability Task 12: the `session_names.name_changed` event log.
+#[path = "session_name_events.rs"]
+mod session_name_events;
+use session_name_apply::{indexed_key, replace_automatic, wire_source, with_outcome};
+use session_name_events::{ExternalChanges, NameChangeCause, NameChangeEvent};
 use session_name_first_message::{first_message_fallback, RefusalSite, SeriesPlan};
 use session_name_store_view::{DocumentStamp, FullCheck};
 use session_name_sweep_batch::StagedNativeBaselines;
@@ -567,6 +571,26 @@ enum Decision<T> {
 struct PublishSpec {
     key: String,
     changed: bool,
+    /// Name-reliability Task 12: why the saved name changed, logged after
+    /// the commit (`session_name_events`). `None` for status-only publishes.
+    change: Option<NameChangeEvent>,
+}
+
+impl PublishSpec {
+    /// A record whose saved name changed for `change`'s reason.
+    fn changed(key: String, change: NameChangeEvent) -> Self {
+        Self {
+            key,
+            changed: true,
+            change: Some(change),
+        }
+    }
+
+    fn change_entry(&self) -> Option<(&str, &NameChangeEvent)> {
+        self.change
+            .as_ref()
+            .map(|change| (self.key.as_str(), change))
+    }
 }
 
 /// Context handed to every decision closure.
@@ -1769,6 +1793,13 @@ where
             reconcile_durability(&core.doc_path, &core.data_dir)?;
         }
     }
+    // Another participant's commits since the adopted view, captured before
+    // this decision mutates the document (name-reliability Task 12).
+    let external = if first_init {
+        ExternalChanges::default()
+    } else {
+        ExternalChanges::between(&core.current_view().document, &document)
+    };
 
     let meta = TxnMeta {
         now_ms: effective_now_ms(&core.data_dir),
@@ -1791,7 +1822,9 @@ where
             // A staged baseline another participant already persisted (or
             // whose record is gone) is no longer pending work.
             core.staged_baselines.prune_persisted(&document);
-            if !adopt_if_newer(core, document, raw_digest, raw_stamp, true) {
+            if adopt_if_newer(core, document, raw_digest, raw_stamp, true) {
+                external.log();
+            } else {
                 // The file still holds the adopted generation.
                 session_name_store_view::confirm_view(core, raw_stamp);
             }
@@ -1803,6 +1836,12 @@ where
             let digest = digest_bytes(&bytes);
             write_durable(core, &document, &bytes, digest)?;
             core.staged_baselines.prune_persisted(&document);
+            // Committed: log the adopted and the own name changes.
+            external.log();
+            session_name_events::log_name_changes(
+                &document,
+                publish.iter().filter_map(PublishSpec::change_entry),
+            );
             // Publish while the lock is still held: local generation order.
             let updates = materialize_publish(&document, &publish);
             core.publish(updates);
@@ -2385,23 +2424,18 @@ fn read_update(document: &StoredDocument, key: &str) -> SessionNameUpdate {
 }
 
 /// The commit-decision shape: the post-commit value update plus the publish
-/// list (records publish only when their accepted value changed;
-/// bookkeeping-only generations publish nothing).
+/// list (records publish only when their accepted value changed — `change`
+/// says why; bookkeeping-only generations pass `None` and publish nothing).
 fn commit_decision(
     document: &StoredDocument,
     key: &str,
-    changed: bool,
+    change: Option<NameChangeEvent>,
 ) -> Decision<SessionNameUpdate> {
-    let value = update_after_commit(document, key, changed, RedirectScope::ToRecord)
+    let value = update_after_commit(document, key, change.is_some(), RedirectScope::ToRecord)
         .expect("the record resolves");
-    let publish = if changed {
-        vec![PublishSpec {
-            key: key.to_string(),
-            changed: true,
-        }]
-    } else {
-        Vec::new()
-    };
+    let publish = change
+        .map(|change| vec![PublishSpec::changed(key.to_string(), change)])
+        .unwrap_or_default();
     Decision::Write { value, publish }
 }
 
@@ -2419,6 +2453,7 @@ fn commit_decision_publishing_status(
         publish: vec![PublishSpec {
             key: key.to_string(),
             changed: false,
+            change: None,
         }],
     }
 }
@@ -2805,9 +2840,10 @@ fn ensure_pending_decision(
     document.records.insert(key.clone(), record);
     let value = update_after_commit(document, &key, true, RedirectScope::None)
         .expect("the freshly inserted record resolves");
+    let change = NameChangeEvent::new(NameChangeCause::EnsurePending, None, None);
     Ok(Decision::Write {
         value,
-        publish: vec![PublishSpec { key, changed: true }],
+        publish: vec![PublishSpec::changed(key, change)],
     })
 }
 
@@ -2832,6 +2868,7 @@ fn rename_decision(
     if input.intent == NameIntent::User {
         // UI Rename always conveys user intent: it always wins (an identical
         // manual rename is not a new decision and changes nothing).
+        let change = NameChangeEvent::new(NameChangeCause::ManualRename, Some(&record), None);
         let outcome = if offer_mut(document, &key, name, NameSource::Manual, meta.now_ms)? {
             let record = document
                 .record_at(&key)
@@ -2839,7 +2876,7 @@ fn rename_decision(
                 .expect("the accepted record resolves");
             reset_native_series(document, &key, &record);
             return Ok(with_outcome(
-                commit_decision(document, &key, true),
+                commit_decision(document, &key, Some(change)),
                 RenameOutcome {
                     applied: true,
                     reason: None,
@@ -2863,9 +2900,14 @@ fn rename_decision(
         session_name_policy::automation_rename_decision(&record, &name, input.cwd.as_deref());
     match verdict {
         session_name_policy::AutomationRenameVerdict::Apply => {
+            let change = NameChangeEvent::new(
+                NameChangeCause::AutomationRename,
+                Some(&record),
+                input.cwd.as_deref(),
+            );
             replace_automatic(document, &key, name, NameSource::ProviderAi)?;
             Ok(with_outcome(
-                commit_decision(document, &key, true),
+                commit_decision(document, &key, Some(change)),
                 verdict.outcome(),
             ))
         }
@@ -2897,7 +2939,7 @@ fn offer_decision(
     name: &str,
     source: NameSource,
 ) -> Result<Decision<SessionNameUpdate>, NameError> {
-    let (key, _record) = required_record(document, target)?;
+    let (key, prior) = required_record(document, target)?;
     let name = validate_name(name)?;
     if offer_mut(document, &key, name, source, meta.now_ms)? {
         let record = document
@@ -2907,7 +2949,8 @@ fn offer_decision(
         if source_is_writable(record.source) {
             reset_native_series(document, &key, &record);
         }
-        Ok(commit_decision(document, &key, true))
+        let change = NameChangeEvent::new(NameChangeCause::of_offer(source), Some(&prior), None);
+        Ok(commit_decision(document, &key, Some(change)))
     } else {
         Ok(Decision::Read(read_update(document, &key)))
     }
@@ -2976,10 +3019,9 @@ fn bind_pending_decision(
                 pending_record.manual_revision.unwrap_or(0) > current.manual_revision.unwrap_or(0)
             } else {
                 source_rank(pending_record.source) > source_rank(current.source)
-                    || session_name_import_policy::pending_beats_import_owned_label(
+                    || session_name_import_policy::import_owned_label_loses_bind(
                         document,
                         &target_key,
-                        pending_record.source,
                     )
             };
             if pending_wins {
@@ -3045,7 +3087,14 @@ fn bind_pending_decision(
         }
     }
 
-    Ok(commit_decision(document, &target_key, true))
+    // The session's saved name before the bind (none: the bind creates it).
+    let cause = if existing.is_some() {
+        NameChangeCause::BindCollision
+    } else {
+        NameChangeCause::Bind
+    };
+    let change = NameChangeEvent::new(cause, existing.as_ref(), None).with_from_ref(&pending_key);
+    Ok(commit_decision(document, &target_key, Some(change)))
 }
 
 /// The pure pre-evaluation of one activity against a document snapshot:
@@ -3135,8 +3184,8 @@ fn plan_activity(
 /// and the sweep maintenance batch).
 struct ActivityApplied {
     key: String,
-    /// The saved name changed.
-    visible: bool,
+    /// The saved name changed, and why (name-reliability Task 12).
+    change: Option<NameChangeEvent>,
     /// Generation bookkeeping changed (a persisted, invisible advance).
     bookkeeping: bool,
 }
@@ -3147,11 +3196,11 @@ fn activity_decision(
     input: NameActivity,
 ) -> Result<Decision<SessionNameUpdate>, NameError> {
     let applied = apply_activity(document, input)?;
-    if applied.visible {
-        Ok(commit_decision(document, &applied.key, true))
+    if let Some(change) = applied.change {
+        Ok(commit_decision(document, &applied.key, Some(change)))
     } else if applied.bookkeeping {
         // Bookkeeping-only commit: a generation advance with no visible text.
-        Ok(commit_decision(document, &applied.key, false))
+        Ok(commit_decision(document, &applied.key, None))
     } else {
         Ok(Decision::Read(read_update(document, &applied.key)))
     }
@@ -3173,10 +3222,10 @@ fn apply_activity(
         first_user_message,
         cwd,
     } = input;
-    let (key, _record) = required_record(document, &target)?;
+    let (key, prior) = required_record(document, &target)?;
     let mut applied = ActivityApplied {
         key: key.clone(),
-        visible: false,
+        change: None,
         bookkeeping: false,
     };
 
@@ -3199,15 +3248,12 @@ fn apply_activity(
     }
 
     if let Some(fallback) = plan.offer_fallback {
-        replace_heal(
-            document,
-            &key,
-            fallback,
-            NameSource::FirstMessage,
-            "activity",
-            plan.offer_heals,
-        )?;
-        applied.visible = true;
+        replace_automatic(document, &key, fallback, NameSource::FirstMessage)?;
+        applied.change = Some(NameChangeEvent::new(
+            NameChangeCause::FirstMessageFallback,
+            Some(&prior),
+            cwd.as_deref(),
+        ));
     }
 
     if let Some(series_plan) = plan.series {
@@ -3269,17 +3315,7 @@ fn observe_native_decision(
                         &name,
                     );
                     if plan.replace {
-                        let heal = source_rank(record.source)
-                            >= source_rank(NameSource::ProviderAi)
-                            && session_name_policy::is_self_heal_record(&record, None);
-                        replace_heal(
-                            document,
-                            &key,
-                            name,
-                            NameSource::ProviderAi,
-                            "observe_native",
-                            heal,
-                        )?;
+                        replace_automatic(document, &key, name, NameSource::ProviderAi)?;
                         changed = true;
                     }
                     new_baseline = plan.new_baseline;
@@ -3387,7 +3423,8 @@ fn observe_native_decision(
     }
 
     if changed {
-        Ok(commit_decision(document, &key, true))
+        let change = NameChangeEvent::new(NameChangeCause::NativeObservation, Some(&record), None);
+        Ok(commit_decision(document, &key, Some(change)))
     } else {
         // A status-only update publishes the unchanged record with its new
         // nativeSync projection; clients fold it by documentGeneration.
@@ -3555,7 +3592,7 @@ fn fold_generation_outcome_decision(
                 &outcome,
                 meta.now_ms,
             ) {
-                commit_decision(document, &key, false)
+                commit_decision(document, &key, None)
             } else {
                 Decision::Read(read_update(document, &key))
             },
@@ -3567,7 +3604,7 @@ fn fold_generation_outcome_decision(
         series.status = GenerationStatus::Idle;
         series.next_due = None;
         series.excerpt = None;
-        return Ok(commit_decision(document, &key, false));
+        return Ok(commit_decision(document, &key, None));
     }
     // An INVALID answer — a control character inside the reply (the
     // transport trims and caps but never strips them), an oversize or
@@ -3586,6 +3623,8 @@ fn fold_generation_outcome_decision(
     match outcome {
         GenerationOutcome::Answer(answer) => {
             let name = validate_name(&answer)?;
+            let change = NameChangeEvent::new(NameChangeCause::Generation, Some(&record), None)
+                .with_series(series_id);
             if offer_mut(document, &key, name, NameSource::FreshellAi, meta.now_ms)? {
                 {
                     let series = document
@@ -3603,7 +3642,7 @@ fn fold_generation_outcome_decision(
                     .cloned()
                     .expect("the accepted record resolves");
                 reset_native_series(document, &key, &record);
-                Ok(commit_decision(document, &key, true))
+                Ok(commit_decision(document, &key, Some(change)))
             } else {
                 Ok(Decision::Read(read_update(document, &key)))
             }
@@ -3612,7 +3651,7 @@ fn fold_generation_outcome_decision(
             // The attempt was charged at the claim and counted: exhaust at
             // the cap, else schedule the remaining delay from this fold.
             session_name_generation_series::settle_consumed_start(series, meta.now_ms);
-            Ok(commit_decision(document, &key, false))
+            Ok(commit_decision(document, &key, None))
         }
         GenerationOutcome::CapabilityUnavailable { attempt_id }
         | GenerationOutcome::Throttled { attempt_id } => {
@@ -3620,7 +3659,7 @@ fn fold_generation_outcome_decision(
             // (refused credential, permission, proxy or quota): give the
             // start back and keep the input.
             if session_name_generation_series::refund_start(series, &attempt_id) {
-                Ok(commit_decision(document, &key, false))
+                Ok(commit_decision(document, &key, None))
             } else {
                 Ok(Decision::Read(read_update(document, &key)))
             }
@@ -3684,8 +3723,13 @@ fn hydrate_indexed_decision(
         // A self-heal record: the allowed rung replaces the junk name; no
         // generation series is created or absorbed on this path.
         Some(session_name_policy::HydratePlan::Heal { name, source }) => {
-            replace_heal(document, &key, name, source, "hydrate", true)?;
-            return Ok(commit_decision(document, &key, true));
+            let change = NameChangeEvent::new(
+                NameChangeCause::Hydrate,
+                document.record_at(&key),
+                input.cwd.as_deref(),
+            );
+            replace_automatic(document, &key, name, source)?;
+            return Ok(commit_decision(document, &key, Some(change)));
         }
         Some(session_name_policy::HydratePlan::Insert { name, source }) => (name, source),
     };
@@ -3745,9 +3789,10 @@ fn hydrate_indexed_decision(
     let _ = meta;
     let value = update_after_commit(document, &key, true, RedirectScope::None)
         .expect("the freshly inserted record resolves");
+    let change = NameChangeEvent::new(NameChangeCause::Hydrate, None, None);
     Ok(Decision::Write {
         value,
-        publish: vec![PublishSpec { key, changed: true }],
+        publish: vec![PublishSpec::changed(key, change)],
     })
 }
 
@@ -4060,7 +4105,7 @@ fn fold_native_outcome_decision(
     if before != after {
         Ok(commit_decision_publishing_status(document, &key))
     } else {
-        Ok(commit_decision(document, &key, false))
+        Ok(commit_decision(document, &key, None))
     }
 }
 
@@ -4531,13 +4576,16 @@ fn import_legacy_decision(
             continue;
         };
         let classified = classify_legacy_candidate(trusted_boot, candidate);
+        let change = NameChangeEvent::new(
+            NameChangeCause::Import,
+            document.record_at(&name_ref_key(&resolved)),
+            None,
+        )
+        .with_import(&input.import_id, &classified.evidence_key);
         let outcome = apply_legacy_candidate(document, resolved, &classified)?;
         if let Some(key) = outcome.key {
             if outcome.changed {
-                publish.push(PublishSpec {
-                    key: key.clone(),
-                    changed: true,
-                });
+                publish.push(PublishSpec::changed(key.clone(), change));
                 names.push(
                     update_after_commit(document, &key, true, RedirectScope::ToRecord)
                         .expect("the winning record resolves"),

@@ -23,6 +23,7 @@ use std::sync::Mutex;
 
 use freshell_freshagent::naming::{NameActivity, NameError};
 
+use super::session_name_events::{NameChangeCause, NameChangeEvent};
 use super::session_name_policy::{plan_hydrate, HydratePlan};
 use super::{Decision, PublishSpec, StoredDocument, TxnMeta};
 use crate::session_name_generation::IndexedNameInput;
@@ -180,22 +181,32 @@ pub(super) fn sweep_maintenance_decision(
     let mut used = 0usize;
     for item in items.into_iter().take(SWEEP_MAINTENANCE_BATCH) {
         used += 1;
-        let mut healed_key: Option<String> = None;
+        let mut healed: Option<(String, NameChangeEvent)> = None;
         if let Some(input) = item.hydrate {
             // Only the heal half of hydration is maintenance; an insert
             // (the record vanished?) is left to the per-row path.
             if let Some(HydratePlan::Heal { name, source }) = plan_hydrate(document, &input) {
                 let key = super::indexed_key(&input);
-                super::replace_heal(document, &key, name, source, "hydrate", true)?;
-                healed_key = Some(key);
+                let change = NameChangeEvent::new(
+                    NameChangeCause::Hydrate,
+                    document.record_at(&key),
+                    input.cwd.as_deref(),
+                );
+                super::replace_automatic(document, &key, name, source)?;
+                healed = Some((key, change));
             }
         }
         if let Some(activity) = item.activity {
             match super::apply_activity(document, activity) {
                 Ok(applied) => {
                     wrote |= applied.bookkeeping;
-                    if applied.visible {
-                        healed_key = Some(applied.key);
+                    if let Some(change) = applied.change {
+                        // The same record healed by hydration first: log one
+                        // change from where the hydration started.
+                        let earlier = healed
+                            .take()
+                            .and_then(|(key, earlier)| (key == applied.key).then_some(earlier));
+                        healed = Some((applied.key, change.after(earlier)));
                     }
                 }
                 // A row whose record is gone has nothing to heal.
@@ -203,11 +214,14 @@ pub(super) fn sweep_maintenance_decision(
                 Err(error) => return Err(error),
             }
         }
-        if let Some(key) = healed_key {
+        if let Some((key, change)) = healed {
             report.healed += 1;
             wrote = true;
-            if !publish.iter().any(|spec| spec.key == key) {
-                publish.push(PublishSpec { key, changed: true });
+            // One publish (and one logged change) per record: a record an
+            // earlier item already changed keeps that item's starting point.
+            match publish.iter_mut().find(|spec| spec.key == key) {
+                Some(spec) => spec.change = Some(change.after(spec.change.take())),
+                None => publish.push(PublishSpec::changed(key, change)),
             }
         }
     }

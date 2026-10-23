@@ -29,9 +29,9 @@
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
-use freshell_protocol::session_names::{LegacyImportResult, LegacyNameImport, NameSource};
+use freshell_protocol::session_names::{LegacyImportResult, LegacyNameImport};
 
-use super::{wire_source, NameError, StoredDocument, NAME_MIGRATION_IMPORT_CANDIDATE_LIMIT};
+use super::{NameError, StoredDocument, NAME_MIGRATION_IMPORT_CANDIDATE_LIMIT};
 
 /// The per-process set of import ids already logged as ignored is cleared
 /// when it reaches this size, which bounds its memory; an id seen again after
@@ -119,33 +119,6 @@ pub(super) fn import_owned_label_loses_bind(document: &StoredDocument, key: &str
         return false;
     };
     super::session_name_policy::is_self_heal_record(record, None) && is_import_owned(document, key)
-}
-
-/// The bind decision's use of rule 2: `true` when the pending record wins
-/// the collision only because the durable record is an import-owned default
-/// label. Logs the decision (INFO `session_names.bind_collision_import_label_lost`)
-/// when it fires; the transaction then commits the swap, and a failed commit
-/// surfaces as the caller's `operation_failed` error.
-pub(super) fn pending_beats_import_owned_label(
-    document: &StoredDocument,
-    key: &str,
-    pending_source: NameSource,
-) -> bool {
-    let Some(current) = document.record_at(key) else {
-        return false;
-    };
-    if !import_owned_label_loses_bind(document, key) {
-        return false;
-    }
-    tracing::info!(
-        target: "freshell_server::session_names",
-        op = "bind_pending",
-        name_ref = %key,
-        loser_source = %wire_source(current.source),
-        winner_source = %wire_source(pending_source),
-        "session_names.bind_collision_import_label_lost"
-    );
-    true
 }
 
 /// True the first time this process sees `import_id` (until the bounded set

@@ -15,6 +15,7 @@ import {
   type Journey,
 } from '../helpers/unified-agent-names-modes.js'
 import type { SessionNameRef } from '../../../shared/session-names.js'
+import { nameRefLogKey, readNameChangedEvents } from '../helpers/name-change-events.js'
 
 // NAME RELIABILITY (plan Task 2, RC1) — the browser no longer sends its live
 // tab and pane titles to the server as "legacy" name evidence. Before the
@@ -222,6 +223,24 @@ test.describe('name import shutdown', () => {
       const { handle, ref } = await createClaudeSession(journey, page, harness)
       const before = await settledRecord(journey, ref)
       await expectTabLabel(page, handle.tabId, before.name)
+      // Name-reliability Task 12: the log rebuilds the saved name. The first
+      // message becomes the session's name once, logged either as the
+      // first-message fallback (the pane bound the session's record first)
+      // or as the index hydrating the record (the index saw the transcript
+      // first): two correct orders of the same race, so either cause.
+      const sessionKey = nameRefLogKey(ref)
+      const sessionHistory = async () => (await readNameChangedEvents(journey.server.info.logsDir))
+        .filter((event) => event.name_ref === sessionKey)
+      const history = await sessionHistory()
+      const named = history.filter((event) => event.new_name === before.name
+        && (event.cause === 'first_message_fallback' || event.cause === 'hydrate'))
+      expect(named, JSON.stringify(history)).toEqual([
+        expect.objectContaining({ new_name: before.name, new_source: 'first_message', self_heal: false }),
+      ])
+      expect(history.at(-1), 'the last logged change is the saved name').toMatchObject({
+        new_name: before.name,
+        new_source: 'first_message',
+      })
 
       await reloadAndConnect(page)
       await quietPeriod(page)
@@ -229,6 +248,9 @@ test.describe('name import shutdown', () => {
       expect(imports.count).toBe(0)
       expect(await readNameRecord(journey, ref)).toMatchObject(before)
       await expectTabLabel(page, handle.tabId, before.name)
+      const afterReload = await readNameChangedEvents(journey.server.info.logsDir)
+      expect(afterReload.filter((event) => event.cause === 'import'), 'a reload imports no name').toEqual([])
+      expect(await sessionHistory(), 'a reload changes no saved name').toEqual(history)
       await context.close()
     } finally {
       await journey.cleanup()

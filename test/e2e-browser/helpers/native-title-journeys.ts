@@ -10,6 +10,7 @@ import {
   sendFirstMessage,
   type FakeGemini,
 } from './unified-agent-names.js'
+import { readNameChangedEvents } from './name-change-events.js'
 
 /**
  * Name-reliability Task 4 — journeys shared by more than one spec file (the
@@ -69,6 +70,13 @@ export async function providerRealTitleNeverThePlaceholder(
     const record = await readRecord(journey, handle.nameRef!)
     expect(record.source).toBe('provider_ai')
     expect(await namingSightings(page), 'no naming surface ever showed the placeholder').toEqual([])
+    // Name-reliability Task 12: the real title is one logged change; the
+    // placeholder never is.
+    const events = await readNameChangedEvents(journey.server.info.logsDir)
+    expect(events.filter((event) => event.cause === 'native_observation')).toEqual([
+      expect.objectContaining({ new_name: OPENCODE_REAL_TITLE, new_source: 'provider_ai' }),
+    ])
+    expect(events.filter((event) => event.new_name.startsWith(PLACEHOLDER_PREFIX))).toEqual([])
     await context.close()
   } finally {
     await journey.cleanup()
