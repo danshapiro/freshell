@@ -120,6 +120,32 @@ describe('freshAgentLive slice (transcript-live D3)', () => {
     expect(tail(store).blocks.map((block) => block.uuid ?? block.kind)).toEqual(['u-text', 'tool_use'])
   })
 
+  it('lands a block it never learned the line of by its API message id and position', () => {
+    const store = createStore()
+    // The snapshot holding msg_1's lines outran the assistant frames that name them.
+    streamTurn(store)
+    apply(store, start('msg_2', 0, 'text'), delta('msg_2', 0, 'next message'))
+    store.dispatch(transcriptLanded({
+      sessionKey: KEY,
+      present: ['line-a', 'line-b'],
+      messageBlockKinds: { msg_1: ['thinking', 'text'] },
+    }))
+    // msg_1's thinking (0) and text (1) are on screen; its tool (2) and msg_2 are not.
+    expect(tail(store).blocks.map((block) => `${block.messageId}:${block.index}`)).toEqual(['msg_1:2', 'msg_2:0'])
+  })
+
+  it('trusts a bound block\'s uuid over its position, and never lands a block of another kind', () => {
+    const store = createStore()
+    apply(store, start('msg_1', 0, 'text'), delta('msg_1', 0, 'bound'), start('msg_1', 1, 'thinking'), delta('msg_1', 1, 'mismatch'))
+    store.dispatch(assistantBlockBound({ ...locator, uuid: 'u-text', messageId: 'msg_1', content: [{ type: 'text', text: 'bound' }] }))
+    store.dispatch(transcriptLanded({
+      sessionKey: KEY,
+      present: ['some-other-line'],
+      messageBlockKinds: { msg_1: ['text', 'text'] },
+    }))
+    expect(tail(store).blocks.map((block) => block.text)).toEqual(['bound', 'mismatch'])
+  })
+
   it('shows a retry until the next block starts', () => {
     const store = createStore()
     store.dispatch(liveRetrySet({ ...locator, attempt: 2, maxRetries: 10, delayMs: 1200, errorStatus: 529, error: 'overloaded' }))

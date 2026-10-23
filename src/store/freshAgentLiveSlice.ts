@@ -1,5 +1,6 @@
 import { createSlice, type PayloadAction } from '@reduxjs/toolkit'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
+import { isLiveBlockLanded, landedTranscript, type LandedTranscript } from '@/lib/fresh-agent-landed-transcript'
 import {
   markSessionLost,
   materializeSession,
@@ -151,16 +152,24 @@ const freshAgentLiveSlice = createSlice({
       if (!session.expectedTurnIds.includes(uuid)) session.expectedTurnIds.push(uuid)
     },
 
-    /** A committed snapshot holds these line uuids: their blocks and expectations are done. */
-    transcriptLanded(state, action: PayloadAction<{ sessionKey: string; present: readonly string[] }>) {
+    /**
+     * A committed snapshot holds these lines: the blocks it shows (by uuid, or
+     * by message id and position for a block whose uuid never arrived) and
+     * the announced lines it holds are done.
+     */
+    transcriptLanded(state, action: PayloadAction<{
+      sessionKey: string
+      present: readonly string[]
+      messageBlockKinds?: LandedTranscript['messageBlockKinds']
+    }>) {
       const session = state.bySession[action.payload.sessionKey]
       if (!session) return
-      const present = new Set(action.payload.present)
-      if (session.blocks.some((block) => block.uuid !== undefined && present.has(block.uuid))) {
-        session.blocks = session.blocks.filter((block) => block.uuid === undefined || !present.has(block.uuid))
+      const landed = landedTranscript(action.payload.present, action.payload.messageBlockKinds)
+      if (session.blocks.some((block) => isLiveBlockLanded(block, landed))) {
+        session.blocks = session.blocks.filter((block) => !isLiveBlockLanded(block, landed))
       }
-      if (session.expectedTurnIds.some((uuid) => present.has(uuid))) {
-        session.expectedTurnIds = session.expectedTurnIds.filter((uuid) => !present.has(uuid))
+      if (session.expectedTurnIds.some((uuid) => landed.lineIds.has(uuid))) {
+        session.expectedTurnIds = session.expectedTurnIds.filter((uuid) => !landed.lineIds.has(uuid))
       }
     },
 

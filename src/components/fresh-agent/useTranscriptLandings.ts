@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react'
-import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
 import { createLogger } from '@/lib/client-logger'
+import type { LandedTranscript } from '@/lib/fresh-agent-landed-transcript'
 import { useAppDispatch, useAppStore } from '@/store/hooks'
 import {
   liveTailCleared,
@@ -20,32 +20,14 @@ const log = createLogger('useTranscriptLandings')
  */
 export const LANDING_RECHECK_MAX = 4
 
-/**
- * The transcript lines a snapshot proves were written: its turns' ids (each
- * claude turn is keyed by its line uuid) and the newest line uuids the server
- * lists separately, which include lines that produce no turn of their own.
- */
-export function presentTranscriptLineIds(snapshot: FreshAgentSnapshot): string[] {
-  const ids = new Set<string>()
-  for (const turn of snapshot.turns) {
-    ids.add(turn.turnId)
-    ids.add(turn.id)
-  }
-  const claude = snapshot.extensions?.claude
-  const lineUuids = claude && typeof claude === 'object' ? (claude as { transcriptLineUuids?: unknown }).transcriptLineUuids : undefined
-  if (Array.isArray(lineUuids)) {
-    for (const uuid of lineUuids) if (typeof uuid === 'string') ids.add(uuid)
-  }
-  return [...ids]
-}
-
 function hasLiveContent(tail: FreshAgentLiveSession | undefined): boolean {
   return Boolean(tail && (tail.blocks.length > 0 || tail.retry || tail.expectedTurnIds.length > 0))
 }
 
 /**
  * Keeps a pane's live tail in step with the snapshots it commits. On every
- * committed snapshot: the blocks and announced lines it holds are landed; an
+ * committed snapshot (`landed`, derived once per snapshot): the blocks and
+ * announced lines it holds are landed; an
  * announced line still missing earns a bounded re-poll; and once nothing is
  * awaited and the turn is over, the tail is cleared — after its lines are on
  * screen, so the text never blinks out between the result and the snapshot.
@@ -54,13 +36,14 @@ function hasLiveContent(tail: FreshAgentLiveSession | undefined): boolean {
  */
 export function useTranscriptLandings({
   sessionKey,
-  snapshot,
+  landed,
   busy,
   isBusyNow,
   requestRefresh,
 }: {
   sessionKey: string | undefined
-  snapshot: FreshAgentSnapshot | null
+  /** What the committed snapshot holds; null before the first one. */
+  landed: LandedTranscript | null
   busy: boolean
   /** The pane's busy state at the moment of the check (not of the last render). */
   isBusyNow: () => boolean
@@ -79,8 +62,12 @@ export function useTranscriptLandings({
   }, [sessionKey])
 
   useEffect(() => {
-    if (!sessionKey || !snapshot) return
-    dispatch(transcriptLanded({ sessionKey, present: presentTranscriptLineIds(snapshot) }))
+    if (!sessionKey || !landed) return
+    dispatch(transcriptLanded({
+      sessionKey,
+      present: [...landed.lineIds],
+      messageBlockKinds: landed.messageBlockKinds,
+    }))
     const expected = store.getState().freshAgentLive?.bySession[sessionKey]?.expectedTurnIds ?? []
     const attempts = attemptsRef.current
     for (const uuid of [...attempts.keys()]) {
@@ -112,7 +99,7 @@ export function useTranscriptLandings({
       return
     }
     if (!isBusyNowRef.current()) dispatch(liveTailCleared({ sessionKey }))
-  }, [dispatch, sessionKey, snapshot, store])
+  }, [dispatch, landed, sessionKey, store])
 
   const wasBusyRef = useRef(busy)
   useEffect(() => {

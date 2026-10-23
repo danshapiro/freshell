@@ -122,7 +122,8 @@ import { FreshAgentOpenSessionContext } from './FreshAgentItemCard'
 import FreshAgentQuestionBanner from './FreshAgentQuestionBanner'
 import { FreshAgentTranscript, type FreshAgentTranscriptHandle } from './FreshAgentTranscript'
 import { FreshAgentLiveTail, liveTailShowsContent } from './FreshAgentLiveTail'
-import { presentTranscriptLineIds, useTranscriptLandings } from './useTranscriptLandings'
+import { useTranscriptLandings } from './useTranscriptLandings'
+import { landedTranscriptOf } from '@/lib/fresh-agent-landed-transcript'
 import { formatFreshAgentNotice } from '@/lib/fresh-agent-notice'
 import type { FreshAgentTurnRewindAvailability } from './FreshAgentTurnActions'
 import { FreshAgentComposer, type FreshAgentComposerHandle } from './FreshAgentComposer'
@@ -3952,12 +3953,9 @@ export function FreshAgentView({
   const liveSessionKey = paneContent.sessionId
     ? makeFreshAgentSessionKey({ sessionId: paneContent.sessionId, sessionType: paneContent.sessionType, provider: paneContent.provider })
     : undefined
-  const landedTurnIds = useMemo<ReadonlySet<string>>(
-    () => new Set(snapshot ? presentTranscriptLineIds(snapshot) : []),
-    [snapshot],
-  )
+  const landedTranscript = useMemo(() => landedTranscriptOf(snapshot), [snapshot])
   const liveTailActive = useAppSelector((state) => (
-    liveSessionKey ? liveTailShowsContent(state.freshAgentLive?.bySession[liveSessionKey], landedTurnIds) : false
+    liveSessionKey ? liveTailShowsContent(state.freshAgentLive?.bySession[liveSessionKey], landedTranscript) : false
   ))
   // Provider notices (rate limits, a failed compaction, CLI banners) show in
   // the pane's notice banner; they never end the turn (transcript-live P4).
@@ -4002,7 +4000,7 @@ export function FreshAgentView({
   }, [requestSnapshotRefresh])
   useTranscriptLandings({
     sessionKey: liveSessionKey,
-    snapshot,
+    landed: snapshot ? landedTranscript : null,
     busy: isBusy,
     isBusyNow: isLiveSessionBusyNow,
     requestRefresh: requestLandingRecheck,
@@ -4804,7 +4802,7 @@ export function FreshAgentView({
                     tail={liveSessionKey ? (
                       <FreshAgentLiveTail
                         sessionKey={liveSessionKey}
-                        landedTurnIds={landedTurnIds}
+                        landed={landedTranscript}
                         agentLabel={descriptor?.label}
                         expandThinking={globalExpandThinking}
                         expandTools={globalExpandTools}
@@ -4966,7 +4964,7 @@ export function FreshAgentView({
     getRewindAvailability,
     isBusy,
     isRestoring,
-    landedTurnIds,
+    landedTranscript,
     liveSessionKey,
     liveTailActive,
     loadError,

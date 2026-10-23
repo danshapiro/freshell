@@ -11,6 +11,7 @@ import freshAgentLiveReducer, {
 import type { LiveStreamOp } from '@/store/freshAgentLiveTypes'
 import { FreshAgentLiveTail } from '@/components/fresh-agent/FreshAgentLiveTail'
 import { FreshAgentTranscript, TranscriptFollowContext } from '@/components/fresh-agent/FreshAgentTranscript'
+import { landedTranscript, type LandedTranscript } from '@/lib/fresh-agent-landed-transcript'
 
 // Render markdown synchronously (the transcript tests' established mock): the
 // real LazyMarkdown swaps a plain fallback for the renderer chunk once loaded.
@@ -23,7 +24,7 @@ vi.mock('@/components/markdown/LazyMarkdown', async () => {
 
 const locator = { sessionId: 'tail-1', sessionType: 'freshclaude' as const, provider: 'claude' as const }
 const KEY = 'freshclaude:claude:tail-1'
-const NONE: ReadonlySet<string> = new Set()
+const NONE: LandedTranscript = landedTranscript([])
 
 function createStore() {
   return configureStore({ reducer: { freshAgent: freshAgentReducer, freshAgentLive: freshAgentLiveReducer } })
@@ -42,10 +43,10 @@ const start = (index: number, kind: 'text' | 'thinking' | 'tool_use', extra: Rec
 )
 const delta = (index: number, text: string): LiveStreamOp => ({ op: 'delta', messageId: 'msg_1', index, text })
 
-function renderTail(store: Store, landed: ReadonlySet<string> = NONE) {
+function renderTail(store: Store, landed: LandedTranscript = NONE) {
   return render(
     <Provider store={store}>
-      <FreshAgentLiveTail sessionKey={KEY} landedTurnIds={landed} agentLabel="Claude" />
+      <FreshAgentLiveTail sessionKey={KEY} landed={landed} agentLabel="Claude" />
     </Provider>,
   )
 }
@@ -130,7 +131,7 @@ describe('FreshAgentLiveTail (transcript-live D4)', () => {
 
     rerender(
       <Provider store={store}>
-        <FreshAgentLiveTail sessionKey={KEY} landedTurnIds={new Set(['u-text'])} agentLabel="Claude" />
+        <FreshAgentLiveTail sessionKey={KEY} landed={landedTranscript(['u-text'])} agentLabel="Claude" />
       </Provider>,
     )
     expect(screen.queryByText('Final words')).not.toBeInTheDocument()
@@ -141,7 +142,21 @@ describe('FreshAgentLiveTail (transcript-live D4)', () => {
     })
     rerender(
       <Provider store={store}>
-        <FreshAgentLiveTail sessionKey={KEY} landedTurnIds={new Set(['u-text', 'u-think'])} agentLabel="Claude" />
+        <FreshAgentLiveTail sessionKey={KEY} landed={landedTranscript(['u-text', 'u-think'])} agentLabel="Claude" />
+      </Provider>,
+    )
+    expect(container).toBeEmptyDOMElement()
+  })
+
+  it('hides a block whose assistant frame never arrived once the snapshot holds its message\'s line at its position', async () => {
+    const store = createStore()
+    apply(store, start(0, 'text'), delta(0, 'Unbound words'))
+    const { rerender, container } = renderTail(store)
+    await screen.findByText('Unbound words')
+
+    rerender(
+      <Provider store={store}>
+        <FreshAgentLiveTail sessionKey={KEY} landed={landedTranscript(['u-elsewhere'], { msg_1: ['text'] })} agentLabel="Claude" />
       </Provider>,
     )
     expect(container).toBeEmptyDOMElement()
@@ -154,7 +169,7 @@ describe('FreshAgentLiveTail (transcript-live D4)', () => {
     render(
       <Provider store={store}>
         <TranscriptFollowContext.Provider value={{ requestFollow, lastTurnRole: 'user' }}>
-          <FreshAgentLiveTail sessionKey={KEY} landedTurnIds={NONE} agentLabel="Claude" />
+          <FreshAgentLiveTail sessionKey={KEY} landed={NONE} agentLabel="Claude" />
         </TranscriptFollowContext.Provider>
       </Provider>,
     )
@@ -171,7 +186,7 @@ describe('FreshAgentLiveTail (transcript-live D4)', () => {
     render(
       <Provider store={store}>
         <TranscriptFollowContext.Provider value={{ requestFollow: () => {}, lastTurnRole: 'assistant' }}>
-          <FreshAgentLiveTail sessionKey={KEY} landedTurnIds={NONE} agentLabel="Claude" />
+          <FreshAgentLiveTail sessionKey={KEY} landed={NONE} agentLabel="Claude" />
         </TranscriptFollowContext.Provider>
       </Provider>,
     )
@@ -198,7 +213,7 @@ describe('FreshAgentTranscript live tail slot (transcript-live D4)', () => {
       <Provider store={store}>
         <FreshAgentTranscript
           turns={turns}
-          tail={<FreshAgentLiveTail sessionKey={KEY} landedTurnIds={NONE} agentLabel="Claude" />}
+          tail={<FreshAgentLiveTail sessionKey={KEY} landed={NONE} agentLabel="Claude" />}
         />
       </Provider>,
     )

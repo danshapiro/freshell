@@ -2,6 +2,7 @@ import { memo, useContext, useLayoutEffect, useMemo } from 'react'
 import type { FreshAgentTranscriptItem, FreshAgentTurn } from '@shared/fresh-agent-contract'
 import { useAppSelector } from '@/store/hooks'
 import type { FreshAgentLiveSession, LiveBlock, LiveRetry } from '@/store/freshAgentLiveTypes'
+import { isLiveBlockLanded, type LandedTranscript } from '@/lib/fresh-agent-landed-transcript'
 import {
   buildTranscriptLayout,
   FreshAgentTurnArticle,
@@ -52,17 +53,17 @@ function blockItem(block: LiveBlock): FreshAgentTranscriptItem {
 
 /**
  * The live tail's one synthetic turn: the blocks whose transcript line is not
- * on screen yet (a block whose uuid the rendered snapshot holds is already
- * shown there), then the API retry in progress — the newest thing happening,
+ * on screen yet (a block the rendered snapshot already shows is hidden in the
+ * same frame), then the API retry in progress — the newest thing happening,
  * so it is the strip's live row.
  */
 export function buildLiveTailTurn(
   tail: FreshAgentLiveSession | undefined,
-  landedTurnIds: ReadonlySet<string>,
+  landed: LandedTranscript,
 ): FreshAgentTurn | null {
   if (!tail) return null
   const items: FreshAgentTranscriptItem[] = tail.blocks
-    .filter((block) => block.uuid === undefined || !landedTurnIds.has(block.uuid))
+    .filter((block) => !isLiveBlockLanded(block, landed))
     .map(blockItem)
   if (tail.retry) {
     const error = describeRetry(tail.retry)
@@ -79,12 +80,12 @@ export function buildLiveTailTurn(
  */
 export function liveTailShowsContent(
   tail: FreshAgentLiveSession | undefined,
-  landedTurnIds: ReadonlySet<string>,
+  landed: LandedTranscript,
 ): boolean {
   if (!tail) return false
   if (tail.retry) return true
   return tail.blocks.some((block) => (
-    (block.uuid === undefined || !landedTurnIds.has(block.uuid))
+    !isLiveBlockLanded(block, landed)
     && (block.kind === 'tool_use' || block.text.trim().length > 0)
   ))
 }
@@ -110,21 +111,21 @@ function tailSignature(turn: FreshAgentTurn | null): string {
  */
 function FreshAgentLiveTailImpl({
   sessionKey,
-  landedTurnIds,
+  landed,
   agentLabel,
   expandThinking = false,
   expandTools = false,
 }: {
   sessionKey: string
-  /** Line uuids the rendered snapshot already shows. */
-  landedTurnIds: ReadonlySet<string>
+  /** What the rendered snapshot already shows. */
+  landed: LandedTranscript
   agentLabel?: string
   expandThinking?: boolean
   expandTools?: boolean
 }) {
   const tail = useAppSelector((state) => state.freshAgentLive?.bySession[sessionKey])
   const follow = useContext(TranscriptFollowContext)
-  const turn = useMemo(() => buildLiveTailTurn(tail, landedTurnIds), [tail, landedTurnIds])
+  const turn = useMemo(() => buildLiveTailTurn(tail, landed), [tail, landed])
   const layout = useMemo(() => {
     if (!turn) return null
     const built = buildTranscriptLayout([turn])
