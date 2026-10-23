@@ -286,6 +286,12 @@ function handleSdkMessage(sessionId, msg) {
   for (const frame of lifecycleFrames(sessionId, msg, st.lifecycle)) emit(frame)
 
   switch (msg.type) {
+    case 'conversation_reset': {
+      // The reset's new_conversation_id is a nonce, not the next session UUID
+      // (pinned CLI T16). Its next init identifies the conversation to follow.
+      st.pendingConversationReset = true
+      break
+    }
     case 'user': {
       // The SDK replays actual persisted user messages when this query opts in.
       // Only the unique UUID that this sidecar supplied for a checkpointed send
@@ -296,6 +302,10 @@ function handleSdkMessage(sessionId, msg) {
     }
     case 'system': {
       if (msg.subtype === 'init') {
+        if (st.pendingConversationReset && isUuid(msg.session_id)) {
+          st.pendingConversationReset = false
+          emit({ type: 'sdk.session.rekeyed', sessionId, newSessionId: msg.session_id, reason: 'conversation_reset' })
+        }
         st.cliSessionId = msg.session_id
         st.settings.cwd ??= msg.cwd
         st.terminalCommandNames = Array.isArray(msg.terminal_slash_commands) ? msg.terminal_slash_commands : []
@@ -447,6 +457,7 @@ function handleCreate(req) {
     abort,
     permissionMode: req.permissionMode,
     settings: { model: req.model, effort: req.effort, permissionMode: req.permissionMode, cwd: req.cwd },
+    pendingConversationReset: false,
     // False until `created` is sent; until then nothing reaches Rust and
     // bootEvidence collects what a refusal is named from (boot.mjs).
     booted: false,
