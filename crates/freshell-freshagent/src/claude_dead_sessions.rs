@@ -31,6 +31,11 @@ pub(crate) struct DeadClaudeSession {
     pub(crate) ids: Vec<String>,
     /// The settings the session last ran under.
     pub(crate) settings: FreshAgentSettings,
+    pub(crate) cli_session_id: Option<String>,
+    pub(crate) ownership_id: String,
+    pub(crate) launch_genesis: Option<crate::identity_sink::RecordedGenesis>,
+    pub(crate) turn_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) freshell_context: Option<crate::claude_freshell_mcp::ClaudeFreshellContext>,
     /// The command catalog the session last published.
     pub(crate) commands: Option<Vec<Value>>,
     /// Why it ended: the `sdk.stream.ended` reason, or `sidecar_exited` for a
@@ -101,6 +106,10 @@ pub(crate) struct Death<'a> {
     /// The durable id the session itself held.
     pub(crate) cli_session_id: Option<&'a str>,
     pub(crate) settings: &'a FreshAgentSettings,
+    pub(crate) ownership_id: &'a str,
+    pub(crate) launch_genesis: Option<&'a crate::identity_sink::RecordedGenesis>,
+    pub(crate) turn_lock: &'a Arc<tokio::sync::Mutex<()>>,
+    pub(crate) freshell_context: Option<&'a crate::claude_freshell_mcp::ClaudeFreshellContext>,
     pub(crate) commands: Option<&'a Vec<Value>>,
     /// The `sdk.stream.ended` reason, or `sidecar_exited`.
     pub(crate) reason: &'a str,
@@ -135,6 +144,11 @@ impl SharedDeadSessions {
         let dead = DeadClaudeSession {
             ids: ids.clone(),
             settings: death.settings.clone(),
+            cli_session_id: death.cli_session_id.map(str::to_string),
+            ownership_id: death.ownership_id.to_string(),
+            launch_genesis: death.launch_genesis.cloned(),
+            turn_lock: death.turn_lock.clone(),
+            freshell_context: death.freshell_context.cloned(),
             commands: death.commands.cloned(),
             reason: death.reason.to_string(),
             at_ms: crate::rollback_record::now_ms(),
@@ -154,6 +168,36 @@ impl SharedDeadSessions {
                 provider = PROVIDER, ids = ?dropped.ids, died_at_ms = dropped.at_ms,
                 cap = DEAD_SESSIONS_CAP,
                 "freshagent.claude.dead_session_dropped");
+        }
+    }
+
+    pub(crate) fn set_settings_if_matches(
+        &self,
+        id: &str,
+        ownership_id: &str,
+        settings: FreshAgentSettings,
+    ) -> bool {
+        let mut store = self.0.lock().expect("dead sessions lock");
+        let Some(dead) = store
+            .entries
+            .iter_mut()
+            .find(|dead| dead.answers_to(id) && dead.ownership_id == ownership_id)
+        else {
+            return false;
+        };
+        dead.settings = settings;
+        true
+    }
+
+    pub(crate) fn clear_genesis(&self, id: &str, ownership_id: Option<&str>) {
+        let mut store = self.0.lock().expect("dead sessions lock");
+        for dead in &mut store.entries {
+            if dead.answers_to(id)
+                && dead.cli_session_id.as_deref().is_none_or(|cli| cli == id)
+                && ownership_id.is_none_or(|owner| dead.ownership_id == owner)
+            {
+                dead.launch_genesis = None;
+            }
         }
     }
 
@@ -180,11 +224,6 @@ pub(crate) fn exited_status_event(session_id: &str) -> Value {
     })
 }
 
-/// The request error a send to a dead session gets (the client shows it as the
-/// reason the message was not sent).
-pub(crate) const SEND_TO_DEAD_SESSION_MESSAGE: &str =
-    "The Claude agent process for this session exited. Resume the session to continue.";
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,6 +232,11 @@ mod tests {
         DeadClaudeSession {
             ids: ids.iter().map(|id| id.to_string()).collect(),
             settings: FreshAgentSettings::default(),
+            cli_session_id: None,
+            ownership_id: "dead-runtime".into(),
+            launch_genesis: None,
+            turn_lock: Arc::new(tokio::sync::Mutex::new(())),
+            freshell_context: None,
             commands: None,
             reason: "cli_exited".into(),
             at_ms: 1,
