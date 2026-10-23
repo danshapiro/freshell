@@ -2372,8 +2372,7 @@ export function FreshAgentView({
     }))
   }, [claudeSession, dispatch, paneId, tabId])
 
-  // A recovery stop must finish before the pane attempts to resume. The
-  // ordinary kill closes the durable session; Codex uses a process-only stop.
+  // A process-only stop must finish before the pane attempts to resume.
   const recoveryStopPendingRef = useRef(false)
   const restartStuckSidecar = useCallback(() => {
     if (recoveryStopPendingRef.current) return
@@ -2390,7 +2389,12 @@ export function FreshAgentView({
     if (!killSessionId) return
     const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
     const fence = selectPaneOwnerFence(appStore.getState(), current)
-    if (current.provider !== 'codex' || current.sessionType !== 'freshcodex') {
+    const recoveryTarget = current.provider === 'codex' && current.sessionType === 'freshcodex'
+      ? { provider: 'codex' as const, sessionType: 'freshcodex' as const }
+      : current.provider === 'claude' && (current.sessionType === 'freshclaude' || current.sessionType === 'kilroy')
+        ? { provider: 'claude' as const, sessionType: current.sessionType }
+        : undefined
+    if (!recoveryTarget) {
       sendFreshAgentMessage({
         type: 'freshAgent.kill',
         sessionId: killSessionId,
@@ -2405,11 +2409,20 @@ export function FreshAgentView({
     recoveryStopPendingRef.current = true
     void sendFreshAgentRecoveryStopAndAwait({
       sessionId: killSessionId,
-      sessionType: 'freshcodex',
-      provider: 'codex',
+      ...recoveryTarget,
       ...(fence ? { observedEpoch: fence.epoch, observedGeneration: fence.generation } : {}),
     }, { send: (message) => sendFreshAgentMessage(message as Record<string, unknown>) })
-      .then((ack) => {
+      .then(async (stopAck) => {
+        let ack = stopAck
+        if (!ack.ok && ack.error === 'UNSUPPORTED_CAPABILITY' && current.provider === 'claude') {
+          if (!isMountedRef.current || paneContentRef.current.createRequestId !== current.createRequestId) return
+          ack = await sendFreshAgentKillAndAwait({
+            sessionId: killSessionId,
+            ...recoveryTarget,
+            ...(cwd ? { cwd } : {}),
+            ...(fence ? { observedEpoch: fence.epoch, observedGeneration: fence.generation } : {}),
+          }, { send: (message) => sendFreshAgentMessage(message as Record<string, unknown>) })
+        }
         if (!isMountedRef.current || paneContentRef.current.createRequestId !== current.createRequestId) return
         if (ack.ok) {
           triggerRecovery()
@@ -2417,8 +2430,7 @@ export function FreshAgentView({
         }
         dispatch(sessionError({
           sessionId: killSessionId,
-          sessionType: 'freshcodex',
-          provider: 'codex',
+          ...recoveryTarget,
           code: ack.error ?? 'RECOVERY_STOP_FAILED',
           message: ack.timedOut
             ? 'The sidecar stop was not confirmed in time. Try again.'

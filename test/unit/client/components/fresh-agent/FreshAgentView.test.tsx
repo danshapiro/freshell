@@ -14363,7 +14363,7 @@ describe('b8ke ext F2: sessionRef-only panes kill the old runtime on replacement
     })
   })
 
-  it('restartStuckSidecar kills the sessionRef session before re-driving creation', async () => {
+  it.each([['freshcodex', 'codex'], ['freshclaude', 'claude'], ['kilroy', 'claude']] as const)('restartStuckSidecar waits for the %s sessionRef process stop before resuming', async (sessionType, provider) => {
     const handlers: Array<(msg: Record<string, unknown>) => void> = []
     wsMock.onMessage.mockReset()
     wsMock.onMessage.mockImplementation((listener: (msg: Record<string, unknown>) => void) => {
@@ -14380,10 +14380,10 @@ describe('b8ke ext F2: sessionRef-only panes kill the old runtime on replacement
           paneId="pane-1"
           paneContent={{
             kind: 'fresh-agent',
-            sessionType: 'freshcodex',
-            provider: 'codex',
+            sessionType,
+            provider,
             createRequestId: 'req-ref-stuck',
-            sessionRef: { provider: 'codex', sessionId: 'thread-ref-stuck' },
+            sessionRef: { provider, sessionId: '550e8400-e29b-41d4-a716-446655440001' },
             status: 'stuck',
           }}
         />
@@ -14398,10 +14398,13 @@ describe('b8ke ext F2: sessionRef-only panes kill the old runtime on replacement
     // correlated confirmation before any new runtime starts.
     const sent = wsMock.send.mock.calls.find(([message]) => message.type === 'freshAgent.recovery.stop')?.[0]
     expect(sent).toMatchObject({
-      sessionId: 'thread-ref-stuck',
-      sessionType: 'freshcodex',
-      provider: 'codex',
+      sessionId: '550e8400-e29b-41d4-a716-446655440001',
+      sessionType,
+      provider,
     })
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
+    fireEvent.click(screen.getByRole('button', { name: /restart sidecar and resume session/i }))
+    expect(wsMock.send.mock.calls.filter(([message]) => message.type === 'freshAgent.recovery.stop')).toHaveLength(1)
     const remintsBeforeAck = dispatchSpy.mock.calls
       .map(([action]) => action)
       .filter((action: any) => action?.type === 'panes/updatePaneContent'
@@ -14411,9 +14414,9 @@ describe('b8ke ext F2: sessionRef-only panes kill the old runtime on replacement
       handler({
         type: 'freshAgent.recovery.stopped',
         requestId: sent.requestId,
-        sessionId: 'thread-ref-stuck',
-        sessionType: 'freshcodex',
-        provider: 'codex',
+        sessionId: '550e8400-e29b-41d4-a716-446655440001',
+        sessionType,
+        provider,
         success: true,
       })
     }
@@ -14423,10 +14426,11 @@ describe('b8ke ext F2: sessionRef-only panes kill the old runtime on replacement
         .filter((action: any) => action?.type === 'panes/updatePaneContent'
           && action.payload?.content?.status === 'creating')
       expect(remints).toHaveLength(1)
+      expect(remints[0].payload.content).toMatchObject({ sessionType, provider, resumeSessionId: '550e8400-e29b-41d4-a716-446655440001', sessionRef: { provider, sessionId: '550e8400-e29b-41d4-a716-446655440001' } })
     })
   })
 
-  it('does not resume a wedged Codex session after a refused recovery stop', async () => {
+  it.each([['freshcodex', 'codex'], ['freshclaude', 'claude'], ['kilroy', 'claude']] as const)('does not resume a wedged %s session after a refused recovery stop', async (sessionType, provider) => {
     const handlers: Array<(msg: Record<string, unknown>) => void> = []
     wsMock.onMessage.mockReset()
     wsMock.onMessage.mockImplementation((listener: (msg: Record<string, unknown>) => void) => {
@@ -14442,10 +14446,10 @@ describe('b8ke ext F2: sessionRef-only panes kill the old runtime on replacement
           paneId="pane-1"
           paneContent={{
             kind: 'fresh-agent',
-            sessionType: 'freshcodex',
-            provider: 'codex',
+            sessionType,
+            provider,
             createRequestId: 'req-ref-stuck-failed',
-            sessionRef: { provider: 'codex', sessionId: 'thread-ref-stuck-failed' },
+            sessionRef: { provider, sessionId: '550e8400-e29b-41d4-a716-446655440002' },
             status: 'stuck',
           }}
         />
@@ -14460,20 +14464,56 @@ describe('b8ke ext F2: sessionRef-only panes kill the old runtime on replacement
       handler({
         type: 'freshAgent.recovery.stopped',
         requestId: sent.requestId,
-        sessionId: 'thread-ref-stuck-failed',
-        sessionType: 'freshcodex',
-        provider: 'codex',
+        sessionId: '550e8400-e29b-41d4-a716-446655440002',
+        sessionType,
+        provider,
         success: false,
         code: 'TEARDOWN_NOT_CONFIRMED',
       })
     }
-    await waitFor(() => expect(store.getState().freshAgent.sessions['freshcodex:codex:thread-ref-stuck-failed']?.lastErrorCode).toBe('TEARDOWN_NOT_CONFIRMED'))
+    await waitFor(() => expect(store.getState().freshAgent.sessions[`${sessionType}:${provider}:550e8400-e29b-41d4-a716-446655440002`]?.lastErrorCode).toBe('TEARDOWN_NOT_CONFIRMED'))
     const remints = dispatchSpy.mock.calls
       .map(([action]) => action)
       .filter((action: any) => action?.type === 'panes/updatePaneContent'
         && action.payload?.content?.status === 'creating')
     expect(remints).toHaveLength(0)
   })
+
+  it.each(['freshclaude', 'kilroy'] as const)('hosted %s waits for ordinary kill after recovery stop is unsupported', async (sessionType) => {
+    const handlers = new Set<(msg: Record<string, unknown>) => void>()
+    wsMock.onMessage.mockReset()
+    wsMock.onMessage.mockImplementation((listener: (msg: Record<string, unknown>) => void) => {
+      handlers.add(listener)
+      return () => { handlers.delete(listener) }
+    })
+    const emit = (message: Record<string, unknown>) => act(() => {
+      for (const handler of [...handlers]) handler(message)
+    })
+    const store = createStore()
+    const dispatchSpy = vi.spyOn(store, 'dispatch')
+    const durable = '550e8400-e29b-41d4-a716-446655440003'
+    render(<Provider store={store}><FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={{
+      kind: 'fresh-agent', sessionType, provider: 'claude', createRequestId: 'hosted-stuck',
+      sessionRef: { provider: 'claude', sessionId: durable }, status: 'stuck',
+    }} /></Provider>)
+    await screen.findByRole('alert')
+    wsMock.send.mockClear()
+    const creating = () => dispatchSpy.mock.calls.map(([action]) => action)
+      .filter((action: any) => action?.type === 'panes/updatePaneContent' && action.payload?.content?.status === 'creating')
+    fireEvent.click(screen.getByRole('button', { name: /restart sidecar and resume session/i }))
+    const stop = wsMock.send.mock.calls.find(([message]) => message.type === 'freshAgent.recovery.stop')?.[0]
+    expect(stop).toMatchObject({ sessionId: durable, sessionType, provider: 'claude' })
+    emit({ type: 'freshAgent.recovery.stopped', requestId: stop.requestId,
+      sessionId: durable, sessionType, provider: 'claude', success: false, code: 'UNSUPPORTED_CAPABILITY' })
+    await waitFor(() => expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.kill', sessionId: durable, sessionType, provider: 'claude',
+    })))
+    expect(creating()).toHaveLength(0)
+    emit({ type: 'freshAgent.killed', sessionId: durable, sessionType, provider: 'claude', success: true })
+    await waitFor(() => expect(creating()).toHaveLength(1))
+    expect(creating()[0].payload.content).toMatchObject({ sessionType, provider: 'claude', resumeSessionId: durable })
+  })
+
 })
 
 describe('b8ke ext F1: locatorMatchesPane accepts canonical-session events for an old-key pane', () => {
