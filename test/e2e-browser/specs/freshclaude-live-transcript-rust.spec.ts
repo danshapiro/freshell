@@ -86,7 +86,7 @@ const liveResponse = (pane: ClaudeSimPane) => pane.paneRoot.getByRole('article',
 const transcriptTurns = (pane: ClaudeSimPane, role: RegExp = /transcript turn$/) => pane.paneRoot.getByRole('article', { name: role })
 /** The turns the agent (not the user) wrote, durable ones only. */
 const agentTurns = (pane: ClaudeSimPane) => transcriptTurns(pane, /^(?!You ).*transcript turn$/)
-const stopButton = (pane: ClaudeSimPane) => pane.paneRoot.getByRole('button', { name: 'Stop' })
+const stopButton = (pane: ClaudeSimPane) => pane.paneRoot.getByRole('button', { name: 'Stop', exact: true })
 
 /** The prompts the simulated CLI started, with the permission mode each ran under. */
 function startedPrompts(lane: ClaudeSimLane) {

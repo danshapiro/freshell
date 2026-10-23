@@ -202,9 +202,13 @@ export class ClaudeSimLane {
     await expect.poll(started, { timeout: 30_000, message: `the CLI starts the prompt ${JSON.stringify(text)}` }).toBe(before + 1)
   }
 
-  /** Wait until the pane's turn is over: Send is back and the pane is idle. */
+  /**
+   * Wait until the pane's turn is over: Send is back and the pane is idle.
+   * The composer's Stop is named exactly "Stop" (other buttons, such as the
+   * plan card's "Approve and stop asking for permission", contain the word).
+   */
   async waitForIdle(pane: ClaudeSimPane, timeout = 30_000): Promise<void> {
-    await expect(pane.paneRoot.getByRole('button', { name: 'Stop' })).toBeHidden({ timeout })
+    await expect(pane.paneRoot.getByRole('button', { name: 'Stop', exact: true })).toBeHidden({ timeout })
     await expect.poll(() => this.paneStatus(pane), { timeout, message: 'the pane returns to idle' }).toBe('idle')
   }
 
