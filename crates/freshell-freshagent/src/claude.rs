@@ -1915,10 +1915,39 @@ impl FreshClaudeState {
     /// rather than one session grace per session. Called on server shutdown.
     pub async fn shutdown(&self) {
         use tracing::instrument::WithSubscriber;
-        let drained: Vec<ClaudeSession> = {
+        let mut drained: Vec<ClaudeSession> = {
             let mut guard = self.sessions.lock().await;
             guard.drain().map(|(_, s)| s).collect()
         };
+        // Stop the stdout consumers before checking which turns remain owed.
+        // Otherwise a result can be folded while the awaited marker writes are
+        // in progress, publishing completion after shutdown has already decided
+        // to persist an interruption notice for that same turn.
+        for session in &drained {
+            session.consumer.abort();
+        }
+        for session in &mut drained {
+            while !session.consumer.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        }
+        let interrupted_ids: Vec<String> = drained
+            .iter()
+            .filter(|session| session.ledger.lock().expect("turn ledger lock").busy())
+            .map(|session| {
+                session
+                    .cli_session_id
+                    .as_deref()
+                    .unwrap_or(&session.sidecar_session_id)
+                    .to_string()
+            })
+            .collect();
+        futures_util::future::join_all(
+            interrupted_ids
+                .iter()
+                .map(|session_id| self.mark_turn_interrupted_for_shutdown(session_id)),
+        )
+        .await;
         let confirm_rounds = self.tree_confirm_rounds();
         // One task per session: each teardown's synchronous `/proc` scans run
         // on the runtime's workers in parallel, so no session's shutdown
@@ -2007,6 +2036,8 @@ impl FreshClaudeState {
                     name_ref,
                     session_name,
                 }));
+                self.notify_turn_interrupted_after_ack(&cached.session_id, session_type)
+                    .await;
                 return ClaudeCreateOutcome::Created {
                     session_id: cached.session_id,
                     session_ref: cached.session_ref,
@@ -2437,6 +2468,8 @@ impl FreshClaudeState {
             name_ref,
             session_name,
         }));
+        self.notify_turn_interrupted_after_ack(&launch_id, session_type)
+            .await;
         // C17: the server says the new session's status itself (no sidecar
         // status reaches a client any more).
         self.announce_claude_status(&created, session_type).await;
@@ -2545,6 +2578,8 @@ impl FreshClaudeState {
             name_ref,
             session_name,
         }));
+        self.notify_turn_interrupted_after_ack(durable, session_type)
+            .await;
         self.announce_claude_status(durable, session_type).await;
         ClaudeCreateOutcome::Created {
             session_id: durable.to_string(),
@@ -7962,6 +7997,7 @@ mod genesis;
 mod history;
 mod pending_runtime;
 mod rekey;
+mod restart_notice;
 use pending_runtime::{is_pending_frame, PendingResponse};
 mod rollback;
 mod sidecar_writer;

@@ -5,7 +5,7 @@
 use freshell_freshagent::{
     BindProvenance, ClaimCommit, FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink,
     RecordedGenesis, RollbackRecord, SinkAliasClearWrite, SinkCloseError, SinkCloseWrite,
-    SinkCommitWrite, SinkWrite,
+    SinkCommitWrite, SinkMarkTurnInterruptedWrite, SinkTakeTurnInterruptedWrite, SinkWrite,
 };
 use freshell_ws::pane_ledger::{CloseEnvelopeError, FreshAgentBindingWrite, PaneLedger};
 use std::sync::Arc;
@@ -403,6 +403,39 @@ impl PaneIdentitySink for LedgerIdentitySink {
                     }
                 }
                 Ok(())
+            })
+            .await
+            .map_err(std::io::Error::other)?
+        })
+    }
+
+    fn mark_turn_interrupted(
+        &self,
+        provider: &str,
+        session_id: &str,
+        at_ms: i64,
+    ) -> SinkMarkTurnInterruptedWrite {
+        let ledger = self.ledger.clone();
+        let (provider, session_id) = (provider.to_string(), session_id.to_string());
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                ledger.mark_fresh_agent_turn_interrupted(&provider, &session_id, at_ms)
+            })
+            .await
+            .map_err(std::io::Error::other)?
+        })
+    }
+
+    fn take_turn_interrupted(
+        &self,
+        provider: &str,
+        session_id: &str,
+    ) -> SinkTakeTurnInterruptedWrite {
+        let ledger = self.ledger.clone();
+        let (provider, session_id) = (provider.to_string(), session_id.to_string());
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                ledger.take_fresh_agent_turn_interrupted(&provider, &session_id)
             })
             .await
             .map_err(std::io::Error::other)?
@@ -833,6 +866,85 @@ mod tests {
         assert!(!sink.was_recorded("codex", "nope"));
         let row = ledger.load_binding("codex", "t1").unwrap();
         assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fresh_agent_restart_marker_survives_reload_and_is_consumed_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone(), None);
+        assert!(!sink
+            .mark_turn_interrupted("claude", "missing", 1_000)
+            .await
+            .expect("marking a missing row is a no-op"));
+        sink.record_binding(FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
+            name_transition: None,
+            provider: "claude".into(),
+            session_id: "session-restart".into(),
+            mode: "freshclaude".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+            authoritative: false,
+            settings: FreshAgentSettings::default(),
+        })
+        .await
+        .expect("binding write succeeds");
+        let updated_at = ledger
+            .load_binding("claude", "session-restart")
+            .expect("binding exists")
+            .updated_at;
+        assert!(sink
+            .mark_turn_interrupted("claude", "session-restart", 2_000)
+            .await
+            .expect("marker write succeeds"));
+
+        let restarted = LedgerIdentitySink::new(
+            Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+                tmp.path().to_path_buf(),
+            ))),
+            None,
+        );
+        let marked = restarted
+            .ledger
+            .load_binding("claude", "session-restart")
+            .expect("binding survives reload");
+        assert_eq!(marked.turn_interrupted_at, Some(2_000));
+        assert_eq!(marked.updated_at, updated_at);
+        assert_eq!(
+            restarted
+                .take_turn_interrupted("claude", "session-restart")
+                .await
+                .expect("consume succeeds"),
+            Some(2_000)
+        );
+        assert_eq!(
+            restarted
+                .take_turn_interrupted("claude", "session-restart")
+                .await
+                .expect("second consume succeeds"),
+            None
+        );
+        let after_consume = LedgerIdentitySink::new(
+            Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+                tmp.path().to_path_buf(),
+            ))),
+            None,
+        );
+        assert_eq!(
+            after_consume
+                .ledger
+                .load_binding("claude", "session-restart")
+                .expect("binding remains")
+                .turn_interrupted_at,
+            None
+        );
     }
 
     /// G15: the claude pane's plugins are part of the resume record — written

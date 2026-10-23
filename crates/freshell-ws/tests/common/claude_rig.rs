@@ -72,6 +72,9 @@ pub struct RigOptions {
     /// claude lane's identity sink (`common::ledger_sink`), the way main.rs wires
     /// it: sessions leave durable binding rows a later resume reads back.
     pub durable_ledger: bool,
+    /// Hold the next shutdown interruption-marker write until the lifecycle
+    /// test releases it, leaving the real sidecar alive during that window.
+    pub turn_interrupted_marker_gate: Option<Arc<super::ledger_sink::TurnInterruptedMarkerGate>>,
     /// The claude lane runs the way the hosted session host runs it: the lane
     /// selects the hosted Freshell MCP (`with_hosted_mcp`) and its sidecars see
     /// `FRESHELL_HOSTED_FRESH_AGENT=claude`, so the sidecar offers the fixed MCP
@@ -1033,10 +1036,14 @@ async fn spawn_rig_server(
         .with_hosted_mcp(options.hosted_claude);
     fresh_claude.set_ownership(Arc::clone(&ownership));
     if let Some(ledger) = pane_ledger.as_ref() {
-        fresh_claude.set_identity_sink(Arc::new(super::ledger_sink::LedgerSink::with_ownership(
+        let mut sink = super::ledger_sink::LedgerSink::with_ownership(
             Arc::clone(ledger),
             Some(Arc::clone(&ownership)),
-        )));
+        );
+        if let Some(gate) = options.turn_interrupted_marker_gate.clone() {
+            sink = sink.with_turn_interrupted_marker_gate(gate);
+        }
+        fresh_claude.set_identity_sink(Arc::new(sink));
     }
     let lane = fresh_claude.clone();
     let fresh_agent_state = freshell_freshagent::FreshAgentState::new(

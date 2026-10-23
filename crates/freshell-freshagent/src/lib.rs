@@ -113,7 +113,7 @@ pub use identity_sink::{
     BindProvenance, ClaimCommit, ClaudeGenesis, CloseAnswer, FreshAgentBindingUpsert,
     FreshAgentSettings, GenesisUpdate, PaneIdentitySink, ProvenanceUpdate, RecordedGenesis,
     SharedPaneIdentitySink, SinkAliasClearWrite, SinkCloseError, SinkCloseWrite, SinkCommitWrite,
-    SinkWrite,
+    SinkMarkTurnInterruptedWrite, SinkTakeTurnInterruptedWrite, SinkWrite,
 };
 pub use opencode_ws::FreshOpencodeState;
 pub use rollback_record::{

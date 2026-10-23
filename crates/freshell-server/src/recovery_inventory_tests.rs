@@ -135,6 +135,7 @@ fn binding_row_at(
         // Delta-r4 Finding 1: unattributed fixture rows are legacy-shaped
         // (no attribution-time key); `with_attribution` stamps one.
         last_attributed_at: None,
+        turn_interrupted_at: None,
         plugins: None,
     }
 }
