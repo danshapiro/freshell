@@ -8,6 +8,7 @@
 // sidecar forwards facts only for the commands it sent: the CLI also replays
 // and queues uuids it minted itself, which the server never knew.
 
+import { randomUUID } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 import {
   createHeartbeatLimiter,
@@ -15,9 +16,9 @@ import {
   HEARTBEAT_INTERVAL_MS,
   lifecycleFrames,
   rememberSend,
-  SENT_COMMANDS_LIMIT,
   stillQueuedOf,
 } from '../../../crates/freshell-claude-sidecar/lifecycle-frames.mjs'
+import { startRealSidecar } from './harness'
 
 const SENT = '3f0b9d2e-1111-4222-8333-444455556666'
 const OTHER = '9a8b7c6d-5555-4666-8777-888899990000'
@@ -30,8 +31,8 @@ function stateWithSent(...uuids: string[]) {
 
 describe('command lifecycle facts', () => {
   it('forwards every lifecycle state of a command the sidecar sent', () => {
-    const state = stateWithSent(SENT)
     for (const lifecycle of ['queued', 'started', 'completed', 'cancelled', 'discarded']) {
+      const state = stateWithSent(SENT)
       expect(lifecycleFrames('s1', { type: 'command_lifecycle', command_uuid: SENT, state: lifecycle }, state, 0))
         .toEqual([{ type: 'sdk.command', sessionId: 's1', uuid: SENT, state: lifecycle }])
     }
@@ -58,13 +59,98 @@ describe('command lifecycle facts', () => {
     expect(lifecycleFrames('s1', { type: 'user', uuid: SENT, message: { role: 'user', content: [] } }, state, 0)).toEqual([])
   })
 
-  it('remembers a bounded number of sent commands, forgetting the oldest first', () => {
+  it('keeps every outstanding command through terminal lifecycle and interrupt receipts', () => {
     const state = createLifecycleState()
     const uuid = (i: number) => `${String(i).padStart(8, '0')}-0000-4000-8000-000000000000`
-    for (let i = 0; i <= SENT_COMMANDS_LIMIT; i += 1) rememberSend(state, uuid(i))
-    expect(lifecycleFrames('s1', { type: 'command_lifecycle', command_uuid: uuid(0), state: 'completed' }, state, 0)).toEqual([])
-    expect(lifecycleFrames('s1', { type: 'command_lifecycle', command_uuid: uuid(1), state: 'completed' }, state, 0)).toHaveLength(1)
+    const uuids = Array.from({ length: 300 }, (_, i) => uuid(i))
+
+    const queued = uuids.flatMap((commandId) => {
+      rememberSend(state, commandId)
+      return lifecycleFrames('s1', { type: 'command_lifecycle', command_uuid: commandId, state: 'queued' }, state, 0)
+    })
+    expect(queued).toEqual(uuids.map((commandId) => ({
+      type: 'sdk.command', sessionId: 's1', uuid: commandId, state: 'queued',
+    })))
+    expect(stillQueuedOf({ still_queued: uuids }, state)).toEqual(uuids)
+
+    const retired = [
+      ['completed', uuids[0]],
+      ['cancelled', uuids[1]],
+      ['discarded', uuids[2]],
+    ] as const
+    for (const [terminalState, commandId] of retired) {
+      expect(lifecycleFrames('s1', { type: 'command_lifecycle', command_uuid: commandId, state: terminalState }, state, 0))
+        .toEqual([{ type: 'sdk.command', sessionId: 's1', uuid: commandId, state: terminalState }])
+    }
+
+    expect(stillQueuedOf({ still_queued: uuids }, state)).toEqual(uuids.slice(retired.length))
+    expect(lifecycleFrames('s1', { type: 'command_lifecycle', command_uuid: uuids[0], state: 'started' }, state, 0)).toEqual([])
+    expect(lifecycleFrames('s1', { type: 'command_lifecycle', command_uuid: uuids.at(-1), state: 'started' }, state, 0))
+      .toEqual([{ type: 'sdk.command', sessionId: 's1', uuid: uuids.at(-1), state: 'started' }])
   })
+})
+
+describe('real sidecar lifecycle queue', () => {
+  it('forwards and drains more than 256 queued commands through an interrupt receipt', async () => {
+    const bridge = await startRealSidecar({ timeScale: 0 })
+    const sessionId = await bridge.create({ requestId: 'create-lifecycle-capacity' })
+    await bridge.waitForBoot()
+
+    const runningId = randomUUID()
+    const queuedIds = Array.from({ length: 300 }, () => randomUUID())
+    const queuedIdSet = new Set(queuedIds)
+    const queuedSeen = new Set<string>()
+    bridge.send({ type: 'send', sessionId, uuid: runningId, text: 'HANG' })
+    await bridge.waitFor(
+      (frame) => frame.type === 'sdk.command' && frame.uuid === runningId && frame.state === 'started',
+      'the first command to start',
+    )
+
+    bridge.sendLines(queuedIds.map((uuid) => ({ type: 'send', sessionId, uuid, text: 'queued command' })))
+    await bridge.waitFor(
+      (frame) => {
+        if (frame.type === 'sdk.command' && frame.state === 'queued' && queuedIdSet.has(frame.uuid)) queuedSeen.add(frame.uuid)
+        return queuedSeen.size === queuedIdSet.size
+      },
+      'all queued command lifecycle frames',
+      60_000,
+    )
+
+    bridge.send({ type: 'interrupt', sessionId, stopId: 'capacity-stop' })
+    const receipt = await bridge.waitFor(
+      (frame) => frame.type === 'sdk.interrupt_settled' && frame.stopId === 'capacity-stop',
+      'the interrupt receipt',
+      60_000,
+    )
+    expect(receipt).toMatchObject({ ok: true, stillQueued: queuedIds })
+
+    const terminalStates = new Set(['completed', 'cancelled', 'discarded'])
+    const terminalSeen = new Set<string>()
+    await bridge.waitFor(
+      (frame) => {
+        if (frame.type === 'sdk.command' && queuedIdSet.has(frame.uuid) && terminalStates.has(frame.state)) terminalSeen.add(frame.uuid)
+        return terminalSeen.size === queuedIdSet.size
+      },
+      'all queued commands to reach terminal lifecycle',
+      60_000,
+    )
+    const lastTerminalIndex = bridge.frames.reduce((last, frame, index) =>
+      frame.type === 'sdk.command' && queuedIdSet.has(frame.uuid) && terminalStates.has(frame.state) ? index : last,
+    -1)
+    await bridge.waitFor(
+      (frame) => frame.type === 'sdk.session.state' && frame.state === 'idle'
+        && bridge.frames.indexOf(frame) > lastTerminalIndex,
+      'the session to return to idle after draining the queue',
+      60_000,
+    )
+
+    const forwardedTerminalIds = new Set(
+      bridge.frames
+        .filter((frame) => frame.type === 'sdk.command' && queuedIdSet.has(frame.uuid) && terminalStates.has(frame.state))
+        .map((frame) => frame.uuid),
+    )
+    expect(forwardedTerminalIds).toEqual(new Set(queuedIds))
+  }, 90_000)
 })
 
 describe('session state and status facts', () => {

@@ -18,13 +18,11 @@
 //   sdk.heartbeat      {sessionId, kind: tool|task|retry, toolUseId?, elapsedMs?}
 //                      — liveness only, at most one per kind every HEARTBEAT_INTERVAL_MS (T17)
 
-/** The most sent command uuids a session remembers (oldest forgotten first). */
-export const SENT_COMMANDS_LIMIT = 256
-
 /** At most one heartbeat of each kind is forwarded in this many milliseconds. */
 export const HEARTBEAT_INTERVAL_MS = 5000
 
 const COMMAND_STATES = new Set(['queued', 'started', 'completed', 'cancelled', 'discarded'])
+const TERMINAL_COMMAND_STATES = new Set(['completed', 'cancelled', 'discarded'])
 const SESSION_STATES = new Set(['running', 'idle', 'requires_action'])
 const TASK_SUBTYPES = new Set(['task_started', 'task_progress', 'task_updated', 'task_notification'])
 
@@ -41,16 +39,15 @@ export function createHeartbeatLimiter(intervalMs = HEARTBEAT_INTERVAL_MS) {
   }
 }
 
-/** One session's lifecycle state: the commands it sent, and its heartbeat allowance. */
+/** One session's lifecycle state: its outstanding sent commands and heartbeat allowance. */
 export function createLifecycleState() {
   return { sent: new Map(), heartbeats: createHeartbeatLimiter() }
 }
 
-/** The sidecar is about to send this command to the CLI. */
+/** The sidecar is about to send this command to the CLI; keep it until terminal lifecycle. */
 export function rememberSend(state, uuid) {
   state.sent.delete(uuid)
   state.sent.set(uuid, { replayed: false })
-  while (state.sent.size > SENT_COMMANDS_LIMIT) state.sent.delete(state.sent.keys().next().value)
 }
 
 /** The facts one SDK message carries (none for any other kind). `now` is in milliseconds. */
@@ -75,7 +72,13 @@ export function stillQueuedOf(receipt, state) {
 
 function commandFrames(sessionId, msg, state) {
   if (!state.sent.has(msg.command_uuid) || !COMMAND_STATES.has(msg.state)) return []
-  return [{ type: 'sdk.command', sessionId, uuid: msg.command_uuid, state: msg.state }]
+  const frame = { type: 'sdk.command', sessionId, uuid: msg.command_uuid, state: msg.state }
+  // Only outstanding commands are needed to recognize future lifecycle and
+  // interrupt-receipt facts. Retire terminal ids here so long-lived sessions
+  // do not accumulate completed history, while an arbitrarily large queue
+  // remains fully attributable to the server's turn ledger.
+  if (TERMINAL_COMMAND_STATES.has(msg.state)) state.sent.delete(msg.command_uuid)
+  return [frame]
 }
 
 /** The first replay of a sent command: the CLI took it as a user message (T8). */
