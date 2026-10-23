@@ -6,7 +6,7 @@ import { initLayout, updatePaneContent } from '@/store/panesSlice'
 import type { PaneContent, PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import type { Tab, TerminalStatus } from '@/store/types'
 import { isScopedPaneContent } from '@/store/selectors/sessionNameSelectors'
-import { collectNameSourceLeaves, firstNameSourceLeaf } from '@/lib/tab-name-source'
+import { tabNamingLeaf } from '@/lib/tab-name-source'
 import { createLogger } from '@/lib/client-logger'
 import { isDefaultOrDerivedName } from '@shared/name-evidence'
 import {
@@ -288,20 +288,6 @@ function collisionFreePaneId(
   return `pane-${view.viewId}`
 }
 
-/**
- * The pane whose runtime facts a tab mirrors at tab level (its naming pane):
- * a session-owned tab's source pane while it is in the layout, else the
- * tab's first leaf (its original pane).
- */
-function tabNamingPaneId(tab: Pick<Tab, 'nameSource'> | undefined, layout: PaneNode | undefined): string | undefined {
-  if (!layout) return undefined
-  if (tab?.nameSource?.kind === 'session') {
-    const sourceId = tab.nameSource.paneId
-    if (collectNameSourceLeaves(layout).some((leaf) => leaf.paneId === sourceId)) return sourceId
-  }
-  return firstNameSourceLeaf(layout)?.paneId
-}
-
 /** The tab-level runtime facts a managed view contributes. Never a title. */
 type TabRuntimeFields = Partial<Pick<Tab, 'status' | 'mode' | 'codingCliProvider' | 'initialCwd' | 'sessionRef'>>
   & ManagedRuntimeProjectionFields
@@ -323,7 +309,7 @@ function tabLevelUpdatesFromNamingPane(input: {
   view: ManagedRuntimeViewIntent
 }): TabRuntimeFields | Record<string, never> {
   const { tabId, tab, layout, paneId, soul, view } = input
-  const namingPaneId = tabNamingPaneId(tab, layout)
+  const namingPaneId = tabNamingLeaf(tab, layout)?.paneId
   if (namingPaneId !== paneId) {
     log.debug('managed view matched a pane that does not name its tab; tab fields left alone', {
       tabId, paneId, namingPaneId, viewId: view.viewId,

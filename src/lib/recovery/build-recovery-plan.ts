@@ -7,13 +7,9 @@ import {
   type FreshAgentSessionType,
 } from '@shared/fresh-agent'
 import { remapTabNameSource, resolveInitialTabNameSource, parsePaneNamingIdentityInput } from '@/lib/tab-name-source'
-import { stripScopedPaneTitleMetadata } from '@/lib/session-name-migration'
-import { createLogger } from '@/lib/client-logger'
-import type { RecoveryInventory, RecoveryPane, RecoveryTab, LedgerOnlyEntry } from './types'
+import { restoredTabNames } from '@/lib/restored-tab-names'
+import type { RecoveryInventory, RecoveryPane, LedgerOnlyEntry } from './types'
 import type { TabNameSource } from '@shared/session-names'
-
-const log = createLogger('recovery-plan')
-
 
 function terminalContent(p: {
   mode: string | null
@@ -373,80 +369,6 @@ export function countRecoverablePanes(inv: RecoveryInventory): number {
   return device + joined
 }
 
-/** Re-key a pane-id map through the explicit old→new pane-id map; entries
- * whose pane is not restored are dropped. */
-function remapPaneKeyedMap<T>(
-  map: Record<string, T>,
-  paneIdMap: ReadonlyMap<string, string>,
-): Record<string, T> {
-  const remapped: Record<string, T> = {}
-  for (const [oldPaneId, value] of Object.entries(map)) {
-    const newPaneId = paneIdMap.get(oldPaneId)
-    if (newPaneId) remapped[newPaneId] = value
-  }
-  return remapped
-}
-
-/**
- * Name reliability (Task 9, D7): the names a rebuilt tab gets back — the
- * recorded pane titles and "user renamed" flags (a flag only alongside its
- * title), remapped to the restored pane ids, minus every scoped agent pane's
- * (the one client sanitizer, `stripScopedPaneTitleMetadata`), and the tab's
- * own flag unless the tab is session-owned (its owner is the recorded
- * pointer, or the rebuilt layout's first leaf when the record predates it).
- */
-function restoredTabNames(input: {
-  tab: RecoveryTab
-  tabId: string
-  restoredPanes: RecoveryPane[]
-  layout: PaneNode
-  paneIdMap: ReadonlyMap<string, string>
-  nameSource: TabNameSource | undefined
-}): Pick<RecoveryTabPlan, 'titleSetByUser' | 'paneTitles' | 'paneTitleSetByUser'> {
-  const { tab, tabId, restoredPanes, layout, paneIdMap, nameSource } = input
-  const recordedTitles: Record<string, string> = {}
-  const recordedFlags: Record<string, boolean> = {}
-  let droppedUntitledPaneFlags = 0
-  for (const p of restoredPanes) {
-    if (typeof p.title !== 'string' || p.title.length === 0) {
-      // A flag only protects a title: alone it would freeze the derived label.
-      if (p.titleSetByUser === true) droppedUntitledPaneFlags += 1
-      continue
-    }
-    recordedTitles[p.paneId] = p.title
-    if (p.titleSetByUser === true) recordedFlags[p.paneId] = true
-  }
-  if (droppedUntitledPaneFlags > 0) {
-    log.debug('recovery plan dropped pane rename flags recorded without a title', {
-      tabKey: tab.tabKey,
-      droppedUntitledPaneFlags,
-    })
-  }
-  const remappedTitles = remapPaneKeyedMap(recordedTitles, paneIdMap)
-  const sanitized = stripScopedPaneTitleMetadata(
-    { [tabId]: layout },
-    { [tabId]: remappedTitles },
-    { [tabId]: remapPaneKeyedMap(recordedFlags, paneIdMap) },
-  )
-  const paneTitles = sanitized.paneTitles[tabId] ?? {}
-  const paneTitleSetByUser = sanitized.paneTitleSetByUser[tabId] ?? {}
-  const sessionOwned = (nameSource ?? resolveInitialTabNameSource(layout))?.kind === 'session'
-  const droppedTabUserFlag = tab.titleSetByUser === true && sessionOwned
-  const droppedScopedPaneTitles = Object.keys(remappedTitles).length - Object.keys(paneTitles).length
-  if (droppedScopedPaneTitles > 0 || droppedTabUserFlag) {
-    log.debug('recovery plan dropped names owned by saved session records', {
-      tabKey: tab.tabKey,
-      droppedScopedPaneTitles,
-      droppedTabUserFlag,
-    })
-  }
-  return {
-    ...(tab.titleSetByUser === true && !sessionOwned ? { titleSetByUser: true } : {}),
-    paneTitles,
-    paneTitleSetByUser,
-  }
-}
-
 export function buildRecoveryPlan(
   inv: RecoveryInventory,
   options: BuildRecoveryPlanOptions = {},
@@ -526,7 +448,9 @@ export function buildRecoveryPlan(
         sourceTabKey: t.tabKey,
         ...(nameSource ? { nameSource } : {}),
         layout,
-        ...restoredTabNames({ tab: t, tabId, restoredPanes, layout, paneIdMap, nameSource }),
+        // Name reliability (Task 9, D7): the recorded pane titles and rename
+        // flags (the shared rebuild rules, `src/lib/restored-tab-names.ts`).
+        ...restoredTabNames({ tab: t, tabId, recordedPanes: restoredPanes, layout, paneIdMap, nameSource }),
         ...(liveTerminalReattach.length ? { liveTerminalReattach } : {}),
       }
     })

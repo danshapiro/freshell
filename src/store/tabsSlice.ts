@@ -432,6 +432,18 @@ export const tabsSlice = createSlice({
         }
       }
     },
+    /**
+     * Name reliability (Task 14): the stored-title heal's only write —
+     * `{tabId: unnamed placeholder}` for tabs whose stored title is a default
+     * label, not a name (`src/store/storedTabTitleHeal.ts`). The title only:
+     * never a user-renamed tab, no `updatedAt` bump, no flag.
+     */
+    healStoredTabTitles: (state, action: PayloadAction<Record<string, string>>) => {
+      for (const tab of state.tabs) {
+        const title = action.payload[tab.id]
+        if (typeof title === 'string' && title.length > 0 && !tab.titleSetByUser) tab.title = title
+      }
+    },
     removeTab: (state, action: PayloadAction<string>) => {
       const removedTabId = action.payload
       const removedIndex = state.tabs.findIndex((t) => t.id === removedTabId)
@@ -566,6 +578,7 @@ export const {
   clearTabRenameRequest,
   updateTab,
   mirrorSessionTabTitles,
+  healStoredTabTitles,
   removeTab,
   clearTabsForMachine,
   hydrateTabs,

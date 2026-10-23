@@ -11,11 +11,12 @@ vi.mock('@/lib/session-names', async (importOriginal) => ({
 
 import tabsReducer, { addTab, setActiveTab, updateTab } from '@/store/tabsSlice'
 import { handleUiCommand } from '@/lib/ui-commands'
-import panesReducer, { startNewManagedRuntimeConversation, updatePaneContent } from '@/store/panesSlice'
+import panesReducer, { initLayout, startNewManagedRuntimeConversation, updatePaneContent } from '@/store/panesSlice'
 import managedRuntimeReducer from '@/store/managedRuntimeSlice'
 import sessionNamesReducer, { receiveSessionNames } from '@/store/sessionNamesSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
 import { savedNameTabTitleMirrorMiddleware } from '@/store/savedNameTabTitleMirror'
+import { healStoredTabTitlesOnLoad, storedTabTitleHealMiddleware } from '@/store/storedTabTitleHeal'
 import { sessionNameLifecycleMiddleware } from '@/store/sessionNameLifecycleMiddleware'
 import { selectTabDisplayName } from '@/store/selectors/sessionNameSelectors'
 import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
@@ -954,19 +955,38 @@ describe('managed runtime merge never writes names', () => {
     })
   }
 
-  it('a stored "Shell agent" title is visible on a single-pane shell tab', () => {
-    // Why the overwrite mattered: a non-default stored title that differs
-    // from the derived name is what a single-pane shell tab displays.
-    const layout: PaneNode = {
-      type: 'leaf',
-      id: 'pane-1',
+  it('a stored "Shell agent" title on an unrenamed single-pane shell tab heals to the derived label', () => {
+    // Task 8 pinned that such a title WAS visible (a stored title that
+    // differs from the derived name is what a single-pane shell tab shows).
+    // Task 14 reverses that: a title an earlier merge stored is not a name,
+    // so the store heals it to the unnamed placeholder and the tab shows its
+    // derived label.
+    vi.useFakeTimers({ now: 1_000 })
+    const reducer = { tabs: tabsReducer, panes: panesReducer, sessionNames: sessionNamesReducer }
+    // The layout as a load from the old stored state produces it.
+    const loaded = configureStore({ reducer })
+    loaded.dispatch(addTab({ id: 'tab-1', title: 'Shell agent', mode: 'shell' }))
+    loaded.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
       content: { kind: 'terminal', createRequestId: 'create-1', status: 'running', mode: 'shell', shell: 'system' },
-    }
-    const tab = {
-      id: 'tab-1', createRequestId: 'tab-1', title: 'Shell agent', status: 'running',
-      mode: 'shell', shell: 'system', createdAt: 1, updatedAt: 1,
-    } as Tab
-    expect(getTabDisplayTitle(tab, layout)).toBe('Shell agent')
+    }))
+    vi.setSystemTime(9_000)
+    const store = configureStore({
+      reducer,
+      middleware: (getDefault) => getDefault().concat(storedTabTitleHealMiddleware),
+      preloadedState: loaded.getState(),
+    })
+    const layout = store.getState().panes.layouts['tab-1']
+    expect(getTabDisplayTitle(store.getState().tabs.tabs[0], layout)).toBe('Shell agent')
+
+    healStoredTabTitlesOnLoad(store)
+
+    const healed = store.getState().tabs.tabs[0]
+    expect(healed.title).toBe('Tab 1')
+    expect(healed.updatedAt).toBe(1_000)
+    expect(healed.titleSetByUser).toBeUndefined()
+    expect(getTabDisplayTitle(healed, layout)).toBe('Shell')
   })
 
   it('an existing tab matched to a "Shell agent" view keeps its title and updatedAt', () => {
