@@ -59,6 +59,8 @@ export function query({ prompt, options }) {
     }
   })()
   return Object.assign(iterator, {
+    // The pinned SDK's boot report (T2): the sidecar answers `created` once it resolves.
+    initializationResult: async () => ({ pid: process.pid, commands: [] }),
     interrupt: async () => {},
     close: () => {
       record('closed')

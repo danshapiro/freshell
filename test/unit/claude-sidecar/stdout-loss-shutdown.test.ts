@@ -15,6 +15,9 @@ import os from 'node:os'
 import path from 'node:path'
 import { createInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
+import { BOOT_FAILED_EXIT_CODE } from '../../../crates/freshell-claude-sidecar/boot.mjs'
+import { STREAM_ENDED_EXIT_CODE } from '../../../crates/freshell-claude-sidecar/stream-end.mjs'
+import { SIDECAR_INDEX, startRealSidecar } from './harness'
 
 const children = new Set<ChildProcess>()
 const directories: string[] = []
@@ -47,7 +50,7 @@ describe('Claude sidecar with a lost stdout reader', () => {
     createInterface({ input: child.stdout! }).on('line', (line) => frames.push(JSON.parse(line)))
     const send = (message: object) => child.stdin!.write(`${JSON.stringify(message)}\n`)
 
-    send({ type: 'create', requestId: 'create', model: 'opus' })
+    send({ type: 'create', protocol: 2, boot: { kind: 'fresh' }, requestId: 'create', model: 'opus' })
     await expect.poll(() => frames.find((frame) => frame.type === 'created'), { timeout: 5_000 }).toBeTruthy()
     const { sessionId } = frames.find((frame) => frame.type === 'created')!
     send({ type: 'send', sessionId, text: 'stream until stopped' })
@@ -69,6 +72,70 @@ describe('Claude sidecar with a lost stdout reader', () => {
     const records = stderr.split('\n').filter((line) => line.trim()).map((line) => JSON.parse(line))
     expect(records.filter((entry) => entry.event === 'stdout.closed'), stderr).toEqual([
       expect.objectContaining({ severity: 'warn', component: 'claude-sidecar', event: 'stdout.closed', code: 'EPIPE', error: expect.any(String) }),
+    ])
+  })
+})
+
+/** The sidecar's JSONL log records (stderr); other stderr lines are skipped. */
+function logRecords(stderr: string): Record<string, any>[] {
+  return stderr.split('\n').flatMap((line) => {
+    try { return [JSON.parse(line)] } catch { return [] }
+  })
+}
+
+/**
+ * The production sidecar behind a slow stderr reader: its exit flush (the
+ * wait of a sidecar exiting on its own) takes half a second, so the stdout
+ * error of a write into a readerless pipe arrives while it is still exiting.
+ */
+function startWithSlowStderr() {
+  return startRealSidecar({
+    entry: fileURLToPath(new URL('./fixtures/slow-stderr-flush-entry.mjs', import.meta.url)),
+    env: { SIDECAR_INDEX_PATH: SIDECAR_INDEX, STDERR_FLUSH_DELAY_MS: '500' },
+  })
+}
+
+// A sidecar that is already exiting on its own (its SDK stream ended, exit 3;
+// its boot was refused, exit 2) has closed its query. Losing its stdout reader
+// then changes nothing: it logs `stdout.closed` and keeps its own exit code,
+// so the Rust side reads why it ended instead of a graceful stop (exit 0).
+describe('Claude sidecar losing its stdout reader while it exits on its own', () => {
+  it('a stream that ends after the reader went away still exits 3', async () => {
+    const sidecar = await startWithSlowStderr()
+    await sidecar.create()
+    const { cliPid } = await sidecar.waitForBoot()
+    // The boot catalog is the last line an idle session writes.
+    await sidecar.waitFor((frame) => frame.type === 'sdk.session.changed', 'the boot catalog')
+
+    sidecar.child.stdout!.destroy()
+    // The CLI dies under the idle session: sdk.stream.ended is the first write
+    // into the readerless pipe, made by a sidecar already exiting with code 3.
+    process.kill(cliPid, 'SIGKILL')
+
+    expect(await sidecar.waitExit(), sidecar.stderr()).toEqual({ code: STREAM_ENDED_EXIT_CODE, signal: null })
+    const records = logRecords(sidecar.stderr())
+    expect(records.filter((entry) => entry.event === 'stdout.closed'), sidecar.stderr()).toEqual([
+      expect.objectContaining({ severity: 'warn', event: 'stdout.closed', code: 'EPIPE' }),
+    ])
+    expect(records.filter((entry) => entry.event === 'stream.ended'), sidecar.stderr()).toEqual([
+      expect.objectContaining({ reason: 'cli_exited' }),
+    ])
+  })
+
+  it('a boot refused after the reader went away still exits 2', async () => {
+    const sidecar = await startWithSlowStderr()
+    sidecar.child.stdout!.destroy()
+    // A create that does not speak protocol 2 is refused at once: create.failed
+    // is the first write into the readerless pipe.
+    sidecar.send({ type: 'create', protocol: 1, boot: { kind: 'fresh' }, requestId: 'create', cwd: sidecar.cwd })
+
+    expect(await sidecar.waitExit(), sidecar.stderr()).toEqual({ code: BOOT_FAILED_EXIT_CODE, signal: null })
+    const records = logRecords(sidecar.stderr())
+    expect(records.filter((entry) => entry.event === 'stdout.closed'), sidecar.stderr()).toEqual([
+      expect.objectContaining({ severity: 'warn', event: 'stdout.closed', code: 'EPIPE' }),
+    ])
+    expect(records.filter((entry) => entry.event === 'boot.failed'), sidecar.stderr()).toEqual([
+      expect.objectContaining({ code: 'SIDECAR_PROTOCOL_MISMATCH' }),
     ])
   })
 })

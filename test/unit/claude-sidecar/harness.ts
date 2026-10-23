@@ -28,6 +28,9 @@ export const CLI_SIMULATOR = path.join(REPO_ROOT, 'test/fixtures/claude-cli-sim/
 
 const DEFAULT_TIMEOUT_MS = 10_000
 
+/** The sidecar stdio protocol the harness speaks (crates/freshell-claude-sidecar/boot.mjs). */
+export const SIDECAR_PROTOCOL = 2
+
 export type SidecarFrame = Record<string, any>
 
 /** One row of the simulator's ledger (see the header of test/fixtures/claude-cli-sim/query.mjs). */
@@ -86,7 +89,12 @@ export interface RealSidecar {
   sendLines(messages: object[]): void
   /** The first frame (already seen or future) of this type or matching this predicate. */
   waitFor(match: string | Predicate, label?: string, timeoutMs?: number): Promise<SidecarFrame>
-  /** `create` (cwd defaults to the workspace) and wait for `created`; returns the session id. */
+  /**
+   * A protocol-v2 `create` (cwd defaults to the workspace, boot to a fresh
+   * conversation) and its answer: `created` or `create.failed`.
+   */
+  requestCreate(fields?: Record<string, unknown>): Promise<SidecarFrame>
+  /** `requestCreate`, which must be answered `created`; returns the session id. */
   create(fields?: Record<string, unknown>): Promise<string>
   /**
    * Resolve once the sidecar has read every line written so far: a line
@@ -207,11 +215,14 @@ export async function startRealSidecar(options: StartRealSidecarOptions = {}): P
     send: (message) => write([message]),
     sendLines: (messages) => write(messages),
     waitFor,
-    async create(fields = {}) {
+    requestCreate(fields = {}) {
       const requestId = typeof fields.requestId === 'string' ? fields.requestId : `create-${++requests}`
-      write([{ type: 'create', cwd, ...fields, requestId }])
-      const answer = await waitFor((frame) => (frame.type === 'created' || frame.type === 'create.failed') && frame.requestId === requestId, `created ${requestId}`)
-      if (answer.type !== 'created') throw new Error(`create ${requestId} failed: ${JSON.stringify(answer)}`)
+      write([{ type: 'create', protocol: SIDECAR_PROTOCOL, boot: { kind: 'fresh' }, cwd, ...fields, requestId }])
+      return waitFor((frame) => (frame.type === 'created' || frame.type === 'create.failed') && frame.requestId === requestId, `the answer to create ${requestId}`)
+    },
+    async create(fields = {}) {
+      const answer = await sidecar.requestCreate(fields)
+      if (answer.type !== 'created') throw new Error(`create ${answer.requestId} failed: ${JSON.stringify(answer)}`)
       return answer.sessionId as string
     },
     async barrier(sessionId) {

@@ -37,10 +37,15 @@
 //! backstop, by the harness sentinel sweep — no orphans.
 
 pub mod claude;
+pub(crate) mod claude_dead_sessions;
+pub(crate) mod claude_handshake;
+pub(crate) mod claude_launch;
 pub(crate) mod claude_projection;
+pub(crate) mod claude_sidecar_exit;
 pub(crate) mod claude_sidecar_io;
 pub(crate) mod claude_snapshot;
 pub mod claude_spawn;
+pub(crate) mod claude_test_holds;
 pub mod codex;
 pub(crate) mod codex_sidecar_tracking;
 pub(crate) mod delegation;
@@ -54,6 +59,11 @@ pub mod native_history;
 pub mod opencode_ws;
 pub mod pane_ops;
 mod pane_resize;
+/// Zombie-aware process and process-group probes, shared with the
+/// `claude_sidecar_teardown` integration test.
+#[cfg(all(test, unix))]
+#[path = "../tests/support/process_probe.rs"]
+mod process_probe;
 pub mod rollback_record;
 pub mod session_handoff;
 pub mod session_lease;

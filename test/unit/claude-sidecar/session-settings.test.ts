@@ -127,26 +127,26 @@ async function authEnvProbe(bridge: Pick<RealSidecar, 'waitForLedger'>) {
 describe('Claude sidecar OneCLI child environment', () => {
   it('passes the fixed selected hosted MCP recipe through the supported SDK option', async () => {
     const bridge = await sidecar({ FRESHELL_HOSTED_FRESH_AGENT: 'claude' })
-    bridge.send({ type: 'create', requestId: 'hosted-mcp', cwd: bridge.cwd, hostedMcp: true })
+    await bridge.create({ requestId: 'hosted-mcp', hostedMcp: true })
     expect(await hostedMcpProbe(bridge)).toMatchObject({ selected: true, fixedRecipe: true })
   })
 
   it('keeps unselected and ordinary Claude SDK sessions free of the hosted recipe', async () => {
     const hosted = await sidecar({ FRESHELL_HOSTED_FRESH_AGENT: 'claude' })
-    hosted.send({ type: 'create', requestId: 'unselected-mcp', cwd: hosted.cwd, hostedMcp: false })
+    await hosted.create({ requestId: 'unselected-mcp', hostedMcp: false })
     expect(await hostedMcpProbe(hosted)).toMatchObject({ selected: false })
     const ordinary = await sidecar({ FRESHELL_HOSTED_FRESH_AGENT: '' })
-    ordinary.send({ type: 'create', requestId: 'ordinary-mcp', cwd: ordinary.cwd, hostedMcp: true })
+    await ordinary.create({ requestId: 'ordinary-mcp', hostedMcp: true })
     expect(await hostedMcpProbe(ordinary)).toMatchObject({ selected: false })
   })
 
   it('passes a managed OneCLI API key to the SDK child without inheriting ambient keys', async () => {
     const unmanaged = await sidecar({ ANTHROPIC_API_KEY: 'onecli-test-key' })
-    unmanaged.send({ type: 'create', requestId: 'unmanaged', cwd: unmanaged.cwd })
+    await unmanaged.create({ requestId: 'unmanaged' })
     expect((await authEnvProbe(unmanaged)).apiKeyVisible).toBe(false)
 
     const managed = await sidecar({ ANTHROPIC_API_KEY: 'onecli-test-key', CLAUDE_CODE_OAUTH_TOKEN: 'onecli-test-oauth', FRESHELL_CLAUDE_ONECLI_API_KEY: '1' })
-    managed.send({ type: 'create', requestId: 'managed', cwd: managed.cwd })
+    await managed.create({ requestId: 'managed' })
     // The child gets the managed values themselves, not some other or empty key.
     expect(await authEnvProbe(managed)).toMatchObject({
       apiKeyVisible: true,
@@ -160,8 +160,7 @@ describe('Claude sidecar OneCLI child environment', () => {
 describe('Claude sidecar configuration protocol', () => {
   it('preserves conversation identity and applies new effort to the next prompt', async () => {
     const bridge = await sidecar()
-    bridge.send({ type: 'create', requestId: 'create', model: 'opus', effort: 'high', permissionMode: 'plan', cwd: bridge.cwd })
-    const { sessionId } = await bridge.waitFor('created')
+    const sessionId = await bridge.create({ requestId: 'create', model: 'opus', effort: 'high', permissionMode: 'plan' })
     bridge.send({ type: 'configure', sessionId, requestId: 'settings', settings: { effort: 'max' } })
     expect(await bridge.waitFor('sdk.configured', 'settings')).toMatchObject({ ok: true, settings: { effort: 'max', model: 'opus', permissionMode: 'plan' } })
     bridge.send({ type: 'send', sessionId, text: 'Continue', images: [{ mediaType: 'image/png', data: 'YWJj' }] })
@@ -175,8 +174,7 @@ describe('Claude sidecar configuration protocol', () => {
 
   it('correlates rejected settings and leaves the existing query available', async () => {
     const bridge = await sidecar()
-    bridge.send({ type: 'create', requestId: 'create', model: 'opus', permissionMode: 'acceptEdits', cwd: bridge.cwd })
-    const { sessionId } = await bridge.waitFor('created')
+    const sessionId = await bridge.create({ requestId: 'create', model: 'opus', permissionMode: 'acceptEdits' })
     bridge.send({ type: 'configure', sessionId, requestId: 'bad-mode', settings: { permissionMode: 'no-such-mode' } })
     // The refused mode is neither reported nor kept: the previous one stands.
     expect(await bridge.waitFor('sdk.configured', 'bad-mode')).toMatchObject({ ok: false, message: UNKNOWN_MODE_REFUSAL, settings: { permissionMode: 'acceptEdits' } })
@@ -186,13 +184,12 @@ describe('Claude sidecar configuration protocol', () => {
 
   it('publishes usable provider commands and removes terminal-only commands', async () => {
     const bridge = await sidecar()
-    bridge.send({ type: 'create', requestId: 'create', model: 'opus', cwd: bridge.cwd })
-    const { sessionId } = await bridge.waitFor('created')
-    // The sidecar publishes the catalog once the CLI has reported a turn's
-    // init (its list of terminal-only commands), which takes a prompt (T1).
-    bridge.send({ type: 'send', sessionId, text: 'hello' })
+    const sessionId = await bridge.create({ requestId: 'create', model: 'opus' })
+    // The FIRST catalog published is the boot's (boot-handshake.test.ts), before
+    // any turn's init has named the CLI's terminal-only commands (T1): even it
+    // must never offer a command the SDK session cannot run.
     const changed = await bridge.waitFor('sdk.session.changed')
-    expect(changed).toMatchObject({ reason: 'session-commands' })
+    expect(changed).toMatchObject({ sessionId, reason: 'session-commands' })
     // A usable command keeps its description and argument hint; the CLI's
     // terminal-only commands (doctor, color) are removed.
     expect(changed.commands).toContainEqual({ name: 'compact', description: 'Free up context by summarizing the conversation so far', argumentHint: '<optional custom summarization instructions>' })
@@ -202,8 +199,7 @@ describe('Claude sidecar configuration protocol', () => {
 
   it('keeps the conversation usable after a settings change fails part way', async () => {
     const bridge = await sidecar()
-    bridge.send({ type: 'create', requestId: 'create', model: 'opus', effort: 'high', permissionMode: 'plan', cwd: bridge.cwd })
-    const { sessionId } = await bridge.waitFor('created')
+    const sessionId = await bridge.create({ requestId: 'create', model: 'opus', effort: 'high', permissionMode: 'plan' })
     // The model change applies, then the permission mode is refused: the
     // answer reports the settings as they now stand, with the refused mode
     // left at its previous value.
@@ -219,8 +215,7 @@ describe('Claude sidecar configuration protocol', () => {
 
   it('surfaces failed turn details and rings the unified attention edge', async () => {
     const bridge = await sidecar()
-    bridge.send({ type: 'create', requestId: 'create', model: 'opus', cwd: bridge.cwd })
-    const { sessionId } = await bridge.waitFor('created')
+    const sessionId = await bridge.create({ requestId: 'create', model: 'opus' })
     bridge.send({ type: 'send', sessionId, text: '__fail__' })
     expect(await bridge.waitFor('sdk.error')).toMatchObject({ message: 'Request timed out', turnFailure: true })
     // Unified needs-attention contract: EVERY result subtype rings — the

@@ -495,10 +495,8 @@ describe('case 10: production wiring through the real index.mjs (FRESHELL_CLAUDE
   it('create -> magic send -> canUseTool -> respond; interrupt cancels a second park; question routing; shutdown', async () => {
     const harness = await spawnSidecar()
 
-    // create — placeholder id comes straight back
-    harness.send({ type: 'create', requestId: 'r-create-1', cwd: harness.cwd, permissionMode: 'default' })
-    const created = await harness.waitFor((f) => f.type === 'created', 'created')
-    const sessionId = created.sessionId as string
+    // create — the placeholder id comes back once the simulated CLI booted
+    const sessionId = await harness.create({ requestId: 'r-create-1', permissionMode: 'default' })
     expect(sessionId).toMatch(/^[A-Za-z0-9_-]{16,32}$/)
 
     // magic send -> the simulated CLI invokes options.canUseTool ->
@@ -588,9 +586,7 @@ describe('production wiring: permission.respond with a null/absent decision is a
   it('the parked entry survives a decisionless respond; a later valid respond resolves verbatim', async () => {
     const harness = await spawnSidecar()
 
-    harness.send({ type: 'create', requestId: 'r-create-guard', cwd: harness.cwd, permissionMode: 'default' })
-    const created = await harness.waitFor((f) => f.type === 'created', 'created')
-    const sessionId = created.sessionId as string
+    const sessionId = await harness.create({ requestId: 'r-create-guard', permissionMode: 'default' })
 
     harness.send({ type: 'send', sessionId, text: '__raise_permission__' })
     const permReq = await harness.waitFor((f) => f.type === 'sdk.permission.request', 'sdk.permission.request')

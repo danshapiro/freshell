@@ -65,6 +65,11 @@ export type FreshAgentComposerHandle = {
   appendText: (text: string) => void
   /** kata 1wxv decision 4: refill = OVERWRITE the current contents, focus, caret to end. */
   replaceText: (text: string) => void
+  /**
+   * A message that was not sent comes back: it goes in front of anything
+   * typed since (never overwriting it), focus, caret to end.
+   */
+  restoreText: (text: string) => void
 }
 
 /**
@@ -236,6 +241,15 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
   // only the Enter-to-send gesture is gated on pointer coarseness.
   const coarsePointer = useCoarsePointer()
 
+  const focusAtEnd = useCallback(() => {
+    requestAnimationFrame(() => {
+      const el = textareaRef.current
+      if (!el) return
+      el.focus()
+      el.setSelectionRange(el.value.length, el.value.length)
+    })
+  }, [])
+
   useImperativeHandle(ref, () => ({
     focus: () => textareaRef.current?.focus(),
     insertText: (value: string) => {
@@ -252,14 +266,13 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
     // editing. The existing persist effect syncs sessionStorage.
     replaceText: (value: string) => {
       setText(value)
-      requestAnimationFrame(() => {
-        const el = textareaRef.current
-        if (!el) return
-        el.focus()
-        el.setSelectionRange(el.value.length, el.value.length)
-      })
+      focusAtEnd()
     },
-  }), [disabled])
+    restoreText: (value: string) => {
+      setText((current) => (current.trim() ? `${value}\n${current}` : value))
+      focusAtEnd()
+    },
+  }), [disabled, focusAtEnd])
 
   const chatPrefix = getCommandPrefix(text)
   const mention = useMemo(() => getMentionToken(text), [text])
