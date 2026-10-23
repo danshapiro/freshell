@@ -5164,24 +5164,41 @@ fn register_fresh_agent_tab(
 /// Resolve them when their provider has a lane; that lane owns the live-session
 /// checks and transcript lookup.
 fn pane_entry_for_request(state: &FreshAgentState, pane_id: &str) -> Option<PaneEntry> {
-    pane_entry_from_layout(state, pane_id).or_else(|| {
-        state
-            .panes
-            .lock()
-            .expect("panes mutex")
-            .get(pane_id)
-            .cloned()
-    })
+    let cached = state
+        .panes
+        .lock()
+        .expect("panes mutex")
+        .get(pane_id)
+        .cloned();
+    let Some(snapshot) = state.layout.get_pane_snapshot(pane_id) else {
+        return cached;
+    };
+    // An existing snapshot is authoritative even when its current content
+    // cannot be controlled by this route. A retired cache row must not make
+    // a browser, shell or unsupported provider address the previous session.
+    let current = pane_entry_from_content(snapshot.pane_content.as_ref()?)?;
+    if state.rest_lane_for(&current.provider).is_some() {
+        return Some(current);
+    }
+    // Local OpenCode predates the generic lane and keeps its materialized
+    // identity in the cache while the layout can still show its placeholder.
+    // Retain that path only for the same, still-visible OpenCode identity.
+    let cached = cached?;
+    (current.provider == PROVIDER
+        && current.session_type == SESSION_TYPE
+        && cached.provider == PROVIDER
+        && cached.session_type == SESSION_TYPE
+        && current.placeholder_id == cached.placeholder_id
+        && (current.durable_id.as_ref() == Some(&current.placeholder_id)
+            || current.durable_id == cached.durable_id))
+        .then_some(cached)
 }
 
-fn pane_entry_from_layout(state: &FreshAgentState, pane_id: &str) -> Option<PaneEntry> {
-    let snapshot = state.layout.get_pane_snapshot(pane_id)?;
-    let content = snapshot.pane_content?;
+fn pane_entry_from_content(content: &Value) -> Option<PaneEntry> {
     if content.get("kind")?.as_str()? != "fresh-agent" {
         return None;
     }
     let provider = content.get("provider")?.as_str()?;
-    state.rest_lane_for(provider)?;
     let session_type = content.get("sessionType")?.as_str()?;
     if !matches!(
         (provider, session_type),

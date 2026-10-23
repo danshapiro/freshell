@@ -539,6 +539,80 @@ async fn a_restored_pane_with_only_its_durable_ref_supports_send_and_capture() {
 }
 
 #[tokio::test]
+async fn replacing_a_cached_claude_pane_with_other_content_never_controls_the_old_session() {
+    for (content, capture_status) in [
+        (
+            json!({"kind":"terminal", "mode":"shell"}),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            json!({"kind":"browser", "url":"https://example.com"}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"kind":"editor", "filePath":"/tmp/example.txt"}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ] {
+        let state = state_with_registry();
+        let lane = Arc::new(ControlLane::default());
+        state.set_claude_rest_lane(lane.clone()).unwrap();
+        let router = app(state.clone());
+        let (_, created) = post(router.clone(), "/api/tabs", json!({"agent":"claude"}), true).await;
+        let tab = created["data"]["tabId"].as_str().unwrap();
+        let pane = created["data"]["paneId"].as_str().unwrap();
+        state.layout.attach_pane_content(tab, pane, content);
+        let (status, body) = post(
+            router.clone(),
+            &format!("/api/panes/{pane}/send-keys"),
+            json!({"data":"do not send to the retired pane"}),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        let (status, text) = capture_response(router, pane).await;
+        assert_eq!(status, capture_status, "{text}");
+        assert!(lane.sends.lock().unwrap().is_empty());
+        assert!(lane.captures.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn the_existing_local_opencode_pane_keeps_its_cached_materialization() {
+    let state = state_with_registry();
+    let router = app(state.clone());
+    let (status, created) = post(
+        router.clone(),
+        "/api/tabs",
+        json!({"agent":"opencode"}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let tab = created["data"]["tabId"].as_str().unwrap();
+    let pane = created["data"]["paneId"].as_str().unwrap();
+    state
+        .panes
+        .lock()
+        .unwrap()
+        .get_mut(pane)
+        .unwrap()
+        .durable_id = Some("ses_materialized".into());
+    // The local OpenCode path stores materialization separately from the
+    // placeholder still shown by the layout. No generic REST lane is installed.
+    let (status, text) = capture_response(router.clone(), pane).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(text.is_empty());
+    state.layout.attach_pane_content(
+        tab,
+        pane,
+        json!({"kind":"browser", "url":"https://example.com"}),
+    );
+    let (status, text) = capture_response(router, pane).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{text}");
+}
+
+#[tokio::test]
 async fn lane_noop_does_not_report_a_submitted_turn() {
     let state = state_with_registry();
     let (tab, pane_id) = state.layout.create_tab(None);
