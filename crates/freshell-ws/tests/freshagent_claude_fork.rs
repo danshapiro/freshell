@@ -537,3 +537,121 @@ async fn a_child_whose_sidecar_died_before_its_first_send_resumes_through_the_cr
         .iter()
         .any(|line| line["message"]["content"][0]["text"] == "second prompt"));
 }
+
+/// Whether process `pid` is gone (or a zombie, which holds no pipes).
+fn process_gone(pid: i64) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .map(|(_, rest)| rest.trim_start().starts_with('Z'))
+            .unwrap_or(false),
+    }
+}
+
+/// The user closes the pane (the client kills the parent) while the fork's
+/// child is still booting. Nothing would ever show or close that child, so the
+/// fork must not hand it out: it answers a refusal instead of `forked`, the
+/// child's runtime is torn down (its sidecar and CLI are gone) and no binding
+/// row offers it for restore.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_the_pane_while_the_child_boots_leaves_no_child_behind() {
+    let rig = fork_rig().await;
+    let mut conn = rig.connect().await;
+    let pane = conn.create("create-1").await;
+    converse(&rig, &mut conn, &pane, &["first prompt"]).await;
+    let a = conn.init_session_id(&pane);
+    let hold = rig.fresh_claude.hold_fork_child();
+    let seen = conn.frames.len();
+    request_fork(&mut conn, &pane, &a, "fork-1", None).await;
+    hold.parked().await;
+    conn.kill(&pane).await;
+    hold.release();
+
+    let answer = fork_answer(&mut conn, &pane, "fork-1", seen).await;
+    assert_eq!(
+        answer["type"], "freshAgent.event",
+        "no child is handed out: {answer}"
+    );
+    assert_eq!(answer["event"]["code"], "FORK_REFUSED", "{answer}");
+    let boot = queries(&rig)
+        .into_iter()
+        .find(|o| o["forkSession"] == true)
+        .expect("the child booted");
+    let child = boot["sessionId"]
+        .as_str()
+        .expect("the child's id")
+        .to_string();
+    assert!(
+        !rig.fresh_claude.has_live_session(&child).await,
+        "the child is torn down"
+    );
+    let pids: Vec<i64> = rig
+        .ledger_rows("boot")
+        .into_iter()
+        .filter(|row| row["sessionId"] == child.as_str())
+        .flat_map(|row| [row["pid"].as_i64(), row["cliPid"].as_i64()])
+        .flatten()
+        .collect();
+    assert_eq!(pids.len(), 2, "the child's sidecar and CLI pids");
+    let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
+    while !pids.iter().all(|pid| process_gone(*pid)) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the child's processes ({pids:?}) are still running"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        ledger(&rig)
+            .load_binding("claude", &child)
+            .is_none_or(|row| row.state != freshell_ws::pane_ledger::RowState::Bound),
+        "nothing offers the child for restore"
+    );
+}
+
+/// A parent whose sidecar died on its own while the fork's child booted is
+/// still the pane's (it shows the ended card, not a closed pane), so the fork
+/// goes on and hands the pane its live child.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parent_that_dies_while_the_child_boots_still_gets_its_fork() {
+    let rig = fork_rig().await;
+    let mut conn = rig.connect().await;
+    let pane = conn.create("create-1").await;
+    converse(&rig, &mut conn, &pane, &["first prompt"]).await;
+    let a = conn.init_session_id(&pane);
+    let parent_sidecar = rig
+        .ledger_rows("boot")
+        .into_iter()
+        .next()
+        .and_then(|row| row["pid"].as_i64())
+        .expect("the parent's sidecar pid");
+    let hold = rig.fresh_claude.hold_fork_child();
+    let seen = conn.frames.len();
+    request_fork(&mut conn, &pane, &a, "fork-1", None).await;
+    hold.parked().await;
+    // SAFETY: a plain signal to a sidecar process this rig's server spawned.
+    assert_eq!(
+        unsafe { libc::kill(parent_sidecar as i32, libc::SIGKILL) },
+        0
+    );
+    conn.wait_for("the parent's sidecar exit", |v| {
+        v["type"] == "freshAgent.event"
+            && v["event"]["type"] == "freshAgent.error"
+            && v["event"]["code"] == "SIDECAR_EXITED"
+    })
+    .await;
+    hold.release();
+
+    let answer = conn
+        .wait_for("the fork's answer", |v| {
+            v["type"] == "freshAgent.forked" && v["requestId"] == "fork-1"
+        })
+        .await;
+    assert!(conn.frames.len() > seen);
+    let child = answer["sessionId"].as_str().expect("the child").to_string();
+    assert!(
+        rig.fresh_claude.has_live_session(&child).await,
+        "the child is live"
+    );
+}

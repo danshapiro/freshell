@@ -13,6 +13,9 @@
 //!   parks after it wrote its durable record, holding the session's turn lock,
 //!   before it boots the replacement runtime, so a test can park a send behind
 //!   it or change the transcript store under it.
+//! - Fork child ([`ClaudeTestHolds::hold_fork_child`]): a fork parks once its
+//!   child runtime is established, before it records the child's binding row,
+//!   so a test can close the parent while the child is still booting.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -25,6 +28,7 @@ pub(crate) struct ClaudeTestHolds {
     registration: Mutex<Option<Duration>>,
     exit_report: Mutex<Option<Arc<StepHold>>>,
     rollback_boot: Mutex<Option<Arc<StepHold>>>,
+    fork_child: Mutex<Option<Arc<StepHold>>>,
 }
 
 /// One parked step: [`Self::parked`] returns once the step reached the hold,
@@ -84,6 +88,15 @@ impl ClaudeTestHolds {
         hold
     }
 
+    /// Park every later fork once its child runtime is established, before it
+    /// records the child's binding row, until the returned hold is released.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn hold_fork_child(&self) -> Arc<StepHold> {
+        let hold = Arc::new(StepHold::default());
+        *self.fork_child.lock().expect("fork child hold lock") = Some(Arc::clone(&hold));
+        hold
+    }
+
     /// The registration hold, if a test set one.
     pub(crate) async fn registration(&self) {
         let hold = *self.registration.lock().expect("registration hold lock");
@@ -110,6 +123,18 @@ impl ClaudeTestHolds {
             .rollback_boot
             .lock()
             .expect("rollback boot hold lock")
+            .clone();
+        if let Some(hold) = hold {
+            hold.park().await;
+        }
+    }
+
+    /// The fork-child hold, if a test set one.
+    pub(crate) async fn fork_child(&self) {
+        let hold = self
+            .fork_child
+            .lock()
+            .expect("fork child hold lock")
             .clone();
         if let Some(hold) = hold {
             hold.park().await;

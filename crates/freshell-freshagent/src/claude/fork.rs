@@ -43,6 +43,11 @@ pub(crate) const FORK_POINT_GONE_MESSAGE: &str =
 pub(crate) const FORK_IN_PROGRESS_MESSAGE: &str =
     "This conversation is already being forked. Wait for the new conversation to open.";
 
+/// The pane closed the conversation while its fork was booting the child
+/// (`FORK_REFUSED`; nothing shows it, since the pane is gone).
+pub(crate) const FORK_PARENT_CLOSED_MESSAGE: &str =
+    "The conversation was closed while it was being forked, so the fork was discarded.";
+
 /// The child's binding row could not be written.
 pub(crate) const FORK_LEDGER_WRITE_MESSAGE: &str =
     "Fork is unavailable right now: the new conversation could not be saved. Try again.";
@@ -81,6 +86,8 @@ fn fork_failure(error: &EstablishError) -> (&'static str, String) {
 
 /// The parent a fork reads, as it stands once the fork holds its turn lock.
 struct ForkParent {
+    /// The parent's sessions-map key.
+    live_key: String,
     /// The id the requester knows the parent by (the reply's `parentSessionId`).
     reply_id: String,
     /// The parent's durable id: whose effective transcript the fork reads.
@@ -399,6 +406,18 @@ impl FreshClaudeState {
             }
         };
 
+        self.test_holds.fork_child().await;
+        // The pane may have closed the parent while the child booted (about a
+        // second, decision 4): then nothing would ever show or close the
+        // child, so it is torn down instead of handed out.
+        if self
+            .refuse_fork_of_closed_parent(&parent, &child, false)
+            .await
+        {
+            refuse("FORK_REFUSED", FORK_PARENT_CLOSED_MESSAGE);
+            return;
+        }
+
         // The child's binding row, AWAITED before the answer (durable before
         // answer): how it came to be (its genesis, so a restart before its first
         // send boots the same fork), the parent's settings and the forking
@@ -432,6 +451,17 @@ impl FreshClaudeState {
                 refuse("INTERNAL_ERROR", FORK_LEDGER_WRITE_MESSAGE);
                 return;
             }
+        }
+
+        // Again once the row is written: from here to the answer nothing
+        // awaits, so a close of the parent lands either before this check or
+        // after the pane was answered.
+        if self
+            .refuse_fork_of_closed_parent(&parent, &child, true)
+            .await
+        {
+            refuse("FORK_REFUSED", FORK_PARENT_CLOSED_MESSAGE);
+            return;
         }
 
         // The child is live: commit `Live{FreshAgent}` under its id (the owner
@@ -489,6 +519,7 @@ impl FreshClaudeState {
         let sessions = self.sessions.lock().await;
         let session = sessions.get(&live_key)?;
         Some(ForkParent {
+            live_key: live_key.clone(),
             // The pane follows a replacement through its `materialized` re-key,
             // so it then knows the parent by the replacement's id.
             reply_id: if live_key == map_key {
@@ -503,6 +534,48 @@ impl FreshClaudeState {
             in_turn: Arc::clone(&session.in_turn),
             settings: session.configuration.settings.clone(),
         })
+    }
+
+    /// Whether the pane closed the fork's parent: a kill of it is in flight
+    /// (its close is pending) or done (its runtime left the live map without
+    /// ending on its own, which leaves a dead-session record instead). A parent
+    /// whose sidecar merely died is still the pane's, so its fork goes on.
+    async fn fork_parent_closed(&self, parent_key: &str) -> bool {
+        let closing = self
+            .close_pending
+            .lock()
+            .expect("close-pending lock")
+            .get(parent_key)
+            .is_some_and(|pending| *pending > 0);
+        if closing {
+            return true;
+        }
+        if self.sessions.lock().await.contains_key(parent_key) {
+            return false;
+        }
+        self.dead_sessions.find(parent_key).is_none()
+    }
+
+    /// When the pane closed the fork's parent, tear the child down (retiring
+    /// its binding row once written) and say so; the caller refuses the fork.
+    async fn refuse_fork_of_closed_parent(
+        &self,
+        parent: &ForkParent,
+        child: &str,
+        row_written: bool,
+    ) -> bool {
+        if !self.fork_parent_closed(&parent.live_key).await {
+            return false;
+        }
+        tracing::info!(target: "freshell_freshagent::claude",
+            event = "freshagent.claude.fork_parent_closed",
+            session_id = %parent.durable,
+            child = %child,
+            row_written,
+            "the pane closed the parent while its fork booted the child; the child is torn down"
+        );
+        self.unwind_fork_child(child, row_written).await;
+        true
     }
 
     /// Tear down a fork child that registered but cannot be handed to the

@@ -875,6 +875,14 @@ impl FreshClaudeState {
         self.test_holds.hold_rollback_boot()
     }
 
+    /// Test seam: park every later fork once its child runtime is established,
+    /// before it records the child's binding row, until the returned hold is
+    /// released.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hold_fork_child(&self) -> Arc<crate::claude_test_holds::StepHold> {
+        self.test_holds.hold_fork_child()
+    }
+
     /// Spawn one claude sidecar process (create, attach-resume and rollback all
     /// come through here) for a session of `session_type`.
     async fn spawn_sidecar_process(&self, session_type: &str) -> Result<SpawnedSidecar, String> {
