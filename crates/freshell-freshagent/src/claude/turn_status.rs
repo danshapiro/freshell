@@ -79,8 +79,13 @@ impl FreshClaudeState {
         session_type: &str,
         uuid: &str,
     ) {
-        ledger.lock().expect("turn ledger lock").undo_arm(uuid);
-        self.publish_claude_status(ledger, session_id, session_type, false);
+        let mut ledger = ledger.lock().expect("turn ledger lock");
+        // EOF may have cleared this command before its writer-failure receipt
+        // reached the handler. Publish only for a command actually removed,
+        // under this same guard so EOF cannot overtake its status update.
+        if ledger.undo_arm(uuid).is_some() {
+            self.publish_locked_status(&mut ledger, session_id, session_type, false);
+        }
     }
 
     /// Say the live session `any_id` names its effective status, changed or
@@ -223,6 +228,16 @@ impl FreshClaudeState {
         after_result: bool,
     ) {
         let mut ledger = ledger.lock().expect("turn ledger lock");
+        self.publish_locked_status(&mut ledger, session_id, session_type, after_result);
+    }
+
+    fn publish_locked_status(
+        &self,
+        ledger: &mut crate::claude_turns::ClaudeTurnLedger,
+        session_id: &str,
+        session_type: &str,
+        after_result: bool,
+    ) {
         let (status, changed) = match ledger.take_status_change(false) {
             Some(status) => (status, true),
             None if after_result && ledger.published_status() != EffectiveStatus::Idle => {
@@ -238,5 +253,55 @@ impl FreshClaudeState {
             session_id: session_id.to_string(),
             session_type: session_type.to_string(),
         }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::claude_turns::SendKind;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn a_failed_send_after_eof_does_not_replace_exited_with_idle() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let state = FreshClaudeState::new(Arc::new(tx));
+        let ledger = SharedLedger::default();
+        ledger
+            .lock()
+            .unwrap()
+            .arm("send-uuid".into(), Some("request".into()), SendKind::Turn);
+        state.publish_claude_status(&ledger, "session", "freshclaude", false);
+        assert!(ledger.lock().unwrap().eof());
+        state.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            provider: "claude".into(),
+            session_id: "session".into(),
+            session_type: "freshclaude".into(),
+            event: json!({"type":"freshAgent.status", "sessionId":"session", "status":"exited"}),
+        }));
+        // A delayed writer-failure handler wakes after stdout EOF has already
+        // cleared the command and announced the ended runtime.
+        state.take_back_unwritten_send(&ledger, "session", "freshclaude", "send-uuid");
+        let frames: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|raw| serde_json::from_str(&raw).unwrap())
+            .collect();
+        assert_eq!(frames.last().unwrap()["event"]["status"], "exited");
+    }
+
+    #[tokio::test]
+    async fn a_live_failed_send_still_returns_the_session_to_idle() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let state = FreshClaudeState::new(Arc::new(tx));
+        let ledger = SharedLedger::default();
+        ledger
+            .lock()
+            .unwrap()
+            .arm("send-uuid".into(), None, SendKind::Turn);
+        state.publish_claude_status(&ledger, "session", "freshclaude", false);
+        state.take_back_unwritten_send(&ledger, "session", "freshclaude", "send-uuid");
+        let frames: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|raw| serde_json::from_str(&raw).unwrap())
+            .collect();
+        assert_eq!(frames.last().unwrap()["event"]["status"], "idle");
     }
 }
