@@ -9700,8 +9700,16 @@ async fn handle_pane_closed(closed: &PaneClosed, state: &WsState, ws_tx: &mut Ws
         })
     };
     match result {
-        Ok(()) => send(ws_tx, &answer(true, None)).await,
+        Ok(()) => {
+            state
+                .layout
+                .release_pane_publication(&closed.create_request_id);
+            send(ws_tx, &answer(true, None)).await
+        }
         Err(err) if err.is_persisted() => {
+            state
+                .layout
+                .release_pane_publication(&closed.create_request_id);
             // The record IS durable despite the reported error — the close
             // evidence stands, so the answer is success; loud, structured,
             // never silent.

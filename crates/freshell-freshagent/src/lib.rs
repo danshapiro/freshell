@@ -5077,7 +5077,7 @@ async fn create_lane_agent_tab(
     mut request: rest_lane::RestLaneCreate,
     name: Option<String>,
 ) -> Response {
-    let (tab_id, pane_id) = state.layout.create_tab(name.as_deref());
+    let (tab_id, pane_id) = state.layout.create_pending_tab(name.as_deref());
     request.tab_id = Some(tab_id.clone());
     request.pane_id = Some(pane_id.clone());
     let created = match gateway.create_agent(request.clone()).await {

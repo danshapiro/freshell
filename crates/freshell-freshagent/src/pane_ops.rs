@@ -175,7 +175,7 @@ pub(crate) async fn split_pane(
         .unwrap_or("horizontal")
         .to_string();
 
-    let (tab_id, new_pane_id) = match state.layout.split_pane(&pane_id, &direction) {
+    let (tab_id, new_pane_id) = match state.layout.split_pending_pane(&pane_id, &direction) {
         Ok(split) => split,
         // Node: `if (!result?.tabId || !result?.newPaneId) res.json(approx(
         // result, 'pane split requested; not applied'))` (router.ts:1312-1314).
@@ -1270,3 +1270,7 @@ mod store_tests;
 #[cfg(test)]
 #[path = "rest_lane_http_tests.rs"]
 mod rest_lane_http_tests;
+
+#[cfg(test)]
+#[path = "rest_lane_publication_tests.rs"]
+mod rest_lane_publication_tests;

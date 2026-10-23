@@ -347,6 +347,68 @@ async fn rest_recovery_does_not_reopen_an_explicitly_closed_session() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_browser_close_before_its_debounce_releases_the_rest_split_publication() {
+    let rig = ClaudeRig::start_with_options(RigKind::Sim, options()).await;
+    let mut browser = rig.connect().await;
+    let original = create(&rig, "claude").await;
+    let source = original["paneId"].as_str().unwrap();
+    let tab = original["tabId"].as_str().unwrap();
+    let (_, snapshot) = get(&rig, "/api/layout/snapshot").await;
+    let snapshot: Value = serde_json::from_str(&snapshot).unwrap();
+    let before_split = json!({
+        "type":"ui.layout.sync", "tabs":snapshot["data"]["tabs"], "activeTabId":tab,
+        "layouts":snapshot["data"]["layouts"], "activePane":snapshot["data"]["activePane"], "timestamp":1,
+    });
+    browser.send(before_split.clone()).await;
+    browser.send(json!({"type":"ping"})).await;
+    browser
+        .wait_for("initial layout sync", |frame| frame["type"] == "pong")
+        .await;
+    let (status, split) = rig
+        .post_json(
+            &format!("/api/panes/{source}/split"),
+            &json!({"agent":"kilroy"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{split}");
+    let pane = split["data"]["paneId"].as_str().unwrap();
+    let announced = browser
+        .wait_for("the unobserved split announcement", |frame| {
+            frame["command"] == "pane.split"
+        })
+        .await;
+    let create_id = announced["payload"]["newContent"]["createRequestId"]
+        .as_str()
+        .unwrap();
+    browser
+        .send(json!({"type":"pane.closed", "createRequestId":create_id}))
+        .await;
+    let closed = browser
+        .wait_for("the close acknowledgement", |frame| {
+            frame["type"] == "pane.closed.result" && frame["createRequestId"] == create_id
+        })
+        .await;
+    assert_eq!(closed["success"], true, "{closed}");
+    browser.frames.clear();
+    browser.send(before_split).await;
+    browser.send(json!({"type":"ping"})).await;
+    browser
+        .wait_for("closed layout sync", |frame| frame["type"] == "pong")
+        .await;
+    let (status, listed) = get(&rig, &format!("/api/panes?tabId={tab}")).await;
+    assert_eq!(status, 200, "{listed}");
+    let listed: Value = serde_json::from_str(&listed).unwrap();
+    assert_eq!(
+        listed["data"]["panes"].as_array().unwrap().len(),
+        1,
+        "{listed}"
+    );
+    assert_eq!(listed["data"]["panes"][0]["id"], source);
+    assert_ne!(listed["data"]["panes"][0]["id"], pane);
+    rig.fresh_claude.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rest_recovery_reports_unreadable_storage_as_retryable_and_can_retry_after_repair() {
     let rig = ClaudeRig::start_with_options(RigKind::Sim, options()).await;
     let mut browser = rig.connect().await;

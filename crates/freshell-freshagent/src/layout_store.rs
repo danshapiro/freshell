@@ -32,6 +32,8 @@ use content::{migrate_legacy_fresh_agent_content, migrate_legacy_fresh_agent_nod
 mod persist;
 use persist::{load_persisted_clients, persist_locked};
 
+mod publication;
+
 /// One ORDERED tab row (`UiSnapshot.tabs`, `layout-store.ts:7`).
 #[derive(Clone, Debug, Default)]
 pub struct TabRow {
@@ -190,6 +192,8 @@ struct LayoutInner {
     /// In-memory only (a transient reconnect-reconciliation aid): the
     /// persist format serializes the client snapshots, not the stamps.
     recovery_stamps: std::collections::HashMap<String, RecoveryStamp>,
+    /// Ordered server creations not yet observed in a browser layout sync.
+    pending_publications: Vec<publication::PendingPublication>,
     /// kata b8ke Task 10 (round-1 review, DURABILITY): `Some` → every
     /// mutation that changes the snapshot set rewrites the multi-client
     /// snapshot to this path (atomic temp+rename) and construction loads
@@ -492,8 +496,10 @@ impl LayoutStore {
                 seed_pane_title(&mut snapshot, &tab_id, &pane_id, &content);
             }
         }
-        let incoming_pane_ids = pane_ids_of(&snapshot);
+        let observed_pane_ids = pane_ids_of(&snapshot);
         let mut inner = self.lock();
+        publication::preserve(&mut inner, &mut snapshot, &observed_pane_ids);
+        let incoming_pane_ids = pane_ids_of(&snapshot);
         // b8ke ext r25 F2: THE SERVER RECOVERY'S CONTENT AUTHORITY. A
         // pane mutated through an authoritative recovery path (an
         // `attach_pane_content` write-through — the REST/MCP respawn and
@@ -519,6 +525,9 @@ impl LayoutStore {
             let mut stale_pane_writes: Vec<String> = Vec::new();
             let mut released_stamps: Vec<String> = Vec::new();
             for (pane_id, stamp) in inner.recovery_stamps.iter() {
+                if !observed_pane_ids.contains(pane_id) {
+                    continue;
+                }
                 let Some(incoming_content) = pane_content_in_snapshot(&snapshot, pane_id) else {
                     // The pane is not in this sync — the stamp stays (a
                     // later sync may still carry the stale copy).
@@ -717,6 +726,14 @@ impl LayoutStore {
     /// `ensureSnapshot` + append an ordered tab with a single terminal leaf and
     /// a seeded title (`createTab`, `layout-store.ts:431-460`).
     pub fn create_tab(&self, title: Option<&str>) -> (String, String) {
+        self.create_tab_with_publication(title, false)
+    }
+
+    pub(crate) fn create_pending_tab(&self, title: Option<&str>) -> (String, String) {
+        self.create_tab_with_publication(title, true)
+    }
+
+    fn create_tab_with_publication(&self, title: Option<&str>, pending: bool) -> (String, String) {
         let tab_id = Uuid::new_v4().to_string();
         let pane_id = Uuid::new_v4().to_string();
         // `buildContent({})` (`layout-store.ts:317-325`): a detached terminal pane.
@@ -753,6 +770,17 @@ impl LayoutStore {
         let name_source = derive_name_source(snapshot, &tab_id);
         if let Some(tab) = snapshot.tabs.iter_mut().find(|t| t.id == tab_id) {
             tab.name_source = name_source;
+        }
+        if pending {
+            inner
+                .pending_publications
+                .push(publication::PendingPublication {
+                    tab_id: tab_id.clone(),
+                    pane_id: pane_id.clone(),
+                    placement: publication::Placement::Tab,
+                    published: false,
+                    create_request_id: None,
+                });
         }
         persist_locked(&inner);
         (tab_id, pane_id)
@@ -813,6 +841,9 @@ impl LayoutStore {
     /// the tab.
     pub fn close_tab(&self, tab_id: &str) -> RenameOutcome {
         let mut inner = self.lock();
+        inner
+            .pending_publications
+            .retain(|entry| entry.tab_id != tab_id);
         if inner.clients.is_empty() {
             return RenameOutcome::failed("no layout snapshot");
         }
@@ -1054,6 +1085,23 @@ impl LayoutStore {
         pane_id: &str,
         direction: &str,
     ) -> Result<(String, String), &'static str> {
+        self.split_pane_with_publication(pane_id, direction, false)
+    }
+
+    pub(crate) fn split_pending_pane(
+        &self,
+        pane_id: &str,
+        direction: &str,
+    ) -> Result<(String, String), &'static str> {
+        self.split_pane_with_publication(pane_id, direction, true)
+    }
+
+    fn split_pane_with_publication(
+        &self,
+        pane_id: &str,
+        direction: &str,
+        pending: bool,
+    ) -> Result<(String, String), &'static str> {
         let mut inner = self.lock();
         let new_pane_id = Uuid::new_v4().to_string();
         let split_node_id = Uuid::new_v4().to_string();
@@ -1098,6 +1146,21 @@ impl LayoutStore {
         }
         match first {
             Some(tab_id) => {
+                if pending {
+                    inner
+                        .pending_publications
+                        .push(publication::PendingPublication {
+                            tab_id: tab_id.clone(),
+                            pane_id: new_pane_id.clone(),
+                            placement: publication::Placement::Split {
+                                source_pane_id: pane_id.to_string(),
+                                split_node_id,
+                                direction: direction.to_string(),
+                            },
+                            published: false,
+                            create_request_id: None,
+                        });
+                }
                 persist_locked(&inner);
                 Ok((tab_id, new_pane_id))
             }
@@ -1110,6 +1173,9 @@ impl LayoutStore {
     /// updates that arrived while creation awaited the provider.
     pub(crate) fn rollback_split(&self, pane_id: &str) -> bool {
         let mut inner = self.lock();
+        inner
+            .pending_publications
+            .retain(|entry| entry.pane_id != pane_id);
         let mut removed = false;
         for snapshot in inner.snapshots_mut() {
             let tab_id = snapshot.layouts.iter_mut().find_map(|(tab_id, root)| {
@@ -1257,6 +1323,17 @@ impl LayoutStore {
             found = true;
         }
         if found {
+            if let Some(pending) = inner
+                .pending_publications
+                .iter_mut()
+                .find(|entry| entry.pane_id == pane_id)
+            {
+                pending.published = true;
+                pending.create_request_id = normalized
+                    .get("createRequestId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
             // b8ke ext r25 F2: record the recovery stamp ONLY when the
             // write actually changed the pane's content — an idempotent
             // re-attach (the same content) stamps nothing.
@@ -1311,6 +1388,9 @@ impl LayoutStore {
             // b8ke ext r25 F2: a closed pane's recovery stamp is dead
             // weight — the pane no longer exists to protect.
             inner.recovery_stamps.remove(pane_id);
+            inner
+                .pending_publications
+                .retain(|entry| entry.pane_id != pane_id);
             persist_locked(&inner);
         }
         first.unwrap_or(Err("pane not found"))
