@@ -34,6 +34,14 @@ for (const resume of [false, true]) {
       const tab = () => lane.page.locator(`[data-context="tab"][data-tab-id="${pane.tabId}"]`)
       await expect(tab()).toContainText('Billing review', { timeout: 30_000 })
       if (resume) {
+        // This scenario resumes a saved conversation explicitly selected as
+        // Freshclaude. Use the production metadata route to establish that
+        // fixture; a fresh create's runtime id precedes durable type tagging.
+        const tagged = await fetch(`${lane.info.baseUrl}/api/session-metadata`, {
+          method: 'POST', headers: { 'content-type': 'application/json', 'x-auth-token': lane.info.token },
+          body: JSON.stringify({ provider: 'claude', sessionId: original, sessionType: 'freshclaude', sessionTypeSource: 'explicit' }),
+        })
+        expect(tagged.ok, await tagged.text()).toBe(true)
         // A live synthetic row can precede the indexed transcript and its
         // persisted freshclaude flavor. Close only once the normal sidebar
         // resume has a durable, interactive Freshclaude row to open.
