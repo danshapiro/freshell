@@ -362,11 +362,15 @@ async fn scoped_session_rename(
     );
     let update = match crate::session_name_routes::rename_through_authority(
         sink.as_ref(),
-        target,
-        name.to_string(),
-        intent,
-        if_revision,
-        cwd,
+        freshell_freshagent::naming::RenameNameInput {
+            target,
+            name: name.to_string(),
+            intent,
+            if_revision,
+            cwd,
+        },
+        &state.identity,
+        state.index.as_deref(),
     )
     .await
     {

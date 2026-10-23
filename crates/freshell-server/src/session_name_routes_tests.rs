@@ -32,6 +32,9 @@ use freshell_protocol::session_names::{
 use super::SessionNamesState;
 use crate::session_names::SessionNames;
 
+#[path = "session_name_known_target_tests.rs"]
+mod known_target_tests;
+
 /// Same fake transport as `sessions_tests`'s: the wired-in result IS the
 /// Gemini reply. NO live Gemini calls in tests, ever.
 struct FakeGemini(Result<String, String>);
