@@ -188,6 +188,23 @@ describe('Claude CLI simulator programs', () => {
     expect(results(s.messages)).toEqual([])
   })
 
+  it('an MCP tool step calls the session\'s stdio server, and a text step can repeat what it returned', async () => {
+    const probe = path.join(REPO_ROOT, 'test/integration/providers/claude-freshell-mcp-probe-server.mjs')
+    const program = { rules: [{ on: 'msg:prompt', match: { text: 'what did the server see' }, emit: [
+      { kind: 'tool', data: { name: 'mcp__freshell__context', input: {} } },
+      { kind: 'text', data: { text: 'The server saw: ', echoToolResult: true } },
+    ] }] }
+    const s = await open(
+      { mcpServers: { freshell: { type: 'stdio', command: process.execPath, args: [probe] } } },
+      { FRESHELL_CLAUDE_SIM_PROGRAM: JSON.stringify(program), FRESHELL: '1', FRESHELL_TAB_ID: 'tab-p', FRESHELL_PANE_ID: 'pane-p' },
+    )
+    s.prompt.push('what did the server see')
+    await s.until(() => results(s.messages).length === 1)
+    const reply = s.messages.filter((m) => m.type === 'assistant').at(-1).message.content[0].text as string
+    expect(reply.startsWith('The server saw: ')).toBe(true)
+    expect(JSON.parse(reply.slice('The server saw: '.length))).toMatchObject({ FRESHELL: '1', FRESHELL_TAB_ID: 'tab-p', FRESHELL_PANE_ID: 'pane-p' })
+  })
+
   it('a completion rule ends the turn with the scripted subtype; a `once` rule then falls back to the prompt markers', async () => {
     const s = await open({}, program([{ on: 'msg:prompt', once: true, emit: [{ kind: 'text', data: { text: 'partial' } }, { kind: 'completion', data: { subtype: 'error_max_turns', text: 'too many turns' } }] }]))
     s.prompt.push('first')

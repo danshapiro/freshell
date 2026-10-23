@@ -14,7 +14,10 @@
 // there. A matching prompt rule replaces the prompt-marker behavior for that
 // turn; its emissions run in order as the model's side of the turn:
 //
-//   text / activity  { text?, chunks?, delayMs? }   one streamed assistant text block
+//   text / activity  { text?, chunks?, delayMs?, echoToolResult? }
+//                                                   one streamed assistant text block; with
+//                                                   echoToolResult it repeats what the turn's last
+//                                                   tool call returned, after `text`
 //   tool             { name, input, id?, seconds?, output?, isError?, inputStreamMs? }
 //                                                   a tool call and its result; with inputStreamMs
 //                                                   the model streams the call's input for that long

@@ -743,7 +743,10 @@ class SimulatedCli {
 
   /** One streamed text block. Returns false when the turn was aborted (and has been ended). */
   async streamText(turn, data) {
-    const pieces = data.chunks ? Array.from({ length: data.chunks }, (_, i) => `chunk${i} `) : [data.text ?? 'ok']
+    // A model that repeats what its last tool call returned (`echoToolResult`,
+    // after an optional `text` prefix).
+    const reply = data.echoToolResult ? `${data.text ?? ''}${turn.lastToolResultText ?? ''}` : (data.text ?? 'ok')
+    const pieces = data.chunks ? Array.from({ length: data.chunks }, (_, i) => `chunk${i} `) : [reply]
     const pace = data.chunks ? (data.delayMs ?? SLOW_DELAY_MS) : 0
     this.emitStream(this.messageStart())
     this.emitStream({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })
@@ -779,6 +782,7 @@ class SimulatedCli {
   toolResult(toolUseId, content, { isError = false, toolUseResult, extra = {} } = {}) {
     const uuid = randomUUID()
     const block = { tool_use_id: toolUseId, type: 'tool_result', content, ...(isError ? { is_error: true } : { is_error: false }) }
+    if (this.turn) this.turn.lastToolResultText = Array.isArray(content) ? content.map((part) => part?.text ?? '').join('') : String(content ?? '')
     this.emit({ type: 'user', message: { role: 'user', content: [block] }, parent_tool_use_id: null, uuid, timestamp: new Date().toISOString(), tool_use_result: toolUseResult, ...extra })
     this.transcript.append({ type: 'user', uuid, message: { role: 'user', content: [block] }, toolUseResult })
     // Sends absorbed while the tool ran join the turn as queued_command
