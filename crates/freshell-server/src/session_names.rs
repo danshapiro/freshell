@@ -124,7 +124,7 @@ mod session_name_store_view;
 mod session_name_events;
 use session_name_apply::{indexed_key, replace_automatic, wire_source, with_outcome};
 use session_name_events::{AdoptedChanges, NameChangeCause, NameChangeEvent, UncertainCommits};
-use session_name_first_message::{first_message_fallback, RefusalSite, SeriesPlan};
+use session_name_first_message::{first_message_fallback, InputRefusals, RefusalSite, SeriesPlan};
 use session_name_store_view::{DocumentStamp, FullCheck};
 use session_name_sweep_batch::StagedNativeBaselines;
 pub(crate) use session_name_sweep_batch::{
@@ -603,6 +603,9 @@ struct TxnMeta {
     /// Name-reliability Task 4: the store's staged native baselines (read
     /// as if persisted; written by the decisions that only stage).
     staged_baselines: Arc<StagedNativeBaselines>,
+    /// Name-reliability Task 5: the prompt-input guard's drops in this
+    /// transaction, logged once it commits.
+    input_refusals: InputRefusals,
 }
 
 /// The adopted read model: the parsed document plus a digest of the exact
@@ -1437,21 +1440,31 @@ impl SessionNames {
     }
 
     /// Name-reliability Task 4 (LB-B1): the sweep pass's ONE maintenance
-    /// transaction — at most [`SWEEP_MAINTENANCE_BATCH`] self-heal items
+    /// transaction — the queued self-heal items (at most
+    /// [`SWEEP_MAINTENANCE_BATCH`]; the queue counts the rest as deferred)
     /// re-planned on the fresh document, then staged native baselines in
-    /// the remaining room. Nothing queued and nothing staged answers at
-    /// once, without a transaction.
+    /// the remaining room, summarized in one INFO line once it committed.
+    /// Nothing queued and nothing staged answers at once, without a
+    /// transaction.
     pub(crate) fn sweep_maintenance(
         &self,
-        items: Vec<SweepMaintenanceItem>,
+        batch: impl Into<SweepMaintenanceQueue>,
     ) -> NameFuture<SweepMaintenanceReport> {
-        if items.is_empty() && !self.has_staged_native_baselines() {
+        let batch = batch.into();
+        if batch.is_empty() && !self.has_staged_native_baselines() {
             return Box::pin(async { Ok(SweepMaintenanceReport::default()) });
         }
         let core = Arc::clone(&self.core);
-        Box::pin(spawn_txn(core, move |doc, meta| {
-            session_name_sweep_batch::sweep_maintenance_decision(doc, meta, items)
-        }))
+        Box::pin(async move {
+            let data_dir = core.data_dir.clone();
+            let report = spawn_txn(core, move |doc, meta| {
+                session_name_sweep_batch::sweep_maintenance_decision(doc, meta, batch)
+            })
+            .await?;
+            // Summarized only once committed (or settled as a Read).
+            report.log_committed(&data_dir);
+            Ok(report)
+        })
     }
 }
 
@@ -1815,6 +1828,7 @@ where
         now_ms: effective_now_ms(&core.data_dir),
         native_retry_floor: take_native_retry_floor(&core.data_dir),
         staged_baselines: Arc::clone(&core.staged_baselines),
+        input_refusals: InputRefusals::default(),
     };
     let decision = f(&mut document, &meta)?;
 
@@ -1864,6 +1878,7 @@ where
                 &document,
                 publish.iter().filter_map(PublishSpec::change_entry),
             );
+            meta.input_refusals.log_committed();
             // Publish while the lock is still held: local generation order.
             let updates = materialize_publish(&document, &publish);
             core.publish(updates);
@@ -3105,7 +3120,7 @@ fn bind_pending_decision(
     // drops it (never armed from it).
     if !source_is_protected(record.source) {
         if let Some(series) = document.generation.get_mut(&target_key) {
-            session_name_first_message::explicit_open(series);
+            session_name_first_message::explicit_open(series, &meta.input_refusals);
         }
     }
 
@@ -3216,10 +3231,10 @@ struct ActivityApplied {
 
 fn activity_decision(
     document: &mut StoredDocument,
-    _meta: &TxnMeta,
+    meta: &TxnMeta,
     input: NameActivity,
 ) -> Result<Decision<SessionNameUpdate>, NameError> {
-    let applied = apply_activity(document, input)?;
+    let applied = apply_activity(document, meta, input)?;
     if let Some(change) = applied.change {
         Ok(commit_decision(document, &applied.key, Some(change)))
     } else if applied.bookkeeping {
@@ -3236,6 +3251,7 @@ fn activity_decision(
 /// and the planned arm advances the series.
 fn apply_activity(
     document: &mut StoredDocument,
+    meta: &TxnMeta,
     input: NameActivity,
 ) -> Result<ActivityApplied, NameError> {
     let NameActivity {
@@ -3281,8 +3297,12 @@ fn apply_activity(
     }
 
     if let Some(series_plan) = plan.series {
-        applied.bookkeeping =
-            session_name_first_message::apply_series_plan(document, &key, series_plan);
+        applied.bookkeeping = session_name_first_message::apply_series_plan(
+            document,
+            &key,
+            series_plan,
+            &meta.input_refusals,
+        );
     }
     Ok(applied)
 }
@@ -3558,7 +3578,11 @@ fn claim_generation_start_decision(
     // or derived text is never sent to the model. The claim refuses it
     // without consuming a start and drops the input, so the series rests
     // and the worker is never offered it again.
-    if session_name_first_message::drop_refused_input(series, RefusalSite::Claim) {
+    if session_name_first_message::drop_refused_input(
+        series,
+        RefusalSite::Claim,
+        &meta.input_refusals,
+    ) {
         return Ok(Decision::Write {
             value: None,
             publish: Vec::new(),

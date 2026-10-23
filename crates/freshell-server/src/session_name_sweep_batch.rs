@@ -17,8 +17,15 @@
 //! plan functions the per-row transactions use, so an item whose record
 //! moved since the pre-check (a user rename, a foreign process) applies
 //! exactly what the current document allows.
+//!
+//! Once the batch commits, one INFO `session_names.sweep_maintenance` line
+//! summarizes it: the records healed, the baselines persisted, and the rows
+//! the pass found but could not fit into the batch (`deferred`, the heals
+//! still waiting). A batch whose commit fails writes no summary; the
+//! caller's `session_names.operation_failed` WARN reports it.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Mutex;
 
 use freshell_freshagent::naming::{NameActivity, NameError};
@@ -58,8 +65,25 @@ pub(crate) struct SweepMaintenanceReport {
     pub healed: usize,
     /// Staged native baselines the batch persisted.
     pub baselines: usize,
-    /// Items beyond the batch size, left for a later pass.
+    /// Rows beyond the batch size, left for a later pass.
     pub deferred: usize,
+}
+
+impl SweepMaintenanceReport {
+    /// The summary line of a batch that committed (see the module docs).
+    pub(super) fn log_committed(&self, data_dir: &Path) {
+        if self.healed + self.baselines > 0 || self.deferred > 0 {
+            tracing::info!(
+                target: "freshell_server::session_names",
+                op = "sweep_maintenance",
+                healed = self.healed,
+                baselines = self.baselines,
+                deferred = self.deferred,
+                data_dir = %data_dir.display(),
+                "session_names.sweep_maintenance"
+            );
+        }
+    }
 }
 
 /// One staged baseline: the title, and the persisted baseline the
@@ -164,22 +188,24 @@ impl StagedNativeBaselines {
     }
 }
 
-/// The batch transaction. Applies at most [`SWEEP_MAINTENANCE_BATCH`]
-/// items, then fills the remaining room with staged baselines; publishes
-/// every record whose name changed. A Read when nothing changed.
+/// The batch transaction. Applies the queued items (at most
+/// [`SWEEP_MAINTENANCE_BATCH`]), then fills the remaining room with staged
+/// baselines; publishes every record whose name changed. A Read when
+/// nothing changed.
 pub(super) fn sweep_maintenance_decision(
     document: &mut StoredDocument,
     meta: &TxnMeta,
-    items: Vec<SweepMaintenanceItem>,
+    batch: SweepMaintenanceQueue,
 ) -> Result<Decision<SweepMaintenanceReport>, NameError> {
+    let SweepMaintenanceQueue { items, deferred } = batch;
     let mut report = SweepMaintenanceReport {
-        deferred: items.len().saturating_sub(SWEEP_MAINTENANCE_BATCH),
+        deferred,
         ..SweepMaintenanceReport::default()
     };
     let mut publish: Vec<PublishSpec> = Vec::new();
     let mut wrote = false;
     let mut used = 0usize;
-    for item in items.into_iter().take(SWEEP_MAINTENANCE_BATCH) {
+    for item in items {
         used += 1;
         let mut healed: Option<(String, NameChangeEvent)> = None;
         if let Some(input) = item.hydrate {
@@ -197,7 +223,7 @@ pub(super) fn sweep_maintenance_decision(
             }
         }
         if let Some(activity) = item.activity {
-            match super::apply_activity(document, activity) {
+            match super::apply_activity(document, meta, activity) {
                 Ok(applied) => {
                     wrote |= applied.bookkeeping;
                     if let Some(change) = applied.change {
@@ -250,16 +276,6 @@ pub(super) fn sweep_maintenance_decision(
         }
         report.baselines += 1;
     }
-    if report.healed + report.baselines > 0 || report.deferred > 0 {
-        tracing::info!(
-            target: "freshell_server::session_names",
-            op = "sweep_maintenance",
-            healed = report.healed,
-            baselines = report.baselines,
-            deferred = report.deferred,
-            "session_names.sweep_maintenance"
-        );
-    }
     if wrote {
         Ok(Decision::Write {
             value: report,
@@ -271,24 +287,41 @@ pub(super) fn sweep_maintenance_decision(
 }
 
 /// The sweep pass's collector: at most one batch of maintenance items per
-/// pass (the rest is found again by the next pass's pre-checks).
+/// pass (the rest is found again by the next pass's pre-checks, and counted
+/// here as `deferred`).
 #[derive(Debug, Default)]
 pub(crate) struct SweepMaintenanceQueue {
     items: Vec<SweepMaintenanceItem>,
+    deferred: usize,
 }
 
 impl SweepMaintenanceQueue {
-    /// Queue one record's maintenance work; `false` when the batch is full.
+    /// Queue one record's maintenance work; `false` (and counted as
+    /// deferred) when the batch is full.
     pub(crate) fn push(&mut self, item: SweepMaintenanceItem) -> bool {
         if self.items.len() >= SWEEP_MAINTENANCE_BATCH {
+            self.deferred += 1;
             return false;
         }
         self.items.push(item);
         true
     }
 
-    pub(crate) fn into_items(self) -> Vec<SweepMaintenanceItem> {
-        self.items
+    /// No item queued (nothing is deferred either: only a full batch
+    /// defers).
+    pub(crate) fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+/// Items queued in order: the first batch-full, the rest deferred.
+impl From<Vec<SweepMaintenanceItem>> for SweepMaintenanceQueue {
+    fn from(items: Vec<SweepMaintenanceItem>) -> Self {
+        let mut queue = Self::default();
+        for item in items {
+            queue.push(item);
+        }
+        queue
     }
 }
 
