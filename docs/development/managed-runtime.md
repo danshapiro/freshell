@@ -204,10 +204,11 @@ mounts and unmounts the new container's overlay root filesystem, and the
 kernel flushes the whole filesystem under Docker's data root when that mount
 goes away, so the create waits for every unwritten change on that disk (on
 the development host: about 0.1s idle, 4.5s with 1 GB unwritten, 16.7s with
-3 GB; up to 43s during the provider parity runs, which build Rust release
+3 GB; up to 48s during the provider parity runs, which build Rust release
 binaries while up to 8 GB sits unwritten). The create right after it is fast
 again, which is why managed-session creates stay quick while the helper
-created just before them is slow.
+created just before them is slow. A host whose load far exceeds its cores
+slows every Docker step the same way, exits and removals included.
 
 - A helper create keeps running when its caller stops waiting, and cleanup
   waits for Docker's answer before it removes the helper by exact name. The
@@ -231,9 +232,9 @@ created just before them is slow.
   lengths with their 5s cleanup: the attempt a stall times out, up to one
   more attempt length for Docker to answer that create, and one full retry;
   a third attempt fits only after a fast refusal. Inside a recovery the read
-  also ends 5s before the recovery scope does (see above). Waits are 1s, then 2s, and a retry
-  starts only after the previous attempt's helpers were removed, so retries
-  never pile creates onto a stalled daemon. Every other failure (a client
+  also ends 5s before the recovery scope does (see above). Waits are 1s,
+  then 2s, and a retry starts only after the previous attempt's helpers were
+  removed, so retries never pile creates onto a stalled daemon. Every other failure (a client
   error, changed ownership or topology, a reader that exited without
   evidence, an unconfirmed cleanup) is final, as before. Events:
   `supervisor.helper.retry` (warn, per retry), `supervisor.helper.recovered`
