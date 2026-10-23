@@ -253,9 +253,11 @@ pub(crate) fn parse_rename_intents(body: &Value) -> Result<(NameIntent, Option<u
 }
 
 /// `POST /api/session-names/read {refs}` → `{names: [SessionNameUpdate]}`.
-/// Adopts the current document first (the common full-document refresh path
-/// before name-dependent reads), then resolves the requested refs — unknown
-/// refs are omitted (plan rule 7). A body naming more than
+/// Resolves the requested refs from the store's adopted view — unknown refs
+/// are omitted (plan rule 7). The store's read peeks the document's stamp
+/// and adopts a same-home participant's commit first, so a CLI/MCP read
+/// reflects current state without the document lock or a full-document
+/// rebuild (name-reliability Task 11). A body naming more than
 /// [`READ_CHUNK_LIMIT`] refs is a 400 (the client chunks).
 async fn read_session_names(
     State(state): State<SessionNamesState>,
@@ -297,21 +299,6 @@ async fn read_session_names(
                     .into_response();
             }
         }
-    }
-    // The common full-document adoption path before the name-dependent read:
-    // a same-home cooperating process's commits (the 2s tick's own refresh)
-    // are adopted here too, so a CLI/MCP read reflects current state without
-    // polling. Adoption failures degrade to the last established snapshot
-    // (the read still answers from it), loudly logged.
-    if let Err(error) = state.names.refresh_current().await {
-        tracing::warn!(
-            target: "freshell_server::session_names",
-            op = "refresh_current",
-            name_ref = "-",
-            revision = 0,
-            class = %error.code(),
-            "session_names.operation_failed: {error}"
-        );
     }
     match state.names.get(targets).await {
         Ok(updates) => Json(json!({ "names": updates })).into_response(),
