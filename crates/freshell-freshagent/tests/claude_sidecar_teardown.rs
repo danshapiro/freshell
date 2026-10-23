@@ -6,10 +6,14 @@
 //! macOS in the `electron-build` workflow (the crate's unit tests do not
 //! compile on Windows, so the cross-platform behavior lives in this
 //! integration target). They need `node` on PATH (or `FRESHELL_CLAUDE_NODE`),
-//! like the crate's other sidecar tests. Only
+//! like the crate's other sidecar tests, and on Linux `python3`. Only
 //! `a_session_stop_confirms_the_whole_sidecar_tree_gone` sets process
 //! environment (`FRESHELL_CLAUDE_SIDECAR`, `CLAUDE_CONFIG_DIR`), which no
 //! other test here reads.
+//!
+//! Whether a process is still running is asked of `support/process_probe.rs`,
+//! never of `kill(pid, 0)`, which also finds a killed orphan its adopter has
+//! not reaped yet (see that module).
 
 use std::path::Path;
 use std::process::Stdio;
@@ -21,6 +25,12 @@ use freshell_freshagent::claude_spawn::{
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
+
+#[path = "support/process_probe.rs"]
+mod process_probe;
+#[cfg(unix)]
+use process_probe::ProcessGroupProbe;
+use process_probe::ProcessProbe;
 
 /// Honors the protocol like `index.mjs`: the shutdown line ends the process
 /// with exit 0. Its SIGTERM handler records that a signal was needed.
@@ -228,61 +238,204 @@ fn grandchild_pid(ready: &str) -> u32 {
         .unwrap_or_else(|| panic!("readiness line carries the grandchild pid: {ready}"))
 }
 
-#[cfg(unix)]
-fn process_group_exists(pgid: i32) -> bool {
-    // SAFETY: signal 0 only probes for existence.
-    let result = unsafe { libc::kill(-pgid, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-/// Observes one process's exit. On Windows the handle is opened while the
-/// process is known to run, so a reused id can never be mistaken for it.
-struct ProcessProbe {
+/// A node that runs until it is killed, as a test's own (unreaped) child.
+/// On Unix it leads its own process group.
+fn spawn_idle_node() -> std::process::Child {
+    let mut command = std::process::Command::new(node());
+    command
+        .args(["-e", "setInterval(() => {}, 1000)"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     #[cfg(unix)]
-    pid: u32,
-    #[cfg(windows)]
-    watch: freshell_platform::process_job::ProcessExitWatch,
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    command.spawn().expect("spawn an idle node")
 }
 
-impl ProcessProbe {
-    fn open(pid: u32) -> Self {
-        Self {
-            #[cfg(unix)]
-            pid,
-            #[cfg(windows)]
-            watch: freshell_platform::process_job::ProcessExitWatch::open(pid)
-                .expect("open the grandchild while it runs"),
-        }
-    }
+/// How long the probe tests below watch a process that keeps running, to
+/// see that it is never reported as exited.
+const KEEPS_RUNNING_WATCH: Duration = Duration::from_millis(300);
 
-    fn alive(&self) -> bool {
-        #[cfg(unix)]
-        {
-            // SAFETY: signal 0 only probes for existence.
-            let result = unsafe { libc::kill(self.pid as i32, 0) };
-            result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-        }
-        #[cfg(windows)]
-        {
-            !self
-                .watch
-                .wait(Duration::ZERO)
-                .expect("wait on the grandchild")
-        }
-    }
+/// The probe the tree assertions below rely on reports a running process
+/// (and, on Unix, its group) as running, and as exited once it was killed
+/// and reaped.
+#[tokio::test]
+async fn the_probe_sees_a_running_process_as_running_until_it_is_killed() {
+    let mut child = spawn_idle_node();
+    let process = ProcessProbe::open(child.id());
+    #[cfg(unix)]
+    let group = ProcessGroupProbe::new(child.id() as i32);
 
-    /// Whether the process exits within `budget`.
+    assert!(process.running(), "the process runs");
+    #[cfg(unix)]
+    {
+        assert!(group.running(), "its group has a running member");
+        let (process_exited, group_exited) = tokio::join!(
+            process.exits_within(KEEPS_RUNNING_WATCH),
+            group.exits_within(KEEPS_RUNNING_WATCH)
+        );
+        assert!(!process_exited, "a running process does not exit");
+        assert!(!group_exited, "nor does its group");
+    }
     #[cfg(windows)]
-    async fn exits_within(&self, budget: Duration) -> bool {
-        let deadline = std::time::Instant::now() + budget;
-        while self.alive() {
-            if std::time::Instant::now() >= deadline {
-                return false;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        !process.exits_within(KEEPS_RUNNING_WATCH).await,
+        "a running process does not exit"
+    );
+
+    child.kill().expect("kill the idle node");
+    child.wait().expect("reap the idle node");
+
+    assert!(
+        process.exited().await,
+        "a killed, reaped process has exited"
+    );
+    #[cfg(unix)]
+    assert!(group.exited().await, "its group has no member left");
+}
+
+/// Block until `pid`, a child of this process, has exited, WITHOUT reaping
+/// it: it stays a zombie until the caller waits on it.
+#[cfg(unix)]
+fn wait_until_zombie(pid: u32) {
+    loop {
+        // SAFETY: `siginfo_t` is plain data that waitid fills in.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: waits on this process's own child; WNOWAIT leaves it
+        // unreaped.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return;
         }
-        true
+        let error = std::io::Error::last_os_error();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::Interrupted,
+            "wait for the child to exit: {error}"
+        );
     }
+}
+
+/// A process that was killed but not yet reaped (a zombie) has exited: it
+/// runs nothing, holds no pipes and writes nothing. An orphaned grandchild
+/// the guard kills is exactly that until whoever adopted it (init, or the
+/// nearest subreaper such as `systemd --user`) reaps it, and on a loaded
+/// machine that can come after the guard has confirmed the tree gone.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_probe_counts_a_killed_but_unreaped_process_as_exited() {
+    let mut child = spawn_idle_node();
+    let pid = child.id();
+    let process = ProcessProbe::open(pid);
+    let group = ProcessGroupProbe::new(pid as i32);
+    assert!(process.running());
+
+    child.kill().expect("kill the idle node");
+    wait_until_zombie(pid);
+
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: signal 0 only probes for existence.
+        assert_eq!(
+            unsafe { libc::kill(pid as i32, 0) },
+            0,
+            "the zombie is still in the process table, where kill(pid, 0) finds it"
+        );
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { libc::kill(-(pid as i32), 0) },
+            0,
+            "and kill(-pgid, 0) finds the group it is still a member of"
+        );
+        // Linux tells the zombie apart at once: no reaper is needed.
+        let process_running = process.running();
+        let group_running = group.running();
+        let (process_exited, group_exited) = tokio::join!(process.exited(), group.exited());
+        child.wait().expect("reap the zombie");
+        assert!(!process_running, "an unreaped zombie is not running");
+        assert!(!group_running, "nor is a group holding only a zombie");
+        assert!(process_exited, "an unreaped zombie has exited");
+        assert!(group_exited, "so has a group holding only a zombie");
+    }
+    // Without /proc a zombie cannot be told from a running process, so the
+    // probes wait for it to be reaped; reap it shortly, as its adopter would.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let reaper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            child.wait().expect("reap the zombie");
+        });
+        let (process_exited, group_exited) = tokio::join!(process.exited(), group.exited());
+        reaper.join().expect("the reaper thread");
+        assert!(process_exited, "a zombie reaped shortly after has exited");
+        assert!(group_exited, "so has the group that held only it");
+    }
+}
+
+/// A process whose main thread ended while another thread still runs is
+/// still running, although Linux then reports its state as `Z` (zombie):
+/// the probe stays as strict as `kill(pid, 0)` for it. Python ends its main
+/// thread alone with `pthread_exit`.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_probe_sees_a_process_whose_main_thread_ended_as_running() {
+    const MAIN_THREAD_ENDS_FIRST: &str = "
+import ctypes, threading, time
+threading.Thread(target=lambda: time.sleep(300)).start()
+ctypes.CDLL(None).pthread_exit(None)
+";
+    let mut command = std::process::Command::new("python3");
+    command
+        .args(["-c", MAIN_THREAD_ENDS_FIRST])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = command
+        .spawn()
+        .expect("python3 is required by the main-thread-ended probe test");
+    let pid = child.id();
+    let process = ProcessProbe::open(pid);
+    let group = ProcessGroupProbe::new(pid as i32);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let stat = loop {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read its stat");
+        // The state follows the last ')' (the command name may hold one).
+        if stat
+            .rsplit(')')
+            .next()
+            .map(str::trim_start)
+            .is_some_and(|rest| rest.starts_with('Z'))
+        {
+            break stat;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the main thread never ended: {stat}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    let running = process.running();
+    let group_running = group.running();
+    let (process_exited, group_exited) = tokio::join!(
+        process.exits_within(KEEPS_RUNNING_WATCH),
+        group.exits_within(KEEPS_RUNNING_WATCH)
+    );
+    child.kill().expect("kill python");
+    child.wait().expect("reap python");
+
+    assert!(running, "its other thread still runs: {stat}");
+    assert!(!process_exited, "it does not exit: {stat}");
+    assert!(group_running, "its group has a running member: {stat}");
+    assert!(!group_exited, "its group does not exit: {stat}");
 }
 
 #[tokio::test]
@@ -299,7 +452,7 @@ async fn a_graceful_exit_does_not_leave_the_grandchild_running() {
         "node and its grandchild both run inside the guard's job: {:?}",
         fake.guard.active_processes()
     );
-    assert!(grandchild.alive());
+    assert!(grandchild.running());
     let grace = Duration::from_millis(500);
 
     let exit = graceful_then_kill(fake.child, fake.stdin, fake.guard, grace).await;
@@ -309,7 +462,7 @@ async fn a_graceful_exit_does_not_leave_the_grandchild_running() {
         "node itself honored the shutdown line: {exit:?}"
     );
     assert!(
-        !grandchild.alive(),
+        grandchild.exited().await,
         "the grandchild node left behind was killed: {exit:?}"
     );
     assert_eq!(
@@ -324,7 +477,10 @@ async fn a_graceful_exit_does_not_leave_the_grandchild_running() {
             "the grandchild got the rest of the grace period to exit by itself: {exit:?}"
         );
         let pgid = pgid.expect("the sidecar ran in its own process group");
-        assert!(!process_group_exists(pgid), "no group member survives");
+        assert!(
+            ProcessGroupProbe::new(pgid).exited().await,
+            "no group member survives"
+        );
     }
 }
 
@@ -353,7 +509,7 @@ async fn an_abnormal_exit_is_not_graceful_and_the_tree_is_killed_at_once() {
     let record = dir.path().join("record.txt");
     let fake = spawn_fake(FAKE_CRASHES_LEAVING_GRANDCHILD, &record).await;
     let grandchild = ProcessProbe::open(grandchild_pid(&fake.ready));
-    assert!(grandchild.alive());
+    assert!(grandchild.running());
 
     let exit = graceful_then_kill(fake.child, fake.stdin, fake.guard, SIDECAR_GRACEFUL_EXIT).await;
 
@@ -371,7 +527,10 @@ async fn an_abnormal_exit_is_not_graceful_and_the_tree_is_killed_at_once() {
         exit.elapsed < SIDECAR_GRACEFUL_EXIT / 2,
         "the orphaned tree did not get the rest of the grace period: {exit:?}"
     );
-    assert!(!grandchild.alive(), "the grandchild was killed: {exit:?}");
+    assert!(
+        grandchild.exited().await,
+        "the grandchild was killed: {exit:?}"
+    );
     assert_eq!(exit.tree, TreeConfirmation::Confirmed, "{exit:?}");
 }
 
@@ -391,7 +550,7 @@ async fn terminating_the_guard_empties_the_job() {
     assert_eq!(confirmation, TreeConfirmation::Confirmed);
     assert_eq!(fake.guard.active_processes(), Some(0), "the job is empty");
     assert!(
-        !grandchild.alive(),
+        grandchild.exited().await,
         "the grandchild was in the job and died"
     );
 }
@@ -423,25 +582,6 @@ async fn dropping_the_guard_kills_the_job_tree() {
 fn kernel_process_group(pid: u32) -> i32 {
     // SAFETY: getpgid only reads the process table.
     unsafe { libc::getpgid(pid as i32) }
-}
-
-/// Whether `pid` is gone, waiting up to five seconds for whoever adopted it to
-/// reap it (a killed orphan is briefly a zombie, which `kill(pid, 0)` still
-/// finds).
-#[cfg(unix)]
-async fn process_gone_within_five_seconds(pid: u32) -> bool {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        // SAFETY: signal 0 only probes for existence.
-        let result = unsafe { libc::kill(pid as i32, 0) };
-        if result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-            return true;
-        }
-        if std::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
 }
 
 #[cfg(unix)]
@@ -476,16 +616,18 @@ async fn terminating_the_guard_kills_every_member_of_the_process_group() {
         "the background member is in the child's group"
     );
     assert_eq!(guard.process_group(), Some(leader as i32));
+    let member = ProcessProbe::open(member);
+    assert!(member.running());
 
     let confirmation = guard.terminate(&mut child).await;
 
     assert_eq!(confirmation, TreeConfirmation::Confirmed);
     assert!(
-        process_gone_within_five_seconds(member).await,
+        member.exited().await,
         "the background member of the group was killed"
     );
     assert!(
-        !process_group_exists(leader as i32),
+        ProcessGroupProbe::new(leader as i32).exited().await,
         "no group member survives"
     );
 }
@@ -517,14 +659,10 @@ async fn dropping_the_guard_kills_the_process_group() {
         Some(9),
         "the drop sent SIGKILL: {status:?}"
     );
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while process_group_exists(pgid) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the background member of the group survived the drop"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    assert!(
+        ProcessGroupProbe::new(pgid).exited().await,
+        "the background member of the group survived the drop"
+    );
 }
 
 /// The session sidecar for the `FreshClaudeState` stop test: it answers
@@ -653,7 +791,7 @@ async fn a_session_stop_confirms_the_whole_sidecar_tree_gone() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
     let grandchild = ProcessProbe::open(grandchild_pid);
-    assert!(grandchild.alive());
+    assert!(grandchild.running());
 
     state.shutdown().await;
     std::env::remove_var("CLAUDE_CONFIG_DIR");
@@ -666,7 +804,7 @@ async fn a_session_stop_confirms_the_whole_sidecar_tree_gone() {
         "{logged:?}"
     );
     assert!(
-        !grandchild.alive(),
+        grandchild.exited().await,
         "the grandchild the sidecar left behind was killed"
     );
 }
