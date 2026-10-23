@@ -181,7 +181,12 @@ fn write_raw_document(dir: &Path, document: &StoredDocument) {
 }
 
 /// Bypass helper writing EXACT raw bytes (restore fixtures) UNDER the
-/// sidecar lock, mirroring the strict path's discipline.
+/// sidecar lock, mirroring the strict path's discipline: like every real
+/// writer it replaces the document (sibling temp + rename), so the file is a
+/// new inode and the stamp peek of name-reliability Task 11 sees the change
+/// at once. An in-place same-length rewrite inside one coarse mtime tick is
+/// the case the peek's periodic full check bounds instead
+/// (`stale_stamp_window_is_bounded_by_the_periodic_full_check`).
 fn write_raw_document_bytes(dir: &Path, bytes: &[u8]) {
     let lock = open_lock_file(&dir.join(LOCK_FILE_NAME)).expect("open lock for raw write");
     // Mirror `acquire_document_lock`'s bounded-retry discipline — a bare
@@ -203,7 +208,9 @@ fn write_raw_document_bytes(dir: &Path, bytes: &[u8]) {
             Err(error) => panic!("lock for raw write: {error}"),
         }
     }
-    std::fs::write(dir.join(DOCUMENT_FILE_NAME), bytes).expect("write raw document");
+    let staged = dir.join(".session-names.raw-fixture.tmp");
+    std::fs::write(&staged, bytes).expect("write raw document");
+    std::fs::rename(&staged, dir.join(DOCUMENT_FILE_NAME)).expect("install raw document");
 }
 
 /// The contract rank order (independent of the implementation's helper).
@@ -1628,7 +1635,13 @@ async fn locally_delayed_publication_cannot_revert_newer_state() {
 
     let bytes = serialize_document(&stale.document).expect("serialize stale doc");
     let digest = digest_bytes(&bytes);
-    let adopted = adopt_if_newer(&store.core, stale.document.clone(), digest, true);
+    let adopted = adopt_if_newer(
+        &store.core,
+        stale.document.clone(),
+        digest,
+        stale.stamp,
+        true,
+    );
     assert!(!adopted, "a stale projection cannot overwrite newer state");
     assert!(
         subscriber.try_recv().is_err(),

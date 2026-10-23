@@ -1392,13 +1392,15 @@ async fn main() -> ExitCode {
         fresh_opencode_state.set_session_naming(names.clone());
 
         // The 2s adoption/reconcile tick: (1) adopt a same-home cooperating
-        // process's committed generation (CLI/MCP writes) — the strict
-        // full-document re-read under the lock, never an mtime shortcut;
-        // (2) bind still-pending handles whose durability has since become
-        // verifiable. Claude: the transcript locator (the signal-first and
-        // zero-turn create lanes bind as soon as the transcript exists).
-        // Codex/opencode: their runtime edges (the rollout walk / the DB
-        // row) own the verified binds — the tick never fabricates one.
+        // process's committed generation — a stat of the document against
+        // the adopted stamp, and the strict locked full read only when the
+        // stamp changed or its 30 s full-check window elapsed
+        // (name-reliability Task 11); (2) bind still-pending handles whose
+        // durability has since become verifiable. Claude: the transcript
+        // locator (the signal-first and zero-turn create lanes bind as soon
+        // as the transcript exists). Codex/opencode: their runtime edges
+        // (the rollout walk / the DB row) own the verified binds — the tick
+        // never fabricates one.
         {
             let names = names.clone();
             let identity = terminal_identity.clone();
@@ -1408,10 +1410,10 @@ async fn main() -> ExitCode {
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     tick.tick().await;
-                    if let Err(error) = names.refresh_current().await {
+                    if let Err(error) = names.adopt_external_if_changed().await {
                         tracing::warn!(
                             target: "freshell_server::session_names",
-                            op = "refresh_current",
+                            op = "adopt_external_if_changed",
                             name_ref = "-",
                             revision = 0,
                             class = %error.code(),

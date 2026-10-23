@@ -54,40 +54,126 @@ export function sessionNameKey(provider: string, sessionId: string): string {
   return JSON.stringify(['session', provider, sessionId])
 }
 
-/** Write the name document. The one-time legacy consolidation is marked
- * complete (a machine past its first post-migration boot), so the boot
- * runs no import over the seeded records. */
-export async function writeSessionNamesDocument(homeDir: string, records: SeedNameRecord[]): Promise<void> {
-  const freshellDir = path.join(homeDir, '.freshell')
-  await fs.mkdir(freshellDir, { recursive: true })
-  const now = Date.now()
-  let revision = 0
-  const out: Record<string, unknown> = {}
-  const generation: Record<string, unknown> = {}
-  for (const record of records) {
-    revision += 1
-    const key = sessionNameKey(record.provider, record.sessionId)
-    out[key] = {
-      ref: { kind: 'session', provider: record.provider, sessionId: record.sessionId },
-      name: record.name,
-      source: record.source,
-      revision,
-      ...(record.source === 'manual' ? { manualRevision: revision, renamedAt: now } : {}),
-    }
-    if (record.restingGenerationInput !== undefined) {
-      generation[key] = restingSeries(record.restingGenerationInput)
-    }
+interface SeededNameDocument {
+  version: 1
+  documentGeneration: number
+  nextRevision: number
+  records: Record<string, unknown>
+  redirects: Record<string, unknown>
+  generation: Record<string, unknown>
+  migration: {
+    completed: boolean
+    acknowledgedCandidateIds?: string[]
+    winningEvidence?: Record<string, unknown>
   }
-  const document = {
+}
+
+/** A document whose one-time legacy consolidation is marked complete (a
+ * machine past its first post-migration boot), so the boot runs no import
+ * over the seeded records. */
+function emptyNameDocument(): SeededNameDocument {
+  return {
     version: 1,
     documentGeneration: 1,
-    nextRevision: revision + 1,
-    records: out,
+    nextRevision: 1,
+    records: {},
     redirects: {},
-    generation,
+    generation: {},
     migration: { completed: true },
   }
-  await fs.writeFile(path.join(freshellDir, 'session-names.json'), JSON.stringify(document, null, 2))
+}
+
+/** Add `record` at the document's next revision; returns its key and
+ * revision. */
+function addRecord(document: SeededNameDocument, record: SeedNameRecord, now: number): { key: string; revision: number } {
+  const revision = document.nextRevision
+  document.nextRevision += 1
+  const key = sessionNameKey(record.provider, record.sessionId)
+  document.records[key] = {
+    ref: { kind: 'session', provider: record.provider, sessionId: record.sessionId },
+    name: record.name,
+    source: record.source,
+    revision,
+    ...(record.source === 'manual' ? { manualRevision: revision, renamedAt: now } : {}),
+  }
+  if (record.restingGenerationInput !== undefined) {
+    document.generation[key] = restingSeries(record.restingGenerationInput)
+  }
+  return { key, revision }
+}
+
+async function writeNameDocument(homeDir: string, serialized: string): Promise<void> {
+  const freshellDir = path.join(homeDir, '.freshell')
+  await fs.mkdir(freshellDir, { recursive: true })
+  await fs.writeFile(path.join(freshellDir, 'session-names.json'), serialized)
+}
+
+/** Write the name document holding exactly `records`. */
+export async function writeSessionNamesDocument(homeDir: string, records: SeedNameRecord[]): Promise<void> {
+  const document = emptyNameDocument()
+  const now = Date.now()
+  for (const record of records) addRecord(document, record, now)
+  await writeNameDocument(homeDir, JSON.stringify(document, null, 2))
+}
+
+/** Name-reliability Task 11 (RC9): the live machine's name document when
+ * name reads were slow and failed — 5,000 records, 1,200 never-attempted
+ * (idle) AI-naming series each holding a 1.5 KB first-message excerpt, and
+ * 1,600 acknowledged migration candidate ids with their winning evidence;
+ * at least 4.5 MB in all. */
+export const LIVE_SIZE_NAME_DOCUMENT = {
+  records: 5_000,
+  idleSeries: 1_200,
+  excerptChars: 1_536,
+  acknowledgedIds: 1_600,
+  minBytes: 4_500_000,
+} as const
+
+/** Write a live-size name document: `records` (the sessions a spec uses)
+ * plus synthetic sessions that no provider index knows, filling it to the
+ * {@link LIVE_SIZE_NAME_DOCUMENT} shape. Written compactly, the way the
+ * store writes it. Returns the document's size in bytes. */
+export async function writeSessionNamesLoadDocument(homeDir: string, records: SeedNameRecord[]): Promise<number> {
+  const shape = LIVE_SIZE_NAME_DOCUMENT
+  const document = emptyNameDocument()
+  const now = Date.now()
+  for (const record of records) addRecord(document, record, now)
+  const acknowledged: string[] = []
+  const evidence: Record<string, unknown> = {}
+  for (let i = 0; i < shape.records - records.length; i += 1) {
+    const n = String(i).padStart(4, '0')
+    const name = `Investigate the importer regression number ${n} in the build pipeline`
+    const { key, revision } = addRecord(document, {
+      provider: 'claude',
+      sessionId: `5e55${n}-0000-4000-8000-00000000${n}`,
+      name,
+      source: 'first_message',
+      ...(i < shape.idleSeries
+        ? { restingGenerationInput: `First message ${n}: `.padEnd(shape.excerptChars, 'x') }
+        : {}),
+    }, now)
+    if (i < shape.acknowledgedIds) {
+      const candidateId = `import-${n}-0000-4000-8000-000000000000:freshell.layout.v3.window-${n}:tab-${n}-0000-4000-8000-000000000000:pane-${n}-0000-4000-8000-000000000000:title`
+      acknowledged.push(candidateId)
+      evidence[key] = {
+        candidateId,
+        name,
+        source: 'first_message',
+        scope: 'session',
+        evidenceKey: `freshell.layout.v3.window-${n}-0000-4000-8000-000000000000`,
+        installedRevision: revision,
+      }
+    }
+  }
+  document.migration.acknowledgedCandidateIds = acknowledged
+  document.migration.winningEvidence = evidence
+  const serialized = JSON.stringify(document)
+  const bytes = Buffer.byteLength(serialized)
+  if (bytes < shape.minBytes) {
+    throw new Error(`the live-size name document is ${bytes} bytes, below ${shape.minBytes}`)
+  }
+  await writeNameDocument(homeDir, serialized)
+  return bytes
 }
 
 /** Real Claude Code project dir name: every non-alphanumeric rune → '-'. */

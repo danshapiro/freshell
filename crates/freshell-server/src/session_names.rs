@@ -41,6 +41,12 @@
 //! Neither settings dirty-merging nor a process mutex is sufficient — two
 //! real processes serialize through the file lock alone.
 //!
+//! Name reads take no lock (name-reliability Task 11,
+//! `session_name_store_view`): they answer from the adopted view after a
+//! stat of the document against the stamp the view was adopted from; only
+//! a changed stamp (or an elapsed 30 s full-check window) runs the locked
+//! full-read adoption above, and a busy lock never makes a read wait.
+//!
 //! Task 2 constructs this store in `main.rs`; Tasks 3–4 consume
 //! [`SessionNames::try_background_guard`] for the serial worker.
 
@@ -107,8 +113,13 @@ mod session_name_first_message;
 // exhaustion).
 #[path = "session_name_generation_series.rs"]
 mod session_name_generation_series;
+// Name-reliability Task 11: lock-free name reads served from the adopted
+// view, and the cheap cross-process stamp peek.
+#[path = "session_name_store_view.rs"]
+mod session_name_store_view;
 use session_name_apply::{indexed_key, replace_automatic, replace_heal, wire_source, with_outcome};
 use session_name_first_message::{first_message_fallback, RefusalSite, SeriesPlan};
+use session_name_store_view::{DocumentStamp, FullCheck};
 use session_name_sweep_batch::StagedNativeBaselines;
 pub(crate) use session_name_sweep_batch::{
     SweepMaintenanceItem, SweepMaintenanceQueue, SweepMaintenanceReport, SweepWork,
@@ -569,10 +580,13 @@ struct TxnMeta {
 }
 
 /// The adopted read model: the parsed document plus a digest of the exact
-/// bytes it was adopted from (equal-generation-different-content detection).
+/// bytes it was adopted from (equal-generation-different-content detection)
+/// and the stamp of the file they came from (name-reliability Task 11: the
+/// lock-free reads' cross-process peek; `None` until stamped).
 struct Adopted {
     document: StoredDocument,
     digest: [u8; 32],
+    stamp: Option<DocumentStamp>,
 }
 
 struct NamesCore {
@@ -585,6 +599,9 @@ struct NamesCore {
     /// here (FIFO) before contending for the cross-process sidecar lock.
     local_turn: Arc<tokio::sync::Mutex<()>>,
     view: RwLock<Arc<Adopted>>,
+    /// Name-reliability Task 11: when the view was last confirmed against
+    /// the whole document (bounds how long an equal stamp is trusted).
+    full_check: FullCheck,
     tx: broadcast::Sender<SessionNameUpdate>,
     /// Name-reliability Task 4: native baselines observed but not yet
     /// persisted (the sweep maintenance batch persists them).
@@ -600,9 +617,15 @@ impl NamesCore {
         self.view.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
-    fn set_view(&self, document: StoredDocument, digest: [u8; 32]) {
-        *self.view.write().unwrap_or_else(|p| p.into_inner()) =
-            Arc::new(Adopted { document, digest })
+    /// Install the view the whole document was just read or written as
+    /// (always under the document lock), which also confirms it.
+    fn set_view(&self, document: StoredDocument, digest: [u8; 32], stamp: Option<DocumentStamp>) {
+        *self.view.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(Adopted {
+            document,
+            digest,
+            stamp,
+        });
+        self.full_check.mark();
     }
 
     fn publish(&self, updates: Vec<SessionNameUpdate>) {
@@ -699,7 +722,9 @@ impl SessionNames {
             view: RwLock::new(Arc::new(Adopted {
                 document: StoredDocument::initial(),
                 digest: [0; 32],
+                stamp: None,
             })),
+            full_check: FullCheck::default(),
             tx,
             staged_baselines: Arc::new(StagedNativeBaselines::default()),
         });
@@ -763,12 +788,13 @@ impl SessionNames {
         }))
     }
 
-    /// The common full-document adoption path before all name-dependent
-    /// reads and reconnect snapshots: re-read the entire document under the
-    /// lock (never an mtime shortcut), reconcile an unfamiliar generation's
-    /// durability, adopt it, and publish the delta to subscribers. Returns
-    /// every record as updates (bootstrap/snapshot shape: each carries the
-    /// full redirect list).
+    /// The unconditional full-document adoption: re-read the entire
+    /// document under the lock (no stamp shortcut), reconcile an unfamiliar
+    /// generation's durability, adopt it, and publish the delta to
+    /// subscribers. Returns every record as updates (bootstrap/snapshot
+    /// shape: each carries the full redirect list). The publisher's lag
+    /// recovery uses it; name reads and the 2 s tick use the cheap stamp
+    /// peek instead (`session_name_store_view`, name-reliability Task 11).
     pub(crate) fn refresh_current(&self) -> NameFuture<Vec<SessionNameUpdate>> {
         let core = Arc::clone(&self.core);
         Box::pin(spawn_txn(core, move |doc, _meta| {
@@ -1399,22 +1425,14 @@ impl SessionNames {
 }
 
 impl SessionNaming for SessionNames {
+    /// Name-reliability Task 11: served from the adopted view after the
+    /// stamp peek — no document lock, no re-parse while nothing changed
+    /// (`session_name_store_view`).
     fn get(&self, refs: Vec<SessionNameRef>) -> NameFuture<Vec<SessionNameUpdate>> {
-        let core = Arc::clone(&self.core);
-        Box::pin(spawn_txn(core, move |doc, _meta| {
-            let mut updates = Vec::new();
-            for target in &refs {
-                let (resolved, traversed) = doc.resolve_ref(target);
-                let key = name_ref_key(&resolved);
-                if let Some(mut update) = update_for_key(doc, &key, false, RedirectScope::None) {
-                    if let Some(redirect) = traversed {
-                        update.redirects.push(redirect);
-                    }
-                    updates.push(update);
-                }
-            }
-            Ok(Decision::Read(updates))
-        }))
+        Box::pin(session_name_store_view::read_names(
+            Arc::clone(&self.core),
+            refs,
+        ))
     }
 
     fn ensure_pending(&self, input: PendingNameInput) -> NameFuture<SessionNameUpdate> {
@@ -1688,15 +1706,25 @@ fn run_txn_sync<T, F>(core: &NamesCore, _turn: &LocalTurn, f: F) -> Result<T, Na
 where
     F: FnOnce(&mut StoredDocument, &TxnMeta) -> Result<Decision<T>, NameError>,
 {
-    let _guard = acquire_document_lock(&core.lock_path)?;
+    let guard = acquire_document_lock(&core.lock_path)?;
+    run_txn_locked(core, guard, f)
+}
+
+/// The transaction body, run while `_guard` holds the document lock (the
+/// reads' single-attempt adoption acquires its own guard,
+/// `session_name_store_view`).
+fn run_txn_locked<T, F>(core: &NamesCore, _guard: std::fs::File, f: F) -> Result<T, NameError>
+where
+    F: FnOnce(&mut StoredDocument, &TxnMeta) -> Result<Decision<T>, NameError>,
+{
     count_store_transaction_for_test(&core.data_dir);
     test_hold_once(&core.data_dir);
 
-    let raw = std::fs::read(&core.doc_path);
-    let (mut document, raw_digest, first_init) = match raw {
-        Ok(bytes) => {
+    let raw = session_name_store_view::read_with_stamp(&core.doc_path);
+    let (mut document, raw_digest, raw_stamp, first_init) = match raw {
+        Ok((bytes, stamp)) => {
             let digest = digest_bytes(&bytes);
-            (parse_document(&bytes)?, digest, false)
+            (parse_document(&bytes)?, digest, Some(stamp), false)
         }
         Err(e) if e.kind() == ErrorKind::NotFound => {
             // A missing document is initialization ONLY for a store with no
@@ -1711,7 +1739,7 @@ where
                         .into(),
                 ));
             }
-            (StoredDocument::initial(), [0u8; 32], true)
+            (StoredDocument::initial(), [0u8; 32], None, true)
         }
         Err(e) => {
             return Err(NameError::Persistence(format!(
@@ -1761,7 +1789,10 @@ where
             // A staged baseline another participant already persisted (or
             // whose record is gone) is no longer pending work.
             core.staged_baselines.prune_persisted(&document);
-            adopt_if_newer(core, document, raw_digest, true);
+            if !adopt_if_newer(core, document, raw_digest, raw_stamp, true) {
+                // The file still holds the adopted generation.
+                session_name_store_view::confirm_view(core, raw_stamp);
+            }
             Ok(value)
         }
         Decision::Write { value, publish } => {
@@ -1809,7 +1840,10 @@ fn write_durable(
             "injected post-replace failure: the replacement may not be durable".into(),
         ));
     }
-    core.set_view(document.clone(), digest);
+    // Still under the lock, so the stamp is the file just written (a failed
+    // stat leaves the view unstamped: the next peek re-reads).
+    let stamp = session_name_store_view::stat_stamp(&core.doc_path).ok();
+    core.set_view(document.clone(), digest, stamp);
     Ok(())
 }
 
@@ -1820,6 +1854,7 @@ fn adopt_if_newer(
     core: &NamesCore,
     document: StoredDocument,
     digest: [u8; 32],
+    stamp: Option<DocumentStamp>,
     publish_delta: bool,
 ) -> bool {
     let prior = core.current_view();
@@ -1827,7 +1862,7 @@ fn adopt_if_newer(
         return false;
     }
     let delta = delta_updates(&prior.document, &document);
-    core.set_view(document, digest);
+    core.set_view(document, digest, stamp);
     if publish_delta {
         core.publish(delta);
     }
@@ -2105,6 +2140,10 @@ pub(crate) enum TestHook {
     /// advance virtual time without sleeping. Data-dir-keyed like every
     /// other hook, so parallel tests never cross-contaminate.
     ClockOffsetMs(i64),
+    /// Name-reliability Task 11: shorten (or lengthen) the stamp peek's
+    /// periodic full-check interval for the data dir. Persists until
+    /// cleared, like the clock offset.
+    FullCheckIntervalMs(u64),
 }
 
 /// Readiness sentinel written by `HoldLock` hooks while the document lock is

@@ -1494,6 +1494,42 @@ async fn read_route_chunks_and_omits_unknown_refs() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// Name-reliability Task 11 (RC9): the read route answers from the adopted
+/// view — it runs no `refresh_current` full-document rebuild and no locked
+/// read, so a page reload burst never queues on the document lock.
+#[tokio::test]
+async fn read_route_does_not_call_refresh_current() {
+    let home = temp_home();
+    let state = names_state(&home);
+    admit_pending(
+        &state.names,
+        "handle-tally",
+        NamedProvider::Claude,
+        Some("/w"),
+    )
+    .await;
+    let data_dir = std::fs::canonicalize(home.join(".freshell")).unwrap();
+    let before = crate::session_names::test_store_transaction_count(&data_dir);
+
+    let (status, body) = post_read(
+        super::router(state.clone()),
+        json!([{ "kind": "pending", "id": "handle-tally" }]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["names"].as_array().unwrap().len(),
+        1,
+        "the read resolves the record: {body}"
+    );
+    assert_eq!(
+        crate::session_names::test_store_transaction_count(&data_dir),
+        before,
+        "the read route took no store transaction"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// A session whose identity was verified under one native location and is
 /// then verified under a NEW location (same provider/session — a supported
 /// relocation) RETAINS its name; a non-target session's record is untouched.
