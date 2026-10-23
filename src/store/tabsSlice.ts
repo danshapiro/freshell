@@ -420,9 +420,10 @@ export const tabsSlice = createSlice({
      * Name reliability (Task 7, D2): the saved-name tab title mirror's only
      * write — `{tabId: title}` for session-owned tabs (the saved name, or the
      * unnamed placeholder when the tab's naming session changed to one
-     * without a saved name). It sets the stored title and nothing else: a
-     * display mirror never bumps `updatedAt` (tab recency) and never sets
-     * `titleSetByUser`.
+     * without a saved name), and the unnamed placeholder for a tab that just
+     * stopped taking its name from a session. It sets the stored title and
+     * nothing else: a display mirror never bumps `updatedAt` (tab recency)
+     * and never sets `titleSetByUser`.
      */
     mirrorSessionTabTitles: (state, action: PayloadAction<Record<string, string>>) => {
       for (const tab of state.tabs) {
