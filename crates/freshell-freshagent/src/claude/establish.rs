@@ -163,6 +163,8 @@ pub(super) struct EstablishPlan<'a> {
 
 /// A runtime that is registered and committed.
 pub(super) struct Established {
+    /// Captured from this launch, never looked up after publication awaits.
+    pub(super) ownership_id: String,
     /// The sessions-map key (the minted id, or the attaching pane's id).
     pub(super) map_key: String,
     /// The create's naming projection (the pending handle's record).
@@ -806,7 +808,7 @@ impl FreshClaudeState {
                     stdin,
                     child,
                     tree_guard,
-                    ownership_id,
+                    ownership_id: ownership_id.clone(),
                     consumer,
                     sidecar_session_id: minted,
                     cli_session_id: durable.clone(),
@@ -998,6 +1000,7 @@ impl FreshClaudeState {
         }
 
         Ok(Established {
+            ownership_id,
             map_key,
             naming_projection,
             sidecar_pid,

@@ -491,6 +491,8 @@ impl AliasTombstones {
 struct ClaudeCreateRecord {
     session_id: String,
     session_ref: Option<freshell_protocol::SessionLocator>,
+    cleanup_ownership_id: Option<String>,
+    cleanup_destination: Option<(String, String)>,
 }
 
 /// The `sessionRef` of the claude conversation `session_id`.
@@ -1982,6 +1984,11 @@ impl FreshClaudeState {
     ) -> ClaudeCreateOutcome {
         let request_id = msg.request_id.clone();
         let session_type = session_type_str(msg.session_type);
+        let cleanup_destination = msg
+            .tab_id
+            .clone()
+            .zip(msg.pane_id.clone())
+            .filter(|(tab, pane)| !tab.is_empty() && !pane.is_empty());
 
         // Dedup by requestId (parity gap fix -- see [`crate::FreshAgentCreateDedup`]'s
         // doc and [`Self::create_dedup`]'s field doc). Held for the whole creation
@@ -2008,6 +2015,13 @@ impl FreshClaudeState {
                 return ClaudeCreateOutcome::Created {
                     session_id: cached.session_id,
                     session_ref: cached.session_ref,
+                    cleanup_ownership_id: if cached.cleanup_destination.is_some()
+                        && cached.cleanup_destination == cleanup_destination
+                    {
+                        cached.cleanup_ownership_id
+                    } else {
+                        None
+                    },
                 };
             }
             FreshAgentCreateOutcome::Proceed(guard) => guard,
@@ -2387,6 +2401,7 @@ impl FreshClaudeState {
             }
         };
         let created = established.map_key;
+        let cleanup_ownership_id = Some(established.ownership_id);
         let naming_projection = established.naming_projection;
 
         // Cache the completed create for requestId dedup BEFORE responding (mirrors
@@ -2404,6 +2419,8 @@ impl FreshClaudeState {
                 ClaudeCreateRecord {
                     session_id: created.clone(),
                     session_ref: session_ref.clone(),
+                    cleanup_ownership_id: cleanup_ownership_id.clone(),
+                    cleanup_destination,
                 },
             )
             .await;
@@ -2431,6 +2448,7 @@ impl FreshClaudeState {
         ClaudeCreateOutcome::Created {
             session_id: created,
             session_ref,
+            cleanup_ownership_id,
         }
     }
 
@@ -2503,6 +2521,8 @@ impl FreshClaudeState {
                 ClaudeCreateRecord {
                     session_id: durable.to_string(),
                     session_ref: Some(claude_session_ref(durable)),
+                    cleanup_ownership_id: None,
+                    cleanup_destination: None,
                 },
             )
             .await;
@@ -2534,6 +2554,7 @@ impl FreshClaudeState {
         ClaudeCreateOutcome::Created {
             session_id: durable.to_string(),
             session_ref: Some(claude_session_ref(durable)),
+            cleanup_ownership_id: None,
         }
     }
 
@@ -8266,6 +8287,7 @@ pub(crate) mod tests {
 
     mod control_tests;
     mod create_binding_tests;
+    mod create_cleanup_tests;
     mod deadman_tests;
     mod recovery_stop_tests;
     mod recovery_tests;
@@ -11200,6 +11222,11 @@ rl.on('line', (line) => {
         assert_eq!(
             fresh,
             ClaudeCreateOutcome::Created {
+                cleanup_ownership_id: Some(
+                    st.sessions.lock().await[frame["sessionId"].as_str().unwrap()]
+                        .ownership_id
+                        .clone()
+                ),
                 session_id: frame["sessionId"].as_str().unwrap().to_string(),
                 session_ref: Some(claude_session_ref(frame["sessionId"].as_str().unwrap())),
             }
@@ -11213,6 +11240,11 @@ rl.on('line', (line) => {
         assert_eq!(
             resumed,
             ClaudeCreateOutcome::Created {
+                cleanup_ownership_id: Some(
+                    st.sessions.lock().await[frame["sessionId"].as_str().unwrap()]
+                        .ownership_id
+                        .clone()
+                ),
                 session_id: frame["sessionId"].as_str().unwrap().to_string(),
                 session_ref: Some(claude_session_ref(durable)),
             }
