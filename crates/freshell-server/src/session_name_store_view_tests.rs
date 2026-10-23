@@ -368,12 +368,83 @@ async fn a_changed_document_under_a_busy_lock_is_read_from_the_view() {
     );
 }
 
+/// The store's local turn (FIFO) serializes this store's own transactions,
+/// and a read is not one of them: while one of this store's own
+/// transactions holds the turn far longer than a read may wait, a read
+/// whose peek sees a changed document does not queue for the turn — it
+/// answers at once from the adopted view (`class = local_turn_busy`, before
+/// it even tries the document lock), and the next read after the commit
+/// answers the transaction's result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_never_queues_behind_this_stores_own_transaction() {
+    let dir = temp_dir();
+    let store = open(dir.path());
+    let target = pending("h-own-turn");
+    ensure(&store, "h-own-turn").await;
+    rename_user(&store, target.clone(), "Adopted name")
+        .await
+        .expect("rename");
+    // Another participant commits, so the read's peek sees a changed stamp
+    // and needs a full read.
+    let other = open(dir.path());
+    rename_user(&other, target.clone(), "Committed elsewhere")
+        .await
+        .expect("the other participant commits");
+
+    let data_dir = store.core.data_dir.clone();
+    set_test_hooks(&data_dir, vec![TestHook::HoldLock(1_500)]);
+    let slow = tokio::spawn({
+        let store = Arc::clone(&store);
+        let target = target.clone();
+        async move { rename_user(&store, target, "Own slow commit").await }
+    });
+    wait_for_lock_held_sentinel(&data_dir).await;
+
+    let busy_before = test_busy_read_count(&data_dir);
+    let (guard, events) = scoped_trace_capture(STORE_TARGET);
+    let started = Instant::now();
+    let read = store.get(vec![target.clone()]).await;
+    let elapsed = started.elapsed();
+    drop(guard);
+    let updates = read.expect("a read never fails behind this store's own transaction");
+    assert_eq!(
+        updates[0].record.name, "Adopted name",
+        "the read answered from the adopted view"
+    );
+    assert!(
+        elapsed < Duration::from_millis(50),
+        "the read did not queue for the local turn (took {elapsed:?})"
+    );
+    assert_eq!(
+        test_busy_read_count(&data_dir),
+        busy_before + 1,
+        "the read is counted as answered while a commit was in flight"
+    );
+    let events = events.snapshot();
+    let served = named(&events, "session_names.read_served_from_view");
+    assert_eq!(served.len(), 1, "one view answer: {events:#?}");
+    assert_eq!(
+        served[0].fields.get("class").map(String::as_str),
+        Some("local_turn_busy"),
+        "the read saw this store's own turn taken, not a busy lock: {events:#?}"
+    );
+
+    slow.await
+        .expect("the slow transaction joins")
+        .expect("the slow rename commits after its hold");
+    clear_test_hooks(&data_dir);
+    assert_eq!(
+        settled_name_of(&store, &target).await,
+        "Own slow commit",
+        "after the commit the next read answers its result"
+    );
+}
+
 /// A lock held only briefly does not make a read stale: the read waits the
-/// hold out and adopts the change. The common brief holder is not a
-/// participant at all: a child process forked anywhere in this process
-/// while a transaction held the lock keeps an inherited copy of that lock's
-/// descriptor until it execs (a few milliseconds at most). The test widens
-/// the read's wait so the 30 ms hold below is deterministic.
+/// hold out and adopts the change (another participant's momentary hold;
+/// a forked child no longer keeps an inherited copy, `HeldSidecarLock`).
+/// The test widens the read's wait so the 30 ms hold below is
+/// deterministic.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_read_waits_out_a_brief_lock_hold_and_adopts_the_change() {
     let dir = temp_dir();
