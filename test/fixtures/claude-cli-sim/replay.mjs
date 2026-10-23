@@ -33,6 +33,13 @@
 //   holdBeforeMs: { '<recorded uuid>': ms }  extra time before that message
 //                                            (a slow tool, so a test can look mid-turn),
 //   pace: n                                  multiply the recorded spacing (default 1),
+//   workspace: true                          the recorded file tools change the session's
+//                                            files as they did when recorded: each
+//                                            successful Write or Edit result writes the
+//                                            file it reports (Write's content, Edit's
+//                                            edit of the file it read) before the result
+//                                            is reported; only files inside the session's
+//                                            cwd are touched,
 // }
 // Times scale with FRESHELL_CLAUDE_SIM_TIME_SCALE like every simulated delay.
 // An interrupt during a replay is not modeled: it fails the stream loudly.
@@ -213,6 +220,33 @@ class LinePlayer {
   }
 }
 
+/**
+ * The file a replayed tool result reports writing, as { file, content }, or
+ * null: a successful Write (its content) or Edit (the file it read, edited).
+ * The message is already in the session's paths; a file outside the
+ * session's cwd is never touched.
+ */
+export function fileChangeOf(msg, cwd) {
+  if (msg.type !== 'user') return null
+  const result = msg.tool_use_result
+  if (!result || typeof result !== 'object' || typeof result.filePath !== 'string') return null
+  const blocks = Array.isArray(msg.message?.content) ? msg.message.content : []
+  if (blocks.some((block) => block?.type === 'tool_result' && block.is_error === true)) return null
+  let content
+  if ((result.type === 'create' || result.type === 'update') && typeof result.content === 'string') {
+    content = result.content
+  } else if (typeof result.originalFile === 'string' && typeof result.oldString === 'string' && typeof result.newString === 'string') {
+    content = result.replaceAll
+      ? result.originalFile.split(result.oldString).join(result.newString)
+      : result.originalFile.replace(result.oldString, () => result.newString)
+  } else {
+    return null
+  }
+  const inside = path.relative(cwd, result.filePath)
+  if (!inside || inside.startsWith('..') || path.isAbsolute(inside)) return null
+  return { file: result.filePath, content }
+}
+
 /** The tool_use ids a (recorded) assistant message starts. */
 const toolUseIdsOf = (msg) => (msg.type === 'assistant' && Array.isArray(msg.message?.content)
   ? msg.message.content.filter((block) => block?.type === 'tool_use').map((block) => block.id)
@@ -269,7 +303,16 @@ export async function replayTurn(cli, turn, data = {}) {
     if (cli.dead) return 'dead'
     // The Agent call starts its subagent: the CLI writes the meta file at spawn.
     for (const id of toolUseIdsOf(row.msg)) subagents.find((s) => s.subagent.toolUseId === id)?.writeMeta()
-    if (row.msg.type !== 'stream_event' || cli.partial) cli.emit(remap.json(row.text))
+    if (row.msg.type !== 'stream_event' || cli.partial) {
+      const message = remap.json(row.text)
+      // The CLI's file tool changes the file before it reports the result.
+      const change = data.workspace ? fileChangeOf(message, cli.cwd) : null
+      if (change) {
+        fs.mkdirSync(path.dirname(change.file), { recursive: true })
+        fs.writeFileSync(change.file, change.content)
+      }
+      cli.emit(message)
+    }
     const uuid = row.msg.uuid
     if (!uuid) continue
     if (main.has(uuid)) main.through(uuid)

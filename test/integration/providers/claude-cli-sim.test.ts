@@ -9,6 +9,7 @@
 
 import { spawn, type ChildProcess } from 'node:child_process'
 import { createHash } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -510,6 +511,45 @@ describe('Claude CLI simulator replay of a recorded real-CLI turn', () => {
     await s.until(() => results(s.messages).length === 1, 10_000)
     for (let i = 0; i < 100 && !(await subagentFile()).some(isToolResult); i += 1) await new Promise((resolve) => setTimeout(resolve, 20))
     expect((await subagentFile()).filter(isToolResult)).toHaveLength(1)
+  })
+
+  it('with `workspace`, each recorded Write and Edit changes the session\'s files before the CLI reports its result; without it, none', async () => {
+    const replayWith = (data: Record<string, unknown>) => program([{ on: 'msg:prompt', emit: [{ kind: 'replay', data: { recording: 'tools-sync', ...data } }] }])
+    const s = await open({ includePartialMessages: false }, replayWith({ workspace: true }))
+    // What the workspace held at the moment each tool result was reported.
+    const seen: Array<{ tool: string, a: string | null, b: string | null }> = []
+    const read = (name: string) => {
+      try { return readFileSync(path.join(s.home.cwd, name), 'utf8') } catch { return null }
+    }
+    const toolNames = new Map<string, string>()
+    const record = () => {
+      const message = s.messages.at(-1)
+      if (message?.type === 'assistant') {
+        for (const block of message.message.content) if (block.type === 'tool_use') toolNames.set(block.id, block.name)
+      }
+      if (message?.type !== 'user' || message.parent_tool_use_id) return
+      const result = Array.isArray(message.message.content) ? message.message.content.find((b: any) => b.type === 'tool_result') : undefined
+      if (result) seen.push({ tool: toolNames.get(result.tool_use_id) ?? 'unknown', a: read('a.txt'), b: read('b.txt') })
+    }
+    const done = s.until(() => {
+      record()
+      return results(s.messages).length === 1
+    })
+    s.prompt.push('GO write then edit then delegate')
+    await done
+
+    expect(seen.map((row) => row.tool)).toEqual(['Write', 'Edit', 'Edit', 'Read', 'Edit', 'Agent'])
+    // Write created a.txt; the first Edit changed it; the failed Edit changed nothing.
+    expect(seen[0]).toMatchObject({ a: 'one\n', b: null })
+    expect(seen[1]).toMatchObject({ a: 'two\n', b: null })
+    expect(seen[2]).toMatchObject({ a: 'two\n', b: null })
+    // The Edit of b.txt writes the file the recording read, edited.
+    expect(seen[4]).toMatchObject({ a: 'two\n', b: 'alpha\nbeta\ngamma\n' })
+
+    const plain = await open({ includePartialMessages: false }, replayWith({}))
+    plain.prompt.push('GO write then edit then delegate')
+    await plain.until(() => results(plain.messages).length === 1)
+    expect(await fs.readdir(plain.home.cwd)).toEqual([])
   })
 })
 
