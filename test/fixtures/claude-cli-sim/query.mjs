@@ -122,6 +122,7 @@ function markerSteps(text) {
     case 'slow': return [{ kind: 'text', data: { chunks: marker.chunks, delayMs: marker.delayMs } }]
     case 'tool': return [{ kind: 'tool', data: { name: 'Bash', input: { command: marker.command, description: 'local provider command', ...(marker.timeoutMs ? { timeout: marker.timeoutMs } : {}) }, seconds: marker.seconds } }]
     case 'api_error': return [{ kind: 'api_error', data: { status: marker.status } }]
+    case 'retry': return [{ kind: 'api_retry', data: { status: marker.status, attempts: marker.attempts } }, { kind: 'text', data: { text: 'ok' } }]
     case 'hang': return [{ kind: 'hang', data: {} }]
     case 'mcp_hang': return [{ kind: 'tool', data: { name: HANG_MCP_QUALIFIED_TOOL, input: {}, hang: true } }]
     case 'agent_async': return [{ kind: 'agent', data: {} }]
@@ -581,14 +582,21 @@ class SimulatedCli {
     await this.sleep(T.initToStatus)
     this.emit({ type: 'system', subtype: 'status', status: 'requesting' })
     turn.requests = 1
+    const scripted = this.program.match('msg', { type: 'prompt', text: cmd.text, uuid: cmd.uuid })
+    if (scripted) for (const emission of scripted) this.ledger('emission', { kind: emission.kind, data: emission.data })
+    const steps = [...(scripted ?? markerSteps(cmd.text))]
+    // A first request that fails is retried before the CLI replays the
+    // prompt: the replay follows the request that is answered (conformance
+    // scenario `retry`).
+    if (steps[0]?.kind === 'api_retry') {
+      if (await this.apiRetries(turn, steps.shift().data)) return this.abortBeforeContent(turn)
+    }
     await this.sleep(T.requestLatency)
     const uuid = cmd.uuid ?? randomUUID()
     this.emit({ type: 'user', message: { role: 'user', content: cmd.content }, parent_tool_use_id: null, uuid, timestamp: new Date().toISOString(), isReplay: true })
     this.transcript.appendPrompt({ uuid, content: cmd.content, permissionMode: this.permissionMode })
-    const scripted = this.program.match('msg', { type: 'prompt', text: cmd.text, uuid: cmd.uuid })
-    if (scripted) for (const emission of scripted) this.ledger('emission', { kind: emission.kind, data: emission.data })
     this.modelTurnsSinceCompact += 1
-    await this.respond(turn, scripted ?? markerSteps(cmd.text))
+    await this.respond(turn, steps)
   }
 
   /** A turn the CLI starts by itself: a background task finished (T19). */
@@ -816,8 +824,8 @@ class SimulatedCli {
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       const delay = Math.min(500 * 2 ** (attempt - 1), 32_000)
       this.emit({ type: 'system', subtype: 'api_retry', attempt, max_retries: 10, retry_delay_ms: delay, error_status: status, error: apiErrorKind(status) })
+      // A retried request is the same request: num_turns does not grow.
       if (await this.wait(delay, turn)) return true
-      turn.requests += 1
     }
     return false
   }

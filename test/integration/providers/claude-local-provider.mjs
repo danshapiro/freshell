@@ -269,6 +269,8 @@ function streamBlocks(send, blocks, { chunk = 8, nextToolId }) {
  */
 export async function startLocalProvider({ replyText = 'ok', respond } = {}) {
   const requests = []
+  /** RETRY:<status>x<n> prompts: how many times each prompt's request has failed so far. */
+  const retryFailures = new Map()
   const hung = new Set()
   let toolSeq = 0
 
@@ -319,6 +321,15 @@ export async function startLocalProvider({ replyText = 'ok', respond } = {}) {
     if (marker.kind === 'api_error' && !scripted) {
       response.writeHead(marker.status, { 'content-type': 'application/json', 'request-id': randomUUID() })
         .end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'local provider error' } }))
+      return
+    }
+
+    // The CLI retries the same request: fail it `attempts` times, then answer.
+    if (marker.kind === 'retry' && !scripted && (retryFailures.get(promptText) ?? 0) < marker.attempts) {
+      retryFailures.set(promptText, (retryFailures.get(promptText) ?? 0) + 1)
+      const errorType = marker.status === 529 ? 'overloaded_error' : 'api_error'
+      response.writeHead(marker.status, { 'content-type': 'application/json', 'request-id': randomUUID() })
+        .end(JSON.stringify({ type: 'error', error: { type: errorType, message: 'local provider retry' } }))
       return
     }
 

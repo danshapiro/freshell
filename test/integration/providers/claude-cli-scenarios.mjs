@@ -656,6 +656,16 @@ const SCENARIOS = {
     await s.close()
   },
 
+  /** F11: the API answers 529 twice; the CLI reports each retry (system/api_retry), then answers. */
+  async retry(ctx) {
+    const s = ctx.open('S')
+    s.push('RETRY:529x2', 'u1')
+    await s.waitForResults(1, 60_000)
+    await s.waitForCount(isStateIdle, 1, 3000, 'idle')
+    await sleep(300)
+    await s.close()
+  },
+
   /** T19: a background Agent's completion starts a CLI-initiated turn with no uuid and no lifecycle. */
   async 'cli-turn'(ctx) {
     const s = ctx.open('S')

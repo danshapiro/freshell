@@ -213,6 +213,14 @@ describe(`pinned Claude CLI ${PINNED_CLI_VERSION} contract (real CLI, loopback p
     expect(results(r, 'S').map((m) => m.subtype)).toEqual(['success'])
   }, SCENARIO_TIMEOUT)
 
+  it('F11: an overloaded API (529) is retried with one system/api_retry per attempt, then the turn succeeds', async () => {
+    const r = await real('retry')
+    const retries = messagesOf(r, 'S').filter((m: any) => m.type === 'system' && m.subtype === 'api_retry')
+    expect(retries.map((m: any) => [m.attempt, m.error_status, m.error])).toEqual([[1, 529, 'overloaded'], [2, 529, 'overloaded']])
+    for (const retry of retries) expect(retry.retry_delay_ms).toBeGreaterThan(0)
+    expect(results(r, 'S').map((m) => [m.subtype, m.is_error])).toEqual([['success', false]])
+  }, SCENARIO_TIMEOUT)
+
   it('T8: every uuid-stamped send gets command_lifecycle queued, started, then completed or cancelled, and is replayed with our uuid', async () => {
     const boot = await real('boot')
     const bootMessages = messagesOf(boot, 'S')
