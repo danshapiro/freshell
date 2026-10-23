@@ -992,6 +992,26 @@ async fn qualify_transport(mode: &'static str) {
     }
 }
 
+/// The candidate reader's ordinary input roots (its mount skeletons), from the
+/// reader create the synthetic daemon saw.
+fn candidate_input_roots(seen: &[(String, Value)]) -> Vec<PathBuf> {
+    seen.iter()
+        .filter(|(_, body)| body["Cmd"] == json!(["project-claude-candidate-private"]))
+        .flat_map(|(_, body)| {
+            body["HostConfig"]["Mounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|mount| {
+                    mount["Target"] == "/run/freshell-candidate-inputs"
+                        || mount["Target"] == "/run/freshell-retained-inputs"
+                })
+                .map(|mount| PathBuf::from(mount["Source"].as_str().unwrap()))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 async fn qualify_candidate_helper_transport(
     owner: &ClaudeSourceOwner,
     request: &ObserveClaudeSourcesRequest,
@@ -1008,6 +1028,7 @@ async fn qualify_candidate_helper_transport(
         "wrong-mount-report",
         "wrong-resource-subpath",
         "late-mountpoints-create",
+        "slow-reader-delete",
     ];
     if matches!(owner, ClaudeSourceOwner::Retained { .. }) {
         modes.extend([
@@ -1122,7 +1143,12 @@ async fn qualify_candidate_helper_transport(
                                     if mode=="writable-retained-home" {v["Mounts"].as_array_mut().unwrap().iter_mut().find(|m|m["Destination"]=="/run/freshell-retained-home").unwrap()["RW"]=json!(true);}
                                     if mode=="wrong-retained-volume" {v["Mounts"].as_array_mut().unwrap().iter_mut().find(|m|m["Destination"]=="/run/freshell-retained-home").unwrap()["Name"]=json!("foreign-provider-home");}
                                 } (200,v)},None=>(404,json!({}))}}
-                            else if line.starts_with("DELETE") && line.contains("/containers/"){let key=line.split("/containers/").nth(1).unwrap().split('?').next().unwrap();let name=bodies.lock().unwrap().iter().find(|(name,v)|*name==key || v["Id"]==key).map(|(name,_)|name.clone());if let Some(name)=name{bodies.lock().unwrap().remove(&name);}(204,json!({}))}
+                            else if line.starts_with("DELETE") && line.contains("/containers/"){let key=line.split("/containers/").nth(1).unwrap().split('?').next().unwrap();let name=bodies.lock().unwrap().iter().find(|(name,v)|*name==key || v["Id"]==key).map(|(name,_)|name.clone());if let Some(name)=name{bodies.lock().unwrap().remove(&name);}
+                                // Docker removes the reader but answers only after the
+                                // caller's cleanup window, as a force-remove that waits
+                                // on a host-wide writeback does.
+                                if mode=="slow-reader-delete" && key=="b".repeat(64) {tokio::time::sleep(Duration::from_millis(5_500)).await;}
+                                (204,json!({}))}
                             else if line.contains("/start "){let id=line.split("/containers/").nth(1).unwrap().split('/').next().unwrap();let v=bodies.lock().unwrap().values().find(|v|v["Id"]==id).unwrap().clone();private_jobs.lock().unwrap().push(tokio::spawn(async move {
                                 let is_mountpoint=v["Config"]["Cmd"]==json!(["prepare-provider-mountpoints"]);
                                 let target=if is_mountpoint {"/run/freshell-input-exchange"} else {"/run/freshell-source-exchange"};
@@ -1195,8 +1221,21 @@ async fn qualify_candidate_helper_transport(
                 retained_name.as_ref().map(|_| prior_stage.as_path()),
             )
             .await;
+        if mode == "slow-reader-delete" {
+            // The reader's removal outlived the cleanup window, so the
+            // attempt failed; what it still owned is removed in the
+            // background, the scratch volume after the helpers.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            while volume.lock().unwrap().is_some() && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let roots = candidate_input_roots(&calls.lock().unwrap());
+            while roots.iter().any(|root| root.exists()) && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
         let _ = stop.send(());
-        tokio::time::timeout(Duration::from_secs(3), server)
+        tokio::time::timeout(Duration::from_secs(10), server)
             .await
             .unwrap()
             .unwrap();

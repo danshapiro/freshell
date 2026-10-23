@@ -206,14 +206,17 @@ again, which is why managed-session creates stay quick while the helper
 created just before them is slow.
 
 - A helper create keeps running when its caller stops waiting, and cleanup
-  waits for Docker's answer before it removes the helper by exact name. A
-  create Docker answers only after the caller's window has passed goes to a
-  background reaper that removes the helper (and, for a candidate read, the
-  scratch volume after it). A create Docker answers after 5s or more is
-  logged as `supervisor.helper.create_slow` (warn) with its latency. Lifecycle
-  events: `supervisor.helper.late_create.deferred` (warn),
-  `supervisor.helper.late_create.removed` (info) or
-  `supervisor.helper.late_create.unconfirmed` (error).
+  waits for Docker's answer before it removes the helper by exact name. The
+  supervisor owns a helper until its absence is confirmed: a create Docker
+  answers only after the caller's window has passed, or a removal that runs
+  past its 5s window or fails, goes to a background reaper. The reaper removes
+  the helper (and, for a candidate read, the scratch volume after it), retrying
+  with a growing wait for up to 120s; every try re-checks ownership. A create
+  Docker answers after 5s or more is logged as `supervisor.helper.create_slow`
+  (warn) with its latency. Lifecycle events: `supervisor.helper.cleanup.deferred`
+  (warn, with `reason` `create_unanswered` or `removal_unconfirmed`), then
+  `supervisor.helper.cleanup.removed` (info) or
+  `supervisor.helper.cleanup.unconfirmed` (error).
 - The Claude source reader retries a run whose create or start timed out, or
   that Docker refused with a server error or left unanswered. Each attempt
   keeps the reader's 25s bound; the whole read gets 90s, three attempt

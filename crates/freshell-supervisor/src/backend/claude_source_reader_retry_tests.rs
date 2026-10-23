@@ -345,8 +345,8 @@ async fn reaper_outcome(path: &Path) -> Vec<Value> {
     loop {
         let events = lifecycle_events(path);
         let settled = events.iter().any(|event| {
-            event["event"] == "supervisor.helper.late_create.removed"
-                || event["event"] == "supervisor.helper.late_create.unconfirmed"
+            event["event"] == "supervisor.helper.cleanup.removed"
+                || event["event"] == "supervisor.helper.cleanup.unconfirmed"
         });
         if settled || tokio::time::Instant::now() >= deadline {
             return events;
@@ -467,11 +467,12 @@ async fn claude_source_reader_removes_a_helper_whose_create_answered_after_its_d
     daemon.finish().await;
     assert_eq!(daemon.removed(), creates, "the late helper is removed");
     assert!(daemon.live().is_empty(), "no helper is left behind");
-    let deferred = named(&events, "supervisor.helper.late_create.deferred");
+    let deferred = named(&events, "supervisor.helper.cleanup.deferred");
     assert_eq!(deferred.len(), 1, "{events:?}");
     assert_eq!(deferred[0]["data"]["severity"], "warn");
+    assert_eq!(deferred[0]["data"]["reason"], "create_unanswered");
     assert_eq!(deferred[0]["data"]["names"], json!(creates));
-    let removed = named(&events, "supervisor.helper.late_create.removed");
+    let removed = named(&events, "supervisor.helper.cleanup.removed");
     assert_eq!(removed.len(), 1, "{events:?}");
     assert_eq!(removed[0]["data"]["severity"], "info");
 }
@@ -515,7 +516,7 @@ async fn claude_source_reader_retries_after_a_stalled_create_answers_and_removes
     let retries = named(&events, "supervisor.helper.retry");
     assert_eq!(retries.len(), 1, "{events:?}");
     assert_eq!(retries[0]["data"]["cause"], "timed_out");
-    assert!(named(&events, "supervisor.helper.late_create.deferred").is_empty());
+    assert!(named(&events, "supervisor.helper.cleanup.deferred").is_empty());
     assert_eq!(named(&events, "supervisor.helper.recovered").len(), 1);
 }
 
@@ -593,13 +594,10 @@ async fn claude_source_reader_stays_inside_its_total_budget_and_reaps_what_outli
         "the reaper removes the late helper"
     );
     assert_eq!(
-        named(&events, "supervisor.helper.late_create.deferred").len(),
+        named(&events, "supervisor.helper.cleanup.deferred").len(),
         1
     );
-    assert_eq!(
-        named(&events, "supervisor.helper.late_create.removed").len(),
-        1
-    );
+    assert_eq!(named(&events, "supervisor.helper.cleanup.removed").len(), 1);
     let exhausted = named(&events, "supervisor.helper.retry_exhausted");
     assert_eq!(exhausted.len(), 1, "{events:?}");
     assert_eq!(exhausted[0]["data"]["cause"], "timed_out");

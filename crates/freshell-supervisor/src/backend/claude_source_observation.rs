@@ -172,6 +172,9 @@ impl CandidateInputView {
     }
 
     fn cleanup(&mut self) -> Result<(), BackendError> {
+        if self.1 {
+            return Ok(());
+        }
         std::fs::remove_dir_all(&self.0)
             .map_err(|_| fail("Claude candidate ordinary input view cleanup failed"))?;
         if !matches!(std::fs::symlink_metadata(&self.0), Err(error) if error.kind()==std::io::ErrorKind::NotFound)
@@ -199,7 +202,9 @@ impl Drop for CandidateInputView {
 /// Everything one candidate read may leave in Docker or on disk: the
 /// mountpoint helper, the reader, the ordinary scratch volume both mount, and
 /// the mount skeletons. Released together, helpers first, so an uncertain
-/// helper removal never deletes a still-mounted volume.
+/// helper removal never deletes a still-mounted volume. The skeletons back
+/// only the helpers' bind mounts, so they go as soon as the helpers are gone,
+/// before the scratch volume, whose removal may still need retrying.
 struct CandidateObjects {
     mountpoints: Option<HelperContainer>,
     reader: Option<HelperContainer>,
@@ -239,14 +244,14 @@ impl helper_lifecycle::HelperObjects for CandidateObjects {
         for helper in self.mountpoints.iter_mut().chain(self.reader.iter_mut()) {
             helper.remove(backend).await?;
         }
-        if let Some(scratch) = self.scratch.as_mut() {
-            backend.cleanup_claude_candidate_scratch(scratch).await?;
-        }
         for view in &mut self.views {
             view.cleanup()?;
         }
-        // The skeletons lived inside the private exchange; it goes last.
+        // The skeletons lived inside the private exchange; it goes after them.
         self.directory.take();
+        if let Some(scratch) = self.scratch.as_mut() {
+            backend.cleanup_claude_candidate_scratch(scratch).await?;
+        }
         Ok(())
     }
 }

@@ -1,6 +1,6 @@
 //! Fixed helper for descriptor-owned placeholders in the exact soul volume.
 use super::helper_lifecycle::{
-    HelperContainer, HelperDeadlines, HelperFailure, HelperKind, HelperObjects,
+    Deferred, HelperContainer, HelperDeadlines, HelperFailure, HelperKind, HelperObjects,
     HELPER_CLEANUP_BUDGET,
 };
 use super::*;
@@ -210,7 +210,6 @@ impl DockerEngineBackend {
         if self.daemon_id().await? != *daemon {
             return Err(fail("provider mountpoint daemon changed"));
         }
-        let mut owned = None;
         let target = MountpointHelperTarget {
             image: &spec.image_ref,
             volume: &spec.provider_volume_name,
@@ -218,17 +217,36 @@ impl DockerEngineBackend {
             daemon,
             labels: json!({"com.freshell.installation-id":spec.installation_id,"com.freshell.soul-id":spec.soul_id,"com.freshell.incarnation-id":spec.incarnation_id}),
         };
+        self.run_launch_mountpoint_helper(
+            target,
+            selected,
+            HelperDeadlines::after(Duration::from_secs(30), HELPER_CLEANUP_BUDGET),
+        )
+        .await
+    }
+
+    /// Run the fixed mountpoint helper for a launch within `deadlines`. A
+    /// launch has no later cleanup of its own, so whatever the run still owns
+    /// when it returns goes to the background reaper.
+    pub(super) async fn run_launch_mountpoint_helper(
+        &self,
+        target: MountpointHelperTarget<'_>,
+        selected: Vec<Mountpoint>,
+        deadlines: HelperDeadlines,
+    ) -> Result<(), BackendError> {
+        let mut owned = None;
         let result = self
-            .run_provider_mountpoint_helper(
-                target,
-                selected,
-                HelperDeadlines::after(Duration::from_secs(30), HELPER_CLEANUP_BUDGET),
-                &mut owned,
-            )
+            .run_provider_mountpoint_helper(target, selected, deadlines, &mut owned)
             .await;
-        // A helper Docker has not created yet is still ours to remove.
-        if let Some(helper) = owned.take().filter(HelperContainer::is_pending) {
-            self.reap_late_helper_objects("provider_mountpoints", helper);
+        // The run still owns a helper Docker has not created yet, or one whose
+        // removal it could not confirm: either is still ours to remove.
+        if let Some(helper) = owned.take() {
+            let why = if helper.is_pending() {
+                Deferred::CreateUnanswered
+            } else {
+                Deferred::RemovalUnconfirmed
+            };
+            self.reap_helper_objects("provider_mountpoints", helper, why);
         }
         result.map_err(|failure| failure.error)
     }
@@ -459,6 +477,7 @@ mod tests {
             "cancel-private-exchange",
             "slow-image",
             "late-create",
+            "slow-cleanup",
         ] {
             let owned = tempfile::tempdir().unwrap();
             let home = owned.path().join("scratch-home");
@@ -486,13 +505,16 @@ mod tests {
             let removed = Arc::new(std::sync::atomic::AtomicBool::new(false));
             // The helper reached its private exchange (the cancel point).
             let exchange_reached = Arc::new(tokio::sync::Notify::new());
-            let (body, seen, deleted, fixture_home, fixture_daemon, reached) = (
+            // The cleanup inspection that answers late has happened.
+            let slowed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (body, seen, deleted, fixture_home, fixture_daemon, reached, fixture_slowed) = (
                 expected.clone(),
                 requests.clone(),
                 removed.clone(),
                 home.clone(),
                 daemon.clone(),
                 exchange_reached.clone(),
+                slowed.clone(),
             );
             let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
             let server = tokio::spawn(async move {
@@ -503,7 +525,7 @@ mod tests {
                         _=&mut stopped=>break,
                         accepted=listener.accept()=>{
                             let (mut stream,_)=accepted.unwrap();
-                            let (body,seen,deleted,home,daemon,private_jobs,reached)=(body.clone(),seen.clone(),deleted.clone(),fixture_home.clone(),fixture_daemon.clone(),private_jobs.clone(),reached.clone());
+                            let (body,seen,deleted,home,daemon,private_jobs,reached,slowed)=(body.clone(),seen.clone(),deleted.clone(),fixture_home.clone(),fixture_daemon.clone(),private_jobs.clone(),reached.clone(),fixture_slowed.clone());
                             jobs.spawn(async move {
                                 let mut header=Vec::new(); let mut byte=[0];
                                 // A caller may abandon a request it no longer waits for.
@@ -520,6 +542,9 @@ mod tests {
                                     if mode=="late-create" {tokio::time::sleep(Duration::from_millis(900)).await;}
                                     *body.lock().unwrap()=Some(serde_json::from_slice(&raw).unwrap());(if mode=="lost-create-ack" {503} else {201},json!({"Id":"c".repeat(64)}))}
                                 else if line.starts_with("GET") && line.contains("/containers/") {
+                                    // Cleanup's first inspection, by name, answers only after the
+                                    // cleanup window: the helper is still there and still ours.
+                                    if mode=="slow-cleanup" && line.contains("/containers/freshell-mountpoints-") && !slowed.swap(true,std::sync::atomic::Ordering::SeqCst) {tokio::time::sleep(Duration::from_millis(5_500)).await;}
                                     if deleted.load(std::sync::atomic::Ordering::SeqCst) && mode!="cleanup-still-present" {(404,json!({}))}
                                     else {
                                         let mut expected=body.lock().unwrap().as_ref().unwrap().clone();
@@ -567,28 +592,39 @@ mod tests {
             });
             let backend = DockerEngineBackend::new(owned.path().join("docker.sock"));
             let mut helper = None;
-            // The cancel mode drops the helper once it reaches its private
-            // exchange; every other mode runs it to completion.
-            let outcome = tokio::time::timeout(Duration::from_secs(3), async {
-                tokio::select! {
-                    result = backend.run_provider_mountpoint_helper(
-                MountpointHelperTarget {image:"synthetic-image",volume:"owned-candidate-volume",binary:&binary,daemon:&daemon,labels:json!({"com.freshell.soul-id":"synthetic-owner","com.freshell.source-request-id":"synthetic-request"})},selected,HelperDeadlines::after(Duration::from_millis(250),Duration::from_millis(250)),&mut helper
-            ) => Some(result),
-                    _ = exchange_reached.notified(), if mode == "cancel-private-exchange" => None,
+            let target = MountpointHelperTarget {
+                image: "synthetic-image",
+                volume: "owned-candidate-volume",
+                binary: &binary,
+                daemon: &daemon,
+                labels: json!({"com.freshell.soul-id":"synthetic-owner","com.freshell.source-request-id":"synthetic-request"}),
+            };
+            if matches!(mode, "late-create" | "slow-cleanup") {
+                // A launch hands whatever its helper run still owns, a create
+                // Docker had not answered or a removal it could not confirm,
+                // to the background reaper.
+                let result = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    backend.run_launch_mountpoint_helper(
+                        target,
+                        selected,
+                        HelperDeadlines::after(
+                            Duration::from_millis(250),
+                            Duration::from_millis(250),
+                        ),
+                    ),
+                )
+                .await
+                .expect("the launch's helper window is bounded");
+                if mode == "late-create" {
+                    assert!(result.is_err(), "{result:?}");
+                } else {
+                    assert!(
+                        format!("{result:?}").contains("cleanup timed out"),
+                        "an unconfirmed removal stays a failure: {result:?}"
+                    );
                 }
-            })
-            .await;
-            if mode == "late-create" {
-                let result = outcome
-                    .expect("the helper's window is bounded")
-                    .expect("runs to completion");
-                assert!(result.is_err(), "{result:?}");
-                let late = helper
-                    .take()
-                    .expect("an unanswered create stays owned by the caller");
-                assert!(late.is_pending());
-                backend.reap_late_helper_objects("provider_mountpoints", late);
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
                 while !removed.load(std::sync::atomic::Ordering::SeqCst)
                     && tokio::time::Instant::now() < deadline
                 {
@@ -601,10 +637,21 @@ mod tests {
                     .unwrap();
                 assert!(
                     removed.load(std::sync::atomic::Ordering::SeqCst),
-                    "the helper Docker made after its caller gave up is removed"
+                    "{mode}: the helper the launch still owned is removed"
                 );
                 continue;
             }
+            // The cancel mode drops the helper once it reaches its private
+            // exchange; every other mode runs it to completion.
+            let outcome = tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::select! {
+                    result = backend.run_provider_mountpoint_helper(
+                target,selected,HelperDeadlines::after(Duration::from_millis(250),Duration::from_millis(250)),&mut helper
+            ) => Some(result),
+                    _ = exchange_reached.notified(), if mode == "cancel-private-exchange" => None,
+                }
+            })
+            .await;
             if mode == "cancel-private-exchange" {
                 assert!(matches!(outcome, Ok(None)), "dropped at the exchange");
                 let owned = helper

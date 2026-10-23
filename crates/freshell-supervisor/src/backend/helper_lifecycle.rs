@@ -14,9 +14,11 @@
 //!    hides whether the helper now exists.
 //! 2. An attempt's objects are removed only once every create they came from
 //!    has answered, by exact name with confirmed absence
-//!    ([`DockerEngineBackend::release_helper_objects`]). A create still
-//!    unanswered when its caller's wait ends goes to a background reaper that
-//!    removes whatever it made.
+//!    ([`DockerEngineBackend::release_helper_objects`]). Objects stay owned
+//!    until their absence is confirmed: a create still unanswered when its
+//!    caller's wait ends, or a removal that runs out of time or fails, goes to
+//!    a background reaper that keeps removing them
+//!    ([`DockerEngineBackend::reap_helper_objects`]).
 //! 3. A helper run whose create or start timed out, or that Docker refused or
 //!    dropped transiently, is retried within a bounded budget
 //!    ([`DockerEngineBackend::retry_helper`]). Every other failure is final.
@@ -33,6 +35,14 @@ pub(super) const HELPER_CLEANUP_BUDGET: Duration = Duration::from_secs(5);
 /// How long the background reaper waits for Docker to answer a create whose
 /// caller gave up, before it reports the helper's absence as unconfirmed.
 const LATE_CREATE_LIMIT: Duration = Duration::from_secs(600);
+
+/// How long the background reaper keeps removing what one attempt left, once
+/// every create it came from has answered. A force-remove can wait on the
+/// same disk flush a create does, so one removal can take tens of seconds.
+const LATE_REMOVAL_LIMIT: Duration = Duration::from_secs(120);
+
+/// The longest wait between two of the background reaper's removal tries.
+const LATE_REMOVAL_BACKOFF_CAP: Duration = Duration::from_secs(15);
 
 /// A helper create Docker answers after this long is logged with its
 /// latency: a healthy create answers in well under a second.
@@ -237,6 +247,25 @@ pub(super) trait HelperObjects: Send + 'static {
     async fn remove(&mut self, backend: &DockerEngineBackend) -> Result<(), BackendError>;
 }
 
+/// Why an attempt's objects went to the background reaper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Deferred {
+    /// A create was still unanswered when the caller's wait ended.
+    CreateUnanswered,
+    /// Every create answered, but removing the objects ran out of time or
+    /// failed before their absence was confirmed.
+    RemovalUnconfirmed,
+}
+
+impl Deferred {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CreateUnanswered => "create_unanswered",
+            Self::RemovalUnconfirmed => "removal_unconfirmed",
+        }
+    }
+}
+
 /// Which fixed helper a [`HelperContainer`] is, for its ownership check.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum HelperKind {
@@ -395,10 +424,11 @@ impl DockerEngineBackend {
     /// `result`. Waits until `settle` for every create the objects came from
     /// to answer, then removes them by exact name; an unconfirmed removal
     /// replaces the result with a final failure. Objects whose create is
-    /// still unanswered go to the background reaper and the attempt's own
-    /// failure stands. [`Self::retry_helper`] settles until its last cleanup
-    /// reserve, so no retry follows a hand-off: it could not reuse what may
-    /// still appear under those names.
+    /// still unanswered, or whose removal is unconfirmed, go to the
+    /// background reaper. [`Self::retry_helper`] settles until its last
+    /// cleanup reserve and treats an unconfirmed removal as final, so no
+    /// retry follows a hand-off: it could not reuse what may still appear
+    /// under those names.
     pub(super) async fn release_helper_objects<T, O: HelperObjects>(
         &self,
         helper: &'static str,
@@ -407,7 +437,7 @@ impl DockerEngineBackend {
         result: Result<T, HelperFailure>,
     ) -> Result<T, HelperFailure> {
         if !objects.settle(deadlines.settle).await {
-            self.reap_late_helper_objects(helper, objects);
+            self.reap_helper_objects(helper, objects, Deferred::CreateUnanswered);
             // Every create answered before an attempt could succeed.
             return result.and_then(|_| {
                 Err(BackendError::Unavailable(format!(
@@ -416,33 +446,44 @@ impl DockerEngineBackend {
                 .into())
             });
         }
-        tokio::time::timeout(deadlines.cleanup, objects.remove(self))
+        let removed = tokio::time::timeout(deadlines.cleanup, objects.remove(self))
             .await
-            .map_err(|_| BackendError::Unavailable(format!("{helper} cleanup timed out")))??;
+            .unwrap_or_else(|_| {
+                Err(BackendError::Unavailable(format!(
+                    "{helper} cleanup timed out"
+                )))
+            });
+        if let Err(error) = removed {
+            // The objects stay ours until their absence is confirmed.
+            self.reap_helper_objects(helper, objects, Deferred::RemovalUnconfirmed);
+            return Err(error.into());
+        }
         result
     }
 
-    pub(super) fn reap_late_helper_objects<O: HelperObjects>(
+    /// Keep removing `objects` in the background: wait for every create they
+    /// came from to answer, then remove them by exact name, retrying with a
+    /// growing wait until their absence is confirmed or the reaper's limit
+    /// passes. Each removal re-checks ownership, so a retry never removes an
+    /// object that is no longer ours.
+    pub(super) fn reap_helper_objects<O: HelperObjects>(
         &self,
         helper: &'static str,
         mut objects: O,
+        why: Deferred,
     ) {
         let names = objects.names();
         self.helper_event(
-            "supervisor.helper.late_create.deferred",
-            json!({"severity":"warn","helper":helper,"names":names}),
+            "supervisor.helper.cleanup.deferred",
+            json!({"severity":"warn","helper":helper,"names":names,"reason":why.as_str()}),
         );
         let backend = self.clone();
         tokio::spawn(async move {
             let started = Instant::now();
             let removed = if objects.settle(started + LATE_CREATE_LIMIT).await {
-                tokio::time::timeout(HELPER_CLEANUP_BUDGET, objects.remove(&backend))
+                backend
+                    .keep_removing(&mut objects, Instant::now() + LATE_REMOVAL_LIMIT)
                     .await
-                    .unwrap_or_else(|_| {
-                        Err(BackendError::Unavailable(format!(
-                            "{helper} cleanup timed out"
-                        )))
-                    })
             } else {
                 Err(BackendError::Unavailable(format!(
                     "{helper} create still unanswered after {}s",
@@ -451,17 +492,44 @@ impl DockerEngineBackend {
             };
             match removed {
                 Ok(()) => backend.helper_event(
-                    "supervisor.helper.late_create.removed",
+                    "supervisor.helper.cleanup.removed",
                     json!({"severity":"info","helper":helper,"names":names,
-                        "answeredAfterMs":millis(started.elapsed())}),
+                        "reason":why.as_str(),"elapsedMs":millis(started.elapsed())}),
                 ),
                 Err(error) => backend.helper_event(
-                    "supervisor.helper.late_create.unconfirmed",
+                    "supervisor.helper.cleanup.unconfirmed",
                     json!({"severity":"error","helper":helper,"names":names,
-                        "reason":error.to_string()}),
+                        "reason":why.as_str(),"error":error.to_string()}),
                 ),
             }
         });
+    }
+
+    /// Remove `objects` until their absence is confirmed or `deadline`
+    /// passes, waiting longer between tries.
+    async fn keep_removing<O: HelperObjects>(
+        &self,
+        objects: &mut O,
+        deadline: Instant,
+    ) -> Result<(), BackendError> {
+        let mut wait = Duration::from_secs(1);
+        loop {
+            let error = match tokio::time::timeout_at(deadline, objects.remove(self)).await {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(error)) => error,
+                Err(_) => {
+                    return Err(BackendError::Unavailable(format!(
+                        "helper removal still unconfirmed after {}s",
+                        LATE_REMOVAL_LIMIT.as_secs()
+                    )))
+                }
+            };
+            if Instant::now() + wait >= deadline {
+                return Err(error);
+            }
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(LATE_REMOVAL_BACKOFF_CAP);
+        }
     }
 
     /// Run `attempt` until it succeeds, fails finally, or `policy` leaves no
