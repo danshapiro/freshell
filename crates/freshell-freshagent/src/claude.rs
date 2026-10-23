@@ -9012,6 +9012,7 @@ impl FreshClaudeState {
                 // map key) so an attach-by-durable rebind flips live event routing.
                 let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
                 let line_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+                crate::claude_live_events::log_provider_event(&value, &stamp, &session_type);
                 if let Some(edge) = AttentionEdge::from_sidecar_type(line_type) {
                     // The sidecar's attention edges leave through the one edge
                     // exit (logged there, G14).
@@ -9816,6 +9817,11 @@ fn normalize_sdk_type(sdk_type: &str) -> Option<&'static str> {
         // provider-originated cancellation).
         "sdk.question.cancelled" => "freshAgent.question.cancelled",
         "sdk.status" => "freshAgent.status",
+        // Non-terminal provider events (transcript-live plan P4): an API
+        // retry and a notice (rate limit, informational banner, failed
+        // compaction). Neither ends the turn; the client shows them in place.
+        "sdk.retry" => "freshAgent.retry",
+        "sdk.notice" => "freshAgent.notice",
         // `sdk.turn.complete` / `sdk.turn.waiting` are deliberately absent: the
         // consumer routes them to `emit_attention_edge` (AttentionEdge), the one
         // logged edge exit, so no other path can broadcast an edge.
@@ -10783,6 +10789,9 @@ mod teardown_tests;
 
 #[cfg(test)]
 mod end_of_output_tests;
+
+#[cfg(test)]
+mod live_frames_tests;
 
 /// ISO-8601 / RFC-3339 millis-Z timestamp (`new Date().toISOString()`) for error frames.
 fn now_iso() -> String {
