@@ -71,7 +71,9 @@ export async function runLocalCommand(cli, turn, { name, args }) {
     await cli.sleep(T.localCommand)
     cli.emit(cli.systemInit())
     replay(commandText, cmd.uuid)
-    cli.transcript.append({ type: 'user', uuid: cmd.uuid, message: { role: 'user', content: commandText } })
+    // T16: /clear creates B immediately with a mode record. Its replayed
+    // command is SDK output only and is not saved dialogue in B.
+    cli.transcript.appendVerbatim({ type: 'mode', mode: 'normal', sessionId: cli.sessionId })
     cli.transcript.flush()
     cli.modelTurnsSinceCompact = 0
     return localResult('')
