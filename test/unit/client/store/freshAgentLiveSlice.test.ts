@@ -228,6 +228,24 @@ describe('websocket routing into the live tail (transcript-live D3)', () => {
     expect(tail(store).retry).toBeUndefined()
   })
 
+  it('numbers each notice and drops a malformed one', () => {
+    const store = createStore()
+    handleFreshAgentMessage(store.dispatch, frame({ type: 'freshAgent.status', status: 'running' }))
+    const sessionsBefore = store.getState().freshAgent.sessions
+    handleFreshAgentMessage(store.dispatch, frame({ type: 'freshAgent.notice', level: 'warning', code: 'INFORMATIONAL', message: ' heads up ' }))
+    expect(tail(store).notice).toEqual({ seq: 1, level: 'warning', code: 'INFORMATIONAL', message: 'heads up' })
+    handleFreshAgentMessage(store.dispatch, frame({
+      type: 'freshAgent.notice', level: 'loud', code: 'RATE_LIMIT_WARNING', message: 'near', rateLimit: { status: 'allowed_warning', resetsAt: 1761300000, extra: 1 },
+    }))
+    expect(tail(store).notice).toEqual({
+      seq: 2, level: 'info', code: 'RATE_LIMIT_WARNING', message: 'near', rateLimit: { status: 'allowed_warning', resetsAt: 1761300000 },
+    })
+    handleFreshAgentMessage(store.dispatch, frame({ type: 'freshAgent.notice', level: 'error', code: 'X' }))
+    expect(tail(store).notice?.seq).toBe(2)
+    // A notice never ends the turn or touches the session (P4).
+    expect(store.getState().freshAgent.sessions).toBe(sessionsBefore)
+  })
+
   it('drops a retry frame without a positive attempt', () => {
     const store = createStore()
     handleFreshAgentMessage(store.dispatch, frame({ type: 'freshAgent.retry', attempt: 'soon' }))

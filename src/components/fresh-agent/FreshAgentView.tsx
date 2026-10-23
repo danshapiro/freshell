@@ -123,6 +123,7 @@ import FreshAgentQuestionBanner from './FreshAgentQuestionBanner'
 import { FreshAgentTranscript, type FreshAgentTranscriptHandle } from './FreshAgentTranscript'
 import { FreshAgentLiveTail, liveTailShowsContent } from './FreshAgentLiveTail'
 import { presentTranscriptLineIds, useTranscriptLandings } from './useTranscriptLandings'
+import { formatFreshAgentNotice } from '@/lib/fresh-agent-notice'
 import type { FreshAgentTurnRewindAvailability } from './FreshAgentTurnActions'
 import { FreshAgentComposer, type FreshAgentComposerHandle } from './FreshAgentComposer'
 import { FreshAgentDiffPanel } from './FreshAgentDiffPanel'
@@ -3958,6 +3959,18 @@ export function FreshAgentView({
   const liveTailActive = useAppSelector((state) => (
     liveSessionKey ? liveTailShowsContent(state.freshAgentLive?.bySession[liveSessionKey], landedTurnIds) : false
   ))
+  // Provider notices (rate limits, a failed compaction, CLI banners) show in
+  // the pane's notice banner; they never end the turn (transcript-live P4).
+  // `seq` shows each notice once; one received before this mount is not replayed.
+  const liveNotice = useAppSelector((state) => (
+    liveSessionKey ? state.freshAgentLive?.bySession[liveSessionKey]?.notice : undefined
+  ))
+  const shownNoticeSeqRef = useRef(liveNotice?.seq ?? 0)
+  useEffect(() => {
+    if (!liveNotice || liveNotice.seq <= shownNoticeSeqRef.current) return
+    shownNoticeSeqRef.current = liveNotice.seq
+    setNotice(formatFreshAgentNotice(liveNotice))
+  }, [liveNotice])
   const isLiveSessionBusyNow = useCallback(() => {
     const status = liveSessionKey ? appStore.getState().freshAgent.sessions[liveSessionKey]?.status : undefined
     return BUSY_STATES.has(status ?? paneContentRef.current.status)

@@ -14,6 +14,7 @@ import type {
   FreshAgentLiveState,
   LiveBlock,
   LiveBlockKind,
+  LiveNotice,
   LiveRetry,
   LiveStreamOp,
 } from './freshAgentLiveTypes'
@@ -179,6 +180,17 @@ const freshAgentLiveSlice = createSlice({
       sessionFor(state, { sessionId, sessionType, provider }).retry = retry
     },
 
+    /**
+     * A provider notice (rate limit, failed compaction, informational banner).
+     * It never ends the turn or touches the session (P4); `seq` lets the pane
+     * show each notice once, even when the same text repeats.
+     */
+    liveNoticeReceived(state, action: PayloadAction<FreshAgentSessionLocator & Omit<LiveNotice, 'seq'>>) {
+      const { sessionId, sessionType, provider, ...notice } = action.payload
+      state.noticeSeq += 1
+      sessionFor(state, { sessionId, sessionType, provider }).notice = { seq: state.noticeSeq, ...notice }
+    },
+
     /** The pane's turn has landed and ended: nothing live is left to show. */
     liveTailCleared(state, action: PayloadAction<{ sessionKey: string }>) {
       const session = state.bySession[action.payload.sessionKey]
@@ -214,6 +226,7 @@ const freshAgentLiveSlice = createSlice({
 
 export const {
   assistantBlockBound,
+  liveNoticeReceived,
   liveRetrySet,
   liveTailCleared,
   streamOpsApplied,

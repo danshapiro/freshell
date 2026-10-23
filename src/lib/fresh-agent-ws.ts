@@ -11,8 +11,8 @@ import { applyFreshAgentCompletion, applyFreshAgentWaiting } from '@/store/turnC
 import { revokeFreshAgentAttention } from '@/store/turnCompletionAttention'
 import type { ObservedOwnerFence } from '@/store/selectors/runtimeOwner'
 import { streamBatcherFor } from '@/lib/fresh-agent-stream-batcher'
-import type { LiveBlockKind, LiveRetry, LiveStreamOp } from '@/store/freshAgentLiveTypes'
-import { assistantBlockBound, liveRetrySet, transcriptAnnounced } from '@/store/freshAgentLiveSlice'
+import type { LiveBlockKind, LiveNotice, LiveNoticeLevel, LiveRateLimit, LiveRetry, LiveStreamOp } from '@/store/freshAgentLiveTypes'
+import { assistantBlockBound, liveNoticeReceived, liveRetrySet, transcriptAnnounced } from '@/store/freshAgentLiveSlice'
 import {
   addPermissionRequest,
   addQuestionRequest,
@@ -388,6 +388,26 @@ function parseLiveRetry(frame: Record<string, unknown>): LiveRetry | undefined {
   }
 }
 
+const NOTICE_LEVELS: ReadonlySet<string> = new Set<LiveNoticeLevel>(['info', 'warning', 'error'])
+
+/** A `freshAgent.notice` frame (the sidecar's `sdk.notice`), or nothing if it is malformed. */
+function parseLiveNotice(frame: Record<string, unknown>): Omit<LiveNotice, 'seq'> | undefined {
+  if (typeof frame.code !== 'string' || !frame.code) return undefined
+  if (typeof frame.message !== 'string' || !frame.message.trim()) return undefined
+  const level = typeof frame.level === 'string' && NOTICE_LEVELS.has(frame.level) ? frame.level as LiveNoticeLevel : 'info'
+  let rateLimit: LiveRateLimit | undefined
+  if (isObject(frame.rateLimit)) {
+    const limit = frame.rateLimit
+    rateLimit = {
+      ...(typeof limit.status === 'string' ? { status: limit.status } : {}),
+      ...(typeof limit.resetsAt === 'number' && Number.isFinite(limit.resetsAt) ? { resetsAt: limit.resetsAt } : {}),
+      ...(typeof limit.rateLimitType === 'string' ? { rateLimitType: limit.rateLimitType } : {}),
+      ...(typeof limit.utilization === 'number' && Number.isFinite(limit.utilization) ? { utilization: limit.utilization } : {}),
+    }
+  }
+  return { level, code: frame.code, message: frame.message.trim(), ...(rateLimit ? { rateLimit } : {}) }
+}
+
 function parseLiveStreamOp(frame: Record<string, unknown>): LiveStreamOp | undefined {
   if (hasParentToolUse(frame)) return undefined
   const event = frame.event
@@ -523,6 +543,13 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
     case 'freshAgent.retry': {
       const retry = parseLiveRetry(event)
       if (retry) dispatch(liveRetrySet({ ...locator, ...retry }))
+      return true
+    }
+    case 'freshAgent.notice': {
+      // Non-terminal (P4): a notice is shown, never folded into the error path.
+      const notice = parseLiveNotice(event)
+      if (notice) dispatch(liveNoticeReceived({ ...locator, ...notice }))
+      else log.warn('dropping malformed freshAgent.notice', { sessionId, code: event.code })
       return true
     }
     case 'freshAgent.stream': {

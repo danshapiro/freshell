@@ -342,3 +342,60 @@ describe('FreshAgentView live transcript (transcript-live D5)', () => {
     expect(within(liveArticle).getByLabelText('running')).toBe(running[0])
   })
 })
+
+describe('provider notices (transcript-live D6)', () => {
+  it('shows a notice in the pane banner without ending the running turn', async () => {
+    serve(() => claudeSnapshot([userTurn('u-user', 'question')]))
+    const store = createStore()
+    await mount(store)
+    deliver(store, { type: 'freshAgent.status', status: 'running' })
+    const sessionsBefore = store.getState().freshAgent.sessions
+
+    deliver(store, {
+      type: 'freshAgent.notice',
+      level: 'error',
+      code: 'COMPACTION_FAILED',
+      message: 'Error during compaction: API Error: 400 prompt is too long',
+    })
+
+    expect(screen.getByRole('alert')).toHaveTextContent('Error during compaction: API Error: 400 prompt is too long')
+    expect(store.getState().freshAgent.sessions).toBe(sessionsBefore)
+    expect(store.getState().freshAgent.sessions[KEY].status).toBe('running')
+    expect(screen.getByRole('button', { name: /stop/i })).toBeInTheDocument()
+  })
+
+  it('tells when a rate limit resets, in local time', async () => {
+    serve(() => claudeSnapshot([userTurn('u-user', 'question')]))
+    const store = createStore()
+    await mount(store)
+    const resetsAt = Math.floor(Date.now() / 1000) + 2 * 60 * 60
+    const expectedTime = new Date(resetsAt * 1000).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
+
+    deliver(store, {
+      type: 'freshAgent.notice',
+      level: 'error',
+      code: 'RATE_LIMITED',
+      message: 'You have reached your Claude usage limit.',
+      rateLimit: { status: 'rejected', resetsAt, rateLimitType: 'five_hour' },
+    })
+
+    const banner = screen.getByRole('alert')
+    expect(banner).toHaveTextContent('You have reached your Claude usage limit.')
+    expect(banner).toHaveTextContent(expectedTime)
+  })
+
+  it('shows each notice once, even when the same text repeats', async () => {
+    serve(() => claudeSnapshot([userTurn('u-user', 'question')]))
+    const store = createStore()
+    await mount(store)
+    const notice = { type: 'freshAgent.notice', level: 'warning', code: 'INFORMATIONAL', message: 'Hook feedback: lint failed' }
+
+    deliver(store, notice)
+    expect(screen.getByRole('alert')).toHaveTextContent('Hook feedback: lint failed')
+    await advance(10_000)
+    expect(screen.queryByText('Hook feedback: lint failed')).not.toBeInTheDocument()
+
+    deliver(store, notice)
+    expect(screen.getByRole('alert')).toHaveTextContent('Hook feedback: lint failed')
+  })
+})
