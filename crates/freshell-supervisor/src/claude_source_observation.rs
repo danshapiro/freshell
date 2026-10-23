@@ -171,8 +171,8 @@ impl Supervisor {
         )
         .map_err(|_| denied("observation request exceeds its metadata profile"))?;
         let digest = format!("{:x}", Sha256::digest(&raw));
-        // The backend owns a 25-second operation and five-second finite cleanup.
-        // This outer deadline permits that cleanup to finish before returning.
+        // The backend owns a bounded retry of the fixed reader, its owned
+        // cleanup included. This outer deadline lets it finish before returning.
         let reply = tokio::time::timeout(
             CLAUDE_SOURCE_OBSERVATION_BUDGET,
             self.backend

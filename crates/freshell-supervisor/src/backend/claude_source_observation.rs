@@ -5,7 +5,7 @@ use freshell_platform::claude_inputs::observation::{
     ObservationReply, MAX_REPLY_BYTES, MAX_REQUEST_BYTES,
 };
 use freshell_runtime_protocol::ObserveClaudeSourcesRequest;
-use std::time::Duration;
+use helper_lifecycle::{HelperContainer, HelperDeadlines, HelperFailure, HelperKind};
 use tokio::net::UnixListener;
 
 fn fail(reason: &'static str) -> BackendError {
@@ -52,9 +52,23 @@ struct CandidateScratch {
     labels: Value,
     daemon: DockerDaemonId,
     attempted: bool,
+    create: helper_lifecycle::InFlightCreate,
 }
 
 impl CandidateScratch {
+    /// Wait until the volume create answers; false if it still has not.
+    async fn settle(&mut self, deadline: tokio::time::Instant) -> bool {
+        use helper_lifecycle::Settled;
+        match self.create.settle(deadline).await {
+            Settled::Pending => false,
+            Settled::Answered(Ok(response)) if response.status == 409 => {
+                self.attempted = false;
+                true
+            }
+            Settled::Idle | Settled::Answered(_) => true,
+        }
+    }
+
     fn owns(&self, actual: &Value) -> bool {
         actual["Name"] == self.name
             && actual["Driver"] == "local"
@@ -188,6 +202,61 @@ impl Drop for CandidateInputView {
     }
 }
 
+/// Everything one candidate read may leave in Docker or on disk: the
+/// mountpoint helper, the reader, the ordinary scratch volume both mount, and
+/// the mount skeletons. Released together, helpers first, so an uncertain
+/// helper removal never deletes a still-mounted volume.
+struct CandidateObjects {
+    mountpoints: Option<HelperContainer>,
+    reader: Option<HelperContainer>,
+    scratch: Option<CandidateScratch>,
+    views: Vec<CandidateInputView>,
+    directory: Option<native_auth::ExchangeDirectory>,
+}
+
+#[async_trait]
+impl helper_lifecycle::HelperObjects for CandidateObjects {
+    fn names(&self) -> Vec<String> {
+        self.mountpoints
+            .iter()
+            .chain(self.reader.iter())
+            .map(|helper| helper.name.clone())
+            .chain(
+                self.scratch
+                    .iter()
+                    .filter(|scratch| scratch.attempted)
+                    .map(|scratch| scratch.name.clone()),
+            )
+            .collect()
+    }
+
+    async fn settle(&mut self, deadline: tokio::time::Instant) -> bool {
+        let mut settled = true;
+        for helper in self.mountpoints.iter_mut().chain(self.reader.iter_mut()) {
+            settled &= helper.settle(deadline).await;
+        }
+        if let Some(scratch) = self.scratch.as_mut() {
+            settled &= scratch.settle(deadline).await;
+        }
+        settled
+    }
+
+    async fn remove(&mut self, backend: &DockerEngineBackend) -> Result<(), BackendError> {
+        for helper in self.mountpoints.iter_mut().chain(self.reader.iter_mut()) {
+            helper.remove(backend).await?;
+        }
+        if let Some(scratch) = self.scratch.as_mut() {
+            backend.cleanup_claude_candidate_scratch(scratch).await?;
+        }
+        for view in &mut self.views {
+            view.cleanup()?;
+        }
+        // The skeletons lived inside the private exchange; it goes last.
+        self.directory.take();
+        Ok(())
+    }
+}
+
 impl DockerEngineBackend {
     async fn retained_claude_volume(
         &self,
@@ -242,16 +311,15 @@ impl DockerEngineBackend {
         request: &ObserveClaudeSourcesRequest,
         root: &Path,
         test_run_id: &str,
-        budget: Duration,
+        deadlines: HelperDeadlines,
         prior_stage: Option<&Path>,
-    ) -> Result<ObservationReply, BackendError> {
+    ) -> Result<ObservationReply, HelperFailure> {
         use freshell_runtime_protocol::{bounded_json_bytes, MAX_CONTROL_FRAME_BYTES};
-        let deadline = tokio::time::Instant::now() + budget;
+        let deadline = deadlines.operation;
         let name = format!("freshell-claude-candidate-reader-{}", uuid::Uuid::new_v4());
         let mut scratch = None::<CandidateScratch>;
-        let mut mountpoint_helper = None::<(String, Value)>;
-        let mut expected = None::<Value>;
-        let mut attempted = false;
+        let mut mountpoint_helper = None::<HelperContainer>;
+        let mut reader = None::<HelperContainer>;
         let mut directory = None::<native_auth::ExchangeDirectory>;
         let mut input_view = None::<CandidateInputView>;
         let mut retained_view = None::<CandidateInputView>;
@@ -261,9 +329,9 @@ impl DockerEngineBackend {
                 .map_err(|_| fail("Claude candidate projection exceeds metadata profile"))?;
             let (daemon, rootless) = self.daemon_info().await?;
             if !rootless {
-                return Err(fail(
-                    "Claude candidate reader requires the qualified rootless daemon",
-                ));
+                return Err(
+                    fail("Claude candidate reader requires the qualified rootless daemon").into(),
+                );
             }
             let mut retained_volume = None;
             let (installation, image, binary_path, reservation_id) = match owner {
@@ -276,7 +344,7 @@ impl DockerEngineBackend {
                         || self.observe_initial_volume(reservation).await? != *observation
                         || !matches!(observation, freshell_runtime_protocol::InitialAuthVolumeObservation::Absent { daemon_id } if daemon_id == &daemon)
                     {
-                        return Err(fail("Claude candidate creation absence changed"));
+                        return Err(fail("Claude candidate creation absence changed").into());
                     }
                     (
                         reservation.installation_id.as_str(),
@@ -304,7 +372,7 @@ impl DockerEngineBackend {
                 .map_err(|_| fail("Claude candidate reader artifact unavailable"))?;
             if let ClaudeSourceOwner::Initial { reservation, .. } = owner {
                 if digest != reservation.binary_sha256 {
-                    return Err(fail("Claude candidate reserved reader artifact changed"));
+                    return Err(fail("Claude candidate reserved reader artifact changed").into());
                 }
             }
             let workspace = canonical_dir(Path::new(&request.workspace_path))
@@ -315,7 +383,7 @@ impl DockerEngineBackend {
                 || cwd != request.observation_request.cwd
                 || !cwd.starts_with(&workspace)
             {
-                return Err(fail("Claude candidate workload topology changed"));
+                return Err(fail("Claude candidate workload topology changed").into());
             }
             let mounts = docker::ordinary_claude_candidate_mounts(
                 &workspace,
@@ -343,6 +411,7 @@ impl DockerEngineBackend {
                 labels: labels.clone(),
                 daemon: daemon.clone(),
                 attempted: false,
+                create: Default::default(),
             });
             let backing = scratch.as_mut().unwrap();
             self.create_claude_candidate_scratch(backing).await?;
@@ -355,10 +424,7 @@ impl DockerEngineBackend {
                     labels: labels.clone(),
                 },
                 provider_mountpoints::selections(&mounts)?,
-                (
-                    deadline.saturating_duration_since(tokio::time::Instant::now()),
-                    Duration::from_secs(5),
-                ),
+                deadlines,
                 &mut mountpoint_helper,
             )
             .await?;
@@ -407,22 +473,25 @@ impl DockerEngineBackend {
                 "HostConfig":{"NetworkMode":"none","ReadonlyRootfs":true,"CapDrop":["ALL"],"CapAdd":["CHOWN","SETGID","SETUID"],
                     "SecurityOpt":["no-new-privileges"],"Memory":256*1024*1024,"MemorySwap":256*1024*1024,"NanoCpus":500_000_000,"PidsLimit":32,
                     "LogConfig":{"Type":"none","Config":{}},"Tmpfs":{},"Mounts":descriptors}});
-            expected = Some(body.clone());
-            attempted = true;
-            let created = self
-                .request_bounded(
-                    "POST",
-                    &format!("{DOCKER_API}/containers/create?name={name}"),
-                    Some(&body),
-                    64 * 1024,
-                )
-                .await?;
-            if created.status == 409 {
-                attempted = false;
-            }
+            let created = reader
+                .insert(HelperContainer::new(
+                    HelperKind::ClaudeCandidateReader,
+                    name.clone(),
+                    body.clone(),
+                ))
+                .create(self)
+                .await
+                .map_err(|_| {
+                    HelperFailure::unanswered(
+                        "create",
+                        fail("Claude candidate reader creation acknowledgement unavailable"),
+                    )
+                })?;
             if created.status != 201 {
-                return Err(fail(
-                    "Claude candidate reader creation acknowledgement unavailable",
+                return Err(HelperFailure::answered(
+                    "create",
+                    created.status,
+                    fail("Claude candidate reader creation acknowledgement unavailable"),
                 ));
             }
             let created: Value = serde_json::from_slice(&created.body)
@@ -446,9 +515,7 @@ impl DockerEngineBackend {
                 || actual["State"]["Running"] != false
                 || !owned_candidate_helper(&actual, &body)
             {
-                return Err(fail(
-                    "Claude candidate reader namespace changed before start",
-                ));
+                return Err(fail("Claude candidate reader namespace changed before start").into());
             }
             let volume_reply = self
                 .request_bounded(
@@ -461,7 +528,7 @@ impl DockerEngineBackend {
             let volume: Value = serde_json::from_slice(&volume_reply.body)
                 .map_err(|_| fail("Claude candidate ordinary volume metadata invalid"))?;
             if volume_reply.status != 200 {
-                return Err(fail("Claude candidate ordinary backing disappeared"));
+                return Err(fail("Claude candidate ordinary backing disappeared").into());
             }
             verify_candidate_mount_reports(
                 &actual,
@@ -479,9 +546,19 @@ impl DockerEngineBackend {
                         None,
                         64 * 1024,
                     )
-                    .await?;
+                    .await
+                    .map_err(|_| {
+                        HelperFailure::unanswered(
+                            "start",
+                            fail("Claude candidate reader start unanswered"),
+                        )
+                    })?;
                 if started.status != 204 {
-                    return Err(fail("Claude candidate reader start failed"));
+                    return Err(HelperFailure::answered(
+                        "start",
+                        started.status,
+                        fail("Claude candidate reader start failed"),
+                    ));
                 }
                 let waited = self
                     .request_bounded(
@@ -494,13 +571,16 @@ impl DockerEngineBackend {
                 let value: Value = serde_json::from_slice(&waited.body)
                     .map_err(|_| fail("Claude candidate reader completion invalid"))?;
                 if waited.status != 200 || value["StatusCode"] != 0 {
-                    return Err(fail(
-                        "Claude candidate reader did not return complete evidence",
-                    ));
+                    return Err(
+                        fail("Claude candidate reader did not return complete evidence").into(),
+                    );
                 }
-                Ok::<_, BackendError>(())
+                Ok::<_, HelperFailure>(())
             };
-            let (reply, ()) = tokio::try_join!(exchange(&listener, &raw), supervision)?;
+            let (reply, ()) = tokio::try_join!(
+                async { exchange(&listener, &raw).await.map_err(HelperFailure::from) },
+                supervision
+            )?;
             let source_raw = bounded_json_bytes(&request.observation_request, MAX_REQUEST_BYTES)
                 .map_err(|_| fail("Claude candidate source metadata exceeds profile"))?;
             reply
@@ -520,7 +600,7 @@ impl DockerEngineBackend {
                     .map_err(|_| fail("Claude candidate reader artifact unavailable"))?
                     != digest
             {
-                return Err(fail("Claude candidate actual namespace changed"));
+                return Err(fail("Claude candidate actual namespace changed").into());
             }
             match owner {
                 ClaudeSourceOwner::Initial {
@@ -528,7 +608,7 @@ impl DockerEngineBackend {
                     observation,
                 } => {
                     if self.observe_initial_volume(reservation).await? != *observation {
-                        return Err(fail("Claude candidate creation absence changed"));
+                        return Err(fail("Claude candidate creation absence changed").into());
                     }
                 }
                 ClaudeSourceOwner::Retained { handle, .. } => {
@@ -539,7 +619,8 @@ impl DockerEngineBackend {
                     {
                         return Err(fail(
                             "Claude retained HOME metadata changed during candidate projection",
-                        ));
+                        )
+                        .into());
                     }
                     qualify_retained_claude_stage(
                         prior_stage
@@ -556,42 +637,27 @@ impl DockerEngineBackend {
         let result = tokio::time::timeout_at(deadline, operation)
             .await
             .unwrap_or_else(|_| {
-                Err(fail(
+                Err(HelperFailure::timed_out(fail(
                     "Claude candidate reader timed out; retain inputs and reprepare",
-                ))
+                )))
             });
-        // One cleanup reserve covers both helpers and the ordinary backing.
-        // Any uncertain helper removal prevents deleting its still-mounted HOME.
-        let cleanup = async {
-            if let Some((helper, body)) = mountpoint_helper.as_ref() {
-                self.cleanup_provider_mountpoint_helper(helper, body)
-                    .await?;
-                mountpoint_helper = None;
-            }
-            if attempted {
-                self.cleanup_claude_candidate_reader(&name, expected.as_ref().unwrap())
-                    .await?;
-                attempted = false;
-            }
-            if let Some(backing) = scratch.as_mut() {
-                self.cleanup_claude_candidate_scratch(backing).await?;
-            }
-            if let Some(view) = input_view.as_mut() {
-                view.cleanup()?;
-            }
-            if let Some(view) = retained_view.as_mut() {
-                view.cleanup()?;
-            }
-            Ok::<_, BackendError>(())
+        // One release covers both helpers and the ordinary backing. Any
+        // uncertain helper removal prevents deleting its still-mounted HOME.
+        let objects = CandidateObjects {
+            mountpoints: mountpoint_helper,
+            reader,
+            scratch,
+            views: input_view.into_iter().chain(retained_view).collect(),
+            directory,
         };
-        tokio::time::timeout(Duration::from_secs(5), cleanup)
-            .await
-            .map_err(|_| fail("Claude candidate owned cleanup timed out"))??;
+        let result = self
+            .release_helper_objects("claude_candidate_reader", objects, deadlines, result)
+            .await;
         tracing::debug!(event="provider.inputs.claude_candidate_helper.settled",soul_id=%request.soul_id,succeeded=result.is_ok(),"Claude candidate reader settled after owned cleanup");
         result
     }
 
-    async fn cleanup_claude_candidate_reader(
+    pub(super) async fn cleanup_claude_candidate_reader(
         &self,
         name: &str,
         expected: &Value,
@@ -644,9 +710,9 @@ impl DockerEngineBackend {
     async fn create_claude_candidate_scratch(
         &self,
         scratch: &mut CandidateScratch,
-    ) -> Result<(), BackendError> {
+    ) -> Result<(), HelperFailure> {
         if scratch.attempted || self.daemon_id().await? != scratch.daemon {
-            return Err(fail("Claude candidate scratch namespace changed"));
+            return Err(fail("Claude candidate scratch namespace changed").into());
         }
         let absent = self
             .request_bounded(
@@ -663,17 +729,31 @@ impl DockerEngineBackend {
                 "Claude candidate scratch name is already present"
             } else {
                 "Claude candidate scratch absence could not be confirmed"
-            }));
+            })
+            .into());
         }
         // Retain ownership on a lost acknowledgement. A conflict is foreign.
         scratch.attempted = true;
-        let created = self.request_bounded("POST", &format!("{DOCKER_API}/volumes/create"), Some(&json!({"Name":scratch.name,"Driver":"local","Labels":scratch.labels,"DriverOpts":{}})), 64 * 1024).await?;
+        let body =
+            json!({"Name":scratch.name,"Driver":"local","Labels":scratch.labels,"DriverOpts":{}});
+        let created = scratch
+            .create
+            .send(self, format!("{DOCKER_API}/volumes/create"), body)
+            .await
+            .map_err(|_| {
+                HelperFailure::unanswered(
+                    "create",
+                    fail("Claude candidate scratch creation acknowledgement unavailable"),
+                )
+            })?;
         if created.status == 409 {
             scratch.attempted = false;
         }
         if !matches!(created.status, 200 | 201) {
-            return Err(fail(
-                "Claude candidate scratch creation acknowledgement unavailable",
+            return Err(HelperFailure::answered(
+                "create",
+                created.status,
+                fail("Claude candidate scratch creation acknowledgement unavailable"),
             ));
         }
         let inspected = self
@@ -690,7 +770,7 @@ impl DockerEngineBackend {
             || !scratch.owns(&actual)
             || self.daemon_id().await? != scratch.daemon
         {
-            return Err(fail("Claude candidate ordinary scratch ownership changed"));
+            return Err(fail("Claude candidate ordinary scratch ownership changed").into());
         }
         Ok(())
     }
@@ -1178,13 +1258,35 @@ async fn exchange(listener: &UnixListener, raw: &[u8]) -> Result<ObservationRepl
 }
 
 impl DockerEngineBackend {
+    /// Observe Claude sources through the fixed reader, retrying a reader
+    /// whose create or start timed out or was refused transiently.
+    pub(super) async fn observe_claude_sources_with(
+        &self,
+        policy: &helper_lifecycle::HelperRetryPolicy,
+        owner: &ClaudeSourceOwner,
+        request: &ObserveClaudeSourcesRequest,
+        test_run_id: &str,
+    ) -> Result<ObservationReply, BackendError> {
+        let helper = if request.candidate.is_some() {
+            "claude_candidate_reader"
+        } else {
+            "claude_source_reader"
+        };
+        let context = json!({"soulId":request.soul_id,"provider":request.provider,
+            "requestId":request.observation_request.request_id});
+        self.retry_helper(policy, helper, context, |deadlines| {
+            self.read_claude_source_helper(owner, request, test_run_id, deadlines)
+        })
+        .await
+    }
+
     pub(super) async fn read_claude_source_helper(
         &self,
         owner: &ClaudeSourceOwner,
         request: &ObserveClaudeSourcesRequest,
         test_run_id: &str,
-        budget: Duration,
-    ) -> Result<ObservationReply, BackendError> {
+        deadlines: HelperDeadlines,
+    ) -> Result<ObservationReply, HelperFailure> {
         request
             .validate()
             .map_err(|_| fail("Claude source request invalid"))?;
@@ -1215,7 +1317,7 @@ impl DockerEngineBackend {
                     request,
                     &root,
                     test_run_id,
-                    budget,
+                    deadlines,
                     prior_stage.as_deref(),
                 )
                 .await;
@@ -1224,7 +1326,7 @@ impl DockerEngineBackend {
             owner,
             request,
             test_run_id,
-            budget,
+            deadlines,
             prior_stage.as_deref(),
         )
         .await
@@ -1235,12 +1337,11 @@ impl DockerEngineBackend {
         owner: &ClaudeSourceOwner,
         request: &ObserveClaudeSourcesRequest,
         test_run_id: &str,
-        budget: Duration,
+        deadlines: HelperDeadlines,
         prior_stage: Option<&Path>,
-    ) -> Result<ObservationReply, BackendError> {
+    ) -> Result<ObservationReply, HelperFailure> {
         let name = format!("freshell-claude-source-{}", uuid::Uuid::new_v4());
-        let mut attempted = false;
-        let mut expected = None::<Value>;
+        let mut helper = None::<HelperContainer>;
         let mut directory = None::<native_auth::ExchangeDirectory>;
         let operation = async {
             let mut retained_volume = None::<Value>;
@@ -1249,9 +1350,9 @@ impl DockerEngineBackend {
                 .await
                 .map_err(|_| fail("Claude source daemon unavailable"))?;
             if !rootless {
-                return Err(fail(
-                    "Claude source reader requires the qualified rootless daemon",
-                ));
+                return Err(
+                    fail("Claude source reader requires the qualified rootless daemon").into(),
+                );
             }
             let (installation, soul, image, binary, retained) = match owner {
                 ClaudeSourceOwner::Initial {
@@ -1261,7 +1362,7 @@ impl DockerEngineBackend {
                     if reservation.provider != request.provider
                         || self.observe_initial_volume(reservation).await? != *observation
                     {
-                        return Err(fail("Claude source creation absence changed"));
+                        return Err(fail("Claude source creation absence changed").into());
                     }
                     (
                         &reservation.installation_id,
@@ -1297,7 +1398,8 @@ impl DockerEngineBackend {
                     {
                         return Err(fail(
                             "Claude source requires its exact quiescent retained owner",
-                        ));
+                        )
+                        .into());
                     }
                     let response = self
                         .request_bounded(
@@ -1313,7 +1415,7 @@ impl DockerEngineBackend {
                         || volume["Name"] != handle.provider_volume_name()
                         || volume["Driver"] != "local"
                     {
-                        return Err(fail("Claude retained HOME is unavailable; preserve native stores and repair the source"));
+                        return Err(fail("Claude retained HOME is unavailable; preserve native stores and repair the source").into());
                     }
                     retained_volume = Some(volume);
                     (
@@ -1326,7 +1428,7 @@ impl DockerEngineBackend {
                 }
             };
             if soul != &request.soul_id {
-                return Err(fail("Claude source soul ownership changed"));
+                return Err(fail("Claude source soul ownership changed").into());
             }
             let binary = canonical_regular_file(binary)
                 .map_err(|_| fail("Claude source reader artifact unavailable"))?;
@@ -1334,7 +1436,7 @@ impl DockerEngineBackend {
                 .map_err(|_| fail("Claude source reader artifact changed"))?;
             if let ClaudeSourceOwner::Initial { reservation, .. } = owner {
                 if digest != reservation.binary_sha256 {
-                    return Err(fail("Claude reserved reader artifact changed"));
+                    return Err(fail("Claude reserved reader artifact changed").into());
                 }
             }
             let workspace = canonical_dir(Path::new(&request.workspace_path))
@@ -1345,7 +1447,7 @@ impl DockerEngineBackend {
                 || cwd != request.observation_request.cwd
                 || !cwd.starts_with(&workspace)
             {
-                return Err(fail("Claude source workload topology changed"));
+                return Err(fail("Claude source workload topology changed").into());
             }
             let common = request
                 .git_common_dir
@@ -1379,7 +1481,7 @@ impl DockerEngineBackend {
             let tmpfs = if let Some(volume) = retained {
                 mounts.push(json!({"Type":"volume","Source":volume,"Target":"/home/freshell/provider","ReadOnly":true,"VolumeOptions":{"NoCopy":true}}));
                 let ClaudeSourceOwner::Retained { handle, .. } = owner else {
-                    return Err(fail("Claude retained ordinary owner unavailable"));
+                    return Err(fail("Claude retained ordinary owner unavailable").into());
                 };
                 let ordinary = docker::ordinary_claude_candidate_mounts(
                     &workspace,
@@ -1415,22 +1517,26 @@ impl DockerEngineBackend {
                 MAX_REQUEST_BYTES,
             )
             .map_err(|_| fail("Claude source request exceeds metadata profile"))?;
-            expected = Some(body.clone());
-            attempted = true;
-            let created = self
-                .request_bounded(
-                    "POST",
-                    &format!("{DOCKER_API}/containers/create?name={name}"),
-                    Some(&body),
-                    64 * 1024,
-                )
+            let created = helper
+                .insert(HelperContainer::new(
+                    HelperKind::ClaudeSource,
+                    name.clone(),
+                    body.clone(),
+                ))
+                .create(self)
                 .await
-                .map_err(|_| fail("Claude source helper creation acknowledgement unavailable"))?;
-            if created.status == 409 {
-                attempted = false;
-            }
+                .map_err(|_| {
+                    HelperFailure::unanswered(
+                        "create",
+                        fail("Claude source helper creation acknowledgement unavailable"),
+                    )
+                })?;
             if created.status != 201 {
-                return Err(fail("Claude source helper creation failed"));
+                return Err(HelperFailure::answered(
+                    "create",
+                    created.status,
+                    fail("Claude source helper creation failed"),
+                ));
             }
             let created: Value = serde_json::from_slice(&created.body)
                 .map_err(|_| fail("Claude source helper creation invalid"))?;
@@ -1453,9 +1559,9 @@ impl DockerEngineBackend {
                 || !owned_helper(&actual, &body)
                 || actual["State"]["Running"] != false
             {
-                return Err(fail(
-                    "Claude source helper namespace/topology ownership changed",
-                ));
+                return Err(
+                    fail("Claude source helper namespace/topology ownership changed").into(),
+                );
             }
             if let Some(volume) = &retained_volume {
                 verify_retained_claude_mount_reports(&actual, &body, volume)?;
@@ -1468,9 +1574,19 @@ impl DockerEngineBackend {
                         None,
                         64 * 1024,
                     )
-                    .await?;
+                    .await
+                    .map_err(|_| {
+                        HelperFailure::unanswered(
+                            "start",
+                            fail("Claude source helper start unanswered"),
+                        )
+                    })?;
                 if started.status != 204 {
-                    return Err(fail("Claude source helper start failed"));
+                    return Err(HelperFailure::answered(
+                        "start",
+                        started.status,
+                        fail("Claude source helper start failed"),
+                    ));
                 }
                 let waited = self
                     .request_bounded(
@@ -1483,13 +1599,16 @@ impl DockerEngineBackend {
                 let value: Value = serde_json::from_slice(&waited.body)
                     .map_err(|_| fail("Claude source helper completion invalid"))?;
                 if waited.status != 200 || value["StatusCode"] != 0 {
-                    return Err(fail(
-                        "Claude source helper did not return complete evidence",
-                    ));
+                    return Err(
+                        fail("Claude source helper did not return complete evidence").into(),
+                    );
                 }
-                Ok::<_, BackendError>(())
+                Ok::<_, HelperFailure>(())
             };
-            let (reply, ()) = tokio::try_join!(exchange(&listener, &raw), supervision)?;
+            let (reply, ()) = tokio::try_join!(
+                async { exchange(&listener, &raw).await.map_err(HelperFailure::from) },
+                supervision
+            )?;
             reply
                 .validate_for_request(
                     &request.observation_request,
@@ -1503,14 +1622,14 @@ impl DockerEngineBackend {
                 reply.observation.egid,
             ) != (65534, 65534, 0, 0)
             {
-                return Err(fail("Claude source native reader identity changed"));
+                return Err(fail("Claude source native reader identity changed").into());
             }
             if self.daemon_id().await? != daemon
                 || crate::registry::binary_digest(&binary)
                     .map_err(|_| fail("Claude source reader artifact unavailable"))?
                     != digest
             {
-                return Err(fail("Claude source daemon or reader artifact changed"));
+                return Err(fail("Claude source daemon or reader artifact changed").into());
             }
             if let ClaudeSourceOwner::Initial {
                 reservation,
@@ -1518,76 +1637,85 @@ impl DockerEngineBackend {
             } = owner
             {
                 if self.observe_initial_volume(reservation).await? != *observation {
-                    return Err(fail("Claude source initial HOME presence changed"));
+                    return Err(fail("Claude source initial HOME presence changed").into());
                 }
             }
             Ok(reply)
         };
-        let result = tokio::time::timeout(budget, operation)
+        let result = tokio::time::timeout_at(deadlines.operation, operation)
             .await
             .unwrap_or_else(|_| {
-                Err(fail(
+                Err(HelperFailure::timed_out(fail(
                     "Claude source helper timed out; retain inputs and reprepare",
-                ))
+                )))
             });
-        if attempted {
-            let cleanup = async {
-                let inspection = self
-                    .request_bounded(
-                        "GET",
-                        &format!("{DOCKER_API}/containers/{name}/json"),
-                        None,
-                        1024 * 1024,
-                    )
-                    .await?;
-                if inspection.status == 404 {
-                    return Ok(());
-                }
-                let actual: Value = serde_json::from_slice(&inspection.body)
-                    .map_err(|_| fail("Claude source cleanup ownership invalid"))?;
-                if inspection.status != 200
-                    || !expected
-                        .as_ref()
-                        .is_some_and(|expected| owned_helper(&actual, expected))
-                {
-                    return Err(fail(
-                        "Claude source cleanup ownership changed; no provider workload was stopped",
-                    ));
-                }
-                let removed = self
-                    .request_bounded(
-                        "DELETE",
-                        &format!("{DOCKER_API}/containers/{name}?force=1"),
-                        None,
-                        64 * 1024,
-                    )
-                    .await?;
-                if !matches!(removed.status, 204 | 404) {
-                    return Err(fail("Claude source helper cleanup failed"));
-                }
-                let absent = self
-                    .request_bounded(
-                        "GET",
-                        &format!("{DOCKER_API}/containers/{name}/json"),
-                        None,
-                        64 * 1024,
-                    )
-                    .await?;
-                if absent.status != 404 {
-                    return Err(fail("Claude source helper cleanup not confirmed"));
-                }
-                Ok(())
-            };
-            tokio::time::timeout(Duration::from_secs(5), cleanup)
-                .await
-                .map_err(|_| fail("Claude source helper cleanup timed out"))??;
-        }
+        let result = match helper {
+            Some(helper) => {
+                self.release_helper_objects("claude_source_reader", helper, deadlines, result)
+                    .await
+            }
+            None => result,
+        };
         tracing::debug!(event="provider.inputs.native_source_helper.settled",soul_id=%request.soul_id,helper=%name,succeeded=result.is_ok(),
             "Claude source helper settled after owned cleanup");
         result
+    }
+
+    /// Remove an owned Claude source helper by exact name and confirm its
+    /// absence; a changed helper is never removed.
+    pub(super) async fn cleanup_claude_source_helper(
+        &self,
+        name: &str,
+        expected: &Value,
+    ) -> Result<(), BackendError> {
+        let inspection = self
+            .request_bounded(
+                "GET",
+                &format!("{DOCKER_API}/containers/{name}/json"),
+                None,
+                1024 * 1024,
+            )
+            .await?;
+        if inspection.status == 404 {
+            return Ok(());
+        }
+        let actual: Value = serde_json::from_slice(&inspection.body)
+            .map_err(|_| fail("Claude source cleanup ownership invalid"))?;
+        if inspection.status != 200 || !owned_helper(&actual, expected) {
+            return Err(fail(
+                "Claude source cleanup ownership changed; no provider workload was stopped",
+            ));
+        }
+        let removed = self
+            .request_bounded(
+                "DELETE",
+                &format!("{DOCKER_API}/containers/{name}?force=1"),
+                None,
+                64 * 1024,
+            )
+            .await?;
+        if !matches!(removed.status, 204 | 404) {
+            return Err(fail("Claude source helper cleanup failed"));
+        }
+        let absent = self
+            .request_bounded(
+                "GET",
+                &format!("{DOCKER_API}/containers/{name}/json"),
+                None,
+                64 * 1024,
+            )
+            .await?;
+        if absent.status != 404 {
+            return Err(fail("Claude source helper cleanup not confirmed"));
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 #[path = "claude_source_observation_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "claude_source_reader_retry_tests.rs"]
+mod reader_retry_tests;

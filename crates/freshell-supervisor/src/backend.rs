@@ -1,5 +1,7 @@
 mod claude_source_observation;
 pub mod docker;
+mod helper_lifecycle;
+pub(crate) use helper_lifecycle::CLAUDE_SOURCE_READER_RETRY;
 mod input_publisher;
 mod native_auth;
 mod native_history;
@@ -230,6 +232,8 @@ pub trait RuntimeBackend: Send + Sync {
 #[derive(Clone)]
 pub struct DockerEngineBackend {
     socket_path: PathBuf,
+    /// The supervisor's lifecycle JSONL, for helper retry and cleanup events.
+    lifecycle_log: Option<std::sync::Arc<PathBuf>>,
     input_publishers:
         std::sync::Arc<std::sync::Mutex<BTreeMap<String, input_publisher::HeldPublisher>>>,
     input_publication_claims: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
@@ -239,9 +243,17 @@ impl DockerEngineBackend {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
+            lifecycle_log: None,
             input_publishers: Default::default(),
             input_publication_claims: Default::default(),
         }
+    }
+
+    /// Record helper retry and late-cleanup events in the supervisor's
+    /// lifecycle JSONL.
+    pub fn with_lifecycle_log(mut self, path: impl Into<PathBuf>) -> Self {
+        self.lifecycle_log = Some(std::sync::Arc::new(path.into()));
+        self
     }
 
     pub async fn ping(&self) -> Result<(), BackendError> {
@@ -710,11 +722,11 @@ impl RuntimeBackend for DockerEngineBackend {
         request: &freshell_runtime_protocol::ObserveClaudeSourcesRequest,
         test_run_id: &str,
     ) -> Result<freshell_platform::claude_inputs::observation::ObservationReply, BackendError> {
-        self.read_claude_source_helper(
+        self.observe_claude_sources_with(
+            &helper_lifecycle::CLAUDE_SOURCE_READER_RETRY,
             owner,
             request,
             test_run_id,
-            std::time::Duration::from_secs(25),
         )
         .await
     }

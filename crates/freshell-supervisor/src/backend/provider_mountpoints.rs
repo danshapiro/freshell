@@ -1,4 +1,8 @@
 //! Fixed helper for descriptor-owned placeholders in the exact soul volume.
+use super::helper_lifecycle::{
+    HelperContainer, HelperDeadlines, HelperFailure, HelperKind, HelperObjects,
+    HELPER_CLEANUP_BUDGET,
+};
 use super::*;
 use freshell_platform::provider_mountpoints::Mountpoint;
 use std::time::Duration;
@@ -214,28 +218,34 @@ impl DockerEngineBackend {
             daemon,
             labels: json!({"com.freshell.installation-id":spec.installation_id,"com.freshell.soul-id":spec.soul_id,"com.freshell.incarnation-id":spec.incarnation_id}),
         };
-        self.run_provider_mountpoint_helper(
-            target,
-            selected,
-            (Duration::from_secs(30), Duration::from_secs(5)),
-            &mut owned,
-        )
-        .await
+        let result = self
+            .run_provider_mountpoint_helper(
+                target,
+                selected,
+                HelperDeadlines::after(Duration::from_secs(30), HELPER_CLEANUP_BUDGET),
+                &mut owned,
+            )
+            .await;
+        // A helper Docker has not created yet is still ours to remove.
+        if let Some(helper) = owned.take().filter(HelperContainer::is_pending) {
+            self.reap_late_helper_objects("provider_mountpoints", helper);
+        }
+        result.map_err(|failure| failure.error)
     }
 
     pub(super) async fn run_provider_mountpoint_helper(
         &self,
         target: MountpointHelperTarget<'_>,
         selected: Vec<Mountpoint>,
-        budgets: (Duration, Duration),
-        owned: &mut Option<(String, Value)>,
-    ) -> Result<(), BackendError> {
+        deadlines: HelperDeadlines,
+        owned: &mut Option<HelperContainer>,
+    ) -> Result<(), HelperFailure> {
         if owned.is_some() {
-            return Err(fail(
-                "provider mountpoint previous helper cleanup remains unconfirmed",
-            ));
+            return Err(
+                fail("provider mountpoint previous helper cleanup remains unconfirmed").into(),
+            );
         }
-        let deadline = tokio::time::Instant::now() + budgets.0;
+        let deadline = deadlines.operation;
         let request = freshell_runtime_protocol::bounded_json_bytes(&selected, 1024 * 1024)
             .map_err(|_| fail("provider mountpoint metadata profile exceeded"))?;
         let directory = native_auth::ExchangeDirectory::create_input()?;
@@ -249,9 +259,7 @@ impl DockerEngineBackend {
                 .await
                 .map_err(|_| fail("provider mountpoint image lookup timed out"))??;
         if tokio::time::Instant::now() >= deadline {
-            return Err(fail(
-                "provider mountpoint preparation timed out before create",
-            ));
+            return Err(fail("provider mountpoint preparation timed out before create").into());
         }
         let body = json!({
             "Image":target.image,"User":"0:0","Tty":false,
@@ -265,24 +273,27 @@ impl DockerEngineBackend {
                     {"Type":"volume","Source":target.volume,"Target":"/home/freshell/provider","ReadOnly":false,"VolumeOptions":{"NoCopy":true}},
                     {"Type":"bind","Source":directory.0,"Target":"/run/freshell-input-exchange","ReadOnly":true}]}
         });
-        let mut attempted = false;
         let operation = async {
-            attempted = true;
-            *owned = Some((name.clone(), body.clone()));
-            let created = self
-                .request_bounded(
-                    "POST",
-                    &format!("{DOCKER_API}/containers/create?name={name}"),
-                    Some(&body),
-                    64 * 1024,
-                )
-                .await?;
-            if created.status == 409 {
-                attempted = false;
-                *owned = None;
-            }
+            let created = owned
+                .insert(HelperContainer::new(
+                    HelperKind::ProviderMountpoints,
+                    name.clone(),
+                    body.clone(),
+                ))
+                .create(self)
+                .await
+                .map_err(|_| {
+                    HelperFailure::unanswered(
+                        "create",
+                        fail("provider mountpoint helper creation unanswered"),
+                    )
+                })?;
             if created.status != 201 {
-                return Err(fail("provider mountpoint helper creation failed"));
+                return Err(HelperFailure::answered(
+                    "create",
+                    created.status,
+                    fail("provider mountpoint helper creation failed"),
+                ));
             }
             let created: Value = serde_json::from_slice(&created.body)
                 .map_err(|_| fail("provider mountpoint helper identity unavailable"))?;
@@ -305,15 +316,25 @@ impl DockerEngineBackend {
                 || actual["State"]["Running"] != false
                 || !owned_mountpoint_helper(&actual, &body)
             {
-                return Err(fail(
-                    "provider mountpoint helper namespace changed before start",
-                ));
+                return Err(
+                    fail("provider mountpoint helper namespace changed before start").into(),
+                );
             }
             let started = self
                 .request("POST", &format!("{DOCKER_API}/containers/{id}/start"), None)
-                .await?;
+                .await
+                .map_err(|_| {
+                    HelperFailure::unanswered(
+                        "start",
+                        fail("provider mountpoint helper start unanswered"),
+                    )
+                })?;
             if started.status != 204 {
-                return Err(fail("provider mountpoint helper start failed"));
+                return Err(HelperFailure::answered(
+                    "start",
+                    started.status,
+                    fail("provider mountpoint helper start failed"),
+                ));
             }
             let exchange = async {
                 let (mut stream, _) = listener
@@ -379,23 +400,26 @@ impl DockerEngineBackend {
             exchange_result?;
             wait_result?;
             if self.daemon_id().await? != *target.daemon {
-                return Err(fail(
-                    "provider mountpoint daemon changed before main create",
-                ));
+                return Err(fail("provider mountpoint daemon changed before main create").into());
             }
             Ok(())
         };
         let result = tokio::time::timeout_at(deadline, operation)
             .await
-            .unwrap_or_else(|_| Err(fail("provider mountpoint preparation timed out")));
-        if attempted {
-            tokio::time::timeout(
-                budgets.1,
-                self.cleanup_provider_mountpoint_helper(&name, &body),
-            )
-            .await
-            .map_err(|_| fail("provider mountpoint cleanup timed out"))??;
-            *owned = None;
+            .unwrap_or_else(|_| {
+                Err(HelperFailure::timed_out(fail(
+                    "provider mountpoint preparation timed out",
+                )))
+            });
+        // A create Docker has not answered by the settle deadline stays in
+        // `owned`: the caller owns removing the helper it may still make.
+        if let Some(helper) = owned.as_mut() {
+            if helper.settle(deadlines.settle).await {
+                tokio::time::timeout(deadlines.cleanup, helper.remove(self))
+                    .await
+                    .map_err(|_| fail("provider mountpoint cleanup timed out"))??;
+                *owned = None;
+            }
         }
         tracing::debug!(
             event = "runtime.provider_mountpoints.settled",
@@ -428,6 +452,7 @@ mod tests {
             "timeout",
             "cancel-private-exchange",
             "slow-image",
+            "late-create",
         ] {
             let owned = tempfile::tempdir().unwrap();
             let home = owned.path().join("scratch-home");
@@ -484,7 +509,10 @@ mod tests {
                                 seen.lock().unwrap().push(line.clone());
                                 let (status,value)=if line.contains("/images/") {if mode=="slow-image" {tokio::time::sleep(Duration::from_secs(10)).await;} (200,json!({"Config":{"Env":["PATH=/usr/bin","ANTHROPIC_API_KEY=PRIVATE_UNUSED_IMAGE_CREDENTIAL"]}}))}
                                 else if line.contains("/info ") {(200,json!({"ID":daemon,"SecurityOptions":["name=rootless"]}))}
-                                else if line.contains("/containers/create?") { *body.lock().unwrap()=Some(serde_json::from_slice(&raw).unwrap());(if mode=="lost-create-ack" {503} else {201},json!({"Id":"c".repeat(64)}))}
+                                else if line.contains("/containers/create?") {
+                                    // A stalled daemon makes the helper only after its caller's window.
+                                    if mode=="late-create" {tokio::time::sleep(Duration::from_millis(900)).await;}
+                                    *body.lock().unwrap()=Some(serde_json::from_slice(&raw).unwrap());(if mode=="lost-create-ack" {503} else {201},json!({"Id":"c".repeat(64)}))}
                                 else if line.starts_with("GET") && line.contains("/containers/") {
                                     if deleted.load(std::sync::atomic::Ordering::SeqCst) && mode!="cleanup-still-present" {(404,json!({}))}
                                     else {
@@ -538,20 +566,47 @@ mod tests {
             let outcome = tokio::time::timeout(Duration::from_secs(3), async {
                 tokio::select! {
                     result = backend.run_provider_mountpoint_helper(
-                MountpointHelperTarget {image:"synthetic-image",volume:"owned-candidate-volume",binary:&binary,daemon:&daemon,labels:json!({"com.freshell.soul-id":"synthetic-owner","com.freshell.source-request-id":"synthetic-request"})},selected,(Duration::from_millis(250),Duration::from_millis(250)),&mut helper
+                MountpointHelperTarget {image:"synthetic-image",volume:"owned-candidate-volume",binary:&binary,daemon:&daemon,labels:json!({"com.freshell.soul-id":"synthetic-owner","com.freshell.source-request-id":"synthetic-request"})},selected,HelperDeadlines::after(Duration::from_millis(250),Duration::from_millis(250)),&mut helper
             ) => Some(result),
                     _ = exchange_reached.notified(), if mode == "cancel-private-exchange" => None,
                 }
             })
             .await;
+            if mode == "late-create" {
+                let result = outcome
+                    .expect("the helper's window is bounded")
+                    .expect("runs to completion");
+                assert!(result.is_err(), "{result:?}");
+                let late = helper
+                    .take()
+                    .expect("an unanswered create stays owned by the caller");
+                assert!(late.is_pending());
+                backend.reap_late_helper_objects("provider_mountpoints", late);
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                while !removed.load(std::sync::atomic::Ordering::SeqCst)
+                    && tokio::time::Instant::now() < deadline
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                let _ = stop.send(());
+                tokio::time::timeout(Duration::from_secs(2), server)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    removed.load(std::sync::atomic::Ordering::SeqCst),
+                    "the helper Docker made after its caller gave up is removed"
+                );
+                continue;
+            }
             if mode == "cancel-private-exchange" {
                 assert!(matches!(outcome, Ok(None)), "dropped at the exchange");
-                let (name, body) = helper
+                let owned = helper
                     .as_ref()
                     .expect("canceled private exchange must retain exact helper ownership");
                 tokio::time::timeout(
                     Duration::from_millis(250),
-                    backend.cleanup_provider_mountpoint_helper(name, body),
+                    backend.cleanup_provider_mountpoint_helper(&owned.name, &owned.expected),
                 )
                 .await
                 .unwrap()

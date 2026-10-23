@@ -4,6 +4,7 @@ use freshell_runtime_protocol::{
     ClaudeSourceAuthority, InitialAuthVolumeObservation, ReserveProviderInputsRequest,
 };
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::{net::UnixListener, task::JoinSet};
 
 #[tokio::test]
@@ -26,6 +27,7 @@ async fn provider_claude_candidate_scratch_owns_disk_backing_and_confirmed_clean
             labels: labels.clone(),
             daemon: daemon.clone(),
             attempted: false,
+            create: Default::default(),
         };
         let present = Arc::new(Mutex::new(mode == "existing"));
         let calls = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
@@ -857,7 +859,7 @@ async fn qualify_transport(mode: &'static str) {
                 &owner,
                 &request,
                 "synthetic-source-run",
-                Duration::from_secs(3),
+                HelperDeadlines::after(Duration::from_secs(3), Duration::from_secs(5)),
                 Some(&stage),
             )
             .await
@@ -867,7 +869,7 @@ async fn qualify_transport(mode: &'static str) {
                 &owner,
                 &request,
                 "synthetic-source-run",
-                Duration::from_millis(250),
+                HelperDeadlines::after(Duration::from_millis(250), Duration::from_secs(5)),
             )
             .await
     };
@@ -1005,6 +1007,7 @@ async fn qualify_candidate_helper_transport(
         "volume-still-present",
         "wrong-mount-report",
         "wrong-resource-subpath",
+        "late-mountpoints-create",
     ];
     if matches!(owner, ClaudeSourceOwner::Retained { .. }) {
         modes.extend([
@@ -1081,7 +1084,8 @@ async fn qualify_candidate_helper_transport(
                         let (seen,bodies,backing,daemon,private_jobs,expected_scratch,retained_name)=(seen.clone(),bodies.clone(),backing.clone(),daemon.clone(),private_jobs.clone(),expected_scratch.clone(),retained_name.clone());
                         jobs.spawn(async move {
                             let mut header=Vec::new();let mut byte=[0];
-                            while !header.ends_with(b"\r\n\r\n") {stream.read_exact(&mut byte).await.unwrap();header.push(byte[0]);assert!(header.len()<=32*1024);}
+                            // A caller may abandon a request it no longer waits for.
+                            while !header.ends_with(b"\r\n\r\n") {if stream.read_exact(&mut byte).await.is_err() {return;}header.push(byte[0]);assert!(header.len()<=32*1024);}
                             let header=String::from_utf8(header).unwrap();let line=header.lines().next().unwrap().to_string();
                             let length=header.lines().find_map(|line|line.strip_prefix("Content-Length: ")).unwrap().trim().parse::<usize>().unwrap();
                             assert!(length<=1024*1024);let mut raw=vec![0;length];stream.read_exact(&mut raw).await.unwrap();
@@ -1098,7 +1102,14 @@ async fn qualify_candidate_helper_transport(
                             else if line.starts_with("DELETE") && line.contains("/volumes/"){assert!(bodies.lock().unwrap().is_empty(),"candidate helpers must be gone before volume deletion");if mode!="volume-still-present" {*backing.lock().unwrap()=None;}(204,json!({}))}
                             else if line.contains("/containers/create?"){
                                 if body["Cmd"]==json!(["project-claude-candidate-private"]) {let root=body["HostConfig"]["Mounts"].as_array().unwrap().iter().find(|m|m["Target"]=="/run/freshell-candidate-inputs").unwrap()["Source"].as_str().unwrap();assert!(!Path::new(root).join(".freshell/mcp-capability.json").exists(),"ordinary candidate input root must not expose capability credentials");}
-                                let name=line.split("name=").nth(1).unwrap().split_whitespace().next().unwrap().to_string();let id=if body["Cmd"]==json!(["prepare-provider-mountpoints"]) {"a".repeat(64)} else {"b".repeat(64)};bodies.lock().unwrap().insert(name,json!({"Id":id,"Config":body,"HostConfig":body["HostConfig"],"State":{"Running":false}}));(if mode=="lost-projection-ack" && body["Cmd"]==json!(["project-claude-candidate-private"]) {503}else{201},json!({"Id":id}))}
+                                let name=line.split("name=").nth(1).unwrap().split_whitespace().next().unwrap().to_string();let id=if body["Cmd"]==json!(["prepare-provider-mountpoints"]) {"a".repeat(64)} else {"b".repeat(64)};let record=json!({"Id":id,"Config":body,"HostConfig":body["HostConfig"],"State":{"Running":false}});
+                                if mode=="late-mountpoints-create" && body["Cmd"]==json!(["prepare-provider-mountpoints"]) {
+                                    // Docker makes this helper after the reader's deadline,
+                                    // whether or not the reader still waits for the answer.
+                                    let (late,late_name)=(bodies.clone(),name.clone());
+                                    private_jobs.lock().unwrap().push(tokio::spawn(async move {tokio::time::sleep(Duration::from_millis(900)).await;late.lock().unwrap().insert(late_name,record);}));
+                                    while !bodies.lock().unwrap().contains_key(&name) {tokio::time::sleep(Duration::from_millis(10)).await;}
+                                } else {bodies.lock().unwrap().insert(name,record);}(if mode=="lost-projection-ack" && body["Cmd"]==json!(["project-claude-candidate-private"]) {503}else{201},json!({"Id":id}))}
                             else if line.starts_with("GET") && line.contains("/containers/"){let key=line.split("/containers/").nth(1).unwrap().split('/').next().unwrap();let found=bodies.lock().unwrap().iter().find(|(name,v)|*name==key || v["Id"]==key).map(|(_,v)|v.clone());match found {Some(mut v)=>{
                                 let reports=v["HostConfig"]["Mounts"].as_array().unwrap().iter().map(|m|json!({"Type":m["Type"],"Destination":m["Target"],"RW":!m["ReadOnly"].as_bool().unwrap(),"Source":if m["Type"]=="volume" {json!(if m["Target"]=="/run/freshell-retained-home" {"/synthetic/retained-home"} else {"/synthetic/ordinary-volume"})} else {m["Source"].clone()},"Name":if m["Type"]=="volume" {m["Source"].clone()} else {Value::Null}})).collect::<Vec<_>>();
                                 v["Mounts"]=json!(reports);
@@ -1169,7 +1180,7 @@ async fn qualify_candidate_helper_transport(
             }
         });
         let backend = DockerEngineBackend::new(owned.path().join("docker.sock"));
-        let budget = if mode == "projection-timeout" {
+        let budget = if matches!(mode, "projection-timeout" | "late-mountpoints-create") {
             Duration::from_millis(250)
         } else {
             Duration::from_secs(3)
@@ -1180,7 +1191,7 @@ async fn qualify_candidate_helper_transport(
                 request,
                 stage,
                 "synthetic-source-run",
-                budget,
+                HelperDeadlines::after(budget, Duration::from_secs(5)),
                 retained_name.as_ref().map(|_| prior_stage.as_path()),
             )
             .await;

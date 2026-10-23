@@ -3176,8 +3176,13 @@ pub async fn serve_control(supervisor: Supervisor, socket_path: &Path) -> Result
     }
 }
 
-pub fn default_backend(socket: impl Into<PathBuf>) -> Arc<dyn RuntimeBackend> {
-    Arc::new(DockerEngineBackend::new(socket))
+/// The Docker backend. Its helper retry and late-cleanup events go to the
+/// supervisor's lifecycle JSONL.
+pub fn default_backend(
+    socket: impl Into<PathBuf>,
+    lifecycle_log: impl Into<PathBuf>,
+) -> Arc<dyn RuntimeBackend> {
+    Arc::new(DockerEngineBackend::new(socket).with_lifecycle_log(lifecycle_log))
 }
 
 /// Default bound on one supervisor→session-host control round trip.
@@ -3317,9 +3322,11 @@ impl HostCommandBudgets {
     }
 }
 
-/// Bound on one Claude source observation: the fixed reader's 25-second
-/// operation and 5-second owned cleanup, with slack for the reply.
-pub(crate) const CLAUDE_SOURCE_OBSERVATION_BUDGET: Duration = Duration::from_secs(35);
+/// Bound on one Claude source observation: the fixed reader's whole bounded
+/// retry ([`crate::backend::CLAUDE_SOURCE_READER_RETRY`]: every attempt, the
+/// waits between them and their owned cleanup), with slack for the reply.
+pub(crate) const CLAUDE_SOURCE_OBSERVATION_BUDGET: Duration =
+    Duration::from_secs(crate::backend::CLAUDE_SOURCE_READER_RETRY.total.as_secs() + 5);
 
 /// Wait for one provider-preparation callback to the web server, covering the
 /// web server's own work for it (selecting and copying the provider's inputs).
@@ -3768,7 +3775,10 @@ mod host_command_budget_tests {
         std::fs::write(&host_binary_path, "synthetic-host-artifact").unwrap();
         let mut supervisor = Supervisor::new(
             registry,
-            default_backend(root.join("absent-docker.sock")),
+            default_backend(
+                root.join("absent-docker.sock"),
+                root.join("lifecycle.jsonl"),
+            ),
             SupervisorConfig {
                 runtime_root: root.join("runtime"),
                 control_socket_path: root.join("control.sock"),
