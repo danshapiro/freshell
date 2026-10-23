@@ -3957,6 +3957,22 @@ export function FreshAgentView({
   const liveTailActive = useAppSelector((state) => (
     liveSessionKey ? liveTailShowsContent(state.freshAgentLive?.bySession[liveSessionKey], landedTranscript) : false
   ))
+  // An ended turn's answer whose lines have not landed shows above a prompt
+  // sent after it (the echo), never below it.
+  const endedLiveTailShows = useAppSelector((state) => (
+    liveSessionKey && localEcho
+      ? liveTailShowsContent(state.freshAgentLive?.bySession[liveSessionKey], landedTranscript, 'ended')
+      : false
+  ))
+  const localEchoTurn = useMemo<FreshAgentTurn | undefined>(() => (localEcho ? {
+    id: `__local-echo:${localEcho.requestId}`,
+    turnId: localEcho.submittedTurnId ?? `__local-echo:${localEcho.requestId}`,
+    requestId: localEcho.requestId,
+    role: 'user',
+    summary: localEcho.text,
+    items: [{ id: `__local-echo-item:${localEcho.requestId}`, kind: 'text', text: localEcho.text }],
+  } as FreshAgentTurn : undefined), [localEcho])
+  const splitLiveTailAtEcho = Boolean(localEchoTurn && endedLiveTailShows)
   // Provider notices (rate limits, a failed compaction, CLI banners) show in
   // the pane's notice banner; they never end the turn (transcript-live P4).
   // `seq` shows each notice once; one received before this mount is not replayed.
@@ -4779,16 +4795,8 @@ export function FreshAgentView({
                     ref={transcriptRef}
                     presentationPaused={revealRefreshBlocking}
                     paneId={paneId}
-                    turns={localEcho
-                      ? [...turns, {
-                          id: `__local-echo:${localEcho.requestId}`,
-                          turnId: localEcho.submittedTurnId ?? `__local-echo:${localEcho.requestId}`,
-                          requestId: localEcho.requestId,
-                          role: 'user',
-                          summary: localEcho.text,
-                          items: [{ id: `__local-echo-item:${localEcho.requestId}`, kind: 'text', text: localEcho.text }],
-                        } as FreshAgentTurn]
-                      : turns}
+                    turns={turns}
+                    localEcho={localEchoTurn}
                     canFork={canFork}
                     canRollback={canRollback}
                     rollbackBusy={isBusy}
@@ -4812,6 +4820,17 @@ export function FreshAgentView({
                       <FreshAgentLiveTail
                         sessionKey={liveSessionKey}
                         landed={landedTranscript}
+                        part={splitLiveTailAtEcho ? 'running' : 'all'}
+                        agentLabel={descriptor?.label}
+                        expandThinking={globalExpandThinking}
+                        expandTools={globalExpandTools}
+                      />
+                    ) : undefined}
+                    beforeLocalEcho={liveSessionKey && !hidden && splitLiveTailAtEcho ? (
+                      <FreshAgentLiveTail
+                        sessionKey={liveSessionKey}
+                        landed={landedTranscript}
+                        part="ended"
                         agentLabel={descriptor?.label}
                         expandThinking={globalExpandThinking}
                         expandTools={globalExpandTools}
@@ -4979,7 +4998,8 @@ export function FreshAgentView({
     loadError,
     managedRecoveryPending,
     managedRecoveryActive,
-    localEcho,
+    localEchoTurn,
+    splitLiveTailAtEcho,
     modelDialogOpen,
     closeModelDialog,
     openModelDialog,

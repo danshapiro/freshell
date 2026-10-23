@@ -16,6 +16,18 @@ const NO_TURN_ACTIONS: TurnActionProps = { canFork: false }
 
 const LIVE_TURN_ID = '__live-tail'
 
+/**
+ * Which of the tail's turns a component shows: the turn that ended (blocks
+ * whose result arrived, waiting for their lines to land), the turn running
+ * now (its blocks and the retry in progress), or both, in that order.
+ */
+export type LiveTailPart = 'ended' | 'running' | 'all'
+
+function inPart(block: LiveBlock, part: LiveTailPart): boolean {
+  if (part === 'all') return true
+  return part === 'ended' ? block.ended === true : block.ended !== true
+}
+
 function liveItemId(block: LiveBlock): string {
   return `live:${block.messageId ?? 'unknown'}:${block.index}`
 }
@@ -60,12 +72,13 @@ function blockItem(block: LiveBlock): FreshAgentTranscriptItem {
 export function buildLiveTailTurn(
   tail: FreshAgentLiveSession | undefined,
   landed: LandedTranscript,
+  part: LiveTailPart = 'all',
 ): FreshAgentTurn | null {
   if (!tail) return null
   const items: FreshAgentTranscriptItem[] = tail.blocks
-    .filter((block) => !isLiveBlockLanded(block, landed))
+    .filter((block) => inPart(block, part) && !isLiveBlockLanded(block, landed))
     .map(blockItem)
-  if (tail.retry) {
+  if (tail.retry && part !== 'ended') {
     const error = describeRetry(tail.retry)
     items.push({ id: `${LIVE_TURN_ID}:retry`, kind: 'retry', attempt: tail.retry.attempt, ...(error ? { error } : {}) })
   }
@@ -81,11 +94,13 @@ export function buildLiveTailTurn(
 export function liveTailShowsContent(
   tail: FreshAgentLiveSession | undefined,
   landed: LandedTranscript,
+  part: LiveTailPart = 'all',
 ): boolean {
   if (!tail) return false
-  if (tail.retry) return true
+  if (tail.retry && part !== 'ended') return true
   return tail.blocks.some((block) => (
-    !isLiveBlockLanded(block, landed)
+    inPart(block, part)
+    && !isLiveBlockLanded(block, landed)
     && (block.kind === 'tool_use' || block.text.trim().length > 0)
   ))
 }
@@ -112,6 +127,7 @@ function tailSignature(turn: FreshAgentTurn | null): string {
 function FreshAgentLiveTailImpl({
   sessionKey,
   landed,
+  part = 'all',
   agentLabel,
   expandThinking = false,
   expandTools = false,
@@ -119,13 +135,15 @@ function FreshAgentLiveTailImpl({
   sessionKey: string
   /** What the rendered snapshot already shows. */
   landed: LandedTranscript
+  /** The tail's turns this component shows (both by default). */
+  part?: LiveTailPart
   agentLabel?: string
   expandThinking?: boolean
   expandTools?: boolean
 }) {
   const tail = useAppSelector((state) => state.freshAgentLive?.bySession[sessionKey])
   const follow = useContext(TranscriptFollowContext)
-  const turn = useMemo(() => buildLiveTailTurn(tail, landed), [tail, landed])
+  const turn = useMemo(() => buildLiveTailTurn(tail, landed, part), [tail, landed, part])
   const layout = useMemo(() => {
     if (!turn) return null
     const built = buildTranscriptLayout([turn])

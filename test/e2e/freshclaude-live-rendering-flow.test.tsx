@@ -1,6 +1,6 @@
 import { Profiler } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { act, cleanup, render } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import { appReducers } from '@/store/appReducers'
@@ -73,6 +73,8 @@ const SESSION_ID = '550e8400-e29b-41d4-a716-44665544d009'
 const locator = { sessionId: SESSION_ID, sessionType: 'freshclaude' as const, provider: 'claude' as const }
 const ANSWER = 'Kittens are small cats that love yarn.'
 const ANSWER_CHUNKS = ['Kittens are ', 'small cats ', 'that love ', 'yarn.']
+const FOLLOW_UP = 'And what about puppies?'
+const NEXT_ANSWER = 'Puppies are young dogs.'
 
 type Turn = { id: string; turnId: string; messageId?: string; role: 'user' | 'assistant'; summary: string; items: unknown[] }
 
@@ -135,6 +137,14 @@ function countOnScreen(text: string): number {
   return (document.body.textContent ?? '').split(text).length - 1
 }
 
+/** Whether `first` shows above `second` (both on screen once). */
+function onScreenBefore(first: string, second: string): boolean {
+  const text = document.body.textContent ?? ''
+  const a = text.indexOf(first)
+  const b = text.indexOf(second)
+  return a >= 0 && b >= 0 && a < b
+}
+
 function renderFlow(store: Store) {
   const frames: number[] = []
   render(
@@ -155,8 +165,8 @@ function deliver(store: Store, event: Record<string, unknown>) {
   })
 }
 
-const stream = (event: Record<string, unknown>) => ({
-  type: 'freshAgent.stream', messageId: 'msg_kittens', parentToolUseId: null, event,
+const stream = (event: Record<string, unknown>, messageId = 'msg_kittens') => ({
+  type: 'freshAgent.stream', messageId, parentToolUseId: null, event,
 })
 
 async function advance(ms: number) {
@@ -328,5 +338,46 @@ describe('freshclaude live rendering flow (transcript-live D9)', () => {
     await settleRefetches(4)
     expect(countOnScreen(ANSWER)).toBe(1)
     expect(document.querySelector('[data-turn-source="live"]')).toBeNull()
+  })
+
+  it('keeps a finished answer above the next prompt sent before the answer\'s line landed, and the next answer below it', async () => {
+    const store = createStore()
+    renderFlow(store)
+    await settleRefetches(2)
+
+    await streamAnswer(store)
+    deliver(store, { type: 'freshAgent.result', costUsd: 0.01 })
+    deliver(store, { type: 'freshAgent.turn.complete', at: Date.now() })
+    await advance(0)
+
+    // The user sends the next prompt at once; the CLI has not written the answer's line yet.
+    const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+    act(() => {
+      fireEvent.change(composer, { target: { value: FOLLOW_UP } })
+    })
+    act(() => {
+      fireEvent.keyDown(composer, { key: 'Enter' })
+    })
+    await advance(0)
+    expect(wsMock.send.mock.calls.some(([message]) => (message as { type?: string })?.type === 'freshAgent.send')).toBe(true)
+    expect(countOnScreen(ANSWER)).toBe(1)
+    expect(countOnScreen(FOLLOW_UP)).toBe(1)
+    expect(onScreenBefore(ANSWER, FOLLOW_UP)).toBe(true)
+
+    // The next turn streams: its text goes below the prompt it answers.
+    deliver(store, { type: 'freshAgent.status', status: 'running' })
+    deliver(store, stream({ type: 'message_start', message: { id: 'msg_next' } }, 'msg_next'))
+    deliver(store, stream({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }, 'msg_next'))
+    deliver(store, stream({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: NEXT_ANSWER } }, 'msg_next'))
+    await advance(LIVE_STREAM_FLUSH_MS)
+    expect(onScreenBefore(ANSWER, FOLLOW_UP)).toBe(true)
+    expect(onScreenBefore(FOLLOW_UP, NEXT_ANSWER)).toBe(true)
+
+    // The first answer's line lands: it stays above the prompt, once.
+    served = [question, answer]
+    await settleRefetches(3)
+    expect(countOnScreen(ANSWER)).toBe(1)
+    expect(onScreenBefore(ANSWER, FOLLOW_UP)).toBe(true)
+    expect(onScreenBefore(FOLLOW_UP, NEXT_ANSWER)).toBe(true)
   })
 })

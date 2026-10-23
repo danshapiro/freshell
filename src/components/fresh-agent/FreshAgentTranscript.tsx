@@ -1150,6 +1150,13 @@ export type FreshAgentTranscriptProps = {
   /** Rendered after the turns (the live tail of a running turn); it reaches
    * the transcript's follow behavior through TranscriptFollowContext. */
   tail?: ReactNode
+  /** The user's just-sent message, before the transcript holds it: shown
+   * after the turns, as the newest turn. */
+  localEcho?: FreshAgentTurn
+  /** Live content of the turn before `localEcho` (an ended turn's answer
+   * whose lines have not landed yet): rendered right above the echo, so the
+   * answer never shows below the prompt that follows it. */
+  beforeLocalEcho?: ReactNode
 }
 
 export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, FreshAgentTranscriptProps>(function FreshAgentTranscript({
@@ -1176,6 +1183,8 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
   sessionId,
   presentationPaused = false,
   tail: liveTail,
+  localEcho,
+  beforeLocalEcho,
 }, ref) {
   const scrollerRef = useRef<HTMLDivElement | null>(null)
   const [atBottom, setAtBottom] = useState(true)
@@ -1218,8 +1227,11 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
   const historicalSteps = historicalMarkers.filter((t) => t.role === 'user').length
   const resolvedShowTimecodes = showTimecodes ?? showModel
   const displayTurns = useMemo(() => (
-    coalesceSyntheticToolResultTurns(reclassifyPtyNotificationTurns(turns))
-  ), [turns])
+    coalesceSyntheticToolResultTurns(reclassifyPtyNotificationTurns(localEcho ? [...turns, localEcho] : turns))
+  ), [localEcho, turns])
+  const localEchoIndex = localEcho ? displayTurns.findIndex((turn) => turn.id === localEcho.id) : -1
+  // The live content shown above the echo, when there is an echo to show it above.
+  const echoPrelude = localEchoIndex >= 0 ? beforeLocalEcho : undefined
   const { layouts: turnLayouts, lineEndIndex, tail, tailCaption } = useMemo(
     () => buildTranscriptLayout(displayTurns),
     [displayTurns],
@@ -1364,6 +1376,11 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
   }, [])
   const lastTurnRole = displayTurns.at(-1)?.role
   const follow = useMemo<TranscriptFollow>(() => ({ requestFollow, lastTurnRole }), [requestFollow, lastTurnRole])
+  const roleBeforeEcho = localEchoIndex > 0 ? displayTurns[localEchoIndex - 1]?.role : undefined
+  const followBeforeEcho = useMemo<TranscriptFollow>(
+    () => ({ requestFollow, lastTurnRole: roleBeforeEcho }),
+    [requestFollow, roleBeforeEcho],
+  )
 
   // Shared row markup for BOTH rolled-back presentations (the e2e locates rows
   // via div.flex.items-start). The redo button branch is gated on the row's
@@ -1417,7 +1434,10 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
           // (the most recent point the line covers), so the existing "fork from
           // the latest activity turn" protection survives merging.
           const actionTurn = displayTurns[lineEndIndex.get(index) ?? index]
-          return (
+          // The echo follows the live content shown above it, never the turn before it.
+          const preludeHere = index === localEchoIndex && echoPrelude
+          const followsSameRole = !preludeHere && index > 0 && displayTurns[index - 1]?.role === turn.role
+          const article = (
             <FreshAgentTurnArticle
               key={`${getFreshAgentDisplayTurnKey(turn)}:${index}`}
               turn={turn}
@@ -1428,13 +1448,20 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
               showTimecodes={resolvedShowTimecodes}
               expandThinking={expandThinking}
               expandTools={expandTools}
-              showHeader={index === 0 || displayTurns[index - 1]?.role !== turn.role}
-              continuation={index > 0 && displayTurns[index - 1]?.role === turn.role}
+              showHeader={!followsSameRole}
+              continuation={followsSameRole}
               liveActivityBlockId={liveActivityBlockId}
               isStreamingLastTurn={isLastStreaming}
               index={index}
             />
           )
+          if (!preludeHere) return article
+          return [
+            <TranscriptFollowContext.Provider key="__live-tail-before-local-echo" value={followBeforeEcho}>
+              {echoPrelude}
+            </TranscriptFollowContext.Provider>,
+            article,
+          ]
         })}
         {tailCaption ? (
           <div

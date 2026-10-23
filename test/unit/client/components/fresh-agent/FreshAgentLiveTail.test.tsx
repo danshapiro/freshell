@@ -2,10 +2,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
-import freshAgentReducer from '@/store/freshAgentSlice'
+import freshAgentReducer, { turnResult } from '@/store/freshAgentSlice'
 import freshAgentLiveReducer, {
   assistantBlockBound,
   liveRetrySet,
+  liveTailViewerAdded,
   streamOpsApplied,
 } from '@/store/freshAgentLiveSlice'
 import type { LiveStreamOp } from '@/store/freshAgentLiveTypes'
@@ -252,5 +253,48 @@ describe('FreshAgentTranscript live tail slot (transcript-live D4)', () => {
     fireEvent.scroll(scroller)
     grow(1400, ' and line two')
     expect(scroller.scrollTop).toBe(100)
+  })
+})
+
+describe('the live tail around a just-sent prompt (an ended turn above it, the running turn below)', () => {
+  it('shows the ended turn\'s unlanded answer above the echo, and the running turn and its retry below it', () => {
+    const store = createStore()
+    apply(store, start(0, 'text'), delta(0, 'previous answer'))
+    act(() => {
+      store.dispatch(liveTailViewerAdded({ sessionKey: KEY }))
+      store.dispatch(turnResult(locator))
+    })
+    act(() => {
+      store.dispatch(streamOpsApplied({ ...locator, ops: [{ op: 'start', messageId: 'msg_2', index: 0, kind: 'text' }, { op: 'delta', messageId: 'msg_2', index: 0, text: 'next answer' }] }))
+      store.dispatch(liveRetrySet({ ...locator, attempt: 2, errorStatus: 529, error: 'overloaded' }))
+    })
+    const question = { id: 'q', turnId: 'q', role: 'user' as const, summary: 'question', items: [{ id: 'q-text', kind: 'text' as const, text: 'question' }] }
+    const echo = { id: '__local-echo:r1', turnId: '__local-echo:r1', role: 'user' as const, summary: 'follow-up', items: [{ id: 'e-text', kind: 'text' as const, text: 'follow-up' }] }
+    render(
+      <Provider store={store}>
+        <FreshAgentTranscript
+          turns={[question]}
+          localEcho={echo}
+          beforeLocalEcho={<FreshAgentLiveTail sessionKey={KEY} landed={NONE} part="ended" agentLabel="Claude" />}
+          tail={<FreshAgentLiveTail sessionKey={KEY} landed={NONE} part="running" agentLabel="Claude" />}
+        />
+      </Provider>,
+    )
+
+    const articles = screen.getAllByRole('article')
+    expect(articles.map((article) => article.getAttribute('aria-label'))).toEqual([
+      'You transcript turn',
+      'Claude live response',
+      'You transcript turn',
+      'Claude live response',
+    ])
+    expect(articles[1]).toHaveTextContent('previous answer')
+    expect(articles[1]).not.toHaveTextContent('Retrying')
+    expect(articles[2]).toHaveTextContent('follow-up')
+    // The echo follows the answer above it, so it carries its own header.
+    expect(within(articles[2]).getByText('You')).toBeInTheDocument()
+    expect(articles[3]).toHaveTextContent('next answer')
+    expect(articles[3]).not.toHaveTextContent('previous answer')
+    expect(within(articles[3]).getByText(/Retrying/)).toBeInTheDocument()
   })
 })
