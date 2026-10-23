@@ -295,6 +295,66 @@ describe('savedNameTabTitleMirrorMiddleware', () => {
     expect(tabOf(store, tabId).title).not.toBe('LotL')
   })
 
+  it('a switch immediately after reload clears the previous session title before names load', () => {
+    const previous = buildStore()
+    const { tabId } = createSessionTab(previous, {
+      title: 'LotL',
+      content: claudeTerminal({ terminalId: 'term-1', sessionRef: { provider: 'claude', sessionId: 'sess-1' } }),
+    })
+    // A reloaded window persists its layout and mirrored title, but not the
+    // name cache or the mirror middleware's memory. Its very first action
+    // can be the server's conversation-switch notification.
+    const store = buildStore({ preloadedState: previous.getState() })
+    expect(store.getState().sessionNames.records).toEqual({})
+
+    store.dispatch(reconcileTerminalSessionRefByTerminalId({
+      terminalId: 'term-1',
+      previousSessionId: 'sess-1',
+      sessionRef: { provider: 'claude', sessionId: 'sess-2' },
+    }))
+
+    expect(tabOf(store, tabId).title).toBe('Tab 1')
+    expect(selectTabDisplayName(store.getState() as unknown as RootState, tabId)).not.toBe('LotL')
+    store.dispatch(receiveSessionNames([update(NEXT_SESSION_REF, 'Billing bug', 1)]))
+    expect(tabOf(store, tabId).title).toBe('Billing bug')
+  })
+
+  it('a switch before either session record loads clears the previous title', () => {
+    const store = buildStore()
+    const { tabId } = createSessionTab(store, {
+      title: 'LotL',
+      content: claudeTerminal({ terminalId: 'term-1', sessionRef: { provider: 'claude', sessionId: 'sess-1' } }),
+    })
+    store.dispatch(setActiveTab(tabId))
+
+    store.dispatch(reconcileTerminalSessionRefByTerminalId({
+      terminalId: 'term-1',
+      previousSessionId: 'sess-1',
+      sessionRef: { provider: 'claude', sessionId: 'sess-2' },
+    }))
+
+    expect(tabOf(store, tabId).title).toBe('Tab 1')
+  })
+
+  it('closing the source immediately after reload releases its title before names load', () => {
+    const previous = buildStore()
+    const { tabId, paneId } = createSessionTab(previous, { title: 'LotL' })
+    previous.dispatch(splitPane({
+      tabId,
+      paneId,
+      direction: 'horizontal',
+      newContent: shellTerminal('crid-split'),
+      newPaneId: 'pane-shell',
+    }))
+    const store = buildStore({ preloadedState: previous.getState() })
+
+    store.dispatch(closePane({ tabId, paneId }))
+
+    expect(tabOf(store, tabId).nameSource).toEqual({ kind: 'legacy' })
+    expect(tabOf(store, tabId).title).toBe('Tab 1')
+    expect(selectTabDisplayName(store.getState() as unknown as RootState, tabId)).not.toBe('LotL')
+  })
+
   it('a tab whose last agent pane closes stops showing that session\'s name', () => {
     const store = buildStore()
     const { tabId, paneId } = createSessionTab(store, { title: 'freshell' })

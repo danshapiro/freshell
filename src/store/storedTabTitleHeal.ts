@@ -18,8 +18,8 @@
  *
  * Rules (`isHealableStoredTabTitle`, `src/lib/tab-title.ts`): only a tab
  * without `titleSetByUser`, never a title the saved-name mirror owns (a
- * session-owned tab whose saved record is cached keeps the mirrored saved
- * name, so the two never fight), never a `Tab N` placeholder or the tab's
+ * session-owned tab keeps its persisted display copy even before its saved
+ * record loads, so the two never fight), never a `Tab N` placeholder or the tab's
  * own derived label, and only text the shared classifier
  * (`shared/name-evidence.ts`) recognizes as a provider or mode label, a
  * provider placeholder or tool wrapper text for the tab's mode and provider
@@ -37,9 +37,9 @@
  */
 import type { Middleware } from '@reduxjs/toolkit'
 import { healStoredTabTitles } from './tabsSlice.js'
-import { selectSessionTabSavedNames } from './selectors/sessionNameSelectors.js'
 import type { RootState } from './store.js'
 import { isHealableStoredTabTitle, unnamedTabTitle } from '@/lib/tab-title'
+import { canWriteLegacyTabTitle } from '@/lib/tab-title-ownership'
 import { createLogger } from '@/lib/client-logger'
 
 const log = createLogger('StoredTabTitleHeal')
@@ -51,12 +51,11 @@ type HealStore = {
 
 /** `{tabId: placeholder}` for every tab whose stored title heals. */
 function planHeals(state: RootState): Record<string, string> {
-  const savedNames = selectSessionTabSavedNames(state)
   const layouts = state.panes?.layouts ?? {}
   const extensions = state.extensions?.entries
   const heals: Record<string, string> = {}
   for (const [index, tab] of (state.tabs?.tabs ?? []).entries()) {
-    if (savedNames[tab.id] !== undefined) continue
+    if (!canWriteLegacyTabTitle(state, tab.id)) continue
     if (!isHealableStoredTabTitle(tab, layouts[tab.id], extensions)) continue
     heals[tab.id] = unnamedTabTitle(index + 1)
   }
@@ -67,8 +66,8 @@ function runHealPass(store: HealStore, trigger: unknown): void {
   const heals = planHeals(store.getState() as RootState)
   const tabIds = Object.keys(heals)
   if (tabIds.length === 0) return
-  // Tab ids only: a stored label can be tool wrapper text that quotes a
-  // prompt, so the titles themselves are never logged.
+  // This client diagnostic needs only the affected ids; omit stored titles,
+  // which can contain wrapper excerpts.
   log.info('stored tab titles were default labels, not names; healed to the unnamed placeholder', {
     tabIds,
     trigger,
@@ -82,8 +81,8 @@ export function healStoredTabTitlesOnLoad(store: HealStore): void {
 }
 
 export const storedTabTitleHealMiddleware: Middleware = (store) => {
-  // Re-plan only when an input changed: the same tabs, layouts, saved names
-  // and extensions cannot hold a new default label.
+  // Re-plan only when an input changed: the same tabs, layouts and
+  // extensions cannot hold a new default label.
   let last: readonly unknown[] | undefined
   return (next) => (action) => {
     const result = next(action)
@@ -91,7 +90,6 @@ export const storedTabTitleHealMiddleware: Middleware = (store) => {
     const inputs = [
       state.tabs?.tabs,
       state.panes?.layouts,
-      selectSessionTabSavedNames(state),
       state.extensions?.entries,
     ] as const
     if (last && inputs.every((input, index) => input === last![index])) return result

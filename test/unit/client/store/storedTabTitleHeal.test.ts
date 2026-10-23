@@ -28,7 +28,7 @@ import type { RootState } from '@/store/store'
 // the unnamed placeholder ("Tab N", which every display treats as no title),
 // at one point — the store — so the display, the persisted layout, the
 // server's layout mirror and the tabs registry agree. A renamed tab, a real
-// title and a session-owned tab whose saved name is known are never touched.
+  // title and a session-owned tab's persisted display copy are never touched.
 
 const reducer = {
   tabs: tabsReducer,
@@ -145,9 +145,9 @@ describe('storedTabTitleHealMiddleware', () => {
     ['claude agent', 'claude', agentTerminal('claude', { initialCwd: '/work/billing' })],
     ['Recovered amplifier agent', 'amplifier', agentTerminal('amplifier', { initialCwd: '/work/billing' })],
     ['<recommended_plugins>\n- github: review pull requests', 'claude', agentTerminal('claude', { initialCwd: '/work/billing' })],
-  ] as const)('heals the stored label %j on an unrenamed %s tab', (title, mode, content) => {
+  ] as const)('heals the stored label %j on an unrenamed legacy %s tab', (title, mode, content) => {
     const store = buildStore()
-    store.dispatch(addTab({ id: 'tab-1', title, mode }))
+    store.dispatch(addTab({ id: 'tab-1', title, mode, nameSource: { kind: 'legacy' } }))
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
 
     expect(tabOf(store, 'tab-1').title).toBe('Tab 1')
@@ -183,6 +183,28 @@ describe('storedTabTitleHealMiddleware', () => {
     expect(tabOf(store, 'tab-1').titleSetByUser).toBe(true)
     expect(displayOf(store, 'tab-1')).toBe('Shell agent')
   })
+
+  it.each(['Gemini', 'Codex', 'OpenCode', 'Amplifier', 'Kimi', 'Shell'])(
+    'keeps a session-owned saved name %j on load before its record is cached',
+    (name) => {
+      const store = buildStore({
+        preloadedState: loadedState([{
+          tab: { id: 'tab-1', title: name, mode: 'claude', nameSource: { kind: 'session', paneId: 'pane-1' } },
+          paneId: 'pane-1',
+          content: agentTerminal('claude', { sessionRef: { provider: 'claude', sessionId: 'sess-1' } }),
+        }]),
+      })
+
+      healStoredTabTitlesOnLoad(store)
+      unrelatedActions(store, 'tab-1', 'pane-1')
+
+      expect(store.getState().sessionNames.records).toEqual({})
+      expect(tabOf(store, 'tab-1').title).toBe(name)
+      expect(displayOf(store, 'tab-1')).toBe(name)
+      expect(selectLiveLocalTabRecords(store.getState() as unknown as RootState)
+        .find((record) => record.tabId === 'tab-1')?.tabName).toBe(name)
+    },
+  )
 
   it.each([
     ['a real title', 'Build watcher', 'shell', shellTerminal()],
@@ -325,7 +347,7 @@ describe('storedTabTitleHealMiddleware', () => {
     expect(displayOf(store, 'tab-1')).toBe('vim notes.md')
   })
 
-  it('a session-owned tab without a cached saved name heals; once the name is known the mirror owns the title', () => {
+  it('the mirror alone owns a session tab title before and after its saved record loads', () => {
     const store = buildStore()
     store.dispatch(addTab({ id: 'tab-1', title: 'OpenCode agent', mode: 'opencode' }))
     store.dispatch(initLayout({
@@ -337,7 +359,7 @@ describe('storedTabTitleHealMiddleware', () => {
       }),
     }))
     expect(tabOf(store, 'tab-1').nameSource).toEqual({ kind: 'session', paneId: 'pane-1' })
-    expect(tabOf(store, 'tab-1').title).toBe('Tab 1')
+    expect(tabOf(store, 'tab-1').title).toBe('OpenCode agent')
 
     store.dispatch(receiveSessionNames([
       update({ kind: 'session', provider: 'opencode', sessionId: 'ses-1' }, 'Billing bug', 1),

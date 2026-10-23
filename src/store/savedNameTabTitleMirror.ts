@@ -64,9 +64,22 @@ type MirrorPass = {
   releasedTabIds: string[]
 }
 
-/** What a tab's stored title was last mirrored from: the naming ref key and
- * the saved name. */
+/** What a tab's stored title belongs to: the naming ref key and the saved
+ * name, or its persisted display copy while the name cache loads. */
 type MirroredTitle = { refKey: string; name: string }
+
+/** A loaded layout already carries display copies of its sessions' names.
+ * Remember their bindings before the first action can replace one, even
+ * though the non-persisted name cache has not loaded yet. */
+function rememberLoadedTitles(state: RootState, mirroredByTab: Map<string, MirroredTitle>): void {
+  const bindings = selectSessionTabNameBindings(state)
+  for (const tab of state.tabs?.tabs ?? []) {
+    const binding = bindings[tab.id]
+    if (binding?.refKey) {
+      mirroredByTab.set(tab.id, { refKey: binding.refKey, name: binding.savedName || tab.title })
+    }
+  }
+}
 
 /**
  * One mirror pass over the tabs. `mirroredByTab` remembers, per tab, what
@@ -104,7 +117,14 @@ function planMirrorPass(
       }
       continue
     }
-    if (mirrored === undefined || mirrored.refKey === refKey) continue
+    if (mirrored === undefined) {
+      // The first naming identity preserves a tab's create-time title, but
+      // observe it now so a later switch cannot keep that identity's title
+      // merely because its saved record never reached this window.
+      if (refKey !== null) mirroredByTab.set(tab.id, { refKey, name: tab.title })
+      continue
+    }
+    if (mirrored.refKey === refKey) continue
     // The stored title is another session's saved name.
     mirroredByTab.delete(tab.id)
     pass.titles[tab.id] = unnamedTabTitle(index + 1)
@@ -123,6 +143,11 @@ export const savedNameTabTitleMirrorMiddleware: Middleware = (store) => {
   let lastBindings: Record<string, SessionTabNameBinding> | undefined
   const mirroredByTab = new Map<string, MirroredTitle>()
   return (next) => (action) => {
+    if (lastBindings === undefined) {
+      const previousState = store.getState() as RootState
+      rememberLoadedTitles(previousState, mirroredByTab)
+      lastBindings = selectSessionTabNameBindings(previousState)
+    }
     const result = next(action)
     const state = store.getState() as RootState
     const bindings = selectSessionTabNameBindings(state)
