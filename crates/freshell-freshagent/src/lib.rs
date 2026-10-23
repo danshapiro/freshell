@@ -42,6 +42,7 @@ pub(crate) mod claude_handshake;
 pub(crate) mod claude_launch;
 pub(crate) mod claude_live_events;
 pub(crate) mod claude_projection;
+pub(crate) mod claude_projection_cache;
 pub(crate) mod claude_sidecar_exit;
 pub(crate) mod claude_sidecar_io;
 pub(crate) mod claude_snapshot;

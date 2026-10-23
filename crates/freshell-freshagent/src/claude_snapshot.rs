@@ -1780,7 +1780,9 @@ pub(crate) async fn get_claude_snapshot_in(
         }
     };
     // Reading the transcript and its subagent files, and projecting them, is
-    // blocking work: keep it off the async runtime.
+    // blocking work: keep it off the async runtime. The projection is
+    // incremental (a live pane refetches after every message): only the lines
+    // appended since the last read are parsed.
     let thread = thread_id.to_string();
     let (mtime_ms, projection) = tokio::task::spawn_blocking(move || {
         let mtime_ms = std::fs::metadata(&path)
@@ -1788,11 +1790,9 @@ pub(crate) async fn get_claude_snapshot_in(
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64);
-        let content = std::fs::read_to_string(&path)?;
         let subagents = crate::claude_projection::FsSubagents::for_transcript(&path);
-        let projection = crate::claude_projection::ClaudeTranscriptProjector::project_with(
-            &thread, &content, &subagents,
-        );
+        let projection =
+            crate::claude_projection_cache::read_transcript(&path, &thread, &subagents)?;
         Ok::<_, std::io::Error>((mtime_ms, projection))
     })
     .await
