@@ -131,7 +131,13 @@ adoption — binds to its session's saved name through one helper
 (`crates/freshell-freshagent/src/terminal_name_binding.rs`); a transient
 store failure is retried and then finished by the 2 s tick, so a row is
 never left unbound, and the row's title is the saved name or a mode
-label, never "Shell" for an agent.
+label, never "Shell" for an agent. A row rebuilt for a session that has no
+saved record yet (a zero-turn pane restored or adopted after a restart)
+rejoins the pane's pending handle, which every recovery request carries
+(the restore create, compatibility adoption, and the `pane.reconcile`
+entry's `namingHandle`); a handle the store already moved onto a
+different session is never used, so the row keeps its own session and
+shows its mode label instead of another conversation's name.
 
 A multi-session tab follows its original pane's session while that pane
 exists, and a tab rename targets that session — not whichever pane last
