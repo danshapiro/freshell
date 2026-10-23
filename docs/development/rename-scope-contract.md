@@ -93,7 +93,9 @@ activity-driven and server-side: it runs for UI-, CLI-, and API-created
 sessions alike after the first accepted user message, with an immediate
 fallback name and bounded retries. The fallback is the first message,
 offered for every activity that carries one (a newly accepted or indexed
-message, and a session that is opened or resumed). Three attempts that
+message, and a session that is opened or resumed). Once captured, the first
+message remains the AI naming input across later sends; a session-index
+extraction may correct that first message. Three attempts that
 end in an empty or unusable answer or an ordinary request failure (a
 timeout, a server error) are the limit; then the series stays exhausted
 and keeps its fallback name. A credential, permission, proxy, certificate
@@ -109,14 +111,16 @@ starts; the pause is logged
 (`session_names.generation_capability_unavailable`, then
 `session_names.generation_capability_restored`) and is not shown in the
 UI. A configured Gemini key (`GOOGLE_GENERATIVE_AI_API_KEY` at boot, else
-Settings → Naming; a Settings save replaces it at the next attempt) is
+Settings → Naming; a nonempty Settings save replaces it at the next attempt) is
 always used: it goes straight to Google when the proxy the server
 inherited from its launching shell is OneCLI's, and through any other
 inherited proxy. Only when no key is configured does AI naming use the
 server's inherited OneCLI connection (a boot WARN,
 `session_names.generation_route_inherited_identity`, says so); with
-neither, no AI naming runs and the fallback names still apply. Each
-attempt makes one request; there is no fallback between the key and
+neither, no AI naming runs and the fallback names still apply.
+Clearing the Settings field does not clear the running server's cached key;
+it stops using that key only after a restart with no startup key configured.
+Each attempt makes one request; there is no fallback between the key and
 OneCLI. Re-deriving an older session's first message (when the extraction
 rules change) never starts AI naming by itself: such a session, if AI
 naming never ran for it, gets its AI name when it is next opened. A
@@ -175,9 +179,34 @@ name, or the pane's fallback label until that session has one (the tab's
 stored title returns to the `Tab N` placeholder, which every display
 treats as no title). Nothing is copied
 from the old session, whose name is untouched; the switch creates or
-changes no record. A pane switched before its first message keeps its
+changes no record. A rename immediately after the switch can admit the
+new session's directory fallback and rename it before the session index
+creates its record. A pending handle that resolves to the old session
+cannot redirect that rename back to it. The retry pins the pending record's
+revision so a concurrent bind cannot change its target silently.
+For terminal pane and tab renames, the current registry binding takes
+precedence over a lagging browser layout. An editor's pending capture
+continues to match its own verified materialization, but not a different
+conversation, and revision checks still apply.
+A pane switched before its first message keeps its
 pending name, which transfers to the new session when that session
 materializes.
+
+Association and materialization frames carry the server's current naming
+reference. The client adopts it even before it has read pending redirects:
+a zero-turn pending reference stays pending, while a switch releases the
+old handle and names the new session.
+
+**Undo and redo.** A Claude undo or redo replaces its runtime as an
+internal continuation. Before announcing the replacement, the name store
+seeds its name once from the current session (or its still-pending name),
+preserving manual provenance, rename time and generation history. The
+child settles a copied in-flight generation start as interrupted, using
+the existing retry budget; the source's actual request stays untouched.
+The source record stays unchanged, no durable redirect is created, and an
+existing child name is never replaced. Later renames address the child.
+This applies to sidebar-resumed conversations too. Ordinary forks and new
+conversations start independently and never inherit a name this way.
 
 **What is never name evidence.** One shared classifier
 (`shared/name-evidence.ts` and `crates/freshell-sessions/src/name_evidence.rs`,
@@ -292,6 +321,7 @@ Every accepted saved-name change writes one INFO line,
 absent for a new record); the `cause` (`import`, `native_observation`,
 `first_message_fallback`, `generation`, `manual_rename`,
 `automation_rename`, `bind`, `bind_collision`, `ensure_pending`,
+`ensure_session`, `internal_continuation`,
 `hydrate`, `adopted_external`); `self_heal` (true when the self-heal rule
 replaced a junk name with one whose source ranks the same or lower); and
 `from_ref`, `import_id`, `evidence_key` or `series` where they apply. A
