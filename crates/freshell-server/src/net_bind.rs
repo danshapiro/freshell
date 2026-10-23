@@ -12,8 +12,8 @@
 //! `Notify::notify_one()` (permit-storing: the wakeup cannot be lost, unlike
 //! `notify_waiters`) and then AWAITS the old accept-loop `JoinHandle`, which
 //! first hands off queued connections, then shuts the listening socket down
-//! (so a duplicate held by a concurrently forked child process cannot keep
-//! it listening) and drops it — a deterministic "old socket closed" barrier,
+//! (so, on Linux, a duplicate held by a concurrently forked child process
+//! cannot keep it listening) and drops it — a deterministic "old socket closed" barrier,
 //! so callers may respond/probe immediately after `serve_on` returns. In-flight connections (incl.
 //! WebSockets) drain in their own spawned tasks — no mass 4009 on rebind.
 //!
@@ -73,8 +73,8 @@ pub fn bind_reusable(addr: SocketAddr, reuse_port: bool) -> std::io::Result<StdT
 /// Git spawn) still holds a duplicate from before its exec: the socket keeps
 /// listening, the kernel keeps queueing new connections on it — preferring
 /// it over a wildcard listener for its own address — and resets them all
-/// when the child's copy finally closes. A shutdown acts on the socket
-/// itself, so it stops listening at once.
+/// when the child's copy finally closes. On Linux a shutdown acts on the
+/// socket itself, so it stops listening at once.
 fn stop_listening(listener: &StdTcpListener) {
     match socket2::SockRef::from(listener).shutdown(std::net::Shutdown::Both) {
         Ok(()) => {}
@@ -454,7 +454,13 @@ mod tests {
     /// connection to its specific address would land in a queue nobody
     /// serves — ahead of the new wildcard listener — and be reset when the
     /// child's copy finally closes.
-    #[cfg(unix)]
+    ///
+    /// Linux only: the fix shuts the listening socket down, and only Linux
+    /// stops a listening socket that way. macOS and the BSDs answer such a
+    /// shutdown with "not connected" and leave the socket listening, which
+    /// `stop_listening` accepts because closing the descriptors is all those
+    /// platforms offer.
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_retired_listener_held_by_a_forked_child_stops_accepting() {
         use axum::{routing::get, Router};
