@@ -1317,6 +1317,7 @@ mod sim {
         let ClaudeSendOutcome::Accepted {
             session_key,
             submitted_turn_id,
+            ..
         } = outcome
         else {
             panic!("the send was accepted: {outcome:?}");
