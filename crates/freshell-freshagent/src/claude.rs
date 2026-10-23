@@ -2220,7 +2220,7 @@ impl FreshClaudeState {
                     // The additive owner fields ride the refusal when the
                     // coordinator can name the owner (Task 6: the post-handoff
                     // refusal says the terminal owner).
-                    let owner_fields = crate::ownership_lane::terminal_owner_fields_from_outcome(
+                    let owner_fields = crate::ownership_lane::fresh_agent_owner_fields_from_outcome(
                         &self.ownership,
                         &outcome,
                     );
@@ -4198,12 +4198,12 @@ impl FreshClaudeState {
                 ) {
                     crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
                     crate::ownership_lane::LaneOpGuard::Unwired => None,
-                    crate::ownership_lane::LaneOpGuard::Refused { message } => {
+                    crate::ownership_lane::LaneOpGuard::Refused { message, owner } => {
                         tracing::warn!(target: "freshell_freshagent::claude",
                         session_id = %session_id, owner_key = %owner_key,
                         request_id = ?request_id,
                         "fresh_agent_send_refused: ownership guard refused");
-                        return self.refuse_send(&request_id, "SESSION_RESERVED", &message);
+                        return self.refuse_reserved_send(&request_id, &message, owner);
                     }
                 }
             } else {
@@ -5068,6 +5068,8 @@ impl FreshClaudeState {
         ClaudeSendOutcome::Refused {
             code: "INVALID_SESSION_ID".to_string(),
             message: crate::claude_dead_sessions::SEND_TO_DEAD_SESSION_MESSAGE.to_string(),
+            retryable: None,
+            owner: None,
         }
     }
 
@@ -8186,6 +8188,7 @@ pub(crate) mod tests {
     use crate::naming::SessionNaming as _;
 
     mod create_binding_tests;
+    mod refusal_tests;
 
     fn state() -> FreshClaudeState {
         let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
