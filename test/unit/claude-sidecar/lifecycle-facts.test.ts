@@ -52,6 +52,17 @@ describe('uuid-stamped sends', () => {
     expect(await bridge.waitFor('sdk.turn.complete')).toMatchObject({ sessionId })
   })
 
+  // C17: the server's turn ledger reads msg_lifecycle_v1 from the per-turn
+  // init, so a result that started none of the server's commands (a turn the
+  // CLI runs by itself) is never taken for one of them.
+  it('forwards the CLI\'s capabilities on the per-turn init', async () => {
+    const { bridge, sessionId } = await session()
+    bridge.send({ type: 'send', sessionId, uuid: randomUUID(), text: 'hello' })
+    const init = await bridge.waitFor('sdk.session.init')
+    expect(init.capabilities).toEqual(expect.arrayContaining(['msg_lifecycle_v1']))
+    expect(init.capabilities.every((cap: unknown) => typeof cap === 'string')).toBe(true)
+  })
+
   it('forwards no lifecycle for commands the CLI makes itself', async () => {
     const { bridge, sessionId } = await session()
     // setModel runs /model inside the CLI and replays it under a uuid of its own (T8).

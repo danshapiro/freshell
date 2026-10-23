@@ -613,18 +613,6 @@ async function handleInput(line) {
     if (!emitted.has('activity') && !emitted.has('marker')) {
       await engine.emitEvent('activity', { status: 'idle' }, 'msg:interrupt:idle')
     }
-  } else if (msg.type === 'rollback.quiesce') {
-    // kata 1wxv ep4-r3: rollback's pre-teardown quiesce probe. This faker has
-    // no SDK-input queue — every sent turn settles immediately on the drive
-    // side — so the answer is always all-clear with a probeId echo.
-    emit({
-      type: 'sdk.rollback.quiesced',
-      sessionId: msg.sessionId,
-      probeId: msg.probeId ?? null,
-      cancelledQueue: 0,
-      inFlightTurn: false,
-      handedCompactLikely: false,
-    })
   } else if (msg.type === 'shutdown') {
     process.exit(0)
   }

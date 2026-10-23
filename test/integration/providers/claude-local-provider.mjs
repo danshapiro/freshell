@@ -253,7 +253,9 @@ export async function startLocalProvider({ replyText = 'ok' } = {}) {
     }
 
     const messages = Array.isArray(body.messages) ? body.messages : []
-    const last = messages[messages.length - 1]
+    // The last USER message: the CLI can append a system-role message after it
+    // (its agent-type listing), which carries no prompt.
+    const last = [...messages].reverse().find((m) => m?.role === 'user')
     const firstUserText = textOfContent(messages.find((m) => m?.role === 'user')?.content)
     const { text: promptText, afterTool } = promptTextAfterTools(last)
     const tools = Array.isArray(body.tools) ? body.tools.map((tool) => tool?.name).filter(Boolean) : []

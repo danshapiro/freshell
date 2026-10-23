@@ -8,10 +8,8 @@
 //! [`FreshClaudeState::refuse_send`], which builds the outcome from the same code
 //! and message, so the two never disagree; the WS dispatcher ignores the value.
 
-use std::sync::atomic::Ordering;
-
-use super::{retire_rejected_send, FreshClaudeState, TurnTracker, PROVIDER};
-use crate::claude_turns::SendRejection;
+use super::{FreshClaudeState, PROVIDER};
+use crate::claude_turns::{SendRejection, SharedLedger};
 
 /// The code a sender sees for a send the sidecar refused (`sdk.send.rejected`).
 const SEND_REJECTED: &str = "CLAUDE_SEND_REJECTED";
@@ -54,21 +52,22 @@ impl FreshClaudeState {
         let key = self.resolve_session_key(id).await?;
         let sessions = self.sessions.lock().await;
         let session = sessions.get(&key)?;
-        Some(session.in_turn.load(Ordering::SeqCst))
+        let busy = session.ledger.lock().expect("turn ledger lock").busy();
+        Some(busy)
     }
 
     /// The sidecar refused a send before the CLI saw it (`sdk.send.rejected`, for
     /// example an image Claude cannot read); the session lives on. Take the send
-    /// back: retire the op it armed, so the session is not left busy waiting for a
-    /// turn that never runs, and tell the sender. A send with a request gets the
+    /// back: the ledger lets go of exactly that command (by its uuid), so the
+    /// session is not left busy waiting for a turn that never runs, and tell the
+    /// sender. A send with a request gets the
     /// request error the client's owned-send path turns into "Message not sent:
     /// <reason>" with the text back in the composer; a compact (no request) gets a
     /// nested `freshAgent.error` on the session. A uuid this session does not
     /// remember is logged and changes nothing.
     pub(super) fn take_back_rejected_send(
         &self,
-        in_turn: &std::sync::atomic::AtomicBool,
-        turn_tracker: &std::sync::Mutex<TurnTracker>,
+        ledger: &SharedLedger,
         session_id: &str,
         session_type: &str,
         rejection: &SendRejection,
@@ -79,7 +78,7 @@ impl FreshClaudeState {
             message,
         } = rejection;
         let uuid = uuid.as_deref();
-        let send = uuid.and_then(|uuid| retire_rejected_send(in_turn, turn_tracker, uuid));
+        let send = uuid.and_then(|uuid| ledger.lock().expect("turn ledger lock").undo_arm(uuid));
         let Some(send) = send else {
             tracing::warn!(target: "freshell_freshagent::claude",
                 provider = PROVIDER, session_id, session_type, uuid, code = %code,
@@ -91,7 +90,7 @@ impl FreshClaudeState {
         tracing::warn!(target: "freshell_freshagent::claude",
             provider = PROVIDER, session_id, session_type, uuid = %send.uuid,
             request_id = send.request_id.as_deref(), kind = send.kind.as_str(), code = %code,
-            busy = in_turn.load(Ordering::SeqCst),
+            busy = ledger.lock().expect("turn ledger lock").busy(),
             event = "freshagent.claude.send_rejected",
             known = true,
             "the sidecar rejected a send; it is taken back");

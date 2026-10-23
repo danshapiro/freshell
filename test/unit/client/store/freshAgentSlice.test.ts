@@ -14,6 +14,7 @@ import reducer, {
   sessionInit,
   sessionSnapshotReceived,
   setSessionStatus,
+  turnResult,
 } from '@/store/freshAgentSlice'
 import { getCanonicalDurableSessionId } from '@/store/persistControl'
 
@@ -60,6 +61,28 @@ describe('freshAgentSlice busy/streaming clearing', () => {
     expect(state.sessions[key].status).toBe('exited')
     expect(state.sessions[key].streamingActive).toBe(false)
     expect(isFreshAgentBusy({ kind: 'fresh-agent', ...loc, createRequestId: 'r', status: 'exited' }, state.sessions[key])).toBe(false)
+  })
+
+  // C17 (G08): a result ends one turn, not the session's work. When the server
+  // says the session is still busy (a send queued behind the finished turn runs
+  // next), the pane stays running; otherwise it settles idle.
+  it('turnResult keeps the session running while the server reports it still busy', () => {
+    let state = streaming()
+    state = reducer(state, turnResult({ ...loc, sessionBusy: true, costUsd: 0.01 }))
+    expect(state.sessions[key].status).toBe('running')
+    expect(state.sessions[key].streamingActive).toBe(false)
+    expect(state.sessions[key].totalCostUsd).toBe(0.01)
+    expect(isFreshAgentBusy({ kind: 'fresh-agent', ...loc, createRequestId: 'r', status: 'running' }, state.sessions[key])).toBe(true)
+
+    state = reducer(state, turnResult({ ...loc, sessionBusy: false }))
+    expect(state.sessions[key].status).toBe('idle')
+  })
+
+  it('turnResult without sessionBusy (an older server) settles idle', () => {
+    let state = streaming()
+    state = reducer(state, turnResult({ ...loc }))
+    expect(state.sessions[key].status).toBe('idle')
+    expect(state.sessions[key].streamingActive).toBe(false)
   })
 
   it('sessionError (non-RESTORE) clears streamingActive and resets running -> idle', () => {

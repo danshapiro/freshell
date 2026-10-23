@@ -528,9 +528,7 @@ async fn undoing_the_only_turn_starts_a_fresh_conversation_and_redo_restores_it(
 /// so the fork's drops-turn guard is refused at boot. The undo answers
 /// ROLLBACK_REFUSED with a plain reason, is never retried without the guard,
 /// writes no rollback record, and the original stays live and takes a send. (A
-/// send absorbed during a tool call is refused the same way by the CLI, pinned
-/// by the `absorbed-undo` contract scenario; until the per-command ledger (C17)
-/// such a session still reads busy, so its undo answers BUSY_TURN first, G08.)
+/// send absorbed during a tool call is refused the same way, below.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_undo_of_a_turn_claude_folded_a_message_into_is_refused_and_the_session_stays_live() {
     let rig = rollback_rig().await;
@@ -588,6 +586,145 @@ async fn an_undo_of_a_turn_claude_folded_a_message_into_is_refused_and_the_sessi
         Vec::<Value>::new(),
         "A took the send"
     );
+}
+
+/// G08 at the rollback gate (C17: the gate reads the per-command ledger): a
+/// send absorbed into a tool call (T10) is one of two commands the turn's one
+/// result settles, so the session is idle afterwards and an undo reaches the
+/// CLI instead of answering BUSY_TURN. The turn being undone absorbed the
+/// second message, so the fork's drops-turn guard refuses it (decision 2):
+/// ROLLBACK_REFUSED, one guarded boot and no guard-less retry, and the original
+/// stays live and takes a send.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_undo_of_a_turn_that_absorbed_a_send_is_refused_by_the_cli_not_busy() {
+    let rig = rollback_rig().await;
+    let mut conn = rig.connect().await;
+    let pane = conn.create("create-1").await;
+    converse(&rig, &mut conn, &pane, &["first prompt"]).await;
+    let results = conn.events_seen("freshAgent.result");
+    conn.send_text(&pane, "send-tool", "TOOL:sleep=2").await;
+    conn.wait_for("the tool call", |v| {
+        v["type"] == "freshAgent.event"
+            && v["event"]["type"] == "freshAgent.assistant"
+            && v["event"]["content"]
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_use"))
+    })
+    .await;
+    conn.send_text(&pane, "send-absorbed", "and one more thing")
+        .await;
+    wait_for_results(&mut conn, results + 1, "the absorbing turn").await;
+    let a = conn.init_session_id(&pane);
+    let a_path = rig.wait_for_transcript(&a).await;
+    let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
+    while !chain_lines(&a_path)
+        .iter()
+        .any(|line| line["type"] == "attachment" && line["attachment"]["type"] == "queued_command")
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the absorbed send never reached disk"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
+    while rig.fresh_claude.session_busy(&pane).await != Some(false) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the absorbed send left the session busy"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let boots_before = queries(&rig).len();
+
+    request_rollback(&mut conn, "undo", &pane, &a, "undo-1", None).await;
+    let refused = rollback_answer(&mut conn, "undo-1").await;
+    assert_eq!(refused["type"], "freshAgent.error", "{refused}");
+    assert_eq!(refused["code"], "ROLLBACK_REFUSED", "{refused}");
+    let forks: Vec<Value> = queries(&rig).into_iter().skip(boots_before).collect();
+    assert_eq!(
+        forks.len(),
+        1,
+        "one guarded fork, never a guard-less retry: {forks:?}"
+    );
+    assert!(forks[0]["resumeDropsTurn"].is_string(), "{:?}", forks[0]);
+    assert!(ledger(&rig).load_rollback_row("claude", &a).is_none());
+
+    let results = conn.events_seen("freshAgent.result");
+    conn.send_text(&pane, "send-after", "still here?").await;
+    wait_for_results(&mut conn, results + 1, "the send after the refusal").await;
+    assert_eq!(
+        conn.request_errors("send-after"),
+        Vec::<Value>::new(),
+        "A took the send"
+    );
+}
+
+/// The rollback gate's recheck (C17): the gate admitted an undo while the
+/// session was idle, but a background agent finished while the undo read the
+/// transcript, and its completion started a turn the CLI runs by itself (T19).
+/// The ledger is busy again when the undo would boot its replacement, so the
+/// undo answers BUSY_TURN, boots nothing and leaves no rollback record, and the
+/// CLI's own turn finishes on the original.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_undo_refuses_when_the_cli_starts_a_turn_of_its_own_after_the_gate() {
+    // A slower clock gives the undo seconds to reach its hold before the
+    // background agent finishes.
+    let rig = ClaudeRig::start_with_options(
+        RigKind::Sim,
+        RigOptions {
+            durable_ledger: true,
+            env: vec![("FRESHELL_CLAUDE_SIM_TIME_SCALE".into(), "3".into())],
+            ..RigOptions::default()
+        },
+    )
+    .await;
+    let mut conn = rig.connect().await;
+    let pane = conn.create("create-1").await;
+    converse(&rig, &mut conn, &pane, &["first prompt"]).await;
+    let results = conn.events_seen("freshAgent.result");
+    conn.send_text(&pane, "send-agent", "AGENT:async").await;
+    wait_for_results(&mut conn, results + 1, "the launching turn").await;
+    let a = conn.init_session_id(&pane);
+    let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
+    while rig.fresh_claude.session_busy(&pane).await != Some(false) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the launching turn left the session busy"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let boots_before = queries(&rig).len();
+
+    let hold = rig.fresh_claude.hold_rollback_boot();
+    request_rollback(&mut conn, "undo", &pane, &a, "undo-1", None).await;
+    tokio::time::timeout(RIG_FRAME_BUDGET, hold.parked())
+        .await
+        .expect("the gate admitted the undo while the session was idle");
+    let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
+    while rig.fresh_claude.session_busy(&pane).await != Some(true) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the background agent's completion never started a turn"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    hold.release();
+
+    let refused = rollback_answer(&mut conn, "undo-1").await;
+    assert_eq!(refused["type"], "freshAgent.error", "{refused}");
+    assert_eq!(refused["code"], "BUSY_TURN", "{refused}");
+    assert_eq!(
+        queries(&rig).len(),
+        boots_before,
+        "the refused undo booted nothing"
+    );
+    assert!(
+        ledger(&rig).load_rollback_row("claude", &a).is_none(),
+        "the pre-written record was compensated"
+    );
+    wait_for_results(&mut conn, results + 2, "the CLI's own turn").await;
+    assert_eq!(conn.init_session_id(&pane), a);
 }
 
 /// The replacement fails to boot (here: A's transcript is moved away while the

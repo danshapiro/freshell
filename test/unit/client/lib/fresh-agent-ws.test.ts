@@ -411,6 +411,26 @@ describe('fresh-agent-ws', () => {
     expect(store.getState().freshAgent.sessions['freshclaude:claude:stale-thread-1']).toBeUndefined()
   })
 
+  // C17: the server's result frame says whether the session is still busy
+  // (a queued send runs next); the pane follows it instead of forcing idle.
+  it('passes the result frame\'s sessionBusy through to the session status', () => {
+    const store = createFreshAgentStore()
+    const sessionId = 'claude-thread-queued'
+    const key = `freshclaude:claude:${sessionId}`
+    const sendEvent = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      event: { sessionId, ...event },
+    })
+    expect(sendEvent({ type: 'freshAgent.status', status: 'running' })).toBe(true)
+    expect(sendEvent({ type: 'freshAgent.result', subtype: 'success', sessionBusy: true })).toBe(true)
+    expect(store.getState().freshAgent.sessions[key].status).toBe('running')
+    expect(sendEvent({ type: 'freshAgent.result', subtype: 'success', sessionBusy: false })).toBe(true)
+    expect(store.getState().freshAgent.sessions[key].status).toBe('idle')
+  })
+
   it('projects every fresh-agent provider event carried by freshAgent.event into fresh-agent state', () => {
     const store = createFreshAgentStore()
     const sessionId = 'claude-thread-parity'

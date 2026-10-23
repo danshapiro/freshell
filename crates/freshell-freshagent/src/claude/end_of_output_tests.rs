@@ -429,14 +429,14 @@ async fn a_node_killed_mid_turn_reports_its_signal_after_the_tree_is_gone_and_ri
         .st
         .handle_send(send_msg(&session.pane, "a turn the sidecar dies in"))
         .await;
-    let in_turn = session
+    let busy = session
         .st
         .sessions
         .lock()
         .await
         .get(&session.pane)
-        .map(|live| live.in_turn.load(std::sync::atomic::Ordering::SeqCst));
-    assert_eq!(in_turn, Some(true), "the turn is in flight");
+        .map(|live| live.ledger.lock().expect("turn ledger lock").busy());
+    assert_eq!(busy, Some(true), "the turn is in flight");
 
     // SAFETY: the sidecar is this test's own child.
     unsafe {

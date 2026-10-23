@@ -596,10 +596,13 @@ const freshAgentSlice = createSlice({
       costUsd?: number
       durationMs?: number
       usage?: { input_tokens?: number; output_tokens?: number }
+      /** The server still owes the session work (a send queued behind this turn). */
+      sessionBusy?: boolean
     }>) {
-      const session = resolveOrEnsureSession(state, action.payload, 'idle')
+      const status = action.payload.sessionBusy === true ? 'running' : 'idle'
+      const session = resolveOrEnsureSession(state, action.payload, status)
       if (!session) return
-      writeSessionStatus(session, 'idle')
+      writeSessionStatus(session, status)
       session.streamingActive = false
       session.totalCostUsd += action.payload.costUsd ?? 0
       session.totalInputTokens += action.payload.usage?.input_tokens ?? 0

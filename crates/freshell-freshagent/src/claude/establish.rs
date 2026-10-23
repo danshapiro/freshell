@@ -64,11 +64,10 @@ pub(super) enum RegisterUnder {
 
 /// The per-session state a replacement runtime takes over from the runtime it
 /// replaces (an undo or redo, design §4.6): the turn lock a parked send waits
-/// on, the busy truth and the attention clock. Only the process changes.
+/// on, the turn ledger and the attention clock. Only the process changes.
 pub(super) struct InheritedRuntime {
     pub(super) turn_lock: Arc<TokioMutex<()>>,
-    pub(super) in_turn: Arc<std::sync::atomic::AtomicBool>,
-    pub(super) turn_tracker: Arc<std::sync::Mutex<TurnTracker>>,
+    pub(super) ledger: crate::claude_turns::SharedLedger,
     pub(super) last_synthesized_complete_at: Arc<std::sync::Mutex<Option<i64>>>,
 }
 
@@ -699,19 +698,14 @@ impl FreshClaudeState {
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
         let InheritedRuntime {
             turn_lock,
-            in_turn,
-            turn_tracker,
+            ledger,
             // Task 5: the session's death-mint clock (see the field doc).
             last_synthesized_complete_at,
         } = inherit.unwrap_or_else(|| InheritedRuntime {
             turn_lock: Arc::new(TokioMutex::new(())),
-            in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            turn_tracker: Arc::new(std::sync::Mutex::new(TurnTracker::default())),
+            ledger: crate::claude_turns::SharedLedger::default(),
             last_synthesized_complete_at: Arc::new(std::sync::Mutex::new(None)),
         });
-        // A just-booted session has announced nothing: no turn can be in flight
-        // before the client sends.
-        let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
         {
             let mut sessions = self.sessions.lock().await;
             let consumer = self.spawn_consumer(
@@ -722,9 +716,7 @@ impl FreshClaudeState {
                 recorded_settings,
                 Arc::clone(&broadcast_id),
                 Arc::clone(&pending),
-                Arc::clone(&last_status),
-                Arc::clone(&in_turn),
-                Arc::clone(&turn_tracker),
+                Arc::clone(&ledger),
                 Arc::clone(&last_synthesized_complete_at),
                 provenance,
             );
@@ -752,12 +744,9 @@ impl FreshClaudeState {
                     owning_generation,
                     broadcast_id,
                     pending,
-                    in_turn,
-                    turn_tracker,
+                    ledger,
                     last_synthesized_complete_at,
                     turn_lock,
-                    rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
-                    last_status,
                     launch_genesis: genesis.map(|genesis| crate::identity_sink::RecordedGenesis {
                         genesis,
                         updated_at_ms: crate::rollback_record::now_ms(),

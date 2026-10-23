@@ -40,7 +40,8 @@
 //                                    forwarded (its error result is the refusal's evidence, not a
 //                                    turn), and the sidecar then exits with code 2.
 //     { type:'sdk.configured',          sessionId, requestId, ok, settings?, message? }
-//     { type:'sdk.session.init',        sessionId, cliSessionId, model, cwd, tools }  // durable Claude UUID
+//     { type:'sdk.session.init',        sessionId, cliSessionId, model, cwd, tools, capabilities? }  // durable Claude UUID;
+//                                  capabilities: the CLI's (msg_lifecycle_v1 says it reports every sent command's lifecycle)
 //     { type:'sdk.assistant',           sessionId, content, model }
 //     { type:'sdk.stream',              sessionId, event, parentToolUseId }
 //     { type:'sdk.result',              sessionId, result, durationMs, costUsd, usage }
@@ -188,10 +189,8 @@ function nanoid(size = 21) {
 // un-cancellable boundary; an absorbed compact pulled mid-window must arm the
 // busy verdict just as the immediate handoff does).
 function createInputStream(onHandoff) {
-  // Items are { msg, isCompact } — the wrapper lets rollback's quiesce drain
-  // never-yet-handed compacts (kata 1wxv ep4-r3: the SDK's queued-input
-  // surface cannot cancel UUID-less items, so cancellation authority lives at
-  // THIS queue, before handoff).
+  // Items are { msg, isCompact }: a compact's handoff arms the configure guard
+  // (handedCompactLikely) on either path below.
   const queue = []
   let waiting = null
   let done = false
@@ -206,16 +205,6 @@ function createInputStream(onHandoff) {
       } else {
         queue.push({ msg, isCompact })
       }
-    },
-    // kata 1wxv ep4-r1 F1 → rollback quiesce: every queued compact is
-    // provably never handed to the SDK (the handoffs above/below are the only
-    // pulls) — dropping them here cancels them permanently.
-    drainCompacts: () => {
-      let cancelled = 0
-      for (let i = queue.length - 1; i >= 0; i--) {
-        if (queue[i].isCompact) { queue.splice(i, 1); cancelled += 1 }
-      }
-      return cancelled
     },
     end: () => {
       done = true
@@ -299,15 +288,12 @@ function handleSdkMessage(sessionId, msg) {
   // status ends, heartbeats.
   for (const frame of lifecycleFrames(sessionId, msg, st.lifecycle)) emit(frame)
 
-  // ep4-r6 quiesce bookkeeping (fail-closed approximations; the discharge rule
-  // is tight per ep4-r5 F1):
+  // The configure guard's bookkeeping (until C18 deletes it; the server's turn
+  // ledger already refuses a settings change while the session is busy):
   // - a `result` closes whatever turn was open (`turnOpen`);
   // - an assistant/system frame marks a TURN boundary (`turnOpen`);
   // - ONLY a `compacting` status discharges `handedCompactLikely`: the handed
-  //   compact's OWN evidence finally carrying the busy truth (an unrelated
-  //   earlier result — the SDK drains the iterable independently — must never
-  //   drop it, or a rollback probe between that result and the compact's
-  //   status sees a false all-clear; the reviewer repro).
+  //   compact's OWN evidence (an unrelated earlier result must never drop it).
   if (msg.type === 'result') {
     st.turnOpen = false
   } else if (
@@ -341,6 +327,8 @@ function handleSdkMessage(sessionId, msg) {
           model: msg.model,
           cwd: msg.cwd,
           tools: Array.isArray(msg.tools) ? msg.tools.map((t) => ({ name: t })) : undefined,
+          // The server's turn ledger reads msg_lifecycle_v1 from them (T8).
+          ...(Array.isArray(msg.capabilities) ? { capabilities: msg.capabilities.filter((cap) => typeof cap === 'string') } : {}),
         })
         publishCommandsIfChanged(sessionId, st)
       } else if (msg.subtype === 'commands_changed') {
@@ -511,11 +499,10 @@ function handleCreate(req) {
 
   const sessionId = nanoid()
   const abort = new AbortController()
-  // ep4-r3/ep4-r4 quiesce state (declared first so the stream can arm it):
+  // The configure guard's state (declared first so the stream can arm it):
   // turnOpen — an SDK turn is mid-flight (cleared at its result);
-  // handedCompactLikely — a compact crossed the un-cancellable SDK handoff
-  // (same-tick push OR queued pull — either path); cleared at the next
-  // result or observed status frame (its evidence has by then reached Rust).
+  // handedCompactLikely — a compact crossed the SDK handoff (same-tick push
+  // OR queued pull — either path); cleared by its compacting status.
   const state = {
     abort,
     permissionMode: req.permissionMode,
@@ -689,9 +676,7 @@ function handleSend(req) {
     rejectSend(req, error?.code ?? 'INVALID_SEND', errorText(error))
     return
   }
-  // ep4-r3: /compact is the only dispatch rollback ever absorbs; mark it so
-  // the quiesce handler can drain never-handed compacts from the input queue
-  // and so a same-tick handoff arms the BUSY-forcing handed flag.
+  // A /compact's handoff arms the configure guard's handed flag.
   const isCompact = /^\s*\/compact(\s|$)/.test(req.text)
   // A checkpoint attempt binds under the send's own uuid.
   const checkpointAttempt = checkpointAttemptOf(req.checkpointAttempt && { ...req.checkpointAttempt, uuid: req.uuid })
@@ -730,30 +715,6 @@ async function handleConfigure(req) {
     log('warn', 'configure.failed', { sessionId: req.sessionId, requestId: req.requestId, error: errorText(err) })
     emit({ type: 'sdk.configured', sessionId: req.sessionId, requestId: req.requestId, ok: false, settings: { ...st.settings }, message: String(err?.message || err) })
   }
-}
-
-// kata 1wxv ep4 (rollback quiesce probe): rollback pre-teardown sends this
-// request instead of a bare interrupt — the answer is stream-ordered AFTER
-// every already-emitted frame and carries this sidecar's OWN queue truth:
-// - cancelledQueue: compact items DROPPED from the still-unhanded input
-//   queue (they provably never start — the SDK owns no reference to them);
-// - inFlightTurn / handedCompactLikely: evidence that provider work already
-//   crossed the un-cancellable handoff — rollback must refuse (BUSY).
-// The probeId echos for correlation ONLY: a quiesced frame fires exclusively
-// the rollback probe that registered it (stale/mismatched receipts never
-// close a live probe).
-function handleRollbackQuiesce(req) {
-  const st = sessions.get(req.sessionId)
-  if (!st) { emit({ type: 'sdk.error', sessionId: req.sessionId, message: 'session not found', sessionNotFound: true }); return }
-  const cancelledQueue = st.inputStream.drainCompacts()
-  emit({
-    type: 'sdk.rollback.quiesced',
-    sessionId: req.sessionId,
-    probeId: req.probeId ?? null,
-    cancelledQueue,
-    inFlightTurn: st.turnOpen === true,
-    handedCompactLikely: st.handedCompactLikely === true,
-  })
 }
 
 // Faithful port of `server/sdk-bridge.ts:785-793`'s `interrupt(sessionId)`:
@@ -838,7 +799,6 @@ rl.on('line', (line) => {
       break
     }
     case 'interrupt': handleInterrupt(req); break
-    case 'rollback.quiesce': handleRollbackQuiesce(req); break
     case 'permission.respond': {
       const st = sessions.get(req.sessionId)
       if (!st) break
