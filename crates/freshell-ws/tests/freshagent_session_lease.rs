@@ -143,10 +143,19 @@ rl.on('line', (line) => {
     }
     if (process.env.FAKE_SIDECAR_SPAWN_GRANDCHILD === '1') {
       // Detached decoy grandchild inheriting env (so /proc/<pid>/environ carries the
-      // ownership tag the kill sweep scans for).
-      const gc = spawn('sleep', ['300'], { detached: true, stdio: 'ignore' })
+      // ownership tag the kill sweep scans for). It IGNORES SIGTERM (an ignored signal
+      // stays ignored across exec), so the claude lane's own one-shot SIGTERM reap of
+      // its tagged tree cannot end it: only the expired-lease sweep's SIGKILL
+      // escalation can. It is logged only once the shell has armed the ignore.
+      const gc = spawn('sh', ['-c', 'trap "" TERM; echo armed; exec sleep 300 >/dev/null'], {
+        detached: true,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      })
+      gc.stdout.once('data', () => {
+        gc.stdout.destroy()
+        logReq({ type: 'grandchild', grandchildPid: gc.pid })
+      })
       gc.unref()
-      logReq({ type: 'grandchild', grandchildPid: gc.pid })
     }
     counter += 1
     const sessionId = `fake-claude-session-${process.pid}-${counter}`
@@ -205,6 +214,50 @@ impl FakeLeaseSidecarEnv {
             .collect()
     }
 
+    /// SIGKILL every decoy grandchild this env's sidecars logged that is still
+    /// alive. The decoy is detached on purpose (it must outlive a raw
+    /// single-pid kill of its sidecar), so nothing else stops it when a test
+    /// ends before the ownership sweep ran — or when a later sidecar spawned
+    /// one of its own. Each pid is pinned through a pidfd and must carry this
+    /// env's unique request-log path in `/proc/<pid>/environ`, so a recycled
+    /// pid is never signalled.
+    #[cfg(target_os = "linux")]
+    fn kill_logged_decoys(&self) {
+        let tag = format!(
+            "FAKE_SIDECAR_REQUEST_LOG={}",
+            self.dir.join("requests.jsonl").display()
+        );
+        for row in self.request_log_rows() {
+            if row["msg"]["type"] != "grandchild" {
+                continue;
+            }
+            let Some(pid) = row["msg"]["grandchildPid"].as_i64() else {
+                continue;
+            };
+            // SAFETY: plain syscalls on an owned descriptor; the pidfd is
+            // closed below on every path.
+            let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+            if pidfd < 0 {
+                continue; // already gone
+            }
+            let pidfd = pidfd as libc::c_int;
+            let ours = std::fs::read(format!("/proc/{pid}/environ"))
+                .is_ok_and(|env| env.split(|b| *b == 0).any(|kv| kv == tag.as_bytes()));
+            if ours {
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        pidfd,
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    );
+                }
+            }
+            unsafe { libc::close(pidfd) };
+        }
+    }
+
     /// Poll the request log until `pred` matches a row (or the budget expires).
     async fn await_log_row(&self, budget: Duration, pred: impl Fn(&Value) -> bool) -> Value {
         let deadline = tokio::time::Instant::now() + budget;
@@ -223,6 +276,8 @@ impl FakeLeaseSidecarEnv {
 
 impl Drop for FakeLeaseSidecarEnv {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        self.kill_logged_decoys();
         for var in [
             "FRESHELL_CLAUDE_SIDECAR",
             "FRESHELL_CLAUDE_NODE",
@@ -662,7 +717,9 @@ async fn codex_loser_create_resume_adopts_and_never_clobbers_the_winner() {
 /// An EXPIRED lease must be TREE-killed before release: the decoy grandchild (which a
 /// raw single-pid SIGKILL of the sidecar would orphan) must be dead BEFORE the second
 /// client's create converges -- i.e. the ownership sweep ran and confirmed empty prior
-/// to force-release.
+/// to force-release. The decoy ignores SIGTERM, so the claude lane's own SIGTERM reap
+/// (run when A's sidecar dies mid-create) cannot stand in for the sweep: only the
+/// sweep's SIGKILL escalation ends it.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn expired_lease_kill_sweeps_the_sidecar_tree_before_release() {
@@ -691,14 +748,35 @@ async fn expired_lease_kill_sweeps_the_sidecar_tree_before_release() {
         std::path::Path::new(&format!("/proc/{gpid}")).exists(),
         "decoy grandchild must be alive before expiry"
     );
+    // A's sidecar captured its environment at spawn. Client B's replacement sidecar
+    // must be a plain one: no decoy of its own (nothing would ever reap it — the
+    // detached `sleep 300` outlived every run) and no artificial create delay on the
+    // path whose convergence this test times.
+    std::env::remove_var("FAKE_SIDECAR_SPAWN_GRANDCHILD");
+    std::env::remove_var("FAKE_SIDECAR_CREATE_DELAY_MS");
     // Let the TTL expire, then client B contends -> ExpiredNeedsKill -> tree kill.
     tokio::time::sleep(Duration::from_millis(300)).await;
     send_json(&mut ws_b, &claude_create_resume("req-ttl-b", durable)).await;
 
-    // The DECOY GRANDCHILD dies (ownership sweep / tree-kill) BEFORE client B's created
-    // lands. NOTE: a dead-but-unreaped ZOMBIE keeps its /proc entry (it reparents to the
-    // container's pid 1, which never reaps it), so "dead" is read from the stat STATE —
-    // gone, Z, or X — not from /proc existence.
+    // B's create settles (force-release + re-claim ONCE). A refusal (e.g. an
+    // unconfirmed tree kill holding the lease closed) answers create.failed — fail
+    // on it at once with its code instead of timing out on a created that never comes.
+    let outcome = await_frame(&mut ws_b, Duration::from_secs(20), |v| {
+        (v["type"] == "freshAgent.created" || v["type"] == "freshAgent.create.failed")
+            && v["requestId"] == "req-ttl-b"
+    })
+    .await;
+    assert_eq!(
+        outcome["type"], "freshAgent.created",
+        "client B's create must converge after the expired holder's tree kill: {outcome}"
+    );
+    assert!(outcome["sessionId"].is_string());
+
+    // The DECOY GRANDCHILD was dead (ownership sweep / tree-kill) BEFORE client B's
+    // created landed: the release follows the sweep's confirmation, so it is already
+    // dead now — no polling. NOTE: a dead-but-unreaped ZOMBIE keeps its /proc entry (it
+    // reparents to the container's pid 1, which never reaps it), so "dead" is read from
+    // the stat STATE — gone, Z, or X — not from /proc existence.
     let grandchild_dead = |pid: i64| -> bool {
         let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
             return true; // gone entirely
@@ -710,24 +788,10 @@ async fn expired_lease_kill_sweeps_the_sidecar_tree_before_release() {
             Some("Z") | Some("X") | None
         )
     };
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if grandchild_dead(gpid) {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "grandchild survived: a raw single-pid kill orphans the writer (V6)"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    // ...and only then does B's own resume converge (force-release + re-claim ONCE).
-    let created = await_frame(&mut ws_b, Duration::from_secs(20), |v| {
-        v["type"] == "freshAgent.created" && v["requestId"] == "req-ttl-b"
-    })
-    .await;
-    assert!(created["sessionId"].is_string());
+    assert!(
+        grandchild_dead(gpid),
+        "grandchild survived B's convergence: a raw single-pid kill orphans the writer (V6)"
+    );
 }
 
 // ── Task 13: lease at the attach-resume seams ────────────────────────────────────────

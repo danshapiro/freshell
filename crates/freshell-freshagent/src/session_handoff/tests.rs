@@ -281,7 +281,8 @@ impl FakeOpencodeServeEnv {
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "audit row did not appear within budget"
+                "audit row did not appear within budget; rows: {:?}",
+                self.audit_rows()
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -8046,15 +8047,33 @@ async fn opencode_handoff_stop_waits_for_a_mid_dispatch_rest_drive_under_the_gat
         axum::Json(json!({ "text": "first REST turn", "timeout": 1 })),
     ));
     let rest_response = first.await.expect("drive #1 completed");
+    let first_status = rest_response.status();
+    let first_body = axum::body::to_bytes(rest_response.into_body(), usize::MAX)
+        .await
+        .expect("drive #1 body");
     assert_eq!(
-        rest_response.status(),
+        first_status,
         axum::http::StatusCode::OK,
-        "drive #1 answers approx: {rest_response:?}"
+        "drive #1 answers approx: {}",
+        String::from_utf8_lossy(&first_body)
+    );
+
+    let is_prompt_row = |r: &Value| {
+        r["method"] == "POST"
+            && r["path"]
+                .as_str()
+                .is_some_and(|p| p == "/session/ses_1/prompt_async")
+    };
+    let prompt_rows = |rows: &[Value]| rows.iter().filter(|r| is_prompt_row(r)).count();
+    assert_eq!(
+        prompt_rows(&env.audit_rows()),
+        1,
+        "drive #1 issued exactly one prompt POST"
     );
 
     // Park drive #2 mid-dispatch — AFTER the gate-held re-check, BEFORE
     // the prompt POST (the R4-2 test seam; never armed in production).
-    let pause = Arc::new(tokio::sync::Notify::new());
+    let pause = Arc::new(crate::RestTurnTestPause::default());
     rig.fresh_agent
         .set_rest_turn_test_pause_for_test(Some(Arc::clone(&pause)));
     let second = tokio::spawn(crate::send_keys(
@@ -8063,14 +8082,18 @@ async fn opencode_handoff_stop_waits_for_a_mid_dispatch_rest_drive_under_the_gat
         headers(()),
         axum::Json(json!({ "text": "second REST turn", "timeout": 5 })),
     ));
-    // The drive reached the park: its retained-witness settle (R4-3)
-    // aborted drive #1's daemon-side turn first — that abort row is the
-    // drive's progress marker up to the park point.
+    // On its way to the park the drive's retained-witness settle (R4-3)
+    // aborts drive #1's daemon-side turn first.
     env.await_audit_row(Duration::from_secs(20), |r| {
         r["event"] == "abort-received" && r["id"] == json!("ses_1")
     })
     .await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The drive reached the park, holding the dispatch gate (the seam's
+    // own signal — never a fixed sleep: a release sent before the drive
+    // parked would be lost and the stop would block until REAP_TIMEOUT).
+    tokio::time::timeout(Duration::from_secs(20), pause.parked.notified())
+        .await
+        .expect("drive #2 parks after its gate-held re-check, before its prompt POST");
 
     // Handoff opencode -> terminal while the drive is parked BEFORE its
     // prompt POST: the stop's quiesce blocks on the dispatch gate.
@@ -8082,26 +8105,30 @@ async fn opencode_handoff_stop_waits_for_a_mid_dispatch_rest_drive_under_the_gat
     // THE R4-2 regression: the handoff must NOT complete while the drive
     // is parked mid-section — pre-fix the quiesce condemned the UNARMED
     // witness and the handoff committed the terminal owner BEFORE the
-    // drive's POST (a daemon-side writer started after the reap).
-    assert!(
-        tokio::time::timeout(Duration::from_millis(250), &mut completion)
-            .await
-            .is_err(),
-        "the handoff completed while the REST drive was parked before its \
-         prompt dispatch — the stop must block on the dispatch gate"
+    // drive's POST (a daemon-side writer started after the reap). The
+    // stop's quiesce reaches the gate the parked drive holds and queues
+    // behind it; until the release, the handoff cannot complete.
+    tokio::select! {
+        biased;
+        done = &mut completion => panic!(
+            "the handoff completed while the REST drive was parked before its \
+             prompt dispatch — the stop must block on the dispatch gate: {done:?}"
+        ),
+        () = pause.quiesce_blocked.notified() => {}
+        () = tokio::time::sleep(Duration::from_secs(20)) => panic!(
+            "the stop's quiesce never reached the dispatch gate the parked drive holds"
+        ),
+    }
+    assert_eq!(
+        prompt_rows(&env.audit_rows()),
+        1,
+        "the parked drive has not issued its prompt POST yet"
     );
 
     // Release the drive: the prompt POST issues UNDER the gate, the gate
     // opens, and the stop takes+condemns the now-ARMED witness and its
     // abort confirms the daemon-side turn BEFORE the reap.
-    pause.notify_waiters();
-    env.await_audit_row(Duration::from_secs(20), |r| {
-        r["method"] == "POST"
-            && r["path"]
-                .as_str()
-                .is_some_and(|p| p == "/session/ses_1/prompt_async")
-    })
-    .await;
+    pause.release.notify_one();
     let result = completion.await.expect("handoff completed");
     assert_eq!(result["ok"], json!(true), "handoff to terminal: {result}");
     let terminal_id = result["owner"]["terminalId"].as_str().unwrap().to_string();
@@ -8112,20 +8139,19 @@ async fn opencode_handoff_stop_waits_for_a_mid_dispatch_rest_drive_under_the_gat
         }
         other => panic!("expected Live terminal owner, got {other:?}"),
     }
-    // Ordering proof: the drive's prompt POST row precedes a SECOND
-    // abort row for ses_1 — the quiesce's confirmed abort of the armed
-    // witness. (Pre-fix the quiesce aborted nothing: no armed witness
-    // existed and the drive's POST armed an orphan AFTER the handoff.)
+    // Ordering proof: drive #2's prompt POST row (the SECOND prompt row —
+    // drive #1 issued the first) precedes a further abort row for ses_1 —
+    // the quiesce's confirmed abort of the armed witness. (Pre-fix the
+    // quiesce aborted nothing: no armed witness existed and the drive's
+    // POST armed an orphan AFTER the handoff.)
     let rows = env.audit_rows();
     let prompt_idx = rows
         .iter()
-        .position(|r| {
-            r["method"] == "POST"
-                && r["path"]
-                    .as_str()
-                    .is_some_and(|p| p == "/session/ses_1/prompt_async")
-        })
-        .expect("the drive's prompt row");
+        .enumerate()
+        .filter(|(_, r)| is_prompt_row(r))
+        .map(|(i, _)| i)
+        .nth(1)
+        .expect("drive #2's prompt row");
     let abort_after_prompt = rows[prompt_idx..]
         .iter()
         .any(|r| r["event"] == "abort-received" && r["id"] == json!("ses_1"));

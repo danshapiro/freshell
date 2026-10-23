@@ -2221,10 +2221,11 @@ pub struct FreshAgentState {
     /// b8ke focused round-4 R4-2 test seam: when set, the REST opencode
     /// drive PARKS at the exact interleaving point under review — after
     /// the gate-held ownership/condemned re-check, BEFORE the prompt POST
-    /// — until the Notify fires. Never armed in production. Installed via
+    /// — until released (see [`RestTurnTestPause`]). Never armed in
+    /// production. Installed via
     /// [`Self::set_rest_turn_test_pause_for_test`].
     #[cfg(test)]
-    rest_turn_test_pause: Arc<Mutex<Option<Arc<tokio::sync::Notify>>>>,
+    rest_turn_test_pause: Arc<Mutex<Option<Arc<RestTurnTestPause>>>>,
     /// The ONE server-wide runtime-ownership coordinator (kata b8ke Task 3),
     /// wired from freshell-server::main next to `fresh_agent_leases`.
     /// `None` (every pre-existing test) = the lane skips coordinator
@@ -2321,6 +2322,24 @@ pub(crate) struct RestOpencodeTurn {
     pub(crate) daemon_turn_accepted: Arc<AtomicBool>,
     pub(crate) condemned: AtomicBool,
     pub(crate) route: Option<String>,
+}
+
+/// b8ke focused round-4 R4-2 test seam (cfg(test) only): the handshake a
+/// test uses to hold the REST opencode drive at the interleaving point
+/// under review and to observe a lifecycle quiesce queueing behind it.
+/// Every signal is `notify_one` (a stored permit), so a waiter that
+/// arrives late still sees it — no step depends on scheduling order.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RestTurnTestPause {
+    /// Signalled by the drive once it is parked — the gate held, the
+    /// ownership/condemned re-check done, the prompt POST not issued.
+    pub(crate) parked: tokio::sync::Notify,
+    /// Awaited by the parked drive before it issues its prompt POST.
+    pub(crate) release: tokio::sync::Notify,
+    /// Signalled by a lifecycle quiesce that found the session's
+    /// dispatch/condemn gate held and is about to wait on it.
+    pub(crate) quiesce_blocked: tokio::sync::Notify,
 }
 
 /// A Slice-1 terminal pane's record: just enough to dispatch `send-keys` /
@@ -3113,14 +3132,29 @@ impl FreshAgentState {
     /// b8ke focused round-4 R4-2 test seam installer: see
     /// [`Self::rest_turn_test_pause`].
     #[cfg(test)]
-    pub(crate) fn set_rest_turn_test_pause_for_test(
-        &self,
-        pause: Option<Arc<tokio::sync::Notify>>,
-    ) {
+    pub(crate) fn set_rest_turn_test_pause_for_test(&self, pause: Option<Arc<RestTurnTestPause>>) {
         *self
             .rest_turn_test_pause
             .lock()
             .expect("rest_turn_test_pause mutex") = pause;
+    }
+
+    /// R4-2 test seam probe, called by the lifecycle quiesce paths right
+    /// before they wait on the session's dispatch/condemn gate: when the
+    /// seam is installed and the gate is held (the parked drive owns it),
+    /// signal [`RestTurnTestPause::quiesce_blocked`].
+    #[cfg(test)]
+    pub(crate) fn note_rest_turn_gate_wait_for_test(&self, gate: &tokio::sync::Mutex<()>) {
+        let pause = self
+            .rest_turn_test_pause
+            .lock()
+            .expect("rest_turn_test_pause mutex")
+            .clone();
+        if let Some(pause) = pause {
+            if gate.try_lock().is_err() {
+                pause.quiesce_blocked.notify_one();
+            }
+        }
     }
 
     /// The REST resume probe's bounded `get_session` budget, in milliseconds:
@@ -6845,7 +6879,8 @@ async fn send_keys(
             .expect("rest_turn_test_pause mutex")
             .clone();
         if let Some(pause) = pause {
-            pause.notified().await;
+            pause.parked.notify_one();
+            pause.release.notified().await;
         }
     }
     let rx = manager.subscribe(&durable_id);

@@ -2732,11 +2732,15 @@ pub(crate) mod tests {
     /// under the `CLAUDE_CONFIG_DIR` candidate, and agrees with
     /// [`locate_transcript`] on the same ordered candidates (one definition
     /// of "the transcript exists"). Env vars are process-global — serialize
-    /// under the shared claude env lock.
+    /// under the shared claude env lock. Only the claude-specific roots are
+    /// cleared: `HOME` is never touched, because tests that do not take the
+    /// claude lock read it concurrently (the OpenCode home harness asserts
+    /// the parent's `HOME` is unchanged) and the platform home candidate
+    /// resolves through the passwd entry without it anyway.
     #[tokio::test]
     async fn locate_transcript_selected_answers_root_path_and_cwd_under_config_dir() {
         let _guard = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-        let _restore = EnvVarsRestore::remove_all(&["CLAUDE_CONFIG_DIR", "CLAUDE_HOME", "HOME"]);
+        let _restore = EnvVarsRestore::remove_all(&["CLAUDE_CONFIG_DIR", "CLAUDE_HOME"]);
         let store = temp_home();
         std::env::set_var("CLAUDE_CONFIG_DIR", store.path());
         let id = "66666666-6666-4666-8666-666666666666";

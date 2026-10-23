@@ -4365,6 +4365,92 @@ describe('TerminalView lifecycle updates', () => {
       })
     })
 
+    it('a handoff pane mounted on its new terminal before the committed owner frame attaches once the frame names that terminal', async () => {
+      // Fresh Agent -> CLI on THIS device: the handoff's HTTP answer switches
+      // the pane onto the new terminal while the canonical record still names
+      // the fresh-agent runtime (the answer and the WS owner frame race). The
+      // attach gate declines while the record says fresh-agent; the committed
+      // frame naming THIS pane's terminal must re-drive the attach. Pre-fix
+      // nothing re-fired the lifecycle effect and the pane never attached (no
+      // output, the server terminal reported hasClients:false) until a reload.
+      const { store } = setupTypedPane({
+        content: { status: 'running', terminalId: 't-handoff' },
+        seed: (seededStore) => {
+          act(() => {
+            seededStore.dispatch(applyRuntimeOwner(runtimeOwnerFrame({
+              generation: 1,
+              ownerKind: 'fresh-agent',
+              terminalId: undefined,
+            })))
+          })
+        },
+      })
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+      })
+      const attachesTo = (terminalId: string) => sentMessages().filter((msg) => (
+        msg?.type === 'terminal.attach' && msg.terminalId === terminalId
+      ))
+      // The gate declined: no attach while the record names the fresh agent.
+      expect(attachesTo('t-handoff')).toHaveLength(0)
+
+      act(() => {
+        store.dispatch(applyRuntimeOwner(runtimeOwnerFrame({
+          generation: 2,
+          ownerKind: 'terminal',
+          terminalId: 't-handoff',
+        })))
+      })
+
+      await waitFor(() => {
+        expect(attachesTo('t-handoff')).toHaveLength(1)
+      })
+    })
+
+    it('a declined attach is never re-driven when the owner frame does not name the pane\'s own terminal', async () => {
+      // The re-drive is scoped to a commit naming THIS terminal: a vacant
+      // record (the session stopped) or another terminal must not re-attach
+      // the declined handle (a dead handle draws INVALID_TERMINAL_ID and the
+      // reconnect recovery would relaunch the stopped session).
+      const { store } = setupTypedPane({
+        content: { status: 'running', terminalId: 't-declined' },
+        seed: (seededStore) => {
+          act(() => {
+            seededStore.dispatch(applyRuntimeOwner(runtimeOwnerFrame({
+              generation: 1,
+              ownerKind: 'fresh-agent',
+              terminalId: undefined,
+            })))
+          })
+        },
+      })
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+      })
+      act(() => {
+        store.dispatch(applyRuntimeOwner(runtimeOwnerFrame({
+          generation: 2,
+          ownerKind: 'vacant',
+          terminalId: undefined,
+          transition: 'stopped',
+        })))
+      })
+      act(() => {
+        store.dispatch(applyRuntimeOwner(runtimeOwnerFrame({
+          generation: 3,
+          ownerKind: 'terminal',
+          terminalId: 't-someone-else',
+        })))
+      })
+
+      // act() flushed every effect the two folds triggered.
+      expect(sentMessages().some((msg) => (
+        msg?.type === 'terminal.attach' && msg.terminalId === 't-declined'
+      ))).toBe(false)
+    })
+
     it('b8ke ext r11 F2: a still-RUNNING pane is never stolen off its own terminal by a committed same-kind owner', async () => {
       const { store } = setupTypedPane({
         content: {
