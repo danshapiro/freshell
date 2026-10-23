@@ -54,6 +54,11 @@ pub mod native_history;
 pub mod opencode_ws;
 pub mod pane_ops;
 mod pane_resize;
+/// Zombie-aware process and process-group probes, shared with the
+/// `claude_sidecar_teardown` integration test.
+#[cfg(all(test, unix))]
+#[path = "../tests/support/process_probe.rs"]
+mod process_probe;
 pub mod rollback_record;
 pub mod session_handoff;
 pub mod session_lease;

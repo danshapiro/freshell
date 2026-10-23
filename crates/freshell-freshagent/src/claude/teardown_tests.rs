@@ -304,31 +304,30 @@ async fn server_shutdown_stops_every_session_concurrently_within_its_share_of_th
         .all(|(_, fields)| fields.get("graceful").map(String::as_str) == Some("false")));
 }
 
-#[cfg(unix)]
-fn process_exists(pid: i32) -> bool {
-    // SAFETY: signal 0 only probes for existence.
-    let result = unsafe { libc::kill(pid, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
 /// G31: the untagged grandchild a sidecar leaves behind is outside the Linux
 /// `/proc` ownership reap; only the process-tree guard reaches it.
 #[cfg(unix)]
 #[tokio::test]
 async fn teardown_kills_a_grandchild_the_sidecar_left_behind() {
+    use crate::process_probe::ProcessProbe;
+
     let dir = tempfile::tempdir().unwrap();
     let record = dir.path().join("record.txt");
     let (session, ready) = fake_session(FAKE_ORPHANS_GRANDCHILD, &record, "orphans").await;
-    let grandchild: i32 = ready
-        .strip_prefix("ready ")
-        .and_then(|pid| pid.trim().parse().ok())
-        .expect("the readiness line carries the grandchild pid");
-    assert!(process_exists(grandchild));
+    let grandchild = ProcessProbe::open(
+        ready
+            .strip_prefix("ready ")
+            .and_then(|pid| pid.trim().parse().ok())
+            .expect("the readiness line carries the grandchild pid"),
+    );
+    assert!(grandchild.running());
 
     let confirmation = teardown_removed_session(session, TREE_DEATH_CONFIRM_ROUNDS).await;
 
+    // The orphaned grandchild may still be a zombie its adopter has not
+    // reaped yet; `kill(pid, 0)` would find that, the probe does not.
     assert!(
-        !process_exists(grandchild),
+        grandchild.exited(),
         "the grandchild did not outlive the teardown"
     );
     assert_eq!(confirmation.label(), "confirmed");
