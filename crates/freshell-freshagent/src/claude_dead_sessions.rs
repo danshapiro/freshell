@@ -13,9 +13,11 @@
 //! stamp and its durable claude UUIDs — so a record answers to all of them.
 
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
+use crate::claude::PROVIDER;
 use crate::identity_sink::FreshAgentSettings;
 
 /// How many dead sessions are remembered (codex bounds its dead threads the same
@@ -81,6 +83,84 @@ impl DeadClaudeSessions {
 
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
+    }
+}
+
+/// One death as the end-of-output path knows it, for [`SharedDeadSessions::record`].
+pub(crate) struct Death<'a> {
+    /// The session's key in the sessions map.
+    pub(crate) map_key: &'a str,
+    /// The id its events were stamped with.
+    pub(crate) stamp: &'a str,
+    pub(crate) session_type: &'a str,
+    /// The durable ids the session's aliases named.
+    pub(crate) durables: &'a [String],
+    /// The durable id the session itself held.
+    pub(crate) cli_session_id: Option<&'a str>,
+    pub(crate) settings: &'a FreshAgentSettings,
+    pub(crate) commands: Option<&'a Vec<Value>>,
+    /// The `sdk.stream.ended` reason, or `sidecar_exited`.
+    pub(crate) reason: &'a str,
+}
+
+/// The claude lane's dead-session records, shared by every clone of its state
+/// (the end-of-output path records from its consumer task).
+#[derive(Clone, Default)]
+pub(crate) struct SharedDeadSessions(Arc<Mutex<DeadClaudeSessions>>);
+
+impl SharedDeadSessions {
+    /// The record of the session answering to `id` whose sidecar ended
+    /// unrequested and that has not been resumed or closed since.
+    pub(crate) fn find(&self, id: &str) -> Option<DeadClaudeSession> {
+        self.0.lock().expect("dead sessions lock").find(id).cloned()
+    }
+
+    /// Record a session the end-of-output path just evicted: it answers to its
+    /// map key, its envelope stamp and every durable id it held.
+    pub(crate) fn record(&self, death: Death<'_>) {
+        let mut ids = vec![death.map_key.to_string()];
+        for id in std::iter::once(death.stamp)
+            .chain(death.durables.iter().map(String::as_str))
+            .chain(death.cli_session_id)
+        {
+            if !ids.iter().any(|known| known == id) {
+                ids.push(id.to_string());
+            }
+        }
+        let dead = DeadClaudeSession {
+            ids: ids.clone(),
+            settings: death.settings.clone(),
+            commands: death.commands.cloned(),
+            reason: death.reason.to_string(),
+            at_ms: crate::rollback_record::now_ms(),
+        };
+        let (dropped, remembered) = {
+            let mut store = self.0.lock().expect("dead sessions lock");
+            let dropped = store.record(dead);
+            (dropped, store.len())
+        };
+        tracing::info!(target: "freshell_freshagent::claude",
+            provider = PROVIDER, session_id = %death.stamp, session_type = %death.session_type,
+            ids = ?ids, reason = death.reason, remembered,
+            "freshagent.claude.dead_session_recorded");
+        if let Some(dropped) = dropped {
+            tracing::info!(target: "freshell_freshagent::claude",
+                provider = PROVIDER, ids = ?dropped.ids, died_at_ms = dropped.at_ms,
+                cap = DEAD_SESSIONS_CAP,
+                "freshagent.claude.dead_session_dropped");
+        }
+    }
+
+    /// Forget the records answering to any of `ids`: the session is live again
+    /// (`resumed`) or the pane closed it (`killed`).
+    pub(crate) fn forget<S: AsRef<str>>(&self, ids: &[S], reason: &'static str) {
+        let forgotten = self.0.lock().expect("dead sessions lock").forget(ids);
+        if forgotten > 0 {
+            let ids: Vec<&str> = ids.iter().map(AsRef::as_ref).collect();
+            tracing::info!(target: "freshell_freshagent::claude",
+                provider = PROVIDER, ids = ?ids, reason, forgotten,
+                "freshagent.claude.dead_session_forgotten");
+        }
     }
 }
 

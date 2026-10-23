@@ -76,6 +76,30 @@ impl ClaudeBoot {
     }
 }
 
+/// A sidecar `create` line: `type`, the stdio `protocol`, `requestId`,
+/// `sessionType` and the `boot` (the fields every launch's line carries), plus
+/// that launch's own `fields` (an object: cwd, model, permission mode and so on).
+/// A launch field never replaces one of the line's own. The one builder of the
+/// common fields until `ClaudeLaunchSpec::create_request()` builds the whole line
+/// (design §3.2, C11).
+pub(crate) fn create_line(
+    request_id: &str,
+    session_type: &str,
+    boot: &ClaudeBoot,
+    fields: Value,
+) -> Value {
+    let mut line = match fields {
+        Value::Object(fields) => fields,
+        _ => Map::new(),
+    };
+    line.insert("type".into(), json!("create"));
+    line.insert("protocol".into(), json!(SIDECAR_PROTOCOL));
+    line.insert("requestId".into(), json!(request_id));
+    line.insert("sessionType".into(), json!(session_type));
+    line.insert("boot".into(), boot.wire());
+    Value::Object(line)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,6 +129,30 @@ mod tests {
             }
             .wire(),
             json!({ "kind": "fork", "resume": "P" })
+        );
+    }
+
+    #[test]
+    fn a_create_line_carries_the_protocol_session_type_and_boot_with_the_launch_fields() {
+        let boot = ClaudeBoot::Resume { resume: "P".into() };
+        let line = create_line(
+            "req-1",
+            "kilroy",
+            &boot,
+            json!({ "cwd": "/w", "model": null, "type": "not-create", "protocol": 1 }),
+        );
+        assert_eq!(
+            line,
+            json!({
+                "type": "create",
+                "protocol": SIDECAR_PROTOCOL,
+                "requestId": "req-1",
+                "sessionType": "kilroy",
+                "boot": { "kind": "resume", "resume": "P" },
+                "cwd": "/w",
+                "model": null,
+            }),
+            "a launch field never overrides the line's own fields"
         );
     }
 
