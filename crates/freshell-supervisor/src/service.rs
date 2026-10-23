@@ -3144,36 +3144,46 @@ pub async fn serve_control(supervisor: Supervisor, socket_path: &Path) -> Result
         serde_json::json!({"installationId":supervisor.registry.installation_id(),"controlEpoch":supervisor.registry.control_epoch(),"socket":socket_path}),
     );
     loop {
-        let (mut stream, _) = listener.accept().await.map_err(|e| e.to_string())?;
-        let supervisor = supervisor.clone();
-        tokio::spawn(async move {
-            let envelope: Result<Envelope<AdminCommand>, _> = read_frame(&mut stream).await;
-            let reply = match envelope {
-                Ok(envelope) => supervisor.dispatch(envelope).await,
-                Err(error) => AdminReply {
-                    request_id: RequestId::new(),
-                    result: Err(RuntimeError::new(
-                        if matches!(error, freshell_runtime_protocol::FrameError::TooLarge) {
-                            RuntimeErrorCode::FrameTooLarge
-                        } else {
-                            RuntimeErrorCode::InvalidRequest
-                        },
-                        error.to_string(),
-                    )),
-                },
-            };
-            let limit = if matches!(
-                reply.result,
-                Ok(AdminResult::FreshAgentHistory(_) | AdminResult::FreshAgentSnapshot(_))
-            ) {
-                freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES
-            } else {
-                freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES
-            };
-            let _ =
-                freshell_runtime_protocol::write_frame_with_limit(&mut stream, &reply, limit).await;
-        });
+        let (stream, _) = listener.accept().await.map_err(|e| e.to_string())?;
+        tokio::spawn(serve_control_connection(supervisor.clone(), stream));
     }
+}
+
+/// Answers the one request a control connection carries.
+///
+/// The connection lets go of its supervisor handle before it writes the
+/// reply. A client holding its answer may then hand the registry to a
+/// successor at once: this connection no longer keeps the registry owned,
+/// however long its worker is descheduled before the task finishes.
+async fn serve_control_connection<S>(supervisor: Supervisor, mut stream: S)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let envelope: Result<Envelope<AdminCommand>, _> = read_frame(&mut stream).await;
+    let reply = match envelope {
+        Ok(envelope) => supervisor.dispatch(envelope).await,
+        Err(error) => AdminReply {
+            request_id: RequestId::new(),
+            result: Err(RuntimeError::new(
+                if matches!(error, freshell_runtime_protocol::FrameError::TooLarge) {
+                    RuntimeErrorCode::FrameTooLarge
+                } else {
+                    RuntimeErrorCode::InvalidRequest
+                },
+                error.to_string(),
+            )),
+        },
+    };
+    drop(supervisor);
+    let limit = if matches!(
+        reply.result,
+        Ok(AdminResult::FreshAgentHistory(_) | AdminResult::FreshAgentSnapshot(_))
+    ) {
+        freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES
+    } else {
+        freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES
+    };
+    let _ = freshell_runtime_protocol::write_frame_with_limit(&mut stream, &reply, limit).await;
 }
 
 pub fn default_backend(socket: impl Into<PathBuf>) -> Arc<dyn RuntimeBackend> {
@@ -4434,3 +4444,150 @@ pub(crate) fn crash_if(point: &'static str) {
 }
 #[cfg(not(feature = "runtime-test-faults"))]
 pub(crate) fn crash_if(_point: &'static str) {}
+
+#[cfg(test)]
+mod control_connection_tests {
+    use super::{default_backend, serve_control_connection, Supervisor, SupervisorConfig};
+    use crate::registry::Registry;
+    use freshell_runtime_protocol::{
+        read_frame, AdminCommand, AdminReply, AdminResult, ControlRole, Envelope, RequestId,
+        RuntimeErrorCode,
+    };
+    use std::path::{Path, PathBuf};
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
+
+    /// What a cold open of the registry returned when the reply was written.
+    type ReopenAtReply = Arc<StdMutex<Option<Result<(), String>>>>;
+
+    /// The supervisor end of a control connection. When the reply starts to
+    /// go out, it cold-opens the registry, as a successor would once the
+    /// client holds its answer, and records whether that open was refused.
+    struct ReopenOnReply {
+        stream: DuplexStream,
+        registry_root: PathBuf,
+        reopened: ReopenAtReply,
+    }
+
+    impl AsyncRead for ReopenOnReply {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.stream).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for ReopenOnReply {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let mut reopened = self.reopened.lock().unwrap();
+            if reopened.is_none() {
+                *reopened = Some(
+                    Registry::open(&self.registry_root, None)
+                        .map(drop)
+                        .map_err(|error| format!("{error:?}")),
+                );
+            }
+            drop(reopened);
+            Pin::new(&mut self.stream).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.stream).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.stream).poll_shutdown(cx)
+        }
+    }
+
+    fn supervisor(root: &Path, registry_root: &Path) -> Supervisor {
+        let host_binary_path = root.join("synthetic-host");
+        std::fs::write(&host_binary_path, "synthetic-host-artifact").unwrap();
+        Supervisor::new(
+            Registry::open(registry_root, None).unwrap(),
+            default_backend(root.join("absent-docker.sock")),
+            SupervisorConfig {
+                runtime_root: root.join("runtime"),
+                control_socket_path: root.join("control.sock"),
+                host_binary_path,
+                image_ref: format!("sha256:{}", "a".repeat(64)),
+                test_run_id: "control-connection".into(),
+                control_secret: "synthetic-control-secret".into(),
+                lifecycle_log: root.join("lifecycle.jsonl"),
+                admission: crate::admission::AdmissionPolicy::default(),
+            },
+        )
+        .unwrap()
+    }
+
+    /// A control client that has read its reply may hand the registry to a
+    /// successor at once: the connection that answered it must already have
+    /// let go of the supervisor, and with it the registry ownership, before
+    /// the reply went out. Otherwise the successor's open is refused as Busy
+    /// whenever the connection's worker is descheduled between writing the
+    /// reply and finishing.
+    #[tokio::test]
+    async fn control_connection_releases_supervisor_before_it_replies() {
+        let valid_request = || {
+            let mut envelope =
+                Envelope::new(RequestId::new(), ControlRole::Web, AdminCommand::Health);
+            envelope.auth = Some("synthetic-control-secret".into());
+            serde_json::to_vec(&envelope).unwrap()
+        };
+        for (request, answered) in [
+            (valid_request(), true),
+            (b"not a control envelope".to_vec(), false),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let registry_root = temp.path().join("registry");
+            // The connection holds the only handle to this supervisor.
+            let supervisor = supervisor(temp.path(), &registry_root);
+            let (mut client, server) = tokio::io::duplex(64 * 1024);
+            let reopened = ReopenAtReply::default();
+            let connection = tokio::spawn(serve_control_connection(
+                supervisor,
+                ReopenOnReply {
+                    stream: server,
+                    registry_root: registry_root.clone(),
+                    reopened: reopened.clone(),
+                },
+            ));
+
+            client
+                .write_all(&(request.len() as u32).to_be_bytes())
+                .await
+                .unwrap();
+            client.write_all(&request).await.unwrap();
+            let reply: AdminReply = read_frame(&mut client).await.unwrap();
+            if answered {
+                assert!(
+                    matches!(reply.result, Ok(AdminResult::Health { .. })),
+                    "the supervisor answers a valid request"
+                );
+            } else {
+                assert_eq!(
+                    reply.result.unwrap_err().code,
+                    RuntimeErrorCode::InvalidRequest
+                );
+            }
+            connection.await.unwrap();
+
+            assert_eq!(
+                reopened.lock().unwrap().take(),
+                Some(Ok(())),
+                "the registry must be free for a successor by the time the reply is written"
+            );
+        }
+    }
+}

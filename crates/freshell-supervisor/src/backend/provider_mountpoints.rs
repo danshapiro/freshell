@@ -414,8 +414,32 @@ mod tests {
         ProviderConfigBind, ProviderResourceKind, ProviderResourceMount,
     };
 
-    #[tokio::test]
+    /// Holds the paused test clock still while real socket I/O runs: tokio
+    /// never auto-advances a paused clock while a blocking task is running.
+    /// A budget then expires only when the test advances the clock at the
+    /// exact stall it exercises, however loaded the machine is. The real-time
+    /// limit matters only if the code under test wedges: the hold ends, the
+    /// clock auto-advances, and the test's own bounds fail it instead of
+    /// letting it hang.
+    struct FrozenClock {
+        _release_on_drop: std::sync::mpsc::Sender<()>,
+    }
+
+    impl FrozenClock {
+        fn hold() -> Self {
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            drop(tokio::task::spawn_blocking(move || {
+                let _ = held.recv_timeout(std::time::Duration::from_secs(60));
+            }));
+            Self {
+                _release_on_drop: release,
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn provider_mountpoint_candidate_target_joins_owned_preparation_and_cleanup() {
+        use std::collections::BTreeSet;
         use std::sync::{Arc, Mutex};
         use tokio::task::JoinSet;
         for mode in [
@@ -429,6 +453,7 @@ mod tests {
             "cancel-private-exchange",
             "slow-image",
         ] {
+            let _clock = FrozenClock::hold();
             let owned = tempfile::tempdir().unwrap();
             let home = owned.path().join("scratch-home");
             std::fs::create_dir(&home).unwrap();
@@ -453,6 +478,9 @@ mod tests {
             let expected = Arc::new(Mutex::new(None::<Value>));
             let requests = Arc::new(Mutex::new(Vec::<String>::new()));
             let removed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // The fixture reports where it parks the operation, so the test
+            // expires a budget exactly at the stall the mode exercises.
+            let (stalls, mut stalled) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
             let (body, seen, deleted, fixture_home, fixture_daemon) = (
                 expected.clone(),
                 requests.clone(),
@@ -469,7 +497,7 @@ mod tests {
                         _=&mut stopped=>break,
                         accepted=listener.accept()=>{
                             let (mut stream,_)=accepted.unwrap();
-                            let (body,seen,deleted,home,daemon,private_jobs)=(body.clone(),seen.clone(),deleted.clone(),fixture_home.clone(),fixture_daemon.clone(),private_jobs.clone());
+                            let (body,seen,deleted,home,daemon,private_jobs,stalls)=(body.clone(),seen.clone(),deleted.clone(),fixture_home.clone(),fixture_daemon.clone(),private_jobs.clone(),stalls.clone());
                             jobs.spawn(async move {
                                 let mut header=Vec::new(); let mut byte=[0];
                                 while !header.ends_with(b"\r\n\r\n") {stream.read_exact(&mut byte).await.unwrap();header.push(byte[0]);assert!(header.len()<=32*1024);}
@@ -478,7 +506,7 @@ mod tests {
                                 let length=header.lines().find_map(|line|line.strip_prefix("Content-Length: ")).unwrap().trim().parse::<usize>().unwrap();
                                 assert!(length<=1024*1024);let mut raw=vec![0;length];stream.read_exact(&mut raw).await.unwrap();
                                 seen.lock().unwrap().push(line.clone());
-                                let (status,value)=if line.contains("/images/") {if mode=="slow-image" {tokio::time::sleep(Duration::from_secs(10)).await;} (200,json!({"Config":{"Env":["PATH=/usr/bin","ANTHROPIC_API_KEY=PRIVATE_UNUSED_IMAGE_CREDENTIAL"]}}))}
+                                let (status,value)=if line.contains("/images/") {if mode=="slow-image" {stalls.send("image-withheld").unwrap();std::future::pending::<()>().await;} (200,json!({"Config":{"Env":["PATH=/usr/bin","ANTHROPIC_API_KEY=PRIVATE_UNUSED_IMAGE_CREDENTIAL"]}}))}
                                 else if line.contains("/info ") {(200,json!({"ID":daemon,"SecurityOptions":["name=rootless"]}))}
                                 else if line.contains("/containers/create?") { *body.lock().unwrap()=Some(serde_json::from_slice(&raw).unwrap());(if mode=="lost-create-ack" {503} else {201},json!({"Id":"c".repeat(64)}))}
                                 else if line.starts_with("GET") && line.contains("/containers/") {
@@ -492,9 +520,10 @@ mod tests {
                                 else if line.contains("/start ") {
                                     let expected=body.lock().unwrap().as_ref().unwrap().clone();
                                     let exchange=expected["HostConfig"]["Mounts"].as_array().unwrap().iter().find(|mount|mount["Target"]=="/run/freshell-input-exchange").unwrap()["Source"].as_str().unwrap().to_owned();
+                                    let stalls=stalls.clone();
                                     private_jobs.lock().unwrap().push(tokio::spawn(async move {
                                         let mut channel=UnixStream::connect(Path::new(&exchange).join("reply.sock")).await.unwrap();
-                                        if matches!(mode,"timeout"|"cancel-private-exchange") {tokio::time::sleep(Duration::from_secs(10)).await;return;}
+                                        if matches!(mode,"timeout"|"cancel-private-exchange") {stalls.send("exchange-withheld").unwrap();std::future::pending::<()>().await;}
                                         let length=channel.read_u32().await.unwrap() as usize; assert!(length<=1024*1024);
                                         let mut raw=vec![0;length];channel.read_exact(&mut raw).await.unwrap();
                                         let selected:Vec<Mountpoint>=serde_json::from_slice(&raw).unwrap();
@@ -512,6 +541,7 @@ mod tests {
                                 else {(500,json!({}))};
                                 let raw=value.to_string();let response=format!("HTTP/1.1 {status} fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{raw}",raw.len());
                                 let _=stream.write_all(response.as_bytes()).await;
+                                if line.contains("/wait?") {stalls.send("wait-answered").unwrap();}
                             });
                         },
                         result=jobs.join_next(),if !jobs.is_empty()=>{result.unwrap().unwrap();}
@@ -528,9 +558,39 @@ mod tests {
             });
             let backend = DockerEngineBackend::new(owned.path().join("docker.sock"));
             let mut helper = None;
-            let outcome=tokio::time::timeout(if mode=="cancel-private-exchange" {Duration::from_millis(50)} else {Duration::from_secs(3)},backend.run_provider_mountpoint_helper(
-                MountpointHelperTarget {image:"synthetic-image",volume:"owned-candidate-volume",binary:&binary,daemon:&daemon,labels:json!({"com.freshell.soul-id":"synthetic-owner","com.freshell.source-request-id":"synthetic-request"})},selected,(Duration::from_millis(250),Duration::from_millis(250)),&mut helper
-            )).await;
+            let budget = Duration::from_millis(250);
+            let caller_bound = if mode == "cancel-private-exchange" {
+                Duration::from_millis(50)
+            } else {
+                Duration::from_secs(3)
+            };
+            // Only the stalled modes move the clock, and only once every
+            // request before the stall has been answered: the private
+            // exchange (with the helper's exit already reported) or the image
+            // lookup is the one thing still pending when its bound expires.
+            let mut stall: BTreeSet<&str> = match mode {
+                "timeout" | "cancel-private-exchange" => {
+                    BTreeSet::from(["exchange-withheld", "wait-answered"])
+                }
+                "slow-image" => BTreeSet::from(["image-withheld"]),
+                _ => BTreeSet::new(),
+            };
+            let expire_at_stall = async {
+                if stall.is_empty() {
+                    return std::future::pending().await;
+                }
+                while !stall.is_empty() {
+                    stall.remove(stalled.recv().await.expect("fixture reports its stall"));
+                }
+                tokio::time::advance(caller_bound.min(budget)).await;
+                std::future::pending().await
+            };
+            let outcome = tokio::select! {
+                outcome = tokio::time::timeout(caller_bound,backend.run_provider_mountpoint_helper(
+                    MountpointHelperTarget {image:"synthetic-image",volume:"owned-candidate-volume",binary:&binary,daemon:&daemon,labels:json!({"com.freshell.soul-id":"synthetic-owner","com.freshell.source-request-id":"synthetic-request"})},selected,(budget,budget),&mut helper
+                )) => outcome,
+                () = expire_at_stall => unreachable!("the stall clock never completes"),
+            };
             if mode == "cancel-private-exchange" {
                 assert!(outcome.is_err());
                 let (name, body) = helper
