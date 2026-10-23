@@ -7,7 +7,7 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { describe, expect, it, vi } from 'vitest'
 
-import { RestrictedDockerBroker, type ClaudeCandidateAuthorization, type PreparedInputAuthorization } from '../../../../scripts/testing/runtime-test-broker.js'
+import { parseHelperCreateDelay, RestrictedDockerBroker, type ClaudeCandidateAuthorization, type PreparedInputAuthorization } from '../../../../scripts/testing/runtime-test-broker.js'
 import { authorizeFreshAgentParityRequest, authorizeProviderParityRequest, captureProviderParityVolumes, cleanupProviderParityVolumes } from '../../../helpers/provider-parity-broker.js'
 import { makeProviderParityResourcesReadable, providerParityCommands, providerParityFailureDiagnostics, writeProviderParityEnvironment } from '../../../helpers/provider-parity-environment.js'
 
@@ -898,6 +898,61 @@ describe('scoped Claude source observer broker', () => {
       expect(forwarded).toHaveLength(0)
       expect((await request('POST', `/v1.47/containers/create?name=${name}`, body)).status).toBe(201)
     }, undefined, true)
+  })
+  it('holds a configured slow helper create before Docker sees it, for the configured count only', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker: instance, returnHelperId }) => {
+      instance.authorizeInitialProviderVolume(sourceAuthorization())
+      instance.delayHelperCreates({ prefix: 'freshell-claude-source-', delayMs: 300, count: 1 })
+      const started = Date.now()
+      const held = request('POST', `/v1.47/containers/create?name=${sourceName}`, sourceHelperBody())
+      await new Promise(resolve => setTimeout(resolve, 100))
+      expect(forwarded, 'Docker has not been asked to make the helper yet').toHaveLength(0)
+      expect((await held).status).toBe(201)
+      expect(Date.now() - started).toBeGreaterThanOrEqual(300)
+      expect(forwarded.map(operation => operation.url)).toEqual([`/v1.47/containers/create?name=${sourceName}`])
+      expect(instance.eventsSnapshot()).toContainEqual(expect.objectContaining({
+        decision: 'inject_failure', reason: 'configured slow helper create (300ms)', helperName: sourceName,
+      }))
+      const next = 'freshell-claude-source-22222222-2222-4222-8222-222222222222'
+      returnHelperId('c'.repeat(64))
+      const quick = Date.now()
+      expect((await request('POST', `/v1.47/containers/create?name=${next}`, sourceHelperBody())).status).toBe(201)
+      expect(Date.now() - quick, 'only the configured count is held').toBeLessThan(250)
+    })
+  })
+  it('lets cleanup wait until a helper create Docker answers late is recorded', async () => {
+    await withHttpBroker(async ({ request, broker: instance }) => {
+      instance.authorizeInitialProviderVolume(sourceAuthorization())
+      instance.delayHelperCreates({ prefix: 'freshell-claude-source-', delayMs: 300, count: 1 })
+      // The supervisor has stopped waiting; the proxy still owes Docker's answer.
+      const owed = request('POST', `/v1.47/containers/create?name=${sourceName}`, sourceHelperBody())
+      await new Promise(resolve => setTimeout(resolve, 50))
+      expect(instance.receiptIds().has(helperId)).toBe(false)
+      expect(await instance.settleForwarded(5_000)).toBe(true)
+      expect(instance.receiptIds().has(helperId), 'cleanup now knows the late helper').toBe(true)
+      expect((await owed).status).toBe(201)
+    })
+  })
+  it('reports requests that are still unanswered at the settle deadline', async () => {
+    await withHttpBroker(async ({ request, broker: instance }) => {
+      instance.authorizeInitialProviderVolume(sourceAuthorization())
+      instance.delayHelperCreates({ prefix: 'freshell-claude-source-', delayMs: 1_000, count: 1 })
+      const owed = request('POST', `/v1.47/containers/create?name=${sourceName}`, sourceHelperBody())
+      await new Promise(resolve => setTimeout(resolve, 50))
+      expect(await instance.settleForwarded(100)).toBe(false)
+      expect((await owed).status).toBe(201)
+      expect(await instance.settleForwarded(100)).toBe(true)
+    })
+  })
+  it('parses the slow helper create setting and refuses anything but the fixed helpers', () => {
+    expect(parseHelperCreateDelay(undefined)).toBeUndefined()
+    expect(parseHelperCreateDelay('')).toBeUndefined()
+    expect(parseHelperCreateDelay('freshell-claude-source-:30000')).toEqual({ prefix: 'freshell-claude-source-', delayMs: 30_000, count: 1 })
+    expect(parseHelperCreateDelay('freshell-mountpoints-:1500:2')).toEqual({ prefix: 'freshell-mountpoints-', delayMs: 1_500, count: 2 })
+    for (const invalid of ['freshell-incarnation-:1000', 'freshell-claude-source-:soon', 'freshell-claude-source-:0',
+      'freshell-claude-source-:1000:0', 'freshell-claude-source-:1000:1:extra', 'freshell-mountpoints-:700000']) {
+      expect(() => parseHelperCreateDelay(invalid), invalid).toThrow(/invalid helper create delay/)
+    }
   })
   it('records bounded upstream helper rejection and host exchange absence without daemon payloads', async () => {
     await withHttpBroker(async ({ request, broker: instance, rejectHelperCreate }) => {

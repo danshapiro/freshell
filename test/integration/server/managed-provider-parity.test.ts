@@ -10,7 +10,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 import { ManagedRuntimeBrowserRig } from '../../e2e-browser/helpers/managed-runtime.js'
 import { exposeGrantsToHarness, fakeOnecliGrants, withMissingGrant } from '../../helpers/provider-parity-onecli.js'
-import { makeProviderParityResourcesReadable, prepareProviderParityUserRoots, providerParityCommands, providerParityFailureDiagnostics, writeProviderParityEnvironment } from '../../helpers/provider-parity-environment.js'
+import { makeProviderParityResourcesReadable, prepareProviderParityUserRoots, providerParityCommands, providerParityFailureDiagnostics, supervisorRegistrySecretScan, writeProviderParityEnvironment } from '../../helpers/provider-parity-environment.js'
 import { authorizeProviderParityRequest, captureProviderParityVolumes, cleanupProviderParityVolumes, readProviderParitySource, type ProviderParitySource } from '../../helpers/provider-parity-broker.js'
 import type { InitialProviderVolumeAuthorization } from '../../../scripts/testing/runtime-test-broker.js'
 
@@ -745,9 +745,8 @@ process.stdout.write(JSON.stringify({uid:process.getuid(),gid:process.getgid(),c
       expect(observed[1].onecliControlPresent).toBe(false)
       const supervisorLogs = rig.runtime.containerLogs(rig.supervisor.containerId)
       const providerLogs = rig.runtime.containerLogs(managedView)
-      rig.runtime.execOwnedContainerExact(rig.supervisor.containerId, [
-        'node', '-e', `const fs=require('fs');const p='/var/lib/freshell-supervisor';for(const f of fs.readdirSync(p).filter(x=>x.startsWith('runtime.sqlite3'))){const value=fs.readFileSync(p+'/'+f);if(['${nestedSecretMarker}','fixture-secret-byte'].some(marker=>value.includes(marker)))process.exit(4)}`,
-      ])
+      rig.runtime.execOwnedContainerExact(rig.supervisor.containerId,
+        supervisorRegistrySecretScan([nestedSecretMarker, 'fixture-secret-byte']))
       for (const material of [inspect, supervisorLogs, providerLogs, fs.readFileSync(rig.runtime.evidenceDir + '/lifecycle.jsonl', 'utf8')]) {
         expect(material).not.toContain(nestedSecretMarker)
         expect(material).not.toContain('fixture-secret-byte')

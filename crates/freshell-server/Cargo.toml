@@ -193,3 +193,8 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # `crates/freshell-opencode/Cargo.toml`'s dev-dependency comment). No new
 # download — tokio is already a direct dependency above.
 tokio = { version = "1", features = ["test-util"] }
+# `test_trace_capture.rs` installs the test binary's one process-wide tracing
+# subscriber before `main`, so no test thread can fire a callsite while it is
+# being installed (tracing-core would cache that callsite as uninterested for
+# the rest of the process). Already in the workspace lock via tauri-utils.
+ctor = "0.8"

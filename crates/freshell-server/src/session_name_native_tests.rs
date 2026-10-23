@@ -364,11 +364,11 @@ async fn armed_pending(store: &Arc<SessionNames>, handle: &str, root: &str) -> S
 
 // `locate_transcript_selected` reads process-global env (the ordered
 // candidate roots). Both discovery tests below MUTATE `CLAUDE_HOME` /
-// `CLAUDE_CONFIG_DIR` for their whole set…restore window, so they hold the
-// crate-wide `CLAUDE_ENV_TEST_LOCK` — shared with every other same-binary
-// mutator of those vars and with the `claude_home`-resolving readers (the
-// final-suite gate's unreadable-projects deferral flake; see
-// `crate::test_env_lock` for the full discipline).
+// `CLAUDE_CONFIG_DIR` for their whole run, so they own the environment
+// through the crate-wide `TestEnv` — the one lock every same-binary env
+// mutator and env-resolving reader holds (the final-suite gate's
+// unreadable-projects deferral flake; see `crate::test_env_lock` for the
+// full discipline).
 
 /// Unified agent names (Task 8 acceptance): a session adopted ONLY through
 /// the index (the auto-title sweep's hydration — the sidebar/history rename
@@ -379,7 +379,7 @@ async fn armed_pending(store: &Arc<SessionNames>, handle: &str, root: &str) -> S
 /// attach the acquisition so the series runs to `synced`.
 #[tokio::test]
 async fn an_index_adopted_claude_series_discovers_its_route_on_demand() {
-    let _guard = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.lock().await;
+    let mut env = crate::test_env_lock::TestEnv::lock().await;
     let home = tempfile::tempdir().expect("claude home tempdir");
     let session_id = "4a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
     let project_cwd = home.path().join("proj");
@@ -403,12 +403,10 @@ async fn an_index_adopted_claude_series_discovers_its_route_on_demand() {
     )
     .expect("transcript");
 
-    let saved_home = std::env::var_os("CLAUDE_HOME");
-    let saved_config = std::env::var_os("CLAUDE_CONFIG_DIR");
-    std::env::set_var("CLAUDE_HOME", home.path());
-    std::env::remove_var("CLAUDE_CONFIG_DIR");
+    env.set("CLAUDE_HOME", home.path());
+    env.remove("CLAUDE_CONFIG_DIR");
 
-    let result = async {
+    async {
         let dir = temp_data_dir();
         let store = open_store(dir.path());
         let target = session(
@@ -464,16 +462,6 @@ async fn an_index_adopted_claude_series_discovers_its_route_on_demand() {
         assert_eq!(sync.status, NativeSyncStatus::Synced);
     }
     .await;
-
-    match saved_home {
-        Some(value) => std::env::set_var("CLAUDE_HOME", value),
-        None => std::env::remove_var("CLAUDE_HOME"),
-    }
-    match saved_config {
-        Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
-        None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
-    }
-    result
 }
 
 /// Task-008 review M-3: a FAILED on-demand route discovery must back the
@@ -485,7 +473,7 @@ async fn an_index_adopted_claude_series_discovers_its_route_on_demand() {
 /// and a successful discovery clears the entry and unpauses the series.
 #[tokio::test]
 async fn a_failed_route_discovery_backs_off_instead_of_rescanning_every_pass() {
-    let _guard = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.lock().await;
+    let mut env = crate::test_env_lock::TestEnv::lock().await;
     let home = tempfile::tempdir().expect("claude home tempdir");
     let session_id = "6c3d4e5f-6a7b-4c8d-9e0f-1a2b3c4d5e6f";
     let project_cwd = home.path().join("proj");
@@ -498,12 +486,10 @@ async fn a_failed_route_discovery_backs_off_instead_of_rescanning_every_pass() {
     let transcript_dir = home.path().join("projects").join(&mangled);
     std::fs::create_dir_all(&transcript_dir).expect("mangled project dir");
 
-    let saved_home = std::env::var_os("CLAUDE_HOME");
-    let saved_config = std::env::var_os("CLAUDE_CONFIG_DIR");
-    std::env::set_var("CLAUDE_HOME", home.path());
-    std::env::remove_var("CLAUDE_CONFIG_DIR");
+    env.set("CLAUDE_HOME", home.path());
+    env.remove("CLAUDE_CONFIG_DIR");
 
-    let result = async {
+    async {
         let dir = temp_data_dir();
         let store = open_store(dir.path());
         let target = session(
@@ -579,16 +565,6 @@ async fn a_failed_route_discovery_backs_off_instead_of_rescanning_every_pass() {
         );
     }
     .await;
-
-    match saved_home {
-        Some(value) => std::env::set_var("CLAUDE_HOME", value),
-        None => std::env::remove_var("CLAUDE_HOME"),
-    }
-    match saved_config {
-        Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
-        None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
-    }
-    result
 }
 
 // ---------------------------------------------------------------------------
@@ -2597,32 +2573,20 @@ async fn a_capability_paused_head_does_not_starve_the_ready_series_behind_it() {
 // T3-I4: the packaged desktop app's staged helper path derivation.
 // ---------------------------------------------------------------------------
 
-/// `from_env` reads process-global env — serialize every from_env probe and
-/// restore the prior values (the repo's ENV_LOCK convention).
-static FROM_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+/// `from_env` reads process-global env — own it through the crate-wide
+/// `TestEnv` (`crate::test_env_lock`), which restores the prior values.
 fn probe_from_env(
     vars: &[(&str, Option<&str>)],
     probe: impl FnOnce(&super::ClaudeNativeNameAdapter),
 ) {
-    let _guard = FROM_ENV_LOCK.lock().unwrap();
-    let saved: Vec<(&str, Option<std::ffi::OsString>)> = vars
-        .iter()
-        .map(|(key, _)| (*key, std::env::var_os(key)))
-        .collect();
+    let mut env = crate::test_env_lock::TestEnv::lock_blocking();
     for (key, value) in vars {
         match value {
-            Some(value) => std::env::set_var(key, value),
-            None => std::env::remove_var(key),
+            Some(value) => env.set(key, value),
+            None => env.remove(key),
         }
     }
     probe(&super::ClaudeNativeNameAdapter::from_env());
-    for (key, value) in saved {
-        match value {
-            Some(value) => std::env::set_var(key, value),
-            None => std::env::remove_var(key),
-        }
-    }
 }
 
 /// T3-I4: the packaged app spawns the server with `FRESHELL_CLAUDE_SIDECAR`
