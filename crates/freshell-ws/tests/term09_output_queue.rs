@@ -570,14 +570,18 @@ struct ThrottledDrain {
 /// consumer (the incident's shape: a real browser on a slow path that keeps
 /// draining, never a dead socket). After every `chunk_bytes` of output
 /// payload received, pause `chunk_pause`, so the sustained drain rate is
-/// ~`chunk_bytes / chunk_pause`. Stops at `marker`, connection end, or the
-/// deadline (whichever first).
+/// ~`chunk_bytes / chunk_pause`. While `trickle_until` (when given) has not
+/// yet reported `true`, the consumer is slower still: it pauses after EVERY
+/// frame, so it reads one frame (at most 16 KiB) per `chunk_pause` — never
+/// stuck, but too slow to keep a flood's backlog down. Stops at `marker`,
+/// connection end, or the deadline (whichever first).
 async fn drain_throttled_until_marker(
     ws: &mut TestWs,
     marker: &str,
     chunk_bytes: usize,
     chunk_pause: Duration,
     deadline: tokio::time::Instant,
+    trickle_until: Option<&dyn Fn() -> bool>,
 ) -> ThrottledDrain {
     let mut report = ThrottledDrain {
         text: String::new(),
@@ -587,6 +591,7 @@ async fn drain_throttled_until_marker(
         closed: false,
     };
     let mut received_since_pause = 0usize;
+    let mut trickling = trickle_until.is_some();
     // Rolling tail for marker detection: a marker can only arrive in fresh
     // data (possibly straddling a frame boundary), so scanning the whole
     // accumulated text per message would be quadratic — at incident-scale
@@ -619,7 +624,10 @@ async fn drain_throttled_until_marker(
                         }
                         report.output_bytes += data_len;
                         received_since_pause += data_len;
-                        if received_since_pause >= chunk_bytes {
+                        if trickling {
+                            trickling = !trickle_until.is_some_and(|done| done());
+                        }
+                        if trickling || received_since_pause >= chunk_bytes {
                             received_since_pause = 0;
                             tokio::time::sleep(chunk_pause).await;
                         }
@@ -657,6 +665,12 @@ async fn drain_throttled_until_marker(
 #[tokio::test]
 async fn incident_backlog_spills_instead_of_disconnecting() {
     let _flood_guard = flood_test_serial().await;
+    // Install the process-global capture BEFORE the server spawns: the
+    // server's own spill event (below) is the signal that the backlog has
+    // crossed the spill bound, and an event emitted before the subscriber
+    // exists is lost for good.
+    let events = global_capture();
+    let captured_from = events.lock().expect("capture lock").len();
     // The real default configuration — this test pins the shipped defaults,
     // not an injected variant.
     let term09 = Term09Config::default();
@@ -665,9 +679,15 @@ async fn incident_backlog_spills_instead_of_disconnecting() {
     let mut creator = connect_and_complete_handshake(&url).await;
     let terminal_id = create_shell_terminal(&mut creator, "create-incident").await;
 
-    // The victim: a normal client that reads continuously but slowly
-    // (~1 MiB/s), like a browser on a congested path. It is never stuck —
-    // its socket keeps accepting writes the whole time.
+    // The victim: a normal client that reads continuously but slowly, like a
+    // browser on a congested path. It is never stuck — its socket keeps
+    // accepting writes the whole time. Until the server reports its first
+    // spill for this terminal it reads one frame per pause (at most
+    // ~64 KiB/s); from then on ~1 MiB/s. A fixed ~1 MiB/s from the start
+    // kept pace with the flood whenever a loaded machine slowed the PTY
+    // producer down to that rate, so the backlog never reached the spill
+    // bound this test is about; the trickle cannot drain more than a few MiB
+    // of a ~40 MB flood before the deadline, so the backlog provably does.
     let mut victim = connect_and_complete_handshake(&url).await;
     attach(&mut victim, &terminal_id, "attach-incident").await;
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -690,6 +710,17 @@ async fn incident_backlog_spills_instead_of_disconnecting() {
         .await
         .expect("send flood input");
 
+    let spilled = || {
+        events
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .skip(captured_from)
+            .any(|event| {
+                event.message == "ws.terminal_stream.queue_overflow_spill"
+                    && event.fields.get("terminal_id") == Some(&terminal_id)
+            })
+    };
     let deadline = started + Duration::from_secs(60);
     let report = drain_throttled_until_marker(
         &mut victim,
@@ -697,6 +728,7 @@ async fn incident_backlog_spills_instead_of_disconnecting() {
         256 * 1024,
         Duration::from_millis(250),
         deadline,
+        Some(&spilled),
     )
     .await;
     let elapsed = started.elapsed();
@@ -835,6 +867,7 @@ async fn slow_but_progressing_client_survives_over_threshold_backlog() {
         128 * 1024,
         Duration::from_millis(125),
         deadline,
+        None,
     )
     .await;
 
