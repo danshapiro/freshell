@@ -163,6 +163,9 @@ pub(crate) struct ClaudeLaunchSpec {
     pub(crate) hosted_mcp: bool,
     /// The client's `modelSelection` on a create, passed through as sent.
     pub(crate) model_selection: Option<Value>,
+    /// The id a fresh or forked boot writes the conversation under (the
+    /// session's own id when it boots from its genesis, design §4.2).
+    pub(crate) session_id: Option<String>,
 }
 
 impl ClaudeLaunchSpec {
@@ -189,7 +192,14 @@ impl ClaudeLaunchSpec {
             plugins: settings.plugins.clone(),
             hosted_mcp,
             model_selection: None,
+            session_id: None,
         }
+    }
+
+    /// This launch writing a fresh or forked conversation under `session_id`.
+    pub(crate) fn with_session_id(mut self, session_id: Option<String>) -> Self {
+        self.session_id = session_id;
+        self
     }
 
     /// This launch carrying the client's `modelSelection` (a create's).
@@ -200,8 +210,9 @@ impl ClaudeLaunchSpec {
 
     /// The sidecar `create` line. Every line carries the same keys, whatever
     /// the launch: `type`, `protocol`, `requestId`, `sessionType`, `boot`, and
-    /// `cwd`, `model`, `permissionMode`, `effort`, `plugins` (each `null` when
-    /// unset) and `hostedMcp`; `modelSelection` only when the launch has one.
+    /// `sessionId`, `cwd`, `model`, `permissionMode`, `effort`, `plugins` (each
+    /// `null` when unset) and `hostedMcp`; `modelSelection` only when the
+    /// launch has one.
     pub(crate) fn create_request(&self) -> Value {
         let mut line = Map::new();
         line.insert("type".into(), json!("create"));
@@ -209,6 +220,7 @@ impl ClaudeLaunchSpec {
         line.insert("requestId".into(), json!(self.request_id));
         line.insert("sessionType".into(), json!(self.session_type));
         line.insert("boot".into(), self.boot.wire());
+        line.insert("sessionId".into(), json!(self.session_id));
         line.insert("cwd".into(), json!(self.cwd));
         line.insert("model".into(), json!(self.model));
         line.insert("permissionMode".into(), json!(self.permission_mode));
@@ -231,6 +243,10 @@ pub(crate) enum BootDecision {
     Boot {
         boot: ClaudeBoot,
         cwd: Option<String>,
+        /// The id a fresh or forked boot writes the conversation under: the
+        /// session's own id when it boots from its genesis. `None` for a
+        /// resume (the conversation already has its id).
+        session_id: Option<String>,
     },
     /// The store holds no transcript for the session: it is gone.
     Lost,
@@ -239,22 +255,63 @@ pub(crate) enum BootDecision {
     Transient(LocateError),
 }
 
-/// Which conversation a session boots, from where its transcript is (design
-/// §4.2): a found transcript resumes, an absent one is lost, and a store that
-/// could not be checked is transient. The genesis rows of §4.2 (a session with
-/// no transcript yet that may still boot) arrive with the binding row's genesis
-/// (C12).
-pub(crate) fn decide_boot(session_id: &str, location: TranscriptLocation) -> BootDecision {
-    match location {
-        TranscriptLocation::Found(path) => {
+/// Which conversation a session boots (design §4.2), from where its transcript
+/// is and the genesis its binding row records:
+///
+/// | transcript | genesis | boot |
+/// |---|---|---|
+/// | found | any (cleared lazily) | resume it |
+/// | absent | `Fresh` | a fresh conversation under the session's id |
+/// | absent | `Fork` | the lazy fork of the parent, under the session's id, from the parent's recorded directory; lost when the parent is gone |
+/// | absent | none | lost |
+/// | unreadable | any | transient, never lost |
+///
+/// `locate` finds a fork genesis's parent transcript.
+pub(crate) fn decide_boot(
+    session_id: &str,
+    location: TranscriptLocation,
+    genesis: Option<&ClaudeGenesis>,
+    locate: impl Fn(&str) -> TranscriptLocation,
+) -> BootDecision {
+    match (location, genesis) {
+        (TranscriptLocation::Found(path), _) => {
             let (resume, cwd) = resume_target(session_id, &path);
             BootDecision::Boot {
                 boot: ClaudeBoot::Resume { resume },
                 cwd,
+                session_id: None,
             }
         }
-        TranscriptLocation::Absent => BootDecision::Lost,
-        TranscriptLocation::Unreadable(error) => BootDecision::Transient(error),
+        (TranscriptLocation::Unreadable(error), _) => BootDecision::Transient(error),
+        (TranscriptLocation::Absent, None) => BootDecision::Lost,
+        (TranscriptLocation::Absent, Some(ClaudeGenesis::Fresh)) => BootDecision::Boot {
+            boot: ClaudeBoot::Fresh,
+            cwd: None,
+            session_id: Some(session_id.to_string()),
+        },
+        (
+            TranscriptLocation::Absent,
+            Some(ClaudeGenesis::Fork {
+                parent,
+                at,
+                drops_turn,
+            }),
+        ) => match locate(parent) {
+            TranscriptLocation::Found(parent_path) => {
+                let (resume, cwd) = resume_target(parent, &parent_path);
+                BootDecision::Boot {
+                    boot: ClaudeBoot::Fork {
+                        resume,
+                        at: at.clone(),
+                        drops_turn: drops_turn.clone(),
+                    },
+                    cwd,
+                    session_id: Some(session_id.to_string()),
+                }
+            }
+            TranscriptLocation::Absent => BootDecision::Lost,
+            TranscriptLocation::Unreadable(error) => BootDecision::Transient(error),
+        },
     }
 }
 
@@ -394,6 +451,7 @@ mod tests {
                 "requestId": "req-1",
                 "sessionType": "kilroy",
                 "boot": { "kind": "resume", "resume": "P" },
+                "sessionId": null,
                 "cwd": "/w",
                 "model": "opus",
                 "permissionMode": "plan",
@@ -492,10 +550,11 @@ mod tests {
             &format!("{{\"type\":\"user\",\"cwd\":{}}}\n", json!(cwd)),
         );
         assert_eq!(
-            decide_boot("S", TranscriptLocation::Found(path)),
+            decide_boot("S", TranscriptLocation::Found(path), None, no_parent),
             BootDecision::Boot {
                 boot: ClaudeBoot::Resume { resume: "S".into() },
                 cwd: Some(cwd),
+                session_id: None,
             }
         );
     }
@@ -509,12 +568,18 @@ mod tests {
             "{\"type\":\"user\",\"cwd\":\"/no/such/directory/anymore\"}\n",
         );
         assert_eq!(
-            decide_boot("S", TranscriptLocation::Found(path.clone())),
+            decide_boot(
+                "S",
+                TranscriptLocation::Found(path.clone()),
+                None,
+                no_parent
+            ),
             BootDecision::Boot {
                 boot: ClaudeBoot::Resume {
                     resume: path.to_string_lossy().to_string()
                 },
                 cwd: None,
+                session_id: None,
             }
         );
     }
@@ -524,10 +589,11 @@ mod tests {
         let store = tempfile::tempdir().unwrap();
         let path = transcript(store.path(), "S", "");
         assert_eq!(
-            decide_boot("S", TranscriptLocation::Found(path)),
+            decide_boot("S", TranscriptLocation::Found(path), None, no_parent),
             BootDecision::Boot {
                 boot: ClaudeBoot::Resume { resume: "S".into() },
                 cwd: None,
+                session_id: None,
             }
         );
     }
@@ -535,7 +601,7 @@ mod tests {
     #[test]
     fn an_absent_transcript_is_lost_and_an_unreadable_store_is_transient() {
         assert_eq!(
-            decide_boot("S", TranscriptLocation::Absent),
+            decide_boot("S", TranscriptLocation::Absent, None, no_parent),
             BootDecision::Lost
         );
         let error = LocateError::Io {
@@ -544,15 +610,180 @@ mod tests {
             message: "denied".into(),
         };
         assert_eq!(
-            decide_boot("S", TranscriptLocation::Unreadable(error.clone())),
+            decide_boot(
+                "S",
+                TranscriptLocation::Unreadable(error.clone()),
+                None,
+                no_parent
+            ),
             BootDecision::Transient(error)
         );
         assert_eq!(
             decide_boot(
                 "S",
-                TranscriptLocation::Unreadable(LocateError::NoStoreRoot)
+                TranscriptLocation::Unreadable(LocateError::NoStoreRoot),
+                None,
+                no_parent
             ),
             BootDecision::Transient(LocateError::NoStoreRoot)
+        );
+    }
+
+    /// A session with no genesis has no parent to look up.
+    fn no_parent(id: &str) -> TranscriptLocation {
+        panic!("decide_boot looked up {id} for a session with no fork genesis")
+    }
+
+    fn fork_genesis(parent: &str) -> ClaudeGenesis {
+        ClaudeGenesis::Fork {
+            parent: parent.into(),
+            at: Some("a1".into()),
+            drops_turn: Some("u2".into()),
+        }
+    }
+
+    /// §4.2: the transcript is the truth once it exists. A genesis not yet
+    /// cleared (the lazy clear runs after the first result) never makes a
+    /// conversation boot again from scratch.
+    #[test]
+    fn a_found_transcript_resumes_whatever_the_genesis_says() {
+        let store = tempfile::tempdir().unwrap();
+        let path = transcript(store.path(), "S", "");
+        for genesis in [ClaudeGenesis::Fresh, fork_genesis("P")] {
+            assert_eq!(
+                decide_boot(
+                    "S",
+                    TranscriptLocation::Found(path.clone()),
+                    Some(&genesis),
+                    no_parent
+                ),
+                BootDecision::Boot {
+                    boot: ClaudeBoot::Resume { resume: "S".into() },
+                    cwd: None,
+                    session_id: None,
+                },
+                "{genesis:?}"
+            );
+        }
+    }
+
+    /// §4.2/§4.3: a zero-turn session (create, no send, then a restart or a
+    /// crash) boots a fresh conversation under its own id again (T3: nothing is
+    /// on disk, so the id cannot collide).
+    #[test]
+    fn an_absent_transcript_with_a_fresh_genesis_boots_fresh_under_its_own_id() {
+        assert_eq!(
+            decide_boot(
+                "S",
+                TranscriptLocation::Absent,
+                Some(&ClaudeGenesis::Fresh),
+                no_parent
+            ),
+            BootDecision::Boot {
+                boot: ClaudeBoot::Fresh,
+                cwd: None,
+                session_id: Some("S".into()),
+            }
+        );
+    }
+
+    /// §4.2/§4.3: a pending fork (undo, then a restart before sending) boots
+    /// the same lazy fork of its parent again under its own id (T6), from the
+    /// parent's recorded directory, where the CLI finds the parent by id.
+    #[test]
+    fn an_absent_transcript_with_a_fork_genesis_boots_the_fork_under_its_own_id() {
+        let store = tempfile::tempdir().unwrap();
+        let recorded = tempfile::tempdir().unwrap();
+        let cwd = recorded.path().to_str().unwrap().to_string();
+        let parent = transcript(
+            store.path(),
+            "P",
+            &format!("{{\"type\":\"user\",\"cwd\":{}}}\n", json!(cwd)),
+        );
+        let locate = |id: &str| {
+            assert_eq!(id, "P", "only the parent is looked up");
+            TranscriptLocation::Found(parent.clone())
+        };
+        assert_eq!(
+            decide_boot(
+                "S",
+                TranscriptLocation::Absent,
+                Some(&fork_genesis("P")),
+                locate
+            ),
+            BootDecision::Boot {
+                boot: ClaudeBoot::Fork {
+                    resume: "P".into(),
+                    at: Some("a1".into()),
+                    drops_turn: Some("u2".into()),
+                },
+                cwd: Some(cwd),
+                session_id: Some("S".into()),
+            }
+        );
+    }
+
+    /// A pending fork whose parent is gone cannot boot (the CLI refuses it), so
+    /// the session is lost; a parent store that cannot be checked is transient.
+    #[test]
+    fn a_fork_genesis_whose_parent_is_gone_is_lost_and_an_unreadable_parent_transient() {
+        assert_eq!(
+            decide_boot(
+                "S",
+                TranscriptLocation::Absent,
+                Some(&fork_genesis("P")),
+                |_: &str| TranscriptLocation::Absent
+            ),
+            BootDecision::Lost
+        );
+        let error = LocateError::Io {
+            root: "/store".into(),
+            kind: std::io::ErrorKind::PermissionDenied,
+            message: "denied".into(),
+        };
+        assert_eq!(
+            decide_boot(
+                "S",
+                TranscriptLocation::Absent,
+                Some(&fork_genesis("P")),
+                |_: &str| TranscriptLocation::Unreadable(error.clone())
+            ),
+            BootDecision::Transient(error)
+        );
+    }
+
+    /// G28 holds with a genesis too: a store that cannot be checked may hold
+    /// the transcript, so nothing boots from the genesis.
+    #[test]
+    fn an_unreadable_store_is_transient_whatever_the_genesis_says() {
+        assert_eq!(
+            decide_boot(
+                "S",
+                TranscriptLocation::Unreadable(LocateError::NoStoreRoot),
+                Some(&ClaudeGenesis::Fresh),
+                no_parent
+            ),
+            BootDecision::Transient(LocateError::NoStoreRoot)
+        );
+    }
+
+    /// The create line names the id a fresh or forked boot writes under
+    /// (`sessionId`, the sidecar's `bootOptions` input), null when the launch
+    /// has none.
+    #[test]
+    fn a_create_line_names_the_id_a_genesis_boot_writes_under() {
+        let spec = ClaudeLaunchSpec::new(
+            "req",
+            "freshclaude",
+            ClaudeBoot::Fresh,
+            None,
+            &FreshAgentSettings::default(),
+            false,
+        );
+        assert_eq!(spec.create_request().get("sessionId"), Some(&Value::Null));
+        assert_eq!(
+            spec.with_session_id(Some("S".into())).create_request()["sessionId"],
+            json!("S")
         );
     }
 

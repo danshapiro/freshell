@@ -1,16 +1,110 @@
-//! The claude lane's reads of a session's genesis (core-runtime design §4.1,
-//! §4.3 and §4.5).
+//! The claude lane's side of a session's genesis (core-runtime design §4.1,
+//! §4.2, §4.3 and §4.5).
 //!
 //! A session that has no transcript yet (a fresh session before its first
 //! prompt, or a pending fork) records how it came to be in its binding row
 //! ([`ClaudeGenesis`]) until the transcript is observed on disk. The lane reads
 //! it to serve the session's snapshot (`Fresh` holds nothing, a pending `Fork`
-//! its parent's prefix), always from the transcript store its sidecars write.
+//! its parent's prefix) and to boot the session again before its transcript
+//! exists (after a restart or a crash), always against the transcript store its
+//! sidecars write. It clears it lazily, only once the transcript is on disk: a
+//! launch that finds the transcript clears it, and so does the first result
+//! after the transcript is flushed (each line lags its SDK frame, T3), so a CLI
+//! death in that window never loses the session.
+
+use std::time::Duration;
 
 use super::*;
 
-use crate::claude_snapshot::ClaudeSnapshotError;
+use crate::claude_launch::{decide_boot, BootDecision};
+use crate::claude_snapshot::{ClaudeSnapshotError, TranscriptLocation};
 use crate::identity_sink::RecordedGenesis;
+
+/// How many times the lazy clear looks for the transcript after a result.
+pub(crate) const GENESIS_CLEAR_ATTEMPTS: u32 = 10;
+/// How long the lazy clear waits between looks (a transcript line lags its SDK
+/// frame by 95-200 ms, T3).
+pub(crate) const GENESIS_CLEAR_INTERVAL: Duration = Duration::from_millis(200);
+
+/// What one lazy clear did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GenesisClear {
+    /// The transcript was on disk at the `attempt`-th look; the genesis is gone.
+    Cleared { attempt: u32 },
+    /// The transcript never appeared: the genesis stays, so the next launch
+    /// boots the session from it again.
+    NotObserved,
+    /// The transcript was on disk but the ledger write failed: the genesis
+    /// stays (harmless: a found transcript always wins), the next result or
+    /// launch clears it.
+    Failed(String),
+}
+
+/// Clear `session_id`'s genesis once its transcript is on disk in `roots`:
+/// look up to `attempts` times, `interval` apart, and clear at the first find.
+/// A store that cannot be read is not a find.
+pub(crate) async fn clear_genesis_once_observed(
+    sink: &crate::identity_sink::SharedPaneIdentitySink,
+    roots: Vec<PathBuf>,
+    session_id: &str,
+    attempts: u32,
+    interval: Duration,
+) -> GenesisClear {
+    for attempt in 1..=attempts {
+        let (store, id) = (roots.clone(), session_id.to_string());
+        let found = tokio::task::spawn_blocking(move || {
+            matches!(
+                crate::claude_snapshot::locate_transcript_state_in(&store, &id),
+                TranscriptLocation::Found(_)
+            )
+        })
+        .await
+        .unwrap_or(false);
+        if found {
+            return match sink.clear_genesis(PROVIDER, session_id).await {
+                Ok(()) => GenesisClear::Cleared { attempt },
+                Err(error) => GenesisClear::Failed(error.to_string()),
+            };
+        }
+        if attempt < attempts {
+            tokio::time::sleep(interval).await;
+        }
+    }
+    GenesisClear::NotObserved
+}
+
+/// One structured line per lazy clear.
+fn log_genesis_clear(session_id: &str, genesis: &str, trigger: &str, outcome: &GenesisClear) {
+    match outcome {
+        GenesisClear::Cleared { attempt } => tracing::info!(
+            component = "freshagent.claude",
+            event = "freshagent.claude.genesis_cleared",
+            session_id = %session_id,
+            genesis,
+            trigger,
+            attempt,
+            "the session's transcript is on disk; its genesis is cleared"
+        ),
+        GenesisClear::NotObserved => tracing::warn!(
+            component = "freshagent.claude",
+            event = "freshagent.claude.genesis_kept",
+            session_id = %session_id,
+            genesis,
+            trigger,
+            attempts = GENESIS_CLEAR_ATTEMPTS,
+            "the session's transcript did not appear; its genesis stays, so the next launch boots it again"
+        ),
+        GenesisClear::Failed(error) => tracing::warn!(
+            component = "freshagent.claude",
+            event = "freshagent.claude.genesis_clear_failed",
+            session_id = %session_id,
+            genesis,
+            trigger,
+            error = %error,
+            "the session's transcript is on disk but its genesis could not be cleared; a later result or launch retries"
+        ),
+    }
+}
 
 impl FreshClaudeState {
     /// The durable session id `any_id` names: a live session's adopted claude
@@ -56,5 +150,196 @@ impl FreshClaudeState {
             rollback.as_ref(),
         )
         .await
+    }
+
+    /// Which conversation an attach that resumes `durable` boots (design §4.2):
+    /// [`decide_boot`] over the lane's store and the binding row's genesis. The
+    /// boot, the directory the conversation was recorded in, and the id a fresh
+    /// or forked boot writes under. A found transcript whose row still records a
+    /// genesis clears it (the transcript is observed). Lost and unreadable map to
+    /// the attach's errors (unreadable is logged and never lost).
+    pub(super) fn decide_attach_boot(
+        &self,
+        durable: &str,
+        sink: Option<&crate::identity_sink::SharedPaneIdentitySink>,
+    ) -> Result<(ClaudeBoot, Option<String>, Option<String>), ResumeClaudeError> {
+        let recorded = sink.and_then(|sink| sink.load_genesis(PROVIDER, durable));
+        let location = self.locate_transcript(durable);
+        let found = matches!(location, TranscriptLocation::Found(_));
+        let decision = decide_boot(
+            durable,
+            location,
+            recorded.as_ref().map(|recorded| &recorded.genesis),
+            |id| self.locate_transcript(id),
+        );
+        match decision {
+            BootDecision::Boot {
+                boot,
+                cwd,
+                session_id,
+            } => {
+                if let (Some(recorded), Some(sink)) = (recorded.as_ref(), sink) {
+                    if found {
+                        self.clear_found_genesis(sink, durable, recorded);
+                    } else {
+                        tracing::info!(
+                            component = "freshagent.claude",
+                            event = "freshagent.claude.genesis_boot",
+                            session_id = %durable,
+                            genesis = recorded.genesis.kind(),
+                            boot = boot.kind(),
+                            "the session has no transcript yet; it boots from its genesis"
+                        );
+                    }
+                }
+                Ok((boot, cwd, session_id))
+            }
+            BootDecision::Lost => Err(ResumeClaudeError::NotFound),
+            BootDecision::Transient(error) => {
+                crate::claude_snapshot::log_transcript_unreadable("attach_resume", durable, &error);
+                Err(ResumeClaudeError::Transient(error.to_string()))
+            }
+        }
+    }
+
+    /// A launch found the transcript of a session whose row still records a
+    /// genesis: clear it now, off the launch's path.
+    fn clear_found_genesis(
+        &self,
+        sink: &crate::identity_sink::SharedPaneIdentitySink,
+        durable: &str,
+        recorded: &RecordedGenesis,
+    ) {
+        let (sink, durable, genesis) = (sink.clone(), durable.to_string(), recorded.genesis.kind());
+        let roots = self.transcript_roots();
+        tokio::spawn(async move {
+            let outcome =
+                clear_genesis_once_observed(&sink, roots, &durable, 1, Duration::ZERO).await;
+            log_genesis_clear(&durable, genesis, "launch", &outcome);
+        });
+    }
+
+    /// After a result of the session `session_key` names: when its binding row
+    /// still records a genesis, clear it once the transcript is flushed (the
+    /// lazy clear, design §4.1). Detached; a session with no genesis costs one
+    /// memory read.
+    pub(super) async fn clear_genesis_after_result(&self, session_key: &str) {
+        let Some(sink) = self.identity_sink() else {
+            return;
+        };
+        let durable = self.durable_session_id(session_key).await;
+        let Some(recorded) = sink.load_genesis(PROVIDER, &durable) else {
+            return;
+        };
+        let roots = self.transcript_roots();
+        tokio::spawn(async move {
+            let outcome = clear_genesis_once_observed(
+                &sink,
+                roots,
+                &durable,
+                GENESIS_CLEAR_ATTEMPTS,
+                GENESIS_CLEAR_INTERVAL,
+            )
+            .await;
+            log_genesis_clear(&durable, recorded.genesis.kind(), "result", &outcome);
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::claude_launch::ClaudeGenesis;
+    use crate::identity_sink::{FakeIdentitySink, PaneIdentitySink, SharedPaneIdentitySink};
+
+    const ID: &str = "e5e5e5e5-e5e5-4e5e-8e5e-e5e5e5e5e5e5";
+
+    fn sink_with_genesis() -> (Arc<FakeIdentitySink>, SharedPaneIdentitySink) {
+        let fake = Arc::new(FakeIdentitySink::default());
+        fake.seed_genesis(PROVIDER, ID, ClaudeGenesis::Fresh);
+        let shared: SharedPaneIdentitySink = fake.clone();
+        (fake, shared)
+    }
+
+    fn transcript_path(store: &std::path::Path) -> PathBuf {
+        store
+            .join("projects")
+            .join("-w")
+            .join(format!("{ID}.jsonl"))
+    }
+
+    /// §4.1: the genesis is cleared only after the transcript is observed. The
+    /// transcript is flushed a moment after the result (T3); the clear keeps
+    /// looking and clears at the first find.
+    #[tokio::test]
+    async fn the_genesis_clears_once_the_transcript_is_flushed() {
+        let store = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(store.path().join("projects")).unwrap();
+        let (fake, sink) = sink_with_genesis();
+        let path = transcript_path(store.path());
+        let flush = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "{}\n").unwrap();
+        });
+        let outcome = clear_genesis_once_observed(
+            &sink,
+            vec![store.path().to_path_buf()],
+            ID,
+            50,
+            Duration::from_millis(10),
+        )
+        .await;
+        flush.await.unwrap();
+        assert!(
+            matches!(outcome, GenesisClear::Cleared { attempt } if attempt > 1),
+            "{outcome:?}"
+        );
+        assert_eq!(fake.load_genesis(PROVIDER, ID), None);
+    }
+
+    /// §4.1/§4.3: a CLI death before the transcript is flushed never loses the
+    /// session: with no transcript (or a store that cannot be read) the genesis
+    /// stays, so the next launch boots the session from it again.
+    #[tokio::test]
+    async fn a_transcript_never_flushed_keeps_the_genesis() {
+        let store = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(store.path().join("projects")).unwrap();
+        let (fake, sink) = sink_with_genesis();
+        for roots in [vec![store.path().to_path_buf()], Vec::new()] {
+            let outcome =
+                clear_genesis_once_observed(&sink, roots, ID, 3, Duration::from_millis(1)).await;
+            assert_eq!(outcome, GenesisClear::NotObserved);
+        }
+        assert_eq!(
+            fake.load_genesis(PROVIDER, ID).map(|r| r.genesis),
+            Some(ClaudeGenesis::Fresh)
+        );
+        assert!(
+            fake.genesis_clears.lock().unwrap().is_empty(),
+            "nothing was cleared"
+        );
+    }
+
+    /// A clear whose ledger write fails is reported and leaves the genesis (a
+    /// found transcript wins at the next launch anyway).
+    #[tokio::test]
+    async fn a_failed_clear_is_reported_and_keeps_the_genesis() {
+        let store = tempfile::tempdir().unwrap();
+        let path = transcript_path(store.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{}\n").unwrap();
+        let (fake, sink) = sink_with_genesis();
+        fake.set_fail_writes(true);
+        let outcome = clear_genesis_once_observed(
+            &sink,
+            vec![store.path().to_path_buf()],
+            ID,
+            3,
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(matches!(outcome, GenesisClear::Failed(_)), "{outcome:?}");
+        assert!(fake.load_genesis(PROVIDER, ID).is_some());
     }
 }

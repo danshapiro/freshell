@@ -352,6 +352,75 @@ impl ClaudeRig {
             .filter(|row| row["kind"] == kind)
             .collect()
     }
+
+    /// Record a binding row for `session_id` with `genesis` (core design §4.1)
+    /// the way a lane that mints a session with no transcript yet writes it:
+    /// a fresh-agent row with the rig's workspace as its cwd. Needs
+    /// [`RigOptions::durable_ledger`].
+    pub fn seed_pending_session(&self, session_id: &str, genesis: &Value) {
+        self.pane_ledger
+            .as_ref()
+            .expect("seeding a binding row needs the rig's durable ledger")
+            .record_fresh_agent_binding(&freshell_ws::pane_ledger::FreshAgentBindingWrite {
+                provider: "claude",
+                session_id,
+                mode: "freshclaude",
+                cwd: Some(self.workspace.to_str().expect("utf-8 path")),
+                create_request_id: None,
+                model: None,
+                sandbox: None,
+                permission_mode: None,
+                effort: None,
+                plugins: None,
+                genesis: freshell_ws::pane_ledger::GenesisWrite::Set(genesis),
+                supersedes: None,
+                provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+                observed_epoch: None,
+                observed_generation: None,
+                authoritative: false,
+                now_ms: 1_000,
+            })
+            .expect("seed the binding row");
+    }
+
+    /// The transcript `<session_id>.jsonl` under this rig's CLAUDE_CONFIG_DIR,
+    /// once the CLI wrote it.
+    pub async fn wait_for_transcript(&self, session_id: &str) -> PathBuf {
+        let name = format!("{session_id}.jsonl");
+        let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
+        loop {
+            if let Some(path) = self
+                .transcripts()
+                .into_iter()
+                .find(|path| path.file_name().and_then(|n| n.to_str()) == Some(name.as_str()))
+            {
+                return path;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no transcript {name}; found {:?}",
+                self.transcripts()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Returns once the binding row of `session_id` no longer records a genesis
+    /// (the lazy clear, core design §4.1). Needs [`RigOptions::durable_ledger`].
+    pub async fn wait_for_genesis_cleared(&self, session_id: &str) {
+        let ledger = self
+            .pane_ledger
+            .as_ref()
+            .expect("a genesis lives in the rig's durable ledger");
+        let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
+        while ledger.binding_genesis("claude", session_id).is_some() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the genesis of {session_id} was never cleared"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
 }
 
 /// One client connection to a rig's server. Every frame it reads is kept in
@@ -529,6 +598,41 @@ impl RigConnection {
             .iter()
             .filter(|v| v["type"] == "freshAgent.event" && v["event"]["type"] == event_type)
             .count()
+    }
+
+    /// The pane reattaches to the durable `session_id` (a reload, or the first
+    /// attach after a restart); returns once the attach is acknowledged.
+    pub async fn attach(&mut self, session_id: &str) {
+        self.send(json!({
+            "type": "freshAgent.attach",
+            "provider": "claude",
+            "sessionType": "freshclaude",
+            "sessionId": session_id,
+            "sessionRef": { "provider": "claude", "sessionId": session_id },
+        }))
+        .await;
+        self.wait_for("the attach acknowledgement", |v| {
+            v["type"] == "freshAgent.event"
+                && v["event"]["type"] == "freshAgent.session.snapshot"
+                && v["event"]["sessionId"] == session_id
+        })
+        .await;
+    }
+
+    /// The durable claude id the first turn of the session `pane_id` names
+    /// reported (`freshAgent.session.init`; its envelope carries the pane's id,
+    /// and a create's event the sidecar's own id).
+    pub fn init_session_id(&self, pane_id: &str) -> String {
+        self.frames
+            .iter()
+            .find_map(|v| {
+                (v["type"] == "freshAgent.event"
+                    && v["event"]["type"] == "freshAgent.session.init"
+                    && (v["sessionId"] == pane_id || v["event"]["sessionId"] == pane_id))
+                    .then(|| v["event"]["cliSessionId"].as_str().map(str::to_string))
+                    .flatten()
+            })
+            .expect("the first turn reported the durable id")
     }
 
     /// `freshAgent.kill`, then wait for `freshAgent.killed{success:true}`.

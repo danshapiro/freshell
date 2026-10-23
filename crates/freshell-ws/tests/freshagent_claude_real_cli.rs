@@ -12,7 +12,7 @@
 
 mod common;
 
-use common::claude_rig::{ClaudeRig, RigKind};
+use common::claude_rig::{ClaudeRig, RigKind, RigOptions};
 use common::log_capture::{self, CapturedEvent};
 use serde_json::json;
 use tracing::Level;
@@ -213,8 +213,44 @@ async fn a_forwarded_turn_complete_is_logged(kind: RigKind) {
     assert_eq!(edges.len(), 1, "one logged edge per edge sent: {edges:?}");
 }
 
+/// Design §11.5 item 10, zero-turn restart: a session created and never sent to
+/// has no transcript yet (T3). After a restart its pane's attach boots it again
+/// from the `Fresh` genesis its binding row records, under its own id; its first
+/// turn writes that id's transcript, and the genesis is then cleared (§4.1).
+async fn a_zero_turn_session_restarts_fresh_under_its_own_id(kind: RigKind) {
+    let rig = ClaudeRig::start_with_options(
+        kind,
+        RigOptions {
+            durable_ledger: true,
+            ..RigOptions::default()
+        },
+    )
+    .await;
+    let id = uuid::Uuid::new_v4().to_string();
+    rig.seed_pending_session(&id, &json!({ "kind": "fresh" }));
+    let mut conn = rig.connect().await;
+
+    conn.attach(&id).await;
+    conn.send_text(&id, "send-1", "hello").await;
+    let result = conn.wait_for_event("freshAgent.result").await;
+    assert_eq!(result["event"]["result"], "success", "{result}");
+    assert_eq!(
+        conn.init_session_id(&id),
+        id,
+        "the CLI ran under the session's id"
+    );
+    rig.wait_for_transcript(&id).await;
+    rig.wait_for_genesis_cleared(&id).await;
+    conn.kill(&id).await;
+}
+
 mod sim {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_zero_turn_session_restarts_fresh_under_its_own_id() {
+        super::a_zero_turn_session_restarts_fresh_under_its_own_id(RigKind::Sim).await;
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sidecar_log_records_reach_the_server_log() {
@@ -278,6 +314,11 @@ mod sim {
 
 mod cli {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_zero_turn_session_restarts_fresh_under_its_own_id() {
+        super::a_zero_turn_session_restarts_fresh_under_its_own_id(RigKind::Cli).await;
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sidecar_log_records_reach_the_server_log() {

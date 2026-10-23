@@ -76,7 +76,7 @@ use freshell_protocol::{
 };
 
 use crate::claude_handshake::{read_created, BootContext};
-use crate::claude_launch::{BootDecision, ClaudeBoot, ClaudeLaunchSpec};
+use crate::claude_launch::{ClaudeBoot, ClaudeLaunchSpec};
 use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
 
 /// The runtime provider (`AGENT_SESSION_TYPES.claude.provider`).
@@ -6895,8 +6895,9 @@ impl FreshClaudeState {
     }
 
     /// The not-tracked resume (codex `ensure_session_resumable` analog, file-store
-    /// flavored): transcript-present gate -> spawn sidecar with a resume boot ->
-    /// register under the CLIENT's id -> idle snapshot. `lease_guard` (Task 13): the
+    /// flavored): boot decision (a found transcript resumes; a session with no
+    /// transcript yet boots from its binding row's genesis, design §4.2) -> spawn
+    /// sidecar with that boot -> register under the CLIENT's id -> idle snapshot. `lease_guard` (Task 13): the
     /// attach-path D8 lease -- the kill handle is armed after the spawn and the lease
     /// completed (bound to the map key) at registration; error paths tear down their
     /// own sidecar and leave the guard for the caller to `fail()`.
@@ -6945,28 +6946,19 @@ impl FreshClaudeState {
         );
         // Which conversation boots (design §4.2, I8): a found transcript resumes;
         // a positive denial only on a CLEAN miss in every candidate root
-        // (CLAUDE_CONFIG_DIR > CLAUDE_HOME > platform home, ledger A3); an
-        // unreadable store (or no root at all) cannot CHECK, so it must not deny.
-        let (boot, transcript_cwd) =
-            match crate::claude_launch::decide_boot(durable, self.locate_transcript(durable)) {
-                BootDecision::Boot { boot, cwd } => (boot, cwd),
-                BootDecision::Lost => return Err(ResumeClaudeError::NotFound),
-                BootDecision::Transient(error) => {
-                    crate::claude_snapshot::log_transcript_unreadable(
-                        "attach_resume",
-                        durable,
-                        &error,
-                    );
-                    return Err(ResumeClaudeError::Transient(error.to_string()));
-                }
-            };
+        // (CLAUDE_CONFIG_DIR > CLAUDE_HOME > platform home, ledger A3) of a session
+        // with no genesis; a session with no transcript yet boots from the genesis
+        // its binding row records (§4.3: a zero-turn session or a pending fork
+        // after a restart); an unreadable store (or no root at all) cannot CHECK,
+        // so it must not deny.
+        let sink = self.identity_sink();
+        let (boot, transcript_cwd, minted_id) = self.decide_attach_boot(durable, sink.as_ref())?;
         // P1.13 (Task 10): recover the pane's recorded settings from the ledger so a
         // resume-in-place does not silently revert model/permissionMode/effort (or,
         // G15, drop its plugins). V7/A10 alarm gate: alarm ONLY when the ledger
         // PROVES prior recording yet no snapshot is recoverable. Never-recorded
         // transcripts (the entire pre-existing ~/.claude/projects population —
         // resume_for_attach exists FOR them) stay silent.
-        let sink = self.identity_sink();
         let recovered = sink
             .as_ref()
             .and_then(|s| s.load_settings("claude", durable));
@@ -7006,7 +6998,8 @@ impl FreshClaudeState {
             resume_cwd,
             &rec,
             self.hosted_mcp,
-        );
+        )
+        .with_session_id(minted_id);
         // Register under the CLIENT's id: the consumer stamps the map key on every
         // envelope and the frozen client routes by envelope sessionId
         // (fresh-agent-ws.ts:180-183) -- a fresh key would strand the pane. The
@@ -8147,6 +8140,10 @@ impl FreshClaudeState {
                     }
                     Some("sdk.result") => {
                         fold_terminal_edge(&in_turn, &turn_tracker);
+                        // Core design §4.1: a session booted from its genesis
+                        // writes its transcript around its first result; clear
+                        // the genesis once the transcript is on disk.
+                        state.clear_genesis_after_result(&session_id).await;
                     }
                     Some("sdk.status")
                         if value.get("status").and_then(Value::as_str) == Some("idle") =>
