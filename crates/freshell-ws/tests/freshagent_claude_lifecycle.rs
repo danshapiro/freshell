@@ -23,9 +23,11 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use common::claude_rig::{ClaudeRig, RigConnection, RigKind, RigOptions, RIG_FRAME_BUDGET};
+use common::ledger_sink::TurnInterruptedMarkerGate;
 use serde_json::{json, Value};
 
 /// How long a test keeps reading after the exit report before it counts edges: the
@@ -542,13 +544,17 @@ async fn a_resume_create_answers_created_with_its_session_ref_once_the_cli_boote
 /// attention edge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_owed_turn_is_reported_once_after_attach_across_a_server_restart() {
-    let program =
-        json!({ "rules": [{ "on": "msg:prompt", "emit": [{ "kind": "hang" }] }] }).to_string();
+    let program = json!({ "rules": [{ "on": "msg:prompt", "emit": [
+        { "kind": "completion" },
+    ] }] })
+    .to_string();
+    let marker_gate = Arc::new(TurnInterruptedMarkerGate::new());
     let mut rig = ClaudeRig::start_with_options(
         RigKind::Sim,
         RigOptions {
             durable_ledger: true,
             env: vec![("FRESHELL_CLAUDE_SIM_PROGRAM".into(), program)],
+            turn_interrupted_marker_gate: Some(marker_gate.clone()),
             ..RigOptions::default()
         },
     )
@@ -564,18 +570,48 @@ async fn an_owed_turn_is_reported_once_after_attach_across_a_server_restart() {
         .await;
     first.wait_for_event("freshAgent.session.init").await;
 
-    let row_before_restart = rig
+    let row_before_shutdown = rig
         .pane_ledger
         .as_ref()
         .expect("durable ledger enabled")
         .load_binding("claude", &session_id)
-        .expect("fresh-agent binding exists before restart");
+        .expect("fresh-agent binding exists before shutdown");
     assert!(
-        serde_json::to_value(&row_before_restart)
+        serde_json::to_value(&row_before_shutdown)
             .expect("binding serializes")
             .get("turnInterruptedAt")
             .is_none(),
         "a live turn is not marked interrupted before shutdown"
+    );
+
+    // Park shutdown inside its real persisted-marker write, then let the
+    // simulator finish the turn. The consumer must already be quiesced, so a
+    // result arriving during disk I/O cannot publish a completion edge while
+    // shutdown still persists the restart marker.
+    let shutdown_state = rig.fresh_claude.clone();
+    let shutdown = tokio::spawn(async move { shutdown_state.shutdown().await });
+    tokio::time::timeout(Duration::from_secs(5), marker_gate.wait_until_entered())
+        .await
+        .expect("shutdown reaches the held marker write");
+    let result_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !rig
+        .ledger_rows("result")
+        .iter()
+        .any(|row| row["sessionId"] == session_id)
+    {
+        assert!(
+            tokio::time::Instant::now() < result_deadline,
+            "the simulated turn did not reach its result while the marker write was held"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    first.read_for(Duration::from_millis(100)).await;
+    let completions_while_marker_write_held = first.events_seen("freshAgent.turn.complete");
+    marker_gate.release();
+    shutdown.await.expect("Claude shutdown task joins");
+    assert_eq!(
+        completions_while_marker_write_held, 0,
+        "a CLI result arriving during the marker write cannot publish a completion edge"
     );
 
     rig.restart().await;

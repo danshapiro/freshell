@@ -1936,10 +1936,22 @@ impl FreshClaudeState {
     /// rather than one session grace per session. Called on server shutdown.
     pub async fn shutdown(&self) {
         use tracing::instrument::WithSubscriber;
-        let drained: Vec<ClaudeSession> = {
+        let mut drained: Vec<ClaudeSession> = {
             let mut guard = self.sessions.lock().await;
             guard.drain().map(|(_, s)| s).collect()
         };
+        // Stop the stdout consumers before checking which turns remain owed.
+        // Otherwise a result can be folded while the awaited marker writes are
+        // in progress, publishing completion after shutdown has already decided
+        // to persist an interruption notice for that same turn.
+        for session in &drained {
+            session.consumer.abort();
+        }
+        for session in &mut drained {
+            while !session.consumer.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        }
         let interrupted_ids: Vec<String> = drained
             .iter()
             .filter(|session| session.ledger.lock().expect("turn ledger lock").busy())
