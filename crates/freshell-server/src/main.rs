@@ -2089,6 +2089,15 @@ async fn main() -> ExitCode {
     fresh_opencode_state.set_identity_sink(fresh_agent_identity_sink.clone());
     // opencode REST surface (Task 7's materialization site; V10 A13-N1)
     fresh_agent_state.set_identity_sink(fresh_agent_identity_sink.clone());
+    let rest_enabled = fresh_codex_state.clone();
+    fresh_agent_state
+        .set_claude_rest_lane(Arc::new(
+            freshell_freshagent::claude_rest_lane::ClaudeRestLane::new(
+                fresh_claude_state.clone(),
+                Arc::new(move || rest_enabled.is_enabled()),
+            ),
+        ))
+        .expect("local Claude REST lane is installed once");
     // Lane D1: the crash-event channel for terminal auto-resume. The receiver
     // is consumed by `auto_resume::spawn_auto_resume_hub`, spawned right
     // after `ws_state` is assembled (the hub needs the full state).

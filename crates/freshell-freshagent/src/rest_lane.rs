@@ -164,6 +164,7 @@ pub struct RestLaneCaptureResult {
 pub enum RestLaneCaptureError {
     Unsupported,
     Unavailable,
+    NotFound,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

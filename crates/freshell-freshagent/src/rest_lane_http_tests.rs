@@ -331,7 +331,10 @@ impl FreshAgentRestLane for ControlLane {
         self: Arc<Self>,
         _: RestLaneCreate,
     ) -> Result<RestLaneCreated, RestLaneError> {
-        unreachable!("pane was created by the browser")
+        Ok(RestLaneCreated {
+            session_id: "cached-rest-session".into(),
+            ..Default::default()
+        })
     }
     async fn send_agent(&self, request: RestLaneSend) -> Result<RestLaneSendResult, RestLaneError> {
         let noop = request.text == "\n";
@@ -436,4 +439,38 @@ async fn lane_noop_does_not_report_a_submitted_turn() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["data"]["status"], "noop");
     assert!(body["data"].get("submittedTurnId").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn lane_controls_use_the_current_layout_identity_after_a_rest_created_pane_is_replaced() {
+    const CURRENT_ID: &str = "67cebd37-9576-4de0-93bb-8f286f5fc499";
+    let state = state_with_registry();
+    let lane = Arc::new(ControlLane::default());
+    state.set_claude_rest_lane(lane.clone()).unwrap();
+    let router = app(state.clone());
+    let (status, created) =
+        post(router.clone(), "/api/tabs", json!({"agent":"claude"}), true).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let pane_id = created["data"]["paneId"].as_str().unwrap();
+    let tab_id = created["data"]["tabId"].as_str().unwrap();
+    state.layout.attach_pane_content(tab_id, pane_id, json!({
+        "kind":"fresh-agent", "provider":"claude", "sessionType":"kilroy", "sessionId":"new-pane-alias",
+        "sessionRef":{"provider":"claude", "sessionId":CURRENT_ID},
+    }));
+    let (status, body) = post(
+        router.clone(),
+        &format!("/api/panes/{pane_id}/send-keys"),
+        json!({"data":"continue"}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let send = lane.sends.lock().unwrap().last().unwrap().clone();
+    assert_eq!(send.session_id, CURRENT_ID);
+    assert_eq!(send.session_type, "kilroy");
+    let (status, text) = capture_response(router, pane_id).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let capture = lane.captures.lock().unwrap().last().unwrap().clone();
+    assert_eq!(capture.session_id, CURRENT_ID);
+    assert_eq!(capture.session_type, "kilroy");
 }

@@ -63,6 +63,8 @@ pub enum RigKind {
 /// local claude lane, no handoff route).
 #[derive(Debug, Clone, Default)]
 pub struct RigOptions {
+    /// REST create/split/send/capture over the shared Claude runtime and layout.
+    pub rest_api: bool,
     /// Extra sidecar environment (for example simulator knobs such as
     /// `FRESHELL_CLAUDE_SIM_PROGRAM`); a key here replaces the rig's own.
     pub env: Vec<(String, String)>,
@@ -106,6 +108,7 @@ pub struct ClaudeRig {
     /// The rig server's claude lane, for the server-side truths a test checks
     /// (for example `has_live_session`).
     pub fresh_claude: freshell_freshagent::FreshClaudeState,
+    pub fresh_codex: freshell_freshagent::FreshCodexState,
     /// The local fake Anthropic endpoint ([`RigKind::Cli`] only), killed on drop.
     _provider: Option<tokio::process::Child>,
     /// What the server was started with, for [`Self::restart`].
@@ -228,6 +231,7 @@ impl ClaudeRig {
             url,
             http_url,
             fresh_claude,
+            fresh_codex,
             server,
         } = spawn_rig_server(environment.clone(), &options, pane_ledger.clone()).await;
         eprintln!(
@@ -246,6 +250,7 @@ impl ClaudeRig {
             claude_config_dir,
             ledger,
             fresh_claude,
+            fresh_codex,
             _provider: provider,
             environment,
             options,
@@ -271,6 +276,7 @@ impl ClaudeRig {
             url,
             http_url,
             fresh_claude,
+            fresh_codex,
             server,
         } = spawn_rig_server(self.environment.clone(), &self.options, pane_ledger.clone()).await;
         eprintln!(
@@ -280,6 +286,7 @@ impl ClaudeRig {
         self.url = url;
         self.http_url = http_url;
         self.fresh_claude = fresh_claude;
+        self.fresh_codex = fresh_codex;
         self.pane_ledger = pane_ledger;
         self.server = server;
     }
@@ -975,6 +982,7 @@ struct RigServer {
     url: String,
     http_url: String,
     fresh_claude: freshell_freshagent::FreshClaudeState,
+    fresh_codex: freshell_freshagent::FreshCodexState,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -999,12 +1007,27 @@ async fn spawn_rig_server(
     // The ONE ownership coordinator, wired into the WS state and the claude lane
     // the way main.rs wires it.
     let epoch = pane_ledger.as_ref().and_then(|ledger| {
-        ledger.reserve_boot_epoch().expect("reserve the rig server's durable boot epoch")
+        ledger
+            .reserve_boot_epoch()
+            .expect("reserve the rig server's durable boot epoch")
     });
     let ownership = Arc::new(match epoch {
         Some(epoch) => freshell_ownership::RuntimeOwnershipRegistry::with_epoch(epoch),
         None => freshell_ownership::RuntimeOwnershipRegistry::new(),
     });
+    let layout = if options.rest_api {
+        let home = environment
+            .iter()
+            .find(|(key, _)| key == "HOME")
+            .expect("rig HOME")
+            .1
+            .clone();
+        freshell_freshagent::layout_store::LayoutStore::with_persistence(
+            PathBuf::from(home).join(".freshell/rest-layout.json"),
+        )
+    } else {
+        Default::default()
+    };
     let mut fresh_claude = freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx))
         .with_sidecar_environment(environment)
         .with_hosted_mcp(options.hosted_claude);
@@ -1019,12 +1042,13 @@ async fn spawn_rig_server(
     let fresh_agent_state = freshell_freshagent::FreshAgentState::new(
         Arc::clone(&auth_token),
         Arc::clone(&broadcast_tx),
-    );
+    )
+    .with_layout(layout.clone());
     let registry = freshell_terminal::TerminalRegistry::new();
     let cli_commands: Arc<Vec<freshell_platform::CliCommandSpec>> = Arc::new(Vec::new());
 
     let state = WsState {
-        layout: Default::default(),
+        layout,
         terminal_meta: Default::default(),
         pane_ledger: pane_ledger
             .clone()
@@ -1086,6 +1110,25 @@ async fn spawn_rig_server(
     );
     let mut router =
         freshell_ws::router(state.clone()).merge(freshell_freshagent::snapshot::router(snapshots));
+    if options.rest_api {
+        let enabled = state.fresh_codex.clone();
+        fresh_agent_state
+            .set_claude_rest_lane(Arc::new(
+                freshell_freshagent::claude_rest_lane::ClaudeRestLane::new(
+                    lane.clone(),
+                    Arc::new(move || enabled.is_enabled()),
+                ),
+            ))
+            .expect("install the rig's local Claude REST lane");
+        let defaults = state.handshake_settings.clone();
+        fresh_agent_state
+            .set_rest_create_settings_reader(Arc::new(move || {
+                let defaults = defaults.clone();
+                Box::pin(async move { defaults.read().await.fresh_agent.clone() })
+            }))
+            .expect("install the rig's REST defaults reader");
+        router = router.merge(freshell_freshagent::router(fresh_agent_state.clone()));
+    }
     if options.handoff {
         let runner = Arc::new(freshell_freshagent::SessionHandoffRunner::new(
             Arc::clone(&auth_token),
@@ -1129,6 +1172,7 @@ async fn spawn_rig_server(
         url: format!("ws://{addr}/ws"),
         http_url: format!("http://{addr}"),
         fresh_claude: lane,
+        fresh_codex: state.fresh_codex.clone(),
         server,
     }
 }

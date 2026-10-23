@@ -50,6 +50,7 @@ pub(crate) mod claude_live_events;
 pub(crate) mod claude_permission_update;
 pub(crate) mod claude_projection;
 pub(crate) mod claude_projection_cache;
+pub mod claude_rest_lane;
 pub(crate) mod claude_sidecar_exit;
 pub(crate) mod claude_sidecar_io;
 pub(crate) mod claude_snapshot;
@@ -5139,9 +5140,17 @@ fn register_fresh_agent_tab(
 /// Resolve them when their provider has a lane; that lane owns the live-session
 /// checks and transcript lookup.
 fn pane_entry_for_request(state: &FreshAgentState, pane_id: &str) -> Option<PaneEntry> {
-    if let Some(pane) = state.panes.lock().expect("panes mutex").get(pane_id) {
-        return Some(pane.clone());
-    }
+    pane_entry_from_layout(state, pane_id).or_else(|| {
+        state
+            .panes
+            .lock()
+            .expect("panes mutex")
+            .get(pane_id)
+            .cloned()
+    })
+}
+
+fn pane_entry_from_layout(state: &FreshAgentState, pane_id: &str) -> Option<PaneEntry> {
     let snapshot = state.layout.get_pane_snapshot(pane_id)?;
     let content = snapshot.pane_content?;
     if content.get("kind")?.as_str()? != "fresh-agent" {
@@ -7091,6 +7100,10 @@ async fn capture(
             Err(rest_lane::RestLaneCaptureError::Unavailable) => fail_json(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "hosted fresh-agent transcript is temporarily unavailable".to_string(),
+            ),
+            Err(rest_lane::RestLaneCaptureError::NotFound) => fail_json(
+                StatusCode::NOT_FOUND,
+                "fresh-agent transcript was not found".to_string(),
             ),
         };
     }
