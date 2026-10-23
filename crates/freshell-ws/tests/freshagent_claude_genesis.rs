@@ -222,3 +222,166 @@ async fn a_create_resuming_a_pending_fork_of_a_gone_parent_is_refused_without_a_
         rig.ledger_rows("query")
     );
 }
+
+// ── §4.2 typed boot retries ──────────────────────────────────────────────────
+
+/// A finished one-turn conversation on its own pane, its transcript on disk with
+/// the answer: (its durable id, its transcript path, its text).
+async fn donor_conversation(
+    rig: &ClaudeRig,
+    conn: &mut RigConnection,
+) -> (String, std::path::PathBuf, String) {
+    let pane = conn.create("create-donor").await;
+    converse(conn, &pane, &["the donor's prompt"]).await;
+    let donor = conn.init_session_id(&pane);
+    let path = rig.wait_for_transcript(&donor).await;
+    let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
+    loop {
+        let text = std::fs::read_to_string(&path).expect("read the donor");
+        if text.contains("\"assistant\"") {
+            return (donor, path, text);
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the donor's answer never reached disk"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The user prompts in the transcript of `session_id`, in order.
+fn prompts_in(rig: &ClaudeRig, session_id: &str) -> Vec<String> {
+    let name = format!("{session_id}.jsonl");
+    let path = rig
+        .transcripts()
+        .into_iter()
+        .find(|path| path.file_name().and_then(|n| n.to_str()) == Some(name.as_str()))
+        .expect("the transcript");
+    std::fs::read_to_string(path)
+        .expect("read the transcript")
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|line| line["type"] == "user" && line["uuid"].is_string())
+        .filter_map(|line| {
+            line["message"]["content"][0]["text"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// §4.2 SESSION_ID_IN_USE: a zero-turn session's fresh boot under its own id
+/// finds its transcript written between the server's check and the CLI's boot
+/// (T4: the CLI refuses the id as already in use). The boot is retried once as
+/// a resume of that conversation, so the attach succeeds and the next send
+/// continues it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_genesis_boot_refused_in_use_is_retried_once_as_a_resume() {
+    let (rig, _) = ledger_rig().await;
+    let mut conn = rig.connect().await;
+    let (donor, donor_path, donor_text) = donor_conversation(&rig, &mut conn).await;
+    let id = uuid::Uuid::new_v4().to_string();
+    rig.seed_pending_session(&id, &json!({ "kind": "fresh" }));
+
+    conn.send(json!({
+        "type": "freshAgent.attach",
+        "provider": "claude",
+        "sessionType": "freshclaude",
+        "sessionId": id,
+        "sessionRef": { "provider": "claude", "sessionId": id },
+    }))
+    .await;
+    // The fresh boot's query() is recorded before the simulated CLI boots; the
+    // transcript lands before the CLI looks for the id.
+    wait_for_query(&rig, "the fresh boot", |o| {
+        o["sessionId"] == id.as_str() && o.get("resume").is_none()
+    })
+    .await;
+    std::fs::write(
+        donor_path.with_file_name(format!("{id}.jsonl")),
+        donor_text.replace(&donor, &id),
+    )
+    .expect("write the transcript under the session's id");
+    let answer = conn
+        .wait_for("the attach's answer", |v| {
+            v["type"] == "error"
+                || (v["type"] == "freshAgent.event"
+                    && matches!(
+                        v["event"]["type"].as_str(),
+                        Some("freshAgent.session.snapshot" | "freshAgent.error")
+                    )
+                    && v["event"]["sessionId"] == id.as_str())
+        })
+        .await;
+    assert_eq!(
+        answer["event"]["type"], "freshAgent.session.snapshot",
+        "{answer}"
+    );
+    wait_for_query(&rig, "the retried resume", |o| o["resume"] == id.as_str()).await;
+
+    converse(&mut conn, &id, &["after the retry"]).await;
+    assert_eq!(
+        conn.init_session_id(&id),
+        id,
+        "the CLI ran under the session's id"
+    );
+    assert_eq!(
+        prompts_in(&rig, &id),
+        ["the donor's prompt", "after the retry"],
+        "the retry resumed the conversation it collided with"
+    );
+}
+
+/// §4.2 CONVERSATION_NOT_FOUND with a genesis: a pending fork whose transcript
+/// the server found is gone when the CLI boots its resume (T5). The boot is
+/// retried once from the genesis, so the pane's Resume (a create resuming the
+/// session) still opens the same fork under its id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resume_refused_not_found_is_retried_once_from_the_genesis() {
+    let (rig, _) = ledger_rig().await;
+    let mut conn = rig.connect().await;
+    let (donor, donor_path, donor_text) = donor_conversation(&rig, &mut conn).await;
+    let id = uuid::Uuid::new_v4().to_string();
+    rig.seed_pending_session(&id, &json!({ "kind": "fork", "parent": donor }));
+    let stale = donor_path.with_file_name(format!("{id}.jsonl"));
+    std::fs::write(&stale, donor_text.replace(&donor, &id)).expect("a transcript to find");
+
+    conn.send(json!({
+        "type": "freshAgent.create",
+        "requestId": "resume-1",
+        "provider": "claude",
+        "sessionType": "freshclaude",
+        "cwd": rig.workspace.to_str().expect("utf-8"),
+        "sessionRef": { "provider": "claude", "sessionId": id },
+    }))
+    .await;
+    wait_for_query(&rig, "the resume", |o| o["resume"] == id.as_str()).await;
+    std::fs::remove_file(&stale).expect("the transcript goes away before the CLI boots");
+    let created = conn
+        .wait_for("the create's answer", |v| {
+            v["requestId"] == "resume-1"
+                && matches!(
+                    v["type"].as_str(),
+                    Some("freshAgent.created" | "freshAgent.create.failed")
+                )
+        })
+        .await;
+    assert_eq!(created["type"], "freshAgent.created", "{created}");
+    let fork = wait_for_query(&rig, "the retried fork", |o| {
+        o["forkSession"] == true && o["sessionId"] == id.as_str()
+    })
+    .await;
+    assert_eq!(fork["resume"], json!(donor), "{fork}");
+
+    let pane = created["sessionId"].as_str().expect("the pane").to_string();
+    converse(&mut conn, &pane, &["after the retry"]).await;
+    assert_eq!(
+        conn.init_session_id(&pane),
+        id,
+        "the fork ran under the session's id"
+    );
+    assert_eq!(
+        prompts_in(&rig, &id),
+        ["the donor's prompt", "after the retry"]
+    );
+}

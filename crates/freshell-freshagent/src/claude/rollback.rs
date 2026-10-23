@@ -1147,6 +1147,7 @@ impl FreshClaudeState {
                         last_synthesized_complete_at: Arc::clone(&last_synthesized_complete_at),
                     }),
                     genesis: Some(genesis.clone()),
+                    retry: None,
                 },
                 &mut lease_guard,
                 &mut own_ticket,

@@ -2454,16 +2454,18 @@ impl FreshClaudeState {
             },
             None => None,
         };
-        let (boot, boot_cwd, boot_session_id, boot_genesis) = match genesis_boot {
+        let (boot, boot_cwd, boot_session_id, boot_genesis, recorded_genesis) = match genesis_boot {
             Some(decided) => (
                 decided.boot,
                 decided.cwd.or_else(|| msg.cwd.clone()),
                 decided.session_id,
                 decided.genesis,
+                Some(decided.recorded),
             ),
             None => (
                 ClaudeBoot::resume_or_fresh(resume_sid.as_deref()),
                 msg.cwd.clone(),
+                None,
                 None,
                 None,
             ),
@@ -2515,6 +2517,10 @@ impl FreshClaudeState {
                     start_pid_slot: &start_pid_slot,
                     inherit: None,
                     genesis: boot_genesis,
+                    retry: resume_sid.clone().map(|durable| BootRetry {
+                        durable,
+                        genesis: recorded_genesis,
+                    }),
                 },
                 &mut lease_guard,
                 &mut own_ticket,
@@ -5832,6 +5838,11 @@ impl FreshClaudeState {
         // so it must not deny.
         let sink = self.identity_sink();
         let (boot, transcript_cwd, minted_id) = self.decide_attach_boot(durable, sink.as_ref())?;
+        // The genesis the boot was decided from, for its one typed retry (§4.2).
+        let recorded_genesis = sink
+            .as_ref()
+            .and_then(|sink| sink.load_genesis(PROVIDER, durable))
+            .map(|recorded| recorded.genesis);
         // P1.13 (Task 10): recover the pane's recorded settings from the ledger so a
         // resume-in-place does not silently revert model/permissionMode/effort (or,
         // G15, drop its plugins). V7/A10 alarm gate: alarm ONLY when the ledger
@@ -5910,6 +5921,10 @@ impl FreshClaudeState {
                 start_pid_slot: &start_pid_slot,
                 inherit: None,
                 genesis: None,
+                retry: Some(BootRetry {
+                    durable: durable.to_string(),
+                    genesis: recorded_genesis,
+                }),
             },
             lease_guard,
             own_ticket,
@@ -8784,7 +8799,7 @@ mod fork;
 mod genesis;
 mod history;
 mod rollback;
-use establish::{DurableClaim, EstablishLane, EstablishPlan, RegisterUnder};
+use establish::{BootRetry, DurableClaim, EstablishLane, EstablishPlan, RegisterUnder};
 
 #[cfg(test)]
 mod teardown_tests;

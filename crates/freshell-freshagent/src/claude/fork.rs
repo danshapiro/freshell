@@ -384,6 +384,7 @@ impl FreshClaudeState {
                     start_pid_slot: &start_pid_slot,
                     inherit: None,
                     genesis: Some(genesis.clone()),
+                    retry: None,
                 },
                 &mut lease_guard,
                 &mut own_ticket,

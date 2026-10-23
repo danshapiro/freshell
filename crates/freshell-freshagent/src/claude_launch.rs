@@ -315,6 +315,70 @@ pub(crate) fn decide_boot(
     }
 }
 
+/// A boot to launch: what [`retry_refused_boot`] plans.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlannedBoot {
+    pub(crate) boot: ClaudeBoot,
+    /// The directory the conversation was recorded in, when it still exists.
+    pub(crate) cwd: Option<String>,
+    /// The id a fresh or forked boot writes under.
+    pub(crate) session_id: Option<String>,
+}
+
+/// The one retry a typed boot refusal gets (design §4.2), decided again from a
+/// fresh look at the store. `failed` is the refused boot and `booted_under` the
+/// id it wrote under (its `sessionId`); `durable` is the session the launch
+/// boots and `genesis` what its binding row records.
+///
+/// | refusal | retry |
+/// |---|---|
+/// | `SESSION_ID_IN_USE` of a boot under an id | the transcript appeared between the check and the spawn (T4): resume it |
+/// | `CONVERSATION_NOT_FOUND` of a resume, with a genesis | the transcript the check found is gone (T5): boot from the genesis |
+/// | anything else | none: the caller's typed failure stands (a resume with no genesis is lost) |
+pub(crate) fn retry_refused_boot(
+    code: &str,
+    failed: &ClaudeBoot,
+    booted_under: Option<&str>,
+    durable: &str,
+    genesis: Option<&ClaudeGenesis>,
+    locate: impl Fn(&str) -> TranscriptLocation,
+) -> Option<PlannedBoot> {
+    match code {
+        crate::claude_handshake::SESSION_ID_IN_USE_CODE => {
+            let id = booted_under?;
+            let (resume, cwd) = match locate(id) {
+                TranscriptLocation::Found(path) => resume_target(id, &path),
+                // The CLI saw the transcript even if this look does not.
+                TranscriptLocation::Absent | TranscriptLocation::Unreadable(_) => {
+                    (id.to_string(), None)
+                }
+            };
+            Some(PlannedBoot {
+                boot: ClaudeBoot::Resume { resume },
+                cwd,
+                session_id: None,
+            })
+        }
+        crate::claude_handshake::CONVERSATION_NOT_FOUND_CODE
+            if matches!(failed, ClaudeBoot::Resume { .. }) =>
+        {
+            match decide_boot(durable, TranscriptLocation::Absent, genesis, locate) {
+                BootDecision::Boot {
+                    boot,
+                    cwd,
+                    session_id,
+                } => Some(PlannedBoot {
+                    boot,
+                    cwd,
+                    session_id,
+                }),
+                BootDecision::Lost | BootDecision::Transient(_) => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// How to name the conversation `session_id`, whose transcript is at `path`, to
 /// a resume (or a fork of it), and the directory to run that CLI in: the id and
 /// the recorded directory while that directory exists. Once it is gone, the
@@ -785,6 +849,177 @@ mod tests {
             spec.with_session_id(Some("S".into())).create_request()["sessionId"],
             json!("S")
         );
+    }
+
+    // ── §4.2 typed retries ──────────────────────────────────────────────────
+
+    const IN_USE: &str = crate::claude_handshake::SESSION_ID_IN_USE_CODE;
+    const NOT_FOUND: &str = crate::claude_handshake::CONVERSATION_NOT_FOUND_CODE;
+
+    /// §4.2 SESSION_ID_IN_USE: a boot under the session's own id (fresh, or a
+    /// fork) found its transcript written between the check and the spawn
+    /// (T4). It is retried once as a resume of that conversation, run where it
+    /// was recorded.
+    #[test]
+    fn a_boot_refused_in_use_is_retried_as_a_resume_of_that_conversation() {
+        let store = tempfile::tempdir().unwrap();
+        let recorded = tempfile::tempdir().unwrap();
+        let cwd = recorded.path().to_str().unwrap().to_string();
+        let path = transcript(
+            store.path(),
+            "S",
+            &format!("{{\"type\":\"user\",\"cwd\":{}}}\n", json!(cwd)),
+        );
+        let fork = ClaudeBoot::Fork {
+            resume: "P".into(),
+            at: Some("a1".into()),
+            drops_turn: None,
+        };
+        for failed in [ClaudeBoot::Fresh, fork] {
+            assert_eq!(
+                retry_refused_boot(IN_USE, &failed, Some("S"), "S", None, |id: &str| {
+                    assert_eq!(id, "S");
+                    TranscriptLocation::Found(path.clone())
+                }),
+                Some(PlannedBoot {
+                    boot: ClaudeBoot::Resume { resume: "S".into() },
+                    cwd: Some(cwd.clone()),
+                    session_id: None,
+                }),
+                "{failed:?}"
+            );
+        }
+        // The CLI saw the transcript even if this look does not: still a resume.
+        assert_eq!(
+            retry_refused_boot(
+                IN_USE,
+                &ClaudeBoot::Fresh,
+                Some("S"),
+                "S",
+                Some(&ClaudeGenesis::Fresh),
+                |_: &str| TranscriptLocation::Absent
+            ),
+            Some(PlannedBoot {
+                boot: ClaudeBoot::Resume { resume: "S".into() },
+                cwd: None,
+                session_id: None,
+            })
+        );
+        // A boot that wrote under no id cannot collide: nothing to retry.
+        assert_eq!(
+            retry_refused_boot(IN_USE, &ClaudeBoot::Fresh, None, "S", None, no_parent),
+            None
+        );
+    }
+
+    /// §4.2 CONVERSATION_NOT_FOUND with a genesis: the resume's transcript
+    /// was found by the check but is gone at the spawn (T5). It is retried once
+    /// from the genesis, under the session's own id.
+    #[test]
+    fn a_resume_refused_not_found_is_retried_from_the_genesis() {
+        let resume = ClaudeBoot::Resume { resume: "S".into() };
+        assert_eq!(
+            retry_refused_boot(
+                NOT_FOUND,
+                &resume,
+                None,
+                "S",
+                Some(&ClaudeGenesis::Fresh),
+                no_parent
+            ),
+            Some(PlannedBoot {
+                boot: ClaudeBoot::Fresh,
+                cwd: None,
+                session_id: Some("S".into()),
+            })
+        );
+        let store = tempfile::tempdir().unwrap();
+        let parent = transcript(store.path(), "P", "");
+        assert_eq!(
+            retry_refused_boot(
+                NOT_FOUND,
+                &resume,
+                None,
+                "S",
+                Some(&fork_genesis("P")),
+                |id: &str| {
+                    assert_eq!(id, "P", "only the parent is looked up");
+                    TranscriptLocation::Found(parent.clone())
+                }
+            ),
+            Some(PlannedBoot {
+                boot: ClaudeBoot::Fork {
+                    resume: "P".into(),
+                    at: Some("a1".into()),
+                    drops_turn: Some("u2".into()),
+                },
+                cwd: None,
+                session_id: Some("S".into()),
+            })
+        );
+    }
+
+    /// No genesis, nothing to boot from, or a refusal no retry can change:
+    /// the typed failure stands (a resume with no genesis is lost; a fork's
+    /// own refusals are the caller's typed answer).
+    #[test]
+    fn other_refusals_are_never_retried() {
+        let resume = ClaudeBoot::Resume { resume: "S".into() };
+        let fork = ClaudeBoot::Fork {
+            resume: "P".into(),
+            at: Some("a1".into()),
+            drops_turn: Some("u2".into()),
+        };
+        assert_eq!(
+            retry_refused_boot(NOT_FOUND, &resume, None, "S", None, no_parent),
+            None,
+            "a resume with no genesis is lost"
+        );
+        assert_eq!(
+            retry_refused_boot(
+                NOT_FOUND,
+                &resume,
+                None,
+                "S",
+                Some(&fork_genesis("P")),
+                |_: &str| TranscriptLocation::Absent
+            ),
+            None,
+            "a fork genesis whose parent is gone"
+        );
+        assert_eq!(
+            retry_refused_boot(
+                NOT_FOUND,
+                &fork,
+                Some("S"),
+                "S",
+                Some(&fork_genesis("P")),
+                no_parent
+            ),
+            None,
+            "a fork whose parent the CLI does not hold"
+        );
+        for code in [
+            crate::claude_handshake::FORK_GUARD_REFUSED_CODE,
+            crate::claude_handshake::RESUME_POINT_NOT_FOUND_CODE,
+            crate::claude_handshake::CREATE_FAILED_CODE,
+            crate::claude_handshake::PROTOCOL_MISMATCH_CODE,
+        ] {
+            for failed in [&resume, &fork, &ClaudeBoot::Fresh] {
+                assert_eq!(
+                    retry_refused_boot(
+                        code,
+                        failed,
+                        Some("S"),
+                        "S",
+                        Some(&ClaudeGenesis::Fresh),
+                        no_parent
+                    ),
+                    None,
+                    "{code} of {failed:?}"
+                );
+            }
+        }
     }
 
     #[test]

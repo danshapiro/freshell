@@ -25,7 +25,7 @@
 use super::*;
 
 use crate::claude_handshake::{CreateFailure, SidecarCreated};
-use crate::claude_launch::ClaudeLaunchSpec;
+use crate::claude_launch::{retry_refused_boot, ClaudeLaunchSpec};
 
 /// The launch establishing a runtime: it names the failures and the log events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +72,14 @@ pub(super) struct InheritedRuntime {
     pub(super) last_synthesized_complete_at: Arc<std::sync::Mutex<Option<i64>>>,
 }
 
+/// What a launch that boots a durable session from its recorded state needs
+/// for its one typed retry (design §4.2, [`retry_refused_boot`]): the session,
+/// and the genesis its binding row records.
+pub(super) struct BootRetry {
+    pub(super) durable: String,
+    pub(super) genesis: Option<crate::claude_launch::ClaudeGenesis>,
+}
+
 /// The durable session a launch claims, with the identity's dead state as it
 /// stood when the claim started (before the spawn), so a close that lands while
 /// the sidecar boots refuses the commit instead of being undone by it.
@@ -115,6 +123,11 @@ pub(super) struct EstablishPlan<'a> {
     /// snapshot shows the conversation before the transcript exists, also on a
     /// lane with no ledger. `None` for every other launch.
     pub(super) genesis: Option<crate::claude_launch::ClaudeGenesis>,
+    /// A launch that boots a durable session from its recorded state (a
+    /// resume, a boot from its genesis) retries a typed refusal once (design
+    /// §4.2). `None` for a launch under an id it minted (an undo, a fork):
+    /// its refusals are its own typed answers.
+    pub(super) retry: Option<BootRetry>,
 }
 
 /// A runtime that is registered and committed.
@@ -333,6 +346,41 @@ impl FreshClaudeState {
         }
     }
 
+    /// The launch to retry after the typed boot refusal `failure` of `spec`
+    /// ([`retry_refused_boot`]), logged; `None` when the refusal stands.
+    fn retry_spec(
+        &self,
+        lane: EstablishLane,
+        spec: &ClaudeLaunchSpec,
+        failure: &CreateFailure,
+        retry: &BootRetry,
+    ) -> Option<ClaudeLaunchSpec> {
+        let planned = retry_refused_boot(
+            failure.code(),
+            &spec.boot,
+            spec.session_id.as_deref(),
+            &retry.durable,
+            retry.genesis.as_ref(),
+            |id| self.locate_transcript(id),
+        )?;
+        tracing::info!(
+            target: "freshell_freshagent::claude",
+            event = "freshagent.claude.boot_retry",
+            lane = lane.name(),
+            request_id = %spec.request_id,
+            session_id = %retry.durable,
+            code = failure.code(),
+            refused = spec.boot.kind(),
+            retry = planned.boot.kind(),
+            "the CLI refused the boot for a reason the store explains; it is retried once"
+        );
+        let mut next = spec.clone();
+        next.boot = planned.boot;
+        next.cwd = planned.cwd.or_else(|| spec.cwd.clone());
+        next.session_id = planned.session_id;
+        Some(next)
+    }
+
     /// Boot a sidecar for `plan` and commit it as the session's live runtime
     /// (design §4.9). Every failure tears down what was spawned and releases the
     /// lease; `own_ticket` is committed on success and otherwise left for the
@@ -382,7 +430,7 @@ impl FreshClaudeState {
     ) -> Result<Established, EstablishError> {
         let EstablishPlan {
             lane,
-            spec,
+            mut spec,
             register_under,
             claim,
             rekey_provisional_claim,
@@ -395,16 +443,32 @@ impl FreshClaudeState {
             start_pid_slot,
             inherit,
             genesis,
+            retry,
         } = plan;
         let start = StartWatch {
             pid_slot: start_pid_slot,
             partial_runtime_key: partial_runtime_key.as_deref(),
             ticket: own_ticket,
         };
-        let booted = match self
+        let mut booted = self
             .boot_sidecar(&spec, lease_guard.as_mut(), Some(start))
-            .await
-        {
+            .await;
+        // Design §4.2: a typed refusal the store can explain is retried once,
+        // decided again from a fresh look at the store.
+        if let (Err(EstablishError::Boot(failure)), Some(retry)) = (&booted, retry.as_ref()) {
+            if let Some(retried) = self.retry_spec(lane, &spec, failure, retry) {
+                spec = retried;
+                let start = StartWatch {
+                    pid_slot: start_pid_slot,
+                    partial_runtime_key: partial_runtime_key.as_deref(),
+                    ticket: own_ticket,
+                };
+                booted = self
+                    .boot_sidecar(&spec, lease_guard.as_mut(), Some(start))
+                    .await;
+            }
+        }
+        let booted = match booted {
             Ok(booted) => booted,
             Err(error) => {
                 // The spawned tree is torn down: releasing the lease is safe.

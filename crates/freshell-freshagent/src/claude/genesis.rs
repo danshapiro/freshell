@@ -53,6 +53,9 @@ pub(super) struct GenesisAwareBoot {
     /// The genesis the boot follows; `None` when the transcript is on disk and
     /// the boot resumes it.
     pub(super) genesis: Option<crate::claude_launch::ClaudeGenesis>,
+    /// The genesis the session's binding row records (the boot's one typed
+    /// retry follows it, design §4.2).
+    pub(super) recorded: crate::claude_launch::ClaudeGenesis,
 }
 
 /// Clear `session_id`'s genesis once its transcript is on disk in `roots`:
@@ -222,12 +225,13 @@ impl FreshClaudeState {
             self.decide_recorded_boot("create_resume", durable, sink.as_ref(), Some(&recorded))?;
         // A boot under the session's own id is a boot from its genesis; a
         // resume (the transcript is on disk) boots nothing from it.
-        let genesis = session_id.is_some().then_some(recorded.genesis);
+        let genesis = session_id.is_some().then(|| recorded.genesis.clone());
         Ok(Some(GenesisAwareBoot {
             boot,
             cwd,
             session_id,
             genesis,
+            recorded: recorded.genesis,
         }))
     }
 
