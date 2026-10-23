@@ -201,6 +201,20 @@ describe('FreshAgentView approvals (client-alerts G20)', () => {
     expect(responds().at(-1)).toMatchObject({ requestId: 'req-2', decision: { behavior: 'allow' } })
   })
 
+  it('a claude ExitPlanMode request shows the plan card, and its choice goes out as the approval decision', async () => {
+    serve(CLAUDE, [{ requestId: 'plan-1', toolName: 'ExitPlanMode', input: { plan: '# Plan\n\n1. Edit' } }])
+    const store = createStore(CLAUDE)
+    await mount(store)
+
+    expect(screen.getByRole('alert', { name: 'Plan approval request' })).toBeInTheDocument()
+    expect(screen.queryByRole('alert', { name: /permission request/i })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Approve and auto-accept edits' }))
+    expect(responds()).toEqual([expect.objectContaining({
+      requestId: 'plan-1',
+      decision: { behavior: 'allow', updatedPermissions: [{ type: 'setMode', mode: 'acceptEdits', destination: 'session' }] },
+    })])
+  })
+
   it('a codex pane keeps "Always allow <Tool> in this pane": it answers the next request for that tool without a click', async () => {
     serve(
       CODEX,

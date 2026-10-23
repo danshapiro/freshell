@@ -8,6 +8,7 @@ import {
   rememberLabel,
   type FreshAgentApprovalDecision,
 } from '@/lib/fresh-agent-permission-updates'
+import { FreshAgentPlanApprovalCard } from './FreshAgentPlanApprovalCard'
 
 // Touch targets ≥44px at base; compact on sm+. flex-1 lets the buttons share
 // the full row width on narrow panes for easy thumbing.
@@ -25,8 +26,23 @@ const BUTTON = 'fresh-agent-approval-button min-h-[2.75rem] flex-1 rounded-md px
  * - `onAlwaysAllow`, when the caller provides it, adds the client-only "Always
  *   allow <Tool> in this pane" (codex): the caller remembers the tool and
  *   answers later requests until the pane reloads.
+ *
+ * Claude's ExitPlanMode request is a plan to review, not a tool call: it gets
+ * the plan card ({@link FreshAgentPlanApprovalCard}).
  */
-export function FreshAgentApprovalCard({
+export function FreshAgentApprovalCard(props: {
+  approval: FreshAgentPendingApproval
+  disabled?: boolean
+  onRespond: (decision: FreshAgentApprovalDecision) => void
+  onAlwaysAllow?: (toolName: string) => void
+}) {
+  if (props.approval.toolName === 'ExitPlanMode') {
+    return <FreshAgentPlanApprovalCard approval={props.approval} disabled={props.disabled} onRespond={props.onRespond} />
+  }
+  return <FreshAgentToolApprovalCard {...props} />
+}
+
+function FreshAgentToolApprovalCard({
   approval,
   disabled,
   onRespond,
