@@ -1106,7 +1106,7 @@ pub struct FreshAgentKill {
     pub observed_generation: Option<u64>,
 }
 
-/// Request-correlated, process-only Codex recovery. A regular
+/// Request-correlated, process-only agent recovery. A regular
 /// `freshAgent.kill` permanently closes the durable session instead.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
