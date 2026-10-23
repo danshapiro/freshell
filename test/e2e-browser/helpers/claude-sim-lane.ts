@@ -148,6 +148,10 @@ export class ClaudeSimLane {
         setupHome: async (homeDir) => {
           const freshellDir = path.join(homeDir, '.freshell')
           await fs.mkdir(freshellDir, { recursive: true })
+          // Arm the transcript watcher at boot, as on a machine where
+          // Claude has already run. An absent provider home cannot be
+          // watched until the 60-second missing-root retry.
+          await fs.mkdir(path.join(homeDir, '.claude', 'projects'), { recursive: true })
           await fs.writeFile(path.join(freshellDir, 'config.json'), JSON.stringify({
             version: 1,
             settings: {

@@ -1,4 +1,5 @@
 import { test, expect } from '../helpers/fixtures.js'
+import { SessionDirectoryPageSchema } from '../../../shared/read-models.js'
 import { ClaudeSimLane, freshAgentLeaf, type ClaudeSimPane } from '../helpers/claude-sim-lane.js'
 import { renameThroughPaneHeader } from '../helpers/unified-agent-names.js'
 
@@ -37,11 +38,11 @@ for (const resume of [false, true]) {
         // persisted freshclaude flavor. Close only once the normal sidebar
         // resume has a durable, interactive Freshclaude row to open.
         await expect.poll(async () => {
-          const query = new URLSearchParams({ includeKeys: `claude:${original}`, includeNonInteractive: '1', includeEmpty: '1', limit: '100' })
+          const query = new URLSearchParams({ priority: 'visible', includeKeys: `claude:${original}`, includeNonInteractive: '1', includeEmpty: '1', limit: '50' })
           const response = await fetch(`${lane.info.baseUrl}/api/session-directory?${query}`, { headers: { 'x-auth-token': lane.info.token } })
-          if (!response.ok) return null
-          const payload = await response.json() as { items?: Array<{ sessionId: string; sessionType?: string; isNonInteractive?: boolean; firstUserMessage?: string }> }
-          const item = payload.items?.find((item) => item.sessionId === original)
+          if (!response.ok) throw new Error(`Session directory readiness failed (${response.status}): ${await response.text()}`)
+          const payload = SessionDirectoryPageSchema.parse(await response.json())
+          const item = payload.items.find((item) => item.provider === 'claude' && item.sessionId === original)
           return item ? { flavor: item.sessionType, interactive: !item.isNonInteractive, firstMessage: item.firstUserMessage } : null
         }, { timeout: 45_000, intervals: [500, 1_000, 2_000] }).toEqual({ flavor: 'freshclaude', interactive: true, firstMessage: 'Explore the cache layer' })
         const row = lane.page.locator(`[data-context="sidebar-session"][data-session-id="${original}"]`)
