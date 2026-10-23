@@ -131,7 +131,7 @@ impl HelperFailure {
 type CreateAnswer = Result<DockerResponse, BackendError>;
 
 /// Where an [`InFlightCreate`] stands after a bounded wait.
-pub(super) enum Settled {
+enum Settled {
     /// Nothing was outstanding.
     Idle,
     /// The outstanding create answered while we waited.
@@ -165,7 +165,7 @@ impl InFlightCreate {
     }
 
     /// Wait until the outstanding create answers, at most until `deadline`.
-    pub(super) async fn settle(&mut self, deadline: Instant) -> Settled {
+    async fn settle(&mut self, deadline: Instant) -> Settled {
         let Some(request) = self.0.as_mut() else {
             return Settled::Idle;
         };
@@ -175,6 +175,25 @@ impl InFlightCreate {
                 Settled::Answered(joined(answer))
             }
             Err(_) => Settled::Pending,
+        }
+    }
+
+    /// Wait until the outstanding create answers, at most until `deadline`;
+    /// false while it is still unanswered. `attempted` records whether Docker
+    /// may hold an object under the create's name: a name conflict proves the
+    /// name was never ours.
+    pub(super) async fn settle_ownership(
+        &mut self,
+        deadline: Instant,
+        attempted: &mut bool,
+    ) -> bool {
+        match self.settle(deadline).await {
+            Settled::Pending => false,
+            Settled::Answered(Ok(response)) if response.status == 409 => {
+                *attempted = false;
+                true
+            }
+            Settled::Idle | Settled::Answered(_) => true,
         }
     }
 }
@@ -255,14 +274,9 @@ impl HelperObjects for HelperContainer {
     }
 
     async fn settle(&mut self, deadline: Instant) -> bool {
-        match self.create.settle(deadline).await {
-            Settled::Pending => false,
-            Settled::Answered(Ok(response)) if response.status == 409 => {
-                self.attempted = false;
-                true
-            }
-            Settled::Idle | Settled::Answered(_) => true,
-        }
+        self.create
+            .settle_ownership(deadline, &mut self.attempted)
+            .await
     }
 
     async fn remove(&mut self, backend: &DockerEngineBackend) -> Result<(), BackendError> {

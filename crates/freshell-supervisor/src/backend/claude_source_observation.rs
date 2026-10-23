@@ -58,15 +58,9 @@ struct CandidateScratch {
 impl CandidateScratch {
     /// Wait until the volume create answers; false if it still has not.
     async fn settle(&mut self, deadline: tokio::time::Instant) -> bool {
-        use helper_lifecycle::Settled;
-        match self.create.settle(deadline).await {
-            Settled::Pending => false,
-            Settled::Answered(Ok(response)) if response.status == 409 => {
-                self.attempted = false;
-                true
-            }
-            Settled::Idle | Settled::Answered(_) => true,
-        }
+        self.create
+            .settle_ownership(deadline, &mut self.attempted)
+            .await
     }
 
     fn owns(&self, actual: &Value) -> bool {

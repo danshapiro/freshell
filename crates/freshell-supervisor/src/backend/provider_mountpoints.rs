@@ -233,6 +233,12 @@ impl DockerEngineBackend {
         result.map_err(|failure| failure.error)
     }
 
+    /// Run the fixed mountpoint helper against `target` within `deadlines`.
+    /// `owned` holds the helper from its create until its removal is
+    /// confirmed; it is still set on return when the removal is unconfirmed or
+    /// Docker has not answered the create yet, and the caller then owns the
+    /// helper's removal. A create or start that timed out or was refused
+    /// transiently is reported as a transient failure.
     pub(super) async fn run_provider_mountpoint_helper(
         &self,
         target: MountpointHelperTarget<'_>,
