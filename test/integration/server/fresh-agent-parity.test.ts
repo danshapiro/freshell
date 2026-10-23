@@ -318,8 +318,11 @@ describe('hosted fresh-agent provider inputs', () => {
     const evidenceDir = process.env.FRESHELL_PROVIDER_PARITY_ROWS_DIR
     if (evidenceDir) {
       const sentinel = 'fixture-secret-byte'
+      // SQLite may delete its -wal or -journal file between the listing and
+      // the read (after a checkpoint, its bytes are in the main file). A file
+      // that vanishes restarts the whole scan, so every byte is still read.
       rig.runtime.execOwnedContainerExact(rig.supervisor.containerId, [
-        'node', '-e', `const fs=require('fs');const p='/var/lib/freshell-supervisor';for(const f of fs.readdirSync(p).filter(x=>x.startsWith('runtime.sqlite3'))){if(fs.readFileSync(p+'/'+f).includes('${sentinel}'))process.exit(4)}`,
+        'node', '-e', `const fs=require('fs');const p='/var/lib/freshell-supervisor';for(let attempt=0;;attempt++){try{for(const f of fs.readdirSync(p).filter(x=>x.startsWith('runtime.sqlite3'))){if(fs.readFileSync(p+'/'+f).includes('${sentinel}'))process.exit(4)}break}catch(error){if(error.code!=='ENOENT'||attempt>=20)throw error}}`,
       ])
       for (const material of [
         JSON.stringify(rig.runtime.inspectContainer(view.containerId!)),
