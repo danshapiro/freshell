@@ -707,7 +707,7 @@ export async function sendFirstMessage(
   await page.keyboard.press('Enter')
 }
 
-async function createThroughUi(options: CreateNamedAgentOptions, fixture: ModeFixture): Promise<NamedAgentHandle> {
+async function createThroughUi(options: CreateNamedAgentOptions & { harness: TestHarness }, fixture: ModeFixture): Promise<NamedAgentHandle> {
   const { page, harness, server } = options
   const cwd = options.cwd ?? server.projectDir
   if (!options.tabId) {
@@ -805,7 +805,7 @@ async function createThroughUi(options: CreateNamedAgentOptions, fixture: ModeFi
     await page.waitForTimeout(150)
   }
   if (!leaf) {
-    throw new Error(`the ${mode} pane never appeared in tab ${tabId}`)
+    throw new Error(`the ${fixture.provider} pane never appeared in tab ${tabId}`)
   }
   content = leaf.content
   if (!nameRef) {
