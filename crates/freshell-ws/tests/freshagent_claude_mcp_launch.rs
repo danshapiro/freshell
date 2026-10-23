@@ -134,9 +134,15 @@ async fn create_for_pane(
         .to_string()
 }
 
-/// One finished turn per prompt, so the conversation is on disk; returns the
-/// durable id the first turn reported.
-async fn converse(conn: &mut RigConnection, session_id: &str, prompts: &[&str]) -> String {
+/// One finished turn per prompt, each on disk before the next (the CLI flushes
+/// a transcript line 95-200 ms after its SDK frame, and the resumes, undo and
+/// fork read the transcript); returns the durable id the first turn reported.
+async fn converse(
+    rig: &ClaudeRig,
+    conn: &mut RigConnection,
+    session_id: &str,
+    prompts: &[&str],
+) -> String {
     for (n, prompt) in prompts.iter().enumerate() {
         let results_before = conn.events_seen("freshAgent.result");
         conn.send_text(session_id, &format!("send-{n}"), prompt)
@@ -149,17 +155,42 @@ async fn converse(conn: &mut RigConnection, session_id: &str, prompts: &[&str]) 
             );
             conn.read_for(std::time::Duration::from_millis(50)).await;
         }
+        let path = rig
+            .wait_for_transcript(&conn.init_session_id(session_id))
+            .await;
+        loop {
+            let lines: Vec<Value> = std::fs::read_to_string(&path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
+            let at = lines.iter().rposition(|line| {
+                line["type"] == "user" && line["message"]["content"][0]["text"] == *prompt
+            });
+            if at.is_some_and(|at| lines[at..].iter().any(|line| line["type"] == "assistant")) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the turn for {prompt:?} never reached disk"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
-    conn.frames
-        .iter()
-        .find_map(|v| {
-            (v["type"] == "freshAgent.event"
-                && v["event"]["type"] == "freshAgent.session.init"
-                && v["event"]["sessionId"] == session_id)
-                .then(|| v["event"]["cliSessionId"].as_str().map(str::to_string))
-                .flatten()
-        })
-        .expect("the first turn reported the durable id")
+    conn.init_session_id(session_id)
+}
+
+/// The owner pair (epoch, generation) of the session's runtime owner record,
+/// once the server has broadcast it (it can trail the first turn's result).
+async fn owner_pair(conn: &mut RigConnection, durable: &str) -> (u64, u64) {
+    conn.wait_for("the session's owner record", |v| {
+        v["type"] == "session.runtimeOwner"
+            && v["provider"] == "claude"
+            && v["sessionId"] == durable
+    })
+    .await;
+    conn.owner_pair(durable)
+        .expect("the session's owner record names its pair")
 }
 
 /// The session's sidecar dies on its own: the session is untracked, the state a
@@ -271,7 +302,7 @@ async fn an_attach_resume_hands_the_cli_the_freshell_mcp_for_the_attaching_pane(
     let mut conn = rig.connect().await;
     let session_id =
         create_for_pane(&mut conn, "create-1", "freshclaude", ("tab-1", "pane-1")).await;
-    let durable = converse(&mut conn, &session_id, &["first prompt"]).await;
+    let durable = converse(&rig, &mut conn, &session_id, &["first prompt"]).await;
     kill_the_sidecar(&rig, &mut conn).await;
 
     // The pane, moved to another tab meanwhile, attaches again (a reload).
@@ -295,7 +326,7 @@ async fn a_handoff_resume_hands_the_cli_the_freshell_mcp() {
     let mut conn = rig.connect().await;
     let session_id =
         create_for_pane(&mut conn, "create-1", "freshclaude", ("tab-1", "pane-1")).await;
-    let durable = converse(&mut conn, &session_id, &["first prompt"]).await;
+    let durable = converse(&rig, &mut conn, &session_id, &["first prompt"]).await;
     kill_the_sidecar(&rig, &mut conn).await;
 
     let (status, answer) = rig
@@ -323,11 +354,15 @@ async fn an_undo_respawn_runs_for_the_same_pane() {
     let mut conn = rig.connect().await;
     let session_id =
         create_for_pane(&mut conn, "create-1", "freshclaude", ("tab-1", "pane-1")).await;
-    let durable = converse(&mut conn, &session_id, &["first prompt", "second prompt"]).await;
+    let durable = converse(
+        &rig,
+        &mut conn,
+        &session_id,
+        &["first prompt", "second prompt"],
+    )
+    .await;
 
-    let (epoch, generation) = conn
-        .owner_pair(&durable)
-        .expect("the session's owner record was broadcast");
+    let (epoch, generation) = owner_pair(&mut conn, &durable).await;
     conn.send(json!({
         "type": "freshAgent.undo",
         "provider": "claude",
@@ -358,21 +393,20 @@ async fn a_fork_child_runs_for_the_forking_pane() {
     let mut conn = rig.connect().await;
     let session_id =
         create_for_pane(&mut conn, "create-1", "freshclaude", ("tab-1", "pane-1")).await;
-    let durable = converse(&mut conn, &session_id, &["first prompt"]).await;
+    let durable = converse(&rig, &mut conn, &session_id, &["first prompt"]).await;
 
-    let mut fork = json!({
+    let (epoch, generation) = owner_pair(&mut conn, &durable).await;
+    conn.send(json!({
         "type": "freshAgent.fork",
         "provider": "claude",
         "sessionType": "freshclaude",
         "sessionId": session_id,
         "requestId": "fork-1",
         "tabId": "tab-1",
-    });
-    if let Some((epoch, generation)) = conn.owner_pair(&durable) {
-        fork["observedEpoch"] = json!(epoch);
-        fork["observedGeneration"] = json!(generation);
-    }
-    conn.send(fork).await;
+        "observedEpoch": epoch,
+        "observedGeneration": generation,
+    }))
+    .await;
     let forked = conn
         .wait_for("the fork's answer", |v| {
             (v["type"] == "freshAgent.forked" && v["requestId"] == "fork-1")
