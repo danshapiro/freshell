@@ -937,6 +937,20 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   const freshAgentOwnerDivergence = derivePaneOwnerDivergence(terminalRuntimeOwner, 'terminal')
   const freshAgentOwnerDivergenceRef = useRef(freshAgentOwnerDivergence)
   freshAgentOwnerDivergenceRef.current = freshAgentOwnerDivergence
+  // The terminal id whose attach the fresh-agent divergence gate declined
+  // (see attachTerminal). A pane switched onto its handoff's NEW terminal by
+  // the handoff's HTTP answer can mount before the committed owner frame
+  // folds — the answer and the WS frame race — so the gate declines while
+  // the record still names the fresh-agent runtime. Nothing else re-fires
+  // the lifecycle effect, so the commit that names THIS terminal re-drives
+  // the attach (the effect below).
+  const ownerDivergenceDeclinedAttachRef = useRef<string | null>(null)
+  const committedOwnerTerminalId = terminalRuntimeOwner
+    && !terminalRuntimeOwner.fenced
+    && terminalRuntimeOwner.transition !== 'handoff-started'
+    && terminalRuntimeOwner.ownerKind === 'terminal'
+    ? terminalRuntimeOwner.terminalId
+    : undefined
 
   // b8ke ext r11 F2: the SAME-KIND TERMINAL convergence — a handoff
   // committed a NEW terminal owner for this pane's canonical session while
@@ -1018,6 +1032,28 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     terminalOwnerConvergenceTarget,
     terminalOwnerConvergenceGeneration,
   ])
+
+  // The declined-attach re-drive (see ownerDivergenceDeclinedAttachRef):
+  // once the committed owner record names THIS pane's terminal, an attach
+  // the fresh-agent divergence gate declined re-fires through the
+  // reconcileEpoch bump — the lifecycle effect's re-fire signal. Scoped to
+  // the pane's own terminal on purpose: a vacant record or another
+  // terminal never re-attaches the declined handle (a dead handle draws
+  // INVALID_TERMINAL_ID and the reconnect recovery would relaunch the
+  // stopped session — the delta F1 hazard).
+  const paneTerminalId = terminalContent?.terminalId
+  useEffect(() => {
+    if (!isTerminal) return
+    const declined = ownerDivergenceDeclinedAttachRef.current
+    if (!declined || declined !== paneTerminalId) return
+    if (committedOwnerTerminalId !== declined) return
+    ownerDivergenceDeclinedAttachRef.current = null
+    log.info('re-driving the attach the fresh-agent owner gate declined: the committed owner names this terminal', {
+      paneId,
+      terminalId: declined,
+    })
+    dispatch(bumpPaneReconcileEpoch({ tabId, paneId }))
+  }, [isTerminal, paneId, tabId, dispatch, paneTerminalId, committedOwnerTerminalId])
 
   // Register live terminal text reader for Stream Deck previews (classic tile style)
   useTerminalTextRegistration(terminalContent?.terminalId, termRef)
@@ -3495,6 +3531,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         paneId: paneIdRef.current,
         intent,
       })
+      ownerDivergenceDeclinedAttachRef.current = tid
       return
     }
     // Never attach a terminal the layouts no longer reference: the layout-diff
