@@ -400,6 +400,10 @@ const SCENARIOS = {
     await seed.waitForResults(1)
     seed.push('turn two', 'u2')
     await seed.waitForResults(2)
+    // A turn ends with its result, then its lifecycle and idle frames. Close
+    // only after them: frames after a close are dropped from the trace, so a
+    // close racing them makes the real CLI's trace differ run to run.
+    await seed.waitForCount(isStateIdle, 2, 5000, 'idle')
     ctx.need(await ctx.pollTranscript(P, 4000, 2), 'parent transcript')
     await seed.close()
     await sleep(300)
@@ -423,6 +427,7 @@ const SCENARIOS = {
     await again.init()
     again.push('after fork', 'u3')
     await again.waitForResults(1)
+    await again.waitForCount(isStateIdle, 1, 5000, 'idle')
     const forkLines = await ctx.pollTranscript(F, 4000)
     await again.close()
     await sleep(300)
