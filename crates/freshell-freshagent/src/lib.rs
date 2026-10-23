@@ -43,6 +43,7 @@ pub(crate) mod claude_launch;
 pub(crate) mod claude_sidecar_exit;
 pub(crate) mod claude_sidecar_io;
 pub(crate) mod claude_snapshot;
+pub(crate) mod claude_test_holds;
 pub mod codex;
 pub(crate) mod codex_sidecar_tracking;
 pub mod hosted_rest;

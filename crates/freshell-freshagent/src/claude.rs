@@ -299,6 +299,9 @@ pub struct FreshClaudeState {
     /// `exited` and a send to it is refused visibly. Resuming or closing the
     /// session forgets the record. See [`crate::claude_dead_sessions`].
     dead_sessions: Arc<std::sync::Mutex<crate::claude_dead_sessions::DeadClaudeSessions>>,
+    /// Test holds on the session lifecycle ([`crate::claude_test_holds`]); none
+    /// is set in production.
+    test_holds: Arc<crate::claude_test_holds::ClaudeTestHolds>,
 }
 
 /// Focused-ep5-r1 Finding 1: retention for demoted alias records. The
@@ -808,6 +811,7 @@ impl FreshClaudeState {
             naming: crate::naming::NamingSink::default(),
             naming_handles: Arc::new(TokioMutex::new(HashMap::new())),
             dead_sessions: Arc::default(),
+            test_holds: Arc::default(),
             handoff_kill_pause: None,
             rollback_adopt_parked: None,
             rollback_adopt_release: None,
@@ -841,6 +845,15 @@ impl FreshClaudeState {
     ) -> Self {
         self.sidecar_environment = Some(environment.into_iter().collect());
         self
+    }
+
+    /// Test seam (see [`crate::claude_test_holds`]): every later session
+    /// registration waits `hold` between starting the session's consumer and
+    /// inserting its record, the way a production resume create awaits its
+    /// identity-sink write there.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hold_session_registration(&self, hold: Duration) {
+        self.test_holds.hold_registration(hold);
     }
 
     /// Spawn one claude sidecar process (create, attach-resume and rollback all
@@ -2612,35 +2625,6 @@ impl FreshClaudeState {
             }
         }
 
-        // Start the stdout consumer (the completion edge normalization + the Task 2
-        // pending-set fold live here). `Some(settings)` => the consumer records a
-        // binding row at `sdk.session.init`.
-        let broadcast_id = Arc::new(std::sync::Mutex::new(created.clone()));
-        log_labels.bind_session(&broadcast_id);
-        let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
-        let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
-        // Task 5: the fresh session's death-mint clock (see the field doc).
-        let last_synthesized_complete_at = Arc::new(std::sync::Mutex::new(None));
-        let turn_lock = Arc::new(TokioMutex::new(()));
-        // Fresh session: nothing announced yet; the consumer's status fold owns it.
-        let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
-        let consumer = self.spawn_consumer(
-            reader,
-            created.clone(),
-            session_type.to_string(),
-            created.clone(),
-            Some(settings.clone()),
-            Arc::clone(&broadcast_id),
-            Arc::clone(&pending),
-            Arc::clone(&last_status),
-            Arc::clone(&in_turn),
-            Arc::clone(&turn_tracker),
-            Arc::clone(&last_synthesized_complete_at),
-            None,
-            provenance,
-        );
-
         // V5 interleaving 2 (Task 12): on the create-resume path, insert
         // `cli_index[durable] = map_key` SYNCHRONOUSLY at session registration
         // (mirroring the attach path) -- NOT lazily at `sdk.session.init`, which lands
@@ -2651,8 +2635,81 @@ impl FreshClaudeState {
                 .lock()
                 .await
                 .insert(sid.to_string(), created.clone());
-            // Round 6 (Finding 2): the alias mapping is durable at
-            // registration (the adopt path's corrector re-stamps it later).
+        }
+
+        // Start the stdout consumer (the completion edge normalization + the Task 2
+        // pending-set fold live here) and register the session, under the sessions
+        // map lock (review PRB-C10): the consumer reaches its session only through
+        // that lock, so no line it reads -- the boot's command catalog, a CLI death
+        // right after the boot -- can find the session missing. `Some(settings)` =>
+        // the consumer records a binding row at `sdk.session.init`.
+        let broadcast_id = Arc::new(std::sync::Mutex::new(created.clone()));
+        log_labels.bind_session(&broadcast_id);
+        let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
+        let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
+        // Task 5: the fresh session's death-mint clock (see the field doc).
+        let last_synthesized_complete_at = Arc::new(std::sync::Mutex::new(None));
+        let turn_lock = Arc::new(TokioMutex::new(()));
+        // Fresh session: nothing announced yet; the consumer's status fold owns it.
+        let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
+        {
+            let mut sessions = self.sessions.lock().await;
+            let consumer = self.spawn_consumer(
+                reader,
+                created.clone(),
+                session_type.to_string(),
+                created.clone(),
+                Some(settings.clone()),
+                Arc::clone(&broadcast_id),
+                Arc::clone(&pending),
+                Arc::clone(&last_status),
+                Arc::clone(&in_turn),
+                Arc::clone(&turn_tracker),
+                Arc::clone(&last_synthesized_complete_at),
+                None,
+                provenance,
+            );
+            self.test_holds.registration().await;
+            sessions.insert(
+                created.clone(),
+                ClaudeSession {
+                    configuration: ClaudeConfiguration {
+                        settings,
+                        ..ClaudeConfiguration::default()
+                    },
+                    stdin,
+                    child,
+                    ownership_id: ownership_id.clone(),
+                    consumer,
+                    sidecar_session_id: created.clone(),
+                    cli_session_id: resume_sid.clone(),
+                    // b8ke focused episode-2 round-2 F2: the owning lifecycle op
+                    // — the create-resume claim's op id, so the session-init
+                    // adoption's Blocked arm can correlate its OWN in-flight
+                    // claim (a foreign blocker tears down instead).
+                    owning_operation: own_ticket.as_ref().map(|t| t.operation_id().to_string()),
+                    owning_generation: None,
+                    broadcast_id,
+                    pending,
+                    in_turn,
+                    turn_tracker,
+                    last_synthesized_complete_at,
+                    turn_lock,
+                    rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
+                    last_status,
+                },
+            );
+            // C09: a create that resumes an ended session makes it live again.
+            // Forgotten before the lock is released, so a death of this new
+            // incarnation is recorded after it, never forgotten by it.
+            if let Some(sid) = resume_sid.as_deref() {
+                self.forget_dead_sessions(&[sid], "resumed");
+            }
+        }
+        // Round 6 (Finding 2): the alias mapping is durable at registration (the
+        // adopt path's corrector re-stamps it later).
+        if let Some(sid) = resume_sid.as_deref() {
             if let Some(sink) = self.identity_sink() {
                 if let Err(e) = sink
                     .record_alias_tombstone(
@@ -2667,39 +2724,6 @@ impl FreshClaudeState {
                         "freshagent.claude.alias_tombstone_write_failed");
                 }
             }
-        }
-        self.sessions.lock().await.insert(
-            created.clone(),
-            ClaudeSession {
-                configuration: ClaudeConfiguration {
-                    settings,
-                    ..ClaudeConfiguration::default()
-                },
-                stdin,
-                child,
-                ownership_id: ownership_id.clone(),
-                consumer,
-                sidecar_session_id: created.clone(),
-                cli_session_id: resume_sid.clone(),
-                // b8ke focused episode-2 round-2 F2: the owning lifecycle op
-                // — the create-resume claim's op id, so the session-init
-                // adoption's Blocked arm can correlate its OWN in-flight
-                // claim (a foreign blocker tears down instead).
-                owning_operation: own_ticket.as_ref().map(|t| t.operation_id().to_string()),
-                owning_generation: None,
-                broadcast_id,
-                pending,
-                in_turn,
-                turn_tracker,
-                last_synthesized_complete_at,
-                turn_lock,
-                rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
-                last_status,
-            },
-        );
-        // C09: a create that resumes an ended session makes it live again.
-        if let Some(sid) = resume_sid.as_deref() {
-            self.forget_dead_sessions(&[sid], "resumed");
         }
 
         // Round 5 (focused-ep5-r4 Finding 1): the claim's POST-REGISTRATION
@@ -6690,56 +6714,62 @@ impl FreshClaudeState {
         // clock (extracted with the other carried handles above) — the fork
         // continues the same logical session lifetime, so its Rust-minted
         // `at`s stay ordered against anything the session minted before.
-        let consumer = self.spawn_consumer(
-            reader,
-            map_key.clone(),
-            session_type.to_string(),
-            sidecar_session_id.clone(),
-            recovered.clone(),
-            Arc::clone(&broadcast_id),
-            Arc::clone(&pending),
-            Arc::clone(&last_status),
-            in_turn.clone(),
-            turn_tracker.clone(),
-            Arc::clone(&last_synthesized_complete_at),
-            Some(RollbackAdoption {
-                supersedes: durable_id.clone(),
-                preseeded_init,
-                adopted_tx,
-            }),
-            // Conn-less lane (D8): the rollback respawn has no client
-            // connection — the ledger merge inherits the superseded parent's
-            // stamps.
-            None,
-        );
-        self.sessions.lock().await.insert(
-            map_key.clone(),
-            ClaudeSession {
-                configuration: ClaudeConfiguration {
-                    settings: recovered.clone().unwrap_or_default(),
-                    ..ClaudeConfiguration::default()
+        // Spawned and registered under the sessions map lock (review PRB-C10): no
+        // line the consumer reads can find the replacement session missing.
+        {
+            let mut sessions = self.sessions.lock().await;
+            let consumer = self.spawn_consumer(
+                reader,
+                map_key.clone(),
+                session_type.to_string(),
+                sidecar_session_id.clone(),
+                recovered.clone(),
+                Arc::clone(&broadcast_id),
+                Arc::clone(&pending),
+                Arc::clone(&last_status),
+                in_turn.clone(),
+                turn_tracker.clone(),
+                Arc::clone(&last_synthesized_complete_at),
+                Some(RollbackAdoption {
+                    supersedes: durable_id.clone(),
+                    preseeded_init,
+                    adopted_tx,
+                }),
+                // Conn-less lane (D8): the rollback respawn has no client
+                // connection — the ledger merge inherits the superseded parent's
+                // stamps.
+                None,
+            );
+            self.test_holds.registration().await;
+            sessions.insert(
+                map_key.clone(),
+                ClaudeSession {
+                    configuration: ClaudeConfiguration {
+                        settings: recovered.clone().unwrap_or_default(),
+                        ..ClaudeConfiguration::default()
+                    },
+                    stdin,
+                    child,
+                    ownership_id,
+                    consumer,
+                    sidecar_session_id,
+                    cli_session_id: Some(cli_id.clone()),
+                    // b8ke focused episode-2 round-2 F2: the ROLLBACK's claim
+                    // owns this respawn's coordinator transition — the
+                    // adoption's Blocked arm correlates through the op id.
+                    owning_operation: own_ticket.as_ref().map(|t| t.operation_id().to_string()),
+                    owning_generation: None,
+                    broadcast_id: Arc::clone(&broadcast_id),
+                    pending,
+                    in_turn: in_turn.clone(),
+                    turn_tracker: turn_tracker.clone(),
+                    last_synthesized_complete_at,
+                    turn_lock: turn_lock.clone(),
+                    rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
+                    last_status,
                 },
-                stdin,
-                child,
-                ownership_id,
-                consumer,
-                sidecar_session_id,
-                cli_session_id: Some(cli_id.clone()),
-                // b8ke focused episode-2 round-2 F2: the ROLLBACK's claim
-                // owns this respawn's coordinator transition — the
-                // adoption's Blocked arm correlates through the op id.
-                owning_operation: own_ticket.as_ref().map(|t| t.operation_id().to_string()),
-                owning_generation: None,
-                broadcast_id: Arc::clone(&broadcast_id),
-                pending,
-                in_turn: in_turn.clone(),
-                turn_tracker: turn_tracker.clone(),
-                last_synthesized_complete_at,
-                turn_lock: turn_lock.clone(),
-                rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
-                last_status,
-            },
-        );
+            );
+        }
 
         // Adoption rides the EXISTING sdk.session.init consumer (preseeded):
         // cli_index insert + AWAITED binding WITH supersedes + rollback-row
@@ -7564,54 +7594,62 @@ impl FreshClaudeState {
         // Freshly resumed session: the tracked status starts "idle" (truthful — no
         // turn can be in flight before the client sends).
         let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
-        let consumer = self.spawn_consumer(
-            reader,
-            msg.session_id.clone(),
-            session_type.clone(),
-            sidecar_session_id.clone(),
-            recovered.clone(),
-            Arc::clone(&broadcast_id),
-            Arc::clone(&pending),
-            Arc::clone(&last_status),
-            Arc::clone(&in_turn),
-            Arc::clone(&turn_tracker),
-            Arc::clone(&last_synthesized_complete_at),
-            None,
-            // Conn-less lane (D8): attach-resume is not a create; the ledger
-            // merge keeps the row's existing stamps.
-            None,
-        );
-        self.sessions.lock().await.insert(
-            msg.session_id.clone(),
-            ClaudeSession {
-                configuration: ClaudeConfiguration {
-                    settings: recovered.unwrap_or_default(),
-                    ..ClaudeConfiguration::default()
+        // Spawned and registered under the sessions map lock (review PRB-C10): no
+        // line the consumer reads can find the resumed session missing.
+        {
+            let mut sessions = self.sessions.lock().await;
+            let consumer = self.spawn_consumer(
+                reader,
+                msg.session_id.clone(),
+                session_type.clone(),
+                sidecar_session_id.clone(),
+                recovered.clone(),
+                Arc::clone(&broadcast_id),
+                Arc::clone(&pending),
+                Arc::clone(&last_status),
+                Arc::clone(&in_turn),
+                Arc::clone(&turn_tracker),
+                Arc::clone(&last_synthesized_complete_at),
+                None,
+                // Conn-less lane (D8): attach-resume is not a create; the ledger
+                // merge keeps the row's existing stamps.
+                None,
+            );
+            self.test_holds.registration().await;
+            sessions.insert(
+                msg.session_id.clone(),
+                ClaudeSession {
+                    configuration: ClaudeConfiguration {
+                        settings: recovered.unwrap_or_default(),
+                        ..ClaudeConfiguration::default()
+                    },
+                    stdin,
+                    child,
+                    ownership_id,
+                    consumer,
+                    sidecar_session_id,
+                    cli_session_id: Some(durable.to_string()),
+                    owning_operation,
+                    owning_generation: handoff_generation,
+                    broadcast_id,
+                    pending,
+                    in_turn,
+                    turn_tracker,
+                    last_synthesized_complete_at,
+                    turn_lock,
+                    rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
+                    last_status,
                 },
-                stdin,
-                child,
-                ownership_id,
-                consumer,
-                sidecar_session_id,
-                cli_session_id: Some(durable.to_string()),
-                owning_operation,
-                owning_generation: handoff_generation,
-                broadcast_id,
-                pending,
-                in_turn,
-                turn_tracker,
-                last_synthesized_complete_at,
-                turn_lock,
-                rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
-                last_status,
-            },
-        );
+            );
+            // C09: the session is live again, so it is no longer an ended one.
+            // Forgotten before the lock is released, so a death of this new
+            // incarnation is recorded after it, never forgotten by it.
+            self.forget_dead_sessions(&[msg.session_id.as_str(), durable], "resumed");
+        }
         self.cli_index
             .lock()
             .await
             .insert(durable.to_string(), msg.session_id.clone());
-        // C09: the session is live again, so it is no longer an ended one.
-        self.forget_dead_sessions(&[msg.session_id.as_str(), durable], "resumed");
         // Test seam (Task 6 round-3 review I-1): park with the target
         // session REGISTERED (map + cli_index) but the resume unreturned —
         // the fresh-arm target-spawn-window abort test's deterministic

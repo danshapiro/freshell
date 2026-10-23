@@ -520,3 +520,87 @@ async fn a_resume_create_answers_created_with_its_session_ref_once_the_cli_boote
     );
     assert!(rig.ledger_rows("prompt").len() == 1, "no prompt was needed");
 }
+
+// ── Registration: a session is in the map before its consumer reads a line ────────
+
+/// How long the server is made to take between starting a session's consumer and
+/// registering the session (the production resume create awaits an identity-sink
+/// write there; the rig has no sink). Longer than the sidecar takes to write the
+/// boot catalog, or a CLI death 300 ms after its boot, so both land inside it.
+const REGISTRATION_HOLD: Duration = Duration::from_millis(1500);
+
+/// The session's snapshot overlay once `ready` holds for it (bounded wait).
+async fn overlay_once(rig: &ClaudeRig, id: &str, ready: impl Fn(&Value) -> bool) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let overlay = rig.fresh_claude.live_snapshot_overlay(id).await;
+        if ready(&overlay) {
+            return overlay;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the snapshot overlay of {id} never got there: {overlay}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The command catalog the sidecar publishes right after `created` reaches the
+/// session's live state (its snapshot's `commands`) with no turn sent, for a fresh
+/// and for a resume create, however long the server takes to register the session.
+/// A consumer that read the catalog line before its session was registered dropped
+/// it, and the slash menu then had only the built-in entries (review PRB-C10).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_boot_catalog_reaches_the_live_state_however_long_the_registration_takes() {
+    let rig = ClaudeRig::start(RigKind::Sim).await;
+    let mut conn = rig.connect().await;
+    let session_id = conn.create("create-1").await;
+    conn.send_text(&session_id, "send-1", "a turn to resume")
+        .await;
+    conn.wait_for_event("freshAgent.turn.complete").await;
+    let durable = durable_id(&conn, &session_id);
+    rig.wait_for_transcripts().await;
+    conn.kill(&session_id).await;
+
+    rig.fresh_claude
+        .hold_session_registration(REGISTRATION_HOLD);
+    for (request_id, extra) in [
+        ("create-fresh", json!({})),
+        ("create-resume", resume_fields(&durable)),
+    ] {
+        let answer = conn.request_create(request_id, extra).await;
+        assert_eq!(answer["type"], "freshAgent.created", "{answer}");
+        let id = answer["sessionId"].as_str().expect("created carries an id");
+        let overlay = overlay_once(&rig, id, |overlay| overlay["commands"].is_array()).await;
+        assert!(
+            overlay["commands"]
+                .as_array()
+                .is_some_and(|commands| commands.iter().any(|c| c["name"] == "compact")),
+            "{request_id}: {overlay}"
+        );
+    }
+    assert_eq!(
+        rig.ledger_rows("prompt").len(),
+        1,
+        "no turn was sent after the first"
+    );
+}
+
+/// A CLI that dies right after it booted, while the server is still registering
+/// the session, still ends the session: the exit report arrives and the session
+/// reads as exited, never as a live session nobody will ever end (review PRB-C10).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cli_death_while_the_session_registers_still_ends_the_session() {
+    let rig =
+        rig_with_program(json!([{ "on": "start", "emit": [{ "kind": "crash", "delayMs": 300 }] }]))
+            .await;
+    rig.fresh_claude
+        .hold_session_registration(REGISTRATION_HOLD);
+    let mut conn = rig.connect().await;
+    let session_id = conn.create("create-1").await;
+
+    let exited = wait_for_sidecar_exited(&mut conn, &session_id).await;
+    assert_eq!(exited["cause"]["reason"], "cli_exited", "{exited}");
+    let overlay = overlay_once(&rig, &session_id, |overlay| overlay["status"].is_string()).await;
+    assert_eq!(overlay["status"], "exited", "{overlay}");
+}
