@@ -207,8 +207,12 @@ Rust server crates (`freshell-server`, `freshell-ws`, `freshell-terminal`,
   `src/store/panesSlice.ts` (3050), `src/components/TerminalView.tsx` (7806).
 - **Logging:** every new decision path logs structured JSONL with severity
   through `tracing` (server) or `createLogger` (client; errors forward to
-  `/api/logs/client`). Never log credentials, tokens, prompts, proxy URLs or
-  OneCLI manage URLs; log error codes and statuses only. The JSONL writer's
+  `/api/logs/client`). Never log credentials, tokens, proxy URLs or OneCLI
+  manage URLs. Prompt/turn content is not logged, with one deliberate
+  exception: `session_names.name_changed` logs the saved display names,
+  at most 200 characters each (a `first_message` name is cut to 50), through
+  the JSONL writer's secret scrubber. Other failure diagnostics use error
+  codes and statuses. The JSONL writer's
   scrubber recognizes only the old `AIza…` Gemini key form, and Dan's key is
   the newer `AQ.` form, so Task 6 extends it (G48).
 - **Rename contract:** user-intent renames always win; nothing automatic ever
@@ -470,7 +474,10 @@ Corrections to the investigation report are marked **(corrected)**.
   The pre-checks report which kind of work a row has, so the pass can sort
   it without transacting.
 - Logging: the Task 12 `name_changed` event carries `self_heal: true` when
-  the replaced record was a self-heal record.
+  an automatic native, first-message, hydrate or bind-collision offer
+  replaces recognizable junk with a name whose source ranks the same or
+  lower. A rank increase is `false`, even when it replaces junk; renames,
+  AI answers, imports and adopted external changes are always `false`.
 
 **Native observation details.**
 - New internal field `NativeWriteState.last_native_title: Option<String>`
@@ -660,8 +667,15 @@ pub async fn bind_terminal_naming_from_identity(
   "no record" with a persisted handle goes to the pending path; `ensure_pending`
   gets the same bounded retry, and on persistent failure the row is still
   bound to the pending ref and marked for the tick (it is never left
-  unbound). It fills `registry.update_session_name` and sets the row title to
-  the saved name or `mode_label(mode)` (never "Shell" for an agent mode).
+  unbound). A recovery create accepts the pending answer only if the
+  handle is still pending or resolves to the intended durable session. A
+  handle already spent on another session never moves the row to that
+  session: the intended durable binding stays, without a cached name.
+  `pane.reconcile.request` carries the pane's optional `namingHandle`
+  through managed-row adoption, so a zero-turn pane can rejoin its existing
+  pending name after a server restart. It fills
+  `registry.update_session_name` and sets the row title to the saved name
+  or `mode_label(mode)` (never "Shell" for an agent mode).
 - The 2 s tick reconciles: rows whose identity ref differs from the registry
   ref; bound rows whose name cache is empty; and scoped-mode rows with NO ref
   (it runs `ensure_pending` for them).
@@ -696,7 +710,10 @@ pub async fn bind_terminal_naming_from_identity(
 INFO `session_names.name_changed` with fields `name_ref`, `old_name`,
 `old_source`, `old_revision`, `new_name`, `new_source`, `new_revision`,
 `cause` (`import`|`native_observation`|`first_message_fallback`|`generation`|`manual_rename`|`automation_rename`|`bind`|`bind_collision`|`ensure_pending`|`hydrate`|`adopted_external`),
-`self_heal` (true when the replaced record was a self-heal record), plus
+`self_heal` (true when an automatic native, first-message, hydrate or
+bind-collision offer replaces recognizable junk at the same or lower
+source rank; rank increases, renames, AI answers, imports and adopted
+external changes are false), plus
 `import_id`/`evidence_key`/`series` when applicable. Emitted once per
 accepted visible change, after the durable commit. A conversation switch
 changes no record, so it emits no `name_changed`; Task 10 logs the binding
@@ -1840,14 +1857,16 @@ repeats its error where possible, not only by hiding the lines.
 - [ ] **Step 3: Local-only receipts** (Docker supervisor, V3 rules from
   Global Constraints): confirm `chromium_headless_shell-1208` is present
   (else install it into a scratch `PLAYWRIGHT_BROWSERS_PATH`); then run the
-  two Task 8 cases in `managed-runtime-names-local-rust.spec.ts` one at a
-  time, each as
+  single shell case in `managed-runtime-names-local-rust.spec.ts` as
   `env -u FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE -u FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE -u FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE pnpm run test:e2e:local --project=chromium test/e2e-browser/specs/managed-runtime-names-local-rust.spec.ts --grep '<exact case name>'`
   after a `--list` with the same arguments shows only that case. Never
   while another managed rig runs (including the Step 7 gate, whose
   coordinated suite runs the managed parity files), and never
   `runtime-terminal-continuity-rust.spec.ts`. The Task 10 restart proof is
-  the Rust integration test, which runs in Step 7.
+  the Rust integration test, which runs in Step 7. Under the LB-B4
+  fallback, OpenCode merge behavior is covered by unit tests and the cloud
+  `managed-runtime-title-merge.spec.ts`: the local OpenCode rig requires
+  OneCLI grant files and could spend real model turns.
 - [ ] **Step 4: Validation receipts.** Confirm the implementation matches
   each recorded V result: Task 1 leading-tag check only; Task 5 tag set,
   cache filter (no schema bump), re-absorb at rest and the prompt-input
@@ -2175,6 +2194,11 @@ and must be red before Task 2's implementation.
     title before the tab title in the window-title handler
     (`TerminalView.tsx`) and exempt a tab title equal to one of its own
     terminal panes' stored titles (the old merge wrote tab titles only).
+26. **Clearing the Settings Gemini key takes effect after restart.** A
+    nonempty Settings key replaces the running server's key, including one
+    supplied by `GOOGLE_GENERATIVE_AI_API_KEY` at startup. An empty field
+    does not clear the in-memory key; after restart the environment key
+    still wins, so remove it too when disabling key-based AI naming.
 
 ### Out-of-scope finding for Dan (pre-existing, not fixed here)
 **A managed shell is not re-adopted after a web-server restart on `main`
@@ -2229,7 +2253,7 @@ decision below is applied in the plan; nothing is pending.
 
 | ID | What was checked | Verdict | Applied where |
 |---|---|---|---|
-| V1 | Keyed Gemini requests with Dan's Settings key, direct and through the inherited OneCLI gateway; env override on the live process | **Confirmed.** 200 both ways (identical bodies); the gateway refuses only no key (403) and a bad key (**400**), both with an `access_restricted` body; no env key on live pid 1612620; the key is the `AQ.` form, which the log scrubber misses (G48, G49) | "Generation capability": the key route uses the normal proxy-honoring client (no `.no_proxy()`); OneCLI-style error bodies on any non-2xx (including 400) are `Capability`; `proxy_tls` by downcasting the rustls certificate error; `AQ.` scrubbing; the e2e fake behaves like the real gateway (Task 6); Residual 19 |
+| V1 | Keyed Gemini requests with Dan's Settings key, direct and through the inherited OneCLI gateway; env override on the live process | **Confirmed.** 200 both ways (identical bodies); the gateway refuses only no key (403) and a bad key (**400**), both with an `access_restricted` body; no env key on live pid 1612620; the key is the `AQ.` form, which the log scrubber misses (G48, G49) | "Generation capability", as amended by LB-B5/B6: the key route goes direct (`.no_proxy()`) when the ambient proxy is OneCLI-marked, and honors other ambient proxies; OneCLI-style error bodies on any non-2xx (including 400) are `Capability`; `proxy_tls` by downcasting the rustls certificate error; `AQ.` scrubbing; the e2e fake behaves like the real gateway (Task 6); Residual 19 |
 | V2 | Parse-cache re-derivation (LB-A4), background arming (LB-A5), self-heal vs. sweep pre-checks (N2) | **A4 falsified** (unchanged files keep cached rows; 164 live rows start with a new tag). **A5 bounded** (141 sessions, at most 423 calls, if re-derived). **N2 confirmed with conditions C1–C5** | Task 5: targeted invalidation in `load_cache_file` (no schema bump); re-absorb at rest; the prompt-input guard; C5. Task 4: C1–C4. "Self-heal rule": the conditions and the ~190 one-time rewrites; Residual 16 |
 | V3 | The local-only Docker managed-runtime lane (LB-A8) | **Falsified as planned.** The lane works when a managed case runs alone, but `runtime-terminal-continuity-rust.spec.ts` P2-G01 is red on `main` (a reattach bug), its serial describe skips later cases, and its P2-G04 is paid (G53) | Global Constraints local-only rules (exact `--grep`, three `env -u` flags, `--list` first, `chromium_headless_shell-1208`, rigs run alone); Task 8's new `managed-runtime-names-local-rust.spec.ts` with WebSocket-drop shapes; Task 10's Rust integration test for restart naming; Task 13 Step 3; the out-of-scope finding |
 | V4 | Reconstructed managed tabs carry a resolvable identity (LB-A12) | **Falsified in general; holds only when the soul has a native session id** (G51) | Task 8: no inventory or server change; session ownership only for `isScopedPaneContent`; the `terminal.session.associated` unit test; Residual 17 |

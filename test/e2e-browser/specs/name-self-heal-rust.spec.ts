@@ -179,10 +179,15 @@ test.describe('saved names self-heal', () => {
 
       const { page, context } = await connectUnifiedPage({ browser, info: server.info })
       await openFromSidebar(page, WRAPPER_ID, JUNK_FIRST_MESSAGE)
-      await context.close()
+      await expect.poll(() => gemini.requests.length, {
+        message: 'opening the healed session sends its real first message for AI naming',
+        timeout: 30_000,
+      }).toBeGreaterThan(0)
       for (const request of gemini.requests) {
+        expect(request.body, 'the model receives the real first message').toContain(JUNK_FIRST_MESSAGE)
         expect(request.body, 'wrapper text never reaches the model').not.toContain('local-command-caveat')
       }
+      await context.close()
     } finally {
       await server.stop()
       await gemini.close().catch(() => {})

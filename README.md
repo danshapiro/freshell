@@ -30,7 +30,7 @@
 - **Live pane headers** — See your active directory, git branch, and context usage in every pane title bar, updating live as you work. Fresh-agent panes carry their context meter in their status strip instead of the header.
 - **Host pressure dashboard pane** — CPU, memory, pressure, and I/O at a glance with near-zero overhead (metrics stream only while you're watching). Linux, WSL, and macOS only — not shown on Windows.
 - **Activity notifications** — Configurable attention indicators (highlight, pulse, darken) on tabs and pane headers when a coding CLI finishes its turn, with click or type dismiss modes
-- **One name per agent conversation** — Every Claude, Codex, and OpenCode conversation gets a single short name that appears on its pane, tab, sidebar, and history — and stays that same name across refreshes, restarts, and other devices. Freshell names new conversations automatically as you work (short names built for a tab), you can rename from anywhere, and the name is written back to the CLI's own session list where the CLI supports it. AI naming uses the Gemini API key you enter in Settings → Naming; with no key, it uses the Freshell server's OneCLI connection, if it has one.
+- **One name per agent conversation** — Every Claude, Codex, and OpenCode conversation gets a single short name that appears on its pane, tab, sidebar, and history — and stays that same name across refreshes, restarts, and other devices. Freshell names new conversations automatically as you work (short names built for a tab), you can rename from anywhere, and the name is written back to the CLI's own session list where the CLI supports it. AI naming uses `GOOGLE_GENERATIVE_AI_API_KEY` at startup, or the Gemini key in Settings → Naming. Saving a nonempty Settings key replaces the running server's key; clearing the field takes effect after a restart, provided no environment key is set. With no key, naming uses the Freshell server's OneCLI connection, if it has one.
 - **Progressive sidebar search** — Two-phase search with instant local results followed by deep server-side content search
 - **Mobile responsive** — Auto-collapsing sidebar and overlay navigation for phones and tablets
 - **Stream Deck** — Drive freshell from an Elgato Stream Deck: tabs on keys with repo icons and status backgrounds (or classic live previews and status rings), press to focus, long-press to approve or stop agents. See [Stream Deck](#stream-deck).
@@ -209,7 +209,7 @@ Then unplug and replug the deck. Without the rule, the connection status shows "
 | `GEMINI_CMD` | No | Gemini CLI command override |
 | `KIMI_CMD` | No | Kimi CLI command override |
 | `AMPLIFIER_CMD` | No | Amplifier CLI command override |
-| `GOOGLE_GENERATIVE_AI_API_KEY` | No | Gemini API key for AI-powered terminal summaries |
+| `GOOGLE_GENERATIVE_AI_API_KEY` | No | Gemini API key for automatic conversation names and terminal summaries; takes precedence over Settings at startup |
 | `FRESHELL_CLAUDE_NODE` | No | Node executable for the isolated Claude SDK sidecar (normally set by Electron) |
 | `FRESHELL_CLAUDE_SIDECAR` | No | Claude sidecar entrypoint override for Rust development/service runs |
 | `FRESHELL_MCP_NODE` | No | Node executable for the standalone MCP client |
