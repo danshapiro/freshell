@@ -188,6 +188,7 @@ export function FreshAgentSettingsButton({
     defaultPermissionMode?: string
     effort?: string
     style?: FreshAgentStyle
+    modelEffortLevels?: { modelId: string; levels: string[] } | undefined
   }) => {
     void dispatch(saveServerSettingsPatch({
       freshAgent: {
@@ -363,6 +364,9 @@ export function FreshAgentSettingsButton({
                           // list entirely — keep the shared static-table
                           // normalizer, unchanged.
                           const nextRow = modelOptions.find((row) => row.value === nextModel)
+                          const nextModelEffortLevels = nextRow?.thinkingEfforts
+                            ? [...nextRow.thinkingEfforts]
+                            : undefined
                           const nextEffort = nextRow
                             ? effortForSwitchedModelRow(nextRow, paneContent.effort)
                             : normalizeFreshAgentEffort(
@@ -391,9 +395,7 @@ export function FreshAgentSettingsButton({
                               // the static table's default-model fallback for
                               // probed-only models. Absent row → field clears
                               // back to static-table normalization.
-                              modelEffortLevels: nextRow?.thinkingEfforts
-                                ? [...nextRow.thinkingEfforts]
-                                : undefined,
+                              modelEffortLevels: nextModelEffortLevels,
                             },
                           }))
                           // Apply to the LIVE session (fire-and-forget): the
@@ -404,9 +406,14 @@ export function FreshAgentSettingsButton({
                             model: nextModel,
                             ...(nextEffort ? { effort: nextEffort } : {}),
                           })
+                          // The same levels travel with the saved default,
+                          // paired with the model (absent row → clear).
                           persistProviderDefaults({
                             modelSelection: { kind: 'exact', modelId: nextModel },
                             ...(nextEffort ? { effort: nextEffort } : {}),
+                            modelEffortLevels: nextModelEffortLevels
+                              ? { modelId: nextModel, levels: nextModelEffortLevels }
+                              : undefined,
                           })
                         }}
                       />
