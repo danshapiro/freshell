@@ -1447,6 +1447,8 @@ impl FreshClaudeState {
             }
         };
         let msg = FreshAgentAttach {
+            tab_id: None,
+            pane_id: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: session_id.to_string(),
             session_type: flavor,
@@ -8674,6 +8676,8 @@ pub(crate) mod tests {
 
     fn attach_msg(session_id: &str) -> FreshAgentAttach {
         FreshAgentAttach {
+            tab_id: None,
+            pane_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
@@ -11246,6 +11250,7 @@ rl.on('line', (line) => {
 
     fn dedup_create_msg(request_id: &str) -> FreshAgentCreate {
         FreshAgentCreate {
+            pane_id: None,
             naming_handle: None,
             observed_epoch: None,
             observed_generation: None,
@@ -12721,6 +12726,8 @@ rl.on('line', (line) => {
         // A delayed ATTACH: the tracked-and-alive fast path is BLOCKED
         // with the typed error (pre-d3: the silent parity return).
         st.handle_attach(freshell_protocol::FreshAgentAttach {
+            tab_id: None,
+            pane_id: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: placeholder.clone(),
             session_type: SessionType::Freshclaude,

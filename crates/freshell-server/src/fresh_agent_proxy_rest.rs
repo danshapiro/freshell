@@ -129,6 +129,7 @@ impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
             rest_agent_identity(&request.provider, &request.session_type)?;
         let runtime_provider = fresh_provider(&Some(provider), session_type).ok_or(())?;
         let message = freshell_protocol::FreshAgentCreate {
+            pane_id: None,
             request_id: request.request_id,
             session_type,
             cwd: request.cwd,

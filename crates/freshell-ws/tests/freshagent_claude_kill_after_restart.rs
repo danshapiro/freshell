@@ -139,6 +139,7 @@ fn new_generation(
 
 fn create_msg_resume(request_id: &str, durable: &str) -> FreshAgentCreate {
     FreshAgentCreate {
+        pane_id: None,
         naming_handle: None,
         observed_epoch: None,
         observed_generation: None,
@@ -164,6 +165,8 @@ fn create_msg_resume(request_id: &str, durable: &str) -> FreshAgentCreate {
 
 fn attach_msg(seat: &str, durable: &str) -> FreshAgentAttach {
     FreshAgentAttach {
+        tab_id: None,
+        pane_id: None,
         observed_epoch: None,
         observed_generation: None,
         provider: AgentProvider::Claude,
