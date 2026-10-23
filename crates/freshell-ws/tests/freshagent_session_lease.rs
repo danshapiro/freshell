@@ -143,10 +143,19 @@ rl.on('line', (line) => {
     }
     if (process.env.FAKE_SIDECAR_SPAWN_GRANDCHILD === '1') {
       // Detached decoy grandchild inheriting env (so /proc/<pid>/environ carries the
-      // ownership tag the kill sweep scans for).
-      const gc = spawn('sleep', ['300'], { detached: true, stdio: 'ignore' })
+      // ownership tag the kill sweep scans for). It IGNORES SIGTERM (an ignored signal
+      // stays ignored across exec), so the claude lane's own one-shot SIGTERM reap of
+      // its tagged tree cannot end it: only the expired-lease sweep's SIGKILL
+      // escalation can. It is logged only once the shell has armed the ignore.
+      const gc = spawn('sh', ['-c', 'trap "" TERM; echo armed; exec sleep 300 >/dev/null'], {
+        detached: true,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      })
+      gc.stdout.once('data', () => {
+        gc.stdout.destroy()
+        logReq({ type: 'grandchild', grandchildPid: gc.pid })
+      })
       gc.unref()
-      logReq({ type: 'grandchild', grandchildPid: gc.pid })
     }
     counter += 1
     const sessionId = `fake-claude-session-${process.pid}-${counter}`
@@ -708,7 +717,9 @@ async fn codex_loser_create_resume_adopts_and_never_clobbers_the_winner() {
 /// An EXPIRED lease must be TREE-killed before release: the decoy grandchild (which a
 /// raw single-pid SIGKILL of the sidecar would orphan) must be dead BEFORE the second
 /// client's create converges -- i.e. the ownership sweep ran and confirmed empty prior
-/// to force-release.
+/// to force-release. The decoy ignores SIGTERM, so the claude lane's own SIGTERM reap
+/// (run when A's sidecar dies mid-create) cannot stand in for the sweep: only the
+/// sweep's SIGKILL escalation ends it.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn expired_lease_kill_sweeps_the_sidecar_tree_before_release() {
