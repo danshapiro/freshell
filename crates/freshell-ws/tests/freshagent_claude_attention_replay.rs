@@ -14,8 +14,7 @@ async fn ready(rig: &ClaudeRig, replay: bool) -> Value {
                 "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
                 "capabilities": { "freshAgentAttentionReplayV1": replay },
             })
-            .to_string()
-            .into(),
+            .to_string(),
         ))
         .await
         .unwrap();
