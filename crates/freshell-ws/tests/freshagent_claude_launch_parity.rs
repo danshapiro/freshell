@@ -231,9 +231,14 @@ async fn a_rollback_respawn_carries_the_bound_plugins_and_the_hosted_mcp() {
     }))
     .await;
 
-    // The undo boots a fork of the conversation through its first turn. (Until C13
-    // the rollback then waits for a turn that never comes, G01; the fork's launch
-    // is what this test pins, and the rig's teardown stops the fork.)
+    // The undo boots a fork of the conversation through its first turn, and
+    // answers once the CLI booted it (C13).
+    let ack = conn
+        .wait_for("the undo's ack", |v| {
+            v["type"] == "freshAgent.event" && v["event"]["requestId"] == "undo-1"
+        })
+        .await;
+    assert_eq!(ack["event"]["type"], "freshAgent.rolledBack", "{ack}");
     let fork = wait_for_query(&rig, "the undo's fork", |o| {
         o["forkSession"] == true && o["resume"] == durable
     })

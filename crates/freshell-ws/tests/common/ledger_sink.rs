@@ -251,6 +251,14 @@ impl PaneIdentitySink for LedgerSink {
             .map(|row| row.session_id)
     }
 
+    fn chain_terminus(&self, provider: &str, session_id: &str) -> Option<String> {
+        // Memory-only chain walk (`supersededBy` links to the live terminus).
+        self.ledger
+            .lookup_by_session(provider, session_id)
+            .filter(|resolution| resolution.corrected)
+            .map(|resolution| resolution.row.session_id)
+    }
+
     fn retire_closed(&self, provider: &str, session_id: &str) -> SinkCloseWrite {
         let ledger = self.ledger.clone();
         let (p, s) = (provider.to_string(), session_id.to_string());

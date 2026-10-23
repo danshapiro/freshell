@@ -518,6 +518,14 @@ impl PaneIdentitySink for LedgerIdentitySink {
             .map(|row| row.session_id)
     }
 
+    fn chain_terminus(&self, provider: &str, session_id: &str) -> Option<String> {
+        // Memory-only chain walk (`supersededBy` links to the live terminus).
+        self.ledger
+            .lookup_by_session(provider, session_id)
+            .filter(|resolution| resolution.corrected)
+            .map(|resolution| resolution.row.session_id)
+    }
+
     /// Retire-on-kill (delta-review round 5, restore-open-sessions-only): the
     /// kill handlers' awaited retire batch — the same awaited-spawn_blocking
     /// discipline as `record_binding`. Delta-r6-r4 (focused-episode-6 round
@@ -884,6 +892,56 @@ mod tests {
     /// Claude core design §4.1: the genesis rides the binding write, survives
     /// a restart, is kept by a later settings write, and is dropped by the
     /// lazy clear once the transcript is on disk.
+    /// Claude core design §4.5 (C13): a send that waited behind an undo
+    /// finds the replacement through the durable supersession chain. The
+    /// chain follows every hop to the live end, survives a restart (it is
+    /// the ledger's), and names nothing for an id nothing superseded.
+    #[tokio::test]
+    async fn the_supersession_chain_leads_to_the_live_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger, None);
+        let upsert = |session_id: &str, supersedes: Option<&str>| FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
+            name_transition: None,
+            provider: "claude".into(),
+            session_id: session_id.into(),
+            mode: "freshclaude".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: supersedes.map(str::to_string),
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+            authoritative: false,
+            settings: FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..FreshAgentSettings::default()
+            },
+        };
+        for (id, supersedes) in [("s-a", None), ("s-c", Some("s-a")), ("s-d", Some("s-c"))] {
+            sink.record_binding(upsert(id, supersedes))
+                .await
+                .expect("awaited write succeeds");
+        }
+        assert_eq!(sink.chain_terminus("claude", "s-a").as_deref(), Some("s-d"));
+        assert_eq!(sink.chain_terminus("claude", "s-c").as_deref(), Some("s-d"));
+        assert_eq!(sink.chain_terminus("claude", "s-d"), None, "the live end");
+        assert_eq!(sink.chain_terminus("claude", "s-unknown"), None);
+        let restarted = LedgerIdentitySink::new(
+            Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+                tmp.path().to_path_buf(),
+            ))),
+            None,
+        );
+        assert_eq!(
+            restarted.chain_terminus("claude", "s-a").as_deref(),
+            Some("s-d")
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn genesis_writes_through_reads_back_and_clears() {
         let tmp = tempfile::tempdir().unwrap();

@@ -14,9 +14,11 @@
 //! ```
 //!
 //! The guards are the ones the create and attach handlers used to run inline,
-//! moved here unchanged, so the kill/claim/commit race tests pin this one path. The
-//! rollback respawn boots through `boot_sidecar` too; its registration still waits
-//! for the fork's first turn until C13 moves it onto `establish_runtime`.
+//! moved here unchanged, so the kill/claim/commit race tests pin this one path.
+//! An undo or redo establishes its replacement runtime here too (C13): it boots
+//! the replacement under the id the rollback minted, registered as already
+//! adopted, while the original is still live; the rollback then moves
+//! ownership and stops the original (`claude/rollback.rs`).
 
 use super::*;
 
@@ -28,6 +30,8 @@ use crate::claude_launch::ClaudeLaunchSpec;
 pub(super) enum EstablishLane {
     Create,
     AttachResume,
+    /// An undo or redo's replacement runtime.
+    Rollback,
 }
 
 impl EstablishLane {
@@ -35,6 +39,7 @@ impl EstablishLane {
         match self {
             Self::Create => "create",
             Self::AttachResume => "attach-resume",
+            Self::Rollback => "rollback",
         }
     }
 }
@@ -46,6 +51,20 @@ pub(super) enum RegisterUnder {
     /// The attaching pane's id: an attach-resume (the client routes the pane's
     /// frames by it).
     Pane(String),
+    /// A durable id the server minted and the CLI boots under (a rollback's
+    /// replacement): registered as already adopted, so it is the map key, the
+    /// envelope stamp and the session's durable id at once.
+    Adopted(String),
+}
+
+/// The per-session state a replacement runtime takes over from the runtime it
+/// replaces (an undo or redo, design §4.6): the turn lock a parked send waits
+/// on, the busy truth and the attention clock. Only the process changes.
+pub(super) struct InheritedRuntime {
+    pub(super) turn_lock: Arc<TokioMutex<()>>,
+    pub(super) in_turn: Arc<std::sync::atomic::AtomicBool>,
+    pub(super) turn_tracker: Arc<std::sync::Mutex<TurnTracker>>,
+    pub(super) last_synthesized_complete_at: Arc<std::sync::Mutex<Option<i64>>>,
 }
 
 /// The durable session a launch claims, with the identity's dead state as it
@@ -84,6 +103,8 @@ pub(super) struct EstablishPlan<'a> {
     pub(super) partial_runtime_key: Option<String>,
     /// The start's cancellation slot: the watchdog signals the spawned sidecar.
     pub(super) start_pid_slot: &'a crate::ownership_lane::SidecarPidSlot,
+    /// The state a replacement takes over (a rollback); `None` starts afresh.
+    pub(super) inherit: Option<InheritedRuntime>,
 }
 
 /// A runtime that is registered and committed.
@@ -95,6 +116,8 @@ pub(super) struct Established {
         freshell_protocol::session_names::SessionNameRef,
         freshell_protocol::session_names::SessionNameRecord,
     )>,
+    /// The established sidecar's pid (the coordinator's owner identity).
+    pub(super) sidecar_pid: Option<u32>,
 }
 
 /// Why a runtime was not established. Everything the launch spawned is torn down.
@@ -360,6 +383,7 @@ impl FreshClaudeState {
             naming,
             partial_runtime_key,
             start_pid_slot,
+            inherit,
         } = plan;
         let start = StartWatch {
             pid_slot: start_pid_slot,
@@ -392,9 +416,10 @@ impl FreshClaudeState {
         // into the session record).
         let sidecar_pid = child.id();
         let minted = created.session_id;
-        let map_key = match register_under {
-            RegisterUnder::Minted => minted.clone(),
-            RegisterUnder::Pane(pane) => pane,
+        let (map_key, adopted) = match register_under {
+            RegisterUnder::Minted => (minted.clone(), None),
+            RegisterUnder::Pane(pane) => (pane, None),
+            RegisterUnder::Adopted(id) => (id.clone(), Some(id)),
         };
 
         // Unified agent names (Task 2): a create's pending handle is admitted with
@@ -477,16 +502,26 @@ impl FreshClaudeState {
         // map lock (review PRB-C10): the consumer reaches its session only
         // through that lock, so no line it reads (the boot's command catalog, a
         // CLI death right after the boot) can find the session missing.
-        let durable = claim.as_ref().map(|claim| claim.durable.clone());
+        let durable = claim
+            .as_ref()
+            .map(|claim| claim.durable.clone())
+            .or(adopted);
         let configuration_settings = recorded_settings.clone().unwrap_or_default();
         let broadcast_id = Arc::new(std::sync::Mutex::new(map_key.clone()));
         log_labels.bind_session(&broadcast_id);
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
-        let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
-        // Task 5: the session's death-mint clock (see the field doc).
-        let last_synthesized_complete_at = Arc::new(std::sync::Mutex::new(None));
-        let turn_lock = Arc::new(TokioMutex::new(()));
+        let InheritedRuntime {
+            turn_lock,
+            in_turn,
+            turn_tracker,
+            // Task 5: the session's death-mint clock (see the field doc).
+            last_synthesized_complete_at,
+        } = inherit.unwrap_or_else(|| InheritedRuntime {
+            turn_lock: Arc::new(TokioMutex::new(())),
+            in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            turn_tracker: Arc::new(std::sync::Mutex::new(TurnTracker::default())),
+            last_synthesized_complete_at: Arc::new(std::sync::Mutex::new(None)),
+        });
         // A just-booted session has announced nothing: no turn can be in flight
         // before the client sends.
         let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
@@ -504,7 +539,6 @@ impl FreshClaudeState {
                 Arc::clone(&in_turn),
                 Arc::clone(&turn_tracker),
                 Arc::clone(&last_synthesized_complete_at),
-                None,
                 provenance,
             );
             self.test_holds.registration().await;
@@ -564,7 +598,7 @@ impl FreshClaudeState {
             }
         }
         // Round 6 (Finding 2): the seat→durable mapping is durable at registration.
-        if let Some(durable) = durable.as_deref() {
+        if let Some(durable) = claim.as_ref().map(|claim| claim.durable.as_str()) {
             if let Some(sink) = self.identity_sink() {
                 if let Err(e) = sink
                     .record_alias_tombstone(
@@ -644,7 +678,9 @@ impl FreshClaudeState {
             if let Err(outcome) = self.commit_lane_claim_at(own_ticket, &map_key, sidecar_pid) {
                 let event = match lane {
                     EstablishLane::Create => "freshagent.claude.create_commit_stale",
-                    EstablishLane::AttachResume => "freshagent.claude.attach_commit_stale",
+                    EstablishLane::AttachResume | EstablishLane::Rollback => {
+                        "freshagent.claude.attach_commit_stale"
+                    }
                 };
                 tracing::error!(target: "invariant",
                     event, provider = PROVIDER, session_id = ?durable,
@@ -664,6 +700,7 @@ impl FreshClaudeState {
         Ok(Established {
             map_key,
             naming_projection,
+            sidecar_pid,
         })
     }
 }

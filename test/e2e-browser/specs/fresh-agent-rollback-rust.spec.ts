@@ -21,17 +21,22 @@
  *     typed /redo is answered by the pinned client-side codex notice
  *     (decision 5 — the reserved-name interception; the wire refusal stays as
  *     backstop).
- *   claude AND kilroy (fork-at-point emulation): /undo re-keys the pane via a
- *     fork-boot sidecar create that MINTS a fresh durable id (the s2rk
- *     correction), refills the composer, never touches checkpoints (decision
- *     1 — zero /checkpoints/restore traffic), and /redo re-forks the retained
- *     original (the tip/LCP contract).
+ *   claude AND kilroy (boot-verified fork runtime, core design §4.5, C13): the
+ *     PRODUCTION sidecar over the CLI simulator (which boots like the pinned
+ *     CLI: no init without a prompt, a lazy fork writes nothing until its
+ *     first prompt). /undo re-keys the pane to a durable id the server MINTS,
+ *     booted as a fork of the original, refills the composer, never touches
+ *     checkpoints (decision 1 — zero /checkpoints/restore traffic), and /redo
+ *     re-forks the retained original (the tip/LCP contract). Two undos with
+ *     no send between them fork the original again (source collapse), and a
+ *     server restart before the next send keeps the kept prefix (the fork
+ *     boots again from its genesis).
  *   mid-turn lockout (decisions 6/7): a typed /undo while a turn runs is
  *     refused by the client busy gate with the pinned steer copy, NO rollback
- *     frames leave the client (the sidecar stdin audit shows no fork create),
- *     and the parked approval card is never silently resolved (cancel frames
- *     fire only on a SUCCESSFUL rollback; the sanity tail then proves /undo
- *     succeeds once the turn completes).
+ *     reaches the CLI (the simulator's ledger shows no second boot), and the
+ *     parked approval card is never silently resolved (cancel frames fire only
+ *     on a SUCCESSFUL rollback; the sanity tail then proves /undo succeeds
+ *     once the turn completes).
  *   multi-client convergence (decision 10): a sibling raw-WS client observes
  *     freshAgent.session.rolledBack{revokeAttention:true}; the REST snapshot
  *     (another client's truth) reads identically; a page reload re-attaches
@@ -70,7 +75,11 @@ import { WsCapture } from '../helpers/ws-capture.js'
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
-const CLAUDE_SIDECAR_FIXTURE = path.resolve(__dirname, '../fixtures/providers/fake-claude-sdk-sidecar.mjs')
+// The production claude sidecar and the CLI simulator it loads through its
+// FRESHELL_CLAUDE_SDK_QUERY_MODULE seam (both in the cloud image's source tree;
+// the simulator needs no CLI binary and no network).
+const CLAUDE_SIDECAR = path.resolve(__dirname, '../../../crates/freshell-claude-sidecar/index.mjs')
+const CLAUDE_CLI_SIMULATOR = path.resolve(__dirname, '../../fixtures/claude-cli-sim/query.mjs')
 const CODEX_APP_SERVER_FIXTURE = path.resolve(
   __dirname,
   '../../fixtures/coding-cli/codex-app-server/fake-app-server.mjs',
@@ -80,23 +89,18 @@ const OPENCODE_FIXTURE = path.resolve(__dirname, '../fixtures/fake-opencode.cjs'
 const CANONICAL_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
-// ── Fixture program (claude/kilroy lane) ────────────────────────────────────
-// Plain sends take the canned success turn (u/a transcript lines + a positive
-// completion); 'RAISE_PERMISSION' parks the turn behind an approval card
-// until the Allow respond lands (the mid-turn lockout case).
+// ── Simulator program (claude/kilroy lane) ──────────────────────────────────
+// Plain prompts take the simulator's plain reply; 'RAISE_PERMISSION' asks
+// canUseTool for a Bash call, which parks the turn behind an approval card
+// until the Allow answer lands (the mid-turn lockout case).
 const ROLLBACK_CLAUDE_PROGRAM = {
   rules: [
     {
-      on: 'msg:send',
+      on: 'msg:prompt',
       match: { text: 'RAISE_PERMISSION' },
       emit: [
         { kind: 'approval', data: { id: 'req-perm-1', tool: 'Bash', input: { command: 'ls' } } },
       ],
-    },
-    {
-      on: 'msg:permission.respond',
-      match: { decision: { behavior: 'allow' } },
-      emit: [{ kind: 'completion', data: { subtype: 'success' } }],
     },
   ],
 }
@@ -186,38 +190,6 @@ function readJsonl(filePath: string): any[] {
       }
     })
     .filter((row) => row !== null)
-}
-
-/** Read the sidecar raw-stdin audit, JSON-parsing each recorded frame. */
-function readStdinFrames(stdinLog: string): any[] {
-  return readJsonl(stdinLog)
-    .map((row) => {
-      try {
-        return JSON.parse(row.line)
-      } catch {
-        return null
-      }
-    })
-    .filter((frame) => frame !== null)
-}
-
-async function waitForStdinFrame(
-  stdinLog: string,
-  pred: (frame: any) => boolean,
-  what: string,
-  timeoutMs = 15_000,
-): Promise<any> {
-  let found: any = null
-  await expect
-    .poll(
-      () => {
-        found = readStdinFrames(stdinLog).find(pred) ?? null
-        return Boolean(found)
-      },
-      { timeout: timeoutMs, message: `timed out waiting for ${what} in ${stdinLog}` },
-    )
-    .toBe(true)
-  return found
 }
 
 /** Direct REST snapshot read — the route every card renders from. */
@@ -311,18 +283,33 @@ async function captureDurableId(
 
 function claudeLaneEnv(
   sharedRoot: string,
-  flavour: 'freshclaude' | 'kilroy',
   extraEnv: Record<string, string> = {},
 ): Record<string, string> {
   return {
-    FRESHELL_CLAUDE_SIDECAR: CLAUDE_SIDECAR_FIXTURE,
+    FRESHELL_CLAUDE_SIDECAR: CLAUDE_SIDECAR,
     FRESHELL_CLAUDE_NODE: process.execPath,
-    FRESHELL_FAKE_PROVIDER: flavour,
-    FRESHELL_FAKE_PROGRAM: JSON.stringify(ROLLBACK_CLAUDE_PROGRAM),
-    FRESHELL_FAKE_STDIN: path.join(sharedRoot, 'sidecar-stdin.jsonl'),
-    FRESHELL_FAKE_EVENTS: path.join(sharedRoot, 'sidecar-events.jsonl'),
+    FRESHELL_CLAUDE_SDK_QUERY_MODULE: CLAUDE_CLI_SIMULATOR,
+    FRESHELL_CLAUDE_SIM_LEDGER: path.join(sharedRoot, 'claude-sim-ledger.jsonl'),
+    FRESHELL_CLAUDE_SIM_PROGRAM: JSON.stringify(ROLLBACK_CLAUDE_PROGRAM),
     ...extraEnv,
   }
+}
+
+/**
+ * The `query()` options of every conversation the simulated CLI booted, in
+ * order (its ledger's `query` rows): the create, then each rollback's
+ * replacement (a fork carries `resume`, `resumeSessionAt`, `forkSession` and
+ * the minted `sessionId`; a first-turn undo boots fresh under `sessionId`).
+ */
+function simBoots(simLedger: string): any[] {
+  return readJsonl(simLedger)
+    .filter((row) => row.kind === 'query')
+    .map((row) => row.options ?? {})
+}
+
+/** The simulated CLI's boots of forks (rollback replacements of a conversation). */
+function simForks(simLedger: string): any[] {
+  return simBoots(simLedger).filter((options) => options.forkSession === true)
 }
 
 /** Boot the claude lane: create a freshclaude/kilroy pane on an owned server. */
@@ -336,8 +323,7 @@ async function bootClaudeLane(
   harness: TestHarness
   sharedRoot: string
   projectDir: string
-  stdinLog: string
-  eventsLog: string
+  simLedger: string
   tabId: string
 }> {
   const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), `freshell-rollback-${flavour}-`))
@@ -345,7 +331,7 @@ async function bootClaudeLane(
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
     const { server, info, harness } = await bootWall(page, {
-      env: claudeLaneEnv(sharedRoot, flavour, extraEnv),
+      env: claudeLaneEnv(sharedRoot, extraEnv),
       // Kilroy parity includes independence from Gemini-summary availability
       // (donor: the control spec's AGENT-24 strip — every Gemini-capable env
       // name is scrubbed from the spawned server's env, unit-pinned in
@@ -370,8 +356,7 @@ async function bootClaudeLane(
       harness,
       sharedRoot,
       projectDir,
-      stdinLog: path.join(sharedRoot, 'sidecar-stdin.jsonl'),
-      eventsLog: path.join(sharedRoot, 'sidecar-events.jsonl'),
+      simLedger: path.join(sharedRoot, 'claude-sim-ledger.jsonl'),
       tabId,
     }
   } catch (error) {
@@ -919,7 +904,8 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
   test('claude: /undo fork-at-point re-keys the pane and refills — and never touches checkpoints (decision 1)', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
-      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      // A booted pane is `connected` until its first turn settles it `idle`.
+      await waitForPaneStatus(lane.harness, lane.tabId, ['idle', 'connected'])
       const checkpointRestores: string[] = []
       page.on('request', (request) => {
         if (request.url().includes('/checkpoints/restore')) checkpointRestores.push(request.url())
@@ -938,8 +924,9 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
 
       await typeSlash(page, '/undo')
 
-      // The pane re-keys: fork-at-point adopts a MINTED-FRESH durable id (the
-      // s2rk correction) via the materialized-adoption leg.
+      // The pane re-keys to the durable id the server MINTED for the fork,
+      // through the materialized frame the undo answers with once the CLI
+      // booted the fork (it never waits for an init, G01).
       await expect
         .poll(
           async () => (await paneLeaf(lane.harness, lane.tabId))?.content?.sessionRef?.sessionId ?? '',
@@ -952,20 +939,14 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
         .poll(() => composerLocator(page).inputValue(), { timeout: 15_000 })
         .toBe('prompt two')
 
-      // Exactly ONE fork-at-point create: a fork boot of ORIG at a
-      // resumeSessionAt the raw-chain resume point (the sidecar's
-      // guard validated — no guard-refusal retry would land a second create).
-      const forks = readStdinFrames(lane.stdinLog)
-        .filter((f) => f?.type === 'create' && f?.boot?.kind === 'fork')
+      // Exactly ONE fork boot: ORIG at the raw-chain resume point, under the
+      // minted id, guarded by the undone prompt (no guard-less retry).
+      const forks = simForks(lane.simLedger)
       expect(forks).toHaveLength(1)
-      expect(forks[0].boot.resume).toBe(ORIG)
-      expect(typeof forks[0].boot.resumeSessionAt).toBe('string')
-      // The wire log's sdk.session.init for the fork carries the NEW id.
-      const wires = readJsonl(lane.eventsLog).filter((r) => r.kind === 'wire')
-      expect(
-        wires.some((r) => r.frame?.type === 'sdk.session.init' && r.frame?.cliSessionId === CHILD),
-        'sdk.session.init carries the fresh-minted cliSessionId (never ORIG)',
-      ).toBe(true)
+      expect(forks[0].resume).toBe(ORIG)
+      expect(typeof forks[0].resumeSessionAt).toBe('string')
+      expect(forks[0].sessionId, 'the fork runs under the minted id (never ORIG)').toBe(CHILD)
+      expect(typeof forks[0].resumeDropsTurn).toBe('string')
 
       // The adopted snapshot shows the prefix + the marker bucket + redo.
       const childSnap = await fetchSnapshot(lane.info, 'freshclaude', 'claude', CHILD)
@@ -990,10 +971,16 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
       await expect
         .poll(async () => userRows(await fetchSnapshot(lane.info, 'freshclaude', 'claude', REDONE)), { timeout: 15_000 })
         .toBe(2)
-      const reforks = readStdinFrames(lane.stdinLog)
-        .filter((f) => f?.type === 'create' && f?.boot?.kind === 'fork')
+      const reforks = simForks(lane.simLedger)
       expect(reforks.length).toBe(2)
-      expect(reforks[1].boot.resume).toBe(ORIG)
+      expect(reforks[1].resume).toBe(ORIG)
+      expect(reforks[1].sessionId).toBe(REDONE)
+
+      // The redone conversation takes the next prompt under its own id.
+      await sendComposerText(page, 'prompt three')
+      await expect
+        .poll(async () => userRows(await fetchSnapshot(lane.info, 'freshclaude', 'claude', REDONE)), { timeout: 15_000 })
+        .toBe(3)
 
       // Rollback never touches files: ZERO checkpoint-restore traffic.
       expect(checkpointRestores).toEqual([])
@@ -1006,7 +993,8 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
   test('kilroy: typed /undo drives the claude lane — fork-at-point fork, pane re-key, refill, marker (r2 provider coverage)', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'kilroy', { KILROY_ENABLED: '1' })
     try {
-      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      // A booted pane is `connected` until its first turn settles it `idle`.
+      await waitForPaneStatus(lane.harness, lane.tabId, ['idle', 'connected'])
       await sendComposerText(page, 'prompt one')
       const ORIG = await captureDurableId(lane.harness, lane.tabId, CANONICAL_UUID_RE)
       await expect
@@ -1029,11 +1017,11 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
         .not.toBe(ORIG)
       const CHILD = (await paneLeaf(lane.harness, lane.tabId))?.content?.sessionRef?.sessionId as string
       expect(CHILD).toMatch(CANONICAL_UUID_RE)
-      const forks = readStdinFrames(lane.stdinLog)
-        .filter((f) => f?.type === 'create' && f?.boot?.kind === 'fork')
+      const forks = simForks(lane.simLedger)
       expect(forks).toHaveLength(1)
-      expect(forks[0].boot.resume).toBe(ORIG)
-      expect(typeof forks[0].boot.resumeSessionAt).toBe('string')
+      expect(forks[0].resume).toBe(ORIG)
+      expect(typeof forks[0].resumeSessionAt).toBe('string')
+      expect(forks[0].sessionId).toBe(CHILD)
       await expect
         .poll(() => composerLocator(page).inputValue(), { timeout: 15_000 })
         .toBe('prompt two')
@@ -1041,6 +1029,73 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
       expect(userRows(childSnap)).toBe(1)
       expect(childSnap?.rolledBackTurns ?? []).toHaveLength(2)
       expect((childSnap?.rolledBackTurns ?? []).every((t: any) => t.rolledBack === true)).toBe(true)
+    } finally {
+      await lane.server.stop().catch(() => {})
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  test('claude: two /undo with no send between them, then a server restart: the pending fork keeps its prefix and takes the next prompt (core design §4.3, §4.5)', async ({ page }) => {
+    const lane = await bootClaudeLane(page, 'freshclaude')
+    try {
+      // A booted pane is `connected` until its first turn settles it `idle`.
+      await waitForPaneStatus(lane.harness, lane.tabId, ['idle', 'connected'])
+      await sendComposerText(page, 'prompt one')
+      const ORIG = await captureDurableId(lane.harness, lane.tabId, CANONICAL_UUID_RE)
+      for (const [n, text] of [[2, 'prompt two'], [3, 'prompt three']] as const) {
+        await expect
+          .poll(async () => userRows(await fetchSnapshot(lane.info, 'freshclaude', 'claude', ORIG)), { timeout: 15_000 })
+          .toBe(n - 1)
+        await sendComposerText(page, text)
+      }
+      await expect
+        .poll(async () => userRows(await fetchSnapshot(lane.info, 'freshclaude', 'claude', ORIG)), { timeout: 15_000 })
+        .toBe(3)
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      await waitForRollbackCapability(page)
+
+      const durable = async () => (await paneLeaf(lane.harness, lane.tabId))?.content?.sessionRef?.sessionId ?? ''
+      await typeSlash(page, '/undo')
+      await expect.poll(durable, { timeout: 30_000 }).not.toBe(ORIG)
+      const FIRST = await durable()
+      await expect.poll(() => composerLocator(page).inputValue(), { timeout: 15_000 }).toBe('prompt three')
+      await expect
+        .poll(async () => userRows(await fetchSnapshot(lane.info, 'freshclaude', 'claude', FIRST)), { timeout: 15_000 })
+        .toBe(2)
+      await waitForRollbackCapability(page)
+      await typeSlash(page, '/undo')
+      await expect.poll(durable, { timeout: 30_000 }).not.toBe(FIRST)
+      const SECOND = await durable()
+      expect(SECOND).toMatch(CANONICAL_UUID_RE)
+      await expect.poll(() => composerLocator(page).inputValue(), { timeout: 15_000 }).toBe('prompt two')
+      // Source collapse: the second fork reads the ORIGINAL, never the first
+      // fork (which wrote no transcript: nothing was sent to it).
+      const forks = simForks(lane.simLedger)
+      expect(forks.map((f) => [f.resume, f.sessionId])).toEqual([[ORIG, FIRST], [ORIG, SECOND]])
+      await expect
+        .poll(async () => userRows(await fetchSnapshot(lane.info, 'freshclaude', 'claude', SECOND)), { timeout: 15_000 })
+        .toBe(1)
+
+      // Restart before any send: the pane re-attaches and the pending fork
+      // boots again from its genesis (a fork of ORIG under SECOND).
+      await lane.server.restart()
+      await lane.harness.waitForConnection()
+      const paneRoot = page.locator('[data-context="fresh-agent"]').last()
+      await expect(paneRoot.locator('article[data-turn-role="user"]')).toHaveCount(1, { timeout: 30_000 })
+      expect(userRows(await fetchSnapshot(lane.info, 'freshclaude', 'claude', SECOND))).toBe(1)
+      await expect
+        .poll(() => simForks(lane.simLedger).filter((f) => f.sessionId === SECOND).length, { timeout: 30_000 })
+        .toBe(2)
+      const reboot = simForks(lane.simLedger).filter((f) => f.sessionId === SECOND)[1]
+      expect(reboot.resume).toBe(ORIG)
+      await waitForPaneStatus(lane.harness, lane.tabId, ['idle', 'connected'])
+
+      await composerLocator(page).fill('')
+      await sendComposerText(page, 'prompt after the restart')
+      await expect
+        .poll(async () => userRows(await fetchSnapshot(lane.info, 'freshclaude', 'claude', SECOND)), { timeout: 15_000 })
+        .toBe(2)
+      expect(await durable()).toBe(SECOND)
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
@@ -1162,7 +1217,17 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
   test('mid-turn lockout: /undo is rejected while a turn runs; cards survive (decisions 6, 7)', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
-      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      // A booted pane is `connected` until its first turn settles it `idle`.
+      await waitForPaneStatus(lane.harness, lane.tabId, ['idle', 'connected'])
+      // The CLI asks canUseTool only outside bypass mode: the turn runs in
+      // the default mode (the send carries the pane's permission mode).
+      const leafId = (await paneLeaf(lane.harness, lane.tabId))?.id as string
+      await page.evaluate(({ tabId, paneId }) => {
+        ;(window as any).__FRESHELL_TEST_HARNESS__?.dispatch({
+          type: 'panes/mergePaneContent',
+          payload: { tabId, paneId, updates: { permissionMode: 'default' } },
+        })
+      }, { tabId: lane.tabId, paneId: leafId })
       await sendComposerText(page, 'RAISE_PERMISSION')
       const card = page.getByRole('alert', { name: 'Permission request for Bash' })
       await expect(card).toBeVisible({ timeout: 15_000 })
@@ -1184,13 +1249,12 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
       expect(userRows(await fetchSnapshot(lane.info, 'freshclaude', 'claude', ORIG))).toBe(1)
       await expect(card).toBeVisible()
       expect(
-        readStdinFrames(lane.stdinLog).filter((f) => f?.type === 'create' && f?.boot?.kind === 'fork'),
-        'no fork-at-point create ever left the client for the refused /undo',
-      ).toEqual([])
+        simBoots(lane.simLedger),
+        'the refused /undo booted nothing: the only boot is the create',
+      ).toHaveLength(1)
 
       // Resolve the approval — the turn completes, then /undo succeeds.
       await card.getByRole('button', { name: 'Allow tool use' }).click()
-      await waitForStdinFrame(lane.stdinLog, (f) => f?.type === 'permission.respond', 'permission.respond')
       await expect(card).toBeHidden({ timeout: 15_000 })
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
       await typeSlash(page, '/undo')
@@ -1198,25 +1262,17 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
         page.getByText(/the removed prompt is back in the composer/),
         'UNDO_REFILL_NOTICE: the post-turn /undo succeeds',
       ).toBeVisible({ timeout: 15_000 })
-      // The tail /undo provably rolled back through EXACTLY ONE create event
-      // for the session: the busy window was proven window-silent above, so a
-      // frame leaked there plus the tail's legitimate rollback create would
-      // surface as TWO — as would a silent second create from the guard-retry
-      // or adoption seams (every attempt mints a fresh "rollback-<uuid>"
-      // requestId and lands on the raw-stdin audit BEFORE its `created`
-      // response, so the row is on disk before the ack that refills the
-      // composer). NOTE: this tail is a FIRST-TURN rollback — the resume point
-      // resolves to None (claude_snapshot.rs), so the rollback create is a
-      // FRESH-conversation create (a fresh boot, no resume or fork);
-      // counting fork-boot frames here would count ZERO by design.
-      const isRollbackCreate = (f: any) =>
-        f?.type === 'create' && typeof f?.requestId === 'string' && (f.requestId as string).startsWith('rollback-')
-      await waitForStdinFrame(lane.stdinLog, isRollbackCreate, 'the tail /undo rollback create')
-      const rollbackCreates = readStdinFrames(lane.stdinLog).filter(isRollbackCreate)
-      expect(
-        rollbackCreates,
-        'exactly ONE rollback create for the session — no second silent create from any retry/adoption race',
-      ).toHaveLength(1)
+      // The tail /undo booted EXACTLY ONE replacement: the busy window was
+      // proven boot-silent above, so a leaked boot there plus the tail's
+      // legitimate one would surface as TWO, as would a silent retry. NOTE:
+      // this tail is a FIRST-TURN rollback (the resume point resolves to
+      // None), so the replacement boots a FRESH conversation under its minted
+      // id (no resume, no fork).
+      const boots = simBoots(lane.simLedger)
+      expect(boots, 'the create, then exactly ONE replacement boot').toHaveLength(2)
+      expect(boots[1].resume).toBeUndefined()
+      expect(boots[1].forkSession).toBeUndefined()
+      expect(boots[1].sessionId).toMatch(CANONICAL_UUID_RE)
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})

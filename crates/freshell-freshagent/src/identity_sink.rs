@@ -522,6 +522,14 @@ pub trait PaneIdentitySink: Send + Sync {
         provider: &str,
         create_request_id: &str,
     ) -> Option<String>;
+    /// The live end of the supersession chain that starts at `session_id`
+    /// (claude core design §4.5: an undo or redo's replacement supersedes the
+    /// session it replaced): `Some(terminus)` only when a later session
+    /// superseded `session_id`. Memory-only, like `load_settings`. A sink that
+    /// keeps no supersession chain answers `None`.
+    fn chain_terminus(&self, _provider: &str, _session_id: &str) -> Option<String> {
+        None
+    }
     /// Retire-on-kill (delta-review round 5, restore-open-sessions-only): an
     /// explicit `freshAgent.kill` is an INTENTIONAL session end — the pane's
     /// binding row retires `Closed` on every kill entry point, so the
@@ -2139,6 +2147,27 @@ impl PaneIdentitySink for FakeIdentitySink {
                 b.provider == provider && b.create_request_id.as_deref() == Some(create_request_id)
             })
             .map(|b| b.session_id.clone())
+    }
+
+    fn chain_terminus(&self, provider: &str, session_id: &str) -> Option<String> {
+        // The ledger's `supersededBy` walk over the bindings log's
+        // `supersedes` edges (newest edge wins), with its hop cap.
+        let bindings = self.bindings.lock().unwrap();
+        let successor = |id: &str| {
+            bindings
+                .iter()
+                .rev()
+                .find(|b| b.provider == provider && b.supersedes.as_deref() == Some(id))
+                .map(|b| b.session_id.clone())
+        };
+        let mut current = successor(session_id)?;
+        for _ in 0..32 {
+            match successor(&current) {
+                Some(next) if next != current => current = next,
+                _ => break,
+            }
+        }
+        Some(current)
     }
 }
 

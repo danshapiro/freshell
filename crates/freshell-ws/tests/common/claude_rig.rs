@@ -97,6 +97,10 @@ pub struct ClaudeRig {
     pub fresh_claude: freshell_freshagent::FreshClaudeState,
     /// The local fake Anthropic endpoint ([`RigKind::Cli`] only), killed on drop.
     _provider: Option<tokio::process::Child>,
+    /// What the server was started with, for [`Self::restart`].
+    environment: Vec<(String, String)>,
+    options: RigOptions,
+    server: tokio::task::JoinHandle<()>,
     _root: tempfile::TempDir,
 }
 
@@ -213,7 +217,8 @@ impl ClaudeRig {
             url,
             http_url,
             fresh_claude,
-        } = spawn_rig_server(environment, &options, pane_ledger.clone()).await;
+            server,
+        } = spawn_rig_server(environment.clone(), &options, pane_ledger.clone()).await;
         eprintln!(
             "{}",
             json!({
@@ -231,8 +236,41 @@ impl ClaudeRig {
             ledger,
             fresh_claude,
             _provider: provider,
+            environment,
+            options,
+            server,
             _root: root,
         }
+    }
+
+    /// Restart the rig's server the way a server restart does: the claude lane
+    /// stops every sidecar (server shutdown), the server goes away, and a new
+    /// one starts on a new port over the same transcript store and the same
+    /// ledger directory, read back from disk. Connections to the old server
+    /// are gone; connect again.
+    pub async fn restart(&mut self) {
+        self.fresh_claude.shutdown().await;
+        self.server.abort();
+        let pane_ledger = self.pane_ledger.as_ref().map(|_| {
+            Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+                self._root.path().join("pane-ledger"),
+            )))
+        });
+        let RigServer {
+            url,
+            http_url,
+            fresh_claude,
+            server,
+        } = spawn_rig_server(self.environment.clone(), &self.options, pane_ledger.clone()).await;
+        eprintln!(
+            "{}",
+            json!({ "severity": "info", "event": "claude_rig.restarted", "url": url })
+        );
+        self.url = url;
+        self.http_url = http_url;
+        self.fresh_claude = fresh_claude;
+        self.pane_ledger = pane_ledger;
+        self.server = server;
     }
 
     /// A WS connection that has completed the handshake (`ready` seen).
@@ -539,6 +577,18 @@ impl RigConnection {
         self.send(frame).await;
     }
 
+    /// The owner pair (epoch, generation) of the latest `session.runtimeOwner`
+    /// frame this connection read for the durable id `durable`.
+    pub fn owner_pair(&self, durable: &str) -> Option<(u64, u64)> {
+        self.frames.iter().rev().find_map(|v| {
+            (v["type"] == "session.runtimeOwner"
+                && v["provider"] == "claude"
+                && v["sessionId"] == durable)
+                .then(|| Some((v["epoch"].as_u64()?, v["generation"].as_u64()?)))
+                .flatten()
+        })
+    }
+
     /// The owner pair the client would hold for this pane's session: the latest
     /// `session.runtimeOwner` frame for the durable id its `session.init` named.
     fn observed_owner(&self, session_id: &str) -> Option<(u64, u64)> {
@@ -737,6 +787,7 @@ struct RigServer {
     url: String,
     http_url: String,
     fresh_claude: freshell_freshagent::FreshClaudeState,
+    server: tokio::task::JoinHandle<()>,
 }
 
 /// A freshell-ws server on an ephemeral loopback port (never 3001/3002) with fresh
@@ -850,12 +901,13 @@ async fn spawn_rig_server(
         .await
         .expect("bind an ephemeral loopback port");
     let addr = listener.local_addr().expect("local addr");
-    tokio::spawn(async move {
+    let server = tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
     RigServer {
         url: format!("ws://{addr}/ws"),
         http_url: format!("http://{addr}"),
         fresh_claude: lane,
+        server,
     }
 }

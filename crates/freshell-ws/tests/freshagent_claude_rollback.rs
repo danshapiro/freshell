@@ -1,1231 +1,784 @@
-//! Kata 1wxv Task 4: end-to-end claude rollback dispatch through the REAL WS
-//! pipeline against a scripted fake sidecar. The inline fake implements the
-//! production sidecar protocol plus the fork-at-point additions: on create with
-//! `forkSession:true` it mints a NEW cliSessionId and writes the transcript PREFIX
-//! (up to and including `resumeSessionAt`) for the child under the fake
-//! CLAUDE_CONFIG_DIR; every create line is logged to `$FAKE_ROLLBACK_SIDECAR_LOG`
-//! for assertion. The pane-ledger rollback row is real (`PaneLedger` rooted under
-//! the temp HOME's `.freshell/pane-ledger`), and the fresh-agent snapshot REST
-//! route is mounted on the same axum app (mirroring freshell-server's main.rs).
+//! Undo and redo for freshclaude through a boot-verified fork runtime (core
+//! design §4.5 and §4.6, C13; audit G01).
 //!
-//! Harness conventions mirror `freshagent_claude_kill_interrupt.rs`: real axum
-//! server on an ephemeral loopback port, real tokio-tungstenite client, the
-//! `FRESHELL_CLAUDE_SIDECAR`/`FRESHELL_CLAUDE_NODE` production env-var overrides,
-//! and one `CLAUDE_ENV_LOCK` serializing the env-var mutation.
+//! Every test runs the REAL claude sidecar over the CLI simulator
+//! (RealSidecarSim), with a real pane ledger and the ownership coordinator wired
+//! the way main.rs wires them. The simulator boots like the pinned CLI: a
+//! conversation boots with no prompt, `system/init` arrives only with a turn
+//! (T1), and a lazy fork writes nothing until its first prompt (T6). The pre-C13
+//! rollback waited for an init after the respawn, which the real CLI never sends
+//! without a prompt, so on this rig every undo timed out (G01).
+//!
+//! An undo mints the replacement's id (C), boots the fork of the conversation's
+//! effective transcript under C while the original (A) is still live, records
+//! C's binding (genesis `Fork{A, at}` or `Fresh`, `supersedes: A`) with the
+//! rollback record re-keyed to C, moves ownership A→C, and only then stops A.
 
 mod common;
-use common::{connect_and_capture_inventory, TestWs, AUTH_TOKEN};
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use freshell_freshagent::{
-    ClaimCommit, FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, RollbackRecord,
-    SinkAliasClearWrite, SinkCloseWrite, SinkCommitWrite, SinkWrite,
-};
-use freshell_ws::pane_ledger::{FreshAgentBindingWrite, PaneLedger};
-use freshell_ws::WsState;
+use common::claude_rig::{ClaudeRig, RigConnection, RigKind, RigOptions, RIG_FRAME_BUDGET};
+use freshell_protocol::SessionType;
 
-/// Serializes every test in this file (process-global env vars + one fake store).
-static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// An undo answers within this budget. The pre-C13 rollback answered only after
+/// its 45 s init wait expired.
+const ROLLBACK_BUDGET: Duration = Duration::from_secs(20);
 
-// ── rollback-aware fake claude sidecar ──────────────────────────────────────
-
-/// The production protocol (`create`/`send`/`shutdown`) plus fork-at-point: a
-/// create carrying `forkSession:true` mints a NEW durable cli id and writes the
-/// resume transcript's PREFIX (up to and including `resumeSessionAt`, walked along
-/// the raw parentUuid chain) as the child's file — the source file is NEVER
-/// touched (Stage-2-proven SDK invariant: the original's JSONL is hash-identical
-/// after a fork). A `<n>`-th `send` appends a uuid-chained u<n>/a<n> pair (the
-/// user line carries the verbatim prompt text) and answers with the turn's
-/// `sdk.result` (the in_turn clear edge, as the real sidecar ends a turn) — and
-/// NEVER a `sdk.turn.complete`, so no completion chime can leak into the rollback
-/// capture.
-const FAKE_ROLLBACK_SIDECAR_SOURCE: &str = r#"
-import fs from 'node:fs'
-import path from 'node:path'
-import readline from 'node:readline'
-
-const logPath = process.env.FRESHELL_TEST_CLAUDE_ROLLBACK_LOG
-const storeRoot = process.env.CLAUDE_CONFIG_DIR
-const projDir = path.join(storeRoot, 'projects', 'fakeproj')
-
-let mintCounter = 0
-let cliId = null
-let turnCount = 0
-
-function transcriptPath(id) { return path.join(projDir, `${id}.jsonl`) }
-function readLines(id) {
-  try { return fs.readFileSync(transcriptPath(id), 'utf8').split('\n').filter(Boolean) } catch { return [] }
-}
-function mintCliId() {
-  mintCounter += 1
-  return `ffffffff-0000-4000-8000-${String(process.pid).padStart(4, '0')}${String(mintCounter).padStart(4, '0')}`.slice(0, 36)
-}
-function prefixThrough(lines, atUuid) {
-  // The RAW parentUuid chain walk: keep up to AND including the named uuid
-  // (resumeSessionAt semantics), every line — display filtering is NEVER the
-  // chain's business.
-  const byUuid = new Map()
-  for (const line of lines) {
-    try {
-      const v = JSON.parse(line)
-      if (v.uuid) byUuid.set(v.uuid, { line, parent: v.parentUuid ?? null })
-    } catch { /* skip */ }
-  }
-  const keep = new Set()
-  let cur = atUuid
-  while (cur && byUuid.has(cur)) {
-    keep.add(cur)
-    cur = byUuid.get(cur).parent
-  }
-  return lines.filter((line) => {
-    try { const v = JSON.parse(line); return v.uuid ? keep.has(v.uuid) : false } catch { return false }
-  })
-}
-
-let placeholderCounter = 0
-const rl = readline.createInterface({ input: process.stdin, terminal: false })
-rl.on('line', (line) => {
-  const trimmed = line.trim()
-  if (!trimmed) return
-  let msg
-  try { msg = JSON.parse(trimmed) } catch { return }
-  if (msg.type === 'create') {
-    // Log the WHOLE create request verbatim — the harness asserts resume/fork keys.
-    if (logPath) fs.appendFileSync(logPath, `${JSON.stringify(msg)}\n`)
-    placeholderCounter += 1
-    const sessionId = `fake-sidecar-${process.pid}-${placeholderCounter}`
-    fs.mkdirSync(projDir, { recursive: true })
-    if (msg.boot?.kind === 'fork') {
-      // Fork-at-point: NEW durable id, child file = the parent transcript's prefix.
-      const src = msg.boot?.resume
-      let lines = readLines(src)
-      if (msg.boot?.resumeSessionAt) lines = prefixThrough(lines, msg.boot?.resumeSessionAt)
-      cliId = mintCliId()
-      turnCount = 0
-      fs.writeFileSync(transcriptPath(cliId), lines.length ? `${lines.join('\n')}\n` : '')
-    } else {
-      cliId = mintCliId()
-      turnCount = 0
-      fs.writeFileSync(transcriptPath(cliId), '')
-    }
-    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 }) + '\n')
-    process.stdout.write(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId: cliId, model: 'fake-model', cwd: '/tmp', tools: [] }) + '\n')
-    process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }) + '\n')
-  } else if (msg.type === 'send') {
-    turnCount += 1
-    let parent = null
-    for (const line of readLines(cliId)) {
-      try { const v = JSON.parse(line); if (v.uuid) parent = v.uuid } catch { /* skip */ }
-    }
-    const u = `u${turnCount}`
-    const a = `a${turnCount}`
-    const user = { type: 'user', uuid: u, parentUuid: parent, timestamp: `t${turnCount}a`, cwd: '/tmp', message: { role: 'user', content: [{ type: 'text', text: msg.text }] } }
-    const assistant = { type: 'assistant', uuid: a, parentUuid: u, timestamp: `t${turnCount}b`, message: { role: 'assistant', content: [{ type: 'text', text: `answer ${turnCount}` }] } }
-    fs.appendFileSync(transcriptPath(cliId), `${JSON.stringify(user)}\n${JSON.stringify(assistant)}\n`)
-    // The rollback capture surface must NEVER see a completion chime; the
-    // turn's result is the busy-clear edge (no per-turn idle, like the real
-    // sidecar).
-    process.stdout.write(JSON.stringify({ type: 'sdk.result', sessionId: msg.sessionId, result: 'success', durationMs: 1, costUsd: 0, usage: {} }) + '\n')
-  } else if (msg.type === 'rollback.quiesce') {
-    // ep4-r3 wire parity: rollback's pre-teardown probe — this fake never has
-    // an inflight turn at that point (its sends settle their statuses
-    // immediately) and nothing sits in an SDK-input queue.
-    process.stdout.write(JSON.stringify({ type: 'sdk.rollback.quiesced', sessionId: msg.sessionId, probeId: msg.probeId ?? null, cancelledQueue: 0, inFlightTurn: false, handedCompactLikely: false }) + '\n')
-  } else if (msg.type === 'interrupt') {
-    // ep4-r2 wire parity: the real sidecar always answers with the signed
-    // settle; on this fake nothing is ever in flight mid-rollback, matching
-    // the real sidecar's 'no in-flight SDK query' answer (NO trailing result
-    // — no turn exists to terminate).
-    process.stdout.write(JSON.stringify({ type: 'sdk.interrupt_settled', sessionId: msg.sessionId, ok: false, message: 'no in-flight SDK query' }) + '\n')
-  } else if (msg.type === 'shutdown') {
-    process.exit(0)
-  }
-})
-"#;
-
-/// One test's installed rig: fake sidecar on disk + env vars + temp HOME.
-struct RollbackRig {
-    home: tempfile::TempDir,
-    sidecar_log: PathBuf,
-}
-impl RollbackRig {
-    fn install() -> Self {
-        let home = tempfile::tempdir().expect("temp home");
-        let dir = home.path().join("rig");
-        std::fs::create_dir_all(&dir).expect("rig dir");
-        let script = dir.join("fake-claude-rollback-sidecar.mjs");
-        std::fs::write(&script, FAKE_ROLLBACK_SIDECAR_SOURCE).expect("write fake sidecar");
-        let sidecar_log = dir.join("creates.log");
-        std::fs::write(&sidecar_log, "").expect("init creates log");
-        std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
-        std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
-        std::env::set_var("FRESHELL_TEST_CLAUDE_ROLLBACK_LOG", &sidecar_log);
-        std::env::set_var("CLAUDE_CONFIG_DIR", home.path().join("claude-store"));
-        Self { home, sidecar_log }
-    }
-
-    fn ledger_dir(&self) -> PathBuf {
-        self.home.path().join(".freshell/pane-ledger")
-    }
-    /// Every create request the fake sidecar received, in order.
-    fn create_lines(&self) -> Vec<Value> {
-        std::fs::read_to_string(&self.sidecar_log)
-            .unwrap_or_default()
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str(l).expect("create log line is JSON"))
-            .collect()
-    }
-}
-impl Drop for RollbackRig {
-    fn drop(&mut self) {
-        std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
-        std::env::remove_var("FRESHELL_CLAUDE_NODE");
-        std::env::remove_var("FRESHELL_TEST_CLAUDE_ROLLBACK_LOG");
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
-    }
-}
-
-/// The rollback-record-provisioning identity sink, backed by the REAL pane
-/// ledger — mirrors `freshell-server/src/identity_sink.rs`'s LedgerIdentitySink
-/// (the ws-test crate cannot depend on freshell-server: the dep edge runs the
-/// other way), INCLUDING the claude-adoption rollback-row re-key that rides the
-/// awaited binding batch.
-struct TestLedgerSink {
-    ledger: Arc<PaneLedger>,
-}
-impl TestLedgerSink {
-    fn now_ms() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0)
-    }
-}
-impl PaneIdentitySink for TestLedgerSink {
-    fn record_pending(&self, placeholder_id: &str, mode: &str, cwd: Option<&str>) -> SinkWrite {
-        let ledger = self.ledger.clone();
-        let (p, m, c) = (
-            placeholder_id.to_string(),
-            mode.to_string(),
-            cwd.map(str::to_string),
-        );
-        let now = Self::now_ms();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                ledger.record_pending(
-                    &p,
-                    &m,
-                    c.as_deref(),
-                    None,
-                    freshell_ws::pane_ledger::ProvenanceStamps::default(),
-                    now,
-                )
-            })
-            .await
-            .map_err(std::io::Error::other)?
-        })
-    }
-    fn record_binding(&self, upsert: FreshAgentBindingUpsert) -> SinkWrite {
-        let ledger = self.ledger.clone();
-        let now = Self::now_ms();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let stored_genesis = upsert.genesis.stored_value();
-                let w = FreshAgentBindingWrite {
-                    genesis: freshell_ws::pane_ledger::GenesisWrite::from_update(
-                        stored_genesis.as_ref(),
-                        upsert.genesis.is_clear(),
-                    ),
-                    provider: &upsert.provider,
-                    session_id: &upsert.session_id,
-                    mode: &upsert.mode,
-                    cwd: upsert.settings.cwd.as_deref(),
-                    create_request_id: upsert.create_request_id.as_deref(),
-                    model: upsert.settings.model.as_deref(),
-                    sandbox: upsert.settings.sandbox.as_deref(),
-                    permission_mode: upsert.settings.permission_mode.as_deref(),
-                    effort: upsert.settings.effort.as_deref(),
-                    supersedes: upsert.supersedes.as_deref(),
-                    provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
-                    observed_epoch: None,
-                    observed_generation: None,
-                    authoritative: upsert.authoritative,
-                    now_ms: now,
-                    plugins: upsert.settings.plugins.as_deref(),
-                };
-                ledger.record_fresh_agent_binding(&w)?;
-                // kata 1wxv Task 4 (claude adoption): the rollback row re-keys
-                // old→new in the SAME awaited batch as the binding write.
-                if upsert.provider == "claude" {
-                    if let Some(old_id) = upsert.supersedes.as_deref() {
-                        if old_id != upsert.session_id {
-                            if let Some(payload) =
-                                ledger.load_rollback_row(&upsert.provider, old_id)
-                            {
-                                ledger.record_rollback_row(
-                                    &upsert.provider,
-                                    &upsert.session_id,
-                                    &payload,
-                                    now,
-                                )?;
-                                if let Err(e) = ledger.delete_rollback_row(&upsert.provider, old_id) {
-                                    tracing::warn!(error = %e, session = %old_id, "rollback row re-key: old row delete failed (cosmetic)");
-                                }
-                            }
-                        }
-                    }
-                }
-                if let Some(p) = upsert.resolves_pending.as_deref() {
-                    let _ = ledger.delete_pending(p);
-                }
-                Ok(())
-            })
-            .await
-            .map_err(std::io::Error::other)?
-        })
-    }
-    fn load_settings(&self, _provider: &str, _session_id: &str) -> Option<FreshAgentSettings> {
-        None
-    }
-    fn load_provenance(
-        &self,
-        _provider: &str,
-        _session_id: &str,
-    ) -> Option<freshell_freshagent::BindProvenance> {
-        // Rollback-focused double (like `load_settings` above): these
-        // rollback tests never cold-attach a codex/opencode session, so the
-        // provenance read-back is out of their contract.
-        None
-    }
-    fn load_genesis(
-        &self,
-        provider: &str,
-        session_id: &str,
-    ) -> Option<freshell_freshagent::RecordedGenesis> {
-        let row = self.ledger.load_binding(provider, session_id)?;
-        if row.pane_kind.as_deref() != Some("fresh-agent") {
-            return None;
-        }
-        freshell_freshagent::RecordedGenesis::from_row(
-            provider,
-            session_id,
-            row.genesis.as_ref(),
-            row.updated_at,
-        )
-    }
-
-    fn clear_genesis(&self, provider: &str, session_id: &str) -> SinkWrite {
-        let ledger = self.ledger.clone();
-        let (p, s) = (provider.to_string(), session_id.to_string());
-        let now = Self::now_ms();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                ledger.clear_binding_genesis(&p, &s, now).map(|_| ())
-            })
-            .await
-            .map_err(std::io::Error::other)?
-        })
-    }
-
-    fn was_recorded(&self, provider: &str, session_id: &str) -> bool {
-        self.ledger.load_binding(provider, session_id).is_some()
-    }
-    fn record_rollback(
-        &self,
-        provider: &str,
-        session_id: &str,
-        record: RollbackRecord,
-    ) -> SinkWrite {
-        let ledger = self.ledger.clone();
-        let (p, s) = (provider.to_string(), session_id.to_string());
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let payload = serde_json::to_value(&record).map_err(std::io::Error::other)?;
-                ledger.record_rollback_row(&p, &s, &payload, TestLedgerSink::now_ms())
-            })
-            .await
-            .map_err(std::io::Error::other)?
-        })
-    }
-    fn repair_failed_transition(
-        &self,
-        provider: &str,
-        session_id: &str,
-        epoch: u64,
-        generation: u64,
-    ) -> SinkWrite {
-        let ledger = self.ledger.clone();
-        let (p, s) = (provider.to_string(), session_id.to_string());
-        let now = Self::now_ms();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                ledger.repair_failed_transition_binding(&p, &s, epoch, generation, now)
-            })
-            .await
-            .map_err(std::io::Error::other)?
-        })
-    }
-    fn load_rollback(&self, provider: &str, session_id: &str) -> Option<RollbackRecord> {
-        // Mirror of freshell-server's LedgerIdentitySink: the shared migrating
-        // reader owns the version gate + the legacy epochless-union migration
-        // (focused ep1-r1 F3, absence-keyed per ep1-r2 F1).
-        let payload = self.ledger.load_rollback_row(provider, session_id)?;
-        RollbackRecord::from_stored_payload(payload)
-    }
-    fn delete_rollback(&self, provider: &str, session_id: &str) -> SinkWrite {
-        let ledger = self.ledger.clone();
-        let (p, s) = (provider.to_string(), session_id.to_string());
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || ledger.delete_rollback_row(&p, &s))
-                .await
-                .map_err(std::io::Error::other)?
-        })
-    }
-
-    fn lookup_by_create_request_id(
-        &self,
-        provider: &str,
-        create_request_id: &str,
-    ) -> Option<String> {
-        self.ledger
-            .lookup_by_create_request_id(provider, create_request_id)
-            .map(|row| row.session_id)
-    }
-
-    // Retire-on-kill (delta-review round 5): the same real-ledger pass-through
-    // the LedgerIdentitySink this double mirrors now implements.
-    fn retire_closed(&self, provider: &str, session_id: &str) -> SinkCloseWrite {
-        let ledger = self.ledger.clone();
-        let (p, s) = (provider.to_string(), session_id.to_string());
-        Box::pin(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                ledger.retire_closed(&p, &s, TestLedgerSink::now_ms())
-            })
-            .await
-            .map_err(|join| {
-                freshell_freshagent::identity_sink::SinkCloseError::Clean(std::io::Error::other(
-                    join,
-                ))
-            })?;
-            result.map_err(|err| match err {
-                freshell_ws::pane_ledger::CloseEnvelopeError::Clean(e) => {
-                    freshell_freshagent::identity_sink::SinkCloseError::Clean(e)
-                }
-                freshell_ws::pane_ledger::CloseEnvelopeError::Persisted(e) => {
-                    freshell_freshagent::identity_sink::SinkCloseError::Persisted(e)
-                }
-            })
-        })
-    }
-
-    /// Delta-r6-r3: the real-ledger delegation mirrors
-    /// `freshell-server/src/identity_sink.rs`'s `retire_closed_batch`
-    /// (the ledger envelope is the atomicity point; one spawn_blocking hop).
-    fn retire_closed_batch(
-        &self,
-        provider: &str,
-        session_ids: &[String],
-        pending_ids: &[String],
-    ) -> SinkCloseWrite {
-        let ledger = self.ledger.clone();
-        let p = provider.to_string();
-        let ids = session_ids.to_vec();
-        let pendings = pending_ids.to_vec();
-        Box::pin(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                ledger.close_identities(&p, &ids, &pendings, TestLedgerSink::now_ms())
-            })
-            .await
-            .map_err(|join| {
-                freshell_freshagent::identity_sink::SinkCloseError::Clean(std::io::Error::other(
-                    join,
-                ))
-            })?;
-            result.map_err(|err| match err {
-                freshell_ws::pane_ledger::CloseEnvelopeError::Clean(e) => {
-                    freshell_freshagent::identity_sink::SinkCloseError::Clean(e)
-                }
-                freshell_ws::pane_ledger::CloseEnvelopeError::Persisted(e) => {
-                    freshell_freshagent::identity_sink::SinkCloseError::Persisted(e)
-                }
-            })
-        })
-    }
-    fn delete_pending(&self, placeholder_id: &str) -> SinkWrite {
-        let ledger = self.ledger.clone();
-        let p = placeholder_id.to_string();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || ledger.delete_pending(&p))
-                .await
-                .map_err(std::io::Error::other)?
-        })
-    }
-
-    // Focused-ep5-r1 Finding 2: same real-ledger pass-through as `retire_closed`.
-    fn clear_kill_tombstone(&self, provider: &str, session_id: &str) -> SinkWrite {
-        let ledger = self.ledger.clone();
-        let (p, s) = (provider.to_string(), session_id.to_string());
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || ledger.clear_kill_tombstone(&p, &s))
-                .await
-                .map_err(std::io::Error::other)?
-        })
-    }
-
-    // Focused-ep5-r3 Finding 1 (retire-on-kill round 4): the snapshot read is
-    // a memory-only inline pass-through (the LedgerIdentitySink discipline).
-    fn kill_tombstone_at_ms(&self, provider: &str, session_id: &str) -> Option<i64> {
-        self.ledger.kill_tombstone_at(provider, session_id)
-    }
-
-    // Retire-on-kill round 5 (focused-ep5-r4 Finding 2): the alias-tombstone
-    // retention probe — memory-only inline pass-through like the snapshot read.
-    fn row_is_bound(&self, provider: &str, session_id: &str) -> bool {
-        self.ledger.row_is_bound(provider, session_id)
-    }
-
-    // Focused-ep5-r3 Findings 1+3: the conditional single-transition claim
-    // commit — a faithful pass-through to the real ledger op.
-    fn commit_claim(
-        &self,
-        provider: &str,
-        session_id: &str,
-        expect_killed_at_ms: Option<i64>,
-    ) -> SinkCommitWrite {
-        self.commit_claim_aliased(provider, session_id, expect_killed_at_ms, &[])
-    }
-    // Focused-ep5-r5 Finding 2 (retire-on-kill round 6): the aliased commit's
-    // faithful pass-through (the alias gate lives inside the ledger's
-    // guarded transition).
-    fn commit_claim_aliased(
-        &self,
-        provider: &str,
-        session_id: &str,
-        expect_killed_at_ms: Option<i64>,
-        fence_checked_aliases: &[String],
-    ) -> SinkCommitWrite {
-        let ledger = self.ledger.clone();
-        let (p, s) = (provider.to_string(), session_id.to_string());
-        let aliases: Vec<String> = fence_checked_aliases.to_vec();
-        Box::pin(async move {
-            let outcome = tokio::task::spawn_blocking(move || {
-                ledger.commit_claim_aliased(
-                    &p,
-                    &s,
-                    expect_killed_at_ms,
-                    &aliases,
-                    TestLedgerSink::now_ms(),
-                )
-            })
-            .await
-            .map_err(std::io::Error::other)??;
-            Ok(match outcome {
-                freshell_ws::pane_ledger::ClaimCommitOutcome::Committed => ClaimCommit::Committed,
-                freshell_ws::pane_ledger::ClaimCommitOutcome::RefusedStale => {
-                    ClaimCommit::RefusedStale
-                }
-            })
-        })
-    }
-    // Finding 2's alias-record pass-throughs (same disciplines as the rest of
-    // the test double).
-    fn record_alias_tombstone(
-        &self,
-        provider: &str,
-        placeholder: &str,
-        durable: &str,
-        at_ms: i64,
-    ) -> SinkWrite {
-        let ledger = self.ledger.clone();
-        let (p, ph, d) = (
-            provider.to_string(),
-            placeholder.to_string(),
-            durable.to_string(),
-        );
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || ledger.record_alias_tombstone(&p, &ph, &d, at_ms))
-                .await
-                .map_err(std::io::Error::other)?
-        })
-    }
-    fn alias_tombstone_records(&self, provider: &str, placeholder: &str) -> Vec<(String, i64)> {
-        self.ledger.alias_tombstone_records(provider, placeholder)
-    }
-    fn clear_alias_tombstones_for_durable(
-        &self,
-        provider: &str,
-        durable: &str,
-    ) -> SinkAliasClearWrite {
-        let ledger = self.ledger.clone();
-        let (p, d) = (provider.to_string(), durable.to_string());
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || ledger.clear_alias_tombstones_for_durable(&p, &d))
-                .await
-                .map_err(std::io::Error::other)?
-        })
-    }
-}
-
-fn test_settings_value() -> Value {
-    json!({
-        "ai": {},
-        "codingCli": { "enabledProviders": [], "mcpServer": true, "providers": {} },
-        "editor": { "externalEditor": "auto" },
-        "extensions": { "disabled": [] },
-        "freshAgent": { "defaultPlugins": [], "enabled": true, "providers": {} },
-        "logging": { "debug": false },
-        "network": { "configured": true, "host": "127.0.0.1" },
-        "panes": { "defaultNewPane": "ask" },
-        "safety": { "autoKillIdleMinutes": 15 },
-        "sidebar": {
-            "autoGenerateTitles": true,
-            "excludeFirstChatMustStart": false,
-            "excludeFirstChatSubstrings": []
+async fn rollback_rig() -> ClaudeRig {
+    ClaudeRig::start_with_options(
+        RigKind::Sim,
+        RigOptions {
+            durable_ledger: true,
+            ..RigOptions::default()
         },
-        "terminal": { "scrollback": 10000 }
-    })
-}
-
-/// Real axum server (ephemeral loopback) with the ws route AND the fresh-agent
-/// snapshot route merged (mirroring freshell-server's main.rs), the pane ledger
-/// rooted under the rig's `.freshell/pane-ledger`, and fresh_claude's identity
-/// sink wired to it. Returns (ws_url, http_addr, ledger).
-async fn spawn_server_with_rollback_rig(
-    rig: &RollbackRig,
-) -> (String, std::net::SocketAddr, Arc<PaneLedger>) {
-    let auth_token = Arc::new(AUTH_TOKEN.to_string());
-    let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
-    let settings =
-        Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
-    let pane_ledger = Arc::new(PaneLedger::new(Some(rig.ledger_dir())));
-
-    let fresh_claude = freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx));
-    fresh_claude.set_identity_sink(Arc::new(TestLedgerSink {
-        ledger: Arc::clone(&pane_ledger),
-    }));
-
-    let state = WsState {
-        pane_ledger: Arc::clone(&pane_ledger),
-        layout: Default::default(),
-        identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
-        terminal_meta: Default::default(),
-        auth_token: Arc::clone(&auth_token),
-        server_instance_id: Arc::new("srv-test".to_string()),
-        boot_id: Arc::new("boot-test".to_string()),
-        settings,
-        handshake_settings: Arc::new(tokio::sync::RwLock::new(
-            serde_json::from_value(test_settings_value()).expect("valid settings fixture"),
-        )),
-        broadcast_tx: Arc::clone(&broadcast_tx),
-        auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
-        auto_resume_cancels: Default::default(),
-        fresh_codex: freshell_freshagent::FreshCodexState::new(
-            Arc::clone(&auth_token),
-            Arc::clone(&broadcast_tx),
-            json!({ "freshAgent": { "enabled": true } }),
-        ),
-        fresh_claude: fresh_claude.clone(),
-        fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
-            freshell_freshagent::FreshAgentState::new(
-                Arc::clone(&auth_token),
-                Arc::clone(&broadcast_tx),
-            ),
-        ),
-        registry: freshell_terminal::TerminalRegistry::new(),
-        tabs: freshell_ws::tabs::TabsRegistry::new(),
-        screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
-        subagent_interest: Default::default(),
-        host_stats: Default::default(),
-        checkpoint_send: Default::default(),
-        terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-        sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-        cli_commands: Arc::new(Vec::new()),
-        shutdown: Arc::new(tokio::sync::Notify::new()),
-        ping_interval_ms: 30_000,
-        hello_timeout_ms: 5_000,
-        allowed_origins: Arc::new(freshell_ws::origin::default_allowed_origins()),
-        ws_max_payload_bytes: 16 * 1024 * 1024,
-        term09: freshell_ws::backpressure::Term09Config::default(),
-        create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
-        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
-        shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
-        config_fallback: None,
-        opencode_locator: None,
-        codex_locator: None,
-        activity: None,
-        session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
-        reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-        fresh_agent_respawn_counts: Default::default(),
-        ownership: None,
-    };
-
-    let fresh_agent = freshell_freshagent::FreshAgentState::new(
-        Arc::clone(&auth_token),
-        Arc::clone(&broadcast_tx),
-    );
-    let snapshot_state = freshell_freshagent::SnapshotState::new(
-        Arc::clone(&auth_token),
-        state.fresh_codex.clone(),
-        fresh_agent,
-        state.fresh_claude.clone(),
-    );
-    let router =
-        freshell_ws::router(state).merge(freshell_freshagent::snapshot::router(snapshot_state));
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral loopback port");
-    let addr = listener.local_addr().expect("local addr");
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
-    (format!("ws://{addr}/ws"), addr, pane_ledger)
-}
-
-async fn send_json(ws: &mut TestWs, value: &Value) {
-    ws.send(WsMessage::Text(value.to_string()))
-        .await
-        .expect("send frame");
-}
-
-/// A capture bag with a CONSUME cursor: every awaited scan STARTS with the
-/// bag's unconsumed tail (a prior await's drain may already have captured the
-/// wanted frame — the undo ack's drain also captures the materialized broadcast
-/// riding immediately behind it), and consumes exactly the matched frame.
-#[derive(Default)]
-struct FrameBag {
-    entries: Vec<(bool, Value)>,
-}
-impl FrameBag {
-    fn collect(&mut self, value: Value) {
-        self.entries.push((false, value));
-    }
-    fn take_matching(&mut self, pred: &dyn Fn(&Value) -> bool) -> Option<Value> {
-        let pos = self
-            .entries
-            .iter()
-            .position(|(consumed, v)| !*consumed && pred(v))?;
-        self.entries[pos].0 = true;
-        Some(self.entries[pos].1.clone())
-    }
-    fn recent_types(&self) -> Vec<String> {
-        self.entries
-            .iter()
-            .rev()
-            .take(12)
-            .map(|(_, f)| {
-                format!(
-                    "{}/{}",
-                    f["type"].as_str().unwrap_or("?"),
-                    f["event"]["type"].as_str().unwrap_or("-")
-                )
-            })
-            .collect()
-    }
-}
-
-/// Drain frames into `bag` until `pred` matches one (bounded); returns the match.
-async fn await_frame_into(
-    ws: &mut TestWs,
-    bag: &mut FrameBag,
-    budget_secs: u64,
-    pred: impl Fn(&Value) -> bool,
-) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(budget_secs);
-    loop {
-        if let Some(value) = bag.take_matching(&pred) {
-            return value;
-        }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let msg = tokio::time::timeout(remaining, ws.next())
-            .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "frame within budget (recent frames seen: {:?})",
-                    bag.recent_types()
-                )
-            })
-            .expect("stream not ended")
-            .expect("no ws error");
-        if let WsMessage::Text(text) = msg {
-            bag.collect(serde_json::from_str(&text).unwrap());
-        }
-    }
-}
-
-async fn http_get_json(addr: &std::net::SocketAddr, path: &str) -> Value {
-    let mut stream = tokio::net::TcpStream::connect(addr)
-        .await
-        .expect("http connect");
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nx-auth-token: {AUTH_TOKEN}\r\nConnection: close\r\n\r\n"
-    );
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .expect("http write");
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await.expect("http read");
-    let text = String::from_utf8(buf).expect("utf8 response");
-    let body = text.split("\r\n\r\n").nth(1).expect("http body present");
-    serde_json::from_str(body.trim()).expect("json snapshot body")
-}
-
-/// Boot the rig and drive a freshclaude pane through `prompts` sends; returns
-/// (ws, original durable cli id, every frame seen so far).
-async fn drive_conversation(
-    rig: &RollbackRig,
-    prompts: &[&str],
-) -> (
-    TestWs,
-    std::net::SocketAddr,
-    Arc<PaneLedger>,
-    FrameBag,
-    String,
-) {
-    let (url, addr, ledger) = spawn_server_with_rollback_rig(rig).await;
-    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
-    let mut frames = FrameBag::default();
-
-    send_json(
-        &mut ws,
-        &json!({
-            "type": "freshAgent.create",
-            "requestId": "req-create-1",
-            "sessionType": "freshclaude",
-            "provider": "claude",
-        }),
     )
-    .await;
-    await_frame_into(&mut ws, &mut frames, 15, |v| {
-        v["type"] == json!("freshAgent.created") && v["requestId"] == json!("req-create-1")
-    })
-    .await;
-    // The durable id arrives on the session.init broadcast; its consumer-side fold
-    // (cli_index insert) precedes the broadcast, so this settles the alias too.
-    let init = await_frame_into(&mut ws, &mut frames, 15, |v| {
-        v["type"] == json!("freshAgent.event")
-            && v["event"]["type"] == json!("freshAgent.session.init")
-    })
-    .await;
-    let original = init["event"]["cliSessionId"]
-        .as_str()
-        .expect("cliSessionId on the init frame")
-        .to_string();
-    // Drain the POST-CREATE idle (the fake emits one idle right after init): each
-    // per-send idle await below must pair with THAT send's emission, or the undo
-    // could observe a not-yet-appended transcript.
-    await_frame_into(&mut ws, &mut frames, 15, |v| {
-        v["type"] == json!("freshAgent.event")
-            && v["event"]["type"] == json!("freshAgent.status")
-            && v["event"]["status"] == json!("idle")
-    })
-    .await;
-    for (i, prompt) in prompts.iter().enumerate() {
-        send_json(
-            &mut ws,
-            &json!({
-                "type": "freshAgent.send",
-                "provider": "claude",
-                "sessionId": original,
-                "sessionType": "freshclaude",
-                "text": prompt,
-                "requestId": format!("send-{i}"),
-            }),
-        )
-        .await;
-        await_frame_into(&mut ws, &mut frames, 15, |v| {
-            v["type"] == json!("freshAgent.send.accepted")
-                && v["requestId"] == json!(format!("send-{i}"))
-        })
-        .await;
-        // The fake appends the u<n>/a<n> pair BEFORE answering with the result,
-        // so this waits out both the transcript append AND the busy-clear edge.
-        await_frame_into(&mut ws, &mut frames, 15, |v| {
-            v["type"] == json!("freshAgent.event")
-                && v["event"]["type"] == json!("freshAgent.result")
-        })
-        .await;
-    }
-    (ws, addr, ledger, frames, original)
+    .await
 }
 
-fn rollback_frame(request_id: &str, kind: &str, session_id: &str, mode: &str) -> Value {
-    json!({
+fn ledger(rig: &ClaudeRig) -> &freshell_ws::pane_ledger::PaneLedger {
+    rig.pane_ledger.as_deref().expect("the rig has a ledger")
+}
+
+/// One finished turn per prompt (each `freshAgent.result`), each on disk before
+/// the next: the CLI flushes a transcript line 95-200 ms after its SDK frame
+/// (T3), and an undo reads the transcript.
+async fn converse(rig: &ClaudeRig, conn: &mut RigConnection, session_id: &str, prompts: &[&str]) {
+    for (n, prompt) in prompts.iter().enumerate() {
+        let results_before = conn.events_seen("freshAgent.result");
+        conn.send_text(session_id, &format!("send-{session_id}-{n}"), prompt)
+            .await;
+        wait_for_results(conn, results_before + 1, prompt).await;
+        let path = rig
+            .wait_for_transcript(&conn.init_session_id(session_id))
+            .await;
+        let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
+        loop {
+            let lines = chain_lines(&path);
+            let at = lines.iter().rposition(|line| {
+                line["type"] == "user" && line["message"]["content"][0]["text"] == *prompt
+            });
+            if at.is_some_and(|at| lines[at..].iter().any(|line| line["type"] == "assistant")) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the turn for {prompt:?} never reached disk"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+async fn wait_for_results(conn: &mut RigConnection, count: usize, what: &str) {
+    let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
+    while conn.events_seen("freshAgent.result") < count {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the turn for {what:?} never finished; frames: {:?}",
+            conn.frames
+        );
+        conn.read_for(Duration::from_millis(50)).await;
+    }
+}
+
+/// `freshAgent.undo` / `freshAgent.redo` from the pane `pane_id`, fenced with the
+/// owner pair the client holds for the session's durable id (the client sends it
+/// with every rollback).
+async fn request_rollback(
+    conn: &mut RigConnection,
+    kind: &str,
+    pane_id: &str,
+    durable: &str,
+    request_id: &str,
+    turn_id: Option<&str>,
+) {
+    let (epoch, generation) = conn
+        .owner_pair(durable)
+        .unwrap_or_else(|| panic!("an owner record for {durable} was broadcast"));
+    let mut frame = json!({
         "type": format!("freshAgent.{kind}"),
         "provider": "claude",
-        "sessionId": session_id,
         "sessionType": "freshclaude",
+        "sessionId": pane_id,
         "requestId": request_id,
-        "mode": mode,
-    })
+        "mode": if turn_id.is_some() { "toTurn" } else { "step" },
+        "observedEpoch": epoch,
+        "observedGeneration": generation,
+    });
+    if let Some(turn_id) = turn_id {
+        frame["turnId"] = json!(turn_id);
+    }
+    conn.send(frame).await;
 }
 
-/// The durable rollback row files under `rollback/claude/` — exactly the rows the
-/// ledger holds for this provider.
-fn rollback_rows(ledger_dir: &Path) -> Vec<Value> {
-    let dir = ledger_dir.join("rollback").join("claude");
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
+/// The requester's answer to rollback `request_id`: the ack (`rolledBack` /
+/// `redone`) or the rollback error, within [`ROLLBACK_BUDGET`].
+async fn rollback_answer(conn: &mut RigConnection, request_id: &str) -> Value {
+    let started = tokio::time::Instant::now();
+    let answer = tokio::time::timeout(
+        ROLLBACK_BUDGET,
+        conn.wait_for(&format!("the answer to rollback {request_id}"), |v| {
+            v["type"] == "freshAgent.event"
+                && v["event"]["requestId"] == request_id
+                && matches!(
+                    v["event"]["type"].as_str(),
+                    Some("freshAgent.rolledBack" | "freshAgent.redone" | "freshAgent.error")
+                )
+        }),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "rollback {request_id} was not answered within {ROLLBACK_BUDGET:?}; frames: {:?}",
+            conn.frames
+        )
+    });
+    eprintln!(
+        "{}",
+        json!({ "severity": "info", "event": "rollback_answered", "request": request_id,
+                "ms": started.elapsed().as_millis() as u64 })
+    );
+    answer["event"].clone()
+}
+
+/// An undo or redo that must succeed: its ack, and the new session id it names.
+async fn rollback_ok(
+    conn: &mut RigConnection,
+    kind: &str,
+    pane_id: &str,
+    durable: &str,
+    request_id: &str,
+) -> (Value, String) {
+    request_rollback(conn, kind, pane_id, durable, request_id, None).await;
+    let ack = rollback_answer(conn, request_id).await;
+    let expected = if kind == "undo" {
+        "freshAgent.rolledBack"
+    } else {
+        "freshAgent.redone"
     };
-    entries
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-        .map(|e| serde_json::from_str(&std::fs::read_to_string(e.path()).unwrap()).unwrap())
+    assert_eq!(ack["type"], expected, "{ack}");
+    let new_id = ack["newSessionId"]
+        .as_str()
+        .expect("the ack names the replacement session")
+        .to_string();
+    (ack, new_id)
+}
+
+/// The `freshAgent.session.materialized` frame that re-keyed `from`.
+async fn materialized_from(conn: &mut RigConnection, from: &str) -> Value {
+    conn.wait_for(&format!("materialized {from}"), |v| {
+        v["type"] == "freshAgent.session.materialized" && v["previousSessionId"] == from
+    })
+    .await
+}
+
+/// The `query()` options the simulator recorded, in order.
+fn queries(rig: &ClaudeRig) -> Vec<Value> {
+    rig.ledger_rows("query")
+        .into_iter()
+        .map(|row| row["options"].clone())
         .collect()
 }
 
-fn assert_never_completes(frames: &FrameBag) {
-    assert!(
-        frames.entries.iter().all(|(_, f)| {
-            f.get("event")
-                .and_then(|e| e.get("type"))
-                .and_then(Value::as_str)
-                != Some("freshAgent.turn.complete")
-        }),
-        "a rollback NEVER chimes — no freshAgent.turn.complete anywhere in the capture"
+/// The recorded `query()` options of the boot that ran under `session_id`.
+fn boot_of(rig: &ClaudeRig, session_id: &str) -> Value {
+    let matching: Vec<Value> = queries(rig)
+        .into_iter()
+        .filter(|o| o["sessionId"] == session_id)
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "one boot under {session_id}: {:?}",
+        queries(rig)
+    );
+    matching.into_iter().next().unwrap()
+}
+
+/// The chain lines (those with a uuid) of a transcript, in file order.
+fn chain_lines(path: &Path) -> Vec<Value> {
+    std::fs::read_to_string(path)
+        .expect("read the transcript")
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|line| line["uuid"].is_string())
+        .collect()
+}
+
+fn uuid_where(lines: &[Value], what: &str, predicate: impl Fn(&Value) -> bool) -> String {
+    lines
+        .iter()
+        .find(|line| predicate(line))
+        .and_then(|line| line["uuid"].as_str())
+        .unwrap_or_else(|| panic!("no transcript line for {what}"))
+        .to_string()
+}
+
+fn prompt_uuid(lines: &[Value], text: &str) -> String {
+    uuid_where(lines, text, |line| {
+        line["type"] == "user" && line["message"]["content"][0]["text"] == text
+    })
+}
+
+/// The uuid of the last chain line before the line `uuid`.
+fn uuid_before(lines: &[Value], uuid: &str) -> String {
+    let at = lines
+        .iter()
+        .position(|line| line["uuid"] == uuid)
+        .expect("the line is in the transcript");
+    lines[at - 1]["uuid"].as_str().expect("a uuid").to_string()
+}
+
+async fn snapshot_turn_ids(rig: &ClaudeRig, session_id: &str) -> Vec<String> {
+    let snapshot = rig
+        .fresh_claude
+        .get_snapshot(SessionType::Freshclaude, session_id)
+        .await
+        .unwrap_or_else(|error| panic!("a snapshot of {session_id}: {error:?}"));
+    snapshot["turns"]
+        .as_array()
+        .expect("turns")
+        .iter()
+        .filter_map(|t| t["turnId"].as_str().map(str::to_string))
+        .collect()
+}
+
+fn transcript_of(rig: &ClaudeRig, session_id: &str) -> Option<PathBuf> {
+    let name = format!("{session_id}.jsonl");
+    rig.transcripts()
+        .into_iter()
+        .find(|path| path.file_name().and_then(|n| n.to_str()) == Some(name.as_str()))
+}
+
+/// Whether process `pid` is gone (or a zombie, which holds no pipes).
+fn process_gone(pid: i64) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .map(|(_, rest)| rest.trim_start().starts_with('Z'))
+            .unwrap_or(false),
+    }
+}
+
+/// The sidecar and stand-in CLI processes of the runtime that booted `session_id`.
+fn runtime_pids(rig: &ClaudeRig, session_id: &str) -> Vec<i64> {
+    let boot = rig
+        .ledger_rows("boot")
+        .into_iter()
+        .find(|row| row["sessionId"] == session_id)
+        .unwrap_or_else(|| panic!("a boot row for {session_id}"));
+    vec![
+        boot["pid"].as_i64().expect("the sidecar's pid"),
+        boot["cliPid"].as_i64().expect("the CLI's pid"),
+    ]
+}
+
+async fn wait_until_gone(pids: &[i64], what: &str) {
+    let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
+    while !pids.iter().all(|pid| process_gone(*pid)) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{what} ({pids:?}) is still running"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn assert_never_chimes(conn: &RigConnection) {
+    assert_eq!(
+        conn.events_seen("freshAgent.turn.complete"),
+        conn.events_seen("freshAgent.result"),
+        "a rollback never rings: one edge per turn, none for the rollback"
     );
 }
 
-/// The canonical Task 4 flow: two sends → undo step → the ack/materalized pair →
-/// every assertion the kata pins on the undo leg. Returns the state needed to
-/// continue (redo test drives on from here).
-async fn setup_and_undo_two_turn_conversation() -> (
-    RollbackRig,
-    TestWs,
-    std::net::SocketAddr,
-    Arc<PaneLedger>,
-    FrameBag,
-    String,
-    String,
-) {
-    let rig = RollbackRig::install();
-    let (mut ws, addr, ledger, mut frames, original) =
-        drive_conversation(&rig, &["first prompt", "second prompt"]).await;
+fn is_uuid(id: &str) -> bool {
+    uuid::Uuid::parse_str(id).is_ok()
+}
 
-    send_json(
-        &mut ws,
-        &rollback_frame("rb-undo-1", "undo", &original, "step"),
-    )
-    .await;
-    let ack = await_frame_into(&mut ws, &mut frames, 20, |v| {
-        v["type"] == json!("freshAgent.event")
-            && v["event"]["type"] == json!("freshAgent.rolledBack")
-    })
-    .await;
-    assert_eq!(ack["event"]["requestId"], json!("rb-undo-1"));
-    assert_eq!(ack["event"]["mode"], json!("step"));
-    assert_eq!(
-        ack["event"]["removedPromptText"],
-        json!("second prompt"),
-        "the ack carries the removed prompt for the composer refill"
-    );
-    assert_eq!(ack["event"]["canRedo"], json!(true));
-    let new_id = ack["event"]["newSessionId"]
-        .as_str()
-        .expect("claude ack carries the adopted id")
-        .to_string();
-    assert_ne!(new_id, original, "forkSession mints a fresh durable id");
-    let removed: Vec<&str> = ack["event"]["removedTurnIds"]
+/// A two-turn conversation on a new pane: (pane id, durable id A, A's transcript).
+async fn two_turns(rig: &ClaudeRig, conn: &mut RigConnection) -> (String, String, PathBuf) {
+    let pane = conn.create("create-1").await;
+    converse(rig, conn, &pane, &["first prompt", "second prompt"]).await;
+    let durable = conn.init_session_id(&pane);
+    let path = rig.wait_for_transcript(&durable).await;
+    (pane, durable, path)
+}
+
+/// G01: the undo answers in time. The pane is re-keyed to the new id C (a UUID
+/// minted by the server), the fork of A through the first answer booted under C
+/// with the drops-turn guard on the undone prompt, C's binding records how C came
+/// to be and supersedes A, the rollback record followed the pane, C's snapshot is
+/// the kept prefix, A's transcript is untouched and A's runtime was stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_undo_answers_in_time_with_a_fork_materialized_under_a_new_id() {
+    let rig = rollback_rig().await;
+    let mut conn = rig.connect().await;
+    let (pane, a, a_path) = two_turns(&rig, &mut conn).await;
+    let a_before = std::fs::read_to_string(&a_path).expect("read A");
+    let lines = chain_lines(&a_path);
+    let u2 = prompt_uuid(&lines, "second prompt");
+    let keep = uuid_before(&lines, &u2);
+    let a_runtime = runtime_pids(&rig, &a);
+
+    let (ack, c) = rollback_ok(&mut conn, "undo", &pane, &a, "undo-1").await;
+    assert_eq!(ack["removedPromptText"], "second prompt", "{ack}");
+    assert_eq!(ack["canRedo"], true, "{ack}");
+    assert!(is_uuid(&c) && c != a, "C is a new UUID: {c}");
+    let removed: Vec<&str> = ack["removedTurnIds"]
         .as_array()
         .expect("removedTurnIds")
         .iter()
         .filter_map(Value::as_str)
         .collect();
-    assert_eq!(removed, vec!["u2", "a2"], "{ack}");
+    assert_eq!(removed.first().copied(), Some(u2.as_str()), "{ack}");
 
-    // The materialized broadcast re-keyed the pane (existing repoint idiom).
-    let materialized = await_frame_into(&mut ws, &mut frames, 20, |v| {
-        v["type"] == json!("freshAgent.session.materialized")
-    })
-    .await;
-    assert_eq!(materialized["previousSessionId"], json!(original));
-    assert_eq!(materialized["sessionId"], json!(new_id));
-
-    // The fake sidecar saw the fork-at-point create with EXACTLY the computed options.
-    let creates = rig.create_lines();
-    let fork_create = creates
-        .iter()
-        .find(|l| l["boot"]["kind"] == json!("fork"))
-        .expect("fork create observed");
-    assert_eq!(fork_create["boot"]["resume"], json!(original));
+    let materialized = materialized_from(&mut conn, &pane).await;
+    assert_eq!(materialized["sessionId"], c.as_str());
     assert_eq!(
-        fork_create["boot"]["resumeSessionAt"],
-        json!("a1"),
-        "keep prefix through a1"
-    );
-    assert_eq!(
-        fork_create["boot"]["dropsTurn"],
-        json!("u2"),
-        "the guard is the first-to-discard turn's prompt uuid"
+        materialized["sessionRef"],
+        json!({ "provider": "claude", "sessionId": c })
     );
 
-    // REST snapshot by the NEW id is the prefix ("turns[] equals what the model sees next").
-    let snapshot = http_get_json(
-        &addr,
-        &format!("/api/fresh-agent/threads/freshclaude/claude/{new_id}"),
-    )
-    .await;
-    let turns = snapshot["turns"].as_array().expect("turns");
-    assert_eq!(turns.len(), 2, "prefix only: u1+a1");
-    assert_eq!(turns[0]["items"][0]["text"], json!("first prompt"));
-    assert_eq!(turns[1]["items"][0]["text"], json!("answer 1"));
+    let boot = boot_of(&rig, &c);
+    assert_eq!(boot["forkSession"], true, "{boot}");
+    assert_eq!(boot["resume"], a.as_str(), "{boot}");
+    assert_eq!(boot["resumeSessionAt"], keep.as_str(), "{boot}");
+    assert_eq!(boot["resumeDropsTurn"], u2.as_str(), "{boot}");
 
-    // The durable record: original_session_id + original_tip_uuid recorded for the
-    // redo contract, re-keyed to the adopted id (exactly ONE row survives the move).
-    let rows = rollback_rows(&rig.ledger_dir());
-    assert_eq!(rows.len(), 1, "the rollback row MOVED old→new: {rows:?}");
-    let record = &rows[0];
-    assert_eq!(record["originalSessionId"], json!(original));
+    let row = ledger(&rig)
+        .load_binding("claude", &c)
+        .expect("C's binding");
     assert_eq!(
-        record["originalTipUuid"],
-        json!("a2"),
-        "undo stamps the original's raw-chain tip"
+        row.genesis,
+        Some(json!({ "kind": "fork", "parent": a, "at": keep, "dropsTurn": u2 }))
     );
-    assert_eq!(record["canRedo"], json!(true));
-    assert!(record["redoDestroyed"].is_boolean() && record["redoDestroyed"] == json!(false));
-    let entry_ids: Vec<&str> = record["entries"]
-        .as_array()
-        .expect("entries")
-        .iter()
-        .flat_map(|e| e["removedTurns"].as_array().expect("removedTurns").iter())
-        .filter_map(|t| t["turnId"].as_str())
-        .collect();
+    assert_eq!(row.cwd.as_deref(), rig.workspace.to_str());
+    let superseded = ledger(&rig)
+        .load_binding("claude", &a)
+        .expect("A's binding");
     assert_eq!(
-        entry_ids,
-        vec!["u2", "a2"],
-        "the marker bucket carries the removed slice (r3 union)"
+        superseded.superseded_by.map(|locator| locator.session_id),
+        Some(c.clone()),
+        "A's binding names C as its successor"
     );
+    assert!(ledger(&rig).load_rollback_row("claude", &a).is_none());
+    let record = ledger(&rig)
+        .load_rollback_row("claude", &c)
+        .expect("the rollback record followed the pane to C");
+    assert_eq!(record["originalSessionId"], a.as_str());
 
-    assert_never_completes(&frames);
-    (rig, ws, addr, ledger, frames, original, new_id)
+    let c_turns = snapshot_turn_ids(&rig, &c).await;
+    let a_turns = snapshot_turn_ids(&rig, &a).await;
+    assert!(
+        !c_turns.is_empty() && a_turns.starts_with(&c_turns) && !c_turns.contains(&u2),
+        "C holds A's turns through the first answer: C {c_turns:?}, A {a_turns:?}"
+    );
+    assert_eq!(
+        transcript_of(&rig, &c),
+        None,
+        "the fork writes nothing yet (T6)"
+    );
+    assert_eq!(std::fs::read_to_string(&a_path).expect("read A"), a_before);
+    wait_until_gone(&a_runtime, "A's runtime").await;
+    assert!(rig.fresh_claude.has_live_session(&c).await);
+    assert_never_chimes(&conn);
 }
 
-#[tokio::test]
-async fn claude_undo_recreates_the_sidecar_with_resume_session_at_and_rekeys_the_pane() {
-    let _guard = CLAUDE_ENV_LOCK.lock().await;
+/// The fork materializes at its first prompt: the CLI reports C as the session
+/// (init), writes C's transcript with A's prefix (uuids kept) and the new turn,
+/// and the genesis is cleared once that transcript is on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_first_send_after_an_undo_writes_the_fork_under_its_id() {
+    let rig = rollback_rig().await;
+    let mut conn = rig.connect().await;
+    let (pane, a, a_path) = two_turns(&rig, &mut conn).await;
+    let a_before = std::fs::read_to_string(&a_path).expect("read A");
+    let (_, c) = rollback_ok(&mut conn, "undo", &pane, &a, "undo-1").await;
+    materialized_from(&mut conn, &pane).await;
+    let prefix = snapshot_turn_ids(&rig, &c).await;
+
+    converse(&rig, &mut conn, &c, &["a different second prompt"]).await;
+    assert_eq!(conn.init_session_id(&c), c, "the CLI ran under C");
+    let c_path = rig.wait_for_transcript(&c).await;
+    rig.wait_for_genesis_cleared(&c).await;
+    let c_lines = chain_lines(&c_path);
+    let a_lines = chain_lines(&a_path);
+    let kept = prefix.len();
+    assert!(kept > 0);
+    let materialized = snapshot_turn_ids(&rig, &c).await;
+    assert!(
+        materialized.starts_with(&prefix) && materialized.len() > prefix.len(),
+        "the prefix leads C with the same turn ids: {prefix:?} then {materialized:?}"
+    );
+    assert!(c_lines
+        .iter()
+        .any(|line| line["message"]["content"][0]["text"] == "a different second prompt"));
+    assert!(
+        c_lines[0]["uuid"] == a_lines[0]["uuid"],
+        "A's lines keep their uuids"
+    );
+    assert_eq!(std::fs::read_to_string(&a_path).expect("read A"), a_before);
+    assert_never_chimes(&conn);
+}
+
+/// Redo re-forks the chain root (A) through the restored turn: the restored
+/// session holds every turn again, and nothing beyond it is left to redo.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_redo_restores_the_undone_turn() {
+    let rig = rollback_rig().await;
+    let mut conn = rig.connect().await;
+    let (pane, a, a_path) = two_turns(&rig, &mut conn).await;
+    let all_turns = snapshot_turn_ids(&rig, &a).await;
+    let lines = chain_lines(&a_path);
+    let tip = lines.last().expect("a tip")["uuid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (_, c) = rollback_ok(&mut conn, "undo", &pane, &a, "undo-1").await;
+    materialized_from(&mut conn, &pane).await;
+
+    let (ack, d) = rollback_ok(&mut conn, "redo", &c, &c, "redo-1").await;
+    assert_eq!(ack["canRedo"], false, "{ack}");
+    assert!(is_uuid(&d) && d != c && d != a, "{d}");
+    materialized_from(&mut conn, &c).await;
+    let boot = boot_of(&rig, &d);
+    assert_eq!(boot["forkSession"], true, "{boot}");
+    assert_eq!(
+        boot["resume"],
+        a.as_str(),
+        "redo forks the chain root: {boot}"
+    );
+    assert_eq!(boot["resumeSessionAt"], tip.as_str(), "{boot}");
+    assert_eq!(
+        boot.get("resumeDropsTurn"),
+        None,
+        "nothing is discarded, so nothing is guarded: {boot}"
+    );
+    assert_eq!(snapshot_turn_ids(&rig, &d).await, all_turns);
+
+    converse(&rig, &mut conn, &d, &["third prompt"]).await;
+    assert_eq!(conn.init_session_id(&d), d);
+    assert_never_chimes(&conn);
+}
+
+/// §4.5 source collapse: a second undo before any send forks the ORIGINAL at the
+/// earlier point (chains never nest), so it boots although the first fork has no
+/// transcript; it discards two of A's turns, so no single-turn guard is armed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_undo_before_any_send_forks_the_original_again() {
+    let rig = rollback_rig().await;
+    let mut conn = rig.connect().await;
+    let pane = conn.create("create-1").await;
+    converse(
+        &rig,
+        &mut conn,
+        &pane,
+        &["first prompt", "second prompt", "third prompt"],
+    )
+    .await;
+    let a = conn.init_session_id(&pane);
+    let a_path = rig.wait_for_transcript(&a).await;
+    let lines = chain_lines(&a_path);
+    let keep = uuid_before(&lines, &prompt_uuid(&lines, "second prompt"));
+
+    let (_, c1) = rollback_ok(&mut conn, "undo", &pane, &a, "undo-1").await;
+    materialized_from(&mut conn, &pane).await;
+    let (ack, c2) = rollback_ok(&mut conn, "undo", &c1, &c1, "undo-2").await;
+    assert_eq!(ack["removedPromptText"], "second prompt", "{ack}");
+    assert_eq!(ack["canRedo"], true, "{ack}");
+    materialized_from(&mut conn, &c1).await;
+
+    let boot = boot_of(&rig, &c2);
+    assert_eq!(
+        boot["resume"],
+        a.as_str(),
+        "the fork of a fork forks A: {boot}"
+    );
+    assert_eq!(boot["resumeSessionAt"], keep.as_str(), "{boot}");
+    assert_eq!(
+        boot.get("resumeDropsTurn"),
+        None,
+        "two turns discarded: {boot}"
+    );
+    assert_eq!(
+        ledger(&rig)
+            .load_binding("claude", &c2)
+            .expect("C2's row")
+            .genesis,
+        Some(json!({ "kind": "fork", "parent": a, "at": keep }))
+    );
+    assert_eq!(transcript_of(&rig, &c1), None, "C1 never materialized");
+    let c2_turns = snapshot_turn_ids(&rig, &c2).await;
+    assert_eq!(c2_turns.len(), 2, "the first turn only: {c2_turns:?}");
+
+    // Redo still reaches the root's later turns from the collapsed chain.
+    let (_, d) = rollback_ok(&mut conn, "redo", &c2, &c2, "redo-1").await;
+    materialized_from(&mut conn, &c2).await;
+    assert_eq!(snapshot_turn_ids(&rig, &d).await.len(), 4);
+    converse(&rig, &mut conn, &d, &["a new third prompt"]).await;
+    assert_eq!(conn.init_session_id(&d), d);
+}
+
+/// First-turn undo (r2): the replacement is a FRESH conversation under C (no
+/// resume, no fork); its snapshot is empty; a redo restores the turn from A.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undoing_the_only_turn_starts_a_fresh_conversation_and_redo_restores_it() {
+    let rig = rollback_rig().await;
+    let mut conn = rig.connect().await;
+    let pane = conn.create("create-1").await;
+    converse(&rig, &mut conn, &pane, &["only prompt"]).await;
+    let a = conn.init_session_id(&pane);
+    let a_turns = snapshot_turn_ids(&rig, &a).await;
+
+    let (ack, c) = rollback_ok(&mut conn, "undo", &pane, &a, "undo-1").await;
+    assert_eq!(ack["removedPromptText"], "only prompt");
+    materialized_from(&mut conn, &pane).await;
+    let boot = boot_of(&rig, &c);
+    assert_eq!(boot.get("resume"), None, "{boot}");
+    assert_eq!(boot.get("forkSession"), None, "{boot}");
+    assert_eq!(
+        ledger(&rig)
+            .load_binding("claude", &c)
+            .expect("C's row")
+            .genesis,
+        Some(json!({ "kind": "fresh" }))
+    );
+    assert!(snapshot_turn_ids(&rig, &c).await.is_empty());
+
+    let (_, d) = rollback_ok(&mut conn, "redo", &c, &c, "redo-1").await;
+    materialized_from(&mut conn, &c).await;
+    assert_eq!(snapshot_turn_ids(&rig, &d).await, a_turns);
+    converse(&rig, &mut conn, &d, &["second prompt"]).await;
+    assert_eq!(conn.init_session_id(&d), d);
+}
+
+/// Decision 2: Claude folded another message into the turn being undone (here a
+/// background agent's completion notice, written into the launching turn, T19),
+/// so the fork's drops-turn guard is refused at boot. The undo answers
+/// ROLLBACK_REFUSED with a plain reason, is never retried without the guard,
+/// writes no rollback record, and the original stays live and takes a send. (A
+/// send absorbed during a tool call is refused the same way by the CLI, pinned
+/// by the `absorbed-undo` contract scenario; until the per-command ledger (C17)
+/// such a session still reads busy, so its undo answers BUSY_TURN first, G08.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_undo_of_a_turn_claude_folded_a_message_into_is_refused_and_the_session_stays_live() {
+    let rig = rollback_rig().await;
+    let mut conn = rig.connect().await;
+    let pane = conn.create("create-1").await;
+    converse(&rig, &mut conn, &pane, &["first prompt"]).await;
+    let results = conn.events_seen("freshAgent.result");
+    conn.send_text(&pane, "send-agent", "AGENT:async").await;
+    // The launching turn's result, then the turn the agent's completion starts.
+    wait_for_results(&mut conn, results + 2, "the background agent's turns").await;
+    let a = conn.init_session_id(&pane);
+    let a_path = rig.wait_for_transcript(&a).await;
+    let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
+    while !chain_lines(&a_path)
+        .iter()
+        .any(|line| line["origin"]["kind"] == "task-notification")
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no notification line"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let boots_before = queries(&rig).len();
+
+    request_rollback(&mut conn, "undo", &pane, &a, "undo-1", None).await;
+    let refused = rollback_answer(&mut conn, "undo-1").await;
+    assert_eq!(refused["type"], "freshAgent.error", "{refused}");
+    assert_eq!(refused["code"], "ROLLBACK_REFUSED", "{refused}");
+    assert_eq!(
+        refused["message"],
+        "Claude folded another message into that turn, so it can't be undone to that point."
+    );
+    let forks: Vec<Value> = queries(&rig).into_iter().skip(boots_before).collect();
+    assert_eq!(
+        forks.len(),
+        1,
+        "one guarded fork, never a guard-less retry: {forks:?}"
+    );
+    assert!(forks[0]["resumeDropsTurn"].is_string(), "{:?}", forks[0]);
+    assert!(ledger(&rig).load_rollback_row("claude", &a).is_none());
+    assert_eq!(
+        ledger(&rig)
+            .load_binding("claude", &a)
+            .expect("A's row")
+            .superseded_by,
+        None
+    );
+
+    let results = conn.events_seen("freshAgent.result");
+    conn.send_text(&pane, "send-after", "still here?").await;
+    wait_for_results(&mut conn, results + 1, "the send after the refusal").await;
+    assert_eq!(
+        conn.request_errors("send-after"),
+        Vec::<Value>::new(),
+        "A took the send"
+    );
+}
+
+/// The replacement fails to boot (here: A's transcript is moved away while the
+/// undo is parked before the boot, so the CLI cannot find the conversation to
+/// fork). The undo answers a retryable error, compensates its record, and A is
+/// untouched: still live, and it takes a send.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_that_cannot_boot_leaves_the_original_live() {
+    let rig = rollback_rig().await;
+    let mut conn = rig.connect().await;
+    let (pane, a, a_path) = two_turns(&rig, &mut conn).await;
+    let hold = rig.fresh_claude.hold_rollback_boot();
+    request_rollback(&mut conn, "undo", &pane, &a, "undo-1", None).await;
+    hold.parked().await;
+    let aside = a_path.with_extension("moved");
+    std::fs::rename(&a_path, &aside).expect("move A's transcript away");
+    hold.release();
+
+    let failed = rollback_answer(&mut conn, "undo-1").await;
+    assert_eq!(failed["type"], "freshAgent.error", "{failed}");
+    assert_eq!(failed["code"], "INTERNAL_ERROR", "{failed}");
+    std::fs::rename(&aside, &a_path).expect("put A's transcript back");
+    assert!(ledger(&rig).load_rollback_row("claude", &a).is_none());
+    assert!(rig.fresh_claude.has_live_session(&a).await);
+    assert_eq!(
+        conn.frames
+            .iter()
+            .filter(|v| v["type"] == "freshAgent.session.materialized")
+            .count(),
+        0
+    );
+
+    converse(&rig, &mut conn, &pane, &["third prompt"]).await;
+    assert_eq!(
+        conn.request_errors(&format!("send-{pane}-0")),
+        Vec::<Value>::new()
+    );
+}
+
+/// §4.5: a send that parked on the session's turn lock while the undo ran lands
+/// on the replacement C, never on the stopped A and never on a revived A.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_parked_behind_an_undo_runs_in_the_fork() {
     let logs = common::log_capture::install();
-    let (rig, _ws, _addr, _ledger, _frames, original, _new_id) =
-        setup_and_undo_two_turn_conversation().await;
-    // G14: the respawned sidecar's log is bound to the session the undo named.
+    let rig = rollback_rig().await;
+    let mut conn = rig.connect().await;
+    let (pane, a, a_path) = two_turns(&rig, &mut conn).await;
+    let hold = rig.fresh_claude.hold_rollback_boot();
+    request_rollback(&mut conn, "undo", &pane, &a, "undo-1", None).await;
+    hold.parked().await;
+    // The pane's next message, sent before it saw the re-key.
+    let results = conn.events_seen("freshAgent.result");
+    conn.send_text(&pane, "send-parked", "sent during the undo")
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    hold.release();
+
+    let (ack, c) = {
+        let ack = rollback_answer(&mut conn, "undo-1").await;
+        let c = ack["newSessionId"].as_str().expect("C").to_string();
+        (ack, c)
+    };
+    assert_eq!(ack["type"], "freshAgent.rolledBack", "{ack}");
+    wait_for_results(&mut conn, results + 1, "the parked send").await;
+    assert_eq!(conn.request_errors("send-parked"), Vec::<Value>::new());
+    let prompt = rig
+        .ledger_rows("prompt")
+        .into_iter()
+        .find(|row| row["text"] == "sent during the undo")
+        .expect("the parked send ran");
+    assert_eq!(
+        prompt["sessionId"],
+        c.as_str(),
+        "it ran in the fork: {prompt}"
+    );
+    let c_path = rig.wait_for_transcript(&c).await;
+    assert!(chain_lines(&c_path)
+        .iter()
+        .any(|line| line["message"]["content"][0]["text"] == "sent during the undo"));
+    assert!(!std::fs::read_to_string(&a_path)
+        .expect("read A")
+        .contains("sent during the undo"));
+    // It found C through the durable supersession chain from A, not a
+    // forward kept in memory.
+    let followed = logs.matching(|event| {
+        event.field("event") == Some("freshagent.claude.send_followed_replacement")
+            && event.field("replacement") == Some(c.as_str())
+    });
+    assert_eq!(followed.len(), 1, "{followed:?}");
+    assert_eq!(followed[0].field("through_ledger_chain"), Some("true"));
+}
+
+/// §4.3 "undo, then restart before sending": C's binding still holds its fork
+/// genesis, so after a restart the pane's attach boots the same lazy fork under
+/// C, its snapshot is the kept prefix, and its first send writes C.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pending_fork_survives_a_restart_with_its_prefix() {
+    let mut rig = rollback_rig().await;
+    let mut conn = rig.connect().await;
+    let (pane, a, _) = two_turns(&rig, &mut conn).await;
+    let (_, c) = rollback_ok(&mut conn, "undo", &pane, &a, "undo-1").await;
+    materialized_from(&mut conn, &pane).await;
+    let prefix = snapshot_turn_ids(&rig, &c).await;
+    drop(conn);
+
+    rig.restart().await;
+    assert_eq!(
+        snapshot_turn_ids(&rig, &c).await,
+        prefix,
+        "served from the genesis"
+    );
+    let mut conn = rig.connect().await;
+    conn.attach(&c).await;
+    let boots: Vec<Value> = queries(&rig)
+        .into_iter()
+        .filter(|o| o["sessionId"] == c.as_str())
+        .collect();
+    assert_eq!(
+        boots.len(),
+        2,
+        "the undo's boot and the restart's: {boots:?}"
+    );
+    assert_eq!(boots[1]["forkSession"], true, "{:?}", boots[1]);
+    assert_eq!(boots[1]["resume"], a.as_str(), "{:?}", boots[1]);
+    converse(&rig, &mut conn, &c, &["after the restart"]).await;
+    assert_eq!(conn.init_session_id(&c), c);
+    rig.wait_for_transcript(&c).await;
+    let turns = snapshot_turn_ids(&rig, &c).await;
+    assert!(
+        turns.starts_with(&prefix) && turns.len() > prefix.len(),
+        "{turns:?}"
+    );
+}
+
+/// G14: the fork's sidecar log lines are bound to the replacement's id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_forks_sidecar_log_is_bound_to_the_new_session() {
+    let logs = common::log_capture::install();
+    let rig = rollback_rig().await;
+    let mut conn = rig.connect().await;
+    let (pane, a, _) = two_turns(&rig, &mut conn).await;
+    let (_, c) = rollback_ok(&mut conn, "undo", &pane, &a, "undo-1").await;
     let bound = logs.matching(|event| {
         event.message == "freshagent.claude.sidecar_bound"
-            && event.field("session_id") == Some(original.as_str())
+            && event.field("session_id") == Some(c.as_str())
     });
     assert_eq!(bound.len(), 1, "{bound:?}");
     assert_eq!(bound[0].field("session_type"), Some("freshclaude"));
-    drop(rig);
 }
 
-#[tokio::test]
-async fn claude_redo_reforks_from_the_original_at_a_later_point() {
-    let _guard = CLAUDE_ENV_LOCK.lock().await;
-    let (rig, mut ws, addr, _ledger, mut frames, original, new_id) =
-        setup_and_undo_two_turn_conversation().await;
+// ── G28: an unreadable transcript store never reads as an empty one ──────────
 
-    send_json(
-        &mut ws,
-        &rollback_frame("rb-redo-1", "redo", &new_id, "step"),
-    )
-    .await;
-    let ack = await_frame_into(&mut ws, &mut frames, 20, |v| {
-        v["type"] == json!("freshAgent.event") && v["event"]["type"] == json!("freshAgent.redone")
-    })
-    .await;
-    assert_eq!(ack["event"]["requestId"], json!("rb-redo-1"));
-    assert_eq!(
-        ack["event"]["restoredThroughTurnId"],
-        json!("a2"),
-        "redo restores through the restored step's OWN last uuid (r3 boundary rule)"
-    );
-    assert_eq!(
-        ack["event"]["canRedo"],
-        json!(false),
-        "nothing lies beyond the chain-root tip after restoring to it"
-    );
-    let redone_id = ack["event"]["newSessionId"]
-        .as_str()
-        .expect("claude ack carries the adopted id")
-        .to_string();
-    assert_ne!(redone_id, new_id);
-
-    // The observed create re-forks the ORIGINAL (the chain root), keeping through
-    // the restored step's group end — never the prefix's current tip + never the
-    // discarded fork.
-    let creates = rig.create_lines();
-    let fork_creates: Vec<&Value> = creates
-        .iter()
-        .filter(|l| l["boot"]["kind"] == json!("fork"))
-        .collect();
-    assert_eq!(fork_creates.len(), 2, "{creates:?}");
-    let redo_create = fork_creates[1];
-    assert_eq!(redo_create["boot"]["resume"], json!(original));
-    assert_eq!(redo_create["boot"]["resumeSessionAt"], json!("a2"));
-    assert_eq!(redo_create["boot"]["kind"], json!("fork"));
-    assert!(
-        redo_create["boot"].get("dropsTurn").is_none(),
-        "the guard is omitted when the discard range is empty (redo to the tip)"
-    );
-
-    // The new snapshot carries all four turns again.
-    let snapshot = http_get_json(
-        &addr,
-        &format!("/api/fresh-agent/threads/freshclaude/claude/{redone_id}"),
-    )
-    .await;
-    let turns = snapshot["turns"].as_array().expect("turns");
-    assert_eq!(
-        turns.len(),
-        4,
-        "the restored conversation is whole: {snapshot}"
-    );
-
-    // The record followed the pane again; the restored turns left the marker bucket.
-    let rows = rollback_rows(&rig.ledger_dir());
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0]["canRedo"], json!(false));
-    assert!(
-        rows[0]["entries"].as_array().expect("entries").is_empty(),
-        "the restored turns left the current-epoch marker portion: {}",
-        rows[0]
-    );
-    assert_never_completes(&frames);
-    drop(rig);
-}
-
-#[tokio::test]
-async fn claude_undo_of_the_only_turn_empties_the_conversation_via_a_fresh_create() {
-    let _guard = CLAUDE_ENV_LOCK.lock().await;
-    let rig = RollbackRig::install();
-    let (mut ws, addr, _ledger, mut frames, original) =
-        drive_conversation(&rig, &["first prompt"]).await;
-
-    // r2: first-turn rollback is LEGAL. Undo of the only step → exactly ONE ack
-    // (removedPromptText == the only prompt, canRedo == true) and a FRESH create
-    // (NO resume/fork keys — the empty fresh transcript IS the rollback target).
-    send_json(
-        &mut ws,
-        &rollback_frame("rb-first-u", "undo", &original, "step"),
-    )
-    .await;
-    let ack = await_frame_into(&mut ws, &mut frames, 20, |v| {
-        v["type"] == json!("freshAgent.event")
-            && v["event"]["type"] == json!("freshAgent.rolledBack")
-    })
-    .await;
-    assert_eq!(ack["event"]["removedPromptText"], json!("first prompt"));
-    assert_eq!(ack["event"]["canRedo"], json!(true));
-    let fresh_id = ack["event"]["newSessionId"]
-        .as_str()
-        .expect("adopted id")
-        .to_string();
-    let materialized = await_frame_into(&mut ws, &mut frames, 20, |v| {
-        v["type"] == json!("freshAgent.session.materialized")
-    })
-    .await;
-    assert_eq!(materialized["sessionId"], json!(fresh_id));
-    assert_ne!(fresh_id, original);
-
-    let creates = rig.create_lines();
-    assert_eq!(
-        creates.len(),
-        2,
-        "the initial create + the rollback's FRESH create: {creates:?}"
-    );
-    let fresh_create = &creates[1];
-    assert_eq!(
-        fresh_create["boot"],
-        json!({ "kind": "fresh" }),
-        "the fresh-conversation leg boots a new conversation, with NO resume/fork keys: {fresh_create}"
-    );
-
-    // The record retained the discarded session as the redo source.
-    let rows = rollback_rows(&rig.ledger_dir());
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0]["originalSessionId"], json!(original));
-    assert_eq!(
-        rows[0]["originalTipUuid"],
-        json!("a1"),
-        "the discarded chain's tip"
-    );
-    assert_eq!(rows[0]["canRedo"], json!(true));
-
-    // The live conversation is genuinely EMPTY (a fresh durable id, empty transcript).
-    let snapshot = http_get_json(
-        &addr,
-        &format!("/api/fresh-agent/threads/freshclaude/claude/{fresh_id}"),
-    )
-    .await;
-    assert_eq!(snapshot["turns"].as_array().expect("turns").len(), 0);
-
-    // A following redo re-forks the ORIGINAL at the LAST raw-chain uuid of the
-    // restored u1/a1 step's group — its assistant tail (the r3 boundary fix:
-    // resumeSessionAt keeps through-AND-including the named uuid, so the target
-    // is a1, NOT u1 — resuming at u1 would restore only the bare prompt).
-    send_json(
-        &mut ws,
-        &rollback_frame("rb-first-r", "redo", &fresh_id, "step"),
-    )
-    .await;
-    let redone = await_frame_into(&mut ws, &mut frames, 20, |v| {
-        v["type"] == json!("freshAgent.event") && v["event"]["type"] == json!("freshAgent.redone")
-    })
-    .await;
-    assert_eq!(redone["event"]["restoredThroughTurnId"], json!("a1"));
-    let restored_id = redone["event"]["newSessionId"]
-        .as_str()
-        .expect("adopted id")
-        .to_string();
-    let creates = rig.create_lines();
-    assert_eq!(creates.len(), 3, "{creates:?}");
-    let redo_create = &creates[2];
-    assert_eq!(redo_create["boot"]["kind"], json!("fork"));
-    assert_eq!(redo_create["boot"]["resume"], json!(original));
-    assert_eq!(
-        redo_create["boot"]["resumeSessionAt"],
-        json!("a1"),
-        "the r3 boundary rule — resume at a1, NOT u1"
-    );
-    let snapshot = http_get_json(
-        &addr,
-        &format!("/api/fresh-agent/threads/freshclaude/claude/{restored_id}"),
-    )
-    .await;
-    assert_eq!(
-        snapshot["turns"].as_array().expect("turns").len(),
-        2,
-        "the whole u1/a1 step is restored"
-    );
-    assert_never_completes(&frames);
-    drop(rig);
-}
-
-/// Makes a directory unreadable (mode 000) and restores it on drop, so the
-/// rig's TempDir cleanup works even when an assertion panics. `None` when the
-/// process bypasses permission bits (root), where EACCES cannot be produced.
-#[cfg(unix)]
+/// Makes a directory unreadable and restores it on drop. `None` when the process
+/// bypasses permission bits (root), where EACCES cannot be produced.
 struct UnreadableDir(PathBuf);
-#[cfg(unix)]
 impl UnreadableDir {
-    fn make(dir: &Path) -> Option<Self> {
-        Self::with_mode(dir, 0o000)
-    }
-    /// Mode 111: listing `dir` fails with EACCES, but a path THROUGH it still
-    /// opens -- a store a scan cannot check while a known file stays readable.
-    fn list_denied(dir: &Path) -> Option<Self> {
-        Self::with_mode(dir, 0o111)
-    }
     fn with_mode(dir: &Path, mode: u32) -> Option<Self> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
@@ -1237,7 +790,6 @@ impl UnreadableDir {
         Some(guard)
     }
 }
-#[cfg(unix)]
 impl Drop for UnreadableDir {
     fn drop(&mut self) {
         use std::os::unix::fs::PermissionsExt;
@@ -1245,202 +797,85 @@ impl Drop for UnreadableDir {
     }
 }
 
-/// The rig's fake transcript store (`CLAUDE_CONFIG_DIR`) projects dir.
-#[cfg(unix)]
-fn rig_projects_dir(rig: &RollbackRig) -> PathBuf {
-    rig.home.path().join("claude-store").join("projects")
-}
-
-/// The rollback refusal answered for `request_id` (the requesting sink's
-/// `freshAgent.error{rollback:true}`).
-#[cfg(unix)]
-async fn await_rollback_error(ws: &mut TestWs, frames: &mut FrameBag, request_id: &str) -> Value {
-    let request_id = request_id.to_string();
-    await_frame_into(ws, frames, 20, move |v| {
-        v["type"] == json!("freshAgent.event")
-            && v["event"]["type"] == json!("freshAgent.error")
-            && v["event"]["requestId"] == json!(request_id)
-    })
-    .await
-}
-
-/// G28: an undo while the transcript store cannot be READ (EACCES) is a
-/// retryable `INTERNAL_ERROR` refusal -- never `NOTHING_TO_UNDO`, which tells
-/// the user their conversation has nothing in it. Nothing is forked and no
-/// rollback record is written.
-#[cfg(unix)]
-#[tokio::test]
-async fn claude_undo_with_an_unreadable_store_is_internal_error_not_nothing_to_undo() {
-    let _guard = CLAUDE_ENV_LOCK.lock().await;
-    let rig = RollbackRig::install();
-    let (mut ws, _addr, _ledger, mut frames, original) =
-        drive_conversation(&rig, &["first prompt", "second prompt"]).await;
-    let Some(_locked) = UnreadableDir::make(&rig_projects_dir(&rig)) else {
+/// An undo while the store cannot be read is a retryable INTERNAL_ERROR, never
+/// NOTHING_TO_UNDO; nothing is forked and no record is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_undo_with_an_unreadable_store_is_internal_error_not_nothing_to_undo() {
+    let rig = rollback_rig().await;
+    let mut conn = rig.connect().await;
+    let (pane, a, _) = two_turns(&rig, &mut conn).await;
+    let boots = queries(&rig).len();
+    let Some(_locked) = UnreadableDir::with_mode(&rig.claude_config_dir.join("projects"), 0o000)
+    else {
         return;
     };
-
-    send_json(
-        &mut ws,
-        &rollback_frame("rb-undo-unreadable", "undo", &original, "step"),
-    )
-    .await;
-    let refusal = await_rollback_error(&mut ws, &mut frames, "rb-undo-unreadable").await;
-    assert_eq!(
-        refusal["event"]["code"],
-        json!("INTERNAL_ERROR"),
-        "an unreadable store is a retryable failure, not an empty conversation: {refusal}"
-    );
-    assert!(
-        rig.create_lines()
-            .iter()
-            .all(|l| l["forkSession"] != json!(true)),
-        "no fork may run against an unchecked store"
-    );
-    assert!(
-        rollback_rows(&rig.ledger_dir()).is_empty(),
-        "a refused undo writes no rollback record"
-    );
-    assert_never_completes(&frames);
+    request_rollback(&mut conn, "undo", &pane, &a, "undo-1", None).await;
+    let refused = rollback_answer(&mut conn, "undo-1").await;
+    assert_eq!(refused["code"], "INTERNAL_ERROR", "{refused}");
+    assert_eq!(queries(&rig).len(), boots, "nothing was forked");
+    assert!(ledger(&rig).load_rollback_row("claude", &a).is_none());
 }
 
-/// G28: a redo whose chain-root ORIGINAL cannot be read (EACCES) is a
-/// retryable `INTERNAL_ERROR` -- never `REDO_UNAVAILABLE`, which tells the user
-/// the removed history is permanently gone. The redo record stays intact.
-#[cfg(unix)]
-#[tokio::test]
-async fn claude_redo_with_an_unreadable_original_is_internal_error_not_redo_unavailable() {
-    let _guard = CLAUDE_ENV_LOCK.lock().await;
-    let (rig, mut ws, _addr, _ledger, mut frames, _original, new_id) =
-        setup_and_undo_two_turn_conversation().await;
-    let creates_before = rig.create_lines().len();
-    let Some(_locked) = UnreadableDir::make(&rig_projects_dir(&rig)) else {
+/// A redo whose original cannot be read is a retryable INTERNAL_ERROR, never
+/// REDO_UNAVAILABLE; the record stays redoable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_redo_with_an_unreadable_original_is_internal_error_not_redo_unavailable() {
+    let rig = rollback_rig().await;
+    let mut conn = rig.connect().await;
+    let (pane, a, _) = two_turns(&rig, &mut conn).await;
+    let (_, c) = rollback_ok(&mut conn, "undo", &pane, &a, "undo-1").await;
+    materialized_from(&mut conn, &pane).await;
+    let boots = queries(&rig).len();
+    let Some(_locked) = UnreadableDir::with_mode(&rig.claude_config_dir.join("projects"), 0o000)
+    else {
         return;
     };
-
-    send_json(
-        &mut ws,
-        &rollback_frame("rb-redo-unreadable", "redo", &new_id, "step"),
-    )
-    .await;
-    let refusal = await_rollback_error(&mut ws, &mut frames, "rb-redo-unreadable").await;
-    assert_eq!(
-        refusal["event"]["code"],
-        json!("INTERNAL_ERROR"),
-        "an unreadable original is a retryable failure, not lost redo history: {refusal}"
-    );
-    assert_eq!(
-        rig.create_lines().len(),
-        creates_before,
-        "no fork may run against an unchecked store"
-    );
-    let rows = rollback_rows(&rig.ledger_dir());
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(
-        rows[0]["canRedo"],
-        json!(true),
-        "the refused redo leaves the record redoable for a retry"
-    );
-    assert_never_completes(&frames);
+    request_rollback(&mut conn, "redo", &c, &c, "redo-1", None).await;
+    let refused = rollback_answer(&mut conn, "redo-1").await;
+    assert_eq!(refused["code"], "INTERNAL_ERROR", "{refused}");
+    assert_eq!(queries(&rig).len(), boots, "nothing was forked");
+    let record = ledger(&rig)
+        .load_rollback_row("claude", &c)
+        .expect("the record");
+    assert_eq!(record["canRedo"], true, "{record}");
 }
 
-/// Sets an env var for one test and removes it on drop (also on panic, while
-/// the caller still holds `CLAUDE_ENV_LOCK`).
-#[cfg(unix)]
-struct EnvVarGuard(&'static str);
-#[cfg(unix)]
-impl EnvVarGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        std::env::set_var(key, value);
-        Self(key)
-    }
-}
-#[cfg(unix)]
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        std::env::remove_var(self.0);
-    }
-}
-
-/// Polls `check` every 10 ms until it holds (bounded).
-#[cfg(unix)]
-async fn wait_until(budget_secs: u64, what: &str, check: impl Fn() -> bool) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(budget_secs);
-    while !check() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for {what}"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
-/// G28: the fork resumes from the transcript the undo ALREADY located. If the
-/// store stops listing between that lookup and the fork (here: the projects
-/// dir turns list-denied while the handler is parked before teardown), a
-/// second scan would miss, and the fork would resume by bare id with no cwd
-/// after the old sidecar is gone. Using the located path keeps the
-/// transcript's own cwd (the CLI's resume lookup is scoped to it).
-#[cfg(unix)]
-#[tokio::test]
-async fn claude_undo_forks_from_the_transcript_it_located_even_if_the_store_stops_listing() {
-    let _guard = CLAUDE_ENV_LOCK.lock().await;
-    let rig = RollbackRig::install();
-    let _park = EnvVarGuard::set("FRESHELL_TEST_CLAUDE_ROLLBACK_PRE_TEARDOWN_MS", "1500");
-    let (mut ws, _addr, _ledger, mut frames, original) =
-        drive_conversation(&rig, &["first prompt", "second prompt"]).await;
-
-    send_json(
-        &mut ws,
-        &rollback_frame("rb-undo-relocate", "undo", &original, "step"),
-    )
-    .await;
-    // The durable pre-write lands AFTER the undo located the transcript and
-    // BEFORE the parked pre-teardown window.
-    let ledger_dir = rig.ledger_dir();
-    wait_until(15, "the rollback pre-write", || {
-        !rollback_rows(&ledger_dir).is_empty()
-    })
-    .await;
-    let Some(locked) = UnreadableDir::list_denied(&rig_projects_dir(&rig)) else {
+/// The fork resumes the transcript the undo already located, in that
+/// transcript's own directory, even when the store stops listing between the
+/// lookup and the boot (a second scan there would miss and lose the cwd).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_undo_forks_from_the_transcript_it_located_even_if_the_store_stops_listing() {
+    let rig = rollback_rig().await;
+    let mut conn = rig.connect().await;
+    let (pane, a, _) = two_turns(&rig, &mut conn).await;
+    let hold = rig.fresh_claude.hold_rollback_boot();
+    request_rollback(&mut conn, "undo", &pane, &a, "undo-1", None).await;
+    hold.parked().await;
+    let Some(locked) = UnreadableDir::with_mode(&rig.claude_config_dir.join("projects"), 0o111)
+    else {
+        hold.release();
         return;
     };
-    wait_until(15, "the fork create", || {
-        rig.create_lines()
-            .iter()
-            .any(|l| l["boot"]["kind"] == json!("fork"))
-    })
-    .await;
+    let boots = queries(&rig).len();
+    hold.release();
+    // The fork's query() is recorded before the simulated CLI boots (600 ms);
+    // the store lists again before the CLI looks for the parent.
+    let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
+    while queries(&rig).len() == boots {
+        assert!(tokio::time::Instant::now() < deadline, "no fork boot");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     drop(locked);
-
-    let creates = rig.create_lines();
-    let fork_create = creates
-        .iter()
-        .find(|l| l["boot"]["kind"] == json!("fork"))
-        .expect("fork create observed");
-    assert_eq!(fork_create["boot"]["resume"], json!(original));
-    assert_eq!(fork_create["boot"]["resumeSessionAt"], json!("a1"));
+    let fork = queries(&rig)
+        .into_iter()
+        .nth(boots)
+        .expect("the fork's boot");
+    assert_eq!(fork["resume"], a.as_str(), "{fork}");
     assert_eq!(
-        fork_create["cwd"],
-        json!("/tmp"),
-        "the fork runs in the located transcript's own cwd: {fork_create}"
+        fork["cwd"],
+        rig.workspace.to_str().expect("utf-8"),
+        "the fork runs in the located transcript's own cwd: {fork}"
     );
-    let ack = await_frame_into(&mut ws, &mut frames, 20, |v| {
-        v["type"] == json!("freshAgent.event")
-            && v["event"]["type"] == json!("freshAgent.rolledBack")
-    })
-    .await;
-    assert_eq!(ack["event"]["requestId"], json!("rb-undo-relocate"));
-    assert_never_completes(&frames);
-}
-
-/// Sanity guard for the raw-HTTP helper's framing (keeps the ws::Write import
-/// meaningful; exercises the same surface the snapshot GETs use).
-#[test]
-fn http_request_write_is_plain_bytes() {
-    let dir = std::env::temp_dir().join("freshell-rollback-http-sanity.bin");
-    let mut f = std::fs::File::create(&dir).unwrap();
-    let request = format!("GET /x HTTP/1.1\r\nx-auth-token: {AUTH_TOKEN}\r\n\r\n");
-    f.write_all(request.as_bytes()).unwrap();
-    assert!(std::fs::read_to_string(&dir).unwrap().contains("GET /x"));
-    let _ = std::fs::remove_file(&dir);
+    let ack = rollback_answer(&mut conn, "undo-1").await;
+    assert_eq!(ack["type"], "freshAgent.rolledBack", "{ack}");
 }

@@ -559,22 +559,6 @@ struct PendingQuestionEntry {
     questions: Value,
 }
 
-/// kata 1wxv Task 4: the rollback-fork adoption wiring handed to the stdout
-/// consumer. The handler PREREAD the respawned sidecar's `sdk.session.init`
-/// line (the `--resume-drops-turn` refusal watch lives in that pre-read, before
-/// any durable state moves); the consumer runs the adoption for it EXACTLY like
-/// an in-stream init (cli_index insert + AWAITED binding carrying
-/// `supersedes` = the pre-rollback durable id + the rollback-row re-key old→new
-/// inside the SAME awaited batch), then resolves `adopted_tx` so the parked
-/// rollback handler proceeds with the new durable id.
-struct RollbackAdoption {
-    /// The pre-rollback durable id this create supersedes.
-    supersedes: String,
-    /// The preread `sdk.session.init` line (consumed by the handler's pre-read).
-    preseeded_init: Value,
-    adopted_tx: tokio::sync::oneshot::Sender<Option<String>>,
-}
-
 /// One live freshclaude session: the Node sidecar it drives + its stdout consumer.
 struct ClaudeSession {
     configuration: ClaudeConfiguration,
@@ -866,8 +850,17 @@ impl FreshClaudeState {
     /// end-of-output path after it recorded the dead session, before it reaps the
     /// sidecar and reports the exit, until the returned hold is released.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn hold_exit_reports(&self) -> Arc<crate::claude_test_holds::ExitReportHold> {
+    pub fn hold_exit_reports(&self) -> Arc<crate::claude_test_holds::StepHold> {
         self.test_holds.hold_exit_report()
+    }
+
+    /// Test seam (see [`crate::claude_test_holds`]): park every later undo or
+    /// redo after it wrote its durable record (holding the session's turn
+    /// lock), before it boots the replacement runtime, until the returned hold
+    /// is released.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hold_rollback_boot(&self) -> Arc<crate::claude_test_holds::StepHold> {
+        self.test_holds.hold_rollback_boot()
     }
 
     /// Spawn one claude sidecar process (create, attach-resume and rollback all
@@ -1587,7 +1580,8 @@ impl FreshClaudeState {
     }
 
     /// b8ke focused episode-2 round-2 F1: commit the rollback's claim by
-    /// RE-KEYING — the start's `Starting{op}` record under the OLD durable
+    /// RE-KEYING (C13: `expected_live_session_key` is the original runtime's
+    /// map key, `live_session_key` the replacement's) — the start's `Starting{op}` record under the OLD durable
     /// id moves to the NEW client-visible durable id in ONE atomic registry
     /// step (`commit_live_rekey`: never both-Live, never both-Vacant), the
     /// stamp is retained under the NEW id (the lane's kill/exit paths key
@@ -1604,6 +1598,7 @@ impl FreshClaudeState {
         old_durable_id: &str,
         ticket: &mut Option<freshell_ownership::OperationTicket>,
         new_durable_id: &str,
+        expected_live_session_key: &str,
         live_session_key: &str,
         pid: Option<u32>,
         initiator: &str,
@@ -1663,7 +1658,7 @@ impl FreshClaudeState {
                     PROVIDER,
                     old_durable_id,
                     new_durable_id,
-                    live_session_key,
+                    expected_live_session_key,
                     replacement_owner,
                     initiator,
                     // b8ke ext r6 F5: the rekey transition's operation id —
@@ -2452,6 +2447,7 @@ impl FreshClaudeState {
                     naming: Some(&msg),
                     partial_runtime_key: resume_sid.clone().or_else(|| fresh_claim_key.clone()),
                     start_pid_slot: &start_pid_slot,
+                    inherit: None,
                 },
                 &mut lease_guard,
                 &mut own_ticket,
@@ -4121,6 +4117,53 @@ impl FreshClaudeState {
 
     // ── freshAgent.send (WS) ─────────────────────────────────────────────────────────
 
+    /// The live session a send resolved before it waited on `turn_lock`,
+    /// after the wait (design §4.5 and §4.8): the same map key while it is
+    /// still registered; else, when an undo or redo replaced that runtime
+    /// while the send waited, the live end of the durable ledger chain from
+    /// the session's durable id (`durable`), then the wire id's own
+    /// resolution. Only a session that took this very lock over counts: a
+    /// send never lands on a runtime it did not serialize behind.
+    async fn live_key_after_turn_wait(
+        &self,
+        map_key: &str,
+        wire_id: &str,
+        durable: Option<&str>,
+        turn_lock: &Arc<TokioMutex<()>>,
+    ) -> Option<String> {
+        if self.sessions.lock().await.contains_key(map_key) {
+            return Some(map_key.to_string());
+        }
+        let terminus = durable.and_then(|durable| {
+            self.identity_sink()
+                .and_then(|sink| sink.chain_terminus(PROVIDER, durable))
+        });
+        let candidates = terminus.iter().map(String::as_str).chain([wire_id]);
+        for candidate in candidates {
+            let Some(key) = self.resolve_session_key(candidate).await else {
+                continue;
+            };
+            let same_lock = self
+                .sessions
+                .lock()
+                .await
+                .get(&key)
+                .is_some_and(|session| Arc::ptr_eq(&session.turn_lock, turn_lock));
+            if same_lock {
+                tracing::info!(target: "freshell_freshagent::claude",
+                    event = "freshagent.claude.send_followed_replacement",
+                    session_id = %wire_id,
+                    replaced = %map_key,
+                    replacement = %key,
+                    through_ledger_chain = terminus.as_deref() == Some(candidate),
+                    "a send that waited behind a rollback goes to the replacement runtime"
+                );
+                return Some(key);
+            }
+        }
+        None
+    }
+
     /// Handle a `freshAgent.send` for claude: push the user turn into the sidecar's SDK
     /// input stream, then broadcast `freshAgent.send.accepted`. The stdout consumer surfaces
     /// the unified attention edge (sidecar `sdk.turn.complete` — minted for EVERY result
@@ -4159,7 +4202,7 @@ impl FreshClaudeState {
         // membership. A miss persisting after the rollback exits means the session
         // is genuinely gone (a provably-rejected fork is torn down) — the honest
         // SESSION_NOT_FOUND leg.
-        let (map_key, turn_lock, in_turn, turn_tracker) = loop {
+        let (map_key, turn_lock, in_turn, turn_tracker, durable_before_wait) = loop {
             let handles = match self.resolve_session_key(&session_id).await {
                 Some(key) => {
                     let guard = self.sessions.lock().await;
@@ -4169,6 +4212,7 @@ impl FreshClaudeState {
                             s.turn_lock.clone(),
                             s.in_turn.clone(),
                             s.turn_tracker.clone(),
+                            s.cli_session_id.clone(),
                         )
                     })
                 }
@@ -4191,6 +4235,23 @@ impl FreshClaudeState {
         // resolved before the teardown window serializes identically to one that
         // parked through it.
         let _turn = turn_lock.lock().await;
+        // An undo or redo that held this lock may have replaced the runtime
+        // the send resolved (C13: the replacement registers under its own id
+        // and takes this same lock over). The send goes to the replacement,
+        // found through the durable supersession chain, never to the stopped
+        // original and never to a revived one.
+        let Some(map_key) = self
+            .live_key_after_turn_wait(
+                &map_key,
+                &session_id,
+                durable_before_wait.as_deref(),
+                &turn_lock,
+            )
+            .await
+        else {
+            self.refuse_send_to_missing_session(&request_id, &session_id, msg.session_type);
+            return;
+        };
         // Arm the coordinator guard only after the send has waited behind any
         // earlier turn. A lifecycle transition during that wait advances the
         // generation, so the captured fence is checked against the owner that
@@ -5098,81 +5159,6 @@ impl FreshClaudeState {
 
     // ── freshAgent.undo / freshAgent.redo (kata 1wxv Task 4; fork-at-point) ────
 
-    /// Decision 6: pending cards inside undone turns are CANCELLED, never silently
-    /// resolved. Emits the exact `freshAgent.permission.cancelled` /
-    /// `freshAgent.question.cancelled` frames the fold consumes, one per parked
-    /// entry, then clears the pending map. Invoked BEFORE the old sidecar is
-    /// torn down.
-    async fn emit_pending_cancellations(
-        &self,
-        map_key: &str,
-        session_id: &str,
-        session_type: &str,
-    ) {
-        let pending = {
-            let guard = self.sessions.lock().await;
-            guard.get(map_key).map(|s| Arc::clone(&s.pending))
-        };
-        let Some(pending) = pending else { return };
-        let (permissions, questions) = {
-            let mut p = pending.lock().expect("pending lock");
-            (
-                std::mem::take(&mut p.permissions),
-                std::mem::take(&mut p.questions),
-            )
-        };
-        for entry in permissions {
-            self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
-                event: json!({
-                    "type": "freshAgent.permission.cancelled",
-                    "sessionId": session_id,
-                    "requestId": entry.request_id,
-                }),
-                provider: PROVIDER.to_string(),
-                session_id: session_id.to_string(),
-                session_type: session_type.to_string(),
-            }));
-        }
-        for entry in questions {
-            self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
-                event: json!({
-                    "type": "freshAgent.question.cancelled",
-                    "sessionId": session_id,
-                    "requestId": entry.request_id,
-                }),
-                provider: PROVIDER.to_string(),
-                session_id: session_id.to_string(),
-                session_type: session_type.to_string(),
-            }));
-        }
-    }
-
-    /// Task-4 compensation: a fork/create failure AFTER the rollback record's
-    /// successful pre-write UNDOES that pre-write before the refusal is
-    /// answered — fork-at-point provably never mutates the ORIGINAL's history
-    /// (the Stage-2 hash-identical invariant), so the ledger must not describe a
-    /// rollback that never took effect. The provider-mutation triad (codex's
-    /// Rpc-vs-transport split) has no claude analog: EVERY claude failure leg is
-    /// provably-unmoved by construction. Task 4 review (Minor-3): when the
-    /// pre-op record was ABSENT, the faithful restore of "nothing was here" is
-    /// a DELETE of the just-created row — never a fabricated empty record.
-    async fn compensate_rollback_record(
-        &self,
-        durable_id: &str,
-        existing: Option<crate::rollback_record::RollbackRecord>,
-    ) {
-        let Some(sink) = self.identity_sink() else {
-            return;
-        };
-        let result = match existing {
-            Some(restore) => sink.record_rollback(PROVIDER, durable_id, restore).await,
-            None => sink.delete_rollback(PROVIDER, durable_id).await,
-        };
-        if let Err(e) = result {
-            tracing::warn!(error = %e, session = %durable_id, "freshagent.claude.rollback_compensate_failed");
-        }
-    }
-
     /// The pane re-key ride (kata 1wxv Task 4): the existing
     /// `freshAgent.session.materialized` broadcast shape (codex's mint-new respawn
     /// precedent), old client-facing id → new adopted durable id.
@@ -5217,1232 +5203,6 @@ impl FreshClaudeState {
             }
         }
         self.broadcast(&message);
-    }
-
-    /// Handle a `freshAgent.undo` / `freshAgent.redo` for claude/kilroy (kata 1wxv
-    /// Task 4) — conversation rollback emulated by FORK-AT-POINT through the
-    /// sidecar: pre-write the durable record, cancel parked cards, kill the old
-    /// sidecar, and recreate it with the SDK `query()` options lane (`{resume,
-    /// resumeSessionAt, forkSession: true, resumeDropsTurn: <guard>}` — the
-    /// standalone `forkSession()` fn is FORBIDDEN, it remaps every uuid), then
-    /// adopt the minted durable id through the existing sdk.session.init machinery
-    /// (cli_index insert + AWAITED binding WITH supersedes + rollback-row re-key
-    /// old→new inside the same awaited batch).
-    ///
-    /// Redo re-forks at a LATER point from the retained ORIGINAL session (the
-    /// chain root), gated by the tip+LCP validity contract: the original's raw
-    /// chain tip must still equal the recorded `original_tip_uuid` AND the current
-    /// chain must still be a strict prefix of it — else `REDO_UNAVAILABLE` +
-    /// `REDO_REMOVED_HISTORY_COPY` (compaction/snips legitimately move things).
-    ///
-    /// First-turn rollback is LEGAL (r2): `resume_at_uuid: None` means "before the
-    /// first message" — the handler creates a FRESH conversation (NO resume keys;
-    /// the empty fresh transcript IS the rollback target) and records the
-    /// discarded session as the redo source.
-    ///
-    /// Ordering (durable-BEFORE-mutation + r2 lock discipline): toTurn validation
-    /// → rollback_in_flight single-flight (FIRST) → per-session turn lock (held
-    /// across the WHOLE handler) → busy gate (`in_turn` — the FIFO tracker's
-    /// DERIVED busy cache — ⇒ BUSY_TURN, the SOLE mid-turn protection; no
-    /// sidecar traffic at all on a refused attempt, ep2-r2) →
-    /// create-resume lease claim on the OLD durable id (so a concurrent attach
-    /// cannot bind the pre-rollback id mid-fork) → transcript reads + resume math
-    /// → AWAITED record pre-write (a pre-write failure REFUSES with
-    /// `LEDGER_WRITE_REFUSAL_COPY`, provider never touched) → pending-cancel
-    /// frames → kill+recreate (one `resumeDropsTurn` guard retry: the refusal
-    /// prefix maps to the plain-resume recovery, never surfaced raw) → adoption
-    /// → `materialized` OLD→NEW broadcast + envelope-stamp flip → rolledBack
-    /// broadcast → requesting-sink ack. A fork/create/adoption failure AFTER the
-    /// successful pre-write COMPENSATES the record (rewrites the pre-op record)
-    /// before the refusal is answered — the ledger never describes a rollback
-    /// the provider provably rejected. A rollback NEVER chimes.
-    pub async fn handle_rollback(
-        &self,
-        op: crate::rollback_record::RollbackRequest,
-        reply_sink: freshell_terminal::FrameSink,
-    ) {
-        use crate::claude_snapshot as snap;
-        use crate::rollback_record::*;
-
-        let Some(map_key) = self.resolve_session_key(&op.session_id).await else {
-            reply_sink(rollback_error_frame(
-                &op,
-                "INVALID_SESSION_ID",
-                "claude session not found",
-            ));
-            return;
-        };
-        // `turnId` absent on a toTurn frame is a SERVER-side validation error
-        // (never a zod refinement — the frozen contract keeps bare objects).
-        if op.mode == RollbackModeReq::ToTurn && op.turn_id.is_none() {
-            reply_sink(rollback_error_frame(
-                &op,
-                "INVALID_ROLLBACK_TARGET",
-                "rollback toTurn requires a turnId",
-            ));
-            return;
-        }
-        let (
-            durable_id,
-            in_turn,
-            turn_tracker,
-            turn_lock,
-            session_type,
-            last_synthesized_complete_at,
-        ) = {
-            let guard = self.sessions.lock().await;
-            match guard.get(&map_key) {
-                Some(s) => (
-                    s.cli_session_id.clone().unwrap_or_else(|| map_key.clone()),
-                    s.in_turn.clone(),
-                    s.turn_tracker.clone(),
-                    s.turn_lock.clone(),
-                    session_type_str(op.session_type),
-                    // Task 5: the fork continues the SAME per-session
-                    // death-mint clock (carried like `in_turn` — the fork is
-                    // the same logical session lifetime, so a death-mint
-                    // after the fork can never regress past one before it).
-                    s.last_synthesized_complete_at.clone(),
-                ),
-                None => {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "INVALID_SESSION_ID",
-                        "claude session not found",
-                    ));
-                    return;
-                }
-            }
-        };
-        // Rollback-vs-rollback single-flight (lock order: FIRST, before the turn
-        // lock — never the reverse). handle_send never acquires this registry —
-        // it only POLLS membership to park through the teardown→respawn window
-        // (task 4 review C1).
-        let Some(_guard) = self.rollback_in_flight.try_acquire(&durable_id) else {
-            reply_sink(rollback_error_frame(
-                &op,
-                "INTERNAL_ERROR",
-                &format!("rollback already in progress for {durable_id}"),
-            ));
-            return;
-        };
-        // b8ke ext r29 F2 + focused ep5 r4 F3: the rollback's observed
-        // generation fence — the wire's observedEpoch/observedGeneration
-        // pair (additive since ext r21 F2) is HONORED verbatim: a request
-        // already stale on ARRIVAL (its pair predates a completed
-        // handoff/crash advance) can never be made current — the claim
-        // under the coordinator lock typed-refuses it, so a queued
-        // old-generation rollback can never tear down or roll back a
-        // newer runtime. A half-sent pair is the typed INVALID_FENCE
-        // refusal (the F7 discipline). And since ep5 r4 F3 the
-        // FULLY-ABSENT pair is the SAME typed refusal on a
-        // coordinator-wired lane — the ext-r13-F3 entry-observation
-        // discipline this replaces was the laundering the round-4
-        // reviewer rejects: a handler-START observation can detect an
-        // ownership change occurring AFTER it, but nothing can detect
-        // that an unfenced request was already stale WHEN RECEIVED
-        // (queued under generation N, arriving after the session moved
-        // away and returned at N+2 — indistinguishable from a current
-        // request, so it could adopt and roll back the NEWER owner).
-        // The refusal is the actionable contract (identical to the
-        // opencode lanes' FENCE_REQUIRED): the client re-observes the
-        // owner record and retries WITH the pair. Only the UNWIRED lane
-        // (no coordinator — the legacy no-coordinator lane) proceeds
-        // unfenced: there is nothing to launder against.
-        let rollback_fence =
-            match crate::ownership_lane::wire_fence(op.observed_epoch, op.observed_generation) {
-                Ok(fence) => fence,
-                Err(err) => {
-                    tracing::warn!(target: "freshell_freshagent::claude",
-                        session_id = %durable_id, request_id = %op.request_id, code = err.code(),
-                        "fresh_agent_rollback_refused: the observed fence is half-sent (invalid)");
-                    reply_sink(rollback_error_frame(&op, err.code(), err.message()));
-                    return;
-                }
-            };
-        let rollback_fence = match rollback_fence {
-            Some(fence) => Some(fence),
-            None => {
-                if self.ownership.is_some() {
-                    tracing::warn!(target: "freshell_freshagent::claude",
-                        session_id = %durable_id, request_id = %op.request_id,
-                        code = "INVALID_FENCE",
-                        "fresh_agent_rollback_refused: the rollback carried no observed \\
-                         ownership pair against a coordinator-wired lane — the client \\
-                         re-observes the owner record and retries with the pair (kata \\
-                         b8ke focused ep5 r4 F3)");
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "INVALID_FENCE",
-                        "the rollback carried no observed ownership pair; re-observe the \\
-                         session's owner record and retry",
-                    ));
-                    return;
-                }
-                None
-            }
-        };
-        // Held for the REST of this handler. in_turn is set by handle_send UNDER
-        // this same lock BEFORE the sidecar write (the check-then-set window is
-        // closed): observed false here means no op is in flight. Focused ep1-r1
-        // F1 through ep2-r2: `in_turn` is the FIFO tracker's DERIVED busy truth
-        // — recomputed from `TurnTracker::busy()` inside every mutation's
-        // critical section — so the gate stays closed through every op that is
-        // queued or mid-compaction, whether its turn ended technically (the
-        // interrupted active turn included, ep2-r2 F2: the queue survives it)
-        // or only structurally (every queued op owes its own terminal edge).
-        let _turn = turn_lock.lock().await;
-        if in_turn.load(std::sync::atomic::Ordering::SeqCst) {
-            // ep3-r3 F1: owed debt broken down — queue entries that are ONLY
-            // unpromoted compacts (nothing running, no candidate pending, no
-            // Turn owed) are provably quiescent and absorb (see
-            // [`absorb_unstarted_compact_debt`]). Everything else is genuinely
-            // mid-execution risk and refuses.
-            if !absorb_unstarted_compact_debt(&in_turn, &turn_tracker) {
-                reply_sink(rollback_error_frame(
-                    &op,
-                    "BUSY_TURN",
-                    ROLLBACK_BUSY_MESSAGE,
-                ));
-                return;
-            }
-        }
-
-        // Lease discipline: claim the OLD durable id exactly like the
-        // create-resume path so a concurrent attach cannot bind the pre-rollback
-        // id mid-fork. A REFUSAL LEG — before any record write or teardown.
-        // kata b8ke Task 3: the coordinator claim comes FIRST — before the
-        // provider lease — so the rollback window (kill + re-resume of the
-        // same durable lane) is cross-kind-authoritative. The "we ARE the
-        // bound live owner" case surfaces as AdoptLive (same-kind live).
-        let rollback_lease_id = format!("rollback-{}", uuid::Uuid::new_v4());
-        // b8ke delta round-2 F2: the rollback-respawn start's watchdog
-        // machinery (the sidecar pid slot + the settle guard — see the
-        // create-resume claim site).
-        let start_pid_slot = crate::ownership_lane::sidecar_pid_cancel_slot();
-        let mut _start_cancellation: Option<crate::ownership_lane::StartCancellationGuard> = None;
-        let granted_ticket = match self.begin_lane_claim_at(
-            &durable_id,
-            &rollback_lease_id,
-            rollback_fence,
-            "freshclaude/rollback",
-        ) {
-            crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
-            crate::ownership_lane::LaneClaim::Unwired => None,
-            crate::ownership_lane::LaneClaim::Adopt => {
-                // Same-kind live under this exact id (the lease arm's "we
-                // ARE the bound live owner" twin): proceed WITHOUT a claim
-                // — the binding already names this lane.
-                None
-            }
-            crate::ownership_lane::LaneClaim::Refused(outcome) => {
-                tracing::warn!(target: "freshell_freshagent::claude",
-                    session_id = %durable_id, outcome = ?outcome,
-                    "fresh_agent_rollback_refused: the ownership coordinator refused the \
-                     claim (kata b8ke cross-kind authority)"
-                );
-                reply_sink(rollback_error_frame(
-                    &op,
-                    "SESSION_RESERVED",
-                    "Another resume for this session is in flight",
-                ));
-                return;
-            }
-        };
-        let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
-        // b8ke delta round-2 F2 + focused episode-2 round-3 F5: the granted
-        // claim registers its REAL cancellation + settle with the watchdog
-        // IMMEDIATELY — the rollback's respawn helper (`rollback_spawn_
-        // create`) spawns the sidecar and then performs TWO sequential
-        // 45-second-budget reads; a watchdog sweep in those waits must
-        // find armed, cancellable evidence, never a fence with nothing
-        // registered. The sidecar pid slot arms when the child exists
-        // (below); the PARTIAL runtime registers NOW with the
-        // kind-appropriate identity (pid unknown until the spawn returns —
-        // the same evidence shape the codex spawn hook rearms with the
-        // real pid).
-        // b8ke ext r13 F3: the Adopt arm holds REAL authority across the
-        // replace window — the guard arms on the live incumbent's key and
-        // is held through the kill + respawn + register + rekey (this
-        // handler's scope), so a handoff or stop begin inside the window
-        // answers the typed Blocked outcome and can NEVER start a terminal
-        // beside the replacement (pre-r13 the Adopt arm proceeded with NO
-        // claim, and the rekey's verify was the only — post-overlap —
-        // defense).
-        // b8ke ext r38 F1: the arm is the ATOMIC ADOPT — the request's
-        // ORIGINAL observed fence (the pair the coordinator's claim already
-        // verified when it answered AdoptLive) plus the EXPECTED
-        // fresh-agent owner, validated in ONE coordinator-lock decision.
-        // Pre-r38 the arm RE-OBSERVED whatever was live and armed on it
-        // (the discard-and-re-observe laundering): a terminal handoff
-        // committing between the claim and the arm armed the guard on the
-        // TERMINAL owner and the rollback spawned a Fresh Claude sidecar
-        // beside the terminal before the late rekey tore it down — two
-        // live writers. The adopt closes the window: the observed pair
-        // names the record the rollback decided on; any advance or a
-        // foreign owner refuses typed BEFORE anything is killed or
-        // spawned.
-        let mut _rollback_adopt_guard: Option<freshell_ownership::AttachGuard> = None;
-        if granted_ticket.is_none() && self.ownership.is_some() {
-            // Test seam (b8ke ext r38 F1): park with the claim ANSWERED
-            // (AdoptLive) but the adopt guard NOT yet armed — the
-            // claim-to-arm race test's deterministic hold (the test
-            // commits a terminal handoff against the key mid-park).
-            if let (Some(parked), Some(release)) = (
-                self.rollback_adopt_parked.as_ref(),
-                self.rollback_adopt_release.as_ref(),
-            ) {
-                parked.notify_one();
-                let _ = release.notified().await;
-            }
-            let resolved = self.resolve_ownership_key(&durable_id);
-            // The Adopt arm only fires on a WIRED lane, where the
-            // original pair is REQUIRED (the ep5-r4-F3 gate above refused
-            // the absent pair typed).
-            let Some(adopt_fence) = rollback_fence else {
-                tracing::warn!(target: "freshell_freshagent::claude",
-                    session_id = %durable_id,
-                    "fresh_agent_rollback_refused: the Adopt arm requires the \
-                     original observed pair (unreachable — the gate above refused \
-                     the absent pair)"
-                );
-                reply_sink(rollback_error_frame(
-                    &op,
-                    "SESSION_RESERVED",
-                    "Another resume for this session is in flight",
-                ));
-                return;
-            };
-            let expected_fresh_owner = freshell_ownership::OwnerIdentity {
-                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
-                terminal_id: None,
-                live_session_key: None,
-                pid: None,
-                ownership_id: None,
-            };
-            match crate::ownership_lane::arm_adopt_guard(
-                &self.ownership,
-                PROVIDER,
-                &resolved,
-                &format!("rollback-adopt-{rollback_lease_id}"),
-                &expected_fresh_owner,
-                adopt_fence,
-                "freshclaude/rollback-adopt",
-            ) {
-                crate::ownership_lane::LaneAttachGuard::Armed(guard) => {
-                    _rollback_adopt_guard = Some(guard);
-                }
-                crate::ownership_lane::LaneAttachGuard::Unwired => {}
-                crate::ownership_lane::LaneAttachGuard::Refused => {
-                    tracing::warn!(target: "freshell_freshagent::claude",
-                        session_id = %durable_id,
-                        "fresh_agent_rollback_refused: the Adopt arm's atomic adopt \
-                         refused to arm (ownership advanced or a foreign owner holds \
-                         the key) — the rollback aborts typed, nothing is killed or \
-                         spawned"
-                    );
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "SESSION_RESERVED",
-                        "Another resume for this session is in flight",
-                    ));
-                    return;
-                }
-            }
-        }
-        let mut own_ticket = granted_ticket;
-        if own_ticket.is_some() {
-            _start_cancellation = Some(
-                crate::ownership_lane::register_start_cancellation_for_ticket(
-                    &self.ownership,
-                    PROVIDER,
-                    &durable_id,
-                    &own_ticket,
-                    crate::ownership_lane::pid_slot_cancellation(&start_pid_slot),
-                ),
-            );
-            crate::ownership_lane::register_partial_fresh_runtime(
-                &self.ownership,
-                PROVIDER,
-                &durable_id,
-                &own_ticket,
-                &map_key,
-                None,
-            );
-        }
-        for round in 0..2u8 {
-            match self.leases.claim(
-                PROVIDER,
-                &durable_id,
-                &rollback_lease_id,
-                crate::session_lease::now_epoch_ms(),
-            ) {
-                crate::session_lease::FreshSessionClaim::Acquired => {
-                    lease_guard = Some(crate::FreshSessionLeaseGuard::armed(
-                        Arc::clone(&self.leases),
-                        PROVIDER,
-                        &durable_id,
-                        &rollback_lease_id,
-                    ));
-                    break;
-                }
-                crate::session_lease::FreshSessionClaim::BoundLive { live_session_key } => {
-                    if live_session_key == map_key {
-                        // We ARE the bound live owner of this exact id — proceed
-                        // WITHOUT a lease (the binding already names this map key,
-                        // which the fork keeps).
-                        break;
-                    }
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "SESSION_RESERVED",
-                        "Another resume for this session is in flight",
-                    ));
-                    return;
-                }
-                crate::session_lease::FreshSessionClaim::Held { .. } => {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "SESSION_RESERVED",
-                        "Another resume for this session is in flight",
-                    ));
-                    return;
-                }
-                crate::session_lease::FreshSessionClaim::ExpiredNeedsKill { pid, ownership_id } => {
-                    if round == 0
-                        && crate::session_lease::kill_and_confirm_tree_dead(
-                            pid,
-                            CLAUDE_SIDECAR_OWNERSHIP_ENV,
-                            &ownership_id,
-                        )
-                        .await
-                    {
-                        self.leases
-                            .force_release_after_confirmed_kill(PROVIDER, &durable_id);
-                        continue;
-                    }
-                    tracing::error!(target: "invariant", pid, session_id = %durable_id,
-                        "fresh_agent_lease_expired_kill_unconfirmed: holding closed");
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "SESSION_RESERVED",
-                        "Another resume for this session is in flight",
-                    ));
-                    return;
-                }
-            }
-        }
-
-        let now = now_ms();
-        let existing = self
-            .identity_sink()
-            .and_then(|s| s.load_rollback(PROVIDER, &durable_id));
-
-        let (
-            resume_from,
-            source_path,
-            resume_at_uuid,
-            removed_turns,
-            prompt_text,
-            chain_root,
-            original_tip_uuid,
-            can_redo_after,
-            guard_uuid,
-        ) = match op.direction {
-            RollbackDirection::Undo => {
-                let path = match self.locate_transcript(&durable_id) {
-                    snap::TranscriptLocation::Found(path) => path,
-                    snap::TranscriptLocation::Absent => {
-                        reply_sink(rollback_error_frame(
-                            &op,
-                            "NOTHING_TO_UNDO",
-                            UNDO_EMPTY_MESSAGE,
-                        ));
-                        return;
-                    }
-                    snap::TranscriptLocation::Unreadable(error) => {
-                        reply_sink(snap::unreadable_rollback_refusal(&op, &durable_id, &error));
-                        return;
-                    }
-                };
-                let text = match std::fs::read_to_string(&path) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &e.to_string()));
-                        return;
-                    }
-                };
-                let target = match op.mode {
-                    RollbackModeReq::Step => snap::ResumeTarget::Step,
-                    RollbackModeReq::ToTurn => {
-                        snap::ResumeTarget::ToTurn(op.turn_id.clone().expect("validated"))
-                    }
-                };
-                let point = match snap::resolve_resume_point(&text, &durable_id, target) {
-                    Ok(p) => p, // resume_at_uuid None = "before the first message" — LEGAL (r2)
-                    Err(snap::ResumeResolveError::Empty) => {
-                        reply_sink(rollback_error_frame(
-                            &op,
-                            "NOTHING_TO_UNDO",
-                            UNDO_EMPTY_MESSAGE,
-                        ));
-                        return;
-                    }
-                    Err(_) => {
-                        reply_sink(rollback_error_frame(
-                            &op,
-                            "INVALID_ROLLBACK_TARGET",
-                            &format!("turn {:?} is not in this conversation", op.turn_id),
-                        ));
-                        return;
-                    }
-                };
-                // Epoch rule (r2/r3): an undo landing while redo_destroyed is set
-                // re-roots the chain to the CURRENT durable id — the retained old
-                // original describes a branch a resend already permanently
-                // replaced; O's redo stays permanently dead.
-                let chain_root = existing
-                    .as_ref()
-                    .filter(|r| !r.redo_destroyed)
-                    .and_then(|r| r.original_session_id.clone())
-                    .unwrap_or_else(|| durable_id.clone());
-                // Tip anchor at UNDO time = the last raw-chain uuid of the
-                // CHAIN-ROOT transcript (at the first undo the current file IS the root).
-                let root_text = if chain_root == durable_id {
-                    text.clone()
-                } else {
-                    match snap::locate_transcript(&chain_root)
-                        .and_then(|p| std::fs::read_to_string(p).ok())
-                    {
-                        Some(t) => t,
-                        None => {
-                            reply_sink(rollback_error_frame(
-                                &op,
-                                "INTERNAL_ERROR",
-                                "chain-root transcript unreadable",
-                            ));
-                            return;
-                        }
-                    }
-                };
-                let tip = snap::raw_chain_tip(&root_text);
-                // The resumeDropsTurn guard: the one prompted turn the fork
-                // discards, when it discards exactly one (decision 2).
-                let guard = snap::drops_turn_guard(&text, point.resume_at_uuid.as_deref());
-                // can_redo after the undo: the removed content provably exists in
-                // the original beyond the resume point (on the r2 first-turn leg
-                // the fresh conversation's tip is NONE — strictly beyond holds
-                // whenever a tip exists).
-                (
-                    durable_id.clone(),
-                    path,
-                    point.resume_at_uuid,
-                    point.removed_turns,
-                    point.prompt_text,
-                    chain_root,
-                    tip,
-                    true,
-                    guard,
-                )
-            }
-            RollbackDirection::Redo => {
-                let Some(record) = existing.clone() else {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "REDO_UNAVAILABLE",
-                        REDO_EMPTY_MESSAGE,
-                    ));
-                    return;
-                };
-                if record.redo_destroyed {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "REDO_UNAVAILABLE",
-                        REDO_DESTROYED_MESSAGE,
-                    ));
-                    return;
-                }
-                let Some(original) = record.original_session_id.clone() else {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "REDO_UNAVAILABLE",
-                        REDO_EMPTY_MESSAGE,
-                    ));
-                    return;
-                };
-                let original_path = match self.locate_transcript(&original) {
-                    snap::TranscriptLocation::Found(path) => path,
-                    snap::TranscriptLocation::Absent => {
-                        reply_sink(rollback_error_frame(
-                            &op,
-                            "REDO_UNAVAILABLE",
-                            REDO_REMOVED_HISTORY_COPY,
-                        ));
-                        return;
-                    }
-                    snap::TranscriptLocation::Unreadable(error) => {
-                        reply_sink(snap::unreadable_rollback_refusal(&op, &original, &error));
-                        return;
-                    }
-                };
-                let original_text = match std::fs::read_to_string(&original_path) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &e.to_string()));
-                        return;
-                    }
-                };
-                let Some(current_path) = snap::locate_transcript(&durable_id) else {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "INTERNAL_ERROR",
-                        "current transcript missing",
-                    ));
-                    return;
-                };
-                // Task 4 review (Minor-2): classify the read OUTCOME — a missing
-                // file (or a raced deletion) is the DELIBERATE vacuous-empty leg
-                // (the post-first-turn-undo empty transcript; LCP admits the
-                // first group end), but any REAL read error on this
-                // existing-expected path is a loud INTERNAL_ERROR, exactly like
-                // the original's read leg above — never a silent empty-chain
-                // degradation yielding a false `redone` ack plus a pointless fork.
-                let current_text = match std::fs::read_to_string(&current_path) {
-                    Ok(t) => t,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-                    Err(e) => {
-                        reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &e.to_string()));
-                        return;
-                    }
-                };
-                // Redo validity contract (wire design; LBC-9): the original must
-                // BE the history the undo observed — raw-chain tip == the
-                // recorded tip — AND the current chain must still be a strict
-                // prefix of it (the LCP resolves PAST the current tip). Any
-                // miss => loud REDO_UNAVAILABLE + REDO_REMOVED_HISTORY_COPY;
-                // never silently re-fork over moved history.
-                let original_tip = snap::raw_chain_tip(&original_text);
-                if original_tip != record.original_tip_uuid {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "REDO_UNAVAILABLE",
-                        REDO_REMOVED_HISTORY_COPY,
-                    ));
-                    return;
-                }
-                if snap::raw_lcp_end(&current_text, &original_text)
-                    != snap::raw_chain_tip(&current_text)
-                {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "REDO_UNAVAILABLE",
-                        REDO_REMOVED_HISTORY_COPY,
-                    ));
-                    return;
-                }
-                // The resume point = the LAST raw-chain uuid of the restored
-                // step's group — its assistant tail (r3 boundary rule).
-                let resume_at = match snap::redo_resume_target(&original_text, &current_text, &op) {
-                    Ok(Some(uuid)) => uuid,
-                    Ok(None) => {
-                        reply_sink(rollback_error_frame(
-                            &op,
-                            "REDO_UNAVAILABLE",
-                            REDO_EMPTY_MESSAGE,
-                        ));
-                        return;
-                    }
-                    Err(msg) => {
-                        reply_sink(rollback_error_frame(&op, "INVALID_ROLLBACK_TARGET", &msg));
-                        return;
-                    }
-                };
-                // The ack payload for a redo = the RESTORED slice (display
-                // projection of the original's range just-after-the-prefix
-                // through the resume point).
-                let restored =
-                    snap::restored_slice_turns(&original_text, &current_text, &resume_at);
-                let can_redo_after_redo = original_tip.as_deref() != Some(resume_at.as_str());
-                // The guard: the one prompted turn of the original the redo
-                // still leaves out, when exactly one (`None` redoing TO the
-                // tip: nothing is discarded).
-                let guard = snap::drops_turn_guard(&original_text, Some(&resume_at));
-                (
-                    original,
-                    original_path,
-                    Some(resume_at),
-                    restored.turns,
-                    restored.prompt_text,
-                    record.original_session_id.clone().expect("checked above"),
-                    record.original_tip_uuid.clone(),
-                    can_redo_after_redo,
-                    guard,
-                )
-            }
-        };
-
-        // Durable record FIRST (durable-BEFORE-mutation): computed from the
-        // pre-mutation reads, keyed by the CURRENT durable id, AWAITED before
-        // anything is torn down. The sdk.session.init adoption leg re-keys the
-        // row old→new inside its awaited binding batch — exactly one
-        // rollback-record-specific write, always pre-mutation. r3 UNION rule:
-        // `entries` accumulates; a NEW epoch freezes every prior entry (they stay
-        // first) and NEVER clears the bucket.
-        let mut record = existing
-            .clone()
-            .unwrap_or_else(|| RollbackRecord::empty(now));
-        match op.direction {
-            RollbackDirection::Undo => {
-                // Epoch rule (r3 + delta-r1 F8's literal bookkeeping): an undo
-                // landing while redo_destroyed was set (or whose chain root
-                // re-roots away from the prior record's) is a NEW epoch — bump
-                // `current_epoch` (every existing entry freezes with its own
-                // epoch), the destroyed bit clears so the record's redo fields
-                // describe the NEW chain (the prior chain's redo stays
-                // permanently dead), `entries` is NEVER cleared. Same-epoch
-                // undos splice the new (earlier-in-conversation) entry BEFORE
-                // the existing current-epoch block — positions never read
-                // timestamps.
-                let new_epoch = record.redo_destroyed
-                    || (existing
-                        .as_ref()
-                        .is_some_and(|r| r.original_session_id.is_some())
-                        && existing
-                            .as_ref()
-                            .and_then(|r| r.original_session_id.clone())
-                            .as_deref()
-                            != Some(chain_root.as_str()));
-                if new_epoch {
-                    record.redo_destroyed = false;
-                    record.begin_new_epoch();
-                }
-                record.splice_undo_entry(
-                    RollbackEntry {
-                        removed_turns: removed_turns.clone(),
-                        prompt_text: prompt_text.clone(),
-                        at_ms: now,
-                        epoch: record.current_epoch,
-                    },
-                    now,
-                );
-            }
-            RollbackDirection::Redo => {
-                // The restored turns leave the CURRENT-epoch marker portion (they
-                // are live again); frozen prior-epoch markers can never match a
-                // restorable id (the redo contract's LCP/tip validation can only
-                // restore from the current chain root).
-                let restored_id_set: std::collections::HashSet<&str> = removed_turns
-                    .iter()
-                    .filter_map(|t| {
-                        t.get("turnId")
-                            .or_else(|| t.get("id"))
-                            .and_then(Value::as_str)
-                    })
-                    .collect();
-                record.entries.retain_mut(|e| {
-                    e.removed_turns.retain(|t| {
-                        !t.get("turnId")
-                            .or_else(|| t.get("id"))
-                            .and_then(Value::as_str)
-                            .is_some_and(|id| restored_id_set.contains(id))
-                    });
-                    !e.removed_turns.is_empty()
-                });
-            }
-        }
-        record.original_session_id = Some(chain_root.clone());
-        record.original_tip_uuid = original_tip_uuid.clone();
-        record.last_op_at_ms = now;
-        record.set_can_redo(can_redo_after, now);
-        if let Some(sink) = self.identity_sink() {
-            if let Err(e) = sink
-                .record_rollback(PROVIDER, &durable_id, record.clone())
-                .await
-            {
-                tracing::warn!(error = %e, session = %durable_id, "freshagent.claude.rollback_pre_write_failed");
-                reply_sink(rollback_error_frame(
-                    &op,
-                    "INTERNAL_ERROR",
-                    LEDGER_WRITE_REFUSAL_COPY,
-                ));
-                return;
-            }
-        }
-
-        // ep3-r5 F1 (the admit→teardown window): the gate's quiescence-proof is
-        // consumed ONCE at admission — a compact can arm and start (status
-        // folded, candidate set, gate re-boosted by ep3-r4 F1) while this
-        // already-admitted handler is doing transcript I/O. The quiesce probe
-        // above makes all provably-written evidence folded-visible; the
-        // recheck here (at the point of no return, immediately before
-        // teardown) aborts the rollback with BUSY_TURN plus a compensating
-        // ledger rewrite whenever that truth revived (the durable pre-write
-        // provably matches the provider: nothing was mutated).
-        if let Ok(ms) = std::env::var("FRESHELL_TEST_CLAUDE_ROLLBACK_PRE_TEARDOWN_MS") {
-            // Test-only knob: parks this handler in the admit→teardown window so
-            // the recheck choreography is deterministic (never in production).
-            if let Ok(ms) = ms.parse::<u64>() {
-                tokio::time::sleep(Duration::from_millis(ms)).await;
-            }
-        }
-
-        // Focused ep4-r2/ep4-r3 (the post-admission evidence race, repaired
-        // for real): absorbed compact debt can STILL start in the sidecar
-        // after admission — the dispatch lifecycle is: sidecar input queue →
-        // SAME-TICK handoff when the SDK consumer is awaiting → SDK turn
-        // start (its `compacting` status folds the candidate here). The
-        // quiesce probe closes every leg of that lifecycle atomically: the
-        // sidecar (1) DROPS never-handed compacts from its own input queue
-        // (cancellation the SDK surface cannot provide for queue items), (2)
-        // reports in-flight/handed truth, and (3) answers on its stdout
-        // stream AFTER every already-emitted piece of evidence has been folded
-        // (stream order), correlated by probeId so a stale receipt can never
-        // close the probe. The verdict gates below plus the recheck cover the
-        // whole shape: all-clear → proceed; any busy signal or no answer →
-        // BUSY_TURN + compensating ledger rewrite. Skip when no live evidence
-        // path exists: write failure (sidecar already dead), or a FINISHED
-        // consumer (its EOF reaped the busy truth; nothing fresh can arrive).
-        let mut probe_armed = false;
-        let mut probe_rx = None;
-        let mut probe_id = String::new();
-        {
-            let mut guard = self.sessions.lock().await;
-            if let Some(session) = guard.get_mut(&map_key) {
-                if session.consumer.is_finished() {
-                    // EOF already zeroed the tracker — the recheck sees it.
-                } else {
-                    let (tx, rx) = tokio::sync::oneshot::channel::<QuiesceVerdict>();
-                    probe_id = uuid::Uuid::new_v4().to_string();
-                    *session
-                        .rollback_probe_slot
-                        .lock()
-                        .expect("rollback probe slot lock") = Some((probe_id.clone(), tx));
-                    // ep4-r3: the quiesce is its own request type — the sidecar
-                    // drains never-handed queued compacts and answers with its
-                    // own queue truth (the SDK's queued inputs cannot be
-                    // cancelled once handed).
-                    let probe_req = json!({
-                        "type": "rollback.quiesce",
-                        "sessionId": session.sidecar_session_id,
-                        "probeId": probe_id,
-                    });
-                    match write_line(&mut session.stdin, &probe_req).await {
-                        Ok(()) => {
-                            probe_armed = true;
-                            probe_rx = Some(rx);
-                        }
-                        Err(_) => {
-                            let _ = session
-                                .rollback_probe_slot
-                                .lock()
-                                .expect("rollback probe slot lock")
-                                .take();
-                        }
-                    }
-                }
-            }
-        }
-        if probe_armed {
-            let timeout_ms = std::env::var("FRESHELL_TEST_CLAUDE_ROLLBACK_PROBE_TIMEOUT_MS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(3000);
-            let verdict =
-                tokio::time::timeout(Duration::from_millis(timeout_ms), probe_rx.unwrap()).await;
-            match verdict {
-                Ok(Ok(QuiesceVerdict {
-                    cancelled_queue,
-                    in_flight_turn: false,
-                    handed_compact_likely: false,
-                })) => {
-                    if cancelled_queue > 0 {
-                        tracing::info!(
-                            session = %map_key,
-                            cancelled = cancelled_queue,
-                            "freshagent.claude.rollback_quiesce_cancelled_queue"
-                        );
-                    }
-                }
-                Ok(Ok(verdict)) => {
-                    // ep4-r3 F1: provider work crossed the un-cancellable
-                    // handoff (a turn mid-flight, or a compact already handed
-                    // to an awaiting SDK consumer) — refuse.
-                    tracing::info!(session = %map_key, ?verdict, "freshagent.claude.rollback_quiesce_busy");
-                    // ep4-r6 F5: never fabricate an empty row for a rollback
-                    // that never happened — the shared helper DELETES the
-                    // pre-write when the pre-op record was absent.
-                    self.compensate_rollback_record(&durable_id, existing.clone())
-                        .await;
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "BUSY_TURN",
-                        ROLLBACK_BUSY_MESSAGE,
-                    ));
-                    return;
-                }
-                _ => {
-                    // Timeout (or a dropped sender — impossible in practice
-                    // since the slot outlives this handler): the absorb premise
-                    // is unproven — refuse rather than tear a live provider
-                    // flow down blind. Clear OUR slot (a stale receipt must
-                    // never fire a later probe — ep4-r3 F2 defense in depth
-                    // on top of probeId correlation).
-                    if let Some(session) = self.sessions.lock().await.get(&map_key) {
-                        let mut slot = session
-                            .rollback_probe_slot
-                            .lock()
-                            .expect("rollback probe slot lock");
-                        if slot.as_ref().is_some_and(|(id, _)| *id == probe_id) {
-                            slot.take();
-                        }
-                    }
-                    // ep4-r6 F5: never fabricate an empty row for a rollback
-                    // that never happened — the shared helper DELETES the
-                    // pre-write when the pre-op record was absent.
-                    self.compensate_rollback_record(&durable_id, existing.clone())
-                        .await;
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "BUSY_TURN",
-                        ROLLBACK_BUSY_MESSAGE,
-                    ));
-                    return;
-                }
-            }
-        }
-
-        let revived = {
-            let tracker = turn_tracker.lock().expect("turn tracker lock");
-            tracker.running.is_some()
-                || tracker.compact_candidate
-                || tracker.queued.iter().any(|op| *op == TrackedOp::Turn)
-        };
-        if revived {
-            // Compensate the pre-op durable record: the provider was never
-            // touched, so the ledger must describe nothing happening —
-            // restore the pre-op record, and DELETE the just-written row when
-            // there was none (never fabricate, ep4-r6 F5).
-            self.compensate_rollback_record(&durable_id, existing.clone())
-                .await;
-            reply_sink(rollback_error_frame(
-                &op,
-                "BUSY_TURN",
-                ROLLBACK_BUSY_MESSAGE,
-            ));
-            return;
-        }
-
-        // Cancel pending cards BEFORE teardown (decision 6) — both spawn legs.
-        self.emit_pending_cancellations(&map_key, &op.session_id, session_type)
-            .await;
-
-        // Pre-compute the create-drive inputs: recovered settings + the resume
-        // value/cwd (ledger A15 slug scoping; the transcript-PATH escape hatch
-        // when the original cwd is gone). The fork READS: undo ⇒ the CURRENT
-        // session's file; redo ⇒ the chain-root ORIGINAL's file (`resume_from`)
-        // -- `source_path`, the file the arm above already located and read
-        // (G28: never a second scan that a store turning unreadable could miss
-        // AFTER the pre-write, with teardown next).
-        let recovered = self
-            .identity_sink()
-            .and_then(|s| s.load_settings(PROVIDER, &durable_id));
-        // resume value (the fork leg): the durable id under its ORIGINAL cwd's
-        // slug scope when that cwd survives; else the transcript PATH (the
-        // verified cli.js escape hatch bypassing slug scoping).
-        let (resume_value, original_cwd) =
-            crate::claude_launch::resume_target(&resume_from, &source_path);
-        let spawn_cwd = original_cwd
-            .or_else(|| op.cwd.clone())
-            .or_else(|| recovered.as_ref().and_then(|r| r.cwd.clone()));
-        // G15: the respawn runs with the session's recorded settings, plugins
-        // included, and the lane's hosted MCP selection.
-        let launch_settings = recovered.clone().unwrap_or_default();
-        // Tear down the old sidecar (handle_kill discipline): remove the record
-        // FIRST so its consumer's exit arm stays silent (evicted=false), then the
-        // shared kill-family teardown (G31: the shutdown request, escalation only
-        // after the grace period, the ownership sweep, the tree confirmation),
-        // and the create-dedup eviction so a replayed requestId genuinely
-        // re-spawns.
-        let old = self.sessions.lock().await.remove(&map_key);
-        self.create_dedup
-            .clear_for_session(|record| record.session_id == map_key)
-            .await;
-        if let Some(session) = old {
-            // An unconfirmed tree is logged and keeps escalating detached; the
-            // fork does not wait on it (it never did).
-            let _ = self.teardown_removed_session_logged(session).await;
-        }
-
-        // Kill + recreate via `spawn_sidecar` with the computed options. The
-        // create payload is selected by `resume_at_uuid`:
-        //   * Some(uuid) — fork-at-point (resume + resumeSessionAt + forkSession);
-        //   * None (r2 first-turn rollback) — a FRESH conversation with NO resume
-        //     keys at all (the empty fresh transcript IS the rollback target).
-        // ONE guard retry: a create whose early output carries the
-        // `Resume rejected by --resume-drops-turn:` prefix is retried ONCE with
-        // resumeDropsTurn omitted (the plain-resume recovery per the SDK docs —
-        // the raw guard text is never surfaced).
-        let mut guard_retried = guard_uuid.is_none(); // no guard => nothing to retry
-        let spawned = loop {
-            let boot = match &resume_at_uuid {
-                Some(resume_at) => ClaudeBoot::Fork {
-                    resume: resume_value.clone(),
-                    at: Some(resume_at.clone()),
-                    // attempt 1 arms the guard; the retried recovery omits it.
-                    drops_turn: guard_uuid.clone().filter(|_| !guard_retried),
-                },
-                None => ClaudeBoot::Fresh,
-            };
-            let spec = ClaudeLaunchSpec::new(
-                format!("rollback-{}", uuid::Uuid::new_v4()),
-                session_type,
-                boot,
-                spawn_cwd.clone(),
-                &launch_settings,
-                self.hosted_mcp,
-            );
-            match self
-                .rollback_spawn_create(&spec, lease_guard.as_mut())
-                .await
-            {
-                Ok(ok) => break Ok(ok),
-                Err(RollbackSpawnError::GuardRefusal) if !guard_retried => {
-                    tracing::warn!(session = %durable_id,
-                        "freshagent.claude.rollback_guard_refused_retrying_plain");
-                    guard_retried = true;
-                    continue;
-                }
-                Err(RollbackSpawnError::GuardRefusal) => {
-                    break Err("the --resume-drops-turn guard refusal persisted after the plain-resume recovery retry".to_string())
-                }
-                Err(RollbackSpawnError::Other(message)) => break Err(message),
-            }
-        };
-        let spawned = match spawned {
-            Ok(ok) => ok,
-            Err(err) => {
-                self.compensate_rollback_record(&durable_id, existing.clone())
-                    .await;
-                if let Some(mut g) = lease_guard.take() {
-                    g.fail();
-                }
-                reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &err));
-                return;
-            }
-        };
-        let RollbackSpawned {
-            child,
-            tree_guard,
-            stdin,
-            reader,
-            ownership_id,
-            log_labels,
-            sidecar_session_id,
-            preseeded_init,
-            cli_id,
-        } = spawned;
-        // kata b8ke Task 3: the respawn's partial runtime (the watchdog's
-        // reap target) + the pid for the commit's owner identity (captured
-        // before `child` moves into the session entry).
-        let sidecar_pid = child.id();
-        // b8ke delta round-2 F2: arm the registered start cancellation.
-        crate::ownership_lane::arm_sidecar_pid_slot(&start_pid_slot, sidecar_pid);
-        crate::ownership_lane::register_partial_fresh_runtime(
-            &self.ownership,
-            PROVIDER,
-            &durable_id,
-            &own_ticket,
-            &map_key,
-            sidecar_pid,
-        );
-
-        // Register the replacement session under the SAME map key, INHERITING
-        // the turn lock + busy truth handles (a mid-rollback send serializes on
-        // the SAME lock regardless of when it resolved its handle).
-        let (adopted_tx, adopted_rx) = tokio::sync::oneshot::channel();
-        let broadcast_id = Arc::new(std::sync::Mutex::new(op.session_id.clone()));
-        log_labels.bind_session(&broadcast_id);
-        let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
-        // The respawn is fresh: nothing announced yet; the consumer's status
-        // fold owns the tracked status from here.
-        let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
-        // Task 5: the fork CARRIES the pre-rollback session's death-mint
-        // clock (extracted with the other carried handles above) — the fork
-        // continues the same logical session lifetime, so its Rust-minted
-        // `at`s stay ordered against anything the session minted before.
-        // Spawned and registered under the sessions map lock (review PRB-C10): no
-        // line the consumer reads can find the replacement session missing.
-        {
-            let mut sessions = self.sessions.lock().await;
-            let consumer = self.spawn_consumer(
-                reader,
-                map_key.clone(),
-                session_type.to_string(),
-                sidecar_session_id.clone(),
-                recovered.clone(),
-                Arc::clone(&broadcast_id),
-                Arc::clone(&pending),
-                Arc::clone(&last_status),
-                in_turn.clone(),
-                turn_tracker.clone(),
-                Arc::clone(&last_synthesized_complete_at),
-                Some(RollbackAdoption {
-                    supersedes: durable_id.clone(),
-                    preseeded_init,
-                    adopted_tx,
-                }),
-                // Conn-less lane (D8): the rollback respawn has no client
-                // connection — the ledger merge inherits the superseded parent's
-                // stamps.
-                None,
-            );
-            self.test_holds.registration().await;
-            sessions.insert(
-                map_key.clone(),
-                ClaudeSession {
-                    configuration: ClaudeConfiguration {
-                        settings: recovered.clone().unwrap_or_default(),
-                        ..ClaudeConfiguration::default()
-                    },
-                    stdin,
-                    child,
-                    tree_guard,
-                    ownership_id,
-                    consumer,
-                    sidecar_session_id,
-                    cli_session_id: Some(cli_id.clone()),
-                    // b8ke focused episode-2 round-2 F2: the ROLLBACK's claim
-                    // owns this respawn's coordinator transition — the
-                    // adoption's Blocked arm correlates through the op id.
-                    owning_operation: own_ticket.as_ref().map(|t| t.operation_id().to_string()),
-                    owning_generation: None,
-                    broadcast_id: Arc::clone(&broadcast_id),
-                    pending,
-                    in_turn: in_turn.clone(),
-                    turn_tracker: turn_tracker.clone(),
-                    last_synthesized_complete_at,
-                    turn_lock: turn_lock.clone(),
-                    rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
-                    last_status,
-                },
-            );
-        }
-
-        // Adoption rides the EXISTING sdk.session.init consumer (preseeded):
-        // cli_index insert + AWAITED binding WITH supersedes + rollback-row
-        // re-key old→new inside the same awaited batch — then resolves this
-        // channel with the adopted durable id.
-        let adopted_id = match tokio::time::timeout(SIDECAR_CREATE_BUDGET, adopted_rx).await {
-            Ok(Ok(Some(id))) if !id.is_empty() => id,
-            _ => {
-                tracing::error!(target: "invariant", session = %durable_id,
-                    "freshagent.claude.rollback_adoption_failed: the consumer never resolved the init adoption");
-                self.compensate_rollback_record(&durable_id, existing.clone())
-                    .await;
-                // Tear the fork down — an unadopted fork must never answer sends.
-                self.teardown_rollback_fork(&map_key).await;
-                if let Some(mut g) = lease_guard.take() {
-                    g.fail();
-                }
-                reply_sink(rollback_error_frame(
-                    &op,
-                    "INTERNAL_ERROR",
-                    "rollback adoption failed on the forked sidecar",
-                ));
-                return;
-            }
-        };
-
-        // Lease completion: bind the OLD durable id to the live map key and
-        // release the lease in one lock scope. A revoked lease means we must NOT
-        // keep the fork — tear down, compensate, refuse.
-        if let Some(mut g) = lease_guard.take() {
-            if !g.complete(&map_key) {
-                self.compensate_rollback_record(&durable_id, existing.clone())
-                    .await;
-                self.teardown_rollback_fork(&map_key).await;
-                g.fail(); // own tree torn down — reopen the key
-                reply_sink(rollback_error_frame(
-                    &op,
-                    "INTERNAL_ERROR",
-                    "session lease revoked during rollback; torn down",
-                ));
-                return;
-            }
-        }
-
-        // kata b8ke Task 3 + focused episode-2 round-2 F1: the rollback's
-        // replacement session is registered — commit `Live{FreshAgent}`
-        // under the CLIENT-VISIBLE durable id. The fork's
-        // `sdk.session.init` minted `adopted_id`, and the materialization
-        // below replaces every pane's sessionRef with it — so the
-        // coordinator record RE-KEYS to the same id (one atomic registry
-        // step: the old key goes Vacant, the new key goes Live; the old id
-        // becomes a resolvable alias). One source of truth: a later
-        // handoff on the pane's sessionRef finds the prior owner, stops
-        // it, and transfers atomically — never a Vacant-looking split
-        // identity with a live runtime beside a second writer.
-        if let Err(outcome) = self.commit_lane_claim_rekey_at(
-            &durable_id,
-            &mut own_ticket,
-            &adopted_id,
-            &map_key,
-            sidecar_pid,
-            "claude/rollback",
-        ) {
-            tracing::error!(target: "invariant",
-                provider = PROVIDER, session_id = %durable_id,
-                outcome = ?outcome,
-                "freshagent.claude.rollback_commit_stale: the coordinator moved on while \
-                 the rollback registered; the uncommitted session is torn down"
-            );
-            self.compensate_rollback_record(&durable_id, existing.clone())
-                .await;
-            self.teardown_rollback_fork(&map_key).await;
-            reply_sink(rollback_error_frame(
-                &op,
-                "INTERNAL_ERROR",
-                "session ownership changed during rollback; torn down",
-            ));
-            return;
-        }
-
-        // Pane re-key: the existing materialized broadcast (old → new) goes out
-        // BEFORE any frame stamped with the new id; the envelope-stamp flip
-        // follows it so the re-key never outruns the pane.
-        self.broadcast_materialized(&op.session_id, &adopted_id, session_type)
-            .await;
-        *broadcast_id.lock().expect("broadcast id lock") = adopted_id.clone();
-
-        let removed_ids: Vec<String> = removed_turns
-            .iter()
-            .filter_map(|t| {
-                t.get("turnId")
-                    .or_else(|| t.get("id"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .collect();
-        // Re-stamp the op for the NEW live id so every outbound frame names the
-        // adopted session.
-        let switch = RollbackRequest {
-            session_id: adopted_id.clone(),
-            ..op
-        };
-        self.broadcast(&rollback_broadcast_frame(
-            &switch,
-            &adopted_id,
-            &removed_ids,
-            record.can_redo(),
-        ));
-        reply_sink(rollback_ack_frame(
-            &switch,
-            &adopted_id,
-            Some(&prompt_text),
-            &removed_ids,
-            record.can_redo(),
-            Some(&adopted_id),
-        ));
     }
 
     /// Resolve a client-addressed session id to the sessions-map key (Task 10b): the id
@@ -7028,6 +5788,7 @@ impl FreshClaudeState {
                 naming: None,
                 partial_runtime_key: Some(durable.to_string()),
                 start_pid_slot: &start_pid_slot,
+                inherit: None,
             },
             lease_guard,
             own_ticket,
@@ -7086,12 +5847,13 @@ impl FreshClaudeState {
         }));
     }
 
-    /// The sdk.session.init adoption block (the consumer's in-stream arm AND the
-    /// rollback-fork preseeded lane share it): record the durable Claude UUID in
-    /// cli_index + the session record, then AWAIT-write the identity binding row
-    /// (V8/A11). On the rollback lane the row carries `supersedes: old durable
-    /// id`, and the rollback-row re-key old→new rides the SAME awaited batch
-    /// (server-side sink). A failed write is surfaced user-visibly, never
+    /// The sdk.session.init adoption block (the consumer's in-stream arm; a
+    /// rollback no longer adopts through it, C13: its replacement registers
+    /// already adopted): record the durable Claude UUID in cli_index + the
+    /// session record, then AWAIT-write the identity binding row (V8/A11). A
+    /// `supersedes` caller's row carries `supersedes: old durable id`, and the
+    /// rollback-row re-key old→new rides the SAME awaited batch (server-side
+    /// sink). A failed write is surfaced user-visibly, never
     /// warn-and-drop, then the identity event proceeds. No-laundering guard
     /// (V7/A10): never persist an all-blank snapshot UNLESS a supersession edge
     /// is being written (a supersession write always goes through — it is the
@@ -7124,12 +5886,12 @@ impl FreshClaudeState {
         .await
     }
 
-    /// [`Self::adopt_session_init`] with the rollback preseed's completion
-    /// hook: `Deferred` outcomes settle asynchronously, and the deferred
-    /// task answers `Some(cli_id)` (published) or `None` (abandoned) on
-    /// the caller's channel — the rollback NEVER continues on an
-    /// unpublished id (finding 2: a failed publication fails the
-    /// adoption, not just the alias bookkeeping).
+    /// [`Self::adopt_session_init`] with a completion hook: `Deferred`
+    /// outcomes settle asynchronously, and the deferred task answers
+    /// `Some(cli_id)` (published) or `None` (abandoned) on the caller's
+    /// channel. Only tests observe the deferred adoption this way since the
+    /// rollback stopped adopting a pre-read init (C13).
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)] // the adoption field set + the completion channel
     async fn adopt_session_init_with_completion(
         &self,
@@ -7142,10 +5904,9 @@ impl FreshClaudeState {
         provenance: Option<&crate::BindProvenance>,
         on_settled: Option<tokio::sync::oneshot::Sender<Option<String>>>,
     ) -> SessionInitAdoptionOutcome {
-        // The preseed runs on the consumer task BEFORE the rollback
-        // handler inserts the replacement session — the registration gate
-        // must decide synchronously so the completion hook routes to the
-        // deferred task on `Deferred`.
+        // The adoption can run before its session is registered — the
+        // registration gate must decide synchronously so the completion hook
+        // routes to the deferred task on `Deferred`.
         let registered = self.sessions.lock().await.contains_key(session_id);
         if !registered {
             self.defer_session_init_adoption(
@@ -7986,15 +6747,9 @@ impl FreshClaudeState {
         // arm below can mint AFTER the eviction has already torn the session
         // record out of the map.
         last_synthesized_complete_at: Arc<std::sync::Mutex<Option<i64>>>,
-        // kata 1wxv Task 4: Some ONLY on the rollback fork/fresh respawn — the
-        // handler PREREAD the sdk.session.init line, so the consumer runs the
-        // adoption for it FIRST (supersedes-aware), then resolves the parked
-        // rollback handler with the adopted durable id.
-        adoption: Option<RollbackAdoption>,
-        // D8: the creating connection's provenance stamps, handed to both
-        // `adopt_session_init` arms (the rollback preseed lane and the
-        // in-stream `sdk.session.init`). `None` on conn-less consumers
-        // (rollback respawn, attach-resume) — the ledger merge keeps prior
+        // D8: the creating connection's provenance stamps, handed to the
+        // in-stream `sdk.session.init` adoption. `None` on conn-less consumers
+        // (rollback replacement, attach-resume) — the ledger merge keeps prior
         // stamps.
         provenance: Option<crate::BindProvenance>,
     ) -> tokio::task::JoinHandle<()> {
@@ -8003,48 +6758,6 @@ impl FreshClaudeState {
         let identity_sink = self.identity_sink();
         let state = self.clone();
         tokio::spawn(async move {
-            // Rollback-fork preseed (kata 1wxv Task 4): adoption via the EXISTING
-            // sdk.session.init adoption block (cli_index insert + AWAITED binding
-            // WITH supersedes — the rollback-row re-key old→new rides the SAME
-            // awaited batch server-side), then emit the mapped init frame, THEN
-            // resolve the parked rollback handler with the adopted durable id.
-            if let Some(adoption) = adoption {
-                let cli_id = adoption
-                    .preseeded_init
-                    .get("cliSessionId")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                if let Some(cli_id) = cli_id.as_deref() {
-                    // b8ke focused episode-2 round-3 F2: the preseed
-                    // adoption routes through the completion hook — a
-                    // `Deferred` outcome hands the channel to the deferred
-                    // task (which answers `Some(id)` on publication or
-                    // `None` on abandon), and an `Abandoned` outcome
-                    // answers `None` HERE: the rollback handler tears the
-                    // replacement down instead of continuing with a live
-                    // runtime unreachable by its advertised id.
-                    let _ = state
-                        .adopt_session_init_with_completion(
-                            cli_id,
-                            &session_id,
-                            &session_type,
-                            settings.as_ref(),
-                            Some(&adoption.supersedes),
-                            identity_sink.clone(),
-                            provenance.as_ref(),
-                            Some(adoption.adopted_tx),
-                        )
-                        .await;
-                    let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
-                    if let Some(frame) =
-                        sdk_line_to_frame(&adoption.preseeded_init, &stamp, &session_type)
-                    {
-                        let _ = broadcast_tx.send(frame);
-                    }
-                } else {
-                    let _ = adoption.adopted_tx.send(None);
-                }
-            }
             // The sidecar's report of its SDK stream's end (its last line before it
             // exits), read by the end-of-output path below.
             let mut stream_ended: Option<crate::claude_sidecar_exit::StreamEnded> = None;
@@ -9254,171 +7967,6 @@ fn lost_session_frame(session_id: &str, session_type: SessionType) -> ServerMess
     })
 }
 
-/// The `resumeDropsTurn` refusal prefix (SDK-documented): an
-/// `error_during_execution` result whose message begins with this. NEVER
-/// surfaced raw — the consumer maps it to the plain-resume recovery (one retry
-/// with the guard omitted; the refusal is deterministic, so it is never retried
-/// twice).
-const RESUME_DROPS_TURN_REFUSAL_PREFIX: &str = "Resume rejected by --resume-drops-turn:";
-
-/// The `create.failed` code of the same refusal when the CLI reports it at boot
-/// (`crates/freshell-claude-sidecar/boot.mjs`).
-const FORK_GUARD_REFUSED_CODE: &str = "FORK_GUARD_REFUSED";
-
-/// Why one rollback-respawn attempt failed.
-enum RollbackSpawnError {
-    /// The create's early output carried the `--resume-drops-turn` refusal
-    /// prefix — retry ONCE with the guard omitted.
-    GuardRefusal,
-    Other(String),
-}
-
-/// The pieces of a successful rollback respawn, ready for registration + the
-/// consumer's preseeded adoption.
-struct RollbackSpawned {
-    child: Child,
-    tree_guard: crate::claude_spawn::SidecarTreeGuard,
-    stdin: ChildStdin,
-    /// The stdout line reader, positioned AFTER the preread `sdk.session.init`.
-    reader: tokio::io::Lines<BufReader<ChildStdout>>,
-    ownership_id: String,
-    /// The labels the respawn's stderr log carries (bound at registration).
-    log_labels: crate::claude_sidecar_io::SidecarLogLabels,
-    /// The sidecar-keyed id (`created.sessionId`).
-    sidecar_session_id: String,
-    /// The preread `sdk.session.init` line (the consumer adopts it preseeded).
-    preseeded_init: Value,
-    /// The new durable id (parsed from the preread init).
-    cli_id: String,
-}
-
-impl FreshClaudeState {
-    /// Rollback post-spawn failure teardown (kata 1wxv Task 4): drop the
-    /// freshly-registered fork's map record, kill its sidecar tree, and clear
-    /// this map key's cli_index aliases — used identically by the acceptance-
-    /// failure and lease-revoked legs (an unadopted/uncompleted fork must never
-    /// answer sends).
-    async fn teardown_rollback_fork(&self, map_key: &str) {
-        if let Some(session) = self.sessions.lock().await.remove(map_key) {
-            session.consumer.abort();
-            let mut child = session.child;
-            let _ = child.start_kill();
-            reap_owned_claude_sidecars(&session.ownership_id);
-        }
-        // Finding 1: demote (not drop) the torn-down fork's aliases.
-        self.evict_cli_index_aliases(map_key).await;
-    }
-
-    /// One rollback-respawn attempt (kata 1wxv Task 4): boot a sidecar for
-    /// `spec` ([`Self::boot_sidecar`]: spawn, arm the lease kill handle, write
-    /// the create line, read `created`), then PREREAD its output until the
-    /// `sdk.session.init` line — the `--resume-drops-turn` refusal
-    /// watch lives in this pre-read, BEFORE any durable state moves (the refusal
-    /// is retried by the caller with the guard omitted; the pre-read ordering is
-    /// how a refused fork can never adopt).
-    async fn rollback_spawn_create(
-        &self,
-        spec: &ClaudeLaunchSpec,
-        lease_guard: Option<&mut crate::FreshSessionLeaseGuard>,
-    ) -> Result<RollbackSpawned, RollbackSpawnError> {
-        let BootedSidecar {
-            mut child,
-            stdin,
-            mut reader,
-            ownership_id,
-            log_labels,
-            tree_guard,
-            created,
-        } = self
-            .boot_sidecar(spec, lease_guard, None)
-            .await
-            .map_err(|error| match error {
-                // The CLI refuses a fork whose drops-turn guard does not hold at
-                // boot (T5): the same refusal the init pre-read below watches for.
-                EstablishError::Boot(failure) if failure.is_refusal(FORK_GUARD_REFUSED_CODE) => {
-                    RollbackSpawnError::GuardRefusal
-                }
-                other => RollbackSpawnError::Other(other.message(EstablishLane::Create)),
-            })?;
-        match read_session_init(&mut reader, SIDECAR_CREATE_BUDGET).await {
-            Ok(init) => {
-                let cli_id = init
-                    .get("cliSessionId")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .unwrap_or_default();
-                Ok(RollbackSpawned {
-                    child,
-                    tree_guard,
-                    stdin,
-                    reader,
-                    ownership_id,
-                    log_labels,
-                    sidecar_session_id: created.session_id,
-                    preseeded_init: init,
-                    cli_id,
-                })
-            }
-            Err(err) => {
-                let _ = child.start_kill();
-                reap_owned_claude_sidecars(&ownership_id);
-                Err(err)
-            }
-        }
-    }
-}
-
-/// Read the respawned sidecar's output until `sdk.session.init`, mapping each
-/// line to its outcome: the init line (returned verbatim for preseeded
-/// adoption), or — checked FIRST — any line carrying the
-/// `--resume-drops-turn` refusal prefix (never surfaced raw). Other early lines
-/// (e.g. a pre-init `sdk.status`) are dropped at this seam; the consumer resumes
-/// at the NEXT line after init.
-async fn read_session_init(
-    reader: &mut tokio::io::Lines<BufReader<ChildStdout>>,
-    budget: Duration,
-) -> Result<Value, RollbackSpawnError> {
-    let read = async {
-        loop {
-            match reader.next_line().await {
-                Ok(Some(line)) => {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    if trimmed.contains(RESUME_DROPS_TURN_REFUSAL_PREFIX) {
-                        return Err(RollbackSpawnError::GuardRefusal);
-                    }
-                    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-                        continue;
-                    };
-                    if value.get("type").and_then(Value::as_str) == Some("sdk.session.init") {
-                        return Ok(value);
-                    }
-                    // pre-init non-init line: tolerated, dropped.
-                }
-                Ok(None) => {
-                    return Err(RollbackSpawnError::Other(
-                        "sidecar stdout closed before sdk.session.init".to_string(),
-                    ))
-                }
-                Err(e) => {
-                    return Err(RollbackSpawnError::Other(format!(
-                        "sidecar stdout read error: {e}"
-                    )))
-                }
-            }
-        }
-    };
-    match tokio::time::timeout(budget, read).await {
-        Ok(result) => result,
-        Err(_) => Err(RollbackSpawnError::Other(format!(
-            "sidecar did not answer sdk.session.init within {}s",
-            budget.as_secs()
-        ))),
-    }
-}
-
 // ── Node sidecar spawn ──────────────────────────────────────────────────────────────────
 
 /// A just-spawned claude sidecar: the owned child with its stdin and stdout, the
@@ -10010,9 +8558,8 @@ pub use create_outcome::ClaudeCreateOutcome;
 
 mod establish;
 mod genesis;
-use establish::{
-    BootedSidecar, DurableClaim, EstablishError, EstablishLane, EstablishPlan, RegisterUnder,
-};
+mod rollback;
+use establish::{DurableClaim, EstablishLane, EstablishPlan, RegisterUnder};
 
 #[cfg(test)]
 mod teardown_tests;
@@ -11447,6 +9994,8 @@ const liveSessions = new Set(
 // cancellation authority at the pre-handoff residence.
 const compactQueue = []
 const configuredSettings = new Map()
+// Sessions booted under a server-minted id whose init waits for the first send.
+const deferredInit = new Map()
 const rl = readline.createInterface({ input: process.stdin, terminal: false })
 rl.on('line', (line) => {
   const trimmed = line.trim()
@@ -11470,10 +10019,15 @@ rl.on('line', (line) => {
       liveSessions.add(sessionId)
       configuredSettings.set(sessionId, { model: msg.model, effort: msg.effort, permissionMode: msg.permissionMode, cwd: msg.cwd })
       process.stdout.write(JSON.stringify({ type: 'created', sessionId, protocol: 2 }) + '\n')
+      if (msg.sessionId) {
+        // A boot under a server-minted id (a rollback's replacement, a boot
+        // from a genesis): the CLI runs under that id and, like the real CLI
+        // (T1), reports it only once a prompt runs — at the first send.
+        deferredInit.set(sessionId, msg.sessionId)
+        return
+      }
       // Mirror the real sidecar's post-create init: echo the resume boot's id as the
       // durable id when present (resume continuity), else a fixed fake uuid.
-      // Task 4 (kata 1wxv): a fork boot mints a FRESH durable id,
-      // never an echo — fork-at-point adoption depends on the id changing.
       const cliSessionId = msg.boot?.kind === 'fork'
         ? `fork-${process.pid}-${counter}-0000-4000-8000-000000000000`
         : (msg.boot?.resume || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
@@ -11494,6 +10048,11 @@ rl.on('line', (line) => {
     // Test hook: lets tests kill the sidecar THROUGH the public API to exercise
     // the consumer-exit eviction path (ledger A9).
     if (msg.text === '__exit__') process.exit(0)
+    const deferredCliId = deferredInit.get(msg.sessionId)
+    if (deferredCliId) {
+      deferredInit.delete(msg.sessionId)
+      console.log(JSON.stringify({ type: 'sdk.session.init', sessionId: msg.sessionId, cliSessionId: deferredCliId, model: 'fake-model', cwd: '/tmp', tools: [] }))
+    }
     // Task 4 (kata 1wxv) in_turn edge hooks: each magic text emits ONE canned sdk.*
     // line so the four-edge/fail-closed busy contract can drive every edge.
     if (msg.text === '__emit_result_error__') {
@@ -15902,6 +14461,7 @@ rl.on('line', (line) => {
             &mut no_ticket,
             new_dur,
             &placeholder,
+            &placeholder,
             Some(replacement_pid),
             "claude/rollback",
         )
@@ -19714,7 +18274,6 @@ rl.on('line', (line) => {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(TurnTracker::default())),
             Arc::new(std::sync::Mutex::new(None)),
-            None,
             None, // provenance: test lane is conn-less (D8)
         );
 
@@ -21121,7 +19680,6 @@ rl.on('line', (line) => {
             Arc::clone(&in_turn),
             Arc::clone(&turn_tracker),
             Arc::clone(&last_synthesized_complete_at),
-            None,
             None, // provenance: test lane is conn-less (D8)
         );
         st.sessions.lock().await.insert(
@@ -21267,7 +19825,6 @@ rl.on('line', (line) => {
             Arc::clone(&in_turn),
             Arc::clone(&turn_tracker),
             Arc::clone(&last_synthesized_complete_at),
-            None,
             None, // provenance: test lane is conn-less (D8)
         );
         st.sessions.lock().await.insert(
@@ -21300,17 +19857,23 @@ rl.on('line', (line) => {
         stdin_log
     }
 
-    /// Poll until the session's `cli_session_id` differs from `prior` (the fork
-    /// adoption mints a NEW durable id mid-rollback) or the budget dies.
+    /// Poll until the session `map_key` names (C13: the rollback's
+    /// replacement, which the map key resolves to once it took the original's
+    /// place) has a `cli_session_id` other than `prior` (the replacement's
+    /// durable id), or the budget dies.
     async fn await_adopted_durable(st: &FreshClaudeState, map_key: &str, prior: &str) -> String {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
-            let current = st
-                .sessions
-                .lock()
-                .await
-                .get(map_key)
-                .and_then(|s| s.cli_session_id.clone());
+            let key = st.resolve_session_key(map_key).await;
+            let current = match key {
+                Some(key) => st
+                    .sessions
+                    .lock()
+                    .await
+                    .get(&key)
+                    .and_then(|s| s.cli_session_id.clone()),
+                None => None,
+            };
             if let Some(current) = current {
                 if current != prior {
                     return current;
