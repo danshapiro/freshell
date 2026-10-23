@@ -323,6 +323,8 @@ async fn hosted_gateway_takes_precedence_over_the_local_claude_lane() {
 struct ControlLane {
     sends: std::sync::Mutex<Vec<RestLaneSend>>,
     captures: std::sync::Mutex<Vec<RestLaneCapture>>,
+    materialized_session_id: Option<String>,
+    concurrent_replacement: Option<(crate::layout_store::LayoutStore, String, String, Value)>,
 }
 
 #[async_trait::async_trait]
@@ -338,8 +340,17 @@ impl FreshAgentRestLane for ControlLane {
     }
     async fn send_agent(&self, request: RestLaneSend) -> Result<RestLaneSendResult, RestLaneError> {
         let noop = request.text == "\n";
+        let first = self.sends.lock().unwrap().is_empty();
+        if first {
+            if let Some((layout, tab_id, pane_id, content)) = &self.concurrent_replacement {
+                layout.attach_pane_content(tab_id, pane_id, content.clone());
+            }
+        }
         let result = RestLaneSendResult {
-            session_id: request.session_id.clone(),
+            session_id: first
+                .then(|| self.materialized_session_id.clone())
+                .flatten()
+                .unwrap_or_else(|| request.session_id.clone()),
             completed: true,
             submitted_turn_id: (!noop).then(|| "actual-submitted-uuid".into()),
             noop,
@@ -360,6 +371,82 @@ impl FreshAgentRestLane for ControlLane {
         self.captures.lock().unwrap().push(request);
         Ok(result)
     }
+}
+
+#[tokio::test]
+async fn settled_session_identity_updates_headless_layout_for_later_send_and_capture() {
+    const NEXT_ID: &str = "67cebd37-9576-4de0-93bb-8f286f5fc499";
+    let state = state_with_registry();
+    let lane = Arc::new(ControlLane {
+        materialized_session_id: Some(NEXT_ID.into()),
+        ..Default::default()
+    });
+    state.set_claude_rest_lane(lane.clone()).unwrap();
+    let router = app(state);
+    let (_, created) = post(router.clone(), "/api/tabs", json!({"agent":"claude"}), true).await;
+    let pane = created["data"]["paneId"].as_str().unwrap();
+    for text in ["/clear", "next turn"] {
+        let (status, body) = post(
+            router.clone(),
+            &format!("/api/panes/{pane}/send-keys"),
+            json!({"data":text}),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"]["sessionId"], NEXT_ID);
+    }
+    assert_eq!(lane.sends.lock().unwrap()[1].session_id, NEXT_ID);
+    assert_eq!(capture_response(router, pane).await.0, StatusCode::OK);
+    assert_eq!(
+        lane.captures.lock().unwrap().last().unwrap().session_id,
+        NEXT_ID
+    );
+}
+
+#[tokio::test]
+async fn an_old_send_settling_does_not_overwrite_a_concurrent_pane_replacement() {
+    const SETTLED_ID: &str = "67cebd37-9576-4de0-93bb-8f286f5fc499";
+    const REPLACED_ID: &str = "39a6e5a0-3601-4c71-a878-d8da4db265c0";
+    let state = state_with_registry();
+    let (tab, pane) = state.layout.create_tab(None);
+    state.layout.attach_pane_content(&tab, &pane, json!({"kind":"fresh-agent", "provider":"claude", "sessionType":"freshclaude", "sessionId":"prior-session"}));
+    let lane = Arc::new(ControlLane {
+        materialized_session_id: Some(SETTLED_ID.into()),
+        concurrent_replacement: Some((
+            state.layout.clone(),
+            tab,
+            pane.clone(),
+            json!({
+                "kind":"fresh-agent", "provider":"claude", "sessionType":"freshclaude", "sessionId":REPLACED_ID,
+                "sessionRef":{"provider":"claude", "sessionId":REPLACED_ID}, "model":"replacement-model",
+            }),
+        )),
+        ..Default::default()
+    });
+    state.set_claude_rest_lane(lane.clone()).unwrap();
+    let router = app(state.clone());
+    let (status, body) = post(
+        router.clone(),
+        &format!("/api/panes/{pane}/send-keys"),
+        json!({"data":"/clear"}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let content = state
+        .layout
+        .get_pane_snapshot(&pane)
+        .unwrap()
+        .pane_content
+        .unwrap();
+    assert_eq!(content["sessionId"], REPLACED_ID);
+    assert_eq!(content["model"], "replacement-model");
+    assert_eq!(capture_response(router, &pane).await.0, StatusCode::OK);
+    assert_eq!(
+        lane.captures.lock().unwrap().last().unwrap().session_id,
+        REPLACED_ID
+    );
 }
 
 async fn capture_response(router: axum::Router, pane_id: &str) -> (StatusCode, String) {
@@ -473,4 +560,170 @@ async fn lane_controls_use_the_current_layout_identity_after_a_rest_created_pane
     let capture = lane.captures.lock().unwrap().last().unwrap().clone();
     assert_eq!(capture.session_id, CURRENT_ID);
     assert_eq!(capture.session_type, "kilroy");
+}
+
+#[tokio::test]
+async fn actual_claude_create_conflict_preserves_the_refusing_owner_and_retry_hint() {
+    use freshell_ownership::{
+        BeginOutcome, CommitOutcome, OwnerIdentity, RuntimeOwnerKind, RuntimeOwnershipRegistry,
+    };
+    const ID: &str = "67cebd37-9576-4de0-93bb-8f286f5fc499";
+    let owner = Arc::new(RuntimeOwnershipRegistry::with_epoch(41));
+    let BeginOutcome::Granted { generation } = owner.begin_start(
+        "claude",
+        ID,
+        RuntimeOwnerKind::Terminal,
+        "terminal-create",
+        None,
+        "test",
+        1,
+    ) else {
+        panic!("terminal claim granted")
+    };
+    assert_eq!(
+        owner.commit_live(
+            "claude",
+            ID,
+            "terminal-create",
+            generation,
+            OwnerIdentity {
+                kind: RuntimeOwnerKind::Terminal,
+                terminal_id: Some("existing-terminal".into()),
+                live_session_key: None,
+                pid: None,
+                ownership_id: None,
+            }
+        ),
+        CommitOutcome::Committed
+    );
+    let state = state_with_registry();
+    let mut claude = crate::FreshClaudeState::new(Arc::new(tokio::sync::broadcast::channel(16).0));
+    claude.set_ownership(owner);
+    state
+        .set_claude_rest_lane(Arc::new(crate::claude_rest_lane::ClaudeRestLane::new(
+            claude,
+            Arc::new(|| true),
+        )))
+        .unwrap();
+    let router = app(state);
+    let (status, body) = post(
+        router.clone(),
+        "/api/tabs",
+        json!({"agent":"claude", "sessionRef":{"provider":"claude", "sessionId":ID}}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "SESSION_RESERVED");
+    assert_eq!(body["ownerKind"], "terminal");
+    assert_eq!(body["ownerEpoch"], 41);
+    assert_eq!(body["ownerGeneration"], generation);
+    assert_eq!(body["retryable"], true);
+    assert!(
+        body["retryAfterMs"].as_u64().is_some_and(|delay| delay > 0),
+        "{body}"
+    );
+    let (_, tabs) = get(router, "/api/tabs", true).await;
+    assert!(tabs["data"]["tabs"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn observed_ownership_pair_reaches_the_create_and_send_lanes_unchanged() {
+    let state = state_with_registry();
+    let creates = Arc::new(ContextLane {
+        layout: state.layout.clone(),
+        creates: Default::default(),
+    });
+    state.set_claude_rest_lane(creates.clone()).unwrap();
+    let (status, body) = post(
+        app(state),
+        "/api/tabs",
+        json!({"agent":"claude", "observedEpoch":41, "observedGeneration":7}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let created = creates.creates.lock().unwrap().last().unwrap().clone();
+    assert_eq!(
+        (created.observed_epoch, created.observed_generation),
+        (Some(41), Some(7))
+    );
+    let state = state_with_registry();
+    let (tab, pane) = state.layout.create_tab(None);
+    state.layout.attach_pane_content(&tab, &pane, json!({"kind":"fresh-agent", "provider":"claude", "sessionType":"freshclaude", "sessionId":"session"}));
+    let sends = Arc::new(ControlLane::default());
+    state.set_claude_rest_lane(sends.clone()).unwrap();
+    let (status, body) = post(
+        app(state),
+        &format!("/api/panes/{pane}/send-keys"),
+        json!({"data":"continue", "observedEpoch":41, "observedGeneration":7}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let sent = sends.sends.lock().unwrap().last().unwrap().clone();
+    assert_eq!(
+        (sent.observed_epoch, sent.observed_generation),
+        (Some(41), Some(7))
+    );
+}
+
+#[tokio::test]
+async fn actual_claude_spawn_failure_is_unavailable_and_leaves_no_tab() {
+    let _guard = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    struct NodeOverride(Option<std::ffi::OsString>);
+    impl Drop for NodeOverride {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("FRESHELL_CLAUDE_NODE", value),
+                None => std::env::remove_var("FRESHELL_CLAUDE_NODE"),
+            }
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let _restore = NodeOverride(std::env::var_os("FRESHELL_CLAUDE_NODE"));
+    std::env::set_var("FRESHELL_CLAUDE_NODE", root.path().join("missing-node"));
+    let state = state_with_registry();
+    let claude = crate::FreshClaudeState::new(Arc::new(tokio::sync::broadcast::channel(16).0));
+    state
+        .set_claude_rest_lane(Arc::new(crate::claude_rest_lane::ClaudeRestLane::new(
+            claude,
+            Arc::new(|| true),
+        )))
+        .unwrap();
+    let router = app(state);
+    let (status, body) = post(
+        router.clone(),
+        "/api/tabs",
+        json!({"agent":"claude", "cwd":root.path().to_str().unwrap()}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "CLAUDE_SIDECAR_START_FAILED");
+    let (_, tabs) = get(router, "/api/tabs", true).await;
+    assert!(tabs["data"]["tabs"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn malformed_or_incomplete_rest_fences_refuse_before_provider_creation() {
+    let state = state_with_registry();
+    let lane = Arc::new(ContextLane {
+        layout: state.layout.clone(),
+        creates: Default::default(),
+    });
+    state.set_claude_rest_lane(lane.clone()).unwrap();
+    let router = app(state);
+    for body in [
+        json!({"agent":"claude", "observedEpoch":41}),
+        json!({"agent":"claude", "observedEpoch":"41", "observedGeneration":7}),
+        json!({"agent":"claude", "observedEpoch":41, "observedGeneration":-1}),
+    ] {
+        let (status, body) = post(router.clone(), "/api/tabs", body, true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "INVALID_FENCE");
+    }
+    assert!(lane.creates.lock().unwrap().is_empty());
+    let (_, tabs) = get(router, "/api/tabs", true).await;
+    assert!(tabs["data"]["tabs"].as_array().unwrap().is_empty());
 }

@@ -26,6 +26,8 @@ fn send(text: &str) -> RestLaneSend {
         request_id: "rest-request".into(),
         text: text.into(),
         timeout_ms: 100,
+        observed_epoch: None,
+        observed_generation: None,
     }
 }
 
@@ -132,7 +134,7 @@ async fn completion_requires_the_accepted_session_uuid_and_request_even_when_bot
     tokio::pin!(future);
     assert!(futures_util::poll!(&mut future).is_pending());
     for unrelated in [
-        settled("another-session", "request", "uuid"),
+        settled("another-session", "request", "another-uuid"),
         settled("session", "request", "another-uuid"),
         settled("session", "another-request", "uuid"),
         ClaudeTurnEvent::Waiting {
@@ -150,7 +152,26 @@ async fn completion_requires_the_accepted_session_uuid_and_request_even_when_bot
     }
     // A user-silenced result still settles its sender, despite carrying no bell.
     tx.send(settled("session", "request", "uuid")).unwrap();
-    assert_eq!(future.await, Ok(true));
+    assert_eq!(future.await, Ok(Some("session".into())));
+}
+
+#[tokio::test]
+async fn the_accepted_uuid_settles_after_the_runtime_moves_to_a_new_session_key() {
+    let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+    tx.send(settled("new-session-key", "request", "uuid"))
+        .unwrap();
+    assert_eq!(
+        wait_for_turn(
+            &mut rx,
+            "accepted-session-key",
+            "runtime",
+            "request",
+            "uuid",
+            Duration::ZERO
+        )
+        .await,
+        Ok(Some("new-session-key".into()))
+    );
 }
 
 #[tokio::test]
@@ -190,6 +211,6 @@ async fn a_deadline_reports_an_incomplete_turn() {
             Duration::ZERO
         )
         .await,
-        Ok(false)
+        Ok(None)
     );
 }

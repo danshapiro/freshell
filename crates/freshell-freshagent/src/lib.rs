@@ -79,6 +79,7 @@ mod process_probe;
 pub(crate) mod quiet_deadman;
 pub mod rest_lane;
 pub(crate) mod rest_lane_create;
+mod rest_lane_sync;
 pub mod rollback_record;
 pub mod session_handoff;
 pub mod session_lease;
@@ -6375,27 +6376,40 @@ async fn send_keys(
         .unwrap_or(DEFAULT_TURN_TIMEOUT);
 
     if let Some(gateway) = state.rest_lane_for(&pane.provider) {
+        let (observed_epoch, observed_generation) = match rest_lane::observed_fence(&body) {
+            Ok(fence) => fence,
+            Err(error) => return rest_lane_failure(error),
+        };
         let request_id = body
             .get("requestId")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+        let addressed_session_id = pane
+            .durable_id
+            .clone()
+            .unwrap_or_else(|| pane.placeholder_id.clone());
         let result = gateway
             .send_agent(rest_lane::RestLaneSend {
                 request_id: request_id.clone(),
-                session_id: pane
-                    .durable_id
-                    .clone()
-                    .unwrap_or_else(|| pane.placeholder_id.clone()),
+                session_id: addressed_session_id.clone(),
                 provider: pane.provider.clone(),
                 session_type: pane.session_type.clone(),
                 text,
                 timeout_ms: u64::try_from(turn_timeout.as_millis()).unwrap_or(u64::MAX),
+                observed_epoch,
+                observed_generation,
             })
             .await;
         return match result {
             Ok(result) => {
+                state.reconcile_rest_send_session(
+                    &pane_id,
+                    &pane,
+                    &addressed_session_id,
+                    &result.session_id,
+                );
                 let mut data = json!({
                     "paneId":pane_id,
                     "sessionId":result.session_id,
@@ -7095,11 +7109,11 @@ async fn capture(
             Ok(capture) => text_plain(capture.text),
             Err(rest_lane::RestLaneCaptureError::Unsupported) => fail_json(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "hosted fresh-agent provider does not support transcript capture".to_string(),
+                "fresh-agent provider does not support transcript capture".to_string(),
             ),
             Err(rest_lane::RestLaneCaptureError::Unavailable) => fail_json(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "hosted fresh-agent transcript is temporarily unavailable".to_string(),
+                "fresh-agent transcript is temporarily unavailable".to_string(),
             ),
             Err(rest_lane::RestLaneCaptureError::NotFound) => fail_json(
                 StatusCode::NOT_FOUND,

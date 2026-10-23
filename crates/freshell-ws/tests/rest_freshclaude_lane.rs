@@ -1,0 +1,313 @@
+//! The default REST/MCP door controls the real WebSocket Claude runtime.
+#![cfg(unix)]
+
+mod common;
+
+use common::claude_rig::{ClaudeRig, RigKind, RigOptions, RIG_FRAME_BUDGET};
+use serde_json::{json, Value};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+fn options() -> RigOptions {
+    RigOptions {
+        rest_api: true,
+        durable_ledger: true,
+        ..Default::default()
+    }
+}
+
+async fn get(rig: &ClaudeRig, path: &str) -> (u16, String) {
+    let host = rig.http_url.strip_prefix("http://").unwrap();
+    let mut stream = tokio::net::TcpStream::connect(host).await.unwrap();
+    stream.write_all(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nx-auth-token: {}\r\nConnection: close\r\n\r\n", common::AUTH_TOKEN).as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    tokio::time::timeout(RIG_FRAME_BUDGET, stream.read_to_end(&mut raw))
+        .await
+        .unwrap()
+        .unwrap();
+    let response = String::from_utf8(raw).unwrap();
+    let (head, body) = response.split_once("\r\n\r\n").unwrap();
+    (
+        head.split_whitespace().nth(1).unwrap().parse().unwrap(),
+        body.to_string(),
+    )
+}
+
+async fn create(rig: &ClaudeRig, agent: &str) -> Value {
+    let (status, body) = rig
+        .post_json(
+            "/api/tabs",
+            &json!({"agent":agent, "cwd":rig.workspace.to_str().unwrap()}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    body["data"].clone()
+}
+
+async fn send(rig: &ClaudeRig, pane: &str, text: &str) -> Value {
+    let (status, body) = rig
+        .post_json(
+            &format!("/api/panes/{pane}/send-keys"),
+            &json!({"data":text, "requestId":"rest-request", "timeout":5}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    body["data"].clone()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rest_create_send_capture_and_ws_create_replay_share_one_writer() {
+    let rig = ClaudeRig::start_with_options(RigKind::Sim, options()).await;
+    let mut observer = rig.connect().await;
+    let created = create(&rig, "claude").await;
+    let id = created["sessionId"].as_str().unwrap();
+    let pane = created["paneId"].as_str().unwrap();
+    assert!(
+        uuid::Uuid::parse_str(id).is_ok(),
+        "REST exposes the durable UUID immediately: {created}"
+    );
+    assert_eq!(
+        created["sessionRef"],
+        json!({"provider":"claude", "sessionId":id})
+    );
+    let ws_created = observer
+        .wait_for("REST-created session", |frame| {
+            frame["type"] == "freshAgent.created" && frame["sessionId"] == id
+        })
+        .await;
+    let command = observer
+        .wait_for("REST tab command", |frame| {
+            frame["type"] == "ui.command" && frame["command"] == "tab.create"
+        })
+        .await;
+    let content = &command["payload"]["paneContent"];
+    assert_eq!(content["createRequestId"], ws_created["requestId"]);
+    assert_eq!(content["sessionId"], id);
+    assert_eq!(content["model"], "opus[1m]");
+    assert_eq!(content["permissionMode"], "bypassPermissions");
+    assert_eq!(content["effort"], "high");
+    assert_eq!(content["status"], "connected");
+    let mut second_browser = rig.connect().await;
+    let replay = second_browser
+        .request_create(
+            content["createRequestId"].as_str().unwrap(),
+            json!({"paneId":pane, "tabId":created["tabId"]}),
+        )
+        .await;
+    assert_eq!(replay["sessionId"], id);
+    assert_eq!(
+        rig.query_options().len(),
+        1,
+        "REST and browser deduplicate at the same runtime create ingress"
+    );
+    let (status, empty) = get(&rig, &format!("/api/panes/{pane}/capture")).await;
+    assert_eq!(status, 200, "{empty}");
+    assert!(empty.is_empty());
+    let sent = send(&rig, pane, "héllo\r").await;
+    assert_eq!(sent["status"], "idle");
+    let prompts = rig.ledger_rows("prompt");
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts[0]["text"], "héllo");
+    assert_eq!(prompts[0]["model"], "opus[1m]");
+    assert_eq!(prompts[0]["effort"], "high");
+    assert_eq!(prompts[0]["permissionMode"], "bypassPermissions");
+    assert_eq!(sent["submittedTurnId"], prompts[0]["uuid"]);
+    assert_ne!(sent["submittedTurnId"], "rest-request");
+    observer
+        .wait_for("REST turn completion", |frame| {
+            frame["event"]["type"] == "freshAgent.turn.complete" && frame["sessionId"] == id
+        })
+        .await;
+    let (status, text) = get(&rig, &format!("/api/panes/{pane}/capture")).await;
+    assert_eq!(status, 200, "{text}");
+    assert!(text.contains("user: héllo"), "{text}");
+    assert!(text.contains("assistant: ok"), "{text}");
+    let (status, bounded) = get(&rig, &format!("/api/panes/{pane}/capture?maxBytes=8")).await;
+    assert_eq!(status, 200);
+    assert!(bounded.len() <= 8);
+    assert!(!bounded.is_empty());
+    let noop = send(&rig, pane, "\r\n").await;
+    assert_eq!(noop["status"], "noop");
+    assert!(noop.get("submittedTurnId").is_none());
+    assert_eq!(rig.ledger_rows("prompt").len(), 1);
+    send(&rig, pane, "second\r\n").await;
+    assert_eq!(
+        rig.ledger_rows("prompt")[1]["text"],
+        "second\r",
+        "strip exactly one final line terminator"
+    );
+    rig.fresh_claude.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_split_uses_kilroy_and_rolls_back_a_disabled_launch() {
+    let rig = ClaudeRig::start_with_options(RigKind::Sim, options()).await;
+    let mut observer = rig.connect().await;
+    let original = create(&rig, "claude").await;
+    let source = original["paneId"].as_str().unwrap();
+    let (status, split) = rig.post_json(&format!("/api/panes/{source}/split"), &json!({"agent":"kilroy", "cwd":rig.workspace.to_str().unwrap(), "direction":"vertical"})).await;
+    assert_eq!(status, 200, "{split}");
+    let pane = split["data"]["paneId"].as_str().unwrap();
+    let command = observer
+        .wait_for("Kilroy split command", |frame| {
+            frame["type"] == "ui.command" && frame["command"] == "pane.split"
+        })
+        .await;
+    assert_eq!(command["payload"]["newContent"]["sessionType"], "kilroy");
+    assert_eq!(command["payload"]["newContent"]["provider"], "claude");
+    assert!(command["payload"]["newContent"]
+        .get("namingHandle")
+        .is_none());
+    assert_eq!(send(&rig, pane, "kilroy hello").await["status"], "idle");
+    observer.read_for(Duration::from_millis(50)).await;
+    let announcements = observer
+        .frames
+        .iter()
+        .filter(|frame| frame["type"] == "ui.command")
+        .count();
+    let (_, before) = get(&rig, "/api/layout/snapshot").await;
+    rig.fresh_codex.set_enabled(false);
+    let (status, refused) = rig
+        .post_json(
+            &format!("/api/panes/{source}/split"),
+            &json!({"agent":"claude"}),
+        )
+        .await;
+    assert_eq!(status, 403, "{refused}");
+    assert_eq!(refused["code"], "FRESH_AGENT_DISABLED");
+    observer.read_for(Duration::from_millis(50)).await;
+    assert_eq!(
+        observer
+            .frames
+            .iter()
+            .filter(|frame| frame["type"] == "ui.command")
+            .count(),
+        announcements,
+        "a failed launch announces no pane create or split"
+    );
+    let (_, after) = get(&rig, "/api/layout/snapshot").await;
+    let before: Value = serde_json::from_str(&before).unwrap();
+    let after: Value = serde_json::from_str(&after).unwrap();
+    assert_eq!(
+        after["data"]["layouts"], before["data"]["layouts"],
+        "failed split leaves the previous layout intact"
+    );
+    let (status, refused) = rig.post_json("/api/tabs", &json!({"agent":"claude"})).await;
+    assert_eq!(status, 403, "{refused}");
+    assert_eq!(rig.query_options().len(), 2);
+    rig.fresh_claude.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rest_controls_a_browser_created_pane_and_capture_survives_server_restart() {
+    let mut rig = ClaudeRig::start_with_options(RigKind::Sim, options()).await;
+    let mut browser = rig.connect().await;
+    let answer = browser
+        .request_create(
+            "browser-create",
+            json!({"tabId":"browser-tab", "paneId":"browser-pane"}),
+        )
+        .await;
+    assert_eq!(answer["type"], "freshAgent.created", "{answer}");
+    let id = answer["sessionId"].as_str().unwrap();
+    browser.send(json!({
+        "type":"ui.layout.sync", "tabs":[{"id":"browser-tab"}], "activeTabId":"browser-tab",
+        "layouts":{"browser-tab":{"type":"leaf", "id":"browser-pane", "content":{
+            "kind":"fresh-agent", "provider":"claude", "sessionType":"freshclaude", "sessionId":id,
+            "sessionRef":{"provider":"claude", "sessionId":id}, "createRequestId":"browser-create",
+        }}}, "activePane":{"browser-tab":"browser-pane"}, "timestamp":1,
+    })).await;
+    browser.send(json!({"type":"ping"})).await;
+    browser
+        .wait_for("layout sync ordering barrier", |frame| {
+            frame["type"] == "pong"
+        })
+        .await;
+    assert_eq!(
+        send(&rig, "browser-pane", "browser pane via REST").await["status"],
+        "idle"
+    );
+    let (status, before) = get(&rig, "/api/panes/browser-pane/capture").await;
+    assert_eq!(status, 200, "{before}");
+    assert!(before.contains("browser pane via REST"));
+    rig.restart().await;
+    let (status, after) = get(&rig, "/api/panes/browser-pane/capture").await;
+    assert_eq!(status, 200, "{after}");
+    assert_eq!(after, before, "the restored layout resolves durable transcript capture without a REST pane row or live runtime");
+    rig.fresh_claude.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rest_deadline_is_approx_and_a_runtime_exit_is_a_retryable_conflict() {
+    let mut config = options();
+    config.env.push((
+        "FRESHELL_CLAUDE_SIM_PROGRAM".into(),
+        json!({"rules":[{
+            "on":"msg:prompt", "match":{"text":"crash"}, "emit":[{"kind":"crash"}],
+        }]})
+        .to_string(),
+    ));
+    let rig = ClaudeRig::start_with_options(RigKind::Sim, config).await;
+    let created = create(&rig, "claude").await;
+    let pane = created["paneId"].as_str().unwrap();
+    let (status, body) = rig
+        .post_json(
+            &format!("/api/panes/{pane}/send-keys"),
+            &json!({"data":"HANG", "timeout":1}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "approx");
+    assert_eq!(body["data"]["status"], "approx");
+    assert!(body["data"]["submittedTurnId"].as_str().is_some());
+    let crashing = create(&rig, "claude").await;
+    let pane = crashing["paneId"].as_str().unwrap();
+    let (status, ended) = rig
+        .post_json(
+            &format!("/api/panes/{pane}/send-keys"),
+            &json!({"data":"crash", "timeout":10}),
+        )
+        .await;
+    assert_eq!(status, 409, "{ended}");
+    assert_eq!(ended["code"], "FRESH_AGENT_SESSION_ENDED");
+    assert_eq!(ended["retryable"], true);
+    assert!(ended["retryAfterMs"]
+        .as_u64()
+        .is_some_and(|delay| delay > 0));
+    rig.fresh_claude.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_fenced_send_refusal_reports_its_owner_and_keeps_the_prompt_unsent() {
+    let rig = ClaudeRig::start_with_options(RigKind::Sim, options()).await;
+    let created = create(&rig, "claude").await;
+    let id = created["sessionId"].as_str().unwrap();
+    let pane = created["paneId"].as_str().unwrap();
+    let owner = rig.fresh_claude.ownership_snapshot("claude", id);
+    assert!(
+        owner.generation > 0,
+        "the runtime owns a committed generation"
+    );
+    let route = format!("/api/panes/{pane}/send-keys");
+    let (status, refused) = rig.post_json(&route, &json!({
+        "data":"stale prompt", "observedEpoch":owner.epoch, "observedGeneration":owner.generation - 1,
+    })).await;
+    assert_eq!(status, 409, "{refused}");
+    assert_eq!(refused["code"], "SESSION_RESERVED");
+    assert_eq!(refused["retryable"], true);
+    assert_eq!(refused["ownerKind"], "fresh-agent");
+    assert_eq!(refused["ownerEpoch"], owner.epoch);
+    assert_eq!(refused["ownerGeneration"], owner.generation);
+    assert!(refused["retryAfterMs"]
+        .as_u64()
+        .is_some_and(|delay| delay > 0));
+    assert!(rig.ledger_rows("prompt").is_empty());
+    let (status, sent) = rig.post_json(&route, &json!({
+        "data":"current prompt", "observedEpoch":owner.epoch, "observedGeneration":owner.generation, "timeout":5,
+    })).await;
+    assert_eq!(status, 200, "{sent}");
+    assert_eq!(sent["data"]["status"], "idle");
+    assert_eq!(rig.ledger_rows("prompt").len(), 1);
+    assert_eq!(rig.ledger_rows("prompt")[0]["text"], "current prompt");
+    rig.fresh_claude.shutdown().await;
+}

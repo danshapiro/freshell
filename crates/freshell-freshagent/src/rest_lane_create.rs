@@ -25,6 +25,7 @@ impl FreshAgentState {
         let invalid =
             |message| RestLaneError::new(RestLaneErrorKind::BadRequest, "INVALID_REQUEST", message);
         let inputs = rest_lane::provider_inputs(body).map_err(invalid)?;
+        let (observed_epoch, observed_generation) = rest_lane::observed_fence(body)?;
         let native_session_id = match body.get("sessionRef") {
             None => None,
             Some(value) => match serde_json::from_value::<SessionLocator>(value.clone()) {
@@ -56,6 +57,8 @@ impl FreshAgentState {
             model_selection: inputs.model_selection,
             permission_mode: inputs.permission_mode,
             sandbox: inputs.sandbox,
+            observed_epoch,
+            observed_generation,
             ..Default::default()
         };
         if provider == "claude" {

@@ -184,14 +184,14 @@ pub(crate) async fn split_pane(
 
     let new_content = if let Some(agent) = body.get("agent").and_then(Value::as_str) {
         let Some((provider, session_type)) = rest_agent_mode(agent) else {
-            let _ = state.layout.close_pane(&new_pane_id);
+            state.layout.rollback_split(&new_pane_id);
             return fail_json(
                 StatusCode::BAD_REQUEST,
                 format!("unknown agent \"{agent}\""),
             );
         };
         let Some(gateway) = state.rest_lane_for(provider) else {
-            let _ = state.layout.close_pane(&new_pane_id);
+            state.layout.rollback_split(&new_pane_id);
             return fail_json(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "durable fresh-agent gateway is not installed".to_string(),
@@ -203,7 +203,7 @@ pub(crate) async fn split_pane(
         {
             Ok(request) => request,
             Err(error) => {
-                let _ = state.layout.close_pane(&new_pane_id);
+                state.layout.rollback_split(&new_pane_id);
                 return rest_lane_failure(error);
             }
         };
@@ -212,7 +212,7 @@ pub(crate) async fn split_pane(
         let created = match gateway.create_agent(request.clone()).await {
             Ok(created) => created,
             Err(error) => {
-                let _ = state.layout.close_pane(&new_pane_id);
+                state.layout.rollback_split(&new_pane_id);
                 return rest_lane_failure(error);
             }
         };

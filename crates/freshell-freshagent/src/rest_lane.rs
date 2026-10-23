@@ -99,6 +99,25 @@ pub fn provider_inputs(body: &Value) -> Result<RestLaneProviderInputs, String> {
     })
 }
 
+pub(crate) fn observed_fence(body: &Value) -> Result<(Option<u64>, Option<u64>), RestLaneError> {
+    let read = |field: &str| match body.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value.as_u64().map(Some).ok_or_else(|| {
+            RestLaneError::new(
+                RestLaneErrorKind::BadRequest,
+                "INVALID_FENCE",
+                format!("{field} must be an unsigned integer"),
+            )
+        }),
+    };
+    let epoch = read("observedEpoch")?;
+    let generation = read("observedGeneration")?;
+    crate::ownership_lane::wire_fence(epoch, generation).map_err(|error| {
+        RestLaneError::new(RestLaneErrorKind::BadRequest, error.code(), error.message())
+    })?;
+    Ok((epoch, generation))
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RestLaneCreate {
     pub request_id: String,
@@ -116,6 +135,8 @@ pub struct RestLaneCreate {
     pub pane_id: Option<String>,
     pub naming_handle: Option<String>,
     pub model_effort_levels: Option<Vec<String>>,
+    pub observed_epoch: Option<u64>,
+    pub observed_generation: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -134,6 +155,8 @@ pub struct RestLaneSend {
     pub session_type: String,
     pub text: String,
     pub timeout_ms: u64,
+    pub observed_epoch: Option<u64>,
+    pub observed_generation: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

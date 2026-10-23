@@ -52,8 +52,8 @@ impl ClaudeRestLane {
                     tab_id: request.tab_id,
                     pane_id: request.pane_id,
                     naming_handle: request.naming_handle,
-                    observed_epoch: None,
-                    observed_generation: None,
+                    observed_epoch: request.observed_epoch,
+                    observed_generation: request.observed_generation,
                     legacy_restore_context: None,
                     resume_session_id: None,
                 },
@@ -76,6 +76,7 @@ impl ClaudeRestLane {
             } => {
                 let mut error = RestLaneError::new(create_error_kind(&code), code, message);
                 error.retryable = retryable;
+                error.retry_after_ms = retryable.filter(|retryable| *retryable).map(|_| 250);
                 error.owner = owner;
                 Err(error)
             }
@@ -114,8 +115,8 @@ impl ClaudeRestLane {
                 cwd: None,
                 images: None,
                 settings: None,
-                observed_epoch: None,
-                observed_generation: None,
+                observed_epoch: request.observed_epoch,
+                observed_generation: request.observed_generation,
                 checkpoint_intent: None,
             })
             .await;
@@ -127,7 +128,7 @@ impl ClaudeRestLane {
             } => (session_key, submitted_turn_id, ownership_id),
             ClaudeSendOutcome::Refused { code, message } => return Err(send_error(code, message)),
         };
-        let completed = wait_for_turn(
+        let settled_key = wait_for_turn(
             &mut events,
             &session_key,
             &ownership_id,
@@ -136,8 +137,9 @@ impl ClaudeRestLane {
             Duration::from_millis(request.timeout_ms),
         )
         .await?;
+        let completed = settled_key.is_some();
         Ok(RestLaneSendResult {
-            session_id: request.session_id.clone(),
+            session_id: settled_key.unwrap_or_else(|| request.session_id.clone()),
             completed,
             submitted_turn_id: Some(submitted_turn_id),
             noop: false,
@@ -307,7 +309,7 @@ async fn wait_for_turn(
     request_id: &str,
     submitted_turn_id: &str,
     budget: Duration,
-) -> Result<bool, RestLaneError> {
+) -> Result<Option<String>, RestLaneError> {
     let waited = tokio::time::timeout(budget, async {
         loop {
             match events.recv().await {
@@ -316,15 +318,17 @@ async fn wait_for_turn(
                     retired_request_ids,
                     retired_command_ids,
                     ..
-                }) if settled_key == session_key
-                    && retired_request_ids
-                        .iter()
-                        .any(|retired| retired == request_id)
+                }) if retired_request_ids
+                    .iter()
+                    .any(|retired| retired == request_id)
                     && retired_command_ids
                         .iter()
                         .any(|retired| retired == submitted_turn_id) =>
                 {
-                    return Ok(true)
+                    // /clear moves this runtime to a new conversation key.
+                    // Its minted command UUID and request still identify the
+                    // exact accepted send, including across that key change.
+                    return Ok(Some(settled_key));
                 }
                 Ok(ClaudeTurnEvent::Ended {
                     ownership_id: ended_owner,
@@ -361,7 +365,7 @@ async fn wait_for_turn(
         }
     })
     .await;
-    waited.unwrap_or(Ok(false))
+    waited.unwrap_or(Ok(None))
 }
 
 #[cfg(test)]
