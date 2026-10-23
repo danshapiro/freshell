@@ -3972,8 +3972,11 @@ export function FreshAgentView({
   // The session's permission mode converges onto the pane (transcript-live
   // §4.4): when the server states a new mode — the CLI left plan mode after an
   // approved ExitPlanMode, or another device changed it — the pane adopts it,
-  // so its next send does not put the CLI back. Only a change of the stated
-  // mode acts, so a mode the user just picked here is never undone.
+  // so its next send does not put the CLI back. A mode the pane cannot show
+  // (the SDK's 'auto' or 'dontAsk') still replaces the pane's own: the pane
+  // lets go of its mode, so its sends state none and the CLI keeps its own.
+  // Only a change of the stated mode acts, so a mode the user just picked here
+  // is never undone.
   const sessionPermissionMode = agentSession?.permissionMode
   const adoptedPermissionModeRef = useRef<string | undefined>(undefined)
   useEffect(() => {
@@ -3982,11 +3985,14 @@ export function FreshAgentView({
     const current = paneContentRef.current
     if (current.provider === 'opencode' || current.permissionMode === sessionPermissionMode) return
     if (!(CLAUDE_PERMISSION_MODE_VALUES as readonly string[]).includes(sessionPermissionMode)) {
-      log.warn('the session reports a permission mode the pane cannot represent; keeping the pane\'s', {
-        event: 'fresh_agent.permission_mode_unknown',
+      if (current.permissionMode === undefined) return
+      log.info('the session is in a permission mode the pane cannot show; the pane stops stating its own', {
+        event: 'fresh_agent.permission_mode_released',
         provider: current.provider,
         permissionMode: sessionPermissionMode,
+        previousPermissionMode: current.permissionMode,
       })
+      dispatch(mergePaneContent({ tabId, paneId, updates: { permissionMode: undefined } }))
       return
     }
     dispatch(mergePaneContent({ tabId, paneId, updates: { permissionMode: sessionPermissionMode } }))

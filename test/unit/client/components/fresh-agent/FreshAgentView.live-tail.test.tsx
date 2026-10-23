@@ -475,13 +475,25 @@ describe('the CLI\'s own permission mode (transcript-live D7)', () => {
     expect(paneContent(store).permissionMode).toBe('acceptEdits')
   })
 
-  it('ignores a mode the pane cannot represent', async () => {
-    serve(() => claudeSnapshot([userTurn('u-user', 'hi')]))
+  it.each(['auto', 'dontAsk'])('lets go of its own mode when the CLI reports one the pane cannot show (%s), so the next send keeps the CLI\'s', async (cliMode) => {
+    serve(() => claudeSnapshot([userTurn('u-user', 'plan it')]))
     const store = createStore()
     setPanePermissionMode(store, 'plan')
     await mount(store)
-    deliver(store, { type: 'freshAgent.session.metadata', permissionMode: 'someFutureMode' })
+
+    // ExitPlanMode was approved: the CLI went back to the mode it had before plan mode.
+    deliver(store, { type: 'freshAgent.session.metadata', permissionMode: cliMode })
     await advance(0)
-    expect(paneContent(store).permissionMode).toBe('plan')
+    expect(paneContent(store).permissionMode).toBeUndefined()
+
+    const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+    act(() => {
+      fireEvent.change(composer, { target: { value: 'now build it' } })
+    })
+    act(() => {
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    })
+    expect(sends().at(-1)?.settings).toBeDefined()
+    expect(sends().at(-1)?.settings).not.toHaveProperty('permissionMode')
   })
 })
