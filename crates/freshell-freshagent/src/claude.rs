@@ -1419,51 +1419,24 @@ impl FreshClaudeState {
         // D8 same-kind lease claim (the provider backstop — the coordinator
         // claim is the runner's, under-ticket).
         let resume_request_id = format!("handoff-resume-{}", uuid::Uuid::new_v4());
-        let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
-        for round in 0..2u8 {
-            match self.leases.claim(
-                PROVIDER,
-                session_id,
-                &resume_request_id,
-                crate::session_lease::now_epoch_ms(),
-            ) {
-                crate::session_lease::FreshSessionClaim::Acquired => {
-                    lease_guard = Some(crate::FreshSessionLeaseGuard::armed(
-                        Arc::clone(&self.leases),
-                        PROVIDER,
-                        session_id,
-                        &resume_request_id,
-                    ));
-                    break;
-                }
-                crate::session_lease::FreshSessionClaim::BoundLive { .. }
-                | crate::session_lease::FreshSessionClaim::Held { .. } => {
-                    return Err((
-                        "another lifecycle operation holds this session's lease".to_string(),
-                        session_id.to_string(),
-                    ));
-                }
-                crate::session_lease::FreshSessionClaim::ExpiredNeedsKill { pid, ownership_id } => {
-                    if round == 0
-                        && crate::session_lease::kill_and_confirm_tree_dead(
-                            pid,
-                            CLAUDE_SIDECAR_OWNERSHIP_ENV,
-                            &ownership_id,
-                        )
-                        .await
-                    {
-                        self.leases
-                            .force_release_after_confirmed_kill(PROVIDER, session_id);
-                        continue;
-                    }
-                    return Err((
-                        "the prior lease holder expired and could not be confirmed dead"
-                            .to_string(),
-                        session_id.to_string(),
-                    ));
-                }
+        let mut lease_guard = match self
+            .claim_launch_lease(session_id, &resume_request_id)
+            .await
+        {
+            LaunchLease::Acquired(guard) => Some(guard),
+            LaunchLease::BoundLive { .. } | LaunchLease::Held => {
+                return Err((
+                    "another lifecycle operation holds this session's lease".to_string(),
+                    session_id.to_string(),
+                ));
             }
-        }
+            LaunchLease::ExpiredUnconfirmed => {
+                return Err((
+                    "the prior lease holder expired and could not be confirmed dead".to_string(),
+                    session_id.to_string(),
+                ));
+            }
+        };
         let msg = FreshAgentAttach {
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: session_id.to_string(),
@@ -2270,50 +2243,15 @@ impl FreshClaudeState {
                     );
                 }
             }
-            for round in 0..2u8 {
-                match self.leases.claim(
-                    PROVIDER,
-                    sid,
-                    &request_id,
-                    crate::session_lease::now_epoch_ms(),
-                ) {
-                    crate::session_lease::FreshSessionClaim::Acquired => {
-                        lease_guard = Some(crate::FreshSessionLeaseGuard::armed(
-                            Arc::clone(&self.leases),
-                            PROVIDER,
-                            sid,
-                            &request_id,
-                        ));
-                        break;
-                    }
-                    crate::session_lease::FreshSessionClaim::BoundLive { .. } => {
-                        // Under-lock ADOPT: the winner completed between our pre-check
-                        // and the claim (the V5 TOCTOU window).
-                        return self.adopt_live_create(&request_id, sid, session_type).await;
-                    }
-                    crate::session_lease::FreshSessionClaim::Held { .. } => {
-                        return self.fail_create_session_reserved(&request_id);
-                    }
-                    crate::session_lease::FreshSessionClaim::ExpiredNeedsKill {
-                        pid,
-                        ownership_id,
-                    } => {
-                        if round == 0
-                            && crate::session_lease::kill_and_confirm_tree_dead(
-                                pid,
-                                CLAUDE_SIDECAR_OWNERSHIP_ENV,
-                                &ownership_id,
-                            )
-                            .await
-                        {
-                            self.leases
-                                .force_release_after_confirmed_kill(PROVIDER, sid);
-                            continue;
-                        }
-                        tracing::error!(target: "invariant", pid, session_id = sid,
-                            "fresh_agent_lease_expired_kill_unconfirmed: holding closed");
-                        return self.fail_create_session_reserved(&request_id);
-                    }
+            match self.claim_launch_lease(sid, &request_id).await {
+                LaunchLease::Acquired(guard) => lease_guard = Some(guard),
+                LaunchLease::BoundLive { .. } => {
+                    // Under-lock ADOPT: the winner completed between our pre-check
+                    // and the claim (the V5 TOCTOU window).
+                    return self.adopt_live_create(&request_id, sid, session_type).await;
+                }
+                LaunchLease::Held | LaunchLease::ExpiredUnconfirmed => {
+                    return self.fail_create_session_reserved(&request_id);
                 }
             }
         }
@@ -5561,87 +5499,34 @@ impl FreshClaudeState {
             }
         };
         let attach_request_id = format!("attach-{}", uuid::Uuid::new_v4());
-        let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
-        for round in 0..2u8 {
-            match self.leases.claim(
-                PROVIDER,
-                &durable,
-                &attach_request_id,
-                crate::session_lease::now_epoch_ms(),
-            ) {
-                crate::session_lease::FreshSessionClaim::Acquired => {
-                    lease_guard = Some(crate::FreshSessionLeaseGuard::armed(
-                        Arc::clone(&self.leases),
-                        PROVIDER,
-                        &durable,
-                        &attach_request_id,
-                    ));
-                    break;
-                }
-                crate::session_lease::FreshSessionClaim::BoundLive { .. } => {
-                    // The winner completed while we contended: converge via the same
-                    // rebind + ack the cli_index arm performs; if the binding is stale
-                    // (session just died), answer RESERVED -- the client re-drive
-                    // converges on the reopened key.
-                    self.resuming
-                        .lock()
-                        .expect("resuming lock")
-                        .remove(&durable);
-                    if !self
+        let lease = self.claim_launch_lease(&durable, &attach_request_id).await;
+        let mut lease_guard = match lease {
+            LaunchLease::Acquired(guard) => Some(guard),
+            refused => {
+                self.resuming
+                    .lock()
+                    .expect("resuming lock")
+                    .remove(&durable);
+                // The winner completed while we contended: converge via the
+                // same rebind + ack the cli_index arm performs; if the binding
+                // is stale (session just died), or another launch holds the
+                // lease, answer RESERVED -- the client re-drive converges on
+                // the reopened key.
+                let rebound = matches!(refused, LaunchLease::BoundLive { .. })
+                    && self
                         .try_rebind_to_live(&durable, session_type_str(msg.session_type))
-                        .await
-                    {
-                        self.emit_fresh_agent_error(
-                            &msg.session_id,
-                            session_type_str(msg.session_type),
-                            "SESSION_RESERVED",
-                            "Another resume for this session is in flight",
-                        );
-                    }
-                    return;
-                }
-                crate::session_lease::FreshSessionClaim::Held { .. } => {
-                    self.resuming
-                        .lock()
-                        .expect("resuming lock")
-                        .remove(&durable);
+                        .await;
+                if !rebound {
                     self.emit_fresh_agent_error(
                         &msg.session_id,
                         session_type_str(msg.session_type),
                         "SESSION_RESERVED",
                         "Another resume for this session is in flight",
                     );
-                    return;
                 }
-                crate::session_lease::FreshSessionClaim::ExpiredNeedsKill { pid, ownership_id } => {
-                    if round == 0
-                        && crate::session_lease::kill_and_confirm_tree_dead(
-                            pid,
-                            CLAUDE_SIDECAR_OWNERSHIP_ENV,
-                            &ownership_id,
-                        )
-                        .await
-                    {
-                        self.leases
-                            .force_release_after_confirmed_kill(PROVIDER, &durable);
-                        continue;
-                    }
-                    tracing::error!(target: "invariant", pid, session_id = %durable,
-                        "fresh_agent_lease_expired_kill_unconfirmed: holding closed");
-                    self.resuming
-                        .lock()
-                        .expect("resuming lock")
-                        .remove(&durable);
-                    self.emit_fresh_agent_error(
-                        &msg.session_id,
-                        session_type_str(msg.session_type),
-                        "SESSION_RESERVED",
-                        "Another resume for this session is in flight",
-                    );
-                    return;
-                }
+                return;
             }
-        }
+        };
         // b8ke focused episode-2 round-2 F2: the attach's OWN claim owns
         // the transition while it is in flight — recorded for the
         // session-init adoption's Blocked correlation.
@@ -8692,7 +8577,9 @@ mod fork;
 mod genesis;
 mod history;
 mod rollback;
-use establish::{BootRetry, DurableClaim, EstablishLane, EstablishPlan, RegisterUnder};
+use establish::{
+    BootRetry, DurableClaim, EstablishLane, EstablishPlan, LaunchLease, RegisterUnder,
+};
 
 #[cfg(test)]
 mod teardown_tests;

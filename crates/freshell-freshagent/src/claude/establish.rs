@@ -72,6 +72,40 @@ pub(super) struct InheritedRuntime {
     pub(super) last_synthesized_complete_at: Arc<std::sync::Mutex<Option<i64>>>,
 }
 
+/// What a launch's claim of the provider lease on a durable id found (design
+/// §4.9 "lease(id)": one live writer per durable transcript).
+pub(super) enum LaunchLease {
+    /// The lease is the launch's: the armed guard releases it if the launch
+    /// fails, and binds it to the registered session if it succeeds.
+    Acquired(crate::FreshSessionLeaseGuard),
+    /// A live session is bound to the id: the launch adopts it or refuses.
+    BoundLive { live_session_key: String },
+    /// Another launch holds the lease.
+    Held,
+    /// An expired holder could not be confirmed dead: the id stays closed.
+    ExpiredUnconfirmed,
+}
+
+/// The binding row of a session a launch minted with no transcript yet (an
+/// undo's replacement, a fork's child; design §4.9 "binding write").
+pub(super) struct GenesisBinding<'a> {
+    /// The minted id.
+    pub(super) session_id: &'a str,
+    pub(super) session_type: &'a str,
+    /// How it came to be, so a launch before its transcript exists boots it
+    /// again (§4.1).
+    pub(super) genesis: &'a crate::claude_launch::ClaudeGenesis,
+    /// The settings it launched with (the plugins too, G15).
+    pub(super) settings: &'a crate::identity_sink::FreshAgentSettings,
+    /// The session it replaces (an undo's original): its row retires and links
+    /// to this one, and its rollback record follows in the same write.
+    pub(super) supersedes: Option<&'a str>,
+    /// Whose it is (a fork's forking connection); `None` inherits.
+    pub(super) provenance: Option<crate::BindProvenance>,
+    /// The launch's coordinator claim: the write is fenced with its pair.
+    pub(super) ticket: &'a Option<freshell_ownership::OperationTicket>,
+}
+
 /// What a launch that boots a durable session from its recorded state needs
 /// for its one typed retry (design §4.2, [`retry_refused_boot`]): the session,
 /// and the genesis its binding row records.
@@ -240,6 +274,84 @@ pub(super) struct StartWatch<'a> {
 }
 
 impl FreshClaudeState {
+    /// Claim the provider lease on `durable` for the launch `request_id`, the
+    /// one claim every launch of a durable id makes (create-resume, attach,
+    /// handoff resume, rollback). A holder whose lease expired with a recorded
+    /// kill handle is killed, its whole tree confirmed dead by its ownership
+    /// tag, and the claim retried once; one that cannot be confirmed dead keeps
+    /// the id closed.
+    pub(super) async fn claim_launch_lease(&self, durable: &str, request_id: &str) -> LaunchLease {
+        for round in 0..2u8 {
+            match self.leases.claim(
+                PROVIDER,
+                durable,
+                request_id,
+                crate::session_lease::now_epoch_ms(),
+            ) {
+                crate::session_lease::FreshSessionClaim::Acquired => {
+                    return LaunchLease::Acquired(crate::FreshSessionLeaseGuard::armed(
+                        Arc::clone(&self.leases),
+                        PROVIDER,
+                        durable,
+                        request_id,
+                    ));
+                }
+                crate::session_lease::FreshSessionClaim::BoundLive { live_session_key } => {
+                    return LaunchLease::BoundLive { live_session_key };
+                }
+                crate::session_lease::FreshSessionClaim::Held { .. } => return LaunchLease::Held,
+                crate::session_lease::FreshSessionClaim::ExpiredNeedsKill { pid, ownership_id } => {
+                    if round == 0
+                        && crate::session_lease::kill_and_confirm_tree_dead(
+                            pid,
+                            CLAUDE_SIDECAR_OWNERSHIP_ENV,
+                            &ownership_id,
+                        )
+                        .await
+                    {
+                        self.leases
+                            .force_release_after_confirmed_kill(PROVIDER, durable);
+                        continue;
+                    }
+                    tracing::error!(target: "invariant", pid, session_id = %durable,
+                        request_id = %request_id,
+                        "fresh_agent_lease_expired_kill_unconfirmed: holding closed");
+                    return LaunchLease::ExpiredUnconfirmed;
+                }
+            }
+        }
+        LaunchLease::ExpiredUnconfirmed
+    }
+
+    /// Write the binding row of a session the launch minted (`binding`),
+    /// awaited: durable before the launch answers. A lane with no ledger
+    /// records nothing.
+    pub(super) async fn record_genesis_binding(
+        &self,
+        binding: GenesisBinding<'_>,
+    ) -> std::io::Result<()> {
+        let Some(sink) = self.identity_sink() else {
+            return Ok(());
+        };
+        let fenced = binding.ticket.as_ref().map(|ticket| ticket.generation());
+        sink.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Set(binding.genesis.clone()),
+            provider: PROVIDER.into(),
+            session_id: binding.session_id.to_string(),
+            mode: binding.session_type.to_string(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: binding.supersedes.map(str::to_string),
+            name_transition: None,
+            provenance: binding.provenance.into(),
+            observed_epoch: fenced.and(self.ownership.as_ref().map(|r| r.boot_epoch())),
+            observed_generation: fenced,
+            authoritative: false,
+            settings: binding.settings.clone(),
+        })
+        .await
+    }
+
     /// The transcript store this lane's sidecars write: the roots their CLI
     /// resolves. That is this process's environment, unless the lane gives its
     /// sidecars their own (the `test-support` seam a rig uses), whose

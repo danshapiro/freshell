@@ -15,7 +15,7 @@ use crate::claude_snapshot as snap;
 use crate::rollback_record::*;
 
 use super::establish::{
-    EstablishError, EstablishLane, EstablishPlan, InheritedRuntime, RegisterUnder,
+    EstablishError, EstablishLane, EstablishPlan, GenesisBinding, InheritedRuntime, RegisterUnder,
 };
 use super::history::EffectiveTranscriptError;
 
@@ -497,66 +497,21 @@ impl FreshClaudeState {
                 None,
             );
         }
-        for round in 0..2u8 {
-            match self.leases.claim(
-                PROVIDER,
-                &durable_id,
-                &rollback_lease_id,
-                crate::session_lease::now_epoch_ms(),
-            ) {
-                crate::session_lease::FreshSessionClaim::Acquired => {
-                    lease_guard = Some(crate::FreshSessionLeaseGuard::armed(
-                        Arc::clone(&self.leases),
-                        PROVIDER,
-                        &durable_id,
-                        &rollback_lease_id,
-                    ));
-                    break;
-                }
-                crate::session_lease::FreshSessionClaim::BoundLive { live_session_key } => {
-                    if live_session_key == map_key {
-                        // We ARE the bound live owner of this exact id — proceed
-                        // WITHOUT a lease (the binding already names this map key,
-                        // which the fork keeps).
-                        break;
-                    }
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "SESSION_RESERVED",
-                        "Another resume for this session is in flight",
-                    ));
-                    return;
-                }
-                crate::session_lease::FreshSessionClaim::Held { .. } => {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "SESSION_RESERVED",
-                        "Another resume for this session is in flight",
-                    ));
-                    return;
-                }
-                crate::session_lease::FreshSessionClaim::ExpiredNeedsKill { pid, ownership_id } => {
-                    if round == 0
-                        && crate::session_lease::kill_and_confirm_tree_dead(
-                            pid,
-                            CLAUDE_SIDECAR_OWNERSHIP_ENV,
-                            &ownership_id,
-                        )
-                        .await
-                    {
-                        self.leases
-                            .force_release_after_confirmed_kill(PROVIDER, &durable_id);
-                        continue;
-                    }
-                    tracing::error!(target: "invariant", pid, session_id = %durable_id,
-                        "fresh_agent_lease_expired_kill_unconfirmed: holding closed");
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "SESSION_RESERVED",
-                        "Another resume for this session is in flight",
-                    ));
-                    return;
-                }
+        match self
+            .claim_launch_lease(&durable_id, &rollback_lease_id)
+            .await
+        {
+            LaunchLease::Acquired(guard) => lease_guard = Some(guard),
+            // We ARE the bound live owner of this exact id — proceed WITHOUT a
+            // lease (the binding already names this map key).
+            LaunchLease::BoundLive { live_session_key } if live_session_key == map_key => {}
+            LaunchLease::BoundLive { .. } | LaunchLease::Held | LaunchLease::ExpiredUnconfirmed => {
+                reply_sink(rollback_error_frame(
+                    &op,
+                    "SESSION_RESERVED",
+                    "Another resume for this session is in flight",
+                ));
+                return;
             }
         }
 
@@ -1177,43 +1132,34 @@ impl FreshClaudeState {
         // the original's settings, `supersedes` = the original, which retires
         // the original's row and links it to the replacement) with the
         // rollback record re-keyed to the replacement in the same write.
-        if let Some(sink) = self.identity_sink() {
-            let fenced = own_ticket.as_ref().map(|ticket| ticket.generation());
-            if let Err(error) = sink
-                .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
-                    genesis: crate::identity_sink::GenesisUpdate::Set(genesis.clone()),
-                    provider: PROVIDER.into(),
-                    session_id: replacement.clone(),
-                    mode: session_type.to_string(),
-                    create_request_id: None,
-                    resolves_pending: None,
-                    supersedes: Some(durable_id.clone()),
-                    name_transition: None,
-                    provenance: None.into(),
-                    observed_epoch: fenced.and(self.ownership.as_ref().map(|r| r.boot_epoch())),
-                    observed_generation: fenced,
-                    authoritative: false,
-                    settings: launch_settings.clone(),
-                })
-                .await
-            {
-                tracing::error!(target: "freshell_freshagent::claude",
-                    event = "freshagent.claude.rollback_binding_write_failed",
-                    session_id = %durable_id, replacement = %replacement, error = %error,
-                    "the replacement's binding could not be written; it is torn down and the \
-                     original stays live"
-                );
-                self.unwind_replacement(&replacement, &durable_id, lease_held)
-                    .await;
-                self.compensate_rollback_record(&durable_id, existing.clone())
-                    .await;
-                reply_sink(rollback_error_frame(
-                    &op,
-                    "INTERNAL_ERROR",
-                    LEDGER_WRITE_REFUSAL_COPY,
-                ));
-                return;
-            }
+        if let Err(error) = self
+            .record_genesis_binding(GenesisBinding {
+                session_id: &replacement,
+                session_type,
+                genesis: &genesis,
+                settings: &launch_settings,
+                supersedes: Some(&durable_id),
+                provenance: None,
+                ticket: &own_ticket,
+            })
+            .await
+        {
+            tracing::error!(target: "freshell_freshagent::claude",
+                event = "freshagent.claude.rollback_binding_write_failed",
+                session_id = %durable_id, replacement = %replacement, error = %error,
+                "the replacement's binding could not be written; it is torn down and the \
+                 original stays live"
+            );
+            self.unwind_replacement(&replacement, &durable_id, lease_held)
+                .await;
+            self.compensate_rollback_record(&durable_id, existing.clone())
+                .await;
+            reply_sink(rollback_error_frame(
+                &op,
+                "INTERNAL_ERROR",
+                LEDGER_WRITE_REFUSAL_COPY,
+            ));
+            return;
         }
 
         // Ownership moves to the replacement in ONE coordinator step (the

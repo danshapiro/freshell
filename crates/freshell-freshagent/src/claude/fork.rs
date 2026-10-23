@@ -20,7 +20,9 @@ use crate::claude_handshake::RESUME_POINT_NOT_FOUND_CODE;
 use crate::claude_launch::{ClaudeBoot, ClaudeGenesis, ClaudeLaunchSpec};
 use crate::claude_snapshot as snap;
 
-use super::establish::{EstablishError, EstablishLane, EstablishPlan, RegisterUnder};
+use super::establish::{
+    EstablishError, EstablishLane, EstablishPlan, GenesisBinding, RegisterUnder,
+};
 use super::history::EffectiveTranscriptError;
 
 /// A fork while the parent runs a turn (`BUSY_TURN`).
@@ -423,35 +425,26 @@ impl FreshClaudeState {
         // answer): how it came to be (its genesis, so a restart before its first
         // send boots the same fork), the parent's settings and the forking
         // connection's attribution. No `supersedes`: the parent lives on.
-        if let Some(sink) = self.identity_sink() {
-            let fenced = own_ticket.as_ref().map(|ticket| ticket.generation());
-            if let Err(error) = sink
-                .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
-                    genesis: crate::identity_sink::GenesisUpdate::Set(genesis.clone()),
-                    provider: PROVIDER.into(),
-                    session_id: child.clone(),
-                    mode: session_type.to_string(),
-                    create_request_id: None,
-                    resolves_pending: None,
-                    supersedes: None,
-                    name_transition: None,
-                    provenance: fork_provenance.clone().into(),
-                    observed_epoch: fenced.and(self.ownership.as_ref().map(|r| r.boot_epoch())),
-                    observed_generation: fenced,
-                    authoritative: false,
-                    settings: launch_settings.clone(),
-                })
-                .await
-            {
-                tracing::error!(target: "freshell_freshagent::claude",
-                    event = "freshagent.claude.fork_binding_write_failed",
-                    session_id = %parent.durable, child = %child, error = %error,
-                    "the fork child's binding could not be written; the child is torn down"
-                );
-                self.unwind_fork_child(&child, false).await;
-                refuse("INTERNAL_ERROR", FORK_LEDGER_WRITE_MESSAGE);
-                return;
-            }
+        if let Err(error) = self
+            .record_genesis_binding(GenesisBinding {
+                session_id: &child,
+                session_type,
+                genesis: &genesis,
+                settings: &launch_settings,
+                supersedes: None,
+                provenance: fork_provenance.clone(),
+                ticket: &own_ticket,
+            })
+            .await
+        {
+            tracing::error!(target: "freshell_freshagent::claude",
+                event = "freshagent.claude.fork_binding_write_failed",
+                session_id = %parent.durable, child = %child, error = %error,
+                "the fork child's binding could not be written; the child is torn down"
+            );
+            self.unwind_fork_child(&child, false).await;
+            refuse("INTERNAL_ERROR", FORK_LEDGER_WRITE_MESSAGE);
+            return;
         }
 
         // Again once the row is written: from here to the answer nothing
