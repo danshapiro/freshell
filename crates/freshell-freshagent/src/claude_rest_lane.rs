@@ -67,6 +67,7 @@ impl ClaudeRestLane {
             } => Ok(RestLaneCreated {
                 session_id,
                 session_ref,
+                cleanup_token: None,
             }),
             ClaudeCreateOutcome::Failed {
                 code,

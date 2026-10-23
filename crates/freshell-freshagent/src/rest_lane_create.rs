@@ -7,6 +7,22 @@ use freshell_protocol::{SessionLocator, SettingsFreshAgent};
 use serde_json::{json, Value};
 
 impl FreshAgentState {
+    pub(crate) async fn abandon_rest_create(
+        &self,
+        lane: &rest_lane::SharedFreshAgentRestLane,
+        request: &RestLaneCreate,
+        created: &RestLaneCreated,
+    ) -> axum::response::Response {
+        if let Some(pane_id) = request.pane_id.as_deref() {
+            self.layout.rollback_split(pane_id);
+        }
+        if let Err(error) = lane.abandon_create(request, created).await {
+            tracing::error!(event = "agent_api.abandoned_create_cleanup_failed", request_id = %request.request_id, session_id = %created.session_id, code = %error.code, message = %error.message);
+            return crate::rest_lane_failure(error);
+        }
+        cancelled_create_response()
+    }
+
     pub fn set_rest_create_settings_reader(
         &self,
         reader: rest_lane::RestCreateSettingsReader,
@@ -157,6 +173,16 @@ impl FreshAgentState {
         }
         Ok(())
     }
+}
+
+pub(crate) fn cancelled_create_response() -> axum::response::Response {
+    let mut error = RestLaneError::new(
+        RestLaneErrorKind::Conflict,
+        "PANE_CREATE_CANCELLED",
+        "the pane was closed while its runtime was starting",
+    );
+    error.retryable = Some(false);
+    crate::rest_lane_failure(error)
 }
 
 pub(crate) fn pane_content(request: &RestLaneCreate, created: &RestLaneCreated) -> Value {

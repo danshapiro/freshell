@@ -1,8 +1,155 @@
-use super::tests::{app, get, post, state_with_registry};
+use super::tests::{app, delete, get, post, state_with_registry};
 use crate::rest_lane::*;
 use axum::http::StatusCode;
 use serde_json::json;
 use std::sync::Arc;
+
+#[derive(Default)]
+struct PausedCreateLane {
+    started: tokio::sync::Notify,
+    finish: tokio::sync::Notify,
+    request: std::sync::Mutex<Option<RestLaneCreate>>,
+    running: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl FreshAgentRestLane for PausedCreateLane {
+    async fn create_agent(
+        self: Arc<Self>,
+        request: RestLaneCreate,
+    ) -> Result<RestLaneCreated, RestLaneError> {
+        *self.request.lock().unwrap() = Some(request);
+        self.started.notify_one();
+        self.finish.notified().await;
+        self.running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(RestLaneCreated {
+            session_id: "late-runtime".into(),
+            cleanup_token: Some("late-runtime-owner".into()),
+            ..Default::default()
+        })
+    }
+    async fn send_agent(&self, _: RestLaneSend) -> Result<RestLaneSendResult, RestLaneError> {
+        unreachable!("the closed pane must never accept a send")
+    }
+    async fn abandon_create(
+        &self,
+        request: &RestLaneCreate,
+        created: &RestLaneCreated,
+    ) -> Result<(), RestLaneError> {
+        assert_eq!(
+            request.request_id,
+            self.request.lock().unwrap().as_ref().unwrap().request_id
+        );
+        assert_eq!(created.cleanup_token.as_deref(), Some("late-runtime-owner"));
+        self.running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+async fn close_during_create(split: bool) {
+    let state = state_with_registry();
+    let before: freshell_protocol::UiLayoutSync = serde_json::from_value(json!({
+        "tabs":[{"id":"current-tab"}], "activeTabId":"current-tab", "timestamp":1,
+        "layouts":{"current-tab":{"type":"split", "id":"ancestor", "direction":"horizontal", "sizes":[50,50], "children":[
+            {"type":"leaf", "id":"source-pane", "content":{"kind":"terminal", "mode":"shell", "createRequestId":"source-create"}},
+            {"type":"leaf", "id":"sibling-pane", "content":{"kind":"browser", "url":"https://survivor.example"}},
+        ]}}, "activePane":{"current-tab":"source-pane"},
+    })).unwrap();
+    state.layout.update_from_ui(&before, "creating-browser");
+    let lane = Arc::new(PausedCreateLane::default());
+    state.set_claude_rest_lane(lane.clone()).unwrap();
+    let router = app(state.clone());
+    let create_router = router.clone();
+    let mut events = state.broadcast_tx.subscribe();
+    let creating = tokio::spawn(async move {
+        post(
+            create_router,
+            if split {
+                "/api/panes/source-pane/split"
+            } else {
+                "/api/tabs"
+            },
+            json!({"agent":"claude"}),
+            true,
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), lane.started.notified())
+        .await
+        .unwrap();
+    let request = lane.request.lock().unwrap().clone().unwrap();
+    if split {
+        let (status, closed) = post(
+            router.clone(),
+            "/api/panes/source-pane/close",
+            json!({}),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{closed}");
+        // The closing browser's next sync excludes the not-yet-announced
+        // split too: it never knew that tentative pane existed.
+        let closed: freshell_protocol::UiLayoutSync = serde_json::from_value(json!({
+            "tabs":[{"id":"current-tab"}], "activeTabId":"current-tab", "timestamp":2,
+            "layouts":{"current-tab":{"type":"leaf", "id":"sibling-pane", "content":{"kind":"browser", "url":"https://survivor.example"}}},
+            "activePane":{"current-tab":"sibling-pane"},
+        })).unwrap();
+        state.layout.update_from_ui(&closed, "creating-browser");
+    } else {
+        let (status, closed) = delete(
+            router.clone(),
+            &format!("/api/tabs/{}", request.tab_id.as_deref().unwrap()),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{closed}");
+    }
+    lane.finish.notify_one();
+    let (status, result) = creating.await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a closed create target must not publish success: {result}"
+    );
+    assert_eq!(result["code"], "PANE_CREATE_CANCELLED");
+    assert_eq!(result["retryable"], false);
+    assert!(
+        !lane.running.load(std::sync::atomic::Ordering::SeqCst),
+        "the late owned runtime must be cleaned up"
+    );
+    assert!(state
+        .layout
+        .get_pane_snapshot(request.pane_id.as_deref().unwrap())
+        .is_none());
+    while let Ok(frame) = events.try_recv() {
+        let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert!(
+            !matches!(frame["command"].as_str(), Some("pane.split" | "tab.create")),
+            "an abandoned create must not be announced: {frame}"
+        );
+    }
+    assert_eq!(
+        state
+            .layout
+            .get_pane_snapshot("sibling-pane")
+            .unwrap()
+            .pane_content
+            .unwrap()["url"],
+        "https://survivor.example"
+    );
+}
+
+#[tokio::test]
+async fn closing_the_target_tab_while_runtime_create_awaits_cleans_the_late_runtime() {
+    close_during_create(false).await;
+}
+
+#[tokio::test]
+async fn closing_the_source_pane_while_runtime_create_awaits_cleans_the_late_runtime() {
+    close_during_create(true).await;
+}
 
 struct SyncDuringCreateLane {
     layout: crate::layout_store::LayoutStore,

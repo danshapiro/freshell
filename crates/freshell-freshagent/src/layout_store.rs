@@ -726,14 +726,22 @@ impl LayoutStore {
     /// `ensureSnapshot` + append an ordered tab with a single terminal leaf and
     /// a seeded title (`createTab`, `layout-store.ts:431-460`).
     pub fn create_tab(&self, title: Option<&str>) -> (String, String) {
-        self.create_tab_with_publication(title, false)
+        self.create_tab_with_publication(title, None)
     }
 
-    pub(crate) fn create_pending_tab(&self, title: Option<&str>) -> (String, String) {
-        self.create_tab_with_publication(title, true)
+    pub(crate) fn create_pending_tab(
+        &self,
+        title: Option<&str>,
+        create_request_id: &str,
+    ) -> (String, String) {
+        self.create_tab_with_publication(title, Some(create_request_id))
     }
 
-    fn create_tab_with_publication(&self, title: Option<&str>, pending: bool) -> (String, String) {
+    fn create_tab_with_publication(
+        &self,
+        title: Option<&str>,
+        pending: Option<&str>,
+    ) -> (String, String) {
         let tab_id = Uuid::new_v4().to_string();
         let pane_id = Uuid::new_v4().to_string();
         // `buildContent({})` (`layout-store.ts:317-325`): a detached terminal pane.
@@ -771,7 +779,7 @@ impl LayoutStore {
         if let Some(tab) = snapshot.tabs.iter_mut().find(|t| t.id == tab_id) {
             tab.name_source = name_source;
         }
-        if pending {
+        if let Some(create_request_id) = pending {
             inner
                 .pending_publications
                 .push(publication::PendingPublication {
@@ -779,7 +787,7 @@ impl LayoutStore {
                     pane_id: pane_id.clone(),
                     placement: publication::Placement::Tab,
                     published: false,
-                    create_request_id: None,
+                    create_request_id: Some(create_request_id.to_string()),
                 });
         }
         persist_locked(&inner);
@@ -849,32 +857,7 @@ impl LayoutStore {
         }
         let mut found = false;
         for snapshot in inner.snapshots_mut() {
-            let Some(removed_index) = snapshot.tabs.iter().position(|t| t.id == tab_id) else {
-                continue;
-            };
-            // Cursor parity with the client's removeTab reducer: a BACKGROUND
-            // close never moves the selection (a failed agent create rolls the
-            // layout back to exactly the user's tab); only closing the cursor's
-            // own tab selects a survivor (previous neighbor, else the new first).
-            let was_active = snapshot.active_tab_id.as_deref() == Some(tab_id);
-            snapshot.tabs.remove(removed_index);
-            snapshot.layouts.remove(tab_id);
-            snapshot.active_pane.remove(tab_id);
-            snapshot.pane_titles.remove(tab_id);
-            snapshot.pane_title_set_by_user.remove(tab_id);
-            if was_active {
-                let next_index = if removed_index > 0 {
-                    removed_index - 1
-                } else {
-                    0
-                };
-                snapshot.active_tab_id = snapshot
-                    .tabs
-                    .get(next_index)
-                    .or_else(|| snapshot.tabs.first())
-                    .map(|t| t.id.clone());
-            }
-            found = true;
+            found |= close_tab_in(snapshot, tab_id);
         }
         if found {
             persist_locked(&inner);
@@ -1178,6 +1161,13 @@ impl LayoutStore {
             .retain(|entry| entry.pane_id != pane_id);
         let mut removed = false;
         for snapshot in inner.snapshots_mut() {
+            let sole_tab = snapshot.layouts.iter().find_map(|(tab_id, root)| {
+                matches!(root, PaneNode::Leaf { id, .. } if id == pane_id).then(|| tab_id.clone())
+            });
+            if let Some(tab_id) = sole_tab {
+                removed |= close_tab_in(snapshot, &tab_id);
+                continue;
+            }
             let tab_id = snapshot.layouts.iter_mut().find_map(|(tab_id, root)| {
                 collapse_split_leaf(root, pane_id).then(|| tab_id.clone())
             });
@@ -1260,7 +1250,15 @@ impl LayoutStore {
         pane_id: &str,
         content: Value,
     ) -> RenameOutcome {
-        let mut inner = self.lock();
+        Self::attach_pane_content_locked(&mut self.lock(), tab_id, pane_id, content)
+    }
+
+    fn attach_pane_content_locked(
+        inner: &mut LayoutInner,
+        tab_id: &str,
+        pane_id: &str,
+        content: Value,
+    ) -> RenameOutcome {
         if inner.clients.is_empty() {
             return RenameOutcome::failed("no layout snapshot");
         }
@@ -1328,7 +1326,6 @@ impl LayoutStore {
                 .iter_mut()
                 .find(|entry| entry.pane_id == pane_id)
             {
-                pending.published = true;
                 pending.create_request_id = normalized
                     .get("createRequestId")
                     .and_then(Value::as_str)
@@ -1345,7 +1342,7 @@ impl LayoutStore {
                     },
                 );
             }
-            persist_locked(&inner);
+            persist_locked(inner);
             RenameOutcome::tab_pane(tab_id, pane_id)
         } else {
             RenameOutcome::failed("tab not found")
@@ -1390,7 +1387,7 @@ impl LayoutStore {
             inner.recovery_stamps.remove(pane_id);
             inner
                 .pending_publications
-                .retain(|entry| entry.pane_id != pane_id);
+                .retain(|entry| entry.pane_id != pane_id && !(!entry.published && matches!(&entry.placement, publication::Placement::Split { source_pane_id, .. } if source_pane_id == pane_id)));
             persist_locked(&inner);
         }
         first.unwrap_or(Err("pane not found"))
@@ -1775,6 +1772,27 @@ fn string_field(content: &Value, key: &str) -> Option<String> {
 
 /// Every pane id in every tab layout of one snapshot — the supersede
 /// (subset) check's unit of coverage.
+fn close_tab_in(snapshot: &mut UiSnapshot, tab_id: &str) -> bool {
+    let Some(removed_index) = snapshot.tabs.iter().position(|tab| tab.id == tab_id) else {
+        return false;
+    };
+    let was_active = snapshot.active_tab_id.as_deref() == Some(tab_id);
+    snapshot.tabs.remove(removed_index);
+    snapshot.layouts.remove(tab_id);
+    snapshot.active_pane.remove(tab_id);
+    snapshot.pane_titles.remove(tab_id);
+    snapshot.pane_title_set_by_user.remove(tab_id);
+    if was_active {
+        let next_index = removed_index.saturating_sub(1);
+        snapshot.active_tab_id = snapshot
+            .tabs
+            .get(next_index)
+            .or_else(|| snapshot.tabs.first())
+            .map(|tab| tab.id.clone());
+    }
+    true
+}
+
 fn pane_ids_of(snapshot: &UiSnapshot) -> std::collections::HashSet<String> {
     snapshot
         .layouts

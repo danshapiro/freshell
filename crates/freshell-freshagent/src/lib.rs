@@ -5077,10 +5077,12 @@ async fn create_lane_agent_tab(
     mut request: rest_lane::RestLaneCreate,
     name: Option<String>,
 ) -> Response {
-    let (tab_id, pane_id) = state.layout.create_pending_tab(name.as_deref());
+    let (tab_id, pane_id) = state
+        .layout
+        .create_pending_tab(name.as_deref(), &request.request_id);
     request.tab_id = Some(tab_id.clone());
     request.pane_id = Some(pane_id.clone());
-    let created = match gateway.create_agent(request.clone()).await {
+    let created = match Arc::clone(&gateway).create_agent(request.clone()).await {
         Ok(created) => created,
         Err(error) => {
             state.layout.close_tab(&tab_id);
@@ -5088,6 +5090,14 @@ async fn create_lane_agent_tab(
         }
     };
     let pane_content = rest_lane_create::pane_content(&request, &created);
+    if !state
+        .layout
+        .finish_pending_pane(&tab_id, &pane_id, pane_content.clone())
+    {
+        return state
+            .abandon_rest_create(&gateway, &request, &created)
+            .await;
+    }
     let rest_lane::RestLaneCreate {
         provider,
         session_type,

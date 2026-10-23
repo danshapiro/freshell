@@ -175,7 +175,12 @@ pub(crate) async fn split_pane(
         .unwrap_or("horizontal")
         .to_string();
 
-    let (tab_id, new_pane_id) = match state.layout.split_pending_pane(&pane_id, &direction) {
+    let split = if body.get("agent").is_some() {
+        state.layout.split_pending_pane(&pane_id, &direction)
+    } else {
+        state.layout.split_pane(&pane_id, &direction)
+    };
+    let (tab_id, new_pane_id) = match split {
         Ok(split) => split,
         // Node: `if (!result?.tabId || !result?.newPaneId) res.json(approx(
         // result, 'pane split requested; not applied'))` (router.ts:1312-1314).
@@ -209,7 +214,14 @@ pub(crate) async fn split_pane(
         };
         request.tab_id = Some(tab_id.clone());
         request.pane_id = Some(new_pane_id.clone());
-        let created = match gateway.create_agent(request.clone()).await {
+        if !state
+            .layout
+            .set_pending_create_request(&new_pane_id, &request.request_id)
+        {
+            state.layout.rollback_split(&new_pane_id);
+            return crate::rest_lane_create::cancelled_create_response();
+        }
+        let created = match gateway.clone().create_agent(request.clone()).await {
             Ok(created) => created,
             Err(error) => {
                 state.layout.rollback_split(&new_pane_id);
@@ -217,6 +229,14 @@ pub(crate) async fn split_pane(
             }
         };
         let content = crate::rest_lane_create::pane_content(&request, &created);
+        if !state
+            .layout
+            .finish_pending_pane(&tab_id, &new_pane_id, content.clone())
+        {
+            return state
+                .abandon_rest_create(&gateway, &request, &created)
+                .await;
+        }
         state.panes.lock().expect("panes mutex").insert(
             new_pane_id.clone(),
             PaneEntry {

@@ -97,11 +97,61 @@ pub(super) fn preserve(
 }
 
 impl LayoutStore {
+    pub(crate) fn set_pending_create_request(&self, pane_id: &str, request_id: &str) -> bool {
+        let mut inner = self.lock();
+        let Some(entry) = inner
+            .pending_publications
+            .iter_mut()
+            .find(|entry| entry.pane_id == pane_id)
+        else {
+            return false;
+        };
+        entry.create_request_id = Some(request_id.to_string());
+        true
+    }
+
+    pub(crate) fn finish_pending_pane(&self, tab_id: &str, pane_id: &str, content: Value) -> bool {
+        let mut inner = self.lock();
+        if !inner
+            .pending_publications
+            .iter()
+            .any(|entry| entry.pane_id == pane_id)
+            || !inner.snapshots().any(|snapshot| {
+                snapshot
+                    .layouts
+                    .get(tab_id)
+                    .and_then(|root| root.find_leaf(pane_id))
+                    .is_some()
+            })
+        {
+            inner
+                .pending_publications
+                .retain(|entry| entry.pane_id != pane_id);
+            return false;
+        }
+        Self::attach_pane_content_locked(&mut inner, tab_id, pane_id, content);
+        if let Some(entry) = inner
+            .pending_publications
+            .iter_mut()
+            .find(|entry| entry.pane_id == pane_id)
+        {
+            entry.published = true;
+        }
+        true
+    }
+
     /// `pane.closed` is acknowledged before the browser removes its leaf.
     /// Release publication authority first so its next layout sync can close it.
     pub fn release_pane_publication(&self, create_request_id: &str) {
-        self.lock()
+        let mut inner = self.lock();
+        let released: std::collections::HashSet<_> = inner.pending_publications.iter().filter(|entry| {
+            entry.create_request_id.as_deref() == Some(create_request_id)
+                || (!entry.published && matches!(&entry.placement, Placement::Split { source_pane_id, .. }
+                    if inner.snapshots().find_map(|snapshot| pane_content_in_snapshot(snapshot, source_pane_id))
+                        .is_some_and(|content| content.get("createRequestId").and_then(Value::as_str) == Some(create_request_id))))
+        }).map(|entry| entry.pane_id.clone()).collect();
+        inner
             .pending_publications
-            .retain(|entry| entry.create_request_id.as_deref() != Some(create_request_id));
+            .retain(|entry| !released.contains(&entry.pane_id));
     }
 }
