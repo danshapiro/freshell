@@ -1,7 +1,7 @@
 import { afterEach, describe, it, expect, vi } from 'vitest'
 import { configureStore, type Middleware } from '@reduxjs/toolkit'
 import tabsReducer, { addTab, setActiveTab, updateTab } from '@/store/tabsSlice'
-import panesReducer, { initLayout, setActivePane, updatePaneTitle } from '@/store/panesSlice'
+import panesReducer, { initLayout, setActivePane, splitPane, updatePaneTitle } from '@/store/panesSlice'
 import sessionNamesReducer, { receiveSessionNames } from '@/store/sessionNamesSlice'
 import settingsReducer from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
@@ -14,6 +14,8 @@ import { selectTabDisplayName } from '@/store/selectors/sessionNameSelectors'
 import { selectLiveLocalTabRecords } from '@/store/selectors/tabsRegistrySelectors'
 import { openRecordAsUnlinkedCopy } from '@/lib/tab-registry-open'
 import { applyRecoveryTabPlan } from '@/lib/recovery/apply-recovery-plan'
+import { installCrossTabSync } from '@/store/crossTabSync'
+import { getWindowLayoutKey } from '@/store/window-layout-keys'
 import type { PaneContent } from '@/store/paneTypes'
 import type { Tab } from '@/store/types'
 import type { RegistryTabRecord } from '@/store/tabRegistryTypes'
@@ -102,8 +104,12 @@ function update(ref: SessionNameRef, name: string, revision: number): SessionNam
 }
 
 describe('storedTabTitleHealMiddleware', () => {
+  const cleanups: Array<() => void> = []
+
   afterEach(() => {
     vi.useRealTimers()
+    for (const cleanup of cleanups.splice(0)) cleanup()
+    localStorage.clear()
   })
 
   it('heals a stored "Shell agent" title when the store loads, without touching recency or the rename flag', () => {
@@ -194,6 +200,46 @@ describe('storedTabTitleHealMiddleware', () => {
     expect(tabOf(store, 'tab-1').title).toBe(title)
   })
 
+  // The tab's folder (its own, else its first pane's) need not be the folder
+  // its derived label comes from: deriveTabName prefers a coding CLI pane, a
+  // fresh agent or a browser over the first shell. A shell prompt that titles
+  // the window with its folder name ('alpha') is then a live title, not a
+  // stored default, and keeps naming the tab.
+  it.each([
+    ['a coding CLI pane in another folder', 'beta', agentTerminal('claude', { initialCwd: '/x/beta' })],
+    ['a browser pane', 'example.com', { kind: 'browser', url: 'https://example.com/docs', devToolsOpen: false } as PaneContent],
+  ] as const)('keeps a shell window title equal to its folder name on a split tab named from %s', (_label, derived, otherContent) => {
+    const store = buildStore()
+    store.dispatch(addTab({ id: 'tab-1', mode: 'shell' }))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-shell', content: shellTerminal({ initialCwd: '/x/alpha' }) }))
+    store.dispatch(splitPane({ tabId: 'tab-1', paneId: 'pane-shell', direction: 'horizontal', newContent: otherContent, newPaneId: 'pane-other' }))
+    expect(displayOf(store, 'tab-1')).toBe(derived)
+
+    // TerminalView's OSC title handler writes the tab and the pane title.
+    store.dispatch(updateTab({ id: 'tab-1', updates: { title: 'alpha' } }))
+    store.dispatch(updatePaneTitle({ tabId: 'tab-1', paneId: 'pane-shell', title: 'alpha', setByUser: false }))
+    unrelatedActions(store, 'tab-1', 'pane-shell')
+    healStoredTabTitlesOnLoad(store)
+
+    expect(tabOf(store, 'tab-1').title).toBe('alpha')
+    expect(displayOf(store, 'tab-1')).toBe('alpha')
+  })
+
+  // A title's writer is not recorded, so a window title that is itself a
+  // provider label heals like a stored one; a single-pane tab still shows it
+  // through the pane title the same OSC write stored.
+  it('a single-pane shell tab keeps showing a window title that is a provider label', () => {
+    const store = buildStore()
+    store.dispatch(addTab({ id: 'tab-1', mode: 'shell' }))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: shellTerminal({ initialCwd: '/x/alpha' }) }))
+
+    store.dispatch(updateTab({ id: 'tab-1', updates: { title: 'opencode' } }))
+    store.dispatch(updatePaneTitle({ tabId: 'tab-1', paneId: 'pane-1', title: 'opencode', setByUser: false }))
+    unrelatedActions(store, 'tab-1', 'pane-1')
+
+    expect(displayOf(store, 'tab-1')).toBe('opencode')
+  })
+
   it('heals a tab that arrives later from stored state: a registry open and a rebuilt tab', () => {
     const store = buildStore()
     const record: RegistryTabRecord = {
@@ -225,6 +271,43 @@ describe('storedTabTitleHealMiddleware', () => {
     expect(copied.title).toBe('Tab 1')
     expect(rebuilt.id).toBe('tab-rebuilt')
     expect(rebuilt.title).toBe('Tab 2')
+  })
+
+  it('heals a tab that arrives through cross-window sync and keeps a renamed one from the same envelope', () => {
+    const store = buildStore()
+    cleanups.push(installCrossTabSync(store as never))
+    const shellLeaf = (paneId: string) => ({ type: 'leaf', id: paneId, content: shellTerminal({ createRequestId: `crid-${paneId}` }) })
+    // Another copy of this window (a duplicated browser tab before its
+    // window id rotates) flushes the layout an old client stored. The tabs
+    // carry their naming source, so nothing but the hydrate itself can
+    // trigger the heal.
+    const envelope = {
+      version: 3,
+      tabs: {
+        activeTabId: 'tab-a',
+        tabs: [
+          { id: 'tab-a', title: 'Shell agent', mode: 'shell', nameSource: { kind: 'legacy' }, createdAt: 1 },
+          { id: 'tab-b', title: 'Shell agent', titleSetByUser: true, mode: 'shell', nameSource: { kind: 'legacy' }, createdAt: 2 },
+        ],
+      },
+      panes: {
+        version: 6,
+        layouts: { 'tab-a': shellLeaf('pane-a'), 'tab-b': shellLeaf('pane-b') },
+        activePane: { 'tab-a': 'pane-a', 'tab-b': 'pane-b' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    }
+
+    window.dispatchEvent(new StorageEvent('storage', { key: getWindowLayoutKey(), newValue: JSON.stringify(envelope) }))
+
+    expect(store.getState().tabs.tabs.map((tab) => tab.id)).toEqual(['tab-a', 'tab-b'])
+    expect(tabOf(store, 'tab-a').title).toBe('Tab 1')
+    expect(tabOf(store, 'tab-a').titleSetByUser).toBeUndefined()
+    expect(displayOf(store, 'tab-a')).toBe('Shell')
+    expect(tabOf(store, 'tab-b').title).toBe('Shell agent')
+    expect(tabOf(store, 'tab-b').titleSetByUser).toBe(true)
   })
 
   it('a real OSC title still wins after a heal', () => {

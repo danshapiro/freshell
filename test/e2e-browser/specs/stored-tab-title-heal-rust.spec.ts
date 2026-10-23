@@ -172,4 +172,45 @@ test.describe('stored provider-label tab titles heal', () => {
     await expect(tabLabel(page, tabId)).toContainText('Build watcher', { timeout: 15_000 })
     expect((await reduxTab(harness, tabId))?.title).toBe('Build watcher')
   })
+
+  // The tab's first pane is a shell started in /tmp, and a browser pane beside
+  // it gives the tab its label (example.com). A shell prompt that titles the
+  // window with its folder name ("tmp") sets a live title, not a stored
+  // default label, so it keeps naming the tab.
+  test('a shell window title equal to its folder name keeps naming a split tab labeled from another pane', async ({ freshellPage: page, harness, serverInfo }) => {
+    const tabId = 'tab-folder-window-title'
+    const shellPaneId = 'pane-folder-shell'
+    await page.evaluate(({ tabId, shellPaneId }) => {
+      const testHarness = window.__FRESHELL_TEST_HARNESS__
+      testHarness?.dispatch({ type: 'tabs/addTab', payload: { id: tabId, mode: 'shell' } })
+      testHarness?.dispatch({
+        type: 'panes/initLayout',
+        payload: { tabId, paneId: shellPaneId, content: { kind: 'terminal', mode: 'shell', initialCwd: '/tmp' } },
+      })
+      testHarness?.dispatch({
+        type: 'panes/splitPane',
+        payload: {
+          tabId,
+          paneId: shellPaneId,
+          direction: 'horizontal',
+          newPaneId: 'pane-folder-browser',
+          newContent: { kind: 'browser', url: 'https://example.com/docs', devToolsOpen: false },
+        },
+      })
+    }, { tabId, shellPaneId })
+    await terminalIdOf(harness, tabId, shellPaneId)
+    await expect(tabLabel(page, tabId)).toContainText('example.com', { timeout: 15_000 })
+
+    await sendWindowTitle(page, harness, { tabId, paneId: shellPaneId, title: 'tmp', marker: 60 })
+
+    await expect(tabLabel(page, tabId)).toContainText('tmp', { timeout: 15_000 })
+    expect(await reduxTab(harness, tabId)).toEqual({ title: 'tmp', titleSetByUser: undefined })
+    await expect.poll(() => serverTabTitle(serverInfo, tabId), { timeout: 30_000 }).toBe('tmp')
+
+    // Nothing heals it on the next load either.
+    await reloadApp(page, harness)
+    await expect(tabLabel(page, tabId)).toContainText('tmp', { timeout: 15_000 })
+    expect(await reduxTab(harness, tabId)).toEqual({ title: 'tmp', titleSetByUser: undefined })
+    expect(await persistedTab(page, tabId)).toEqual({ title: 'tmp' })
+  })
 })

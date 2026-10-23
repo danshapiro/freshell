@@ -110,9 +110,9 @@ export function firstNameSourceLeaf(
 }
 
 /**
- * The pane a tab takes its tab-level facts from (name reliability, Tasks 8
- * and 14): its session naming source while that pane is still in the layout,
- * else its first leaf.
+ * The pane a tab takes its tab-level facts from (name reliability, Task 8:
+ * the managed-runtime merge): its session naming source while that pane is
+ * still in the layout, else its first leaf.
  */
 export function tabNamingLeaf(
   tab: { nameSource?: TabNameSource } | undefined,

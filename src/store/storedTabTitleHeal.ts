@@ -21,11 +21,15 @@
  * session-owned tab whose saved record is cached keeps the mirrored saved
  * name, so the two never fight), never a `Tab N` placeholder or the tab's
  * own derived label, and only text the shared classifier
- * (`shared/name-evidence.ts`) recognizes as a default label for the tab's
- * folder, mode and provider. A real title (a shell's window title, a
- * session name, a rename) is never healed and still wins. The write
- * (`healStoredTabTitles`) changes the title only: no `updatedAt` bump, no
- * flag.
+ * (`shared/name-evidence.ts`) recognizes as a provider or mode label, a
+ * provider placeholder or tool wrapper text for the tab's mode and provider
+ * (its folder-name rule is not used). A title's writer is not recorded, so a
+ * live window title that is itself such a label (a program in a shell
+ * titling the window "opencode") heals too; a single-pane tab still shows it
+ * through its pane title, a split tab shows its derived label. Any other
+ * window title, a session name or a rename is never healed and still wins.
+ * The write (`healStoredTabTitles`) changes the title only: no `updatedAt`
+ * bump, no flag.
  *
  * It runs after every action whose tabs, layouts, saved names or extensions
  * changed, and once when the store is created (`healStoredTabTitlesOnLoad`),
