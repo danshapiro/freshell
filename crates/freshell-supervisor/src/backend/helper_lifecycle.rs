@@ -62,8 +62,14 @@ pub(super) struct HelperDeadlines {
     /// Cleanup waits until here for a create Docker has not answered yet;
     /// after that the background reaper owns its removal.
     pub(super) settle: Instant,
-    /// The exact-name removal after every create answered.
+    /// The exact-name removal after every create answered gets at least
+    /// this long...
     pub(super) cleanup: Duration,
+    /// ...and may run until here when that is later: the time the caller
+    /// set aside for this attempt's cleanup and any retry after it. A
+    /// removal that waits on the same stall as the attempt then costs
+    /// reserved time instead of the evidence.
+    pub(super) reserved: Instant,
 }
 
 impl HelperDeadlines {
@@ -75,7 +81,14 @@ impl HelperDeadlines {
             operation,
             settle: operation + settle_after,
             cleanup: HELPER_CLEANUP_BUDGET,
+            reserved: operation,
         }
+    }
+
+    /// When a removal that starts now must have confirmed absence: one
+    /// cleanup window from now, or the reserved instant if that is later.
+    pub(super) fn removal_deadline(&self) -> Instant {
+        (Instant::now() + self.cleanup).max(self.reserved)
     }
 }
 
@@ -457,7 +470,8 @@ impl DockerEngineBackend {
 
     /// Release one attempt's helper objects, then hand back the attempt's
     /// `result`. Waits until `settle` for every create the objects came from
-    /// to answer, then removes them by exact name; an unconfirmed removal
+    /// to answer, then removes them by exact name within one cleanup window
+    /// or until `reserved`, whichever is later; an unconfirmed removal
     /// replaces the result with a final failure. Objects whose create is
     /// still unanswered, or whose removal is unconfirmed, go to the
     /// background reaper. [`Self::retry_helper`] settles until its last
@@ -481,7 +495,7 @@ impl DockerEngineBackend {
                 .into())
             });
         }
-        let removed = tokio::time::timeout(deadlines.cleanup, objects.remove(self))
+        let removed = tokio::time::timeout_at(deadlines.removal_deadline(), objects.remove(self))
             .await
             .unwrap_or_else(|_| {
                 Err(BackendError::Unavailable(format!(
@@ -598,6 +612,7 @@ impl DockerEngineBackend {
                 operation: (Instant::now() + policy.attempt).min(reserve),
                 settle: reserve,
                 cleanup: policy.cleanup,
+                reserved: end,
             };
             let failure = match attempt(deadlines).await {
                 Ok(value) => {

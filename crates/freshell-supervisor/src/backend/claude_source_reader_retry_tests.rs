@@ -45,14 +45,23 @@ struct ReaderDaemon {
 
 impl ReaderDaemon {
     fn start(socket: &Path, daemon: DockerDaemonId, script: Vec<Create>, exit_code: i64) -> Self {
-        Self::with_reader(socket, daemon, script, Reader::Exits(exit_code))
+        Self::with_reader(
+            socket,
+            daemon,
+            script,
+            Reader::Exits(exit_code),
+            Duration::ZERO,
+        )
     }
 
+    /// `delete_delay`: how long after removing a container Docker answers
+    /// the DELETE, as a force-remove that waits on a flush does.
     fn with_reader(
         socket: &Path,
         daemon: DockerDaemonId,
         script: Vec<Create>,
         reader: Reader,
+        delete_delay: Duration,
     ) -> Self {
         let inventory = Arc::new(Mutex::new(Inventory::default()));
         let late = Arc::new(Mutex::new(Vec::new()));
@@ -68,7 +77,7 @@ impl ReaderDaemon {
                         let (stream, _) = accepted.unwrap();
                         let (state, late_jobs, daemon, script) =
                             (state.clone(), late_jobs.clone(), daemon.clone(), script.clone());
-                        jobs.spawn(answer(stream, state, late_jobs, daemon, script, reader));
+                        jobs.spawn(answer(stream, state, late_jobs, daemon, script, reader, delete_delay));
                     }
                     result = jobs.join_next(), if !jobs.is_empty() => { result.unwrap().unwrap(); }
                 }
@@ -133,6 +142,7 @@ async fn answer(
     daemon: DockerDaemonId,
     script: Vec<Create>,
     reader: Reader,
+    delete_delay: Duration,
 ) {
     let mut header = Vec::new();
     let mut byte = [0];
@@ -312,16 +322,19 @@ async fn answer(
         }
     } else if line.starts_with("DELETE") && line.contains("/containers/") {
         let key = key(&line);
-        let mut inventory = state.lock().unwrap();
-        let name = inventory
-            .containers
-            .iter()
-            .find(|(name, value)| **name == key || value["Id"] == key)
-            .map(|(name, _)| name.clone());
-        if let Some(name) = name {
-            inventory.containers.remove(&name);
-            inventory.removed.push(name);
+        {
+            let mut inventory = state.lock().unwrap();
+            let name = inventory
+                .containers
+                .iter()
+                .find(|(name, value)| **name == key || value["Id"] == key)
+                .map(|(name, _)| name.clone());
+            if let Some(name) = name {
+                inventory.containers.remove(&name);
+                inventory.removed.push(name);
+            }
         }
+        tokio::time::sleep(delete_delay).await;
         (204, json!({}))
     } else {
         (500, json!({}))
@@ -772,6 +785,7 @@ async fn claude_source_reader_names_a_hung_read_apart_from_a_docker_stall() {
         daemon_id,
         vec![],
         Reader::Hangs,
+        Duration::ZERO,
     );
     let log = temp.path().join("lifecycle.jsonl");
     let backend =
@@ -804,4 +818,40 @@ async fn claude_source_reader_names_a_hung_read_apart_from_a_docker_stall() {
             .map(|event| event["data"]["step"].clone()),
     );
     assert_eq!(steps, vec![json!("read"); 3], "{events:?}");
+}
+
+#[tokio::test]
+async fn claude_source_reader_lets_a_slow_removal_use_the_time_its_retry_reserved() {
+    let temp = tempfile::tempdir().unwrap();
+    let daemon_id = DockerDaemonId::new();
+    let (owner, request) = initial_request(temp.path(), &daemon_id).await;
+    // Docker answers the reader's removal well after one cleanup window,
+    // and well inside the time the read reserved for cleanup and retries.
+    let mut daemon = ReaderDaemon::with_reader(
+        &temp.path().join("docker.sock"),
+        daemon_id,
+        vec![Create::Now],
+        Reader::Exits(0),
+        QUICK.cleanup + Duration::from_secs(4),
+    );
+    let log = temp.path().join("lifecycle.jsonl");
+    let backend =
+        DockerEngineBackend::new(temp.path().join("docker.sock")).with_lifecycle_log(&log);
+    let result = backend
+        .observe_claude_sources_with(&QUICK, &owner, &request, "synthetic-run", far())
+        .await;
+    let creates = daemon.creates();
+    let removed = daemon.removed();
+    daemon.finish().await;
+    assert!(
+        result.is_ok(),
+        "a removal confirmed inside the reserve keeps the evidence: {result:?}"
+    );
+    assert_eq!(creates.len(), 1);
+    assert_eq!(removed, creates);
+    let events = lifecycle_events(&log);
+    assert!(
+        named(&events, "supervisor.helper.cleanup.deferred").is_empty(),
+        "{events:?}"
+    );
 }

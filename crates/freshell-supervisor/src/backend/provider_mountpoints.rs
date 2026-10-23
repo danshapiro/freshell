@@ -453,7 +453,7 @@ impl DockerEngineBackend {
         // `owned`: the caller owns removing the helper it may still make.
         if let Some(helper) = owned.as_mut() {
             if helper.settle(deadlines.settle).await {
-                tokio::time::timeout(deadlines.cleanup, helper.remove(self))
+                tokio::time::timeout_at(deadlines.removal_deadline(), helper.remove(self))
                     .await
                     .map_err(|_| fail("provider mountpoint cleanup timed out"))??;
                 *owned = None;

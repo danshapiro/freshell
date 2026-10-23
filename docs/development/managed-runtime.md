@@ -212,9 +212,10 @@ slows every Docker step the same way, exits and removals included.
 
 - A helper create keeps running when its caller stops waiting, and cleanup
   waits for Docker's answer before it removes the helper by exact name. The
-  supervisor owns a helper until its absence is confirmed: a create Docker
-  answers only after the caller's window has passed, or a removal that runs
-  past its 5s window or fails, goes to a background reaper. The reaper removes
+  supervisor owns a helper until its absence is confirmed. A removal gets 5s,
+  or, inside a retried read, all the time the read still has reserved. A
+  create Docker answers only after the caller's window has passed, or a
+  removal that runs past its window or fails, goes to a background reaper. The reaper removes
   the helper (and, for a candidate read, the scratch volume after it), retrying
   with a growing wait for up to 120s; every try re-checks ownership. A create
   Docker answers after 5s or more is logged as `supervisor.helper.create_slow`
