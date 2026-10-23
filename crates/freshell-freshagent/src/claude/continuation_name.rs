@@ -29,9 +29,8 @@ impl FreshClaudeState {
         let source = if sink
             .get(vec![durable.clone()])
             .await
-            .map_err(|error| {
-                crate::naming::log_name_error("internal_continuation_read", &durable, &error);
-                error
+            .inspect_err(|error| {
+                crate::naming::log_name_error("internal_continuation_read", &durable, error);
             })?
             .is_empty()
         {
@@ -51,9 +50,8 @@ impl FreshClaudeState {
         };
         sink.continue_session(source, target.clone())
             .await
-            .map_err(|error| {
-                crate::naming::log_name_error("internal_continuation", &target, &error);
-                error
+            .inspect_err(|error| {
+                crate::naming::log_name_error("internal_continuation", &target, error);
             })?;
         Ok(())
     }
