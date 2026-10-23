@@ -95,7 +95,7 @@ impl SidecarExitCause {
     /// The user-facing `freshAgent.error{SIDECAR_EXITED}` message.
     pub(crate) fn user_message(&self) -> String {
         format!(
-            "The Claude agent process exited unexpectedly: {}. Reopen the pane or create a new agent to continue.",
+            "The Claude agent process exited unexpectedly: {}. Resume the session to continue.",
             self.detail()
         )
     }
