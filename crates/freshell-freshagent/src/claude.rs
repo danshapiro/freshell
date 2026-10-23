@@ -10438,31 +10438,92 @@ fn escalate_unconfirmed_teardown(
 }
 
 /// The detached unconfirmed-tree escalation (b8ke focused round-2 review
-/// R2-2): SIGTERM→SIGKILL rounds until the captured tree is confirmed
-/// dead-by-starttime. Resolves `true` only on confirmed death — the
-/// deferred stop commit releases on exactly that.
+/// R2-2): SIGTERM→SIGKILL windows until the captured tree is confirmed
+/// dead-by-starttime ([`escalate_until_dead`]). Resolves `true` only on
+/// confirmed death — the deferred stop commit releases on exactly that.
 fn spawn_claude_tree_death_escalation(
     tree: Vec<(i32, u64)>,
     ownership_id: String,
     session_label: String,
 ) -> tokio::task::JoinHandle<bool> {
     tokio::spawn(async move {
-        let mut tree = tree;
-        while !confirm_captured_claude_tree_dead(
-            &mut tree,
-            &ownership_id,
+        let mut captured = CapturedClaudeTree { tree, ownership_id };
+        escalate_until_dead(&mut captured, &session_label).await
+    })
+}
+
+/// One bounded kill-and-confirm window of the detached escalation.
+trait TreeDeathWindow {
+    /// Signal the tree and poll it for one window; `true` once every member
+    /// is confirmed dead.
+    async fn confirm_dead(&mut self) -> bool;
+    /// How many members were still alive after the last window.
+    fn lingering(&self) -> usize;
+}
+
+/// The captured ownership-tagged tree a stop could not confirm gone.
+struct CapturedClaudeTree {
+    tree: Vec<(i32, u64)>,
+    ownership_id: String,
+}
+
+impl TreeDeathWindow for CapturedClaudeTree {
+    async fn confirm_dead(&mut self) -> bool {
+        confirm_captured_claude_tree_dead(
+            &mut self.tree,
+            &self.ownership_id,
             TREE_DEATH_CONFIRM_ROUNDS,
         )
         .await
-        {
-            tracing::warn!(target: "freshell_freshagent::claude",
-                session_id = %session_label, lingering = tree.len(),
-                "freshagent.claude.teardown_escalation_continues: the detached tree-death \
-                 escalation re-armed its bounded window"
-            );
-        }
-        true
-    })
+    }
+
+    fn lingering(&self) -> usize {
+        self.tree.len()
+    }
+}
+
+/// The detached escalation's pause before the next window, after
+/// `failed_windows` windows that ended with the tree alive: half a second,
+/// doubling, at most a minute. A tree that outlives a whole window
+/// (SIGKILL included) is stuck in the kernel; retrying it at once would only
+/// rescan `/proc` every 25 ms and warn every 0.6 s for as long as it stays
+/// stuck.
+fn escalation_pause(failed_windows: u32) -> Duration {
+    const FIRST: Duration = Duration::from_millis(500);
+    const LONGEST: Duration = Duration::from_secs(60);
+    let doublings = failed_windows.saturating_sub(1).min(16);
+    FIRST.saturating_mul(1 << doublings).min(LONGEST)
+}
+
+/// Run `window` until it confirms the tree dead, pausing between windows
+/// ([`escalation_pause`]). It never gives up: an explicit kill's deferred
+/// stop commit waits on the confirmation. Each unconfirmed window logs
+/// `freshagent.claude.teardown_escalation_continues` (warn), the
+/// confirmation `freshagent.claude.teardown_escalation_confirmed` (info).
+async fn escalate_until_dead(window: &mut impl TreeDeathWindow, session_label: &str) -> bool {
+    let started = std::time::Instant::now();
+    let mut failed_windows: u32 = 0;
+    while !window.confirm_dead().await {
+        failed_windows = failed_windows.saturating_add(1);
+        let pause = escalation_pause(failed_windows);
+        tracing::warn!(target: "freshell_freshagent::claude",
+            session_id = %session_label,
+            lingering = window.lingering(),
+            windows = failed_windows,
+            next_window_in_ms = u64::try_from(pause.as_millis()).unwrap_or(u64::MAX),
+            "freshagent.claude.teardown_escalation_continues: the detached tree-death \
+             escalation's window ended with the tree still alive; it tries again after a pause"
+        );
+        tokio::time::sleep(pause).await;
+    }
+    tracing::info!(target: "freshell_freshagent::claude",
+        session_id = %session_label,
+        windows = failed_windows.saturating_add(1),
+        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "freshagent.claude.teardown_escalation_confirmed: the detached escalation confirmed \
+         the runtime tree's death"
+    );
+    true
 }
 
 /// The bounded SIGTERM→SIGKILL confirmation round budget (24 × 25ms with
