@@ -3,6 +3,11 @@
 //! no HTTP-mock crates; see crates/freshell-opencode for precedent).
 use std::sync::{Arc, RwLock};
 
+use crate::gemini_failure::GeminiFailure;
+use crate::session_name_capability::{
+    KeyRouteTransport, NamingRoute, ProxyFacts, SessionNameTransport,
+};
+
 pub const GEMINI_MODEL: &str = "gemini-3.5-flash-lite";
 pub const GEMINI_DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 pub const SESSION_TITLE_MAX_OUTPUT_TOKENS: u32 = 30;
@@ -139,13 +144,6 @@ pub trait GeminiTransport: Send + Sync {
     ) -> BoxFuture<Result<String, String>>;
 }
 
-/// Authentication source selected for session-name Gemini requests.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GeminiCredentialRoute {
-    Direct,
-    OneCliProxy,
-}
-
 /// The environment values that reqwest's system proxy matcher uses. Values
 /// stay private because they can contain proxy credentials.
 #[derive(Clone, Default)]
@@ -217,6 +215,20 @@ impl GeminiProxyEnvironment {
             })
     }
 
+    /// The proxy reqwest would use for `url` under this environment, if any
+    /// (NO_PROXY applied). Callers reduce it to booleans immediately: proxy
+    /// URLs can carry credentials.
+    pub(crate) fn proxy_for_url(&self, url: &str) -> Option<&str> {
+        let destination = url.parse::<axum::http::Uri>().ok()?;
+        let (Some(scheme), Some(host)) = (destination.scheme_str(), destination.host()) else {
+            return None;
+        };
+        if self.bypasses_proxy(host) {
+            return None;
+        }
+        self.effective_proxy(scheme)
+    }
+
     fn bypasses_proxy(&self, host: &str) -> bool {
         self.no_proxy.split(',').map(str::trim).any(|entry| {
             if entry == "*" {
@@ -237,158 +249,178 @@ impl GeminiProxyEnvironment {
     }
 }
 
-/// Whether session-name requests can use either the selected OneCLI proxy or
-/// an existing direct API key. The proxy route is captured at construction;
-/// the shared key cell remains live for settings-save updates.
+/// The credential and proxy facts for session-name Gemini requests
+/// (name-reliability Task 6). The key cell stays live, so a Settings save
+/// takes effect at the next attempt; the proxy facts are read once at
+/// construction, as reqwest reads the proxy environment once per client.
+/// The route itself is chosen per attempt by
+/// [`crate::session_name_capability::select_naming_route`].
 #[derive(Clone)]
 pub struct GeminiSessionNameAuth {
-    direct_key: AiKeyCell,
-    route: GeminiCredentialRoute,
+    key: AiKeyCell,
+    facts: ProxyFacts,
 }
 
 impl GeminiSessionNameAuth {
-    pub fn from_environment(direct_key: AiKeyCell, gemini_base_url: &str) -> Self {
-        let proxy_environment = GeminiProxyEnvironment::from_environment();
-        let route = Self::route_for(gemini_base_url, &proxy_environment);
-        Self { direct_key, route }
+    pub fn from_environment(key: AiKeyCell, gemini_base_url: &str) -> Self {
+        Self::from_proxy_environment(
+            key,
+            gemini_base_url,
+            &GeminiProxyEnvironment::from_environment(),
+        )
     }
 
-    pub fn enabled(&self) -> bool {
-        self.route == GeminiCredentialRoute::OneCliProxy || self.direct_key().is_some()
-    }
-
-    pub fn direct_key(&self) -> Option<String> {
-        self.direct_key.get().filter(|key| !key.is_empty())
-    }
-
-    #[cfg(test)]
-    pub fn route(&self) -> GeminiCredentialRoute {
-        self.route
-    }
-
-    pub fn route_for(
+    pub fn from_proxy_environment(
+        key: AiKeyCell,
         gemini_base_url: &str,
         proxy_environment: &GeminiProxyEnvironment,
-    ) -> GeminiCredentialRoute {
-        let Ok(destination) = gemini_base_url.parse::<axum::http::Uri>() else {
-            return GeminiCredentialRoute::Direct;
-        };
-        let (Some(scheme), Some(host)) = (destination.scheme_str(), destination.host()) else {
-            return GeminiCredentialRoute::Direct;
-        };
-        if proxy_environment.bypasses_proxy(host) {
-            return GeminiCredentialRoute::Direct;
-        }
-        proxy_environment
-            .effective_proxy(scheme)
-            .filter(|proxy| has_onecli_authorization(proxy))
-            .map_or(GeminiCredentialRoute::Direct, |_| {
-                GeminiCredentialRoute::OneCliProxy
-            })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn direct_for_test(direct_key: AiKeyCell) -> Self {
+    ) -> Self {
         Self {
-            direct_key,
-            route: GeminiCredentialRoute::Direct,
+            key,
+            facts: crate::session_name_capability::proxy_facts(proxy_environment, gemini_base_url),
         }
     }
 
+    /// The route the next attempt uses.
+    pub fn route(&self) -> NamingRoute {
+        crate::session_name_capability::select_naming_route(&self.key, self.facts)
+    }
+
+    pub fn facts(&self) -> ProxyFacts {
+        self.facts
+    }
+
+    /// Whether any credential route is available (a key, or a OneCLI proxy).
+    pub fn enabled(&self) -> bool {
+        self.route().is_available()
+    }
+
+    pub fn key(&self) -> Option<String> {
+        self.key.get().filter(|key| !key.is_empty())
+    }
+
+    pub fn key_configured(&self) -> bool {
+        self.key.enabled()
+    }
+
+    /// No ambient proxy: a configured key is the only route.
     #[cfg(test)]
-    pub(crate) fn onecli_for_test(direct_key: AiKeyCell) -> Self {
+    pub(crate) fn direct_for_test(key: AiKeyCell) -> Self {
         Self {
-            direct_key,
-            route: GeminiCredentialRoute::OneCliProxy,
+            key,
+            facts: ProxyFacts::default(),
+        }
+    }
+
+    /// A OneCLI-marked ambient proxy.
+    #[cfg(test)]
+    pub(crate) fn onecli_for_test(key: AiKeyCell) -> Self {
+        Self {
+            key,
+            facts: ProxyFacts {
+                via_proxy: true,
+                onecli_marker: true,
+            },
         }
     }
 }
 
-/// Name-specific Gemini transport. Unlike [`GeminiHttp`], it leaves the
-/// direct API-key header off when reqwest routes through OneCLI.
+/// The session-name Gemini transport (name-reliability Task 6): one request
+/// per attempt on the route [`GeminiSessionNameAuth::route`] picks. A keyed
+/// request always carries the key; it goes DIRECT when the ambient proxy is
+/// OneCLI's and through the normal (proxy-honoring) client otherwise; a
+/// keyless request (the inherited OneCLI route) uses the normal client.
+/// Failures come back classified ([`crate::gemini_failure`]) and never carry
+/// reqwest's error text, which can name the proxy.
 pub struct GeminiSessionNameHttp {
+    /// Honors the ambient proxy environment (`reqwest::Client::new()`).
     client: reqwest::Client,
+    /// Ignores it.
+    direct_client: reqwest::Client,
     auth: GeminiSessionNameAuth,
     base_url: String,
 }
 
 impl GeminiSessionNameHttp {
     pub fn new(client: reqwest::Client, auth: GeminiSessionNameAuth, base_url: String) -> Self {
+        // Fails only when the TLS backend cannot initialize, which
+        // `reqwest::Client::new()` (the normal client) would already have
+        // panicked on. Never fall back to the proxy-honoring client: the
+        // direct route must not reach a OneCLI proxy.
+        let direct_client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("the TLS backend initializes, as for reqwest::Client::new()");
         Self {
             client,
+            direct_client,
             auth,
             base_url,
         }
     }
 }
 
+impl SessionNameTransport for GeminiSessionNameHttp {
+    fn generate_content(
+        &self,
+        prompt: String,
+        max_output_tokens: u32,
+    ) -> BoxFuture<Result<String, GeminiFailure>> {
+        let route = self.auth.route();
+        let (client, key) = match route {
+            NamingRoute::Key(KeyRouteTransport::Direct) => {
+                (self.direct_client.clone(), self.auth.key())
+            }
+            NamingRoute::Key(KeyRouteTransport::AmbientProxy) => {
+                (self.client.clone(), self.auth.key())
+            }
+            NamingRoute::InheritedOneCli => (self.client.clone(), None),
+            NamingRoute::Unavailable => {
+                return Box::pin(async { Err(GeminiFailure::no_credential()) });
+            }
+        };
+        let via_proxy = route.request_via_proxy(self.auth.facts());
+        let url = format!(
+            "{}/models/{GEMINI_MODEL}:generateContent",
+            self.base_url.trim_end_matches('/')
+        );
+        Box::pin(async move {
+            let request = build_gemini_request(&client, &url, prompt, max_output_tokens, key)
+                .map_err(|_| GeminiFailure::request_encoding())?;
+            let response = request.send().await.map_err(|error| {
+                crate::gemini_failure::classify_reqwest_error(&error, via_proxy)
+            })?;
+            let status = response.status().as_u16();
+            if !response.status().is_success() {
+                // An unreadable error body still classifies by status.
+                let body = response.bytes().await.unwrap_or_default();
+                return Err(crate::gemini_failure::classify_gemini_failure(
+                    status, &body,
+                ));
+            }
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|_| GeminiFailure::response_read_failed(status))?;
+            let value: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|_| GeminiFailure::malformed_response(status))?;
+            Ok(extract_candidate_text(&value))
+        })
+    }
+}
+
+/// The legacy string-error view, for the callers that still take a
+/// [`GeminiTransport`] (the sweep's excluded-provider ladder and the
+/// generate-title compatibility route): the same route and request, with
+/// the failure rendered as its safe text.
 impl GeminiTransport for GeminiSessionNameHttp {
     fn generate_content(
         &self,
         prompt: String,
         max_output_tokens: u32,
     ) -> BoxFuture<Result<String, String>> {
-        let client = self.client.clone();
-        let direct_key = match self.auth.route {
-            GeminiCredentialRoute::Direct => self.auth.direct_key(),
-            GeminiCredentialRoute::OneCliProxy => None,
-        };
-        let fallback_key = self.auth.direct_key();
-        let route = self.auth.route;
-        let url = format!(
-            "{}/models/{GEMINI_MODEL}:generateContent",
-            self.base_url.trim_end_matches('/')
-        );
-        Box::pin(async move {
-            if route == GeminiCredentialRoute::Direct && direct_key.is_none() {
-                return Err("no gemini api key".to_string());
-            }
-            let request =
-                build_gemini_request(&client, &url, prompt.clone(), max_output_tokens, direct_key)?;
-            let response = request
-                .send()
-                .await
-                .map_err(|_| "gemini request failed".to_string())?;
-            let status = response.status();
-
-            if !status.is_success() {
-                // Only an explicit structured OneCLI credential error can
-                // authorize the one direct-key retry. A status by itself,
-                // unreadable body, or any other response remains an error.
-                let body = response
-                    .bytes()
-                    .await
-                    .map_err(|_| format!("gemini http {status}"))?;
-                if route == GeminiCredentialRoute::OneCliProxy {
-                    if let (Some(classification), Some(key)) = (
-                        classify_onecli_credential_error(status, &body),
-                        fallback_key.filter(|key| !key.is_empty()),
-                    ) {
-                        tracing::debug!(
-                            target: "freshell_server::ai_title",
-                            operation = "onecli_direct_key_fallback",
-                            classification,
-                            "ai_title.onecli_direct_key_fallback"
-                        );
-                        let retry = build_gemini_request(
-                            &client,
-                            &url,
-                            prompt,
-                            max_output_tokens,
-                            Some(key),
-                        )?;
-                        return send_gemini_request(retry)
-                            .await
-                            .map_err(safe_session_name_request_error);
-                    }
-                }
-                return Err(format!("gemini http {status}"));
-            }
-
-            parse_gemini_success_response(response)
-                .await
-                .map_err(safe_session_name_request_error)
-        })
+        let call = SessionNameTransport::generate_content(self, prompt, max_output_tokens);
+        Box::pin(async move { call.await.map_err(|failure| failure.to_string()) })
     }
 }
 
@@ -431,35 +463,6 @@ async fn parse_gemini_success_response(response: reqwest::Response) -> Result<St
     Ok(extract_candidate_text(&value))
 }
 
-/// Return the OneCLI classification that permits direct-key fallback. This
-/// accepts only the two exact top-level JSON error values from a non-success
-/// response, except for HTTP 407 which never authorizes direct-key fallback.
-fn classify_onecli_credential_error(
-    status: reqwest::StatusCode,
-    body: &[u8],
-) -> Option<&'static str> {
-    if status.is_success() || status == reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
-    match value.get("error")?.as_str()? {
-        "credential_not_found" => Some("credential_not_found"),
-        "app_not_connected" => Some("app_not_connected"),
-        _ => None,
-    }
-}
-
-fn safe_session_name_request_error(reason: String) -> String {
-    if reason.starts_with("gemini http ") {
-        reason
-    } else {
-        // reqwest errors can include details from its proxy connection. The
-        // naming worker logs returned errors, so keep those details out of
-        // diagnostics.
-        "gemini request failed".to_string()
-    }
-}
-
 fn first_present<'a>(upper: Option<&'a str>, lower: Option<&'a str>) -> Option<&'a str> {
     upper.or(lower)
 }
@@ -468,7 +471,7 @@ fn first_present<'a>(upper: Option<&'a str>, lower: Option<&'a str>) -> Option<&
 /// environment matcher, then inspect its parsed authority for OneCLI's
 /// authorization marker. This deliberately returns only a boolean so proxy
 /// credentials can never enter diagnostics.
-fn has_onecli_authorization(proxy: &str) -> bool {
+pub(crate) fn has_onecli_authorization(proxy: &str) -> bool {
     parse_proxy(proxy).unwrap_or(false)
 }
 
@@ -595,98 +598,22 @@ pub async fn generate_ai_session_title(
     let text = transport
         .generate_content(prompt, SESSION_TITLE_MAX_OUTPUT_TOKENS)
         .await?;
+    Ok(finalize_session_title(&text))
+}
+
+/// Trim the model's answer, cap it at 80 characters, and map empty to None.
+pub fn finalize_session_title(text: &str) -> Option<String> {
     let title: String = text.trim().chars().take(SESSION_TITLE_CHAR_CAP).collect();
-    Ok(if title.is_empty() { None } else { Some(title) })
+    if title.is_empty() {
+        None
+    } else {
+        Some(title)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const TEST_DIRECT_FALLBACK_KEY: &str = "direct-fallback-sentinel";
-
-    struct SessionNameResponseFixture {
-        base_url: String,
-        observed_keys: Arc<std::sync::Mutex<Vec<Option<String>>>>,
-    }
-
-    async fn start_session_name_response_fixture(
-        responses: Vec<(axum::http::StatusCode, String)>,
-    ) -> SessionNameResponseFixture {
-        use axum::body::Body;
-        use axum::routing::post;
-        use axum::{http::Response, Router};
-        use std::collections::VecDeque;
-        use std::sync::Mutex;
-
-        let observed_keys = Arc::new(Mutex::new(Vec::new()));
-        let observed = Arc::clone(&observed_keys);
-        let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
-        let app = Router::new().route(
-            "/v1beta/models/gemini-3.5-flash-lite:generateContent",
-            post(move |headers: axum::http::HeaderMap| {
-                let observed = Arc::clone(&observed);
-                let responses = Arc::clone(&responses);
-                async move {
-                    observed.lock().unwrap().push(
-                        headers
-                            .get("x-goog-api-key")
-                            .and_then(|value| value.to_str().ok())
-                            .map(str::to_string),
-                    );
-                    let (status, body) = responses
-                        .lock()
-                        .unwrap()
-                        .pop_front()
-                        .expect("fixture has a response for each request");
-                    let mut response = Response::new(Body::from(body));
-                    *response.status_mut() = status;
-                    response
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        SessionNameResponseFixture {
-            base_url: format!("http://{addr}/v1beta"),
-            observed_keys,
-        }
-    }
-
-    fn onecli_session_name_transport(
-        fixture: &SessionNameResponseFixture,
-        direct_key: Option<&str>,
-    ) -> GeminiSessionNameHttp {
-        let auth = GeminiSessionNameAuth {
-            direct_key: AiKeyCell::init(direct_key.map(str::to_string), None),
-            route: GeminiCredentialRoute::OneCliProxy,
-        };
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        GeminiSessionNameHttp::new(client, auth, fixture.base_url.clone())
-    }
-
-    fn assert_onecli_fallback_keys(observed_keys: &std::sync::Mutex<Vec<Option<String>>>) {
-        let observed = observed_keys.lock().unwrap();
-        assert_eq!(observed.len(), 2, "fallback makes exactly two requests");
-        assert!(
-            observed[0].is_none(),
-            "the OneCLI request has no direct key"
-        );
-        assert!(
-            observed[1].as_deref() == Some(TEST_DIRECT_FALLBACK_KEY),
-            "the single fallback request carries the existing direct key"
-        );
-    }
-
-    fn assert_onecli_no_fallback_key(observed_keys: &std::sync::Mutex<Vec<Option<String>>>) {
-        let observed = observed_keys.lock().unwrap();
-        assert_eq!(observed.len(), 1, "a rejected response makes one request");
-        assert!(
-            observed[0].is_none(),
-            "a rejected OneCLI request has no direct key"
-        );
-    }
 
     #[test]
     fn key_cell_boot_env_wins_over_settings_nonforcing() {
@@ -823,8 +750,15 @@ mod tests {
     fn onecli_route_detection_matches_effective_reqwest_proxy() {
         let https_gemini = "https://generativelanguage.googleapis.com/v1beta";
         let http_gemini = "http://generativelanguage.googleapis.com/v1beta";
+        // The OneCLI marker of the effective proxy (name-reliability Task 6
+        // moved route choice to `session_name_capability`; the marker
+        // detection itself is unchanged).
         let route = |base_url: &str, env: &GeminiProxyEnvironment| {
-            GeminiSessionNameAuth::route_for(base_url, env)
+            if crate::session_name_capability::proxy_facts(env, base_url).onecli_marker {
+                "onecli"
+            } else {
+                "none"
+            }
         };
         let env =
             |https: Option<&str>, http: Option<&str>, all: Option<&str>, no: Option<&str>, cgi| {
@@ -842,7 +776,7 @@ mod tests {
                     false
                 ),
             ),
-            GeminiCredentialRoute::OneCliProxy,
+            "onecli",
         );
         assert_eq!(
             route(
@@ -855,7 +789,7 @@ mod tests {
                     false
                 ),
             ),
-            GeminiCredentialRoute::OneCliProxy,
+            "onecli",
         );
         assert_eq!(
             route(
@@ -868,7 +802,7 @@ mod tests {
                     false
                 ),
             ),
-            GeminiCredentialRoute::OneCliProxy,
+            "onecli",
         );
         assert_eq!(
             route(
@@ -881,7 +815,7 @@ mod tests {
                     false,
                 ),
             ),
-            GeminiCredentialRoute::Direct,
+            "none",
             "a valid scheme-specific proxy takes precedence over ALL_PROXY",
         );
         assert_eq!(
@@ -895,7 +829,7 @@ mod tests {
                     false,
                 ),
             ),
-            GeminiCredentialRoute::OneCliProxy,
+            "onecli",
             "an unparseable scheme-specific proxy falls back to ALL_PROXY",
         );
 
@@ -916,7 +850,7 @@ mod tests {
                         false,
                     ),
                 ),
-                GeminiCredentialRoute::Direct,
+                "none",
                 "NO_PROXY entry {no_proxy:?} bypasses the proxy",
             );
         }
@@ -931,7 +865,7 @@ mod tests {
                     false,
                 ),
             ),
-            GeminiCredentialRoute::OneCliProxy,
+            "onecli",
             "a nonmatching domain must not bypass the proxy",
         );
         assert_eq!(
@@ -945,7 +879,7 @@ mod tests {
                     true,
                 ),
             ),
-            GeminiCredentialRoute::Direct,
+            "none",
             "REQUEST_METHOD disables environment proxies",
         );
         assert_eq!(
@@ -955,12 +889,9 @@ mod tests {
         );
 
         let no_key = AiKeyCell::default();
-        let proxy_auth = GeminiSessionNameAuth {
-            direct_key: no_key.clone(),
-            route: GeminiCredentialRoute::OneCliProxy,
-        };
+        let proxy_auth = GeminiSessionNameAuth::onecli_for_test(no_key.clone());
         assert!(proxy_auth.enabled());
-        assert_eq!(proxy_auth.direct_key(), None);
+        assert_eq!(proxy_auth.key(), None);
         assert!(!GeminiSessionNameAuth::direct_for_test(no_key).enabled());
     }
 
@@ -972,9 +903,9 @@ mod tests {
             "http://proxy:%61oc_fixture@127.0.0.1:10255",
         ] {
             let environment = GeminiProxyEnvironment::literal(Some(proxy), None, None, None, false);
-            assert_eq!(
-                GeminiSessionNameAuth::route_for(https_gemini, &environment),
-                GeminiCredentialRoute::OneCliProxy,
+            assert!(
+                crate::session_name_capability::proxy_facts(&environment, https_gemini)
+                    .onecli_marker,
                 "a percent-encoded OneCLI marker in either proxy credential selects the proxy route",
             );
         }
@@ -1011,181 +942,25 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let key_cell = AiKeyCell::init(Some("synthetic-direct-key".into()), None);
-        let auth = GeminiSessionNameAuth {
-            direct_key: key_cell,
-            route: GeminiCredentialRoute::Direct,
-        };
-        assert_eq!(auth.route(), GeminiCredentialRoute::Direct);
+        let auth = GeminiSessionNameAuth::direct_for_test(key_cell);
+        assert_eq!(
+            auth.route(),
+            NamingRoute::Key(KeyRouteTransport::AmbientProxy)
+        );
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let http = GeminiSessionNameHttp::new(client, auth, format!("http://{addr}/v1beta"));
-        let title = http
-            .generate_content("hello world".into(), SESSION_TITLE_MAX_OUTPUT_TOKENS)
-            .await
-            .unwrap();
+        let title = SessionNameTransport::generate_content(
+            &http,
+            "hello world".into(),
+            SESSION_TITLE_MAX_OUTPUT_TOKENS,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(title, "Flux repair");
         assert_eq!(
             *observed_keys.lock().unwrap(),
             vec![Some("synthetic-direct-key".to_string())],
         );
-    }
-
-    #[tokio::test]
-    async fn session_name_onecli_route_omits_direct_key() {
-        use axum::{routing::post, Json, Router};
-        use std::sync::{Arc, Mutex};
-
-        let observed_keys = Arc::new(Mutex::new(Vec::new()));
-        let observed = Arc::clone(&observed_keys);
-        let app = Router::new().route(
-            "/v1beta/models/gemini-3.5-flash-lite:generateContent",
-            post(
-                move |headers: axum::http::HeaderMap, Json(_body): Json<serde_json::Value>| {
-                    let observed = Arc::clone(&observed);
-                    async move {
-                        observed
-                            .lock()
-                            .unwrap()
-                            .push(headers.contains_key("x-goog-api-key"));
-                        Json(serde_json::json!({
-                            "candidates": [{ "content": { "parts": [{ "text": "Flux repair" }] } }]
-                        }))
-                    }
-                },
-            ),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let key_cell = AiKeyCell::init(Some("synthetic-direct-key".into()), None);
-        let auth = GeminiSessionNameAuth {
-            direct_key: key_cell,
-            route: GeminiCredentialRoute::OneCliProxy,
-        };
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let http = GeminiSessionNameHttp::new(client, auth, format!("http://{addr}/v1beta"));
-        let title = http
-            .generate_content("hello world".into(), SESSION_TITLE_MAX_OUTPUT_TOKENS)
-            .await
-            .unwrap();
-
-        assert_eq!(title, "Flux repair");
-        assert_eq!(*observed_keys.lock().unwrap(), vec![false]);
-    }
-
-    #[tokio::test]
-    async fn onecli_missing_credential_retries_with_direct_key() {
-        let fixture = start_session_name_response_fixture(vec![
-            (
-                axum::http::StatusCode::UNAUTHORIZED,
-                r#"{"error":"credential_not_found"}"#.to_string(),
-            ),
-            (
-                axum::http::StatusCode::OK,
-                r#"{"candidates":[{"content":{"parts":[{"text":"Flux repair"}]}}]}"#.to_string(),
-            ),
-        ])
-        .await;
-        let transport = onecli_session_name_transport(&fixture, Some(TEST_DIRECT_FALLBACK_KEY));
-
-        let title = transport
-            .generate_content("hello world".into(), SESSION_TITLE_MAX_OUTPUT_TOKENS)
-            .await
-            .unwrap();
-
-        assert_eq!(title, "Flux repair");
-        assert_onecli_fallback_keys(&fixture.observed_keys);
-    }
-
-    #[tokio::test]
-    async fn onecli_missing_app_retries_with_direct_key() {
-        let fixture = start_session_name_response_fixture(vec![
-            (
-                axum::http::StatusCode::UNAUTHORIZED,
-                r#"{"error":"app_not_connected"}"#.to_string(),
-            ),
-            (
-                axum::http::StatusCode::OK,
-                r#"{"candidates":[{"content":{"parts":[{"text":"Flux repair"}]}}]}"#.to_string(),
-            ),
-        ])
-        .await;
-        let transport = onecli_session_name_transport(&fixture, Some(TEST_DIRECT_FALLBACK_KEY));
-
-        let title = transport
-            .generate_content("hello world".into(), SESSION_TITLE_MAX_OUTPUT_TOKENS)
-            .await
-            .unwrap();
-
-        assert_eq!(title, "Flux repair");
-        assert_onecli_fallback_keys(&fixture.observed_keys);
-    }
-
-    #[tokio::test]
-    async fn onecli_missing_credential_does_not_retry_other_failures() {
-        let cases = [
-            (
-                axum::http::StatusCode::FORBIDDEN,
-                r#"{"error":"access_restricted"}"#,
-            ),
-            (
-                axum::http::StatusCode::FORBIDDEN,
-                r#"{"error":"approval_required"}"#,
-            ),
-            (axum::http::StatusCode::UNAUTHORIZED, "unauthorized"),
-            (axum::http::StatusCode::FORBIDDEN, "forbidden"),
-            (axum::http::StatusCode::UNAUTHORIZED, "{malformed-json"),
-            (
-                axum::http::StatusCode::PROXY_AUTHENTICATION_REQUIRED,
-                "proxy auth",
-            ),
-            (
-                axum::http::StatusCode::PROXY_AUTHENTICATION_REQUIRED,
-                r#"{"error":"credential_not_found"}"#,
-            ),
-            (
-                axum::http::StatusCode::PROXY_AUTHENTICATION_REQUIRED,
-                r#"{"error":"app_not_connected"}"#,
-            ),
-        ];
-
-        for (status, body) in cases {
-            let fixture =
-                start_session_name_response_fixture(vec![(status, body.to_string())]).await;
-            let transport = onecli_session_name_transport(&fixture, Some(TEST_DIRECT_FALLBACK_KEY));
-
-            let error = transport
-                .generate_content("hello world".into(), SESSION_TITLE_MAX_OUTPUT_TOKENS)
-                .await
-                .expect_err("unapproved fallback cases remain errors");
-
-            assert!(
-                error.contains(&status.as_u16().to_string()),
-                "the original HTTP status remains visible"
-            );
-            assert_onecli_no_fallback_key(&fixture.observed_keys);
-        }
-    }
-
-    #[tokio::test]
-    async fn onecli_missing_credential_without_direct_key_does_not_retry() {
-        let fixture = start_session_name_response_fixture(vec![(
-            axum::http::StatusCode::UNAUTHORIZED,
-            r#"{"error":"credential_not_found"}"#.to_string(),
-        )])
-        .await;
-        let transport = onecli_session_name_transport(&fixture, None);
-
-        let error = transport
-            .generate_content("hello world".into(), SESSION_TITLE_MAX_OUTPUT_TOKENS)
-            .await
-            .expect_err("a missing direct key cannot be used for fallback");
-
-        assert!(
-            error.contains("401"),
-            "the original HTTP status remains visible"
-        );
-        assert_onecli_no_fallback_key(&fixture.observed_keys);
     }
 }

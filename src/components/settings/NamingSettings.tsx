@@ -14,6 +14,7 @@ export default function NamingSettings({
       >
         <input
           type="password"
+          aria-label="Gemini API key"
           value={settings.ai?.geminiApiKey || ''}
           placeholder="Enter Gemini API key"
           onChange={(e) => {

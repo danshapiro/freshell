@@ -576,8 +576,10 @@ async fn scoped_generate_title(
     };
     if let Some(generator) = &state.generation_wake {
         // Ensure already-eligible unattempted work: the wake makes the
-        // worker's next pass immediate. Never replenishes anything.
-        generator.notify_capability_change();
+        // worker's next pass immediate. Never replenishes anything, and
+        // never clears the naming pause (name-reliability Task 6: only a
+        // key change does).
+        generator.wake();
     }
     match record {
         Some(record) => Json(json!({

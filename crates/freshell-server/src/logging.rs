@@ -106,7 +106,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 #[cfg(test)]
 use freshell_runtime_observability::scrub;
-use freshell_runtime_observability::RotatingJsonlWriter as RotatingWriter;
+use freshell_runtime_observability::{LiveSecrets, RotatingJsonlWriter as RotatingWriter};
 use serde_json::{Map, Value};
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
@@ -140,6 +140,11 @@ pub struct LoggingConfig {
     /// every log line. Never logged itself, including here (this struct is
     /// never `Debug`-derived/printed).
     pub secret: String,
+    /// Name-reliability Task 6: secret values learned while the process runs
+    /// (the configured Gemini key, then any key saved in Settings), redacted
+    /// verbatim from every line like `secret`. Shared: values added after
+    /// [`init`] are redacted from then on.
+    pub live_secrets: LiveSecrets,
     /// The app version stamped onto EVERY line as `app_version` (DIAG-01's
     /// "app version" field): any arbitrary log tail is then attributable to
     /// the release that produced it without cross-referencing boot lines.
@@ -154,7 +159,12 @@ pub struct LoggingConfig {
 /// `resolveDebugLogPath`) and adding two new, narrowly-scoped overrides
 /// (`FRESHELL_LOG_MAX_BYTES`/`FRESHELL_LOG_MAX_BACKUPS`) so the rotation
 /// bound is testable without waiting to actually accumulate 10 MiB.
-pub fn resolve_config(home: Option<&Path>, secret: String, app_version: String) -> LoggingConfig {
+pub fn resolve_config(
+    home: Option<&Path>,
+    secret: String,
+    live_secrets: LiveSecrets,
+    app_version: String,
+) -> LoggingConfig {
     let log_dir = std::env::var("FRESHELL_LOG_DIR")
         .ok()
         .filter(|v| !v.is_empty())
@@ -176,6 +186,7 @@ pub fn resolve_config(home: Option<&Path>, secret: String, app_version: String) 
         max_bytes,
         max_backups,
         secret,
+        live_secrets,
         app_version,
     }
 }
@@ -191,7 +202,13 @@ pub fn resolve_config(home: Option<&Path>, secret: String, app_version: String) 
 /// running server either way).
 pub fn init(config: LoggingConfig) -> std::io::Result<()> {
     let path = config.log_dir.join(LOG_FILE_NAME);
-    let writer = RotatingWriter::create(path, config.max_bytes, config.max_backups, config.secret)?;
+    let writer = RotatingWriter::create_with_live_secrets(
+        path,
+        config.max_bytes,
+        config.max_backups,
+        config.secret,
+        config.live_secrets,
+    )?;
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -525,6 +542,84 @@ mod tests {
         let line = r#"{"ts":"now","msg":"Cookie: freshell-auth=abcdef123456; other=1"}"#;
         let out = scrub(line, "");
         assert!(!out.contains("freshell-auth=abcdef123456"));
+    }
+
+    /// Name-reliability Task 6 (G48): the newer `AQ.` Gemini key form is a
+    /// common secret pattern, like `AIza…`.
+    #[test]
+    fn scrub_redacts_aq_form_gemini_keys() {
+        // A synthetic key of the live key's shape: `AQ.` + 50 characters.
+        let key = format!("AQ.{}", "Ab3_x-Yz9Q".repeat(5));
+        assert_eq!(key.len(), 53);
+        for line in [
+            format!("plain line with {key} inside"),
+            format!(r#"{{"ts":"now","detail":"{key}"}}"#),
+            format!("gemini request rejected: key={key}; retry later"),
+        ] {
+            let out = scrub(&line, "");
+            assert!(!out.contains(&key[3..20]), "AQ. key leaked: {out}");
+            assert!(out.contains("***REDACTED***"), "{out}");
+        }
+        // The existing AIza arm and non-secret text are unchanged.
+        let aiza = format!("AIza{}", "B3c".repeat(12));
+        assert!(!scrub(&format!("key {aiza}"), "").contains(&aiza));
+        let benign = r#"{"msg":"AQ.short, AQUARIUM and Q.A"}"#;
+        assert_eq!(scrub(benign, ""), benign);
+    }
+
+    /// Name-reliability Task 6 (LB-B13): the configured key VALUE is redacted
+    /// even when no pattern covers all of it (here a second `.` stops the
+    /// `AQ.` pattern early), and a key saved in Settings later is redacted
+    /// from then on.
+    #[test]
+    fn scrub_redacts_the_configured_key_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rust-server.jsonl");
+        let secrets = LiveSecrets::default();
+        let writer = RotatingWriter::create_with_live_secrets(
+            path.clone(),
+            1 << 20,
+            1,
+            String::new(),
+            secrets.clone(),
+        )
+        .unwrap();
+        // What main does after the key cell is initialized.
+        let configured = "AQ.firstPartOfTheKey12345.second-part_after-the-dot";
+        assert!(secrets.insert(configured));
+        writer
+            .write_line(&format!(
+                r#"{{"msg":"failure for {configured}","nested":"see {configured}"}}"#
+            ))
+            .unwrap();
+        // A Settings save of a new key, through the path the PATCH route uses.
+        let cell = crate::ai_title::AiKeyCell::default();
+        let saved = "plain.saved-gemini.key-value-99";
+        assert!(crate::session_name_capability::apply_saved_gemini_key(
+            &cell,
+            &secrets,
+            None,
+            Some(saved),
+        ));
+        assert_eq!(cell.get().as_deref(), Some(saved));
+        writer
+            .write_line(&format!("later line with {saved}"))
+            .unwrap();
+        // A value too short to be a credential never shreds ordinary text.
+        assert!(!secrets.insert("k2"));
+        writer.write_line("k2 stays readable").unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        for fragment in [
+            configured,
+            "second-part_after-the-dot",
+            "firstPartOfTheKey",
+            saved,
+        ] {
+            assert!(!content.contains(fragment), "{fragment} leaked: {content}");
+        }
+        assert!(content.contains("k2 stays readable"));
+        assert!(content.matches("***REDACTED***").count() >= 3, "{content}");
     }
 
     #[test]

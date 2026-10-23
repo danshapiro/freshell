@@ -52,6 +52,22 @@ describe('SettingsView naming settings', () => {
     })
   })
 
+  it('names the Gemini API key input so it can be found by its label', async () => {
+    const store = createSettingsViewStore()
+    renderSettingsView(store)
+    switchSettingsTab('Naming')
+
+    const input = screen.getByLabelText('Gemini API key')
+    expect(input).toHaveAttribute('type', 'password')
+    fireEvent.change(input, { target: { value: 'labelled-key' } })
+    await act(async () => {
+      vi.advanceTimersByTime(500)
+    })
+    expect(api.patch).toHaveBeenCalledWith('/api/settings', {
+      ai: { geminiApiKey: 'labelled-key' },
+    })
+  })
+
   it('toggles automatic session titles through server settings', async () => {
     const store = createSettingsViewStore({
       settings: { sidebar: { autoGenerateTitles: true } },
