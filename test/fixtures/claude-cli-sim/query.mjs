@@ -20,14 +20,18 @@
 //   - tool heartbeats every 30 s, Bash task promotion and the
 //     BASH_MAX_TIMEOUT_MS cap, background agents and the CLI-initiated turn
 //     their completion starts, API errors, canUseTool with suggestions and
-//     ExitPlanMode.
+//     ExitPlanMode;
+//   - stdio MCP servers started with the CLI's environment, listed once
+//     connected, and called for their tools (mcp.mjs).
 //
 // The model's side of each turn comes from prompt markers
 // (prompt-markers.mjs, shared with the real-CLI loopback provider) or from a
-// scenario program (program.mjs). Layout: this module owns the session (boot,
+// scenario program (program.mjs). A program can also retry failed API
+// requests (api_retry, F11) and replay the model's side of a turn the pinned
+// CLI really ran, with its transcript and subagent files (replay.mjs). Layout: this module owns the session (boot,
 // input, the command queue, turns, interrupts, results); tools.mjs runs tool
-// calls; local-commands.mjs runs slash commands; transcript.mjs persists the
-// JSONL; sdk-shapes.mjs holds the recorded catalog and fixed shapes.
+// calls; local-commands.mjs runs slash commands; replay.mjs plays recorded
+// turns; transcript.mjs persists the JSONL; sdk-shapes.mjs holds the recorded catalog and fixed shapes.
 //
 // Knobs (read from options.env, then process.env):
 //   FRESHELL_CLAUDE_SIM_TIME_SCALE      multiply every simulated delay (default 1);
@@ -58,15 +62,18 @@
 //                                       `query`, the ordinal of its query() call in
 //                                       this process. Rows: `query` (the options, env
 //                                       reduced to key names plus short sha256
-//                                       digests of credential values), `boot` (the session id
+//                                       digests of credential values and the
+//                                       Freshell context values), `boot` (the session id
 //                                       and the stand-in CLI's pid), `prompt` (each
 //                                       command as it starts: uuid, text, content and
 //                                       the model, effort and permission mode it runs
 //                                       under), `can_use_tool` (each answer the host's
 //                                       canUseTool gave), `interrupt` (each interrupt
 //                                       the CLI took: the receipt's stillQueued and
-//                                       whether a turn was running) and `emission`
-//                                       (program steps)
+//                                       whether a turn was running), `control` (each settings call
+//                                       the CLI handles: setModel, setPermissionMode,
+//                                       applyFlagSettings, with its arguments) and
+//                                       `emission` (program steps)
 
 import fs from 'node:fs'
 import path from 'node:path'
@@ -76,6 +83,7 @@ import { fileURLToPath } from 'node:url'
 import { HANG_MCP_QUALIFIED_TOOL, parsePromptMarkers, PLAN_TEXT, SLOW_DELAY_MS } from './prompt-markers.mjs'
 import { loadProgram, ProgramEngine } from './program.mjs'
 import { runLocalCommand } from './local-commands.mjs'
+import { replayTurn } from './replay.mjs'
 import {
   CATALOG,
   CAVEAT,
@@ -92,6 +100,7 @@ import {
   usage,
 } from './sdk-shapes.mjs'
 import { toolCall } from './tools.mjs'
+import { McpServers } from './mcp.mjs'
 import {
   claudeConfigDir,
   CLI_VERSION,
@@ -116,6 +125,15 @@ function parseSlash(text) {
   return match ? { name: match[1], args: (match[2] ?? '').trim() } : null
 }
 
+/** The SDK's error kind for a failed API request's HTTP status (null: no response). */
+function apiErrorKind(status) {
+  if (status === 529) return 'overloaded'
+  if (status === 429) return 'rate_limit'
+  if (status === 401) return 'authentication_failed'
+  if (status !== null && status >= 500) return 'server_error'
+  return 'unknown'
+}
+
 /** The model steps a prompt's markers ask for (see prompt-markers.mjs). */
 function markerSteps(text) {
   const marker = parsePromptMarkers(text)
@@ -123,8 +141,10 @@ function markerSteps(text) {
     case 'slow': return [{ kind: 'text', data: { chunks: marker.chunks, delayMs: marker.delayMs } }]
     case 'tool': return [{ kind: 'tool', data: { name: 'Bash', input: { command: marker.command, description: 'local provider command', ...(marker.timeoutMs ? { timeout: marker.timeoutMs } : {}) }, seconds: marker.seconds } }]
     case 'api_error': return [{ kind: 'api_error', data: { status: marker.status } }]
+    case 'retry': return [{ kind: 'api_retry', data: { status: marker.status, attempts: marker.attempts } }, { kind: 'text', data: { text: 'ok' } }]
     case 'hang': return [{ kind: 'hang', data: {} }]
     case 'mcp_hang': return [{ kind: 'tool', data: { name: HANG_MCP_QUALIFIED_TOOL, input: {}, hang: true } }]
+    case 'mcp_call': return [{ kind: 'tool', data: { name: marker.tool, input: {} } }]
     case 'agent_async': return [{ kind: 'agent', data: {} }]
     case 'exit_plan': return [{ kind: 'exit_plan', data: { plan: PLAN_TEXT } }]
     default: return [{ kind: 'text', data: { text: 'ok' } }]
@@ -226,6 +246,9 @@ class SimulatedCli {
   constructor({ prompt, options = {} }) {
     this.options = options
     this.env = { ...process.env, ...(options.env ?? {}) }
+    // What the CLI process itself (and so its MCP servers) gets: the SDK's
+    // `env` option in place of this process's environment, as the SDK does.
+    this.cliEnv = options.env ?? process.env
     this.scale = Math.max(0, Number(this.env.FRESHELL_CLAUDE_SIM_TIME_SCALE ?? 1) || 0)
     this.channel = createChannel()
     this.program = new ProgramEngine(loadProgram(this.env))
@@ -264,6 +287,8 @@ class SimulatedCli {
 
     this.sessionId = options.forkSession ? (options.sessionId ?? randomUUID()) : (options.resume ?? options.sessionId ?? randomUUID())
     this.spawnCli()
+    // The CLI starts its stdio MCP servers with its own environment (mcp.mjs).
+    this.mcp = new McpServers(options.mcpServers, { env: this.cliEnv, cwd: this.cwd })
     this.background(this.pumpInput(prompt))
     this.background(this.boot())
 
@@ -389,6 +414,7 @@ class SimulatedCli {
     for (const timer of this.timers) clearTimeout(timer)
     this.timers.clear()
     this.turn?.abort()
+    this.mcp?.stop()
     this.init.reject(error ?? new Error('Query closed before the CLI booted'))
     this.channel.end(error)
     if (!this.cliExited) {
@@ -483,7 +509,7 @@ class SimulatedCli {
   }
 
   systemInit() {
-    const mcpServers = Object.keys(this.options.mcpServers ?? {}).map((name) => ({ name, status: 'connected' }))
+    const mcpServers = this.mcp.statuses()
     const plugins = (this.options.plugins ?? []).map((plugin) => ({ name: path.basename(plugin.path ?? String(plugin)), path: plugin.path ?? String(plugin) }))
     return {
       type: 'system',
@@ -494,6 +520,7 @@ class SimulatedCli {
       ...(this.env.FRESHELL_CLAUDE_SIM_TERMINAL_COMMANDS === undefined
         ? {}
         : { terminal_slash_commands: this.env.FRESHELL_CLAUDE_SIM_TERMINAL_COMMANDS.split(',').filter(Boolean) }),
+      tools: [...CATALOG.init.tools, ...this.mcp.toolNames()],
       mcp_servers: mcpServers,
       plugins,
       model: this.model,
@@ -641,18 +668,27 @@ class SimulatedCli {
   async runModelTurn(turn) {
     const { cmd } = turn
     await this.sleep(T.startedToInit)
+    // A turn's request waits for the MCP servers to connect (or fail).
+    await this.mcp.settled()
     this.emit(this.systemInit())
     await this.sleep(T.initToStatus)
     this.emit({ type: 'system', subtype: 'status', status: 'requesting' })
     turn.requests = 1
+    const scripted = this.program.match('msg', { type: 'prompt', text: cmd.text, uuid: cmd.uuid })
+    if (scripted) for (const emission of scripted) this.ledger('emission', { kind: emission.kind, data: emission.data })
+    const steps = [...(scripted ?? markerSteps(cmd.text))]
+    // A first request that fails is retried before the CLI replays the
+    // prompt: the replay follows the request that is answered (conformance
+    // scenario `retry`).
+    if (steps[0]?.kind === 'api_retry') {
+      if (await this.apiRetries(turn, steps.shift().data)) return this.abortBeforeContent(turn)
+    }
     await this.sleep(T.requestLatency)
     const uuid = cmd.uuid ?? randomUUID()
     this.emit({ type: 'user', message: { role: 'user', content: cmd.content }, parent_tool_use_id: null, uuid, timestamp: new Date().toISOString(), isReplay: true })
     this.transcript.appendPrompt({ uuid, content: cmd.content, permissionMode: this.permissionMode })
-    const scripted = this.program.match('msg', { type: 'prompt', text: cmd.text, uuid: cmd.uuid })
-    if (scripted) for (const emission of scripted) this.ledger('emission', { kind: emission.kind, data: emission.data })
     this.modelTurnsSinceCompact += 1
-    await this.respond(turn, scripted ?? markerSteps(cmd.text))
+    await this.respond(turn, steps)
   }
 
   /** A turn the CLI starts by itself: a background task finished (T19). */
@@ -664,6 +700,7 @@ class SimulatedCli {
     // origin task-notification: no prompt of its own, and no SDK message.
     this.transcript.append({ type: 'user', message: { role: 'user', content: taskNotificationXml(task) }, origin: { kind: 'task-notification' } })
     this.transcript.append({ type: 'attachment', attachment: { type: 'total_tokens_reminder', text: '<total_tokens>15000000 tokens left</total_tokens>' } })
+    await this.mcp.settled()
     this.emit(this.systemInit())
     await this.sleep(T.initToStatus)
     this.emit({ type: 'system', subtype: 'status', status: 'requesting' })
@@ -707,6 +744,12 @@ class SimulatedCli {
           return this.finishTurn(turn, { subtype: step.data.subtype ?? 'success', text: step.data.text, errors: step.data.errors })
         case 'api_error':
           return this.apiError(turn, step.data)
+        case 'api_retry':
+          if (await this.apiRetries(turn, step.data)) return this.abortBeforeContent(turn)
+          break
+        case 'replay':
+          if (await replayTurn(this, turn, step.data) === 'dead') return undefined
+          break
         case 'hang':
           this.emitStream(this.messageStart())
           await this.wait(Number.POSITIVE_INFINITY, turn)
@@ -728,18 +771,25 @@ class SimulatedCli {
     return this.finishTurn(turn, { subtype: 'success' })
   }
 
+  /**
+   * The start of one model response. Its id is the API message id every
+   * content block of that response carries on its assistant message (F2).
+   */
   messageStart() {
+    this.streamedMessageId = `msg_${randomUUID().replaceAll('-', '')}`
     return {
       type: 'message_start',
-      message: { id: `msg_${randomUUID().replaceAll('-', '')}`, type: 'message', role: 'assistant', model: FAKE_MODEL, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } },
+      message: { id: this.streamedMessageId, type: 'message', role: 'assistant', model: FAKE_MODEL, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } },
     }
   }
 
+  /** One completed content block of the main thread's current response (or of a subagent's, with parent_tool_use_id). */
   assistant(content, extra = {}) {
     const uuid = randomUUID()
+    const id = !extra.parent_tool_use_id && this.streamedMessageId ? this.streamedMessageId : `msg_${randomUUID().replaceAll('-', '')}`
     const message = {
       type: 'assistant',
-      message: { id: `msg_${randomUUID().replaceAll('-', '')}`, type: 'message', role: 'assistant', model: FAKE_MODEL, content, stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }, context_management: null },
+      message: { id, type: 'message', role: 'assistant', model: FAKE_MODEL, content, stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }, context_management: null },
       parent_tool_use_id: null,
       uuid,
       timestamp: new Date().toISOString(),
@@ -759,7 +809,10 @@ class SimulatedCli {
 
   /** One streamed text block. Returns false when the turn was aborted (and has been ended). */
   async streamText(turn, data) {
-    const pieces = data.chunks ? Array.from({ length: data.chunks }, (_, i) => `chunk${i} `) : [data.text ?? 'ok']
+    // A model that repeats what its last tool call returned (`echoToolResult`,
+    // after an optional `text` prefix).
+    const reply = data.echoToolResult ? `${data.text ?? ''}${turn.lastToolResultText ?? ''}` : (data.text ?? 'ok')
+    const pieces = data.chunks ? Array.from({ length: data.chunks }, (_, i) => `chunk${i} `) : [reply]
     const pace = data.chunks ? (data.delayMs ?? SLOW_DELAY_MS) : 0
     this.emitStream(this.messageStart())
     this.emitStream({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })
@@ -778,14 +831,24 @@ class SimulatedCli {
     return true
   }
 
-  setMode(mode) {
+  /**
+   * The CLI's permission mode changes. Entering plan mode remembers the mode
+   * it left: an approved ExitPlanMode returns there, not to default (B6).
+   */
+  changeMode(mode) {
+    if (mode === 'plan' && this.permissionMode !== 'plan') this.modeBeforePlan = this.permissionMode
     this.permissionMode = mode
+  }
+
+  setMode(mode) {
+    this.changeMode(mode)
     this.emit({ type: 'system', subtype: 'status', status: null, permissionMode: mode })
   }
 
   toolResult(toolUseId, content, { isError = false, toolUseResult, extra = {} } = {}) {
     const uuid = randomUUID()
     const block = { tool_use_id: toolUseId, type: 'tool_result', content, ...(isError ? { is_error: true } : { is_error: false }) }
+    if (this.turn) this.turn.lastToolResultText = Array.isArray(content) ? content.map((part) => part?.text ?? '').join('') : String(content ?? '')
     this.emit({ type: 'user', message: { role: 'user', content: [block] }, parent_tool_use_id: null, uuid, timestamp: new Date().toISOString(), tool_use_result: toolUseResult, ...extra })
     this.transcript.append({ type: 'user', uuid, message: { role: 'user', content: [block] }, toolUseResult })
     // Sends absorbed while the tool ran join the turn as queued_command
@@ -855,6 +918,24 @@ class SimulatedCli {
     this.emit(message)
     this.transcript.append({ type: 'assistant', uuid, requestId: message.request_id, error: 'unknown', isApiErrorMessage: true, apiErrorStatus: status, message: message.message })
     return this.finishTurn(turn, { subtype: 'success', isError: true, terminalReason: 'api_error', stopReason: 'stop_sequence', text, apiErrorStatus: status, lifecycle: 'cancelled' })
+  }
+
+  /**
+   * The model request fails `attempts` times with `status` and the CLI
+   * retries each (F11; live only, never in the transcript): a
+   * system/api_retry, then the CLI's backoff. Returns true when the turn was
+   * aborted meanwhile.
+   */
+  async apiRetries(turn, data) {
+    const status = data.status === null ? null : Number(data.status ?? 529)
+    const attempts = Math.max(1, Number(data.attempts ?? 1))
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const delay = Math.min(500 * 2 ** (attempt - 1), 32_000)
+      this.emit({ type: 'system', subtype: 'api_retry', attempt, max_retries: 10, retry_delay_ms: delay, error_status: status, error: apiErrorKind(status) })
+      // A retried request is the same request: num_turns does not grow.
+      if (await this.wait(delay, turn)) return true
+    }
+    return false
   }
 
   async abortBeforeContent(turn) {
@@ -983,6 +1064,7 @@ class SimulatedCli {
 
   async setModel(model) {
     return this.control(async () => {
+      this.ledger('control', { name: 'setModel', args: [model] })
       this.model = model ?? FAKE_MODEL
       const text = `<local-command-stdout>Set model to ${this.model}</local-command-stdout>`
       this.emit({ type: 'user', message: { role: 'user', content: text }, parent_tool_use_id: null, timestamp: new Date().toISOString(), isReplay: true })
@@ -995,9 +1077,10 @@ class SimulatedCli {
 
   async setPermissionMode(mode) {
     return this.control(() => {
+      this.ledger('control', { name: 'setPermissionMode', args: [mode] })
       // The only settings call the CLI validates (any model or effort name is accepted).
       if (!PERMISSION_MODES.includes(mode)) throw new Error(`Cannot set permission mode: must be one of ${PERMISSION_MODES.join(', ')}`)
-      this.permissionMode = mode
+      this.changeMode(mode)
       // Reported after the call resolves, before anything sent after it is taken.
       setImmediate(() => this.emit({ type: 'system', subtype: 'status', status: null, permissionMode: mode }))
     })
@@ -1005,6 +1088,7 @@ class SimulatedCli {
 
   async applyFlagSettings(settings) {
     return this.control(() => {
+      this.ledger('control', { name: 'applyFlagSettings', args: [settings] })
       this.flagSettings = { ...(this.flagSettings ?? {}), ...(settings ?? {}) }
       if (settings && 'effortLevel' in settings) this.effort = settings.effortLevel ?? undefined
     })
@@ -1027,7 +1111,7 @@ class SimulatedCli {
   }
 
   async mcpServerStatus() {
-    return this.control(() => Object.keys(this.options.mcpServers ?? {}).map((name) => ({ name, status: 'connected' })))
+    return this.control(() => this.mcp.statuses())
   }
 
   async initializationResult() {
@@ -1036,14 +1120,18 @@ class SimulatedCli {
 }
 
 /** The credentials whose value a test may need to tell apart (as a digest, never the value). */
-const DIGESTED_CREDENTIALS = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN']
+const DIGESTED_CREDENTIALS = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'FRESHELL_TOKEN']
+
+/** The non-secret Freshell context names whose values the ledger records (the token is digested). */
+const RECORDED_CONTEXT = ['FRESHELL', 'FRESHELL_URL', 'FRESHELL_TERMINAL_ID', 'FRESHELL_TAB_ID', 'FRESHELL_PANE_ID']
 
 /** A short sha256 digest of a credential value: enough to compare, useless to read. */
 const credentialDigest = (value) => createHash('sha256').update(String(value)).digest('hex').slice(0, 12)
 
 /**
  * The options as a ledger row: functions and controllers by kind, env by key
- * names only, plus a short digest of each credential the child got.
+ * names only, plus a short digest of each credential the child got and the
+ * values of the non-secret Freshell context names.
  */
 function describeOptions(options) {
   const out = {}
@@ -1052,6 +1140,7 @@ function describeOptions(options) {
       const env = value ?? {}
       out.envKeys = Object.keys(env).sort()
       out.envDigests = Object.fromEntries(DIGESTED_CREDENTIALS.filter((name) => env[name] !== undefined).map((name) => [name, credentialDigest(env[name])]))
+      out.envContext = Object.fromEntries(RECORDED_CONTEXT.filter((name) => env[name] !== undefined).map((name) => [name, env[name]]))
     } else if (key === 'abortController') out.abortController = Boolean(value)
     else if (typeof value === 'function') out[key] = '[function]'
     else out[key] = value

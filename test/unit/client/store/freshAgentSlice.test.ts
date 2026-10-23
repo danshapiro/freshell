@@ -11,6 +11,7 @@ import reducer, {
   registerPendingCreate,
   sessionCreated,
   sessionError,
+  sessionExited,
   sessionInit,
   sessionSnapshotReceived,
   setSessionStatus,
@@ -25,6 +26,11 @@ describe('freshAgentSlice busy/streaming clearing', () => {
   function streaming() {
     return reducer(undefined, sessionSnapshotReceived({ ...loc, latestTurnId: null, status: 'running', streamingActive: true }))
   }
+
+  it('sessionExited for a session this client never saw changes nothing', () => {
+    const before = reducer(undefined, { type: '@@init' })
+    expect(reducer(before, sessionExited(loc))).toBe(before)
+  })
 
   it('setSessionStatus(idle) clears streamingActive so the pane does not stay blue', () => {
     let state = streaming()
@@ -323,5 +329,22 @@ describe('freshAgentSlice lost revocation on truth-bearing snapshot evidence', (
       },
     }))
     expect(state.sessions[key].lost).toBe(false)
+  })
+})
+
+describe('turnResult cost and usage (transcript-live D8)', () => {
+  const loc = { sessionId: 'cost-1', sessionType: 'freshclaude' as const, provider: 'claude' as const }
+  const key = makeFreshAgentSessionKey(loc)
+
+  it('takes the SDK\'s session-cumulative cost as the total and adds up per-turn token usage', () => {
+    let state = reducer(undefined, turnResult({ ...loc, costUsd: 0.02, usage: { input_tokens: 10, output_tokens: 4 } }))
+    state = reducer(state, turnResult({ ...loc, costUsd: 0.05, usage: { input_tokens: 7, output_tokens: 3 } }))
+    expect(state.sessions[key]).toMatchObject({ totalCostUsd: 0.05, totalInputTokens: 17, totalOutputTokens: 7 })
+  })
+
+  it('keeps the last known cost when a result carries none', () => {
+    let state = reducer(undefined, turnResult({ ...loc, costUsd: 0.05 }))
+    state = reducer(state, turnResult({ ...loc }))
+    expect(state.sessions[key].totalCostUsd).toBe(0.05)
   })
 })

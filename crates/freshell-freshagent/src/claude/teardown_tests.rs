@@ -339,7 +339,7 @@ async fn spawn_sidecar_runs_the_sidecar_inside_its_own_process_group() {
     let script = dir.path().join("idle-sidecar.mjs");
     std::fs::write(&script, "setInterval(() => {}, 1000)\n").unwrap();
     std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
-    let spawned = spawn_sidecar(None, "freshclaude").await;
+    let spawned = spawn_sidecar(None, None, "freshclaude").await;
     std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
 
     let SpawnedSidecar {

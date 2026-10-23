@@ -2734,6 +2734,7 @@ impl FreshOpencodeState {
                 &busy_session_id,
                 model.as_deref(),
                 effort.as_deref(),
+                None,
             ));
         }
 
@@ -3208,6 +3209,7 @@ impl FreshOpencodeState {
             &session_id,
             model.as_deref(),
             effort.as_deref(),
+            None,
         ));
     }
 
@@ -9715,6 +9717,7 @@ mod tests {
 
     fn create_msg(request_id: &str) -> FreshAgentCreate {
         FreshAgentCreate {
+            pane_id: None,
             naming_handle: None,
             observed_epoch: None,
             observed_generation: None,
@@ -10523,6 +10526,8 @@ mod tests {
         // the terminal-owner gate must answer the TYPED refusal (never
         // the wildcard reuse that restarts the serve bridge).
         st.handle_attach(FreshAgentAttach {
+            tab_id: None,
+            pane_id: None,
             provider: AgentProvider::Opencode,
             session_id: real_id.clone(),
             session_type: SessionType::Freshopencode,
@@ -10631,6 +10636,8 @@ mod tests {
         // THE DELAYED ATTACH with the STALE pair — the state precheck sees
         // Live (passes); the ADOPT validates the pair and refuses typed.
         st.handle_attach(FreshAgentAttach {
+            tab_id: None,
+            pane_id: None,
             provider: AgentProvider::Opencode,
             session_id: real_id.clone(),
             session_type: SessionType::Freshopencode,
@@ -12907,6 +12914,8 @@ mod tests {
 
     fn attach_msg(session_id: &str) -> FreshAgentAttach {
         FreshAgentAttach {
+            tab_id: None,
+            pane_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: AgentProvider::Opencode,
@@ -24755,6 +24764,8 @@ mod tests {
         // THE MAP-HIT FENCED ATTACH — the incident's three wasted attempts,
         // now the documented recovery verb.
         st.handle_attach(FreshAgentAttach {
+            tab_id: None,
+            pane_id: None,
             provider: AgentProvider::Opencode,
             session_id: durable.clone(),
             session_type: SessionType::Freshopencode,

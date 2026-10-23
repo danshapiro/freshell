@@ -391,6 +391,9 @@ impl FreshClaudeState {
         lease_guard: Option<&mut crate::FreshSessionLeaseGuard>,
         start: Option<StartWatch<'_>>,
     ) -> Result<BootedSidecar, EstablishError> {
+        // The Freshell MCP recipe is resolved per launch (G19), so the
+        // setting applies to the next sidecar without a restart.
+        let spec = &self.freshell_mcp.launch(spec.clone()).await;
         let SpawnedSidecar {
             mut child,
             mut stdin,
@@ -735,6 +738,7 @@ impl FreshClaudeState {
                 ClaudeSession {
                     configuration: ClaudeConfiguration {
                         settings: configuration_settings,
+                        freshell_context: spec.freshell_context.clone(),
                         ..ClaudeConfiguration::default()
                     },
                     stdin,

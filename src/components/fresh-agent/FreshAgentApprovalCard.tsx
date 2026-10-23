@@ -1,32 +1,61 @@
+import { useId } from 'react'
 import DiffView from '@/components/fresh-agent/shared/DiffView'
 import type { FreshAgentPendingApproval } from '@shared/fresh-agent-contract'
+import {
+  buildAllowDecision,
+  buildDenyDecision,
+  describePermissionUpdate,
+  rememberLabel,
+  type FreshAgentApprovalDecision,
+} from '@/lib/fresh-agent-permission-updates'
+import { FreshAgentPlanApprovalCard } from './FreshAgentPlanApprovalCard'
+
+// Touch targets ≥44px at base; compact on sm+. flex-1 lets the buttons share
+// the full row width on narrow panes for easy thumbing.
+const BUTTON = 'fresh-agent-approval-button min-h-[2.75rem] flex-1 rounded-md px-4 text-sm disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:flex-none sm:px-3 sm:py-1 sm:text-xs'
+
+type FreshAgentApprovalCardProps = {
+  approval: FreshAgentPendingApproval
+  disabled?: boolean
+  onRespond: (decision: FreshAgentApprovalDecision) => void
+  onAlwaysAllow?: (toolName: string) => void
+}
 
 /**
  * Approval card with an inline preview of what is being approved — the exact
- * Bash command, an Edit diff, or pretty-printed input for other tools — plus a
- * session-scoped "always allow" escape hatch handled by the caller.
+ * Bash command, an Edit diff, or pretty-printed input for other tools. Every
+ * answer goes out through `onRespond` as a decision from the shared builders:
+ *
+ * - "Allow" and "Deny";
+ * - when the CLI suggested permission updates (Claude only), the remember
+ *   button sends exactly those suggestions, each spelled out in plain language
+ *   underneath, so Claude itself stops asking;
+ * - `onAlwaysAllow`, when the caller provides it, adds the client-only "Always
+ *   allow <Tool> in this pane" (codex): the caller remembers the tool and
+ *   answers later requests until the pane reloads.
+ *
+ * Claude's ExitPlanMode request is a plan to review, not a tool call: it gets
+ * the plan card ({@link FreshAgentPlanApprovalCard}).
  */
-export function FreshAgentApprovalCard({
-  approval,
-  disabled,
-  onAllow,
-  onAlwaysAllow,
-  onDeny,
-}: {
-  approval: FreshAgentPendingApproval
-  disabled?: boolean
-  onAllow: () => void
-  onAlwaysAllow: (toolName: string) => void
-  onDeny: () => void
-}) {
+export function FreshAgentApprovalCard(props: FreshAgentApprovalCardProps) {
+  if (props.approval.toolName === 'ExitPlanMode') {
+    return <FreshAgentPlanApprovalCard approval={props.approval} disabled={props.disabled} onRespond={props.onRespond} />
+  }
+  return <FreshAgentToolApprovalCard {...props} />
+}
+
+function FreshAgentToolApprovalCard({ approval, disabled, onRespond, onAlwaysAllow }: FreshAgentApprovalCardProps) {
+  const suggestionsId = useId()
   const toolName = approval.toolName ?? 'Tool'
   const input = approval.input ?? {}
+  const suggestions = approval.suggestions ?? []
   const command = toolName === 'Bash' && typeof input.command === 'string' ? input.command : null
   const editDiff = toolName === 'Edit'
     && typeof input.old_string === 'string'
     && typeof input.new_string === 'string'
     ? { oldStr: input.old_string, newStr: input.new_string, filePath: typeof input.file_path === 'string' ? input.file_path : undefined }
     : null
+  const remember = suggestions.length > 0 ? rememberLabel(suggestions) : null
 
   return (
     <div
@@ -61,40 +90,59 @@ export function FreshAgentApprovalCard({
         </pre>
       ) : null}
 
-      {/* Touch targets ≥44px at base; compact on sm+. flex-1 lets the buttons
-          share the full row width on narrow panes for easy thumbing. */}
       <div className="fresh-agent-approval-actions mt-2 flex flex-wrap gap-2">
         <button
           type="button"
           aria-label="Allow tool use"
           disabled={disabled}
-          onClick={onAllow}
-          className="fresh-agent-approval-button fresh-agent-approval-button-primary min-h-[2.75rem] flex-1 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:flex-none sm:px-3 sm:py-1 sm:text-xs"
+          onClick={() => onRespond(buildAllowDecision())}
+          className={`${BUTTON} fresh-agent-approval-button-primary bg-primary font-medium text-primary-foreground`}
         >
           Allow
         </button>
-        {approval.toolName ? (
+        {remember ? (
           <button
             type="button"
-            aria-label={`Always allow ${toolName} this session`}
+            aria-describedby={suggestionsId}
+            disabled={disabled}
+            onClick={() => onRespond(buildAllowDecision(suggestions))}
+            className={`${BUTTON} fresh-agent-approval-button-remember border border-border`}
+          >
+            {remember}
+          </button>
+        ) : null}
+        {onAlwaysAllow && approval.toolName ? (
+          <button
+            type="button"
             disabled={disabled}
             onClick={() => onAlwaysAllow(toolName)}
-            className="fresh-agent-approval-button min-h-[2.75rem] flex-1 rounded-md border border-border px-4 text-sm disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:flex-none sm:px-3 sm:py-1 sm:text-xs"
-            title={`Auto-approve every ${toolName} request for the rest of this session`}
+            className={`${BUTTON} border border-border`}
+            title="Until this pane reloads"
           >
-            Always allow {toolName} this session
+            Always allow {toolName} in this pane
           </button>
         ) : null}
         <button
           type="button"
           aria-label="Deny tool use"
           disabled={disabled}
-          onClick={onDeny}
-          className="fresh-agent-approval-button fresh-agent-approval-button-deny min-h-[2.75rem] flex-1 rounded-md border border-border px-4 text-sm text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:flex-none sm:px-3 sm:py-1 sm:text-xs"
+          onClick={() => onRespond(buildDenyDecision())}
+          className={`${BUTTON} fresh-agent-approval-button-deny border border-border text-muted-foreground hover:text-destructive`}
         >
           Deny
         </button>
       </div>
+      {remember ? (
+        <ul
+          id={suggestionsId}
+          aria-label={`What "${remember}" saves`}
+          className="fresh-agent-approval-suggestions mt-2 list-disc space-y-0.5 pl-5 text-xs text-muted-foreground"
+        >
+          {suggestions.map((update, index) => (
+            <li key={index}>{describePermissionUpdate(update)}</li>
+          ))}
+        </ul>
+      ) : null}
     </div>
   )
 }

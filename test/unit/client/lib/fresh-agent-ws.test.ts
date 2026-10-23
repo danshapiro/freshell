@@ -1,6 +1,8 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
-import freshAgentReducer, { materializeSession } from '@/store/freshAgentSlice'
+import freshAgentReducer, { materializeSession, sessionCreated } from '@/store/freshAgentSlice'
+import freshAgentLiveReducer, { liveTailViewerAdded } from '@/store/freshAgentLiveSlice'
+import { LIVE_STREAM_FLUSH_MS } from '@/lib/fresh-agent-stream-batcher'
 import panesReducer, { initLayout, materializeFreshAgentSession, type PanesState } from '@/store/panesSlice'
 import turnCompletionReducer, { markPaneAttention, markTabAttention } from '@/store/turnCompletionSlice'
 import {
@@ -18,6 +20,7 @@ function createFreshAgentStore() {
   return configureStore({
     reducer: {
       freshAgent: freshAgentReducer,
+      freshAgentLive: freshAgentLiveReducer,
     },
   })
 }
@@ -447,14 +450,24 @@ describe('fresh-agent-ws', () => {
     expect(sendEvent({ type: 'freshAgent.session.init', cliSessionId: 'cli-1', model: 'claude-opus-4-6', cwd: '/repo' })).toBe(true)
     expect(sendEvent({ type: 'freshAgent.session.metadata', cliSessionId: 'cli-2', model: 'claude-sonnet-4-6', tools: [{ name: 'Bash' }] })).toBe(true)
     expect(sendEvent({ type: 'freshAgent.status', status: 'running' })).toBe(true)
-    expect(sendEvent({ type: 'freshAgent.stream', event: { type: 'content_block_start' } })).toBe(true)
-    expect(sendEvent({ type: 'freshAgent.stream', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'partial' } } })).toBe(true)
-    expect(sendEvent({ type: 'freshAgent.stream', event: { type: 'content_block_stop' } })).toBe(true)
+    const stream = (event: Record<string, unknown>) => sendEvent({
+      type: 'freshAgent.stream', messageId: 'msg_parity', parentToolUseId: null, event,
+    })
+    expect(stream({ type: 'message_start', message: { id: 'msg_parity' } })).toBe(true)
+    expect(stream({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })).toBe(true)
+    expect(stream({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'partial' } })).toBe(true)
+    expect(stream({ type: 'content_block_stop', index: 0 })).toBe(true)
     expect(sendEvent({
       type: 'freshAgent.assistant',
       model: 'claude-sonnet-4-6',
-      content: [{ type: 'text', text: 'final answer' }],
+      content: [{ type: 'text', text: 'partial' }],
+      uuid: 'line-uuid-parity',
+      messageId: 'msg_parity',
+      parentToolUseId: null,
     })).toBe(true)
+    // The streamed text lives in the live tail; the assistant frame flushed it
+    // there without waiting for the batch timer.
+    expect(store.getState().freshAgentLive.bySession[key].blocks.map((block) => block.text)).toEqual(['partial'])
     expect(sendEvent({ type: 'freshAgent.result', costUsd: 0.02, usage: { input_tokens: 10, output_tokens: 5 } })).toBe(true)
     expect(sendEvent({
       type: 'freshAgent.permission.request',
@@ -478,18 +491,15 @@ describe('fresh-agent-ws', () => {
     expect(session).toMatchObject({
       cliSessionId: 'cli-2',
       model: 'claude-sonnet-4-6',
-      streamingText: '',
       streamingActive: false,
       totalCostUsd: 0.02,
       totalInputTokens: 10,
       totalOutputTokens: 5,
       lastError: 'recoverable',
     })
-    expect(session.turns.at(-1)).toMatchObject({
-      role: 'assistant',
-      model: 'claude-sonnet-4-6',
-      summary: '',
-    })
+    // Durable content comes from the snapshot only (transcript-live P1): an
+    // assistant frame never invents a client-side turn.
+    expect(session.turns).toEqual([])
     expect(session.pendingPermissions).toEqual({})
     expect(session.pendingQuestions['question-1']).toMatchObject({
       questions: [{ question: 'Continue?' }],
@@ -499,6 +509,101 @@ describe('fresh-agent-ws', () => {
     expect(store.getState().freshAgent.sessions[key].status).toBe('exited')
     expect(sendEvent({ type: 'freshAgent.killed' })).toBe(true)
     expect(store.getState().freshAgent.sessions[key]).toBeUndefined()
+  })
+
+  describe('stream deltas (transcript-live D1)', () => {
+    const sessionId = 'claude-stream-d1'
+    const key = `freshclaude:claude:${sessionId}`
+    const frame = (event: Record<string, unknown>) => ({
+      type: 'freshAgent.event',
+      sessionId,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      event: { sessionId, ...event },
+    })
+    const stream = (event: Record<string, unknown>) => frame({
+      type: 'freshAgent.stream', messageId: 'msg_d1', parentToolUseId: null, event,
+    })
+
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it('leaves the sessions map untouched by 200 text deltas after the first block start; the text accumulates in the live tail', () => {
+      vi.useFakeTimers()
+      const store = createFreshAgentStore()
+      handleFreshAgentMessage(store.dispatch, frame({ type: 'freshAgent.status', status: 'running' }))
+      handleFreshAgentMessage(store.dispatch, stream({ type: 'message_start', message: { id: 'msg_d1' } }))
+      handleFreshAgentMessage(store.dispatch, stream({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }))
+      const sessionsAfterStart = store.getState().freshAgent.sessions
+      // The block start marks the turn as streaming (busy follows it) at once.
+      expect(sessionsAfterStart[key]).toMatchObject({ status: 'running', streamingActive: true })
+
+      const tokens = Array.from({ length: 200 }, (_, i) => `t${i} `)
+      for (const text of tokens) {
+        handleFreshAgentMessage(store.dispatch, stream({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } }))
+      }
+      handleFreshAgentMessage(store.dispatch, stream({ type: 'content_block_stop', index: 0 }))
+      // A second block of the same turn does not write the sessions map either.
+      handleFreshAgentMessage(store.dispatch, stream({ type: 'content_block_start', index: 1, content_block: { type: 'thinking', thinking: '' } }))
+      handleFreshAgentMessage(store.dispatch, stream({ type: 'content_block_delta', index: 1, delta: { type: 'thinking_delta', thinking: 'hmm' } }))
+
+      // Batched: nothing reaches the tail before the flush interval.
+      expect(store.getState().freshAgentLive.bySession[key]).toBeUndefined()
+      vi.advanceTimersByTime(LIVE_STREAM_FLUSH_MS)
+
+      expect(store.getState().freshAgent.sessions).toBe(sessionsAfterStart)
+      expect(store.getState().freshAgentLive.bySession[key].blocks).toEqual([
+        { messageId: 'msg_d1', index: 0, kind: 'text', text: tokens.join('') },
+        { messageId: 'msg_d1', index: 1, kind: 'thinking', text: 'hmm' },
+      ])
+    })
+
+    it('applies pending deltas before any other event of the session', () => {
+      vi.useFakeTimers()
+      const store = createFreshAgentStore()
+      // A visible pane settles the tail, so the turn's end keeps its blocks.
+      store.dispatch(liveTailViewerAdded({ sessionKey: key }))
+      handleFreshAgentMessage(store.dispatch, frame({ type: 'freshAgent.status', status: 'running' }))
+      handleFreshAgentMessage(store.dispatch, stream({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }))
+      handleFreshAgentMessage(store.dispatch, stream({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'done' } }))
+      handleFreshAgentMessage(store.dispatch, frame({ type: 'freshAgent.result', costUsd: 0.01 }))
+
+      expect(store.getState().freshAgentLive.bySession[key].blocks.map((block) => block.text)).toEqual(['done'])
+      expect(store.getState().freshAgent.sessions[key]).toMatchObject({ status: 'idle', streamingActive: false })
+    })
+
+    it('ignores a subagent\'s stream events: no live block and no streaming mark', () => {
+      vi.useFakeTimers()
+      const store = createFreshAgentStore()
+      const subagent = (event: Record<string, unknown>) => frame({
+        type: 'freshAgent.stream', messageId: 'msg_sub', parentToolUseId: 'toolu_agent', event,
+      })
+      handleFreshAgentMessage(store.dispatch, subagent({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }))
+      handleFreshAgentMessage(store.dispatch, subagent({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'subagent words' } }))
+      vi.advanceTimersByTime(LIVE_STREAM_FLUSH_MS)
+
+      expect(store.getState().freshAgentLive.bySession).toEqual({})
+      expect(store.getState().freshAgent.sessions[key]?.streamingActive ?? false).toBe(false)
+    })
+
+    it('marks a just-created session running when its first block opens', () => {
+      const store = createFreshAgentStore()
+      store.dispatch(sessionCreated({ requestId: 'req-d1', sessionId, sessionType: 'freshclaude', provider: 'claude' }))
+      expect(store.getState().freshAgent.sessions[key].status).toBe('connected')
+      handleFreshAgentMessage(store.dispatch, stream({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }))
+      expect(store.getState().freshAgent.sessions[key]).toMatchObject({ status: 'running', streamingActive: true })
+    })
+
+    it('marks the session streaming again when the next turn opens a block', () => {
+      const store = createFreshAgentStore()
+      handleFreshAgentMessage(store.dispatch, stream({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }))
+      handleFreshAgentMessage(store.dispatch, frame({ type: 'freshAgent.result', costUsd: 0.01 }))
+      expect(store.getState().freshAgent.sessions[key].streamingActive).toBe(false)
+
+      handleFreshAgentMessage(store.dispatch, stream({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }))
+      expect(store.getState().freshAgent.sessions[key]).toMatchObject({ status: 'running', streamingActive: true })
+    })
   })
 
   it('folds freshAgent.status(stuck) with no attention action; a companion turn.complete edge folds attention independently', () => {
@@ -739,6 +844,25 @@ describe('fresh-agent-ws', () => {
       streamingActive: false,
       lastError: billingMessage,
     })
+  })
+
+  it('folds a stated permission mode; metadata that states none keeps it (transcript-live D7)', () => {
+    const store = createFreshAgentStore()
+    const sessionId = 'claude-permission-mode'
+    const key = `freshclaude:claude:${sessionId}`
+    const metadata = (fields: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      event: { type: 'freshAgent.session.metadata', sessionId, ...fields },
+    })
+    metadata({ permissionMode: 'bypassPermissions' })
+    expect(store.getState().freshAgent.sessions[key].permissionMode).toBe('bypassPermissions')
+    metadata({ model: 'claude-sonnet-4-6', effort: null })
+    expect(store.getState().freshAgent.sessions[key].permissionMode).toBe('bypassPermissions')
+    metadata({ permissionMode: 'default' })
+    expect(store.getState().freshAgent.sessions[key].permissionMode).toBe('default')
   })
 
   it('does not let delayed metadata downgrade newer snapshot identity', () => {

@@ -1102,6 +1102,7 @@ fn create_request_for_profile(profile: &FreshAgentProfile) -> FreshAgentCreate {
         ),
     };
     FreshAgentCreate {
+        pane_id: None,
         request_id: format!("host-create-{}", uuid::Uuid::new_v4()),
         observed_epoch: None,
         observed_generation: None,

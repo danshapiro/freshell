@@ -99,6 +99,9 @@ struct ForkParent {
     /// The settings the parent runs with (model, effort, permission mode,
     /// plugins, cwd): the child starts with the same.
     settings: crate::identity_sink::FreshAgentSettings,
+    /// The pane the parent runs for (G19): the pane follows the child, so the
+    /// child runs for it too.
+    freshell_context: Option<crate::claude_freshell_mcp::ClaudeFreshellContext>,
 }
 
 impl FreshClaudeState {
@@ -369,7 +372,8 @@ impl FreshClaudeState {
             &launch_settings,
             self.hosted_mcp,
         )
-        .with_session_id(Some(child.clone()));
+        .with_session_id(Some(child.clone()))
+        .with_freshell_context(parent.freshell_context.clone());
         let established = match self
             .establish_runtime(
                 EstablishPlan {
@@ -534,6 +538,7 @@ impl FreshClaudeState {
                 .unwrap_or_else(|| live_key.clone()),
             ledger: Arc::clone(&session.ledger),
             settings: session.configuration.settings.clone(),
+            freshell_context: session.configuration.freshell_context.clone(),
         })
     }
 

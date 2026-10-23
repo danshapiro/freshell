@@ -10,14 +10,17 @@
 //     { type:'create',             protocol:2, requestId, sessionType?, sessionId?,
 //                                    boot:{kind:'fresh'} | {kind:'resume', resume}
 //                                         | {kind:'fork', resume, resumeSessionAt?, dropsTurn?},
-//                                    cwd?, model?, permissionMode?, effort?, plugins?, hostedMcp? }
+//                                    cwd?, model?, permissionMode?, effort?, plugins?, hostedMcp?,
+//                                    freshellMcp?:{command,args}, freshellContext?:{tabId?,paneId?} }
 //                                  — `boot` picks the conversation the CLI boots (bootOptions): a
 //                                    fork keeps the parent through-AND-including resumeSessionAt
 //                                    over the raw parentUuid chain, writes a NEW conversation and
 //                                    never rewrites the parent's JSONL; dropsTurn arms the SDK's
 //                                    fork-time discard guard. `sessionId` is the id Rust minted for
-//                                    a fresh or forked boot, when it minted one. One sidecar hosts
-//                                    one session: a second create is refused.
+//                                    a fresh or forked boot, when it minted one. `hostedMcp` and
+//                                    `freshellMcp` pick the Freshell MCP recipe (mcp-servers.mjs);
+//                                    `freshellContext` names the pane the CLI's environment carries.
+//                                    One sidecar hosts one session: a second create is refused.
 //     { type:'configure',          sessionId, requestId, settings }
 //     { type:'send',               sessionId, uuid, text, images?, checkpointAttempt?:{logicalAttemptId, requestId} }
 //                                  — `uuid` is the id the server minted for this send (required): the
@@ -43,15 +46,37 @@
 //     { type:'sdk.configured',          sessionId, requestId, ok, settings?, message? }
 //     { type:'sdk.session.init',        sessionId, cliSessionId, model, cwd, tools, capabilities? }  // durable Claude UUID;
 //                                  capabilities: the CLI's (msg_lifecycle_v1 says it reports every sent command's lifecycle)
-//     { type:'sdk.assistant',           sessionId, content, model }
-//     { type:'sdk.stream',              sessionId, event, parentToolUseId }
+//     { type:'sdk.assistant',           sessionId, content, model, uuid, messageId, parentToolUseId }
+//                                  — one per completed content block (blocks of one API message share
+//                                    messageId); parentToolUseId is set inside a subagent, else null
+//     { type:'sdk.stream',              sessionId, event, parentToolUseId:null, messageId }
+//                                  — the main thread's message_start, content_block_start/stop and
+//                                    text/thinking deltas only, stamped with the API message id of the
+//                                    message being streamed (a subagent's events, tool input JSON,
+//                                    signatures, message_delta and message_stop are not sent)
+//     { type:'sdk.retry',               sessionId, attempt, maxRetries, delayMs, errorStatus, error }
+//                                  — the CLI will retry a failed API request (errorStatus null: no HTTP
+//                                    response); live only, never a turn end
+//     { type:'sdk.notice',              sessionId, level:'info'|'warning'|'error', code, message, rateLimit? }
+//                                  — a non-terminal provider notice: RATE_LIMIT_WARNING / RATE_LIMITED
+//                                    (rateLimit {status, resetsAt?, rateLimitType?, utilization?}),
+//                                    INFORMATIONAL (the CLI's own warning or suggestion text, or a message
+//                                    that stops the turn; its quiet info/notice levels are not sent),
+//                                    COMPACTION_FAILED (the CLI's reason); never a turn end
 //     { type:'sdk.result',              sessionId, result, durationMs, costUsd, usage }
 //     { type:'sdk.session.changed',     sessionId, reason:'session-commands', commands }
 //                                  — the command catalog without the terminal-only commands (the pinned
 //                                    CLI's until a turn's init names its own): from the boot, then
 //                                    whenever a turn's init or commands_changed changes it
-//     { type:'sdk.status',              sessionId, status }               // compacting (an ended stream sends
-//                                  no status: the server reports the session as exited)
+//     { type:'sdk.session.changed',     sessionId, reason:'transcript', uuid, parentToolUseId }
+//                                  — the CLI writes this message (assistant, user, compaction boundary,
+//                                    local command output) to its transcript under `uuid`, about 100 ms
+//                                    later; sent right after the message's own frames
+//                                    (sdk-message-frames.mjs)
+//     { type:'sdk.status',              sessionId, status }               // compacting or null; the
+//                                  server's turn ledger owns the effective status
+//     { type:'sdk.session.metadata',    sessionId, permissionMode }       // the CLI changed its own
+//                                  permission mode (an ExitPlanMode approval); the session adopts it first
 //     { type:'sdk.error',               sessionId, message }              // a request-level failure only
 //     { type:'sdk.stream.ended',        sessionId, reason, message }      // the session's SDK stream ended
 //                                  unrequested (reason cli_exited | stream_error | stream_eof, stream-end.mjs):
@@ -102,12 +127,14 @@
 // nothing. If the PROCESS itself dies mid-turn, stdout simply ends with no
 // `sdk.stream.ended`; the server's end-of-output path handles both ends.
 //
-// Scope discipline (ADR "keep it minimal — only what the claude T2 invariant set
-// needs"): the freshell MCP-server injection (createClaudeSdkMcpServers) is
-// DELIBERATELY OMITTED — a pinned pure-text T2 turn never calls a tool, MCP tools
-// are not in the T2 baseline, and injecting the MCP server would spawn an extra
-// node grandchild bound to the REST API. The interactive permission/question
-// RESPONSE channel IS in scope (permission-channel.mjs, a faithful port of
+// The Freshell MCP server (G19): the create line names the recipe, the hosted
+// one or the ordinary one the Rust server resolved while
+// settings.codingCli.mcpServer is on (mcp-servers.mjs; never both, never an env
+// key, since the SDK puts the MCP config on the CLI's argv). The endpoint and
+// token reach the MCP child through the inherited environment the Rust server
+// set on this process, and the pane context (`freshellContext`) is merged into
+// the SDK env here. The interactive permission/question RESPONSE channel IS in
+// scope (permission-channel.mjs, a faithful port of
 // server/sdk-bridge.ts): canUseTool parks a pending request, surfaces
 // sdk.permission.request / sdk.question.request, and waits for the Rust side's
 // permission.respond / question.respond (unknown respond ids are stderr-log-only
@@ -117,10 +144,10 @@
 import { createInterface } from 'node:readline'
 import { randomBytes } from 'node:crypto'
 import { configureSession, userMessageContent } from './session-settings.mjs'
-import { resultFrames } from './sdk-message-frames.mjs'
+import { createFrameState, frameLogRecord, framesForSdkMessage, resultFrames } from './sdk-message-frames.mjs'
 import { checkpointAttemptOf, isUuid, rememberCheckpointAttempt, takeCheckpointIdentity } from './checkpoint-identity.mjs'
 import { managedSdkSpawn } from './exec-profile.mjs'
-import { hostedMcpServers } from './hosted-mcp.mjs'
+import { mcpServersFor, withFreshellContext } from './mcp-servers.mjs'
 import { cliStderrLogger, errorText, log } from './log.mjs'
 import { isHostedSidecar } from './hosted.mjs'
 import { STREAM_ENDED_EXIT_CODE, streamEnd } from './stream-end.mjs'
@@ -289,32 +316,7 @@ function handleSdkMessage(sessionId, msg) {
           st.commandCatalog = commands
           publishCommandsIfChanged(sessionId, st)
         }
-      } else if (msg.subtype === 'status' && msg.status === 'compacting') {
-        emit({ type: 'sdk.status', sessionId, status: 'compacting' })
-      } else if (msg.subtype === 'compact_boundary') {
-        // kata 1wxv ep3-r1 F1: the bare compacting STATUS frame carries no
-        // trigger — the SDK fires it for an explicit `/compact` AND for its
-        // own automatic context compaction, and misattributing the automatic
-        // one to a queued explicit compact wedges the rollback busy gate
-        // (the phantom compact absorbs the turn's own terminal edge). Only the
-        // compact COMPLETION boundary discriminates the trigger; relay it.
-        // Fail toward 'auto' on a missing/unknown trigger so promotion to a
-        // queued explicit compact never happens without a proven manual run.
-        const trigger = msg.compact_metadata?.trigger === 'manual' ? 'manual' : 'auto'
-        emit({ type: 'sdk.compact_boundary', sessionId, trigger })
       }
-      break
-    }
-    case 'assistant': {
-      const content = msg.message?.content || []
-      const blocks = content.map((b) => {
-        if (b.type === 'text') return { type: 'text', text: b.text }
-        if (b.type === 'thinking') return { type: 'thinking', thinking: b.thinking }
-        if (b.type === 'tool_use') return { type: 'tool_use', id: b.id, name: b.name, input: b.input }
-        if (b.type === 'tool_result') return { type: 'tool_result', tool_use_id: b.tool_use_id, content: b.content, is_error: b.is_error }
-        return b
-      })
-      emit({ type: 'sdk.assistant', sessionId, content: blocks, model: msg.message?.model })
       break
     }
     case 'result': {
@@ -323,13 +325,27 @@ function handleSdkMessage(sessionId, msg) {
       for (const frame of resultFrames(sessionId, msg)) emit(frame)
       break
     }
-    case 'stream_event': {
-      emit({ type: 'sdk.stream', sessionId, event: msg.event, parentToolUseId: msg.parent_tool_use_id })
-      break
-    }
     default:
-      // Unhandled SDK message type — ignored (matches SdkBridge default).
       break
+  }
+  // The content kinds (assistant, user, stream events, status, retries and
+  // notices): a pure mapping, sdk-message-frames.mjs. Any kind it does not
+  // map is dropped there.
+  const frames = framesForSdkMessage(sessionId, msg, {
+    stream: st.frameState,
+    permissionMode: st.settings.permissionMode,
+  })
+  for (const frame of frames) {
+    // The CLI changed its own permission mode (an ExitPlanMode approval): the
+    // session adopts it before saying so, so a configure to that mode applies
+    // nothing and the permission channel sees the mode the CLI is in.
+    if (frame.type === 'sdk.session.metadata' && frame.permissionMode !== undefined) {
+      st.settings.permissionMode = frame.permissionMode
+      st.permissionMode = frame.permissionMode
+    }
+    emit(frame)
+    const record = frameLogRecord(frame)
+    if (record) log(record.severity, record.event, record.fields)
   }
 }
 
@@ -436,6 +452,8 @@ function handleCreate(req) {
     // The commands this session sent and its heartbeat allowance (lifecycle-frames.mjs).
     lifecycle: createLifecycleState(),
     pendingCheckpointAttempts: new Map(),
+    // The content mapping's own per-session state (sdk-message-frames.mjs).
+    frameState: createFrameState(),
   }
   const { iterable, handle } = createInputStream()
   state.inputStream = handle
@@ -469,7 +487,7 @@ function handleCreate(req) {
         plugins: Array.isArray(req.plugins)
           ? req.plugins.map(path => ({ type: 'local', path }))
           : undefined,
-        mcpServers: hostedMcpServers(req.hostedMcp),
+        mcpServers: mcpServersFor(req, process.env, { fields: { sessionId } }),
         pathToClaudeCodeExecutable: process.env.CLAUDE_CMD || undefined,
         includePartialMessages: true,
         // This is the SDK's native persisted-user witness. Without the replay
@@ -479,7 +497,7 @@ function handleCreate(req) {
         abortController: abort,
         // The CLI reports when the session starts and stops working (T9):
         // the server's turn accounting reads it (sdk.session.state).
-        env: { ...createClaudeSdkCleanEnv(process.env), CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' },
+        env: withFreshellContext({ ...createClaudeSdkCleanEnv(process.env), CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' }, req.freshellContext),
         settingSources: ['user', 'project', 'local'],
         spawnClaudeCodeProcess: managedSdkSpawn(sdkStderr),
         stderr: sdkStderr,

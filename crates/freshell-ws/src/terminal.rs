@@ -8793,50 +8793,12 @@ fn build_terminal_base_env(
     tab_id: Option<&str>,
     pane_id: Option<&str>,
 ) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    out.insert("FRESHELL".to_string(), "1".to_string());
-    // `const port = Number(process.env.PORT || 3001)` (truthy: '' → 3001).
-    let port_raw = env
-        .get("PORT")
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "3001".to_string());
-    let url = env
-        .get("FRESHELL_URL")
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| format!("http://localhost:{}", js_number_string(&port_raw)));
-    out.insert("FRESHELL_URL".to_string(), url);
-    out.insert(
-        "FRESHELL_TOKEN".to_string(),
-        env.get("AUTH_TOKEN").unwrap_or_default(),
-    );
-    out.insert("FRESHELL_TERMINAL_ID".to_string(), terminal_id.to_string());
-    if let Some(t) = tab_id.filter(|s| !s.is_empty()) {
-        out.insert("FRESHELL_TAB_ID".to_string(), t.to_string());
-    }
-    if let Some(p) = pane_id.filter(|s| !s.is_empty()) {
-        out.insert("FRESHELL_PANE_ID".to_string(), p.to_string());
-    }
-    out
-}
-
-/// JS `String(Number(s))` for the `PORT` template slot: every real deployment is
-/// a plain integer; whitespace-only → `0`, unparseable → `NaN` (faithful to the
-/// reference's `Number(...)` coercion in the template literal).
-fn js_number_string(s: &str) -> String {
-    let t = s.trim();
-    if t.is_empty() {
-        return "0".to_string();
-    }
-    match t.parse::<f64>() {
-        Ok(n) if n.is_finite() => {
-            if n.fract() == 0.0 && n.abs() < 1e15 {
-                format!("{}", n as i64)
-            } else {
-                format!("{n}")
-            }
-        }
-        _ => "NaN".to_string(),
-    }
+    freshell_platform::freshell_context_env::freshell_context_env(
+        &freshell_platform::freshell_context_env::FreshellEndpoint::from_env(env),
+        Some(terminal_id),
+        tab_id,
+        pane_id,
+    )
 }
 
 /// `wrapTerminalSpawnError` (`terminal-registry.ts:450-481`): the user-facing
@@ -11586,14 +11548,6 @@ mod cli_create_helper_tests {
             None,
         );
         assert_eq!(out2.get("FRESHELL_URL").unwrap(), "http://example:9");
-    }
-
-    #[test]
-    fn js_number_string_coercion() {
-        assert_eq!(js_number_string("17872"), "17872");
-        assert_eq!(js_number_string(" 17872 "), "17872");
-        assert_eq!(js_number_string("abc"), "NaN");
-        assert_eq!(js_number_string(" "), "0");
     }
 
     /// DEV-0006 S5.e: managed codex launch defaults ON; only the exact string

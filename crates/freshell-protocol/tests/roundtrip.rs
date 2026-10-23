@@ -880,3 +880,41 @@ fn session_name_updated_broadcast_roundtrips_and_conforms() {
         other => panic!("expected SessionNameUpdated, got {other:?}"),
     }
 }
+
+/// G19 (api-hosted-ops plan §2.4): a fresh-agent create and attach name the pane
+/// they run for (`tabId`, `paneId`), so the agent's Freshell MCP acts for that
+/// pane. Both are additive optionals: present ones round-trip, absent ones stay
+/// absent on re-serialize, and frames from older clients still parse.
+#[test]
+fn fresh_agent_create_and_attach_carry_the_pane_they_run_for() {
+    let wire = r#"{"type":"freshAgent.create","requestId":"r1","sessionType":"freshclaude","provider":"claude","tabId":"tab-1","paneId":"pane-1"}"#;
+    match client_roundtrip(wire, "freshAgent.create") {
+        ClientMessage::FreshAgentCreate(m) => {
+            assert_eq!(m.tab_id.as_deref(), Some("tab-1"));
+            assert_eq!(m.pane_id.as_deref(), Some("pane-1"));
+        }
+        other => panic!("expected FreshAgentCreate, got {other:?}"),
+    }
+    let wire = r#"{"type":"freshAgent.create","requestId":"r2","sessionType":"kilroy","provider":"claude"}"#;
+    match client_roundtrip(wire, "freshAgent.create") {
+        ClientMessage::FreshAgentCreate(m) => assert_eq!(m.pane_id, None),
+        other => panic!("expected FreshAgentCreate, got {other:?}"),
+    }
+
+    let wire = r#"{"type":"freshAgent.attach","sessionId":"s1","sessionType":"freshclaude","provider":"claude","tabId":"tab-1","paneId":"pane-1"}"#;
+    match client_roundtrip(wire, "freshAgent.attach") {
+        ClientMessage::FreshAgentAttach(m) => {
+            assert_eq!(m.tab_id.as_deref(), Some("tab-1"));
+            assert_eq!(m.pane_id.as_deref(), Some("pane-1"));
+        }
+        other => panic!("expected FreshAgentAttach, got {other:?}"),
+    }
+    let wire = r#"{"type":"freshAgent.attach","sessionId":"s1","sessionType":"freshcodex","provider":"codex"}"#;
+    match client_roundtrip(wire, "freshAgent.attach") {
+        ClientMessage::FreshAgentAttach(m) => {
+            assert_eq!(m.tab_id, None);
+            assert_eq!(m.pane_id, None);
+        }
+        other => panic!("expected FreshAgentAttach, got {other:?}"),
+    }
+}

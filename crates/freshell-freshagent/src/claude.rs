@@ -115,6 +115,11 @@ pub struct FreshClaudeState {
     /// Host-only selection of the fixed Freshell stdio MCP recipe. Its endpoint
     /// and grant remain in the child environment, never in create IPC.
     hosted_mcp: bool,
+    /// The ordinary Freshell MCP (G19): the endpoint every sidecar's
+    /// environment carries and the recipe provider asked at each launch, both
+    /// wired by `freshell-server` ([`Self::set_freshell_endpoint`],
+    /// [`Self::set_freshell_mcp_provider`]); unwired in the session host.
+    freshell_mcp: crate::claude_freshell_mcp::ClaudeFreshellMcpWiring,
     /// Test seam (`test-support` feature, C04 rigs): the complete environment of
     /// every claude sidecar this state spawns, replacing the inherited one (the
     /// ownership tag is still layered on). `None` in production: the sidecar
@@ -523,12 +528,17 @@ struct PendingApprovalEntry {
     blocked_path: Option<String>,
     decision_reason: Option<String>,
     input: Option<Value>,
+    /// The CLI's own suggestions (what "Allow and don't ask again" sends back),
+    /// normalized to the strict contract shape on entry
+    /// ([`crate::claude_permission_update::normalize_permission_updates`]); `None`
+    /// when the request offered none that survive.
+    suggestions: Option<Vec<Value>>,
 }
 
 impl PendingApprovalEntry {
     /// The `.strict()` contract shape the Task 3 snapshot overlay serializes
-    /// (`{requestId, toolName?, toolUseID?, blockedPath?, decisionReason?, input?}` —
-    /// keys omitted when absent, never null).
+    /// (`{requestId, toolName?, toolUseID?, blockedPath?, decisionReason?, input?,
+    /// suggestions?}` — keys omitted when absent, never null).
     fn to_json(&self) -> Value {
         let mut obj = Map::new();
         obj.insert("requestId".to_string(), json!(self.request_id));
@@ -546,6 +556,9 @@ impl PendingApprovalEntry {
         }
         if let Some(input) = &self.input {
             obj.insert("input".to_string(), input.clone());
+        }
+        if let Some(suggestions) = &self.suggestions {
+            obj.insert("suggestions".to_string(), Value::Array(suggestions.clone()));
         }
         Value::Object(obj)
     }
@@ -581,11 +594,10 @@ struct ClaudeSession {
     /// `handle_interrupt` MUST address the sidecar with this id, never the map key.
     sidecar_session_id: String,
     /// Best-effort copy of the durable Claude UUID, recorded from `sdk.session.init`
-    /// by the stdout consumer. Nothing in production reads it: attach/eviction resolve
-    /// durable ids through [`FreshClaudeState::cli_index`], and the snapshot adapter
-    /// is disk-only. Currently read only by in-crate tests; kept as a diagnostic/
-    /// forward slot.
-    #[allow(dead_code)]
+    /// by the stdout consumer. Attach/eviction resolve durable ids through
+    /// [`FreshClaudeState::cli_index`], and the snapshot adapter is disk-only; the
+    /// settings paths (a settings apply, the CLI's own permission-mode change) read
+    /// it to write the session's binding row once the session has one.
     cli_session_id: Option<String>,
     /// b8ke focused episode-2 round-2 F2: the operation id of the lifecycle
     /// op that OWNS this runtime's coordinator claim — the create-resume
@@ -647,6 +659,15 @@ struct ClaudeSession {
     launch_genesis: Option<crate::identity_sink::RecordedGenesis>,
 }
 
+/// What a claude `freshAgent.session.metadata` frame states (see
+/// [`FreshClaudeState::stated_settings`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StatedSettings {
+    model: Option<String>,
+    effort: Option<String>,
+    permission_mode: Option<String>,
+}
+
 #[derive(Default)]
 struct ClaudeConfiguration {
     settings: crate::identity_sink::FreshAgentSettings,
@@ -654,6 +675,9 @@ struct ClaudeConfiguration {
     commands: Option<Vec<Value>>,
     needs_configure: bool,
     runtime_cwd: Option<String>,
+    /// The pane this runtime was launched for (G19): an undo's replacement and
+    /// a fork's child launch for the same pane.
+    freshell_context: Option<crate::claude_freshell_mcp::ClaudeFreshellContext>,
 }
 
 impl ClaudeSession {
@@ -722,6 +746,7 @@ impl FreshClaudeState {
     pub fn new(broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>) -> Self {
         Self {
             hosted_mcp: false,
+            freshell_mcp: Default::default(),
             sidecar_environment: None,
             edges: crate::claude_edges::ClaudeEdgeHub::new(Arc::clone(&broadcast_tx)),
             broadcast_tx,
@@ -787,6 +812,26 @@ impl FreshClaudeState {
         self.edges.subscribe()
     }
 
+    /// Wire where every sidecar's CLI reaches this server (G19): its
+    /// environment carries `FRESHELL=1`, `FRESHELL_URL` and `FRESHELL_TOKEN`.
+    /// Set-once; `false` when an endpoint was already wired.
+    pub fn set_freshell_endpoint(
+        &self,
+        endpoint: crate::claude_freshell_mcp::FreshellEndpoint,
+    ) -> bool {
+        self.freshell_mcp.set_endpoint(endpoint)
+    }
+
+    /// Wire the Freshell MCP recipe provider (G19), asked at every sidecar
+    /// launch of a lane that did not select the hosted recipe. Set-once;
+    /// `false` when a provider was already wired.
+    pub fn set_freshell_mcp_provider(
+        &self,
+        provider: crate::claude_freshell_mcp::ClaudeFreshellMcpProvider,
+    ) -> bool {
+        self.freshell_mcp.set_provider(provider)
+    }
+
     /// Test seam (see [`Self::sidecar_environment`]): every sidecar this state
     /// spawns gets exactly `environment` (plus its ownership tag) instead of
     /// inheriting the server's environment.
@@ -836,7 +881,12 @@ impl FreshClaudeState {
     /// Spawn one claude sidecar process (create, attach-resume and rollback all
     /// come through here) for a session of `session_type`.
     async fn spawn_sidecar_process(&self, session_type: &str) -> Result<SpawnedSidecar, String> {
-        spawn_sidecar(self.sidecar_environment.as_deref(), session_type).await
+        spawn_sidecar(
+            self.sidecar_environment.as_deref(),
+            self.freshell_mcp.endpoint(),
+            session_type,
+        )
+        .await
     }
 
     pub fn set_checkpoint_event_persister(
@@ -1342,11 +1392,17 @@ impl FreshClaudeState {
     /// vs kilroy, so a kilroy session resumes AS kilroy (the created/snapshot
     /// frames keep the flavor; never map by provider alone). Registers under
     /// the durable id itself and returns the constructed owner identity.
+    /// `tab_id`/`pane_id` name the pane that adopts the session (the client
+    /// names it on every handoff); the resumed CLI runs for that pane, so its
+    /// Freshell MCP defaults to it.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn resume_for_handoff(
         &self,
         session_type: &str,
         session_id: &str,
         cwd: Option<&str>,
+        tab_id: Option<&str>,
+        pane_id: Option<&str>,
         operation_id: &str,
         generation: u64,
     ) -> Result<freshell_ownership::OwnerIdentity, (String, String)> {
@@ -1396,6 +1452,8 @@ impl FreshClaudeState {
             }
         };
         let msg = FreshAgentAttach {
+            tab_id: tab_id.map(str::to_string),
+            pane_id: pane_id.map(str::to_string),
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: session_id.to_string(),
             session_type: flavor,
@@ -2333,7 +2391,13 @@ impl FreshClaudeState {
             self.hosted_mcp,
         )
         .with_session_id(boot_session_id)
-        .with_model_selection(serde_json::to_value(&msg.model_selection).ok());
+        .with_model_selection(serde_json::to_value(&msg.model_selection).ok())
+        .with_freshell_context(
+            crate::claude_freshell_mcp::ClaudeFreshellContext::from_ids(
+                msg.tab_id.as_deref(),
+                msg.pane_id.as_deref(),
+            ),
+        );
         // b8ke focused episode-2 round-2 F2: the create's claim owns this
         // runtime's coordinator transition (the session-init adoption's Blocked
         // arm correlates its own in-flight claim through it).
@@ -4219,39 +4283,20 @@ impl FreshClaudeState {
             // whose settings CHANGED the live session can converge every
             // device's model surfaces — the same frame `handle_configure`
             // emits (a device that missed the configure still lands here).
-            let settings_before = {
-                let guard = self.sessions.lock().await;
-                guard.get(&map_key).map(|s| {
-                    (
-                        s.configuration.settings.model.clone(),
-                        s.configuration.settings.effort.clone(),
-                    )
-                })
-            };
+            let settings_before = self.stated_settings(&map_key).await;
             if let Err(err) = self
                 .configure_for_send(&map_key, settings, session_type)
                 .await
             {
                 return self.refuse_send(&request_id, "CLAUDE_SETTINGS_FAILED", &err);
             }
-            let settings_after = {
-                let guard = self.sessions.lock().await;
-                guard.get(&map_key).map(|s| {
-                    (
-                        s.configuration.settings.model.clone(),
-                        s.configuration.settings.effort.clone(),
-                    )
-                })
-            };
+            let settings_after = self.stated_settings(&map_key).await;
             if settings_before != settings_after {
-                let (model, effort) = settings_after.unwrap_or((None, None));
-                self.broadcast(&crate::session_metadata::session_metadata_frame(
-                    PROVIDER,
+                self.broadcast_stated_settings(
                     session_type,
                     &session_id,
-                    model.as_deref(),
-                    effort.as_deref(),
-                ));
+                    settings_after.unwrap_or_default(),
+                );
             }
         }
         // Task 4 review (C1b): the destroy target comes from POST-lock session
@@ -4575,15 +4620,7 @@ impl FreshClaudeState {
             );
         }
 
-        let before = {
-            let guard = self.sessions.lock().await;
-            guard.get(&map_key).map(|s| {
-                (
-                    s.configuration.settings.model.clone(),
-                    s.configuration.settings.effort.clone(),
-                )
-            })
-        };
+        let before = self.stated_settings(&map_key).await;
         if let Err(err) = self
             .configure_for_send(&map_key, &msg.settings, session_type)
             .await
@@ -4593,28 +4630,46 @@ impl FreshClaudeState {
             self.emit_fresh_agent_error(&session_id, session_type, "CLAUDE_SETTINGS_FAILED", &err);
             return;
         }
-        let after = {
-            let guard = self.sessions.lock().await;
-            guard.get(&map_key).map(|s| {
-                (
-                    s.configuration.settings.model.clone(),
-                    s.configuration.settings.effort.clone(),
-                )
-            })
-        };
+        let after = self.stated_settings(&map_key).await;
         if before == after {
             // Idempotent configure: nothing to converge.
             return;
         }
-        let (model, effort) = after.unwrap_or((None, None));
         // Broadcast keyed at the CLIENT-ADDRESSED id (the id the configure
         // named): the client's fold resolves the sessions-map entry by it.
+        self.broadcast_stated_settings(session_type, &session_id, after.unwrap_or_default());
+    }
+
+    /// The settings a `freshAgent.session.metadata` frame states for the
+    /// session under `map_key` (`None` when it is gone): model, effort and
+    /// permission mode. The configure and send paths diff these around an
+    /// apply and broadcast only a change.
+    async fn stated_settings(&self, map_key: &str) -> Option<StatedSettings> {
+        let guard = self.sessions.lock().await;
+        guard.get(map_key).map(|session| {
+            let settings = &session.configuration.settings;
+            StatedSettings {
+                model: settings.model.clone(),
+                effort: settings.effort.clone(),
+                permission_mode: settings.permission_mode.clone(),
+            }
+        })
+    }
+
+    /// Converge every device's settings surfaces on `stated`.
+    fn broadcast_stated_settings(
+        &self,
+        session_type: &str,
+        session_id: &str,
+        stated: StatedSettings,
+    ) {
         self.broadcast(&crate::session_metadata::session_metadata_frame(
             PROVIDER,
             session_type,
-            &session_id,
-            model.as_deref(),
-            effort.as_deref(),
+            session_id,
+            stated.model.as_deref(),
+            stated.effort.as_deref(),
+            stated.permission_mode.as_deref(),
         ));
     }
 
@@ -4699,6 +4754,33 @@ impl FreshClaudeState {
                 session_type,
                 "INTERNAL_ERROR",
                 &format!("Claude approval {request_id} requires a JSON object decision"),
+            );
+            return;
+        }
+        // Client-alerts G20: the decision's `updatedPermissions` (the CLI's own
+        // suggestions the user accepted) reaches the CLI verbatim, so a malformed
+        // one would fail or misapply the user's choice there. Refuse it with the
+        // same discipline as above: nothing forwarded, the request stays pending.
+        // The refusal names the failing update by position and variant only, so
+        // neither the log nor the error frame carries a rule's content.
+        if let Err(refusal) = crate::claude_permission_update::validate_decision(&msg.decision) {
+            drop(session);
+            tracing::warn!(
+                target: "freshell_freshagent::claude",
+                event = "freshagent.claude.approval_decision_refused",
+                provider = PROVIDER,
+                session_id = %session_id,
+                session_type,
+                request_id = %request_id,
+                update_index = refusal.update_index(),
+                update_type = refusal.update_type(),
+                "a claude approval decision carried malformed permission updates; nothing was sent"
+            );
+            self.emit_fresh_agent_error(
+                &session_id,
+                session_type,
+                "INVALID_APPROVAL_DECISION",
+                &format!("Claude approval {request_id} was not sent: {refusal}"),
             );
             return;
         }
@@ -4886,9 +4968,10 @@ impl FreshClaudeState {
     /// The session's live pending approvals + questions as overlay JSON (approvals,
     /// questions) — Task 3's snapshot route consumes this. Entry keys are exactly the
     /// `.strict()` contract shape (`{requestId, toolName?, toolUseID?, blockedPath?,
-    /// decisionReason?, input?}` / `{requestId, questions}`, no extra keys, absent keys
-    /// omitted). `any_id` resolves like every handler here: the map key OR the durable
-    /// Claude UUID via `cli_index`. An untracked id yields two empty vecs.
+    /// decisionReason?, input?, suggestions?}` / `{requestId, questions}`, no extra
+    /// keys, absent keys omitted). `any_id` resolves like every handler here: the map
+    /// key OR the durable Claude UUID via `cli_index`. An untracked id yields two empty
+    /// vecs.
     pub(crate) async fn snapshot_pending_overlay(&self, any_id: &str) -> (Vec<Value>, Vec<Value>) {
         let Some(map_key) = self.resolve_session_key(any_id).await else {
             return (Vec::new(), Vec::new());
@@ -5623,7 +5706,13 @@ impl FreshClaudeState {
             &rec,
             self.hosted_mcp,
         )
-        .with_session_id(minted_id);
+        .with_session_id(minted_id)
+        .with_freshell_context(
+            crate::claude_freshell_mcp::ClaudeFreshellContext::from_ids(
+                msg.tab_id.as_deref(),
+                msg.pane_id.as_deref(),
+            ),
+        );
         // Register under the CLIENT's id: the consumer stamps the map key on every
         // envelope and the frozen client routes by envelope sessionId
         // (fresh-agent-ws.ts:180-183) -- a fresh key would strand the pane. The
@@ -6632,6 +6721,41 @@ impl FreshClaudeState {
                             }
                         }
                     }
+                    // The CLI changed its own permission mode (an approved
+                    // ExitPlanMode returns it to the mode it had before plan
+                    // mode). The sidecar already runs in it; the session's
+                    // settings take it too, so a later configure stating the
+                    // same mode applies nothing and the snapshot states it.
+                    // The binding row takes it the way a configure's settings
+                    // do (client-alerts G20), so a resume after a restart
+                    // boots the conversation in the mode the CLI is in.
+                    Some("sdk.session.metadata") => {
+                        if let Some(mode) = value.get("permissionMode").and_then(Value::as_str) {
+                            let adopted =
+                                sessions.lock().await.get_mut(&session_id).map(|session| {
+                                    session.configuration.settings.permission_mode =
+                                        Some(mode.to_string());
+                                    (
+                                        session.cli_session_id.clone(),
+                                        session.configuration.settings.clone(),
+                                    )
+                                });
+                            if let Some((Some(durable), settings)) = adopted {
+                                state
+                                    .adopt_session_init(
+                                        &durable,
+                                        &session_id,
+                                        &session_type,
+                                        Some(&settings),
+                                        identity_sink.clone(),
+                                        // Conn-less, like a settings apply: the
+                                        // ledger merge keeps the row's stamps.
+                                        None,
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
                     Some("sdk.configured") => {
                         if let Some(session) = sessions.lock().await.get_mut(&session_id) {
                             if session
@@ -6738,6 +6862,7 @@ impl FreshClaudeState {
                 // Task 10b: stamp the envelope from the SHARED handle (not the captured
                 // map key) so an attach-by-durable rebind flips live event routing.
                 let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
+                crate::claude_live_events::log_provider_event(&value, &stamp, &session_type);
                 if let Some(frame) = sdk_line_to_frame(&value, &stamp, &session_type) {
                     if value.get("type").and_then(Value::as_str)
                         == Some("sdk.checkpointTurnIdentity")
@@ -7040,6 +7165,11 @@ fn fold_pending_line(pending: &std::sync::Mutex<ClaudePending>, value: &Value) {
                     .and_then(Value::as_str)
                     .map(str::to_string),
                 input: value.get("tool").and_then(|t| t.get("input")).cloned(),
+                // Normalized like the questions below: the snapshot's strict
+                // parse must never see an unknown variant or key (AGENT-06).
+                suggestions: crate::claude_permission_update::normalize_permission_updates(
+                    value.get("suggestions"),
+                ),
             };
             let mut p = pending.lock().expect("pending lock");
             p.permissions.retain(|e| e.request_id != entry.request_id);
@@ -7229,6 +7359,11 @@ fn normalize_sdk_type(sdk_type: &str) -> Option<&'static str> {
         // provider-originated cancellation).
         "sdk.question.cancelled" => "freshAgent.question.cancelled",
         "sdk.status" => "freshAgent.status",
+        // Non-terminal provider events (transcript-live plan P4): an API
+        // retry and a notice (rate limit, informational banner, failed
+        // compaction). Neither ends the turn; the client shows them in place.
+        "sdk.retry" => "freshAgent.retry",
+        "sdk.notice" => "freshAgent.notice",
         // `sdk.turn.complete` / `sdk.turn.waiting` are deliberately absent: the
         // server mints every edge itself (`claude_edges.rs`, C18), so no sidecar
         // line becomes one.
@@ -7410,6 +7545,7 @@ pub(crate) fn sidecar_node_command(
 /// `test-support` seam); otherwise it inherits this process's.
 async fn spawn_sidecar(
     environment: Option<&[(String, String)]>,
+    freshell_endpoint: Option<&crate::claude_freshell_mcp::FreshellEndpoint>,
     session_type: &str,
 ) -> Result<SpawnedSidecar, String> {
     let entry = sidecar_entry_path();
@@ -7429,7 +7565,8 @@ async fn spawn_sidecar(
         crate::claude_spawn::ClaudeNodeCommand::new(&entry),
         &ownership_id,
     )
-    .with_complete_environment(environment);
+    .with_complete_environment(environment)
+    .with_freshell_endpoint(freshell_endpoint);
     let node = command.node().to_string();
     let (mut child, tree_guard) = command.spawn_guarded().map_err(|error| match error {
         crate::claude_spawn::ClaudeSpawnError::ExecProfile(classification) => classification,
@@ -7480,7 +7617,7 @@ mod provider_exec_tests {
                     .collect(),
             )
             .unwrap();
-            let mut result = spawn_sidecar(None, "freshclaude").await;
+            let mut result = spawn_sidecar(None, None, "freshclaude").await;
             if let Ok(SpawnedSidecar { child, .. }) = &mut result {
                 let pid = child.id().unwrap();
                 child.kill().await.unwrap();
@@ -8044,6 +8181,9 @@ mod teardown_tests;
 #[cfg(test)]
 mod end_of_output_tests;
 
+#[cfg(test)]
+mod live_frames_tests;
+
 /// ISO-8601 / RFC-3339 millis-Z timestamp (`new Date().toISOString()`) for error frames.
 fn now_iso() -> String {
     let now = SystemTime::now()
@@ -8109,6 +8249,8 @@ pub(crate) mod tests {
 
     fn attach_msg(session_id: &str) -> FreshAgentAttach {
         FreshAgentAttach {
+            tab_id: None,
+            pane_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
@@ -10495,6 +10637,7 @@ rl.on('line', (line) => {
 
     fn dedup_create_msg(request_id: &str) -> FreshAgentCreate {
         FreshAgentCreate {
+            pane_id: None,
             naming_handle: None,
             observed_epoch: None,
             observed_generation: None,
@@ -11970,6 +12113,8 @@ rl.on('line', (line) => {
         // A delayed ATTACH: the tracked-and-alive fast path is BLOCKED
         // with the typed error (pre-d3: the silent parity return).
         st.handle_attach(freshell_protocol::FreshAgentAttach {
+            tab_id: None,
+            pane_id: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: placeholder.clone(),
             session_type: SessionType::Freshclaude,
@@ -17062,6 +17207,7 @@ rl.on('line', (line) => {
                 blocked_path: None,
                 decision_reason: None,
                 input: None,
+                suggestions: None,
             }],
             questions: Vec::new(),
         };
@@ -17130,6 +17276,141 @@ rl.on('line', (line) => {
             env.respond_log_frames(0).await.is_empty(),
             "a refused non-object decision is never forwarded to the sidecar"
         );
+        drop(env);
+    }
+
+    /// Client-alerts G20 (D4): a decision whose `updatedPermissions` is not a list of
+    /// well-formed permission updates is refused with `INVALID_APPROVAL_DECISION`
+    /// before anything reaches the sidecar, and the request stays pending; a retry
+    /// with well-formed updates is written VERBATIM and resolves it.
+    #[tokio::test]
+    async fn approval_respond_refuses_malformed_updated_permissions_until_a_valid_retry() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-approval-bad-updates"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-approval-bad-updates").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        st.handle_send(send_msg(&session_id, "__raise_permission__"))
+            .await;
+        await_pending_permission(&st, &session_id, "req-1").await;
+
+        st.handle_approval_respond(approval_respond_msg(
+            &session_id,
+            SessionType::Freshclaude,
+            "req-1",
+            json!({ "behavior": "allow", "updatedPermissions": [
+                { "type": "grantEverything", "destination": "session" },
+            ] }),
+        ))
+        .await;
+
+        let frame = await_frame_of_inner_type(&mut rx, "freshAgent.error").await;
+        assert_eq!(frame["event"]["code"], "INVALID_APPROVAL_DECISION");
+        assert_eq!(frame["sessionId"], json!(session_id));
+        let (permissions, _) = pending_request_ids(&st, &session_id).await;
+        assert_eq!(
+            permissions,
+            vec!["req-1".to_string()],
+            "a refused decision leaves the request pending"
+        );
+        assert!(
+            env.respond_log_frames(0).await.is_empty(),
+            "a refused decision never reaches the sidecar"
+        );
+
+        let decision = json!({ "behavior": "allow", "updatedPermissions": [
+            { "type": "addRules", "rules": [{ "toolName": "Bash", "ruleContent": "npm test *" }],
+              "behavior": "allow", "destination": "localSettings" },
+            { "type": "setMode", "mode": "acceptEdits", "destination": "session" },
+        ] });
+        st.handle_approval_respond(approval_respond_msg(
+            &session_id,
+            SessionType::Freshclaude,
+            "req-1",
+            decision.clone(),
+        ))
+        .await;
+        let frames = env.respond_log_frames(1).await;
+        let respond = frames
+            .iter()
+            .find(|f| f["type"] == "permission.respond")
+            .expect("the valid retry reaches the sidecar");
+        assert_eq!(respond["decision"], decision, "forwarded verbatim");
+        let (permissions, _) = pending_request_ids(&st, &session_id).await;
+        assert!(
+            permissions.is_empty(),
+            "the valid retry resolves the request"
+        );
+        drop(env);
+    }
+
+    /// Client-alerts G20 (D4): the refusal of a malformed `updatedPermissions` is
+    /// logged and reported by the failing update's position and variant only. A
+    /// rule's content (a Bash command, a path) is user content, which claude logs
+    /// never carry, and the refused update is never echoed back.
+    #[tokio::test]
+    async fn a_refused_decision_names_the_update_by_position_and_variant_never_its_content() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        // Another test reaches the same `warn!` (under this lock), and tracing
+        // caches a callsite's interest from the first thread that reaches it, so
+        // that thread (no capture) can leave it cached as "never". Rebuild the
+        // cache once this thread's capture is installed.
+        let (events, _capture_guard) = info_capture_for_test::capture();
+        tracing::callsite::rebuild_interest_cache();
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-approval-refusal-log"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-approval-refusal-log").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        st.handle_send(send_msg(&session_id, "__raise_permission__"))
+            .await;
+        await_pending_permission(&st, &session_id, "req-1").await;
+
+        const SECRET: &str = "deploy --token s3cr3t-value";
+        st.handle_approval_respond(approval_respond_msg(
+            &session_id,
+            SessionType::Freshclaude,
+            "req-1",
+            json!({ "behavior": "allow", "updatedPermissions": [
+                { "type": "setMode", "mode": "acceptEdits", "destination": "session" },
+                { "type": "addRules", "rules": [{ "toolName": "Bash", "ruleContent": SECRET }],
+                  "behavior": "allow", "destination": "session", "extra": 1 },
+            ] }),
+        ))
+        .await;
+
+        let frame = await_frame_of_inner_type(&mut rx, "freshAgent.error").await;
+        assert_eq!(frame["event"]["code"], "INVALID_APPROVAL_DECISION");
+        assert!(
+            !frame.to_string().contains("s3cr3t"),
+            "the error frame never echoes the refused update: {frame}"
+        );
+        let events = events.lock().expect("capture lock");
+        // The capture records every field through `Debug`, so a string field
+        // keeps its quotes.
+        let field = |fields: &std::collections::BTreeMap<String, String>, key: &str| {
+            fields
+                .get(key)
+                .map(|value| value.trim_matches('"').to_string())
+        };
+        let (_, fields) = events
+            .iter()
+            .find(|(_, fields)| {
+                field(fields, "event").as_deref()
+                    == Some("freshagent.claude.approval_decision_refused")
+            })
+            .expect("the refusal is logged");
+        assert_eq!(field(fields, "update_index").as_deref(), Some("1"));
+        assert_eq!(field(fields, "update_type").as_deref(), Some("addRules"));
+        for (key, value) in fields {
+            assert!(
+                !value.contains("s3cr3t"),
+                "the refusal log never carries rule content (`{key}` = {value})"
+            );
+        }
         drop(env);
     }
 

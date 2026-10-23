@@ -205,7 +205,15 @@ impl FreshClaudeState {
             ));
             return;
         }
-        let (durable_id, ledger, turn_lock, session_type, clock, live_settings) = {
+        let (
+            durable_id,
+            ledger,
+            turn_lock,
+            session_type,
+            clock,
+            live_settings,
+            freshell_context,
+        ) = {
             let guard = self.sessions.lock().await;
             match guard.get(&map_key) {
                 Some(s) => (
@@ -221,6 +229,8 @@ impl FreshClaudeState {
                     // The settings the session runs with (G15): the
                     // replacement launches with them, on every lane.
                     s.configuration.settings.clone(),
+                    // The pane it runs for (G19): the replacement's too.
+                    s.configuration.freshell_context.clone(),
                 ),
                 None => {
                     reply_sink(rollback_error_frame(
@@ -908,7 +918,8 @@ impl FreshClaudeState {
             &launch_settings,
             self.hosted_mcp,
         )
-        .with_session_id(Some(replacement.clone()));
+        .with_session_id(Some(replacement.clone()))
+        .with_freshell_context(freshell_context);
         // A lease the rollback took on the original completes onto the
         // replacement (the original's durable id resolves to it); a lease the
         // original already held as its live owner is cleared once it is gone.

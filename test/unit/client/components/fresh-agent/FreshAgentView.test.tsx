@@ -10,6 +10,7 @@ import { configureStore, type Middleware } from '@reduxjs/toolkit'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { previewServerSettingsPatch, updateSettingsLocal } from '@/store/settingsSlice'
 import sessionsReducer, { applySessionsPatch, applyContextUsageExtras } from '@/store/sessionsSlice'
+import freshAgentLiveReducer from '@/store/freshAgentLiveSlice'
 import freshAgentReducer, { applyRuntimeOwner, historyPageReceived, sessionError, sessionExited, sessionInit, sessionMetadataReceived, sessionSnapshotReceived, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
 import { selectPaneOwnerFence } from '@/store/selectors/runtimeOwner'
 import tabsReducer, { closeTab, closePaneWithCleanup } from '@/store/tabsSlice'
@@ -347,6 +348,7 @@ function createStore(tabTitleSetByUser = false, extraMiddleware: Middleware[] = 
       panes: panesReducer,
       settings: settingsReducer,
       freshAgent: freshAgentReducer,
+      freshAgentLive: freshAgentLiveReducer,
       tabs: tabsReducer,
       // FreshAgentView reads connection.status to gate the .lost recovery
       // driver; preload ready so tests keep the pre-gate behavior.
@@ -2415,6 +2417,67 @@ describe('FreshAgentView', () => {
     }))
   })
 
+  // G19: the agent's Freshell MCP acts for the pane it runs in, so a create
+  // names that pane (FRESHELL_TAB_ID / FRESHELL_PANE_ID in the agent's CLI).
+  it('names the pane a freshclaude create runs for', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-pane-context',
+        status: 'creating',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1))
+    expect(sentFreshAgentMessages('freshAgent.create')[0]).toMatchObject({
+      requestId: 'req-pane-context',
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+    })
+  })
+
+  // G19: an attach can resume the session's sidecar; the resumed agent's
+  // Freshell MCP acts for the pane that attached.
+  it('names the attaching pane on a kilroy attach', async () => {
+    const store = createStore()
+    const locator = { sessionId: CLAUDE_THREAD_ID, sessionType: 'kilroy' as const, provider: 'claude' as const }
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        ...locator,
+        createRequestId: 'req-attach-context',
+        sessionRef: { provider: 'claude', sessionId: CLAUDE_THREAD_ID },
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1))
+    expect(sentFreshAgentMessages('freshAgent.attach')[0]).toMatchObject({
+      ...locator,
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+    })
+  })
+
   it('acquires a session id for a new non-Claude fresh-agent pane after freshAgent.created', async () => {
     const store = createStore()
     store.dispatch(initLayout({
@@ -2774,22 +2837,25 @@ describe('FreshAgentView', () => {
 
     deliverThroughAppAndMountedView({
       type: 'freshAgent.stream',
-      event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'partial' } },
+      messageId: 'msg_single_projection',
+      event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
     })
-    expect(store.getState().freshAgent.sessions[sessionKey].streamingText).toBe('partial')
+    deliverThroughAppAndMountedView({
+      type: 'freshAgent.stream',
+      messageId: 'msg_single_projection',
+      event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'partial' } },
+    })
 
     deliverThroughAppAndMountedView({
       type: 'freshAgent.assistant',
       model: 'codex-5',
-      content: [{ type: 'text', text: 'Final answer' }],
+      content: [{ type: 'text', text: 'partial' }],
+      messageId: 'msg_single_projection',
     })
-    const assistantSession = store.getState().freshAgent.sessions[sessionKey]
-    expect(assistantSession.turns).toHaveLength(1)
-    expect(assistantSession.turns[0]).toMatchObject({
-      role: 'assistant',
-      model: 'codex-5',
-      summary: '',
-    })
+    // One projection: the streamed text reached the live tail once, and the
+    // assistant frame added no client-side turn.
+    expect(store.getState().freshAgentLive.bySession[sessionKey].blocks.map((block) => block.text)).toEqual(['partial'])
+    expect(store.getState().freshAgent.sessions[sessionKey].turns).toEqual([])
 
     deliverThroughAppAndMountedView({
       type: 'freshAgent.result',
@@ -3341,6 +3407,8 @@ describe('FreshAgentView', () => {
         provider: 'opencode',
         sessionRef: { provider: 'opencode', sessionId: 'ses_attach_route' },
         cwd: '/repo/route-aware',
+        tabId: 'tab-1',
+        paneId: 'pane-1',
       })
     })
     expect(reconnectHandler).toBeTypeOf('function')
@@ -3358,6 +3426,8 @@ describe('FreshAgentView', () => {
         provider: 'opencode',
         sessionRef: { provider: 'opencode', sessionId: 'ses_attach_route' },
         cwd: '/repo/route-aware',
+        tabId: 'tab-1',
+        paneId: 'pane-1',
       })
     })
   })
@@ -7160,6 +7230,8 @@ describe('FreshAgentView', () => {
         sessionType: 'freshcodex',
         provider: 'codex',
         sessionRef: { provider: 'codex', sessionId: 'thread-refresh' },
+        tabId: 'tab-1',
+        paneId: 'pane-1',
       })
     })
     await waitFor(() => {
