@@ -452,6 +452,10 @@
                     "minLength": 1,
                     "type": "string"
                   },
+                  "namingHandle": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
                   "paneKey": {
                     "minLength": 1,
                     "type": "string"
@@ -7958,6 +7962,10 @@
                 "minLength": 1,
                 "type": "string"
               },
+              "namingHandle": {
+                "minLength": 1,
+                "type": "string"
+              },
               "paneKey": {
                 "minLength": 1,
                 "type": "string"
@@ -8277,6 +8285,10 @@
           "type": "string"
         },
         "mode": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "namingHandle": {
           "minLength": 1,
           "type": "string"
         },
