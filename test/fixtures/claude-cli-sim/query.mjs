@@ -38,6 +38,9 @@
 //   FRESHELL_CLAUDE_SIM_STALL_STDIN     '1'/'boot' or 'prompt': the host process
 //                                       stops reading stdin after boot / at the
 //                                       first prompt
+//   FRESHELL_CLAUDE_SIM_TERMINAL_COMMANDS  comma-separated names: the terminal-only
+//                                       commands each init lists, in place of the
+//                                       pinned CLI's (a CLI whose list changed)
 //   FRESHELL_CLAUDE_SIM_LEDGER          JSONL path, for tests that need to see what
 //                                       the SDK side received. Every row carries
 //                                       `query`, the ordinal of its query() call in
@@ -324,6 +327,13 @@ class SimulatedCli {
   onCliExit(code, signal) {
     this.cliExited = true
     if (this.closing || this.dead) return
+    // Like the SDK's process transport (getProcessExitError): a CLI that exits
+    // with code 0 is no error, so the message stream just ends. A real CLI
+    // does that, for one, after SIGINT (an aborted result, then exit 0).
+    if (code === 0 && !signal && !this.bootError) {
+      this.terminate(undefined)
+      return
+    }
     const message = this.bootError
       ?? (signal ? `Claude Code process terminated by signal ${signal}` : `Claude Code process exited with code ${code}`)
     this.terminate(new Error(message))
@@ -444,6 +454,9 @@ class SimulatedCli {
       cwd: this.cwd,
       session_id: this.sessionId,
       ...CATALOG.init,
+      ...(this.env.FRESHELL_CLAUDE_SIM_TERMINAL_COMMANDS === undefined
+        ? {}
+        : { terminal_slash_commands: this.env.FRESHELL_CLAUDE_SIM_TERMINAL_COMMANDS.split(',').filter(Boolean) }),
       mcp_servers: mcpServers,
       plugins,
       model: this.model,

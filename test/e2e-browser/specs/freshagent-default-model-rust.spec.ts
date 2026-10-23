@@ -277,7 +277,7 @@ async function runDefaultModelJourney(page: Page, flavour: Flavour): Promise<voi
 
     const freshCreate = await waitForStdinFrame(
       stdinLog,
-      (frame) => frame?.type === 'create' && !frame?.resumeSessionId,
+      (frame) => frame?.type === 'create' && frame?.boot?.kind === 'fresh',
       `the new ${label} pane's sidecar create`,
     )
     expect(freshCreate.model, 'a new pane starts on the saved default model').toBe('sonnet')
@@ -343,7 +343,7 @@ async function runDefaultModelJourney(page: Page, flavour: Flavour): Promise<voi
     await sidebarRow.click()
     const resumeCreate = await waitForStdinFrame(
       stdinLog,
-      (frame) => frame?.type === 'create' && frame?.resumeSessionId === durableId,
+      (frame) => frame?.type === 'create' && frame?.boot?.kind === 'resume' && frame?.boot?.resume === durableId,
       `the resumed ${label} pane's sidecar create`,
       30_000,
     )

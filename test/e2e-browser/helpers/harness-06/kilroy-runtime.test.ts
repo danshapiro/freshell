@@ -40,6 +40,22 @@ async function readLedger(logPath: string): Promise<Array<Record<string, unknown
   }
 }
 
+/** Whether the fake wrote an idle status between event indexes `from` and `to`. */
+function idleBetween(rt: KilroyRuntime, from: number, to: number): boolean {
+  return rt.events().slice(from, to).some((e) => e.type === 'sdk.status' && e.status === 'idle')
+}
+
+/**
+ * Every frame the fake wrote before this call has been read: an interrupt with
+ * nothing in flight is settled after all of them (it arms nothing). Returns the
+ * index of its settle.
+ */
+async function readEverythingSoFar(rt: KilroyRuntime, sessionId: string): Promise<number> {
+  rt.send({ type: 'interrupt', sessionId })
+  const settle = await rt.nextEvent('sdk.interrupt_settled')
+  return rt.events().indexOf(settle)
+}
+
 describe('harness-06 fake kilroy runtime', () => {
   it('answers create with created-first, init, idle — and records the invocation', async () => {
     const { rt, logPath } = await make()
@@ -68,7 +84,7 @@ describe('harness-06 fake kilroy runtime', () => {
     expect((ledger[0].msg as { cwd?: string }).cwd).toBe('/tmp/fixture-cwd')
   })
 
-  it('runs a full send turn: running -> assistant -> result(success) -> turn.complete -> idle', async () => {
+  it('runs a full send turn: running -> assistant -> result(success) -> turn.complete, with no idle after it', async () => {
     const { rt, logPath } = await make()
     rt.send({ type: 'create', requestId: 'r-1', cwd: '/tmp' })
     const created = (await rt.nextEvent('created')) as { sessionId: string }
@@ -91,12 +107,17 @@ describe('harness-06 fake kilroy runtime', () => {
     expect(typeof complete.at).toBe('number')
     expect(complete.at).toBeGreaterThan(0)
 
-    await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'idle')
-
     // A second turn's `at` must exceed the first (monotonic completion clock).
     rt.send({ type: 'send', sessionId: created.sessionId, text: 'again' })
     const complete2 = (await rt.nextEvent('sdk.turn.complete')) as { at: number }
     expect(complete2.at).toBeGreaterThan(complete.at)
+    // The result ends the turn, as with the real sidecar (which sends no idle):
+    // nothing between the first turn's result and the second turn is an idle.
+    const secondRunning = rt.events().findIndex(
+      (e, i) => i > rt.events().indexOf(result) && e.type === 'sdk.status' && e.status === 'running',
+    )
+    expect(secondRunning).toBeGreaterThan(0)
+    expect(idleBetween(rt, rt.events().indexOf(result), secondRunning), 'no per-turn idle').toBe(false)
 
     const ledger = await readLedger(logPath)
     expect(ledger.map((row) => (row.msg as { type: string }).type)).toEqual(['create', 'send', 'send'])
@@ -117,7 +138,6 @@ describe('harness-06 fake kilroy runtime', () => {
     // Consume through the completion, THEN assert ordering in the full stream.
     await rt.nextEvent('sdk.assistant')
     await rt.nextEvent('sdk.turn.complete') // auto-allowed after the delay
-    await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'idle')
     const types = rt.events().map((e) => (e as { type: string }).type)
     expect(types.indexOf('sdk.turn.waiting')).toBeLessThan(types.indexOf('sdk.assistant'))
     expect(types.indexOf('sdk.assistant')).toBeLessThan(types.indexOf('sdk.turn.complete'))
@@ -135,8 +155,7 @@ describe('harness-06 fake kilroy runtime', () => {
     const complete = (await rt.nextEvent('sdk.turn.complete')) as { at: number }
     expect(Number.isFinite(complete.at)).toBe(true)
     expect((complete as { sessionId?: string }).sessionId).toBe(created.sessionId)
-    await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'idle')
-    // Stream order mirrors the real sidecar: result -> edge -> idle. An error
+    // Stream order mirrors the real sidecar: result -> edge, no idle. An error
     // turn end rings the SAME unified attention edge a success would — the
     // old success-only guard is gone (the fake now imports the REAL gate).
     const types = rt.events().map((e) => (e as { type: string }).type)
@@ -161,7 +180,9 @@ describe('harness-06 fake kilroy runtime', () => {
     expect(settle.ok).toBe(true)
     const result = (await rt.nextEvent('sdk.result')) as { result: string }
     expect(result.result).toBe('error_during_execution')
-    await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'idle')
+    const settled = await readEverythingSoFar(rt, created.sessionId)
+    // The stopped turn's result ends it: no idle follows (the real sidecar sends none).
+    expect(idleBetween(rt, rt.events().indexOf(result), settled), 'no idle after the stopped result').toBe(false)
 
     // TOTAL silence for the user-initiated interrupt: no attention edge on
     // the wire — the armed gate consumed the interrupted turn's own result —
@@ -194,7 +215,6 @@ describe('harness-06 fake kilroy runtime', () => {
     // subtype; its ring is consumed by the armed gate.
     const result = (await rt.nextEvent('sdk.result')) as { result: string }
     expect(result.result).toBe('error_during_execution')
-    await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'idle')
     expect(
       rt.events().some((e) => (e as { type: string }).type === 'sdk.turn.complete'),
       'the interrupted turn stays silent (the gate consumed its result)',
@@ -206,7 +226,6 @@ describe('harness-06 fake kilroy runtime', () => {
     rt.send({ type: 'send', sessionId: created.sessionId, text: 'next unrelated turn' })
     const complete = (await rt.nextEvent('sdk.turn.complete')) as { at: number }
     expect(Number.isFinite(complete.at)).toBe(true)
-    await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'idle')
     expect(
       rt.events().filter((e) => (e as { type: string }).type === 'sdk.turn.complete'),
       'exactly one edge — the next turn rings; the interrupt never did',
@@ -249,7 +268,7 @@ describe('harness-06 fake kilroy runtime', () => {
   it('resume keeps the durable cliSessionId and replays a session snapshot', async () => {
     const durable = randomUUID()
     const { rt } = await make()
-    rt.send({ type: 'create', requestId: 'r-1', cwd: '/tmp', resumeSessionId: durable })
+    rt.send({ type: 'create', protocol: 2, requestId: 'r-1', cwd: '/tmp', boot: { kind: 'resume', resume: durable } })
     const init = (await rt.nextEvent('sdk.session.init')) as { cliSessionId: string }
     expect(init.cliSessionId).toBe(durable)
     const snapshot = (await rt.nextEvent('sdk.session.snapshot')) as { messages: unknown[] }

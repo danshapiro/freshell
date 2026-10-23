@@ -2,10 +2,11 @@
 // Fake Claude SDK-bridge sidecar for e2e (freshclaude). Enabled via the
 // production env seam: FRESHELL_CLAUDE_SIDECAR=<this file>. Speaks the
 // newline-JSON stdio protocol from crates/freshell-freshagent/src/claude.rs:
-//   in : {"type":"create",requestId,cwd,model,permissionMode,effort,resumeSessionId}
+//   in : {"type":"create",protocol:2,requestId,cwd,model,permissionMode,effort,
+//         boot:{kind:'fresh'}|{kind:'resume',resume}}  (protocol v2, crates/freshell-claude-sidecar/boot.mjs)
 //        {"type":"send",sessionId,text} {"type":"interrupt",sessionId} {"type":"shutdown"}
-//   out: {"type":"created","sessionId"} FIRST (any earlier sdk.* line is
-//        DISCARDED by read_created, claude.rs:551; 45s budget claude.rs:71),
+//   out: {"type":"created","sessionId",protocol:2} FIRST (any earlier sdk.* line is
+//        DISCARDED by read_created, claude_handshake.rs; 45s budget claude.rs),
 //        then sdk.* event lines (renamed sdk.X -> freshAgent.X server-side).
 // FIELD shapes come from the REAL sidecar (crates/freshell-claude-sidecar/
 // index.mjs:15-30) + the client consumer (src/lib/fresh-agent-ws.ts:195-284):
@@ -20,7 +21,7 @@
 // NEW knobs (Task 7):
 // - FAKE_CLAUDE_SIDECAR_LOG=<path> -> append request log (JSONL: {pid, t, msg})
 // - FAKE_CLAUDE_SIDECAR_HOLD_TURN_ONCE_MARKER=<path> -> first send wedges, rest work
-// - resumeSessionId on create -> cliSessionId uses that (resume continuity)
+// - a resume boot on create -> cliSessionId uses that (resume continuity)
 // - transcripts: create ensures, each send appends to <store>/projects/-fixture/<cliSessionId>.jsonl
 // - FAKE_CLAUDE_SIDECAR_INIT_AT=turn -> report the session (sdk.session.init)
 //   at the start of every turn and never at create, the REAL CLI's order: it
@@ -113,17 +114,18 @@ rl.on('line', (line) => {
     const sessionId = `fc-e2e-${process.pid}-${Date.now()}`
     // Resume continuity: a resumed session keeps its durable id (what the real
     // CLI's transcript filename stem provides across restarts).
-    const cliSessionId = msg.resumeSessionId ?? CLI_SESSION_ID
+    const resumeSessionId = msg.boot?.resume
+    const cliSessionId = resumeSessionId ?? CLI_SESSION_ID
     const cwd = msg.cwd ?? process.cwd()
     sessions.set(sessionId, { cliSessionId, cwd, model: msg.model ?? 'claude-opus-4-6', effort: msg.effort, permissionMode: msg.permissionMode })
     // Ensure the transcript file EXISTS from create (the attach arm's
     // transcript-present gate reads it before any send happens post-restart).
     fs.closeSync(fs.openSync(transcriptPath(cliSessionId), 'a'))
-    emit({ type: 'created', requestId: msg.requestId, sessionId })
+    emit({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 })
     if (!INIT_AT_TURN) {
       emitSessionInit(sessionId, { cliSessionId, cwd, model: msg.model ?? 'claude-opus-4-6' })
     }
-    if (msg.resumeSessionId) {
+    if (resumeSessionId) {
       emit({ type: 'sdk.session.snapshot', sessionId, messages: [] })
     }
     emit({ type: 'sdk.status', sessionId, status: 'idle' })
@@ -159,8 +161,10 @@ rl.on('line', (line) => {
       content: [{ type: 'text', text }],
       model,
     })
-    emit({ type: 'sdk.turn.complete', sessionId: msg.sessionId, subtype: 'success', at: Date.now() })
-    emit({ type: 'sdk.status', sessionId: msg.sessionId, status: 'idle' })
+    // A turn ends the way the real sidecar ends it: its result, then the
+    // attention edge. No per-turn idle (the real sidecar sends no idle at all).
+    emit({ type: 'sdk.result', sessionId: msg.sessionId, result: 'success', durationMs: 1, costUsd: 0, usage: { input_tokens: 1, output_tokens: 1 } })
+    emit({ type: 'sdk.turn.complete', sessionId: msg.sessionId, at: Date.now() })
   } else if (msg.type === 'shutdown') {
     process.exit(0)
   }

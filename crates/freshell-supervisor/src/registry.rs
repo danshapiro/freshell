@@ -90,8 +90,47 @@ struct RegistryInner {
     db_path: PathBuf,
     installation_id: InstallationId,
     control_epoch: u64,
-    #[allow(dead_code)]
-    lock_file: std::fs::File,
+    /// Held for its `Drop`: the registry root stays owned until the last
+    /// handle to this registry is gone.
+    _owner_lock: OwnerLock,
+}
+
+/// Exclusive supervisor ownership of one registry root (`supervisor.lock`).
+struct OwnerLock(std::fs::File);
+
+impl OwnerLock {
+    fn acquire(root: &Path) -> Result<Self, RegistryError> {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(root.join("supervisor.lock"))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self(file)),
+            Err(std::fs::TryLockError::WouldBlock) => Err(RegistryError::Busy),
+            Err(std::fs::TryLockError::Error(error)) => Err(RegistryError::Io(error)),
+        }
+    }
+}
+
+impl Drop for OwnerLock {
+    fn drop(&mut self) {
+        // The lock belongs to the open file description, which every
+        // duplicate descriptor shares, including the copy that a child
+        // process spawned by any other thread holds between fork and exec
+        // (close-on-exec only closes it at exec). Closing this descriptor
+        // alone would keep the root owned until that child execs, so a
+        // successor opening the registry right after this owner is gone
+        // would be refused as Busy. Unlocking releases ownership now.
+        if let Err(error) = self.0.unlock() {
+            tracing::warn!(
+                event = "runtime.registry.owner_lock_release_failed",
+                error = %error,
+                "Registry owner lock release failed; it is released when every duplicate descriptor closes"
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -345,14 +384,7 @@ impl Registry {
         // The registry contains protected queued input and durable provider
         // identity. Keep the entire SQLite/WAL directory supervisor-private.
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
-        let lock_path = root.join("supervisor.lock");
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(lock_path)?;
-        acquire_exclusive_lock(&lock_file)?;
+        let owner_lock = OwnerLock::acquire(root)?;
 
         let db_path = root.join("runtime.sqlite3");
         let mut conn = open_connection(&db_path)?;
@@ -400,7 +432,7 @@ impl Registry {
                 db_path,
                 installation_id,
                 control_epoch: next_epoch,
-                lock_file,
+                _owner_lock: owner_lock,
             }),
         })
     }
@@ -3109,25 +3141,6 @@ fn durable_sync_parent(parent: Option<&Path>) -> Result<(), RegistryError> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn acquire_exclusive_lock(file: &std::fs::File) -> Result<(), RegistryError> {
-    use std::os::fd::AsRawFd;
-    // SAFETY: the descriptor is valid for this call and owned by `file`.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        Ok(())
-    } else if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
-        Err(RegistryError::Busy)
-    } else {
-        Err(RegistryError::Io(std::io::Error::last_os_error()))
-    }
-}
-
-#[cfg(not(unix))]
-fn acquire_exclusive_lock(_file: &std::fs::File) -> Result<(), RegistryError> {
-    Ok(())
-}
-
 #[cfg(feature = "runtime-test-faults")]
 pub(crate) fn failpoint(name: &'static str) -> Result<(), RegistryError> {
     if std::env::var("FRESHELL_RUNTIME_DB_FAILPOINT")
@@ -4105,6 +4118,25 @@ mod tests {
         let second = Registry::open(dir.path(), Some(installation));
         assert!(matches!(second, Err(RegistryError::Busy)));
         drop(first);
+    }
+
+    #[test]
+    fn dropped_registry_releases_ownership_while_a_spawning_child_shares_its_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Registry::open(dir.path(), None).unwrap();
+        // A child process spawned by any other thread holds a duplicate of
+        // every descriptor between fork and exec, and the ownership lock
+        // belongs to the open file description that duplicate shares.
+        let spawning_child_copy = first.inner._owner_lock.0.try_clone().unwrap();
+        drop(first);
+        let reopened = Registry::open(dir.path(), None)
+            .expect("the dropped owner's lock must not outlive it in a duplicate descriptor");
+        assert!(
+            matches!(Registry::open(dir.path(), None), Err(RegistryError::Busy)),
+            "the reopened registry owns the root exclusively"
+        );
+        drop(reopened);
+        drop(spawning_child_copy);
     }
 
     #[tokio::test]

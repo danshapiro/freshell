@@ -127,7 +127,7 @@ try {
 
   failureStage = 'create'
   const requestId = randomUUID()
-  write({ type: 'create', requestId, cwd, model: FAKE_MODEL, permissionMode: 'bypassPermissions' })
+  write({ type: 'create', protocol: 2, boot: { kind: 'fresh' }, requestId, cwd, model: FAKE_MODEL, permissionMode: 'bypassPermissions' })
   const created = await waitFor(frame => frame.requestId === requestId && (frame.type === 'created' || frame.type === 'create.failed'), 30_000, 'created')
   if (created.type !== 'created') throw new Error('the sidecar refused the create')
 
