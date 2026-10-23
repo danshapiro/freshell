@@ -389,11 +389,11 @@ function remapPaneKeyedMap<T>(
 
 /**
  * Name reliability (Task 9, D7): the names a rebuilt tab gets back — the
- * recorded pane titles and "user renamed" flags, remapped to the restored
- * pane ids, minus every scoped agent pane's (the one client sanitizer,
- * `stripScopedPaneTitleMetadata`), and the tab's own flag unless the tab is
- * session-owned (its owner is the recorded pointer, or the rebuilt layout's
- * first leaf when the record predates it).
+ * recorded pane titles and "user renamed" flags (a flag only alongside its
+ * title), remapped to the restored pane ids, minus every scoped agent pane's
+ * (the one client sanitizer, `stripScopedPaneTitleMetadata`), and the tab's
+ * own flag unless the tab is session-owned (its owner is the recorded
+ * pointer, or the rebuilt layout's first leaf when the record predates it).
  */
 function restoredTabNames(input: {
   tab: RecoveryTab
@@ -406,9 +406,21 @@ function restoredTabNames(input: {
   const { tab, tabId, restoredPanes, layout, paneIdMap, nameSource } = input
   const recordedTitles: Record<string, string> = {}
   const recordedFlags: Record<string, boolean> = {}
+  let droppedUntitledPaneFlags = 0
   for (const p of restoredPanes) {
-    if (typeof p.title === 'string' && p.title.length > 0) recordedTitles[p.paneId] = p.title
+    if (typeof p.title !== 'string' || p.title.length === 0) {
+      // A flag only protects a title: alone it would freeze the derived label.
+      if (p.titleSetByUser === true) droppedUntitledPaneFlags += 1
+      continue
+    }
+    recordedTitles[p.paneId] = p.title
     if (p.titleSetByUser === true) recordedFlags[p.paneId] = true
+  }
+  if (droppedUntitledPaneFlags > 0) {
+    log.debug('recovery plan dropped pane rename flags recorded without a title', {
+      tabKey: tab.tabKey,
+      droppedUntitledPaneFlags,
+    })
   }
   const remappedTitles = remapPaneKeyedMap(recordedTitles, paneIdMap)
   const sanitized = stripScopedPaneTitleMetadata(
