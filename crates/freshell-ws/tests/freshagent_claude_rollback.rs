@@ -1254,11 +1254,17 @@ async fn claude_undo_with_an_unreadable_store_is_internal_error_not_nothing_to_u
         json!("INTERNAL_ERROR"),
         "an unreadable store is a retryable failure, not an empty conversation: {refusal}"
     );
+    // The create log holds protocol-2 creates, whose boot names the kind: a
+    // fork is `boot.kind == "fork"` (a v1 `forkSession` key is never written,
+    // so reading it would pass whatever ran).
+    let creates = rig.create_lines();
     assert!(
-        rig.create_lines()
-            .iter()
-            .all(|l| l["forkSession"] != json!(true)),
-        "no fork may run against an unchecked store"
+        !creates.is_empty() && creates.iter().all(|l| l["boot"]["kind"].is_string()),
+        "every logged create names its boot kind: {creates:?}"
+    );
+    assert!(
+        creates.iter().all(|l| l["boot"]["kind"] != json!("fork")),
+        "no fork may run against an unchecked store: {creates:?}"
     );
     assert!(
         rollback_rows(&rig.ledger_dir()).is_empty(),
