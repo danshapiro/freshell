@@ -36,6 +36,7 @@
 //! [`FreshAgentState::shutdown`] (SIGTERM + the `/proc` ownership sweep) and, as a
 //! backstop, by the harness sentinel sweep — no orphans.
 
+pub mod attention_ledger;
 pub mod claude;
 pub(crate) mod claude_dead_sessions;
 pub mod claude_freshell_mcp;
