@@ -56,6 +56,7 @@ impl FreshClaudeState {
         &self,
         session_id: &str,
         session_type: &str,
+        naming_handle: Option<&str>,
     ) -> Option<(
         freshell_protocol::session_names::SessionNameRef,
         freshell_protocol::session_names::SessionNameRecord,
@@ -68,7 +69,10 @@ impl FreshClaudeState {
         {
             return None;
         }
-        let handle = self.naming_handles.lock().await.get(session_id).cloned()?;
+        let handle = naming_handle?.trim();
+        if handle.is_empty() {
+            return None;
+        }
         let target = freshell_protocol::session_names::SessionNameRef::Session {
             provider: freshell_protocol::session_names::NamedProvider::Claude,
             session_id: session_id.into(),
@@ -86,14 +90,11 @@ impl FreshClaudeState {
                 evidence: freshell_protocol::native_location::NativeEvidenceKind::PersistedMetadata,
                 persistence: freshell_protocol::native_location::NativePersistence::Verified,
             },
-            handle,
+            handle.to_string(),
         );
         let update =
             crate::naming::fold_identity_transition(&self.naming(), &transition, target.clone())
                 .await?;
-        if update.record.name_ref == target {
-            self.naming_handles.lock().await.remove(session_id);
-        }
         Some((update.record.name_ref.clone(), update.record))
     }
 }
