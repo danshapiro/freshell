@@ -1988,9 +1988,12 @@ async fn pending_snapshot(
 }
 
 /// Read and project the transcript at `path` as `thread_id`'s, with its
-/// subagent activity, off the async runtime. `fork_at` projects only the
-/// conversation a lazy fork of it holds ([`fork_prefix_transcript`]); a fork
-/// point the transcript does not hold answers `NotFound`.
+/// subagent activity, off the async runtime. The whole transcript is projected
+/// incrementally (a live pane refetches after every message): only the lines
+/// appended since the last read are parsed
+/// ([`crate::claude_projection_cache::read_transcript`]). `fork_at` projects
+/// only the conversation a lazy fork of it holds ([`fork_prefix_transcript`]);
+/// a fork point the transcript does not hold answers `NotFound`.
 async fn project_transcript_file(
     path: PathBuf,
     thread_id: &str,
@@ -2003,17 +2006,20 @@ async fn project_transcript_file(
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64);
-        let content = std::fs::read_to_string(&path)
-            .map_err(|error| ClaudeSnapshotError::Io(error.to_string()))?;
-        let content = match fork_at {
-            None => content,
-            Some(at) => fork_prefix_transcript(&content, at.as_deref())
-                .ok_or(ClaudeSnapshotError::NotFound)?,
-        };
         let subagents = crate::claude_projection::FsSubagents::for_transcript(&path);
-        let projection = crate::claude_projection::ClaudeTranscriptProjector::project_with(
-            &thread, &content, &subagents,
-        );
+        let projection = match fork_at {
+            None => crate::claude_projection_cache::read_transcript(&path, &thread, &subagents)
+                .map_err(|error| ClaudeSnapshotError::Io(error.to_string()))?,
+            Some(at) => {
+                let content = std::fs::read_to_string(&path)
+                    .map_err(|error| ClaudeSnapshotError::Io(error.to_string()))?;
+                let content = fork_prefix_transcript(&content, at.as_deref())
+                    .ok_or(ClaudeSnapshotError::NotFound)?;
+                crate::claude_projection::ClaudeTranscriptProjector::project_with(
+                    &thread, &content, &subagents,
+                )
+            }
+        };
         Ok((mtime_ms, projection))
     })
     .await

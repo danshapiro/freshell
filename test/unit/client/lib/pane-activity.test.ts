@@ -28,7 +28,6 @@ function freshAgentSession(input: {
     turns: [],
     historyItems: [],
     historyBodies: {},
-    streamingText: '',
     streamingActive: input.streamingActive ?? true,
     pendingPermissions: {},
     pendingQuestions: {},

@@ -5217,7 +5217,6 @@ describe('Sidebar Component - Session-Centric Display', () => {
         turns: [],
         historyItems: [],
         historyBodies: {},
-        streamingText: '',
         streamingActive: input.streamingActive ?? true,
         pendingPermissions: {},
         pendingQuestions: {},

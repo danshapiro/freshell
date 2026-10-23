@@ -12,12 +12,16 @@
 //   - claude-capture-fixtures.mjs (resolvePinnedClaude only: the manual
 //     transcript-fixture capture keeps its own `ws` workspace, which the
 //     committed fixtures' paths depend on)
+//   - claude-live-frames.mjs (the real sidecar's live frames; it brings its
+//     own model through the `respond` hook)
 //
 // The model's behavior is chosen by prompt markers (see
 // test/fixtures/claude-cli-sim/prompt-markers.mjs), the same language the CLI
-// simulator understands. Run directly (`node claude-local-provider.mjs
-// --serve`) it prints one JSON line {"port","url"} and serves until stdin
-// closes, for lanes that are not written in JavaScript.
+// simulator understands. A real-CLI-only test may bring its own model for the
+// requests it scripts (startLocalProvider's `respond` hook); the markers answer
+// the rest. Run directly (`node claude-local-provider.mjs --serve`) it prints
+// one JSON line {"port","url"} and serves until stdin closes, for lanes that
+// are not written in JavaScript.
 
 import fs from 'node:fs/promises'
 import http from 'node:http'
@@ -215,12 +219,58 @@ function sseWriter(response) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
+/** The last tool_result block of a message, if it has one. */
+function lastToolResultOf(message) {
+  const content = Array.isArray(message?.content) ? message.content : []
+  return content.filter((block) => block?.type === 'tool_result').at(-1)
+}
+
+/**
+ * Stream `blocks` as the content of one message: text (in `chunk`-sized
+ * deltas), thinking (one delta plus its signature) and tool_use blocks (the
+ * input as one JSON delta). `nextToolId` names a tool_use without an id.
+ */
+function streamBlocks(send, blocks, { chunk = 8, nextToolId }) {
+  blocks.forEach((block, index) => {
+    if (block.type === 'text') {
+      send('content_block_start', { index, content_block: { type: 'text', text: '' } })
+      for (const piece of block.text.match(new RegExp(`[\\s\\S]{1,${chunk}}`, 'g')) ?? []) {
+        send('content_block_delta', { index, delta: { type: 'text_delta', text: piece } })
+      }
+    } else if (block.type === 'thinking') {
+      send('content_block_start', { index, content_block: { type: 'thinking', thinking: '', signature: '' } })
+      send('content_block_delta', { index, delta: { type: 'thinking_delta', thinking: block.thinking } })
+      send('content_block_delta', { index, delta: { type: 'signature_delta', signature: 'local-signature' } })
+    } else if (block.type === 'tool_use') {
+      send('content_block_start', { index, content_block: { type: 'tool_use', id: block.id ?? nextToolId(), name: block.name, input: {} } })
+      send('content_block_delta', { index, delta: { type: 'input_json_delta', partial_json: JSON.stringify(block.input ?? {}) } })
+    } else {
+      throw new Error(`unknown scripted block type ${block.type}`)
+    }
+    send('content_block_stop', { index })
+  })
+  const stopReason = blocks.some((block) => block.type === 'tool_use') ? 'tool_use' : 'end_turn'
+  send('message_delta', { delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: 1 } })
+}
+
 /**
  * Start the loopback endpoint. Returns { url, port, requests, close }.
  * `requests` records one summary row per model request (no bodies).
+ *
+ * `respond(request)` (optional) is a test's own model, asked first for every
+ * model request. `request` is { messages, promptText, afterTool, isSubagent,
+ * tools, toolResult } (toolResult: the last tool_result of the last message).
+ * It returns undefined to let the prompt markers answer, or one of:
+ *   { status, errorType?, message? }  the request fails with that HTTP status
+ *   { blocks, chunk? }                one streamed message of text, thinking
+ *                                     and tool_use ({name, input, id?}) blocks
+ * The CLI simulator has no counterpart (its scripting is a program), so a test
+ * that uses it runs on the real CLI only.
  */
-export async function startLocalProvider({ replyText = 'ok' } = {}) {
+export async function startLocalProvider({ replyText = 'ok', respond } = {}) {
   const requests = []
+  /** RETRY:<status>x<n> prompts: how many times each prompt's request has failed so far. */
+  const retryFailures = new Map()
   const hung = new Set()
   let toolSeq = 0
 
@@ -259,11 +309,27 @@ export async function startLocalProvider({ replyText = 'ok' } = {}) {
     const tools = Array.isArray(body.tools) ? body.tools.map((tool) => tool?.name).filter(Boolean) : []
     const isSubagent = firstUserText.includes(SUBAGENT_MARKER)
     const marker = parsePromptMarkers(promptText)
-    requests.push({ n: requests.length + 1, marker: marker.kind, afterTool, isSubagent, tools: tools.length })
+    const scripted = respond?.({ messages, promptText, afterTool, isSubagent, tools, toolResult: lastToolResultOf(last) })
+    requests.push({ n: requests.length + 1, marker: scripted ? 'scripted' : marker.kind, afterTool, isSubagent, tools: tools.length })
 
-    if (marker.kind === 'api_error') {
+    if (scripted?.status) {
+      response.writeHead(scripted.status, { 'content-type': 'application/json', 'request-id': randomUUID() })
+        .end(JSON.stringify({ type: 'error', error: { type: scripted.errorType ?? 'api_error', message: scripted.message ?? 'local provider error' } }))
+      return
+    }
+
+    if (marker.kind === 'api_error' && !scripted) {
       response.writeHead(marker.status, { 'content-type': 'application/json', 'request-id': randomUUID() })
         .end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'local provider error' } }))
+      return
+    }
+
+    // The CLI retries the same request: fail it `attempts` times, then answer.
+    if (marker.kind === 'retry' && !scripted && (retryFailures.get(promptText) ?? 0) < marker.attempts) {
+      retryFailures.set(promptText, (retryFailures.get(promptText) ?? 0) + 1)
+      const errorType = marker.status === 529 ? 'overloaded_error' : 'api_error'
+      response.writeHead(marker.status, { 'content-type': 'application/json', 'request-id': randomUUID() })
+        .end(JSON.stringify({ type: 'error', error: { type: errorType, message: 'local provider retry' } }))
       return
     }
 
@@ -282,6 +348,13 @@ export async function startLocalProvider({ replyText = 'ok' } = {}) {
         usage: { ...usage, output_tokens: 0 },
       },
     })
+
+    if (scripted) {
+      streamBlocks(send, scripted.blocks ?? [], { chunk: scripted.chunk, nextToolId: () => `toolu_local_${++toolSeq}` })
+      send('message_stop', {})
+      response.end()
+      return
+    }
 
     if (marker.kind === 'hang') {
       hung.add(response)

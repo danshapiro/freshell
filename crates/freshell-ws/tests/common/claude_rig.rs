@@ -13,7 +13,8 @@
 //!   key. It never contacts the real API.
 //!
 //! Each rig's server is wired like production: one ownership coordinator shared by
-//! the WS state and the claude lane (main.rs does the same).
+//! the WS state and the claude lane (main.rs does the same), and the fresh-agent
+//! snapshot REST route ([`ClaudeRig::snapshot`]) beside the WS endpoint.
 //!
 //! Each rig gets a throwaway HOME / CLAUDE_CONFIG_DIR / workspace, and its server's
 //! [`freshell_freshagent::FreshClaudeState`] gives every sidecar exactly the rig's
@@ -31,7 +32,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -376,8 +377,46 @@ impl ClaudeRig {
         }
     }
 
+    /// `GET /api/fresh-agent/threads/freshclaude/claude/<thread_id>` (the route the
+    /// browser's pane fetches its transcript from): the status and the JSON body.
+    pub async fn snapshot(&self, thread_id: &str) -> (u16, Value) {
+        let host = self
+            .http_url
+            .strip_prefix("http://")
+            .expect("the rig serves http");
+        let mut stream = tokio::net::TcpStream::connect(host)
+            .await
+            .expect("connect to the rig's HTTP address");
+        let request = format!(
+            "GET /api/fresh-agent/threads/freshclaude/claude/{thread_id} HTTP/1.1\r\n\
+             Host: 127.0.0.1\r\nx-auth-token: {AUTH_TOKEN}\r\nConnection: close\r\n\r\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("send the snapshot request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read the snapshot response");
+        let text = String::from_utf8(response).expect("a utf-8 response");
+        let (head, body) = text
+            .split_once("\r\n\r\n")
+            .expect("an HTTP response with a body");
+        let status = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .expect("an HTTP status code");
+        (
+            status,
+            serde_json::from_str(body.trim()).unwrap_or(Value::Null),
+        )
+    }
+
     /// The simulator's ledger rows of one kind (`query`, `boot`, `prompt`,
-    /// `can_use_tool`, `emission`); see `test/fixtures/claude-cli-sim/query.mjs`.
+    /// `can_use_tool`, `control`, `emission`); see `test/fixtures/claude-cli-sim/query.mjs`.
     pub fn ledger_rows(&self, kind: &str) -> Vec<Value> {
         assert_eq!(
             self.kind,
@@ -932,7 +971,18 @@ async fn spawn_rig_server(
         ownership: Some(Arc::clone(&ownership)),
     };
 
-    let mut router = freshell_ws::router(state.clone());
+    // The snapshot REST route (`GET /api/fresh-agent/threads/...`) the pane reads.
+    let snapshots = freshell_freshagent::SnapshotState::new(
+        Arc::clone(&auth_token),
+        state.fresh_codex.clone(),
+        freshell_freshagent::FreshAgentState::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+        ),
+        lane.clone(),
+    );
+    let mut router =
+        freshell_ws::router(state.clone()).merge(freshell_freshagent::snapshot::router(snapshots));
     if options.handoff {
         let runner = Arc::new(freshell_freshagent::SessionHandoffRunner::new(
             Arc::clone(&auth_token),

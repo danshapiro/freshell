@@ -204,6 +204,23 @@ describe(`pinned Claude CLI ${PINNED_CLI_VERSION} contract (real CLI, loopback p
     expect(messagesOf(r, 'S').find(isInit)).toMatchObject({ model: 'no-such-model', permissionMode: 'plan' })
   }, SCENARIO_TIMEOUT)
 
+  it('T7: an approved ExitPlanMode returns the CLI to the mode it had before plan mode, not to default', async () => {
+    const r = await real('plan-return')
+    const modes = messagesOf(r, 'S')
+      .filter((m: any) => m.type === 'system' && m.subtype === 'status' && typeof m.permissionMode === 'string')
+      .map((m: any) => m.permissionMode)
+    expect(modes).toEqual(['plan', 'bypassPermissions'])
+    expect(results(r, 'S').map((m) => m.subtype)).toEqual(['success'])
+  }, SCENARIO_TIMEOUT)
+
+  it('F11: an overloaded API (529) is retried with one system/api_retry per attempt, then the turn succeeds', async () => {
+    const r = await real('retry')
+    const retries = messagesOf(r, 'S').filter((m: any) => m.type === 'system' && m.subtype === 'api_retry')
+    expect(retries.map((m: any) => [m.attempt, m.error_status, m.error])).toEqual([[1, 529, 'overloaded'], [2, 529, 'overloaded']])
+    for (const retry of retries) expect(retry.retry_delay_ms).toBeGreaterThan(0)
+    expect(results(r, 'S').map((m) => [m.subtype, m.is_error])).toEqual([['success', false]])
+  }, SCENARIO_TIMEOUT)
+
   it('T8: every uuid-stamped send gets command_lifecycle queued, started, then completed or cancelled, and is replayed with our uuid', async () => {
     const boot = await real('boot')
     const bootMessages = messagesOf(boot, 'S')

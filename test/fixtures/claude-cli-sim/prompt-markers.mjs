@@ -11,6 +11,8 @@
 //   TOOL:sleep=<s>,timeout=<ms>   the same Bash call with an explicit timeout
 //   TOOL:touch                a Bash call that writes a file (needs approval outside bypass mode)
 //   APIERR:<status>           the model request fails with that HTTP status
+//   RETRY:<status>x<n>        the model request fails <n> times with that HTTP status
+//                             (the CLI retries each), then answers as for no marker
 //   HANG                      the model request never completes
 //   MCP:hang                  a call to the hung stdio MCP tool (mcp__hang__wait)
 //   AGENT:async               a background Agent; its completion starts a CLI-initiated turn
@@ -32,15 +34,18 @@ export const PLAN_TEXT = '# Plan\n\n1. Edit the file\n2. Run the tests'
 
 const TOOL_RE = /\bTOOL:sleep=(\d+(?:\.\d+)?)(?:,timeout=(\d+))?/
 const APIERR_RE = /\bAPIERR:(\d{3})\b/
+const RETRY_RE = /\bRETRY:(\d{3})x(\d+)\b/
 
 /**
  * @param {string} text the text of the last user message
- * @returns {{kind:'text'}|{kind:'slow',chunks:number,delayMs:number}|{kind:'tool',command:string,seconds:number,timeoutMs?:number}|{kind:'api_error',status:number}|{kind:'hang'}|{kind:'mcp_hang'}|{kind:'agent_async'}|{kind:'exit_plan'}}
+ * @returns {{kind:'text'}|{kind:'slow',chunks:number,delayMs:number}|{kind:'tool',command:string,seconds:number,timeoutMs?:number}|{kind:'api_error',status:number}|{kind:'retry',status:number,attempts:number}|{kind:'hang'}|{kind:'mcp_hang'}|{kind:'agent_async'}|{kind:'exit_plan'}}
  */
 export function parsePromptMarkers(text) {
   const value = String(text ?? '')
   const apiError = APIERR_RE.exec(value)
   if (apiError) return { kind: 'api_error', status: Number(apiError[1]) }
+  const retry = RETRY_RE.exec(value)
+  if (retry) return { kind: 'retry', status: Number(retry[1]), attempts: Number(retry[2]) }
   if (/\bMCP:hang\b/.test(value)) return { kind: 'mcp_hang' }
   if (/\bAGENT:async\b/.test(value)) return { kind: 'agent_async' }
   if (/\bPLAN:exit\b/.test(value)) return { kind: 'exit_plan' }

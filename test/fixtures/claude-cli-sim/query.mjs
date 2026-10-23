@@ -24,10 +24,12 @@
 //
 // The model's side of each turn comes from prompt markers
 // (prompt-markers.mjs, shared with the real-CLI loopback provider) or from a
-// scenario program (program.mjs). Layout: this module owns the session (boot,
+// scenario program (program.mjs). A program can also retry failed API
+// requests (api_retry, F11) and replay the model's side of a turn the pinned
+// CLI really ran, with its transcript and subagent files (replay.mjs). Layout: this module owns the session (boot,
 // input, the command queue, turns, interrupts, results); tools.mjs runs tool
-// calls; local-commands.mjs runs slash commands; transcript.mjs persists the
-// JSONL; sdk-shapes.mjs holds the recorded catalog and fixed shapes.
+// calls; local-commands.mjs runs slash commands; replay.mjs plays recorded
+// turns; transcript.mjs persists the JSONL; sdk-shapes.mjs holds the recorded catalog and fixed shapes.
 //
 // Knobs (read from options.env, then process.env):
 //   FRESHELL_CLAUDE_SIM_TIME_SCALE      multiply every simulated delay (default 1);
@@ -51,7 +53,10 @@
 //                                       command as it starts: uuid, text, content and
 //                                       the model, effort and permission mode it runs
 //                                       under), `can_use_tool` (each answer the host's
-//                                       canUseTool gave) and `emission` (program steps)
+//                                       canUseTool gave), `control` (each settings call
+//                                       the CLI handles: setModel, setPermissionMode,
+//                                       applyFlagSettings, with its arguments) and
+//                                       `emission` (program steps)
 
 import fs from 'node:fs'
 import path from 'node:path'
@@ -61,6 +66,7 @@ import { fileURLToPath } from 'node:url'
 import { HANG_MCP_QUALIFIED_TOOL, parsePromptMarkers, PLAN_TEXT, SLOW_DELAY_MS } from './prompt-markers.mjs'
 import { loadProgram, ProgramEngine } from './program.mjs'
 import { runLocalCommand } from './local-commands.mjs'
+import { replayTurn } from './replay.mjs'
 import {
   CATALOG,
   CAVEAT,
@@ -101,6 +107,15 @@ function parseSlash(text) {
   return match ? { name: match[1], args: (match[2] ?? '').trim() } : null
 }
 
+/** The SDK's error kind for a failed API request's HTTP status (null: no response). */
+function apiErrorKind(status) {
+  if (status === 529) return 'overloaded'
+  if (status === 429) return 'rate_limit'
+  if (status === 401) return 'authentication_failed'
+  if (status !== null && status >= 500) return 'server_error'
+  return 'unknown'
+}
+
 /** The model steps a prompt's markers ask for (see prompt-markers.mjs). */
 function markerSteps(text) {
   const marker = parsePromptMarkers(text)
@@ -108,6 +123,7 @@ function markerSteps(text) {
     case 'slow': return [{ kind: 'text', data: { chunks: marker.chunks, delayMs: marker.delayMs } }]
     case 'tool': return [{ kind: 'tool', data: { name: 'Bash', input: { command: marker.command, description: 'local provider command', ...(marker.timeoutMs ? { timeout: marker.timeoutMs } : {}) }, seconds: marker.seconds } }]
     case 'api_error': return [{ kind: 'api_error', data: { status: marker.status } }]
+    case 'retry': return [{ kind: 'api_retry', data: { status: marker.status, attempts: marker.attempts } }, { kind: 'text', data: { text: 'ok' } }]
     case 'hang': return [{ kind: 'hang', data: {} }]
     case 'mcp_hang': return [{ kind: 'tool', data: { name: HANG_MCP_QUALIFIED_TOOL, input: {}, hang: true } }]
     case 'agent_async': return [{ kind: 'agent', data: {} }]
@@ -578,14 +594,21 @@ class SimulatedCli {
     await this.sleep(T.initToStatus)
     this.emit({ type: 'system', subtype: 'status', status: 'requesting' })
     turn.requests = 1
+    const scripted = this.program.match('msg', { type: 'prompt', text: cmd.text, uuid: cmd.uuid })
+    if (scripted) for (const emission of scripted) this.ledger('emission', { kind: emission.kind, data: emission.data })
+    const steps = [...(scripted ?? markerSteps(cmd.text))]
+    // A first request that fails is retried before the CLI replays the
+    // prompt: the replay follows the request that is answered (conformance
+    // scenario `retry`).
+    if (steps[0]?.kind === 'api_retry') {
+      if (await this.apiRetries(turn, steps.shift().data)) return this.abortBeforeContent(turn)
+    }
     await this.sleep(T.requestLatency)
     const uuid = cmd.uuid ?? randomUUID()
     this.emit({ type: 'user', message: { role: 'user', content: cmd.content }, parent_tool_use_id: null, uuid, timestamp: new Date().toISOString(), isReplay: true })
     this.transcript.appendPrompt({ uuid, content: cmd.content, permissionMode: this.permissionMode })
-    const scripted = this.program.match('msg', { type: 'prompt', text: cmd.text, uuid: cmd.uuid })
-    if (scripted) for (const emission of scripted) this.ledger('emission', { kind: emission.kind, data: emission.data })
     this.modelTurnsSinceCompact += 1
-    await this.respond(turn, scripted ?? markerSteps(cmd.text))
+    await this.respond(turn, steps)
   }
 
   /** A turn the CLI starts by itself: a background task finished (T19). */
@@ -640,6 +663,12 @@ class SimulatedCli {
           return this.finishTurn(turn, { subtype: step.data.subtype ?? 'success', text: step.data.text, errors: step.data.errors })
         case 'api_error':
           return this.apiError(turn, step.data)
+        case 'api_retry':
+          if (await this.apiRetries(turn, step.data)) return this.abortBeforeContent(turn)
+          break
+        case 'replay':
+          if (await replayTurn(this, turn, step.data) === 'dead') return undefined
+          break
         case 'hang':
           this.emitStream(this.messageStart())
           await this.wait(Number.POSITIVE_INFINITY, turn)
@@ -661,18 +690,25 @@ class SimulatedCli {
     return this.finishTurn(turn, { subtype: 'success' })
   }
 
+  /**
+   * The start of one model response. Its id is the API message id every
+   * content block of that response carries on its assistant message (F2).
+   */
   messageStart() {
+    this.streamedMessageId = `msg_${randomUUID().replaceAll('-', '')}`
     return {
       type: 'message_start',
-      message: { id: `msg_${randomUUID().replaceAll('-', '')}`, type: 'message', role: 'assistant', model: FAKE_MODEL, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } },
+      message: { id: this.streamedMessageId, type: 'message', role: 'assistant', model: FAKE_MODEL, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } },
     }
   }
 
+  /** One completed content block of the main thread's current response (or of a subagent's, with parent_tool_use_id). */
   assistant(content, extra = {}) {
     const uuid = randomUUID()
+    const id = !extra.parent_tool_use_id && this.streamedMessageId ? this.streamedMessageId : `msg_${randomUUID().replaceAll('-', '')}`
     const message = {
       type: 'assistant',
-      message: { id: `msg_${randomUUID().replaceAll('-', '')}`, type: 'message', role: 'assistant', model: FAKE_MODEL, content, stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }, context_management: null },
+      message: { id, type: 'message', role: 'assistant', model: FAKE_MODEL, content, stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }, context_management: null },
       parent_tool_use_id: null,
       uuid,
       timestamp: new Date().toISOString(),
@@ -711,8 +747,17 @@ class SimulatedCli {
     return true
   }
 
-  setMode(mode) {
+  /**
+   * The CLI's permission mode changes. Entering plan mode remembers the mode
+   * it left: an approved ExitPlanMode returns there, not to default (B6).
+   */
+  changeMode(mode) {
+    if (mode === 'plan' && this.permissionMode !== 'plan') this.modeBeforePlan = this.permissionMode
     this.permissionMode = mode
+  }
+
+  setMode(mode) {
+    this.changeMode(mode)
     this.emit({ type: 'system', subtype: 'status', status: null, permissionMode: mode })
   }
 
@@ -788,6 +833,24 @@ class SimulatedCli {
     this.emit(message)
     this.transcript.append({ type: 'assistant', uuid, requestId: message.request_id, error: 'unknown', isApiErrorMessage: true, apiErrorStatus: status, message: message.message })
     return this.finishTurn(turn, { subtype: 'success', isError: true, terminalReason: 'api_error', stopReason: 'stop_sequence', text, apiErrorStatus: status, lifecycle: 'cancelled' })
+  }
+
+  /**
+   * The model request fails `attempts` times with `status` and the CLI
+   * retries each (F11; live only, never in the transcript): a
+   * system/api_retry, then the CLI's backoff. Returns true when the turn was
+   * aborted meanwhile.
+   */
+  async apiRetries(turn, data) {
+    const status = data.status === null ? null : Number(data.status ?? 529)
+    const attempts = Math.max(1, Number(data.attempts ?? 1))
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const delay = Math.min(500 * 2 ** (attempt - 1), 32_000)
+      this.emit({ type: 'system', subtype: 'api_retry', attempt, max_retries: 10, retry_delay_ms: delay, error_status: status, error: apiErrorKind(status) })
+      // A retried request is the same request: num_turns does not grow.
+      if (await this.wait(delay, turn)) return true
+    }
+    return false
   }
 
   async abortBeforeContent(turn) {
@@ -903,6 +966,7 @@ class SimulatedCli {
 
   async setModel(model) {
     return this.control(async () => {
+      this.ledger('control', { name: 'setModel', args: [model] })
       this.model = model ?? FAKE_MODEL
       const text = `<local-command-stdout>Set model to ${this.model}</local-command-stdout>`
       this.emit({ type: 'user', message: { role: 'user', content: text }, parent_tool_use_id: null, timestamp: new Date().toISOString(), isReplay: true })
@@ -915,9 +979,10 @@ class SimulatedCli {
 
   async setPermissionMode(mode) {
     return this.control(() => {
+      this.ledger('control', { name: 'setPermissionMode', args: [mode] })
       // The only settings call the CLI validates (any model or effort name is accepted).
       if (!PERMISSION_MODES.includes(mode)) throw new Error(`Cannot set permission mode: must be one of ${PERMISSION_MODES.join(', ')}`)
-      this.permissionMode = mode
+      this.changeMode(mode)
       // Reported after the call resolves, before anything sent after it is taken.
       setImmediate(() => this.emit({ type: 'system', subtype: 'status', status: null, permissionMode: mode }))
     })
@@ -925,6 +990,7 @@ class SimulatedCli {
 
   async applyFlagSettings(settings) {
     return this.control(() => {
+      this.ledger('control', { name: 'applyFlagSettings', args: [settings] })
       this.flagSettings = { ...(this.flagSettings ?? {}), ...(settings ?? {}) }
       if (settings && 'effortLevel' in settings) this.effort = settings.effortLevel ?? undefined
     })

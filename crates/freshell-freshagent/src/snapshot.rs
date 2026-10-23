@@ -38,7 +38,7 @@
 //! the typed ownership refusals or the EMPTY-FROM-DISK snapshot and never
 //! spawn (cold resume only via the explicit lifecycle); while
 //! **freshclaude/claude** and **kilroy/claude** are a
-//! disk+env adapter ([`crate::claude_snapshot::get_claude_snapshot`]) that reads the CLI's
+//! disk adapter ([`crate::claude::FreshClaudeState::transcript_snapshot`]) that reads the CLI's
 //! own transcript store directly (`<claude_home>/projects/*/<threadId>.jsonl`) — no sidecar
 //! required, so snapshots survive a server restart. When the session is LIVE, the route
 //! overlays its folded pending approvals/questions onto the disk-built JSON and flips the

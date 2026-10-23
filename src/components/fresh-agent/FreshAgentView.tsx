@@ -109,7 +109,7 @@ import {
   getFreshAgentSnapshotThreadId,
   getManagedBootstrapHistoryThreadId,
 } from '@/lib/fresh-agent-snapshot-thread'
-import { DEFAULT_FRESH_AGENT_STYLE, normalizeFreshAgentStyle } from '@shared/settings'
+import { CLAUDE_PERMISSION_MODE_VALUES, DEFAULT_FRESH_AGENT_STYLE, normalizeFreshAgentStyle } from '@shared/settings'
 import {
   pickCheckpointForTurn,
   type CheckpointEntry,
@@ -121,6 +121,11 @@ import { FreshAgentApprovalCard } from './FreshAgentApprovalCard'
 import { FreshAgentOpenSessionContext } from './FreshAgentItemCard'
 import FreshAgentQuestionBanner from './FreshAgentQuestionBanner'
 import { FreshAgentTranscript, type FreshAgentTranscriptHandle } from './FreshAgentTranscript'
+import { FreshAgentLiveTail, liveTailShowsContent } from './FreshAgentLiveTail'
+import { useTranscriptLandings } from './useTranscriptLandings'
+import { landedTranscriptOf } from '@/lib/fresh-agent-landed-transcript'
+import { withSharedTurns } from '@/lib/fresh-agent-turn-sharing'
+import { formatFreshAgentNotice } from '@/lib/fresh-agent-notice'
 import type { FreshAgentTurnRewindAvailability } from './FreshAgentTurnActions'
 import { FreshAgentComposer, type FreshAgentComposerHandle } from './FreshAgentComposer'
 import { FreshAgentDiffPanel } from './FreshAgentDiffPanel'
@@ -3330,11 +3335,12 @@ export function FreshAgentView({
         autoTitleSentRef.current = true
       }
       const previousSnapshot = snapshotRef.current
-      const displaySnapshot = mergeSnapshotForDisplay(
+      // Unchanged turns keep their objects, so a refetch re-renders only what changed.
+      const displaySnapshot = withSharedTurns(previousSnapshot, mergeSnapshotForDisplay(
         previousSnapshot,
         resolved,
         isManagedRuntimeRecoveryPending(paneContentRef.current.recoverySummary),
-      )
+      ))
       const snapshotAccepted = displaySnapshot !== previousSnapshot
       if (snapshotAccepted) snapshotRequestAuthorityRef.current.applied = requestSerial
       const snapshotStatusAuthoritative = !requestReadOnly && !historyOnly && (provider === 'codex'
@@ -3942,6 +3948,88 @@ export function FreshAgentView({
     : (agentSession?.status ?? paneContent.status)
   const isBusy = BUSY_STATES.has(effectiveStatus)
   const sessionEnded = effectiveStatus === 'exited' || effectiveStatus === 'create-failed'
+  // The live tail (transcript-live plan §4.4): what the running turn shows
+  // before its transcript lines land. This view never subscribes to the
+  // tail's text — only to whether it shows anything, so the transcript's own
+  // live strip yields to it and one live reel shows.
+  const liveSessionKey = paneContent.sessionId
+    ? makeFreshAgentSessionKey({ sessionId: paneContent.sessionId, sessionType: paneContent.sessionType, provider: paneContent.provider })
+    : undefined
+  const landedTranscript = useMemo(() => landedTranscriptOf(snapshot), [snapshot])
+  const liveTailActive = useAppSelector((state) => (
+    liveSessionKey ? liveTailShowsContent(state.freshAgentLive?.bySession[liveSessionKey], landedTranscript) : false
+  ))
+  // An ended turn's answer whose lines have not landed shows above a prompt
+  // sent after it (the echo), never below it.
+  const endedLiveTailShows = useAppSelector((state) => (
+    liveSessionKey && localEcho
+      ? liveTailShowsContent(state.freshAgentLive?.bySession[liveSessionKey], landedTranscript, 'ended')
+      : false
+  ))
+  const localEchoTurn = useMemo<FreshAgentTurn | undefined>(() => (localEcho ? {
+    id: `__local-echo:${localEcho.requestId}`,
+    turnId: localEcho.submittedTurnId ?? `__local-echo:${localEcho.requestId}`,
+    requestId: localEcho.requestId,
+    role: 'user',
+    summary: localEcho.text,
+    items: [{ id: `__local-echo-item:${localEcho.requestId}`, kind: 'text', text: localEcho.text }],
+  } as FreshAgentTurn : undefined), [localEcho])
+  const splitLiveTailAtEcho = Boolean(localEchoTurn && endedLiveTailShows)
+  // Provider notices (rate limits, a failed compaction, CLI banners) show in
+  // the pane's notice banner; they never end the turn (transcript-live P4).
+  // `seq` shows each notice once; one received before this mount is not replayed.
+  const liveNotice = useAppSelector((state) => (
+    liveSessionKey ? state.freshAgentLive?.bySession[liveSessionKey]?.notice : undefined
+  ))
+  const shownNoticeSeqRef = useRef(liveNotice?.seq ?? 0)
+  useEffect(() => {
+    if (!liveNotice || liveNotice.seq <= shownNoticeSeqRef.current) return
+    shownNoticeSeqRef.current = liveNotice.seq
+    setNotice(formatFreshAgentNotice(liveNotice))
+  }, [liveNotice])
+  // The session's permission mode converges onto the pane (transcript-live
+  // §4.4): when the server states a new mode — the CLI left plan mode after an
+  // approved ExitPlanMode, or another device changed it — the pane adopts it,
+  // so its next send does not put the CLI back. A mode the pane cannot show
+  // (the SDK's 'auto' or 'dontAsk') still replaces the pane's own: the pane
+  // lets go of its mode, so its sends state none and the CLI keeps its own.
+  // Only a change of the stated mode acts, so a mode the user just picked here
+  // is never undone.
+  const sessionPermissionMode = agentSession?.permissionMode
+  const adoptedPermissionModeRef = useRef<string | undefined>(undefined)
+  useEffect(() => {
+    if (!sessionPermissionMode || sessionPermissionMode === adoptedPermissionModeRef.current) return
+    adoptedPermissionModeRef.current = sessionPermissionMode
+    const current = paneContentRef.current
+    if (current.provider === 'opencode' || current.permissionMode === sessionPermissionMode) return
+    if (!(CLAUDE_PERMISSION_MODE_VALUES as readonly string[]).includes(sessionPermissionMode)) {
+      if (current.permissionMode === undefined) return
+      log.info('the session is in a permission mode the pane cannot show; the pane stops stating its own', {
+        event: 'fresh_agent.permission_mode_released',
+        provider: current.provider,
+        permissionMode: sessionPermissionMode,
+        previousPermissionMode: current.permissionMode,
+      })
+      dispatch(mergePaneContent({ tabId, paneId, updates: { permissionMode: undefined } }))
+      return
+    }
+    dispatch(mergePaneContent({ tabId, paneId, updates: { permissionMode: sessionPermissionMode } }))
+  }, [dispatch, paneId, sessionPermissionMode, tabId])
+  const isLiveSessionBusyNow = useCallback(() => {
+    const status = liveSessionKey ? appStore.getState().freshAgent.sessions[liveSessionKey]?.status : undefined
+    return BUSY_STATES.has(status ?? paneContentRef.current.status)
+  }, [appStore, liveSessionKey])
+  const requestLandingRecheck = useCallback(() => {
+    if (!hiddenRef.current) requestSnapshotRefresh('event')
+  }, [requestSnapshotRefresh])
+  useTranscriptLandings({
+    sessionKey: liveSessionKey,
+    visible: !hidden,
+    landed: snapshot ? landedTranscript : null,
+    busy: isBusy,
+    isBusyNow: isLiveSessionBusyNow,
+    requestRefresh: requestLandingRecheck,
+  })
   // The durable conversation an ended session's Resume reopens (triggerRecovery
   // resolves the same id): codex threads, and claude/kilroy sessions whose
   // sidecar died (G05).
@@ -4709,16 +4797,8 @@ export function FreshAgentView({
                     ref={transcriptRef}
                     presentationPaused={revealRefreshBlocking}
                     paneId={paneId}
-                    turns={localEcho
-                      ? [...turns, {
-                          id: `__local-echo:${localEcho.requestId}`,
-                          turnId: localEcho.submittedTurnId ?? `__local-echo:${localEcho.requestId}`,
-                          requestId: localEcho.requestId,
-                          role: 'user',
-                          summary: localEcho.text,
-                          items: [{ id: `__local-echo-item:${localEcho.requestId}`, kind: 'text', text: localEcho.text }],
-                        } as FreshAgentTurn]
-                      : turns}
+                    turns={turns}
+                    localEcho={localEchoTurn}
                     canFork={canFork}
                     canRollback={canRollback}
                     rollbackBusy={isBusy}
@@ -4735,7 +4815,29 @@ export function FreshAgentView({
                     expandTools={globalExpandTools}
                     showTimecodes={effectiveShowTimecodes}
                     showTranscriptMinimap={showTranscriptMinimap}
-                    isStreaming={isBusy}
+                    isStreaming={isBusy && !liveTailActive}
+                    // A background pane keeps its tail in the store but renders
+                    // none of it: no markdown re-parse per token while unseen.
+                    tail={liveSessionKey && !hidden ? (
+                      <FreshAgentLiveTail
+                        sessionKey={liveSessionKey}
+                        landed={landedTranscript}
+                        part={splitLiveTailAtEcho ? 'running' : 'all'}
+                        agentLabel={descriptor?.label}
+                        expandThinking={globalExpandThinking}
+                        expandTools={globalExpandTools}
+                      />
+                    ) : undefined}
+                    beforeLocalEcho={liveSessionKey && !hidden && splitLiveTailAtEcho ? (
+                      <FreshAgentLiveTail
+                        sessionKey={liveSessionKey}
+                        landed={landedTranscript}
+                        part="ended"
+                        agentLabel={descriptor?.label}
+                        expandThinking={globalExpandThinking}
+                        expandTools={globalExpandTools}
+                      />
+                    ) : undefined}
                     onForkFromTurn={(turnId) => sendFork(turnId)}
                     getRewindAvailability={getRewindAvailability}
                     onRollbackToTurn={(turnId) => {
@@ -4892,10 +4994,14 @@ export function FreshAgentView({
     getRewindAvailability,
     isBusy,
     isRestoring,
+    landedTranscript,
+    liveSessionKey,
+    liveTailActive,
     loadError,
     managedRecoveryPending,
     managedRecoveryActive,
-    localEcho,
+    localEchoTurn,
+    splitLiveTailAtEcho,
     modelDialogOpen,
     closeModelDialog,
     openModelDialog,
