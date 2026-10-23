@@ -14,7 +14,7 @@ import {
 } from 'lucide-react'
 import type { AppDispatch } from '@/store/store'
 import { addTab, setActiveTab } from '@/store/tabsSlice'
-import { addPane, initLayout, updatePaneTitle } from '@/store/panesSlice'
+import { initCopiedLayout, initLayout, updatePaneTitle } from '@/store/panesSlice'
 import {
   RegistryPaneSnapshotSchema,
   type RegistryPaneSnapshot,
@@ -269,9 +269,9 @@ export type OpenTabRecordDeps = {
 }
 
 /**
- * The layout an unlinked copy builds: `initLayout` places the first pane and
- * each `addPane` splits the pane added before it, which makes a right-leaning
- * chain. The name restore reads only its leaves and its first leaf.
+ * The layout an unlinked copy builds: the same right-leaning chain that
+ * repeated addPane calls made, installed in one fold so naming middleware
+ * never sees a recorded source missing from an incomplete layout.
  */
 function copiedLayout(leaves: PaneNode[]): PaneNode {
   return leaves.reduceRight((rest, head) => ({
@@ -314,7 +314,7 @@ export function openRecordAsUnlinkedCopy(record: RegistryTabRecord, deps: OpenTa
   const tabId = nanoid()
   const paneSnapshots = record.panes || []
   // Unified agent names (Task 6): the copy remints every pane id EXPLICITLY
-  // (initLayout/addPane accept the minted ids) so the old→new map exists to
+  // (initCopiedLayout accepts the minted ids) so the old→new map exists to
   // remap the tab's nameSource through — a stale recorded pane id must never
   // survive into the new tab's pointer.
   const paneIdMap = new Map<string, string>()
@@ -326,6 +326,9 @@ export function openRecordAsUnlinkedCopy(record: RegistryTabRecord, deps: OpenTa
     content: sanitizePaneSnapshot(record, pane, localServerInstanceId),
   }))
   const nameSource = record.nameSource ? remapTabNameSource(record.nameSource, paneIdMap) : undefined
+  const layout: PaneNode = panes.length > 0
+    ? copiedLayout(panes.map(({ paneId, content }) => ({ type: 'leaf', id: paneId, content: content as PaneContent })))
+    : { type: 'leaf', id: nanoid(), content: { kind: 'terminal', mode: 'shell' } as PaneContent }
   // Name reliability (Task 14): the copy keeps the record's names and their
   // rename protection, exactly as the Task 9 new-window rebuild does.
   const names = panes.length > 0
@@ -333,11 +336,7 @@ export function openRecordAsUnlinkedCopy(record: RegistryTabRecord, deps: OpenTa
       tab: record,
       tabId,
       recordedPanes: paneSnapshots,
-      layout: copiedLayout(panes.map(({ paneId, content }) => ({
-        type: 'leaf',
-        id: paneId,
-        content: content as PaneContent,
-      }))),
+      layout,
       paneIdMap,
       nameSource,
     })
@@ -353,19 +352,11 @@ export function openRecordAsUnlinkedCopy(record: RegistryTabRecord, deps: OpenTa
       ...(names?.titleSetByUser ? { titleSetByUser: true } : {}),
     }),
   )
-  const [first, ...rest] = panes
-  dispatch(initLayout({
+  dispatch(initCopiedLayout({
     tabId,
-    paneId: first?.paneId,
-    content: first?.content ?? { kind: 'terminal', mode: 'shell' },
+    layout,
+    activePaneId: panes.at(-1)?.paneId,
   }))
-  for (const pane of rest) {
-    dispatch(addPane({
-      tabId,
-      newContent: pane.content,
-      newPaneId: pane.paneId,
-    }))
-  }
   if (names) dispatchRestoredPaneNames(dispatch, record, tabId, names)
   onOpened?.()
 }

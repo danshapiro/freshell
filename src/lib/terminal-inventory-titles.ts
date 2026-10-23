@@ -141,6 +141,7 @@ const TERMINAL_BINDING_PANE_ACTIONS = new Set([
   'panes/applyReattachToLiveTerminal',
   'panes/hydratePanes',
   'panes/initLayout',
+  'panes/initCopiedLayout',
   'panes/splitPane',
   'panes/addPane',
 ])
