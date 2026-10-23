@@ -127,6 +127,55 @@ handshake included — is bounded by
 typed `HostUnreachable`, after which the caller proceeds through the
 Docker-level path it already owns.
 
+An execution grant is not a control round trip, so it has its own bound. The
+host answers a grant only after it has prepared the selected provider inputs
+and started the provider. The supervisor waits
+`FRESHELL_RUNTIME_TERMINAL_DISPATCH_TIMEOUT_MS` for a terminal grant and
+`FRESHELL_RUNTIME_FRESH_AGENT_COMMAND_TIMEOUT_MS` for a fresh-agent grant or
+turn operation (both default 60s). That is a policy bound on one dispatch,
+roughly ten times a healthy one, not the sum of the host's inner limits: one
+Codex app-server start may take up to 45s and a terminal start retries it up
+to five times (about 251s worst case), and an exact resume first runs the
+provider-owned config refresh (25s, plus up to 32s of recovery).
+
+So the grant carries its own dispatch budget (`dispatch_budget_ms`): the
+supervisor's wait less a five-second reply allowance, never less than half the
+wait (55s by default). The host stops there itself. Every awaited dispatch
+stage runs inside the budget and is cut at the deadline; the native dispatch
+boundary is never crossed once the budget is spent, so the grant stays
+unconsumed; and the refusal is a typed `HostUnreachable` that names the stage
+the budget ran out before. A synchronous stage (the provider projection, the
+provider-owned refresh) cannot be cut; the host notices when it returns, and
+the reply allowance covers that overrun. The supervisor therefore never
+abandons a dispatch the host is still working on, and its recovery policy
+decides whether a fresh incarnation tries again.
+
+Every grant records a `host.grant_timing` event (in the incarnation's
+`host-lifecycle.jsonl` and on the host's stderr) naming how long each dispatch
+stage took, the budget it had (`budgetMs`) and, when it ran out, the stage it
+ran out before (`budgetExhaustedBefore`), for accepted and refused grants
+alike.
+
+Recovery also calls back to the web server to prepare the replacement's
+provider inputs. That callback waits 35s for the web server's own work; a
+Claude recovery's callback waits 105s, because before it answers the web
+server observes the current Claude sources and then the candidate projection,
+back to back, through the supervisor, and each observation is bounded at 35s
+(the fixed reader's 25s operation plus 5s cleanup). The recovery scope those
+nested lookups present lives exactly as long as the callback wait, so an
+observation that finishes inside its own bound never finds its scope expired.
+
+A launch or recovery holds the soul's lifecycle lock for its whole
+activation, callback and grant included, and `stop` takes the same lock
+before it commits the stop intent. A stop issued during activation therefore
+waits for the activation to settle — up to the dispatch wait (60s by default)
+when the host is slow or silent, plus the callback wait during a recovery.
+
+The provider projection inside a grant makes every staged file durable before
+it is published. Those flushes overlap (`PROVIDER_PROJECTION_SYNC_WORKERS`) so
+the filesystem journal commits them together; one at a time, a selected
+plugin with a 4,200-file `node_modules` spent 8-13s of the grant flushing.
+
 This matters most for `stop`: the durable stop intent commits first, then the
 graceful host stop is *attempted*. A host that accepts the control connection
 and then goes silent used to hold the authoritative stop open forever. It is
