@@ -520,12 +520,17 @@ struct PendingApprovalEntry {
     blocked_path: Option<String>,
     decision_reason: Option<String>,
     input: Option<Value>,
+    /// The CLI's own suggestions (what "Allow and don't ask again" sends back),
+    /// normalized to the strict contract shape on entry
+    /// ([`crate::claude_permission_update::normalize_permission_updates`]); `None`
+    /// when the request offered none that survive.
+    suggestions: Option<Vec<Value>>,
 }
 
 impl PendingApprovalEntry {
     /// The `.strict()` contract shape the Task 3 snapshot overlay serializes
-    /// (`{requestId, toolName?, toolUseID?, blockedPath?, decisionReason?, input?}` —
-    /// keys omitted when absent, never null).
+    /// (`{requestId, toolName?, toolUseID?, blockedPath?, decisionReason?, input?,
+    /// suggestions?}` — keys omitted when absent, never null).
     fn to_json(&self) -> Value {
         let mut obj = Map::new();
         obj.insert("requestId".to_string(), json!(self.request_id));
@@ -543,6 +548,9 @@ impl PendingApprovalEntry {
         }
         if let Some(input) = &self.input {
             obj.insert("input".to_string(), input.clone());
+        }
+        if let Some(suggestions) = &self.suggestions {
+            obj.insert("suggestions".to_string(), Value::Array(suggestions.clone()));
         }
         Value::Object(obj)
     }
@@ -4977,8 +4985,8 @@ impl FreshClaudeState {
     /// The session's live pending approvals + questions as overlay JSON (approvals,
     /// questions) — Task 3's snapshot route consumes this. Entry keys are exactly the
     /// `.strict()` contract shape (`{requestId, toolName?, toolUseID?, blockedPath?,
-    /// decisionReason?, input?}` / `{requestId, questions}`, no extra keys, absent keys
-    /// omitted). `any_id` resolves like every handler here: the map key OR the durable
+    /// decisionReason?, input?, suggestions?}` / `{requestId, questions}`, no extra keys,
+    /// absent keys omitted). `any_id` resolves like every handler here: the map key OR the durable
     /// Claude UUID via `cli_index`. An untracked id yields two empty vecs.
     pub(crate) async fn snapshot_pending_overlay(&self, any_id: &str) -> (Vec<Value>, Vec<Value>) {
         let Some(map_key) = self.resolve_session_key(any_id).await else {
@@ -7554,6 +7562,11 @@ fn fold_pending_frame(pending: &std::sync::Mutex<ClaudePending>, value: &Value) 
                     .and_then(Value::as_str)
                     .map(str::to_string),
                 input: value.get("tool").and_then(|t| t.get("input")).cloned(),
+                // Normalized like the questions below: the snapshot's strict
+                // parse must never see an unknown variant or key (AGENT-06).
+                suggestions: crate::claude_permission_update::normalize_permission_updates(
+                    value.get("suggestions"),
+                ),
             };
             let mut p = pending.lock().expect("pending lock");
             p.permissions.retain(|e| e.request_id != entry.request_id);
@@ -17816,6 +17829,7 @@ rl.on('line', (line) => {
                 blocked_path: None,
                 decision_reason: None,
                 input: None,
+                suggestions: None,
             }],
             questions: Vec::new(),
         };
