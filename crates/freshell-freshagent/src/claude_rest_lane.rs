@@ -64,10 +64,11 @@ impl ClaudeRestLane {
             ClaudeCreateOutcome::Created {
                 session_id,
                 session_ref,
-                ..
+                cleanup_ownership_id,
             } => Ok(RestLaneCreated {
                 session_id,
                 session_ref,
+                cleanup_token: cleanup_ownership_id,
             }),
             ClaudeCreateOutcome::Failed {
                 code,
@@ -161,6 +162,34 @@ impl ClaudeRestLane {
 
 #[async_trait::async_trait]
 impl FreshAgentRestLane for ClaudeRestLane {
+    async fn abandon_create(
+        &self,
+        request: &RestLaneCreate,
+        created: &RestLaneCreated,
+    ) -> Result<(), RestLaneError> {
+        if let Some(ownership_id) = created.cleanup_token.as_deref() {
+            self.state
+                .abandon_created_runtime(
+                    &created.session_id,
+                    claude_session_type(&request.provider, &request.session_type)?,
+                    ownership_id,
+                )
+                .await
+                .map_err(|error| {
+                    let mut refused = RestLaneError::new(
+                        RestLaneErrorKind::Unavailable,
+                        error.code,
+                        error.message,
+                    );
+                    refused.retryable = Some(true);
+                    refused.retry_after_ms = Some(250);
+                    refused
+                })?;
+            tracing::info!(event = "freshagent.claude.rest_lane.create_abandoned", request_id = %request.request_id, session_id = %created.session_id, ownership_id, "processed the closed destination's create cleanup");
+        }
+        Ok(())
+    }
+
     async fn create_agent(
         self: Arc<Self>,
         request: RestLaneCreate,
@@ -299,12 +328,18 @@ fn retryable_conflict(code: &str, message: &str) -> RestLaneError {
 
 fn send_error(code: String, message: String) -> RestLaneError {
     match code.as_str() {
-        "SESSION_NOT_FOUND" | "INVALID_SESSION_ID" => retryable_conflict(
-            "FRESH_AGENT_SESSION_NOT_LIVE",
-            "Claude is not running for this session; attach the pane and retry",
-        ),
+        "SESSION_NOT_FOUND" | "INVALID_SESSION_ID" | "SESSION_CLOSED" => {
+            let kind = if code == "SESSION_CLOSED" {
+                RestLaneErrorKind::Conflict
+            } else {
+                RestLaneErrorKind::NotFound
+            };
+            let mut error = RestLaneError::new(kind, code, message);
+            error.retryable = Some(false);
+            error
+        }
         "SESSION_BUSY" | "SESSION_RESERVED" | "STALE_CLAIM" => retryable_conflict(&code, &message),
-        "CLAUDE_SEND_FAILED" | "CLAUDE_SETTINGS_FAILED" => {
+        "CLAUDE_SEND_FAILED" | "CLAUDE_SETTINGS_FAILED" | "CLAUDE_ATTACH_RESUME_FAILED" => {
             RestLaneError::new(RestLaneErrorKind::Unavailable, code, message)
         }
         code if code.starts_with("INVALID_") => {

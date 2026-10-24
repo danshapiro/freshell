@@ -388,7 +388,7 @@ describe(`pinned Claude CLI ${PINNED_CLI_VERSION} contract (real CLI, loopback p
     expect(messagesOf(r, 'S').find((m) => m.subtype === 'compact_boundary')?.compact_metadata?.trigger).toBe('manual')
   }, SCENARIO_TIMEOUT)
 
-  it('T16: /clear sends conversation_reset stamped with the old id, then the new session id arrives in the next init and the result; its transcript exists at once without saved dialogue and resumes', async () => {
+  it('T16: /clear sends the old-id reset then new-id init/result; B has mode metadata at once, flushes only its local command, and resumes', async () => {
     const r = await real('clear')
     const events = eventsOf(r, 'S')
     const reset = messagesOf(r, 'S').find((m) => m.type === 'conversation_reset')
@@ -401,8 +401,16 @@ describe(`pinned Claude CLI ${PINNED_CLI_VERSION} contract (real CLI, loopback p
     expect(results(r, 'S').map((m) => m.session_id)).toEqual(['A', 'B', 'B'])
     expect(lifecycleStates(messagesOf(r, 'S'), 'u2')).toEqual(['queued', 'started', 'completed'])
     expect(r.observations.afterClear.files.map((f: string) => path.basename(f)).sort()).toEqual(['A.jsonl', 'B.jsonl'])
-    expect(r.observations.afterClear.newSessionLineTypes).toEqual(['mode'])
-    expect(r.observations.afterClear.newSessionMessages).toEqual([])
+    expect(r.observations.afterClear.hasModeMetadata).toBe(true)
+    expect(r.observations.afterClearFlush.lineTypes).toEqual(['mode', 'user', 'user', 'system'])
+    expect(r.observations.afterClearFlush.messages).toEqual([
+      { type: 'user', isMeta: true, content: expect.stringContaining('<local-command-caveat>') },
+      { type: 'user', isMeta: false, content: expect.stringContaining('<command-name>/clear</command-name>') },
+    ])
+    expect(JSON.stringify(r.observations.afterClearFlush.messages)).not.toContain('hello')
+    expect(r.observations.afterClearFlush.localCommands).toEqual([
+      { subtype: 'local_command', content: '<local-command-stdout></local-command-stdout>', isMeta: false },
+    ])
     expect(eventsOf(r, 'resumeB').some((e) => e.k === 'init-resolved')).toBe(true)
   }, SCENARIO_TIMEOUT)
 

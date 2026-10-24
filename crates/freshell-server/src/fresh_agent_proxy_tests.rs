@@ -176,6 +176,98 @@ fn configure_command(session_id: &str) -> HostedFreshAgentCommand {
     )
 }
 
+async fn abandon_hosted_create(stale_intent: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("supervisor.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let owned = SoulId::parse("newly-created-hosted-soul").unwrap();
+    let expected = owned.clone();
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            let result = match request.body {
+                AdminCommand::Health => Ok(AdminResult::Health {
+                    control_epoch: 77,
+                    installation_id: InstallationId::new(),
+                }),
+                AdminCommand::Stop(stop) => {
+                    assert_eq!(stop.soul_id, expected);
+                    assert_eq!(stop.expected_intent_revision, Some(9));
+                    if stale_intent {
+                        Err(freshell_runtime_protocol::RuntimeError::new(
+                            RuntimeErrorCode::StaleIntentRevision,
+                            "another intent now owns this soul",
+                        ))
+                    } else {
+                        Ok(AdminResult::Stop { outcome: StopOutcome::VerifiedEmpty, view: serde_json::from_value(serde_json::json!({
+                            "soulId":expected, "incarnationId":"created-incarnation", "launchState":"stopped", "cleanupState":"none",
+                            "intentRevision":9, "executionGeneration":1,
+                        })).unwrap() })
+                    }
+                }
+                other => {
+                    panic!("abandon must use its captured receipt without re-resolving: {other:?}")
+                }
+            };
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: request.request_id,
+                    result,
+                },
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let (proxy, _) = configure_proxy(
+        &socket,
+        HashMap::from([(
+            ("claude".into(), "public-created".into()),
+            SoulId::parse("replacement-alias-target").unwrap(),
+        )]),
+    );
+    proxy
+        .abandon_create(
+            &RestLaneCreate::default(),
+            &RestLaneCreated {
+                session_id: "public-created".into(),
+                cleanup_token: Some(serde_json::to_string(&(owned, 9_u64)).unwrap()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    settled(server).await;
+}
+
+#[tokio::test]
+async fn hosted_rest_abandon_stops_only_the_captured_created_soul_and_intent() {
+    abandon_hosted_create(false).await;
+}
+
+#[tokio::test]
+async fn hosted_rest_abandon_does_not_stop_a_replacement_intent() {
+    abandon_hosted_create(true).await;
+}
+
+#[tokio::test]
+async fn hosted_rest_abandon_preserves_an_adopted_existing_writer_without_a_host_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let (proxy, _) = configure_proxy(&dir.path().join("no-supervisor.sock"), HashMap::new());
+    proxy
+        .abandon_create(
+            &RestLaneCreate::default(),
+            &RestLaneCreated {
+                session_id: "adopted-writer".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+}
+
 /// Answers Health and then one configure the way `answer` decides, and
 /// returns the admin methods it saw.
 fn configure_supervisor(
