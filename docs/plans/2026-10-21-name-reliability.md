@@ -11,68 +11,19 @@
 ## User Request
 
 ### Requested result
-Dan (product manager): "We are having serious issues with pane and tab names
-not getting set properly, and reverting after they're set. Investigate and
-write a plan to fix." Also: "this is a regression; … seemed to get much worse
-when we did the 'durable souls' work."
-
-The investigation is complete
-(`/tmp/claude-1000/-home-dan-code-freshell/b0e858cc-c789-4cc8-aba4-46c81f21d8b8/scratchpad/investigation-report.md`,
-root causes RC1–RC11). This plan fixes all eleven plus one more found while
-revising it (RC12, below: 171 saved names are a tool's wrapper text such as
-`<recommended_plugins>`), lets existing junk names heal on their own as
-sessions are seen (the self-heal rule, below), and proves each fix in the
-browser.
-
-Charter change (Dan, 2026-10-22; see "Decisions (resolved)"): no repair tool;
-no dedicated naming proxy (Dan entered a Gemini key in Settings); no
-conversation-switch carry-forward; one PR at the end, which Dan approved.
+Complete the pane/tab naming-reliability work recovered from Claude session b0e858cc-c789-4cc8-aba4-46c81f21d8b8. Rebase fix/name-reliability onto current main, preserve the intended naming fixes alongside main's new behavior, finish remaining necessary repairs and validation, then land via the already-authorized PR path.
 
 ### Explicit constraints
-- One plan, one branch (`fix/name-reliability` in `.worktrees/name-reliability`,
-  based on `origin/main`, currently 1c7e4dff7), tasks sized for independent
-  review, delivered as ONE PR at the end.
-- Ship order: import shutdown first (it stops new damage), then ranking,
-  self-heal and fallback, then client data models, then server binding, then
-  store performance, then logging. With one branch, commit order is not
-  delivery order: every fix reaches Dan's live server only when the PR is
-  merged and Dan approves the deploy.
-- Coordinator decisions D1–D11 (encoded below) are the design, as amended by
-  Dan's charter change; D12 (the repair tool) is withdrawn.
-- Delivery (Dan's words): "Build, code review, check, and if it was gnarly
-  recheck a few times (max 5). Then land on main via PR." Dan approved
-  creating and merging that PR after the code review and the gate (Task 13).
-  No deploy and no restart of the live server without Dan's explicit
-  "APPROVED"; no writes to live data. The live server on port 3001 and
-  `~/.freshell` are never touched by this work; tests use owned scratch
-  servers, fixtures, or the copies under the scratchpad.
-- Repo rules: Red/Green/Refactor TDD, unit AND e2e coverage, coordinated test
-  commands, NodeNext `.js` imports, structured JSONL logs with severity, a11y
-  rules, files over 1000 lines get new logic in new modules,
-  `docs/development/rename-scope-contract.md` updated, `docs/index.html` only
-  for a major UI change (none is planned).
-- Every test exercises real behavior and fails when that behavior breaks. No
-  test checks prose, prompts, docs or config text.
+- At most 10 additional repair/review rounds are authorized. Stop immediately at the first passing result; no further fixes or review rounds after it passes.
+- Keep all work in /home/dan/code/freshell/.worktrees/name-reliability on fix/name-reliability. Preserve unrelated work. Rebase is explicitly authorized.
+- One durable saved name per coding-agent session; manual names protected; a conversation switch adopts its new session's name. No repair command or dedicated naming proxy.
+- Preserve main's current Freshclaude identity, lifecycle and attention behavior.
+- Use meaningful red/green/refactor tests and unit/integration/browser coverage. Do not weaken or skip tests. Fix observed test races. Use coordinated broad gates and the destructive-test sandbox.
+- Known main failures require reproduction evidence before any baseline qualification. Unknown/new failures remain failures.
+- One PR targeting main, already approved for creation and merge after checks; do not ask again. No production deployment or port3001 restart without the user's exact APPROVED, not given.
 
 ### Accepted tradeoffs and residuals
-See "Residuals and out of scope" at the end. The main ones: per-record name
-storage (one file per record) is a follow-up; the reconstructed managed shell
-tab can only recover a custom name when the view intent carries one; the
-hosted fresh-agent proxy naming gap is fixed only if it is small (Task 10
-decision rule); the server-side default-label check cannot recognize a folder
-name where the server has no folder for the record (Task 4 pins that limit);
-existing names that are not recognizable junk (for example the imported
-"ms-people-summit") stay as they are, because nothing repairs them; 11
-tool-text names whose sessions are no longer indexed stay; a name given
-before the first message is not shown on a reconstructed managed tab until
-the session links; Claude sessions made only of slash commands plus one
-prompt now count as non-interactive; a keyed request goes straight to
-Google when the ambient proxy is OneCLI's, so a host that can reach Google
-only through OneCLI pauses AI naming; an older binary sharing `~/.freshell`
-could fight the self-heal; managed rigs can flake unless run alone; the key's
-generation quota is confirmed only by the first AI name after deploy. A
-pre-existing managed reattach bug found during validation is reported to
-Dan, not fixed here.
+Existing accepted limitations in the committed naming plan remain: one-file name storage, recognizable-junk-only healing, unindexed/exhausted histories, incomplete closed-registry cleanup, inherited OneCLI only without a configured Gemini key, and deployment-time quota confirmation. The separate pre-existing managed-shell restart and initial Freshclaude view-flavor persistence issues stay outside this change.
 
 **Goal:** A Claude, Codex or OpenCode session gets a sensible name (first
 message, then Freshell's AI name) and keeps it across reloads, new windows,
@@ -1895,10 +1846,11 @@ repeats its error where possible, not only by hiding the lines.
   `FRESHELL_TEST_SUMMARY="name-reliability final gate" GCLOUD_ROBOT_REQUIRE=1 pnpm run check`.
   Pass condition: no failures outside the waived 7-test baseline (list the
   failing tests in the receipt).
-- [ ] **Step 8: Recheck when it was gnarly.** If the review or the gate
-  found significant problems, repeat Steps 6–7 on the updated diff. At most
-  5 review-and-gate rounds in total; if round 5 still finds significant
-  problems, stop and report to Dan instead of landing.
+- [ ] **Step 8: Recheck when it was gnarly.** For the resumed run, use at most
+  10 additional repair/review rounds. Stop immediately at the first passing
+  result: no further fixes or review rounds after it passes. If the added
+  allowance is exhausted with unresolved findings, stop and report instead
+  of landing.
 - [ ] **Step 9: Land on main via PR (approved by Dan on 2026-10-22).**
   Commit anything left, push the branch, select the `gh` account per the
   repo rules, open the PR targeting `main` (body ends with the attribution
@@ -2241,6 +2193,7 @@ Dan decided these on 2026-10-22; no product question is open.
    merging it: "Build, code review, check, and if it was gnarly recheck a
    few times (max 5). Then land on main via PR." Deploying and restarting
    the live server still needs his "APPROVED".
+   The resumed run uses the additional allowance and stop-on-pass rule in User Request.
 5. **Conversation switch.** No carry-forward. As the existing contract says,
    the pane adopts the new conversation's name, or its fallback until it
    has one.
