@@ -901,15 +901,14 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
       // The durable transcript accumulates compaction + follow-up entries.
       const transcriptDir = path.join(lane.info.homeDir, '.claude', 'projects')
       const transcriptFile = path.join(transcriptDir, projectSlugOf(lane.projectDir), `${durableBefore}.jsonl`)
-      const transcriptLines = readJsonl(transcriptFile)
-      const userTexts = transcriptLines
-        .filter((l) => l.type === 'user')
-        .map((line) => {
+      // Native transcript writes may finish just after the result/idle frame.
+      // Retain the earlier conversation and follow-up, and correlate the saved
+      // local-command metadata with the actual command submitted to this CLI.
+      await expect(async () => {
+        const transcriptLines = readJsonl(transcriptFile)
+        const userRows = transcriptLines.filter((line) => line.type === 'user')
+        const textOf = (line: any): string => {
           const content = line.message?.content
-          // Ordinary prompts use the simulator's string content shape while
-          // real CLI message blocks (including tool results) use text blocks.
-          // The local /compact command is written to native history as a
-          // string, so inspect both supported Claude transcript forms.
           if (typeof content === 'string') return content
           if (Array.isArray(content)) {
             return content
@@ -918,10 +917,19 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
               .join('\n')
           }
           return ''
-        })
-      expect(userTexts).toEqual(
-        expect.arrayContaining(['warm-up turn', '/compact focus the diff', 'follow-up after compact']),
-      )
+        }
+        expect(userRows.map(textOf)).toEqual(
+          expect.arrayContaining(['warm-up turn', 'follow-up after compact']),
+        )
+        const savedCommands = userRows.filter((line) => line.uuid === compactSend.uuid)
+        expect(savedCommands, 'exactly one saved row for the submitted compact command').toHaveLength(1)
+        expect(textOf(savedCommands[0])).toContain('<command-name>/compact</command-name>')
+        expect(textOf(savedCommands[0])).toContain('<command-args>focus the diff</command-args>')
+        expect(transcriptLines).toEqual(expect.arrayContaining([
+          expect.objectContaining({ type: 'system', subtype: 'compact_boundary' }),
+          expect.objectContaining({ type: 'user', isCompactSummary: true }),
+        ]))
+      }).toPass({ timeout: 15_000 })
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})

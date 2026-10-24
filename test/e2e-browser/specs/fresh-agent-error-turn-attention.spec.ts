@@ -208,6 +208,7 @@ test.describe('fresh-agent error-turn attention (unified needs-attention signal)
     let server: RustServer | undefined
     try {
       const projectDir = path.join(sharedRoot, 'project')
+      await fs.mkdir(projectDir, { recursive: true })
       server = new RustServer({
         env: {
           ...claudeSimulatorServerEnv({ ledgerPath: simLedger, program: SIMULATOR_PROGRAM }),
