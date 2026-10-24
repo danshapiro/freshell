@@ -638,6 +638,7 @@ struct ClaudeSession {
     /// still-vacant canonical key, a foreign start) fails CLOSED — the
     /// freshly spawned runtime is torn down, never left running unowned
     /// while the other operation believes there was no prior owner.
+    #[cfg(test)]
     owning_operation: Option<String>,
     /// b8ke ext r27 F2: the GENERATION of the lifecycle op that owns this
     /// runtime's coordinator transition (the handoff runner's under-ticket
@@ -769,6 +770,7 @@ pub struct AdoptionTestPause {
 /// unreachable live runtime. `Deferred` — the session is not yet
 /// registered; the publication lands post-registration and the completion
 /// hook carries the final answer.
+#[cfg(test)]
 enum SessionInitAdoptionOutcome {
     Published,
     Abandoned,
@@ -4456,10 +4458,7 @@ impl FreshClaudeState {
             // device's model surfaces — the same frame `handle_configure`
             // emits (a device that missed the configure still lands here).
             let settings_before = self.stated_settings(&map_key).await;
-            if let Err(err) = self
-                .configure_for_send(&map_key, settings, session_type)
-                .await
-            {
+            if let Err(err) = self.configure_for_send(&map_key, settings).await {
                 return self.refuse_send(&request_id, "CLAUDE_SETTINGS_FAILED", &err);
             }
             let settings_after = self.stated_settings(&map_key).await;
@@ -4621,7 +4620,6 @@ impl FreshClaudeState {
         &self,
         map_key: &str,
         requested: &freshell_protocol::FreshAgentSendSettings,
-        session_type: &str,
     ) -> Result<(), String> {
         let request_id = uuid::Uuid::new_v4().to_string();
         let (response, next, writer, frame, ownership_id) = {
@@ -4682,44 +4680,25 @@ impl FreshClaudeState {
                     .into(),
             ),
         };
-        let (durable, effective) = {
+        {
             let mut sessions = self.sessions.lock().await;
             let session = sessions
-                .get_mut(map_key)
-                .ok_or("Claude session is no longer available.")?;
-            if session.ownership_id != ownership_id {
-                return Err(
-                    "Claude changed while applying settings. Your message was not sent; try again."
-                        .into(),
-                );
-            }
+                .values_mut()
+                .find(|session| session.ownership_id == ownership_id)
+                .ok_or(
+                    "Claude changed while applying settings. Your message was not sent; try again.",
+                )?;
             session.configuration.pending = None;
             session.configuration.needs_configure = applied.is_err();
             if applied.is_ok() {
                 session.configuration.settings = next;
             }
-            // A setter can succeed before a later setter rejects. The receipt
-            // reconciles that partial success; persist the actual runtime state
-            // even though the user's prompt must remain unsent.
-            (
-                session.cli_session_id.clone(),
-                session.configuration.settings.clone(),
-            )
-        };
-        if let Some(durable) = durable {
-            self.adopt_session_init(
-                &durable,
-                map_key,
-                session_type,
-                Some(&effective),
-                self.identity_sink(),
-                // Settings-apply is conn-less from the pane's perspective: not a
-                // browser assertion — the ledger merge keeps the row's prior
-                // stamps (ep4 writer rules).
-                None,
-            )
-            .await;
         }
+        // A partial setter success is actual runtime state even when a later
+        // setter rejects. Save it without repeating identity establishment.
+        self.persist_runtime_settings(&ownership_id)
+            .await
+            .map_err(|message| format!("{message} Your message was not sent."))?;
         applied
     }
 
@@ -4791,10 +4770,7 @@ impl FreshClaudeState {
         let map_key = live_key;
 
         let before = self.stated_settings(&map_key).await;
-        if let Err(err) = self
-            .configure_for_send(&map_key, &msg.settings, session_type)
-            .await
-        {
+        if let Err(err) = self.configure_for_send(&map_key, &msg.settings).await {
             // The refusal/failure is user-facing session state (busy turn,
             // sidecar death): the pane banner is the surface, on every device.
             self.emit_control_error(
@@ -5650,6 +5626,7 @@ impl FreshClaudeState {
     /// creating connection's stamps, when this adoption flows from a
     /// connection-scoped create; `None` on conn-less lanes — the ledger's
     /// keep-when-None merge then keeps the prior stamps.
+    #[cfg(test)]
     async fn adopt_session_init(
         &self,
         cli_id: &str,
@@ -5742,6 +5719,7 @@ impl FreshClaudeState {
     /// (its own failure path killed the child): nothing adopted, nothing
     /// committed.
     #[allow(clippy::too_many_arguments)] // the adoption field set + the completion channel
+    #[cfg(test)]
     fn defer_session_init_adoption(
         &self,
         cli_id: &str,
@@ -5807,6 +5785,7 @@ impl FreshClaudeState {
     /// remove the registered session, run the standard typed teardown,
     /// evict its placeholder aliases, and engage the client's
     /// lost-session recovery.
+    #[cfg(test)]
     async fn teardown_unadopted_session(&self, session_id: &str, session_type: &str) {
         tracing::error!(target: "invariant",
             placeholder = %session_id,
@@ -5857,6 +5836,7 @@ impl FreshClaudeState {
     /// captured pid of a KILLED runtime (snapshots then reported the dead
     /// runtime as the authoritative owner). Missing/incarnation-changed →
     /// `false`: no alias, no commit — the kill owns the session.
+    #[cfg(test)]
     async fn publish_session_init_alias(
         &self,
         cli_id: &str,
@@ -5911,6 +5891,7 @@ impl FreshClaudeState {
     }
 
     #[allow(clippy::too_many_arguments)] // the adoption field set (the deferral adds the re-entry flag)
+    #[cfg(test)]
     async fn adopt_session_init_inner(
         &self,
         cli_id: &str,
@@ -6321,13 +6302,8 @@ impl FreshClaudeState {
     /// eviction so a stale consumer can never evict a newer session re-registered under
     /// the same map key (attach-resume, Task 6).
     ///
-    /// `settings` (P1.13): `Some` = record a fresh-agent binding row at
-    /// `sdk.session.init` (create path / resume-with-record); `None` = do NOT record
-    /// (resume of a never-recorded session — writing would launder a blank row under
-    /// the new cliSessionId, V7/A10). The row's `mode` is the `session_type` param
-    /// (the `"freshclaude"` vs `"kilroy"` flavour; provider is always [`PROVIDER`]).
-    /// `broadcast_id` (Task 10b): the shared envelope-stamp handle read PER EVENT --
-    /// starts as the map key; an attach-by-durable rebind flips it to the durable id.
+    /// The shared current UUID follows native conversation resets. Attaching
+    /// another observer never changes it or repeats identity establishment.
     /// `pending` (Task 2): the shared pending approval/question handle the consumer
     /// folds `sdk.permission.*`/`sdk.question.*` lines into BEFORE the normalize/
     /// broadcast step (so a respond racing the event never sees stale membership).
@@ -6340,7 +6316,7 @@ impl FreshClaudeState {
     /// ledger's verdict on each result says whether it rings, and every edge
     /// (a result, a waiting edge, a death while a turn was owed) leaves through
     /// the edge hub on the session's `clock`.
-    #[allow(clippy::too_many_arguments)] // Session-scoped wiring handed to the detached consumer; four call sites.
+    #[allow(clippy::too_many_arguments)] // Session-scoped wiring handed to the detached consumer.
     fn spawn_consumer(
         &self,
         mut reader: tokio::io::Lines<BufReader<ChildStdout>>,
@@ -6360,7 +6336,6 @@ impl FreshClaudeState {
     ) -> tokio::task::JoinHandle<()> {
         let broadcast_tx = self.broadcast_tx.clone();
         let sessions = self.sessions.clone();
-        let identity_sink = self.identity_sink();
         let state = self.clone();
         tokio::spawn(async move {
             let mut session_id = session_id;
@@ -6497,28 +6472,29 @@ impl FreshClaudeState {
                     // boots the conversation in the mode the CLI is in.
                     Some("sdk.session.metadata") => {
                         if let Some(mode) = value.get("permissionMode").and_then(Value::as_str) {
-                            let adopted =
-                                sessions.lock().await.get_mut(&session_id).map(|session| {
+                            let changed = sessions
+                                .lock()
+                                .await
+                                .get_mut(&session_id)
+                                .filter(|session| session.ownership_id == ownership_id)
+                                .map(|session| {
                                     session.configuration.settings.permission_mode =
                                         Some(mode.to_string());
-                                    (
-                                        session.cli_session_id.clone(),
-                                        session.configuration.settings.clone(),
-                                    )
-                                });
-                            if let Some((Some(durable), settings)) = adopted {
-                                state
-                                    .adopt_session_init(
-                                        &durable,
-                                        &session_id,
+                                })
+                                .is_some();
+                            if changed {
+                                if let Err(message) =
+                                    state.persist_runtime_settings(&ownership_id).await
+                                {
+                                    let stamp =
+                                        broadcast_id.lock().expect("broadcast id lock").clone();
+                                    state.emit_fresh_agent_error(
+                                        &stamp,
                                         &session_type,
-                                        Some(&settings),
-                                        identity_sink.clone(),
-                                        // Conn-less, like a settings apply: the
-                                        // ledger merge keeps the row's stamps.
-                                        None,
-                                    )
-                                    .await;
+                                        "SETTINGS_PERSIST_FAILED",
+                                        &message,
+                                    );
+                                }
                             }
                         }
                     }
@@ -7955,7 +7931,7 @@ fn log_claude_teardown(
     }
 }
 
-mod create_binding;
+mod binding;
 mod create_outcome;
 mod deadman;
 mod recovery;
@@ -8031,6 +8007,7 @@ pub(crate) mod tests {
     mod recovery_stop_tests;
     mod recovery_tests;
     mod refusal_tests;
+    mod settings_persistence_tests;
 
     fn state() -> FreshClaudeState {
         let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);

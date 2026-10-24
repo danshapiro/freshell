@@ -597,7 +597,7 @@ impl FreshClaudeState {
             claim,
             rekey_provisional_claim,
             recorded_settings,
-            owning_operation,
+            owning_operation: _owning_operation,
             owning_generation,
             provenance,
             naming,
@@ -803,7 +803,8 @@ impl FreshClaudeState {
                     // b8ke focused episode-2 round-2 F2: the lifecycle op that owns
                     // this runtime's coordinator transition, so the session-init
                     // adoption's Blocked arm can correlate its own in-flight claim.
-                    owning_operation,
+                    #[cfg(test)]
+                    owning_operation: _owning_operation,
                     // b8ke ext r27 F2: the handoff's generation (the under-ticket
                     // target resume) stamps the adoption's binding write.
                     owning_generation,
@@ -899,9 +900,15 @@ impl FreshClaudeState {
         // A created session is already a durable identity, including before
         // its first prompt. Write lineage/genesis while the ownership claim
         // still fences the registration, before Live or the acknowledgement.
-        if let Some(create) = naming {
+        if naming.is_some() || lane == EstablishLane::AttachResume {
             if let Err(error) = self
-                .record_create_binding(&map_key, create, provenance.as_ref(), own_ticket)
+                .record_established_binding(
+                    &map_key,
+                    &spec.session_type,
+                    naming.map(|create| create.request_id.as_str()),
+                    provenance.as_ref(),
+                    own_ticket,
+                )
                 .await
             {
                 if let Some(session) = { self.sessions.lock().await.remove(&map_key) } {

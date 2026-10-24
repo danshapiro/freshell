@@ -72,7 +72,6 @@ async fn a_configure_receipt_from_a_replaced_runtime_cannot_change_its_replaceme
                         permission_mode: None,
                         sandbox: None,
                     },
-                    "freshclaude",
                 )
                 .await
         })
