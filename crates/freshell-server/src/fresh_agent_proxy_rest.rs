@@ -159,11 +159,60 @@ impl FreshAgentRestLane for HostedFreshAgentProxy {
                 .as_ref()
                 .map(|value| value.session_id.as_str()),
         );
-        self.create(message).await?;
+        let cleanup_token = self
+            .create(message)
+            .await?
+            .map(|receipt| serde_json::to_string(&receipt).map_err(|_| ()))
+            .transpose()?;
         Ok(RestLaneCreated {
             session_id,
+            cleanup_token,
             ..Default::default()
         })
+    }
+
+    async fn abandon_create(
+        &self,
+        _: &RestLaneCreate,
+        created: &RestLaneCreated,
+    ) -> Result<(), freshell_freshagent::rest_lane::RestLaneError> {
+        use freshell_freshagent::rest_lane::{RestLaneError, RestLaneErrorKind};
+        let Some(token) = created.cleanup_token.as_deref() else {
+            return Ok(());
+        };
+        let (soul, revision): (SoulId, u64) = serde_json::from_str(token).map_err(|_| {
+            RestLaneError::new(
+                RestLaneErrorKind::Internal,
+                "INVALID_CREATE_CLEANUP_TOKEN",
+                "invalid hosted create cleanup receipt",
+            )
+        })?;
+        let stopped = self
+            .client
+            .stop_expected(soul.clone(), Some(revision))
+            .await;
+        match stopped {
+            Ok((StopOutcome::VerifiedEmpty, _)) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.runtime_code(),
+                    Some(RuntimeErrorCode::StaleIntentRevision | RuntimeErrorCode::UnknownSoul)
+                ) =>
+            {
+                Ok(())
+            }
+            result => {
+                tracing::warn!(event = "fresh_agent.abandoned_create_cleanup_failed", soul_id = %soul, expected_intent_revision = revision, result = ?result);
+                let mut error = RestLaneError::new(
+                    RestLaneErrorKind::Unavailable,
+                    "CREATE_CLEANUP_UNCONFIRMED",
+                    "the abandoned hosted runtime could not be confirmed stopped",
+                );
+                error.retryable = Some(true);
+                error.retry_after_ms = Some(250);
+                Err(error)
+            }
+        }
     }
 
     async fn send_agent(
