@@ -26,8 +26,11 @@ export function projectSlug(cwd) {
   return String(cwd).replace(/[^A-Za-z0-9]/g, '-')
 }
 
-/** Locate `<sessionId>.jsonl` in any project directory, or null. */
+/** Locate a saved conversation by native id or absolute transcript path. */
 export function findTranscript(configDir, sessionId) {
+  if (typeof sessionId === 'string' && path.isAbsolute(sessionId)) {
+    try { return fs.statSync(sessionId).isFile() ? sessionId : null } catch { return null }
+  }
   const projects = path.join(configDir, 'projects')
   let dirs
   try { dirs = fs.readdirSync(projects, { withFileTypes: true }) } catch { return null }
