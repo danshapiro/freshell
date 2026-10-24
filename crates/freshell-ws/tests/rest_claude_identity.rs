@@ -54,6 +54,12 @@ fn unique_temp_dir(label: &str) -> std::path::PathBuf {
 /// and the REST pane-ops surface resolve the same store), exactly like
 /// `main.rs`.
 async fn spawn_merged_server() -> Harness {
+    spawn_merged_server_with_claude_environment(None).await
+}
+
+async fn spawn_merged_server_with_claude_environment(
+    environment: Option<Vec<(String, String)>>,
+) -> Harness {
     let _ = common::isolate_amplifier_home();
     let ledger_dir = unique_temp_dir("ledger");
     let signal_root = unique_temp_dir("signals");
@@ -76,6 +82,9 @@ async fn spawn_merged_server() -> Harness {
     let layout_store = freshell_freshagent::layout_store::LayoutStore::default();
 
     let mut fresh_claude = freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx));
+    if let Some(environment) = environment {
+        fresh_claude = fresh_claude.with_sidecar_environment(environment);
+    }
     fresh_claude.set_ownership(Arc::clone(&ownership));
     let fresh_agent_state = freshell_freshagent::FreshAgentState::new(
         Arc::clone(&auth_token),
@@ -566,89 +575,70 @@ async fn rest_claude_resume_create_writes_identity_row_and_ledger_binding() {
 
 // ── kata b8ke Task 10: REST + WS + browser-shaped parity on ONE coordinator ──
 
-// The lease-suite fake claude sidecar (request-log knob), duplicated
-// per-file per the cross_kind_liveness.rs convention: sets
-// FRESHELL_CLAUDE_SIDECAR/FRESHELL_CLAUDE_NODE so a `freshAgent.create`
-// over WS genuinely establishes a live freshclaude owner, and logs every
-// sidecar request for the no-second-runtime assertions.
-const FAKE_CLAUDE_SIDECAR_SOURCE: &str = r#"
-import readline from 'node:readline'
-import fs from 'node:fs'
-
-const logPath = process.env.FAKE_SIDECAR_REQUEST_LOG || ''
-function logReq(msg) {
-  if (!logPath) return
-  try { fs.appendFileSync(logPath, JSON.stringify({ pid: process.pid, msg }) + '\n') } catch {}
-}
-
-let counter = 0
-const rl = readline.createInterface({ input: process.stdin, terminal: false })
-rl.on('line', (line) => {
-  const trimmed = line.trim()
-  if (!trimmed) return
-  let msg
-  try { msg = JSON.parse(trimmed) } catch { return }
-  logReq(msg)
-  if (msg.type === 'create') {
-    counter += 1
-    const sessionId = `fake-claude-session-${process.pid}-${counter}`
-    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 }) + '\n')
-    const cliSessionId = msg.boot?.resume || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-    process.stdout.write(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }) + '\n')
-    process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }) + '\n')
-  } else if (msg.type === 'shutdown') {
-    process.exit(0)
-  }
-})
-"#;
-
-/// The fake sidecar env (cross_kind_liveness.rs's `FakeSidecarEnv`, copied
-/// per the per-file convention). Only the Task 10 parity test below reads
-/// the env vars, so no cross-test env locking is needed within THIS file.
-struct FakeSidecarEnv {
+// A real sidecar environment local to this lane: no process-global env changes.
+struct ClaudeSimEnvironment {
     dir: std::path::PathBuf,
 }
 
-impl FakeSidecarEnv {
-    fn install() -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "rest-claude-identity-r10-sidecar-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).expect("create fake sidecar temp dir");
-        let script = dir.join("fake-claude-sidecar.mjs");
-        std::fs::write(&script, FAKE_CLAUDE_SIDECAR_SOURCE).expect("write fake sidecar");
-        std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
-        std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
-        std::env::set_var("FAKE_SIDECAR_REQUEST_LOG", dir.join("requests.jsonl"));
+impl ClaudeSimEnvironment {
+    fn new() -> Self {
+        let dir = unique_temp_dir("sidecar");
+        for child in ["home", "workspace", "tmp"] {
+            std::fs::create_dir_all(dir.join(child)).unwrap();
+        }
+        std::fs::write(dir.join("active"), "").unwrap();
         Self { dir }
     }
 
-    fn create_rows(&self) -> Vec<serde_json::Value> {
-        let Ok(raw) = std::fs::read_to_string(self.dir.join("requests.jsonl")) else {
-            return Vec::new();
-        };
-        raw.lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("request log row parses"))
-            .filter(|r| r["msg"]["type"] == "create")
+    fn environment(&self) -> Vec<(String, String)> {
+        let adapter = common::claude_rig::repo_root()
+            .join("test/integration/providers/claude-sdk-for-rust-runtime.mjs");
+        vec![
+            (
+                "HOME".into(),
+                self.dir.join("home").to_string_lossy().into(),
+            ),
+            ("PATH".into(), std::env::var("PATH").unwrap_or_default()),
+            (
+                "TMPDIR".into(),
+                self.dir.join("tmp").to_string_lossy().into(),
+            ),
+            (
+                "CLAUDE_CONFIG_DIR".into(),
+                self.dir.join("home/.claude").to_string_lossy().into(),
+            ),
+            (
+                "FRESHELL_CLAUDE_SDK_QUERY_MODULE".into(),
+                freshell_platform::opencode_plugin::plugin_file_spec(&adapter),
+            ),
+            (
+                "FRESHELL_CLAUDE_SIM_LEDGER".into(),
+                self.dir.join("ledger.jsonl").to_string_lossy().into(),
+            ),
+            ("FRESHELL_CLAUDE_SIM_TIME_SCALE".into(), "0.01".into()),
+            (
+                "FRESHELL_TEST_CLAUDE_RUNTIME_GUARD".into(),
+                self.dir.join("active").to_string_lossy().into(),
+            ),
+        ]
+    }
+
+    fn rows(&self, kind: &str) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(self.dir.join("ledger.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("simulator row"))
+            .filter(|row| row["kind"] == kind)
             .collect()
     }
 }
 
-impl Drop for FakeSidecarEnv {
+impl Drop for ClaudeSimEnvironment {
     fn drop(&mut self) {
-        for var in [
-            "FRESHELL_CLAUDE_SIDECAR",
-            "FRESHELL_CLAUDE_NODE",
-            "FAKE_SIDECAR_REQUEST_LOG",
-        ] {
-            std::env::remove_var(var);
-        }
+        // The shared SDK adapter closes its query when the guard ends or this
+        // unique directory disappears; cleanup never needs a PID signal.
+        let _ = std::fs::write(self.dir.join("active.stop"), "");
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -683,22 +673,23 @@ async fn next_frame_of_type(ws: &mut common::TestWs, wanted: &str) -> serde_json
 /// second runtime.
 #[tokio::test(flavor = "multi_thread")]
 async fn rest_ws_and_browser_paths_share_the_one_coordinator() {
-    let sidecar = FakeSidecarEnv::install();
-    let mut h = spawn_merged_server().await;
-    let sid = format!("r10-parity-{}", uuid::Uuid::new_v4());
+    let sidecar = ClaudeSimEnvironment::new();
+    let mut h = spawn_merged_server_with_claude_environment(Some(sidecar.environment())).await;
 
     // 1. A live freshclaude owner for (claude, sid), established over WS.
     h.ws.send(WsMessage::Text(
         json!({
             "type": "freshAgent.create", "requestId": "req-r10-parity-1",
             "sessionType": "freshclaude", "provider": "claude",
-            "sessionRef": { "provider": "claude", "sessionId": sid },
+            "cwd": sidecar.dir.join("workspace").to_string_lossy(),
         })
         .to_string(),
     ))
     .await
     .unwrap();
-    let _created = next_frame_of_type(&mut h.ws, "freshAgent.created").await;
+    let created = next_frame_of_type(&mut h.ws, "freshAgent.created").await;
+    let sid = created["sessionId"].as_str().unwrap().to_string();
+    uuid::Uuid::parse_str(&sid).expect("the native create-time UUID");
 
     // 2. The REST terminal door: POST /api/tabs for the same sessionRef is
     //    the typed 409 carrying the fresh-agent owner fields.
@@ -798,11 +789,24 @@ async fn rest_ws_and_browser_paths_share_the_one_coordinator() {
         .count();
     assert_eq!(ptys_for_sid, 0, "no second writer for {sid}");
     let sidecar_creates = sidecar
-        .create_rows()
+        .rows("query")
         .iter()
-        .filter(|r| r["msg"]["boot"]["resume"].as_str() == Some(sid.as_str()))
+        .filter(|r| r["options"]["sessionId"].as_str() == Some(sid.as_str()))
         .count();
     assert_eq!(sidecar_creates, 1, "exactly the one freshclaude owner");
+    let boots = sidecar.rows("boot");
+    assert_eq!(boots.len(), 1);
+    assert_eq!(boots[0]["sessionId"], sid);
+    let processes = [
+        boots[0]["pid"].as_u64().unwrap(),
+        boots[0]["cliPid"].as_u64().unwrap(),
+    ]
+    .map(|pid| {
+        (
+            pid,
+            common::process_probe::ProcessProbe::open(u32::try_from(pid).unwrap()),
+        )
+    });
 
     // Tear the freshclaude owner down through its own lane so the sidecar
     // child does not outlive the harness.
@@ -815,6 +819,13 @@ async fn rest_ws_and_browser_paths_share_the_one_coordinator() {
     ))
     .await
     .unwrap();
-    let _killed = next_frame_of_type(&mut h.ws, "freshAgent.killed").await;
+    let killed = next_frame_of_type(&mut h.ws, "freshAgent.killed").await;
+    assert_eq!(killed["success"], true, "{killed}");
+    for (pid, process) in processes {
+        assert!(
+            process.exits_within(common::FRAME_BUDGET).await,
+            "the owned sidecar/CLI process {pid} survived its acknowledged kill"
+        );
+    }
     cleanup(&h);
 }
