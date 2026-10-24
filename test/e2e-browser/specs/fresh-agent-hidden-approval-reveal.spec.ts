@@ -33,6 +33,11 @@
  * the real one). The Stop reaches the sidecar because the parked turn is
  * running (an idle session's Stop sends nothing, C18).
  *
+ * Stop also ends the turn, whose result legitimately invalidates the
+ * transcript. Pause delivery immediately after the cancellation, preserving
+ * WebSocket order, to isolate the approval-only reveal. Then deliver the
+ * held result and assert that the normal turn end still reaches the client.
+ *
  * CLOUD-LEGALITY: no timing dependencies — every wait is a poll on observed
  * state (sidecar stdin/wire ledgers, received WS frames, DOM). This spec must
  * NOT be added to CLOUD_SKIP_SPECS.
@@ -168,7 +173,33 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
     const stdinLog = path.join(sharedRoot, 'sidecar-stdin.jsonl')
     const eventsLog = path.join(sharedRoot, 'sidecar-events.jsonl')
     let server: RustServer | undefined
+    let pauseAfterCancellation = false
+    let deliveryPaused = false
+    let heldResults = 0
+    const heldDeliveries: Array<() => void> = []
+    const releaseDeliveries = () => {
+      deliveryPaused = false
+      for (const deliver of heldDeliveries.splice(0)) deliver()
+    }
     try {
+      await page.routeWebSocket('**/ws', (route) => {
+        const upstream = route.connectToServer()
+        upstream.onMessage((message) => {
+          let frame: any
+          try { frame = JSON.parse(String(message)) } catch { /* Forward non-JSON messages unchanged. */ }
+          if (deliveryPaused) {
+            if (frame?.type === 'freshAgent.event' && frame.event?.type === 'freshAgent.result') heldResults += 1
+            heldDeliveries.push(() => route.send(message))
+            return
+          }
+          route.send(message)
+          if (pauseAfterCancellation && frame?.type === 'freshAgent.event'
+            && frame.event?.type === 'freshAgent.permission.cancelled') {
+            pauseAfterCancellation = false
+            deliveryPaused = true
+          }
+        })
+      })
       const projectDir = path.join(sharedRoot, 'project')
       await fs.mkdir(projectDir, { recursive: true })
       server = new RustServer({
@@ -288,6 +319,7 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
       // ── 2. The same approval CANCELLED while hidden is gone on reveal ────
       await tabBLocator.click()
       await expect.poll(() => harness.getActiveTabId(), { timeout: 10_000 }).toBe(tabB)
+      pauseAfterCancellation = true
       await interruptHiddenPane()
       await expect
         .poll(() => stdinFrames(stdinLog, 'interrupt').length, {
@@ -307,6 +339,11 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
           message: 'the client receives the cancellation while tab A is hidden',
         })
         .toBe(1)
+      await expect.poll(() => heldResults, {
+        timeout: 15_000,
+        message: 'the Stop result is held after the cancellation, in wire order',
+      }).toBe(1)
+      expect(await receivedFreshAgentEvents(harness, 'freshAgent.result')).toHaveLength(0)
       expect(await harness.getActiveTabId(), 'the cancellation arrived while tab A was hidden').toBe(tabB)
 
       await armRevealOverlayRecorder(page)
@@ -315,7 +352,13 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
       await expect(paneA, 'the reveal has rendered the pane').toBeVisible()
       await expect(cardInAnyTab, 'the revealed pane no longer shows the cancelled card').toHaveCount(0, { timeout: 15_000 })
       expect(await revealOverlaySeen(page), 'the reveal never blocks behind "Refreshing conversation"').toBe(false)
+      releaseDeliveries()
+      await expect.poll(async () => (await receivedFreshAgentEvents(harness, 'freshAgent.result')).length, {
+        timeout: 15_000,
+        message: 'the stopped turn result is delivered after the approval-only reveal',
+      }).toBe(1)
     } finally {
+      try { releaseDeliveries() } catch { /* The page can already be closed after a failed test. */ }
       await server?.stop().catch(() => {})
       await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
     }

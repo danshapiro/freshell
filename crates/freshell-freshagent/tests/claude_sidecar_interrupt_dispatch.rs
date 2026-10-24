@@ -17,9 +17,9 @@
 //! `query()`; the stub throws if it is called). Only module RESOLUTION is redirected
 //! — every dispatched line of JS is the real source, read at test time.
 //!
-//! An interrupt for an unknown session reports a failed `sdk.interrupt_settled`
-//! receipt with the request's Stop id. A dispatch regression instead logs an
-//! unknown request and emits no receipt.
+//! Protocol v2 answers an interrupt for an unknown session with a failed
+//! `sdk.interrupt_settled` carrying the submitted Stop id. A missing dispatch
+//! produces no stdout response; a generic error cannot settle the Stop latch.
 //!
 //! Requires `node` on PATH — the same requirement the crate's existing
 //! fake-sidecar tests already impose.
@@ -167,23 +167,21 @@ fn real_sidecar_dispatches_interrupt_frames_to_handle_interrupt() {
 
     let mut stdin = sidecar.child.stdin.take().expect("piped stdin");
     stdin
-        .write_all(
-            b"{\"type\":\"interrupt\",\"sessionId\":\"nope\",\"stopId\":\"dispatch-stop\"}\n",
-        )
+        .write_all(b"{\"type\":\"interrupt\",\"sessionId\":\"nope\",\"stopId\":\"missing-session-stop\"}\n")
         .expect("write interrupt frame");
     stdin.flush().expect("flush interrupt frame");
 
-    // The real handler answers this exact Stop even when the session is gone.
-    // A dispatch regression drops it and produces no stdout receipt.
-    let mut receipt_frame: Option<serde_json::Value> = None;
+    // The real dispatch must settle this exact Stop, even when its session is
+    // missing. The old default arm dropped it without answering.
+    let mut settled_frame: Option<serde_json::Value> = None;
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while receipt_frame.is_none() {
+    while settled_frame.is_none() {
         let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
             break;
         };
         match rx.recv_timeout(remaining) {
             Ok(("stdout", line)) => {
-                receipt_frame =
+                settled_frame =
                     Some(serde_json::from_str(&line).expect("sidecar stdout is newline-JSON"));
             }
             Ok((_, line)) => stderr_lines.push(line),
@@ -200,17 +198,17 @@ fn real_sidecar_dispatches_interrupt_frames_to_handle_interrupt() {
         "pre-fix behavior: the interrupt frame fell into the dispatch default arm and was \
          dropped; stderr: {stderr_lines:?}"
     );
-    let frame = receipt_frame.expect(
+    let frame = settled_frame.expect(
         "no stdout frame arrived: the interrupt request was not dispatched to handleInterrupt",
     );
     assert_eq!(frame["type"], "sdk.interrupt_settled", "frame: {frame}");
-    assert_eq!(frame["stopId"], "dispatch-stop", "frame: {frame}");
-    assert_eq!(frame["ok"], false, "frame: {frame}");
     assert_eq!(frame["sessionId"], "nope", "frame: {frame}");
+    assert_eq!(frame["stopId"], "missing-session-stop", "frame: {frame}");
+    assert_eq!(frame["ok"], false, "frame: {frame}");
     assert!(
         frame["message"]
             .as_str()
             .is_some_and(|message| !message.is_empty()),
-        "a failed Stop explains why it was refused: {frame}"
+        "a refused Stop includes its reason: {frame}"
     );
 }

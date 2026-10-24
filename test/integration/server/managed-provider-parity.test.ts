@@ -382,10 +382,12 @@ process.stdout.write(JSON.stringify({rootExists:fs.existsSync(root),fileExists:f
   beforeAll(async () => {
     inheritedFreshellUrl = process.env.FRESHELL_URL
     delete process.env.FRESHELL_URL
-    workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-provider-parity-'))
-    // Select this synthetic project, without inheriting repository-local skills.
-    execFileSync('git', ['init', '--quiet', workspace])
     webHome = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-provider-parity-home-'))
+    // Keep package ancestor discovery inside this fixture's HOME rather than
+    // capturing dependencies from a shared /tmp/node_modules directory.
+    workspace = path.join(webHome, 'workspace')
+    fs.mkdirSync(workspace)
+    execFileSync('git', ['init', '--quiet', workspace])
     onecli = fakeOnecliGrants(providers)
     restoreOnecliEnvironment = exposeGrantsToHarness(onecli.serverEnv)
     xdgConfigHome = path.join(webHome, 'custom-xdg')
@@ -436,10 +438,15 @@ process.stdout.write(JSON.stringify({rootExists:fs.existsSync(root),fileExists:f
         opencode: { model: 'openai/gpt-5.6-luna', effort: 'low' },
         amplifier: { model: 'glm-5.3', effort: 'provider-default' },
       },
-    }, webHome)
+    }, webHome, {
+      workspaceRoots: [workspace],
+      providerInputRoots: [],
+      bootstrapFiles: Object.values(onecli.grants),
+      defaultCwd: workspace,
+    })
     // The controller validates executables before setting a child's cwd.
     // The worker environment selects installed commands and owned OpenCode roots.
-    const providerEnvironment = providerParityCommands(path.join(rig.runtime.testRoot, 'workspace'))
+    const providerEnvironment = providerParityCommands(workspace)
     inheritedProviderEnvironment = Object.fromEntries(Object.keys(providerEnvironment).map(key => [key, process.env[key]]))
     for (const key of ['OPENCODE_CONFIG_DIR', 'OPENCODE_DISABLE_PROJECT_CONFIG']) {
       inheritedProviderEnvironment[key] = process.env[key]
@@ -447,17 +454,10 @@ process.stdout.write(JSON.stringify({rootExists:fs.existsSync(root),fileExists:f
     }
     Object.assign(process.env, providerEnvironment)
     await rig.start()
-    // prepare() recreates this run's root. Populate the project afterwards so
-    // provider configuration discovery cannot inherit the repository's inputs.
-    const preparedWorkspace = workspace
-    workspace = path.join(rig.runtime.testRoot, 'workspace')
-    fs.cpSync(preparedWorkspace, workspace, { recursive: true })
-    // cpSync creates a private destination directory. Restore only the owned
-    // project leaf's shared mode so the provider user can traverse its mount.
-    fs.chmodSync(workspace, 0o777)
+    // The selected project survives harness preparation outside its runtime
+    // control directory. Make its fixture resources readable by provider users.
     makeProviderParityResourcesReadable(workspace)
     fs.chmodSync(workspace, 0o777)
-    fs.rmSync(preparedWorkspace, { recursive: true })
     fs.writeFileSync(path.join(workspace, 'opencode.jsonc'), projectOpencodeConfig())
     fs.writeFileSync(path.join(workspace, '.opencode/opencode.json'), projectOpencodeConfig())
     fs.writeFileSync(path.join(workspace, 'user-tui.jsonc'), JSON.stringify({ plugin: [pathToFileURL(path.join(workspace, 'user-selected-tui.js')).href] }))

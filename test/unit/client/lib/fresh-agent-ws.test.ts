@@ -609,7 +609,7 @@ describe('fresh-agent-ws', () => {
   it('folds freshAgent.status(stuck) with no attention action; a companion turn.complete edge folds attention independently', () => {
     // Wedged-sidecar deadman fold: the STATUS frame itself dispatches no
     // attention — it must land (and stop the busy-driving streaming flag)
-    // with zero turnCompletion/* actions. The deadman's companion
+    // without recording an attention event. The deadman's companion
     // freshAgent.turn.complete edge is a SEPARATE frame: when it follows for
     // the same session, it folds attention independently (the unified
     // contract — the deadman rings deliberately). The pane layout below is
@@ -650,6 +650,9 @@ describe('fresh-agent-ws', () => {
       },
     })).toBe(true)
     expect(store.getState().freshAgent.sessions[`freshcodex:codex:${sessionId}`].streamingActive).toBe(true)
+    // The snapshot observes the session for reconnect dedupe; only actions
+    // caused by the following status frame belong to this assertion.
+    actionTypes.length = 0
 
     expect(handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.event',
@@ -662,12 +665,12 @@ describe('fresh-agent-ws', () => {
     const session = store.getState().freshAgent.sessions[`freshcodex:codex:${sessionId}`]
     expect(session.status).toBe('stuck')
     expect(session.streamingActive).toBe(false)
-    expect(actionTypes.filter((type) => type.startsWith('turnCompletion/'))).toHaveLength(0)
+    expect(actionTypes.filter((type) => type.startsWith('turnCompletion/') && type !== 'turnCompletion/advanceCompletionBaseline')).toHaveLength(0)
 
     // Companion edge: the deadman's discrete freshAgent.turn.complete for the
     // same session dispatches recordTurnComplete — attention folds
-    // independently of the status frame (exactly one turnCompletion action,
-    // and it is the record, not anything the status fold minted).
+    // independently of the status frame (exactly one attention record;
+    // observing its reconnect baselines does not record an event).
     expect(handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.event',
       sessionId,
@@ -676,7 +679,7 @@ describe('fresh-agent-ws', () => {
       event: { type: 'freshAgent.turn.complete', sessionId, at: 1_700_000_000_000 },
     })).toBe(true)
     expect(actionTypes.filter((type) => type === 'turnCompletion/recordTurnComplete')).toHaveLength(1)
-    expect(actionTypes.filter((type) => type.startsWith('turnCompletion/'))).toEqual([
+    expect(actionTypes.filter((type) => type.startsWith('turnCompletion/') && type !== 'turnCompletion/advanceCompletionBaseline')).toEqual([
       'turnCompletion/recordTurnComplete',
     ])
     // The status fold itself stays untouched by the companion: still 'stuck',
