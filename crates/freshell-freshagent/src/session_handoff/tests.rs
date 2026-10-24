@@ -61,9 +61,9 @@ rl.on('line', (line) => {
   logReq(msg)
   if (msg.type === 'create') {
     counter += 1
-    const sessionId = `fake-claude-session-${process.pid}-${counter}`
+    const sessionId = msg.sessionId || `fake-claude-session-${process.pid}-${counter}`
     process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 }) + '\n')
-    const cliSessionId = msg.boot?.resume || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const cliSessionId = msg.boot?.resume || sessionId
     process.stdout.write(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }) + '\n')
     process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }) + '\n')
   } else if (msg.type === 'shutdown') {
@@ -6256,16 +6256,21 @@ async fn the_claude_handoff_target_binding_carries_the_handoff_generation() {
     std::env::set_var("CLAUDE_CONFIG_DIR", &store_dir);
 
     let mut rig = build_rig(None);
-    // The sink wired BEFORE the seed below; the establish's own
-    // all-blank adoption writes NOTHING (the V7 no-laundering gate), so
-    // the ONLY binding row is the handoff target's.
+    // Creation now records a binding even for default settings. Preserve
+    // that initial receipt and distinguish the later handoff generation.
     let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
     rig.fresh_claude.set_identity_sink(fake.clone());
     establish_fresh_claude_owner(&mut rig, &sid).await;
-    assert!(
-        fake.bindings.lock().unwrap().is_empty(),
-        "fixture: the all-blank establish wrote no binding row"
-    );
+    let initial_generation = rig.ownership.observe("claude", &sid).generation;
+    {
+        let bindings = fake.bindings.lock().unwrap();
+        let initial = bindings
+            .last()
+            .expect("creation records its native binding");
+        assert_eq!(initial.session_id, sid);
+        assert_eq!(initial.observed_epoch, Some(rig.ownership.boot_epoch()));
+        assert_eq!(initial.observed_generation, Some(initial_generation));
+    }
     // Seed the settings record so the TARGET resume's create carries
     // non-default settings — its session-init adoption's binding write is
     // recordable (the settings-bearing row).
@@ -6293,6 +6298,7 @@ async fn the_claude_handoff_target_binding_carries_the_handoff_generation() {
     let committed_generation = {
         let snap = rig.ownership.observe("claude", &sid);
         assert!(matches!(snap.state, OwnershipState::Live { .. }));
+        assert!(snap.generation > initial_generation);
         snap.generation
     };
 
@@ -6948,10 +6954,6 @@ async fn an_abort_cleanup_broadcasts_the_restored_prior_owner() {
     );
 }
 
-/// The fake sidecar's durable id for a create with NO resume boot
-/// (the fresh-create fallback in FAKE_CLAUDE_SIDECAR_SOURCE).
-const FRESH_CREATE_DURABLE_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-
 fn fresh_create_msg(session_type: SessionType) -> FreshAgentCreate {
     FreshAgentCreate {
         pane_id: None,
@@ -6971,9 +6973,7 @@ fn fresh_create_msg(session_type: SessionType) -> FreshAgentCreate {
         resume_session_id: None,
         sandbox: None,
         // b8ke delta round-2 F1: the ORDINARY create — NO explicit
-        // sessionRef. The durable id materializes at sdk.session.init
-        // (the pre-fix tests all created with an explicit sessionRef,
-        // masking the no-adoption defect).
+        // sessionRef. Creation must establish its own durable UUID and owner.
         session_ref: None,
         tab_id: None,
     }
@@ -7086,7 +7086,7 @@ async fn a_handoff_on_a_superseded_rekeyed_id_resolves_the_canonical_owner() {
 }
 
 /// 8a. b8ke delta round-2 F1: a NORMALLY created freshclaude session (no
-/// explicit sessionRef) adopts the canonical key at `sdk.session.init` —
+/// explicit sessionRef) establishes its native UUID before acknowledgement —
 /// the coordinator holds authoritative Live{FreshAgent} under the durable
 /// id, every device receives the owner broadcast, and a handoff to the CLI
 /// sees the prior owner, STOPS it (the sidecar is reaped), and transfers
@@ -7094,7 +7094,7 @@ async fn a_handoff_on_a_superseded_rekeyed_id_resolves_the_canonical_owner() {
 /// was never stopped), the handoff "succeeded" over a live second writer,
 /// and no owner frame ever reached the bus.
 #[tokio::test]
-async fn a_fresh_created_claude_session_adopts_the_canonical_key_and_hands_off_atomically() {
+async fn a_fresh_created_claude_session_owns_its_uuid_and_hands_off_atomically() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
     let env = FakeSidecarEnv::install();
@@ -7102,19 +7102,27 @@ async fn a_fresh_created_claude_session_adopts_the_canonical_key_and_hands_off_a
     let _ = drain_runtime_owner_frames(&mut rig.rx);
 
     // The ORDINARY create: no sessionRef, no resume id.
-    rig.fresh_claude
+    let created = rig
+        .fresh_claude
         .handle_create(fresh_create_msg(SessionType::Freshclaude), None)
         .await;
+    let crate::ClaudeCreateOutcome::Created {
+        session_id: durable,
+        ..
+    } = created
+    else {
+        panic!("fresh create failed: {created:?}");
+    };
+    assert!(uuid::Uuid::parse_str(&durable).is_ok());
 
-    // THE F1 ADOPTION: the durable id minted at sdk.session.init becomes
-    // the authoritative Live{FreshAgent} owner. Pre-fix: the key stayed
-    // Vacant forever (this await is the red).
+    // A fresh create owns the UUID that its acknowledgement names. The
+    // handoff must discover and reap that exact prior before transferring it.
     await_cond(
         "the fresh-created session must adopt the canonical key",
         || {
             matches!(
                 rig.ownership
-                    .observe("claude", FRESH_CREATE_DURABLE_ID)
+                    .observe("claude", &durable)
                     .state,
                 OwnershipState::Live { owner, .. }
                     if owner.kind == RuntimeOwnerKind::FreshAgent
@@ -7131,7 +7139,7 @@ async fn a_fresh_created_claude_session_adopts_the_canonical_key_and_hands_off_a
         .find(|f| {
             f["transition"] == "handoff-committed"
                 && f["ownerKind"] == "fresh-agent"
-                && f["sessionId"] == json!(FRESH_CREATE_DURABLE_ID)
+                && f["sessionId"] == json!(&durable)
         })
         .expect("the adoption's authoritative owner frame");
     assert_eq!(committed["provider"], json!("claude"));
@@ -7148,11 +7156,9 @@ async fn a_fresh_created_claude_session_adopts_the_canonical_key_and_hands_off_a
     // the runner sees the prior owner, stops the sidecar, and transfers
     // atomically. Pre-fix: prior=None (Vacant) — the handoff committed a
     // terminal over the LIVE sidecar (two writers).
-    let handle = rig.runner.spawn_handoff(handoff_req_terminal(
-        "claude",
-        FRESH_CREATE_DURABLE_ID,
-        "claude",
-    ));
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &durable, "claude"));
     let result = handle.completion.await.expect("handoff completed");
     assert_eq!(
         result["ok"],
@@ -7160,11 +7166,7 @@ async fn a_fresh_created_claude_session_adopts_the_canonical_key_and_hands_off_a
         "the from-fresh-create handoff must succeed: {result}"
     );
     let terminal_id = result["owner"]["terminalId"].as_str().unwrap().to_string();
-    match rig
-        .ownership
-        .observe("claude", FRESH_CREATE_DURABLE_ID)
-        .state
-    {
+    match rig.ownership.observe("claude", &durable).state {
         OwnershipState::Live { owner, .. } => {
             assert_eq!(owner.kind, RuntimeOwnerKind::Terminal);
             assert_eq!(owner.terminal_id.as_deref(), Some(terminal_id.as_str()));
@@ -7177,27 +7179,36 @@ async fn a_fresh_created_claude_session_adopts_the_canonical_key_and_hands_off_a
 }
 
 /// 8b. b8ke delta round-2 F1 (kilroy): the ORDINARY create shares the
-/// claude lane — a fresh-created KILROY session adopts the canonical key
-/// at `sdk.session.init` the same way (the ownership machinery is
+/// claude lane — a fresh-created KILROY session owns its acknowledged native UUID
+/// the same way (the ownership machinery is
 /// flavor-independent).
 #[tokio::test]
-async fn a_fresh_created_kilroy_session_adopts_the_canonical_key() {
+async fn a_fresh_created_kilroy_session_owns_its_acknowledged_uuid() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
     let _env = FakeSidecarEnv::install();
     let mut rig = build_rig(None);
     let _ = drain_runtime_owner_frames(&mut rig.rx);
 
-    rig.fresh_claude
+    let created = rig
+        .fresh_claude
         .handle_create(fresh_create_msg(SessionType::Kilroy), None)
         .await;
+    let crate::ClaudeCreateOutcome::Created {
+        session_id: durable,
+        ..
+    } = created
+    else {
+        panic!("fresh Kilroy create failed: {created:?}");
+    };
+    assert!(uuid::Uuid::parse_str(&durable).is_ok());
 
     await_cond(
         "the fresh-created kilroy session must adopt the canonical key",
         || {
             matches!(
                 rig.ownership
-                    .observe("claude", FRESH_CREATE_DURABLE_ID)
+                    .observe("claude", &durable)
                     .state,
                 OwnershipState::Live { owner, .. }
                     if owner.kind == RuntimeOwnerKind::FreshAgent
