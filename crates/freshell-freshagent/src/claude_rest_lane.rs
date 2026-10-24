@@ -64,10 +64,11 @@ impl ClaudeRestLane {
             ClaudeCreateOutcome::Created {
                 session_id,
                 session_ref,
+                cleanup_ownership_id,
             } => Ok(RestLaneCreated {
                 session_id,
                 session_ref,
-                cleanup_token: None,
+                cleanup_token: cleanup_ownership_id,
             }),
             ClaudeCreateOutcome::Failed {
                 code,
@@ -161,6 +162,24 @@ impl ClaudeRestLane {
 
 #[async_trait::async_trait]
 impl FreshAgentRestLane for ClaudeRestLane {
+    async fn abandon_create(
+        &self,
+        request: &RestLaneCreate,
+        created: &RestLaneCreated,
+    ) -> Result<(), RestLaneError> {
+        if let Some(ownership_id) = created.cleanup_token.as_deref() {
+            self.state
+                .abandon_created_runtime(
+                    &created.session_id,
+                    claude_session_type(&request.provider, &request.session_type)?,
+                    ownership_id,
+                )
+                .await;
+            tracing::info!(event = "freshagent.claude.rest_lane.create_abandoned", request_id = %request.request_id, session_id = %created.session_id, ownership_id, "abandoned the closed destination's owned create");
+        }
+        Ok(())
+    }
+
     async fn create_agent(
         self: Arc<Self>,
         request: RestLaneCreate,
