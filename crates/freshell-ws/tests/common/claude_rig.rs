@@ -677,7 +677,18 @@ impl RigConnection {
 
     /// The first frame (already read or still to come) matching `predicate`.
     pub async fn wait_for(&mut self, what: &str, predicate: impl Fn(&Value) -> bool) -> Value {
-        if let Some(hit) = self.frames.iter().find(|frame| predicate(frame)) {
+        self.wait_for_since(0, what, predicate).await
+    }
+
+    /// A request acknowledgement must be newer than that request, even when
+    /// this connection previously observed the same session and operation.
+    pub async fn wait_for_since(
+        &mut self,
+        start: usize,
+        what: &str,
+        predicate: impl Fn(&Value) -> bool,
+    ) -> Value {
+        if let Some(hit) = self.frames[start..].iter().find(|frame| predicate(frame)) {
             return hit.clone();
         }
         let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
@@ -706,6 +717,7 @@ impl RigConnection {
     /// `extra` fields merged in (a resume, say); returns the answer:
     /// `freshAgent.created`, `freshAgent.create.failed` or a request `error`.
     pub async fn request_create(&mut self, request_id: &str, extra: Value) -> Value {
+        let start = self.frames.len();
         let cwd = path_string(&self.workspace);
         let mut frame = json!({
             "type": "freshAgent.create",
@@ -718,7 +730,7 @@ impl RigConnection {
             frame.extend(extra);
         }
         self.send(frame).await;
-        self.wait_for(&format!("the answer to create {request_id}"), |v| {
+        self.wait_for_since(start, &format!("the answer to create {request_id}"), |v| {
             v["requestId"] == request_id
                 && matches!(
                     v["type"].as_str(),
@@ -851,6 +863,7 @@ impl RigConnection {
     /// The pane reattaches to the durable `session_id` (a reload, or the first
     /// attach after a restart); returns once the attach is acknowledged.
     pub async fn attach(&mut self, session_id: &str) {
+        let start = self.frames.len();
         self.send(json!({
             "type": "freshAgent.attach",
             "provider": "claude",
@@ -859,7 +872,7 @@ impl RigConnection {
             "sessionRef": { "provider": "claude", "sessionId": session_id },
         }))
         .await;
-        self.wait_for("the attach acknowledgement", |v| {
+        self.wait_for_since(start, "the attach acknowledgement", |v| {
             v["type"] == "freshAgent.event"
                 && v["event"]["type"] == "freshAgent.session.snapshot"
                 && v["event"]["sessionId"] == session_id
@@ -885,6 +898,7 @@ impl RigConnection {
 
     /// `freshAgent.kill`, then wait for `freshAgent.killed{success:true}`.
     pub async fn kill(&mut self, session_id: &str) {
+        let start = self.frames.len();
         self.send(json!({
             "type": "freshAgent.kill",
             "provider": "claude",
@@ -893,7 +907,9 @@ impl RigConnection {
         }))
         .await;
         let killed = self
-            .wait_for("freshAgent.killed", |v| v["type"] == "freshAgent.killed")
+            .wait_for_since(start, "freshAgent.killed", |v| {
+                v["type"] == "freshAgent.killed" && v["sessionId"] == session_id
+            })
             .await;
         assert_eq!(killed["success"], true, "{killed}");
     }

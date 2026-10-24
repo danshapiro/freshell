@@ -776,14 +776,11 @@ impl FreshClaudeState {
                 ownership_id.clone(),
                 spec.session_type.clone(),
                 minted.clone(),
-                recorded_settings,
                 Arc::clone(&broadcast_id),
                 Arc::clone(&pending),
                 Arc::clone(&ledger),
                 quiet.state.clone(),
                 clock.clone(),
-                provenance.clone(),
-                naming.is_some(),
             );
             self.test_holds.registration().await;
             sessions.insert(
