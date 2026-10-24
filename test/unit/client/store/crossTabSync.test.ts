@@ -1472,7 +1472,7 @@ describe('crossTabSync', () => {
             kind: 'fresh-agent',
             sessionType: 'freshclaude',
             provider: 'claude',
-            sessionId: 'sdk-local-current',
+            sessionId: canonicalSessionId,
             createRequestId: 'req-local-current',
             status: 'running',
             resumeSessionId: canonicalSessionId,
@@ -1513,7 +1513,7 @@ describe('crossTabSync', () => {
               kind: 'fresh-agent',
               sessionType: 'freshclaude',
               provider: 'claude',
-              sessionId: 'sdk-local-current',
+              sessionId: canonicalSessionId,
               createRequestId: 'req-local-current',
               status: 'running',
               resumeSessionId: canonicalSessionId,
@@ -1590,7 +1590,7 @@ describe('crossTabSync', () => {
       provider: 'claude',
       sessionId: canonicalSessionId,
     })
-    expect(paneContent.sessionId).toBe('sdk-local-current')
+    expect(paneContent.sessionId).toBe(canonicalSessionId)
     expect(paneContent.createRequestId).toBe('req-local-current')
     expect(paneContent.status).toBe('running')
   })
