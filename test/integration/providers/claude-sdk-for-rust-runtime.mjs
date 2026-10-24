@@ -68,6 +68,25 @@ export function query(params) {
   })
   recordInput()
   const runtime = simulateQuery(params)
+  // Rare SDK notices have no local-provider CLI recording. These explicit
+  // per-test SDK messages still pass through production index.mjs mapping.
+  const injected = JSON.parse(process.env.FRESHELL_TEST_CLAUDE_SDK_MESSAGES ?? '[]')
+  const messages = runtime[Symbol.asyncIterator].bind(runtime)
+  runtime[Symbol.asyncIterator] = async function* () {
+    let emitted = false
+    for await (const message of { [Symbol.asyncIterator]: messages }) {
+      append(process.env.FRESHELL_TEST_CLAUDE_SDK_LOG, message)
+      yield message
+      if (!emitted && message.type === 'assistant') {
+        emitted = true
+        for (const notice of injected) {
+          const injectedMessage = { session_id: message.session_id, ...notice }
+          append(process.env.FRESHELL_TEST_CLAUDE_SDK_LOG, injectedMessage)
+          yield injectedMessage
+        }
+      }
+    }
+  }
   closeWhenGuardEnds(runtime)
   const initialize = runtime.initializationResult.bind(runtime)
   runtime.initializationResult = async () => {

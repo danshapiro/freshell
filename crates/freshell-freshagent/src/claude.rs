@@ -7784,7 +7784,8 @@ pub(crate) mod tests {
     pub(crate) static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     mod test_sidecar_env;
-    use test_sidecar_env::ClaudeTestRuntime as FakeClaudeSidecarEnv;
+    pub(crate) use test_sidecar_env::ClaudeTestRuntime;
+    use ClaudeTestRuntime as FakeClaudeSidecarEnv;
 
     fn send_msg(session_id: &str, text: &str) -> FreshAgentSend {
         FreshAgentSend {

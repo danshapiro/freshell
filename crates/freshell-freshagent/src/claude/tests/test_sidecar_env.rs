@@ -12,6 +12,8 @@ const KEYS: &[&str] = &[
     "FRESHELL_TEST_CLAUDE_SPAWN_LOG",
     "FRESHELL_TEST_CLAUDE_INTERRUPT_LOG",
     "FRESHELL_TEST_CLAUDE_RESPOND_LOG",
+    "FRESHELL_TEST_CLAUDE_SDK_LOG",
+    "FRESHELL_TEST_CLAUDE_SDK_MESSAGES",
     "FRESHELL_TEST_CLAUDE_DEFER_CREATE_MS",
     "FRESHELL_TEST_CLAUDE_FAIL_CREATE",
     "FRESHELL_TEST_CLAUDE_RUNTIME_GUARD",
@@ -23,8 +25,8 @@ const KEYS: &[&str] = &[
     "CLAUDE_CONFIG_DIR",
 ];
 
-pub(super) struct ClaudeTestRuntime {
-    pub(super) dir: PathBuf,
+pub(crate) struct ClaudeTestRuntime {
+    pub(crate) dir: PathBuf,
     spawn_log: PathBuf,
     interrupt_log: PathBuf,
     respond_log: PathBuf,
@@ -32,11 +34,11 @@ pub(super) struct ClaudeTestRuntime {
 }
 
 impl ClaudeTestRuntime {
-    pub(super) fn install() -> Self {
+    pub(crate) fn install() -> Self {
         Self::install_with_knobs(None, false)
     }
 
-    pub(super) fn install_with_knobs(defer_create_ms: Option<u64>, fail_create: bool) -> Self {
+    pub(crate) fn install_with_knobs(defer_create_ms: Option<u64>, fail_create: bool) -> Self {
         let previous = KEYS
             .iter()
             .map(|&key| (key, std::env::var_os(key)))
@@ -73,6 +75,8 @@ impl ClaudeTestRuntime {
         std::env::set_var("FRESHELL_TEST_CLAUDE_SPAWN_LOG", &spawn_log);
         std::env::set_var("FRESHELL_TEST_CLAUDE_INTERRUPT_LOG", &interrupt_log);
         std::env::set_var("FRESHELL_TEST_CLAUDE_RESPOND_LOG", &respond_log);
+        std::env::set_var("FRESHELL_TEST_CLAUDE_SDK_LOG", dir.join("sdk.jsonl"));
+        std::env::remove_var("FRESHELL_TEST_CLAUDE_SDK_MESSAGES");
         std::env::set_var("FRESHELL_TEST_CLAUDE_RUNTIME_GUARD", &guard);
         std::env::set_var("FRESHELL_CLAUDE_SIM_LEDGER", dir.join("sim-ledger.jsonl"));
         std::env::set_var("FRESHELL_CLAUDE_SIM_TIME_SCALE", "0.01");
@@ -106,11 +110,11 @@ impl ClaudeTestRuntime {
         }
     }
 
-    pub(super) fn spawn_log_path(&self) -> &Path {
+    pub(crate) fn spawn_log_path(&self) -> &Path {
         &self.spawn_log
     }
 
-    pub(super) fn program(&self, steps: Value) {
+    pub(crate) fn program(&self, steps: Value) {
         std::env::set_var(
             "FRESHELL_CLAUDE_SIM_PROGRAM",
             json!({
@@ -120,7 +124,7 @@ impl ClaudeTestRuntime {
         );
     }
 
-    pub(super) async fn simulator_row(&self, kind: &str) -> Value {
+    pub(crate) async fn simulator_row(&self, kind: &str) -> Value {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             if let Some(row) = rows(&self.dir.join("sim-ledger.jsonl"))
@@ -137,7 +141,7 @@ impl ClaudeTestRuntime {
         }
     }
 
-    pub(super) async fn create_request(&self) -> Value {
+    pub(crate) async fn create_request(&self) -> Value {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             if let Some(row) = self.query_rows().first() {
@@ -155,19 +159,19 @@ impl ClaudeTestRuntime {
         rows(&self.spawn_log)
     }
 
-    pub(super) fn spawn_count(&self) -> usize {
+    pub(crate) fn spawn_count(&self) -> usize {
         self.query_rows().len()
     }
 
-    pub(super) fn interrupt_log_contents(&self) -> String {
+    pub(crate) fn interrupt_log_contents(&self) -> String {
         std::fs::read_to_string(&self.interrupt_log).unwrap_or_default()
     }
 
-    pub(super) async fn respond_log_frames(&self, min: usize) -> Vec<Value> {
+    pub(crate) async fn respond_log_frames(&self, min: usize) -> Vec<Value> {
         self.wait_request_frames(None, min).await
     }
 
-    pub(super) async fn request_frames_of_type(&self, kind: &str, min: usize) -> Vec<Value> {
+    pub(crate) async fn request_frames_of_type(&self, kind: &str, min: usize) -> Vec<Value> {
         self.wait_request_frames(Some(kind), min).await
     }
 
