@@ -3061,6 +3061,9 @@
         "capabilities": {
           "additionalProperties": false,
           "properties": {
+            "freshAgentAttentionReplayV1": {
+              "type": "boolean"
+            },
             "managedRuntimeV1": {
               "type": "boolean"
             },
@@ -3081,6 +3084,34 @@
             }
           },
           "type": "object"
+        },
+        "freshAgentAttention": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "lastTurnCompleteAt": {
+                "type": "number"
+              },
+              "lastWaitingAt": {
+                "type": "number"
+              },
+              "provider": {
+                "type": "string"
+              },
+              "sessionId": {
+                "type": "string"
+              },
+              "sessionType": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider",
+              "sessionId"
+            ],
+            "type": "object"
+          },
+          "type": "array"
         },
         "runtimeOwners": {
           "items": {
