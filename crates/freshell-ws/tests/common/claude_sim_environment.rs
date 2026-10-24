@@ -33,11 +33,15 @@ impl ClaudeSimEnvironment {
 
     /// A saved conversation in the native JSONL format, for cold-resume tests.
     pub fn seed_transcript(&self, id: &str) {
+        self.seed_transcript_at(id, &self.workspace());
+    }
+
+    pub fn seed_transcript_at(&self, id: &str, cwd: &Path) {
         let project = self.config_dir().join("projects/fixture");
         std::fs::create_dir_all(&project).unwrap();
         let row = serde_json::json!({
             "type":"user", "sessionId":id, "uuid":uuid::Uuid::new_v4().to_string(),
-            "parentUuid":null, "cwd":self.workspace(), "isSidechain":false,
+            "parentUuid":null, "cwd":cwd, "isSidechain":false,
             "message":{"role":"user", "content":[{"type":"text", "text":"saved conversation"}]}
         });
         std::fs::write(project.join(format!("{id}.jsonl")), format!("{row}\n")).unwrap();
