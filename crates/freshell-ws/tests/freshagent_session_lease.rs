@@ -158,10 +158,10 @@ rl.on('line', (line) => {
       gc.unref()
     }
     counter += 1
-    const sessionId = `fake-claude-session-${process.pid}-${counter}`
+    const sessionId = msg.sessionId || `fake-claude-session-${process.pid}-${counter}`
     const reply = () => {
       process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 }) + '\n')
-      const cliSessionId = msg.boot?.resume || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+      const cliSessionId = msg.boot?.resume || sessionId
       process.stdout.write(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }) + '\n')
       process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }) + '\n')
     }
