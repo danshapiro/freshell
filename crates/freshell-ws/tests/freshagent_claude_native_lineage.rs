@@ -1,5 +1,7 @@
 //! A hosted kernel follows native conversation resets across runtime recovery.
 
+#![cfg(unix)] // This process-crash regression uses the rig's SIGKILL probe.
+
 mod common;
 
 use common::claude_rig::{ClaudeRig, RigConnection, RigKind, RigOptions};

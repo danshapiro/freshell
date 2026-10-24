@@ -476,6 +476,9 @@ class SimulatedCli {
     if (resume) {
       const parentFile = findTranscript(this.configDir, resume)
       if (!parentFile) return { message: `No conversation found with session ID: ${resume}` }
+      // T5 path: the path selects a saved file; it never becomes the native
+      // conversation id or a second transcript filename after a resume.
+      if (!forkSession) this.sessionId = path.basename(parentFile, '.jsonl')
       const parentLines = readTranscriptLines(parentFile)
       let prefix
       try { prefix = forkPrefix(parentLines, resumeSessionAt) } catch (error) { return { message: error.message } }

@@ -66,7 +66,9 @@ impl ClaudeTestRuntime {
         std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
         std::env::set_var(
             "FRESHELL_CLAUDE_SDK_QUERY_MODULE",
-            root.join("test/integration/providers/claude-sdk-for-rust-runtime.mjs"),
+            freshell_platform::opencode_plugin::plugin_file_spec(
+                &root.join("test/integration/providers/claude-sdk-for-rust-runtime.mjs"),
+            ),
         );
         std::env::set_var("FRESHELL_TEST_CLAUDE_SPAWN_LOG", &spawn_log);
         std::env::set_var("FRESHELL_TEST_CLAUDE_INTERRUPT_LOG", &interrupt_log);

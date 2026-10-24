@@ -169,6 +169,17 @@ describe(`pinned Claude CLI ${PINNED_CLI_VERSION} contract (real CLI, loopback p
     expect(r.observations.afterRefusals.files.filter((f: string) => /F2|F3|Z/.test(path.basename(f)))).toEqual([])
   }, SCENARIO_TIMEOUT)
 
+  it('T5 path: a transcript path resumes after its cwd is removed, keeping its UUID and original saved file', async () => {
+    const r = await real('resume-path')
+    expect(r.observations.pathBoot).toEqual({ ok: true })
+    expect(r.observations.pathResult.sessionIds).toEqual(['P'])
+    expect(r.observations.pathResult.shape).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'user', uuid: 'u1' }),
+      expect.objectContaining({ type: 'user', uuid: 'u2' }),
+    ]))
+    expect(r.observations.afterResume.files.map((file: string) => path.basename(file))).toEqual(['P.jsonl'])
+  }, SCENARIO_TIMEOUT)
+
   it('T6: a lazy fork boots with no prompt, writes nothing until its first prompt, can be re-spawned before it, then holds the parent prefix with its uuids', async () => {
     const r = await real('fork')
     const { parent, forkBeforePrompt, forkAfterPrompt } = r.observations

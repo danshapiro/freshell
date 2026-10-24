@@ -7520,18 +7520,15 @@ pub(crate) mod tests {
         let (log_events, _log_guard) = crate::claude_sidecar_io::test_capture::capture();
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
+        env.program(json!([
+            {"kind":"text", "data":{"text":"a partial answer before the crash"}},
+            {"kind":"hang"},
+        ]));
         let (st, mut rx) = state_with_bus();
 
-        // One full death cycle: create → a plain send ARMS the turn (the
-        // fake's create-time idle can land at any point: an idle never ends a
-        // command the CLI has not reported, C17) → a mid-turn assistant frame
-        // models the truncated stream →
-        // the sidecar dies through its own exit hook (the consumer observes
-        // plain stdout EOF — indistinguishable from a SIGKILL mid-turn, the one
-        // death shape whose sidecar finally never runs). Returns the minted
-        // `at`. The `__exit__`/`__emit_assistant__` writes go through
-        // `inject_raw_send` (NOT handle_send) so no phantom second op arms —
-        // the armed state under test is exactly the one plain send.
+        // One accepted command produces an actual assistant block, then its
+        // model request stays pending. Kill the owned Node process at that
+        // boundary: stdout ends without sidecar finally or an SDK result.
         async fn death_cycle(
             st: &FreshClaudeState,
             rx: &mut tokio::sync::broadcast::Receiver<String>,
@@ -7543,8 +7540,15 @@ pub(crate) mod tests {
             st.handle_send(send_msg(&sid, "a turn that dies mid-flight"))
                 .await;
             await_ledger_busy(st, &sid, true).await;
-            inject_raw_send(st, &sid, "__emit_assistant__").await;
-            inject_raw_send(st, &sid, "__exit__").await;
+            await_frame_of_inner_type(rx, "freshAgent.assistant").await;
+            st.sessions
+                .lock()
+                .await
+                .get_mut(&sid)
+                .expect("the running session")
+                .child
+                .start_kill()
+                .expect("kill only this test's sidecar");
             // The death arm's two frames arrive in stream order (banner, then
             // the synthesized edge) but the scan is order-agnostic. Poll with a
             // deadline: a blocking recv could
@@ -8735,6 +8739,7 @@ pub(crate) mod tests {
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
         let durable = "66666666-6666-4666-8666-666666666666";
+        write_fake_transcript(&env.dir.join("claude"), durable);
         let mut msg = dedup_create_msg("req-sref-only-1");
         msg.session_ref = Some(freshell_protocol::SessionLocator {
             provider: "claude".to_string(),
@@ -9039,6 +9044,7 @@ pub(crate) mod tests {
         );
 
         let durable = "77777777-7777-4777-8777-777777777777";
+        write_fake_transcript(&env.dir.join("claude"), durable);
         let mut resume = dedup_create_msg("req-outcome-resume");
         resume.resume_session_id = Some(durable.to_string());
         let resumed = st.handle_create(resume, None).await;
@@ -9066,8 +9072,8 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_fresh_claude_create_spawn_failure_settles_the_durable_record() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
-        // The FAIL knob: the sidecar dies before `created` (a spawn-time
-        // provider rejection — EOF).
+        // The SDK initialization rejects before `created`, through the real
+        // sidecar's typed boot-failure path.
         let env = FakeClaudeSidecarEnv::install_with_knobs(Some(1500), true);
         let (mut st, mut rx) = state_with_bus();
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
@@ -9112,7 +9118,7 @@ pub(crate) mod tests {
         }
         assert_eq!(
             failed_code.as_deref(),
-            Some("CLAUDE_CREATE_FAILED"),
+            Some("BOOT_FAILED"),
             "the spawn failure answers typed"
         );
         assert!(
@@ -16446,6 +16452,7 @@ pub(crate) mod tests {
         let create_req: serde_json::Value =
             serde_json::from_str(log.lines().next().expect("one spawn-logged create request"))
                 .unwrap();
+        let create_req = &create_req["options"];
         assert_eq!(create_req["model"], "opus-x");
         assert_eq!(create_req["permissionMode"], "plan");
         assert_eq!(create_req["effort"], "high");
@@ -16527,10 +16534,8 @@ pub(crate) mod tests {
         let log = std::fs::read_to_string(env.spawn_log_path()).unwrap();
         let create_req: serde_json::Value =
             serde_json::from_str(log.lines().next().unwrap()).unwrap();
-        assert_eq!(
-            create_req["boot"],
-            json!({ "kind": "resume", "resume": DURABLE })
-        );
+        let create_req = &create_req["options"];
+        assert_eq!(create_req["resume"], json!(DURABLE));
         assert_eq!(create_req["model"], "opus-x");
         assert_eq!(create_req["permissionMode"], "plan");
         let frame = await_frame_of_inner_type(&mut rx, "freshAgent.session.snapshot").await;
@@ -16582,8 +16587,9 @@ pub(crate) mod tests {
         let create_req: serde_json::Value =
             serde_json::from_str(log.lines().next().expect("one spawn-logged create request"))
                 .unwrap();
+        let create_req = &create_req["options"];
         assert_eq!(
-            create_req["boot"]["resume"]
+            create_req["resume"]
                 .as_str()
                 .expect("the resume on the wire"),
             DURABLE,

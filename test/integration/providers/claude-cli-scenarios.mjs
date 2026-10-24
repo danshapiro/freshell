@@ -421,6 +421,37 @@ const SCENARIOS = {
     await s.close()
   },
 
+  /** T5: a saved transcript can resume by path after its original cwd is gone. */
+  async 'resume-path'(ctx) {
+    const P = ctx.uuid('P')
+    const seed = ctx.open('seed', { options: { sessionId: P } })
+    seed.push('seed the path-resumed history', 'u1')
+    await seed.waitForResults(1)
+    await seed.waitForCount(isStateIdle, 1, 5000, 'idle')
+    ctx.need(await ctx.pollTranscript(P, 5000, 2), 'seed history flushed')
+    await seed.close()
+    const file = path.join(ctx.fixture.claudeConfigDir, (await ctx.files()).find((f) => f.endsWith(`${P}.jsonl`)))
+    const replacement = path.join(ctx.fixture.root, 'replacement')
+    await fs.mkdir(replacement)
+    await fs.rm(ctx.fixture.cwd, { recursive: true })
+    const resumed = ctx.open('path', { options: { resume: file, cwd: replacement } })
+    const init = await resumed.init()
+    ctx.observe('pathBoot', { ok: init.ok, ...(init.message ? { message: init.message } : {}) })
+    if (init.ok) {
+      resumed.push('continue the saved history', 'u2')
+      await resumed.waitForResults(1)
+      await resumed.waitForCount(isStateIdle, 1, 5000, 'idle')
+      const saved = ctx.need(await ctx.pollTranscript(P, 5000, 1, (lines) =>
+        lines.some((line) => line.uuid === ctx.uuidOf('u2')) && lines.filter((line) => line.type === 'assistant').length >= 2), 'continued history flushed')
+      ctx.observe('pathResult', {
+        sessionIds: resumed.messages((message) => message.type === 'result').map((message) => message.session_id),
+        shape: transcriptShape(saved),
+      })
+    }
+    await resumed.close()
+    ctx.observe('afterResume', { files: await ctx.files() })
+  },
+
   /** T5 T6: lazy fork with a guard, re-spawned before its prompt; then the three boot refusals. */
   async fork(ctx) {
     const P = ctx.uuid('P')
