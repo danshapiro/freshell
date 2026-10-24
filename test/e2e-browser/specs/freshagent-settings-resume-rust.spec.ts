@@ -185,7 +185,11 @@ async function bootWall(
     setupHome?: (homeDir: string) => Promise<void>
   } = {},
 ): Promise<{ server: RustServer; info: Awaited<ReturnType<RustServer['start']>>; harness: TestHarness }> {
-  const server = new RustServer({ env: options.env, setupHome: options.setupHome })
+  const server = new RustServer({
+    env: options.env,
+    setupHome: options.setupHome,
+    verbose: process.env.FRESHELL_E2E_SERVER_VERBOSE === '1',
+  })
   const info = await server.start()
   await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
   const harness = new TestHarness(page)
@@ -507,6 +511,7 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
     const projectDir = path.join(sharedRoot, 'proj')
     await fsp.mkdir(projectDir, { recursive: true })
     const server = new RustServer({
+      verbose: process.env.FRESHELL_E2E_SERVER_VERBOSE === '1',
       env: claudeSimulatorServerEnv({ ledgerPath: simLedger }),
     })
     let ws: WsCapture | null = null

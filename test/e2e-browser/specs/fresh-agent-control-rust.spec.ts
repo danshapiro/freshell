@@ -280,6 +280,7 @@ async function bootWall(
     env: options.env,
     stripEnvPrefixes: options.stripEnvPrefixes,
     setupHome: options.setupHome,
+    verbose: process.env.FRESHELL_E2E_SERVER_VERBOSE === '1',
   })
   const info = await server.start()
   await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
@@ -527,7 +528,28 @@ async function raisePermissionAndAssertNoDecisions(
 ): Promise<void> {
   await sendComposerText(page, 'RAISE_PERMISSION')
   const card = page.getByRole('alert', { name: 'Permission request for Bash' })
-  await expect(card).toBeVisible({ timeout: 15_000 })
+  try {
+    await expect(card).toBeVisible({ timeout: 15_000 })
+  } catch (error) {
+    const rows = readClaudeSimLedger(simLedger)
+    const received = (await harness.getReceivedWsMessages()) as any[]
+    console.error(JSON.stringify({
+      severity: 'error',
+      event: 'e2e.claude_approval_card_diagnostic',
+      queryPermissionModes: rows.filter((row) => row.kind === 'query')
+        .map((row) => row.options?.permissionMode ?? null),
+      promptPermissionModes: rows.filter((row) => row.kind === 'prompt')
+        .map((row) => row.permissionMode ?? null),
+      approvalEmissionCount: rows.filter((row) => row.kind === 'approval').length,
+      canUseToolOutcomes: rows.filter((row) => row.kind === 'can_use_tool')
+        .map((row) => ({ toolName: row.toolName, behavior: row.decision?.behavior, rejected: Boolean(row.error) })),
+      receivedFreshAgentEvents: received
+        .filter((message) => message?.type === 'freshAgent.event')
+        .map((message) => ({ type: message.event?.type, code: message.event?.code }))
+        .slice(-30),
+    }))
+    throw error
+  }
   // AGENT-05 pause-proof: the CLI has received zero decisions — the card came
   // from the snapshot overlay, not from any fabricated user choice.
   expect(

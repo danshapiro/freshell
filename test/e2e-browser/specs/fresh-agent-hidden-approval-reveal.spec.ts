@@ -161,6 +161,7 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
       const projectDir = path.join(sharedRoot, 'project')
       await fs.mkdir(projectDir, { recursive: true })
       server = new RustServer({
+        verbose: process.env.FRESHELL_E2E_SERVER_VERBOSE === '1',
         env: claudeSimulatorServerEnv({ ledgerPath: simLedger, program: SIMULATOR_PROGRAM }),
         setupHome: async (homeDir) => {
           const freshellDir = path.join(homeDir, '.freshell')
@@ -252,12 +253,34 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
           message: 'the simulated CLI invokes the production canUseTool approval path',
         })
         .toBe(1)
-      await expect
-        .poll(async () => (await receivedFreshAgentEvents(harness, 'freshAgent.permission.request')).length, {
-          timeout: 15_000,
-          message: 'the client receives the approval while tab A is hidden',
-        })
-        .toBe(1)
+      try {
+        await expect
+          .poll(async () => (await receivedFreshAgentEvents(harness, 'freshAgent.permission.request')).length, {
+            timeout: 15_000,
+            message: 'the client receives the approval while tab A is hidden',
+          })
+          .toBe(1)
+      } catch (error) {
+        const rows = readClaudeSimLedger(simLedger)
+        const received = (await harness.getReceivedWsMessages()) as any[]
+        console.error(JSON.stringify({
+          severity: 'error',
+          event: 'e2e.claude_hidden_approval_diagnostic',
+          queryPermissionModes: rows.filter((row) => row.kind === 'query')
+            .map((row) => row.options?.permissionMode ?? null),
+          promptPermissionModes: rows.filter((row) => row.kind === 'prompt')
+            .map((row) => row.permissionMode ?? null),
+          approvalEmissionCount: rows.filter((row) => row.kind === 'approval').length,
+          canUseToolOutcomes: rows.filter((row) => row.kind === 'can_use_tool')
+            .map((row) => ({ toolName: row.toolName, behavior: row.decision?.behavior, rejected: Boolean(row.error) })),
+          receivedFreshAgentEvents: received
+            .filter((message) => message?.type === 'freshAgent.event')
+            .map((message) => ({ type: message.event?.type, code: message.event?.code }))
+            .slice(-30),
+          serverOutput: server?.capturedOutput(),
+        }))
+        throw error
+      }
       expect(await harness.getActiveTabId(), 'the approval arrived while tab A was hidden').toBe(tabB)
 
       await armRevealOverlayRecorder(page)
