@@ -207,6 +207,20 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
       const bridgeSessionId: string = (await leafA()).content.sessionId
       expect(bridgeSessionId, 'the pane is bound to its sidecar session').toBeTruthy()
 
+      // The provider's saved default is bypassPermissions in a fresh test
+      // HOME. This scenario needs a real canUseTool approval, so opt into the
+      // asking mode through the same settings control a user would use.
+      await page.getByRole('button', { name: 'Agent settings', exact: true }).click()
+      await page.getByRole('combobox', { name: 'Permission mode' }).selectOption('default')
+      await page.keyboard.press('Escape')
+      await expect.poll(async () => {
+        const content = findFreshAgentLeaf(await harness.getPaneLayout(tabA))?.content
+        return content?.permissionMode ?? null
+      }).toBe('default')
+      await expect.poll(() => readClaudeSimLedger(simLedger).some(
+        (row) => row.kind === 'control' && row.name === 'setPermissionMode' && row.args?.[0] === 'default',
+      )).toBe(true)
+
       const paneA = page.locator('[data-context="fresh-agent"]').first()
       await expect(paneA).toBeVisible({ timeout: 15_000 })
       // The composer is up: the pane's first snapshot has rendered.

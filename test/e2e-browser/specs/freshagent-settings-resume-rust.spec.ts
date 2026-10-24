@@ -253,7 +253,25 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
         supportedEffortLevels: ['low', 'medium', 'high'], supportsAdaptiveThinking: false }],
     } }))
     const { server, harness } = await bootWall(page, {
-      env: claudeSimulatorServerEnv({ ledgerPath: simLedger }),
+      env: claudeSimulatorServerEnv({
+        ledgerPath: simLedger,
+        program: {
+          rules: [
+            {
+              on: 'msg:prompt',
+              match: { text: 'First message before settings change' },
+              once: true,
+              emit: [{ kind: 'text', data: { text: 'settings test first response' } }],
+            },
+            {
+              on: 'msg:prompt',
+              match: { text: 'Second message uses the selected settings' },
+              once: true,
+              emit: [{ kind: 'text', data: { text: 'settings test updated response' } }],
+            },
+          ],
+        },
+      }),
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
     try {
@@ -266,7 +284,7 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
       await expect(composer).toBeEnabled({ timeout: 30_000 })
       await composer.fill('First message before settings change')
       await pane.getByRole('button', { name: 'Send', exact: true }).click()
-      await expect(pane.getByText(/^Fixture claude turn/)).toBeVisible({ timeout: 30_000 })
+      await expect(pane.getByText('settings test first response', { exact: true })).toBeVisible({ timeout: 30_000 })
       await expect(pane.getByRole('button', { name: 'Stop', exact: true })).toBeHidden()
       const before = findFreshAgentLeaf(await harness.getPaneLayout(tabId)).content
 
@@ -280,7 +298,7 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
       await page.getByRole('button', { name: 'Agent settings', exact: true }).click()
       await composer.fill('Second message uses the selected settings')
       await pane.getByRole('button', { name: 'Send', exact: true }).click()
-      await expect(pane.getByText('Fixture claude turn (sonnet, low, plan)', { exact: true })).toBeVisible({ timeout: 30_000 })
+      await expect(pane.getByText('settings test updated response', { exact: true })).toBeVisible({ timeout: 30_000 })
 
       const ledger = readClaudeSimLedger(simLedger)
       const secondPrompt = ledger.find((row) => row.kind === 'prompt' && row.text === 'Second message uses the selected settings')
@@ -538,7 +556,16 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
         'freshAgent.created (claude create)',
       )
       const bridgeSessionId = created.sessionId as string
-      // sdk.session.init -> freshAgent.session.init carries the durable UUID.
+
+      // The SDK reports its durable identity with the first model turn's
+      // system init. Drive that turn before waiting for the identity event.
+      ws.send({
+        type: 'freshAgent.send',
+        provider: 'claude',
+        sessionId: bridgeSessionId,
+        sessionType: 'freshclaude',
+        text: 'settings-resume first claude turn',
+      })
       const init = await ws.waitFor(
         (f) =>
           f.type === 'freshAgent.event' &&
@@ -550,15 +577,8 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
       const durable = init.event.cliSessionId as string
       expect(durable).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
 
-      // The CLI reports its durable id from the first prompt, then ends the
-      // turn through the production sidecar's result frame.
-      ws.send({
-        type: 'freshAgent.send',
-        provider: 'claude',
-        sessionId: bridgeSessionId,
-        sessionType: 'freshclaude',
-        text: 'settings-resume first claude turn',
-      })
+      // The production sidecar reports the turn's durable id before forwarding
+      // its completion frame.
       await ws.waitFor(
         (f) =>
           f.type === 'freshAgent.event' &&

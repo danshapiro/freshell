@@ -547,6 +547,8 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
         userTexts: ['C26 first turn'],
         minAssistantTurns: 1,
       })
+      const bootsBeforeReload = readClaudeSimLedger(simLedger).filter((row) => row.kind === 'boot').length
+      const queriesBeforeReload = readClaudeSimLedger(simLedger).filter((row) => row.kind === 'query').length
 
       await flushPersistence(page)
       await expect.poll(() => persistedFreshAgentIdentity(page, tabId)).toBe(originalDurable)
@@ -557,16 +559,25 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
       const reloadedTabId = (await harness.getActiveTabId())!
       await expect.poll(async () => durableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(reloadedTabId))))
         .toBe(originalDurable)
+      await expect.poll(async () => (await harness.getSentWsMessages() as any[]).some(
+        (message) => message?.type === 'freshAgent.attach'
+          && message?.sessionRef?.provider === 'claude'
+          && message?.sessionRef?.sessionId === originalDurable,
+      ), { message: 'reload attaches using the pane’s durable Claude reference' }).toBe(true)
+      const durableAttach = (await harness.getSentWsMessages() as any[]).find(
+        (message) => message?.type === 'freshAgent.attach'
+          && message?.sessionRef?.sessionId === originalDurable,
+      )
+      expect(durableAttach?.sessionRef).toEqual({ provider: 'claude', sessionId: originalDurable })
       await sendFreshAgentTurn(page, harness, reloadedTabId, 'C26 second turn after reload')
       await expectFixtureTranscript(harness, server, info.homeDir, originalDurable, {
         userTexts: ['C26 first turn', 'C26 second turn after reload'],
         minAssistantTurns: 2,
       })
 
-      const resumeBoots = readClaudeSimLedger(simLedger)
-        .filter((row) => row.kind === 'query')
-        .filter((row) => (row.options as any)?.resume === originalDurable)
-      expect(resumeBoots.length, 'reload must resume the durable Claude conversation').toBeGreaterThan(0)
+      const ledgerAfterReload = readClaudeSimLedger(simLedger)
+      expect(ledgerAfterReload.filter((row) => row.kind === 'boot')).toHaveLength(bootsBeforeReload)
+      expect(ledgerAfterReload.filter((row) => row.kind === 'query')).toHaveLength(queriesBeforeReload)
     } finally {
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })

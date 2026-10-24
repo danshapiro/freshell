@@ -526,7 +526,25 @@ async function raisePermissionAndAssertNoDecisions(
   tabId: string,
   simLedger: string,
 ): Promise<void> {
+  // Claude's REST create default is bypassPermissions unless the user saved a
+  // provider default. This scenario exercises canUseTool, so choose the
+  // product's asking mode explicitly instead of relying on that saved default.
+  await page.getByRole('button', { name: 'Agent settings', exact: true }).click()
+  await page.getByRole('combobox', { name: 'Permission mode' }).selectOption('default')
+  await page.keyboard.press('Escape')
+  await expect.poll(async () => (await paneLeaf(harness, tabId))?.content?.permissionMode ?? null)
+    .toBe('default')
+  await waitForSimRow(
+    simLedger,
+    (row) => row.kind === 'control' && row.name === 'setPermissionMode' && row.args?.[0] === 'default',
+    'the CLI asking permission mode',
+  )
+
   await sendComposerText(page, 'RAISE_PERMISSION')
+  const raiseSend = (await harness.getSentWsMessages() as any[]).find(
+    (message) => message?.type === 'freshAgent.send' && message?.text === 'RAISE_PERMISSION',
+  )
+  expect(raiseSend?.settings?.permissionMode, 'the approval send carries the asking mode').toBe('default')
   const card = page.getByRole('alert', { name: 'Permission request for Bash' })
   try {
     await expect(card).toBeVisible({ timeout: 15_000 })
