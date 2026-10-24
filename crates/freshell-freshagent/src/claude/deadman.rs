@@ -184,8 +184,11 @@ impl FreshClaudeState {
             return;
         }
         let sessions = self.sessions.lock().await;
+        let Some(current_key) = Self::session_key_in(&sessions, &map_key) else {
+            return;
+        };
         let Some(session) = sessions
-            .get(&map_key)
+            .get(&current_key)
             .filter(|session| session.ownership_id == ownership_id)
         else {
             return;
@@ -203,7 +206,7 @@ impl FreshClaudeState {
         tracing::warn!(provider = PROVIDER, session_id = %stamp, ownership_id = %ownership_id,
             phase = "fired", generation, "freshagent.claude.quiet_deadman");
         self.edges.quiet_deadman(&crate::claude_edges::EdgeRecord {
-            session_key: &map_key,
+            session_key: &current_key,
             stamp: &stamp,
             sidecar_session_id: &session.sidecar_session_id,
             session_type: &session.session_type,
