@@ -1435,18 +1435,36 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       await expect(
         page.locator('[data-context="fresh-agent"]').last().getByText('RESTORE_WALL_LIVENESS_REPLY', { exact: true }),
       ).toBeVisible({ timeout: 30_000 })
+      const claudeProjectSlug = projectDir.replace(/[^A-Za-z0-9]/g, '-')
       const transcriptFile = path.join(
         info.homeDir,
         '.claude',
         'projects',
-        '-fixture',
+        claudeProjectSlug,
         `${originalSessionId}.jsonl`,
       )
-      const transcriptLines = (await fs.readFile(transcriptFile, 'utf8'))
-        .trim()
-        .split('\n')
-        .filter(Boolean)
-        .map((line) => JSON.parse(line))
+      let transcriptLines: any[] = []
+      await expect.poll(async () => {
+        const raw = await fs.readFile(transcriptFile, 'utf8').catch(() => '')
+        transcriptLines = raw.trim().split('\n').filter(Boolean).flatMap((line) => {
+          try { return [JSON.parse(line)] } catch { return [] }
+        })
+        const currentUserTexts = transcriptLines
+          .filter((line: any) => line.type === 'user')
+          .map((line: any) => line.message?.content?.[0]?.text)
+        const currentAssistantTexts = transcriptLines
+          .filter((line: any) => line.type === 'assistant')
+          .flatMap((line: any) => line.message?.content ?? [])
+          .filter((block: any) => block?.type === 'text')
+          .map((block: any) => block.text)
+        return currentUserTexts.includes('wall freshclaude turn')
+          && currentUserTexts.includes('wall freshclaude liveness turn')
+          && currentAssistantTexts.includes('RESTORE_WALL_REPLY')
+          && currentAssistantTexts.includes('RESTORE_WALL_LIVENESS_REPLY')
+      }, {
+        timeout: 20_000,
+        message: 'the same durable Claude transcript contains both turns and replies',
+      }).toBe(true)
       const userTexts = transcriptLines
         .filter((l: any) => l.type === 'user')
         .map((l: any) => l.message?.content?.[0]?.text)
