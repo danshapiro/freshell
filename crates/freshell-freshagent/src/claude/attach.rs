@@ -123,8 +123,13 @@ impl FreshClaudeState {
         let Some(key) = self.resolve_session_key(&msg.session_id).await else {
             return Ok(None);
         };
-        let Some(native_id) = self.sessions.lock().await.get(&key)
-            .map(|runtime| runtime.identity.current()) else {
+        let Some(native_id) = self
+            .sessions
+            .lock()
+            .await
+            .get(&key)
+            .map(|runtime| runtime.identity.current())
+        else {
             return Ok(None);
         };
         let operation = format!("claude-attach-{}", uuid::Uuid::new_v4());
@@ -175,12 +180,8 @@ impl FreshClaudeState {
         };
         if previous != native_id {
             reply(
-                self.materialized_message(
-                    previous,
-                    &native_id,
-                    session_type_str(msg.session_type),
-                )
-                .await,
+                self.materialized_message(previous, &native_id, session_type_str(msg.session_type))
+                    .await,
             );
         }
         reply(status_snapshot_frame(

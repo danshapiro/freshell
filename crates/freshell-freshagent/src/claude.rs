@@ -13438,9 +13438,8 @@ pub(crate) mod tests {
     // ── retire-on-kill round 6 (focused-ep5-r5 Finding 2): durable alias tombstones ──
 
     /// Finding 2's headline: the kill's alias consult reaches the DURABLE
-    /// record — the post-restart shape directly: this process's in-memory
-    /// sessions map is empty (a restarted server
-    /// is exactly that), yet the placeholder→durable mapping survives in the
+    /// record after restart: this process's in-memory sessions map is empty,
+    /// yet the placeholder→durable mapping survives in the
     /// persisted alias tombstones, so the close names the bare placeholder
     /// and still fences + retires the durable row.
     #[tokio::test]
