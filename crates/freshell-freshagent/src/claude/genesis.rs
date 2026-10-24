@@ -376,12 +376,7 @@ impl FreshClaudeState {
                     .dead_sessions
                     .find(&session_key)
                     .filter(|dead| dead.ownership_id == ownership_id)
-                    .map(|dead| {
-                        (
-                            dead.cli_session_id.unwrap_or_else(|| session_key.clone()),
-                            dead.launch_genesis,
-                        )
-                    })
+                    .map(|dead| (dead.session_id, dead.launch_genesis))
             });
             let Some((durable, runtime_genesis)) = captured else {
                 return;

@@ -157,7 +157,6 @@ impl FreshClaudeState {
                 stamp: &stamp,
                 session_type: &session.session_type,
                 durables: &aliases,
-                cli_session_id: Some(&stamp),
                 settings: &session.configuration.settings,
                 ownership_id: &session.ownership_id,
                 launch_genesis: session.launch_genesis.as_ref(),

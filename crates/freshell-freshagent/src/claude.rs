@@ -5302,7 +5302,6 @@ impl FreshClaudeState {
                         stamp: &stamp,
                         session_type: &session_type,
                         durables: &removed_durables,
-                        cli_session_id: Some(&stamp),
                         settings: &evicted.configuration.settings,
                         ownership_id: &evicted.ownership_id,
                         launch_genesis: evicted.launch_genesis.as_ref(),
