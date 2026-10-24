@@ -8959,18 +8959,15 @@ pub(crate) mod tests {
         let (log_events, _log_guard) = crate::claude_sidecar_io::test_capture::capture();
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
+        env.program(json!([
+            {"kind":"text", "data":{"text":"a partial answer before the crash"}},
+            {"kind":"hang"},
+        ]));
         let (st, mut rx) = state_with_bus();
 
-        // One full death cycle: create → a plain send ARMS the turn (the
-        // fake's create-time idle can land at any point: an idle never ends a
-        // command the CLI has not reported, C17) → a mid-turn assistant frame
-        // models the truncated stream →
-        // the sidecar dies through its own exit hook (the consumer observes
-        // plain stdout EOF — indistinguishable from a SIGKILL mid-turn, the one
-        // death shape whose sidecar finally never runs). Returns the minted
-        // `at`. The `__exit__`/`__emit_assistant__` writes go through
-        // `inject_raw_send` (NOT handle_send) so no phantom second op arms —
-        // the armed state under test is exactly the one plain send.
+        // One accepted command produces an actual assistant block, then its
+        // model request stays pending. Kill the owned Node process at that
+        // boundary: stdout ends without sidecar finally or an SDK result.
         async fn death_cycle(
             st: &FreshClaudeState,
             rx: &mut tokio::sync::broadcast::Receiver<String>,
@@ -8982,8 +8979,15 @@ pub(crate) mod tests {
             st.handle_send(send_msg(&sid, "a turn that dies mid-flight"))
                 .await;
             await_ledger_busy(st, &sid, true).await;
-            inject_raw_send(st, &sid, "__emit_assistant__").await;
-            inject_raw_send(st, &sid, "__exit__").await;
+            await_frame_of_inner_type(rx, "freshAgent.assistant").await;
+            st.sessions
+                .lock()
+                .await
+                .get_mut(&sid)
+                .expect("the running session")
+                .child
+                .start_kill()
+                .expect("kill only this test's sidecar");
             // The death arm's two frames arrive in stream order (banner, then
             // the synthesized edge) but the scan is order-agnostic. Poll with a
             // deadline: a blocking recv could
