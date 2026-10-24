@@ -157,8 +157,25 @@ test.describe('AI naming pauses on refused credentials', () => {
       }, { tabId, paneId, sessionId, cwd: path.join(journey.server.info.homeDir, 'work', 'historical-sardines') })
       const pane = page.locator(`[data-pane-id="${paneId}"] [data-context="fresh-agent"], [data-pane-id="${paneId}"][data-context="fresh-agent"]`).first()
       await expect(pane.getByRole('button', { name: 'Send', exact: true })).toBeEnabled({ timeout: 30_000 })
+      // This fixture starts idle before its attach finishes. Wait for the
+      // committed owner pair that the real send must carry.
+      await expect.poll(async () => {
+        const owner = (await harness.getState()).freshAgent?.runtimeOwners?.[`claude:${sessionId}`]
+        return owner && owner.epoch > 0 && owner.generation > 0 && !owner.fenced ? owner : null
+      }, { timeout: 30_000 }).toMatchObject({
+        provider: 'claude', sessionId, ownerKind: 'fresh-agent', transition: 'handoff-committed',
+      })
       expect(gemini.requests, 'resting historical input is not background work').toEqual([])
       await sendFirstMessage(page, harness, { tabId, paneId, nameRef: ref, sessionId }, 'freshclaude', 'Second turn must never be title input')
+      await expect.poll(async () => {
+        const sent = await harness.getSentWsMessages() as Record<string, unknown>[]
+        const send = sent.find((frame) => frame.type === 'freshAgent.send'
+          && frame.sessionId === sessionId && frame.text === 'Second turn must never be title input')
+        if (typeof send?.requestId !== 'string') return false
+        const received = await harness.getReceivedWsMessages() as Record<string, unknown>[]
+        return received.some((frame) => frame.type === 'freshAgent.send.accepted'
+          && frame.sessionId === sessionId && frame.requestId === send.requestId)
+      }, { timeout: 30_000 }).toBe(true)
       await expect.poll(() => gemini.requests.length, { timeout: 30_000 }).toBeGreaterThan(0)
       for (const request of gemini.requests) {
         expect(request.body).toContain(FIRST_MESSAGE)
