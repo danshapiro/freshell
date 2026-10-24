@@ -100,6 +100,29 @@ describe('persistedState fresh-agent migration', () => {
     })
   })
 
+  it('retains a validated same-provider Claude sessionRef alongside a persisted restore error', () => {
+    const sessionId = '00000000-0000-4000-8000-000000000780'
+    const parsed = parsePersistedLayoutRaw(layoutRaw({
+      'tab-1': leaf('lost-claude', {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        sessionId: 'legacy-runtime-placeholder',
+        sessionRef: { provider: 'claude', sessionId },
+        restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'durable_artifact_missing' },
+      }),
+    }))
+
+    expect(collectLeafContents(parsed!.panes.layouts['tab-1'])[0]).toMatchObject({
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      sessionId,
+      sessionRef: { provider: 'claude', sessionId },
+      restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'durable_artifact_missing' },
+    })
+  })
+
   it('leaves a legacy zero-turn placeholder without a durable reference available for lost-session recovery', () => {
     const parsed = parsePersistedLayoutRaw(layoutRaw({
       'tab-1': leaf('legacy', {

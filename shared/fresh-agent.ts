@@ -218,8 +218,8 @@ export type FreshAgentIdentityFold = {
  *   with the pane provider, and classify placeholder (a DURABLE locator means
  *   the fold carries a real identity — never stale, so a restoreError on a
  *   genuinely broken durable pane is left alone).
- * - Locator absent (the restoreError migration strips it — the incident's
- *   normalized shape): ANY present scalar identity field (sessionId or
+ * - Locator absent (including older normalized restoreError payloads whose
+ *   migration stripped it): ANY present scalar identity field (sessionId or
  *   resumeSessionId) classifying placeholder marks the fold stale.
  *
  * Returns the previous durable identity tuple — the sessionRef OBJECT
@@ -295,6 +295,12 @@ export function migrateLegacyFreshAgentContent<T extends FreshAgentCompatibility
 
     const existingRestoreError = readRestoreError(input.restoreError)
     if (existingRestoreError) {
+      const candidateSessionRef = sanitizeSessionRef(input.sessionRef)
+      const retainedSessionRef = existingRestoreError.reason !== 'invalid_legacy_restore_target'
+        && candidateSessionRef?.provider === provider
+        && isDurableProviderSessionId(provider, candidateSessionRef.sessionId)
+        ? candidateSessionRef
+        : undefined
       const {
         kind: _legacyKind,
         provider: _legacyProvider,
@@ -312,6 +318,8 @@ export function migrateLegacyFreshAgentContent<T extends FreshAgentCompatibility
 
       return {
         ...rest,
+        ...(retainedSessionRef ? { sessionRef: retainedSessionRef } : {}),
+        ...(retainedSessionRef?.provider === 'claude' ? { sessionId: retainedSessionRef.sessionId } : {}),
         kind: 'fresh-agent',
         provider,
         sessionType,
