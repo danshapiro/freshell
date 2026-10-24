@@ -10,7 +10,7 @@
  * and then fail. G26 keeps this refresh non-blocking (a hidden pane owes one
  * 'reveal-surface' refresh instead of marking its transcript dirty).
  *
- *   1. an approval raised while tab A is hidden shows its card after the
+ *   1. an approval delivered while tab A is hidden shows its card after the
  *      reveal, and the overlay is never drawn;
  *   2. the same approval cancelled while tab A is hidden is gone after the
  *      reveal, and the overlay is never drawn.
@@ -24,11 +24,12 @@
  * itself. What this spec does catch is a regression to the blocking reveal
  * path (the overlay recorder) and a broken end-to-end journey.
  *
- * Trigger: a visible composer starts the turn, then the user switches tabs
- * before the simulator causes the production sidecar's canUseTool callback
- * to raise one Bash approval. The send itself must not be hidden: a hidden
- * send acceptance legitimately dirties the transcript and tests the blocking
- * transcript-refresh path instead of the approval-only reveal path.
+ * Trigger: a visible composer starts the turn. The production sidecar streams
+ * the Bash tool-use transcript while tab A is visible; the test holds only
+ * the resulting canUseTool approval frame at the WebSocket boundary, switches
+ * tabs, then delivers that frame while A is hidden. The send and tool-use
+ * transcript must not be hidden: their transcript changes legitimately test
+ * the blocking transcript-refresh path instead of the approval-only reveal.
  * Then the client's own `freshAgent.interrupt` frame for the session — the
  * exact frame the Stream Deck "stop" sends to a pane in a background tab —
  * cancels it (the sidecar's interrupt-time pending cancellation, mirroring
@@ -151,7 +152,14 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
     let pauseAfterCancellation = false
     let deliveryPaused = false
     let heldResults = 0
+    let heldPermissionRequest = false
+    let releasePermissionRequest: (() => void) | null = null
     const heldDeliveries: Array<() => void> = []
+    const releaseApprovalRequest = () => {
+      const deliver = releasePermissionRequest
+      releasePermissionRequest = null
+      deliver?.()
+    }
     const releaseDeliveries = () => {
       deliveryPaused = false
       for (const deliver of heldDeliveries.splice(0)) deliver()
@@ -165,6 +173,18 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
           if (deliveryPaused) {
             if (frame?.type === 'freshAgent.event' && frame.event?.type === 'freshAgent.result') heldResults += 1
             heldDeliveries.push(() => route.send(message))
+            return
+          }
+          // Deliver the streamed tool-use transcript while the pane is
+          // visible, then hold only the approval surface event until its tab
+          // is hidden. This isolates the non-blocking approval reveal from
+          // the separate transcript-dirty reveal path.
+          if (!heldPermissionRequest
+            && frame?.type === 'freshAgent.event'
+            && frame.event?.type === 'freshAgent.permission.request'
+            && frame.provider === 'claude') {
+            heldPermissionRequest = true
+            releasePermissionRequest = () => route.send(message)
             return
           }
           route.send(message)
@@ -267,7 +287,7 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
         })
       }, bridgeSessionId)
 
-      // ── 1. An approval RAISED while hidden appears on reveal ─────────────
+      // ── 1. An approval delivered while hidden appears on reveal ─────────
       const composer = paneA.getByRole('textbox', { name: 'Chat message input' })
       await composer.fill(RAISE_TEXT)
       await paneA.getByRole('button', { name: 'Send' }).click()
@@ -288,15 +308,38 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
         timeout: 10_000,
         message: 'the visible pane observed the turn start before it is hidden',
       }).toBe('running')
-      // The delayed canUseTool request now arrives after A is hidden.
-      await tabBLocator.click()
-      await expect.poll(() => harness.getActiveTabId(), { timeout: 10_000 }).toBe(tabB)
+      // The tool-use transcript and assistant line arrive while A remains
+      // visible. The matching canUseTool request is held at the WS boundary.
+      await expect.poll(async () => {
+        const received = ((await harness.getReceivedWsMessages()) as any[]).filter((message) => (
+          message?.type === 'freshAgent.event' && message.sessionId === bridgeSessionId
+        ))
+        const assistant = received.find((message) => message.event?.type === 'freshAgent.assistant'
+          && message.event?.content?.some((block: any) => block?.type === 'tool_use' && block?.name === 'Bash'))
+        return typeof assistant?.event?.uuid === 'string'
+          && received.some((message) => message.event?.type === 'freshAgent.session.changed'
+            && message.event?.reason === 'transcript'
+            && message.event?.uuid === assistant.event.uuid)
+      }, {
+        timeout: 15_000,
+        message: 'the prompt and Bash tool-use transcript land while the pane is visible',
+      }).toBe(true)
       await expect
         .poll(() => readClaudeSimLedger(simLedger).filter((row) => row.kind === 'approval').length, {
           timeout: 15_000,
           message: 'the simulated CLI invokes the production canUseTool approval path',
         })
         .toBe(1)
+      await expect.poll(() => releasePermissionRequest !== null, {
+        timeout: 15_000,
+        message: 'the pending approval event is held at the WS boundary',
+      }).toBe(true)
+      expect(await harness.getActiveTabId(), 'the transcript changed while tab A was visible').toBe(tabA)
+      // The approval event arrives after A is hidden; no transcript-changing
+      // event is introduced in the hidden interval before this surface update.
+      await tabBLocator.click()
+      await expect.poll(() => harness.getActiveTabId(), { timeout: 10_000 }).toBe(tabB)
+      releaseApprovalRequest()
       try {
         await expect
           .poll(async () => (await receivedFreshAgentEvents(harness, 'freshAgent.permission.request')).length, {
@@ -369,6 +412,7 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
         message: 'the stopped turn result is delivered after the approval-only reveal',
       }).toBe(1)
     } finally {
+      try { releaseApprovalRequest() } catch { /* The page can already be closed after a failed test. */ }
       try { releaseDeliveries() } catch { /* The page can already be closed after a failed test. */ }
       await server?.stop().catch(() => {})
       await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
