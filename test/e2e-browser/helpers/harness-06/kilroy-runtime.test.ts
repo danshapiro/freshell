@@ -1,261 +1,233 @@
 import { describe, it, expect, afterEach } from 'vitest'
-import fsp from 'node:fs/promises'
-import os from 'node:os'
+import fs from 'node:fs/promises'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { spawnFakeKilroy, type KilroyRuntime } from './kilroy-runtime.js'
+import {
+  spawnKilroyRuntime,
+  readKilroyLedger,
+  type KilroyRuntime,
+  type KilroyRuntimeOptions,
+} from './kilroy-runtime.js'
 
-/**
- * HARNESS-06 kilroy-runtime coverage: the harness-level "full Kilroy runtime"
- * fake. It must speak the real claude-sidecar newline-JSON protocol
- * (crates/freshell-claude-sidecar/index.mjs doc comment) with kilroy flavour,
- * record every request to a JSONL ledger ("records Kilroy invocations"), and
- * expose controllable approval / failure / crash / resume edges.
- */
-
+// Drive the production sidecar, not a second implementation of its protocol.
+// The simulator supplies model turns and records the real SDK's inputs.
 const runtimes: KilroyRuntime[] = []
-const tmpDirs: string[] = []
-
-async function make(env: NodeJS.ProcessEnv = {}): Promise<{ rt: KilroyRuntime; logPath: string }> {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-h06-kilroy-'))
-  tmpDirs.push(dir)
-  const logPath = path.join(dir, 'requests.jsonl')
-  const rt = await spawnFakeKilroy({ FAKE_KILROY_LOG: logPath, ...env })
-  runtimes.push(rt)
-  return { rt, logPath }
+async function make(options: KilroyRuntimeOptions = {}): Promise<KilroyRuntime> {
+  const runtime = await spawnKilroyRuntime({ timeScale: 0.02, ...options })
+  runtimes.push(runtime)
+  return runtime
 }
 
 afterEach(async () => {
   while (runtimes.length) await runtimes.pop()!.kill()
-  while (tmpDirs.length) await fsp.rm(tmpDirs.pop()!, { recursive: true, force: true })
 })
 
-async function readLedger(logPath: string): Promise<Array<Record<string, unknown>>> {
-  try {
-    const text = await fsp.readFile(logPath, 'utf8')
-    return text.split('\n').filter(Boolean).map((l) => JSON.parse(l))
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return []
-    throw err
-  }
+async function create(rt: KilroyRuntime, extra: Record<string, unknown> = {}): Promise<string> {
+  const sessionId = randomUUID()
+  rt.send({ type: 'create', protocol: 2, sessionType: 'kilroy', sessionId, requestId: 'create', cwd: rt.cwd, boot: { kind: 'fresh' }, ...extra })
+  const answer = await rt.nextEvent('created')
+  return answer.sessionId as string
 }
 
-/** Whether the fake wrote an idle status between event indexes `from` and `to`. */
-function idleBetween(rt: KilroyRuntime, from: number, to: number): boolean {
-  return rt.events().slice(from, to).some((e) => e.type === 'sdk.status' && e.status === 'idle')
+function send(rt: KilroyRuntime, sessionId: string, text: string): string {
+  const uuid = randomUUID()
+  rt.send({ type: 'send', sessionId, uuid, text })
+  return uuid
 }
 
-/**
- * Every frame the fake wrote before this call has been read: an interrupt with
- * nothing in flight is settled after all of them (it arms nothing). Returns the
- * index of its settle.
- */
-async function readEverythingSoFar(rt: KilroyRuntime, sessionId: string): Promise<number> {
-  rt.send({ type: 'interrupt', sessionId })
-  const settle = await rt.nextEvent('sdk.interrupt_settled')
-  return rt.events().indexOf(settle)
+function serverOnlyFrames(rt: KilroyRuntime) {
+  return rt.events().filter((event) => ['sdk.turn.complete', 'sdk.turn.waiting', 'sdk.exit'].includes(event.type))
 }
 
-describe('harness-06 fake kilroy runtime', () => {
-  it('answers create with created-first, init, idle — and records the invocation', async () => {
-    const { rt, logPath } = await make()
-    const sessionId = '11111111-1111-4111-8111-111111111111'
-    rt.send({ type: 'create', sessionId, requestId: 'r-1', cwd: '/tmp/fixture-cwd', model: 'claude-opus-4-6' })
+async function barrier(rt: KilroyRuntime, sessionId: string) {
+  const requestId = randomUUID()
+  rt.send({ type: 'configure', sessionId, requestId, settings: {} })
+  await rt.nextEvent('sdk.configured', (event) => event.requestId === requestId)
+}
 
-    const created = (await rt.nextEvent('created')) as { requestId: string; sessionId: string }
-    expect(created.requestId).toBe('r-1')
-    expect(created.sessionId).toBe(sessionId)
+const APPROVAL_PROGRAM = {
+  rules: [{
+    on: 'msg:prompt', match: { text: 'needs approval' },
+    emit: [
+      { kind: 'approval', data: { tool: 'Bash', input: { command: 'ls' } } },
+      { kind: 'text', data: { text: 'approved reply' } },
+    ],
+  }],
+}
 
-    const init = (await rt.nextEvent('sdk.session.init', undefined, 5000)) as {
-      sessionId: string; cliSessionId: string; model: string; cwd: string
-    }
-    expect(init.sessionId).toBe(created.sessionId)
-    expect(init.cliSessionId).toBe(sessionId)
-    expect(init.cwd).toBe('/tmp/fixture-cwd')
+describe('harness-06 production Kilroy runtime', () => {
+  it('answers create first with the native UUID and defers session init until a real prompt', async () => {
+    const rt = await make()
+    const sessionId = await create(rt, { model: 'claude-opus-4-6' })
+    expect(rt.events()[0]).toMatchObject({ type: 'created', requestId: 'create', sessionId, protocol: 2 })
+    rt.send({ type: 'interrupt', sessionId, stopId: 'idle-before-prompt' })
+    await rt.nextEvent('sdk.interrupt_settled')
+    expect(rt.events().filter((event) => event.type === 'sdk.session.init')).toEqual([])
+    const query = (await readKilroyLedger(rt.ledgerPath)).find((row) => row.kind === 'query')!
+    expect(query.options).toMatchObject({ sessionId, cwd: rt.cwd, model: 'claude-opus-4-6' })
 
-    const idle = (await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'idle', 5000))
-    expect((idle as { sessionId: string }).sessionId).toBe(created.sessionId)
-
-    // The FIRST stdout line must be `created` (read_created discards earlier sdk.*).
-    expect((rt.events()[0] as { type: string }).type).toBe('created')
-
-    const ledger = await readLedger(logPath)
-    expect(ledger).toHaveLength(1)
-    expect((ledger[0].msg as { type: string }).type).toBe('create')
-    expect((ledger[0].msg as { cwd?: string }).cwd).toBe('/tmp/fixture-cwd')
-  })
-
-  it('runs a full send turn: running -> assistant -> result(success, with its facts), with no edge and no idle after it', async () => {
-    const { rt, logPath } = await make()
-    rt.send({ type: 'create', requestId: 'r-1', cwd: '/tmp' })
-    const created = (await rt.nextEvent('created')) as { sessionId: string }
-    await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'idle')
-
-    rt.send({ type: 'send', sessionId: created.sessionId, text: 'hello kilroy' })
-
-    const running = (await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'running'))
-    expect((running as { sessionId: string }).sessionId).toBe(created.sessionId)
-
-    const assistant = (await rt.nextEvent('sdk.assistant')) as { content: Array<{ type: string; text?: string }> }
-    expect(Array.isArray(assistant.content)).toBe(true)
-    expect(assistant.content[0].type).toBe('text')
-    expect(assistant.content[0].text).toContain('hello kilroy')
-
-    const result = (await rt.nextEvent('sdk.result')) as Record<string, unknown>
-    // The facts the server's verdict reads (it mints the edge, C18).
-    expect(result).toMatchObject({ result: 'success', subtype: 'success', isError: false, terminalReason: 'completed' })
-
-    rt.send({ type: 'send', sessionId: created.sessionId, text: 'again' })
+    send(rt, sessionId, 'first prompt')
+    expect(await rt.nextEvent('sdk.session.init')).toMatchObject({ sessionId, cliSessionId: sessionId, cwd: rt.cwd, model: 'claude-opus-4-6' })
     await rt.nextEvent('sdk.result')
-    expect(rt.events().filter((e) => e.type === 'sdk.turn.complete'), 'the fake mints no edge').toEqual([])
-    // The result ends the turn, as with the real sidecar (which sends no idle):
-    // nothing between the first turn's result and the second turn is an idle.
-    const secondRunning = rt.events().findIndex(
-      (e, i) => i > rt.events().indexOf(result) && e.type === 'sdk.status' && e.status === 'running',
-    )
-    expect(secondRunning).toBeGreaterThan(0)
-    expect(idleBetween(rt, rt.events().indexOf(result), secondRunning), 'no per-turn idle').toBe(false)
-
-    const ledger = await readLedger(logPath)
-    expect(ledger.map((row) => (row.msg as { type: string }).type)).toEqual(['create', 'send', 'send'])
   })
 
-  it('approval knob surfaces an approval request before completing (the server mints the waiting edge)', async () => {
-    const { rt } = await make({ FAKE_KILROY_APPROVAL: '1', FAKE_KILROY_APPROVAL_DELAY_MS: '150' })
-    rt.send({ type: 'create', requestId: 'r-1', cwd: '/tmp' })
-    const created = (await rt.nextEvent('created')) as { sessionId: string }
-    await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'idle')
-
-    rt.send({ type: 'send', sessionId: created.sessionId, text: 'needs approval' })
-
-    const request = (await rt.nextEvent('sdk.permission.request')) as { requestId: string; sessionId: string }
-    expect(request.sessionId).toBe(created.sessionId)
-
-    // Consume through the completion, THEN assert ordering in the full stream.
-    await rt.nextEvent('sdk.assistant')
-    await rt.nextEvent('sdk.result') // allowed by the fake after the delay
-    const types = rt.events().map((e) => (e as { type: string }).type)
-    expect(types.indexOf('sdk.permission.request')).toBeLessThan(types.indexOf('sdk.permission.cancelled'))
-    expect(types.indexOf('sdk.permission.cancelled')).toBeLessThan(types.indexOf('sdk.assistant'))
-    expect(types.indexOf('sdk.assistant')).toBeLessThan(types.indexOf('sdk.result'))
-    expect(types.filter((type) => type === 'sdk.turn.waiting' || type === 'sdk.turn.complete'), 'the fake mints no edge').toEqual([])
+  it('runs successive real turns with their submitted UUIDs and result facts, and mints no edge or synthetic idle', async () => {
+    const rt = await make({ program: { rules: [{ on: 'msg:prompt', emit: [{ kind: 'text', data: { text: 'kilroy reply' } }] }] } })
+    const sessionId = await create(rt)
+    const first = send(rt, sessionId, 'hello kilroy')
+    const assistant = await rt.nextEvent('sdk.assistant')
+    expect(assistant.content).toEqual([{ type: 'text', text: 'kilroy reply' }])
+    const result = await rt.nextEvent('sdk.result')
+    expect(result).toMatchObject({ sessionId, result: 'success', subtype: 'success', isError: false, terminalReason: 'completed' })
+    const second = send(rt, sessionId, 'again')
+    await rt.nextEvent('sdk.result')
+    const prompts = (await readKilroyLedger(rt.ledgerPath)).filter((row) => row.kind === 'prompt')
+    expect(prompts.map((row) => [row.sessionId, row.uuid, row.text])).toEqual([
+      [sessionId, first, 'hello kilroy'], [sessionId, second, 'again'],
+    ])
+    expect(serverOnlyFrames(rt)).toEqual([])
+    expect(rt.events().slice(rt.events().indexOf(result)).filter((event) => event.type === 'sdk.status' && event.status === 'idle')).toEqual([])
   })
 
-  it('failure knob yields a failed result with its error text, and no edge (the server rings it)', async () => {
-    const { rt } = await make({ FAKE_KILROY_FAIL_RESULT: '1' })
-    rt.send({ type: 'create', requestId: 'r-1', cwd: '/tmp' })
-    const created = (await rt.nextEvent('created')) as { sessionId: string }
-    await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'idle')
-
-    rt.send({ type: 'send', sessionId: created.sessionId, text: 'fail me' })
-    const result = (await rt.nextEvent('sdk.result')) as Record<string, unknown>
-    expect(result).toMatchObject({ subtype: 'error_during_execution', isError: true, errorText: 'Fixture turn failed', sessionId: created.sessionId })
-    expect(result).not.toHaveProperty('terminalReason')
-    await readEverythingSoFar(rt, created.sessionId)
-    expect(rt.events().filter((e) => e.type === 'sdk.turn.complete' || e.type === 'sdk.error'), 'no edge, no banner').toEqual([])
+  it('waits for the actual approval decision before completing and records what canUseTool received', async () => {
+    const rt = await make({ program: APPROVAL_PROGRAM })
+    const sessionId = await create(rt)
+    send(rt, sessionId, 'needs approval')
+    const request = await rt.nextEvent('sdk.permission.request')
+    expect(request).toMatchObject({ sessionId, tool: { name: 'Bash', input: { command: 'ls' } } })
+    await barrier(rt, sessionId)
+    expect(rt.events().some((event) => event.type === 'sdk.result')).toBe(false)
+    expect((await readKilroyLedger(rt.ledgerPath)).filter((row) => row.kind === 'can_use_tool')).toEqual([])
+    rt.send({ type: 'permission.respond', sessionId, requestId: request.requestId, decision: { behavior: 'allow', updatedInput: { command: 'ls' } } })
+    // A user answer resolves canUseTool; cancellation frames belong to aborts.
+    const assistant = await rt.nextEvent('sdk.assistant', (event) => event.content?.some((block: any) => block.text === 'approved reply'))
+    const result = await rt.nextEvent('sdk.result')
+    expect(rt.events().indexOf(request)).toBeLessThan(rt.events().indexOf(assistant))
+    expect(rt.events().indexOf(assistant)).toBeLessThan(rt.events().indexOf(result))
+    const decision = (await readKilroyLedger(rt.ledgerPath)).find((row) => row.kind === 'can_use_tool')!
+    expect(decision.decision).toMatchObject({ behavior: 'allow', updatedInput: { command: 'ls' } })
+    expect(serverOnlyFrames(rt)).toEqual([])
   })
 
-  it('interrupt on a HELD in-flight turn settles ok:true with its stopId, then the aborted result — never an edge or an sdk.exit', async () => {
-    const { rt } = await make({ FAKE_KILROY_HOLD_TURN: '1' })
-    rt.send({ type: 'create', requestId: 'r-1', cwd: '/tmp' })
-    const created = (await rt.nextEvent('created')) as { sessionId: string }
-    await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'idle')
-
-    rt.send({ type: 'send', sessionId: created.sessionId, text: 'hold' })
-    await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'running')
-
-    rt.send({ type: 'interrupt', sessionId: created.sessionId, stopId: 'stop-1' })
-    const settle = (await rt.nextEvent('sdk.interrupt_settled')) as { ok: boolean; stopId: string }
-    expect(settle).toMatchObject({ ok: true, stopId: 'stop-1' })
-    const result = (await rt.nextEvent('sdk.result')) as Record<string, unknown>
-    expect(result).toMatchObject({ result: 'error_during_execution', terminalReason: 'aborted_streaming' })
-    const settled = await readEverythingSoFar(rt, created.sessionId)
-    // The stopped turn's result ends it: no idle follows (the real sidecar sends none).
-    expect(idleBetween(rt, rt.events().indexOf(result), settled), 'no idle after the stopped result').toBe(false)
-
-    // No attention edge on the wire (the server silences the user's own
-    // Stop) and NEVER an sdk.exit (interrupt ends the TURN, not the session).
-    expect(
-      rt.events().some((e) => (e as { type: string }).type === 'sdk.turn.complete'),
-      'a user-initiated interrupt rings no attention edge',
-    ).toBe(false)
-    expect(
-      rt.events().some((e) => (e as { type: string }).type === 'sdk.exit'),
-      'interrupt must never end the session',
-    ).toBe(false)
+  it('forwards a failed result with its error text while leaving attention accounting to Rust', async () => {
+    const rt = await make({ program: { rules: [{ on: 'msg:prompt', emit: [{ kind: 'completion', data: { subtype: 'error_max_turns', errors: ['Fixture turn failed'] } }] }] } })
+    const sessionId = await create(rt)
+    send(rt, sessionId, 'fail me')
+    const result = await rt.nextEvent('sdk.result')
+    expect(result).toMatchObject({ sessionId, subtype: 'error_max_turns', isError: true, errorText: 'Fixture turn failed' })
+    await barrier(rt, sessionId)
+    expect(serverOnlyFrames(rt)).toEqual([])
+    expect(rt.events().filter((event) => event.type === 'sdk.error')).toEqual([])
   })
 
-  it('interrupt during a scripted approval defers to the turn: its aborted result, no edge, and the NEXT turn runs', async () => {
-    const { rt } = await make({ FAKE_KILROY_APPROVAL: '1', FAKE_KILROY_APPROVAL_DELAY_MS: '1000' })
-    rt.send({ type: 'create', requestId: 'r-1', cwd: '/tmp' })
-    const created = (await rt.nextEvent('created')) as { sessionId: string }
-    await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'idle')
-
-    rt.send({ type: 'send', sessionId: created.sessionId, text: 'interrupt me mid-approval' })
-    await rt.nextEvent('sdk.permission.request')
-    // The turn is provably in flight (inside the approval await) — interrupt.
-    rt.send({ type: 'interrupt', sessionId: created.sessionId })
-    const settle = (await rt.nextEvent('sdk.interrupt_settled')) as { ok: boolean }
-    expect(settle.ok).toBe(true)
-    // The in-flight scripted completion lands with the aborted result.
-    const result = (await rt.nextEvent('sdk.result')) as Record<string, unknown>
-    expect(result).toMatchObject({ result: 'error_during_execution', terminalReason: 'aborted_streaming' })
-
-    // The NEXT turn on the same live session runs to success.
-    rt.send({ type: 'send', sessionId: created.sessionId, text: 'next unrelated turn' })
-    const next = (await rt.nextEvent('sdk.result')) as Record<string, unknown>
-    expect(next).toMatchObject({ subtype: 'success' })
-    expect(rt.events().filter((e) => e.type === 'sdk.turn.complete'), 'the fake mints no edge').toEqual([])
-  })
-
-  it('an interrupt with NOTHING in flight settles ok:true and leaves the session as it was: the next turn runs', async () => {
-    const { rt } = await make()
-    rt.send({ type: 'create', requestId: 'r-1', cwd: '/tmp' })
-    const created = (await rt.nextEvent('created')) as { sessionId: string }
-    await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'idle')
-
-    rt.send({ type: 'interrupt', sessionId: created.sessionId })
-    const settle = (await rt.nextEvent('sdk.interrupt_settled')) as { ok: boolean }
-    expect(settle.ok).toBe(true)
-    await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'idle')
-
-    rt.send({ type: 'send', sessionId: created.sessionId, text: 'next unrelated turn' })
+  it('interrupts an actual held turn with the Stop receipt and aborted result, then runs the next turn', async () => {
+    const rt = await make()
+    const sessionId = await create(rt)
+    send(rt, sessionId, 'HANG')
+    await rt.nextEvent('sdk.status', (event) => event.status === 'requesting')
+    rt.send({ type: 'interrupt', sessionId, stopId: 'stop-1' })
+    expect(await rt.nextEvent('sdk.interrupt_settled')).toMatchObject({ sessionId, stopId: 'stop-1', ok: true, stillQueued: [] })
+    const result = await rt.nextEvent('sdk.result')
+    expect(result).toMatchObject({ sessionId, subtype: 'error_during_execution', isError: true })
+    expect(result.terminalReason).toMatch(/^aborted_/)
+    send(rt, sessionId, 'next unrelated turn')
     expect(await rt.nextEvent('sdk.result')).toMatchObject({ subtype: 'success' })
+    expect(serverOnlyFrames(rt)).toEqual([])
   })
 
-  it('crash knob kills the process mid-turn with NO completion edge (the Rust death synthesis rings, not the fake)', async () => {
-    const { rt } = await make({ FAKE_KILROY_CRASH_ON_SEND: '1' })
-    rt.send({ type: 'create', requestId: 'r-1', cwd: '/tmp' })
-    const created = (await rt.nextEvent('created')) as { sessionId: string }
-    await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'idle')
-
-    rt.send({ type: 'send', sessionId: created.sessionId, text: 'boom' })
-    const code = await new Promise<number | null>((resolve) => {
-      rt.proc.once('exit', (c) => resolve(c))
-    })
-    expect(code).toBe(3)
-    // A real crash screams no protocol frame — the fake must NOT mint an
-    // edge here or a real crash would double-ring (sidecar edge + the Rust
-    // unrequested-death synthesis). The RUST side rings for process death.
-    expect(rt.events().some((e) => (e as { type: string }).type === 'sdk.turn.complete')).toBe(false)
+  it('interrupts a pending approval through the SDK and keeps the session usable', async () => {
+    const rt = await make({ program: APPROVAL_PROGRAM })
+    const sessionId = await create(rt)
+    send(rt, sessionId, 'needs approval')
+    const request = await rt.nextEvent('sdk.permission.request')
+    rt.send({ type: 'interrupt', sessionId, stopId: 'stop-approval' })
+    expect(await rt.nextEvent('sdk.interrupt_settled')).toMatchObject({ sessionId, stopId: 'stop-approval', ok: true })
+    expect(await rt.nextEvent('sdk.result')).toMatchObject({ sessionId, subtype: 'error_during_execution', terminalReason: 'aborted_streaming' })
+    expect(rt.events().some((event) => event.type === 'sdk.permission.cancelled' && event.requestId === request.requestId)).toBe(true)
+    send(rt, sessionId, 'next unrelated turn')
+    expect(await rt.nextEvent('sdk.result')).toMatchObject({ subtype: 'success' })
+    expect(serverOnlyFrames(rt)).toEqual([])
   })
 
-  it('resume keeps the durable cliSessionId and replays a session snapshot', async () => {
+  it('settles an idle interrupt without a synthetic status or latch that affects the next turn', async () => {
+    const rt = await make()
+    const sessionId = await create(rt)
+    rt.send({ type: 'interrupt', sessionId, stopId: 'idle-stop' })
+    expect(await rt.nextEvent('sdk.interrupt_settled')).toMatchObject({ sessionId, stopId: 'idle-stop', ok: true })
+    send(rt, sessionId, 'next unrelated turn')
+    expect(await rt.nextEvent('sdk.result')).toMatchObject({ subtype: 'success' })
+    expect(rt.events().filter((event) => event.type === 'sdk.status' && event.status === 'idle')).toEqual([])
+    expect(serverOnlyFrames(rt)).toEqual([])
+  })
+
+  it('reports a mid-turn CLI crash as the real stream end and process exit, without a result or edge', async () => {
+    const rt = await make({ program: { rules: [{ on: 'msg:prompt', emit: [{ kind: 'crash' }] }] } })
+    const sessionId = await create(rt)
+    send(rt, sessionId, 'crash now')
+    expect(await rt.nextEvent('sdk.stream.ended')).toMatchObject({ sessionId, reason: 'cli_exited' })
+    expect(await rt.waitExit()).toMatchObject({ code: 3, signal: null })
+    expect(rt.events().filter((event) => event.type === 'sdk.result')).toEqual([])
+    expect(serverOnlyFrames(rt)).toEqual([])
+  })
+
+  it('resumes the saved native conversation and initializes it only after the next prompt', async () => {
+    const rt = await make()
     const durable = randomUUID()
-    const { rt } = await make()
-    rt.send({ type: 'create', protocol: 2, requestId: 'r-1', cwd: '/tmp', boot: { kind: 'resume', resume: durable } })
-    const init = (await rt.nextEvent('sdk.session.init')) as { cliSessionId: string }
-    expect(init.cliSessionId).toBe(durable)
-    const snapshot = (await rt.nextEvent('sdk.session.snapshot')) as { messages: unknown[] }
-    expect(Array.isArray(snapshot.messages)).toBe(true)
-    await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'idle')
+    const project = path.join(rt.claudeConfigDir, 'projects', 'saved')
+    await fs.mkdir(project, { recursive: true })
+    const saved = path.join(project, `${durable}.jsonl`)
+    await fs.writeFile(saved, `${JSON.stringify({ type: 'user', uuid: randomUUID(), parentUuid: null, sessionId: durable, cwd: rt.cwd, message: { role: 'user', content: 'saved history' } })}\n`)
+    expect(await create(rt, { sessionId: durable, boot: { kind: 'resume', resume: durable } })).toBe(durable)
+    expect(rt.events().some((event) => event.type === 'sdk.session.init')).toBe(false)
+    const query = (await readKilroyLedger(rt.ledgerPath)).find((row) => row.kind === 'query')!
+    expect(query.options.resume).toBe(durable)
+    const uuid = send(rt, durable, 'continue the conversation')
+    expect(await rt.nextEvent('sdk.session.init')).toMatchObject({ sessionId: durable, cliSessionId: durable })
+    await rt.nextEvent('sdk.result')
+    const prompt = (await readKilroyLedger(rt.ledgerPath)).find((row) => row.kind === 'prompt')!
+    expect(prompt).toMatchObject({ sessionId: durable, uuid, text: 'continue the conversation' })
+    await expect.poll(() => fs.readFile(saved, 'utf8')).toContain('continue the conversation')
+    const lines = (await fs.readFile(saved, 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
+    expect(lines).toEqual(expect.arrayContaining([
+      expect.objectContaining({ message: { role: 'user', content: 'saved history' } }),
+      expect.objectContaining({ sessionId: durable, uuid, type: 'user' }),
+    ]))
   })
 
-  it('shutdown exits 0', async () => {
-    const { rt } = await make()
+  it('shutdown exits zero even before a session is created', async () => {
+    const rt = await make()
     rt.send({ type: 'shutdown' })
-    const code = await new Promise<number | null>((resolve) => rt.proc.once('exit', (c) => resolve(c)))
-    expect(code).toBe(0)
-    runtimes.pop() // already exited
+    expect(await rt.waitExit()).toEqual({ code: 0, signal: null })
+  })
+
+  it('cleanup confirms the sidecar exit and removes the owned workspace and ledger', async () => {
+    const rt = await make()
+    const sessionId = await create(rt)
+    const boot = (await readKilroyLedger(rt.ledgerPath)).find((row) => row.kind === 'boot')!
+    const cliPid = boot.cliPid as number
+    let cliStart: string | undefined
+    const running = async () => {
+      if (process.platform === 'linux') {
+        try {
+          const stat = await fs.readFile(`/proc/${cliPid}/stat`, 'utf8')
+          const fields = stat.slice(stat.lastIndexOf(')') + 1).trim().split(/\s+/)
+          if (cliStart !== undefined && fields[19] !== cliStart) return false
+          cliStart ??= fields[19]
+          return fields[0] !== 'Z' && fields[0] !== 'X'
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+          throw error
+        }
+      }
+      try { process.kill(cliPid, 0); return true } catch { return false }
+    }
+    expect(sessionId).toBe(boot.sessionId)
+    expect(await running(), 'the actual simulated CLI is alive before cleanup').toBe(true)
+    await rt.kill()
+    expect(rt.proc.exitCode).toBe(0)
+    expect(rt.proc.signalCode).toBeNull()
+    await expect.poll(running).toBe(false)
+    await expect(fs.stat(rt.cwd)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(fs.stat(rt.ledgerPath)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 })

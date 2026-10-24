@@ -22,7 +22,7 @@ import {
   FAKE_GEMINI_DEFAULT_TEXT,
 } from '../helpers/harness-06/fake-ai.js'
 import {
-  spawnFakeKilroy,
+  spawnKilroyRuntime,
   readKilroyLedger,
 } from '../helpers/harness-06/kilroy-runtime.js'
 import {
@@ -283,32 +283,37 @@ test.describe('harness-06 misc fixtures smoke', () => {
     }
   })
 
-  test('fake Kilroy runtime: create handshake + full success turn + request ledger', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-h06-smoke-kilroy-'))
-    const logPath = path.join(dir, 'requests.jsonl')
-    const rt = await spawnFakeKilroy({ FAKE_KILROY_LOG: logPath })
+  test('Kilroy production sidecar: native create + full success turn + SDK ledger', async () => {
+    const rt = await spawnKilroyRuntime({
+      timeScale: 0.02,
+      program: { rules: [{ on: 'msg:prompt', emit: [{ kind: 'text', data: { text: 'kilroy smoke reply' } }] }] },
+    })
     try {
-      rt.send({ type: 'create', requestId: 'smoke-1', cwd: '/tmp/smoke', model: 'claude-opus-4-6' })
-      const created = (await rt.nextEvent('created')) as { requestId: string; sessionId: string }
-      expect(created.requestId).toBe('smoke-1')
-      const init = (await rt.nextEvent('sdk.session.init')) as { cliSessionId: string }
-      expect(init.cliSessionId).toMatch(/^[0-9a-f-]{36}$/)
-      await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'idle')
+      const sessionId = crypto.randomUUID()
+      rt.send({ type: 'create', protocol: 2, sessionType: 'kilroy', sessionId, requestId: 'smoke-1', cwd: rt.cwd, model: 'claude-opus-4-6', boot: { kind: 'fresh' } })
+      expect(await rt.nextEvent('created')).toMatchObject({ requestId: 'smoke-1', sessionId, protocol: 2 })
+      expect(rt.events().filter((event) => event.type === 'sdk.session.init')).toEqual([])
 
-      rt.send({ type: 'send', sessionId: created.sessionId, text: 'kilroy smoke turn' })
-      await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'running')
-      const assistant = (await rt.nextEvent('sdk.assistant')) as { content: Array<{ text?: string }> }
-      expect(assistant.content[0].text).toContain('kilroy smoke turn')
-      // The result ends the turn; the server mints its edge (C18), the fake none.
-      await rt.nextEvent('sdk.result', (e) => (e as { result?: string }).result === 'success')
-      expect(rt.events().some((e) => (e as { type?: string }).type === 'sdk.turn.complete')).toBe(false)
+      const uuid = crypto.randomUUID()
+      rt.send({ type: 'send', sessionId, uuid, text: 'kilroy smoke turn' })
+      expect(await rt.nextEvent('sdk.session.init')).toMatchObject({ cliSessionId: sessionId, sessionId })
+      const assistant = await rt.nextEvent('sdk.assistant')
+      expect(assistant.content).toEqual([{ type: 'text', text: 'kilroy smoke reply' }])
+      expect(await rt.nextEvent('sdk.result')).toMatchObject({ sessionId, subtype: 'success', isError: false })
+      expect(rt.events().filter((event) => event.type === 'sdk.turn.complete' || event.type === 'sdk.turn.waiting')).toEqual([])
 
-      // "Records Kilroy invocations": the JSONL ledger carries both requests.
-      const ledger = await readKilroyLedger(logPath)
-      expect(ledger.map((row) => (row.msg as { type: string }).type)).toEqual(['create', 'send'])
+      const ledger = await readKilroyLedger(rt.ledgerPath)
+      const queries = ledger.filter((row) => row.kind === 'query')
+      expect(queries).toHaveLength(1)
+      expect(queries[0].options).toMatchObject({ sessionId, model: 'claude-opus-4-6', cwd: rt.cwd })
+      expect(ledger.filter((row) => row.kind === 'prompt')).toEqual([
+        expect.objectContaining({ sessionId, uuid, text: 'kilroy smoke turn' }),
+      ])
     } finally {
       await rt.kill()
-      fs.rmSync(dir, { recursive: true, force: true })
+      expect(rt.proc.exitCode).toBe(0)
+      expect(rt.proc.signalCode).toBeNull()
+      expect(fs.existsSync(rt.cwd)).toBe(false)
     }
   })
 
