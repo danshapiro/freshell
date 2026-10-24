@@ -3245,7 +3245,7 @@ impl SessionHandoffRunner {
             .load(std::sync::atomic::Ordering::SeqCst)
             && hooks
                 .force_reap_timeout_fenced_skip
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::SeqCst,
                     std::sync::atomic::Ordering::SeqCst,
                     |n| if n == 0 { None } else { Some(n - 1) },
@@ -3261,7 +3261,7 @@ impl SessionHandoffRunner {
             .load(std::sync::atomic::Ordering::SeqCst)
             && hooks
                 .force_platform_limited_skip
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::SeqCst,
                     std::sync::atomic::Ordering::SeqCst,
                     |n| if n == 0 { None } else { Some(n - 1) },
@@ -4112,7 +4112,6 @@ impl SessionHandoffRunner {
                         req.cwd.as_deref(),
                         req.tab_id.as_deref(),
                         req.pane_id.as_deref(),
-                        operation_id,
                         generation,
                     )
                     .await
@@ -4125,7 +4124,6 @@ impl SessionHandoffRunner {
                         req.cwd.as_deref(),
                         req.tab_id.as_deref(),
                         req.pane_id.as_deref(),
-                        operation_id,
                         generation,
                     )
                     .await

@@ -93,6 +93,7 @@ describe(`Claude permission suggestions and plan approvals over the pinned CLI $
       'remember-local', 'remember-session', 'shapes', 'plan-default', 'plan-accept-edits', 'plan-bypass', 'plan-file', 'plan-empty',
     ])
     for (const name of Object.keys(receipt.scenarios)) {
+      expect(ofType(receipt.scenarios[name]!.frames, 'sdk.send.rejected'), `${name}: the native send was accepted`).toEqual([])
       expect(scenario(name), name).toMatchObject({ fixtureRemoved: true, sidecarExit: { code: 0, signal: null } })
       expect(ofType(scenario(name).frames, 'sdk.error'), name).toEqual([])
     }

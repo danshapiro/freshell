@@ -191,9 +191,11 @@ async function runScenario(name, spec) {
     })
 
     const requestId = randomUUID()
-    send({ type: 'create', protocol: 2, boot: { kind: 'fresh' }, requestId, cwd: fixture.cwd, model: FAKE_MODEL, permissionMode: 'default' })
+    const nativeSessionId = randomUUID()
+    send({ type: 'create', protocol: 2, boot: { kind: 'fresh' }, requestId, sessionId: nativeSessionId, cwd: fixture.cwd, model: FAKE_MODEL, permissionMode: 'default' })
     const created = await waitFor((frame) => frame.requestId === requestId && (frame.type === 'created' || frame.type === 'create.failed'), 'created')
     if (created.type !== 'created') throw new Error(`the sidecar refused the create: ${created.message}`)
+    if (created.sessionId !== nativeSessionId) throw new Error('the sidecar changed the requested native session identity')
     sessionId = created.sessionId
     if (spec.plan) {
       send({ type: 'configure', sessionId, requestId: 'to-plan', settings: { permissionMode: 'plan' } })
@@ -205,7 +207,7 @@ async function runScenario(name, spec) {
       state.step = 0
       const results = frames.filter((frame) => frame.type === 'sdk.result').length
       log('info', 'turn.start', { scenario: name, turn })
-      send({ type: 'send', sessionId, text: `contract turn ${turn + 1}` })
+      send({ type: 'send', sessionId, uuid: randomUUID(), text: `contract turn ${turn + 1}` })
       await waitFor(() => frames.filter((frame) => frame.type === 'sdk.result').length > results, `the result of turn ${turn + 1}`)
     }
     // A status the CLI reports after a result still reaches the sidecar.

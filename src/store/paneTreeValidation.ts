@@ -1,6 +1,7 @@
 import { isFreshAgentModelSelection, type PaneNode } from './paneTypes'
 import { CodexDurabilityRefSchema } from '@shared/codex-durability'
 import { isFreshAgentSessionType, resolveFreshAgentRuntimeProvider } from '@shared/fresh-agent'
+import { isDurableProviderSessionId } from '@shared/session-flavor'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object'
@@ -69,6 +70,16 @@ function isPaneContentShape(content: unknown): boolean {
       const hasSessionRef = content.sessionRef !== undefined
         && (typeof content.sessionRef === 'object' || !!(content.sessionRef as object))
       const hasRestoreError = content.restoreError !== undefined
+      const sessionRef = isRecord(content.sessionRef) ? content.sessionRef : undefined
+      const restoreError = isRecord(content.restoreError) ? content.restoreError : undefined
+      const restoreErrorHasDurableIdentity = hasSessionRef
+        && hasRestoreError
+        && restoreError?.reason !== 'invalid_legacy_restore_target'
+        && sessionRef?.provider === content.provider
+        && isDurableProviderSessionId(
+          typeof content.provider === 'string' ? content.provider : undefined,
+          typeof sessionRef?.sessionId === 'string' ? sessionRef.sessionId : undefined,
+        )
       return !!sessionType
         && providerValid
         && typeof content.createRequestId === 'string'
@@ -86,7 +97,7 @@ function isPaneContentShape(content: unknown): boolean {
         && isOptionalString(content.effort)
         && isSessionRefShape(content.sessionRef)
         && isRestoreErrorShape(content.restoreError)
-        && !(hasSessionRef && hasRestoreError)
+        && (!(hasSessionRef && hasRestoreError) || restoreErrorHasDurableIdentity)
         && (content.plugins === undefined
           || (Array.isArray(content.plugins) && content.plugins.every((plugin) => typeof plugin === 'string')))
         && (content.settingsDismissed === undefined || typeof content.settingsDismissed === 'boolean')

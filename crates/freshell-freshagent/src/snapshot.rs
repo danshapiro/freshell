@@ -212,7 +212,7 @@ async fn get_snapshot(
     {
         if let Some(gateway) = state.opencode.hosted_rest_gateway() {
             match gateway
-                .snapshot(crate::hosted_rest::HostedRestSnapshot {
+                .snapshot(crate::rest_lane::RestLaneSnapshot {
                     session_id: thread_id.clone(),
                     provider: provider.clone(),
                     session_type: session_type.clone(),
@@ -221,13 +221,13 @@ async fn get_snapshot(
             {
                 Ok(Some(snapshot)) => return Json(snapshot).into_response(),
                 Ok(None) => {}
-                Err(crate::hosted_rest::HostedRestSnapshotError::ManagedUnavailable) => {
+                Err(crate::rest_lane::RestLaneSnapshotError::ManagedUnavailable) => {
                     return fail(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "Managed conversation snapshot unavailable".into(),
                     );
                 }
-                Err(crate::hosted_rest::HostedRestSnapshotError::OwnershipUnavailable) => {
+                Err(crate::rest_lane::RestLaneSnapshotError::OwnershipUnavailable) => {
                     return state
                         .saved_history_or_unavailable(&session_type, &provider, &thread_id)
                         .await
@@ -504,26 +504,25 @@ mod tests {
     struct SnapshotGateway;
 
     #[async_trait::async_trait]
-    impl crate::hosted_rest::HostedFreshAgentRestGateway for SnapshotGateway {
+    impl crate::rest_lane::FreshAgentRestLane for SnapshotGateway {
         async fn create_agent(
             self: Arc<Self>,
-            _: crate::hosted_rest::HostedRestCreate,
-        ) -> Result<crate::hosted_rest::HostedRestCreated, ()> {
+            _: crate::rest_lane::RestLaneCreate,
+        ) -> Result<crate::rest_lane::RestLaneCreated, crate::rest_lane::RestLaneError> {
             panic!("GET must not create")
         }
         async fn send_agent(
             &self,
-            _: crate::hosted_rest::HostedRestSend,
-        ) -> Result<crate::hosted_rest::HostedRestSendResult, ()> {
+            _: crate::rest_lane::RestLaneSend,
+        ) -> Result<crate::rest_lane::RestLaneSendResult, crate::rest_lane::RestLaneError> {
             panic!("GET must not send")
         }
         async fn snapshot(
             &self,
-            request: crate::hosted_rest::HostedRestSnapshot,
-        ) -> Result<Option<serde_json::Value>, crate::hosted_rest::HostedRestSnapshotError>
-        {
+            request: crate::rest_lane::RestLaneSnapshot,
+        ) -> Result<Option<serde_json::Value>, crate::rest_lane::RestLaneSnapshotError> {
             if request.session_id == "unavailable-host" {
-                return Err(crate::hosted_rest::HostedRestSnapshotError::ManagedUnavailable);
+                return Err(crate::rest_lane::RestLaneSnapshotError::ManagedUnavailable);
             }
             Ok(Some(
                 json!({"threadId":request.session_id,"status":"running",
@@ -561,6 +560,27 @@ mod tests {
                 assert_eq!(value["turns"][0]["turnId"], "owned-live-turn");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn local_rest_lane_does_not_replace_the_claude_snapshot_reader() {
+        let state = snapshot_state();
+        state
+            .opencode
+            .set_claude_rest_lane(Arc::new(SnapshotGateway))
+            .unwrap();
+        let response = get_snapshot(
+            State(state),
+            Path((
+                "freshclaude".into(),
+                "claude".into(),
+                "absent-local-rest-snapshot".into(),
+            )),
+            Query(HashMap::new()),
+            headers_with_token("tok"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -837,7 +857,7 @@ mod tests {
     /// `pendingQuestions` populated with the exact `.strict()` contract entry keys
     /// (object equality pins the KEY SET: no extras, no missing) and the
     /// presence-of-pending gates flipped (`normalize.ts:186-204, 226-232`). Addressed by
-    /// the DURABLE UUID (the `cli_index` alias), the id a live pane's GET carries.
+    /// the native UUID, the id a live pane's GET carries.
     #[tokio::test]
     async fn claude_locator_overlays_live_pending_and_flips_capability_gates() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
@@ -846,7 +866,7 @@ mod tests {
         let claude = claude_state();
         crate::claude::tests::insert_fake_claude_session_with_pending(
             &claude,
-            "client-nanoid-9",
+            durable,
             Some(durable),
             &[
                 json!({ "type": "sdk.permission.request", "sessionId": "s", "requestId": "req-1",
@@ -903,7 +923,7 @@ mod tests {
         let claude = claude_state();
         crate::claude::tests::insert_fake_claude_session_with_pending(
             &claude,
-            "client-nanoid-suggest",
+            durable,
             Some(durable),
             &[
                 json!({ "type": "sdk.permission.request", "sessionId": "s", "requestId": "req-npm",
@@ -970,7 +990,7 @@ mod tests {
         let claude = claude_state();
         crate::claude::tests::insert_fake_claude_session_with_pending(
             &claude,
-            "client-nanoid-12",
+            durable,
             Some(durable),
             &[
                 json!({ "type": "sdk.question.request", "sessionId": "s", "requestId": "q-prev",
@@ -1056,7 +1076,7 @@ mod tests {
         let claude = claude_state();
         crate::claude::tests::insert_fake_claude_session_with_pending(
             &claude,
-            "client-nanoid-10",
+            durable,
             Some(durable),
             &[
                 json!({ "type": "sdk.permission.request", "sessionId": "s", "requestId": "req-7",
@@ -1187,7 +1207,7 @@ mod tests {
         let claude = claude_state();
         crate::claude::tests::insert_fake_claude_session_with_pending(
             &claude,
-            "client-nanoid-11",
+            durable,
             Some(durable),
             &[],
         )

@@ -72,8 +72,9 @@
 //                                       the CLI took: the receipt's stillQueued and
 //                                       whether a turn was running), `control` (each settings call
 //                                       the CLI handles: setModel, setPermissionMode,
-//                                       applyFlagSettings, with its arguments) and
-//                                       `emission` (program steps)
+//                                       applyFlagSettings, with its arguments),
+//                                       `emission` (program steps), and `result`
+//                                       (a turn's result reached the SDK stream)
 
 import fs from 'node:fs'
 import path from 'node:path'
@@ -359,6 +360,9 @@ class SimulatedCli {
 
   emit(message) {
     if (this.dead || this.closing) return
+    // Fault injection for consumers that must follow an init identity even
+    // when the reset announcement is missing. The default trace is intact.
+    if (message.type === 'conversation_reset' && this.env.FRESHELL_CLAUDE_SIM_DROP_CONVERSATION_RESET === '1') return
     this.channel.push({ ...message, uuid: message.uuid ?? randomUUID(), session_id: message.session_id ?? this.sessionId })
   }
 
@@ -472,6 +476,9 @@ class SimulatedCli {
     if (resume) {
       const parentFile = findTranscript(this.configDir, resume)
       if (!parentFile) return { message: `No conversation found with session ID: ${resume}` }
+      // T5 path: the path selects a saved file; it never becomes the native
+      // conversation id or a second transcript filename after a resume.
+      if (!forkSession) this.sessionId = path.basename(parentFile, '.jsonl')
       const parentLines = readTranscriptLines(parentFile)
       let prefix
       try { prefix = forkPrefix(parentLines, resumeSessionAt) } catch (error) { return { message: error.message } }
@@ -1004,6 +1011,12 @@ class SimulatedCli {
       ...(turn.cmd?.uuid && subtype === 'success' ? { user_message_uuid: turn.cmd.uuid } : {}),
     }
     if (isError || subtype !== 'success') result.usage = usage(0, 0)
+    this.ledger('result', {
+      sessionId: this.sessionId,
+      uuid: turn.cmd?.uuid ?? null,
+      subtype,
+      isError,
+    })
     this.emit(result)
     await this.endCommand(turn, lifecycle ?? (success ? 'completed' : 'cancelled'))
   }

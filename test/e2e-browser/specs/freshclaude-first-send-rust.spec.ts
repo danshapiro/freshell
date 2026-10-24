@@ -1,17 +1,6 @@
-// FRESHCLAUDE FIRST SEND -- the real Claude CLI's session-report order.
-//
-// The real CLI emits system/init (relayed by the sidecar as sdk.session.init,
-// which gives the pane its durable session id and the server's ownership
-// coordinator its owner record) only once a prompt runs, and again at the
-// start of every turn. So a new freshclaude pane's first message is sent
-// before anything owns its session, and its later messages are sent after the
-// coordinator owns the session under the durable id, while the pane still
-// addresses it by the sidecar's placeholder id. Every message must run.
-//
-// The fake sidecar's FAKE_CLAUDE_SIDECAR_INIT_AT=turn reproduces that order.
-// Every other freshclaude spec uses the fake's default, which reports the
-// session right at create, so without this spec no browser test sends a
-// message before the session is reported.
+// FRESHCLAUDE FIRST SEND -- create-time identity reaches the real browser and
+// the production sidecar. The first prompt and a follow-up must both run under
+// the same durable session identity.
 //
 // Helpers are copied, not imported, per this suite's per-spec-ownership
 // convention (donor: freshclaude-restart-parity-rust.spec.ts, itself copied
@@ -27,12 +16,11 @@ import { RustServer } from '../helpers/rust-server.js'
 import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { claudeSimulatorServerEnv, readClaudeSimLedger } from '../helpers/claude-sim-lane.js'
 
 // ESM project ("type": "module" in package.json): derive __dirname.
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
-
-const FIXTURE = path.resolve(__dirname, '../fixtures/fake-claude-sidecar.mjs')
 
 const CANONICAL_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -153,17 +141,11 @@ async function createFreshclaudePane(page: Page, harness: TestHarness, cwd: stri
   })
 }
 
-/** The text of every prompt the fake sidecar received, in order (its request
- * log is the ground truth for "the message ran"). */
-function sidecarPrompts(requestLog: string): string[] {
-  if (!fs.existsSync(requestLog)) return []
-  return fs
-    .readFileSync(requestLog, 'utf-8')
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => JSON.parse(line))
-    .filter((entry) => entry.msg?.type === 'send')
-    .map((entry) => entry.msg.text)
+/** The simulated CLI's started prompts, in order. */
+function simulatedPrompts(ledger: string): string[] {
+  return readClaudeSimLedger(ledger)
+    .filter((entry) => entry.kind === 'prompt')
+    .map((entry) => String(entry.text ?? ''))
 }
 
 // ---------------------------------------------------------------------------
@@ -171,18 +153,21 @@ function sidecarPrompts(requestLog: string): string[] {
 // ---------------------------------------------------------------------------
 
 test.describe('freshclaude first send (rust)', () => {
-  test("a new pane's messages run when the CLI reports the session only once a prompt runs", async ({ page }) => {
+  test("a new pane accepts its first message after create-time identity is available", async ({ page }) => {
     test.setTimeout(120_000)
     const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshclaude-first-send-'))
-    const requestLog = path.join(sharedRoot, 'sidecar-requests.jsonl')
+    const simLedger = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
     const projectDir = path.join(sharedRoot, 'proj')
     await fsp.mkdir(projectDir, { recursive: true })
     const { server, harness } = await bootWall(page, {
-      env: {
-        FRESHELL_CLAUDE_SIDECAR: FIXTURE,
-        FAKE_CLAUDE_SIDECAR_INIT_AT: 'turn',
-        FAKE_CLAUDE_SIDECAR_LOG: requestLog,
-      },
+      env: claudeSimulatorServerEnv({
+        ledgerPath: simLedger,
+        // The production sidecar reports the durable session only when the
+        // simulated CLI starts its first prompt, matching the real CLI order.
+        program: {
+          rules: [{ on: 'msg:prompt', emit: [{ kind: 'text', data: { text: 'Fixture claude turn' } }] }],
+        },
+      }),
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
     try {
@@ -195,34 +180,31 @@ test.describe('freshclaude first send (rust)', () => {
       await createFreshclaudePane(page, harness, projectDir)
       const pane = page.locator('[data-context="fresh-agent"]').last()
 
-      // The order under test: the session exists but the CLI has not reported
-      // it, so the pane has no durable id when the user types.
+      // Create allocates and returns a durable identity before the user types.
       await expect
-        .poll(async () => findFreshAgentLeaf(await harness.getPaneLayout(tabId))?.content?.status, {
+        .poll(async () => liveDurableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId))), {
           timeout: 20_000,
         })
-        .toBe('idle')
-      expect(liveDurableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId)))).toBe('')
+        .toMatch(CANONICAL_UUID_RE)
+      const durableBeforeSend = liveDurableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId)))
 
       const suffix = Math.random().toString(36).slice(2, 10)
       const first = `first message ${suffix}`
       await sendFreshAgentTurn(page, harness, tabId, first)
       await expect
-        .poll(() => sidecarPrompts(requestLog), { timeout: 30_000 })
+        .poll(() => simulatedPrompts(simLedger), { timeout: 30_000 })
         .toEqual([first])
-      // Running the first prompt made the CLI report the session: the pane now
-      // holds its durable id (and the server owns the session under it).
       await expect
         .poll(async () => liveDurableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId))), {
           timeout: 15_000,
         })
-        .toMatch(CANONICAL_UUID_RE)
+        .toBe(durableBeforeSend)
       await expect(pane).toContainText('Fixture claude turn', { timeout: 30_000 })
 
       const second = `second message ${suffix}`
       await sendFreshAgentTurn(page, harness, tabId, second)
       await expect
-        .poll(() => sidecarPrompts(requestLog), { timeout: 30_000 })
+        .poll(() => simulatedPrompts(simLedger), { timeout: 30_000 })
         .toEqual([first, second])
 
       // Each message was sent once and none was refused.

@@ -4826,6 +4826,7 @@ fn crash_mid_supersession_two_bound_rows_repaired_by_updated_at_tiebreak() {
             device_id: None,
             tab_key: None,
             last_attributed_at: None,
+            turn_interrupted_at: None,
             plugins: None,
         };
         write_row_atomic(
@@ -5220,6 +5221,42 @@ fn old_terminal_rows_without_settings_fields_still_deserialize() {
     let row: BindingRow = serde_json::from_str(json).expect("old row must parse");
     assert_eq!(row.pane_kind, None);
     assert_eq!(row.model, None);
+    assert_eq!(row.turn_interrupted_at, None);
+}
+
+#[test]
+fn fresh_agent_restart_marker_survives_reload_and_is_consumed_atomically() {
+    let root = temp_root("turn-interrupted");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_fresh_agent_binding(&fa_write("claude", "session-restart", 1_000))
+        .expect("fresh-agent binding");
+    assert!(ledger
+        .mark_fresh_agent_turn_interrupted("claude", "session-restart", 2_000)
+        .expect("mark turn interrupted"));
+
+    let reloaded = PaneLedger::new(Some(root.clone()));
+    let marked = reloaded
+        .load_binding("claude", "session-restart")
+        .expect("binding after reload");
+    assert_eq!(marked.turn_interrupted_at, Some(2_000));
+    assert_eq!(
+        marked.updated_at, 1_000,
+        "the marker is not an identity rebind"
+    );
+    assert_eq!(
+        reloaded
+            .take_fresh_agent_turn_interrupted("claude", "session-restart")
+            .expect("consume turn marker"),
+        Some(2_000)
+    );
+
+    let consumed = PaneLedger::new(Some(root.clone()))
+        .load_binding("claude", "session-restart")
+        .expect("binding after marker consumption reload");
+    assert_eq!(consumed.turn_interrupted_at, None);
+    assert_eq!(consumed.updated_at, 1_000);
+    std::fs::remove_dir_all(&root).ok();
 }
 
 #[test]
@@ -8485,6 +8522,7 @@ fn close_record_covers_row_is_the_shared_recovery_predicate() {
             device_id: None,
             tab_key: None,
             last_attributed_at: None,
+            turn_interrupted_at: None,
             plugins: None,
         }
     }

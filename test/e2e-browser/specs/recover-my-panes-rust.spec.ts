@@ -30,6 +30,7 @@ import { request, type BrowserContext, type Page } from '@playwright/test'
 import { RustServer, ensureRustServerBuilt } from '../helpers/rust-server.js'
 import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
+import { claudeSimulatorServerEnv } from '../helpers/claude-sim-lane.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -242,8 +243,8 @@ async function shapeEvidenceExcluding(opts: {
 }
 
 /**
- * Donor: hidden-pane-rebind-rust.spec.ts:153 (fixture: fake-claude-sidecar.mjs
- * via the production env seam FRESHELL_CLAUDE_SIDECAR).
+ * Donor: hidden-pane-rebind-rust.spec.ts:153 (production Claude sidecar over
+ * the committed CLI simulator).
  */
 async function createFreshclaudePane(page: Page, harness: TestHarness, cwd: string): Promise<void> {
   // setAvailableClis is client-only AND gets overwritten by the app
@@ -378,11 +379,10 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
       env: {
         CLAUDE_CMD: fakeClaude,
         FAKE_CLAUDE_ARGV_LOG: argLog,
-        // Scenario 5's freshclaude lane: the fake SDK-bridge sidecar via the
-        // production env seam (read only at freshclaude sidecar spawn — inert
-        // for scenarios 1-4). restart() re-merges this env on every boot.
-        FRESHELL_CLAUDE_SIDECAR: path.resolve(__dirname, '../fixtures/fake-claude-sidecar.mjs'),
-        FAKE_CLAUDE_SIDECAR_LOG: path.join(sharedRoot, 'claude-sidecar-requests.jsonl'),
+        // Scenario 5's freshclaude lane: the production sidecar and CLI
+        // simulator (read only at fresh-agent spawn — inert for scenarios 1-4).
+        // restart() re-merges this env on every boot.
+        ...claudeSimulatorServerEnv({ ledgerPath: path.join(sharedRoot, 'claude-sim-ledger.jsonl') }),
       },
       setupHome: async (homeDir: string) => {
         capturedHome = homeDir

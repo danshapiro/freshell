@@ -169,6 +169,17 @@ describe(`pinned Claude CLI ${PINNED_CLI_VERSION} contract (real CLI, loopback p
     expect(r.observations.afterRefusals.files.filter((f: string) => /F2|F3|Z/.test(path.basename(f)))).toEqual([])
   }, SCENARIO_TIMEOUT)
 
+  it('T5 path: a transcript path resumes after its cwd is removed, keeping its UUID and original saved file', async () => {
+    const r = await real('resume-path')
+    expect(r.observations.pathBoot).toEqual({ ok: true })
+    expect(r.observations.pathResult.sessionIds).toEqual(['P'])
+    expect(r.observations.pathResult.shape).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'user', uuid: 'u1' }),
+      expect.objectContaining({ type: 'user', uuid: 'u2' }),
+    ]))
+    expect(r.observations.afterResume.files.map((file: string) => path.basename(file))).toEqual(['P.jsonl'])
+  }, SCENARIO_TIMEOUT)
+
   it('T6: a lazy fork boots with no prompt, writes nothing until its first prompt, can be re-spawned before it, then holds the parent prefix with its uuids', async () => {
     const r = await real('fork')
     const { parent, forkBeforePrompt, forkAfterPrompt } = r.observations
@@ -388,7 +399,7 @@ describe(`pinned Claude CLI ${PINNED_CLI_VERSION} contract (real CLI, loopback p
     expect(messagesOf(r, 'S').find((m) => m.subtype === 'compact_boundary')?.compact_metadata?.trigger).toBe('manual')
   }, SCENARIO_TIMEOUT)
 
-  it('T16: /clear sends conversation_reset stamped with the old id, then the new session id arrives in the next init and the result; its transcript exists at once and resumes', async () => {
+  it('T16: /clear sends the old-id reset then new-id init/result; B has mode metadata at once, flushes only its local command, and resumes', async () => {
     const r = await real('clear')
     const events = eventsOf(r, 'S')
     const reset = messagesOf(r, 'S').find((m) => m.type === 'conversation_reset')
@@ -401,6 +412,16 @@ describe(`pinned Claude CLI ${PINNED_CLI_VERSION} contract (real CLI, loopback p
     expect(results(r, 'S').map((m) => m.session_id)).toEqual(['A', 'B', 'B'])
     expect(lifecycleStates(messagesOf(r, 'S'), 'u2')).toEqual(['queued', 'started', 'completed'])
     expect(r.observations.afterClear.files.map((f: string) => path.basename(f)).sort()).toEqual(['A.jsonl', 'B.jsonl'])
+    expect(r.observations.afterClear.hasModeMetadata).toBe(true)
+    expect(r.observations.afterClearFlush.lineTypes).toEqual(['mode', 'user', 'user', 'system'])
+    expect(r.observations.afterClearFlush.messages).toEqual([
+      { type: 'user', isMeta: true, content: expect.stringContaining('<local-command-caveat>') },
+      { type: 'user', isMeta: false, content: expect.stringContaining('<command-name>/clear</command-name>') },
+    ])
+    expect(JSON.stringify(r.observations.afterClearFlush.messages)).not.toContain('hello')
+    expect(r.observations.afterClearFlush.localCommands).toEqual([
+      { subtype: 'local_command', content: '<local-command-stdout></local-command-stdout>', isMeta: false },
+    ])
     expect(eventsOf(r, 'resumeB').some((e) => e.k === 'init-resolved')).toBe(true)
   }, SCENARIO_TIMEOUT)
 

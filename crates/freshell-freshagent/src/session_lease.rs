@@ -1022,6 +1022,36 @@ impl FreshAgentSessionLeases {
         inner.bindings.remove(&lease_key(provider, session_id));
     }
 
+    /// Move a completed binding with the same live process after a native
+    /// conversation reset. An unrelated or in-flight target is untouched.
+    pub(crate) fn rekey_binding(
+        &self,
+        provider: &str,
+        old: &str,
+        new: &str,
+        old_live_key: &str,
+        new_live_key: &str,
+        ownership_id: &str,
+    ) -> bool {
+        let mut inner = self.inner.lock().expect("fresh-agent lease lock poisoned");
+        let old_key = lease_key(provider, old);
+        let new_key = lease_key(provider, new);
+        let Some(binding) = inner.bindings.get(&old_key) else {
+            return true;
+        };
+        if binding.live_session_key != old_live_key
+            || binding.ownership_id.as_deref() != Some(ownership_id)
+            || inner.bindings.contains_key(&new_key)
+            || inner.leases.contains_key(&new_key)
+        {
+            return false;
+        }
+        let mut binding = inner.bindings.remove(&old_key).expect("validated binding");
+        binding.live_session_key = new_live_key.into();
+        inner.bindings.insert(new_key, binding);
+        true
+    }
+
     /// Clear a completed binding only when it still names the watched
     /// runtime. A missing or different ownership tag is a deliberate no-op:
     /// the caller is stale or cannot prove it owns the binding.
@@ -1199,6 +1229,55 @@ mod tests {
                 live_session_key: "live-key-1".into()
             }
         );
+    }
+
+    #[test]
+    fn conversation_reset_moves_only_the_matching_runtime_binding() {
+        let leases = FreshAgentSessionLeases::new();
+        leases.claim("claude", "old", "create", 0);
+        assert!(leases.complete_with_identity("claude", "old", "create", "old", Some("owner")));
+        assert!(!leases.rekey_binding("claude", "old", "new", "old", "new", "stale"));
+        assert_eq!(
+            leases.claim("claude", "old", "observe", 1),
+            FreshSessionClaim::BoundLive {
+                live_session_key: "old".into()
+            }
+        );
+        assert!(leases.rekey_binding("claude", "old", "new", "old", "new", "owner"));
+        assert_eq!(
+            leases.claim("claude", "new", "observe", 2),
+            FreshSessionClaim::BoundLive {
+                live_session_key: "new".into()
+            }
+        );
+        assert_eq!(
+            leases.claim("claude", "old", "reuse", 2),
+            FreshSessionClaim::Acquired
+        );
+        assert!(leases.clear_binding_if_matches("claude", "new", "new", "owner"));
+        assert_eq!(
+            leases.claim("claude", "new", "resume", 3),
+            FreshSessionClaim::Acquired
+        );
+    }
+
+    #[test]
+    fn conversation_reset_does_not_overwrite_another_launch() {
+        let leases = FreshAgentSessionLeases::new();
+        leases.claim("claude", "old", "create", 0);
+        assert!(leases.complete_with_identity("claude", "old", "create", "old", Some("owner")));
+        leases.claim("claude", "new", "other", 0);
+        assert!(!leases.rekey_binding("claude", "old", "new", "old", "new", "owner"));
+        assert_eq!(
+            leases.claim("claude", "old", "observe", 1),
+            FreshSessionClaim::BoundLive {
+                live_session_key: "old".into()
+            }
+        );
+        assert!(matches!(
+            leases.claim("claude", "new", "observe", 1),
+            FreshSessionClaim::Held { .. }
+        ));
     }
 
     #[test]

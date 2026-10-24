@@ -44,6 +44,7 @@ const receipt = {
   verdict: 'FAIL',
   sdkVersion: pinned.sdkVersion,
   bundledCliVersion: pinned.cliVersion,
+  sendRefusals: [],
   cliArgvHasMcpConfig: false,
   cliArgvHasToken: null,
   probe: null,
@@ -87,6 +88,7 @@ try {
     let frame
     try { frame = JSON.parse(line) } catch { return }
     frames.push(frame)
+    if (frame.type === 'sdk.send.rejected') receipt.sendRefusals.push(frame)
     for (const waiter of [...waiters]) if (waiter.match(frame)) { waiters.splice(waiters.indexOf(waiter), 1); waiter.resolve(frame) }
   })
   const waitFor = (match, ms, what) => new Promise((resolve, reject) => {
@@ -99,14 +101,16 @@ try {
 
   failureStage = 'create'
   const requestId = randomUUID()
+  const nativeSessionId = randomUUID()
   write({
-    type: 'create', protocol: 2, boot: { kind: 'fresh' }, requestId, cwd: fixture.cwd, model: FAKE_MODEL,
+    type: 'create', protocol: 2, boot: { kind: 'fresh' }, requestId, sessionId: nativeSessionId, cwd: fixture.cwd, model: FAKE_MODEL,
     permissionMode: 'bypassPermissions', hostedMcp: false,
     freshellMcp: { command: process.execPath, args: [PROBE_SERVER, reportFile] },
     freshellContext: context,
   })
   const created = await waitFor(frame => frame.requestId === requestId && (frame.type === 'created' || frame.type === 'create.failed'), 45_000, 'created')
   if (created.type !== 'created') throw new Error(`the sidecar refused the create: ${created.message}`)
+  if (created.sessionId !== nativeSessionId) throw new Error('the sidecar changed the requested native session identity')
 
   failureStage = 'cli argv'
   const argv = (await fs.readFile(`/proc/${created.cliPid}/cmdline`, 'utf8')).split('\0')
@@ -115,7 +119,7 @@ try {
   receipt.cliArgvHasToken = argv.some(arg => arg.includes(token))
 
   failureStage = 'turn'
-  write({ type: 'send', sessionId: created.sessionId, text: PROMPT })
+  write({ type: 'send', sessionId: created.sessionId, uuid: randomUUID(), text: PROMPT })
   const init = await waitFor(frame => frame.type === 'sdk.session.init', 45_000, 'the turn init')
   // The sidecar forwards the CLI's tool list as `{ name }` objects.
   receipt.toolNames = (init.tools ?? []).map(tool => (typeof tool === 'string' ? tool : tool?.name)).filter(name => String(name).startsWith('mcp__'))

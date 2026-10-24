@@ -126,9 +126,6 @@ impl FreshClaudeState {
                 };
             }
         };
-        let owning_operation = ticket
-            .as_ref()
-            .map(|ticket| ticket.operation_id().to_string());
         let outcome = self
             .resume_for_attach(
                 msg,
@@ -138,7 +135,6 @@ impl FreshClaudeState {
                 },
                 &mut lease,
                 &mut ticket,
-                owning_operation,
                 None,
             )
             .await;
@@ -282,11 +278,7 @@ impl FreshClaudeState {
         let candidate = sink
             .as_ref()
             .and_then(|sink| sink.chain_terminus(PROVIDER, wire_id))
-            .or_else(|| {
-                self.dead_sessions
-                    .find(wire_id)
-                    .and_then(|dead| dead.cli_session_id)
-            })
+            .or_else(|| self.dead_sessions.find(wire_id).map(|dead| dead.session_id))
             .or_else(|| is_canonical_claude_uuid(wire_id).then(|| wire_id.to_string()))?;
         Some(
             sink.and_then(|sink| sink.chain_terminus(PROVIDER, &candidate))

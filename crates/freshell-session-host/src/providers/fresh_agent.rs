@@ -10,6 +10,7 @@ use freshell_agent_runtime::host_actor::{
     FreshAgentProfile, FreshAgentTransport, OperationAck, OperationFailure, OperationFailureKind,
     TransportStart,
 };
+use freshell_agent_runtime::snapshot_text::render_snapshot_text;
 use freshell_codex::launch_plan::CodexSidecarLaunchContext;
 use freshell_freshagent::rollback_record::{RollbackDirection, RollbackModeReq, RollbackRequest};
 use freshell_freshagent::{FreshAgentState, FreshClaudeState, FreshCodexState, FreshOpencodeState};
@@ -162,13 +163,15 @@ impl HostedTransport {
     async fn with_claude_sidecar_environment(
         provider: FreshProvider,
         environment: Vec<(String, String)>,
+        context: Option<&ProviderLaunchContext>,
     ) -> Arc<Self> {
-        let (broadcast_tx, broadcast_rx) = broadcast::channel(1024);
-        let broadcast_tx = Arc::new(broadcast_tx);
-        let state = ProviderState::Claude(
-            FreshClaudeState::new(Arc::clone(&broadcast_tx)).with_sidecar_environment(environment),
-        );
-        Self::from_parts(provider, state, broadcast_tx, broadcast_rx)
+        let mut transport = Self::new_with_context(provider, context).await;
+        let hosted = Arc::get_mut(&mut transport).expect("new transport has one owner");
+        let ProviderState::Claude(state) = &mut hosted.state else {
+            panic!("the fixture requires a Claude runtime");
+        };
+        *state = state.clone().with_sidecar_environment(environment);
+        transport
     }
 
     async fn new_with_context(
@@ -1464,55 +1467,6 @@ fn find_operation_session_id(value: &Value) -> Option<String> {
     }
 }
 
-fn render_snapshot_text(snapshot: &Value, max_bytes: usize) -> (String, bool) {
-    let mut output = String::new();
-    if let Some(turns) = snapshot.get("turns").and_then(Value::as_array) {
-        for turn in turns {
-            let role = turn
-                .get("role")
-                .and_then(Value::as_str)
-                .unwrap_or("assistant");
-            let mut body = Vec::new();
-            if let Some(items) = turn.get("items").and_then(Value::as_array) {
-                for item in items {
-                    if let Some(text) = item.get("text").and_then(Value::as_str) {
-                        body.push(text);
-                    } else if let Some(command) = item.get("command").and_then(Value::as_str) {
-                        body.push(command);
-                    } else if let Some(result) = item.get("output").and_then(Value::as_str) {
-                        body.push(result);
-                    }
-                }
-            }
-            if body.is_empty() {
-                // An item-less turn carrying only the durable error module
-                // (a claude API error or failed local command) reads as its
-                // error; anything else falls back to the summary.
-                if let Some(message) = turn.pointer("/error/message").and_then(Value::as_str) {
-                    body.push(message);
-                } else if let Some(summary) = turn.get("summary").and_then(Value::as_str) {
-                    body.push(summary);
-                }
-            }
-            if !body.is_empty() {
-                output.push_str(role);
-                output.push_str(": ");
-                output.push_str(&body.join("\n"));
-                output.push('\n');
-            }
-        }
-    }
-    if output.len() <= max_bytes {
-        return (output, false);
-    }
-    let mut boundary = max_bytes;
-    while boundary > 0 && !output.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    output.truncate(boundary);
-    (output, true)
-}
-
 fn parse_send_outcome(value: &Value) -> Option<(String, bool)> {
     let event_type = value.get("type")?.as_str()?;
     let request_id = value.get("requestId").and_then(|value| match value {
@@ -1585,36 +1539,6 @@ mod tests {
     #[tokio::test]
     async fn managed_provider_fresh_claude_sends_only_fixed_hosted_mcp_selection() {
         let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
-        let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("sidecar.mjs");
-        let receipt = dir.path().join("create.json");
-        std::fs::write(&script, r#"
-import {createInterface} from 'node:readline';
-import {writeFileSync} from 'node:fs';
-const lines=createInterface({input:process.stdin});
-lines.on('line', line=>{
-  const req=JSON.parse(line);
-  if(req.type==='create'){
-    writeFileSync(process.env.FRESHELL_TEST_MCP_RECEIPT,JSON.stringify(req));
-    process.stdout.write(JSON.stringify({type:'created',requestId:req.requestId,sessionId:'owned-mcp-fixture',protocol:2})+'\n');
-    if(req.model!=='deferred-identity')process.stdout.write(JSON.stringify({type:'sdk.session.init',sessionId:'owned-mcp-fixture',cliSessionId:req.boot?.resume??'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',model:'fixture',cwd:req.cwd,tools:[],slashCommands:[]})+'\n');
-  }
-  if(req.type==='shutdown')process.exit(0);
-});
-"#).unwrap();
-        let keys = [
-            "FRESHELL_CLAUDE_SIDECAR",
-            "FRESHELL_CLAUDE_NODE",
-            "FRESHELL_TEST_MCP_RECEIPT",
-        ];
-        let _env = SnapshotProviderEnv(
-            keys.iter()
-                .map(|key| (*key, std::env::var_os(key)))
-                .collect(),
-        );
-        std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
-        std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
-        std::env::set_var("FRESHELL_TEST_MCP_RECEIPT", &receipt);
         let context = ProviderLaunchContext {
             preparation: ProviderPreparation::Claude {
                 mcp_args: vec!["--mcp-config".into(), ".claude/freshell-mcp.json".into()],
@@ -1629,60 +1553,54 @@ lines.on('line', line=>{
             (true, true, None),
             (true, false, Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")),
         ] {
-            let transport = HostedTransport::new_with_context(
-                FreshProvider::Claude,
+            let conversations: Vec<&str> = expected_identity.into_iter().collect();
+            let claude = SimulatedClaude::start_with(
+                &conversations,
                 selected.then_some(&context),
+                vec![("FRESHELL_HOSTED_FRESH_AGENT".into(), "claude".into())],
             )
             .await;
-            let profile = FreshAgentProfile {
-                provider: FreshProvider::Claude,
-                runtime_variant: "freshclaude".into(),
-                cwd: dir.path().to_string_lossy().into(),
-                model: deferred_identity.then(|| "deferred-identity".into()),
-                effort: None,
-                permission_mode: None,
-                sandbox: None,
-                provider_store_id: "owned-store".into(),
-                native_session_id: expected_identity.map(str::to_owned),
-                plugins: None,
-                model_selection: None,
-                session_ref: None,
-                provider_launch_context: selected.then_some(context.clone()),
-                provider_secret_references: vec![],
-            };
+            let mut profile = claude.profile(expected_identity);
+            profile.model = deferred_identity.then(|| "deferred-identity".into());
+            profile.provider_launch_context = selected.then_some(context.clone());
             let started =
-                tokio::time::timeout(Duration::from_secs(1), transport.start(&profile)).await;
-            let observed: Value =
-                serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
-            transport.stop().await.unwrap();
-            let started = started
-                .expect("Claude create cannot wait for the first model turn")
-                .unwrap();
+                tokio::time::timeout(Duration::from_secs(20), claude.transport.start(&profile))
+                    .await
+                    .expect("Claude create cannot wait for the first model turn")
+                    .unwrap();
+            let queries = claude.ledger_rows("query");
+            assert_eq!(queries.len(), 1, "one actual SDK query boots the runtime");
+            let observed = &queries[0]["options"];
             if let Some(expected) = expected_identity {
-                // A resume is named by `created` (the sidecar answers it once the
-                // CLI booted that conversation), not by a later turn's init.
                 assert_eq!(started.native_session_id.as_deref(), Some(expected));
-                assert_eq!(
-                    observed["boot"],
-                    json!({ "kind": "resume", "resume": expected }),
-                    "the create boots the resumed conversation"
-                );
+                assert_eq!(observed["resume"], expected);
             }
             if deferred_identity {
                 assert_eq!(
                     started.native_session_id.as_deref(),
-                    observed["sessionId"].as_str(),
-                    "fresh native identity is known before any prompt or init"
+                    observed["sessionId"].as_str()
                 );
             }
-            assert_eq!(
-                observed["hostedMcp"], selected,
-                "only accepted hosted selection enables the SDK recipe"
-            );
             assert!(
-                observed.get("mcpServers").is_none(),
-                "arbitrary MCP maps are never sent over private create IPC"
+                claude.ledger_rows("prompt").is_empty(),
+                "identity never needs a prompt"
             );
+            if selected {
+                assert_eq!(
+                    observed["mcpServers"],
+                    json!({
+                        "freshell": {"command":"node", "args":["/opt/freshell-mcp/server.js"]}
+                    }),
+                    "accepted hosted selection reaches the real SDK as the fixed recipe"
+                );
+                assert!(observed["mcpServers"]["freshell"].get("env").is_none());
+            } else {
+                assert!(
+                    observed.get("mcpServers").is_none(),
+                    "unselected context enables no recipe"
+                );
+            }
+            Arc::clone(&claude.transport).stop().await.unwrap();
         }
     }
 
@@ -1697,6 +1615,14 @@ lines.on('line', line=>{
 
     impl SimulatedClaude {
         async fn start(conversations: &[&str]) -> Self {
+            Self::start_with(conversations, None, vec![]).await
+        }
+
+        async fn start_with(
+            conversations: &[&str],
+            context: Option<&ProviderLaunchContext>,
+            extra_environment: Vec<(String, String)>,
+        ) -> Self {
             let root = tempfile::tempdir().unwrap();
             let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
             let home = root.path().join("home");
@@ -1712,8 +1638,20 @@ lines.on('line', line=>{
             }
             let ledger = root.path().join("sim-ledger.jsonl");
             let text = |path: &std::path::Path| path.to_string_lossy().into_owned();
-            let environment = vec![
+            let tmp = root.path().join("tmp");
+            std::fs::create_dir_all(&tmp).unwrap();
+            std::fs::write(root.path().join("active"), "").unwrap();
+            let mut environment = vec![
                 ("HOME".to_string(), text(&home)),
+                ("TMPDIR".into(), text(&tmp)),
+                (
+                    "FRESHELL_TEST_CLAUDE_RUNTIME_GUARD".into(),
+                    text(&root.path().join("active")),
+                ),
+                (
+                    "FRESHELL_TEST_CLAUDE_RESPOND_LOG".into(),
+                    text(&root.path().join("requests.jsonl")),
+                ),
                 (
                     "PATH".to_string(),
                     std::env::var("PATH").unwrap_or_default(),
@@ -1722,13 +1660,17 @@ lines.on('line', line=>{
                 ("CLAUDE_CONFIG_DIR".to_string(), text(&config)),
                 (
                     "FRESHELL_CLAUDE_SDK_QUERY_MODULE".to_string(),
-                    text(&repo.join("test/fixtures/claude-cli-sim/query.mjs")),
+                    freshell_platform::opencode_plugin::plugin_file_spec(
+                        &repo.join("test/integration/providers/claude-sdk-for-rust-runtime.mjs"),
+                    ),
                 ),
                 ("FRESHELL_CLAUDE_SIM_LEDGER".to_string(), text(&ledger)),
             ];
+            environment.extend(extra_environment);
             let transport = HostedTransport::with_claude_sidecar_environment(
                 FreshProvider::Claude,
                 environment,
+                context,
             )
             .await;
             Self {
@@ -2063,7 +2005,7 @@ lines.on('line', line=>{
     }
 
     /// What one hosted Claude configure produced: the actor's answer, the
-    /// durable profile afterwards, every configure line the scripted sidecar
+    /// durable profile afterwards, every configure line the production sidecar
     /// received, the provider event named `settled_on` once it reached the
     /// host journal, and the whole journal at that point.
     struct HostedClaudeConfigure {
@@ -2078,56 +2020,35 @@ lines.on('line', line=>{
     }
 
     /// Runs one configure through the real `FreshClaudeState` behind a hosted
-    /// actor whose profile starts on sonnet/low. The scripted sidecar answers
-    /// the configure line with `receipt`, a JavaScript expression over `req`.
+    /// actor whose profile starts on sonnet/low. The real sidecar applies SDK
+    /// settings; the refusal case injects an error at the SDK setModel boundary.
     async fn hosted_claude_configure(
         settings: freshell_runtime_protocol::FreshAgentTurnSettings,
-        receipt: &str,
+        reject_model: bool,
         settled_on: &str,
     ) -> HostedClaudeConfigure {
         let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("sidecar.mjs");
-        let receipt_log = dir.path().join("configure.jsonl");
-        std::fs::write(
-            &script,
-            format!(
-                r#"
-import {{createInterface}} from 'node:readline';
-import {{appendFileSync}} from 'node:fs';
-const lines=createInterface({{input:process.stdin}});
-const emit=frame=>process.stdout.write(JSON.stringify(frame)+'\n');
-lines.on('line', line=>{{
-  const req=JSON.parse(line);
-  if(req.type==='create')emit({{type:'created',requestId:req.requestId,sessionId:req.sessionId??'owned-configure',protocol:2}});
-  if(req.type==='configure'){{
-    appendFileSync(process.env.FRESHELL_TEST_CONFIGURE_RECEIPT,JSON.stringify(req)+'\n');
-    emit({receipt});
-  }}
-  if(req.type==='shutdown')process.exit(0);
-}});
-"#
-            ),
+        let claude = SimulatedClaude::start_with(
+            &[],
+            None,
+            if reject_model {
+                vec![("FRESHELL_TEST_CLAUDE_REJECT_MODEL".into(), "opus".into())]
+            } else {
+                vec![]
+            },
         )
-        .unwrap();
-        let keys = [
-            "FRESHELL_CLAUDE_SIDECAR",
-            "FRESHELL_CLAUDE_NODE",
-            "FRESHELL_TEST_CONFIGURE_RECEIPT",
-        ];
-        let _env = SnapshotProviderEnv(
-            keys.iter()
-                .map(|key| (*key, std::env::var_os(key)))
-                .collect(),
-        );
-        std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
-        std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
-        std::env::set_var("FRESHELL_TEST_CONFIGURE_RECEIPT", &receipt_log);
-        let transport = HostedTransport::new(FreshProvider::Claude).await;
+        .await;
+        let transport = claude.transport.clone();
         let profile = FreshAgentProfile {
             provider: FreshProvider::Claude,
             runtime_variant: "freshclaude".into(),
-            cwd: dir.path().to_string_lossy().into(),
+            cwd: claude
+                .root
+                .path()
+                .join("workspace")
+                .to_string_lossy()
+                .into(),
             model: Some("sonnet".into()),
             effort: Some("low".into()),
             permission_mode: Some("default".into()),
@@ -2171,10 +2092,11 @@ lines.on('line', line=>{{
             .into_iter()
             .map(|entry| entry.event)
             .collect();
-        let applied = std::fs::read_to_string(&receipt_log)
+        let applied = std::fs::read_to_string(claude.root.path().join("requests.jsonl"))
             .unwrap_or_default()
             .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|request| request["type"] == "configure")
             .collect();
         Arc::clone(&transport).stop().await.unwrap();
         HostedClaudeConfigure {
@@ -2186,9 +2108,6 @@ lines.on('line', line=>{{
         }
     }
 
-    const CLAUDE_CONFIGURED_OK: &str =
-        "{type:'sdk.configured',sessionId:req.sessionId,requestId:req.requestId,ok:true,settings:req.settings}";
-
     #[tokio::test]
     async fn hosted_claude_configure_applies_live_and_relays_the_session_metadata_frame() {
         let run = hosted_claude_configure(
@@ -2197,7 +2116,7 @@ lines.on('line', line=>{{
                 effort: Some("high".into()),
                 ..Default::default()
             },
-            CLAUDE_CONFIGURED_OK,
+            false,
             "freshAgent.session.metadata",
         )
         .await;
@@ -2236,7 +2155,7 @@ lines.on('line', line=>{{
                 model: Some("opus".into()),
                 ..Default::default()
             },
-            CLAUDE_CONFIGURED_OK,
+            false,
             "freshAgent.session.metadata",
         )
         .await;
@@ -2273,7 +2192,7 @@ lines.on('line', line=>{{
                 effort: Some("high".into()),
                 ..Default::default()
             },
-            "{type:'sdk.configured',sessionId:req.sessionId,requestId:req.requestId,ok:false,message:'Model or effort is unavailable'}",
+            true,
             "freshAgent.error",
         )
         .await;
@@ -4016,40 +3935,5 @@ lines.on('line', line=>{{
             })),
             Some("new-native".into())
         );
-    }
-
-    #[test]
-    fn snapshot_text_renderer_is_plain_and_utf8_bounded() {
-        let snapshot = json!({"turns":[
-            {"role":"user","summary":"ignored","items":[{"kind":"text","text":"héllo"}]},
-            {"role":"assistant","summary":"world","items":[]}
-        ]});
-        let (full, truncated) = render_snapshot_text(&snapshot, 100);
-        assert_eq!(full, "user: héllo\nassistant: world\n");
-        assert!(!truncated);
-        let (short, truncated) = render_snapshot_text(&snapshot, 8);
-        assert!(short.len() <= 8);
-        assert!(short.is_char_boundary(short.len()));
-        assert!(truncated);
-    }
-
-    #[test]
-    fn snapshot_text_renders_error_only_turns_by_their_error_message() {
-        // Real claude snapshots (pinned CLI 2.1.237 goldens): a failed /compact
-        // and an API error are item-less turns carrying only the error module.
-        for (golden, expected) in [
-            (
-                include_str!("../../../../test/fixtures/fresh-agent/claude/real-cli-2.1.237/compact-fail/snapshot.golden.json"),
-                "system: Error during compaction: API Error: 400 compaction refused by fake\n",
-            ),
-            (
-                include_str!("../../../../test/fixtures/fresh-agent/claude/real-cli-2.1.237/api-error/snapshot.golden.json"),
-                "assistant: API Error: 400 fixture bad request\n",
-            ),
-        ] {
-            let snapshot: Value = serde_json::from_str(golden).unwrap();
-            let (text, _) = render_snapshot_text(&snapshot, 1 << 20);
-            assert!(text.contains(expected), "{text}");
-        }
     }
 }

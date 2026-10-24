@@ -20,9 +20,7 @@ use crate::claude_handshake::RESUME_POINT_NOT_FOUND_CODE;
 use crate::claude_launch::{ClaudeBoot, ClaudeGenesis, ClaudeLaunchSpec};
 use crate::claude_snapshot as snap;
 
-use super::establish::{
-    EstablishError, EstablishLane, EstablishPlan, GenesisBinding, RegisterUnder,
-};
+use super::establish::{EstablishError, EstablishLane, EstablishPlan, GenesisBinding};
 use super::history::EffectiveTranscriptError;
 
 /// A fork while the parent runs a turn (`BUSY_TURN`).
@@ -164,13 +162,7 @@ impl FreshClaudeState {
         let (turn_lock, durable_before) = {
             let sessions = self.sessions.lock().await;
             match sessions.get(&map_key) {
-                Some(session) => (
-                    Arc::clone(&session.turn_lock),
-                    session
-                        .cli_session_id
-                        .clone()
-                        .unwrap_or_else(|| map_key.clone()),
-                ),
+                Some(session) => (Arc::clone(&session.turn_lock), session.identity.current()),
                 None => {
                     drop(sessions);
                     reply_sink(lost_session_frame(&msg.session_id, msg.session_type));
@@ -379,11 +371,9 @@ impl FreshClaudeState {
                 EstablishPlan {
                     lane: EstablishLane::Fork,
                     spec,
-                    register_under: RegisterUnder::Adopted(child.clone()),
+                    native_id: child.clone(),
                     claim: None,
-                    rekey_provisional_claim: false,
                     recorded_settings: Some(launch_settings.clone()),
-                    owning_operation: own_ticket.as_ref().map(|t| t.operation_id().to_string()),
                     owning_generation: None,
                     provenance: fork_provenance.clone(),
                     naming: None,
@@ -517,7 +507,7 @@ impl FreshClaudeState {
                 TurnLockedRequest::Fork,
                 map_key,
                 wire_id,
-                Some(durable),
+                durable,
                 turn_lock,
             )
             .await?;
@@ -532,10 +522,7 @@ impl FreshClaudeState {
             } else {
                 live_key.clone()
             },
-            durable: session
-                .cli_session_id
-                .clone()
-                .unwrap_or_else(|| live_key.clone()),
+            durable: session.identity.current(),
             ledger: Arc::clone(&session.ledger),
             settings: session.configuration.settings.clone(),
             freshell_context: session.configuration.freshell_context.clone(),
@@ -547,17 +534,8 @@ impl FreshClaudeState {
     /// ending on its own, which leaves a dead-session record instead). A parent
     /// whose sidecar merely died is still the pane's, so its fork goes on.
     async fn fork_parent_closed(&self, parent_key: &str) -> bool {
-        let closing = self
-            .close_pending
-            .lock()
-            .expect("close-pending lock")
-            .get(parent_key)
-            .is_some_and(|pending| *pending > 0);
-        if closing {
-            return true;
-        }
-        if self.sessions.lock().await.contains_key(parent_key) {
-            return false;
+        if let Some(session) = self.sessions.lock().await.get(parent_key) {
+            return session.identity.is_closing();
         }
         self.dead_sessions.find(parent_key).is_none()
     }
@@ -592,7 +570,7 @@ impl FreshClaudeState {
         if let Some(session) = self.sessions.lock().await.remove(child) {
             let _teardown: LoggedTeardown = self.teardown_removed_session_logged(session).await;
         }
-        self.evict_cli_index_aliases(child).await;
+
         self.leases.clear_binding(PROVIDER, child);
         if row_written {
             if let Some(sink) = self.identity_sink() {

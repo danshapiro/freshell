@@ -206,6 +206,59 @@ describe('storage-migration', () => {
     })
   })
 
+  it('preserves a validated Claude sessionRef alongside a recoverable restore error during boot migration', async () => {
+    localStorage.setItem('freshell_version', '5')
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify({
+      persistedAt: Date.now(),
+      version: 3,
+      tabs: {
+        activeTabId: 'tab-claude',
+        tabs: [{ id: 'tab-claude', title: 'Claude', createdAt: 1, mode: 'freshclaude' }],
+      },
+      panes: {
+        version: 6,
+        layouts: {
+          'tab-claude': {
+            type: 'leaf',
+            id: 'pane-claude',
+            content: {
+              kind: 'fresh-agent',
+              sessionType: 'freshclaude',
+              provider: 'claude',
+              createRequestId: 'req-restore-error',
+              status: 'idle',
+              sessionId: VALID_CLAUDE_SESSION_ID,
+              sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+              restoreError: {
+                code: 'RESTORE_UNAVAILABLE',
+                reason: 'durable_artifact_missing',
+              },
+            },
+          },
+        },
+        activePane: { 'tab-claude': 'pane-claude' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    }))
+
+    await importFreshStorageMigration()
+
+    const migratedRaw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+    expect(migratedRaw).not.toBeNull()
+    const migrated = JSON.parse(migratedRaw!)
+    const content = migrated.panes.layouts['tab-claude'].content
+    expect(content.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: VALID_CLAUDE_SESSION_ID,
+    })
+    expect(content.restoreError).toEqual({
+      code: 'RESTORE_UNAVAILABLE',
+      reason: 'durable_artifact_missing',
+    })
+  })
+
   it('migrates durable legacy Codex recovery_failed panes to creating resume panes', async () => {
     localStorage.setItem('freshell_version', '3')
     localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify({

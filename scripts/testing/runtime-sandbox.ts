@@ -7,6 +7,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { configuredAmplifierOnecliGrantFiles } from './runtime-amplifier-onecli.js'
+import { preparedRuntimeBinary } from './runtime-build-preflight.js'
 import { parseHelperCreateDelay, RestrictedDockerBroker, type BrokerEvent, type BrokerReceipt } from './runtime-test-broker.js'
 
 export const PHASE1_RUNTIME_IMAGE_TAG = 'ubuntu:24.04'
@@ -1278,18 +1279,28 @@ export class RuntimeHarness {
 
   private buildBinaries(): void {
     fs.mkdirSync(this.buildDir, { recursive: true })
-    const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
-    execFileSync(mise, ['exec', 'rust@1.96', '--', 'cargo', 'build', '-p', 'freshell-supervisor', '-p', 'freshell-session-host', '--features', 'freshell-supervisor/runtime-test-faults,freshell-session-host/fresh-agent-fixtures'], { cwd: this.repoRoot, stdio: 'inherit' })
     this.testSupervisorBinary = path.join(this.buildDir, 'freshell-supervisor-test')
     this.testHostBinary = path.join(this.buildDir, 'freshell-session-host-test')
+    this.releaseSupervisorBinary = path.join(this.buildDir, 'freshell-supervisor-release')
+    this.releaseHostBinary = path.join(this.buildDir, 'freshell-session-host-release')
+    const prepared = preparedRuntimeBinary(this.repoRoot, 'supervisor-test')
+    if (prepared) {
+      for (const [source, destination] of [
+        [prepared, this.testSupervisorBinary],
+        [preparedRuntimeBinary(this.repoRoot, 'host-test')!, this.testHostBinary],
+        [preparedRuntimeBinary(this.repoRoot, 'supervisor-release')!, this.releaseSupervisorBinary],
+        [preparedRuntimeBinary(this.repoRoot, 'host-release')!, this.releaseHostBinary],
+      ]) fs.copyFileSync(source, destination)
+      return
+    }
+    const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
+    execFileSync(mise, ['exec', 'rust@1.96', '--', 'cargo', 'build', '-p', 'freshell-supervisor', '-p', 'freshell-session-host', '--features', 'freshell-supervisor/runtime-test-faults,freshell-session-host/fresh-agent-fixtures'], { cwd: this.repoRoot, stdio: 'inherit' })
     fs.copyFileSync(path.join(this.repoRoot, 'target/debug/freshell-supervisor'), this.testSupervisorBinary)
     fs.copyFileSync(path.join(this.repoRoot, 'target/debug/freshell-session-host'), this.testHostBinary)
     fs.chmodSync(this.testSupervisorBinary, 0o755)
     fs.chmodSync(this.testHostBinary, 0o755)
 
     execFileSync(mise, ['exec', 'rust@1.96', '--', 'cargo', 'build', '--release', '-p', 'freshell-supervisor', '-p', 'freshell-session-host'], { cwd: this.repoRoot, stdio: 'inherit' })
-    this.releaseSupervisorBinary = path.join(this.buildDir, 'freshell-supervisor-release')
-    this.releaseHostBinary = path.join(this.buildDir, 'freshell-session-host-release')
     fs.copyFileSync(path.join(this.repoRoot, 'target/release/freshell-supervisor'), this.releaseSupervisorBinary)
     fs.copyFileSync(path.join(this.repoRoot, 'target/release/freshell-session-host'), this.releaseHostBinary)
     fs.chmodSync(this.releaseSupervisorBinary, 0o755)

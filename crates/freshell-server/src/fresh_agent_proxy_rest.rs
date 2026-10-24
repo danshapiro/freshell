@@ -3,13 +3,13 @@
 use super::*;
 
 #[async_trait::async_trait]
-impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
+impl FreshAgentRestLane for HostedFreshAgentProxy {
     async fn snapshot(
         &self,
-        request: freshell_freshagent::hosted_rest::HostedRestSnapshot,
-    ) -> Result<Option<serde_json::Value>, freshell_freshagent::hosted_rest::HostedRestSnapshotError>
+        request: freshell_freshagent::rest_lane::RestLaneSnapshot,
+    ) -> Result<Option<serde_json::Value>, freshell_freshagent::rest_lane::RestLaneSnapshotError>
     {
-        use freshell_freshagent::hosted_rest::HostedRestSnapshotError::{
+        use freshell_freshagent::rest_lane::RestLaneSnapshotError::{
             ManagedUnavailable, OwnershipUnavailable,
         };
         let (provider, session_type) =
@@ -123,13 +123,13 @@ impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
     }
     async fn create_agent(
         self: Arc<Self>,
-        request: HostedRestCreate,
-    ) -> Result<HostedRestCreated, ()> {
+        request: RestLaneCreate,
+    ) -> Result<RestLaneCreated, freshell_freshagent::rest_lane::RestLaneError> {
         let (provider, session_type) =
             rest_agent_identity(&request.provider, &request.session_type)?;
         let runtime_provider = fresh_provider(&Some(provider), session_type).ok_or(())?;
         let message = freshell_protocol::FreshAgentCreate {
-            pane_id: None,
+            pane_id: request.pane_id,
             request_id: request.request_id,
             session_type,
             cwd: request.cwd,
@@ -137,8 +137,8 @@ impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
             legacy_restore_context: None,
             model: request.model,
             model_selection: request.model_selection,
-            observed_epoch: None,
-            observed_generation: None,
+            observed_epoch: request.observed_epoch,
+            observed_generation: request.observed_generation,
             permission_mode: request.permission_mode,
             plugins: request.plugins,
             provider: Some(provider),
@@ -148,8 +148,8 @@ impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
                 provider: provider_wire(&provider),
                 session_id,
             }),
-            tab_id: None,
-            naming_handle: None,
+            tab_id: request.tab_id,
+            naming_handle: request.naming_handle,
         };
         let session_id = presentation_id_for_create(
             &runtime_provider,
@@ -159,11 +159,66 @@ impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
                 .as_ref()
                 .map(|value| value.session_id.as_str()),
         );
-        self.create(message).await?;
-        Ok(HostedRestCreated { session_id })
+        let cleanup_token = self
+            .create(message)
+            .await?
+            .map(|receipt| serde_json::to_string(&receipt).map_err(|_| ()))
+            .transpose()?;
+        Ok(RestLaneCreated {
+            session_id,
+            cleanup_token,
+            ..Default::default()
+        })
     }
 
-    async fn send_agent(&self, request: HostedRestSend) -> Result<HostedRestSendResult, ()> {
+    async fn abandon_create(
+        &self,
+        _: &RestLaneCreate,
+        created: &RestLaneCreated,
+    ) -> Result<(), freshell_freshagent::rest_lane::RestLaneError> {
+        use freshell_freshagent::rest_lane::{RestLaneError, RestLaneErrorKind};
+        let Some(token) = created.cleanup_token.as_deref() else {
+            return Ok(());
+        };
+        let (soul, revision): (SoulId, u64) = serde_json::from_str(token).map_err(|_| {
+            RestLaneError::new(
+                RestLaneErrorKind::Internal,
+                "INVALID_CREATE_CLEANUP_TOKEN",
+                "invalid hosted create cleanup receipt",
+            )
+        })?;
+        let stopped = self
+            .client
+            .stop_expected(soul.clone(), Some(revision))
+            .await;
+        match stopped {
+            Ok((StopOutcome::VerifiedEmpty, _)) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.runtime_code(),
+                    Some(RuntimeErrorCode::StaleIntentRevision | RuntimeErrorCode::UnknownSoul)
+                ) =>
+            {
+                Ok(())
+            }
+            result => {
+                tracing::warn!(event = "fresh_agent.abandoned_create_cleanup_failed", soul_id = %soul, expected_intent_revision = revision, result = ?result);
+                let mut error = RestLaneError::new(
+                    RestLaneErrorKind::Unavailable,
+                    "CREATE_CLEANUP_UNCONFIRMED",
+                    "the abandoned hosted runtime could not be confirmed stopped",
+                );
+                error.retryable = Some(true);
+                error.retry_after_ms = Some(250);
+                Err(error)
+            }
+        }
+    }
+
+    async fn send_agent(
+        &self,
+        request: RestLaneSend,
+    ) -> Result<RestLaneSendResult, freshell_freshagent::rest_lane::RestLaneError> {
         let (provider, session_type) =
             rest_agent_identity(&request.provider, &request.session_type)?;
         let soul = self
@@ -187,32 +242,33 @@ impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
             Duration::from_millis(request.timeout_ms),
         )
         .await;
-        Ok(HostedRestSendResult {
+        Ok(RestLaneSendResult {
             session_id: request.session_id,
             completed,
+            ..Default::default()
         })
     }
 
     async fn capture(
         &self,
-        request: HostedRestCapture,
-    ) -> Result<HostedRestCaptureResult, HostedRestCaptureError> {
+        request: RestLaneCapture,
+    ) -> Result<RestLaneCaptureResult, RestLaneCaptureError> {
         let (provider, session_type) =
             rest_agent_identity(&request.provider, &request.session_type)
-                .map_err(|_| HostedRestCaptureError::Unavailable)?;
+                .map_err(|_| RestLaneCaptureError::Unavailable)?;
         let soul = self
             .resolve_soul(&provider, session_type, &request.session_id)
             .await
-            .ok_or(HostedRestCaptureError::Unavailable)?;
+            .ok_or(RestLaneCaptureError::Unavailable)?;
         let capture = self
             .client
             .fresh_agent_capture(soul, request.max_bytes.min(256 * 1024) as u32)
             .await
             .map_err(|error| match error.runtime_code() {
-                Some(RuntimeErrorCode::UnsupportedOperation) => HostedRestCaptureError::Unsupported,
-                _ => HostedRestCaptureError::Unavailable,
+                Some(RuntimeErrorCode::UnsupportedOperation) => RestLaneCaptureError::Unsupported,
+                _ => RestLaneCaptureError::Unavailable,
             })?;
-        Ok(HostedRestCaptureResult {
+        Ok(RestLaneCaptureResult {
             session_id: capture.presentation_session_id,
             native_session_id: capture.native_session_id,
             text: capture.text,

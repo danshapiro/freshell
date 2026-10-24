@@ -13,6 +13,9 @@
 //!   in-request dedupe, the respawn cap + reset-on-live, and the G3
 //!   supersession-chain reader rule end-to-end through the real ledger.
 
+mod common;
+
+use common::claude_sim_environment::ClaudeSimEnvironment;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -27,12 +30,6 @@ use freshell_ws::pane_ledger::{FreshAgentBindingWrite, PaneLedger};
 use freshell_ws::WsState;
 
 const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
-
-/// Serializes every test in this file that mutates the process-global
-/// `FRESHELL_CLAUDE_SIDECAR` / `FRESHELL_CLAUDE_NODE` / `CLAUDE_CONFIG_DIR`
-/// env vars, mirroring `freshagent_claude_attach.rs`'s convention for the
-/// same hazard.
-static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 // ── scripted disk-truth probe ─────────────────────────────────────────────────
 
@@ -64,89 +61,6 @@ impl freshell_ws::existence::SessionExistenceProbe for StubProbe {
             .unwrap()
             .contains(&(provider.into(), session_id.into()))
     }
-}
-
-// ── fake claude sidecar (donor: freshagent_claude_attach.rs) ──────────────────
-
-/// A minimal scripted fake claude sidecar (no real SDK, no network, no cost)
-/// speaking the SAME newline-JSON protocol `spawn_sidecar()` drives the
-/// vendored package with. On `create` it replies `created`, then
-/// `sdk.session.init` echoing the resume boot's id (or a fixed durable UUID the
-/// tests control) as the durable `cliSessionId`, then `sdk.status idle`; on
-/// `shutdown` it exits.
-const FAKE_CLAUDE_SIDECAR_SOURCE: &str = r#"
-import readline from 'node:readline'
-
-let counter = 0
-const rl = readline.createInterface({ input: process.stdin, terminal: false })
-rl.on('line', (line) => {
-  const trimmed = line.trim()
-  if (!trimmed) return
-  let msg
-  try {
-    msg = JSON.parse(trimmed)
-  } catch {
-    return
-  }
-  if (msg.type === 'create') {
-    counter += 1
-    const sessionId = `fake-claude-session-${process.pid}-${counter}`
-    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 }) + '\n')
-    const cliSessionId = msg.boot?.resume || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-    process.stdout.write(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }) + '\n')
-    process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }) + '\n')
-  } else if (msg.type === 'shutdown') {
-    process.exit(0)
-  }
-})
-"#;
-
-/// The fixed durable `cliSessionId` the fake sidecar mints on a plain (non
-/// resume) `create` — the id the live-session tests key their probe on.
-const FAKE_DURABLE_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-
-/// A fresh temp dir holding the fake sidecar script, with
-/// `FRESHELL_CLAUDE_SIDECAR`/`FRESHELL_CLAUDE_NODE` pointed at it, PLUS an
-/// empty claude store with `CLAUDE_CONFIG_DIR` pointed at it (so no test ever
-/// touches the real home). Caller must hold [`CLAUDE_ENV_LOCK`] for the
-/// lifetime of the returned guard.
-struct FakeClaudeEnv {
-    dir: std::path::PathBuf,
-}
-impl FakeClaudeEnv {
-    fn install() -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "freshell-fake-claude-reconcile-ws-{}",
-            uuid_like_suffix()
-        ));
-        std::fs::create_dir_all(&dir).expect("create fake sidecar temp dir");
-        let script = dir.join("fake-claude-sidecar.mjs");
-        std::fs::write(&script, FAKE_CLAUDE_SIDECAR_SOURCE).expect("write fake sidecar");
-        let store = dir.join("claude-store");
-        std::fs::create_dir_all(&store).expect("create claude store dir");
-        std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
-        std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
-        std::env::set_var("CLAUDE_CONFIG_DIR", &store);
-        Self { dir }
-    }
-}
-impl Drop for FakeClaudeEnv {
-    fn drop(&mut self) {
-        std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
-        std::env::remove_var("FRESHELL_CLAUDE_NODE");
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-/// Dependency-free unique suffix (avoids pulling in `uuid` for this test crate).
-fn uuid_like_suffix() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("{nanos}-{:?}", std::thread::current().id())
 }
 
 fn test_settings_value() -> serde_json::Value {
@@ -192,6 +106,13 @@ struct Server {
 /// so tests can seed and assert deterministically (the §9.1 headless
 /// convention).
 async fn spawn_server_with_probe(probe: Arc<StubProbe>) -> Server {
+    spawn_server_with_claude_environment(probe, None).await
+}
+
+async fn spawn_server_with_claude_environment(
+    probe: Arc<StubProbe>,
+    environment: Option<Vec<(String, String)>>,
+) -> Server {
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let settings =
@@ -203,6 +124,11 @@ async fn spawn_server_with_probe(probe: Arc<StubProbe>) -> Server {
         ledger_root.path().to_path_buf(),
     )));
     let respawn_counts: Arc<Mutex<HashMap<(String, String), u32>>> = Arc::default();
+
+    let mut fresh_claude = freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx));
+    if let Some(environment) = environment {
+        fresh_claude = fresh_claude.with_sidecar_environment(environment);
+    }
 
     let state = WsState {
         layout: Default::default(),
@@ -224,7 +150,7 @@ async fn spawn_server_with_probe(probe: Arc<StubProbe>) -> Server {
             Arc::clone(&broadcast_tx),
             serde_json::json!({ "freshAgent": { "enabled": true } }),
         ),
-        fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
+        fresh_claude,
         fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
             freshell_freshagent::FreshAgentState::new(
                 Arc::clone(&auth_token),
@@ -389,28 +315,71 @@ async fn await_frame(
     .expect("expected frame did not arrive within budget")
 }
 
-/// Drive a claude `freshAgent.create` through the fake sidecar and return the
-/// durable `cliSessionId` from the `freshAgent.session.init` event.
-async fn create_live_claude_session(ws: &mut TestWs, request_id: &str) -> String {
-    ws.send(WsMessage::Text(
-        serde_json::json!({
-            "type": "freshAgent.create",
-            "requestId": request_id,
-            "sessionType": "freshclaude",
-            "provider": "claude",
-        })
-        .to_string(),
-    ))
-    .await
-    .expect("send freshAgent.create");
-    let init = await_frame(ws, Duration::from_secs(15), |v| {
-        v["type"] == "freshAgent.event" && v["event"]["type"] == "freshAgent.session.init"
+/// Create or resume through the production sidecar. Native identity is established
+/// before ACK; the CLI emits its init only after an actual prompt (T3).
+async fn create_live_claude_session(
+    ws: &mut TestWs,
+    environment: &ClaudeSimEnvironment,
+    request_id: &str,
+    resume: Option<&str>,
+) -> String {
+    let mut request = serde_json::json!({
+        "type": "freshAgent.create", "requestId": request_id,
+        "sessionType": "freshclaude", "provider": "claude",
+        "cwd": environment.workspace(),
+    });
+    if let Some(id) = resume {
+        request["sessionRef"] = serde_json::json!({"provider":"claude", "sessionId":id});
+    }
+    ws.send(WsMessage::Text(request.to_string())).await.unwrap();
+    let created = await_frame(ws, common::FRAME_BUDGET, |v| {
+        v["requestId"] == request_id
+            && matches!(
+                v["type"].as_str(),
+                Some("freshAgent.created" | "freshAgent.create.failed" | "error")
+            )
     })
     .await;
-    init["event"]["cliSessionId"]
-        .as_str()
-        .expect("session.init carries the durable cliSessionId")
-        .to_string()
+    assert_eq!(created["type"], "freshAgent.created", "{created}");
+    let id = created["sessionId"].as_str().unwrap().to_string();
+    assert!(
+        uuid::Uuid::parse_str(&id).is_ok(),
+        "native conversation UUID: {created}"
+    );
+    assert_eq!(created["sessionRef"]["sessionId"], id);
+    assert!(environment
+        .rows("boot")
+        .iter()
+        .any(|row| row["sessionId"] == id));
+    id
+}
+
+async fn kill_live_claude_session(ws: &mut TestWs, environment: &ClaudeSimEnvironment, id: &str) {
+    let boot = environment
+        .rows("boot")
+        .into_iter()
+        .rev()
+        .find(|row| row["sessionId"] == id)
+        .unwrap();
+    let processes = [
+        boot["pid"].as_u64().unwrap(),
+        boot["cliPid"].as_u64().unwrap(),
+    ]
+    .map(|pid| common::process_probe::ProcessProbe::open(u32::try_from(pid).unwrap()));
+    ws.send(WsMessage::Text(serde_json::json!({
+        "type":"freshAgent.kill", "provider":"claude", "sessionType":"freshclaude", "sessionId":id
+    }).to_string())).await.unwrap();
+    let killed = await_frame(ws, common::FRAME_BUDGET, |v| {
+        v["type"] == "freshAgent.killed" && v["sessionId"] == id
+    })
+    .await;
+    assert_eq!(killed["success"], true, "{killed}");
+    for process in processes {
+        assert!(
+            process.exits_within(common::FRAME_BUDGET).await,
+            "owned runtime survived kill"
+        );
+    }
 }
 
 // --- negotiation ---------------------------------------------------------------
@@ -499,14 +468,16 @@ async fn fresh_agent_verdicts_cover_the_four_states() {
 
 #[tokio::test]
 async fn live_fresh_agent_session_gets_attach() {
-    let _guard = CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeClaudeEnv::install();
-
-    let server = spawn_server().await;
+    let environment = ClaudeSimEnvironment::new();
+    let server = spawn_server_with_claude_environment(
+        Arc::new(StubProbe::default()),
+        Some(environment.environment()),
+    )
+    .await;
     let (mut ws, _ready) = connect(&server.url, true, true).await;
 
-    let cli_session_id = create_live_claude_session(&mut ws, "req-live-attach").await;
-    assert_eq!(cli_session_id, FAKE_DURABLE_ID);
+    let cli_session_id =
+        create_live_claude_session(&mut ws, &environment, "req-live-attach", None).await;
 
     let verdicts = reconcile_request(
         &mut ws,
@@ -519,6 +490,7 @@ async fn live_fresh_agent_session_gets_attach() {
     assert_eq!(verdicts[0]["verdict"], "attach");
     assert_eq!(verdicts[0]["sessionRef"]["sessionId"], cli_session_id);
     assert!(verdicts[0].get("terminalId").is_none());
+    kill_live_claude_session(&mut ws, &environment, &cli_session_id).await;
 }
 
 /// WAVE-B B1xB4 seam pin (V9 3.6): a mixed request whose TERMINAL pane
@@ -648,16 +620,29 @@ async fn a_session_resolving_live_clears_the_respawn_counter() {
     // Reset-on-live (V2/A7): a successful respawn is OBSERVED as the session
     // going live; the counter must clear so healthy sessions are never
     // exhausted by reconnect/reload storms.
-    let _guard = CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeClaudeEnv::install();
-
-    let probe = std::sync::Arc::new(StubProbe::default());
+    let environment = ClaudeSimEnvironment::new();
+    let probe = Arc::new(StubProbe::default());
+    let server =
+        spawn_server_with_claude_environment(Arc::clone(&probe), Some(environment.environment()))
+            .await;
+    let (mut ws, _ready) = connect(&server.url, true, true).await;
+    let cli_session_id =
+        create_live_claude_session(&mut ws, &environment, "req-counter-original", None).await;
+    // Materialize a real saved conversation, then close it so reconcile sees a
+    // resumable session with no live runtime before the subsequent resume.
+    ws.send(WsMessage::Text(serde_json::json!({
+        "type":"freshAgent.send", "requestId":"counter-first-turn", "provider":"claude",
+        "sessionType":"freshclaude", "sessionId":cli_session_id, "text":"remember this conversation"
+    }).to_string())).await.unwrap();
+    await_frame(&mut ws, common::FRAME_BUDGET, |v| {
+        v["sessionId"] == cli_session_id && v["event"]["type"] == "freshAgent.result"
+    })
+    .await;
+    kill_live_claude_session(&mut ws, &environment, &cli_session_id).await;
     probe.answers.lock().unwrap().insert(
-        ("claude".into(), FAKE_DURABLE_ID.into()),
+        ("claude".into(), cli_session_id.clone()),
         SessionExistence::Present,
     );
-    let server = spawn_server_with_probe(probe).await;
-    let (mut ws, _ready) = connect(&server.url, true, true).await;
 
     // TWO reconcile requests while the session is NOT yet live → both respawn.
     for i in 0..2 {
@@ -665,7 +650,7 @@ async fn a_session_resolving_live_clears_the_respawn_counter() {
             &mut ws,
             serde_json::json!([
                 { "paneKey": "p", "kind": "fresh-agent",
-                  "sessionRef": {"provider": "claude", "sessionId": FAKE_DURABLE_ID} }
+                  "sessionRef": {"provider": "claude", "sessionId": cli_session_id} }
             ]),
         )
         .await;
@@ -676,22 +661,27 @@ async fn a_session_resolving_live_clears_the_respawn_counter() {
             .respawn_counts
             .lock()
             .unwrap()
-            .get(&("claude".to_string(), FAKE_DURABLE_ID.to_string()))
+            .get(&("claude".to_string(), cli_session_id.clone()))
             .copied(),
         Some(2),
         "two respawn answers burned two"
     );
 
-    // Drive freshAgent.create through the fake sidecar so has_live_session
-    // becomes true for the durable id.
-    let cli_session_id = create_live_claude_session(&mut ws, "req-reset-on-live").await;
-    assert_eq!(cli_session_id, FAKE_DURABLE_ID);
+    // Resume the same saved conversation through the real SDK boundary.
+    let resumed = create_live_claude_session(
+        &mut ws,
+        &environment,
+        "req-reset-on-live",
+        Some(&cli_session_id),
+    )
+    .await;
+    assert_eq!(resumed, cli_session_id);
 
     let verdicts = reconcile_request(
         &mut ws,
         serde_json::json!([
             { "paneKey": "p", "kind": "fresh-agent",
-              "sessionRef": {"provider": "claude", "sessionId": FAKE_DURABLE_ID} }
+              "sessionRef": {"provider": "claude", "sessionId": cli_session_id} }
         ]),
     )
     .await;
@@ -701,9 +691,10 @@ async fn a_session_resolving_live_clears_the_respawn_counter() {
             .respawn_counts
             .lock()
             .unwrap()
-            .contains_key(&("claude".to_string(), FAKE_DURABLE_ID.to_string())),
+            .contains_key(&("claude".to_string(), cli_session_id.clone())),
         "counter cleared (not merely un-incremented) when presence resolved Live"
     );
+    kill_live_claude_session(&mut ws, &environment, &cli_session_id).await;
 }
 
 #[tokio::test]
@@ -985,7 +976,7 @@ fn log_capture() -> Arc<Mutex<Vec<CapturedEvent>>> {
 #[tokio::test]
 async fn dead_session_verdict_is_warn_logged_with_claimed_identity() {
     let events = log_capture();
-    let marker = uuid_like_suffix();
+    let marker = uuid::Uuid::new_v4().to_string();
     let pane_key = format!("deadpane-{marker}");
     let session_id = format!("gone-{marker}");
     let probe = std::sync::Arc::new(StubProbe::default());

@@ -10,7 +10,7 @@
  * and then fail. G26 keeps this refresh non-blocking (a hidden pane owes one
  * 'reveal-surface' refresh instead of marking its transcript dirty).
  *
- *   1. an approval raised while tab A is hidden shows its card after the
+ *   1. an approval delivered while tab A is hidden shows its card after the
  *      reveal, and the overlay is never drawn;
  *   2. the same approval cancelled while tab A is hidden is gone after the
  *      reveal, and the overlay is never drawn.
@@ -24,9 +24,12 @@
  * itself. What this spec does catch is a regression to the blocking reveal
  * path (the overlay recorder) and a broken end-to-end journey.
  *
- * Trigger: the hidden pane's session gets a `freshAgent.send` written straight
- * to the socket (the pane's composer is hidden), and the fake Claude-SDK
- * sidecar's program answers it with one Bash approval: the turn parks on it.
+ * Trigger: a visible composer starts the turn. The production sidecar streams
+ * the Bash tool-use transcript while tab A is visible; the test holds only
+ * the resulting canUseTool approval frame at the WebSocket boundary, switches
+ * tabs, then delivers that frame while A is hidden. The send and tool-use
+ * transcript must not be hidden: their transcript changes legitimately test
+ * the blocking transcript-refresh path instead of the approval-only reveal.
  * Then the client's own `freshAgent.interrupt` frame for the session — the
  * exact frame the Stream Deck "stop" sends to a pane in a background tab —
  * cancels it (the sidecar's interrupt-time pending cancellation, mirroring
@@ -39,24 +42,18 @@
  * held result and assert that the normal turn end still reaches the client.
  *
  * CLOUD-LEGALITY: no timing dependencies — every wait is a poll on observed
- * state (sidecar stdin/wire ledgers, received WS frames, DOM). This spec must
+ * state (simulator ledger, received WS frames, DOM). This spec must
  * NOT be added to CLOUD_SKIP_SPECS.
  */
 import fs from 'node:fs/promises'
-import { existsSync, readFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import type { Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
 import { RustServer } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
-
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = path.dirname(__filename)
-
-const CLAUDE_SIDECAR_FIXTURE = path.resolve(__dirname, '../fixtures/providers/fake-claude-sdk-sidecar.mjs')
+import { claudeSimulatorServerEnv, readClaudeSimLedger } from '../helpers/claude-sim-lane.js'
 
 const APPROVAL_REQUEST_ID = 'perm-raised-while-hidden'
 
@@ -64,16 +61,17 @@ const APPROVAL_REQUEST_ID = 'perm-raised-while-hidden'
 const RAISE_TEXT = 'raise an approval while hidden'
 
 /** The send raises one Bash approval; the Stop cancels it. */
-const FAKE_PROGRAM = {
+const SIMULATOR_PROGRAM = {
   rules: [
     {
-      on: 'msg:send',
+      on: 'msg:prompt',
       match: { text: RAISE_TEXT },
       once: true,
       emit: [
         {
           kind: 'approval',
           data: { id: APPROVAL_REQUEST_ID, tool: 'Bash', input: { command: 'echo raised-while-hidden' } },
+          delayMs: 3_000,
         },
       ],
     },
@@ -97,44 +95,23 @@ function findFreshAgentLeaf(node: any): any {
   return null
 }
 
-function readJsonl(file: string): any[] {
-  if (!existsSync(file)) return []
-  return readFileSync(file, 'utf8')
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => {
-      try {
-        return JSON.parse(line)
-      } catch {
-        return null
-      }
-    })
-    .filter(Boolean)
-}
-
-/** Every outbound sidecar frame of `type` (the fixture's wire audit rows). */
-function wireFrames(eventsLog: string, type: string): any[] {
-  return readJsonl(eventsLog)
-    .filter((row) => row.kind === 'wire' && row.frame?.type === type)
-    .map((row) => row.frame)
-}
-
-/** Every raw stdin frame of `type` the server wrote to the sidecar. */
-function stdinFrames(stdinLog: string, type: string): any[] {
-  return readJsonl(stdinLog)
-    .map((row) => {
-      try {
-        return JSON.parse(row.line)
-      } catch {
-        return null
-      }
-    })
-    .filter((frame) => frame?.type === type)
-}
-
 async function receivedFreshAgentEvents(harness: TestHarness, eventType: string): Promise<any[]> {
   const received = (await harness.getReceivedWsMessages()) as any[]
   return received.filter((msg) => msg?.type === 'freshAgent.event' && msg?.event?.type === eventType)
+}
+
+/** POST /api/tabs returns an unfocused tab, leaving the current pane visible. */
+async function createBackgroundShellTab(info: { baseUrl: string; token: string }, cwd: string): Promise<string> {
+  const res = await fetch(`${info.baseUrl}/api/tabs`, {
+    method: 'POST',
+    headers: { 'x-auth-token': info.token, 'content-type': 'application/json' },
+    body: JSON.stringify({ mode: 'shell', cwd }),
+  })
+  const payload = await res.json()
+  expect(res.ok, `POST /api/tabs: ${JSON.stringify(payload)}`).toBe(true)
+  const tabId = payload?.data?.tabId
+  expect(tabId, 'POST /api/tabs envelope data.tabId').toBeTruthy()
+  return tabId as string
 }
 
 /** Record whether the blocking reveal overlay is EVER drawn from now on. */
@@ -170,13 +147,19 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
 
   test('an approval raised, then cancelled, while the pane is hidden is current on reveal, with no blocking overlay', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-hidden-approval-'))
-    const stdinLog = path.join(sharedRoot, 'sidecar-stdin.jsonl')
-    const eventsLog = path.join(sharedRoot, 'sidecar-events.jsonl')
+    const simLedger = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
     let server: RustServer | undefined
     let pauseAfterCancellation = false
     let deliveryPaused = false
     let heldResults = 0
+    let heldPermissionRequest = false
+    let releasePermissionRequest: (() => void) | null = null
     const heldDeliveries: Array<() => void> = []
+    const releaseApprovalRequest = () => {
+      const deliver = releasePermissionRequest
+      releasePermissionRequest = null
+      deliver?.()
+    }
     const releaseDeliveries = () => {
       deliveryPaused = false
       for (const deliver of heldDeliveries.splice(0)) deliver()
@@ -192,6 +175,18 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
             heldDeliveries.push(() => route.send(message))
             return
           }
+          // Deliver the streamed tool-use transcript while the pane is
+          // visible, then hold only the approval surface event until its tab
+          // is hidden. This isolates the non-blocking approval reveal from
+          // the separate transcript-dirty reveal path.
+          if (!heldPermissionRequest
+            && frame?.type === 'freshAgent.event'
+            && frame.event?.type === 'freshAgent.permission.request'
+            && frame.provider === 'claude') {
+            heldPermissionRequest = true
+            releasePermissionRequest = () => route.send(message)
+            return
+          }
           route.send(message)
           if (pauseAfterCancellation && frame?.type === 'freshAgent.event'
             && frame.event?.type === 'freshAgent.permission.cancelled') {
@@ -203,14 +198,8 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
       const projectDir = path.join(sharedRoot, 'project')
       await fs.mkdir(projectDir, { recursive: true })
       server = new RustServer({
-        env: {
-          FRESHELL_CLAUDE_SIDECAR: CLAUDE_SIDECAR_FIXTURE,
-          FRESHELL_CLAUDE_NODE: process.execPath,
-          FRESHELL_FAKE_PROVIDER: 'freshclaude',
-          FRESHELL_FAKE_PROGRAM: JSON.stringify(FAKE_PROGRAM),
-          FRESHELL_FAKE_STDIN: stdinLog,
-          FRESHELL_FAKE_EVENTS: eventsLog,
-        },
+        verbose: process.env.FRESHELL_E2E_SERVER_VERBOSE === '1',
+        env: claudeSimulatorServerEnv({ ledgerPath: simLedger, program: SIMULATOR_PROGRAM }),
         setupHome: async (homeDir) => {
           const freshellDir = path.join(homeDir, '.freshell')
           await fs.mkdir(freshellDir, { recursive: true })
@@ -255,6 +244,20 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
       const bridgeSessionId: string = (await leafA()).content.sessionId
       expect(bridgeSessionId, 'the pane is bound to its sidecar session').toBeTruthy()
 
+      // The provider's saved default is bypassPermissions in a fresh test
+      // HOME. This scenario needs a real canUseTool approval, so opt into the
+      // asking mode through the same settings control a user would use.
+      await page.getByRole('button', { name: 'Agent settings', exact: true }).click()
+      await page.getByRole('combobox', { name: 'Permission mode' }).selectOption('default')
+      await page.keyboard.press('Escape')
+      await expect.poll(async () => {
+        const content = findFreshAgentLeaf(await harness.getPaneLayout(tabA))?.content
+        return content?.permissionMode ?? null
+      }).toBe('default')
+      await expect.poll(() => readClaudeSimLedger(simLedger).some(
+        (row) => row.kind === 'control' && row.name === 'setPermissionMode' && row.args?.[0] === 'default',
+      )).toBe(true)
+
       const paneA = page.locator('[data-context="fresh-agent"]').first()
       await expect(paneA).toBeVisible({ timeout: 15_000 })
       // The composer is up: the pane's first snapshot has rendered.
@@ -265,24 +268,15 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
       const visibleCard = page.getByRole('alert', { name: 'Permission request for Bash' })
       await expect(cardInAnyTab, 'no approval before the trigger').toHaveCount(0)
 
-      // ── Tab B: the user moves away; tab A (and its pane) is now hidden ────
-      await page.getByRole('button', { name: 'New shell tab' }).click()
+      // Create B without changing focus, then start the turn while A is
+      // visible. This keeps send acceptance out of the hidden-pane path.
+      const tabB = await createBackgroundShellTab(info, os.tmpdir())
       await harness.waitForTabCount(2)
-      const tabB = (await harness.getActiveTabId())!
       expect(tabB).not.toBe(tabA)
+      expect(await harness.getActiveTabId()).toBe(tabA)
       const tabALocator = page.locator(`[data-context="tab"][data-tab-id="${tabA}"]`)
       const tabBLocator = page.locator(`[data-context="tab"][data-tab-id="${tabB}"]`)
 
-      const sendToHiddenPane = () => page.evaluate(({ sessionId, text }) => {
-        window.__FRESHELL_TEST_HARNESS__?.sendWsMessage({
-          type: 'freshAgent.send',
-          requestId: 'send-while-hidden',
-          sessionId,
-          sessionType: 'freshclaude',
-          provider: 'claude',
-          text,
-        })
-      }, { sessionId: bridgeSessionId, text: RAISE_TEXT })
       const interruptHiddenPane = () => page.evaluate((sessionId) => {
         // The Stream Deck stop's exact frame for a fresh-agent pane.
         window.__FRESHELL_TEST_HARNESS__?.sendWsMessage({
@@ -293,20 +287,86 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
         })
       }, bridgeSessionId)
 
-      // ── 1. An approval RAISED while hidden appears on reveal ─────────────
-      await sendToHiddenPane()
+      // ── 1. An approval delivered while hidden appears on reveal ─────────
+      const composer = paneA.getByRole('textbox', { name: 'Chat message input' })
+      await composer.fill(RAISE_TEXT)
+      await paneA.getByRole('button', { name: 'Send' }).click()
+      await expect.poll(() => readClaudeSimLedger(simLedger).some(
+        (row) => row.kind === 'prompt' && row.text === RAISE_TEXT,
+      ), { timeout: 15_000, message: 'the visible pane starts the approval-triggering prompt' }).toBe(true)
+      let sendRequestId = ''
+      await expect.poll(async () => {
+        const sends = (await harness.getSentWsMessages())
+          .filter((message: any) => message?.type === 'freshAgent.send' && message?.text === RAISE_TEXT)
+        sendRequestId = sends.at(-1)?.requestId ?? ''
+        return sendRequestId
+      }, { timeout: 10_000, message: 'the visible turn has a request id before the tab switch' }).toBeTruthy()
+      await expect.poll(async () => (await harness.getReceivedWsMessages()).some(
+        (message: any) => message?.type === 'freshAgent.send.accepted' && message?.requestId === sendRequestId,
+      ), { timeout: 10_000, message: 'the server accepted the send while tab A is still visible' }).toBe(true)
+      await expect.poll(async () => (await leafA())?.content?.status, {
+        timeout: 10_000,
+        message: 'the visible pane observed the turn start before it is hidden',
+      }).toBe('running')
+      // The tool-use transcript and assistant line arrive while A remains
+      // visible. The matching canUseTool request is held at the WS boundary.
+      await expect.poll(async () => {
+        const received = ((await harness.getReceivedWsMessages()) as any[]).filter((message) => (
+          message?.type === 'freshAgent.event' && message.sessionId === bridgeSessionId
+        ))
+        const assistant = received.find((message) => message.event?.type === 'freshAgent.assistant'
+          && message.event?.content?.some((block: any) => block?.type === 'tool_use' && block?.name === 'Bash'))
+        return typeof assistant?.event?.uuid === 'string'
+          && received.some((message) => message.event?.type === 'freshAgent.session.changed'
+            && message.event?.reason === 'transcript'
+            && message.event?.uuid === assistant.event.uuid)
+      }, {
+        timeout: 15_000,
+        message: 'the prompt and Bash tool-use transcript land while the pane is visible',
+      }).toBe(true)
       await expect
-        .poll(() => wireFrames(eventsLog, 'sdk.permission.request').length, {
+        .poll(() => readClaudeSimLedger(simLedger).filter((row) => row.kind === 'approval').length, {
           timeout: 15_000,
-          message: 'the sidecar raises the approval',
+          message: 'the simulated CLI invokes the production canUseTool approval path',
         })
         .toBe(1)
-      await expect
-        .poll(async () => (await receivedFreshAgentEvents(harness, 'freshAgent.permission.request')).length, {
-          timeout: 15_000,
-          message: 'the client receives the approval while tab A is hidden',
-        })
-        .toBe(1)
+      await expect.poll(() => releasePermissionRequest !== null, {
+        timeout: 15_000,
+        message: 'the pending approval event is held at the WS boundary',
+      }).toBe(true)
+      expect(await harness.getActiveTabId(), 'the transcript changed while tab A was visible').toBe(tabA)
+      // The approval event arrives after A is hidden; no transcript-changing
+      // event is introduced in the hidden interval before this surface update.
+      await tabBLocator.click()
+      await expect.poll(() => harness.getActiveTabId(), { timeout: 10_000 }).toBe(tabB)
+      releaseApprovalRequest()
+      try {
+        await expect
+          .poll(async () => (await receivedFreshAgentEvents(harness, 'freshAgent.permission.request')).length, {
+            timeout: 15_000,
+            message: 'the client receives the approval while tab A is hidden',
+          })
+          .toBe(1)
+      } catch (error) {
+        const rows = readClaudeSimLedger(simLedger)
+        const received = (await harness.getReceivedWsMessages()) as any[]
+        const diagnostic = {
+          severity: 'error',
+          event: 'e2e.claude_hidden_approval_diagnostic',
+          queryPermissionModes: rows.filter((row) => row.kind === 'query')
+            .map((row) => row.options?.permissionMode ?? null),
+          promptPermissionModes: rows.filter((row) => row.kind === 'prompt')
+            .map((row) => row.permissionMode ?? null),
+          approvalEmissionCount: rows.filter((row) => row.kind === 'approval').length,
+          canUseToolOutcomes: rows.filter((row) => row.kind === 'can_use_tool')
+            .map((row) => ({ toolName: row.toolName, behavior: row.decision?.behavior, rejected: Boolean(row.error) })),
+          receivedFreshAgentEvents: received
+            .filter((message) => message?.type === 'freshAgent.event')
+            .map((message) => ({ type: message.event?.type, code: message.event?.code }))
+            .slice(-30),
+        }
+        throw new Error(`${error instanceof Error ? error.message : String(error)}\n${JSON.stringify(diagnostic)}`)
+      }
       expect(await harness.getActiveTabId(), 'the approval arrived while tab A was hidden').toBe(tabB)
 
       await armRevealOverlayRecorder(page)
@@ -322,17 +382,11 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
       pauseAfterCancellation = true
       await interruptHiddenPane()
       await expect
-        .poll(() => stdinFrames(stdinLog, 'interrupt').length, {
+        .poll(() => readClaudeSimLedger(simLedger).filter((row) => row.kind === 'interrupt').length, {
           timeout: 15_000,
           message: 'the server forwards the Stop of the parked turn',
         })
         .toBe(1)
-      await expect
-        .poll(() => wireFrames(eventsLog, 'sdk.permission.cancelled').map((frame) => frame.requestId), {
-          timeout: 15_000,
-          message: 'the sidecar cancels the pending approval',
-        })
-        .toEqual([APPROVAL_REQUEST_ID])
       await expect
         .poll(async () => (await receivedFreshAgentEvents(harness, 'freshAgent.permission.cancelled')).length, {
           timeout: 15_000,
@@ -358,6 +412,7 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
         message: 'the stopped turn result is delivered after the approval-only reveal',
       }).toBe(1)
     } finally {
+      try { releaseApprovalRequest() } catch { /* The page can already be closed after a failed test. */ }
       try { releaseDeliveries() } catch { /* The page can already be closed after a failed test. */ }
       await server?.stop().catch(() => {})
       await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})

@@ -1,15 +1,15 @@
 /**
  * FRESH-AGENT CONTROL SURFACES — PW-RUST e2e validation (AGENT-04/05/06/07/24).
  *
- * Drives the REAL Rust server + real browser UI against hermetic provider
- * fakes and pins the four control surfaces end-to-end:
+ * Drives the REAL Rust server + real browser UI against the production Claude
+ * sidecar over the CLI simulator, plus the existing Codex/OpenCode fixtures,
+ * and pins the control surfaces end-to-end:
  *
  *   AGENT-05 (approval responses + cancellation): Allow/Deny clicks must
- *     write the EXACT `permission.respond` frame to the sidecar
- *     stdin (FRESHELL_FAKE_STDIN raw audit log) — and provably ZERO frames
- *     before the click; reload-while-pending restores exactly one card from
- *     the REST snapshot overlay; the composer Stop button cancels without
- *     inventing a user decision.
+ *     Allow/Deny clicks reach the simulated CLI's real canUseTool callback —
+ *     and provably no decision exists before the click; reload-while-pending
+ *     restores exactly one card from the REST snapshot overlay; composer Stop
+ *     cancels without inventing a user decision.
  *   AGENT-06 (question responses): single-choice / multi-select / Other
  *     answers land in `question.respond` keyed by QUESTION TEXT, and the turn
  *     continues.
@@ -30,35 +30,6 @@
  *   Plus the capability-gate pin: /fork IS offered for claude (snapshot
  *     capabilities.fork=true since C14; the fork itself is pinned end to end
  *     by freshclaude-fork-rust.spec.ts).
- *
- * RESIDUAL HONESTY (also recorded in the checklist note): these fakes pin the
- * CONTRACT SHAPE + server/client wiring. Real-provider semantic fidelity of
- * compact content is out of scope for shape tests by design (the real-provider
- * contract suites are opt-in per repo policy).
- *
- * ── PRE-FIX NEGATIVE (mutation-check recipe) ────────────────────────────────
- * The spec must fail loudly without the response wiring. Prove it by pointing
- * the claude lane at a NO-OP stub that answers create but never raises a card
- * (NOTE: the stub must be .cjs — a require()-based stub in a .mjs file crashes
- * at import under NodeNext, which would fail the run for the WRONG reason):
- *   1. Write /tmp/noop-sidecar.cjs:
- *      const rl = require('readline').createInterface({ input: process.stdin })
- *      rl.on('line', (line) => {
- *        let m; try { m = JSON.parse(line) } catch { return }
- *        if (m.type === 'create') {
- *          const id = 'noop-' + process.pid
- *          process.stdout.write(JSON.stringify({ type:'created', requestId:m.requestId, sessionId:id })+'\n')
- *          process.stdout.write(JSON.stringify({ type:'sdk.session.init', sessionId:id, cliSessionId:'66666666-6666-4666-8666-666666666666', model:'noop', cwd:m.cwd||process.cwd(), tools:[] })+'\n')
- *          process.stdout.write(JSON.stringify({ type:'sdk.status', sessionId:id, status:'idle' })+'\n')
- *        }
- *      })
- *      process.stdin.resume()
- *   2. FRESHELL_FAKE_NOOP=1 pnpm exec playwright test --config test/e2e-browser/playwright.config.ts \
- *   Expected: the approval-allow test fails — the approval card never renders
- *   (timeout waiting for role=alert "Permission request for Bash"), proving
- *   the assertion chain is not vacuous. (Recorded in the Task-8 report; with
- *   the Tasks 1-6 server wiring REMOVED the failure is instead the click
- *   producing zero `permission.respond` lines in the sidecar stdin audit.)
  *
  * Donors (helpers copied, not imported, per this suite's per-spec-ownership
  * convention): freshclaude-identity-persistence-rust.spec.ts (boot/identity
@@ -81,11 +52,11 @@ import type { E2eServerInfo } from '../helpers/server-fixture-support.js';
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-version.js'
+import { claudeSimulatorServerEnv, readClaudeSimLedger } from '../helpers/claude-sim-lane.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
-const CLAUDE_SIDECAR_FIXTURE = path.resolve(__dirname, '../fixtures/providers/fake-claude-sdk-sidecar.mjs')
 const CODEX_APP_SERVER_FIXTURE = path.resolve(
   __dirname,
   '../../fixtures/coding-cli/codex-app-server/fake-app-server.mjs',
@@ -95,26 +66,21 @@ const OPENCODE_FIXTURE = path.resolve(__dirname, '../fixtures/fake-opencode.cjs'
 const CANONICAL_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
-// ── Fixture program (the shared claude/kilroy lane) ─────────────────────────
-// Text-driven raises; responds continue the turn: allow → success completion,
-// deny → a NON-SUCCESS closure that rings the unified attention edge — a deny
-// is an unwitnessed-error turn end and rings exactly like any other turn end
-// (the edge is outcome-agnostic; only a user-initiated interrupt stays
-// silent), question answers → success completion. Compact emits the compacting
-// status then completes after a pollable window. Crash exits the process
-// mid-turn — no protocol frames, like a real sidecar death (the Rust
-// unrequested-death synthesis rings for it, never the fake).
+// ── Simulator program (the shared Claude/Kilroy lane) ───────────────────────
+// Text-driven permission and question requests. The simulator's real
+// canUseTool callback handles the user's answer; its local /compact command
+// and process-death behavior supply the remaining lifecycle events.
 const CLAUDE_PROGRAM = {
   rules: [
     {
-      on: 'msg:send',
+      on: 'msg:prompt',
       match: { text: 'RAISE_PERMISSION' },
       emit: [
         { kind: 'approval', data: { id: 'req-perm-1', tool: 'Bash', input: { command: 'ls' } } },
       ],
     },
     {
-      on: 'msg:send',
+      on: 'msg:prompt',
       match: { text: 'RAISE_QUESTION' },
       emit: [
         {
@@ -137,7 +103,7 @@ const CLAUDE_PROGRAM = {
       ],
     },
     {
-      on: 'msg:send',
+      on: 'msg:prompt',
       match: { text: 'RAISE_QUESTION_MULTI' },
       emit: [
         {
@@ -161,7 +127,7 @@ const CLAUDE_PROGRAM = {
       ],
     },
     {
-      on: 'msg:send',
+      on: 'msg:prompt',
       match: { text: 'RAISE_QUESTION_OTHER' },
       emit: [
         {
@@ -181,40 +147,9 @@ const CLAUDE_PROGRAM = {
       ],
     },
     {
-      on: 'msg:permission.respond',
-      match: { decision: { behavior: 'allow' } },
-      emit: [{ kind: 'completion', data: { subtype: 'success' } }],
-    },
-    {
-      on: 'msg:permission.respond',
-      match: { decision: { behavior: 'deny' } },
-      emit: [
-        {
-          kind: 'completion',
-          delayMs: 20,
-          data: { subtype: 'error', text: 'The user denied this request.' },
-        },
-      ],
-    },
-    {
-      on: 'msg:question.respond',
-      emit: [{ kind: 'completion', delayMs: 10, data: { subtype: 'success' } }],
-    },
-    {
-      on: 'msg:send',
-      match: { text: '/compact focus the diff' },
-      emit: [
-        { kind: 'activity', data: { status: 'compacting' } },
-        // The compacting indicator assertion polls attribute state; under
-        // full-suite multi-worker load the page's rAF polling can stall beyond a
-        // few hundred ms, so the hold must comfortably outlast that (1500ms).
-        { kind: 'completion', delayMs: 1500, data: { subtype: 'success' } },
-      ],
-    },
-    {
       // The 3s delay is the window in which the crash lane moves the user to
       // another tab, so the crash ends a turn nobody is watching.
-      on: 'msg:send',
+      on: 'msg:prompt',
       match: { text: 'CRASH_NOW' },
       emit: [{ kind: 'crash', delayMs: 3_000, data: { code: 1 } }],
     },
@@ -345,6 +280,7 @@ async function bootWall(
     env: options.env,
     stripEnvPrefixes: options.stripEnvPrefixes,
     setupHome: options.setupHome,
+    verbose: process.env.FRESHELL_E2E_SERVER_VERBOSE === '1',
   })
   const info = await server.start()
   await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
@@ -382,19 +318,6 @@ function readJsonl(filePath: string): any[] {
     .filter((row) => row !== null)
 }
 
-/** Read the sidecar raw-stdin audit, JSON-parsing each recorded frame. */
-function readStdinFrames(stdinLog: string): any[] {
-  return readJsonl(stdinLog)
-    .map((row) => {
-      try {
-        return JSON.parse(row.line)
-      } catch {
-        return null
-      }
-    })
-    .filter((frame) => frame !== null)
-}
-
 async function waitForLogEntry(
   logPath: string,
   pred: (row: any) => boolean,
@@ -414,9 +337,9 @@ async function waitForLogEntry(
   return found
 }
 
-async function waitForStdinFrame(
-  stdinLog: string,
-  pred: (frame: any) => boolean,
+async function waitForSimRow(
+  simLedger: string,
+  pred: (row: any) => boolean,
   what: string,
   timeoutMs = 15_000,
 ): Promise<any> {
@@ -424,10 +347,10 @@ async function waitForStdinFrame(
   await expect
     .poll(
       () => {
-        found = readStdinFrames(stdinLog).find(pred) ?? null
+        found = readClaudeSimLedger(simLedger).find(pred) ?? null
         return Boolean(found)
       },
-      { timeout: timeoutMs, message: `timed out waiting for ${what} in ${stdinLog}` },
+      { timeout: timeoutMs, message: `timed out waiting for ${what} in ${simLedger}` },
     )
     .toBe(true)
   return found
@@ -527,16 +450,12 @@ function claudeLaneEnv(
   flavour: 'freshclaude' | 'kilroy',
   extraEnv: Record<string, string> = {},
 ): Record<string, string> {
-  const sidecar = process.env.FRESHELL_FAKE_NOOP === '1'
-    ? '/tmp/noop-sidecar.cjs'
-    : CLAUDE_SIDECAR_FIXTURE
   return {
-    FRESHELL_CLAUDE_SIDECAR: sidecar,
-    FRESHELL_CLAUDE_NODE: process.execPath,
-    FRESHELL_FAKE_PROVIDER: flavour,
-    FRESHELL_FAKE_PROGRAM: JSON.stringify(CLAUDE_PROGRAM),
-    FRESHELL_FAKE_STDIN: path.join(sharedRoot, 'sidecar-stdin.jsonl'),
-    FRESHELL_FAKE_EVENTS: path.join(sharedRoot, 'sidecar-events.jsonl'),
+    ...claudeSimulatorServerEnv({
+      ledgerPath: path.join(sharedRoot, 'claude-sim-ledger.jsonl'),
+      flavour,
+      program: CLAUDE_PROGRAM,
+    }),
     ...extraEnv,
   }
 }
@@ -552,8 +471,7 @@ async function bootClaudeLane(
   harness: TestHarness
   sharedRoot: string
   projectDir: string
-  stdinLog: string
-  eventsLog: string
+  simLedger: string
   tabId: string
 }> {
   const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), `freshell-agentctl-${flavour}-`))
@@ -591,8 +509,7 @@ async function bootClaudeLane(
       harness,
       sharedRoot,
       projectDir,
-      stdinLog: path.join(sharedRoot, 'sidecar-stdin.jsonl'),
-      eventsLog: path.join(sharedRoot, 'sidecar-events.jsonl'),
+      simLedger: path.join(sharedRoot, 'claude-sim-ledger.jsonl'),
       tabId,
     }
   } catch (error) {
@@ -602,21 +519,60 @@ async function bootClaudeLane(
 }
 
 /** Raise the scripted Bash permission and wait until its card is up, proving
- * ZERO respond frames landed before the user's click. */
+ * no decision reached the CLI before the user's click. */
 async function raisePermissionAndAssertNoDecisions(
   page: Page,
   harness: TestHarness,
   tabId: string,
-  stdinLog: string,
+  simLedger: string,
 ): Promise<void> {
+  // Claude's REST create default is bypassPermissions unless the user saved a
+  // provider default. This scenario exercises canUseTool, so choose the
+  // product's asking mode explicitly instead of relying on that saved default.
+  await page.getByRole('button', { name: 'Agent settings', exact: true }).click()
+  await page.getByRole('combobox', { name: 'Permission mode' }).selectOption('default')
+  await page.keyboard.press('Escape')
+  await expect.poll(async () => (await paneLeaf(harness, tabId))?.content?.permissionMode ?? null)
+    .toBe('default')
+  await waitForSimRow(
+    simLedger,
+    (row) => row.kind === 'control' && row.name === 'setPermissionMode' && row.args?.[0] === 'default',
+    'the CLI asking permission mode',
+  )
+
   await sendComposerText(page, 'RAISE_PERMISSION')
+  const raiseSend = (await harness.getSentWsMessages() as any[]).find(
+    (message) => message?.type === 'freshAgent.send' && message?.text === 'RAISE_PERMISSION',
+  )
+  expect(raiseSend?.settings?.permissionMode, 'the approval send carries the asking mode').toBe('default')
   const card = page.getByRole('alert', { name: 'Permission request for Bash' })
-  await expect(card).toBeVisible({ timeout: 15_000 })
-  // AGENT-05 pause-proof: the fake has received zero decisions — the card came
+  try {
+    await expect(card).toBeVisible({ timeout: 15_000 })
+  } catch (error) {
+    const rows = readClaudeSimLedger(simLedger)
+    const received = (await harness.getReceivedWsMessages()) as any[]
+    const diagnostic = {
+      severity: 'error',
+      event: 'e2e.claude_approval_card_diagnostic',
+      queryPermissionModes: rows.filter((row) => row.kind === 'query')
+        .map((row) => row.options?.permissionMode ?? null),
+      promptPermissionModes: rows.filter((row) => row.kind === 'prompt')
+        .map((row) => row.permissionMode ?? null),
+      approvalEmissionCount: rows.filter((row) => row.kind === 'approval').length,
+      canUseToolOutcomes: rows.filter((row) => row.kind === 'can_use_tool')
+        .map((row) => ({ toolName: row.toolName, behavior: row.decision?.behavior, rejected: Boolean(row.error) })),
+      receivedFreshAgentEvents: received
+        .filter((message) => message?.type === 'freshAgent.event')
+        .map((message) => ({ type: message.event?.type, code: message.event?.code }))
+        .slice(-30),
+    }
+    throw new Error(`${error instanceof Error ? error.message : String(error)}\n${JSON.stringify(diagnostic)}`)
+  }
+  // AGENT-05 pause-proof: the CLI has received zero decisions — the card came
   // from the snapshot overlay, not from any fabricated user choice.
   expect(
-    readStdinFrames(stdinLog).filter((f) => f?.type === 'permission.respond'),
-    'no permission.respond may exist before a user click',
+    readClaudeSimLedger(simLedger).filter((row) => row.kind === 'can_use_tool'),
+    'no canUseTool decision may exist before a user click',
   ).toEqual([])
   // And the raise is pending server-side too (the REST snapshot overlay the
   // card renders from carries exactly one pending approval).
@@ -632,26 +588,23 @@ async function raisePermissionAndAssertNoDecisions(
 test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
   test.setTimeout(180_000)
 
-  test('approval: Allow writes the exact permission.respond, never before the click', async ({ page }) => {
+  test('approval: Allow reaches the simulated CLI only after the click', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
-      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
-      await raisePermissionAndAssertNoDecisions(page, lane.harness, lane.tabId, lane.stdinLog)
+      await waitForPaneStatus(lane.harness, lane.tabId, ['connected', 'idle'])
+      await raisePermissionAndAssertNoDecisions(page, lane.harness, lane.tabId, lane.simLedger)
 
       const card = page.getByRole('alert', { name: 'Permission request for Bash' })
       await card.getByRole('button', { name: 'Allow tool use' }).click()
 
-      // The decision reaches the sidecar stdin VERBATIM (the transparency the
-      // pre-fix UNSUPPORTED_MESSAGE path destroyed).
-      const respond = await waitForStdinFrame(
-        lane.stdinLog,
-        (f) => f?.type === 'permission.respond',
-        'permission.respond frame',
+      // The production sidecar resolves its parked canUseTool callback with
+      // the user's decision; the simulator ledger records that actual result.
+      const response = await waitForSimRow(
+        lane.simLedger,
+        (row) => row.kind === 'can_use_tool' && row.toolName === 'Bash',
+        'the CLI permission decision',
       )
-      expect(respond.requestId).toBe('req-perm-1')
-      expect(respond.decision).toEqual({ behavior: 'allow' })
-      const leaf = await paneLeaf(lane.harness, lane.tabId)
-      expect(respond.sessionId).toBe(leaf?.content?.sessionId)
+      expect(response.decision).toEqual({ behavior: 'allow' })
 
       // The scripted continuation completes the turn; the card clears.
       await expect(card).toBeHidden({ timeout: 15_000 })
@@ -662,11 +615,11 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
     }
   })
 
-  test('approval: Deny writes the deny decision, no success completion, rings the unified attention edge, pane stays usable', async ({ page }) => {
+  test('approval: Deny reaches the CLI, rings the unified attention edge, and leaves the pane usable', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
-      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
-      await raisePermissionAndAssertNoDecisions(page, lane.harness, lane.tabId, lane.stdinLog)
+      await waitForPaneStatus(lane.harness, lane.tabId, ['connected', 'idle'])
+      await raisePermissionAndAssertNoDecisions(page, lane.harness, lane.tabId, lane.simLedger)
 
       const card = page.getByRole('alert', { name: 'Permission request for Bash' })
 
@@ -682,63 +635,19 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
 
       await card.getByRole('button', { name: 'Deny tool use' }).click()
 
-      const respond = await waitForStdinFrame(
-        lane.stdinLog,
-        (f) => f?.type === 'permission.respond',
-        'permission.respond frame',
+      const response = await waitForSimRow(
+        lane.simLedger,
+        (row) => row.kind === 'can_use_tool' && row.toolName === 'Bash',
+        'the CLI permission decision',
       )
-      expect(respond.decision).toEqual({ behavior: 'deny', message: 'Denied by user', interrupt: false })
+      expect(response.decision).toMatchObject({ behavior: 'deny', message: 'Denied by user' })
 
-      // The denial closes the turn WITHOUT a success completion (the fixture
-      // keys its scripted continuation on the decision behavior).
+      // A denied tool result returns control to the simulated model, which
+      // completes its response just as the real CLI can.
       await expect(card).toBeHidden({ timeout: 15_000 })
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
-      const completions = readJsonl(lane.eventsLog).filter((e) => e.kind === 'completion')
-      expect(
-        completions.length,
-        'exactly one scripted completion exists for this deny cycle',
-      ).toBe(1)
-      expect(
-        completions.every((e) => e.data?.subtype === 'error'),
-        'a deny must never produce a success completion',
-      ).toBe(true)
-
-      // D1-F2 WIRE TRUTH: the fixture mirrors the real sidecar — the denied
-      // turn ends with its ERRORED result alone (no per-turn idle), and the
-      // fixture mints no attention edge: the server rings the result itself
-      // (C18), the SAME edge a success would. A deny is an error turn end;
-      // only a user-initiated interrupt stays silent. Race-free: poll the
-      // outbound ledger until the errored result exists — fenced BEFORE the
-      // follow-up send below (a LATER, legitimately-completing turn).
-      const deniedBridgeId = respond.sessionId as string
-      const denyWires = () => readJsonl(lane.eventsLog).filter((r) => r.kind === 'wire')
-      const denyResultIndex = (wires: any[]) => wires.findIndex(
-        (r) => r.frame?.type === 'sdk.result' && r.frame?.sessionId === deniedBridgeId
-          && r.frame?.result === 'error',
-      )
-      await expect
-        .poll(
-          () => denyResultIndex(denyWires()),
-          { timeout: 15_000, message: 'the errored sdk.result for the denied turn' },
-        )
-        .toBeGreaterThanOrEqual(0)
-      const wires = denyWires()
-      const denyResultIdx = denyResultIndex(wires)
-      expect(
-        wires.filter((r) => r.frame?.type === 'sdk.turn.complete' || r.frame?.type === 'sdk.turn.waiting'),
-        'the fixture mints no attention edge: the server does',
-      ).toEqual([])
-      expect(
-        wires
-          .slice(denyResultIdx)
-          .filter((r) => r.frame?.type === 'sdk.status' && r.frame?.sessionId === deniedBridgeId && r.frame?.status === 'idle'),
-        'no per-turn idle follows the result (the real sidecar sends no idle at all)',
-      ).toEqual([])
-      expect(
-        wires.some((r) => r.frame?.type === 'sdk.assistant' && r.frame?.sessionId === deniedBridgeId
-          && r.frame?.content?.[0]?.text?.includes('denied')),
-        'the denial assistant frame did arrive on the wire',
-      ).toBe(true)
+      const deniedBridgeId = (await paneLeaf(lane.harness, lane.tabId))?.content?.sessionId as string
+      expect(deniedBridgeId).toBeTruthy()
 
       // BROWSER-FACING contract: the server's edge for the denied result
       // folded in the browser as EXACTLY ONE new turnCompletion event
@@ -778,10 +687,10 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
       // Prompt-usable again: a plain follow-up send completes normally.
       await sendComposerText(page, 'follow-up after deny')
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
-      await waitForStdinFrame(
-        lane.stdinLog,
-        (f) => f?.type === 'send' && f?.text === 'follow-up after deny',
-        'follow-up send frame',
+      await waitForSimRow(
+        lane.simLedger,
+        (row) => row.kind === 'prompt' && row.text === 'follow-up after deny',
+        'the follow-up prompt',
       )
     } finally {
       await lane.server.stop().catch(() => {})
@@ -792,9 +701,9 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
   test('approval: survives page reload mid-pending (exactly one restored card), Allow still works', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
-      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      await waitForPaneStatus(lane.harness, lane.tabId, ['connected', 'idle'])
       const durableBefore = await captureDurableId(lane.harness, lane.tabId, CANONICAL_UUID_RE)
-      await raisePermissionAndAssertNoDecisions(page, lane.harness, lane.tabId, lane.stdinLog)
+      await raisePermissionAndAssertNoDecisions(page, lane.harness, lane.tabId, lane.simLedger)
 
       // RELOAD while the permission is pending. The card must come back from
       // the REST snapshot overlay as EXACTLY ONE entry — no WS replay exists.
@@ -814,16 +723,16 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
       ).toHaveCount(1)
       // The reload window itself must never have fabricated a decision.
       expect(
-        readStdinFrames(lane.stdinLog).filter((f) => f?.type === 'permission.respond'),
+        readClaudeSimLedger(lane.simLedger).filter((row) => row.kind === 'can_use_tool'),
       ).toEqual([])
 
       await card.getByRole('button', { name: 'Allow tool use' }).click()
-      const respond = await waitForStdinFrame(
-        lane.stdinLog,
-        (f) => f?.type === 'permission.respond',
-        'permission.respond frame',
+      const response = await waitForSimRow(
+        lane.simLedger,
+        (row) => row.kind === 'can_use_tool' && row.toolName === 'Bash',
+        'the CLI permission decision',
       )
-      expect(respond.decision).toEqual({ behavior: 'allow' })
+      expect(response.decision).toEqual({ behavior: 'allow' })
       await expect(card).toBeHidden({ timeout: 15_000 })
       expect(await captureDurableId(harness2, tabId2, CANONICAL_UUID_RE)).toBe(durableBefore)
     } finally {
@@ -835,8 +744,8 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
   test('approval cancellation: composer Stop removes the card with zero fabricated decisions', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
-      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
-      await raisePermissionAndAssertNoDecisions(page, lane.harness, lane.tabId, lane.stdinLog)
+      await waitForPaneStatus(lane.harness, lane.tabId, ['connected', 'idle'])
+      await raisePermissionAndAssertNoDecisions(page, lane.harness, lane.tabId, lane.simLedger)
 
       const card = page.getByRole('alert', { name: 'Permission request for Bash' })
       const paneRoot = page.locator('[data-context="fresh-agent"]').last()
@@ -844,16 +753,18 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
 
       await expect(card).toBeHidden({ timeout: 15_000 })
       // Give the interrupt's full round trip a deterministic landing point:
-      // the fixture's cancelled frame drives the snapshot refresh that clears
-      // the card, and the session returns to idle.
+      // the sidecar's cancellation event clears the card, and the session
+      // returns to idle.
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
       expect(
-        readStdinFrames(lane.stdinLog).filter((f) => f?.type === 'permission.respond'),
-        'a provider cancellation must never invent a user decision',
-      ).toEqual([])
+        readClaudeSimLedger(lane.simLedger)
+          .filter((row) => row.kind === 'can_use_tool')
+          .map((row) => ({ toolName: row.toolName, decision: row.decision })),
+        'Stop resolves the CLI callback as a provider interruption, never as a user choice',
+      ).toEqual([{ toolName: 'Bash', decision: { behavior: 'deny', message: 'Interrupted' } }])
       expect(
-        readStdinFrames(lane.stdinLog).some((f) => f?.type === 'interrupt'),
-        'the interrupt frame itself must reach the sidecar',
+        readClaudeSimLedger(lane.simLedger).some((row) => row.kind === 'interrupt'),
+        'the CLI observes the actual interrupt call',
       ).toBe(true)
     } finally {
       await lane.server.stop().catch(() => {})
@@ -864,24 +775,23 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
   test('questions: single-choice, multi-select, and Other answers keyed by question text', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
-      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      await waitForPaneStatus(lane.harness, lane.tabId, ['connected', 'idle'])
       const banner = page.getByRole('region', { name: /Question from/ })
 
       // 1. single-choice
       await sendComposerText(page, 'RAISE_QUESTION')
       await expect(banner).toBeVisible({ timeout: 15_000 })
       expect(
-        readStdinFrames(lane.stdinLog).filter((f) => f?.type === 'question.respond'),
-        'no question.respond may exist before an answer',
+        readClaudeSimLedger(lane.simLedger).filter((row) => row.kind === 'can_use_tool' && row.toolName === 'AskUserQuestion'),
+        'no question answer may reach canUseTool before the user answers',
       ).toEqual([])
       await banner.getByRole('button', { name: 'A' }).click()
-      let respond = await waitForStdinFrame(
-        lane.stdinLog,
-        (f) => f?.type === 'question.respond',
-        'question.respond #1',
+      let answer = await waitForSimRow(
+        lane.simLedger,
+        (row) => row.kind === 'can_use_tool' && row.toolName === 'AskUserQuestion',
+        'the first CLI question answer',
       )
-      expect(respond.requestId).toBe('req-q-1')
-      expect(respond.answers).toEqual({ 'Pick one': 'A' })
+      expect(answer.decision.updatedInput.answers).toEqual({ 'Pick one': 'A' })
       await expect(banner).toBeHidden({ timeout: 15_000 })
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
 
@@ -893,14 +803,14 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
       await banner.getByRole('button', { name: 'Submit' }).click()
       await expect
         .poll(
-          () => readStdinFrames(lane.stdinLog).filter((f) => f?.type === 'question.respond').length,
+          () => readClaudeSimLedger(lane.simLedger).filter((row) => row.kind === 'can_use_tool' && row.toolName === 'AskUserQuestion').length,
           { timeout: 15_000 },
         )
         .toBe(2)
-      respond = readStdinFrames(lane.stdinLog)
-        .filter((f) => f?.type === 'question.respond')
-        .find((f) => f.requestId === 'req-qm-1')
-      expect(respond.answers).toEqual({ 'Pick any two': 'A, C' })
+      answer = readClaudeSimLedger(lane.simLedger)
+        .filter((row) => row.kind === 'can_use_tool' && row.toolName === 'AskUserQuestion')
+        .at(-1)
+      expect(answer.decision.updatedInput.answers).toEqual({ 'Pick any two': 'A, C' })
       await expect(banner).toBeHidden({ timeout: 15_000 })
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
 
@@ -913,14 +823,14 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
       await banner.getByRole('button', { name: 'Submit' }).click()
       await expect
         .poll(
-          () => readStdinFrames(lane.stdinLog).filter((f) => f?.type === 'question.respond').length,
+          () => readClaudeSimLedger(lane.simLedger).filter((row) => row.kind === 'can_use_tool' && row.toolName === 'AskUserQuestion').length,
           { timeout: 15_000 },
         )
         .toBe(3)
-      respond = readStdinFrames(lane.stdinLog)
-        .filter((f) => f?.type === 'question.respond')
-        .find((f) => f.requestId === 'req-qo-1')
-      expect(respond.answers).toEqual({ 'Free text': 'Something custom' })
+      answer = readClaudeSimLedger(lane.simLedger)
+        .filter((row) => row.kind === 'can_use_tool' && row.toolName === 'AskUserQuestion')
+        .at(-1)
+      expect(answer.decision.updatedInput.answers).toEqual({ 'Free text': 'Something custom' })
       await expect(banner).toBeHidden({ timeout: 15_000 })
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
     } finally {
@@ -930,9 +840,15 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
   })
 
   test('compact: /compact instructions land on the same session; compacting shows; context retained', async ({ page }) => {
-    const lane = await bootClaudeLane(page, 'freshclaude')
+    // Give the simulator's real local /compact operation enough wall time for
+    // the UI's compacting state to be observed.
+    // 20x keeps the 500 ms simulated /compact window observable without
+    // stretching the 600 ms SDK boot to 30 seconds (50x). At that scale the
+    // pane did not reach its initial ready state before the test's 30 second
+    // setup bound under cloud scheduling.
+    const lane = await bootClaudeLane(page, 'freshclaude', { FRESHELL_CLAUDE_SIM_TIME_SCALE: '20' })
     try {
-      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      await waitForPaneStatus(lane.harness, lane.tabId, ['connected', 'idle'])
       const durableBefore = await captureDurableId(lane.harness, lane.tabId, CANONICAL_UUID_RE)
 
       // Warm the session with one ordinary turn.
@@ -944,57 +860,76 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
       await paneRoot.getByRole('textbox', { name: 'Chat message input' }).fill('/compact focus the diff')
       await paneRoot.getByRole('textbox', { name: 'Chat message input' }).press('Enter')
 
-      // The compacting indicator is visible while the fixture parks the turn
-      // (the program holds completion for a pollable window).
+      // The real local command exposes the compacting state while it works.
       await expect(page.getByTestId('fresh-agent-thinking-bar')).toHaveAttribute(
         'data-state',
         'active',
         { timeout: 15_000 },
       )
-      // The sidecar sees the compact as a SEND with the full instructions on
-      // the SAME bridge session id (never a fresh session, never dropped args).
-      const compactSend = await waitForStdinFrame(
-        lane.stdinLog,
-        (f) => f?.type === 'send' && typeof f?.text === 'string' && f.text.startsWith('/compact'),
-        'compact send frame',
+      // The CLI ledger records the exact local command text and durable id.
+      const compactSend = await waitForSimRow(
+        lane.simLedger,
+        (row) => row.kind === 'prompt' && typeof row.text === 'string' && row.text.startsWith('/compact'),
+        'compact command',
       )
       expect(compactSend.text).toBe('/compact focus the diff')
-      const leaf = await paneLeaf(lane.harness, lane.tabId)
-      expect(compactSend.sessionId).toBe(leaf?.content?.sessionId)
+      expect(compactSend.sessionId).toBe(durableBefore)
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
 
       // Follow-up prompt on the same pane → retained session + turn completes.
-      // Gate on the frame landing in the stdin audit (never the pane status,
-      // which can report a stale idle before the busy flip).
+      // Gate on the prompt reaching the simulated CLI, never a stale idle
+      // status from before the send's busy flip.
       await sendComposerText(page, 'follow-up after compact')
-      await waitForStdinFrame(
-        lane.stdinLog,
-        (f) => f?.type === 'send' && f?.text === 'follow-up after compact',
-        'follow-up send frame',
+      await waitForSimRow(
+        lane.simLedger,
+        (row) => row.kind === 'prompt' && row.text === 'follow-up after compact',
+        'follow-up prompt',
       )
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
-      const sends = readStdinFrames(lane.stdinLog).filter((f) => f?.type === 'send')
+      const prompts = readClaudeSimLedger(lane.simLedger).filter((row) => row.kind === 'prompt')
       expect(
-        sends.filter((f) => f.text === '/compact focus the diff').length,
-        'exactly one compact send',
+        prompts.filter((row) => row.text === '/compact focus the diff').length,
+        'exactly one compact command',
       ).toBe(1)
       expect(
-        sends.filter((f) => f.text === 'follow-up after compact').length,
-        'exactly one follow-up send',
+        prompts.filter((row) => row.text === 'follow-up after compact').length,
+        'exactly one follow-up prompt',
       ).toBe(1)
-      expect(new Set(sends.map((f) => f.sessionId)).size, 'all sends ride ONE bridge session').toBe(1)
+      expect(new Set(prompts.map((row) => row.sessionId)), 'all commands use ONE durable Claude session').toEqual(new Set([durableBefore]))
       expect(await captureDurableId(lane.harness, lane.tabId, CANONICAL_UUID_RE)).toBe(durableBefore)
 
       // The durable transcript accumulates compaction + follow-up entries.
       const transcriptDir = path.join(lane.info.homeDir, '.claude', 'projects')
       const transcriptFile = path.join(transcriptDir, projectSlugOf(lane.projectDir), `${durableBefore}.jsonl`)
-      const transcriptLines = readJsonl(transcriptFile)
-      const userTexts = transcriptLines
-        .filter((l) => l.type === 'user')
-        .map((l) => l.message?.content?.[0]?.text)
-      expect(userTexts).toEqual(
-        expect.arrayContaining(['warm-up turn', '/compact focus the diff', 'follow-up after compact']),
-      )
+      // Native transcript writes may finish just after the result/idle frame.
+      // Retain the earlier conversation and follow-up, and correlate the saved
+      // local-command metadata with the actual command submitted to this CLI.
+      await expect(async () => {
+        const transcriptLines = readJsonl(transcriptFile)
+        const userRows = transcriptLines.filter((line) => line.type === 'user')
+        const textOf = (line: any): string => {
+          const content = line.message?.content
+          if (typeof content === 'string') return content
+          if (Array.isArray(content)) {
+            return content
+              .map((block: any) => typeof block?.text === 'string' ? block.text : '')
+              .filter(Boolean)
+              .join('\n')
+          }
+          return ''
+        }
+        expect(userRows.map(textOf)).toEqual(
+          expect.arrayContaining(['warm-up turn', 'follow-up after compact']),
+        )
+        const savedCommands = userRows.filter((line) => line.uuid === compactSend.uuid)
+        expect(savedCommands, 'exactly one saved row for the submitted compact command').toHaveLength(1)
+        expect(textOf(savedCommands[0])).toContain('<command-name>/compact</command-name>')
+        expect(textOf(savedCommands[0])).toContain('<command-args>focus the diff</command-args>')
+        expect(transcriptLines).toEqual(expect.arrayContaining([
+          expect.objectContaining({ type: 'system', subtype: 'compact_boundary' }),
+          expect.objectContaining({ type: 'user', isCompactSummary: true }),
+        ]))
+      }).toPass({ timeout: 15_000 })
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
@@ -1004,7 +939,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
   test('capability gate: /fork is offered for claude', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
-      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      await waitForPaneStatus(lane.harness, lane.tabId, ['connected', 'idle'])
       // One turn so the snapshot sheet is fully hydrated.
       await sendComposerText(page, 'gate warm-up')
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -1013,7 +948,10 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
       await paneRoot.getByRole('button', { name: 'Slash commands' }).click()
       const menu = page.getByRole('menu', { name: 'Slash commands' })
       await expect(menu).toBeVisible({ timeout: 10_000 })
-      await expect(menu.getByRole('menuitem', { name: /^\/compact/ })).toBeVisible()
+      await expect(
+        menu.getByRole('group', { name: 'Pane actions' })
+          .getByRole('menuitem', { name: /^\/compact Ask the agent to compact its current conversation context$/ }),
+      ).toBeVisible()
       await expect(
         menu.getByRole('menuitem', { name: /^\/fork/ }),
         'claude capabilities.fork=true offers /fork in the menu (C14)',
@@ -1025,12 +963,10 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
     }
   })
 
-  test('per-send settings reach the claude sidecar before the send (freshclaude)', async ({ page }) => {
+  test('per-send settings reach the CLI before the next prompt (freshclaude)', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
-      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
-      const paneSessionId = (await paneLeaf(lane.harness, lane.tabId))?.content?.sessionId as string
-      expect(paneSessionId, 'the pane bridge session id must be known before the send').toBeTruthy()
+      await waitForPaneStatus(lane.harness, lane.tabId, ['connected', 'idle'])
 
       // Change the permission mode BETWEEN sends through the pane's real
       // settings gear: freshclaude's registry default is 'default', so picking
@@ -1043,43 +979,29 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
         .toBe('acceptEdits')
 
       await sendComposerText(page, 'settings probe')
-      // Canonical machinery: the settings-bearing send routes through
-      // configure_for_send, which writes a `configure` frame and awaits the
-      // sidecar's ack BEFORE the user message frame — the stdin audit proves
-      // strict ordering (the knobs provably land before the turn starts).
-      await waitForStdinFrame(
-        lane.stdinLog,
-        (f) => f?.type === 'configure' && f?.settings?.permissionMode === 'acceptEdits',
-        'configure frame carrying permissionMode:acceptEdits',
+      // The production sidecar applies controls before it sends the queued
+      // prompt to the simulated CLI; the ledger records both operations.
+      await waitForSimRow(
+        lane.simLedger,
+        (row) => row.kind === 'control' && row.name === 'setPermissionMode' && row.args?.[0] === 'acceptEdits',
+        'the CLI permission-mode control',
       )
-      await waitForStdinFrame(
-        lane.stdinLog,
-        (f) => f?.type === 'send' && f?.text === 'settings probe',
-        'send frame for "settings probe"',
+      await waitForSimRow(
+        lane.simLedger,
+        (row) => row.kind === 'prompt' && row.text === 'settings probe',
+        'settings probe prompt',
       )
 
-      const frames = readStdinFrames(lane.stdinLog)
-      const configureIdx = frames.findIndex(
-        (f) => f?.type === 'configure' && f?.settings?.permissionMode === 'acceptEdits',
+      const records = readClaudeSimLedger(lane.simLedger)
+      const configureIdx = records.findIndex(
+        (row) => row.kind === 'control' && row.name === 'setPermissionMode' && row.args?.[0] === 'acceptEdits',
       )
-      const sendIdx = frames.findIndex((f) => f?.type === 'send' && f?.text === 'settings probe')
-      expect(configureIdx, 'the per-send configure frame must exist in the audit').toBeGreaterThanOrEqual(0)
-      expect(sendIdx, 'the probe send must exist in the audit').toBeGreaterThanOrEqual(0)
-      expect(configureIdx, 'configure must land strictly BEFORE the send it applies to').toBeLessThan(sendIdx)
-
-      // The fake sidecar answers with sdk.configured carrying the applied
-      // settings (the ack configure_for_send awaits): the wire-row proves the
-      // ack as well as the ordering.
-      const ack = await waitForLogEntry(
-        lane.eventsLog,
-        (e) => e.kind === 'wire'
-          && e.frame?.type === 'sdk.configured'
-          && e.frame?.ok === true
-          && e.frame?.settings?.permissionMode === 'acceptEdits'
-          && e.frame?.sessionId === paneSessionId,
-        'sdk.configured wire row acknowledging permissionMode:acceptEdits',
-      )
-      expect(ack.frame.ok).toBe(true)
+      const sendIdx = records.findIndex((row) => row.kind === 'prompt' && row.text === 'settings probe')
+      expect(configureIdx, 'the CLI must receive the new permission mode').toBeGreaterThanOrEqual(0)
+      expect(sendIdx, 'the CLI must receive the settings probe').toBeGreaterThanOrEqual(0)
+      expect(configureIdx, 'the control must land strictly BEFORE the prompt it applies to').toBeLessThan(sendIdx)
+      expect(records[sendIdx].sessionId).toBe((await paneLeaf(lane.harness, lane.tabId))?.content?.sessionRef?.sessionId)
+      expect(records[sendIdx].permissionMode).toBe('acceptEdits')
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
     } finally {
       await lane.server.stop().catch(() => {})
@@ -1128,12 +1050,12 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
         'the raise send carries the non-bypass pane permission mode',
       ).toBe('default')
       await card.getByRole('button', { name: 'Allow tool use' }).click()
-      const respond = await waitForStdinFrame(
-        lane.stdinLog,
-        (f) => f?.type === 'permission.respond',
-        'permission.respond frame',
+      const response = await waitForSimRow(
+        lane.simLedger,
+        (row) => row.kind === 'can_use_tool' && row.toolName === 'Bash',
+        'the CLI permission decision',
       )
-      expect(respond.decision).toEqual({ behavior: 'allow' })
+      expect(response.decision).toEqual({ behavior: 'allow' })
       await expect(card).toBeHidden({ timeout: 15_000 })
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
 
@@ -1144,12 +1066,12 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
       await banner.getByRole('button', { name: 'A' }).click()
       await expect
         .poll(
-          () => readStdinFrames(lane.stdinLog).filter((f) => f?.type === 'question.respond').length,
+          () => readClaudeSimLedger(lane.simLedger).filter((row) => row.kind === 'can_use_tool' && row.toolName === 'AskUserQuestion').length,
           { timeout: 15_000 },
         )
         .toBe(1)
-      const qRespond = readStdinFrames(lane.stdinLog).find((f) => f?.type === 'question.respond')
-      expect(qRespond.answers).toEqual({ 'Pick one': 'A' })
+      const qAnswer = readClaudeSimLedger(lane.simLedger).find((row) => row.kind === 'can_use_tool' && row.toolName === 'AskUserQuestion')
+      expect(qAnswer.decision.updatedInput.answers).toEqual({ 'Pick one': 'A' })
       await expect(banner).toBeHidden({ timeout: 15_000 })
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
 
@@ -1168,7 +1090,7 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
       await card.getByRole('button', { name: 'Allow tool use' }).click()
       await expect
         .poll(
-          () => readStdinFrames(lane.stdinLog).filter((f) => f?.type === 'permission.respond').length,
+          () => readClaudeSimLedger(lane.simLedger).filter((row) => row.kind === 'can_use_tool' && row.toolName === 'Bash').length,
           { timeout: 15_000 },
         )
         .toBe(2)
@@ -1184,9 +1106,15 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
       await expect(card).toBeHidden({ timeout: 15_000 })
       await waitForPaneStatus(harness2, tabId2, 'idle')
       expect(
-        readStdinFrames(lane.stdinLog).filter((f) => f?.type === 'permission.respond'),
-        'exactly the two human clicks ever produced responds',
-      ).toHaveLength(2)
+        readClaudeSimLedger(lane.simLedger)
+          .filter((row) => row.kind === 'can_use_tool' && row.toolName === 'Bash')
+          .map((row) => row.decision),
+        'the two clicks allow the tool; Stop resolves the parked callback as Interrupted',
+      ).toEqual([
+        { behavior: 'allow' },
+        { behavior: 'allow' },
+        { behavior: 'deny', message: 'Interrupted' },
+      ])
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
@@ -1196,7 +1124,7 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
   test('kilroy crash mid-turn in the background: one ring, Resume (no reload), a reload and restart recover the SAME durable session', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'kilroy', { KILROY_ENABLED: '1' })
     try {
-      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      await waitForPaneStatus(lane.harness, lane.tabId, ['connected', 'idle'])
       const durableBefore = await captureDurableId(lane.harness, lane.tabId, CANONICAL_UUID_RE)
       const paneRoot = page.locator('[data-context="fresh-agent"]').last()
       const tabLocator = page.locator(`[data-context="tab"][data-tab-id="${lane.tabId}"]`)
@@ -1206,15 +1134,15 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
       // conversation in place.
       await page.evaluate(() => { (window as any).__freshellNoReloadMarker = 'kilroy-crash-lane' })
 
-      // Crash mid-turn while the user is in another tab: the fixture
-      // exits(1) with no protocol frames (a Node death), 3s after the send.
+      // Crash mid-turn while the user is in another tab: the simulator ends
+      // the CLI process, so the production sidecar reports the stream exit.
       await sendComposerText(page, 'CRASH_NOW')
       await page.getByRole('button', { name: 'New shell tab' }).click()
       await lane.harness.waitForTabCount(2)
-      await waitForLogEntry(
-        lane.eventsLog,
-        (e) => e.kind === 'crash',
-        'fixture crash event',
+      await waitForSimRow(
+        lane.simLedger,
+        (row) => row.kind === 'crash',
+        'simulated CLI process exit',
       )
       // The server rings the lost turn exactly once (G05: a crash is a turn
       // end the user did not witness) and the background tab is highlighted.
@@ -1224,13 +1152,6 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
         .toBe(seqBefore + 1)
       expect((await turnCompletion()).attentionByTab?.[lane.tabId], 'the crash highlights the tab').toBe(true)
       await expect(tabLocator, 'the background tab carries the attention highlight').toHaveClass(/bg-emerald-100/)
-      // Ground truth: the fixture fabricated no completion; the one ring is
-      // the server's for the dead sidecar.
-      expect(
-        readJsonl(lane.eventsLog).filter((e) => e.kind === 'completion'),
-        'no completion may be fabricated for the crashed turn',
-      ).toEqual([])
-
       // Back on the tab: the session reads as ended, with Resume, and the
       // composer is disabled (nothing typed there could be lost).
       await tabLocator.click()
@@ -1244,10 +1165,10 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
 
       // Resume reopens the SAME durable session in place, with no reload.
       await paneRoot.getByRole('button', { name: 'Resume session' }).click()
-      await waitForLogEntry(
-        lane.eventsLog,
-        (e) => e.kind === 'resume' && e.data?.id === durableBefore,
-        'the replacement sidecar resumed the crashed durable session',
+      await waitForSimRow(
+        lane.simLedger,
+        (row) => row.kind === 'query' && row.options?.resume === durableBefore,
+        'the replacement CLI resumed the crashed durable session',
       )
       expect(await captureDurableId(lane.harness, lane.tabId, CANONICAL_UUID_RE, 30_000)).toBe(durableBefore)
       await waitForPaneStatus(lane.harness, lane.tabId, ['idle', 'connected'])
@@ -1261,10 +1182,10 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
       // landing (the sidecar saw the send and completed it), never the
       // client's optimistic local echo.
       await sendComposerText(page, 'post-crash recovery turn')
-      await waitForStdinFrame(
-        lane.stdinLog,
-        (f) => f?.type === 'send' && f?.text === 'post-crash recovery turn',
-        'post-crash send frame',
+      await waitForSimRow(
+        lane.simLedger,
+        (row) => row.kind === 'prompt' && row.text === 'post-crash recovery turn',
+        'post-crash recovery prompt',
         30_000,
       )
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -1273,9 +1194,9 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
       // A second crash, recovered by reloading the page instead: the pane
       // hydrates as ended, and its attach must still resume the SAME durable
       // session (the server holds a dead-session record for it until then).
-      const crashes = () => readJsonl(lane.eventsLog).filter((e) => e.kind === 'crash').length
-      const resumes = () => readJsonl(lane.eventsLog)
-        .filter((e) => e.kind === 'resume' && e.data?.id === durableBefore).length
+      const crashes = () => readClaudeSimLedger(lane.simLedger).filter((row) => row.kind === 'crash').length
+      const resumes = () => readClaudeSimLedger(lane.simLedger)
+        .filter((row) => row.kind === 'query' && row.options?.resume === durableBefore).length
       const resumesBeforeReload = resumes()
       await sendComposerText(page, 'CRASH_NOW')
       await expect.poll(crashes, { timeout: 30_000, message: 'the second fixture crash' }).toBe(2)
@@ -1296,10 +1217,10 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
       await waitForPaneStatus(harness2, tabId2, ['idle', 'connected'])
       await expect(paneRoot.getByText('This session has ended')).toHaveCount(0)
       await sendComposerText(page, 'post-reload recovery turn')
-      await waitForStdinFrame(
-        lane.stdinLog,
-        (f) => f?.type === 'send' && f?.text === 'post-reload recovery turn',
-        'post-reload send frame',
+      await waitForSimRow(
+        lane.simLedger,
+        (row) => row.kind === 'prompt' && row.text === 'post-reload recovery turn',
+        'post-reload recovery prompt',
         30_000,
       )
       await waitForPaneStatus(harness2, tabId2, 'idle')
@@ -1314,10 +1235,10 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
         { timeout: 60_000, message: 'the restarted server resumed the same durable session' })
         .toBeGreaterThanOrEqual(resumesBeforeReload + 2)
       await sendComposerText(page, 'post-restart turn')
-      await waitForStdinFrame(
-        lane.stdinLog,
-        (f) => f?.type === 'send' && f?.text === 'post-restart turn',
-        'post-restart send frame (lands on the new sidecar process)',
+      await waitForSimRow(
+        lane.simLedger,
+        (row) => row.kind === 'prompt' && row.text === 'post-restart turn',
+        'post-restart prompt on the new CLI process',
         60_000,
       )
       await waitForPaneStatus(harness2, tabId2, 'idle', 60_000)

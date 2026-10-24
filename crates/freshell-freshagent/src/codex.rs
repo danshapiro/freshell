@@ -23451,57 +23451,103 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn crash_recovery_resume_wrong_thread_id_is_rejected_not_silently_recovered() {
         let _guard = ENV_LOCK.lock().await;
-        configure_fake_codex_cmd(r#"{"threadResumeThreadId":"thread-B-wrong"}"#);
+        let log_dir = tempfile::tempdir().unwrap();
+        let operation_log = log_dir.path().join("thread-operations.jsonl");
+        configure_fake_codex_cmd(
+            &json!({
+                "threadResumeThreadId": "thread-B-wrong",
+                "appendThreadOperationLogPath": operation_log,
+            })
+            .to_string(),
+        );
         let (st, mut rx) = state_with_bus();
 
-        // A dead in-process client + a child that exits immediately: the exit-watcher
-        // flips `exited`, so the next attach takes the crash-recovery resume path.
+        // Keep the owned child alive until its watcher captures the process
+        // identity. An immediately exiting `true` can leave an unconfirmable
+        // prior, which correctly refuses recovery before thread/resume.
+        let ownership_id = "codex-sidecar-test-term25-recovery";
         let (transport, _peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
-        let mut cmd = tokio::process::Command::new("true");
-        cmd.kill_on_drop(true);
-        let child = cmd.spawn().expect("spawn true fixture");
+        let mut cmd = tokio::process::Command::new("node");
+        cmd.args([
+            "-e",
+            "process.stdin.resume(); process.stdin.once('end', () => process.exit(0)); process.stdout.write('ready\\n');",
+        ])
+        .env(CODEX_SIDECAR_OWNERSHIP_ENV, ownership_id)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true);
+        let mut child = cmd.spawn().expect("spawn controlled crash fixture");
+        let exit_gate = child.stdin.take().expect("fixture exit gate");
+        let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap());
+        let mut ready = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::io::AsyncBufReadExt::read_line(&mut output, &mut ready),
+        )
+        .await
+        .expect("the fixture becomes ready within the budget")
+        .expect("read fixture readiness");
+        assert_eq!(ready, "ready\n");
         insert_fake_session(
             &st,
             "thread-A-crashed",
             Arc::new(client),
             Arc::new(StdMutex::new(None)),
             child,
-            "codex-sidecar-test-term25-recovery",
+            ownership_id,
         )
         .await;
-
+        // EOF makes the child exit on its own: this exercises the real
+        // unrequested-exit watcher, never the requested kill channel.
+        drop(exit_gate);
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                let exited = st
-                    .sessions
-                    .lock()
-                    .await
-                    .get("thread-A-crashed")
-                    .map(|s| s.exited.load(Ordering::SeqCst))
-                    .unwrap_or(false);
-                if exited {
-                    return;
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["sessionId"] == "thread-A-crashed"
+                    && frame["event"]["type"] == "freshAgent.status"
+                    && frame["event"]["status"] == "exited"
+                {
+                    break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         })
         .await
-        .expect("the exit-watcher observes the crash within the budget");
-
+        .expect("the real exit-watcher observes the crash within the budget");
+        assert!(st.sessions.lock().await["thread-A-crashed"]
+            .exited
+            .load(Ordering::SeqCst));
+        let prior_before_attach = st
+            .condemned_priors
+            .lock()
+            .unwrap()
+            .get("thread-A-crashed")
+            .cloned();
+        assert!(prior_before_attach.is_none(), "the fixture's writer death must be confirmed before testing resume: {prior_before_attach:?}");
         st.handle_attach(attach_msg("thread-A-crashed")).await;
 
+        let mut observed = Vec::new();
         let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
-                if frame["type"] == "error" {
+                observed.push(frame.clone());
+                if frame["type"] == "error"
+                    || frame["event"]["type"] == "freshAgent.error"
+                    || frame["event"]["type"] == "freshAgent.session.snapshot"
+                {
                     return frame;
                 }
             }
         })
         .await
-        .expect("attach resolves within the budget");
+        .unwrap_or_else(|error| {
+            panic!("attach resolves within the budget: {error:?}; frames={observed:?}")
+        });
 
+        assert_eq!(
+            frame["type"], "error",
+            "the wrong-thread resume is rejected: {frame}"
+        );
         let message = frame["message"].as_str().unwrap_or_default();
         assert!(
             message.starts_with("CODEX_ATTACH_RESPAWN_FAILED:"),
@@ -23515,6 +23561,19 @@ pub(crate) mod tests {
             !st.sessions.lock().await.contains_key("thread-B-wrong"),
             "the wrong thread id must never be adopted"
         );
+        let operations: Vec<Value> = std::fs::read_to_string(operation_log)
+            .expect("the fake records real thread operations before answering")
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            operations.len(),
+            1,
+            "recovery never silently starts a fresh thread: {operations:?}"
+        );
+        assert_eq!(operations[0]["method"], "thread/resume");
+        assert_eq!(operations[0]["params"]["threadId"], "thread-A-crashed");
+        assert_eq!(operations[0]["threadId"], "thread-B-wrong");
     }
 
     // -- dead-thread negative cache (CODEX-FIRST triage Finding 2) --

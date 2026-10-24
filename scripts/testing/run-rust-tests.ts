@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { createHash } from 'node:crypto'
 import { spawn, type ChildProcess } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -10,6 +11,8 @@ const PROJECT_ROOT = path.resolve(SCRIPT_DIR, '../..')
 const SANDBOX_CARGO_BUILD_JOBS = 3
 const SANDBOX_RUST_TEST_THREADS = 4
 const SANDBOX_TOKIO_WORKER_THREADS = 2
+// All worktrees mount at /workspace; choose the namespace on the host first.
+const SANDBOX_TARGET_DIRECTORY = `/freshell-test-artifacts/targets/${createHash('sha256').update(PROJECT_ROOT).digest('hex').slice(0, 12)}`
 
 function log(severity: 'info' | 'error', event: string, fields: Record<string, unknown> = {}): void {
   const stream = severity === 'error' ? process.stderr : process.stdout
@@ -116,6 +119,7 @@ owned_runtime_tmp="$(mktemp -d /freshell-test-artifacts/XXX)"
 printf '{"severity":"info","event":"rust_test_temp_created","directory":"%s","runtimeDirectory":"%s"}\\n' "$owned_tmp" "$owned_runtime_tmp"
 # Preserve every test while bounding independent libtest/Tokio runtimes within
 # the sandbox's existing PID budget. Runtime construction precedes fixture locks.
+export CARGO_TARGET_DIR=${shellQuote(SANDBOX_TARGET_DIRECTORY)}
 export TMPDIR="$owned_runtime_tmp" FRESHELL_TEST_EXECUTABLE_TMP_DIR="$owned_tmp" FRESHELL_RUST_TEST_SANDBOX=0 CARGO_BUILD_JOBS=${SANDBOX_CARGO_BUILD_JOBS} RUST_TEST_THREADS=${SANDBOX_RUST_TEST_THREADS} TOKIO_WORKER_THREADS=${SANDBOX_TOKIO_WORKER_THREADS}
 node --import tsx /workspace/scripts/testing/run-rust-tests.ts ${argv.map(shellQuote).join(' ')} &
 runner_pid=$!
@@ -125,16 +129,17 @@ wait "$runner_pid"`
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
   if (process.env.FRESHELL_RUST_TEST_SANDBOX === '1') {
     log('info', 'rust_test_sandbox_route_selected', {
-      mode: 'runtime-suite', cargoBuildJobs: SANDBOX_CARGO_BUILD_JOBS,
+      mode: 'runtime-suite', cargoTargetDirectory: SANDBOX_TARGET_DIRECTORY, cargoBuildJobs: SANDBOX_CARGO_BUILD_JOBS,
       rustTestThreads: SANDBOX_RUST_TEST_THREADS, tokioWorkerThreads: SANDBOX_TOKIO_WORKER_THREADS,
       forwardedArgumentCount: argv.length,
     })
-    // Do not inherit a host binary selection. The unchanged inner runner
-    // selects its own freshly built /workspace/target/debug server.
+    // The inner runner selects the server it builds in the sandbox's
+    // worktree-specific Cargo target directory.
     const { FRESHELL_SERVER_BIN: _hostBinary, ...env } = process.env
     return runChild(path.join(PROJECT_ROOT, 'scripts/sandbox-test.sh'), ['--runtime-suite', sandboxCommand(argv)], { ...env, FRESHELL_SANDBOX_OWNER_GUARD: '1' }, true)
   }
-  const binary = path.join(PROJECT_ROOT, 'target', 'debug', `freshell-server${process.platform === 'win32' ? '.exe' : ''}`)
+  const targetDirectory = path.resolve(PROJECT_ROOT, process.env.CARGO_TARGET_DIR || 'target')
+  const binary = path.join(targetDirectory, 'debug', `freshell-server${process.platform === 'win32' ? '.exe' : ''}`)
   const cargo = process.platform === 'win32' ? 'cargo.exe' : 'cargo'
   const buildExitCode = await runChild(cargo, ['build', '-p', 'freshell-server', '--locked'], process.env)
   if (buildExitCode !== 0) return buildExitCode

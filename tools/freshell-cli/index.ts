@@ -8,7 +8,7 @@ import { resolveTarget } from './targets.js'
 import { runCommand as sendKeysCommand } from './commands/sendKeys.js'
 import { partitionSendKeysArgs } from './send-keys-args.js'
 import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../node-client-runtime/codex-restore-contract.js'
-import { renderCliHelp, resolveCanonicalAction, unsupportedInvocationResult } from '../node-client-runtime/action-capabilities.js'
+import { freshAgentResumeProvider, renderCliHelp, resolveCanonicalAction, unsupportedInvocationResult } from '../node-client-runtime/action-capabilities.js'
 
 type Flags = Record<string, string | boolean>
 
@@ -459,7 +459,7 @@ async function main() {
       const model = getFlag(flags, 'model') as string | undefined
       const effort = getFlag(flags, 'effort') as string | undefined
       const resumeSessionId = getFlag(flags, 'resume') as string | undefined
-      const resumeProvider = mode ?? agent
+      const resumeProvider = mode ?? freshAgentResumeProvider(agent)
       const sessionRefResult = resolveSessionRefFlag(resumeProvider, getFlag(flags, 'session-ref'))
       const prompt = getFlag(flags, 'prompt') as string | undefined
       if (rejectRawCodexResume(resumeProvider, resumeSessionId)) return
@@ -576,11 +576,15 @@ async function main() {
       const mode = getFlag(flags, 'mode') as string | undefined
       const shell = getFlag(flags, 'shell') as string | undefined
       const cwd = getFlag(flags, 'cwd') as string | undefined
+      const agent = getFlag(flags, 'agent') as string | undefined
+      const model = getFlag(flags, 'model') as string | undefined
+      const effort = getFlag(flags, 'effort') as string | undefined
       const resumeSessionId = getFlag(flags, 'resume') as string | undefined
-      const sessionRefResult = resolveSessionRefFlag(mode, getFlag(flags, 'session-ref'))
-      if (rejectRawCodexResume(mode, resumeSessionId)) return
+      const resumeProvider = mode ?? freshAgentResumeProvider(agent)
+      const sessionRefResult = resolveSessionRefFlag(resumeProvider, getFlag(flags, 'session-ref'))
+      if (rejectRawCodexResume(resumeProvider, resumeSessionId)) return
       if (sessionRefResult.rejected) return
-      const promoted = promoteResumeFlag(mode, resumeSessionId, sessionRefResult.sessionRef)
+      const promoted = promoteResumeFlag(resumeProvider, resumeSessionId, sessionRefResult.sessionRef)
       if (promoted.rejected) return
 
       const resolved = await resolvePaneTarget(client, target)
@@ -597,6 +601,9 @@ async function main() {
         mode,
         shell,
         cwd,
+        agent,
+        model,
+        effort,
         ...(isTruthy(getFlag(flags, 'hostStats')) ? { hostStats: true } : {}),
         ...(promoted.sessionRef ? { sessionRef: promoted.sessionRef } : {}),
       })

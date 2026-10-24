@@ -30,6 +30,7 @@ export default defineConfig({
   test: {
     environment: 'jsdom',
     setupFiles: ['./test/setup/dom.ts'],
+    globalSetup: ['./test/setup/runtime-build-preflight.ts'],
     exclude: [
       'test/runtime/**',
       '**/node_modules/**',

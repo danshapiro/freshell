@@ -108,10 +108,8 @@ async fn fake_session(
         ownership_id: format!("test-teardown-{session_id}"),
         consumer,
         sidecar_session_id: session_id.to_string(),
-        cli_session_id: None,
-        owning_operation: None,
         owning_generation: None,
-        broadcast_id: Arc::new(std::sync::Mutex::new(session_id.to_string())),
+        identity: RuntimeIdentity::new(session_id, Vec::new()),
         pending: Arc::new(std::sync::Mutex::new(ClaudePending::default())),
         ledger: crate::claude_turns::SharedLedger::default(),
         clock: crate::attention::AttentionClock::default(),
@@ -181,7 +179,9 @@ pub(super) mod capture {
     ) {
         let events = Arc::new(StdMutex::new(Vec::new()));
         let subscriber = tracing_subscriber::registry().with(CaptureLayer(Arc::clone(&events)));
-        (events, tracing::subscriber::set_default(subscriber))
+        let guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        (events, guard)
     }
 }
 

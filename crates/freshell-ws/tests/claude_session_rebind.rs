@@ -9,7 +9,7 @@
 //!   restore:true and CLAUDE_ARGV capture -> argv contains ["--resume","B"].
 //! Phase 3 (hijack): second live claude pane bound to "C"; drop a signal
 //!   for pane1 claiming "C" -> refused; both panes' meta unchanged (A13).
-//! Phase 4 (cross-kind, D7): a LIVE freshclaude sidecar owns "D" (fake
+//! Phase 4 (cross-kind, D7): a LIVE freshclaude sidecar owns "D" (real
 //!   sidecar, in-memory session map only -- no ledger row); a signal claiming
 //!   "D" for a terminal pane -> refused (live-sidecar session-map probe).
 //! Phase 5 (multi-instance, P4): a signal naming a terminal id unknown to
@@ -155,6 +155,7 @@ fn registry_resume_id(
 #[cfg(unix)]
 async fn spawn_server_returning_state(
     cli_commands: Vec<freshell_platform::CliCommandSpec>,
+    claude_environment: Vec<(String, String)>,
 ) -> (
     String,
     freshell_terminal::TerminalRegistry,
@@ -196,7 +197,8 @@ async fn spawn_server_returning_state(
         },
         fresh_claude: {
             let fresh_claude =
-                freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx));
+                freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx))
+                    .with_sidecar_environment(claude_environment);
             fresh_claude.set_session_naming(sink.clone());
             fresh_claude
         },
@@ -318,72 +320,6 @@ async fn send_create(ws: &mut common::TestWs, body: serde_json::Value) -> serde_
     common::next_frame_of_type(ws, "terminal.created").await
 }
 
-/// Minimal fake claude sidecar speaking the newline-JSON protocol: answers
-/// `create` with `created` + `sdk.session.init` (echoing the resume boot's id as
-/// the durable cliSessionId), exits on `shutdown`.#[cfg(unix)]
-const FAKE_CLAUDE_SIDECAR_SOURCE: &str = r#"import readline from 'node:readline'
-
-let counter = 0
-const rl = readline.createInterface({ input: process.stdin, terminal: false })
-rl.on('line', (line) => {
-  const trimmed = line.trim()
-  if (!trimmed) return
-  let msg
-  try {
-    msg = JSON.parse(trimmed)
-  } catch {
-    return
-  }
-  if (msg.type === 'create') {
-    counter += 1
-    const sessionId = `fake-claude-session-${process.pid}-${counter}`
-    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 }) + '\n')
-    const cliSessionId = msg.boot?.resume || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-    process.stdout.write(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }) + '\n')
-    process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }) + '\n')
-  } else if (msg.type === 'shutdown') {
-    process.exit(0)
-  }
-})
-"#;
-
-/// A fresh temp dir holding the fake sidecar script, with
-/// `FRESHELL_CLAUDE_SIDECAR`/`FRESHELL_CLAUDE_NODE` pointed at it, PLUS an
-/// empty claude store with `CLAUDE_CONFIG_DIR` pointed at it (so the test
-/// never touches the real home). This file is `#[cfg(unix)]` and its single
-/// test fn owns process env, so no env lock is needed.
-#[cfg(unix)]
-struct FakeClaudeEnv {
-    dir: std::path::PathBuf,
-}
-#[cfg(unix)]
-impl FakeClaudeEnv {
-    fn install() -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "freshell-fake-claude-rebind-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create fake sidecar temp dir");
-        let script = dir.join("fake-claude-sidecar.mjs");
-        std::fs::write(&script, FAKE_CLAUDE_SIDECAR_SOURCE).expect("write fake sidecar");
-        let store = dir.join("claude-store");
-        std::fs::create_dir_all(&store).expect("create claude store dir");
-        std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
-        std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
-        std::env::set_var("CLAUDE_CONFIG_DIR", &store);
-        Self { dir }
-    }
-}
-#[cfg(unix)]
-impl Drop for FakeClaudeEnv {
-    fn drop(&mut self) {
-        std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
-        std::env::remove_var("FRESHELL_CLAUDE_NODE");
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
 /// Unified agent names (phases 8-10): plant
 /// `<store>/projects/<project>/<session_id>.jsonl` — the exact direct-layout
 /// file `locate_transcript_selected` accepts as VERIFIED durability evidence
@@ -437,8 +373,12 @@ async fn session_start_signal_rebinds_and_restores_the_new_id() {
     std::fs::create_dir_all(&signal_root).expect("signal root");
     let watcher = freshell_ws::claude_signal::ClaudeSignalWatcher::new(signal_root.clone());
 
-    let (url, registry, state, sink) =
-        spawn_server_returning_state(vec![claude_capture_spec()]).await;
+    let claude_environment = common::claude_sim_environment::ClaudeSimEnvironment::new();
+    let (url, registry, state, sink) = spawn_server_returning_state(
+        vec![claude_capture_spec()],
+        claude_environment.environment(),
+    )
+    .await;
     let (mut ws, _inventory) = common::connect_and_capture_inventory(&url).await;
 
     // ── Phase 1 -- mid-session rebind: fresh claude pane (identity A via the
@@ -607,31 +547,32 @@ async fn session_start_signal_rebinds_and_restores_the_new_id() {
         .expect("terminalId")
         .to_string();
 
-    let _fake_env = FakeClaudeEnv::install();
-    let sidecar_sid = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
     ws.send(WsMessage::Text(
         json!({
             "type": "freshAgent.create",
             "requestId": "req-live-owner",
             "sessionType": "freshclaude",
             "provider": "claude",
-            "cwd": "/tmp",
-            "sessionRef": { "provider": "claude", "sessionId": sidecar_sid },
+            "cwd": claude_environment.workspace(),
         })
         .to_string(),
     ))
     .await
     .expect("send freshAgent.create");
-    assert!(
-        frame_seen_within(&mut ws, Duration::from_secs(15), |v| {
-            v["type"] == "freshAgent.created" && v["requestId"] == "req-live-owner"
-        })
-        .await,
-        "fake sidecar must come live"
-    );
-    // The resume path inserts cli_index[S] synchronously before `created`
-    // (claude.rs:436), so the probe is authoritative now:
-    assert!(state.fresh_claude.has_live_session(sidecar_sid).await);
+    let created = common::next_frame_of_type(&mut ws, "freshAgent.created").await;
+    assert_eq!(created["requestId"], "req-live-owner", "{created}");
+    let sidecar_sid = created["sessionId"].as_str().unwrap().to_string();
+    assert!(uuid::Uuid::parse_str(&sidecar_sid).is_ok());
+    assert_eq!(created["sessionRef"]["sessionId"], sidecar_sid);
+    assert!(state.fresh_claude.has_live_session(&sidecar_sid).await);
+    let boot = claude_environment.rows("boot").into_iter().next().unwrap();
+    assert_eq!(boot["sessionId"], sidecar_sid);
+    assert_eq!(claude_environment.rows("query").len(), 1);
+    let sidecar_processes = [
+        boot["pid"].as_u64().unwrap(),
+        boot["cliPid"].as_u64().unwrap(),
+    ]
+    .map(|pid| common::process_probe::ProcessProbe::open(u32::try_from(pid).unwrap()));
 
     // Forge a SessionStart signal from the phase-4 pane claiming the
     // sidecar-owned session.
@@ -646,7 +587,7 @@ async fn session_start_signal_rebinds_and_restores_the_new_id() {
     // Refusal proof: the pane's identity did not move...
     assert_ne!(
         registry_resume_id(&registry, &tid4).as_deref(),
-        Some(sidecar_sid),
+        Some(sidecar_sid.as_str()),
         "a live-sidecar-owned session must never be claimed by a terminal pane"
     );
     // ...no association frame was emitted for it...
@@ -867,7 +808,7 @@ async fn session_start_signal_rebinds_and_restores_the_new_id() {
 
     // The CLI reports a NEW session (B2) whose transcript already exists on
     // disk — the signal lane's verified first-bind. The naming phases own
-    // CLAUDE_CONFIG_DIR from here (phase 4's fake sidecar is long done).
+    // CLAUDE_CONFIG_DIR from here; the sidecar keeps its isolated per-state store.
     let naming_store = tempfile::tempdir().expect("naming transcript store");
     std::env::set_var("CLAUDE_CONFIG_DIR", naming_store.path());
     let b2 = "88888888-9999-4aaa-8bbb-cccccccc0001";
@@ -1161,7 +1102,13 @@ async fn session_start_signal_rebinds_and_restores_the_new_id() {
          must re-stamp the persisted pre-durable handle"
     );
 
-    state.fresh_claude.shutdown().await; // reap the fake node child
+    state.fresh_claude.shutdown().await;
+    for process in sidecar_processes {
+        assert!(
+            process.exits_within(common::FRAME_BUDGET).await,
+            "owned sidecar/CLI survived shutdown"
+        );
+    }
 
     registry.kill(&tid2);
     registry.kill(&tid3);

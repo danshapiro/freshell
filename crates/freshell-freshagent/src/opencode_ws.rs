@@ -271,6 +271,11 @@ pub struct FreshOpencodeState {
     /// `Started`), mirroring the freshcodex onExit self-heal. See
     /// [`Self::ensure_daemon_loss_watcher`].
     daemon_loss_watcher: Arc<std::sync::OnceLock<()>>,
+    /// Test-only pause after a revival restart, before its ownership guard releases.
+    #[cfg(test)]
+    revival_completion_pause: Arc<StdMutex<Option<RevivalCompletionPause>>>,
+    #[cfg(test)]
+    daemon_loss_watcher_bootstrapped: Arc<tokio::sync::Notify>,
     /// ep2-r3 test seam (`cfg(test)`-only): when armed for a durable id, the
     /// post-commit rescue tail parks BETWEEN its map re-lookup clone and the
     /// session-lock take — the exact window the ep2-r3 fresheyes Major pins
@@ -300,6 +305,13 @@ struct RescueStallGate {
     entered_tx: std::sync::mpsc::Sender<()>,
     /// The test's release: the rescue parks until this oneshot resolves.
     release_rx: StdMutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+#[cfg(test)]
+struct RevivalCompletionPause {
+    session_id: String,
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
 }
 
 /// The handles [`FreshOpencodeState::arm_rescue_stall`] hands the test
@@ -859,6 +871,10 @@ impl FreshOpencodeState {
             naming: crate::naming::NamingSink::default(),
             condemned_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             daemon_loss_watcher: Arc::new(std::sync::OnceLock::new()),
+            #[cfg(test)]
+            revival_completion_pause: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            daemon_loss_watcher_bootstrapped: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             rescue_stall: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
@@ -8202,6 +8218,8 @@ impl FreshOpencodeState {
             // history — a daemon that re-warmed before this subscription
             // must still get its dead bridges revived now.
             state.revive_dead_bridges_if_daemon_running().await;
+            #[cfg(test)]
+            state.daemon_loss_watcher_bootstrapped.notify_waiters();
             loop {
                 match signals.recv().await {
                     Ok(DaemonSignal::Lost { reason }) => {
@@ -8358,10 +8376,29 @@ impl FreshOpencodeState {
             // lock; the snapshot push goes ONLY to actually-restarted
             // bridges. `Ok(None)` (bridge alive against the CURRENT daemon /
             // unmaterialized) is the quiet no-op.
-            let restarted = {
-                let mut session = session_arc.lock().await;
-                self.restart_session_bridge_guarded(&mut session).await
-            };
+            // Keep publication inside the same session/ownership window. Tuple
+            // fields drop in order, so ownership releases before the session
+            // mutex wakes a waiting kill, including when this future is cancelled.
+            let mut guards = (adopt_guard, session_arc.lock().await);
+            let restarted = self.restart_session_bridge_guarded(&mut guards.1).await;
+            #[cfg(test)]
+            {
+                let pause = {
+                    let mut gate = self.revival_completion_pause.lock().unwrap();
+                    if gate
+                        .as_ref()
+                        .is_some_and(|pause| pause.session_id == durable)
+                    {
+                        gate.take()
+                    } else {
+                        None
+                    }
+                };
+                if let Some(pause) = pause {
+                    let _ = pause.entered.send(());
+                    let _ = pause.release.await;
+                }
+            }
             match restarted {
                 Ok(Some(real_id)) => {
                     self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
@@ -8376,8 +8413,7 @@ impl FreshOpencodeState {
                     );
                 }
             }
-            // The guard covered the restart; release the window.
-            drop(adopt_guard);
+            drop(guards);
         }
     }
 
@@ -9104,6 +9140,7 @@ mod tests {
         next_session: AtomicUsize,
         prompts: StdMutex<Vec<String>>,
         aborts: StdMutex<Vec<String>>,
+        prompt_dispatched: tokio::sync::Notify,
     }
     impl AbortRecordingHttp {
         fn session_of(url: &str, marker: &str) -> Option<String> {
@@ -9113,18 +9150,20 @@ mod tests {
                 .next()
                 .map(str::to_string)
         }
-        fn await_prompt(&self, budget: Duration) -> String {
-            let deadline = std::time::Instant::now() + budget;
-            loop {
-                if let Some(id) = self.prompts.lock().unwrap().first().cloned() {
-                    return id;
+        async fn await_prompt(&self, budget: Duration) -> String {
+            tokio::time::timeout(budget, async {
+                loop {
+                    let dispatched = self.prompt_dispatched.notified();
+                    tokio::pin!(dispatched);
+                    dispatched.as_mut().enable();
+                    if let Some(id) = self.prompts.lock().unwrap().first().cloned() {
+                        return id;
+                    }
+                    dispatched.await;
                 }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "the prompt POST was never dispatched"
-                );
-                std::thread::sleep(Duration::from_millis(5));
-            }
+            })
+            .await
+            .expect("the prompt POST was never dispatched")
         }
     }
     impl ServeHttp for AbortRecordingHttp {
@@ -9152,6 +9191,7 @@ mod tests {
                         && matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
                     {
                         self.prompts.lock().unwrap().push(id);
+                        self.prompt_dispatched.notify_one();
                     } else if req.url.contains("/abort")
                         && matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
                     {
@@ -9161,6 +9201,46 @@ mod tests {
             }
             Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) })
         }
+    }
+
+    async fn abort_recording_state() -> (
+        FreshOpencodeState,
+        Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+        Arc<AbortRecordingHttp>,
+        tokio::sync::broadcast::Receiver<String>,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let http = Arc::new(AbortRecordingHttp::default());
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: http.clone(),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let mut state = FreshOpencodeState::new(fresh_agent);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        state.set_ownership(registry.clone());
+        // Let the real watcher finish its initial pass while the map is empty,
+        // before this fixture creates the accepted daemon-side turn under test.
+        {
+            let ready = state.daemon_loss_watcher_bootstrapped.notified();
+            tokio::pin!(ready);
+            ready.as_mut().enable();
+            state.ensure_daemon_loss_watcher().await;
+            tokio::time::timeout(Duration::from_secs(10), ready)
+                .await
+                .expect("the initial daemon recovery pass completed");
+        }
+        (state, registry, http, rx)
     }
 
     /// A `ServeProcess` fake that records whether it was ever killed, so tests can
@@ -11746,26 +11826,7 @@ mod tests {
     /// committed the stop with the daemon turn still running.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_kill_during_an_accepted_daemon_turn_aborts_it_before_the_stop_commits() {
-        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
-        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
-        let http = Arc::new(AbortRecordingHttp::default());
-        let deps = ServeDeps {
-            spawner: Arc::new(TrackedSpawner {
-                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            }),
-            http: http.clone(),
-            ports: Arc::new(FakeAllocator),
-            events: Arc::new(NoopEventSource),
-        };
-        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
-        manager
-            .ensure_started()
-            .await
-            .expect("healthy fake serve starts");
-        fresh_agent.set_manager_for_test(manager).await;
-        let mut st = FreshOpencodeState::new(fresh_agent);
-        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
-        st.set_ownership(registry.clone());
+        let (st, registry, http, mut rx) = abort_recording_state().await;
 
         st.handle_create(create_msg("req-kill-daemon-abort"), None)
             .await;
@@ -11785,9 +11846,18 @@ mod tests {
         // witness armed at the dispatch boundary); then the LOCAL task is
         // settled — the IdleTimeout shape (a finished local task with the
         // daemon-side turn still running).
-        let real_id = http.await_prompt(Duration::from_secs(10));
+        let real_id = http.await_prompt(Duration::from_secs(10)).await;
         assert_eq!(real_id, "ses_1");
         st.settle_local_turn_task_for_test(placeholder).await;
+        assert!(
+            session_arc
+                .lock()
+                .await
+                .daemon_turn_accepted
+                .load(Ordering::SeqCst),
+            "fixture: the daemon-side turn is still accepted after local settlement"
+        );
+        let owner_before_kill = registry.observe("opencode", "ses_1");
         while rx.try_recv().is_ok() {}
 
         st.handle_kill(FreshAgentKill {
@@ -11800,22 +11870,6 @@ mod tests {
         })
         .await;
 
-        // THE R3-2 regression: the kill issued the per-session daemon-side
-        // abort for the REAL session id before declaring the reap
-        // confirmed.
-        let aborts = http.aborts.lock().unwrap().clone();
-        assert_eq!(
-            aborts,
-            vec!["ses_1".to_string()],
-            "the kill must abort the accepted daemon-side turn (per-session /abort)"
-        );
-        // The stop committed AFTER the abort: Stopping → Vacant.
-        assert_eq!(
-            registry.observe("opencode", "ses_1").state,
-            freshell_ownership::OwnershipState::Vacant,
-            "the kill's coordinator stop must commit (Stopping → Vacant)"
-        );
-        // The answer reports success (the quiesced kill).
         let mut killed_frame = None;
         while let Ok(raw) = rx.try_recv() {
             let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -11824,10 +11878,114 @@ mod tests {
             }
         }
         let killed_frame = killed_frame.expect("the kill answers freshAgent.killed");
+        // THE R3-2 regression: the kill issued the per-session daemon-side
+        // abort for the REAL session id before declaring the reap
+        // confirmed.
+        let aborts = http.aborts.lock().unwrap().clone();
+        assert_eq!(
+            aborts,
+            vec!["ses_1".to_string()],
+            "the kill must abort the accepted daemon-side turn (per-session /abort); owner={owner_before_kill:?}; answer={killed_frame}"
+        );
+        // The stop committed AFTER the abort: Stopping → Vacant.
+        assert_eq!(
+            registry.observe("opencode", "ses_1").state,
+            freshell_ownership::OwnershipState::Vacant,
+            "the kill's coordinator stop must commit (Stopping → Vacant)"
+        );
+        // The answer reports success (the quiesced kill).
         assert_eq!(
             killed_frame["success"], true,
             "the quiesced kill answers success: {killed_frame}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_kill_waits_for_daemon_revival_to_release_its_ownership_guard() {
+        for restart_bridge in [false, true] {
+            let (st, registry, http, mut rx) = abort_recording_state().await;
+            // Drive the real revival pass explicitly after materialization,
+            // controlling the same ordering a delayed background pass can reach.
+            st.handle_create(create_msg("req-kill-revival"), None).await;
+            let placeholder = "freshopencode-req-kill-revival";
+            st.handle_send(send_msg(placeholder, "accepted in the shared daemon"))
+                .await;
+            assert_eq!(http.await_prompt(Duration::from_secs(10)).await, "ses_1");
+            st.settle_local_turn_task_for_test(placeholder).await;
+            if restart_bridge {
+                let session = st.sessions.lock().await[placeholder].clone();
+                session.lock().await.serve_bridge.take().unwrap().abort();
+            }
+            let _ = drain_frames(&mut rx);
+
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            *st.revival_completion_pause.lock().unwrap() = Some(RevivalCompletionPause {
+                session_id: "ses_1".into(),
+                entered: entered_tx,
+                release: release_rx,
+            });
+            let revival = {
+                let state = st.clone();
+                tokio::spawn(async move { state.revive_dead_bridges_if_daemon_running().await })
+            };
+            tokio::time::timeout(Duration::from_secs(10), entered_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            let kill = tokio::task::unconstrained(st.handle_kill(FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Opencode,
+                session_id: placeholder.into(),
+                session_type: SessionType::Freshopencode,
+                observed_epoch: None,
+                observed_generation: None,
+                cwd: None,
+            }));
+            tokio::pin!(kill);
+            let waiting = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(kill.as_mut(), cx).is_pending())
+            })
+            .await;
+            assert!(
+                waiting,
+                "kill escaped the guarded session before revival released ownership: {:?}",
+                drain_frames(&mut rx)
+            );
+            assert!(http.aborts.lock().unwrap().is_empty());
+
+            release_tx.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(10), revival)
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), kill)
+                .await
+                .unwrap();
+            assert_eq!(*http.aborts.lock().unwrap(), vec!["ses_1".to_string()]);
+            assert_eq!(
+                registry.observe("opencode", "ses_1").state,
+                freshell_ownership::OwnershipState::Vacant
+            );
+            let frames = drain_frames(&mut rx);
+            let killed = frames
+                .iter()
+                .position(|frame| frame["type"] == "freshAgent.killed" && frame["success"] == true)
+                .expect("the quiesced kill succeeds");
+            let snapshot = frames
+                .iter()
+                .position(|frame| frame["event"]["type"] == "freshAgent.session.snapshot");
+            if restart_bridge {
+                assert!(
+                    snapshot.expect("the restarted bridge publishes its snapshot") < killed,
+                    "publication precedes the completed kill: {frames:?}"
+                );
+            } else {
+                assert!(
+                    snapshot.is_none(),
+                    "a healthy bridge needs no restart publication"
+                );
+            }
+        }
     }
 
     /// Delta-r6-r4 (focused-episode-6 round 3, Finding 3), the opencode

@@ -729,12 +729,13 @@ describe('the real sidecar over the simulator (FRESHELL_CLAUDE_SDK_QUERY_MODULE)
 
   it('creates a session, runs a turn and reports its result through the sidecar protocol', async () => {
     const { home, frames, until, send } = await startSidecar()
-    send({ type: 'create', protocol: 2, boot: { kind: 'fresh' }, requestId: 'r1', cwd: home.cwd, permissionMode: 'bypassPermissions' })
+    const sessionId = randomUUID()
+    send({ type: 'create', protocol: 2, boot: { kind: 'fresh' }, requestId: 'r1', sessionId, cwd: home.cwd, permissionMode: 'bypassPermissions' })
     expect(await until(() => frames.some((f) => f.type === 'created'))).toBe(true)
-    const sessionId = frames.find((f) => f.type === 'created').sessionId
+    expect(frames.find((f) => f.type === 'created')).toMatchObject({ sessionId })
     send({ type: 'send', sessionId, uuid: randomUUID(), text: 'hello' })
     expect(await until(() => frames.some((f) => f.type === 'sdk.result' && f.subtype === 'success'))).toBe(true)
-    expect(frames.find((f) => f.type === 'sdk.session.init')).toMatchObject({ sessionId, cliSessionId: expect.stringMatching(/^[0-9a-f-]{36}$/) })
+    expect(frames.find((f) => f.type === 'sdk.session.init')).toMatchObject({ sessionId, cliSessionId: sessionId })
     expect(frames.find((f) => f.type === 'sdk.result')).toMatchObject({ sessionId, result: 'success' })
     expect(frames.find((f) => f.type === 'sdk.assistant')?.content).toEqual([{ type: 'text', text: 'ok' }])
   })

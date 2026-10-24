@@ -947,6 +947,12 @@ pub struct BindingRow {
     /// excludes such rows exactly like unattributed ones.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_attributed_at: Option<i64>,
+    /// A freshclaude turn that was still owed when the server shut down.
+    /// The next successful create/attach consumes this marker and reports the
+    /// interruption once. Optional under LEDGER_VERSION 1 so older rows keep
+    /// loading unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_interrupted_at: Option<i64>,
 }
 
 /// Evidence that identity establishment was in flight (G1: never a binding).
@@ -2296,6 +2302,7 @@ impl PaneLedger {
             device_id,
             tab_key,
             last_attributed_at,
+            turn_interrupted_at: None,
         };
         self.write_binding(root, index, &row)?; // new bound row FIRST (pinned)
 
@@ -2679,12 +2686,28 @@ impl PaneLedger {
             }
         }
         let created_at = existing.map(|r| r.created_at).unwrap_or(w.now_ms);
+        // A superseding conversation keeps its pane's create lineage, so a
+        // replay after reset or rollback still finds the current session.
+        let superseded_parent = w
+            .supersedes
+            .filter(|old| *old != w.session_id)
+            .and_then(|old| {
+                index
+                    .bindings
+                    .get(&(w.provider.to_string(), old.to_string()))
+                    .cloned()
+            });
         // Advisory field: keep the existing row's value when the new write
         // has none (latest-observed semantics, D4).
         let create_request_id = w
             .create_request_id
             .map(str::to_string)
-            .or_else(|| existing.and_then(|r| r.create_request_id.clone()));
+            .or_else(|| existing.and_then(|r| r.create_request_id.clone()))
+            .or_else(|| {
+                superseded_parent
+                    .as_ref()
+                    .and_then(|r| r.create_request_id.clone())
+            });
         // Lineage (delta-r7-round-3, F1): the fresh-agent row's origin
         // mirrors its pane key — the same computed value — so the coverage
         // join against either key is identical to the pre-F1 crid arm on
@@ -2738,15 +2761,6 @@ impl PaneLedger {
         // documented in the terminal body (focused-ep4-r5 Finding 2a); no
         // sequence counter is built for it. The retire/link below is
         // unchanged by the policy; this block is stamps+time only.
-        let superseded_parent = w
-            .supersedes
-            .filter(|old| *old != w.session_id)
-            .and_then(|old| {
-                index
-                    .bindings
-                    .get(&(w.provider.to_string(), old.to_string()))
-                    .cloned()
-            });
         let inherit = existing.or(superseded_parent.as_ref());
         let prior_attribution = inherit.and_then(|r| r.last_attributed_at);
         let apply = match w.provenance {
@@ -2815,6 +2829,9 @@ impl PaneLedger {
             permission_mode: w.permission_mode.map(str::to_string),
             effort: w.effort.map(str::to_string),
             plugins: w.plugins.map(<[String]>::to_vec),
+            // A rebind during recovery must not erase a shutdown marker
+            // before a create or attach can acknowledge the interruption.
+            turn_interrupted_at: existing.and_then(|row| row.turn_interrupted_at),
             // Claude core design §4.1: the genesis is not part of the
             // settings snapshot. Only the write that mints a pending session
             // sets it and only the transcript's observation clears it; every
@@ -4628,6 +4645,63 @@ impl PaneLedger {
         };
         self.write_binding(root, &mut index, &row)?;
         Ok(true)
+    }
+
+    /// Record that a live fresh-agent turn was interrupted by server shutdown.
+    /// This updates only the optional marker on an existing bound fresh-agent
+    /// row; it never creates or revives an identity row. `Ok(false)` means the
+    /// row was unavailable or no longer bound.
+    pub fn mark_fresh_agent_turn_interrupted(
+        &self,
+        provider: &str,
+        session_id: &str,
+        at_ms: i64,
+    ) -> std::io::Result<bool> {
+        let Some(root) = &self.root else {
+            return Ok(false);
+        };
+        let mut index = self.guard();
+        let key = (provider.to_string(), session_id.to_string());
+        let Some(mut row) = index.bindings.get(&key).cloned() else {
+            return Ok(false);
+        };
+        if row.pane_kind.as_deref() != Some("fresh-agent") || row.state != RowState::Bound {
+            return Ok(false);
+        }
+        if row.turn_interrupted_at == Some(at_ms) {
+            return Ok(true);
+        }
+        row.turn_interrupted_at = Some(at_ms);
+        self.write_binding(root, &mut index, &row)?;
+        Ok(true)
+    }
+
+    /// Atomically read and clear the restart marker on an existing bound
+    /// fresh-agent row. The marker is returned only after the cleared row is
+    /// durably written, so callers can emit one notice after their create or
+    /// attach acknowledgement without racing another acknowledgement.
+    pub fn take_fresh_agent_turn_interrupted(
+        &self,
+        provider: &str,
+        session_id: &str,
+    ) -> std::io::Result<Option<i64>> {
+        let Some(root) = &self.root else {
+            return Ok(None);
+        };
+        let mut index = self.guard();
+        let key = (provider.to_string(), session_id.to_string());
+        let Some(mut row) = index.bindings.get(&key).cloned() else {
+            return Ok(None);
+        };
+        if row.pane_kind.as_deref() != Some("fresh-agent") || row.state != RowState::Bound {
+            return Ok(None);
+        }
+        let Some(at_ms) = row.turn_interrupted_at else {
+            return Ok(None);
+        };
+        row.turn_interrupted_at = None;
+        self.write_binding(root, &mut index, &row)?;
+        Ok(Some(at_ms))
     }
 
     /// Fresh-agent Task 3 (`was_recorded` rekeying): true iff a FRESH-AGENT

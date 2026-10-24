@@ -1,3 +1,5 @@
+import fs from 'node:fs/promises'
+import path from 'node:path'
 import { expect, type Browser } from './fixtures.js'
 import type { SessionNameRef } from '../../shared/session-names.js'
 import {
@@ -515,15 +517,88 @@ export async function twoBrowsersAndAnloadedHistoryConverge(mode: UnifiedAgentMo
   }
 }
 
+function countClaudeTurnCompleteEvents(messages: unknown[], identities: Array<string | undefined>): number {
+  const ids = new Set(identities.filter((identity): identity is string => Boolean(identity)))
+  return messages.filter((raw) => {
+    if (!raw || typeof raw !== 'object') return false
+    const message = raw as { type?: unknown; sessionId?: unknown; event?: { type?: unknown; sessionId?: unknown } }
+    return message.type === 'freshAgent.event'
+      && message.event?.type === 'freshAgent.turn.complete'
+      && (ids.has(String(message.sessionId ?? '')) || ids.has(String(message.event?.sessionId ?? '')))
+  }).length
+}
+
+async function hasSavedClaudeExchanges(
+  homeDir: string,
+  projectDir: string,
+  sessionId: string,
+  exchanges: Array<{ prompt: string; reply: string }>,
+): Promise<boolean> {
+  const projectSlug = projectDir.replace(/[^A-Za-z0-9]/g, '-')
+  const transcriptPath = path.join(homeDir, '.claude', 'projects', projectSlug, `${sessionId}.jsonl`)
+  const contents = await fs.readFile(transcriptPath, 'utf8').catch(() => '')
+  const rows = contents.split(/\r?\n/).flatMap((line) => {
+    if (!line.trim()) return []
+    try {
+      return [JSON.parse(line) as { type?: string; message?: { content?: unknown } }]
+    } catch {
+      // The simulator appends JSONL asynchronously; ignore an incomplete final line
+      // while polling for the flushed record.
+      return []
+    }
+  })
+  const messageText = (row: { message?: { content?: unknown } }): string => {
+    const content = row.message?.content
+    if (typeof content === 'string') return content
+    if (!Array.isArray(content)) return ''
+    return content.flatMap((block: unknown) => {
+      if (!block || typeof block !== 'object') return []
+      const item = block as { type?: unknown; text?: unknown }
+      return item.type === 'text' && typeof item.text === 'string' ? [item.text] : []
+    }).join('')
+  }
+
+  let cursor = 0
+  for (const exchange of exchanges) {
+    const userIndex = rows.findIndex((row, index) => index >= cursor && row.type === 'user' && messageText(row) === exchange.prompt)
+    if (userIndex < 0) return false
+    const nextUserIndex = rows.findIndex((row, index) => index > userIndex && row.type === 'user')
+    const end = nextUserIndex < 0 ? rows.length : nextUserIndex
+    const hasReply = rows.slice(userIndex + 1, end)
+      .some((row) => row.type === 'assistant' && messageText(row).includes(exchange.reply))
+    if (!hasReply) return false
+    cursor = userIndex + 1
+  }
+  return true
+}
+
 export async function manualNameSurvivesLateGenerationAndSwitch(mode: UnifiedAgentMode, browser: Browser): Promise<void> {
   {
     const gemini = await startFakeGemini(AI_NAME, { hold: true })
-      const journey = await bootJourney(mode, { gemini })
+      const firstOldPrompt = 'Hold the generation request'
+      const firstOldReply = 'First old conversation reply is saved'
+      const secondOldPrompt = 'A second turn keeps the old session listed'
+      const secondOldReply = 'Second old conversation reply is saved'
+      const freshClaudeProgram = mode === 'freshclaude'
+        ? JSON.stringify({
+            rules: [
+              { on: 'msg:prompt', match: { text: firstOldPrompt }, once: true, emit: [{ kind: 'text', data: { text: firstOldReply } }] },
+              { on: 'msg:prompt', match: { text: secondOldPrompt }, once: true, emit: [{ kind: 'text', data: { text: secondOldReply } }] },
+            ],
+          })
+        : undefined
+      const journey = await bootJourney(mode, {
+        gemini,
+        ...(freshClaudeProgram ? { env: { FRESHELL_CLAUDE_SIM_PROGRAM: freshClaudeProgram } } : {}),
+      })
       try {
         const { page, harness, context } = await connect(journey, browser)
         const created = await createNamedAgent(harness, mode, { entry: 'ui', page, server: journey.server })
         const handle = await refreshHandle(harness, created, mode)
-        await sendFirstMessage(page, harness, handle, mode, 'Hold the generation request')
+        const firstCompletionCount = mode === 'freshclaude'
+          ? countClaudeTurnCompleteEvents(await harness.getReceivedWsMessages(), [handle.sessionId])
+          : 0
+        await sendFirstMessage(page, harness, handle, mode, firstOldPrompt)
         // The generation request is provably in flight.
         await expect.poll(() => gemini.requests.length, { timeout: 30_000 }).toBeGreaterThan(0)
         // The manual rename commits mid-flight.
@@ -537,6 +612,19 @@ export async function manualNameSurvivesLateGenerationAndSwitch(mode: UnifiedAge
         await page.waitForTimeout(3_000)
         const sessionId = await resolveSessionId(journey, handle)
         const sessionRef: SessionNameRef = { kind: 'session', provider: (await modeFixture(mode)).provider, sessionId }
+        if (mode === 'freshclaude') {
+          const identities = [handle.sessionId, sessionId]
+          await expect.poll(
+            async () => countClaudeTurnCompleteEvents(await harness.getReceivedWsMessages(), identities),
+            { timeout: 30_000, message: 'the first old-session Claude turn completes' },
+          ).toBeGreaterThan(firstCompletionCount)
+          await expect.poll(
+            () => hasSavedClaudeExchanges(journey.server.info.homeDir, journey.server.projectDir, sessionId, [
+              { prompt: firstOldPrompt, reply: firstOldReply },
+            ]),
+            { timeout: 30_000, message: 'the first old-session exchange is flushed to its native transcript' },
+          ).toBe(true)
+        }
         let record = await readRecord(journey, sessionRef)
         expect(record.name).toBe(manualName)
         expect(record.source).toBe('manual')
@@ -549,7 +637,24 @@ export async function manualNameSurvivesLateGenerationAndSwitch(mode: UnifiedAge
         // transcript the real-exchange shape (the directory listing's
         // parity filter hides a single-turn session, and after the switch
         // no live pane carries the old row).
-        await sendFirstMessage(page, harness, handle, mode, 'A second turn keeps the old session listed')
+        const oldSessionIdentities = [handle.sessionId, sessionId]
+        const secondCompletionCount = mode === 'freshclaude'
+          ? countClaudeTurnCompleteEvents(await harness.getReceivedWsMessages(), oldSessionIdentities)
+          : 0
+        await sendFirstMessage(page, harness, handle, mode, secondOldPrompt)
+        if (mode === 'freshclaude') {
+          await expect.poll(
+            async () => countClaudeTurnCompleteEvents(await harness.getReceivedWsMessages(), oldSessionIdentities),
+            { timeout: 30_000, message: 'the second old-session Claude turn completes before /new' },
+          ).toBeGreaterThan(secondCompletionCount)
+          await expect.poll(
+            () => hasSavedClaudeExchanges(journey.server.info.homeDir, journey.server.projectDir, sessionId, [
+              { prompt: firstOldPrompt, reply: firstOldReply },
+              { prompt: secondOldPrompt, reply: secondOldReply },
+            ]),
+            { timeout: 30_000, message: 'both completed old-session exchanges are flushed before /new' },
+          ).toBe(true)
+        }
         const fixture = await modeFixture(mode)
         if (fixture.fresh) {
           // The pane's REAL conversation-switch control: the `/new` slash

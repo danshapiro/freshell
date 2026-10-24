@@ -1,83 +1,43 @@
-//! The live frames a claude sidecar sends mid-turn (transcript-live plan §4.2,
-//! Phase C): API retries, notices, per-message transcript announcements and the
-//! CLI's own permission-mode changes, as every client receives them.
-//!
-//! The sidecar is a small Node fake started through the production create
-//! (`handle_create`), so the stdout consumer, its folds and the broadcast are
-//! the real ones. A send's text is the list of `sdk.*` frames the fake writes
-//! back (as a JSON array), each stamped with the sidecar's session id; a
-//! configure is logged and answered the way index.mjs answers it.
-
-use super::*;
+//! Live retry, notice, transcript and permission-mode behavior through the
+//! production sidecar, SDK adapter and contract-tested CLI simulator.
 
 use super::teardown_tests::capture;
+use super::tests::ClaudeTestRuntime;
+use super::*;
 
-/// The durable id the fake's session reports.
-const DURABLE: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
-
-/// The fake sidecar; `CONFIGURE_LOG` and `DURABLE` are prepended.
-const ECHO_SIDECAR: &str = r#"
-const fs = require('node:fs')
-const out = (frame) => process.stdout.write(JSON.stringify(frame) + '\n')
-require('node:readline').createInterface({ input: process.stdin }).on('line', (line) => {
-  let msg
-  try { msg = JSON.parse(line) } catch { return }
-  if (msg.type === 'create') {
-    const sessionId = 'live-frames-session'
-    out({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 })
-    out({ type: 'sdk.session.init', sessionId, cliSessionId: DURABLE, model: 'fake-model', cwd: '/tmp', tools: [] })
-  } else if (msg.type === 'send') {
-    for (const frame of JSON.parse(msg.text)) out({ ...frame, sessionId: msg.sessionId })
-  } else if (msg.type === 'configure') {
-    fs.appendFileSync(CONFIGURE_LOG, JSON.stringify(msg) + '\n')
-    out({ type: 'sdk.configured', sessionId: msg.sessionId, requestId: msg.requestId, ok: true, settings: msg.settings })
-  } else if (msg.type === 'shutdown') {
-    process.exit(0)
-  }
-})
-"#;
-
-/// One session of the echo fake, created through the production create.
-struct EchoSession {
+struct LiveSession {
     st: FreshClaudeState,
     rx: tokio::sync::broadcast::Receiver<String>,
-    /// The pane's id for the session (its map key and envelope id).
     pane: String,
-    configure_log: std::path::PathBuf,
-    /// Every frame read off the bus so far, in order.
     frames: Vec<Value>,
-    _dir: tempfile::TempDir,
+    runtime: ClaudeTestRuntime,
     _env: tokio::sync::MutexGuard<'static, ()>,
 }
 
-impl EchoSession {
+impl LiveSession {
     async fn start(permission_mode: Option<&str>) -> Self {
+        Self::start_program(permission_mode, json!([{"kind":"hang"}]), None).await
+    }
+
+    async fn start_program(
+        permission_mode: Option<&str>,
+        steps: Value,
+        sdk_messages: Option<Value>,
+    ) -> Self {
         let env = super::tests::CLAUDE_ENV_LOCK.lock().await;
-        let dir = tempfile::tempdir().expect("fake sidecar directory");
-        let script = dir.path().join("echo-sidecar.cjs");
-        let configure_log = dir.path().join("configure.log");
-        std::fs::write(&configure_log, "").expect("init the configure log");
-        let quoted = |text: &str| serde_json::to_string(text).expect("a JS string");
-        std::fs::write(
-            &script,
-            format!(
-                "const CONFIGURE_LOG = {}\nconst DURABLE = {}\n{ECHO_SIDECAR}",
-                quoted(&configure_log.to_string_lossy()),
-                quoted(DURABLE),
-            ),
-        )
-        .expect("write the fake sidecar");
-        std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
-        std::env::set_var("CLAUDE_CONFIG_DIR", dir.path().join("claude"));
-        let (tx, rx) = tokio::sync::broadcast::channel::<String>(256);
+        let runtime = ClaudeTestRuntime::install();
+        runtime.program(steps);
+        if let Some(messages) = sdk_messages {
+            std::env::set_var("FRESHELL_TEST_CLAUDE_SDK_MESSAGES", messages.to_string());
+        }
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(512);
         let st = FreshClaudeState::new(Arc::new(tx));
         let mut session = Self {
             st,
             rx,
             pane: String::new(),
-            configure_log,
             frames: Vec::new(),
-            _dir: dir,
+            runtime,
             _env: env,
         };
         let mut create = create_msg("live-frames");
@@ -89,21 +49,17 @@ impl EchoSession {
             })
             .await;
         assert_eq!(created["type"], "freshAgent.created", "{created}");
-        session.pane = created["sessionId"]
-            .as_str()
-            .expect("the created session id")
-            .to_string();
+        session.pane = created["sessionId"].as_str().unwrap().to_string();
         session
     }
 
-    /// The fake writes `frames` back as the CLI side of a send.
-    async fn sidecar_writes(&mut self, frames: Value) {
-        self.st
-            .handle_send(send_msg(&self.pane, &frames.to_string()))
-            .await;
+    async fn send(&self, text: &str) {
+        assert!(matches!(
+            self.st.handle_send(send_msg(&self.pane, text)).await,
+            ClaudeSendOutcome::Accepted { .. }
+        ));
     }
 
-    /// Read frames until one matches `want` (returned) or 20 s pass.
     async fn await_frame(&mut self, what: &str, want: impl Fn(&Value) -> bool) -> Value {
         if let Some(hit) = self.frames.iter().find(|frame| want(frame)) {
             return hit.clone();
@@ -125,26 +81,29 @@ impl EchoSession {
         found.unwrap_or_else(|_| panic!("no {what}; frames: {:?}", self.frames))
     }
 
-    /// The first `freshAgent.event` whose inner event has this type.
     async fn await_event(&mut self, event_type: &str) -> Value {
-        let what = format!("a {event_type} event");
-        self.await_frame(&what, |frame| {
+        self.await_frame(event_type, |frame| {
             frame["type"] == "freshAgent.event" && frame["event"]["type"] == event_type
         })
         .await
     }
 
-    /// The configure lines the fake received.
-    fn configures(&self) -> Vec<Value> {
-        std::fs::read_to_string(&self.configure_log)
+    fn rows(&self, file: &str) -> Vec<Value> {
+        std::fs::read_to_string(self.runtime.dir.join(file))
             .unwrap_or_default()
             .lines()
             .filter(|line| !line.trim().is_empty())
-            .map(|line| serde_json::from_str(line).expect("a configure line"))
+            .map(|line| serde_json::from_str(line).unwrap())
             .collect()
     }
 
-    /// The status the snapshot overlay states for the session.
+    fn configures(&self) -> Vec<Value> {
+        self.rows("requests.jsonl")
+            .into_iter()
+            .filter(|frame| frame["type"] == "configure")
+            .collect()
+    }
+
     async fn overlay_status(&self) -> Value {
         let mut snapshot = json!({});
         self.st
@@ -154,26 +113,14 @@ impl EchoSession {
     }
 }
 
-impl Drop for EchoSession {
-    fn drop(&mut self) {
-        // The script and store die with `_dir`: no later test in this binary
-        // may inherit paths to them (the env lock is still held here).
-        remove_claude_env();
-    }
-}
-
-/// Removes the process-wide variables these tests point at their tempdirs.
-fn remove_claude_env() {
-    std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
-    std::env::remove_var("CLAUDE_CONFIG_DIR");
-}
-
-/// Calls [`remove_claude_env`] when dropped, so a failed assertion cannot leak them.
-struct ClaudeEnvReset;
-
+/// Restores the process store in the snapshot-only environment test.
+struct ClaudeEnvReset(Option<std::ffi::OsString>);
 impl Drop for ClaudeEnvReset {
     fn drop(&mut self) {
-        remove_claude_env();
+        match &self.0 {
+            Some(previous) => std::env::set_var("CLAUDE_CONFIG_DIR", previous),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
     }
 }
 
@@ -253,13 +200,17 @@ fn records(
 #[tokio::test]
 async fn an_api_retry_reaches_every_client_as_freshagent_retry_and_keeps_the_turn_running() {
     let (events, _capture) = capture::install();
-    let mut session = EchoSession::start(None).await;
-    session
-        .sidecar_writes(json!([
-            { "type": "sdk.assistant", "content": [{ "type": "text", "text": "working" }], "model": "fake-model" },
-            { "type": "sdk.retry", "attempt": 1, "maxRetries": 10, "delayMs": 512, "errorStatus": 529, "error": "overloaded" },
-        ]))
-        .await;
+    let mut session = LiveSession::start_program(
+        None,
+        json!([
+            {"kind":"text", "data":{"text":"working"}},
+            {"kind":"api_retry", "data":{"status":529}},
+            {"kind":"hang"},
+        ]),
+        None,
+    )
+    .await;
+    session.send("retry this model request").await;
 
     let retry = session.await_event("freshAgent.retry").await;
     assert_eq!(retry["sessionId"], json!(session.pane), "{retry}");
@@ -267,7 +218,7 @@ async fn an_api_retry_reaches_every_client_as_freshagent_retry_and_keeps_the_tur
     assert_eq!(retry["sessionType"], "freshclaude");
     assert_eq!(retry["event"]["attempt"], 1);
     assert_eq!(retry["event"]["maxRetries"], 10);
-    assert_eq!(retry["event"]["delayMs"], 512);
+    assert_eq!(retry["event"]["delayMs"], 500);
     assert_eq!(retry["event"]["errorStatus"], 529);
     assert_eq!(retry["event"]["error"], "overloaded");
 
@@ -289,16 +240,15 @@ async fn an_api_retry_reaches_every_client_as_freshagent_retry_and_keeps_the_tur
 #[tokio::test]
 async fn a_notice_reaches_every_client_as_freshagent_notice_and_keeps_the_turn_running() {
     let (events, _capture) = capture::install();
-    let mut session = EchoSession::start(None).await;
     let rate_limit =
-        json!({ "status": "rejected", "resetsAt": 1_792_656_000, "rateLimitType": "five_hour" });
-    session
-        .sidecar_writes(json!([
-            { "type": "sdk.assistant", "content": [{ "type": "text", "text": "working" }], "model": "fake-model" },
-            { "type": "sdk.notice", "level": "error", "code": "RATE_LIMITED", "message": "You have reached your Claude usage limit.", "rateLimit": rate_limit },
-            { "type": "sdk.notice", "level": "info", "code": "INFORMATIONAL", "message": "a private hook said hello" },
-        ]))
-        .await;
+        json!({"status":"rejected", "resetsAt":1_792_656_000, "rateLimitType":"five_hour"});
+    let mut session = LiveSession::start_program(None, json!([
+        {"kind":"text", "data":{"text":"working"}}, {"kind":"hang"},
+    ]), Some(json!([
+        {"type":"rate_limit_event", "uuid":"11111111-1111-4111-8111-111111111111", "rate_limit_info":rate_limit},
+        {"type":"system", "subtype":"informational", "uuid":"22222222-2222-4222-8222-222222222222", "level":"suggestion", "content":"a private hook said hello"},
+    ]))).await;
+    session.send("show provider notices").await;
 
     let notice = session.await_event("freshAgent.notice").await;
     assert_eq!(notice["sessionId"], json!(session.pane), "{notice}");
@@ -352,40 +302,46 @@ async fn a_notice_reaches_every_client_as_freshagent_notice_and_keeps_the_turn_r
 /// unchanged (only the `session-commands` reason is folded server-side).
 #[tokio::test]
 async fn a_transcript_announcement_reaches_every_client_as_session_changed() {
-    let mut session = EchoSession::start(None).await;
+    let mut session = LiveSession::start_program(
+        None,
+        json!([
+            {"kind":"replay", "data":{"recording":"tools-sync", "pace":0}},
+        ]),
+        None,
+    )
+    .await;
     session
-        .sidecar_writes(json!([
-            { "type": "sdk.session.changed", "reason": "transcript", "uuid": "11111111-1111-4111-8111-111111111111", "parentToolUseId": null },
-            { "type": "sdk.session.changed", "reason": "transcript", "uuid": "22222222-2222-4222-8222-222222222222", "parentToolUseId": "toolu_agent1" },
-        ]))
+        .send("replay the recorded CLI tool and subagent turn")
         .await;
-
-    let announced = session
-        .await_frame("the subagent's announcement", |frame| {
-            frame["event"]["type"] == "freshAgent.session.changed"
-                && frame["event"]["parentToolUseId"] == "toolu_agent1"
+    session.await_event("freshAgent.result").await;
+    let expected: Vec<Value> = session
+        .rows("sdk.jsonl")
+        .into_iter()
+        .filter(|msg| {
+            (msg["type"] == "assistant" || msg["type"] == "user") && msg["uuid"].is_string()
         })
-        .await;
-    assert_eq!(announced["sessionId"], json!(session.pane));
-    assert_eq!(announced["event"]["reason"], "transcript");
-    assert_eq!(
-        announced["event"]["uuid"],
-        "22222222-2222-4222-8222-222222222222"
-    );
-    let main_thread: Vec<&Value> = session
-        .frames
-        .iter()
-        .filter(|frame| {
-            frame["event"]["type"] == "freshAgent.session.changed"
-                && frame["event"]["reason"] == "transcript"
-        })
+        .map(|msg| json!({"uuid":msg["uuid"], "parentToolUseId":msg["parent_tool_use_id"]}))
         .collect();
-    assert_eq!(main_thread.len(), 2, "{main_thread:?}");
-    assert_eq!(
-        main_thread[0]["event"]["uuid"],
-        "11111111-1111-4111-8111-111111111111"
+    assert!(
+        expected
+            .iter()
+            .any(|row| row["parentToolUseId"].is_string()),
+        "the real recording includes a subagent"
     );
-    assert_eq!(main_thread[0]["event"]["parentToolUseId"], Value::Null);
+    assert!(
+        expected.iter().any(|row| row["parentToolUseId"].is_null()),
+        "the main conversation also writes messages"
+    );
+    let actual: Vec<Value> = session.frames.iter()
+        .filter(|frame| frame["event"]["type"] == "freshAgent.session.changed" && frame["event"]["reason"] == "transcript")
+        .map(|frame| {
+            assert_eq!(frame["sessionId"], session.pane);
+            json!({"uuid":frame["event"]["uuid"], "parentToolUseId":frame["event"]["parentToolUseId"]})
+        }).collect();
+    assert_eq!(
+        actual, expected,
+        "every actual SDK transcript message is announced once in order"
+    );
 }
 
 /// The CLI changed its own permission mode (an approved ExitPlanMode): the
@@ -396,12 +352,29 @@ async fn a_transcript_announcement_reaches_every_client_as_session_changed() {
 #[tokio::test]
 async fn the_clis_own_permission_mode_change_becomes_the_sessions_setting() {
     let (events, _capture) = capture::install();
-    let mut session = EchoSession::start(Some("plan")).await;
+    let mut session = LiveSession::start_program(
+        Some("plan"),
+        json!([
+            {"kind":"exit_plan", "data":{"plan":"# Plan\n\nContinue the work"}},
+            {"kind":"text", "data":{"text":"plan approved"}},
+        ]),
+        None,
+    )
+    .await;
+    session.send("request approval to exit plan mode").await;
+    let permission = session.await_event("freshAgent.permission.request").await;
     session
-        .sidecar_writes(json!([
-            { "type": "sdk.session.metadata", "permissionMode": "default" },
-            { "type": "sdk.result", "result": "success", "durationMs": 1, "costUsd": 0, "usage": {} },
-        ]))
+        .st
+        .handle_approval_respond(FreshAgentApprovalRespond {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: session.pane.clone(),
+            session_type: SessionType::Freshclaude,
+            request_id: freshell_protocol::StringOrNumber::Str(
+                permission["event"]["requestId"].as_str().unwrap().into(),
+            ),
+            decision: json!({"behavior":"allow"}),
+            cwd: None,
+        })
         .await;
     let metadata = session.await_event("freshAgent.session.metadata").await;
     assert_eq!(metadata["sessionId"], json!(session.pane), "{metadata}");
@@ -447,7 +420,7 @@ async fn the_clis_own_permission_mode_change_becomes_the_sessions_setting() {
 /// model and effort pair, as every metadata frame does).
 #[tokio::test]
 async fn a_configure_that_changes_the_permission_mode_broadcasts_metadata_stating_it() {
-    let mut session = EchoSession::start(None).await;
+    let mut session = LiveSession::start(None).await;
     session
         .st
         .handle_configure(configure_msg(&session.pane, "plan"))
@@ -465,7 +438,7 @@ async fn a_configure_that_changes_the_permission_mode_broadcasts_metadata_statin
 /// that missed the configure still lands here).
 #[tokio::test]
 async fn a_send_that_changes_the_permission_mode_broadcasts_metadata_stating_it() {
-    let mut session = EchoSession::start(Some("plan")).await;
+    let mut session = LiveSession::start(Some("plan")).await;
     let mut send = send_msg(&session.pane, "[]");
     send.settings = Some(freshell_protocol::FreshAgentSendSettings {
         cwd: None,
@@ -488,7 +461,7 @@ async fn a_send_that_changes_the_permission_mode_broadcasts_metadata_stating_it(
 #[tokio::test]
 async fn snapshots_read_the_store_the_lanes_sidecars_write() {
     let _env = super::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _reset = ClaudeEnvReset;
+    let _reset = ClaudeEnvReset(std::env::var_os("CLAUDE_CONFIG_DIR"));
     let process_store = tempfile::tempdir().expect("this process's store");
     std::env::set_var("CLAUDE_CONFIG_DIR", process_store.path());
     let sidecar_store = tempfile::tempdir().expect("the sidecars' store");
@@ -526,11 +499,21 @@ async fn snapshots_read_the_store_the_lanes_sidecars_write() {
 }
 
 #[tokio::test]
-async fn an_echo_session_leaves_the_process_environment_as_it_found_it() {
-    // The fake's script and store live in a tempdir that dies with the session:
-    // a later test in this binary must not inherit paths to them.
-    drop(EchoSession::start(None).await);
+async fn a_live_session_restores_the_process_environment() {
+    let before = {
+        let _env = super::tests::CLAUDE_ENV_LOCK.lock().await;
+        (
+            std::env::var_os("FRESHELL_CLAUDE_SIDECAR"),
+            std::env::var_os("CLAUDE_CONFIG_DIR"),
+        )
+    };
+    drop(LiveSession::start(None).await);
     let _env = super::tests::CLAUDE_ENV_LOCK.lock().await;
-    assert_eq!(std::env::var_os("FRESHELL_CLAUDE_SIDECAR"), None);
-    assert_eq!(std::env::var_os("CLAUDE_CONFIG_DIR"), None);
+    assert_eq!(
+        (
+            std::env::var_os("FRESHELL_CLAUDE_SIDECAR"),
+            std::env::var_os("CLAUDE_CONFIG_DIR")
+        ),
+        before
+    );
 }

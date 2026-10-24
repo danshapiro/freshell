@@ -15,7 +15,7 @@ use crate::claude_snapshot as snap;
 use crate::rollback_record::*;
 
 use super::establish::{
-    EstablishError, EstablishLane, EstablishPlan, GenesisBinding, InheritedRuntime, RegisterUnder,
+    EstablishError, EstablishLane, EstablishPlan, GenesisBinding, InheritedRuntime,
 };
 use super::history::EffectiveTranscriptError;
 
@@ -209,7 +209,7 @@ impl FreshClaudeState {
             let guard = self.sessions.lock().await;
             match guard.get(&map_key) {
                 Some(s) => (
-                    s.cli_session_id.clone().unwrap_or_else(|| map_key.clone()),
+                    s.identity.current(),
                     s.ledger.clone(),
                     s.turn_lock.clone(),
                     session_type_str(op.session_type),
@@ -921,14 +921,11 @@ impl FreshClaudeState {
                 EstablishPlan {
                     lane: EstablishLane::Rollback,
                     spec,
-                    register_under: RegisterUnder::Adopted(replacement.clone()),
+                    native_id: replacement.clone(),
                     claim: None,
-                    rekey_provisional_claim: false,
                     recorded_settings: Some(launch_settings.clone()),
                     // b8ke focused episode-2 round-2 F2: the ROLLBACK's claim
                     // owns this runtime's coordinator transition — the
-                    // adoption's Blocked arm correlates through the op id.
-                    owning_operation: own_ticket.as_ref().map(|t| t.operation_id().to_string()),
                     owning_generation: None,
                     // Conn-less lane (D8): the ledger merge inherits the
                     // superseded parent's stamps.
@@ -1042,10 +1039,7 @@ impl FreshClaudeState {
         // and the original's sidecar is stopped as a requested teardown (its
         // record is gone first, so its end of output stays silent; #859's
         // graceful stop).
-        if let Some(original) = self
-            .replace_runtime(&map_key, &durable_id, &replacement)
-            .await
-        {
+        if let Some(original) = self.replace_runtime(&map_key, &replacement).await {
             let _teardown: LoggedTeardown = self.teardown_removed_session_logged(original).await;
         }
         if !lease_held {
@@ -1095,38 +1089,23 @@ impl FreshClaudeState {
         ));
     }
 
-    /// The replacement takes the original's place (design §4.6, the rollback
-    /// re-key): the original's record leaves the sessions map, and every id
-    /// that resolved to it (its map key, its durable id, their aliases)
-    /// resolves to the replacement, as does its pending naming handle. The
-    /// original's record is returned for its teardown. Lock order `cli_index`
-    /// then `sessions`, as the adoption's publication takes them.
+    /// Move the original's native history to the replacement under the map
+    /// lock. Its close counter belongs to the new process and starts empty.
     async fn replace_runtime(
         &self,
         original_key: &str,
-        original_durable: &str,
         replacement: &str,
     ) -> Option<ClaudeSession> {
         let original = {
-            let mut index = self.cli_index.lock().await;
             let mut sessions = self.sessions.lock().await;
             let original = sessions.remove(original_key);
-            for mapped in index.values_mut() {
-                if mapped == original_key {
-                    *mapped = replacement.to_string();
-                }
+            if let (Some(original), Some(replacement)) =
+                (original.as_ref(), sessions.get(replacement))
+            {
+                replacement.identity.inherit(original.identity.ids());
             }
-            index.insert(original_key.to_string(), replacement.to_string());
-            index.insert(original_durable.to_string(), replacement.to_string());
             original
         };
-        let handle = self.naming_handles.lock().await.remove(original_key);
-        if let Some(handle) = handle {
-            self.naming_handles
-                .lock()
-                .await
-                .insert(replacement.to_string(), handle);
-        }
         // A replayed create requestId of the original must not answer with
         // its retired map key.
         self.create_dedup
@@ -1147,7 +1126,7 @@ impl FreshClaudeState {
         if let Some(session) = self.sessions.lock().await.remove(replacement) {
             let _teardown: LoggedTeardown = self.teardown_removed_session_logged(session).await;
         }
-        self.evict_cli_index_aliases(replacement).await;
+
         if lease_held {
             self.leases.clear_binding(PROVIDER, original_durable);
         }

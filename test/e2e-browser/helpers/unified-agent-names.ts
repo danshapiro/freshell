@@ -12,6 +12,7 @@ import type { E2eServerInfo } from './server-fixture-support.js'
 import { selectShellFromPicker } from './test-harness.js'
 import { openPanePicker } from './pane-picker.js'
 import type { SessionNameRef } from '../../../shared/session-names.js'
+import { claudeSimulatorServerEnv } from './claude-sim-lane.js'
 
 /**
  * UNIFIED AGENT NAMES (plan Task 8) — the shared six-mode journey helper.
@@ -263,10 +264,9 @@ export async function modeFixture(mode: UnifiedAgentMode): Promise<ModeFixture> 
         provider: 'claude',
         fresh: true,
         pickerLabel: /^Freshclaude$/,
-        env: async () => ({
-          FRESHELL_CLAUDE_SIDECAR: path.join(providers, 'fake-claude-sdk-sidecar.mjs'),
-          FRESHELL_CLAUDE_NODE: process.execPath,
-          FRESHELL_FAKE_PROVIDER: 'freshclaude',
+        env: async (root) => claudeSimulatorServerEnv({
+          ledgerPath: path.join(root, 'claude-sim-ledger.jsonl'),
+          flavour: 'freshclaude',
         }),
       }
     case 'freshcodex':
@@ -329,7 +329,6 @@ export async function bootUnifiedNamesServer(opts: BootUnifiedNamesOptions = {})
     const env: Record<string, string> = {
       GOOGLE_GENERATIVE_AI_API_KEY: '',
       ...(opts.gemini ? { FRESHELL_GEMINI_BASE_URL: opts.gemini.baseUrl } : {}),
-      ...(opts.env ?? {}),
     }
     let enabledProviders: string[] = []
     if (opts.mode) {
@@ -337,6 +336,7 @@ export async function bootUnifiedNamesServer(opts: BootUnifiedNamesOptions = {})
       enabledProviders = [fixture.provider]
       Object.assign(env, await fixture.env(root))
     }
+    Object.assign(env, opts.env ?? {})
     const server = new RustServer({
       port: opts.port,
       homeDir: opts.homeDir ?? debugHome,
@@ -1079,9 +1079,15 @@ export async function expectSharedName(
       server,
     )
     if (sessionId) {
-      await expect(
-        page.locator(`[data-context="sidebar-session"][data-session-id="${sessionId}"]`),
-      ).toContainText(expected, { timeout: 20_000 })
+      const row = page.locator(`[data-context="sidebar-session"][data-session-id="${sessionId}"]`)
+      if (!(await row.isVisible().catch(() => false))) {
+        // Conversation switches and rename surfaces can leave the sidebar on
+        // another view. The assertion is about the session directory row, so
+        // select its owning view before deciding that the old session is
+        // absent from the directory.
+        await page.getByTitle('Coding Agents (Ctrl+B T)').click()
+      }
+      await expect(row).toContainText(expected, { timeout: 20_000 })
     }
   }
 

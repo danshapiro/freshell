@@ -8,9 +8,8 @@
 //! a send to it is refused visibly instead of vanishing. Resuming the session
 //! (attach or a create that resumes it) or closing it forgets the record.
 //!
-//! Until the durable id is minted at create (C23) a session answers to several
-//! ids — its sessions-map key (the pane's id from create or attach), its envelope
-//! stamp and its durable claude UUIDs — so a record answers to all of them.
+//! A record retains the current native UUID and the native history of its
+//! runtime, so late requests using an earlier UUID can recover the same writer.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -31,7 +30,7 @@ pub(crate) struct DeadClaudeSession {
     pub(crate) ids: Vec<String>,
     /// The settings the session last ran under.
     pub(crate) settings: FreshAgentSettings,
-    pub(crate) cli_session_id: Option<String>,
+    pub(crate) session_id: String,
     pub(crate) ownership_id: String,
     pub(crate) launch_genesis: Option<crate::identity_sink::RecordedGenesis>,
     pub(crate) turn_lock: Arc<tokio::sync::Mutex<()>>,
@@ -103,8 +102,6 @@ pub(crate) struct Death<'a> {
     pub(crate) session_type: &'a str,
     /// The durable ids the session's aliases named.
     pub(crate) durables: &'a [String],
-    /// The durable id the session itself held.
-    pub(crate) cli_session_id: Option<&'a str>,
     pub(crate) settings: &'a FreshAgentSettings,
     pub(crate) ownership_id: &'a str,
     pub(crate) launch_genesis: Option<&'a crate::identity_sink::RecordedGenesis>,
@@ -133,10 +130,7 @@ impl SharedDeadSessions {
     /// map key, its envelope stamp and every durable id it held.
     pub(crate) fn record(&self, death: Death<'_>) {
         let mut ids = vec![death.map_key.to_string()];
-        for id in std::iter::once(death.stamp)
-            .chain(death.durables.iter().map(String::as_str))
-            .chain(death.cli_session_id)
-        {
+        for id in std::iter::once(death.stamp).chain(death.durables.iter().map(String::as_str)) {
             if !ids.iter().any(|known| known == id) {
                 ids.push(id.to_string());
             }
@@ -144,7 +138,7 @@ impl SharedDeadSessions {
         let dead = DeadClaudeSession {
             ids: ids.clone(),
             settings: death.settings.clone(),
-            cli_session_id: death.cli_session_id.map(str::to_string),
+            session_id: death.stamp.to_string(),
             ownership_id: death.ownership_id.to_string(),
             launch_genesis: death.launch_genesis.cloned(),
             turn_lock: death.turn_lock.clone(),
@@ -193,7 +187,7 @@ impl SharedDeadSessions {
         let mut store = self.0.lock().expect("dead sessions lock");
         for dead in &mut store.entries {
             if dead.answers_to(id)
-                && dead.cli_session_id.as_deref().is_none_or(|cli| cli == id)
+                && dead.session_id == id
                 && ownership_id.is_none_or(|owner| dead.ownership_id == owner)
             {
                 dead.launch_genesis = None;
@@ -232,7 +226,7 @@ mod tests {
         DeadClaudeSession {
             ids: ids.iter().map(|id| id.to_string()).collect(),
             settings: FreshAgentSettings::default(),
-            cli_session_id: None,
+            session_id: ids.last().expect("a native identity").to_string(),
             ownership_id: "dead-runtime".into(),
             launch_genesis: None,
             turn_lock: Arc::new(tokio::sync::Mutex::new(())),
