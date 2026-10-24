@@ -4,7 +4,12 @@
 mod common;
 
 use common::claude_rig::{ClaudeRig, RigKind, RigOptions, RIG_FRAME_BUDGET};
+use freshell_freshagent::rest_lane::{
+    FreshAgentRestLane, RestLaneCreate, RestLaneCreated, RestLaneError, RestLaneSend,
+    RestLaneSendResult,
+};
 use serde_json::{json, Value};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -14,6 +19,183 @@ fn options() -> RigOptions {
         durable_ledger: true,
         ..Default::default()
     }
+}
+
+struct PausedRealCreate {
+    inner: Arc<freshell_freshagent::claude_rest_lane::ClaudeRestLane>,
+    started: tokio::sync::Notify,
+    finish: tokio::sync::Notify,
+    receipt: std::sync::Mutex<Option<(RestLaneCreate, RestLaneCreated)>>,
+}
+
+#[async_trait::async_trait]
+impl FreshAgentRestLane for PausedRealCreate {
+    async fn create_agent(
+        self: Arc<Self>,
+        request: RestLaneCreate,
+    ) -> Result<RestLaneCreated, RestLaneError> {
+        let created = self.inner.clone().create_agent(request.clone()).await?;
+        *self.receipt.lock().unwrap() = Some((request, created.clone()));
+        self.started.notify_one();
+        self.finish.notified().await;
+        Ok(created)
+    }
+    async fn send_agent(&self, request: RestLaneSend) -> Result<RestLaneSendResult, RestLaneError> {
+        self.inner.send_agent(request).await
+    }
+    async fn abandon_create(
+        &self,
+        request: &RestLaneCreate,
+        created: &RestLaneCreated,
+    ) -> Result<(), RestLaneError> {
+        self.inner.abandon_create(request, created).await
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CancelRealCreate {
+    Owned,
+    Adopted,
+    CloseWriteFailure,
+}
+
+async fn close_after_real_create(case: CancelRealCreate) {
+    let adopt_existing = matches!(case, CancelRealCreate::Adopted);
+    let rig = ClaudeRig::start_with_options(
+        RigKind::Sim,
+        RigOptions {
+            durable_ledger: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut browser = rig.connect().await;
+    let existing = if adopt_existing {
+        Some(browser.create("existing-visible-runtime").await)
+    } else {
+        None
+    };
+    let lane = Arc::new(PausedRealCreate {
+        inner: Arc::new(freshell_freshagent::claude_rest_lane::ClaudeRestLane::new(
+            rig.fresh_claude.clone(),
+            Arc::new(|| true),
+        )),
+        started: Default::default(),
+        finish: Default::default(),
+        receipt: Default::default(),
+    });
+    let state = freshell_freshagent::FreshAgentState::new(
+        Arc::new(common::AUTH_TOKEN.into()),
+        Arc::new(tokio::sync::broadcast::channel(64).0),
+    );
+    state.set_claude_rest_lane(lane.clone()).unwrap();
+    let router = freshell_freshagent::router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap()
+    });
+    let create_base = base.clone();
+    let mut body = json!({"agent":"claude", "cwd":rig.workspace.to_str().unwrap()});
+    if let Some(id) = existing.as_deref() {
+        body["sessionRef"] = json!({"provider":"claude", "sessionId":id});
+    }
+    let creating = tokio::spawn(async move {
+        ClaudeRig::request_json_to("POST", &create_base, "/api/tabs", &body).await
+    });
+    tokio::time::timeout(RIG_FRAME_BUDGET, lane.started.notified())
+        .await
+        .unwrap();
+    let (request, receipt) = lane.receipt.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        receipt.cleanup_token.is_none(),
+        adopt_existing,
+        "only a newly started runtime belongs to cancellation"
+    );
+    let processes = rig.runtime_processes(&receipt.session_id);
+    // This is the isolated rig's actual close journal. A regular file at the
+    // directory path causes a real, root-independent atomic-write failure.
+    let journal = rig
+        .workspace
+        .parent()
+        .unwrap()
+        .join("pane-ledger/close-envelopes");
+    let saved_journal = journal.with_extension("saved");
+    let had_journal = journal.exists();
+    if matches!(case, CancelRealCreate::CloseWriteFailure) {
+        if had_journal {
+            std::fs::rename(&journal, &saved_journal).unwrap();
+        }
+        std::fs::write(&journal, b"injected close-journal failure").unwrap();
+    }
+    let (status, closed) = ClaudeRig::request_json_to(
+        "DELETE",
+        &base,
+        &format!("/api/tabs/{}", request.tab_id.as_deref().unwrap()),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "{closed}");
+    lane.finish.notify_one();
+    let (status, cancelled) = creating.await.unwrap();
+    if matches!(case, CancelRealCreate::CloseWriteFailure) {
+        assert_eq!(status, 503, "{cancelled}");
+        assert_eq!(cancelled["code"], "CLAUDE_CLEANUP_UNCONFIRMED");
+        assert_eq!(cancelled["retryable"], true);
+        assert!(
+            rig.fresh_claude.has_live_session(&receipt.session_id).await,
+            "an uncommitted close must not claim the writer was stopped"
+        );
+        std::fs::remove_file(&journal).unwrap();
+        if had_journal {
+            std::fs::rename(saved_journal, &journal).unwrap();
+        }
+        lane.inner.abandon_create(&request, &receipt).await.unwrap();
+    } else {
+        assert_eq!(status, 409, "{cancelled}");
+        assert_eq!(cancelled["code"], "PANE_CREATE_CANCELLED");
+    }
+    if adopt_existing {
+        assert!(rig.fresh_claude.has_live_session(&receipt.session_id).await);
+        browser
+            .send_text(
+                &receipt.session_id,
+                "still-owned-by-existing-pane",
+                "the existing writer survives the cancelled adoption",
+            )
+            .await;
+        browser.wait_for_event("freshAgent.result").await;
+        assert_eq!(rig.query_options().len(), 1);
+    } else {
+        processes
+            .wait_until_exited("the cancelled REST create's owned runtime")
+            .await;
+        assert!(!rig.fresh_claude.has_live_session(&receipt.session_id).await);
+    }
+    rig.fresh_claude.shutdown().await;
+    let _ = shutdown.send(());
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_a_late_rest_create_reaps_its_real_sidecar_and_cli() {
+    close_after_real_create(CancelRealCreate::Owned).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_a_late_rest_adoption_keeps_the_existing_real_writer_alive() {
+    close_after_real_create(CancelRealCreate::Adopted).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_a_late_rest_create_reports_failed_cleanup_and_can_retry_after_repair() {
+    close_after_real_create(CancelRealCreate::CloseWriteFailure).await;
 }
 
 async fn get(rig: &ClaudeRig, path: &str) -> (u16, String) {

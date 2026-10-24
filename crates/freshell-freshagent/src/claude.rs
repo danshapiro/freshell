@@ -2728,8 +2728,7 @@ impl FreshClaudeState {
                                 // The receipt names the process-tree tag; the
                                 // coordinator names a lifecycle operation. The
                                 // exact runtime record ties them together.
-                                stamp.owner.kind
-                                    == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                                stamp.owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
                                     && stamp.owner.live_session_key.as_deref()
                                         == Some(map_key.as_str())
                                     && stamp.owner.pid == session.child.id()

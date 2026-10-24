@@ -318,14 +318,22 @@ impl ClaudeRig {
     /// `POST <path>` on the rig's server with the auth token and a JSON body; the
     /// status and the JSON answer (`Null` when the body is not JSON).
     pub async fn post_json(&self, path: &str, body: &Value) -> (u16, Value) {
+        Self::request_json_to("POST", &self.http_url, path, body).await
+    }
+
+    pub async fn request_json_to(
+        method: &str,
+        base_url: &str,
+        path: &str,
+        body: &Value,
+    ) -> (u16, Value) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let host = self
-            .http_url
+        let host = base_url
             .strip_prefix("http://")
             .expect("the rig serves http");
         let payload = body.to_string();
         let request = format!(
-            "POST {path} HTTP/1.1\r\nHost: {host}\r\nx-auth-token: {AUTH_TOKEN}\r\n\
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\nx-auth-token: {AUTH_TOKEN}\r\n\
              content-type: application/json\r\ncontent-length: {}\r\nConnection: close\r\n\r\n\
              {payload}",
             payload.len(),

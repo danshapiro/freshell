@@ -48,7 +48,15 @@ impl FreshAgentRestLane for PausedCreateLane {
     }
 }
 
-async fn close_during_create(split: bool) {
+#[derive(Clone, Copy)]
+enum CloseDuringCreate {
+    Tab,
+    SourcePane { sync_layout: bool },
+    PendingPane,
+}
+
+async fn close_during_create(target: CloseDuringCreate) {
+    let split = matches!(target, CloseDuringCreate::SourcePane { .. });
     let state = state_with_registry();
     let before: freshell_protocol::UiLayoutSync = serde_json::from_value(json!({
         "tabs":[{"id":"current-tab"}], "activeTabId":"current-tab", "timestamp":1,
@@ -80,7 +88,7 @@ async fn close_during_create(split: bool) {
         .await
         .unwrap();
     let request = lane.request.lock().unwrap().clone().unwrap();
-    if split {
+    if let CloseDuringCreate::SourcePane { sync_layout } = target {
         let (status, closed) = post(
             router.clone(),
             "/api/panes/source-pane/close",
@@ -96,7 +104,11 @@ async fn close_during_create(split: bool) {
             "layouts":{"current-tab":{"type":"leaf", "id":"sibling-pane", "content":{"kind":"browser", "url":"https://survivor.example"}}},
             "activePane":{"current-tab":"sibling-pane"},
         })).unwrap();
-        state.layout.update_from_ui(&closed, "creating-browser");
+        if sync_layout {
+            state.layout.update_from_ui(&closed, "creating-browser");
+        }
+    } else if matches!(target, CloseDuringCreate::PendingPane) {
+        state.layout.release_pane_publication(&request.request_id);
     } else {
         let (status, closed) = delete(
             router.clone(),
@@ -143,12 +155,22 @@ async fn close_during_create(split: bool) {
 
 #[tokio::test]
 async fn closing_the_target_tab_while_runtime_create_awaits_cleans_the_late_runtime() {
-    close_during_create(false).await;
+    close_during_create(CloseDuringCreate::Tab).await;
 }
 
 #[tokio::test]
 async fn closing_the_source_pane_while_runtime_create_awaits_cleans_the_late_runtime() {
-    close_during_create(true).await;
+    close_during_create(CloseDuringCreate::SourcePane { sync_layout: true }).await;
+}
+
+#[tokio::test]
+async fn closing_the_source_before_its_layout_debounce_cancels_the_pending_create() {
+    close_during_create(CloseDuringCreate::SourcePane { sync_layout: false }).await;
+}
+
+#[tokio::test]
+async fn a_pane_closed_ack_before_runtime_create_returns_cancels_its_publication() {
+    close_during_create(CloseDuringCreate::PendingPane).await;
 }
 
 struct SyncDuringCreateLane {
