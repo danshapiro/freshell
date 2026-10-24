@@ -55,18 +55,18 @@ async fn create_send_result_rings_once(kind: RigKind) {
     }
 }
 
-/// A new pane's messages are sent the way the browser sends every message: with a
-/// checkpoint intent, which the coordinator fences. The CLI reports the session
-/// only once a prompt runs (T1), so nothing owns the new pane's session in the
-/// coordinator yet: the first send must still run, not be refused as
-/// SESSION_RESERVED. Once the session is reported the coordinator owns it under
-/// its durable id, and the next send, fenced with the owner pair the client
-/// observed for that id, runs too.
+/// Both first and later checkpointed sends carry the owner pair of the native
+/// UUID acknowledged at create. The first one must run before the CLI's init.
 async fn first_checkpointed_send_of_a_new_pane_runs(kind: RigKind) {
     let rig = ClaudeRig::start(kind).await;
     let mut conn = rig.connect().await;
 
     let session_id = conn.create("create-1").await;
+    assert!(
+        conn.owner_pair(&session_id).is_some(),
+        "creation announces ownership before the first SDK init"
+    );
+
     conn.send_checkpointed_text(&session_id, "send-1", "hello")
         .await;
     let result = conn.wait_for_event("freshAgent.result").await;
