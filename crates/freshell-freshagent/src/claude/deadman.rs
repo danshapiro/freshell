@@ -123,11 +123,7 @@ impl FreshClaudeState {
             .lock()
             .expect("quiet deadman lock")
             .feed(busy && !pending, window);
-        let stamp = session
-            .broadcast_id
-            .lock()
-            .expect("broadcast id lock")
-            .clone();
+        let stamp = session.identity.current();
         if let Some(waiter) = session.quiet.waiter.take() {
             waiter.abort();
             if busy && pending {
@@ -202,11 +198,7 @@ impl FreshClaudeState {
         if !ledger.busy() || session.pending.lock().expect("pending lock").len() > 0 {
             return;
         }
-        let stamp = session
-            .broadcast_id
-            .lock()
-            .expect("broadcast id lock")
-            .clone();
+        let stamp = session.identity.current();
         self.publish_locked_status(&mut ledger, &stamp, &session.session_type, false, true);
         tracing::warn!(provider = PROVIDER, session_id = %stamp, ownership_id = %ownership_id,
             phase = "fired", generation, "freshagent.claude.quiet_deadman");

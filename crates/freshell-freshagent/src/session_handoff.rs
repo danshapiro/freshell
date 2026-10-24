@@ -4112,7 +4112,6 @@ impl SessionHandoffRunner {
                         req.cwd.as_deref(),
                         req.tab_id.as_deref(),
                         req.pane_id.as_deref(),
-                        operation_id,
                         generation,
                     )
                     .await
@@ -4125,7 +4124,6 @@ impl SessionHandoffRunner {
                         req.cwd.as_deref(),
                         req.tab_id.as_deref(),
                         req.pane_id.as_deref(),
-                        operation_id,
                         generation,
                     )
                     .await

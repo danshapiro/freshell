@@ -128,7 +128,6 @@ impl FreshClaudeState {
         };
         // Match the established alias->map lock order. No process I/O or await
         // follows the claim until the removal, pending drain and end are visible.
-        let index = self.cli_index.lock().await;
         let mut sessions = self.sessions.lock().await;
         let Some(session) = sessions.get(&map_key) else {
             return Err((
@@ -136,30 +135,16 @@ impl FreshClaudeState {
                 "Claude changed before recovery stopped it. Try again.".into(),
             ));
         };
-        let durable = session
-            .cli_session_id
-            .clone()
-            .unwrap_or_else(|| map_key.clone());
+        let durable = session.identity.current();
         let operation = self.claim_recovery_stop(session, &map_key, &durable, fence)?;
-        let mut aliases: Vec<String> = index
-            .iter()
-            .filter(|(_, mapped)| **mapped == map_key)
-            .map(|(id, _)| id.clone())
-            .collect();
-        if !aliases.contains(&durable) {
-            aliases.push(durable.clone());
-        }
+        let aliases = session.identity.ids();
         let mut session = sessions
             .remove(&map_key)
             .expect("validated recovery runtime");
         session.consumer.abort();
         session.quiet.cancel();
         session.ledger.lock().expect("turn ledger lock").eof();
-        let stamp = session
-            .broadcast_id
-            .lock()
-            .expect("broadcast id lock")
-            .clone();
+        let stamp = session.identity.current();
         {
             let mut pending = session.pending.lock().expect("pending lock");
             pending.permissions.clear();
@@ -172,7 +157,7 @@ impl FreshClaudeState {
                 stamp: &stamp,
                 session_type: &session.session_type,
                 durables: &aliases,
-                cli_session_id: session.cli_session_id.as_deref(),
+                cli_session_id: Some(&stamp),
                 settings: &session.configuration.settings,
                 ownership_id: &session.ownership_id,
                 launch_genesis: session.launch_genesis.as_ref(),
@@ -328,7 +313,7 @@ impl FreshClaudeState {
                 record.session_id == map_key || aliases.contains(&record.session_id)
             })
             .await;
-        self.evict_cli_index_aliases(&map_key).await;
+
         let teardown = self.teardown_removed_session_logged(session).await;
         let teardown = self.release_leases_after_teardown(
             teardown,

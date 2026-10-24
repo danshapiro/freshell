@@ -140,7 +140,7 @@ fn log_genesis_clear(session_id: &str, genesis: &str, trigger: &str, outcome: &G
 impl FreshClaudeState {
     /// The durable session id `any_id` names: a live session's adopted claude
     /// id (or its map key until it has one), resolved like every handler here
-    /// (map key or durable UUID through `cli_index`); an untracked id (a
+    /// (map key or durable UUID through native runtime history); an untracked id (a
     /// disk-only read after a restart) is itself.
     pub(crate) async fn durable_session_id(&self, any_id: &str) -> String {
         match self.resolve_session_key(any_id).await {
@@ -149,7 +149,7 @@ impl FreshClaudeState {
                 .lock()
                 .await
                 .get(&map_key)
-                .and_then(|session| session.cli_session_id.clone())
+                .map(|session| session.identity.current())
                 .unwrap_or(map_key),
             None => any_id.to_string(),
         }
@@ -369,15 +369,7 @@ impl FreshClaudeState {
                 sessions
                     .get(&session_key)
                     .filter(|session| session.ownership_id == ownership_id)
-                    .map(|session| {
-                        (
-                            session
-                                .cli_session_id
-                                .clone()
-                                .unwrap_or_else(|| session_key.clone()),
-                            session.launch_genesis.clone(),
-                        )
-                    })
+                    .map(|session| (session.identity.current(), session.launch_genesis.clone()))
             }
             .or_else(|| {
                 state
@@ -412,8 +404,7 @@ impl FreshClaudeState {
             if matches!(outcome, GenesisClear::Cleared { .. }) {
                 let mut sessions = state.sessions.lock().await;
                 if let Some(session) = sessions.get_mut(&session_key).filter(|session| {
-                    session.ownership_id == ownership_id
-                        && session.cli_session_id.as_deref().unwrap_or(&session_key) == durable
+                    session.ownership_id == ownership_id && session.identity.current() == durable
                 }) {
                     session.launch_genesis = None;
                 }

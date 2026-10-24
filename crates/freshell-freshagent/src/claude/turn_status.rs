@@ -6,7 +6,7 @@
 
 use serde_json::{json, Value};
 
-use super::{FreshClaudeState, PROVIDER};
+use super::{FreshClaudeState, RuntimeIdentity, PROVIDER};
 use crate::claude_turns::{
     EffectiveStatus, Folded, ResultVerdict, SharedLedger, StopReissue, TurnFact,
 };
@@ -62,13 +62,7 @@ impl FreshClaudeState {
             .lock()
             .await
             .get(map_key)
-            .map(|session| {
-                session
-                    .broadcast_id
-                    .lock()
-                    .expect("broadcast id lock")
-                    .clone()
-            })
+            .map(|session| session.identity.current())
             .unwrap_or_else(|| map_key.to_string())
     }
 
@@ -114,11 +108,7 @@ impl FreshClaudeState {
         let Some(session) = sessions.get(&key) else {
             return;
         };
-        let session_id = session
-            .broadcast_id
-            .lock()
-            .expect("broadcast id lock")
-            .clone();
+        let session_id = session.identity.current();
         let quiet = session.quiet.state.lock().expect("quiet deadman lock");
         let mut ledger = session.ledger.lock().expect("turn ledger lock");
         let status = ledger
@@ -141,7 +131,7 @@ impl FreshClaudeState {
         &self,
         ledger: &SharedLedger,
         line: &Value,
-        broadcast_id: &std::sync::Mutex<String>,
+        identity: &RuntimeIdentity,
         session_type: &str,
     ) -> LedgerStep {
         let Some(fact) = TurnFact::from_line(line) else {
@@ -152,7 +142,7 @@ impl FreshClaudeState {
             let folded = ledger.fold(&fact);
             (folded, ledger.busy())
         };
-        let session_id = broadcast_id.lock().expect("broadcast id lock").clone();
+        let session_id = identity.current();
         match folded {
             Folded::Applied => LedgerStep::Nothing,
             Folded::UnknownCommand => {

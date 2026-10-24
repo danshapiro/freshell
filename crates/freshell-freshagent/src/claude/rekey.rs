@@ -44,7 +44,6 @@ impl FreshClaudeState {
         let settings = {
             // The same map-lock order as kill/adoption. Ownership, routing,
             // and the envelope move together before metadata IO starts.
-            let mut index = self.cli_index.lock().await;
             let mut sessions = self.sessions.lock().await;
             let session = sessions
                 .get(old)
@@ -53,15 +52,7 @@ impl FreshClaudeState {
             if sessions.contains_key(new) {
                 return Err("the new conversation already has a live runtime".into());
             }
-            if self
-                .close_pending
-                .lock()
-                .expect("close-pending lock")
-                .get(old)
-                .copied()
-                .unwrap_or(0)
-                > 0
-            {
+            if session.identity.is_closing() {
                 return Err("the conversation is closing".into());
             }
             self.commit_lane_claim_rekey_at(
@@ -84,21 +75,16 @@ impl FreshClaudeState {
                     previous_session_id = old, session_id = new,
                     "the runtime moved but its lease binding could not follow");
             }
-            session.cli_session_id = Some(new.into());
-            *session.broadcast_id.lock().expect("broadcast id lock") = new.into();
+            session
+                .identity
+                .rekey(new)
+                .map_err(|error| error.to_string())?;
             session.launch_genesis = Some(crate::identity_sink::RecordedGenesis {
                 genesis: crate::identity_sink::ClaudeGenesis::Fresh,
                 updated_at_ms: now,
             });
             let settings = session.configuration.settings.clone();
             sessions.insert(new.into(), session);
-            for target in index.values_mut() {
-                if target == old {
-                    *target = new.into();
-                }
-            }
-            index.insert(old.into(), new.into());
-            index.insert(new.into(), new.into());
             self.ownership_stamps
                 .lock()
                 .expect("ownership stamps lock")

@@ -42,11 +42,7 @@ impl FreshClaudeState {
             PendingResponse::Question => pending.questions.retain(|q| q.request_id != request_id),
         }
         if PendingChange::between(before, pending.len()) == Some(PendingChange::Drained) {
-            let stamp = session
-                .broadcast_id
-                .lock()
-                .expect("broadcast id lock")
-                .clone();
+            let stamp = session.identity.current();
             self.edges.pending_drained(&stamp);
         }
         drop(pending);
@@ -67,11 +63,7 @@ impl FreshClaudeState {
         else {
             return;
         };
-        let stamp = session
-            .broadcast_id
-            .lock()
-            .expect("broadcast id lock")
-            .clone();
+        let stamp = session.identity.current();
         self.publish_claude_status(
             &session.ledger,
             &session.quiet.state,
