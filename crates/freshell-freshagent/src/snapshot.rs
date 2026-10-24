@@ -857,7 +857,7 @@ mod tests {
     /// `pendingQuestions` populated with the exact `.strict()` contract entry keys
     /// (object equality pins the KEY SET: no extras, no missing) and the
     /// presence-of-pending gates flipped (`normalize.ts:186-204, 226-232`). Addressed by
-    /// the DURABLE UUID (the `cli_index` alias), the id a live pane's GET carries.
+    /// the native UUID, the id a live pane's GET carries.
     #[tokio::test]
     async fn claude_locator_overlays_live_pending_and_flips_capability_gates() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
@@ -866,7 +866,7 @@ mod tests {
         let claude = claude_state();
         crate::claude::tests::insert_fake_claude_session_with_pending(
             &claude,
-            "client-nanoid-9",
+            durable,
             Some(durable),
             &[
                 json!({ "type": "sdk.permission.request", "sessionId": "s", "requestId": "req-1",
@@ -923,7 +923,7 @@ mod tests {
         let claude = claude_state();
         crate::claude::tests::insert_fake_claude_session_with_pending(
             &claude,
-            "client-nanoid-suggest",
+            durable,
             Some(durable),
             &[
                 json!({ "type": "sdk.permission.request", "sessionId": "s", "requestId": "req-npm",
@@ -990,7 +990,7 @@ mod tests {
         let claude = claude_state();
         crate::claude::tests::insert_fake_claude_session_with_pending(
             &claude,
-            "client-nanoid-12",
+            durable,
             Some(durable),
             &[
                 json!({ "type": "sdk.question.request", "sessionId": "s", "requestId": "q-prev",
@@ -1076,7 +1076,7 @@ mod tests {
         let claude = claude_state();
         crate::claude::tests::insert_fake_claude_session_with_pending(
             &claude,
-            "client-nanoid-10",
+            durable,
             Some(durable),
             &[
                 json!({ "type": "sdk.permission.request", "sessionId": "s", "requestId": "req-7",
@@ -1207,7 +1207,7 @@ mod tests {
         let claude = claude_state();
         crate::claude::tests::insert_fake_claude_session_with_pending(
             &claude,
-            "client-nanoid-11",
+            durable,
             Some(durable),
             &[],
         )

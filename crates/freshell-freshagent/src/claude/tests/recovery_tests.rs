@@ -127,6 +127,7 @@ async fn a_configure_receipt_from_a_replaced_runtime_cannot_change_its_replaceme
 async fn an_observed_hosted_transcript_cannot_fall_back_to_fresh_after_it_is_removed() {
     let _guard = CLAUDE_ENV_LOCK.lock().await;
     let env = FakeClaudeSidecarEnv::install();
+    env.program(json!([{"kind":"text", "data":{"text":"transcript observed"}}]));
     let home = tempfile::tempdir().unwrap();
     let (st, mut rx) = state_with_bus();
     let mut environment: Vec<(String, String)> = std::env::vars().collect();
@@ -142,7 +143,8 @@ async fn an_observed_hosted_transcript_cannot_fall_back_to_fresh_after_it_is_rem
     let id = created["sessionId"].as_str().unwrap().to_string();
     assert!(st.sessions.lock().await[&id].launch_genesis.is_some());
     write_fake_transcript(home.path(), &id);
-    inject_raw_send(&st, &id, "__emit_result__").await;
+    st.handle_send(send_msg(&id, "observe the saved transcript"))
+        .await;
     await_frame_of_inner_type(&mut rx, "freshAgent.result").await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while st.sessions.lock().await[&id].launch_genesis.is_some() {
@@ -152,12 +154,15 @@ async fn an_observed_hosted_transcript_cannot_fall_back_to_fresh_after_it_is_rem
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let transcript = home.path().join("projects/-t").join(format!("{id}.jsonl"));
-    std::fs::rename(&transcript, transcript.with_extension("saved")).unwrap();
     let pid = st.sessions.lock().await[&id].child.id().unwrap();
     // SAFETY: this process belongs to this test's isolated fake sidecar.
     assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGKILL) }, 0);
-    await_frame_of_inner_type(&mut rx, "freshAgent.status").await;
+    loop {
+        let status = await_frame_of_inner_type(&mut rx, "freshAgent.status").await;
+        if status["event"]["status"] == "exited" {
+            break;
+        }
+    }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while st.resolve_session_key(&id).await.is_some() {
         assert!(
@@ -166,6 +171,20 @@ async fn an_observed_hosted_transcript_cannot_fall_back_to_fresh_after_it_is_rem
         );
         tokio::task::yield_now().await;
     }
+    // The real CLI wrote its own project directory in addition to the seeded
+    // file. Once its writer is confirmed stopped, remove every copy of this id.
+    let mut moved = 0;
+    for project in std::fs::read_dir(home.path().join("projects")).unwrap() {
+        let transcript = project.unwrap().path().join(format!("{id}.jsonl"));
+        if transcript.is_file() {
+            std::fs::rename(&transcript, transcript.with_extension("saved")).unwrap();
+            moved += 1;
+        }
+    }
+    assert!(
+        moved >= 1,
+        "the observed transcript was present before removal"
+    );
     assert!(matches!(
         st.ensure_runtime(&id, SessionType::Freshclaude, None, None)
             .await,

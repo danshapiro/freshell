@@ -7003,54 +7003,18 @@ async fn a_handoff_on_a_superseded_rekeyed_id_resolves_the_canonical_owner() {
     let sidecar_pid = env.sidecar_pid_for(&superseded);
     assert!(sidecar_pid.is_some(), "the live owner's sidecar pid");
 
-    // A re-key in the FULL production sequence: (1) an in-stream init
-    // naming the NEW durable id publishes the re-key bookkeeping at the LANE
-    // level (cli_index[new] = map key + the session's cli_session_id = new;
-    // the session already carries the old id, so the adoption claims
-    // nothing under the new one), then (2) the registry's own rekey_live
-    // performs the atomic old→new coordinator move, leaving
-    // Aliased{to: canonical} at the superseded key — the COORDINATOR as the
-    // single source of truth (e2r3 F3). Pre-fix this id pair was a
-    // lane-local HashMap nobody hydrated.
-    // (1) The re-key's publication — the REAL lane-level bookkeeping,
-    // driven through the adoption itself.
-    {
-        let map_key = rig
-            .fresh_claude
+    // Use the consumer's actual native reset path: runtime identity, lease,
+    // coordinator owner and retained stamp move together.
+    rig.fresh_claude
+        .test_rekey_conversation(&superseded, &canonical)
+        .await;
+    assert_eq!(
+        rig.fresh_claude
             .test_resolve_session_key(&superseded)
             .await
-            .expect("the live session's map key");
-        rig.fresh_claude
-            .test_adopt_session_init(&canonical, &map_key, "freshclaude")
-            .await;
-    }
-    // (2) The registry's own rekey_live performs the atomic old→new
-    // coordinator move (the same step the rollback's Adopt-path commit
-    // performs), leaving Aliased{to: canonical} at the superseded key —
-    // the COORDINATOR as the single source of truth (e2r3 F3).
-    let rekey_map_key = rig
-        .fresh_claude
-        .test_resolve_session_key(&superseded)
-        .await
-        .expect("the live session's map key");
-    assert!(matches!(
-        rig.ownership.rekey_live(
-            "claude",
-            &superseded,
-            &canonical,
-            &rekey_map_key,
-            freshell_ownership::OwnerIdentity {
-                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
-                terminal_id: None,
-                live_session_key: Some(rekey_map_key.clone()),
-                pid: sidecar_pid,
-                ownership_id: Some("test-rekey-op".into()),
-            },
-            "test-rekey",
-            "test-rekey-op",
-        ),
-        freshell_ownership::CommitOutcome::Committed
-    ));
+            .as_deref(),
+        Some(canonical.as_str())
+    );
 
     // THE e2r2 F1 red/green: the handoff on the SUPERSEDED id resolves the
     // canonical key and stops the prior owner.

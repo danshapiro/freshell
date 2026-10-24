@@ -507,7 +507,7 @@ impl FreshClaudeState {
                 TurnLockedRequest::Fork,
                 map_key,
                 wire_id,
-                Some(durable),
+                durable,
                 turn_lock,
             )
             .await?;
