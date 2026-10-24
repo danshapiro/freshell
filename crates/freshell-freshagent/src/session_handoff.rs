@@ -3245,7 +3245,7 @@ impl SessionHandoffRunner {
             .load(std::sync::atomic::Ordering::SeqCst)
             && hooks
                 .force_reap_timeout_fenced_skip
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::SeqCst,
                     std::sync::atomic::Ordering::SeqCst,
                     |n| if n == 0 { None } else { Some(n - 1) },
@@ -3261,7 +3261,7 @@ impl SessionHandoffRunner {
             .load(std::sync::atomic::Ordering::SeqCst)
             && hooks
                 .force_platform_limited_skip
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::SeqCst,
                     std::sync::atomic::Ordering::SeqCst,
                     |n| if n == 0 { None } else { Some(n - 1) },
