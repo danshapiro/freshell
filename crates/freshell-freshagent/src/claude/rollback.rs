@@ -15,7 +15,7 @@ use crate::claude_snapshot as snap;
 use crate::rollback_record::*;
 
 use super::establish::{
-    EstablishError, EstablishLane, EstablishPlan, GenesisBinding, InheritedRuntime, RegisterUnder,
+    EstablishError, EstablishLane, EstablishPlan, GenesisBinding, InheritedRuntime,
 };
 use super::history::EffectiveTranscriptError;
 
@@ -921,9 +921,8 @@ impl FreshClaudeState {
                 EstablishPlan {
                     lane: EstablishLane::Rollback,
                     spec,
-                    register_under: RegisterUnder::Adopted(replacement.clone()),
+                    native_id: replacement.clone(),
                     claim: None,
-                    rekey_provisional_claim: false,
                     recorded_settings: Some(launch_settings.clone()),
                     // b8ke focused episode-2 round-2 F2: the ROLLBACK's claim
                     // owns this runtime's coordinator transition — the
@@ -1041,10 +1040,7 @@ impl FreshClaudeState {
         // and the original's sidecar is stopped as a requested teardown (its
         // record is gone first, so its end of output stays silent; #859's
         // graceful stop).
-        if let Some(original) = self
-            .replace_runtime(&map_key, &durable_id, &replacement)
-            .await
-        {
+        if let Some(original) = self.replace_runtime(&map_key, &replacement).await {
             let _teardown: LoggedTeardown = self.teardown_removed_session_logged(original).await;
         }
         if !lease_held {
@@ -1094,16 +1090,11 @@ impl FreshClaudeState {
         ));
     }
 
-    /// The replacement takes the original's place (design §4.6, the rollback
-    /// re-key): the original's record leaves the sessions map, and every id
-    /// that resolved to it (its map key, its durable id, their aliases)
-    /// resolves to the replacement, as does its pending naming handle. The
-    /// original's record is returned for its teardown. Lock order native runtime history
-    /// then `sessions`, as the adoption's publication takes them.
+    /// Move the original's native history to the replacement under the map
+    /// lock. Its close counter belongs to the new process and starts empty.
     async fn replace_runtime(
         &self,
         original_key: &str,
-        _original_durable: &str,
         replacement: &str,
     ) -> Option<ClaudeSession> {
         let original = {

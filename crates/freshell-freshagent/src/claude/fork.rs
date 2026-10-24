@@ -20,9 +20,7 @@ use crate::claude_handshake::RESUME_POINT_NOT_FOUND_CODE;
 use crate::claude_launch::{ClaudeBoot, ClaudeGenesis, ClaudeLaunchSpec};
 use crate::claude_snapshot as snap;
 
-use super::establish::{
-    EstablishError, EstablishLane, EstablishPlan, GenesisBinding, RegisterUnder,
-};
+use super::establish::{EstablishError, EstablishLane, EstablishPlan, GenesisBinding};
 use super::history::EffectiveTranscriptError;
 
 /// A fork while the parent runs a turn (`BUSY_TURN`).
@@ -373,9 +371,8 @@ impl FreshClaudeState {
                 EstablishPlan {
                     lane: EstablishLane::Fork,
                     spec,
-                    register_under: RegisterUnder::Adopted(child.clone()),
+                    native_id: child.clone(),
                     claim: None,
-                    rekey_provisional_claim: false,
                     recorded_settings: Some(launch_settings.clone()),
                     owning_generation: None,
                     provenance: fork_provenance.clone(),

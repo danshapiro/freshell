@@ -2029,12 +2029,11 @@ impl FreshClaudeState {
                 EstablishPlan {
                     lane: EstablishLane::Create,
                     spec,
-                    register_under: RegisterUnder::Adopted(launch_id.clone()),
+                    native_id: launch_id.clone(),
                     claim: Some(DurableClaim {
                         durable: launch_id.clone(),
                         dead_state: claim_dead_state,
                     }),
-                    rekey_provisional_claim: false,
                     recorded_settings: Some(settings),
                     owning_generation: None,
                     provenance,
@@ -4806,12 +4805,11 @@ impl FreshClaudeState {
             EstablishPlan {
                 lane: EstablishLane::AttachResume,
                 spec,
-                register_under: RegisterUnder::Pane(msg.session_id.clone()),
+                native_id: msg.session_id.clone(),
                 claim: Some(DurableClaim {
                     durable: durable.to_string(),
                     dead_state: claim_dead_state,
                 }),
-                rekey_provisional_claim: false,
                 recorded_settings: recovered,
                 owning_generation: handoff_generation,
                 // Conn-less lane (D8): attach-resume is not a create; the ledger
@@ -6517,7 +6515,6 @@ mod stop;
 mod turn_status;
 use establish::{
     BootRetry, DurableClaim, EstablishLane, EstablishPlan, InheritedRuntime, LaunchLease,
-    RegisterUnder,
 };
 
 #[cfg(test)]

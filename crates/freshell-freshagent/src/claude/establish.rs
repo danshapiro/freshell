@@ -7,17 +7,15 @@
 //! commit the booted sidecar through [`FreshClaudeState::establish_runtime`]:
 //!
 //! ```text
-//! boot → naming admission (create) → kill-fence claim commit (resumes)
-//!      → provisional-key rekey (fresh create) → register the session
-//!      → alias records (resumes) → post-registration dead-state recheck
-//!      → lease completion → coordinator commit (resumes)
+//! boot native UUID → close-fence claim commit (resumes)
+//!      → create binding and ownership → register runtime and consumer
+//!      → post-registration dead-state recheck → lease completion
+//!      → coordinator commit (resumes)
 //! ```
 //!
-//! The guards are the ones the create and attach handlers used to run inline,
-//! moved here unchanged, so the kill/claim/commit race tests pin this one path.
 //! An undo or redo establishes its replacement runtime here too (C13): it boots
-//! the replacement under the id the rollback minted, registered as already
-//! adopted, while the original is still live; the rollback then moves
+//! the replacement under its new native UUID while the original is still live;
+//! the rollback then moves
 //! ownership and stops the original (`claude/rollback.rs`). A fork establishes
 //! its child the same way, beside the parent, which it never touches
 //! (`claude/fork.rs`, C14).
@@ -47,17 +45,6 @@ impl EstablishLane {
             Self::Fork => "fork",
         }
     }
-}
-
-/// The map key a new session registers under.
-pub(super) enum RegisterUnder {
-    /// The attaching pane's id: an attach-resume (the client routes the pane's
-    /// frames by it).
-    Pane(String),
-    /// A durable id the server minted and the CLI boots under (a rollback's
-    /// replacement): registered as already adopted, so it is the map key, the
-    /// envelope stamp and the session's durable id at once.
-    Adopted(String),
 }
 
 /// The per-session state a replacement runtime takes over from the runtime it
@@ -123,14 +110,10 @@ pub(super) struct DurableClaim {
 pub(super) struct EstablishPlan<'a> {
     pub(super) lane: EstablishLane,
     pub(super) spec: ClaudeLaunchSpec,
-    pub(super) register_under: RegisterUnder,
-    /// The durable session this launch claims (every resume). `None` for a fresh
-    /// create: its durable id appears only with its first turn.
+    pub(super) native_id: String,
+    /// A resumed conversation's close-state fence. Fresh UUIDs have no prior
+    /// close to consume.
     pub(super) claim: Option<DurableClaim>,
-    /// A fresh create's coordinator claim is held under its pane-scoped
-    /// provisional key; the minted session id takes it over once `created`
-    /// names it (b8ke ext r22 F1).
-    pub(super) rekey_provisional_claim: bool,
     /// The settings the session records at `sdk.session.init` (`None`: record
     /// nothing, the resume of a session that never recorded any, V7/A10). The
     /// session runs with them, or with the defaults.
@@ -192,8 +175,6 @@ pub(super) enum EstablishError {
     LeaseRevoked,
     /// The ownership coordinator moved on while the launch registered.
     OwnershipChanged,
-    /// Another owner claimed the minted session id during a fresh create.
-    MintedIdClaimed,
 }
 
 impl EstablishError {
@@ -212,10 +193,6 @@ impl EstablishError {
                 "session ownership changed during {}; torn down",
                 lane.name()
             ),
-            Self::MintedIdClaimed => {
-                "the minted session id was claimed by another owner during the create; torn down"
-                    .to_string()
-            }
         }
     }
 
@@ -226,10 +203,9 @@ impl EstablishError {
             Self::Write(_) => "CLAUDE_SIDECAR_WRITE_FAILED",
             Self::Binding(_) => "LEDGER_WRITE_FAILED",
             Self::Boot(failure) => failure.code(),
-            Self::ClosedInFlight
-            | Self::LeaseRevoked
-            | Self::OwnershipChanged
-            | Self::MintedIdClaimed => "FRESH_AGENT_CREATE_FAILED",
+            Self::ClosedInFlight | Self::LeaseRevoked | Self::OwnershipChanged => {
+                "FRESH_AGENT_CREATE_FAILED"
+            }
         }
     }
 
@@ -250,7 +226,6 @@ impl EstablishError {
             Self::ClosedInFlight => "closed_in_flight",
             Self::LeaseRevoked => "lease_revoked",
             Self::OwnershipChanged => "ownership_changed",
-            Self::MintedIdClaimed => "minted_id_claimed",
         }
     }
 }
@@ -591,9 +566,8 @@ impl FreshClaudeState {
         let EstablishPlan {
             lane,
             mut spec,
-            register_under,
+            native_id: map_key,
             claim,
-            rekey_provisional_claim,
             recorded_settings,
             owning_generation,
             provenance,
@@ -650,23 +624,10 @@ impl FreshClaudeState {
         // into the session record).
         let sidecar_pid = child.id();
         let minted = created.session_id;
-        let (map_key, adopted) = match register_under {
-            RegisterUnder::Pane(pane) => (pane, None),
-            RegisterUnder::Adopted(id) => (id.clone(), Some(id)),
-        };
-
         let mut naming_projection = None;
 
-        // Retire-on-kill rounds 2-6: a resume GENUINELY CLAIMS the durable id, and
-        // the claim commits here, once the replacement is established (`created`
-        // answered) and strictly before the consumer starts, so its
-        // `sdk.session.init` adoption write never consults a fence whose clear it
-        // raced. The commit is conditional on the claim-start dead state: a close
-        // that landed while the sidecar booted refuses it with no side effects,
-        // and the just-spawned sidecar is an orphan of a pane the user closed. A
-        // close fence under the registration seat (the minted id, or the
-        // attaching pane's id) blocks the commit exactly like one under the
-        // durable id (round 6).
+        // A close that landed while this resume booted invalidates its
+        // captured fence. Refuse it before starting the consumer.
         if let Some(claim) = claim.as_ref() {
             if !self
                 .commit_session_claim(
@@ -685,51 +646,11 @@ impl FreshClaudeState {
             }
         }
 
-        // b8ke ext r22 F1: a fresh create's in-flight coordinator record moves
-        // from its pane-scoped provisional key to the minted id in one atomic
-        // step (`rekey_starting`; the provisional key becomes the resolution
-        // alias an idempotent re-drive adopts through). A record already under
-        // the minted id (a competitor claimed it inside the window) refuses
-        // typed, and the minted runtime is torn down: never two writers.
-        if rekey_provisional_claim {
-            if let Some(ticket) = own_ticket.as_mut() {
-                let Some(registry) = self.ownership.as_ref() else {
-                    unreachable!("a live ticket implies a wired coordinator");
-                };
-                match registry.rekey_starting(
-                    PROVIDER,
-                    ticket.session_id(),
-                    &minted,
-                    ticket.operation_id(),
-                    ticket.generation(),
-                ) {
-                    freshell_ownership::CommitOutcome::Committed => {
-                        ticket.rekey_session_id(&minted);
-                    }
-                    outcome => {
-                        tracing::error!(target: "invariant",
-                            provider = PROVIDER, session_id = %minted,
-                            request_id = %spec.request_id, outcome = ?outcome,
-                            "freshagent.claude.create_rekey_refused: the minted session id \
-                             was claimed by another owner during the create window — the \
-                             minted runtime is torn down (kata b8ke ext r22 F1)"
-                        );
-                        let _ = child.start_kill();
-                        reap_owned_claude_sidecars(&ownership_id);
-                        return Err(EstablishError::MintedIdClaimed);
-                    }
-                }
-            }
-        }
-
         // Start the stdout consumer and register the session under the sessions
         // map lock (review PRB-C10): the consumer reaches its session only
         // through that lock, so no line it reads (the boot's command catalog, a
         // CLI death right after the boot) can find the session missing.
-        let durable = claim
-            .as_ref()
-            .map(|claim| claim.durable.clone())
-            .or(adopted);
+        let durable = map_key.clone();
         let configuration_settings = recorded_settings.clone().unwrap_or_default();
         let identity = RuntimeIdentity::new(map_key.clone(), Vec::new());
         let log_identity = identity.clone();
@@ -737,12 +658,7 @@ impl FreshClaudeState {
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
         // A resume after an unrequested death continues the dead session's
         // attention clock (design §5.5): its edges stay above the death's.
-        let resumed_runtime = || {
-            [Some(map_key.as_str()), durable.as_deref()]
-                .into_iter()
-                .flatten()
-                .find_map(|id| self.dead_sessions.find(id))
-        };
+        let resumed_runtime = || self.dead_sessions.find(&map_key);
         if let Some(dead) = resumed_runtime() {
             identity.inherit(dead.ids);
         }
@@ -800,9 +716,6 @@ impl FreshClaudeState {
                     ownership_id: ownership_id.clone(),
                     consumer,
                     sidecar_session_id: minted,
-                    // b8ke focused episode-2 round-2 F2: the lifecycle op that owns
-                    // this runtime's coordinator transition, so the session-init
-                    // b8ke ext r27 F2: the handoff's generation (the under-ticket
                     owning_generation,
                     identity,
                     pending,
@@ -819,10 +732,7 @@ impl FreshClaudeState {
             // C09: a resumed session is live again, so it is no longer an ended
             // one. Forgotten before the lock is released, so a death of this new
             // incarnation is recorded after it, never forgotten by it.
-            if let Some(durable) = durable.as_deref() {
-                self.dead_sessions
-                    .forget(&[map_key.as_str(), durable], "resumed");
-            }
+            self.dead_sessions.forget(&[map_key.as_str()], "resumed");
         }
         // Test seam (Task 6 round-3 review I-1): park with the target session
         // registered but the resume unreturned (the handoff abort-window tests).
@@ -935,10 +845,8 @@ impl FreshClaudeState {
             }
         }
 
-        // kata b8ke Task 3: the registration survived every teardown gate; commit
-        // `Live{FreshAgent}` under the claimed durable id. A fresh create claims
-        // no durable id: its canonical commit is the consumer's
-        // `sdk.session.init` adoption.
+        // Registration survived every teardown gate. Resumed targets now
+        // commit their lane claim; fresh creates committed before their ACK.
         if claim.is_some() {
             if let Err(outcome) = self.commit_lane_claim_at(own_ticket, &map_key, sidecar_pid) {
                 let event = match lane {
