@@ -63,6 +63,9 @@ pub enum RigKind {
 /// local claude lane, no handoff route).
 #[derive(Debug, Clone, Default)]
 pub struct RigOptions {
+    /// Exercise the hosted kernel's in-memory lifecycle without a coordinator
+    /// or identity sink; native files and dead-runtime memory are authoritative.
+    pub unwired_runtime: bool,
     /// REST create/split/send/capture over the shared Claude runtime and layout.
     pub rest_api: bool,
     /// Extra sidecar environment (for example simulator knobs such as
@@ -1058,8 +1061,10 @@ async fn spawn_rig_server(
     let mut fresh_claude = freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx))
         .with_sidecar_environment(environment)
         .with_hosted_mcp(options.hosted_claude);
-    fresh_claude.set_ownership(Arc::clone(&ownership));
-    if let Some(ledger) = pane_ledger.as_ref() {
+    if !options.unwired_runtime {
+        fresh_claude.set_ownership(Arc::clone(&ownership));
+    }
+    if let Some(ledger) = pane_ledger.as_ref().filter(|_| !options.unwired_runtime) {
         let mut sink = super::ledger_sink::LedgerSink::with_ownership(
             Arc::clone(ledger),
             Some(Arc::clone(&ownership)),
