@@ -575,73 +575,7 @@ async fn rest_claude_resume_create_writes_identity_row_and_ledger_binding() {
 
 // ── kata b8ke Task 10: REST + WS + browser-shaped parity on ONE coordinator ──
 
-// A real sidecar environment local to this lane: no process-global env changes.
-struct ClaudeSimEnvironment {
-    dir: std::path::PathBuf,
-}
-
-impl ClaudeSimEnvironment {
-    fn new() -> Self {
-        let dir = unique_temp_dir("sidecar");
-        for child in ["home", "workspace", "tmp"] {
-            std::fs::create_dir_all(dir.join(child)).unwrap();
-        }
-        std::fs::write(dir.join("active"), "").unwrap();
-        Self { dir }
-    }
-
-    fn environment(&self) -> Vec<(String, String)> {
-        let adapter = common::claude_rig::repo_root()
-            .join("test/integration/providers/claude-sdk-for-rust-runtime.mjs");
-        vec![
-            (
-                "HOME".into(),
-                self.dir.join("home").to_string_lossy().into(),
-            ),
-            ("PATH".into(), std::env::var("PATH").unwrap_or_default()),
-            (
-                "TMPDIR".into(),
-                self.dir.join("tmp").to_string_lossy().into(),
-            ),
-            (
-                "CLAUDE_CONFIG_DIR".into(),
-                self.dir.join("home/.claude").to_string_lossy().into(),
-            ),
-            (
-                "FRESHELL_CLAUDE_SDK_QUERY_MODULE".into(),
-                freshell_platform::opencode_plugin::plugin_file_spec(&adapter),
-            ),
-            (
-                "FRESHELL_CLAUDE_SIM_LEDGER".into(),
-                self.dir.join("ledger.jsonl").to_string_lossy().into(),
-            ),
-            ("FRESHELL_CLAUDE_SIM_TIME_SCALE".into(), "0.01".into()),
-            (
-                "FRESHELL_TEST_CLAUDE_RUNTIME_GUARD".into(),
-                self.dir.join("active").to_string_lossy().into(),
-            ),
-        ]
-    }
-
-    fn rows(&self, kind: &str) -> Vec<serde_json::Value> {
-        std::fs::read_to_string(self.dir.join("ledger.jsonl"))
-            .unwrap_or_default()
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("simulator row"))
-            .filter(|row| row["kind"] == kind)
-            .collect()
-    }
-}
-
-impl Drop for ClaudeSimEnvironment {
-    fn drop(&mut self) {
-        // The shared SDK adapter closes its query when the guard ends or this
-        // unique directory disappears; cleanup never needs a PID signal.
-        let _ = std::fs::write(self.dir.join("active.stop"), "");
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
+use common::claude_sim_environment::ClaudeSimEnvironment;
 
 /// Read text frames until one with `type == wanted` arrives (bounded).
 async fn next_frame_of_type(ws: &mut common::TestWs, wanted: &str) -> serde_json::Value {
@@ -681,7 +615,7 @@ async fn rest_ws_and_browser_paths_share_the_one_coordinator() {
         json!({
             "type": "freshAgent.create", "requestId": "req-r10-parity-1",
             "sessionType": "freshclaude", "provider": "claude",
-            "cwd": sidecar.dir.join("workspace").to_string_lossy(),
+            "cwd": sidecar.workspace().to_string_lossy(),
         })
         .to_string(),
     ))
