@@ -43,7 +43,22 @@ export function fixture() {
       const result = cp.spawnSync(process.execPath, [file], {env:process.env, stdio:'inherit'});
       process.exit(result.status ?? 1);
     }
-    fs.appendFileSync(process.env.RECEIPT, JSON.stringify({kind:'cargo', args,
+    const target = (await import('node:path')).default.resolve(process.cwd(), process.env.CARGO_TARGET_DIR || 'target');
+    const binary = target + '/debug/freshell-server';
+    if (args[0] === 'build' && !Number(process.env.BUILD_EXIT || 0)) {
+      fs.mkdirSync(target + '/debug', { recursive: true });
+      fs.writeFileSync(binary, '#!/usr/bin/env node\\nprocess.stdout.write(' + JSON.stringify(process.cwd()) + ')\\n');
+      fs.chmodSync(binary, 0o755);
+    }
+    if (args[0] === 'test') {
+      const cp = await import('node:child_process');
+      const actual = cp.spawnSync(process.env.FRESHELL_SERVER_BIN, [], { encoding: 'utf8' });
+      if (actual.status !== 0 || actual.stdout !== process.cwd()) {
+        console.error('the selected server was not built for this checkout', process.env.FRESHELL_SERVER_BIN, actual.error);
+        process.exit(91);
+      }
+    }
+    fs.appendFileSync(process.env.RECEIPT, JSON.stringify({kind:'cargo', args, target, testThreads:process.env.RUST_TEST_THREADS, tokioThreads:process.env.TOKIO_WORKER_THREADS,
       binary:process.env.FRESHELL_SERVER_BIN, route:process.env.FRESHELL_RUST_TEST_SANDBOX, jobs:process.env.CARGO_BUILD_JOBS,
       tmp:process.env.TMPDIR, executableTmp:process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR})+'\\n');
     if (args[0] === 'test' && process.env.HOLD_TEST) {
@@ -59,9 +74,10 @@ export function fixture() {
     import fs from 'node:fs';
     import cp from 'node:child_process';
     const args = process.argv.slice(2);
-    fs.appendFileSync(process.env.RECEIPT, JSON.stringify({kind:'sandbox', args})+'\\n');
+    fs.appendFileSync(process.env.RECEIPT, JSON.stringify({kind:'sandbox', args, ownerGuard:process.env.FRESHELL_SANDBOX_OWNER_GUARD})+'\\n');
     if (process.env.SANDBOX_EXIT) process.exit(Number(process.env.SANDBOX_EXIT));
     const command = args[1]
+      .replaceAll('/freshell-test-artifacts/targets/', ${JSON.stringify(artifacts)} + '/targets/')
       .replace('mktemp -d /freshell-test-artifacts/.freshell-rust-tests-', 'mktemp -d ' + ${JSON.stringify(artifacts)} + '/.freshell-rust-tests-')
       .replace('mktemp -d /freshell-test-artifacts/XXX', 'mktemp -d ' + ${JSON.stringify(runtimeTemplate)})
       .replace('mktemp -d /workspace/target/', 'mktemp -d ' + ${JSON.stringify(root)} + '/target/')
@@ -74,7 +90,7 @@ export function fixture() {
     run(env: NodeJS.ProcessEnv = {}, args: string[] = []) {
       const result = spawnSync(process.execPath, ['--import', tsx, path.join(root, 'scripts/testing/run-rust-tests.ts'), ...args], {
         env: { ...process.env, PATH: `${root}/bin:${process.env.PATH}`, RECEIPT: receipt,
-          FRESHELL_RUST_TEST_SANDBOX: '0', FRESHELL_SERVER_BIN: '/host/stale-server', ...env },
+          FRESHELL_RUST_TEST_SANDBOX: '0', CARGO_TARGET_DIR: '', FRESHELL_SERVER_BIN: '/host/stale-server', ...env },
         encoding: 'utf8', timeout: 15_000,
       })
       const events = existsSync(receipt) ? readFileSync(receipt, 'utf8').trim().split('\n').map(line => JSON.parse(line)) : []
