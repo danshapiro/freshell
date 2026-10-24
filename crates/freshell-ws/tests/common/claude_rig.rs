@@ -808,23 +808,22 @@ impl RigConnection {
         })
     }
 
-    /// The owner pair the client would hold for this pane's session: the latest
-    /// `session.runtimeOwner` frame for the durable id its `session.init` named.
+    /// The current init identifies an existing conversation; before the first
+    /// init, create already supplied the native UUID and its owner record.
     fn observed_owner(&self, session_id: &str) -> Option<(u64, u64)> {
-        let durable = self.frames.iter().rev().find_map(|v| {
-            (v["type"] == "freshAgent.event"
-                && v["event"]["type"] == "freshAgent.session.init"
-                && v["event"]["sessionId"] == session_id)
-                .then(|| v["event"]["cliSessionId"].as_str().map(str::to_string))
-                .flatten()
-        })?;
-        self.frames.iter().rev().find_map(|v| {
-            (v["type"] == "session.runtimeOwner"
-                && v["provider"] == "claude"
-                && v["sessionId"] == durable.as_str())
-            .then(|| Some((v["epoch"].as_u64()?, v["generation"].as_u64()?)))
-            .flatten()
-        })
+        let durable = self
+            .frames
+            .iter()
+            .rev()
+            .find_map(|v| {
+                (v["type"] == "freshAgent.event"
+                    && v["event"]["type"] == "freshAgent.session.init"
+                    && v["event"]["sessionId"] == session_id)
+                    .then(|| v["event"]["cliSessionId"].as_str().map(str::to_string))
+                    .flatten()
+            })
+            .unwrap_or_else(|| session_id.to_string());
+        self.owner_pair(&durable)
     }
 
     /// Top-level `error` frames answering this request id, read so far.
