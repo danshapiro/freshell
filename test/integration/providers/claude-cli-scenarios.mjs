@@ -673,9 +673,19 @@ const SCENARIOS = {
     const cleared = ctx.need(await ctx.fixture.readTranscript(B), 'post-reset transcript exists')
     ctx.observe('afterClear', {
       files: await ctx.files(),
-      newSessionLineTypes: cleared.map((row) => row.type),
-      newSessionMessages: cleared.filter((row) => row.type === 'user' || row.type === 'assistant')
+      hasModeMetadata: cleared.some((row) => row.type === 'mode' && row.mode === 'normal'),
+    })
+    const flushed = ctx.need(await ctx.pollTranscript(B, 5000, 1, (rows) =>
+      rows.some((row) => row.type === 'user' && typeof row.message?.content === 'string'
+        && row.message.content.includes('<command-name>/clear</command-name>'))
+      && rows.some((row) => row.type === 'system' && row.subtype === 'local_command')),
+    'post-reset local-command rows flushed')
+    ctx.observe('afterClearFlush', {
+      lineTypes: flushed.map((row) => row.type),
+      messages: flushed.filter((row) => row.type === 'user' || row.type === 'assistant')
         .map((row) => ({ type: row.type, isMeta: row.isMeta === true, content: row.message?.content })),
+      localCommands: flushed.filter((row) => row.type === 'system' && row.subtype === 'local_command')
+        .map((row) => ({ subtype: row.subtype, content: row.content, isMeta: row.isMeta === true })),
     })
     s.push('after clear', 'u3')
     await s.waitForResults(3)
@@ -864,12 +874,12 @@ export async function runScenario(target, name, { repoRoot = DEFAULT_REPO_ROOT }
       return value
     },
     files: () => fixture.transcripts(),
-    /** Poll until `<id>.jsonl` holds at least `minLines` lines; returns the lines or null. */
-    async pollTranscript(id, ms, minLines = 1) {
+    /** Poll until the saved lines satisfy the requested count and optional predicate. */
+    async pollTranscript(id, ms, minLines = 1, predicate) {
       const started = Date.now()
       while (Date.now() - started <= ms) {
         const lines = await fixture.readTranscript(id)
-        if (lines && lines.length >= minLines) {
+        if (lines && lines.length >= minLines && (!predicate || predicate(lines))) {
           trace.add({ k: 'transcript-seen', id, lines: lines.length })
           return lines
         }

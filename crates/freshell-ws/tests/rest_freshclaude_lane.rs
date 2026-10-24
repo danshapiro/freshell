@@ -563,11 +563,27 @@ async fn clear_rekeys_the_headless_rest_pane(kind: RigKind) {
         cleared["data"]["sessionRef"],
         json!({"provider":"claude", "sessionId":new_id})
     );
-    let (status, fresh_capture) = get(&rig, &format!("/api/panes/{pane}/capture")).await;
-    assert_eq!(status, 200, "{fresh_capture}");
-    assert!(
-        fresh_capture.is_empty(),
-        "the same headless pane now captures the new empty conversation: {fresh_capture}"
+    let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
+    let fresh_capture = loop {
+        let (status, capture) = get(&rig, &format!("/api/panes/{pane}/capture")).await;
+        assert_eq!(status, 200, "{capture}");
+        assert!(
+            !capture.contains("before clear conversation"),
+            "the new conversation must never expose its parent's dialogue: {capture}"
+        );
+        if capture.trim() == "user: /clear" {
+            break capture;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the CLI's buffered local-command rows never reached capture: {capture}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(
+        fresh_capture.trim(),
+        "user: /clear",
+        "the new saved history holds only its own local command"
     );
     let next = send(&rig, pane, "after clear conversation").await;
     assert_eq!(next["status"], "idle");
