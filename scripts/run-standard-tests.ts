@@ -1,6 +1,6 @@
 #!/usr/bin/env tsx
 
-import { execFile, spawn, type ChildProcess } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
 import { availableParallelism, constants as osConstants, setPriority } from 'node:os'
 import { existsSync, readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
@@ -418,15 +418,16 @@ function resolveExistingLocalOnlyDirs(): string[] {
 
 function dispatchCloudVitest(cloudScript: string, forwardedArgs: string[]): Promise<void> {
   return new Promise((resolveDispatch, rejectDispatch) => {
-    execFile(
+    const child = spawn(
       cloudScript,
       ['run', '--cloud', '--config=default', ...forwardedArgs],
-      { stdio: 'inherit', cwd: PROJECT_ROOT, env: process.env },
-      (error) => {
-        if (error) rejectDispatch(error)
-        else resolveDispatch()
-      },
+      { stdio: 'inherit', cwd: PROJECT_ROOT, env: process.env, windowsHide: true },
     )
+    child.once('error', rejectDispatch)
+    child.once('exit', (code, signal) => {
+      if (code === 0) resolveDispatch()
+      else rejectDispatch(new Error(`Cloud Vitest phase exited with code ${code ?? 1}${signal ? ` (${signal})` : ''}`))
+    })
   })
 }
 
