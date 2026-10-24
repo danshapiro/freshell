@@ -317,6 +317,17 @@ impl FreshAgentBindingUpsert {
 pub type SinkWrite =
     std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'static>>;
 
+/// The awaited shutdown-marker write. `false` means the durable binding row
+/// was absent or no longer belonged to a live fresh-agent session.
+pub type SinkMarkTurnInterruptedWrite =
+    std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<bool>> + Send + 'static>>;
+
+/// The awaited one-shot shutdown-marker consumption. The timestamp is
+/// returned only after the cleared marker is durable.
+pub type SinkTakeTurnInterruptedWrite = std::pin::Pin<
+    Box<dyn std::future::Future<Output = std::io::Result<Option<i64>>> + Send + 'static>,
+>;
+
 /// Delta-r6-r4 (focused-episode-6 round 3, Finding 3): the close envelope's
 /// failure classes — this crate's mirror of
 /// `freshell_ws::pane_ledger::CloseEnvelopeError` (it cannot see the ledger;
@@ -429,6 +440,23 @@ pub type SinkAliasClearWrite = std::pin::Pin<
 pub trait PaneIdentitySink: Send + Sync {
     fn record_pending(&self, placeholder_id: &str, mode: &str, cwd: Option<&str>) -> SinkWrite;
     fn record_binding(&self, upsert: FreshAgentBindingUpsert) -> SinkWrite;
+    /// Persist a freshclaude shutdown interruption marker on an existing
+    /// bound fresh-agent row. Called only for owed live sessions and bounded
+    /// by the caller during server shutdown.
+    fn mark_turn_interrupted(
+        &self,
+        provider: &str,
+        session_id: &str,
+        at_ms: i64,
+    ) -> SinkMarkTurnInterruptedWrite;
+    /// Atomically clear and return a shutdown interruption marker. Call only
+    /// after the next successful create/attach acknowledgement; an error
+    /// leaves the durable marker available for a later retry.
+    fn take_turn_interrupted(
+        &self,
+        provider: &str,
+        session_id: &str,
+    ) -> SinkTakeTurnInterruptedWrite;
     fn load_settings(&self, provider: &str, session_id: &str) -> Option<FreshAgentSettings>;
     /// The fresh-agent binding row's genesis (claude core design §4.1), bound
     /// or retired; `None` when it has none or there is no fresh-agent row.
@@ -739,6 +767,8 @@ pub(crate) struct FakeIdentitySink {
     /// bindings never enter (and a blank rewrite removes the key, matching
     /// the ledger's full-snapshot replace).
     pub recorded: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+    /// The optional persisted-restart marker, keyed like a binding row.
+    pub turn_interrupted: std::sync::Mutex<std::collections::HashMap<(String, String), i64>>,
     /// Focused-ep1-r4 Finding 2: the row's CURRENT provenance stamps,
     /// atomically applied/preserved on every `record_binding` — the ledger
     /// merge's (`pane_ledger.rs`) in-memory twin, backing `load_provenance`.
@@ -1586,6 +1616,39 @@ impl PaneIdentitySink for FakeIdentitySink {
             self.apply_binding(upsert);
         }
         self.write_result()
+    }
+    fn mark_turn_interrupted(
+        &self,
+        provider: &str,
+        session_id: &str,
+        at_ms: i64,
+    ) -> SinkMarkTurnInterruptedWrite {
+        let result = if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(std::io::Error::other("fake write failure"))
+        } else {
+            self.turn_interrupted
+                .lock()
+                .unwrap()
+                .insert((provider.into(), session_id.into()), at_ms);
+            Ok(true)
+        };
+        Box::pin(std::future::ready(result))
+    }
+    fn take_turn_interrupted(
+        &self,
+        provider: &str,
+        session_id: &str,
+    ) -> SinkTakeTurnInterruptedWrite {
+        let result = if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(std::io::Error::other("fake write failure"))
+        } else {
+            Ok(self
+                .turn_interrupted
+                .lock()
+                .unwrap()
+                .remove(&(provider.into(), session_id.into())))
+        };
+        Box::pin(std::future::ready(result))
     }
     fn load_settings(&self, provider: &str, session_id: &str) -> Option<FreshAgentSettings> {
         self.settings

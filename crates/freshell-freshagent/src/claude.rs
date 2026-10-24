@@ -1915,10 +1915,39 @@ impl FreshClaudeState {
     /// rather than one session grace per session. Called on server shutdown.
     pub async fn shutdown(&self) {
         use tracing::instrument::WithSubscriber;
-        let drained: Vec<ClaudeSession> = {
+        let mut drained: Vec<ClaudeSession> = {
             let mut guard = self.sessions.lock().await;
             guard.drain().map(|(_, s)| s).collect()
         };
+        // Stop the stdout consumers before checking which turns remain owed.
+        // Otherwise a result can be folded while the awaited marker writes are
+        // in progress, publishing completion after shutdown has already decided
+        // to persist an interruption notice for that same turn.
+        for session in &drained {
+            session.consumer.abort();
+        }
+        for session in &mut drained {
+            while !session.consumer.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        }
+        let interrupted_ids: Vec<String> = drained
+            .iter()
+            .filter(|session| session.ledger.lock().expect("turn ledger lock").busy())
+            .map(|session| {
+                session
+                    .cli_session_id
+                    .as_deref()
+                    .unwrap_or(&session.sidecar_session_id)
+                    .to_string()
+            })
+            .collect();
+        futures_util::future::join_all(
+            interrupted_ids
+                .iter()
+                .map(|session_id| self.mark_turn_interrupted_for_shutdown(session_id)),
+        )
+        .await;
         let confirm_rounds = self.tree_confirm_rounds();
         // One task per session: each teardown's synchronous `/proc` scans run
         // on the runtime's workers in parallel, so no session's shutdown
@@ -2007,6 +2036,8 @@ impl FreshClaudeState {
                     name_ref,
                     session_name,
                 }));
+                self.notify_turn_interrupted_after_ack(&cached.session_id, session_type)
+                    .await;
                 return ClaudeCreateOutcome::Created {
                     session_id: cached.session_id,
                     session_ref: cached.session_ref,
@@ -2437,6 +2468,8 @@ impl FreshClaudeState {
             name_ref,
             session_name,
         }));
+        self.notify_turn_interrupted_after_ack(&launch_id, session_type)
+            .await;
         // C17: the server says the new session's status itself (no sidecar
         // status reaches a client any more).
         self.announce_claude_status(&created, session_type).await;
@@ -2545,6 +2578,8 @@ impl FreshClaudeState {
             name_ref,
             session_name,
         }));
+        self.notify_turn_interrupted_after_ack(durable, session_type)
+            .await;
         self.announce_claude_status(durable, session_type).await;
         ClaudeCreateOutcome::Created {
             session_id: durable.to_string(),
@@ -6313,7 +6348,6 @@ impl FreshClaudeState {
         ownership_id: String,
         session_type: String,
         sidecar_session_id: String,
-        settings: Option<crate::identity_sink::FreshAgentSettings>,
         broadcast_id: Arc<std::sync::Mutex<String>>,
         pending: Arc<std::sync::Mutex<ClaudePending>>,
         ledger: crate::claude_turns::SharedLedger,
@@ -6323,12 +6357,6 @@ impl FreshClaudeState {
         // below can mint AFTER the eviction has already torn the session record
         // out of the map.
         clock: crate::attention::AttentionClock,
-        // D8: the creating connection's provenance stamps, handed to the
-        // in-stream `sdk.session.init` adoption. `None` on conn-less consumers
-        // (rollback replacement, attach-resume) — the ledger merge keeps prior
-        // stamps.
-        provenance: Option<crate::BindProvenance>,
-        create_binding_expected: bool,
     ) -> tokio::task::JoinHandle<()> {
         let broadcast_tx = self.broadcast_tx.clone();
         let sessions = self.sessions.clone();
@@ -6573,29 +6601,23 @@ impl FreshClaudeState {
                         state.publish_claude_status(&ledger, &quiet, &stamp, &session_type, false);
                     }
                 }
-                // Restart-parity (plan §2.8 item 2): record the durable Claude UUID
-                // through the shared adoption block (cli_index insert is
-                // load-bearing; the session-field copy is best-effort — the map
-                // entry may not exist yet during create).
+                // Establishment already bound the native identity. Every
+                // consumer verifies init, including a resumed conversation.
                 if value.get("type").and_then(Value::as_str) == Some("sdk.session.init") {
                     if let Some(cli_id) = value.get("cliSessionId").and_then(Value::as_str) {
-                        let (current_settings, known_identity) = {
+                        let known_identity = {
                             let mut guard = sessions.lock().await;
                             guard
                                 .get_mut(&session_id)
+                                .filter(|session| Arc::ptr_eq(&session.pending, &pending))
                                 .map(|session| {
                                     session.configuration.runtime_cwd =
                                         value["cwd"].as_str().map(str::to_string);
-                                    (
-                                        Some(session.configuration.settings.clone()),
-                                        session.cli_session_id.as_deref() == Some(cli_id),
-                                    )
+                                    session.cli_session_id.as_deref() == Some(cli_id)
                                 })
-                                .unwrap_or_else(|| (settings.clone(), false))
+                                .unwrap_or(false)
                         };
-                        if known_identity && create_binding_expected {
-                            // Establishment already bound this native identity.
-                        } else if create_binding_expected {
+                        if !known_identity {
                             tracing::error!(target: "freshell_freshagent::claude",
                                 event = "freshagent.claude.unannounced_rekey", provider = PROVIDER,
                                 session_id = %session_id, requested_session_id = cli_id,
@@ -6618,17 +6640,6 @@ impl FreshClaudeState {
                                     "the unannounced conversation identity could not be followed")
                                 }
                             }
-                        } else {
-                            state
-                                .adopt_session_init(
-                                    cli_id,
-                                    &session_id,
-                                    &session_type,
-                                    current_settings.as_ref(),
-                                    identity_sink.clone(),
-                                    provenance.as_ref(),
-                                )
-                                .await;
                         }
                     }
                 }
@@ -7961,6 +7972,7 @@ mod genesis;
 mod history;
 mod pending_runtime;
 mod rekey;
+mod restart_notice;
 use pending_runtime::{is_pending_frame, PendingResponse};
 mod rollback;
 mod sidecar_writer;
@@ -17483,14 +17495,11 @@ rl.on('line', (line) => {
             "test-fold-session".to_string(),
             "freshclaude".to_string(),
             "fold-session".to_string(),
-            None,
             Arc::new(std::sync::Mutex::new("fold-session".to_string())),
             Arc::clone(&pending),
             crate::claude_turns::SharedLedger::default(),
             quiet,
             crate::attention::AttentionClock::default(),
-            None, // provenance: test lane is conn-less (D8)
-            false,
         );
 
         // The replace-resend is the LAST scripted line: observing its input proves the
@@ -19021,14 +19030,11 @@ rl.on('line', (line) => {
             format!("test-{map_key}"),
             "freshclaude".to_string(),
             map_key.to_string(),
-            None,
             Arc::clone(&broadcast_id),
             Arc::clone(&pending),
             Arc::clone(&ledger),
             quiet.state.clone(),
             clock.clone(),
-            None, // provenance: test lane is conn-less (D8)
-            false,
         );
         st.sessions.lock().await.insert(
             map_key.to_string(),

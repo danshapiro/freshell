@@ -54,14 +54,24 @@ impl FreshClaudeState {
         msg.resume_session_id = None;
 
         match self.reply_live_attach(&msg, &previous, fence, &reply).await {
-            Ok(true) | Err(()) => return,
+            Ok(true) => {
+                self.notify_turn_interrupted_after_ack(&msg.session_id, session_type)
+                    .await;
+                return;
+            }
+            Err(()) => return,
             Ok(false) => {}
         }
         // A competing attach may already be booting this conversation.
         // Wait for it, then inspect the runtime again before launching.
         let _flight = self.wait_resume_flight(&durable).await;
         match self.reply_live_attach(&msg, &previous, fence, &reply).await {
-            Ok(true) | Err(()) => return,
+            Ok(true) => {
+                self.notify_turn_interrupted_after_ack(&msg.session_id, session_type)
+                    .await;
+                return;
+            }
+            Err(()) => return,
             Ok(false) => {}
         }
         match self.resume_untracked(&msg, &durable, fence, true).await {
@@ -69,7 +79,11 @@ impl FreshClaudeState {
                 // This operation advanced its own claim. The incoming
                 // pre-launch fence no longer names its committed owner.
                 match self.reply_live_attach(&msg, &previous, None, &reply).await {
-                    Ok(true) | Err(()) => {}
+                    Ok(true) => {
+                        self.notify_turn_interrupted_after_ack(&msg.session_id, session_type)
+                            .await;
+                    }
+                    Err(()) => {}
                     Ok(false) => attach_error(
                         &reply,
                         &msg,

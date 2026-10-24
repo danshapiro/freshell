@@ -340,6 +340,19 @@ describe('kill-ack', () => {
       await expect(pending).resolves.toEqual({ ok: true })
     })
 
+    it.each(['freshclaude', 'kilroy'] as const)('sends the %s recovery stop with the observed owner fence', async (sessionType) => {
+      const pending = sendFreshAgentRecoveryStopAndAwait({
+        sessionId: 'claude-durable', sessionType, provider: 'claude', observedEpoch: 4, observedGeneration: 9,
+      })
+      const sent = mockSend.mock.calls[0][0]
+      expect(sent).toMatchObject({ type: 'freshAgent.recovery.stop', sessionId: 'claude-durable',
+        sessionType, provider: 'claude', observedEpoch: 4, observedGeneration: 9 })
+      emit({ type: 'freshAgent.recovery.stopped', requestId: sent.requestId, sessionId: 'claude-durable', provider: 'codex', success: true })
+      expect(handlers.size).toBe(1)
+      emit({ type: 'freshAgent.recovery.stopped', requestId: sent.requestId, sessionId: 'claude-durable', sessionType, provider: 'claude', success: false, code: 'UNSUPPORTED_CAPABILITY' })
+      await expect(pending).resolves.toEqual({ ok: false, error: 'UNSUPPORTED_CAPABILITY' })
+    })
+
     it('keeps a refused recovery stop as a failure', async () => {
       const pending = sendFreshAgentRecoveryStopAndAwait({
         sessionId: 'thread-2',

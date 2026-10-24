@@ -72,6 +72,9 @@ pub struct RigOptions {
     /// claude lane's identity sink (`common::ledger_sink`), the way main.rs wires
     /// it: sessions leave durable binding rows a later resume reads back.
     pub durable_ledger: bool,
+    /// Hold the next shutdown interruption-marker write until the lifecycle
+    /// test releases it, leaving the real sidecar alive during that window.
+    pub turn_interrupted_marker_gate: Option<Arc<super::ledger_sink::TurnInterruptedMarkerGate>>,
     /// The claude lane runs the way the hosted session host runs it: the lane
     /// selects the hosted Freshell MCP (`with_hosted_mcp`) and its sidecars see
     /// `FRESHELL_HOSTED_FRESH_AGENT=claude`, so the sidecar offers the fixed MCP
@@ -682,7 +685,18 @@ impl RigConnection {
 
     /// The first frame (already read or still to come) matching `predicate`.
     pub async fn wait_for(&mut self, what: &str, predicate: impl Fn(&Value) -> bool) -> Value {
-        if let Some(hit) = self.frames.iter().find(|frame| predicate(frame)) {
+        self.wait_for_since(0, what, predicate).await
+    }
+
+    /// A request acknowledgement must be newer than that request, even when
+    /// this connection previously observed the same session and operation.
+    pub async fn wait_for_since(
+        &mut self,
+        start: usize,
+        what: &str,
+        predicate: impl Fn(&Value) -> bool,
+    ) -> Value {
+        if let Some(hit) = self.frames[start..].iter().find(|frame| predicate(frame)) {
             return hit.clone();
         }
         let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
@@ -711,6 +725,7 @@ impl RigConnection {
     /// `extra` fields merged in (a resume, say); returns the answer:
     /// `freshAgent.created`, `freshAgent.create.failed` or a request `error`.
     pub async fn request_create(&mut self, request_id: &str, extra: Value) -> Value {
+        let start = self.frames.len();
         let cwd = path_string(&self.workspace);
         let mut frame = json!({
             "type": "freshAgent.create",
@@ -723,7 +738,7 @@ impl RigConnection {
             frame.extend(extra);
         }
         self.send(frame).await;
-        self.wait_for(&format!("the answer to create {request_id}"), |v| {
+        self.wait_for_since(start, &format!("the answer to create {request_id}"), |v| {
             v["requestId"] == request_id
                 && matches!(
                     v["type"].as_str(),
@@ -856,6 +871,7 @@ impl RigConnection {
     /// The pane reattaches to the durable `session_id` (a reload, or the first
     /// attach after a restart); returns once the attach is acknowledged.
     pub async fn attach(&mut self, session_id: &str) {
+        let start = self.frames.len();
         self.send(json!({
             "type": "freshAgent.attach",
             "provider": "claude",
@@ -864,7 +880,7 @@ impl RigConnection {
             "sessionRef": { "provider": "claude", "sessionId": session_id },
         }))
         .await;
-        self.wait_for("the attach acknowledgement", |v| {
+        self.wait_for_since(start, "the attach acknowledgement", |v| {
             v["type"] == "freshAgent.event"
                 && v["event"]["type"] == "freshAgent.session.snapshot"
                 && v["event"]["sessionId"] == session_id
@@ -890,6 +906,7 @@ impl RigConnection {
 
     /// `freshAgent.kill`, then wait for `freshAgent.killed{success:true}`.
     pub async fn kill(&mut self, session_id: &str) {
+        let start = self.frames.len();
         self.send(json!({
             "type": "freshAgent.kill",
             "provider": "claude",
@@ -898,7 +915,9 @@ impl RigConnection {
         }))
         .await;
         let killed = self
-            .wait_for("freshAgent.killed", |v| v["type"] == "freshAgent.killed")
+            .wait_for_since(start, "freshAgent.killed", |v| {
+                v["type"] == "freshAgent.killed" && v["sessionId"] == session_id
+            })
             .await;
         assert_eq!(killed["success"], true, "{killed}");
     }
@@ -1041,10 +1060,14 @@ async fn spawn_rig_server(
         .with_hosted_mcp(options.hosted_claude);
     fresh_claude.set_ownership(Arc::clone(&ownership));
     if let Some(ledger) = pane_ledger.as_ref() {
-        fresh_claude.set_identity_sink(Arc::new(super::ledger_sink::LedgerSink::with_ownership(
+        let mut sink = super::ledger_sink::LedgerSink::with_ownership(
             Arc::clone(ledger),
             Some(Arc::clone(&ownership)),
-        )));
+        );
+        if let Some(gate) = options.turn_interrupted_marker_gate.clone() {
+            sink = sink.with_turn_interrupted_marker_gate(gate);
+        }
+        fresh_claude.set_identity_sink(Arc::new(sink));
     }
     let lane = fresh_claude.clone();
     let fresh_agent_state = freshell_freshagent::FreshAgentState::new(

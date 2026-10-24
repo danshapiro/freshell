@@ -12,11 +12,47 @@
 
 use std::sync::Arc;
 
+/// Deterministic hold point for the shutdown-marker write in the lifecycle
+/// integration test. The sidecar keeps running while this awaited write is
+/// held, so the test can prove how a late CLI result races server shutdown.
+#[derive(Debug)]
+pub struct TurnInterruptedMarkerGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Semaphore,
+}
+
+impl TurnInterruptedMarkerGate {
+    pub fn new() -> Self {
+        Self {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    pub async fn wait_until_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    pub fn release(&self) {
+        self.release.add_permits(1);
+    }
+
+    async fn hold(&self) -> std::io::Result<()> {
+        self.entered.notify_one();
+        self.release
+            .acquire()
+            .await
+            .map_err(std::io::Error::other)?
+            .forget();
+        Ok(())
+    }
+}
+
 use freshell_freshagent::identity_sink::SinkCloseError;
 use freshell_freshagent::{
     BindProvenance, ClaimCommit, FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink,
     ProvenanceUpdate, RollbackRecord, SinkAliasClearWrite, SinkCloseWrite, SinkCommitWrite,
-    SinkWrite,
+    SinkMarkTurnInterruptedWrite, SinkTakeTurnInterruptedWrite, SinkWrite,
 };
 use freshell_ws::pane_ledger::{
     ClaimCommitOutcome, CloseEnvelopeError, FreshAgentBindingWrite, PaneLedger, ProvenancePolicy,
@@ -28,6 +64,7 @@ pub struct LedgerSink {
     /// The ownership coordinator an authoritative write is re-validated
     /// against (the one the lanes writing through this sink are wired to).
     ownership: Option<Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
+    turn_interrupted_marker_gate: Option<Arc<TurnInterruptedMarkerGate>>,
 }
 
 impl LedgerSink {
@@ -36,6 +73,7 @@ impl LedgerSink {
         Self {
             ledger,
             ownership: None,
+            turn_interrupted_marker_gate: None,
         }
     }
 
@@ -45,7 +83,19 @@ impl LedgerSink {
         ledger: Arc<PaneLedger>,
         ownership: Option<Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
     ) -> Self {
-        Self { ledger, ownership }
+        Self {
+            ledger,
+            ownership,
+            turn_interrupted_marker_gate: None,
+        }
+    }
+
+    pub fn with_turn_interrupted_marker_gate(
+        mut self,
+        gate: Arc<TurnInterruptedMarkerGate>,
+    ) -> Self {
+        self.turn_interrupted_marker_gate = Some(gate);
+        self
     }
 }
 
@@ -199,6 +249,43 @@ impl PaneIdentitySink for LedgerSink {
                 let _ = ledger.delete_pending(p);
             }
             Ok(())
+        })
+    }
+
+    fn mark_turn_interrupted(
+        &self,
+        provider: &str,
+        session_id: &str,
+        at_ms: i64,
+    ) -> SinkMarkTurnInterruptedWrite {
+        let ledger = self.ledger.clone();
+        let gate = self.turn_interrupted_marker_gate.clone();
+        let (provider, session_id) = (provider.to_string(), session_id.to_string());
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                gate.hold().await?;
+            }
+            tokio::task::spawn_blocking(move || {
+                ledger.mark_fresh_agent_turn_interrupted(&provider, &session_id, at_ms)
+            })
+            .await
+            .map_err(std::io::Error::other)?
+        })
+    }
+
+    fn take_turn_interrupted(
+        &self,
+        provider: &str,
+        session_id: &str,
+    ) -> SinkTakeTurnInterruptedWrite {
+        let ledger = self.ledger.clone();
+        let (provider, session_id) = (provider.to_string(), session_id.to_string());
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                ledger.take_fresh_agent_turn_interrupted(&provider, &session_id)
+            })
+            .await
+            .map_err(std::io::Error::other)?
         })
     }
 
