@@ -176,7 +176,7 @@ impl ClaudeRig {
                 environment.extend([
                     (
                         "FRESHELL_CLAUDE_SDK_QUERY_MODULE".into(),
-                        path_string(&simulator),
+                        freshell_platform::opencode_plugin::plugin_file_spec(&simulator),
                     ),
                     ("FRESHELL_CLAUDE_SIM_LEDGER".into(), path_string(&ledger)),
                     ("FRESHELL_CLAUDE_SIM_TIME_SCALE".into(), "1".into()),
@@ -632,6 +632,7 @@ impl ClaudeRig {
     /// The first sidecar this rig booted dies on its own (SIGKILL of the Node
     /// process): its session is untracked, the state a reload or a handoff
     /// resumes from. Returns once `conn` has read the exit.
+    #[cfg(unix)]
     pub async fn kill_first_sidecar(&self, conn: &mut RigConnection) {
         let pid = self.ledger_rows("boot")[0]["pid"]
             .as_i64()
