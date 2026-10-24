@@ -4,15 +4,11 @@
  * restart (RustServer.restartAbrupt(): SIGKILL + revive on the same
  * home/port/token) and resume in place -- never be adjudicated dead.
  *
- * Why this spec exists: the fake sidecar creates the transcript file AT
- * SESSION CREATE, before any turn -- a 0-byte .jsonl. (Validated: the REAL
- * CLI materializes the transcript only at first turn; the fixture's shape
- * stands in for any on-disk-but-R10b-excluded transcript, e.g. crash-window
- * partial writes.) That file fails the session index's R10b cwd gate, so pre-fix the
- * reconcile existence probe answered Absent while the attach arm's raw-file
- * check would happily resume it => DeadSession{session_not_on_disk} and the
- * 'Dead sessions' dialog. Every OTHER freshclaude-restart spec sends a turn
- * before restarting (which writes a cwd-bearing line and masks the bug);
+ * Why this spec exists: the real CLI does not materialize a transcript until
+ * the first turn. A create-time durable identity with no transcript must
+ * still survive restart without a false dead-session adjudication. Every
+ * OTHER freshclaude-restart spec sends a turn before restarting (which writes
+ * a cwd-bearing line and masks the no-transcript case);
  * hidden-pane-rebind-rust.spec.ts covers the HIDDEN zero-turn pane; this
  * spec covers the VISIBLE one. DO NOT add a turn before the restart --
  * zero-turn is the entire point.
@@ -31,15 +27,7 @@ import type { Page } from '@playwright/test'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
-
-// ESM project ("type": "module" in package.json): __dirname does not exist in
-// ESM modules, so derive it -- same convention as every fixture-referencing
-// donor spec (e.g. restore-contract-wall-rust.spec.ts:39-40).
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = path.dirname(__filename)
-
-const FAKE_CLAUDE_SIDECAR_SOURCE = path.resolve(__dirname, '../fixtures/fake-claude-sidecar.mjs')
+import { claudeSimulatorServerEnv, onPrompt, readClaudeSimLedger } from '../helpers/claude-sim-lane.js'
 
 // ---------------------------------------------------------------------------
 // Shared helpers (per-spec copies -- donor: restore-contract-wall-rust.spec.ts)
@@ -124,8 +112,7 @@ function findFreshAgentLeaf(node: any): any {
   return null
 }
 
-// --- freshclaude fresh-agent helper (fixture: fake-claude-sidecar.mjs via the
-// production env seam FRESHELL_CLAUDE_SIDECAR) ---
+// --- freshclaude fresh-agent helper (production sidecar + CLI simulator) ---
 
 async function createFreshclaudePane(page: Page, harness: TestHarness, cwd: string): Promise<void> {
   // setAvailableClis is client-only AND gets overwritten by the app
@@ -166,10 +153,15 @@ test.describe('freshclaude zero-turn restart (kata 09v1)', () => {
   test.setTimeout(180_000)
 
   test('visible zero-turn freshclaude pane resumes after abrupt restart', async ({ page }) => {
-    // Sidecar REQUEST log: the post-restart resume proof reads it.
-    const requestLog = path.join(os.tmpdir(), `freshell-e2e-claude-sidecar-${Date.now()}.jsonl`)
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-e2e-zero-turn-'))
+    const simLedger = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
     const { server, harness } = await bootWall(page, {
-      env: { FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE, FAKE_CLAUDE_SIDECAR_LOG: requestLog },
+      env: claudeSimulatorServerEnv({
+        ledgerPath: simLedger,
+        program: {
+          rules: [onPrompt('zero-turn post-restart send', [{ kind: 'text', data: { text: 'ZERO_TURN_REPLY' } }])],
+        },
+      }),
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
     try {
@@ -185,10 +177,9 @@ test.describe('freshclaude zero-turn restart (kata 09v1)', () => {
           return c?.sessionId && c?.createRequestId ? true : null
         }, { timeout: 30_000 })
         .not.toBeNull()
-      // Wait for the DURABLE identity (sdk.session.init merge writes the
-      // canonical UUID to sessionRef.sessionId + resumeSessionId). The fake
-      // sidecar mints a RANDOM canonical UUID per process, so gate on the
-      // canonical-UUID SHAPE and capture what this run minted.
+      // Rust assigns the durable UUID as part of create, before any turn.
+      // Capture that acknowledgement identity rather than depending on an
+      // SDK init event that only arrives after a prompt.
       await expect
         .poll(async () => {
           const c = findFreshAgentLeaf(await harness.getPaneLayout(freshTabId))?.content
@@ -198,41 +189,40 @@ test.describe('freshclaude zero-turn restart (kata 09v1)', () => {
       const contentBefore = findFreshAgentLeaf(await harness.getPaneLayout(freshTabId))!.content!
       const originalDurable = (contentBefore.sessionRef?.sessionId ?? contentBefore.resumeSessionId) as string
       const createRequestIdBefore = contentBefore.createRequestId as string
+      const createdFrame = (await harness.getReceivedWsMessages() as any[]).find(
+        (message) => message?.type === 'freshAgent.created' && message.requestId === createRequestIdBefore,
+      )
+      expect(createdFrame?.sessionRef, 'the create acknowledgement assigns the durable identity before any turn')
+        .toEqual({ provider: 'claude', sessionId: originalDurable })
+      await expect.poll(async () => {
+        const owners = Object.values((await harness.getState())?.freshAgent?.runtimeOwners ?? {}) as any[]
+        return owners.find((owner) => owner.provider === 'claude' && owner.sessionId === originalDurable)?.ownerKind ?? null
+      }, { message: 'the create-time durable identity has a live fresh-agent owner' }).toBe('fresh-agent')
 
       // ZERO TURNS, pane stays VISIBLE (no extra tab, no hide): the
       // transcript on disk is the sidecar's create-time 0-byte file --
       // exactly the R10b-excluded shape this regression pins.
 
+      await harness.clearSentWsMessages()
       await server.restartAbrupt()
       await waitForWsReady(page)
 
-      // Positive proof (same discriminator as the hidden-pane spec): the
-      // sidecar request log must contain a `create` whose resume boot names
-      // originalDurable -- only the restart-parity resume arm emits that, and
-      // the initial create boots fresh, so a match is unambiguous
-      // post-restart evidence.
-      // The parity arm resumes by durable UUID or by the transcript's
-      // .jsonl PATH; both carry the durable UUID -- accept either shape.
+      // A new query is not required when the original live writer survives
+      // the server restart. Prove the post-restart attach carries the
+      // create-time durable reference and the ready handshake reports its
+      // live owner; both are server-originated lifecycle evidence.
       await expect
         .poll(async () => {
-          const c = findFreshAgentLeaf(await harness.getPaneLayout(freshTabId))?.content
-          const status = c?.status ?? ''
-          const usable = c?.sessionId && ['connected', 'idle', 'running'].includes(status)
-          const log = await fs.readFile(requestLog, 'utf-8').catch(() => '')
-          const resumed = log
-            .split('\n')
-            .filter(Boolean)
-            .map((l) => JSON.parse(l))
-            .some(
-              (e) =>
-                e.msg?.type === 'create' &&
-                typeof e.msg?.boot?.resume === 'string' &&
-                (e.msg.boot.resume === originalDurable ||
-                  e.msg.boot.resume.endsWith(`/${originalDurable}.jsonl`)),
-            )
-          return usable && resumed ? `resumed:${status}` : null
+          const sent = await harness.getSentWsMessages() as any[]
+          return sent.find((message) => message?.type === 'freshAgent.attach'
+            && message?.sessionRef?.provider === 'claude'
+            && message?.sessionRef?.sessionId === originalDurable) ?? null
         }, { timeout: 30_000 })
-        .not.toBeNull()
+        .toMatchObject({ type: 'freshAgent.attach', sessionRef: { provider: 'claude', sessionId: originalDurable } })
+      await expect.poll(async () => {
+        const owners = Object.values((await harness.getState())?.freshAgent?.runtimeOwners ?? {}) as any[]
+        return owners.find((owner) => owner.provider === 'claude' && owner.sessionId === originalDurable)?.ownerKind ?? null
+      }, { timeout: 30_000, message: 'the restarted connection observes the fresh-agent owner' }).toBe('fresh-agent')
 
       // Negative proof (the pre-fix failure shape must be gone): the
       // zero-turn session must NOT be adjudicated dead.
@@ -243,6 +233,15 @@ test.describe('freshclaude zero-turn restart (kata 09v1)', () => {
         deadEntries.some((e: any) => e?.sessionRef?.sessionId === originalDurable),
         'zero-turn session must not appear in dead-session adjudication',
       ).toBe(false)
+      const paneRoot = page.locator('[data-context="fresh-agent"]').last()
+      const composer = paneRoot.getByRole('textbox', { name: 'Chat message input' })
+      await composer.fill('zero-turn post-restart send')
+      await paneRoot.getByRole('button', { name: 'Send' }).click()
+      await expect(paneRoot.getByText('ZERO_TURN_REPLY', { exact: true })).toBeVisible({ timeout: 30_000 })
+      await expect.poll(() => readClaudeSimLedger(simLedger).some(
+        (row) => row.kind === 'prompt' && row.text === 'zero-turn post-restart send' && row.sessionId === originalDurable,
+      ), { timeout: 15_000, message: 'the resumed zero-turn conversation receives the next send under its original UUID' })
+        .toBe(true)
       const contentAfter = findFreshAgentLeaf(await harness.getPaneLayout(freshTabId))!.content!
       expect(contentAfter.restoreError?.reason ?? null).not.toBe('durable_artifact_missing')
       // In-place resume: the client's .lost re-create fallback must NOT have
@@ -250,6 +249,7 @@ test.describe('freshclaude zero-turn restart (kata 09v1)', () => {
       expect(contentAfter.createRequestId).toBe(createRequestIdBefore)
     } finally {
       await server.stop()
+      await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
     }
   })
 })

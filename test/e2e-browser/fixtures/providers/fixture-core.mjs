@@ -1,10 +1,9 @@
 // HARNESS-03 — deterministic provider-fixture core engine.
 //
-// Shared engine behind the seven fake provider executables in this directory
-// (fake-claude / fake-gemini / fake-kimi / fake-amplifier terminal CLIs,
-// fake-claude-sdk-sidecar for kilroy/freshclaude, fake-codex-app-server,
-// fake-opencode-server). It provides two uniform, provider-independent
-// observability surfaces plus a scriptable event engine:
+// Shared engine behind the six remaining fake provider executables in this
+// directory (fake-claude / fake-gemini / fake-kimi / fake-amplifier terminal
+// CLIs, fake-codex-app-server, fake-opencode-server). It provides two uniform,
+// provider-independent observability surfaces plus a scriptable event engine:
 //
 //   - Launch ledger (env FRESHELL_FAKE_LEDGER): one JSONL row per process
 //     launch — { t, pid, provider, argv, cwd, env } where `env` is STRICTLY

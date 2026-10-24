@@ -10,7 +10,7 @@
  * - Test 1 (terminal): the replacement terminal is claimed in the hidden
  *   pane's terminal.interest snapshot without attaching. Reveal then attaches
  *   and proves that the replacement shell accepts input and has real geometry.
- * - Test 2 (fresh-agent): the sidecar request log records a resume using the
+ * - Test 2 (fresh-agent): the simulator ledger records a resume using the
  *   original durable session ID while the pane remains hidden, and the pane
  *   keeps its createRequestId instead of creating a duplicate session.
  *
@@ -24,6 +24,7 @@ import { RustServer } from '../helpers/rust-server.js'
 import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { claudeSimulatorServerEnv, onPrompt, readClaudeSimLedger } from '../helpers/claude-sim-lane.js'
 import type { Page } from '@playwright/test'
 import fs from 'node:fs/promises'
 import os from 'node:os'
@@ -35,8 +36,6 @@ import { fileURLToPath } from 'node:url'
 // donor spec (e.g. restore-contract-wall-rust.spec.ts:39-40).
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
-
-const FAKE_CLAUDE_SIDECAR_SOURCE = path.resolve(__dirname, '../fixtures/fake-claude-sidecar.mjs')
 
 // ---------------------------------------------------------------------------
 // Shared helpers (per-spec copies -- donor: restore-contract-wall-rust.spec.ts)
@@ -141,8 +140,7 @@ async function createTabViaRest(info: E2eServerInfo, body: object): Promise<stri
   return tabId as string
 }
 
-// --- freshclaude fresh-agent helper (fixture: fake-claude-sidecar.mjs via the
-// production env seam FRESHELL_CLAUDE_SIDECAR) ---
+// --- freshclaude fresh-agent helper (production sidecar + CLI simulator) ---
 
 async function createFreshclaudePane(page: Page, harness: TestHarness, cwd: string): Promise<void> {
   // setAvailableClis is client-only AND gets overwritten by the app
@@ -281,12 +279,16 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
   })
 
   test('hidden fresh-agent pane recovers after abrupt restart without reveal', async ({ page }) => {
-    // Sidecar REQUEST log (FAKE_CLAUDE_SIDECAR_LOG, fake-claude-sidecar.mjs
-    // Task 7 knob): the post-restart resume proof below reads it. NOT the
-    // terminal-CLI argv log -- the fresh-agent path never spawns the CLI.
-    const requestLog = path.join(os.tmpdir(), `freshell-e2e-claude-sidecar-${Date.now()}.jsonl`)
+    // The simulator query ledger proves the durable identity used after restart.
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-hidden-rebind-'))
+    const simLedger = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
     const { server, harness, info } = await bootWall(page, {
-      env: { FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE, FAKE_CLAUDE_SIDECAR_LOG: requestLog },
+      env: claudeSimulatorServerEnv({
+        ledgerPath: simLedger,
+        program: {
+          rules: [onPrompt('hidden pane post-restart send', [{ kind: 'text', data: { text: 'HIDDEN_REBIND_REPLY' } }])],
+        },
+      }),
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
     try {
@@ -299,7 +301,7 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
       // Create a freshclaude pane in the current tab (helper copied from the wall).
       const freshTabId = (await harness.getActiveTabId())!
       // Helper signature is (page, harness, cwd) -- the wall spec's call sites
-      // pass a project dir; any existing directory works for the fake sidecar.
+      // pass a project dir; any existing directory works for the simulator.
       await createFreshclaudePane(page, harness, os.tmpdir())
       await expect
         .poll(async () => {
@@ -307,12 +309,10 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
           return c?.sessionId && c?.createRequestId ? true : null
         }, { timeout: 30_000 })
         .not.toBeNull()
-      // Wait for the DURABLE identity (sdk.session.init merge writes the
-      // canonical UUID to sessionRef.sessionId + resumeSessionId,
-      // FreshAgentView.tsx mergePaneContent) -- the post-restart attach must
-      // deterministically carry it so the server's restart-parity resume arm
-      // (claude.rs handle_attach decision table) can engage.
-      // The fake sidecar mints a RANDOM canonical UUID per process (council
+      // Rust assigns the durable UUID in the create acknowledgement before
+      // any prompt, so the hidden rebind can carry it without waiting for an
+      // SDK init event.
+      // The simulator mints a RANDOM canonical UUID per conversation (council
       // follow-up: the old static default was collision-blind), so gate on
       // the canonical-UUID SHAPE and capture what this run minted below.
       await expect
@@ -323,6 +323,11 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
         .toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
       const contentBefore = findFreshAgentLeaf(await harness.getPaneLayout(freshTabId))!.content!
       const originalDurable = (contentBefore.sessionRef?.sessionId ?? contentBefore.resumeSessionId) as string
+      const createdFrame = (await harness.getReceivedWsMessages() as any[]).find(
+        (message) => message?.type === 'freshAgent.created' && message.requestId === contentBefore.createRequestId,
+      )
+      expect(createdFrame?.sessionRef, 'the create acknowledgement carries the durable Claude identity')
+        .toEqual({ provider: 'claude', sessionId: originalDurable })
       // COMBINED-TREE CONTRACT (F8 rebind x freshclaude restart parity): with
       // the restart-parity attach arm merged, a post-restart attach carrying
       // the durable UUID is resumed IN PLACE (sidecar respawn with
@@ -340,42 +345,34 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
       await revealTab(page, harness, shellTabId)
       await expect.poll(async () => harness.getActiveTabId(), { timeout: 15_000 }).not.toBe(freshTabId)
 
+      await harness.clearSentWsMessages()
       await server.restartAbrupt()
       await waitForWsReady(page)
 
       // TARGET CONTRACT (F8): WITHOUT reveal, the hidden fresh-agent pane's
       // session recovers to a usable state. DISCRIMINATING evidence -- stale
       // pre-restart Redux state also shows `sessionId` + 'idle', so client
-      // state alone proves nothing. The discriminator is SERVER-SIDE: the
-      // sidecar request log must contain a `create` carrying
-      // a resume boot of originalDurable, which only the restart-parity
-      // resume arm emits, and it only runs when THIS hidden pane's
-      // post-restart freshAgent.attach actually went out (the rebind queue
-      // under test driving the attach arm). The initial pane create carries
-      // a fresh boot, so a matching entry is unambiguous post-restart
-      // evidence. Do not weaken either conjunct.
+      // state alone proves nothing. Require the hidden pane's actual
+      // post-restart attach and the server's ready-replayed live owner before
+      // revealing it. A surviving writer need not start another SDK query.
+      await expect.poll(async () => {
+        const sent = await harness.getSentWsMessages() as any[]
+        return sent.find((message) => message?.type === 'freshAgent.attach'
+          && message?.sessionRef?.provider === 'claude'
+          && message?.sessionRef?.sessionId === originalDurable) ?? null
+      }, { timeout: 30_000, message: 'the hidden pane reattaches under its durable session reference' })
+        .toMatchObject({ type: 'freshAgent.attach', sessionRef: { provider: 'claude', sessionId: originalDurable } })
+      await expect.poll(async () => {
+        const owners = Object.values((await harness.getState())?.freshAgent?.runtimeOwners ?? {}) as any[]
+        return owners.find((owner) => owner.provider === 'claude' && owner.sessionId === originalDurable)?.ownerKind ?? null
+      }, { timeout: 30_000, message: 'the restarted connection reports the hidden session live owner' }).toBe('fresh-agent')
       await expect
         .poll(async () => {
           const c = findFreshAgentLeaf(await harness.getPaneLayout(freshTabId))?.content
           const status = c?.status ?? ''
           const usable = c?.sessionId && ['connected', 'idle', 'running'].includes(status)
-          const log = await fs.readFile(requestLog, 'utf-8').catch(() => '')
-          // The parity arm resumes by durable UUID when the session's original
-          // cwd survives, or by the transcript's `.jsonl` PATH when it does
-          // not (claude.rs decision table, ledger A15). Both carry the durable
-          // UUID; accept either shape.
-          const resumed = log
-            .split('\n')
-            .filter(Boolean)
-            .map((l) => JSON.parse(l))
-            .some(
-              (e) =>
-                e.msg?.type === 'create' &&
-                typeof e.msg?.boot?.resume === 'string' &&
-                (e.msg.boot.resume === originalDurable ||
-                  e.msg.boot.resume.endsWith(`/${originalDurable}.jsonl`)),
-            )
-          return usable && resumed ? `resumed:${status}` : null
+          const durable = c?.sessionRef?.sessionId ?? c?.resumeSessionId ?? ''
+          return usable && durable === originalDurable ? `usable:${status}` : null
         }, { timeout: 30_000 })
         .not.toBeNull()
 
@@ -392,8 +389,16 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
           return ['connected', 'idle', 'running'].includes(leaf?.content?.status ?? '')
         }, { timeout: 15_000 })
         .toBe(true)
+      const paneRoot = page.locator('[data-context="fresh-agent"]').last()
+      await paneRoot.getByRole('textbox', { name: 'Chat message input' }).fill('hidden pane post-restart send')
+      await paneRoot.getByRole('button', { name: 'Send' }).click()
+      await expect(paneRoot.getByText('HIDDEN_REBIND_REPLY', { exact: true })).toBeVisible({ timeout: 30_000 })
+      await expect.poll(() => readClaudeSimLedger(simLedger).some(
+        (row) => row.kind === 'prompt' && row.text === 'hidden pane post-restart send' && row.sessionId === originalDurable,
+      ), { timeout: 15_000, message: 'the revealed hidden pane still sends on the original durable session' }).toBe(true)
     } finally {
       await server.stop()
+      await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
     }
   })
 

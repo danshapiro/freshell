@@ -41,6 +41,7 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { claudeSimulatorServerEnv } from '../helpers/claude-sim-lane.js'
 
 // ESM project ("type": "module" in package.json): __dirname does not exist in
 // ESM modules, so derive it -- same convention as every fixture-referencing
@@ -58,7 +59,6 @@ const FAKE_CODEX_CLI_SOURCE = path.resolve(__dirname, '../fixtures/fake-codex-cl
 const FAKE_OPENCODE_TERMINAL_SOURCE = path.resolve(__dirname, '../fixtures/fake-opencode-terminal.mjs')
 const FAKE_OPENCODE_SIDECAR_SOURCE = path.resolve(__dirname, '../fixtures/fake-opencode.cjs')
 const FAKE_CLAUDE_CLI_SOURCE = path.resolve(__dirname, '../fixtures/fake-claude-cli.mjs')
-const FAKE_CLAUDE_SIDECAR_SOURCE = path.resolve(__dirname, '../fixtures/fake-claude-sidecar.mjs')
 const FAKE_CODEX_APP_SERVER_SOURCE = path.resolve(
   __dirname,
   '../../fixtures/coding-cli/codex-app-server/fake-app-server.mjs',
@@ -479,8 +479,7 @@ async function createFreshopencodePane(page: Page, cwd: string): Promise<void> {
   })
 }
 
-// --- freshclaude fresh-agent helper (fixture: fake-claude-sidecar.mjs via the
-// production env seam FRESHELL_CLAUDE_SIDECAR) ---
+// --- freshclaude fresh-agent helper (production sidecar + CLI simulator) ---
 
 async function createFreshclaudePane(page: Page, harness: TestHarness, cwd: string): Promise<void> {
   // setAvailableClis is client-only AND gets overwritten by the app
@@ -1326,7 +1325,23 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     await fs.mkdir(projectDir, { recursive: true })
 
     const { server, harness, info, context, page } = await bootWall(browser, {
-      env: { FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE },
+      env: claudeSimulatorServerEnv({
+        ledgerPath: path.join(sharedRoot, 'claude-sim-ledger.jsonl'),
+        program: {
+          rules: [
+            {
+              on: 'msg:prompt',
+              match: { text: 'wall freshclaude turn' },
+              emit: [{ kind: 'text', data: { text: 'RESTORE_WALL_REPLY' } }],
+            },
+            {
+              on: 'msg:prompt',
+              match: { text: 'wall freshclaude liveness turn' },
+              emit: [{ kind: 'text', data: { text: 'RESTORE_WALL_LIVENESS_REPLY' } }],
+            },
+          ],
+        },
+      }),
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
     try {
@@ -1340,36 +1355,14 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
       await createFreshclaudePane(page, harness, projectDir)
       await sendFreshAgentTurn(page, harness, tabId, 'wall freshclaude turn')
-      // Pre-kill turn proof via the HARNESS (Redux), not UI chrome (corrected,
-      // council fix round): the fresh-agent transcript renders exclusively
-      // from the REST thread snapshot (FreshAgentView.tsx:1302,1782 --
-      // getFreshAgentThreadSnapshot -> snapshot?.turns). The claim that "the
-      // Rust router has NO claude snapshot adapter -> 503" is FALSE at HEAD --
-      // crates/freshell-freshagent/src/snapshot.rs:133-146 routes
-      // freshclaude/kilroy + claude through get_claude_snapshot(), a
-      // disk+env adapter over the CLI's own transcript store;
-      // FRESH_AGENT_RUNTIME_UNAVAILABLE now only fires for session types
-      // with no adapter registered at all. This assertion still reads via
-      // the harness (not DOM) because the snapshot fetch can race pane
-      // creation, not because the adapter is missing. The sidecar protocol
-      // itself is verified end-to-end regardless: freshAgent.event/
-      // freshAgent.assistant arrives on the wire and folds into the
-      // freshAgent slice (turns[]) -- assert THAT (createFreshclaudePane's
-      // note: assert pane state via the harness, never error-free UI chrome
-      // for freshclaude).
-      await expect
-        .poll(async () => {
-          const sessions = (await harness.getState())?.freshAgent?.sessions ?? {}
-          return Object.values(sessions).some((s: any) =>
-            (s?.turns ?? []).some((turn: any) =>
-              turn?.role === 'assistant'
-              && (turn?.items ?? []).some(
-                (item: any) => typeof item?.text === 'string' && item.text.includes('Fixture claude turn'),
-              ),
-            ),
-          )
-        }, { timeout: 20_000 })
-        .toBe(true)
+      // Verify the unique scripted reply in the pane's live transcript. The
+      // SDK assistant frame is folded into the live-transcript slice; the
+      // `freshAgent.sessions` Redux cache is populated by REST snapshots and
+      // is not the live-stream source. After restart, the later assertion
+      // checks the same reply was rehydrated from the durable transcript.
+      await expect(
+        page.locator('[data-context="fresh-agent"]').last().getByText('RESTORE_WALL_REPLY', { exact: true }),
+      ).toBeVisible({ timeout: 20_000 })
 
       const originalSessionId: string = await expect
         .poll(async () => leafDurableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId))) ?? null, {
@@ -1405,7 +1398,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         })
         .toBe(originalSessionId)
       await expect(
-        page.locator('[data-context="fresh-agent"]').last().getByText('Fixture claude turn'),
+        page.locator('[data-context="fresh-agent"]').last().getByText('RESTORE_WALL_REPLY', { exact: true }),
       ).toBeVisible({ timeout: 30_000 })
       const finalLeaf = findFreshAgentLeaf(await harness.getPaneLayout(rehydratedTabId))
       expect(finalLeaf?.content?.status).not.toBe('error')
@@ -1433,30 +1426,15 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         expect(create.resumeSessionId ?? create.sessionRef?.sessionId, JSON.stringify(create)).toBe(originalSessionId)
       }
 
-      // LIVENESS (council follow-up, PR #562/#563 close-out): everything
-      // above proves the durable IDENTITY survived, but a mutation where the
-      // attach arm sets pane status and never wires the event stream (the
-      // literal historical P0.2 bug shape) would leave every assertion above
-      // green over a dead socket. Mirror lane test 1's post-restart turn on
-      // THIS ordering (SIGKILL restart THEN reload, attach-resolved): send a
-      // second turn and require the assistant reply to ROUND-TRIP through
-      // the live event stream into the freshAgent slice (turns[] is fed by
-      // wire events -- freshAgent.assistant folds, fresh-agent-ws.ts -- so a
-      // dead socket can never grow it), plus the fixture transcript on disk
-      // gaining the second user line (the server->sidecar leg).
-      const countFoldedAssistantTurns = async (): Promise<number> => {
-        const sessions = (await harness.getState())?.freshAgent?.sessions ?? {}
-        return Object.values(sessions).reduce(
-          (n: number, s: any) =>
-            n + (s?.turns ?? []).filter((t: any) => t?.role === 'assistant').length,
-          0,
-        )
-      }
-      const assistantTurnsBefore = await countFoldedAssistantTurns()
+      // LIVENESS: after this SIGKILL restart and reload, send another turn
+      // through the same pane and require its unique answer in the rendered
+      // conversation. The normalized session cache's `turns` array is
+      // snapshot-only; assistant frames are folded into the transcript view,
+      // so the pane and durable JSONL are the behavior-level checks here.
       await sendFreshAgentTurn(page, harness, rehydratedTabId, 'wall freshclaude liveness turn')
-      await expect
-        .poll(countFoldedAssistantTurns, { timeout: 30_000 })
-        .toBeGreaterThan(assistantTurnsBefore)
+      await expect(
+        page.locator('[data-context="fresh-agent"]').last().getByText('RESTORE_WALL_LIVENESS_REPLY', { exact: true }),
+      ).toBeVisible({ timeout: 30_000 })
       const transcriptFile = path.join(
         info.homeDir,
         '.claude',
@@ -1475,7 +1453,14 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       expect(userTexts).toEqual(
         expect.arrayContaining(['wall freshclaude turn', 'wall freshclaude liveness turn']),
       )
-      expect(transcriptLines.filter((l: any) => l.type === 'assistant').length).toBeGreaterThanOrEqual(2)
+      const assistantTexts = transcriptLines
+        .filter((line: any) => line.type === 'assistant')
+        .flatMap((line: any) => line.message?.content ?? [])
+        .filter((block: any) => block?.type === 'text')
+        .map((block: any) => block.text)
+      expect(assistantTexts).toEqual(
+        expect.arrayContaining(['RESTORE_WALL_REPLY', 'RESTORE_WALL_LIVENESS_REPLY']),
+      )
     } finally {
       await context.close().catch(() => {})
       await server.stop()
@@ -1621,6 +1606,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     const codexArgLog = path.join(sharedRoot, 'codex-argv.jsonl')
     const opencodeArgLog = path.join(sharedRoot, 'opencode-argv.jsonl')
     const opencodeAuditLog = path.join(sharedRoot, 'opencode-audit.jsonl')
+    const claudeSimLedger = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
     const binDir = path.join(sharedRoot, 'bin')
     const fakeClaudePath = await installFakeCli(FAKE_CLAUDE_CLI_SOURCE, 'claude', binDir)
     const fakeCodexPath = await installDualRoleCodex(binDir, codexArgLog)
@@ -1633,7 +1619,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         CODEX_CMD: fakeCodexPath,
         FAKE_CODEX_ARGV_LOG: codexArgLog,
         OPENCODE_CMD: fakeOpencodePath,
-        FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE,
+        ...claudeSimulatorServerEnv({ ledgerPath: claudeSimLedger }),
       },
       setupHome: async (homeDir) => {
         await seedWallConfig({ providers: ['claude', 'codex', 'opencode'], freshAgent: true })(
@@ -2368,8 +2354,12 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     await fs.mkdir(projectDir, { recursive: true })
     const { server, harness, context, page } = await bootWall(browser, {
       env: {
-        FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE,
-        FAKE_CLAUDE_SIDECAR_HOLD_TURN: '1',
+        ...claudeSimulatorServerEnv({
+          ledgerPath: path.join(sharedRoot, 'claude-sim-ledger.jsonl'),
+          program: {
+            rules: [{ on: 'msg:prompt', match: { text: 'busy turn' }, emit: [{ kind: 'hang' }] }],
+          },
+        }),
       },
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
@@ -2381,7 +2371,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
       await createFreshclaudePane(page, harness, projectDir)
 
-      // Send a turn that NEVER completes (HOLD_TURN) -> status running.
+      // Send a turn that NEVER completes (the simulator hangs this prompt) -> status running.
       const paneRoot = page.locator('[data-context="fresh-agent"]').last()
       await expect
         .poll(async () => findFreshAgentLeaf(await harness.getPaneLayout(tabId))?.content?.status, {

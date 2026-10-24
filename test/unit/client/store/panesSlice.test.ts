@@ -3436,6 +3436,24 @@ describe('panesSlice', () => {
         expect(content.resumeSessionId).toBe(OPENCODE_DURABLE_ID)
       })
 
+      it('retains a non-Claude durable ref without rewriting its distinct live sessionId', () => {
+        const liveSessionId = 'opencode-live-session-handle'
+        const brokenDurable: FreshAgentPaneContent = {
+          ...durableOpencodeContent(),
+          sessionId: liveSessionId,
+          restoreError: DEAD_HANDLE_RESTORE_ERROR,
+        }
+
+        const updated = panesReducer(
+          initialState,
+          initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: brokenDurable }),
+        )
+        const content = freshAgentLeaf(updated)
+        expect(content.sessionRef).toEqual({ provider: 'opencode', sessionId: OPENCODE_DURABLE_ID })
+        expect(content.sessionId).toBe(liveSessionId)
+        expect(content.restoreError).toEqual(DEAD_HANDLE_RESTORE_ERROR)
+      })
+
       it('hydrate: restoreError on a DURABLE incoming identity applies unchanged', () => {
         const brokenDurable: FreshAgentPaneContent = {
           ...durableOpencodeContent(),
@@ -3456,6 +3474,73 @@ describe('panesSlice', () => {
         const content = freshAgentLeaf(merged)
         expect(content.restoreError).toEqual(DEAD_HANDLE_RESTORE_ERROR)
         expect(content.sessionId).toBe(OPENCODE_DURABLE_ID)
+      })
+
+      it('hydrate: retains a valid same-provider Claude sessionRef with a recoverable restore error', () => {
+        const claudeSessionId = VALID_CLAUDE_SESSION_ID
+        const brokenClaude: FreshAgentPaneContent = {
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
+          createRequestId: 'req-claude-hydrate-restore-error',
+          status: 'idle',
+          sessionId: claudeSessionId,
+          sessionRef: { provider: 'claude', sessionId: claudeSessionId },
+          restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'durable_artifact_missing' },
+        }
+
+        const hydrated = panesReducer(
+          initialState,
+          hydratePanes(stateWithLayout({
+            'tab-1': { type: 'leaf', id: 'pane-1', content: brokenClaude },
+          })),
+        )
+        const content = freshAgentLeaf(hydrated)
+        expect(content.sessionRef).toEqual({ provider: 'claude', sessionId: claudeSessionId })
+        expect(content.sessionId).toBe(claudeSessionId)
+        expect(content.restoreError).toEqual({
+          code: 'RESTORE_UNAVAILABLE',
+          reason: 'durable_artifact_missing',
+        })
+      })
+
+      it('keeps a validated same-provider Claude sessionRef through restore-error folds and later updates', () => {
+        const claudeSessionId = VALID_CLAUDE_SESSION_ID
+        const claudeContent: FreshAgentPaneContent = {
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
+          createRequestId: 'req-claude-restore-error',
+          status: 'idle',
+          sessionId: claudeSessionId,
+          resumeSessionId: claudeSessionId,
+          sessionRef: { provider: 'claude', sessionId: claudeSessionId },
+        }
+        const seeded = panesReducer(
+          initialState,
+          initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: claudeContent }),
+        )
+
+        const markedLost = panesReducer(
+          seeded,
+          mergePaneContent({
+            tabId: 'tab-1',
+            paneId: 'pane-1',
+            updates: { restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'durable_artifact_missing' } },
+          }),
+        )
+        const afterRefresh = panesReducer(
+          markedLost,
+          mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: { status: 'idle' } }),
+        )
+
+        const content = freshAgentLeaf(afterRefresh)
+        expect(content.sessionRef).toEqual({ provider: 'claude', sessionId: claudeSessionId })
+        expect(content.sessionId).toBe(claudeSessionId)
+        expect(content.restoreError).toEqual({
+          code: 'RESTORE_UNAVAILABLE',
+          reason: 'durable_artifact_missing',
+        })
       })
 
       it('deliberate reset: restoreError + placeholder under a NEW createRequestId applies unchanged', () => {

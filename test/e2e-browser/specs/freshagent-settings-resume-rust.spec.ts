@@ -39,6 +39,7 @@ import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import type { Page } from '@playwright/test'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-version.js'
+import { claudeSimulatorServerEnv, readClaudeSimLedger } from '../helpers/claude-sim-lane.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -47,7 +48,6 @@ const CODEX_FIXTURE = path.resolve(
   __dirname,
   '../../fixtures/coding-cli/codex-app-server/fake-app-server.mjs',
 )
-const CLAUDE_FIXTURE = path.resolve(__dirname, '../fixtures/fake-claude-sidecar.mjs')
 const OPENCODE_FIXTURE = path.resolve(__dirname, '../fixtures/fake-opencode.cjs')
 
 // ---------------------------------------------------------------------------
@@ -185,7 +185,11 @@ async function bootWall(
     setupHome?: (homeDir: string) => Promise<void>
   } = {},
 ): Promise<{ server: RustServer; info: Awaited<ReturnType<RustServer['start']>>; harness: TestHarness }> {
-  const server = new RustServer({ env: options.env, setupHome: options.setupHome })
+  const server = new RustServer({
+    env: options.env,
+    setupHome: options.setupHome,
+    verbose: process.env.FRESHELL_E2E_SERVER_VERBOSE === '1',
+  })
   const info = await server.start()
   await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
   const harness = new TestHarness(page)
@@ -240,7 +244,7 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
   test('claude: model, thinking, and permission changes apply to the next message in the same conversation', async ({ page }) => {
     test.setTimeout(180_000)
     const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'fa-settings-next-claude-'))
-    const sidecarLogPath = path.join(sharedRoot, 'sidecar-requests.jsonl')
+    const simLedger = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
     // Deterministic catalog only: the conversation and settings writes run
     // through the real browser, WebSocket handler, and Rust Claude runtime.
     await page.route('**/api/fresh-agent/model-capabilities/freshclaude**', (route) => route.fulfill({ json: {
@@ -249,7 +253,25 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
         supportedEffortLevels: ['low', 'medium', 'high'], supportsAdaptiveThinking: false }],
     } }))
     const { server, harness } = await bootWall(page, {
-      env: { FRESHELL_CLAUDE_SIDECAR: CLAUDE_FIXTURE, FAKE_CLAUDE_SIDECAR_LOG: sidecarLogPath, FAKE_CLAUDE_SIDECAR_ECHO_SETTINGS: '1' },
+      env: claudeSimulatorServerEnv({
+        ledgerPath: simLedger,
+        program: {
+          rules: [
+            {
+              on: 'msg:prompt',
+              match: { text: 'First message before settings change' },
+              once: true,
+              emit: [{ kind: 'text', data: { text: 'settings test first response' } }],
+            },
+            {
+              on: 'msg:prompt',
+              match: { text: 'Second message uses the selected settings' },
+              once: true,
+              emit: [{ kind: 'text', data: { text: 'settings test updated response' } }],
+            },
+          ],
+        },
+      }),
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
     try {
@@ -262,7 +284,7 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
       await expect(composer).toBeEnabled({ timeout: 30_000 })
       await composer.fill('First message before settings change')
       await pane.getByRole('button', { name: 'Send', exact: true }).click()
-      await expect(pane.getByText(/^Fixture claude turn/)).toBeVisible({ timeout: 30_000 })
+      await expect(pane.getByText('settings test first response', { exact: true })).toBeVisible({ timeout: 30_000 })
       await expect(pane.getByRole('button', { name: 'Stop', exact: true })).toBeHidden()
       const before = findFreshAgentLeaf(await harness.getPaneLayout(tabId)).content
 
@@ -276,15 +298,12 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
       await page.getByRole('button', { name: 'Agent settings', exact: true }).click()
       await composer.fill('Second message uses the selected settings')
       await pane.getByRole('button', { name: 'Send', exact: true }).click()
-      await expect(pane.getByText('Fixture claude turn (sonnet, low, plan)', { exact: true })).toBeVisible({ timeout: 30_000 })
+      await expect(pane.getByText('settings test updated response', { exact: true })).toBeVisible({ timeout: 30_000 })
 
-      const requests = readJsonl(sidecarLogPath).map((row) => row.msg)
-      const secondSend = requests.findIndex((msg) => msg.type === 'send' && msg.text === 'Second message uses the selected settings')
-      const configure = requests.findLastIndex((msg) => msg.type === 'configure')
-      expect(configure).toBeGreaterThan(-1)
-      expect(configure).toBeLessThan(secondSend)
-      expect(requests[configure].settings).toMatchObject({ model: 'sonnet', effort: 'low', permissionMode: 'plan' })
-      expect(requests.filter((msg) => msg.type === 'create')).toHaveLength(1)
+      const ledger = readClaudeSimLedger(simLedger)
+      const secondPrompt = ledger.find((row) => row.kind === 'prompt' && row.text === 'Second message uses the selected settings')
+      expect(secondPrompt).toMatchObject({ model: 'sonnet', effort: 'low', permissionMode: 'plan' })
+      expect(ledger.filter((row) => row.kind === 'query')).toHaveLength(1)
       const after = findFreshAgentLeaf(await harness.getPaneLayout(tabId)).content
       expect(after.sessionId).toBe(before.sessionId)
       expect(after.sessionRef).toEqual(before.sessionRef)
@@ -506,14 +525,12 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
   test('claude: attach resume request carries model/permissionMode', async () => {
     test.setTimeout(180_000)
     const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'fa-settings-claude-'))
-    const sidecarLogPath = path.join(sharedRoot, 'sidecar-requests.jsonl')
+    const simLedger = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
     const projectDir = path.join(sharedRoot, 'proj')
     await fsp.mkdir(projectDir, { recursive: true })
     const server = new RustServer({
-      env: {
-        FRESHELL_CLAUDE_SIDECAR: CLAUDE_FIXTURE,
-        FAKE_CLAUDE_SIDECAR_LOG: sidecarLogPath,
-      },
+      verbose: process.env.FRESHELL_E2E_SERVER_VERBOSE === '1',
+      env: claudeSimulatorServerEnv({ ledgerPath: simLedger }),
     })
     let ws: WsCapture | null = null
     try {
@@ -539,7 +556,16 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
         'freshAgent.created (claude create)',
       )
       const bridgeSessionId = created.sessionId as string
-      // sdk.session.init -> freshAgent.session.init carries the durable UUID.
+
+      // The SDK reports its durable identity with the first model turn's
+      // system init. Drive that turn before waiting for the identity event.
+      ws.send({
+        type: 'freshAgent.send',
+        provider: 'claude',
+        sessionId: bridgeSessionId,
+        sessionType: 'freshclaude',
+        text: 'settings-resume first claude turn',
+      })
       const init = await ws.waitFor(
         (f) =>
           f.type === 'freshAgent.event' &&
@@ -551,14 +577,8 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
       const durable = init.event.cliSessionId as string
       expect(durable).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
 
-      // One turn (the fixture ends it with its result; the server rings it).
-      ws.send({
-        type: 'freshAgent.send',
-        provider: 'claude',
-        sessionId: bridgeSessionId,
-        sessionType: 'freshclaude',
-        text: 'settings-resume first claude turn',
-      })
+      // The production sidecar reports the turn's durable id before forwarding
+      // its completion frame.
       await ws.waitFor(
         (f) =>
           f.type === 'freshAgent.event' &&
@@ -588,21 +608,22 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
         sessionRef: { provider: 'claude', sessionId: durable },
       })
 
-      // The resume-on-attach spawns a fresh sidecar whose create carries
-      // a resume boot + the LEDGER-recorded settings (Task 10).
+      // The resume-on-attach starts a new simulated CLI query with the durable
+      // resume id and LEDGER-recorded settings (Task 10).
       await expect
         .poll(
-          () =>
-            readJsonl(sidecarLogPath).some((m) => m.msg && m.msg.boot?.resume === durable),
+          () => readClaudeSimLedger(simLedger)
+            .some((row) => row.kind === 'query' && (row.options as any)?.resume === durable),
           { timeout: 30_000 },
         )
         .toBe(true)
 
-      const msgs = fs.readFileSync(sidecarLogPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l))
-      const resumeCreate = msgs.filter((m) => m.msg && m.msg.boot?.resume).pop()
-      expect(resumeCreate, 'restart must issue a resume create').toBeTruthy()
-      expect(resumeCreate.msg.model, 'resume must carry the recorded model, not null').toBe('opus-x')
-      expect(resumeCreate.msg.permissionMode, 'resume must carry the recorded permissionMode').toBe('plan')
+      const resumeBoot = readClaudeSimLedger(simLedger)
+        .filter((row) => row.kind === 'query' && (row.options as any)?.resume === durable)
+        .at(-1)
+      expect(resumeBoot, 'restart must issue a resume query').toBeTruthy()
+      expect((resumeBoot?.options as any)?.model, 'resume must carry the recorded model, not null').toBe('opus-x')
+      expect((resumeBoot?.options as any)?.permissionMode, 'resume must carry the recorded permissionMode').toBe('plan')
     } finally {
       ws?.close()
       await server.stop().catch(() => {})

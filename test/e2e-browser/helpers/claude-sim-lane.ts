@@ -37,6 +37,28 @@ export const CLAUDE_CLI_SIMULATOR = path.resolve(__dirname, '../../fixtures/clau
 
 export type ClaudeSimFlavour = 'freshclaude' | 'kilroy'
 
+/** Environment for custom RustServer fixtures that use the production sidecar and CLI simulator. */
+export function claudeSimulatorServerEnv(input: {
+  ledgerPath: string
+  flavour?: ClaudeSimFlavour
+  program?: unknown
+  extra?: Record<string, string>
+}): Record<string, string> {
+  return {
+    FRESHELL_CLAUDE_SIDECAR: CLAUDE_SIDECAR,
+    FRESHELL_CLAUDE_NODE: process.execPath,
+    FRESHELL_CLAUDE_SDK_QUERY_MODULE: CLAUDE_CLI_SIMULATOR,
+    FRESHELL_CLAUDE_SIM_LEDGER: input.ledgerPath,
+    // An empty program preserves the simulator's built-in prompt markers
+    // (HANG, SLOW, ERROR_TURN, and friends) while preventing an inherited
+    // runner program from changing the test. Scenario-specific programs are
+    // supplied explicitly by the caller.
+    FRESHELL_CLAUDE_SIM_PROGRAM: JSON.stringify(input.program ?? { rules: [] }),
+    ...(input.flavour === 'kilroy' ? { KILROY_ENABLED: '1' } : {}),
+    ...input.extra,
+  }
+}
+
 /** One program emission (see test/fixtures/claude-cli-sim/program.mjs for the kinds). */
 export type ClaudeSimEmission = { kind: string, delayMs?: number, data?: Record<string, unknown> }
 export type ClaudeSimRule = { on: string, match?: Record<string, unknown>, once?: boolean, emit: ClaudeSimEmission[] }
@@ -64,6 +86,21 @@ export interface ClaudeSimLaneOptions {
 
 /** A row of the simulator's ledger (FRESHELL_CLAUDE_SIM_LEDGER). */
 export type ClaudeSimLedgerRow = { kind: string, [key: string]: unknown }
+
+/** Read the simulator's append-only JSONL ledger, tolerating a partial last write. */
+export function readClaudeSimLedger(file: string): ClaudeSimLedgerRow[] {
+  if (!existsSync(file)) return []
+  return readFileSync(file, 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .flatMap((line) => {
+      try {
+        return [JSON.parse(line) as ClaudeSimLedgerRow]
+      } catch {
+        return []
+      }
+    })
+}
 
 export interface ClaudeSimPane {
   paneRoot: Locator
@@ -214,17 +251,7 @@ export class ClaudeSimLane {
 
   /** What the simulated CLI recorded so far (its ledger). */
   ledger(): ClaudeSimLedgerRow[] {
-    if (!existsSync(this.ledgerPath)) return []
-    return readFileSync(this.ledgerPath, 'utf8')
-      .split('\n')
-      .filter(Boolean)
-      .flatMap((line) => {
-        try {
-          return [JSON.parse(line) as ClaudeSimLedgerRow]
-        } catch {
-          return []
-        }
-      })
+    return readClaudeSimLedger(this.ledgerPath)
   }
 
   /** Attach the server's output to a failed test's report. */

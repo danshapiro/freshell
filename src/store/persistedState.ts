@@ -28,6 +28,7 @@ import {
 } from './paneTypes'
 import { createLogger } from '@/lib/client-logger'
 import { isValidMachineIdStamp } from '@/lib/machine-identity'
+import { isDurableProviderSessionId } from '@shared/session-flavor'
 
 export { TABS_STORAGE_KEY, PANES_STORAGE_KEY }
 
@@ -357,6 +358,16 @@ function normalizeFreshAgentContent(content: Record<string, unknown>): Record<st
   )
   const existingRestoreError = readRestoreError(content.restoreError)
   if (existingRestoreError) {
+    const provider = content.provider === 'claude' || content.provider === 'codex' || content.provider === 'opencode'
+      ? content.provider
+      : undefined
+    const candidateSessionRef = sanitizeSessionRef(content.sessionRef)
+    const retainedSessionRef = existingRestoreError.reason !== 'invalid_legacy_restore_target'
+      && candidateSessionRef !== undefined
+      && candidateSessionRef.provider === provider
+      && isDurableProviderSessionId(provider, candidateSessionRef.sessionId)
+      ? candidateSessionRef
+      : undefined
     const {
       sessionRef: _legacySessionRef,
       restoreError: _legacyRestoreError,
@@ -382,6 +393,8 @@ function normalizeFreshAgentContent(content: Record<string, unknown>): Record<st
 
     return {
       ...rest,
+      ...(retainedSessionRef ? { sessionRef: retainedSessionRef } : {}),
+      ...(retainedSessionRef?.provider === 'claude' ? { sessionId: retainedSessionRef.sessionId } : {}),
       restoreError: existingRestoreError,
       ...(checkpointOutcomes ? { checkpointOutcomes } : {}),
     }

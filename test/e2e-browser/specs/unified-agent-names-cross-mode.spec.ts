@@ -13,7 +13,6 @@ import {
 } from '../helpers/unified-agent-names.js'
 import {
   bootJourney,
-  collectFreshAgentSessionIds,
   connect,
   findPaneIdOfSession,
   postJsonRetry429,
@@ -245,7 +244,6 @@ test.describe('cross-mode unified agent names', () => {
     // to the unified store or the generator.
     const journey = await bootJourney('freshclaude', {
       env: {
-        FRESHELL_FAKE_PROVIDER: 'kilroy',
         KILROY_ENABLED: '1',
         GEMINI_CMD: path.join(REPO_ROOT, 'test', 'e2e-browser', 'fixtures', 'providers', 'fake-gemini.mjs'),
       },
@@ -356,24 +354,55 @@ test.describe('cross-mode unified agent names', () => {
         'an excluded provider pane never carries a unified nameRef',
       ).toBeUndefined()
 
-      // (4) The excluded kilroy runtime: kilroy panes keep their existing
-      // naming behavior and never enter the unified store (no session-names
-      // record is created for a kilroy session, and no generation arms).
-      const kilroy = await createNamedAgent(harness, 'freshclaude', { entry: 'ui', page, server: journey.server })
+      // (4) Create a real Kilroy pane through the supported REST agent path.
+      // FRESHELL_FAKE_PROVIDER only selected the retired protocol fake's
+      // flavor; the production sidecar uses the pane's actual sessionType.
+      const kilroyResponse = await postJsonRetry429(
+        `${journey.server.info.baseUrl}/api/tabs`,
+        { agent: 'kilroy', cwd: journey.server.projectDir },
+        journey.server.info.token,
+      )
+      const kilroyText = await kilroyResponse.text()
+      expect(kilroyResponse.ok, kilroyText).toBe(true)
+      const kilroyData = (JSON.parse(kilroyText) as { data: { tabId: string; paneId: string } }).data
+      await harness.waitForTabCount(5, 15_000)
+      await expect.poll(async () => (
+        await paneContentFromLayoutSnapshot(journey.server, kilroyData.tabId, kilroyData.paneId)
+      )?.sessionType ?? null, { timeout: 15_000 }).toBe('kilroy')
+      const kilroyContent = await paneContentFromLayoutSnapshot(journey.server, kilroyData.tabId, kilroyData.paneId)
+      expect(kilroyContent?.namingHandle, 'Kilroy creates no unified pending-name handle').toBeUndefined()
+      expect(kilroyContent?.nameRef, 'Kilroy creates no unified session-name reference').toBeUndefined()
+
+      const kilroy = { tabId: kilroyData.tabId, paneId: kilroyData.paneId, nameRef: null }
+      await page.locator(`[data-context="tab"][data-tab-id="${kilroy.tabId}"]`).click()
+      const kilroyPane = page.locator(
+        `[data-pane-id="${kilroy.paneId}"] [data-context="fresh-agent"], [data-pane-id="${kilroy.paneId}"][data-context="fresh-agent"]`,
+      ).first()
+      await expect(kilroyPane).toBeVisible({ timeout: 15_000 })
       await sendFirstMessage(page, harness, kilroy, 'freshclaude', 'Kilroy keeps its naming')
-      await page.waitForTimeout(4_000)
-      const state = await harness.getState()
-      const kilroySessionIds = collectFreshAgentSessionIds(state)
-      expect(kilroySessionIds.length).toBeGreaterThan(0)
-      for (const sessionId of kilroySessionIds) {
-        const read = await fetch(`${journey.server.info.baseUrl}/api/session-names/read`, {
-          method: 'POST',
-          headers: { 'x-auth-token': journey.server.info.token, 'content-type': 'application/json' },
-          body: JSON.stringify({ refs: [{ kind: 'session', provider: 'claude', sessionId } as SessionNameRef] }),
-        })
-        const payload = await read.json() as { names: unknown[] }
-        expect(payload.names, `kilroy session ${sessionId} never enters the unified store`).toEqual([])
-      }
+      await expect(kilroyPane).toContainText('YouKilroy keeps its naming', { timeout: 30_000 })
+
+      let kilroySessionId = ''
+      await expect.poll(async () => {
+        const content = await paneContentFromLayoutSnapshot(journey.server, kilroy.tabId, kilroy.paneId)
+        const sessionRef = content?.sessionRef as { provider?: unknown; sessionId?: unknown } | undefined
+        if (content?.sessionType !== 'kilroy' || sessionRef?.provider !== 'claude'
+          || typeof sessionRef.sessionId !== 'string') return ''
+        kilroySessionId = sessionRef.sessionId
+        return kilroySessionId
+      }, {
+        timeout: 15_000,
+        message: 'the real Kilroy sidecar materialized a Claude sessionRef after the first turn',
+      }).not.toBe('')
+      const read = await fetch(`${journey.server.info.baseUrl}/api/session-names/read`, {
+        method: 'POST',
+        headers: { 'x-auth-token': journey.server.info.token, 'content-type': 'application/json' },
+        body: JSON.stringify({ refs: [{ kind: 'session', provider: 'claude', sessionId: kilroySessionId } as SessionNameRef] }),
+      })
+      const readText = await read.text()
+      expect(read.ok, readText).toBe(true)
+      const payload = JSON.parse(readText) as { names: unknown[] }
+      expect(payload.names, `real Kilroy session ${kilroySessionId} never enters the unified store`).toEqual([])
       await context.close()
     } finally {
       await journey.cleanup()

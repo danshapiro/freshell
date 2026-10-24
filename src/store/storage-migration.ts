@@ -56,6 +56,7 @@ import {
 } from '@shared/session-contract'
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 import { migrateLegacyFreshAgentContent, migrateLegacyFreshAgentDurableState } from '@shared/fresh-agent'
+import { isDurableProviderSessionId } from '@shared/session-flavor'
 import { normalizeFreshAgentPaneModelSelection } from './paneTypes'
 
 const log = createLogger('StorageMigration')
@@ -208,6 +209,16 @@ function normalizeLayoutNode(node: unknown): unknown {
     if (content.kind === 'fresh-agent') {
       const existingRestoreError = readRestoreError(content.restoreError)
       if (existingRestoreError) {
+        const provider = content.provider === 'claude' || content.provider === 'codex' || content.provider === 'opencode'
+          ? content.provider
+          : undefined
+        const candidateSessionRef = sanitizeSessionRef(content.sessionRef)
+        const retainedSessionRef = existingRestoreError.reason !== 'invalid_legacy_restore_target'
+          && candidateSessionRef !== undefined
+          && candidateSessionRef.provider === provider
+          && isDurableProviderSessionId(provider, candidateSessionRef.sessionId)
+          ? candidateSessionRef
+          : undefined
         const {
           sessionRef: _legacySessionRef,
           restoreError: _legacyRestoreError,
@@ -234,6 +245,8 @@ function normalizeLayoutNode(node: unknown): unknown {
           ...candidate,
           content: {
             ...rest,
+            ...(retainedSessionRef ? { sessionRef: retainedSessionRef } : {}),
+            ...(retainedSessionRef?.provider === 'claude' ? { sessionId: retainedSessionRef.sessionId } : {}),
             restoreError: existingRestoreError,
           },
         }

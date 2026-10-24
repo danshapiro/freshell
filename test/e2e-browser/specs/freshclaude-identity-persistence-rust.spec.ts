@@ -24,11 +24,11 @@ import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { MACHINE_ID_STORAGE_KEY } from '../../../src/store/storage-keys.js'
+import { claudeSimulatorServerEnv, onPrompt, readClaudeSimLedger } from '../helpers/claude-sim-lane.js'
 // NOTE: `Page` comes from '@playwright/test' (fixtures.ts exports only
 // `test`/`expect`, as every donor spec does). `openPanePicker` is IMPORTED,
 // not copied -- the copied `createFreshclaudePane` body calls it (wall :29,
-// :448). `fileURLToPath` feeds the FAKE_CLAUDE_SIDECAR_SOURCE constant below
-// (wall :34, :39).
+// :448).
 
 // ESM project ("type": "module" in package.json): __dirname does not exist in
 // ESM modules, so derive it -- same convention as every fixture-referencing
@@ -36,10 +36,8 @@ import { MACHINE_ID_STORAGE_KEY } from '../../../src/store/storage-keys.js'
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
-const FAKE_CLAUDE_SIDECAR_SOURCE = path.resolve(__dirname, '../fixtures/fake-claude-sidecar.mjs')
-
 // Canonical claude session id shape (copy of shared/session-contract.ts's
-// CLAUDE_SESSION_ID_RE -- per-spec-ownership convention). The fake sidecar
+// CLAUDE_SESSION_ID_RE -- per-spec-ownership convention). The simulator
 // mints a RANDOM canonical UUID per process (council follow-up, PR #562/#563
 // close-out: the old static 44444444-... default made every resume-less
 // create in every sidecar process collide onto one constant id --
@@ -134,7 +132,11 @@ async function bootWall(
     setupHome?: (homeDir: string) => Promise<void>
   } = {},
 ): Promise<{ server: RustServer; info: E2eServerInfo; harness: TestHarness }> {
-  const server = new RustServer({ env: options.env, setupHome: options.setupHome })
+  const server = new RustServer({
+    env: options.env,
+    setupHome: options.setupHome,
+    verbose: process.env.FRESHELL_E2E_SERVER_VERBOSE === '1',
+  })
   const info = await server.start()
   await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
   const harness = new TestHarness(page)
@@ -149,6 +151,18 @@ function findFreshAgentLeaf(node: any): any {
   if (node.type === 'split') {
     for (const child of node.children ?? []) {
       const found = findFreshAgentLeaf(child)
+      if (found) return found
+    }
+  }
+  return null
+}
+
+function findPaneById(node: any, paneId: string): any {
+  if (!node) return null
+  if (node.type === 'leaf' && node.id === paneId) return node
+  if (node.type === 'split') {
+    for (const child of node.children ?? []) {
+      const found = findPaneById(child, paneId)
       if (found) return found
     }
   }
@@ -191,6 +205,33 @@ async function persistedFreshAgentIdentity(page: Page, tabId: string): Promise<s
   }, tabId)
 }
 
+/** Add the pre-identity-migration live placeholder back to a persisted pane. */
+async function seedLegacyFreshAgentPlaceholder(page: Page, tabId: string, placeholder: string): Promise<void> {
+  const seededIdentity = await page.evaluate(({ id, legacyPlaceholder }) => {
+    const layoutWindowId = sessionStorage.getItem('freshell.layout-window-id.v1')
+    if (!layoutWindowId) throw new Error('Missing layout-window-id while seeding the old pane shape')
+    const key = `freshell.layout.v3.${layoutWindowId}`
+    const raw = localStorage.getItem(key)
+    if (!raw) throw new Error('Missing persisted layout while seeding the old pane shape')
+    const layout = JSON.parse(raw)
+    const visit = (node: any): any => {
+      if (!node) return null
+      if (node.type === 'leaf' && node.content?.kind === 'fresh-agent') return node
+      for (const child of node.children ?? []) {
+        const found = visit(child)
+        if (found) return found
+      }
+      return null
+    }
+    const leaf = visit(layout?.panes?.layouts?.[id])
+    if (!leaf) throw new Error(`Missing persisted fresh-agent pane ${id}`)
+    leaf.content.sessionId = legacyPlaceholder
+    localStorage.setItem(key, JSON.stringify(layout))
+    return leaf.content.sessionRef?.sessionId ?? null
+  }, { id: tabId, legacyPlaceholder: placeholder })
+  expect(seededIdentity, 'the old placeholder must coexist with a durable Claude sessionRef').toBeTruthy()
+}
+
 /** Send one chat turn in the last fresh-agent pane and wait for idle. For a
  * claude pane the idle wait does not prove the turn ran: the client never marks
  * a claude pane running on send (only opencode), and the composer hands the
@@ -228,13 +269,13 @@ async function sendFreshAgentTurn(
     .toBe('idle')
 }
 
-/** The fake sidecar's transcript for `durable` (its ground truth for what
- * reached it): the user texts in order and the number of assistant replies. */
+/** The simulated CLI transcript for `durable`: user texts and assistant replies. */
 async function readFixtureTranscript(
   homeDir: string,
   durable: string,
 ): Promise<{ userTexts: string[]; assistantTurns: number }> {
-  const transcriptFile = path.join(homeDir, '.claude', 'projects', '-fixture', `${durable}.jsonl`)
+  const transcriptFile = await findTranscriptFile(path.join(homeDir, '.claude', 'projects'), `${durable}.jsonl`)
+  if (!transcriptFile) return { userTexts: [], assistantTurns: 0 }
   const lines = (await fs.readFile(transcriptFile, 'utf-8'))
     .trim()
     .split('\n')
@@ -246,6 +287,24 @@ async function readFixtureTranscript(
       .map((l: any) => l.message?.content?.[0]?.text),
     assistantTurns: lines.filter((l: any) => l.type === 'assistant').length,
   }
+}
+
+async function findTranscriptFile(root: string, basename: string): Promise<string | null> {
+  let entries
+  try {
+    entries = await fs.readdir(root, { withFileTypes: true })
+  } catch {
+    return null
+  }
+  for (const entry of entries) {
+    const candidate = path.join(root, entry.name)
+    if (entry.isFile() && entry.name === basename) return candidate
+    if (entry.isDirectory()) {
+      const nested = await findTranscriptFile(candidate, basename)
+      if (nested) return nested
+    }
+  }
+  return null
 }
 
 /** The page's freshAgent.send frames since the last clear, each with when it
@@ -328,8 +387,7 @@ async function expectFixtureTranscript(
   }
 }
 
-// --- freshclaude fresh-agent helper (fixture: fake-claude-sidecar.mjs via the
-// production env seam FRESHELL_CLAUDE_SIDECAR) ---
+// --- freshclaude fresh-agent helper (production sidecar + CLI simulator) ---
 
 async function createFreshclaudePane(page: Page, harness: TestHarness, cwd: string): Promise<void> {
   // setAvailableClis is client-only AND gets overwritten by the app
@@ -375,10 +433,18 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
   test('durable identity survives browser reload, then SIGKILL restart resumes the SAME conversation', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-identity-freshclaude-'))
     const projectDir = path.join(sharedRoot, 'project')
+    const simLedger = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
     await fs.mkdir(projectDir, { recursive: true })
     const { server, info, harness } = await bootWall(page, {
-      // EXACT leg-G options (wall :1174-1177):
-      env: { FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE },
+      env: claudeSimulatorServerEnv({
+        ledgerPath: simLedger,
+        program: {
+          rules: [
+            onPrompt('first turn before reload', [{ kind: 'text', data: { text: 'IDENTITY_FIRST_REPLY' } }]),
+            onPrompt('second turn after restart', [{ kind: 'text', data: { text: 'IDENTITY_SECOND_REPLY' } }]),
+          ],
+        },
+      }),
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
     try {
@@ -396,7 +462,7 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
       // harness, exactly as the wall's leg G does (:1180).
       await createFreshclaudePane(page, harness, projectDir)
       await sendFreshAgentTurn(page, harness, tabId!, 'first turn before reload')
-      await expect(page.locator('[data-context="fresh-agent"]').last()).toContainText('Fixture claude turn', { timeout: 30_000 })
+      await expect(page.locator('[data-context="fresh-agent"]').last()).toContainText('IDENTITY_FIRST_REPLY', { timeout: 30_000 })
 
       // THE FOLD (shipped behavior: FreshAgentView.tsx's durable-identity
       // merge effect -- cited at plan-time base 7508149b as :1798-1830; on
@@ -445,8 +511,8 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
         .poll(async () => durableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabIdAfterReload!))), { timeout: 30_000 })
         .toBe(originalDurable)
       await sendFreshAgentTurn(page, harness, tabIdAfterReload!, 'second turn after restart')
-      await expect(page.locator('[data-context="fresh-agent"]').last()).toContainText('Fixture claude turn', { timeout: 30_000 })
-      await expect(page.locator('[data-context="fresh-agent"]').last()).toContainText('first turn before reload', { timeout: 30_000 })
+      await expect(page.locator('[data-context="fresh-agent"]').last()).toContainText('IDENTITY_SECOND_REPLY', { timeout: 30_000 })
+      await expect(page.locator('[data-context="fresh-agent"]').last()).toContainText('IDENTITY_FIRST_REPLY', { timeout: 30_000 })
 
       // Every create sent across the reload+restart window targeted the
       // ORIGINAL session -- no identity-losing re-create. A create IS
@@ -480,6 +546,65 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
     }
   })
 
+  test('old persisted placeholder with a durable sessionRef reloads and accepts another send', async ({ page }) => {
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-identity-legacy-placeholder-'))
+    const projectDir = path.join(sharedRoot, 'project')
+    const simLedger = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
+    await fs.mkdir(projectDir, { recursive: true })
+    const { server, info, harness } = await bootWall(page, {
+      env: claudeSimulatorServerEnv({ ledgerPath: simLedger }),
+      setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
+    })
+    try {
+      await selectShellIfPickerShowing(page)
+      const tabId = (await harness.getActiveTabId())!
+      await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+      await createFreshclaudePane(page, harness, projectDir)
+      await sendFreshAgentTurn(page, harness, tabId, 'C26 first turn')
+      await expect.poll(async () => durableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId))))
+        .toMatch(CANONICAL_UUID_RE)
+      const originalDurable = durableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId)))
+      await expectFixtureTranscript(harness, server, info.homeDir, originalDurable, {
+        userTexts: ['C26 first turn'],
+        minAssistantTurns: 1,
+      })
+      const bootsBeforeReload = readClaudeSimLedger(simLedger).filter((row) => row.kind === 'boot').length
+      const queriesBeforeReload = readClaudeSimLedger(simLedger).filter((row) => row.kind === 'query').length
+
+      await flushPersistence(page)
+      await expect.poll(() => persistedFreshAgentIdentity(page, tabId)).toBe(originalDurable)
+      await seedLegacyFreshAgentPlaceholder(page, tabId, 'fc-e2e-legacy-placeholder')
+      await harness.clearSentWsMessages()
+      await reloadAndReconnect(page, harness)
+
+      const reloadedTabId = (await harness.getActiveTabId())!
+      await expect.poll(async () => durableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(reloadedTabId))))
+        .toBe(originalDurable)
+      await expect.poll(async () => (await harness.getSentWsMessages() as any[]).some(
+        (message) => message?.type === 'freshAgent.attach'
+          && message?.sessionRef?.provider === 'claude'
+          && message?.sessionRef?.sessionId === originalDurable,
+      ), { message: 'reload attaches using the pane’s durable Claude reference' }).toBe(true)
+      const durableAttach = (await harness.getSentWsMessages() as any[]).find(
+        (message) => message?.type === 'freshAgent.attach'
+          && message?.sessionRef?.sessionId === originalDurable,
+      )
+      expect(durableAttach?.sessionRef).toEqual({ provider: 'claude', sessionId: originalDurable })
+      await sendFreshAgentTurn(page, harness, reloadedTabId, 'C26 second turn after reload')
+      await expectFixtureTranscript(harness, server, info.homeDir, originalDurable, {
+        userTexts: ['C26 first turn', 'C26 second turn after reload'],
+        minAssistantTurns: 2,
+      })
+
+      const ledgerAfterReload = readClaudeSimLedger(simLedger)
+      expect(ledgerAfterReload.filter((row) => row.kind === 'boot')).toHaveLength(bootsBeforeReload)
+      expect(ledgerAfterReload.filter((row) => row.kind === 'query')).toHaveLength(queriesBeforeReload)
+    } finally {
+      await server.stop()
+      await fs.rm(sharedRoot, { recursive: true, force: true })
+    }
+  })
+
   test('real-user reload: identity survives with NO manual persist flush (natural persistence path only)', async ({ page }) => {
     // COUNCIL FOLLOW-UP (PR #562/#563 close-out, user-advocate's held
     // finding): every other journey in this suite (and the wall's leg G)
@@ -503,7 +628,7 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
     const { server, info, harness } = await bootWall(page, {
-      env: { FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE },
+      env: claudeSimulatorServerEnv({ ledgerPath: path.join(sharedRoot, 'claude-sim-ledger.jsonl') }),
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
     try {
@@ -570,7 +695,7 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
     const { server, info, harness } = await bootWall(page, {
-      env: { FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE },
+      env: claudeSimulatorServerEnv({ ledgerPath: path.join(sharedRoot, 'claude-sim-ledger.jsonl') }),
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
     let coldContext: BrowserContext | null = null
@@ -631,9 +756,8 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
     const { server, info, harness } = await bootWall(page, {
-      // Same exact leg-G options as test 1 (env: fake sidecar via
-      // FAKE_CLAUDE_SIDECAR_SOURCE; setupHome: seedWallConfig claude+freshAgent).
-      env: { FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE },
+      // Use the same production-sidecar simulator lane as the other identity tests.
+      env: claudeSimulatorServerEnv({ ledgerPath: path.join(sharedRoot, 'claude-sim-ledger.jsonl') }),
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
     try {
@@ -648,7 +772,10 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
       await expect
         .poll(async () => durableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId!))), { timeout: 15_000 })
         .toMatch(CANONICAL_UUID_RE)
-      const staleDurable: string = durableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId!)))
+      const originalPane = findFreshAgentLeaf(await harness.getPaneLayout(tabId!))
+      const originalPaneId = originalPane?.id as string | undefined
+      expect(originalPaneId).toBeTruthy()
+      const staleDurable: string = durableIdentity(originalPane)
       await flushPersistence(page)
 
       // Make the persisted identity STALE: delete every server-side artifact
@@ -657,15 +784,15 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
       expect(deleted.length, `expected transcript artifacts for ${staleDurable} under ${info.homeDir}`).toBeGreaterThan(0)
 
       // SIGKILL, then reload IMMEDIATELY -- the OLD page must never
-      // reconnect and fire a recovery create-with-resume: the fake sidecar
-      // re-creates the transcript on ANY create carrying resumeSessionId
-      // (fake-claude-sidecar.mjs:95, fs.openSync(..., 'a')), after which the
-      // session is Present again and dead_session can never surface. No
+      // reconnect and fire a recovery create-with-resume. The simulator
+      // refuses a resume after its transcript has been deleted, so the
+      // server can surface the stale session claim. No
       // waitForWsReady on the old page here, by design.
       await harness.clearSentWsMessages()
       await server.restartAbrupt()
       await reloadAndReconnect(page, harness)
       const tabIdAfter = await harness.getActiveTabId()
+      expect(tabIdAfter).toBe(tabId)
 
       // LOUD: the dead-session adjudication surfaces the stale claim.
       await expect
@@ -675,7 +802,8 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
           return entries.some((e: any) => e?.kind === 'fresh-agent' && e?.sessionRef?.sessionId === staleDurable)
         }, { timeout: 30_000 })
         .toBe(true)
-      const leaf = findFreshAgentLeaf(await harness.getPaneLayout(tabIdAfter!))
+      const leaf = findPaneById(await harness.getPaneLayout(tabIdAfter!), originalPaneId!)
+      expect(leaf?.content?.kind).toBe('fresh-agent')
       expect(leaf?.content?.restoreError?.reason).toBe('durable_artifact_missing')
       // Batched dead-session adjudication is a real modal dialog
       // (DeadSessionPanel.tsx:20-24, role="dialog" aria-label="Dead sessions"),
@@ -700,7 +828,7 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
       // create that might land during the settle window, so asserting on it
       // here would not actually prove "never silent" (follow-up from the PR
       // #562 council review).
-      const leafAfterSettle = findFreshAgentLeaf(await harness.getPaneLayout(tabIdAfter!))
+      const leafAfterSettle = findPaneById(await harness.getPaneLayout(tabIdAfter!), originalPaneId!)
       // NEVER silent: identity not swapped, the loud restoreError still
       // standing (post-settle re-check -- council follow-up, PR #562/#563
       // close-out: the pre-settle restoreError read alone could not prove
@@ -710,6 +838,27 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
       expect(leafAfterSettle?.content?.restoreError?.reason).toBe('durable_artifact_missing')
       const sent = await harness.getSentWsMessages()
       expect(sent.filter((m: any) => m?.type === 'freshAgent.create')).toEqual([])
+
+      // Reload once more to prove the failed durable claim remains attached
+      // to this exact pane and stays visible after hydration, rather than
+      // existing only in the first page's transient adjudication state.
+      await harness.clearSentWsMessages()
+      await reloadAndReconnect(page, harness)
+      const secondReloadTabId = await harness.getActiveTabId()
+      expect(secondReloadTabId).toBe(tabId)
+      const leafAfterSecondReload = findPaneById(
+        await harness.getPaneLayout(secondReloadTabId!),
+        originalPaneId!,
+      )
+      expect(leafAfterSecondReload?.content?.kind).toBe('fresh-agent')
+      expect(leafAfterSecondReload?.content?.sessionRef?.sessionId).toBe(staleDurable)
+      expect(leafAfterSecondReload?.content?.restoreError?.reason).toBe('durable_artifact_missing')
+      await expect(page.getByRole('alert').filter({
+        hasText: 'This session cannot be resumed because the saved session artifact is no longer available.',
+      })).toBeVisible({ timeout: 10_000 })
+      await page.waitForTimeout(1_000)
+      const sentAfterSecondReload = await harness.getSentWsMessages()
+      expect(sentAfterSecondReload.filter((m: any) => m?.type === 'freshAgent.create')).toEqual([])
     } finally {
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })

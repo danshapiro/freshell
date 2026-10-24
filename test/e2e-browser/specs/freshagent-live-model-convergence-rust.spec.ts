@@ -8,7 +8,7 @@
 //      idempotent configure stays silent on the bus.
 //   2. claude: `freshAgent.configure` applies for real through the sidecar's
 //      configure lane (the fake's sdk.configured receipt) and broadcasts the
-//      metadata frame; the sidecar request log records the configure.
+//      metadata frame; the simulator ledger records the SDK settings call.
 //
 // The codex lane's wire contract is pinned in-crate
 // (crates/freshell-freshagent/src/codex.rs configure tests against the real
@@ -32,11 +32,11 @@ import WebSocket from 'ws'
 import { test, expect } from '../helpers/fixtures.js'
 import { RustServer } from '../helpers/rust-server.js'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-version.js'
+import { claudeSimulatorServerEnv, readClaudeSimLedger } from '../helpers/claude-sim-lane.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
-const CLAUDE_FIXTURE = path.resolve(__dirname, '../fixtures/fake-claude-sidecar.mjs')
 const OPENCODE_FIXTURE = path.resolve(__dirname, '../fixtures/fake-opencode.cjs')
 
 /** Raw node-side WS client with a real hello handshake and a frame buffer
@@ -273,14 +273,11 @@ test.describe('fresh-agent live model convergence (rust)', () => {
   test('claude: configure applies through the sidecar lane and broadcasts session metadata', async () => {
     test.setTimeout(180_000)
     const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'fa-conv-claude-'))
-    const sidecarLogPath = path.join(sharedRoot, 'sidecar-requests.jsonl')
+    const simLedger = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
     const projectDir = path.join(sharedRoot, 'proj')
     await fsp.mkdir(projectDir, { recursive: true })
     const server = new RustServer({
-      env: {
-        FRESHELL_CLAUDE_SIDECAR: CLAUDE_FIXTURE,
-        FAKE_CLAUDE_SIDECAR_LOG: sidecarLogPath,
-      },
+      env: claudeSimulatorServerEnv({ ledgerPath: simLedger }),
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
     let ws: WsCapture | null = null
@@ -305,8 +302,8 @@ test.describe('fresh-agent live model convergence (rust)', () => {
       )
       const sessionId = created.sessionId as string
 
-      // The live-settings convergence lane: the sidecar applies the configure
-      // for real (setModel + applyFlagSettings through the fake's receipt)…
+      // The live-settings convergence lane: the production sidecar applies
+      // the configure through the simulator's SDK controls…
       ws.send({
         type: 'freshAgent.configure',
         requestId: 'cfg-conv-claude-1',
@@ -327,17 +324,18 @@ test.describe('fresh-agent live model convergence (rust)', () => {
       expect(metadata.event.model).toBe('sonnet')
       expect(metadata.event.effort).toBe('low')
 
-      // …and the sidecar request log proves the configure reached the runtime.
+      // …and the simulator ledger proves the SDK controls received the update.
       await expect
         .poll(
-          () => readJsonl(sidecarLogPath).filter((e) => e.msg?.type === 'configure').length,
+          () => readClaudeSimLedger(simLedger).filter((row) => row.kind === 'control').length,
           { timeout: 30_000 },
         )
         .toBeGreaterThan(0)
-      const configureRequest = readJsonl(sidecarLogPath).find((e) => e.msg?.type === 'configure')
-      expect(configureRequest.msg.sessionId).toBe(sessionId)
-      expect(configureRequest.msg.settings.model).toBe('sonnet')
-      expect(configureRequest.msg.settings.effort).toBe('low')
+      const controls = readClaudeSimLedger(simLedger).filter((row) => row.kind === 'control')
+      expect(controls).toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: 'setModel', args: ['sonnet'] }),
+        expect.objectContaining({ name: 'applyFlagSettings' }),
+      ]))
     } finally {
       ws?.close()
       await server.stop().catch(() => {})

@@ -7,9 +7,8 @@
  *      reconcile round-trip names the fresh-agent pane; the pane converges on
  *      the SAME durable identity; the happy path never marks the session lost
  *      and never lands a restoreError);
- *   2. two clients resuming one fresh-agent sessionRef spawn exactly ONE
- *      sidecar (the D8 fresh-agent lease + create dedup, proven via the fake
- *      sidecar's request log);
+ *   2. two clients resuming one fresh-agent sessionRef start exactly ONE
+ *      simulated CLI query through the production sidecar;
  *   3. a page.reload storm never spawns an identity-less resume (the
  *      pre-verdict create hold: every post-watermark spawn carries the resume
  *      identity; live panes across reloads take attach verdicts -- zero
@@ -27,6 +26,7 @@ import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import type { Page } from '@playwright/test'
+import { claudeSimulatorServerEnv, readClaudeSimLedger } from '../helpers/claude-sim-lane.js'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -35,7 +35,6 @@ import { fileURLToPath } from 'node:url'
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
-const FAKE_CLAUDE_SIDECAR_SOURCE = path.resolve(__dirname, '../fixtures/fake-claude-sidecar.mjs')
 const FAKE_CLAUDE_CLI_SOURCE = path.resolve(__dirname, '../fixtures/fake-claude-cli.mjs')
 
 // ---------------------------------------------------------------------------
@@ -64,21 +63,10 @@ function hasFlagPair(argv: string[], flag: string, value: string): boolean {
   return idx >= 0 && argv[idx + 1] === value
 }
 
-/**
- * Read the fake claude SIDECAR request log (FAKE_CLAUDE_SIDECAR_LOG,
- * fake-claude-sidecar.mjs: JSONL rows `{pid, t, msg}` -- one per inbound
- * stdio request; `msg.type === 'create'` rows carry the protocol-v2 `boot`).
- */
-async function readSidecarLog(
-  logPath: string,
-): Promise<Array<{ pid: number; t: number; msg: { type?: string; boot?: { kind?: string; resume?: string } } }>> {
-  const raw = await fs.readFile(logPath, 'utf8').catch(() => '')
-  if (!raw) return []
-  return raw
-    .trim()
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => JSON.parse(line) as { pid: number; t: number; msg: { type?: string; boot?: { kind?: string; resume?: string } } })
+type SimQueryRow = { kind: 'query'; options?: { resume?: string } }
+
+function simQueryRows(ledgerPath: string): SimQueryRow[] {
+  return readClaudeSimLedger(ledgerPath).filter((row) => row.kind === 'query') as SimQueryRow[]
 }
 
 /** Dismiss the initial pane-type picker by choosing the first visible shell. */
@@ -327,13 +315,10 @@ test.describe('reconcile completion (rust server, real SPA)', () => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-recompl-verdicts-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
-    const sidecarLogPath = path.join(sharedRoot, 'sidecar-requests.jsonl')
+    const simLedgerPath = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
 
     const { server, harness } = await bootSpec(page, {
-      env: {
-        FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE,
-        FAKE_CLAUDE_SIDECAR_LOG: sidecarLogPath,
-      },
+      env: claudeSimulatorServerEnv({ ledgerPath: simLedgerPath }),
       setupHome: seedSpecConfig({ providers: ['claude'], freshAgent: true }),
     })
     try {
@@ -395,13 +380,10 @@ test.describe('reconcile completion (rust server, real SPA)', () => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-recompl-onesidecar-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
-    const sidecarLogPath = path.join(sharedRoot, 'sidecar-requests.jsonl')
+    const simLedgerPath = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
 
     const { server, info, harness } = await bootSpec(page, {
-      env: {
-        FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE,
-        FAKE_CLAUDE_SIDECAR_LOG: sidecarLogPath,
-      },
+      env: claudeSimulatorServerEnv({ ledgerPath: simLedgerPath }),
       setupHome: seedSpecConfig({ providers: ['claude'], freshAgent: true }),
     })
     let pageB: Page | null = null
@@ -425,17 +407,17 @@ test.describe('reconcile completion (rust server, real SPA)', () => {
       await harnessB.waitForHarness()
       await harnessB.waitForConnection()
 
-      const watermark = (await readSidecarLog(sidecarLogPath)).length
+      const watermark = simQueryRows(simLedgerPath).length
 
       await server.restartAbrupt()
       await waitForWsReady(page)
       await waitForWsReady(pageB)
 
-      // Both recovery rounds settle; exactly ONE resume reaches a sidecar.
+      // Both recovery rounds settle; exactly ONE resume reaches the simulated CLI.
       const countResumes = async () =>
-        (await readSidecarLog(sidecarLogPath))
+        simQueryRows(simLedgerPath)
           .slice(watermark)
-          .filter((r) => r.msg?.type === 'create' && r.msg?.boot?.resume === identity).length
+          .filter((row) => row.options?.resume === identity).length
       await expect.poll(countResumes, { timeout: 45_000 }).toBeGreaterThan(0)
       // STABLE-COUNT settle (donor: restore-contract-wall-rust.spec.ts):
       // accept only when two samples >=5s apart agree, so a tail-latency
@@ -484,7 +466,7 @@ test.describe('reconcile completion (rust server, real SPA)', () => {
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
     const argvLogPath = path.join(sharedRoot, 'claude-argv.jsonl')
-    const sidecarLogPath = path.join(sharedRoot, 'sidecar-requests.jsonl')
+    const simLedgerPath = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
     const fakeClaudePath = await installFakeCli(
       FAKE_CLAUDE_CLI_SOURCE,
       'claude',
@@ -495,8 +477,7 @@ test.describe('reconcile completion (rust server, real SPA)', () => {
       env: {
         CLAUDE_CMD: fakeClaudePath,
         FAKE_CLAUDE_ARGV_LOG: argvLogPath,
-        FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE,
-        FAKE_CLAUDE_SIDECAR_LOG: sidecarLogPath,
+        ...claudeSimulatorServerEnv({ ledgerPath: simLedgerPath }),
       },
       setupHome: seedSpecConfig({ providers: ['claude'], freshAgent: true }),
     })
@@ -523,7 +504,7 @@ test.describe('reconcile completion (rust server, real SPA)', () => {
       await flushPersistence(page)
 
       const watermarkArgv = (await readArgvLog(argvLogPath)).length
-      const watermarkSidecar = (await readSidecarLog(sidecarLogPath)).length
+      const watermarkSidecar = simQueryRows(simLedgerPath).length
 
       for (let i = 0; i < 3; i += 1) {
         await page.reload({ waitUntil: 'domcontentloaded' })
@@ -562,14 +543,12 @@ test.describe('reconcile completion (rust server, real SPA)', () => {
       // is the non-negotiable assertion.)
       expect(spawns.length).toBe(0)
 
-      // Fresh-agent: every post-watermark sidecar create carries the resume
+      // Fresh-agent: every post-watermark simulator query carries the resume
       // identity (and on the attach path there should be none at all).
-      const creates = (await readSidecarLog(sidecarLogPath))
-        .slice(watermarkSidecar)
-        .filter((r) => r.msg?.type === 'create')
+      const creates = simQueryRows(simLedgerPath).slice(watermarkSidecar)
       expect(
-        creates.every((r) => r.msg?.boot?.resume === freshclaudeIdentity),
-        `identity-less fresh-agent create detected: ${JSON.stringify(creates)}`,
+        creates.every((row) => row.options?.resume === freshclaudeIdentity),
+        `identity-less fresh-agent query detected: ${JSON.stringify(creates)}`,
       ).toBe(true)
     } finally {
       await server.stop()

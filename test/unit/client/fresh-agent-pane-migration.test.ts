@@ -134,6 +134,38 @@ describe('fresh-agent pane migration', () => {
     expect((migrated as { sessionRef?: unknown }).sessionRef).toBeUndefined()
   })
 
+  it('retains a canonical same-provider sessionRef when an existing pane has a recoverable restore error', () => {
+    const sessionId = '00000000-0000-4000-8000-000000000789'
+    const migrated = migrateLegacyFreshAgentContent({
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      createRequestId: 'req-lost-durable',
+      status: 'idle',
+      sessionId: 'old-runtime-placeholder',
+      sessionRef: { provider: 'claude', sessionId },
+      restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'durable_artifact_missing' },
+    })
+
+    expect(migrated).toMatchObject({
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      sessionId,
+      sessionRef: { provider: 'claude', sessionId },
+      restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'durable_artifact_missing' },
+    })
+    expect(validatePaneTree({ type: 'leaf', id: 'pane-lost', content: migrated } as never).valid).toBe(true)
+    expect(validatePaneTree({
+      type: 'leaf',
+      id: 'pane-invalid-restore-identity',
+      content: {
+        ...(migrated as Record<string, unknown>),
+        sessionRef: { provider: 'codex', sessionId: 'codex-durable-id' },
+      },
+    } as never).valid).toBe(false)
+  })
+
   it('keeps a bad Claude sessionRef alias as a restore error even when resumeSessionId is canonical', () => {
     const canonical = '00000000-0000-4000-8000-000000000777'
     const migrated = migrateLegacyFreshAgentContent({

@@ -194,6 +194,12 @@ function normalizePaneContent(
         ? previous.createRequestId
         : undefined
     const existingRestoreError = sanitizeRestoreError(rawFreshAgent.restoreError)
+    const restoreErrorSessionRef = sanitizeSessionRef(rawFreshAgent.sessionRef)
+    const retainedRestoreErrorSessionRef = existingRestoreError?.reason !== 'invalid_legacy_restore_target'
+      && restoreErrorSessionRef?.provider === input.provider
+      && isDurableProviderSessionId(input.provider, restoreErrorSessionRef.sessionId)
+      ? restoreErrorSessionRef
+      : undefined
     const style = normalizeFreshAgentStyleOverride((input as { style?: unknown }).style)
     const pendingLocalEcho = normalizeFreshAgentPendingLocalEcho(rawFreshAgent.pendingLocalEcho)
     const modelEffortLevels = normalizeFreshAgentModelEffortLevels(rawFreshAgent.modelEffortLevels)
@@ -250,7 +256,10 @@ function normalizePaneContent(
           ...normalizeManagedRuntimeProjection(rawFreshAgent),
           sessionType: input.sessionType,
           provider: input.provider,
-          sessionId: input.sessionId,
+          sessionId: retainedRestoreErrorSessionRef?.provider === 'claude'
+            ? retainedRestoreErrorSessionRef.sessionId
+            : input.sessionId,
+          ...(retainedRestoreErrorSessionRef ? { sessionRef: retainedRestoreErrorSessionRef } : {}),
           createRequestId: typeof input.createRequestId === 'string' && input.createRequestId
             ? input.createRequestId
             : previousCreateRequestId || nanoid(),

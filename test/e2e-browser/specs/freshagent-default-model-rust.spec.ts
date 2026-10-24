@@ -10,15 +10,15 @@
  *      (decision D2, matching `claude --resume`).
  *
  * The spec drives the real Rust server + real browser UI against the
- * deterministic fake Claude-SDK sidecar and asserts the EXACT `create` frame
- * the server wrote to the sidecar's stdin (FRESHELL_FAKE_STDIN raw audit).
+ * production Claude sidecar over the CLI simulator and asserts the query
+ * options it received for fresh and resumed conversations.
  * The saved default is written through the real `PATCH /api/settings` route
  * and observed in the client's settings before any pane is created.
  *
  * Pre-fix, both create frames carried the registry default `opus[1m]`.
  *
  * CLOUD-LEGALITY: no idle-grace or timing dependencies — every wait is a poll
- * on observed state (stdin audit rows, pane layout, sidebar rows).
+ * on observed state (simulator ledger rows, pane layout, sidebar rows).
  *
  * Helpers are copied, not imported, per this suite's per-spec-ownership
  * convention (donor: fresh-agent-control-rust.spec.ts — boot, stdin audit,
@@ -29,18 +29,13 @@ import { existsSync, readFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { fileURLToPath } from 'node:url'
 import type { Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
 import { RustServer, GEMINI_STRIP_ENV_PREFIXES } from '../helpers/rust-server.js'
 import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
-
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = path.dirname(__filename)
-
-const CLAUDE_SIDECAR_FIXTURE = path.resolve(__dirname, '../fixtures/providers/fake-claude-sdk-sidecar.mjs')
+import { claudeSimulatorServerEnv, readClaudeSimLedger } from '../helpers/claude-sim-lane.js'
 
 const CANONICAL_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -76,22 +71,9 @@ function readJsonl(filePath: string): any[] {
     .filter((row) => row !== null)
 }
 
-/** Read the sidecar raw-stdin audit, JSON-parsing each recorded frame. */
-function readStdinFrames(stdinLog: string): any[] {
-  return readJsonl(stdinLog)
-    .map((row) => {
-      try {
-        return JSON.parse(row.line)
-      } catch {
-        return null
-      }
-    })
-    .filter((frame) => frame !== null)
-}
-
-async function waitForStdinFrame(
-  stdinLog: string,
-  pred: (frame: any) => boolean,
+async function waitForSimQuery(
+  simLedger: string,
+  pred: (options: any) => boolean,
   what: string,
   timeoutMs = 20_000,
 ): Promise<any> {
@@ -99,10 +81,10 @@ async function waitForStdinFrame(
   await expect
     .poll(
       () => {
-        found = readStdinFrames(stdinLog).find(pred) ?? null
+        found = readClaudeSimLedger(simLedger).find((row) => row.kind === 'query' && pred(row.options ?? {})) ?? null
         return Boolean(found)
       },
-      { timeout: timeoutMs, message: `timed out waiting for ${what} in ${stdinLog}` },
+      { timeout: timeoutMs, message: `timed out waiting for ${what} in ${simLedger}` },
     )
     .toBe(true)
   return found
@@ -171,19 +153,15 @@ async function bootLane(page: Page, flavour: Flavour): Promise<{
   harness: TestHarness
   sharedRoot: string
   projectDir: string
-  stdinLog: string
+  simLedger: string
 }> {
   const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), `freshell-default-model-${flavour}-`))
   const projectDir = path.join(sharedRoot, 'project')
   await fs.mkdir(projectDir, { recursive: true })
-  const stdinLog = path.join(sharedRoot, 'sidecar-stdin.jsonl')
+  const simLedger = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
   const server = new RustServer({
     env: {
-      FRESHELL_CLAUDE_SIDECAR: CLAUDE_SIDECAR_FIXTURE,
-      FRESHELL_CLAUDE_NODE: process.execPath,
-      FRESHELL_FAKE_PROVIDER: flavour,
-      FRESHELL_FAKE_STDIN: stdinLog,
-      FRESHELL_FAKE_EVENTS: path.join(sharedRoot, 'sidecar-events.jsonl'),
+      ...claudeSimulatorServerEnv({ ledgerPath: simLedger, flavour }),
       ...(flavour === 'kilroy' ? { KILROY_ENABLED: '1' } : {}),
     },
     stripEnvPrefixes: flavour === 'kilroy' ? [...GEMINI_STRIP_ENV_PREFIXES] : undefined,
@@ -216,7 +194,7 @@ async function bootLane(page: Page, flavour: Flavour): Promise<{
         payload: { claude: true },
       })
     })
-    return { server, info, harness, sharedRoot, projectDir, stdinLog }
+    return { server, info, harness, sharedRoot, projectDir, simLedger }
   } catch (error) {
     await server.stop().catch(() => {})
     await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
@@ -226,7 +204,7 @@ async function bootLane(page: Page, flavour: Flavour): Promise<{
 
 /** Append one user/assistant exchange to the session's CLI transcript
  * (`~/.claude/projects/<mangled cwd>/<id>.jsonl`, parentUuid-chained like
- * the CLI and the fake sidecar write it). */
+ * the CLI and simulator write it). */
 async function appendTranscriptExchange(
   homeDir: string,
   cwd: string,
@@ -258,7 +236,7 @@ const LABELS: Record<Flavour, string> = { freshclaude: 'Freshclaude', kilroy: 'K
 async function runDefaultModelJourney(page: Page, flavour: Flavour): Promise<void> {
   const lane = await bootLane(page, flavour)
   try {
-    const { harness, info, stdinLog } = lane
+    const { harness, info, simLedger } = lane
     const label = LABELS[flavour]
     const tabId = (await harness.getActiveTabId())!
     expect(tabId).toBeTruthy()
@@ -275,12 +253,12 @@ async function runDefaultModelJourney(page: Page, flavour: Flavour): Promise<voi
     const paneRoot = page.locator('[data-context="fresh-agent"]').last()
     await expect(paneRoot).toBeVisible({ timeout: 15_000 })
 
-    const freshCreate = await waitForStdinFrame(
-      stdinLog,
-      (frame) => frame?.type === 'create' && frame?.boot?.kind === 'fresh',
-      `the new ${label} pane's sidecar create`,
+    const freshCreate = await waitForSimQuery(
+      simLedger,
+      (options) => !options.resume && options.model === 'sonnet',
+      `the new ${label} pane's simulator query`,
     )
-    expect(freshCreate.model, 'a new pane starts on the saved default model').toBe('sonnet')
+    expect(freshCreate.options.model, 'a new pane starts on the saved default model').toBe('sonnet')
 
     let durableId = ''
     await expect
@@ -296,8 +274,8 @@ async function runDefaultModelJourney(page: Page, flavour: Flavour): Promise<voi
     // conversation after its pane closes: the first user message titles the
     // row, and a transcript with fewer than two user messages is classified
     // non-interactive, which the default sidebar filter hides once no pane
-    // holds the session. This step deliberately does not depend on the fake
-    // sidecar's turn lanes: the resume path is what is under test.
+    // holds the session. This step deliberately does not depend on the
+    // simulator's turn program: the resume path is what is under test.
     await appendTranscriptExchange(info.homeDir, lane.projectDir, durableId, 'hello default model')
     await appendTranscriptExchange(info.homeDir, lane.projectDir, durableId, 'and a follow-up')
 
@@ -341,13 +319,13 @@ async function runDefaultModelJourney(page: Page, flavour: Flavour): Promise<voi
       { timeout: 30_000 },
     )
     await sidebarRow.click()
-    const resumeCreate = await waitForStdinFrame(
-      stdinLog,
-      (frame) => frame?.type === 'create' && frame?.boot?.kind === 'resume' && frame?.boot?.resume === durableId,
-      `the resumed ${label} pane's sidecar create`,
+    const resumeCreate = await waitForSimQuery(
+      simLedger,
+      (options) => options.resume === durableId && options.model === 'haiku',
+      `the resumed ${label} pane's simulator query`,
       30_000,
     )
-    expect(resumeCreate.model, 'a resumed pane starts on the current saved default model').toBe('haiku')
+    expect(resumeCreate.options.model, 'a resumed pane starts on the current saved default model').toBe('haiku')
 
     const resumedLeaf = findFreshAgentLeaf(await harness.getPaneLayout((await harness.getActiveTabId())!))
     expect(resumedLeaf?.content?.sessionType).toBe(flavour)
