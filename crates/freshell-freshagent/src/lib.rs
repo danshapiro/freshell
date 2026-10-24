@@ -5091,45 +5091,38 @@ async fn create_lane_agent_tab(
         }
     };
     let pane_content = rest_lane_create::pane_content(&request, &created);
-    if !state
-        .layout
-        .finish_pending_pane(&tab_id, &pane_id, pane_content.clone())
-    {
+    let published =
+        state
+            .layout
+            .finish_pending_pane(&tab_id, &pane_id, pane_content.clone(), || {
+                register_fresh_agent_tab_cache(
+                    state,
+                    &tab_id,
+                    &pane_id,
+                    name.as_deref(),
+                    PaneEntry {
+                        placeholder_id: created.session_id.clone(),
+                        provider: request.provider.clone(),
+                        session_type: request.session_type.clone(),
+                        cwd: request.cwd.clone(),
+                        model: request.model.clone(),
+                        effort: request.effort.clone(),
+                        durable_id: Some(
+                            created
+                                .session_ref
+                                .as_ref()
+                                .map(|reference| reference.session_id.clone())
+                                .unwrap_or_else(|| created.session_id.clone()),
+                        ),
+                    },
+                );
+                broadcast_tab_create(state, &tab_id, &pane_id, name.as_deref(), &pane_content);
+            });
+    if !published {
         return state
             .abandon_rest_create(&gateway, &request, &created)
             .await;
     }
-    let rest_lane::RestLaneCreate {
-        provider,
-        session_type,
-        cwd,
-        model,
-        effort,
-        ..
-    } = request;
-    register_fresh_agent_tab(
-        state,
-        &tab_id,
-        &pane_id,
-        name.as_deref(),
-        &pane_content,
-        PaneEntry {
-            placeholder_id: created.session_id.clone(),
-            provider,
-            session_type,
-            cwd,
-            model,
-            effort,
-            durable_id: Some(
-                created
-                    .session_ref
-                    .as_ref()
-                    .map(|reference| reference.session_id.clone())
-                    .unwrap_or_else(|| created.session_id.clone()),
-            ),
-        },
-    );
-    broadcast_tab_create(state, &tab_id, &pane_id, name.as_deref(), &pane_content);
     let mut data = json!({"tabId":tab_id,"paneId":pane_id,"sessionId":created.session_id});
     if let Some(reference) = created.session_ref {
         data["sessionRef"] = json!(reference);
@@ -5153,6 +5146,16 @@ fn register_fresh_agent_tab(
     state
         .layout
         .attach_pane_content(tab_id, pane_id, pane_content.clone());
+    register_fresh_agent_tab_cache(state, tab_id, pane_id, name, pane_entry);
+}
+
+fn register_fresh_agent_tab_cache(
+    state: &FreshAgentState,
+    tab_id: &str,
+    pane_id: &str,
+    name: Option<&str>,
+    pane_entry: PaneEntry,
+) {
     state.tabs.lock().expect("tabs mutex").insert(
         tab_id.to_string(),
         TabRecord {

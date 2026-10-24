@@ -173,6 +173,184 @@ async fn a_pane_closed_ack_before_runtime_create_returns_cancels_its_publication
     close_during_create(CloseDuringCreate::PendingPane).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_after_layout_finalization_cannot_announce_before_the_create() {
+    let state = state_with_registry();
+    let lane = Arc::new(PausedCreateLane::default());
+    state.set_claude_rest_lane(lane.clone()).unwrap();
+    let router = app(state.clone());
+    let mut events = state.broadcast_tx.subscribe();
+    let create_router = router.clone();
+    let creating = tokio::spawn(async move {
+        post(create_router, "/api/tabs", json!({"agent":"claude"}), true).await
+    });
+    lane.started.notified().await;
+    let request = lane.request.lock().unwrap().clone().unwrap();
+    let tab_id = request.tab_id.clone().unwrap();
+
+    // Block the existing cache insertion after the layout has been finalized.
+    // DELETE does not need this cache lock to close and announce the tab.
+    let held_state = state.clone();
+    let (locked, ready) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _cache = held_state.panes.lock().unwrap();
+        locked.send(()).unwrap();
+        released.recv().unwrap();
+    });
+    ready.await.unwrap();
+    lane.finish.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !state.tabs.lock().unwrap().contains_key(&tab_id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the create reached cache registration");
+    let close_tab = tab_id.clone();
+    let mut closing =
+        tokio::spawn(async move { delete(router, &format!("/api/tabs/{close_tab}"), true).await });
+    // While registration is blocked, a properly serialized close must wait.
+    let early_close =
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut closing).await;
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    let (created_status, created) = creating.await.unwrap();
+    assert_eq!(created_status, StatusCode::OK, "{created}");
+    let (closed_status, closed) = match early_close {
+        Ok(closed) => closed.unwrap(),
+        Err(_) => closing.await.unwrap(),
+    };
+    assert_eq!(closed_status, StatusCode::OK, "{closed}");
+    let mut commands = Vec::new();
+    while let Ok(frame) = events.try_recv() {
+        let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        if let Some(command) = frame["command"].as_str() {
+            commands.push(command.to_string());
+        }
+    }
+    assert_eq!(commands, ["tab.create", "tab.close"]);
+    assert!(!state.tabs.lock().unwrap().contains_key(&tab_id));
+    assert!(state
+        .layout
+        .get_pane_snapshot(request.pane_id.as_deref().unwrap())
+        .is_none());
+}
+
+async fn split_finalization_and_close_are_ordered(close_source: bool) {
+    let state = state_with_registry();
+    let before = serde_json::from_value(json!({
+        "tabs":[{"id":"current-tab"}], "activeTabId":"current-tab", "timestamp":1,
+        "layouts":{"current-tab":{"type":"leaf", "id":"source-pane", "content":{"kind":"browser", "url":"https://source.example"}}},
+        "activePane":{"current-tab":"source-pane"},
+    })).unwrap();
+    state.layout.update_from_ui(&before, "creating-browser");
+    let lane = Arc::new(PausedCreateLane::default());
+    state.set_claude_rest_lane(lane.clone()).unwrap();
+    let router = app(state.clone());
+    let mut events = state.broadcast_tx.subscribe();
+    let create_router = router.clone();
+    let creating = tokio::spawn(async move {
+        post(
+            create_router,
+            "/api/panes/source-pane/split",
+            json!({"agent":"claude"}),
+            true,
+        )
+        .await
+    });
+    lane.started.notified().await;
+    let request = lane.request.lock().unwrap().clone().unwrap();
+    let new_pane = request.pane_id.clone().unwrap();
+    let held_state = state.clone();
+    let (locked, ready) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _cache = held_state.panes.lock().unwrap();
+        locked.send(()).unwrap();
+        released.recv().unwrap();
+    });
+    ready.await.unwrap();
+    lane.finish.notify_one();
+
+    // On the broken path, the finalized content is observable while cache
+    // insertion is blocked. Atomic publication instead keeps this reader and
+    // the close behind the layout lock until the announcement is queued.
+    let observed_state = state.clone();
+    let observed_pane = new_pane.clone();
+    let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observer_stopping = stopping.clone();
+    let (finalized, observed) = tokio::sync::oneshot::channel();
+    let observer = std::thread::spawn(move || {
+        while !observer_stopping.load(std::sync::atomic::Ordering::SeqCst) {
+            if observed_state
+                .layout
+                .get_pane_snapshot(&observed_pane)
+                .and_then(|pane| pane.pane_content)
+                .is_some_and(|content| content["sessionId"] == "late-runtime")
+            {
+                let _ = finalized.send(());
+                return;
+            }
+            std::thread::yield_now();
+        }
+    });
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(100), observed).await;
+    let close_pane = if close_source {
+        "source-pane".to_string()
+    } else {
+        new_pane.clone()
+    };
+    let mut closing = tokio::spawn(async move {
+        post(
+            router,
+            &format!("/api/panes/{close_pane}/close"),
+            json!({}),
+            true,
+        )
+        .await
+    });
+    let early_close =
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut closing).await;
+    stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    observer.join().unwrap();
+    let (created_status, created) = creating.await.unwrap();
+    assert_eq!(created_status, StatusCode::OK, "{created}");
+    let (closed_status, closed) = match early_close {
+        Ok(closed) => closed.unwrap(),
+        Err(_) => closing.await.unwrap(),
+    };
+    assert_eq!(closed_status, StatusCode::OK, "{closed}");
+    let mut commands = Vec::new();
+    while let Ok(frame) = events.try_recv() {
+        let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        if let Some(command) = frame["command"].as_str() {
+            commands.push(command.to_string());
+        }
+    }
+    assert_eq!(commands, ["pane.split", "pane.close"]);
+    assert_eq!(
+        state.layout.get_pane_snapshot(&new_pane).is_some(),
+        close_source
+    );
+    assert_eq!(
+        state.layout.get_pane_snapshot("source-pane").is_some(),
+        !close_source
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closing_a_finalized_split_cannot_announce_before_the_split() {
+    split_finalization_and_close_are_ordered(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closing_a_finalized_split_source_cannot_announce_before_the_split() {
+    split_finalization_and_close_are_ordered(true).await;
+}
+
 struct SyncDuringCreateLane {
     layout: crate::layout_store::LayoutStore,
     browser_sync: freshell_protocol::UiLayoutSync,

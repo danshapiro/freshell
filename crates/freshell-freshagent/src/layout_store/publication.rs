@@ -110,7 +110,15 @@ impl LayoutStore {
         true
     }
 
-    pub(crate) fn finish_pending_pane(&self, tab_id: &str, pane_id: &str, content: Value) -> bool {
+    /// Register caches and queue the announcement before a close can acquire
+    /// the layout lock. The callback must stay synchronous and not reenter us.
+    pub(crate) fn finish_pending_pane(
+        &self,
+        tab_id: &str,
+        pane_id: &str,
+        content: Value,
+        publish: impl FnOnce(),
+    ) -> bool {
         let mut inner = self.lock();
         if !inner
             .pending_publications
@@ -137,6 +145,7 @@ impl LayoutStore {
         {
             entry.published = true;
         }
+        publish();
         true
     }
 

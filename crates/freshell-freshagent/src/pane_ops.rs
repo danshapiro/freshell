@@ -229,32 +229,51 @@ pub(crate) async fn split_pane(
             }
         };
         let content = crate::rest_lane_create::pane_content(&request, &created);
-        if !state
-            .layout
-            .finish_pending_pane(&tab_id, &new_pane_id, content.clone())
-        {
+        let published =
+            state
+                .layout
+                .finish_pending_pane(&tab_id, &new_pane_id, content.clone(), || {
+                    state.panes.lock().expect("panes mutex").insert(
+                        new_pane_id.clone(),
+                        PaneEntry {
+                            placeholder_id: created.session_id.clone(),
+                            provider: provider.into(),
+                            session_type: session_type.into(),
+                            cwd: request.cwd.clone(),
+                            model: request.model.clone(),
+                            effort: request.effort.clone(),
+                            durable_id: Some(
+                                created
+                                    .session_ref
+                                    .as_ref()
+                                    .map(|reference| reference.session_id.clone())
+                                    .unwrap_or_else(|| created.session_id.clone()),
+                            ),
+                        },
+                    );
+                    state
+                        .pane_tabs
+                        .lock()
+                        .expect("pane_tabs mutex")
+                        .insert(new_pane_id.clone(), tab_id.clone());
+                    broadcast_pane_split(
+                        &state,
+                        &tab_id,
+                        &pane_id,
+                        &direction,
+                        &new_pane_id,
+                        &content,
+                    );
+                });
+        if !published {
             return state
                 .abandon_rest_create(&gateway, &request, &created)
                 .await;
         }
-        state.panes.lock().expect("panes mutex").insert(
-            new_pane_id.clone(),
-            PaneEntry {
-                placeholder_id: created.session_id.clone(),
-                provider: provider.into(),
-                session_type: session_type.into(),
-                cwd: request.cwd,
-                model: request.model,
-                effort: request.effort,
-                durable_id: Some(
-                    created
-                        .session_ref
-                        .map(|reference| reference.session_id)
-                        .unwrap_or(created.session_id),
-                ),
-            },
+        return ok_json(
+            json!({ "paneId": new_pane_id, "terminalId": Value::Null }),
+            "pane split (non-terminal)",
         );
-        content
     } else if body
         .get("hostStats")
         .and_then(Value::as_bool)
@@ -321,18 +340,14 @@ pub(crate) async fn split_pane(
 
     let terminal_id = new_content.get("terminalId").cloned();
 
-    // `ui.command{pane.split}` payload (`router.ts:1373-1382`): tabId, paneId
-    // (the SOURCE pane), direction, newPaneId, newContent.
-    state.broadcast(&ServerMessage::UiCommand(UiCommand {
-        command: "pane.split".to_string(),
-        payload: Some(json!({
-            "tabId": tab_id,
-            "paneId": pane_id,
-            "direction": direction,
-            "newPaneId": new_pane_id,
-            "newContent": new_content,
-        })),
-    }));
+    broadcast_pane_split(
+        &state,
+        &tab_id,
+        &pane_id,
+        &direction,
+        &new_pane_id,
+        &new_content,
+    );
 
     let message = if terminal_id.is_some() {
         "pane split"
@@ -343,6 +358,39 @@ pub(crate) async fn split_pane(
         json!({ "paneId": new_pane_id, "terminalId": terminal_id }),
         message,
     )
+}
+
+fn broadcast_pane_split(
+    state: &FreshAgentState,
+    tab_id: &str,
+    pane_id: &str,
+    direction: &str,
+    new_pane_id: &str,
+    new_content: &Value,
+) {
+    // The source pane and newly allocated pane remain distinct on the wire.
+    state.broadcast(&ServerMessage::UiCommand(UiCommand {
+        command: "pane.split".to_string(),
+        payload: Some(json!({
+            "tabId": tab_id,
+            "paneId": pane_id,
+            "direction": direction,
+            "newPaneId": new_pane_id,
+            "newContent": new_content,
+        })),
+    }));
+}
+
+fn pane_tab_from_cache_or_layout(state: &FreshAgentState, pane_id: &str) -> Option<String> {
+    // Publication takes layout before these caches, so release this guard
+    // before the fallback acquires layout.
+    let cached = state
+        .pane_tabs
+        .lock()
+        .expect("pane_tabs mutex")
+        .get(pane_id)
+        .cloned();
+    cached.or_else(|| state.layout.find_pane_tab(pane_id))
 }
 
 // ── POST /api/panes/:id/close ──────────────────────────────────────────────
@@ -902,13 +950,7 @@ pub(crate) async fn respawn_pane(
         );
     }
 
-    let tab_id = state
-        .pane_tabs
-        .lock()
-        .expect("pane_tabs mutex")
-        .get(&pane_id)
-        .cloned()
-        .or_else(|| state.layout.find_pane_tab(&pane_id));
+    let tab_id = pane_tab_from_cache_or_layout(&state, &pane_id);
     // Round-1 review: an authoritative registry misses only when no connected
     // browser has synced the pane -- ask the owner client to re-sync before
     // giving up (bounded window, above the mirror's debounce).
@@ -1046,14 +1088,7 @@ pub(crate) async fn attach_pane(
             };
             // The pane resolves through the same authoritative registry
             // respawn uses (`pane_tabs` first, then the durable LayoutStore).
-            let Some(tab_id) = state
-                .pane_tabs
-                .lock()
-                .expect("pane_tabs mutex")
-                .get(&pane_id)
-                .cloned()
-                .or_else(|| state.layout.find_pane_tab(&pane_id))
-            else {
+            let Some(tab_id) = pane_tab_from_cache_or_layout(&state, &pane_id) else {
                 return crate::fail_json_code(
                     StatusCode::NOT_FOUND,
                     "PANE_NOT_FOUND",
