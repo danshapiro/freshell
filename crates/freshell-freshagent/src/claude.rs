@@ -710,18 +710,29 @@ impl FreshClaudeState {
         self.kill_after_resolve_pause = pause;
     }
 
-    /// b8ke focused episode-2 round-3 F3: resolve a wire session id to
-    /// its canonical coordinator key. The COORDINATOR is the single
-    /// source of truth: a re-keyed session's old key holds an
-    /// `Aliased{to: new}` record there (written atomically by the rekey
-    /// commit), and this resolves through the registry's own fixpoint
-    /// walk — never a lane-local map, never a bounded link cap. Unwired
-    /// (no coordinator): the identity (legacy behavior).
+    /// Active coordinator records take precedence over a staged durable
+    /// successor. After restart, persisted supersession supplies the chain
+    /// that the new coordinator has not observed yet.
     pub fn resolve_ownership_key(&self, session_id: &str) -> String {
-        match self.ownership.as_ref() {
-            Some(registry) => registry.resolve_canonical(PROVIDER, session_id),
-            None => session_id.to_string(),
+        if let Some(registry) = &self.ownership {
+            let current = registry.resolve_canonical(PROVIDER, session_id);
+            if current != session_id
+                || !matches!(
+                    registry.observe(PROVIDER, &current).state,
+                    freshell_ownership::OwnershipState::Vacant
+                )
+            {
+                return current;
+            }
         }
+        let durable = self
+            .identity_sink()
+            .and_then(|sink| sink.chain_terminus(PROVIDER, session_id))
+            .unwrap_or_else(|| session_id.to_string());
+        self.ownership.as_ref().map_or_else(
+            || durable.clone(),
+            |registry| registry.resolve_canonical(PROVIDER, &durable),
+        )
     }
 
     /// Test seam (Task 6 round-3 review I-1): arm the deterministic holds
@@ -914,7 +925,8 @@ impl FreshClaudeState {
     }
 
     /// Every registered runtime has a native UUID before create returns.
-    /// Unknown IDs still consult the coordinator's persisted rekey chain.
+    /// A live runtime remains authoritative while a replacement binding is
+    /// staged; unknown IDs consult the durable supersession chain.
     async fn claude_owner_key(&self, map_key: Option<&str>, wire_id: &str) -> String {
         let native = match map_key {
             Some(key) => self
@@ -925,7 +937,13 @@ impl FreshClaudeState {
                 .map(|runtime| runtime.identity.current()),
             None => None,
         };
-        self.resolve_ownership_key(native.as_deref().unwrap_or(wire_id))
+        match native {
+            Some(native) => self.ownership.as_ref().map_or_else(
+                || native.clone(),
+                |registry| registry.resolve_canonical(PROVIDER, &native),
+            ),
+            None => self.resolve_ownership_key(wire_id),
+        }
     }
 
     /// Side-effect-free coordinator read for `(provider, session_id)`
@@ -2291,7 +2309,7 @@ impl FreshClaudeState {
         let mut map_key = self
             .resolve_session_key(&session_id)
             .await
-            .unwrap_or_else(|| session_id.clone());
+            .unwrap_or_else(|| self.resolve_ownership_key(&session_id));
         #[cfg(test)]
         if let Some(pause) = &self.kill_after_resolve_pause {
             pause
@@ -2306,7 +2324,9 @@ impl FreshClaudeState {
         let _close_guard;
         {
             let sessions = self.sessions.lock().await;
-            if let Some(current_key) = Self::session_key_in(&sessions, &session_id) {
+            if let Some(current_key) = Self::session_key_in(&sessions, &session_id)
+                .or_else(|| Self::session_key_in(&sessions, &map_key))
+            {
                 map_key = current_key;
             }
             if let Some(expected_owner) = expected_owner {
@@ -3157,14 +3177,16 @@ impl FreshClaudeState {
             if sink.kill_tombstone_at_ms(PROVIDER, id).is_none() {
                 continue; // a claim re-opened the identity after the close — not ours to kill
             }
-            let map_key = self
-                .resolve_session_key(id)
-                .await
-                .unwrap_or_else(|| id.to_string());
             // The ONE critical section the decision rule above lives in:
             // remove + re-verify, no await between the two.
             let removed = {
                 let mut sessions = self.sessions.lock().await;
+                // Only this runtime's retained lineage belongs to the close.
+                // A persisted successor may have reopened independently and
+                // cleared its own fence while this older ID remains fenced.
+                let Some(map_key) = Self::session_key_in(&sessions, id) else {
+                    continue;
+                };
                 match sessions.remove(&map_key) {
                     None => None,
                     Some(session) => {
@@ -3181,12 +3203,12 @@ impl FreshClaudeState {
                             );
                             None
                         } else {
-                            Some(session)
+                            Some((map_key, session))
                         }
                     }
                 }
             };
-            if let Some(session) = removed {
+            if let Some((map_key, session)) = removed {
                 tracing::info!(target: "freshell_freshagent::claude",
                     durable = %id,
                     map_key = %map_key,
@@ -3282,6 +3304,11 @@ impl FreshClaudeState {
                     .map(|dead| dead.ids)
             })
             .unwrap_or_default();
+        if !sessions.contains_key(map_key) {
+            // A persisted current UUID can have a Bound row without a live
+            // runtime in this server. It must close with the addressed ID.
+            candidates.push(map_key.to_string());
+        }
         if let Some(sink) = self.identity_sink() {
             for (durable, _) in sink.alias_tombstone_records(PROVIDER, wire_session_id) {
                 // An old placeholder cannot close a genuinely reopened writer.
@@ -4674,8 +4701,18 @@ impl FreshClaudeState {
     }
 
     async fn resolve_session_key(&self, session_id: &str) -> Option<String> {
+        {
+            let sessions = self.sessions.lock().await;
+            if let Some(key) = Self::session_key_in(&sessions, session_id) {
+                return Some(key);
+            }
+        }
+        let durable = self
+            .identity_sink()
+            .and_then(|sink| sink.chain_terminus(PROVIDER, session_id))?;
         let sessions = self.sessions.lock().await;
         Self::session_key_in(&sessions, session_id)
+            .or_else(|| Self::session_key_in(&sessions, &durable))
     }
 
     /// The not-tracked resume (codex `ensure_session_resumable` analog, file-store
@@ -10030,6 +10067,189 @@ pub(crate) mod tests {
                 && retired.contains(&("claude".to_string(), new.clone())),
             "kill(old) must close both the addressed alias and current identity: {retired:?}"
         );
+    }
+
+    async fn link_native_fixture(st: &FreshClaudeState, prior: &str, current: &str) {
+        st.identity_sink()
+            .unwrap()
+            .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+                provider: PROVIDER.into(),
+                session_id: current.into(),
+                mode: "freshclaude".into(),
+                create_request_id: None,
+                resolves_pending: None,
+                supersedes: Some(prior.into()),
+                name_transition: None,
+                provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
+                observed_epoch: None,
+                observed_generation: None,
+                authoritative: false,
+                settings: Default::default(),
+                genesis: crate::identity_sink::GenesisUpdate::Keep,
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_persisted_native_close_follows_its_captured_runtime_through_a_concurrent_rekey() {
+        let (mut st, mut rx) = state_with_bus();
+        let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(sink.clone());
+        let prior = uuid::Uuid::new_v4().to_string();
+        let current = uuid::Uuid::new_v4().to_string();
+        let next = uuid::Uuid::new_v4().to_string();
+        insert_fake_claude_session(&st, &current).await;
+        link_native_fixture(&st, &prior, &current).await;
+        assert!(!st.sessions.lock().await[&current].identity.contains(&prior));
+        let pause = Arc::new(AdoptionTestPause {
+            notify: tokio::sync::Notify::new(),
+            reached: std::sync::atomic::AtomicBool::new(false),
+        });
+        st.set_kill_after_resolve_test_pause(Some(pause.clone()));
+        let kill = {
+            let st = st.clone();
+            let id = prior.clone();
+            tokio::spawn(async move { st.handle_kill(kill_msg(&id)).await })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !pause.reached.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "kill never resolved its id"
+            );
+            tokio::task::yield_now().await;
+        }
+        let pending = st.sessions.lock().await[&current].pending.clone();
+        st.rekey_conversation(
+            &current,
+            &next,
+            "freshclaude",
+            &pending,
+            "test/persisted-close-rekey",
+        )
+        .await
+        .unwrap();
+        pause.notify.notify_one();
+        tokio::time::timeout(Duration::from_secs(15), kill)
+            .await
+            .unwrap()
+            .unwrap();
+        let answer = await_specific_frame(&mut rx, "freshAgent.killed", &prior).await;
+        assert_eq!(answer["success"], true, "{answer}");
+        assert!(
+            !st.sessions.lock().await.contains_key(&next),
+            "the captured runtime survives neither a stale map key nor missing wire history"
+        );
+        let retires = sink.retires.lock().unwrap();
+        for id in [&prior, &current, &next] {
+            assert!(
+                retires.contains(&(PROVIDER.into(), id.clone())),
+                "missing native close for {id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_direct_live_native_id_precedes_a_conflicting_persisted_successor() {
+        let (st, mut rx) = state_with_bus();
+        let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(sink.clone());
+        let direct = uuid::Uuid::new_v4().to_string();
+        let other = uuid::Uuid::new_v4().to_string();
+        insert_fake_claude_session(&st, &direct).await;
+        insert_fake_claude_session(&st, &other).await;
+        link_native_fixture(&st, &direct, &other).await;
+        assert_eq!(
+            st.resolve_session_key(&direct).await.as_deref(),
+            Some(direct.as_str())
+        );
+        assert_eq!(st.claude_owner_key(Some(&direct), &direct).await, direct);
+        st.handle_kill(kill_msg(&direct)).await;
+        let answer = await_specific_frame(&mut rx, "freshAgent.killed", &direct).await;
+        assert_eq!(answer["success"], true);
+        assert!(st.sessions.lock().await.contains_key(&other));
+        assert!(!sink
+            .retires
+            .lock()
+            .unwrap()
+            .contains(&(PROVIDER.into(), other)));
+        st.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_active_coordinator_owner_precedes_a_staged_persisted_successor() {
+        use freshell_ownership::{BeginOutcome, RuntimeOwnerKind};
+
+        let (mut st, _rx) = state_with_bus();
+        st.set_identity_sink(Arc::new(crate::identity_sink::FakeIdentitySink::default()));
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        let original = uuid::Uuid::new_v4().to_string();
+        let staged = uuid::Uuid::new_v4().to_string();
+        assert!(matches!(
+            registry.begin_start(
+                PROVIDER,
+                &original,
+                RuntimeOwnerKind::FreshAgent,
+                "pending-original",
+                None,
+                "test",
+                1
+            ),
+            BeginOutcome::Granted { .. }
+        ));
+        link_native_fixture(&st, &original, &staged).await;
+        assert_eq!(st.resolve_ownership_key(&original), original);
+        assert!(matches!(
+            st.ownership_snapshot(PROVIDER, &original).state,
+            freshell_ownership::OwnershipState::Starting { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_kill_sweep_spares_a_reopened_successor_whose_prior_native_id_remains_fenced() {
+        let (st, _rx) = state_with_bus();
+        let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(sink.clone());
+        let prior = uuid::Uuid::new_v4().to_string();
+        let current = uuid::Uuid::new_v4().to_string();
+        link_native_fixture(&st, &prior, &current).await;
+        sink.retire_closed(PROVIDER, &prior).await.unwrap();
+        sink.retire_closed(PROVIDER, &current).await.unwrap();
+        let fence = sink.kill_tombstone_at_ms(PROVIDER, &current);
+        assert!(fence.is_some());
+        assert!(st.commit_session_claim(&current, fence, &[]).await);
+        insert_fake_claude_session(&st, &current).await;
+        let pid = st.sessions.lock().await[&current].child.id();
+        assert!(!st.sessions.lock().await[&current].identity.contains(&prior));
+        assert!(sink.kill_tombstone_at_ms(PROVIDER, &prior).is_some());
+        assert!(sink.kill_tombstone_at_ms(PROVIDER, &current).is_none());
+        assert_eq!(
+            st.resolve_session_key(&prior).await.as_deref(),
+            Some(current.as_str())
+        );
+
+        st.sweep_late_claim_orphans(&[prior.clone(), current.clone()])
+            .await;
+
+        {
+            let mut sessions = st.sessions.lock().await;
+            let session = sessions
+                .get_mut(&current)
+                .expect("a genuine reopen survives the old close's sweep");
+            assert_eq!(session.child.id(), pid);
+            assert!(session.child.try_wait().unwrap().is_none());
+        }
+        assert_eq!(
+            sink.states
+                .lock()
+                .unwrap()
+                .get(&(PROVIDER.into(), current))
+                .copied(),
+            Some(crate::identity_sink::FakeRowState::Bound)
+        );
+        st.shutdown().await;
     }
 
     /// Retire-on-kill (delta-review round 5, restore-open-sessions-only): an
