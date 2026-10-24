@@ -277,7 +277,7 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
       } catch (error) {
         const rows = readClaudeSimLedger(simLedger)
         const received = (await harness.getReceivedWsMessages()) as any[]
-        console.error(JSON.stringify({
+        const diagnostic = {
           severity: 'error',
           event: 'e2e.claude_hidden_approval_diagnostic',
           queryPermissionModes: rows.filter((row) => row.kind === 'query')
@@ -291,9 +291,8 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
             .filter((message) => message?.type === 'freshAgent.event')
             .map((message) => ({ type: message.event?.type, code: message.event?.code }))
             .slice(-30),
-          serverOutput: server?.capturedOutput(),
-        }))
-        throw error
+        }
+        throw new Error(`${error instanceof Error ? error.message : String(error)}\n${JSON.stringify(diagnostic)}`)
       }
       expect(await harness.getActiveTabId(), 'the approval arrived while tab A was hidden').toBe(tabB)
 

@@ -551,7 +551,7 @@ async function raisePermissionAndAssertNoDecisions(
   } catch (error) {
     const rows = readClaudeSimLedger(simLedger)
     const received = (await harness.getReceivedWsMessages()) as any[]
-    console.error(JSON.stringify({
+    const diagnostic = {
       severity: 'error',
       event: 'e2e.claude_approval_card_diagnostic',
       queryPermissionModes: rows.filter((row) => row.kind === 'query')
@@ -565,8 +565,8 @@ async function raisePermissionAndAssertNoDecisions(
         .filter((message) => message?.type === 'freshAgent.event')
         .map((message) => ({ type: message.event?.type, code: message.event?.code }))
         .slice(-30),
-    }))
-    throw error
+    }
+    throw new Error(`${error instanceof Error ? error.message : String(error)}\n${JSON.stringify(diagnostic)}`)
   }
   // AGENT-05 pause-proof: the CLI has received zero decisions — the card came
   // from the snapshot overlay, not from any fabricated user choice.
