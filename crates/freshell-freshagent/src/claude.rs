@@ -12940,8 +12940,6 @@ rl.on('line', (line) => {
 
     // ── b8ke focused episode-2 round-1: the adoption's atomicity tests ─────
 
-    /// The fake sidecar's durable id for a create with NO resume boot.
-
     /// A minimal thread-local tracing capture (the session_handoff
     /// tracing_capture pattern, trimmed to the events the e2r1 tests need).
     mod init_capture {
@@ -18369,7 +18367,7 @@ rl.on('line', (line) => {
         let fresh_create_durable_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
         assert_eq!(created["type"], "freshAgent.created", "{created}");
 
-        prepare_legacy_init(&st, &created["sessionId"].as_str().unwrap()).await;
+        prepare_legacy_init(&st, created["sessionId"].as_str().unwrap()).await;
         while rx.try_recv().is_ok() {}
         fake.set_fail_writes(true);
         st.adopt_session_init(
