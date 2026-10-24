@@ -108,6 +108,33 @@ impl ClaudeTestRuntime {
         &self.spawn_log
     }
 
+    pub(super) fn program(&self, steps: Value) {
+        std::env::set_var(
+            "FRESHELL_CLAUDE_SIM_PROGRAM",
+            json!({
+                "rules":[{"on":"msg:prompt", "emit":steps}]
+            })
+            .to_string(),
+        );
+    }
+
+    pub(super) async fn simulator_row(&self, kind: &str) -> Value {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(row) = rows(&self.dir.join("sim-ledger.jsonl"))
+                .into_iter()
+                .find(|row| row["kind"] == kind)
+            {
+                return row;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "simulator never recorded {kind}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     pub(super) async fn create_request(&self) -> Value {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
@@ -135,9 +162,20 @@ impl ClaudeTestRuntime {
     }
 
     pub(super) async fn respond_log_frames(&self, min: usize) -> Vec<Value> {
+        self.wait_request_frames(None, min).await
+    }
+
+    pub(super) async fn request_frames_of_type(&self, kind: &str, min: usize) -> Vec<Value> {
+        self.wait_request_frames(Some(kind), min).await
+    }
+
+    async fn wait_request_frames(&self, kind: Option<&str>, min: usize) -> Vec<Value> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
-            let frames = rows(&self.respond_log);
+            let frames: Vec<_> = rows(&self.respond_log)
+                .into_iter()
+                .filter(|frame| kind.is_none_or(|kind| frame["type"] == kind))
+                .collect();
             if frames.len() >= min {
                 return frames;
             }

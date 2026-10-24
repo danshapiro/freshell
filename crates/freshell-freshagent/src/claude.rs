@@ -16461,19 +16461,28 @@ pub(crate) mod tests {
         )
     }
 
-    /// Bounded-wait until the consumer has folded a pending `requestId` permission for
+    fn permission_runtime() -> FakeClaudeSidecarEnv {
+        let env = FakeClaudeSidecarEnv::install();
+        env.program(json!([
+            {"kind":"approval", "data":{"tool":"Bash", "input":{"command":"ls"}}},
+            {"kind":"hang"},
+        ]));
+        env
+    }
+
+    /// Bounded-wait until the consumer has folded the SDK's pending permission for
     /// the session (the respond handlers refuse ids outside the pending set, so the
     /// fold MUST be observed before responding).
-    async fn await_pending_permission(st: &FreshClaudeState, session_id: &str, request_id: &str) {
+    async fn await_pending_permission(st: &FreshClaudeState, session_id: &str) -> String {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
         loop {
             let (permissions, _) = pending_request_ids(st, session_id).await;
-            if permissions.iter().any(|id| id == request_id) {
-                return;
+            if let Some(request_id) = permissions.into_iter().next() {
+                return request_id;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "pending permission {request_id} never folded into the session"
+                "the pending permission never folded into the session"
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
@@ -16557,29 +16566,29 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn approval_respond_writes_the_frame_and_removes_the_pending_entry() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
-        let env = FakeClaudeSidecarEnv::install();
+        let env = permission_runtime();
         let (st, mut rx) = state_with_bus();
         st.handle_create(dedup_create_msg("req-approval-respond"), None)
             .await;
         let created = await_claude_created(&mut rx, "req-approval-respond").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
 
-        // Raise the pending permission through the fake's canUseTool stand-in; the
+        // Raise the pending permission through the real sidecar's canUseTool callback; the
         // consumer folds it into the session's pending set.
-        st.handle_send(send_msg(&session_id, "__raise_permission__"))
+        st.handle_send(send_msg(&session_id, "ask before listing files"))
             .await;
-        await_pending_permission(&st, &session_id, "req-1").await;
+        let request_id = await_pending_permission(&st, &session_id).await;
 
         let decision = json!({ "behavior": "allow", "updatedInput": { "command": "ls -la" } });
         st.handle_approval_respond(approval_respond_msg(
             &session_id,
             SessionType::Freshclaude,
-            "req-1",
+            &request_id,
             decision.clone(),
         ))
         .await;
 
-        let frames = env.respond_log_frames(1).await;
+        let frames = env.request_frames_of_type("permission.respond", 1).await;
         let respond = frames
             .iter()
             .find(|f| f["type"] == "permission.respond")
@@ -16589,14 +16598,14 @@ pub(crate) mod tests {
             json!(session_id),
             "sidecar-keyed sessionId"
         );
-        assert_eq!(respond["requestId"], "req-1");
+        assert_eq!(respond["requestId"], json!(request_id));
         assert_eq!(
             respond["decision"], decision,
             "the decision payload is a VERBATIM passthrough"
         );
         let (permissions, _) = pending_request_ids(&st, &session_id).await;
         assert!(
-            !permissions.iter().any(|id| id == "req-1"),
+            !permissions.iter().any(|id| id == &request_id),
             "the resolved entry leaves the pending set"
         );
         drop(env);
@@ -16652,23 +16661,23 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn approval_respond_with_a_non_object_decision_is_refused_and_keeps_the_pending_entry() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
-        let env = FakeClaudeSidecarEnv::install();
+        let env = permission_runtime();
         let (st, mut rx) = state_with_bus();
         st.handle_create(dedup_create_msg("req-approval-null-decision"), None)
             .await;
         let created = await_claude_created(&mut rx, "req-approval-null-decision").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
 
-        // Raise the pending permission through the fake's canUseTool stand-in; the
+        // Raise the pending permission through the real sidecar's canUseTool callback; the
         // consumer folds it into the session's pending set.
-        st.handle_send(send_msg(&session_id, "__raise_permission__"))
+        st.handle_send(send_msg(&session_id, "ask before listing files"))
             .await;
-        await_pending_permission(&st, &session_id, "req-1").await;
+        let request_id = await_pending_permission(&st, &session_id).await;
 
         st.handle_approval_respond(approval_respond_msg(
             &session_id,
             SessionType::Freshclaude,
-            "req-1",
+            &request_id,
             json!(null),
         ))
         .await;
@@ -16679,11 +16688,13 @@ pub(crate) mod tests {
         let (permissions, _) = pending_request_ids(&st, &session_id).await;
         assert_eq!(
             permissions,
-            vec!["req-1".to_string()],
+            vec![request_id.clone()],
             "a refused non-object decision leaves the entry pending (never hide-then-wedge)"
         );
         assert!(
-            env.respond_log_frames(0).await.is_empty(),
+            env.request_frames_of_type("permission.respond", 0)
+                .await
+                .is_empty(),
             "a refused non-object decision is never forwarded to the sidecar"
         );
         drop(env);
@@ -16696,20 +16707,20 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn approval_respond_refuses_malformed_updated_permissions_until_a_valid_retry() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
-        let env = FakeClaudeSidecarEnv::install();
+        let env = permission_runtime();
         let (st, mut rx) = state_with_bus();
         st.handle_create(dedup_create_msg("req-approval-bad-updates"), None)
             .await;
         let created = await_claude_created(&mut rx, "req-approval-bad-updates").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
-        st.handle_send(send_msg(&session_id, "__raise_permission__"))
+        st.handle_send(send_msg(&session_id, "ask before listing files"))
             .await;
-        await_pending_permission(&st, &session_id, "req-1").await;
+        let request_id = await_pending_permission(&st, &session_id).await;
 
         st.handle_approval_respond(approval_respond_msg(
             &session_id,
             SessionType::Freshclaude,
-            "req-1",
+            &request_id,
             json!({ "behavior": "allow", "updatedPermissions": [
                 { "type": "grantEverything", "destination": "session" },
             ] }),
@@ -16722,11 +16733,13 @@ pub(crate) mod tests {
         let (permissions, _) = pending_request_ids(&st, &session_id).await;
         assert_eq!(
             permissions,
-            vec!["req-1".to_string()],
+            vec![request_id.clone()],
             "a refused decision leaves the request pending"
         );
         assert!(
-            env.respond_log_frames(0).await.is_empty(),
+            env.request_frames_of_type("permission.respond", 0)
+                .await
+                .is_empty(),
             "a refused decision never reaches the sidecar"
         );
 
@@ -16738,11 +16751,11 @@ pub(crate) mod tests {
         st.handle_approval_respond(approval_respond_msg(
             &session_id,
             SessionType::Freshclaude,
-            "req-1",
+            &request_id,
             decision.clone(),
         ))
         .await;
-        let frames = env.respond_log_frames(1).await;
+        let frames = env.request_frames_of_type("permission.respond", 1).await;
         let respond = frames
             .iter()
             .find(|f| f["type"] == "permission.respond")
@@ -16769,21 +16782,21 @@ pub(crate) mod tests {
         // cache once this thread's capture is installed.
         let (events, _capture_guard) = info_capture_for_test::capture();
         tracing::callsite::rebuild_interest_cache();
-        let env = FakeClaudeSidecarEnv::install();
+        let env = permission_runtime();
         let (st, mut rx) = state_with_bus();
         st.handle_create(dedup_create_msg("req-approval-refusal-log"), None)
             .await;
         let created = await_claude_created(&mut rx, "req-approval-refusal-log").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
-        st.handle_send(send_msg(&session_id, "__raise_permission__"))
+        st.handle_send(send_msg(&session_id, "ask before listing files"))
             .await;
-        await_pending_permission(&st, &session_id, "req-1").await;
+        let request_id = await_pending_permission(&st, &session_id).await;
 
         const SECRET: &str = "deploy --token s3cr3t-value";
         st.handle_approval_respond(approval_respond_msg(
             &session_id,
             SessionType::Freshclaude,
-            "req-1",
+            &request_id,
             json!({ "behavior": "allow", "updatedPermissions": [
                 { "type": "setMode", "mode": "acceptEdits", "destination": "session" },
                 { "type": "addRules", "rules": [{ "toolName": "Bash", "ruleContent": SECRET }],
@@ -16867,43 +16880,40 @@ pub(crate) mod tests {
     async fn question_respond_writes_the_frame_with_the_answers_object() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
+        env.program(json!([
+            {"kind":"question", "data":{"questions":[
+                {"question":"choice", "header":"Choice", "options":[
+                    {"label":"yes", "description":"Continue"}, {"label":"no", "description":"Stop"}]},
+                {"question":"note", "header":"Note", "options":[
+                    {"label":"ship it", "description":"Proceed"}, {"label":"wait", "description":"Wait"}]},
+            ]}},
+            {"kind":"hang"},
+        ]));
         let (st, mut rx) = state_with_bus();
         st.handle_create(dedup_create_msg("req-question-respond"), None)
             .await;
         let created = await_claude_created(&mut rx, "req-question-respond").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
 
-        // Seed the pending question directly (the consumer fold itself is pinned by
-        // consumer_folds_permission_and_question_frames_into_the_pending_set below).
-        {
-            let guard = st.sessions.lock().await;
-            guard
-                .get(&session_id)
-                .unwrap()
-                .pending
-                .lock()
-                .unwrap()
-                .questions
-                .push(PendingQuestionEntry {
-                    request_id: "q-1".to_string(),
-                    questions: json!([{ "question": "Continue?" }]),
-                });
-        }
+        st.handle_send(send_msg(&session_id, "ask the release questions"))
+            .await;
+        let question = await_frame_of_inner_type(&mut rx, "freshAgent.question.request").await;
+        let request_id = question["event"]["requestId"].as_str().unwrap().to_string();
 
         st.handle_question_respond(question_respond_msg(
             &session_id,
-            "q-1",
+            &request_id,
             &[("choice", "yes"), ("note", "ship it")],
         ))
         .await;
 
-        let frames = env.respond_log_frames(1).await;
+        let frames = env.request_frames_of_type("question.respond", 1).await;
         let respond = frames
             .iter()
             .find(|f| f["type"] == "question.respond")
             .expect("question.respond frame written to the sidecar");
         assert_eq!(respond["sessionId"], json!(session_id));
-        assert_eq!(respond["requestId"], "q-1");
+        assert_eq!(respond["requestId"], json!(request_id));
         assert_eq!(
             respond["answers"],
             json!({ "choice": "yes", "note": "ship it" }),
@@ -16913,6 +16923,13 @@ pub(crate) mod tests {
         assert!(
             questions.is_empty(),
             "the answered question leaves the pending set"
+        );
+        let answer = env.simulator_row("can_use_tool").await;
+        assert_eq!(answer["toolName"], "AskUserQuestion");
+        assert_eq!(
+            answer["decision"]["updatedInput"]["answers"],
+            json!({ "choice": "yes", "note": "ship it" }),
+            "the production sidecar resolves the SDK's parked question"
         );
         drop(env);
     }
@@ -17013,9 +17030,26 @@ pub(crate) mod tests {
         let created = await_claude_created(&mut rx, "req-compact").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
 
-        st.handle_compact(compact_msg(&session_id, None)).await;
-        st.handle_compact(compact_msg(&session_id, Some("  focus the diff  ")))
-            .await;
+        for instructions in [None, Some("  focus the diff  ")] {
+            st.handle_compact(compact_msg(&session_id, instructions))
+                .await;
+            // Each real command owns its turn until the CLI's result. Observe
+            // all frames through that boundary so an erroneous send ack fails.
+            loop {
+                let raw = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+                    .await
+                    .expect("compaction result in time")
+                    .expect("bus open");
+                let frame: Value = serde_json::from_str(&raw).unwrap();
+                assert_ne!(
+                    frame["type"], "freshAgent.send.accepted",
+                    "compact emits no send ack: {frame}"
+                );
+                if frame["event"]["type"] == "freshAgent.result" {
+                    break;
+                }
+            }
+        }
 
         let frames = env.respond_log_frames(2).await;
         let sends: Vec<&Value> = frames.iter().filter(|f| f["type"] == "send").collect();
@@ -17028,7 +17062,6 @@ pub(crate) mod tests {
         );
 
         // No ack: compact must not reuse handle_send's send.accepted broadcast.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         while let Ok(frame) = rx.try_recv() {
             let frame: Value = serde_json::from_str(&frame).unwrap();
             assert_ne!(
@@ -17096,7 +17129,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn kilroy_approval_respond_lands_and_removes_the_pending_entry() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
-        let env = FakeClaudeSidecarEnv::install();
+        let env = permission_runtime();
         let (st, mut rx) = state_with_bus();
         let mut create = dedup_create_msg("req-kilroy-approval-lands");
         create.session_type = SessionType::Kilroy;
@@ -17108,23 +17141,23 @@ pub(crate) mod tests {
         );
         let session_id = created["sessionId"].as_str().unwrap().to_string();
 
-        // Raise the pending permission through the fake's canUseTool stand-in; the
+        // Raise the pending permission through the real sidecar's canUseTool callback; the
         // consumer folds it into the kilroy session's pending set.
-        st.handle_send(send_msg(&session_id, "__raise_permission__"))
+        st.handle_send(send_msg(&session_id, "ask before listing files"))
             .await;
-        await_pending_permission(&st, &session_id, "req-1").await;
+        let request_id = await_pending_permission(&st, &session_id).await;
 
         let decision =
             json!({ "behavior": "deny", "message": "Denied by user", "interrupt": false });
         st.handle_approval_respond(approval_respond_msg(
             &session_id,
             SessionType::Kilroy,
-            "req-1",
+            &request_id,
             decision.clone(),
         ))
         .await;
 
-        let frames = env.respond_log_frames(1).await;
+        let frames = env.request_frames_of_type("permission.respond", 1).await;
         let respond = frames
             .iter()
             .find(|f| f["type"] == "permission.respond")
@@ -17134,14 +17167,14 @@ pub(crate) mod tests {
             json!(session_id),
             "sidecar-keyed sessionId"
         );
-        assert_eq!(respond["requestId"], "req-1");
+        assert_eq!(respond["requestId"], json!(request_id));
         assert_eq!(
             respond["decision"], decision,
             "the decision payload is a VERBATIM passthrough"
         );
         let (permissions, _) = pending_request_ids(&st, &session_id).await;
         assert!(
-            !permissions.iter().any(|id| id == "req-1"),
+            !permissions.iter().any(|id| id == &request_id),
             "the resolved entry leaves the pending set"
         );
         drop(env);
@@ -17432,11 +17465,21 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(creates.len(), 2);
         assert_eq!(
-            creates[0]["plugins"],
-            json!(["/workspace/.claude/plugins/local"])
+            creates[0]["options"]["plugins"],
+            json!([{"type":"local", "path":"/workspace/.claude/plugins/local"}])
         );
-        assert_eq!(creates[1]["plugins"], Value::Null);
-        assert_eq!(creates[1]["boot"], json!({ "kind": "fresh" }));
+        assert_eq!(creates[1]["options"]["plugins"], Value::Null);
+        assert!(creates[1]["options"].get("resume").is_none());
+        assert!(creates[1]["options"].get("forkSession").is_none());
+        for create in &creates {
+            assert!(
+                uuid::Uuid::parse_str(create["options"]["sessionId"].as_str().unwrap()).is_ok()
+            );
+        }
+        assert_ne!(
+            creates[0]["options"]["sessionId"],
+            creates[1]["options"]["sessionId"]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -18170,7 +18213,7 @@ pub(crate) mod tests {
     /// A known session's interrupt is forwarded to the sidecar (the Rust-side half of
     /// the parity fix -- mirrors `adapters/claude/adapter.ts:163-168`'s
     /// `sdkBridge.interrupt(sessionId)` -> `sp.query.interrupt()`), observed via the
-    /// fake sidecar's interrupt log since a successful interrupt broadcasts NOTHING
+    /// production sidecar's captured stdin since a successful interrupt broadcasts NOTHING
     /// (fire-and-forget, matching legacy exactly -- there is no confirmation frame to
     /// assert on instead).
     #[tokio::test]
@@ -18184,11 +18227,12 @@ pub(crate) mod tests {
             .await;
         let created = await_claude_created(&mut rx, "req-claude-interrupt").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
-        // C18: a Stop reaches the sidecar only while something runs. The fake
-        // answers no plain send, so the turn stays owed until the Stop.
+        // C18: a Stop reaches the sidecar only while something runs. The
+        // simulated model request stays pending until the SDK interrupt.
         st.handle_send(send_msg(&session_id, "a turn to stop"))
             .await;
         await_ledger_busy(&st, &session_id, true).await;
+        let _ = env.simulator_row("prompt").await;
 
         st.handle_interrupt(FreshAgentInterrupt {
             request_id: None,
@@ -18199,7 +18243,7 @@ pub(crate) mod tests {
         })
         .await;
 
-        // Bounded poll for the fake sidecar's interrupt log (it's an OS-level pipe
+        // Bounded poll for the production sidecar's captured input (an OS-level pipe
         // write, not synchronous with `handle_interrupt`'s `write_line` await).
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
@@ -18247,6 +18291,7 @@ pub(crate) mod tests {
     async fn handle_interrupt_of_an_idle_session_sends_nothing() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
+        env.program(json!([{"kind":"text", "data":{"text":"the next turn completes"}}]));
         let (log_events, _log_guard) = crate::claude_sidecar_io::test_capture::capture();
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let st = FreshClaudeState::new(Arc::new(tx));
@@ -18264,7 +18309,6 @@ pub(crate) mod tests {
             cwd: None,
         })
         .await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
             env.interrupt_log_contents(),
             "",
@@ -18281,9 +18325,13 @@ pub(crate) mod tests {
         while rx.try_recv().is_ok() {}
         st.handle_send(send_msg(&session_id, "a turn")).await;
         await_ledger_busy(&st, &session_id, true).await;
-        inject_raw_send(&st, &session_id, "__emit_result__").await;
         let edge = await_frame_of_inner_type(&mut rx, "freshAgent.turn.complete").await;
         assert!(edge["event"]["at"].as_i64().is_some(), "{edge}");
+        assert_eq!(
+            env.interrupt_log_contents(),
+            "",
+            "the idle Stop never reaches the sidecar, even after the next real turn"
+        );
     }
 
     /// Adapter-asymmetry fix (bug-hunt pbh-20260807): an UNREQUESTED sidecar death
