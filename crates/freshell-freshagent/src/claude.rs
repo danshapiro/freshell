@@ -12,7 +12,7 @@
 //!
 //! | Client→server | Behaviour |
 //! |---|---|
-//! | `freshAgent.create {sessionType:'freshclaude'\|'kilroy',…}` | allocate a native Claude UUID, establish ownership and recovery metadata, then acknowledge the sidecar and broadcast `freshAgent.created` with its durable ref |
+//! | `freshAgent.create {sessionType:'freshclaude'\|'kilroy',…}` | allocate a native Claude UUID, boot its owned sidecar, establish ownership and recovery metadata, then publish `freshAgent.created` with its durable ref |
 //! | `freshAgent.send {sessionId,text}` | recover an ended runtime when needed, apply settings, then push the user turn into the SDK input stream and broadcast its correlated acceptance |
 //!
 //! The live map uses the current native UUID. A conversation reset moves the
@@ -48,9 +48,8 @@
 //!
 //! ## Safety
 //!
-//! The Node sidecar (and the `claude` CLI grandchild the SDK spawns) inherit the server's
-//! isolated HOME (so they authenticate from + write ALL transcript data under
-//! `<isolatedHOME>/.claude`, never the user's real store) and carry a
+//! The Node sidecar and SDK-spawned Claude CLI use the configured provider
+//! environment. Test rigs supply an isolated HOME and transcript store. Both carry a
 //! `FRESHELL_CLAUDE_SIDECAR_ID` ownership tag. Every teardown, and
 //! [`FreshClaudeState::shutdown`] for all sessions concurrently, first asks the sidecar to
 //! shut down (it aborts its SDK query, which stops the claude CLI), escalates to
@@ -1486,19 +1485,10 @@ impl FreshClaudeState {
         self.naming.get()
     }
 
-    /// Unified agent names (Task 2): admit a freshclaude create's pre-durable
-    /// naming handle and stash it against the placeholder session id, so the
-    /// `sdk.session.init` adoption binds it to the durable UUID. Kilroy is
-    /// out of scope (its `naming_handle` is ignored); a create WITHOUT a
-    /// handle simply proceeds unnamed. Returns the frame projection when a
-    /// handle was admitted.
-    /// Unified agent names (Task 8 acceptance): the pending RECORD for the
-    /// create frame's handle, admitted at REQUEST RECEIPT — BEFORE the
-    /// sidecar spawn/`created` handshake (seconds) during which the pane
-    /// content and the client's rename capture already carry the handle.
-    /// A rename committed inside that window must resolve the same record
-    /// the server accepted on the wire (the pre-fix shape answered 404
-    /// NAME_NOT_FOUND and silently lost the manual pre-durable name).
+    /// Admit the pending name at request receipt, before the CLI boots, so
+    /// a rename during startup reaches the same record. Establishment binds
+    /// it to the native UUID after saving recovery metadata. Kilroy ignores
+    /// naming handles; a create without a handle proceeds unnamed.
     async fn admit_create_handle_early(&self, msg: &FreshAgentCreate, session_type: &str) {
         if session_type == "kilroy" {
             return;
@@ -2080,10 +2070,8 @@ impl FreshClaudeState {
         // codex/opencode: a duplicate `create` arriving right after this point must see
         // the cache populated, never race past this guard's release and spawn a second
         // sidecar).
-        // A resume create names the conversation the CLI booted: `created` comes
-        // only after that boot, so the caller learns the native identity here
-        // instead of waiting for a turn's init (design §6, §7.3). A fresh create
-        // has no durable id until its first turn, so it carries none.
+        // Every successful create names its boot-verified native conversation,
+        // including a fresh conversation that has not received a prompt.
         let session_ref = Some(claude_session_ref(&launch_id));
         self.create_dedup
             .record_success(
@@ -2097,9 +2085,7 @@ impl FreshClaudeState {
             )
             .await;
 
-        // Broadcast freshAgent.created (ws-handler.ts:3378); placeholder == the bare
-        // nanoid. Unified agent names: the created frame carries the pane's naming
-        // projection (the pending handle's record) when one was admitted.
+        // Publish the native identity and its current durable naming projection.
         let name_ref = naming_projection
             .as_ref()
             .map(|(reference, _)| reference.clone());
