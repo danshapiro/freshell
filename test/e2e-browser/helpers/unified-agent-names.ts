@@ -329,7 +329,6 @@ export async function bootUnifiedNamesServer(opts: BootUnifiedNamesOptions = {})
     const env: Record<string, string> = {
       GOOGLE_GENERATIVE_AI_API_KEY: '',
       ...(opts.gemini ? { FRESHELL_GEMINI_BASE_URL: opts.gemini.baseUrl } : {}),
-      ...(opts.env ?? {}),
     }
     let enabledProviders: string[] = []
     if (opts.mode) {
@@ -337,6 +336,7 @@ export async function bootUnifiedNamesServer(opts: BootUnifiedNamesOptions = {})
       enabledProviders = [fixture.provider]
       Object.assign(env, await fixture.env(root))
     }
+    Object.assign(env, opts.env ?? {})
     const server = new RustServer({
       port: opts.port,
       homeDir: opts.homeDir ?? debugHome,
