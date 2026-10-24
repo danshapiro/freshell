@@ -212,7 +212,8 @@ where
         }
 
         if metadata.target() == "freshell_server::auto_title_sweep"
-            && visitor.message.split(':').next() != Some("session_names.first_message_lookup_failed")
+            && visitor.message.split(':').next()
+                != Some("session_names.first_message_lookup_failed")
         {
             return;
         }

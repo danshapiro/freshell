@@ -79,11 +79,11 @@ mod process_probe;
 /// The wedged-runtime quiet deadman shared by the fresh-agent lanes (design
 /// 2026-10-22 §3.2, §5.6).
 pub(crate) mod quiet_deadman;
+mod rename_response;
+mod rename_target_cwd;
 pub mod rest_lane;
 pub(crate) mod rest_lane_create;
 mod rest_lane_sync;
-mod rename_response;
-mod rename_target_cwd;
 pub mod rollback_record;
 mod scoped_name_rename;
 pub mod session_handoff;
