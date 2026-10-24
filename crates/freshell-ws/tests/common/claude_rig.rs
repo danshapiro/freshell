@@ -112,6 +112,8 @@ pub struct ClaudeRig {
     /// (for example `has_live_session`).
     pub fresh_claude: freshell_freshagent::FreshClaudeState,
     pub fresh_codex: freshell_freshagent::FreshCodexState,
+    /// The same coordinator the WS dispatcher and Claude lane use.
+    pub ownership: Arc<freshell_ownership::RuntimeOwnershipRegistry>,
     /// The local fake Anthropic endpoint ([`RigKind::Cli`] only), killed on drop.
     _provider: Option<tokio::process::Child>,
     /// What the server was started with, for [`Self::restart`].
@@ -235,6 +237,7 @@ impl ClaudeRig {
             http_url,
             fresh_claude,
             fresh_codex,
+            ownership,
             server,
         } = spawn_rig_server(environment.clone(), &options, pane_ledger.clone()).await;
         eprintln!(
@@ -254,6 +257,7 @@ impl ClaudeRig {
             ledger,
             fresh_claude,
             fresh_codex,
+            ownership,
             _provider: provider,
             environment,
             options,
@@ -280,6 +284,7 @@ impl ClaudeRig {
             http_url,
             fresh_claude,
             fresh_codex,
+            ownership,
             server,
         } = spawn_rig_server(self.environment.clone(), &self.options, pane_ledger.clone()).await;
         eprintln!(
@@ -290,6 +295,7 @@ impl ClaudeRig {
         self.http_url = http_url;
         self.fresh_claude = fresh_claude;
         self.fresh_codex = fresh_codex;
+        self.ownership = ownership;
         self.pane_ledger = pane_ledger;
         self.server = server;
     }
@@ -1010,6 +1016,7 @@ struct RigServer {
     http_url: String,
     fresh_claude: freshell_freshagent::FreshClaudeState,
     fresh_codex: freshell_freshagent::FreshCodexState,
+    ownership: Arc<freshell_ownership::RuntimeOwnershipRegistry>,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -1204,6 +1211,7 @@ async fn spawn_rig_server(
         http_url: format!("http://{addr}"),
         fresh_claude: lane,
         fresh_codex: state.fresh_codex.clone(),
+        ownership,
         server,
     }
 }
