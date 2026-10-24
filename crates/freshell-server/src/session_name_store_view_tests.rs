@@ -33,6 +33,14 @@ fn temp_dir() -> tempfile::TempDir {
     tempfile::tempdir().expect("tempdir")
 }
 
+/// This store's local turn, for driving `full_read` directly (nothing else
+/// in these tests holds it at that point).
+fn free_turn(store: &SessionNames) -> LocalTurn {
+    Arc::clone(&store.core.local_turn)
+        .try_lock_owned()
+        .expect("no transaction of this store is in flight")
+}
+
 fn open(dir: &Path) -> Arc<SessionNames> {
     SessionNames::open(dir.to_path_buf()).expect("open store")
 }
@@ -610,19 +618,12 @@ async fn a_peek_that_raced_a_commit_settles_under_the_lock_without_a_parse() {
 
     let before = test_store_transaction_count(&data_dir);
     for wait in [LockWait::Brief, LockWait::Bounded] {
-        // A short-wait attempt can still find a forked child's inherited
-        // copy of the rename's lock (Busy also parses nothing); retry it.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let adoption = loop {
-            match full_read(&store.core, wait, FullReadReason::StampChanged)
-                .expect("the full read succeeds")
-            {
-                Adoption::Busy if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                other => break other,
-            }
-        };
+        // The rename released its lock explicitly (`HeldSidecarLock`), so no
+        // forked child can still hold it: the short wait finds it free.
+        let turn = free_turn(&store);
+        let adoption = full_read(&store.core, &turn, wait, FullReadReason::StampChanged)
+            .expect("the full read succeeds");
+        drop(turn);
         assert_eq!(
             adoption,
             Adoption::Current,
@@ -663,8 +664,15 @@ async fn an_ordinary_commit_after_a_periodic_peek_is_not_logged_as_a_missed_chan
         .expect("B commits the ordinary way");
 
     let (guard, events) = scoped_trace_capture(STORE_TARGET);
-    let adoption = full_read(&a.core, LockWait::Bounded, FullReadReason::PeriodicCheck)
-        .expect("the full read succeeds");
+    let turn = free_turn(&a);
+    let adoption = full_read(
+        &a.core,
+        &turn,
+        LockWait::Bounded,
+        FullReadReason::PeriodicCheck,
+    )
+    .expect("the full read succeeds");
+    drop(turn);
     drop(guard);
     clear_test_hooks(&data_dir);
 
@@ -698,12 +706,15 @@ async fn a_change_the_stamp_could_not_see_is_logged_as_missed() {
     set_test_hooks(&data_dir, vec![TestHook::FullCheckIntervalMs(0)]);
 
     let (guard, events) = scoped_trace_capture(STORE_TARGET);
+    let turn = free_turn(&store);
     let adoption = full_read(
         &store.core,
+        &turn,
         LockWait::Bounded,
         FullReadReason::PeriodicCheck,
     )
     .expect("the full read succeeds");
+    drop(turn);
     drop(guard);
     clear_test_hooks(&data_dir);
 

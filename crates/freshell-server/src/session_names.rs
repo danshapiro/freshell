@@ -1780,18 +1780,23 @@ async fn await_local_turn(core: &NamesCore) -> LocalTurn {
     turn
 }
 
-fn run_txn_sync<T, F>(core: &NamesCore, _turn: &LocalTurn, f: F) -> Result<T, NameError>
+fn run_txn_sync<T, F>(core: &NamesCore, turn: &LocalTurn, f: F) -> Result<T, NameError>
 where
     F: FnOnce(&mut StoredDocument, &TxnMeta) -> Result<Decision<T>, NameError>,
 {
     let guard = acquire_document_lock(&core.lock_path)?;
-    run_txn_locked(core, guard, f)
+    run_txn_locked(core, turn, guard, f)
 }
 
-/// The transaction body, run while `_guard` holds the document lock (the
-/// reads' short-wait adoption acquires its own guard,
-/// `session_name_store_view`).
-fn run_txn_locked<T, F>(core: &NamesCore, _guard: std::fs::File, f: F) -> Result<T, NameError>
+/// The transaction body, run while the caller holds this store's local turn
+/// and `_guard` holds the document lock (the reads' short-wait adoption
+/// takes both its own way, `session_name_store_view`).
+fn run_txn_locked<T, F>(
+    core: &NamesCore,
+    _turn: &LocalTurn,
+    _guard: HeldSidecarLock,
+    f: F,
+) -> Result<T, NameError>
 where
     F: FnOnce(&mut StoredDocument, &TxnMeta) -> Result<Decision<T>, NameError>,
 {

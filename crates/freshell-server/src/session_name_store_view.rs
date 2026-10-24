@@ -30,18 +30,22 @@
 //! can catch a commit halfway (the old view stamp, then the new file); when
 //! the file then turns out to be the adopted one, nothing is parsed.
 //!
-//! A read never queues behind a commit: when the stamp changed it tries the
-//! lock for at most [`READ_LOCK_WAIT`], and if the lock is still busy
-//! (normally another participant mid-commit) it answers from the current
-//! view; a later read or the 2 s tick adopts the change. The short wait is
-//! there because a busy lock does not always mean a commit: a child process
-//! forked anywhere in this process while a transaction held the lock keeps
-//! an inherited copy of that lock's descriptor until it execs, and a single
-//! attempt would mistake that brief hold for a commit and answer stale.
-//! Once a read holds the lock, fences fail it exactly as before (an
-//! unreconciled replacement, a vanished document, a decreasing or rewritten
-//! generation); a read answered under a busy lock gets the established
-//! view, never the fenced document, and a later read reports the fence.
+//! A read never queues behind a commit. When the stamp changed it takes
+//! this store's local turn only if it is free — a turn held by one of this
+//! process's own transactions means that transaction is about to adopt or
+//! replace the document itself and publish the result into the view — and
+//! then tries the document lock for at most [`READ_LOCK_WAIT`]. If either
+//! is busy (normally a transaction mid-commit, here or in another
+//! participant) it answers from the current view; a later read or the 2 s
+//! tick adopts the change. The tick's full read is not a read a caller
+//! waits on: it queues for the local turn like every transaction and then
+//! takes the strict lock budget. Every lock this module takes is a
+//! [`HeldSidecarLock`](super::HeldSidecarLock), so a child process forked
+//! while a read held it cannot keep it held. Once a read holds the lock,
+//! fences fail it exactly as before (an unreconciled replacement, a
+//! vanished document, a decreasing or rewritten generation); a read
+//! answered under a busy lock gets the established view, never the fenced
+//! document, and a later read reports the fence.
 
 use std::fs::TryLockError;
 use std::io::Read as _;
@@ -53,8 +57,9 @@ use freshell_freshagent::naming::{NameError, NameFuture};
 use freshell_protocol::session_names::{SessionNameRef, SessionNameUpdate};
 
 use super::{
-    acquire_document_lock, name_ref_key, open_lock_file, run_txn_locked, spawn_txn, update_for_key,
-    Adopted, Decision, NamesCore, RedirectScope, SessionNames, StoredDocument,
+    acquire_document_lock, await_local_turn, name_ref_key, open_lock_file, run_txn_locked,
+    spawn_txn, update_for_key, Adopted, Decision, HeldSidecarLock, LocalTurn, NamesCore,
+    RedirectScope, SessionNames, StoredDocument,
 };
 
 /// How long an equal stamp is trusted before the peek re-reads the whole
@@ -62,10 +67,9 @@ use super::{
 const FULL_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How long a read tries a busy document lock before answering from the
-/// adopted view. It outlasts a lock descriptor inherited by a forked child
-/// (measured on Linux: at most 2.4 ms with four threads spawning processes
-/// nonstop) and stays far below a real commit of a live-size document, which
-/// the read does not wait for.
+/// adopted view. It rides out a momentary hold by another participant and
+/// stays far below a real commit of a live-size document, which the read
+/// does not wait for.
 const READ_LOCK_WAIT: Duration = Duration::from_millis(10);
 
 /// How often a read retries a busy lock within [`READ_LOCK_WAIT`].
@@ -179,14 +183,15 @@ impl FullReadReason {
     }
 }
 
-/// How long a full read may wait for the document lock.
+/// How long a full read may wait for the local turn and the document lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LockWait {
-    /// The strict transaction budget (the 2 s tick).
+    /// The local turn (FIFO), then the strict transaction budget (the 2 s
+    /// tick).
     Bounded,
-    /// At most [`READ_LOCK_WAIT`] (reads): a lock still busy after that
-    /// means another participant is mid-commit, and the read answers from
-    /// the current view.
+    /// The local turn only if it is free, then at most [`READ_LOCK_WAIT`]
+    /// for the document lock (reads): either still busy means a commit is
+    /// in flight, and the read answers from the current view.
     Brief,
 }
 
@@ -200,8 +205,8 @@ enum Adoption {
     Confirmed,
     /// A full read adopted a newer generation.
     Adopted,
-    /// The stamp changed but the lock stayed busy for the read's short wait
-    /// (reads only).
+    /// The stamp changed but the local turn was taken or the lock stayed
+    /// busy for the read's short wait (reads only).
     Busy,
 }
 
@@ -225,12 +230,17 @@ fn peek(core: &NamesCore) -> Option<FullReadReason> {
 fn try_document_lock_within(
     path: &Path,
     wait: Duration,
-) -> Result<Option<std::fs::File>, NameError> {
+) -> Result<Option<HeldSidecarLock>, NameError> {
     let file = open_lock_file(path)?;
     let deadline = Instant::now() + wait;
     loop {
         match file.try_lock() {
-            Ok(()) => return Ok(Some(file)),
+            Ok(()) => {
+                return Ok(Some(HeldSidecarLock {
+                    file,
+                    path: path.to_path_buf(),
+                }))
+            }
             Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
                 std::thread::sleep(READ_LOCK_POLL);
             }
@@ -253,6 +263,7 @@ fn try_document_lock_within(
 /// is the adopted one, nothing is read.
 fn full_read(
     core: &NamesCore,
+    turn: &LocalTurn,
     wait: LockWait,
     peeked: FullReadReason,
 ) -> Result<Adoption, NameError> {
@@ -261,18 +272,7 @@ fn full_read(
         LockWait::Brief => {
             match try_document_lock_within(&core.lock_path, read_lock_wait(&core.data_dir))? {
                 Some(guard) => guard,
-                None => {
-                    count_busy_read_for_test(&core.data_dir);
-                    tracing::debug!(
-                        target: "freshell_server::session_names",
-                        op = "get",
-                        reason = peeked.as_str(),
-                        class = "lock_busy",
-                        "session_names.read_served_from_view: the document lock stayed busy \
-                         for the read's short wait; answering from the adopted view"
-                    );
-                    return Ok(Adoption::Busy);
-                }
+                None => return Ok(served_busy(core, peeked, "lock_busy")),
             }
         }
     };
@@ -287,7 +287,7 @@ fn full_read(
         return Ok(Adoption::Current);
     };
     let before = core.current_view();
-    run_txn_locked(core, guard, |_doc, _meta| Ok(Decision::Read(())))?;
+    run_txn_locked(core, turn, guard, |_doc, _meta| Ok(Decision::Read(())))?;
     let after = core.current_view();
     if after.document.document_generation <= before.document.document_generation {
         return Ok(Adoption::Confirmed);
@@ -333,11 +333,35 @@ async fn adopt_if_changed(core: Arc<NamesCore>, wait: LockWait) -> Result<Adopti
     let Some(reason) = peek(&core) else {
         return Ok(Adoption::Current);
     };
-    tokio::task::spawn_blocking(move || full_read(&core, wait, reason))
+    let turn = match wait {
+        LockWait::Bounded => await_local_turn(&core).await,
+        LockWait::Brief => match Arc::clone(&core.local_turn).try_lock_owned() {
+            Ok(turn) => turn,
+            Err(_) => return Ok(served_busy(&core, reason, "local_turn_busy")),
+        },
+    };
+    tokio::task::spawn_blocking(move || full_read(&core, &turn, wait, reason))
         .await
         .map_err(|join_err| {
             NameError::Persistence(format!("naming adoption task failed: {join_err}"))
         })?
+}
+
+/// A read whose full read could not start without waiting: it answers from
+/// the adopted view (`class`: `local_turn_busy` when one of this process's
+/// own transactions holds the turn, `lock_busy` when the document lock
+/// stayed busy for the short wait).
+fn served_busy(core: &NamesCore, peeked: FullReadReason, class: &'static str) -> Adoption {
+    count_busy_read_for_test(&core.data_dir);
+    tracing::debug!(
+        target: "freshell_server::session_names",
+        op = "get",
+        reason = peeked.as_str(),
+        class,
+        "session_names.read_served_from_view: a commit is in flight; answering from the \
+         adopted view"
+    );
+    Adoption::Busy
 }
 
 /// Resolve `refs` against `document` — the read model's answer shape:
@@ -429,13 +453,11 @@ pub(super) fn test_busy_read_count(data_dir: &Path) -> u64 {
 }
 
 /// Test helper: `get`, repeated only while the read answered from the view
-/// because the lock stayed busy past its short wait (the busy tally proves
-/// it). Under a heavily loaded test run, a child process forked while a
-/// transaction held the lock can keep its inherited copy of the lock's
-/// descriptor longer than [`READ_LOCK_WAIT`]; the read then answers from the
-/// adopted view (safe, but not yet the new document) and a later read
-/// settles. Every other outcome (an adoption, a fence error, an answer from
-/// an unchanged document) is returned as is.
+/// because a commit was in flight (the local turn was taken or the lock
+/// stayed busy past its short wait; the busy tally proves it). The read
+/// then answers from the adopted view (safe, but not yet the new document)
+/// and a later read settles. Every other outcome (an adoption, a fence
+/// error, an answer from an unchanged document) is returned as is.
 #[cfg(test)]
 pub(super) async fn get_settled_for_test(
     names: &SessionNames,
