@@ -3,6 +3,7 @@
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+
 pub struct ClaudeSimEnvironment {
     dir: PathBuf,
 }
@@ -28,6 +29,18 @@ impl ClaudeSimEnvironment {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// A saved conversation in the native JSONL format, for cold-resume tests.
+    pub fn seed_transcript(&self, id: &str) {
+        let project = self.config_dir().join("projects/fixture");
+        std::fs::create_dir_all(&project).unwrap();
+        let row = serde_json::json!({
+            "type":"user", "sessionId":id, "uuid":uuid::Uuid::new_v4().to_string(),
+            "parentUuid":null, "cwd":self.workspace(), "isSidechain":false,
+            "message":{"role":"user", "content":[{"type":"text", "text":"saved conversation"}]}
+        });
+        std::fs::write(project.join(format!("{id}.jsonl")), format!("{row}\n")).unwrap();
     }
 
     pub fn environment(&self) -> Vec<(String, String)> {
