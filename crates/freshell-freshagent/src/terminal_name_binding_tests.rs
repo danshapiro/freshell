@@ -262,6 +262,7 @@ async fn seed(sink: &dyn SessionNaming, target: &SessionNameRef, name: &str) -> 
         name: name.to_string(),
         intent: NameIntent::User,
         if_revision: None,
+        cwd: None,
     })
     .await
     .unwrap()

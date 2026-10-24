@@ -224,6 +224,7 @@ async fn seed_saved_name(
         name: name.into(),
         intent: NameIntent::User,
         if_revision: None,
+        cwd: None,
     })
     .await
     .unwrap();
