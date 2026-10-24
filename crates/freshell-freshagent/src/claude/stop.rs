@@ -28,11 +28,7 @@ impl FreshClaudeState {
         let Some(session) = sessions.get_mut(map_key) else {
             return false;
         };
-        let stamp = session
-            .broadcast_id
-            .lock()
-            .expect("broadcast id lock")
-            .clone();
+        let stamp = session.identity.current();
         let stop_id = uuid::Uuid::new_v4().to_string();
         // Latched under the ledger lock before the write: the receipt and the
         // stopped turn's result can come back before this task runs again.

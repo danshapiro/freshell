@@ -111,7 +111,7 @@ async fn fake_session(
         cli_session_id: None,
         owning_operation: None,
         owning_generation: None,
-        broadcast_id: Arc::new(std::sync::Mutex::new(session_id.to_string())),
+        identity: RuntimeIdentity::new(session_id, Vec::new()),
         pending: Arc::new(std::sync::Mutex::new(ClaudePending::default())),
         ledger: crate::claude_turns::SharedLedger::default(),
         clock: crate::attention::AttentionClock::default(),

@@ -135,8 +135,6 @@ pub(super) struct EstablishPlan<'a> {
     /// nothing, the resume of a session that never recorded any, V7/A10). The
     /// session runs with them, or with the defaults.
     pub(super) recorded_settings: Option<crate::identity_sink::FreshAgentSettings>,
-    /// The lifecycle operation that owns this runtime's coordinator transition.
-    pub(super) owning_operation: Option<String>,
     pub(super) owning_generation: Option<u64>,
     pub(super) provenance: Option<crate::BindProvenance>,
     /// A create's request: its pending naming handle is admitted under the
@@ -597,7 +595,6 @@ impl FreshClaudeState {
             claim,
             rekey_provisional_claim,
             recorded_settings,
-            owning_operation: _owning_operation,
             owning_generation,
             provenance,
             naming,
@@ -734,8 +731,9 @@ impl FreshClaudeState {
             .map(|claim| claim.durable.clone())
             .or(adopted);
         let configuration_settings = recorded_settings.clone().unwrap_or_default();
-        let broadcast_id = Arc::new(std::sync::Mutex::new(map_key.clone()));
-        log_labels.bind_session(&broadcast_id);
+        let identity = RuntimeIdentity::new(map_key.clone(), Vec::new());
+        let log_identity = identity.clone();
+        log_labels.bind_session(move || log_identity.current());
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
         // A resume after an unrequested death continues the dead session's
         // attention clock (design §5.5): its edges stay above the death's.
@@ -745,6 +743,9 @@ impl FreshClaudeState {
                 .flatten()
                 .find_map(|id| self.dead_sessions.find(id))
         };
+        if let Some(dead) = resumed_runtime() {
+            identity.inherit(dead.ids);
+        }
         let InheritedRuntime {
             turn_lock,
             ledger,
@@ -776,7 +777,7 @@ impl FreshClaudeState {
                 ownership_id.clone(),
                 spec.session_type.clone(),
                 minted.clone(),
-                Arc::clone(&broadcast_id),
+                identity.clone(),
                 Arc::clone(&pending),
                 Arc::clone(&ledger),
                 quiet.state.clone(),
@@ -799,16 +800,11 @@ impl FreshClaudeState {
                     ownership_id: ownership_id.clone(),
                     consumer,
                     sidecar_session_id: minted,
-                    cli_session_id: durable.clone(),
                     // b8ke focused episode-2 round-2 F2: the lifecycle op that owns
                     // this runtime's coordinator transition, so the session-init
-                    // adoption's Blocked arm can correlate its own in-flight claim.
-                    #[cfg(test)]
-                    owning_operation: _owning_operation,
                     // b8ke ext r27 F2: the handoff's generation (the under-ticket
-                    // target resume) stamps the adoption's binding write.
                     owning_generation,
-                    broadcast_id,
+                    identity,
                     pending,
                     ledger,
                     clock,
@@ -828,15 +824,6 @@ impl FreshClaudeState {
                     .forget(&[map_key.as_str(), durable], "resumed");
             }
         }
-        // V5 interleaving 2 (Task 12): the durable id resolves to the session at
-        // registration, not lazily at `sdk.session.init` (hundreds of ms later,
-        // exactly when a 1 s loser retry arrives).
-        if let Some(durable) = durable.as_deref() {
-            self.cli_index
-                .lock()
-                .await
-                .insert(durable.to_string(), map_key.clone());
-        }
         // Test seam (Task 6 round-3 review I-1): park with the target session
         // registered but the resume unreturned (the handoff abort-window tests).
         if lane == EstablishLane::AttachResume {
@@ -844,28 +831,6 @@ impl FreshClaudeState {
                 let _ = pause.notified().await;
             }
         }
-        // Round 6 (Finding 2): the seat→durable mapping is durable at registration.
-        if let Some(durable) = claim
-            .as_ref()
-            .map(|claim| claim.durable.as_str())
-            .filter(|durable| *durable != map_key)
-        {
-            if let Some(sink) = self.identity_sink() {
-                if let Err(e) = sink
-                    .record_alias_tombstone(
-                        PROVIDER,
-                        &map_key,
-                        durable,
-                        crate::session_lease::now_epoch_ms() as i64,
-                    )
-                    .await
-                {
-                    tracing::warn!(error = %e, session = %durable, placeholder = %map_key,
-                        "freshagent.claude.alias_tombstone_write_failed");
-                }
-            }
-        }
-
         // Round 5 (focused-ep5-r4 Finding 1): the claim's POST-REGISTRATION
         // dead-state recheck. The commit and a kill's retire serialize on the
         // ledger guard, so a kill queued behind the commit lands between the
@@ -889,7 +854,7 @@ impl FreshClaudeState {
                 }
                 // Demote, never drop: a later kill naming the seat still
                 // resolves the durable.
-                self.evict_cli_index_aliases(&map_key).await;
+
                 if let Some(mut guard) = lease_guard.take() {
                     guard.fail();
                 }
@@ -915,7 +880,7 @@ impl FreshClaudeState {
                     let _teardown: LoggedTeardown =
                         self.teardown_removed_session_logged(session).await;
                 }
-                self.evict_cli_index_aliases(&map_key).await;
+
                 if let Some(mut guard) = lease_guard.take() {
                     guard.fail();
                 }
@@ -930,7 +895,7 @@ impl FreshClaudeState {
                         let _teardown: LoggedTeardown =
                             self.teardown_removed_session_logged(session).await;
                     }
-                    self.evict_cli_index_aliases(&map_key).await;
+
                     if let Some(mut guard) = lease_guard.take() {
                         guard.fail();
                     }
@@ -964,7 +929,6 @@ impl FreshClaudeState {
                     // durable again (fence re-raised, the revived row re-retired).
                     self.rollback_session_claim(&claim.durable).await;
                     // Finding 1: demote, never drop.
-                    self.evict_cli_index_aliases(&map_key).await;
                 }
                 guard.fail(); // own tree torn down: reopen the key
                 return Err(EstablishError::LeaseRevoked);
@@ -993,7 +957,7 @@ impl FreshClaudeState {
                     let _teardown: LoggedTeardown =
                         self.teardown_removed_session_logged(session).await;
                 }
-                self.evict_cli_index_aliases(&map_key).await;
+
                 return Err(EstablishError::OwnershipChanged);
             }
         }

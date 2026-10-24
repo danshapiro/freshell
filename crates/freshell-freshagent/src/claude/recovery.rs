@@ -126,9 +126,6 @@ impl FreshClaudeState {
                 };
             }
         };
-        let owning_operation = ticket
-            .as_ref()
-            .map(|ticket| ticket.operation_id().to_string());
         let outcome = self
             .resume_for_attach(
                 msg,
@@ -138,7 +135,6 @@ impl FreshClaudeState {
                 },
                 &mut lease,
                 &mut ticket,
-                owning_operation,
                 None,
             )
             .await;

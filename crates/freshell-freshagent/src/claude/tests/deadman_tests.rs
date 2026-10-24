@@ -159,3 +159,46 @@ async fn an_idle_runtime_never_arms_a_quiet_timeout() {
     tokio::time::resume();
     st.shutdown().await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn an_armed_quiet_deadline_follows_the_same_runtime_across_a_native_reset() {
+    let (st, mut rx) = state_with_bus();
+    let st = st
+        .with_sidecar_environment([("FRESHELL_FRESHCLAUDE_QUIET_WINDOW_MS".into(), "100".into())]);
+    let old = uuid::Uuid::new_v4().to_string();
+    let new = uuid::Uuid::new_v4().to_string();
+    insert_fake_claude_session(&st, &old).await;
+    let (owner, pending) = {
+        let sessions = st.sessions.lock().await;
+        let runtime = &sessions[&old];
+        runtime.ledger.lock().unwrap().arm(
+            "reset-turn".into(),
+            None,
+            crate::claude_turns::SendKind::Turn,
+        );
+        (runtime.ownership_id.clone(), runtime.pending.clone())
+    };
+    st.note_claude_stdout(&old, &owner, None).await;
+    st.rekey_conversation(&old, &new, "freshclaude", &pending, "test-reset")
+        .await
+        .unwrap();
+    clock_forward(150).await;
+    let frames: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
+        .map(|raw| serde_json::from_str(&raw).unwrap())
+        .collect();
+    let completed: Vec<_> = frames
+        .iter()
+        .filter(|frame| frame["event"]["type"] == "freshAgent.turn.complete")
+        .collect();
+    assert_eq!(
+        completed.len(),
+        1,
+        "the old deadline must still publish its stuck edge: {frames:?}"
+    );
+    assert_eq!(completed[0]["sessionId"], new);
+    assert!(frames
+        .iter()
+        .any(|frame| frame["sessionId"] == new && frame["event"]["status"] == "stuck"));
+    tokio::time::resume();
+    st.shutdown().await;
+}
