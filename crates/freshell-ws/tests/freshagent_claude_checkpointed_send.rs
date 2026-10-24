@@ -7,11 +7,10 @@
 //! (`FreshAgentView.tsx`'s `sendFreshAgentSendFrame`), and once a
 //! `session.runtimeOwner` frame named the pane's durable session id it also
 //! carries that record's observed `(epoch, generation)` pair. `handle_send`
-//! fences such a send through the coordinator. The claude lane's pane id is the
-//! sidecar's placeholder; the coordinator owns the session under the durable id
-//! the CLI reports in `system/init` (`sdk.session.init`). The real CLI reports
-//! it only once a prompt runs; the e2e fake reports it at create. Both orders
-//! are covered here.
+//! fences such a send through the coordinator. Creation establishes the native
+//! UUID and its owner before acknowledgement. The CLI repeats that identity in
+//! `system/init` (`sdk.session.init`), either after create or on the first prompt;
+//! checkpointed sends must work with both reporting orders.
 //!
 //! The claude sidecar is a scripted fake (the production
 //! `FRESHELL_CLAUDE_SIDECAR`/`FRESHELL_CLAUDE_NODE` overrides): no SDK, no
@@ -50,7 +49,6 @@ static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 const FAKE_CLAUDE_SIDECAR_SOURCE: &str = r#"
 import fs from 'node:fs'
 import readline from 'node:readline'
-import { randomUUID } from 'node:crypto'
 
 const initAt = process.env.FRESHELL_TEST_CLAUDE_INIT_AT
 const sendLog = process.env.FRESHELL_TEST_CLAUDE_SEND_LOG
@@ -71,8 +69,8 @@ rl.on('line', (line) => {
   try { msg = JSON.parse(trimmed) } catch { return }
   if (msg.type === 'create') {
     counter += 1
-    const sessionId = `fake-claude-${process.pid}-${counter}`
-    const st = { cliSessionId: randomUUID() }
+    const sessionId = msg.sessionId || `fake-claude-${process.pid}-${counter}`
+    const st = { cliSessionId: msg.boot?.resume || sessionId }
     sessions.set(sessionId, st)
     emit({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 })
     if (initAt === 'create') reportSession(sessionId, st)
@@ -410,15 +408,24 @@ impl Conn {
     }
 }
 
-/// The durable id the session's `freshAgent.session.init` reported.
+/// The browser learns the native identity from create before the CLI reports it.
 fn durable_id(frames: &[Value], session_id: &str) -> Option<String> {
-    frames.iter().find_map(|v| {
-        (v["type"] == "freshAgent.event"
-            && v["sessionId"] == session_id
-            && v["event"]["type"] == "freshAgent.session.init")
-            .then(|| v["event"]["cliSessionId"].as_str().map(str::to_string))
-            .flatten()
-    })
+    frames
+        .iter()
+        .find_map(|v| {
+            (v["type"] == "freshAgent.created" && v["sessionId"] == session_id)
+                .then(|| v["sessionRef"]["sessionId"].as_str().map(str::to_string))
+                .flatten()
+        })
+        .or_else(|| {
+            frames.iter().find_map(|v| {
+                (v["type"] == "freshAgent.event"
+                    && v["sessionId"] == session_id
+                    && v["event"]["type"] == "freshAgent.session.init")
+                    .then(|| v["event"]["cliSessionId"].as_str().map(str::to_string))
+                    .flatten()
+            })
+        })
 }
 
 /// The owner pair the browser holds for the pane: the latest
@@ -461,14 +468,16 @@ async fn a_new_panes_messages_each_run_once(init_at: InitAt) {
     let mut conn = Conn::connect(&url).await;
 
     let session_id = conn.create("create-1").await;
-    if matches!(init_at, InitAt::Create) {
-        // The session was reported at create: the pane learns its durable id and
-        // owner pair before the user types, so even the first message carries
-        // the pair.
-        conn.wait_until("the reported session's owner frame", |frames| {
-            observed_owner(frames, &session_id).is_some()
-        })
-        .await;
+    conn.wait_until("the created session's owner frame", |frames| {
+        observed_owner(frames, &session_id).is_some()
+    })
+    .await;
+    if matches!(init_at, InitAt::FirstPrompt) {
+        assert_eq!(
+            conn.events_of(&session_id, "freshAgent.session.init"),
+            0,
+            "the first checkpointed send is fenced before any CLI init"
+        );
     }
     let messages = ["first message", "second message", "third message"];
     for (index, text) in messages.iter().enumerate() {
@@ -511,8 +520,8 @@ async fn a_new_panes_messages_each_run_once(init_at: InitAt) {
 mod checkpointed_sends {
     use super::*;
 
-    /// The real CLI reports the session only once a prompt runs: nothing owns the
-    /// new pane's session in the coordinator when its first message is sent.
+    /// The first send carries the create-time UUID's owner pair even when the
+    /// CLI has not emitted its first init yet.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_when_the_session_is_reported_by_the_first_prompt() {
         a_new_panes_messages_each_run_once(InitAt::FirstPrompt).await;
@@ -600,14 +609,11 @@ mod checkpointed_sends {
         assert_eq!(turn_completes(&conn.frames, &session_id).len(), 1);
     }
 
-    /// Before the CLI reports the session, the coordinator can still hold a
-    /// record under the pane's placeholder id: a lifecycle operation started from
-    /// a pane with no durable id addresses the session by that id. A message sent
-    /// while the operation is in flight is refused and never reaches the sidecar;
-    /// once the operation settles and nothing owns the placeholder, the same
-    /// message runs.
+    /// A lifecycle operation can own the newly created native UUID before the
+    /// first CLI init. Checkpointing must respect it; restoring the known-live
+    /// prior lets a freshly fenced retry run exactly once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn wait_for_a_lifecycle_operation_on_the_placeholder_before_the_session_is_reported() {
+    async fn wait_for_a_lifecycle_operation_on_the_native_uuid_before_the_first_init() {
         let _env = CLAUDE_ENV_LOCK.lock().await;
         let sidecar = FakeSidecar::install(InitAt::FirstPrompt);
         let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
@@ -619,16 +625,21 @@ mod checkpointed_sends {
             "claude",
             &session_id,
             freshell_ownership::RuntimeOwnerKind::Terminal,
-            "test-placeholder-handoff",
+            "test-native-handoff",
             None,
             "test",
             freshell_ownership::now_epoch_ms(),
         ) else {
-            panic!("the handoff on the unreported session's placeholder must be granted")
+            panic!("the handoff on the created native session must be granted")
         };
 
-        conn.send_like_the_browser(&session_id, "send-during", "message during the handoff")
-            .await;
+        conn.send_checkpointed(
+            &session_id,
+            "send-during",
+            "message during the handoff",
+            Some((ownership.boot_epoch(), generation)),
+        )
+        .await;
         let refusal = conn.send_outcome("send-during").await;
         assert_eq!(refusal["type"], "error", "{refusal}");
         let message = refusal["message"].as_str().unwrap_or_default();
@@ -636,7 +647,7 @@ mod checkpointed_sends {
             message.starts_with("SESSION_RESERVED")
                 && message
                     .contains(freshell_freshagent::ownership_lane::LIFECYCLE_OP_GUARD_MESSAGE),
-            "refused while the handoff owns the placeholder: {refusal}"
+            "refused while the handoff owns the native UUID: {refusal}"
         );
 
         assert!(
@@ -644,16 +655,22 @@ mod checkpointed_sends {
                 ownership.fail(
                     "claude",
                     &session_id,
-                    "test-placeholder-handoff",
+                    "test-native-handoff",
                     generation,
-                    false
+                    true
                 ),
-                freshell_ownership::FailOutcome::Vacant { .. }
+                freshell_ownership::FailOutcome::RestoredPriorOwner
             ),
-            "fixture: the failed handoff leaves the placeholder vacant"
+            "fixture: the failed handoff restores the confirmed live prior"
         );
-        conn.send_like_the_browser(&session_id, "send-after", "message after the handoff")
-            .await;
+        let restored = ownership.observe("claude", &session_id);
+        conn.send_checkpointed(
+            &session_id,
+            "send-after",
+            "message after the handoff",
+            Some((restored.epoch, restored.generation)),
+        )
+        .await;
         conn.expect_send_runs(&session_id, "send-after", 1).await;
 
         conn.kill(&session_id).await;
