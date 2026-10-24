@@ -74,18 +74,18 @@ Rust server crates (`freshell-server`, `freshell-ws`, `freshell-terminal`,
   every naming line number below holds; `git fetch origin` and re-check
   before creating the worktree). Before creating the worktree run the
   green-base check through `GCLOUD_ROBOT_REQUIRE=1 scripts/base-gate.sh test`.
-- **Known baseline failures (Dan waived them on 2026-10-22; the branch must
-  not add failures):** on
-  `origin/main` the coordinated suite has exactly 7 failing tests in 3 files,
-  all Docker managed-runtime host timeouts unrelated to naming:
-  `test/integration/server/managed-provider-parity.test.ts` (7 cases),
-  `test/integration/server/fresh-agent-parity.test.ts` and
-  `test/integration/server/provider-parity-contract.test.ts` (failing as
-  wrappers of the same timeouts; receipt
-  `/tmp/claude-1000/-home-dan-code-freshell/b0e858cc-c789-4cc8-aba4-46c81f21d8b8/scratchpad/base-gate-rerun.log`
-  lines 777–1053). Every gate in this plan treats that exact set as the
-  baseline: the run passes when the failing set is identical or smaller, and
-  fails on any new failure. Record the failing-test list in each gate receipt.
+- **Current baseline (2026-10-24):** the resumed run is rebased onto
+  `b5f86817ce3a9a1907e90eda8924927a55e669d6`. All five previously failing
+  OpenCode cases passed on that exact clean main checkout, across
+  `test/integration/server/managed-provider-parity.test.ts` and
+  `test/integration/server/fresh-agent-parity.test.ts`. The dependent wrapper
+  was not rerun, so its former failure qualification is not renewed either.
+  The historical managed-runtime waiver from 2026-10-22 is retired for this
+  run: use the ordinary complete gate without the temporary companion
+  adapter and require zero test failures. This focused baseline proof does
+  not claim that the entire main suite passed. Receipt:
+  `.worktrees/.the-usual-logs/name-reliability/reports/main-baseline-20261024/report.md`
+  (relative to the main checkout).
 - **Focused client tests:**
   `pnpm run test:vitest run <paths...> --config config/vitest/vitest.config.ts`.
   Never raw `pnpm exec vitest`/`npx vitest`.
@@ -1844,8 +1844,8 @@ repeats its error where possible, not only by hiding the lines.
 - [ ] **Step 7: Gate.** `pnpm run lint`, `pnpm run typecheck`, cargo fmt and
   clippy (Global Constraints), then
   `FRESHELL_TEST_SUMMARY="name-reliability final gate" GCLOUD_ROBOT_REQUIRE=1 pnpm run check`.
-  Pass condition: no failures outside the waived 7-test baseline (list the
-  failing tests in the receipt).
+  Pass condition: zero test failures on the current baseline; no historical
+  managed-runtime exception or temporary companion adapter applies.
 - [ ] **Step 8: Recheck when it was gnarly.** For the resumed run, use at most
   10 additional repair/review rounds. Stop immediately at the first passing
   result: no further fixes or review rounds after it passes. If the added
@@ -2187,8 +2187,10 @@ Dan decided these on 2026-10-22; no product question is open.
    WARN. A keyed request goes direct when the ambient proxy is OneCLI's,
    and through the ambient proxy otherwise (coordinator decision on
    LB-B5/B6; on Dan's host it goes direct, Residual 19).
-3. **Known failing tests.** The 7 managed-runtime tests failing on `main`
-   are waived; the branch must not add failures.
+3. **Known failing tests.** Dan waived the historical managed-runtime
+   failures on 2026-10-22. The fresh 2026-10-24 baseline passed all five
+   selected OpenCode cases; the resumed run retires that exception and
+   requires zero test failures, as recorded in Global Constraints.
 4. **Delivery.** One branch, one PR at the end. Dan approved creating and
    merging it: "Build, code review, check, and if it was gnarly recheck a
    few times (max 5). Then land on main via PR." Deploying and restarting
