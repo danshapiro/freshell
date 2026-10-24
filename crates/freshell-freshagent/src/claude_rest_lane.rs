@@ -174,8 +174,18 @@ impl FreshAgentRestLane for ClaudeRestLane {
                     claude_session_type(&request.provider, &request.session_type)?,
                     ownership_id,
                 )
-                .await;
-            tracing::info!(event = "freshagent.claude.rest_lane.create_abandoned", request_id = %request.request_id, session_id = %created.session_id, ownership_id, "abandoned the closed destination's owned create");
+                .await
+                .map_err(|error| {
+                    let mut refused = RestLaneError::new(
+                        RestLaneErrorKind::Unavailable,
+                        error.code,
+                        error.message,
+                    );
+                    refused.retryable = Some(true);
+                    refused.retry_after_ms = Some(250);
+                    refused
+                })?;
+            tracing::info!(event = "freshagent.claude.rest_lane.create_abandoned", request_id = %request.request_id, session_id = %created.session_id, ownership_id, "processed the closed destination's create cleanup");
         }
         Ok(())
     }

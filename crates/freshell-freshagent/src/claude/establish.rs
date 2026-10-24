@@ -658,16 +658,7 @@ impl FreshClaudeState {
             RegisterUnder::Adopted(id) => (id.clone(), Some(id)),
         };
 
-        // Unified agent names (Task 2): a create's pending handle is admitted with
-        // the minted id BEFORE any failure arm, so no failure strands a handle the
-        // pane already carries (retries re-ensure the same handle idempotently).
-        let mut naming_projection = match naming {
-            Some(msg) => {
-                self.admit_create_handle(msg, &spec.session_type, &map_key)
-                    .await
-            }
-            None => None,
-        };
+        let mut naming_projection = None;
 
         // Retire-on-kill rounds 2-6: a resume GENUINELY CLAIMS the durable id, and
         // the claim commits here, once the replacement is established (`created`
@@ -943,7 +934,11 @@ impl FreshClaudeState {
                 }
             }
             naming_projection = self
-                .bind_create_name(&map_key, &spec.session_type)
+                .bind_create_name(
+                    &map_key,
+                    &spec.session_type,
+                    naming.and_then(|msg| msg.naming_handle.as_deref()),
+                )
                 .await
                 .or(naming_projection);
         }

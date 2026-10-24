@@ -1120,13 +1120,6 @@ impl FreshClaudeState {
             index.insert(original_durable.to_string(), replacement.to_string());
             original
         };
-        let handle = self.naming_handles.lock().await.remove(original_key);
-        if let Some(handle) = handle {
-            self.naming_handles
-                .lock()
-                .await
-                .insert(replacement.to_string(), handle);
-        }
         // A replayed create requestId of the original must not answer with
         // its retired map key.
         self.create_dedup

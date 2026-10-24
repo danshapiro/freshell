@@ -80,6 +80,29 @@ use turn_status::LedgerStep;
 /// The runtime provider (`AGENT_SESSION_TYPES.claude.provider`).
 pub(crate) const PROVIDER: &str = "claude";
 
+#[derive(Debug)]
+pub struct ClaudeCleanupError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl std::fmt::Display for ClaudeCleanupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ClaudeCleanupError {}
+
+impl ClaudeCleanupError {
+    fn unconfirmed() -> Self {
+        Self {
+            code: "CLAUDE_CLEANUP_UNCONFIRMED",
+            message: "Claude could not confirm cleanup of this cancelled pane. Try again.".into(),
+        }
+    }
+}
+
 /// Build the sidecar-only correlation record for one checkpointed Claude
 /// send. The send's UUID is supplied on SDKUserMessage and the attempt is
 /// later accepted only when the SDK replays the persisted user row carrying
@@ -290,12 +313,6 @@ pub struct FreshClaudeState {
     /// set-once/shared model as [`Self::identity_sink`]. Wired by
     /// `freshell-server::main`; unwired = scoped naming fails unavailable.
     naming: crate::naming::NamingSink,
-    /// Unified agent names: placeholder session id → the pre-durable naming
-    /// handle admitted at create. Popped by [`Self::adopt_session_init`]'s
-    /// naming hook, so the handle binds to the durable UUID exactly once
-    /// (idempotent in the store) even when blank settings bypass
-    /// `record_binding`.
-    naming_handles: Arc<TokioMutex<HashMap<String, String>>>,
     /// Sessions whose sidecar ended unrequested (C09, G05): the end-of-output
     /// path records each one here as it evicts it from [`Self::sessions`], so the
     /// pane's ids still resolve to an ended session — its snapshot overlay says
@@ -783,7 +800,6 @@ impl FreshClaudeState {
             alias_tombstones: Arc::new(std::sync::Mutex::new(AliasTombstones::default())),
             close_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
             naming: crate::naming::NamingSink::default(),
-            naming_handles: Arc::new(TokioMutex::new(HashMap::new())),
             dead_sessions: Default::default(),
             test_holds: Arc::default(),
             handoff_kill_pause: None,
@@ -1827,8 +1843,6 @@ impl FreshClaudeState {
     /// A rename committed inside that window must resolve the same record
     /// the server accepted on the wire (the pre-fix shape answered 404
     /// NAME_NOT_FOUND and silently lost the manual pre-durable name).
-    /// Idempotent: the post-`created` re-ensure in [`Self::admit_create_handle`]
-    /// answers the same record and adds the placeholder-keyed stash.
     async fn admit_create_handle_early(&self, msg: &FreshAgentCreate, session_type: &str) {
         if session_type == "kilroy" {
             return;
@@ -1851,41 +1865,7 @@ impl FreshClaudeState {
         .await;
     }
 
-    async fn admit_create_handle(
-        &self,
-        msg: &FreshAgentCreate,
-        session_type: &str,
-        placeholder: &str,
-    ) -> Option<(
-        freshell_protocol::session_names::SessionNameRef,
-        freshell_protocol::session_names::SessionNameRecord,
-    )> {
-        if session_type == "kilroy" {
-            return None;
-        }
-        let handle = msg.naming_handle.as_deref()?.trim().to_string();
-        if handle.is_empty() {
-            return None;
-        }
-        let sink = self.naming();
-        let projection = crate::naming::admit_pending_projection(
-            &sink,
-            &handle,
-            freshell_protocol::session_names::NamedProvider::Claude,
-            msg.cwd.as_deref(),
-        )
-        .await?;
-        self.naming_handles
-            .lock()
-            .await
-            .insert(placeholder.to_string(), handle);
-        Some(projection)
-    }
-
-    /// Unified agent names: the current frame projection for an ALREADY
-    /// created session (the dedup-replay arm) — the stashed handle's
-    /// record, resolved through the wired authority (a pending ref and its
-    /// redirected durable record answer the same record via `get`).
+    /// Resolve the native name record for an already-created conversation.
     async fn created_projection_for(
         &self,
         session_id: &str,
@@ -1893,27 +1873,12 @@ impl FreshClaudeState {
         freshell_protocol::session_names::SessionNameRef,
         freshell_protocol::session_names::SessionNameRecord,
     )> {
-        if let Some(projection) = crate::naming::session_projection(
+        crate::naming::session_projection(
             &self.naming(),
             freshell_protocol::session_names::NamedProvider::Claude,
             session_id,
         )
         .await
-        {
-            return Some(projection);
-        }
-        let handle = self.naming_handles.lock().await.get(session_id).cloned()?;
-        let sink = self.naming();
-        let target = freshell_protocol::session_names::SessionNameRef::Pending { id: handle };
-        let updates = sink?
-            .get(vec![target.clone()])
-            .await
-            .map_err(|error| crate::naming::log_name_error("get", &target, &error))
-            .ok()?;
-        updates
-            .into_iter()
-            .next()
-            .map(|update| (update.record.name_ref.clone(), update.record))
     }
 
     /// Broadcast a `freshAgent.error` alarm/degradation frame (P1.13; Task 10
@@ -2062,7 +2027,7 @@ impl FreshClaudeState {
         // and the client's rename capture carry the handle immediately,
         // while the sidecar spawn + `created` handshake below takes seconds.
         // Idempotent with the post-`created` re-ensure
-        // (`admit_create_handle`, which also stashes the placeholder key).
+        // The pending name binds to the native identity during establishment.
         self.admit_create_handle_early(&msg, session_type).await;
 
         // Task 12 (D8 for fresh agents): a create-with-resume claims the per-sessionRef
@@ -2598,7 +2563,7 @@ impl FreshClaudeState {
     /// `ws-handler.ts:3673`), then broadcast `freshAgent.killed`. Idempotent for an
     /// unknown session id, matching the codex/opencode `success:true` pattern.
     pub async fn handle_kill(&self, msg: FreshAgentKill) {
-        self.handle_kill_inner(msg, None).await;
+        let _ = self.handle_kill_inner(msg, None).await;
     }
 
     /// Release a runtime allocated by a create whose destination disappeared.
@@ -2608,7 +2573,7 @@ impl FreshClaudeState {
         session_id: &str,
         session_type: SessionType,
         ownership_id: &str,
-    ) {
+    ) -> Result<(), ClaudeCleanupError> {
         self.handle_kill_inner(
             FreshAgentKill {
                 provider: freshell_protocol::AgentProvider::Claude,
@@ -2620,10 +2585,14 @@ impl FreshClaudeState {
             },
             Some(ownership_id),
         )
-        .await;
+        .await
     }
 
-    async fn handle_kill_inner(&self, msg: FreshAgentKill, expected_owner: Option<&str>) {
+    async fn handle_kill_inner(
+        &self,
+        msg: FreshAgentKill,
+        expected_owner: Option<&str>,
+    ) -> Result<(), ClaudeCleanupError> {
         let session_id = msg.session_id.clone();
         let session_type = session_type_str(msg.session_type);
 
@@ -2646,7 +2615,7 @@ impl FreshClaudeState {
                         code: Some(err.code().to_string()),
                         message: Some(err.message().to_string()),
                     }));
-                    return;
+                    return Err(ClaudeCleanupError::unconfirmed());
                 }
             };
 
@@ -2749,21 +2718,28 @@ impl FreshClaudeState {
                         event = "freshagent.claude.abandoned_create_already_released",
                         session_id, expected_owner,
                         "the create receipt no longer owns this runtime; cleanup is complete");
-                    return;
+                    return Ok(());
                 };
                 if self.ownership.is_some() {
                     let durable = session.cli_session_id.as_deref().unwrap_or(&map_key);
                     let Some(stamp) =
                         crate::ownership_lane::peek_retained_stamp(&self.ownership_stamps, durable)
                             .filter(|stamp| {
-                                stamp.owner.ownership_id.as_deref() == Some(expected_owner)
+                                // The receipt names the process-tree tag; the
+                                // coordinator names a lifecycle operation. The
+                                // exact runtime record ties them together.
+                                stamp.owner.kind
+                                    == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                                    && stamp.owner.live_session_key.as_deref()
+                                        == Some(map_key.as_str())
+                                    && stamp.owner.pid == session.child.id()
                             })
                     else {
                         tracing::warn!(target: "freshell_freshagent::claude",
                             event = "freshagent.claude.abandoned_create_stamp_missing",
                             session_id, expected_owner,
                             "the create receipt has no matching retained ownership stamp");
-                        return;
+                        return Err(ClaudeCleanupError::unconfirmed());
                     };
                     // Capture authority while inspecting that exact runtime. A
                     // later stop must never borrow a replacement's stamp.
@@ -2965,7 +2941,7 @@ impl FreshClaudeState {
                         code: Some(refusal_code.to_string()),
                         message: Some(refusal_message),
                     }));
-                    return;
+                    return Err(ClaudeCleanupError::unconfirmed());
                 }
             } else {
                 // b8ke delta round-3 F1: NO retained stamp — the kill STILL
@@ -3027,7 +3003,7 @@ impl FreshClaudeState {
                                         .to_string(),
                                 ),
                             }));
-                            return;
+                            return Err(ClaudeCleanupError::unconfirmed());
                         }
                         // e3r1 F1: honor the REQUEST'S fence — a delayed
                         // kill carrying a stale observed pair is refused by
@@ -3160,7 +3136,7 @@ impl FreshClaudeState {
                                         message: Some(refusal_message),
                                     },
                                 ));
-                                return;
+                                return Err(ClaudeCleanupError::unconfirmed());
                             }
                         }
                     }
@@ -3201,7 +3177,7 @@ impl FreshClaudeState {
                                     .to_string(),
                             ),
                         }));
-                        return;
+                        return Err(ClaudeCleanupError::unconfirmed());
                     }
                     freshell_ownership::OwnershipState::Starting { .. }
                     | freshell_ownership::OwnershipState::Stopping { .. } => {
@@ -3232,7 +3208,7 @@ impl FreshClaudeState {
                                     .to_string(),
                             ),
                         }));
-                        return;
+                        return Err(ClaudeCleanupError::unconfirmed());
                     }
                     freshell_ownership::OwnershipState::Fenced { .. } => {
                         tracing::warn!(target: "freshell_freshagent::claude",
@@ -3263,7 +3239,7 @@ impl FreshClaudeState {
                                     .to_string(),
                             ),
                         }));
-                        return;
+                        return Err(ClaudeCleanupError::unconfirmed());
                     }
                     _ => {
                         // Genuinely Vacant (or this-lane rekey residue):
@@ -3382,7 +3358,7 @@ impl FreshClaudeState {
                     "the pane-ledger close failed; nothing was killed — retry".to_string(),
                 ),
             }));
-            return;
+            return Err(ClaudeCleanupError::unconfirmed());
         }
         let main_close_reported_failure =
             close_answer == crate::identity_sink::CloseAnswer::Persisted;
@@ -3495,6 +3471,8 @@ impl FreshClaudeState {
         // confirmation (non-Linux) fences the key typed — never a Vacant
         // over an unverifiable descendant tree. NEVER before the reap
         // (round-1 review), never unconfirmed (round-2 review).
+        let cleanup_confirmed =
+            expected_owner.is_none() || matches!(&teardown, LoggedTeardown::Confirmed);
         let mut kill_failure: Option<(&'static str, String)> = None;
         if let (Some(registry), Some(generation), Some(op_id), Some(key)) = (
             self.ownership.as_ref(),
@@ -3616,15 +3594,24 @@ impl FreshClaudeState {
             }
         }
 
+        let success = !main_close_reported_failure
+            && !invariant_broken
+            && kill_failure.is_none()
+            && cleanup_confirmed;
         self.edges.forgotten(&session_id);
         self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
             provider: PROVIDER.to_string(),
             session_id,
             session_type: session_type.to_string(),
-            success: !main_close_reported_failure && !invariant_broken && kill_failure.is_none(),
+            success,
             code: kill_failure.as_ref().map(|(code, _)| code.to_string()),
             message: kill_failure.as_ref().map(|(_, message)| message.clone()),
         }));
+        if success {
+            Ok(())
+        } else {
+            Err(ClaudeCleanupError::unconfirmed())
+        }
     }
 
     /// Round 5 (focused-ep5-r4 Finding 1): for every id this kill retired
@@ -4555,75 +4542,26 @@ impl FreshClaudeState {
         }
         drop(ownership_guard);
 
-        // Unified agent names (Task 4): the shared accepted-input callback —
-        // the send reached the sidecar, so the user input is ACCEPTED. The
-        // naming target is the stashed pre-durable handle when one exists
-        // (it redirects to the bound durable record once adopted), else
-        // the adopted durable claude session, else — review N1 — the
-        // pending ref for the ADDRESSED id itself: a send racing the init
-        // adoption (the stash entry just consumed by the bound cleanup,
-        // the addressed id still the placeholder) must never silently
-        // drop the feed; the store's redirect resolution decides, and
-        // the next send addresses the adopted id anyway. Kilroy is out
-        // of scope; a failed feed never blocks the turn.
-        //
-        // Task 8 acceptance: once the init ADOPTION consumed the stash and
-        // recorded the session's durable `cli_session_id`, a placeholder-
-        // addressed send targets the ADOPTED durable record — the old
-        // pending-<placeholder> fallback can never resolve in the real
-        // store (no record is keyed by a placeholder id), and the
-        // first-message fallback upgrade was silently lost for exactly
-        // these sends.
-        let naming_target = {
-            // Sequential lock reads (never nested): the pre-durable stash,
-            // then the session row's adopted durable id.
-            let stashed_handle = self.naming_handles.lock().await.get(&session_id).cloned();
-            let adopted_cli_id = self
-                .sessions
-                .lock()
-                .await
-                .get(&map_key)
-                .and_then(|s| s.cli_session_id.clone());
-            stashed_handle
-                .map(
-                    |handle| freshell_protocol::session_names::SessionNameRef::Pending {
-                        id: handle,
-                    },
-                )
-                .or_else(|| {
-                    adopted_cli_id.map(|cli_id| {
-                        freshell_protocol::session_names::SessionNameRef::Session {
-                            provider: freshell_protocol::session_names::NamedProvider::Claude,
-                            session_id: cli_id,
-                        }
-                    })
-                })
-                .or_else(|| {
-                    is_canonical_claude_uuid(&session_id).then(|| {
-                        freshell_protocol::session_names::SessionNameRef::Session {
-                            provider: freshell_protocol::session_names::NamedProvider::Claude,
-                            session_id: session_id.clone(),
-                        }
-                    })
-                })
-                .or_else(|| {
-                    Some(freshell_protocol::session_names::SessionNameRef::Pending {
-                        id: session_id.clone(),
-                    })
-                })
-        };
+        // Accepted input belongs to the conversation created before this send.
+        // Resolve a concurrent reset through the same native lineage as routing.
         if session_type != "kilroy" {
-            if let Some(target) = naming_target {
-                crate::naming::report_accepted_input(
-                    &self.naming(),
-                    &target,
-                    session_type,
-                    request_id.as_deref().unwrap_or(""),
-                    &msg.text,
-                    msg.cwd.as_deref(),
-                )
-                .await;
-            }
+            let current_id = self
+                .resolve_session_key(&map_key)
+                .await
+                .unwrap_or(map_key.clone());
+            let target = freshell_protocol::session_names::SessionNameRef::Session {
+                provider: freshell_protocol::session_names::NamedProvider::Claude,
+                session_id: current_id,
+            };
+            crate::naming::report_accepted_input(
+                &self.naming(),
+                &target,
+                session_type,
+                request_id.as_deref().unwrap_or(""),
+                &msg.text,
+                msg.cwd.as_deref(),
+            )
+            .await;
         }
 
         self.broadcast(&ServerMessage::FreshAgentSendAccepted(
@@ -6208,23 +6146,6 @@ impl FreshClaudeState {
         // load_settings keying (Task 3) keeps a legitimately-default
         // session from ever arming a false SETTINGS_RESET on a later
         // resume (the codex REST lane's unconditional-lineage discipline).
-        // Unified agent names (Task 2): the init hook runs EVEN for an
-        // all-blank settings row — the naming bind is driven by verified
-        // transcript durability, not by the settings row (their r27-F4
-        // write below is unconditional for exactly the same reason). The
-        // stashed pre-durable handle (keyed by this placeholder) binds to
-        // the durable UUID exactly once (idempotent in the store); a
-        // zero-turn init whose transcript has not materialized yet retains
-        // the handle and records only the acquired location (InitialRecovery
-        // semantics — the name authority never moves on unverified
-        // evidence). Deliberately NOT
-        // a lane blocker: a naming failure never fails the identity event
-        // (the handle is retained; the main.rs naming tick retries the
-        // transition visibly), and the bind targets the DURABLE session —
-        // its verified transcript outlives even this runtime's teardown.
-        let declared_transition = self
-            .bind_naming_handle_at_init(cli_id, session_id, session_type)
-            .await;
         if let Some(sink) = &identity_sink {
             if let Err(e) = sink
                 .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
@@ -6240,7 +6161,7 @@ impl FreshClaudeState {
                     // naming fold above consumed (InitialMaterialization), so
                     // the identity event carries the naming fact alongside the
                     // ledger write.
-                    name_transition: declared_transition,
+                    name_transition: None,
                     provenance: provenance.cloned().into(),
                     observed_epoch: binding_epoch,
                     observed_generation: binding_generation,
@@ -6354,106 +6275,6 @@ impl FreshClaudeState {
             }
         }
         SessionInitAdoptionOutcome::Published
-    }
-
-    /// Unified agent names (Task 2): the `sdk.session.init` naming hook —
-    /// see [`Self::adopt_session_init`]. Deliberately NOT a lane blocker: a
-    /// naming failure never fails the identity event (the handle is
-    /// retained; the main.rs naming tick retries the transition visibly).
-    async fn bind_naming_handle_at_init(
-        &self,
-        cli_id: &str,
-        placeholder: &str,
-        session_type: &str,
-    ) -> Option<crate::naming::NameTransition> {
-        if session_type == "kilroy" {
-            return None;
-        }
-        let handle = self.naming_handles.lock().await.get(placeholder).cloned()?;
-        // Existing provider durability evidence: the claude CLI writes the
-        // session transcript at startup, so a located transcript file
-        // verifies the durable identity (`claude_snapshot::locate_transcript_selected`
-        // walks the same ordered candidate roots the snapshot lane reads and
-        // answers the selected root + original cwd the store retains).
-        let selected = crate::claude_snapshot::locate_transcript_selected(cli_id);
-        let (persistence, evidence) = if selected.is_some() {
-            (
-                freshell_protocol::native_location::NativePersistence::Verified,
-                freshell_protocol::native_location::NativeEvidenceKind::SelectedTranscript,
-            )
-        } else {
-            (
-                freshell_protocol::native_location::NativePersistence::Prospective,
-                freshell_protocol::native_location::NativeEvidenceKind::InitializedRuntime,
-            )
-        };
-        let acquisition = freshell_protocol::native_location::NativeAcquisition {
-            location: freshell_protocol::native_location::NativeLocation::Claude {
-                config_root: selected
-                    .as_ref()
-                    .map(|s| s.config_root.display().to_string())
-                    .or_else(|| {
-                        crate::claude_snapshot::claude_home_candidates()
-                            .first()
-                            .map(|root| root.display().to_string())
-                    })
-                    .unwrap_or_default(),
-                transcript_path: selected
-                    .as_ref()
-                    .map(|s| s.transcript_path.display().to_string()),
-                project_directory_key: None,
-                transcript_cwd: selected.as_ref().and_then(|s| s.transcript_cwd.clone()),
-                effective_project_key_override: None,
-            },
-            evidence,
-            persistence,
-        };
-        let target = freshell_protocol::session_names::SessionNameRef::Session {
-            provider: freshell_protocol::session_names::NamedProvider::Claude,
-            session_id: cli_id.to_string(),
-        };
-        // Transition classification: an init is the initial
-        // materialization (a rollback's or a fork's runtime registers
-        // already adopted and never reaches here, C13/C14). The shared
-        // classification-driven fold (plan Task 4) applies the policy:
-        // verified persistence binds the handle, prospective evidence
-        // RETAINS it (zero-turn rule — only the routing evidence moves).
-        let reason = crate::naming::NameTransitionReason::InitialMaterialization;
-        let transition = crate::naming::NameTransition {
-            reason,
-            acquisition,
-            pending: Some(handle),
-        };
-        let pending_ref = freshell_protocol::session_names::SessionNameRef::Pending {
-            id: transition.pending.clone().unwrap_or_default(),
-        };
-        match crate::naming::fold_identity_transition(&self.naming(), &transition, target.clone())
-            .await
-        {
-            Some(update) => {
-                tracing::debug!(target: "freshell_freshagent::claude",
-                    session_id = %cli_id,
-                    reason = ?reason,
-                    "freshagent.claude.naming_transition_committed"
-                );
-                // Bound: the stash entry is consumed once the handle is
-                // redirected to the durable record.
-                if update.record.name_ref == target {
-                    self.naming_handles.lock().await.remove(placeholder);
-                }
-            }
-            None => {
-                // Retained (prospective zero-turn), unwired, or a failed
-                // bind: the stash survives for the tick's visible retry.
-                tracing::debug!(target: "freshell_freshagent::claude",
-                    session_id = %cli_id,
-                    reason = ?reason,
-                    "freshagent.claude.naming_transition_retained"
-                );
-                let _ = pending_ref;
-            }
-        }
-        Some(transition)
     }
 
     // ── stdout consumer (the completion edge normalization) ──────────────────────────
@@ -6774,13 +6595,7 @@ impl FreshClaudeState {
                                 .unwrap_or_else(|| (settings.clone(), false))
                         };
                         if known_identity && create_binding_expected {
-                            // Create/establish already bound this exact durable
-                            // identity. Init verifies it; no second adoption or
-                            // lineage rewrite is needed. A retained naming bind
-                            // may still retry once native persistence appears.
-                            state
-                                .bind_naming_handle_at_init(cli_id, &session_id, &session_type)
-                                .await;
+                            // Establishment already bound this native identity.
                         } else if create_binding_expected {
                             tracing::error!(target: "freshell_freshagent::claude",
                                 event = "freshagent.claude.unannounced_rekey", provider = PROVIDER,
@@ -10185,13 +10000,14 @@ rl.on('line', (line) => {
     /// Unified agent names (Task 4): the shared accepted-input callback — an
     /// accepted freshclaude send feeds the naming authority ONE activity
     /// carrying the prompt text (the first-message fallback upgrade plus
-    /// generation arming happen store-side); the pre-durable handle is the
-    /// activity target until the init adoption binds it.
+    /// generation arming happen store-side), addressed to the native identity
+    /// already bound at creation.
     #[tokio::test(flavor = "multi_thread")]
     async fn send_feeds_the_naming_authority_once_with_the_accepted_text() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (state, mut rx) = state_with_bus();
+        state.set_identity_sink(Arc::new(crate::identity_sink::FakeIdentitySink::default()));
         let sink = crate::naming::test_support::RecordingSink::new();
         state.set_session_naming(sink.clone());
         let mut create = dedup_create_msg("naming-send");
@@ -10209,8 +10025,9 @@ rl.on('line', (line) => {
         assert_eq!(activities.len(), 1, "{activities:?}");
         assert_eq!(
             activities[0].target,
-            freshell_protocol::session_names::SessionNameRef::Pending {
-                id: "handle-naming-send".to_string()
+            freshell_protocol::session_names::SessionNameRef::Session {
+                provider: freshell_protocol::session_names::NamedProvider::Claude,
+                session_id: session_id.clone(),
             }
         );
         assert_eq!(activities[0].mode, "freshclaude");
@@ -10232,8 +10049,8 @@ rl.on('line', (line) => {
     /// pane-header rename committed inside that window targeted a record
     /// the server had accepted on the wire but not yet admitted (404
     /// NAME_NOT_FOUND), silently losing the manual pre-durable name to the
-    /// first-message fallback. Admission is idempotent, so the
-    /// post-`created` re-ensure answers the same record unchanged.
+    /// first-message fallback. Establishment then binds that pending name to
+    /// the new conversation's native identity.
     #[tokio::test(flavor = "multi_thread")]
     async fn create_admits_the_pending_record_before_the_sidecar_answers_created() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
@@ -10278,197 +10095,6 @@ rl.on('line', (line) => {
         // Cleanup: let the deferred handshake finish (the task must end so
         // no spawned session outlives the test).
         let _ = joined.await;
-    }
-
-    /// Unified agent names (Task 4, review N1): a send RACING the init
-    /// adoption — the stash entry already consumed by the adoption's
-    /// bound cleanup, the addressed id still the placeholder (the
-    /// client has not yet learned the adopted id) — must still feed the
-    /// authority instead of silently dropping the activity. The feed
-    /// falls back to the pending ref for the addressed id itself (the
-    /// store's redirect resolution decides); the next send addresses the
-    /// adopted id anyway.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_send_racing_the_init_adoption_still_feeds_the_naming_authority() {
-        let _guard = CLAUDE_ENV_LOCK.lock().await;
-        let env = FakeClaudeSidecarEnv::install();
-        let (state, mut rx) = state_with_bus();
-        let sink = crate::naming::test_support::RecordingSink::new();
-        state.set_session_naming(sink.clone());
-        let mut create = dedup_create_msg("naming-race");
-        create.naming_handle = Some("handle-naming-race".into());
-        state.handle_create(create, None).await;
-        let created = await_claude_created(&mut rx, "naming-race").await;
-        let session_id = created["sessionId"].as_str().unwrap().to_string();
-
-        // The adoption's bound cleanup consumed the stash entry
-        // (`bind_naming_handle_at_init` removes it once the handle is
-        // redirected to the durable record) — this send is still
-        // addressed to the placeholder and is not a canonical UUID.
-        // Model the TRUE racing moment: BEFORE the adoption recorded the
-        // durable id on the session row, neither the stash nor the adopted
-        // id can answer, and the feed falls back to the pending ref for
-        // the addressed id itself (the store's redirect resolution
-        // decides); the next send addresses the adopted id anyway.
-        //
-        // DEFLAKE (parallel-starvation family): the fake's ASYNC init
-        // adoption re-writes `cli_session_id` whenever it lands, so
-        // hand-clearing it immediately after `created` races the adoption
-        // — a scheduling delay lets the adoption land between the
-        // hand-clear and the send, and the feed then targets the fake's
-        // adopted id instead of the pending fallback (observed in a
-        // full-crate run). Wait for the adoption to COMPLETE first (the
-        // fake emits init ONCE), then hand-model the mid-adoption window:
-        // stash consumed + durable id not yet recorded.
-        {
-            let adoption_deadline =
-                tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-            loop {
-                {
-                    let adopted_yet = state
-                        .sessions
-                        .lock()
-                        .await
-                        .get(&session_id)
-                        .and_then(|s| s.cli_session_id.clone());
-                    if adopted_yet.is_some() {
-                        break;
-                    }
-                    assert!(
-                        tokio::time::Instant::now() < adoption_deadline,
-                        "the fake sidecar's init adoption never landed"
-                    );
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-        }
-        state.naming_handles.lock().await.remove(&session_id);
-        state
-            .sessions
-            .lock()
-            .await
-            .get_mut(&session_id)
-            .expect("the created session row")
-            .cli_session_id = None;
-
-        let legacy_id = "legacy-name-placeholder";
-        state
-            .cli_index
-            .lock()
-            .await
-            .insert(legacy_id.into(), session_id.clone());
-        state
-            .handle_send(send_msg(legacy_id, "Race the adoption"))
-            .await;
-        let _ = env.respond_log_frames(1).await;
-
-        let activities = await_activities(&sink, 1).await;
-        assert_eq!(
-            activities.len(),
-            1,
-            "the racing send must not silently drop the activity feed: {activities:?}"
-        );
-        assert_eq!(
-            activities[0].target,
-            freshell_protocol::session_names::SessionNameRef::Pending {
-                id: legacy_id.into()
-            }
-        );
-        assert_eq!(activities[0].mode, "freshclaude");
-        assert_eq!(
-            activities[0].first_user_message.as_deref(),
-            Some("Race the adoption")
-        );
-    }
-
-    /// Unified agent names (Task 8 acceptance): once the init ADOPTION has
-    /// consumed the pre-durable stash and recorded the session's durable
-    /// `cli_session_id`, a send still addressed to the PLACEHOLDER (the
-    /// client has not yet learned the adopted id) must feed the activity to
-    /// the ADOPTED durable record — the pending-<placeholder> fallback of
-    /// the racing-send shape can never resolve in the real store (no naming
-    /// record is keyed by a placeholder id), and the first-message fallback
-    /// upgrade was silently lost for exactly these sends.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_post_adoption_send_targets_the_adopted_durable_record() {
-        let _guard = CLAUDE_ENV_LOCK.lock().await;
-        let env = FakeClaudeSidecarEnv::install();
-        let (state, mut rx) = state_with_bus();
-        let sink = crate::naming::test_support::RecordingSink::new();
-        state.set_session_naming(sink.clone());
-        let mut create = dedup_create_msg("naming-adopted");
-        create.naming_handle = Some("handle-naming-adopted".into());
-        state.handle_create(create, None).await;
-        let created = await_claude_created(&mut rx, "naming-adopted").await;
-        let session_id = created["sessionId"].as_str().unwrap().to_string();
-
-        // The real post-adoption shape, set directly (the unit lane's fake
-        // sidecar emits init asynchronously and the racing-send precedent
-        // models the state the same way): the stash is consumed (the init
-        // bind's cleanup) and the session row carries the adopted durable
-        // id — the client is still addressing the placeholder.
-        //
-        // DEFLAKE (parallel-starvation family): the fake's ASYNC init
-        // adoption overwrites `cli_session_id` (with the fake's own id)
-        // whenever it runs, so hand-setting the adopted id immediately
-        // after `created` races it — a scheduling delay lets the adoption
-        // land between the hand-set and the send, and the activity then
-        // targets the fake's id (observed once in a full-crate run). Wait
-        // for the adoption to COMPLETE first, then hand-set the modeled
-        // adopted id — the scenario is the POST-adoption state either way.
-        let adopted_cli_id = "11111111-2222-4333-8444-555555555555".to_string();
-        {
-            let adoption_deadline =
-                tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-            loop {
-                {
-                    let adopted_yet = state
-                        .sessions
-                        .lock()
-                        .await
-                        .get(&session_id)
-                        .and_then(|s| s.cli_session_id.clone());
-                    if adopted_yet.is_some() {
-                        break;
-                    }
-                    assert!(
-                        tokio::time::Instant::now() < adoption_deadline,
-                        "the fake sidecar's init adoption never landed"
-                    );
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-            let mut sessions = state.sessions.lock().await;
-            sessions
-                .get_mut(&session_id)
-                .expect("the created session row")
-                .cli_session_id = Some(adopted_cli_id.clone());
-        }
-        state.naming_handles.lock().await.remove(&session_id);
-
-        state
-            .handle_send(send_msg(&session_id, "Feed the adopted record"))
-            .await;
-        let _ = env.respond_log_frames(1).await;
-
-        let activities = await_activities(&sink, 1).await;
-        assert_eq!(
-            activities.len(),
-            1,
-            "the post-adoption send must not silently drop the activity feed: {activities:?}"
-        );
-        assert_eq!(
-            activities[0].target,
-            freshell_protocol::session_names::SessionNameRef::Session {
-                provider: freshell_protocol::session_names::NamedProvider::Claude,
-                session_id: adopted_cli_id,
-            },
-            "the activity targets the ADOPTED durable record, not the unresolvable placeholder"
-        );
-        assert_eq!(
-            activities[0].first_user_message.as_deref(),
-            Some("Feed the adopted record")
-        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
