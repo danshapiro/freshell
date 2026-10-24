@@ -157,6 +157,18 @@ function findFreshAgentLeaf(node: any): any {
   return null
 }
 
+function findPaneById(node: any, paneId: string): any {
+  if (!node) return null
+  if (node.type === 'leaf' && node.id === paneId) return node
+  if (node.type === 'split') {
+    for (const child of node.children ?? []) {
+      const found = findPaneById(child, paneId)
+      if (found) return found
+    }
+  }
+  return null
+}
+
 /** The durable session id this window's persisted layout names for the tab's
  * fresh-agent pane — read from the per-window envelope the product actually
  * writes (freshell.layout.v3.<layoutWindowId>, derived exactly like
@@ -760,7 +772,10 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
       await expect
         .poll(async () => durableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId!))), { timeout: 15_000 })
         .toMatch(CANONICAL_UUID_RE)
-      const staleDurable: string = durableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId!)))
+      const originalPane = findFreshAgentLeaf(await harness.getPaneLayout(tabId!))
+      const originalPaneId = originalPane?.id as string | undefined
+      expect(originalPaneId).toBeTruthy()
+      const staleDurable: string = durableIdentity(originalPane)
       await flushPersistence(page)
 
       // Make the persisted identity STALE: delete every server-side artifact
@@ -777,6 +792,7 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
       await server.restartAbrupt()
       await reloadAndReconnect(page, harness)
       const tabIdAfter = await harness.getActiveTabId()
+      expect(tabIdAfter).toBe(tabId)
 
       // LOUD: the dead-session adjudication surfaces the stale claim.
       await expect
@@ -786,7 +802,8 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
           return entries.some((e: any) => e?.kind === 'fresh-agent' && e?.sessionRef?.sessionId === staleDurable)
         }, { timeout: 30_000 })
         .toBe(true)
-      const leaf = findFreshAgentLeaf(await harness.getPaneLayout(tabIdAfter!))
+      const leaf = findPaneById(await harness.getPaneLayout(tabIdAfter!), originalPaneId!)
+      expect(leaf?.content?.kind).toBe('fresh-agent')
       expect(leaf?.content?.restoreError?.reason).toBe('durable_artifact_missing')
       // Batched dead-session adjudication is a real modal dialog
       // (DeadSessionPanel.tsx:20-24, role="dialog" aria-label="Dead sessions"),
@@ -811,7 +828,7 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
       // create that might land during the settle window, so asserting on it
       // here would not actually prove "never silent" (follow-up from the PR
       // #562 council review).
-      const leafAfterSettle = findFreshAgentLeaf(await harness.getPaneLayout(tabIdAfter!))
+      const leafAfterSettle = findPaneById(await harness.getPaneLayout(tabIdAfter!), originalPaneId!)
       // NEVER silent: identity not swapped, the loud restoreError still
       // standing (post-settle re-check -- council follow-up, PR #562/#563
       // close-out: the pre-settle restoreError read alone could not prove
@@ -821,6 +838,27 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
       expect(leafAfterSettle?.content?.restoreError?.reason).toBe('durable_artifact_missing')
       const sent = await harness.getSentWsMessages()
       expect(sent.filter((m: any) => m?.type === 'freshAgent.create')).toEqual([])
+
+      // Reload once more to prove the failed durable claim remains attached
+      // to this exact pane and stays visible after hydration, rather than
+      // existing only in the first page's transient adjudication state.
+      await harness.clearSentWsMessages()
+      await reloadAndReconnect(page, harness)
+      const secondReloadTabId = await harness.getActiveTabId()
+      expect(secondReloadTabId).toBe(tabId)
+      const leafAfterSecondReload = findPaneById(
+        await harness.getPaneLayout(secondReloadTabId!),
+        originalPaneId!,
+      )
+      expect(leafAfterSecondReload?.content?.kind).toBe('fresh-agent')
+      expect(leafAfterSecondReload?.content?.sessionRef?.sessionId).toBe(staleDurable)
+      expect(leafAfterSecondReload?.content?.restoreError?.reason).toBe('durable_artifact_missing')
+      await expect(page.getByRole('alert').filter({
+        hasText: 'This session cannot be resumed because the saved session artifact is no longer available.',
+      })).toBeVisible({ timeout: 10_000 })
+      await page.waitForTimeout(1_000)
+      const sentAfterSecondReload = await harness.getSentWsMessages()
+      expect(sentAfterSecondReload.filter((m: any) => m?.type === 'freshAgent.create')).toEqual([])
     } finally {
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })

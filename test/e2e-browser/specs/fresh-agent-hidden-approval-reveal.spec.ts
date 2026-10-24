@@ -274,6 +274,20 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
       await expect.poll(() => readClaudeSimLedger(simLedger).some(
         (row) => row.kind === 'prompt' && row.text === RAISE_TEXT,
       ), { timeout: 15_000, message: 'the visible pane starts the approval-triggering prompt' }).toBe(true)
+      let sendRequestId = ''
+      await expect.poll(async () => {
+        const sends = (await harness.getSentWsMessages())
+          .filter((message: any) => message?.type === 'freshAgent.send' && message?.text === RAISE_TEXT)
+        sendRequestId = sends.at(-1)?.requestId ?? ''
+        return sendRequestId
+      }, { timeout: 10_000, message: 'the visible turn has a request id before the tab switch' }).toBeTruthy()
+      await expect.poll(async () => (await harness.getReceivedWsMessages()).some(
+        (message: any) => message?.type === 'freshAgent.send.accepted' && message?.requestId === sendRequestId,
+      ), { timeout: 10_000, message: 'the server accepted the send while tab A is still visible' }).toBe(true)
+      await expect.poll(async () => (await leafA())?.content?.status, {
+        timeout: 10_000,
+        message: 'the visible pane observed the turn start before it is hidden',
+      }).toBe('running')
       // The delayed canUseTool request now arrives after A is hidden.
       await tabBLocator.click()
       await expect.poll(() => harness.getActiveTabId(), { timeout: 10_000 }).toBe(tabB)

@@ -113,6 +113,11 @@ async function settleBootPicker(page: Page): Promise<void> {
     }
   }
   await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+  // The terminal becomes visible before the picker exit transition ends.
+  // Wait for that old toolbar to leave before openPanePicker looks for an
+  // existing picker; otherwise a forced Freshclaude click can land on the
+  // fading boot picker and the directory form never creates a pane.
+  await expect(picker).toBeHidden({ timeout: 10_000 })
 }
 
 /**

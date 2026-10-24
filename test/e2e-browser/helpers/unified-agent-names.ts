@@ -1079,9 +1079,15 @@ export async function expectSharedName(
       server,
     )
     if (sessionId) {
-      await expect(
-        page.locator(`[data-context="sidebar-session"][data-session-id="${sessionId}"]`),
-      ).toContainText(expected, { timeout: 20_000 })
+      const row = page.locator(`[data-context="sidebar-session"][data-session-id="${sessionId}"]`)
+      if (!(await row.isVisible().catch(() => false))) {
+        // Conversation switches and rename surfaces can leave the sidebar on
+        // another view. The assertion is about the session directory row, so
+        // select its owning view before deciding that the old session is
+        // absent from the directory.
+        await page.getByTitle('Coding Agents (Ctrl+B T)').click()
+      }
+      await expect(row).toContainText(expected, { timeout: 20_000 })
     }
   }
 

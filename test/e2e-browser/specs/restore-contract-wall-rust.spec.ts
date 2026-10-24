@@ -1350,36 +1350,14 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
       await createFreshclaudePane(page, harness, projectDir)
       await sendFreshAgentTurn(page, harness, tabId, 'wall freshclaude turn')
-      // Pre-kill turn proof via the HARNESS (Redux), not UI chrome (corrected,
-      // council fix round): the fresh-agent transcript renders exclusively
-      // from the REST thread snapshot (FreshAgentView.tsx:1302,1782 --
-      // getFreshAgentThreadSnapshot -> snapshot?.turns). The claim that "the
-      // Rust router has NO claude snapshot adapter -> 503" is FALSE at HEAD --
-      // crates/freshell-freshagent/src/snapshot.rs:133-146 routes
-      // freshclaude/kilroy + claude through get_claude_snapshot(), a
-      // disk+env adapter over the CLI's own transcript store;
-      // FRESH_AGENT_RUNTIME_UNAVAILABLE now only fires for session types
-      // with no adapter registered at all. This assertion still reads via
-      // the harness (not DOM) because the snapshot fetch can race pane
-      // creation, not because the adapter is missing. The sidecar protocol
-      // itself is verified end-to-end regardless: freshAgent.event/
-      // freshAgent.assistant arrives on the wire and folds into the
-      // freshAgent slice (turns[]) -- assert THAT (createFreshclaudePane's
-      // note: assert pane state via the harness, never error-free UI chrome
-      // for freshclaude).
-      await expect
-        .poll(async () => {
-          const sessions = (await harness.getState())?.freshAgent?.sessions ?? {}
-          return Object.values(sessions).some((s: any) =>
-            (s?.turns ?? []).some((turn: any) =>
-              turn?.role === 'assistant'
-              && (turn?.items ?? []).some(
-                (item: any) => typeof item?.text === 'string' && item.text.includes('RESTORE_WALL_REPLY'),
-              ),
-            ),
-          )
-        }, { timeout: 20_000 })
-        .toBe(true)
+      // Verify the unique scripted reply in the pane's live transcript. The
+      // SDK assistant frame is folded into the live-transcript slice; the
+      // `freshAgent.sessions` Redux cache is populated by REST snapshots and
+      // is not the live-stream source. After restart, the later assertion
+      // checks the same reply was rehydrated from the durable transcript.
+      await expect(
+        page.locator('[data-context="fresh-agent"]').last().getByText('RESTORE_WALL_REPLY', { exact: true }),
+      ).toBeVisible({ timeout: 20_000 })
 
       const originalSessionId: string = await expect
         .poll(async () => leafDurableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId))) ?? null, {

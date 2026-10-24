@@ -904,7 +904,21 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
       const transcriptLines = readJsonl(transcriptFile)
       const userTexts = transcriptLines
         .filter((l) => l.type === 'user')
-        .map((l) => l.message?.content?.[0]?.text)
+        .map((line) => {
+          const content = line.message?.content
+          // Ordinary prompts use the simulator's string content shape while
+          // real CLI message blocks (including tool results) use text blocks.
+          // The local /compact command is written to native history as a
+          // string, so inspect both supported Claude transcript forms.
+          if (typeof content === 'string') return content
+          if (Array.isArray(content)) {
+            return content
+              .map((block: any) => typeof block?.text === 'string' ? block.text : '')
+              .filter(Boolean)
+              .join('\n')
+          }
+          return ''
+        })
       expect(userTexts).toEqual(
         expect.arrayContaining(['warm-up turn', '/compact focus the diff', 'follow-up after compact']),
       )
