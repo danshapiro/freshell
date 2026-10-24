@@ -8471,20 +8471,38 @@ async fn handoff_to_a_kilroy_target_resumes_as_kilroy_on_the_claude_lane() {
     // The prior terminal is dead.
     assert!(rig.registry.terminal_is_dead(&prior_terminal));
 
-    // The created/resumed session's frames carry sessionType "kilroy".
+    // Retain both facts regardless of their relative delivery order. The
+    // consumer can publish its first Kilroy frame before or after the runner's
+    // owner commit; waiting for one must never discard the other.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut saw_kilroy_frame = false;
+    let mut frames = Vec::new();
     while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(250), rig.rx.recv()).await {
+        match tokio::time::timeout_at(deadline, rig.rx.recv()).await {
             Ok(Ok(raw)) => {
-                if raw.contains("\"sessionType\":\"kilroy\"") && raw.contains(&sid) {
+                let frame: Value = serde_json::from_str(&raw).expect("JSON bus frame");
+                if frame["type"] == "session.runtimeOwner"
+                    && frame["sessionId"] == sid
+                    && frame["ownerKind"] == "fresh-agent"
+                {
+                    frames.push(frame.clone());
+                }
+                if frame["type"] == "freshAgent.event"
+                    && frame["sessionType"] == "kilroy"
+                    && frame["sessionId"] == sid
+                {
                     saw_kilroy_frame = true;
+                }
+                if saw_kilroy_frame
+                    && frames
+                        .iter()
+                        .any(|frame| frame["transition"] == "handoff-committed")
+                {
                     break;
                 }
             }
             Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Err(_)) => break,
-            Err(_) => {}
+            Ok(Err(_)) | Err(_) => break,
         }
     }
     assert!(
@@ -8501,7 +8519,6 @@ async fn handoff_to_a_kilroy_target_resumes_as_kilroy_on_the_claude_lane() {
     }
 
     // The broadcast frames carry epoch + ownerKind fresh-agent.
-    let frames = drain_runtime_owner_frames(&mut rig.rx);
     let committed = runtime_owner_frame(&frames, "handoff-committed");
     assert!(committed["epoch"].as_u64().unwrap_or(0) >= 1);
     assert_eq!(committed["ownerKind"], json!("fresh-agent"));
