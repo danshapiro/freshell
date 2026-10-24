@@ -160,9 +160,11 @@ try {
   const resultCount = () => frames.filter((frame) => frame.type === 'sdk.result').length
 
   const requestId = randomUUID()
-  write({ type: 'create', protocol: 2, boot: { kind: 'fresh' }, requestId, cwd, model: FAKE_MODEL, permissionMode: 'bypassPermissions' })
+  const nativeSessionId = randomUUID()
+  write({ type: 'create', protocol: 2, boot: { kind: 'fresh' }, requestId, sessionId: nativeSessionId, cwd, model: FAKE_MODEL, permissionMode: 'bypassPermissions' })
   const created = await waitFor((frame) => frame.requestId === requestId && (frame.type === 'created' || frame.type === 'create.failed'), 'created')
   if (created.type !== 'created') throw new Error(`the sidecar refused the create: ${created.message}`)
+  if (created.sessionId !== nativeSessionId) throw new Error('the sidecar changed the requested native session identity')
   const sessionId = created.sessionId
   poller = pollTranscripts()
 
@@ -177,7 +179,7 @@ try {
     await waitFor(() => resultCount() > results, `the ${name} result`)
     scenarios[name].end = frames.length
   }
-  const send = (text) => write({ type: 'send', sessionId, text })
+  const send = (text) => write({ type: 'send', sessionId, uuid: randomUUID(), text })
   const configure = async (requestId, settings) => {
     write({ type: 'configure', sessionId, requestId, settings })
     const answer = await waitFor((frame) => frame.type === 'sdk.configured' && frame.requestId === requestId, `configure ${requestId}`)

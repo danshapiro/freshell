@@ -52,6 +52,7 @@ describe('Freshell MCP in a Claude sidecar against the pinned CLI and a local pr
     expect(receipt, `${lines[0]}\n${stderr}`).toMatchObject({
       sdkVersion: PINNED_SDK_VERSION,
       bundledCliVersion: PINNED_CLI_VERSION,
+      sendRefusals: [],
       cliArgvHasMcpConfig: true,
       cliArgvHasToken: false,
       probeToolListed: true,

@@ -80,6 +80,7 @@ const isAnnouncement = (frame: Frame) => frame.type === 'sdk.session.changed' &&
 
 describe(`the Claude sidecar's live frames over the pinned CLI ${PINNED_CLI_VERSION} and a local provider`, () => {
   it('runs every scenario on the pinned SDK and CLI, and the sidecar then exits cleanly', () => {
+    expect(ofType(all(), 'sdk.send.rejected'), 'native command acceptance').toEqual([])
     expect(receipt.failure, stderr.slice(-2000)).toBeUndefined()
     expect(receipt).toMatchObject({ sdkVersion: PINNED_SDK_VERSION, bundledCliVersion: PINNED_CLI_VERSION, fixtureRemoved: true, sidecarExit: { code: 0, signal: null } })
     expect(Object.keys(receipt.scenarios)).toEqual(['text', 'edit', 'agent', 'retry', 'compact-ok', 'more', 'compact-fail', 'plan', 'configure-stated'])
@@ -160,18 +161,28 @@ describe(`the Claude sidecar's live frames over the pinned CLI ${PINNED_CLI_VERS
       .toEqual([['warn', 1, 529], ['warn', 2, 529]])
   })
 
-  it('/compact: compacting, running again, the manual boundary and its transcript lines, then the result, with no notice', () => {
+  it('/compact: compacting, its successful null status, the manual boundary and its transcript lines, then the result, with no notice', () => {
     const list = frames('compact-ok')
-    const order = list.filter((frame) => ['sdk.status', 'sdk.compact_boundary', 'sdk.result', 'sdk.notice'].includes(frame.type)).map((frame) => frame.status ?? frame.trigger ?? frame.type)
-    expect(order).toEqual(['compacting', 'running', 'manual', 'sdk.result'])
+    const order = list.filter((frame) => ['sdk.status', 'sdk.compact_boundary', 'sdk.result', 'sdk.notice'].includes(frame.type))
+    expect(order).toEqual([
+      expect.objectContaining({ type: 'sdk.status', status: 'compacting' }),
+      expect.objectContaining({ type: 'sdk.status', status: null, compactResult: 'success' }),
+      expect.objectContaining({ type: 'sdk.compact_boundary', trigger: 'manual' }),
+      expect.objectContaining({ type: 'sdk.result', result: 'success' }),
+    ])
     const boundary = list.findIndex((frame) => frame.type === 'sdk.compact_boundary')
     expect(list[boundary + 1]).toMatchObject({ type: 'sdk.session.changed', reason: 'transcript' })
   })
 
-  it('a /compact whose summary request fails: a COMPACTION_FAILED notice with the CLI\'s reason, running again, the result, no error frame', () => {
+  it('a /compact whose summary request fails: its failed null status, a COMPACTION_FAILED notice with the CLI\'s reason, then the result, no error frame', () => {
     const list = frames('compact-fail')
-    const order = list.filter((frame) => ['sdk.status', 'sdk.notice', 'sdk.result', 'sdk.error'].includes(frame.type)).map((frame) => frame.status ?? frame.code ?? frame.type)
-    expect(order).toEqual(['compacting', 'COMPACTION_FAILED', 'running', 'sdk.result'])
+    const order = list.filter((frame) => ['sdk.status', 'sdk.notice', 'sdk.result', 'sdk.error'].includes(frame.type))
+    expect(order).toEqual([
+      expect.objectContaining({ type: 'sdk.status', status: 'compacting' }),
+      expect.objectContaining({ type: 'sdk.status', status: null, compactResult: 'failed', compactError: expect.stringContaining('API Error: 400') }),
+      expect.objectContaining({ type: 'sdk.notice', code: 'COMPACTION_FAILED' }),
+      expect.objectContaining({ type: 'sdk.result', result: 'success' }),
+    ])
     expect(ofType(list, 'sdk.notice')[0]).toMatchObject({ level: 'error', message: expect.stringMatching(/^Error during compaction: API Error: 400/) })
     expect(receipt.logRecords.find((record) => record.code === 'COMPACTION_FAILED')).toMatchObject({ severity: 'error', error: expect.stringMatching(/^Error during compaction/) })
   })
