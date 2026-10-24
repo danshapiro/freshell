@@ -42,8 +42,8 @@ impl FreshClaudeState {
         };
         let now = crate::session_lease::now_epoch_ms() as i64;
         let settings = {
-            // The same map-lock order as kill/adoption. Ownership, routing,
-            // and the envelope move together before metadata IO starts.
+            // The map lock serializes close guards and identity moves.
+            // Ownership and event identity move before metadata IO starts.
             let mut sessions = self.sessions.lock().await;
             let session = sessions
                 .get(old)

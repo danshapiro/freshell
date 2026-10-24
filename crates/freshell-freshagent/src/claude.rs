@@ -542,7 +542,6 @@ impl FreshClaudeState {
             handoff_resume_pause: None,
             condemned_priors: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(test)]
-            #[cfg(test)]
             kill_stop_take_pause: None,
             #[cfg(test)]
             kill_after_resolve_pause: None,

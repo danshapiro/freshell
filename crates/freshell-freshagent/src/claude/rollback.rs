@@ -926,7 +926,6 @@ impl FreshClaudeState {
                     recorded_settings: Some(launch_settings.clone()),
                     // b8ke focused episode-2 round-2 F2: the ROLLBACK's claim
                     // owns this runtime's coordinator transition — the
-                    // adoption's Blocked arm correlates through the op id.
                     owning_generation: None,
                     // Conn-less lane (D8): the ledger merge inherits the
                     // superseded parent's stamps.
