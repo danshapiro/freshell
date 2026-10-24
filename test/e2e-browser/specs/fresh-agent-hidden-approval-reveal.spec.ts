@@ -24,9 +24,11 @@
  * itself. What this spec does catch is a regression to the blocking reveal
  * path (the overlay recorder) and a broken end-to-end journey.
  *
- * Trigger: the hidden pane's session gets a `freshAgent.send` written straight
- * to the socket (the pane's composer is hidden), and the simulator causes the
- * production sidecar's canUseTool callback to raise one Bash approval.
+ * Trigger: a visible composer starts the turn, then the user switches tabs
+ * before the simulator causes the production sidecar's canUseTool callback
+ * to raise one Bash approval. The send itself must not be hidden: a hidden
+ * send acceptance legitimately dirties the transcript and tests the blocking
+ * transcript-refresh path instead of the approval-only reveal path.
  * Then the client's own `freshAgent.interrupt` frame for the session — the
  * exact frame the Stream Deck "stop" sends to a pane in a background tab —
  * cancels it (the sidecar's interrupt-time pending cancellation, mirroring
@@ -68,6 +70,7 @@ const SIMULATOR_PROGRAM = {
         {
           kind: 'approval',
           data: { id: APPROVAL_REQUEST_ID, tool: 'Bash', input: { command: 'echo raised-while-hidden' } },
+          delayMs: 3_000,
         },
       ],
     },
@@ -94,6 +97,20 @@ function findFreshAgentLeaf(node: any): any {
 async function receivedFreshAgentEvents(harness: TestHarness, eventType: string): Promise<any[]> {
   const received = (await harness.getReceivedWsMessages()) as any[]
   return received.filter((msg) => msg?.type === 'freshAgent.event' && msg?.event?.type === eventType)
+}
+
+/** POST /api/tabs returns an unfocused tab, leaving the current pane visible. */
+async function createBackgroundShellTab(info: { baseUrl: string; token: string }, cwd: string): Promise<string> {
+  const res = await fetch(`${info.baseUrl}/api/tabs`, {
+    method: 'POST',
+    headers: { 'x-auth-token': info.token, 'content-type': 'application/json' },
+    body: JSON.stringify({ mode: 'shell', cwd }),
+  })
+  const payload = await res.json()
+  expect(res.ok, `POST /api/tabs: ${JSON.stringify(payload)}`).toBe(true)
+  const tabId = payload?.data?.tabId
+  expect(tabId, 'POST /api/tabs envelope data.tabId').toBeTruthy()
+  return tabId as string
 }
 
 /** Record whether the blocking reveal overlay is EVER drawn from now on. */
@@ -231,24 +248,15 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
       const visibleCard = page.getByRole('alert', { name: 'Permission request for Bash' })
       await expect(cardInAnyTab, 'no approval before the trigger').toHaveCount(0)
 
-      // ── Tab B: the user moves away; tab A (and its pane) is now hidden ────
-      await page.getByRole('button', { name: 'New shell tab' }).click()
+      // Create B without changing focus, then start the turn while A is
+      // visible. This keeps send acceptance out of the hidden-pane path.
+      const tabB = await createBackgroundShellTab(info, os.tmpdir())
       await harness.waitForTabCount(2)
-      const tabB = (await harness.getActiveTabId())!
       expect(tabB).not.toBe(tabA)
+      expect(await harness.getActiveTabId()).toBe(tabA)
       const tabALocator = page.locator(`[data-context="tab"][data-tab-id="${tabA}"]`)
       const tabBLocator = page.locator(`[data-context="tab"][data-tab-id="${tabB}"]`)
 
-      const sendToHiddenPane = () => page.evaluate(({ sessionId, text }) => {
-        window.__FRESHELL_TEST_HARNESS__?.sendWsMessage({
-          type: 'freshAgent.send',
-          requestId: 'send-while-hidden',
-          sessionId,
-          sessionType: 'freshclaude',
-          provider: 'claude',
-          text,
-        })
-      }, { sessionId: bridgeSessionId, text: RAISE_TEXT })
       const interruptHiddenPane = () => page.evaluate((sessionId) => {
         // The Stream Deck stop's exact frame for a fresh-agent pane.
         window.__FRESHELL_TEST_HARNESS__?.sendWsMessage({
@@ -260,7 +268,15 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
       }, bridgeSessionId)
 
       // ── 1. An approval RAISED while hidden appears on reveal ─────────────
-      await sendToHiddenPane()
+      const composer = paneA.getByRole('textbox', { name: 'Chat message input' })
+      await composer.fill(RAISE_TEXT)
+      await paneA.getByRole('button', { name: 'Send' }).click()
+      await expect.poll(() => readClaudeSimLedger(simLedger).some(
+        (row) => row.kind === 'prompt' && row.text === RAISE_TEXT,
+      ), { timeout: 15_000, message: 'the visible pane starts the approval-triggering prompt' }).toBe(true)
+      // The delayed canUseTool request now arrives after A is hidden.
+      await tabBLocator.click()
+      await expect.poll(() => harness.getActiveTabId(), { timeout: 10_000 }).toBe(tabB)
       await expect
         .poll(() => readClaudeSimLedger(simLedger).filter((row) => row.kind === 'approval').length, {
           timeout: 15_000,

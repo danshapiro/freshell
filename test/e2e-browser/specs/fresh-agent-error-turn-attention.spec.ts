@@ -98,6 +98,23 @@ function findFreshAgentLeaf(node: any): any {
   return null
 }
 
+/** Select a real boot terminal before opening a provider pane picker. The
+ * boot picker fades out after the choice, so opening another picker before
+ * the terminal surface appears can route the click to the fading picker. */
+async function settleBootPicker(page: Page): Promise<void> {
+  const picker = page.getByRole('toolbar', { name: /pane type picker/i }).last()
+  if (await picker.isVisible().catch(() => false)) {
+    for (const name of ['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash']) {
+      const option = picker.getByRole('button', { name: new RegExp(`^${name}$`, 'i') })
+      if (await option.isVisible().catch(() => false)) {
+        await option.click({ force: true })
+        break
+      }
+    }
+  }
+  await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+}
+
 /**
  * Boot a server whose Claude sidecar is the PRODUCTION sidecar over the CLI
  * simulator (with its ledger, and `extraEnv` such as a simulator program), and
@@ -145,6 +162,7 @@ async function bootProductionClaudePane(
     await harness.waitForHarness()
     await harness.waitForConnection()
 
+    await settleBootPicker(page)
     await page.evaluate(() => {
       window.__FRESHELL_TEST_HARNESS__?.dispatch({
         type: 'connection/setAvailableClis',
@@ -207,9 +225,9 @@ test.describe('fresh-agent error-turn attention (unified needs-attention signal)
       await harness.waitForHarness()
       await harness.waitForConnection()
 
-      // The boot tab shows the pane-type picker (no shell is selected first,
-      // so the freshclaude pane REPLACES the picker — no split sibling): make
-      // the fresh-agent options visible, then pick Freshclaude.
+      // Settle the initial picker and its fade-out before opening the
+      // fresh-agent picker. The boot shell remains a real sibling pane.
+      await settleBootPicker(page)
       await page.evaluate(() => {
         window.__FRESHELL_TEST_HARNESS__?.dispatch({
           type: 'connection/setAvailableClis',

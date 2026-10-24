@@ -1325,7 +1325,18 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     await fs.mkdir(projectDir, { recursive: true })
 
     const { server, harness, info, context, page } = await bootWall(browser, {
-      env: claudeSimulatorServerEnv({ ledgerPath: path.join(sharedRoot, 'claude-sim-ledger.jsonl') }),
+      env: claudeSimulatorServerEnv({
+        ledgerPath: path.join(sharedRoot, 'claude-sim-ledger.jsonl'),
+        program: {
+          rules: [
+            {
+              on: 'msg:prompt',
+              match: { text: 'wall freshclaude turn' },
+              emit: [{ kind: 'text', data: { text: 'RESTORE_WALL_REPLY' } }],
+            },
+          ],
+        },
+      }),
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
     try {
@@ -1363,7 +1374,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
             (s?.turns ?? []).some((turn: any) =>
               turn?.role === 'assistant'
               && (turn?.items ?? []).some(
-                (item: any) => typeof item?.text === 'string' && item.text.includes('Fixture claude turn'),
+                (item: any) => typeof item?.text === 'string' && item.text.includes('RESTORE_WALL_REPLY'),
               ),
             ),
           )
@@ -1404,7 +1415,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         })
         .toBe(originalSessionId)
       await expect(
-        page.locator('[data-context="fresh-agent"]').last().getByText('Fixture claude turn'),
+        page.locator('[data-context="fresh-agent"]').last().getByText('RESTORE_WALL_REPLY', { exact: true }),
       ).toBeVisible({ timeout: 30_000 })
       const finalLeaf = findFreshAgentLeaf(await harness.getPaneLayout(rehydratedTabId))
       expect(finalLeaf?.content?.status).not.toBe('error')

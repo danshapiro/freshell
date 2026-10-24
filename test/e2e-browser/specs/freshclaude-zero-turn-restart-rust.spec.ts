@@ -27,7 +27,7 @@ import type { Page } from '@playwright/test'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { claudeSimulatorServerEnv, readClaudeSimLedger } from '../helpers/claude-sim-lane.js'
+import { claudeSimulatorServerEnv, onPrompt, readClaudeSimLedger } from '../helpers/claude-sim-lane.js'
 
 // ---------------------------------------------------------------------------
 // Shared helpers (per-spec copies -- donor: restore-contract-wall-rust.spec.ts)
@@ -156,7 +156,12 @@ test.describe('freshclaude zero-turn restart (kata 09v1)', () => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-e2e-zero-turn-'))
     const simLedger = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
     const { server, harness } = await bootWall(page, {
-      env: claudeSimulatorServerEnv({ ledgerPath: simLedger }),
+      env: claudeSimulatorServerEnv({
+        ledgerPath: simLedger,
+        program: {
+          rules: [onPrompt('zero-turn post-restart send', [{ kind: 'text', data: { text: 'ZERO_TURN_REPLY' } }])],
+        },
+      }),
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
     try {
@@ -172,10 +177,9 @@ test.describe('freshclaude zero-turn restart (kata 09v1)', () => {
           return c?.sessionId && c?.createRequestId ? true : null
         }, { timeout: 30_000 })
         .not.toBeNull()
-      // Wait for the durable identity assigned to this zero-turn pane. The
-      // production sidecar keeps the create-time identity until the CLI
-      // reports its session on a prompt, so gate on the
-      // canonical-UUID SHAPE and capture what this run minted.
+      // Rust assigns the durable UUID as part of create, before any turn.
+      // Capture that acknowledgement identity rather than depending on an
+      // SDK init event that only arrives after a prompt.
       await expect
         .poll(async () => {
           const c = findFreshAgentLeaf(await harness.getPaneLayout(freshTabId))?.content
@@ -185,29 +189,40 @@ test.describe('freshclaude zero-turn restart (kata 09v1)', () => {
       const contentBefore = findFreshAgentLeaf(await harness.getPaneLayout(freshTabId))!.content!
       const originalDurable = (contentBefore.sessionRef?.sessionId ?? contentBefore.resumeSessionId) as string
       const createRequestIdBefore = contentBefore.createRequestId as string
+      const createdFrame = (await harness.getReceivedWsMessages() as any[]).find(
+        (message) => message?.type === 'freshAgent.created' && message.requestId === createRequestIdBefore,
+      )
+      expect(createdFrame?.sessionRef, 'the create acknowledgement assigns the durable identity before any turn')
+        .toEqual({ provider: 'claude', sessionId: originalDurable })
+      await expect.poll(async () => {
+        const owners = Object.values((await harness.getState())?.freshAgent?.runtimeOwners ?? {}) as any[]
+        return owners.find((owner) => owner.provider === 'claude' && owner.sessionId === originalDurable)?.ownerKind ?? null
+      }, { message: 'the create-time durable identity has a live fresh-agent owner' }).toBe('fresh-agent')
 
       // ZERO TURNS, pane stays VISIBLE (no extra tab, no hide): the
       // transcript on disk is the sidecar's create-time 0-byte file --
       // exactly the R10b-excluded shape this regression pins.
 
+      await harness.clearSentWsMessages()
       await server.restartAbrupt()
       await waitForWsReady(page)
 
-      // Positive proof (same discriminator as the hidden-pane spec): the
-      // simulator ledger must contain a resumed CLI query naming originalDurable.
-      // post-restart evidence.
-      // The parity arm resumes by durable UUID or by the transcript's
-      // .jsonl PATH; both carry the durable UUID -- accept either shape.
+      // A new query is not required when the original live writer survives
+      // the server restart. Prove the post-restart attach carries the
+      // create-time durable reference and the ready handshake reports its
+      // live owner; both are server-originated lifecycle evidence.
       await expect
         .poll(async () => {
-          const c = findFreshAgentLeaf(await harness.getPaneLayout(freshTabId))?.content
-          const status = c?.status ?? ''
-          const usable = c?.sessionId && ['connected', 'idle', 'running'].includes(status)
-          const resumed = readClaudeSimLedger(simLedger)
-            .some((row) => row.kind === 'query' && (row.options as any)?.resume === originalDurable)
-          return usable && resumed ? `resumed:${status}` : null
+          const sent = await harness.getSentWsMessages() as any[]
+          return sent.find((message) => message?.type === 'freshAgent.attach'
+            && message?.sessionRef?.provider === 'claude'
+            && message?.sessionRef?.sessionId === originalDurable) ?? null
         }, { timeout: 30_000 })
-        .not.toBeNull()
+        .toMatchObject({ type: 'freshAgent.attach', sessionRef: { provider: 'claude', sessionId: originalDurable } })
+      await expect.poll(async () => {
+        const owners = Object.values((await harness.getState())?.freshAgent?.runtimeOwners ?? {}) as any[]
+        return owners.find((owner) => owner.provider === 'claude' && owner.sessionId === originalDurable)?.ownerKind ?? null
+      }, { timeout: 30_000, message: 'the restarted connection observes the fresh-agent owner' }).toBe('fresh-agent')
 
       // Negative proof (the pre-fix failure shape must be gone): the
       // zero-turn session must NOT be adjudicated dead.
@@ -218,6 +233,15 @@ test.describe('freshclaude zero-turn restart (kata 09v1)', () => {
         deadEntries.some((e: any) => e?.sessionRef?.sessionId === originalDurable),
         'zero-turn session must not appear in dead-session adjudication',
       ).toBe(false)
+      const paneRoot = page.locator('[data-context="fresh-agent"]').last()
+      const composer = paneRoot.getByRole('textbox', { name: 'Chat message input' })
+      await composer.fill('zero-turn post-restart send')
+      await paneRoot.getByRole('button', { name: 'Send' }).click()
+      await expect(paneRoot.getByText('ZERO_TURN_REPLY', { exact: true })).toBeVisible({ timeout: 30_000 })
+      await expect.poll(() => readClaudeSimLedger(simLedger).some(
+        (row) => row.kind === 'prompt' && row.text === 'zero-turn post-restart send' && row.sessionId === originalDurable,
+      ), { timeout: 15_000, message: 'the resumed zero-turn conversation receives the next send under its original UUID' })
+        .toBe(true)
       const contentAfter = findFreshAgentLeaf(await harness.getPaneLayout(freshTabId))!.content!
       expect(contentAfter.restoreError?.reason ?? null).not.toBe('durable_artifact_missing')
       // In-place resume: the client's .lost re-create fallback must NOT have

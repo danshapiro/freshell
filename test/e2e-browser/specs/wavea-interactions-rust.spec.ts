@@ -34,7 +34,7 @@ import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import type { Page } from '@playwright/test'
-import { claudeSimulatorServerEnv, readClaudeSimLedger } from '../helpers/claude-sim-lane.js'
+import { claudeSimulatorServerEnv } from '../helpers/claude-sim-lane.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -320,13 +320,12 @@ test.describe('wave-A cross-lane interactions', () => {
     try {
       const fakeClaude = await installFakeCli(path.join(sharedRoot, 'bin'), 'claude', 'fake-claude-cli.mjs')
       const argvLog = path.join(sharedRoot, 'claude-argv.jsonl')
-      const simLedger = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
       const seed = seedConfig({ providers: ['claude'], freshAgent: true })
       const server = new RustServer({
         env: {
           CLAUDE_CMD: fakeClaude,
           FAKE_CLAUDE_ARGV_LOG: argvLog,
-          ...claudeSimulatorServerEnv({ ledgerPath: simLedger }),
+          ...claudeSimulatorServerEnv({ ledgerPath: path.join(sharedRoot, 'claude-sim-ledger.jsonl') }),
         },
         setupHome: async (homeDir: string) => {
           capturedHome = homeDir
@@ -360,8 +359,8 @@ test.describe('wave-A cross-lane interactions', () => {
           }, { timeout: 15_000 })
           .not.toBe('')
 
-        // Identity store 2 (A2): freshclaude pane -> sidecar cliSessionId index.
-        // Gate on the canonical-UUID SHAPE, then capture what this run minted.
+        // Identity store 2 (A2): freshclaude pane -> create-time durable UUID.
+        // Gate on the canonical-UUID SHAPE, then capture the create acknowledgement.
         await createFreshclaudePane(page, sharedRoot)
         await expect
           .poll(async () => {
@@ -373,6 +372,16 @@ test.describe('wave-A cross-lane interactions', () => {
           const c = freshAgentLeaf(await harness.getPaneLayout(tabId))?.content
           FRESH_DURABLE = (c?.sessionRef?.sessionId ?? c?.resumeSessionId) as string
         }
+        const freshContent = freshAgentLeaf(await harness.getPaneLayout(tabId))!.content!
+        const createdFrame = (await harness.getReceivedWsMessages() as any[]).find(
+          (message) => message?.type === 'freshAgent.created' && message.requestId === freshContent.createRequestId,
+        )
+        expect(createdFrame?.sessionRef, 'freshclaude create acknowledges its durable UUID before any prompt')
+          .toEqual({ provider: 'claude', sessionId: FRESH_DURABLE })
+        await expect.poll(async () => {
+          const owners = Object.values((await harness.getState())?.freshAgent?.runtimeOwners ?? {}) as any[]
+          return owners.find((owner) => owner.provider === 'claude' && owner.sessionId === FRESH_DURABLE)?.ownerKind ?? null
+        }, { message: 'the freshclaude UUID is registered as a fresh-agent runtime owner' }).toBe('fresh-agent')
         expect(terminalSession).not.toBe(FRESH_DURABLE)
 
         // FIXTURE REALISM (reconcile adoption): real claude writes
@@ -397,6 +406,7 @@ test.describe('wave-A cross-lane interactions', () => {
         )
 
         // ── ONE abrupt restart; both stores must restore, independently. ──
+        await harness.clearSentWsMessages()
         await server.restartAbrupt()
         await waitForWsReady(page)
 
@@ -414,15 +424,20 @@ test.describe('wave-A cross-lane interactions', () => {
         const rowsAfter = await readClaudeBindingRows(ledgerDir)
         expect(rowsAfter.some((r) => r.sessionId === terminalSession)).toBe(true)
 
-        // A2 path: the fresh-agent pane resumed in place — server-side proof
-        // is the simulator query carrying a resume boot (UUID or transcript
-        // path shape, claude.rs decision table).
-        await expect
-          .poll(async () => {
-            return readClaudeSimLedger(simLedger)
-              .some((row) => row.kind === 'query' && (row.options as any)?.resume === FRESH_DURABLE)
-          }, { timeout: 30_000 })
-          .toBe(true)
+        // A2 path: the fresh-agent pane reattaches under the durable UUID.
+        // A surviving writer does not need to start a second SDK query; the
+        // post-restart attach and ready-replayed owner are the server evidence.
+        await expect.poll(async () => {
+          const sent = await harness.getSentWsMessages() as any[]
+          return sent.find((message) => message?.type === 'freshAgent.attach'
+            && message?.sessionRef?.provider === 'claude'
+            && message?.sessionRef?.sessionId === FRESH_DURABLE) ?? null
+        }, { timeout: 30_000, message: 'the fresh-agent pane attaches using its create-time UUID' })
+          .toMatchObject({ type: 'freshAgent.attach', sessionRef: { provider: 'claude', sessionId: FRESH_DURABLE } })
+        await expect.poll(async () => {
+          const owners = Object.values((await harness.getState())?.freshAgent?.runtimeOwners ?? {}) as any[]
+          return owners.find((owner) => owner.provider === 'claude' && owner.sessionId === FRESH_DURABLE)?.ownerKind ?? null
+        }, { timeout: 30_000, message: 'the restarted connection reports the fresh-agent owner' }).toBe('fresh-agent')
         await expect
           .poll(async () => {
             const c = freshAgentLeaf(await harness.getPaneLayout(tabId))?.content

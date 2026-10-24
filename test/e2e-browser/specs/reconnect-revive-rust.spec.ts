@@ -44,7 +44,7 @@ import { RustServer } from '../helpers/rust-server.js'
 import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
-import { claudeSimulatorServerEnv, readClaudeSimLedger } from '../helpers/claude-sim-lane.js'
+import { claudeSimulatorServerEnv, onPrompt, readClaudeSimLedger } from '../helpers/claude-sim-lane.js'
 import type { Page } from '@playwright/test'
 import fs from 'node:fs/promises'
 import os from 'node:os'
@@ -372,19 +372,6 @@ async function sendFreshAgentTurn(
     .toBe('idle')
 }
 
-/** Count rendered copies of the fixture's fixed assistant reply text inside
- *  the LAST fresh-agent pane. Per-turn render count is >=1 per turn, so a
- *  strictly-greater count after the second turn is proof the second reply
- *  genuinely rendered (the fixture's reply text is constant, so a distinct-
- *  text assertion is impossible -- count growth is the discriminator). */
-async function fixtureReplyCount(page: Page): Promise<number> {
-  return page
-    .locator('[data-context="fresh-agent"]')
-    .last()
-    .getByText('Fixture claude turn', { exact: false })
-    .count()
-}
-
 /** Count prompts the simulated CLI actually started. */
 function simulatedPromptCount(ledgerPath: string): number {
   return readClaudeSimLedger(ledgerPath).filter((row) => row.kind === 'prompt').length
@@ -686,7 +673,15 @@ test.describe('reconnect revive (rust)', () => {
     await fs.mkdir(projectDir, { recursive: true })
     const simLedger = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
     const { server, harness } = await bootWall(page, {
-      env: claudeSimulatorServerEnv({ ledgerPath: simLedger }),
+      env: claudeSimulatorServerEnv({
+        ledgerPath: simLedger,
+        program: {
+          rules: [
+            onPrompt('rr fresh agent turn one', [{ kind: 'text', data: { text: 'RR_FIRST_REPLY' } }]),
+            onPrompt('rr fresh agent turn two', [{ kind: 'text', data: { text: 'RR_SECOND_REPLY' } }]),
+          ],
+        },
+      }),
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
     try {
@@ -704,10 +699,8 @@ test.describe('reconnect revive (rust)', () => {
 
       // One completed turn BEFORE the drop (the plain happy path).
       await sendFreshAgentTurn(page, harness, freshTabId, 'rr fresh agent turn one')
-      const replyCountBeforeDrop: number = await expect
-        .poll(async () => fixtureReplyCount(page), { timeout: 30_000 })
-        .toBeGreaterThan(0)
-        .then(() => fixtureReplyCount(page))
+      await expect(page.locator('[data-context="fresh-agent"]').last().getByText('RR_FIRST_REPLY', { exact: true }))
+        .toBeVisible({ timeout: 30_000 })
       const sendsBeforeDrop = simulatedPromptCount(simLedger)
       expect(sendsBeforeDrop).toBe(1)
 
@@ -737,14 +730,12 @@ test.describe('reconnect revive (rust)', () => {
         contentBeforeDrop.resumeSessionId,
       )
 
-      // Discriminating round trip:
-      // (a) the pane renders strictly MORE replies than survived the drop...
+      // Discriminating round trip: the scenario-specific second reply is
+      // visible after reconnect, and the ledger proves its prompt crossed the
+      // new server connection to the still-live sidecar.
       await sendFreshAgentTurn(page, harness, freshTabId, 'rr fresh agent turn two')
-      await expect
-        .poll(async () => fixtureReplyCount(page), { timeout: 30_000 })
-        .toBeGreaterThan(replyCountBeforeDrop)
-      // ...(b) and the simulator ledger proves the second prompt genuinely
-      // crossed the (new) server connection to the still-live sidecar.
+      await expect(page.locator('[data-context="fresh-agent"]').last().getByText('RR_SECOND_REPLY', { exact: true }))
+        .toBeVisible({ timeout: 30_000 })
       await expect
         .poll(async () => simulatedPromptCount(simLedger), { timeout: 15_000 })
         .toBe(2)

@@ -270,7 +270,16 @@ if (sid) {
   fs.mkdirSync(dir, { recursive: true })
   const transcript = path.join(dir, sid + '.jsonl')
   if (!fs.existsSync(transcript)) {
-    fs.writeFileSync(transcript, JSON.stringify({ type: 'user', message: { role: 'user', content: 'seed' }, sessionId: sid, timestamp: new Date().toISOString() }) + '\\n')
+    // A recorded cwd lets Rust resume by the session UUID while the original
+    // workspace still exists. Without it, Rust correctly falls back to the
+    // transcript path, which the simulator treats as a distinct session id.
+    fs.writeFileSync(transcript, JSON.stringify({
+      type: 'user',
+      message: { role: 'user', content: 'seed' },
+      sessionId: sid,
+      cwd: process.cwd(),
+      timestamp: new Date().toISOString(),
+    }) + '\\n')
   }
 }
 process.stdout.write('fake-claude ready\\r\\n')
@@ -441,9 +450,9 @@ process.stdin.resume()
       //    LayoutStore-only), carrying the server-preallocated session id S.
       const picker = await openPanePicker(page)
       await picker.getByRole('button', { name: /^Claude CLI$/i }).click({ force: true })
-      await page
-        .getByRole('combobox', { name: /Starting directory for Claude CLI/i })
-        .press('Enter')
+      const startingDirectory = page.getByRole('combobox', { name: /Starting directory for Claude CLI/i })
+      await startingDirectory.fill(projectDir)
+      await startingDirectory.press('Enter')
 
       const leaf = await expect.poll(async () => {
         const layout = await harness.getPaneLayout(tabId!)

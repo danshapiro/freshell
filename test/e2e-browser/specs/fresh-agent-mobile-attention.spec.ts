@@ -232,6 +232,21 @@ test.describe('mobile tab surfaces show needs-attention marks (G17)', () => {
       // ── 3. An approval wait raised while the user is in another tab ───────
       // Send from tab A, then move to tab B inside the 3 s window. Tab A is
       // first of two now: the strip's right action is "Next tab".
+      // The server's default Claude permission mode bypasses tool approval.
+      // Set the user-facing asking mode explicitly so this prompt reaches the
+      // real canUseTool approval path that the attention assertion covers.
+      await page.getByRole('button', { name: 'Agent settings', exact: true }).click()
+      await page.getByRole('combobox', { name: 'Permission mode' }).selectOption('default')
+      await page.keyboard.press('Escape')
+      await expect
+        .poll(async () => findFreshAgentLeaf(await harness.getPaneLayout(tabA))?.content?.permissionMode ?? null)
+        .toBe('default')
+      await expect
+        .poll(() => readClaudeSimLedger(simLedger).some(
+          (row) => row.kind === 'control' && row.name === 'setPermissionMode' && row.args?.[0] === 'default',
+        ))
+        .toBe(true)
+
       await composer.fill(BACKGROUND_APPROVAL)
       await sendButton.click()
       await page.getByRole('button', { name: 'Next tab' }).click()

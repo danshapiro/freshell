@@ -24,7 +24,7 @@ import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { MACHINE_ID_STORAGE_KEY } from '../../../src/store/storage-keys.js'
-import { claudeSimulatorServerEnv, readClaudeSimLedger } from '../helpers/claude-sim-lane.js'
+import { claudeSimulatorServerEnv, onPrompt, readClaudeSimLedger } from '../helpers/claude-sim-lane.js'
 // NOTE: `Page` comes from '@playwright/test' (fixtures.ts exports only
 // `test`/`expect`, as every donor spec does). `openPanePicker` is IMPORTED,
 // not copied -- the copied `createFreshclaudePane` body calls it (wall :29,
@@ -421,9 +421,18 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
   test('durable identity survives browser reload, then SIGKILL restart resumes the SAME conversation', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-identity-freshclaude-'))
     const projectDir = path.join(sharedRoot, 'project')
+    const simLedger = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
     await fs.mkdir(projectDir, { recursive: true })
     const { server, info, harness } = await bootWall(page, {
-      env: claudeSimulatorServerEnv({ ledgerPath: path.join(sharedRoot, 'claude-sim-ledger.jsonl') }),
+      env: claudeSimulatorServerEnv({
+        ledgerPath: simLedger,
+        program: {
+          rules: [
+            onPrompt('first turn before reload', [{ kind: 'text', data: { text: 'IDENTITY_FIRST_REPLY' } }]),
+            onPrompt('second turn after restart', [{ kind: 'text', data: { text: 'IDENTITY_SECOND_REPLY' } }]),
+          ],
+        },
+      }),
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
     try {
@@ -441,7 +450,7 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
       // harness, exactly as the wall's leg G does (:1180).
       await createFreshclaudePane(page, harness, projectDir)
       await sendFreshAgentTurn(page, harness, tabId!, 'first turn before reload')
-      await expect(page.locator('[data-context="fresh-agent"]').last()).toContainText('Fixture claude turn', { timeout: 30_000 })
+      await expect(page.locator('[data-context="fresh-agent"]').last()).toContainText('IDENTITY_FIRST_REPLY', { timeout: 30_000 })
 
       // THE FOLD (shipped behavior: FreshAgentView.tsx's durable-identity
       // merge effect -- cited at plan-time base 7508149b as :1798-1830; on
@@ -490,8 +499,8 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
         .poll(async () => durableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabIdAfterReload!))), { timeout: 30_000 })
         .toBe(originalDurable)
       await sendFreshAgentTurn(page, harness, tabIdAfterReload!, 'second turn after restart')
-      await expect(page.locator('[data-context="fresh-agent"]').last()).toContainText('Fixture claude turn', { timeout: 30_000 })
-      await expect(page.locator('[data-context="fresh-agent"]').last()).toContainText('first turn before reload', { timeout: 30_000 })
+      await expect(page.locator('[data-context="fresh-agent"]').last()).toContainText('IDENTITY_SECOND_REPLY', { timeout: 30_000 })
+      await expect(page.locator('[data-context="fresh-agent"]').last()).toContainText('IDENTITY_FIRST_REPLY', { timeout: 30_000 })
 
       // Every create sent across the reload+restart window targeted the
       // ORIGINAL session -- no identity-losing re-create. A create IS

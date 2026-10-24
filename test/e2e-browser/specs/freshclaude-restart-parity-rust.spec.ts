@@ -22,7 +22,7 @@ import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import type { Page } from '@playwright/test'
-import { claudeSimulatorServerEnv, readClaudeSimLedger } from '../helpers/claude-sim-lane.js'
+import { claudeSimulatorServerEnv, onPrompt, readClaudeSimLedger } from '../helpers/claude-sim-lane.js'
 
 // ESM project ("type": "module" in package.json): __dirname does not exist in
 // ESM modules -- derive it, same shim as the donor spec
@@ -209,8 +209,18 @@ test.describe('freshclaude restart parity (rust)', () => {
     test.setTimeout(120_000) // restart + resume + snapshot legs are slow
     const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshclaude-parity-'))
     const simLedger = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
+    const prompt = 'parity first turn'
+    const secondPrompt = 'parity second turn'
     const { server, harness } = await bootWall(page, {
-      env: claudeSimulatorServerEnv({ ledgerPath: simLedger }),
+      env: claudeSimulatorServerEnv({
+        ledgerPath: simLedger,
+        program: {
+          rules: [
+            onPrompt(prompt, [{ kind: 'text', data: { text: 'PARITY_FIRST_REPLY' } }]),
+            onPrompt(secondPrompt, [{ kind: 'text', data: { text: 'PARITY_SECOND_REPLY' } }]),
+          ],
+        },
+      }),
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
     try {
@@ -225,9 +235,8 @@ test.describe('freshclaude restart parity (rust)', () => {
       const projectDir = path.join(sharedRoot, 'proj')
       await fsp.mkdir(projectDir, { recursive: true })
       await createFreshclaudePane(page, harness, projectDir)
-      const prompt = `parity first turn ${Math.random().toString(36).slice(2, 10)}`
       await sendFreshAgentTurn(page, harness, tabId, prompt)
-      await expect(page.locator('[data-context="fresh-agent"]').last()).toContainText('Fixture claude turn')
+      await expect(page.locator('[data-context="fresh-agent"]').last()).toContainText('PARITY_FIRST_REPLY')
 
       // Durable identity = the simulator's canonical UUID (via liveDurableIdentity;
       // content.sessionId stays the create-time nanoid on a live claude pane).
@@ -304,9 +313,8 @@ test.describe('freshclaude restart parity (rust)', () => {
       })
 
       // Same conversation continues: next send round-trips on the resumed session.
-      const secondPrompt = `parity second turn ${Math.random().toString(36).slice(2, 10)}`
       await sendFreshAgentTurn(page, harness, tabId, secondPrompt)
-      await expect(page.locator('[data-context="fresh-agent"]').last()).toContainText('Fixture claude turn')
+      await expect(page.locator('[data-context="fresh-agent"]').last()).toContainText('PARITY_SECOND_REPLY')
       const layout = await harness.getPaneLayout(tabId)
       expect(liveDurableIdentity(findFreshAgentLeaf(layout))).toBe(originalDurable)
     } finally {
@@ -319,11 +327,15 @@ test.describe('freshclaude restart parity (rust)', () => {
     test.setTimeout(120_000) // restart + resume legs are slow
     const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshclaude-busy-'))
     const simLedger = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
+    const postWedgePrompt = 'post-wedge turn recovery'
     const { server, harness } = await bootWall(page, {
       env: claudeSimulatorServerEnv({
         ledgerPath: simLedger,
         program: {
-          rules: [{ on: 'msg:prompt', match: { text: 'wedge me' }, emit: [{ kind: 'hang' }] }],
+          rules: [
+            { on: 'msg:prompt', match: { text: 'wedge me' }, emit: [{ kind: 'hang' }] },
+            onPrompt(postWedgePrompt, [{ kind: 'text', data: { text: 'POST_WEDGE_REPLY' } }]),
+          ],
         },
       }),
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
@@ -378,8 +390,8 @@ test.describe('freshclaude restart parity (rust)', () => {
         .toBe('idle')
 
       // And the conversation is live again on the SAME durable session.
-      await sendFreshAgentTurn(page, harness, tabId, `post-wedge turn ${Date.now()}`)
-      await expect(page.locator('[data-context="fresh-agent"]').last()).toContainText('Fixture claude turn')
+      await sendFreshAgentTurn(page, harness, tabId, postWedgePrompt)
+      await expect(page.locator('[data-context="fresh-agent"]').last()).toContainText('POST_WEDGE_REPLY')
       const resumed = readClaudeSimLedger(simLedger)
         .some((row) => row.kind === 'query' && (row.options as any)?.resume === busyDurable)
       expect(resumed).toBe(true)

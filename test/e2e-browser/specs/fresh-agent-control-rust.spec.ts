@@ -842,7 +842,11 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
   test('compact: /compact instructions land on the same session; compacting shows; context retained', async ({ page }) => {
     // Give the simulator's real local /compact operation enough wall time for
     // the UI's compacting state to be observed.
-    const lane = await bootClaudeLane(page, 'freshclaude', { FRESHELL_CLAUDE_SIM_TIME_SCALE: '50' })
+    // 20x keeps the 500 ms simulated /compact window observable without
+    // stretching the 600 ms SDK boot to 30 seconds (50x). At that scale the
+    // pane did not reach its initial ready state before the test's 30 second
+    // setup bound under cloud scheduling.
+    const lane = await bootClaudeLane(page, 'freshclaude', { FRESHELL_CLAUDE_SIM_TIME_SCALE: '20' })
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, ['connected', 'idle'])
       const durableBefore = await captureDurableId(lane.harness, lane.tabId, CANONICAL_UUID_RE)
@@ -922,7 +926,10 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
       await paneRoot.getByRole('button', { name: 'Slash commands' }).click()
       const menu = page.getByRole('menu', { name: 'Slash commands' })
       await expect(menu).toBeVisible({ timeout: 10_000 })
-      await expect(menu.getByRole('menuitem', { name: /^\/compact/ })).toBeVisible()
+      await expect(
+        menu.getByRole('group', { name: 'Pane actions' })
+          .getByRole('menuitem', { name: /^\/compact Ask the agent to compact its current conversation context$/ }),
+      ).toBeVisible()
       await expect(
         menu.getByRole('menuitem', { name: /^\/fork/ }),
         'claude capabilities.fork=true offers /fork in the menu (C14)',
