@@ -1385,9 +1385,13 @@ impl LayoutStore {
             // b8ke ext r25 F2: a closed pane's recovery stamp is dead
             // weight — the pane no longer exists to protect.
             inner.recovery_stamps.remove(pane_id);
-            inner
-                .pending_publications
-                .retain(|entry| entry.pane_id != pane_id && !(!entry.published && matches!(&entry.placement, publication::Placement::Split { source_pane_id, .. } if source_pane_id == pane_id)));
+            inner.pending_publications.retain(|entry| {
+                entry.pane_id != pane_id
+                    && (entry.published
+                        || !matches!(&entry.placement,
+                            publication::Placement::Split { source_pane_id, .. }
+                                if source_pane_id == pane_id))
+            });
             persist_locked(&inner);
         }
         first.unwrap_or(Err("pane not found"))
