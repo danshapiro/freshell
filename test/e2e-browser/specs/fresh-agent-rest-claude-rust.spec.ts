@@ -84,7 +84,12 @@ test.describe('external REST/MCP controls the shared Claude runtime', () => {
       expect(split.status).toBe('ok')
       const splitId = split.data.paneId
       await expect.poll(async () => leaf(await harness.getPaneLayout(tabId), splitId)?.content?.sessionType, { timeout: 20_000 }).toBe('kilroy')
-      await mcp.callFreshellAction('send-keys', { target: splitId, keys: 'kilroy hello\r', literal: true })
+      const kilroySend = await mcp.callFreshellAction('send-keys', { target: splitId, keys: 'kilroy hello\r', literal: true })
+      expect(kilroySend.status, JSON.stringify(kilroySend)).toBe('ok')
+      expect(kilroySend.data.status, JSON.stringify(kilroySend)).toBe('idle')
+      await expect.poll(() => mcp.callFreshellAction('capture-pane', { target: splitId }), {
+        timeout: 20_000, message: 'the externally prompted Kilroy turn reached saved history',
+      }).toContain('Kilroy REST reply')
       await expect(page.locator(`[data-context="fresh-agent"][data-pane-id="${splitId}"]`)).toBeVisible()
       await expect(page.locator(`[data-context="fresh-agent"][data-pane-id="${splitId}"]`)).toContainText('Kilroy REST reply')
 

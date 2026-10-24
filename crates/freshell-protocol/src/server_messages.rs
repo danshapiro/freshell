@@ -1256,6 +1256,8 @@ pub struct ReadyCapabilities {
     /// opted in and this server boot has an installed managed controller.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub managed_runtime_v1: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fresh_agent_attention_replay_v1: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1285,6 +1287,22 @@ pub struct Ready {
     /// (frozen-client inertness — same rule as `boot_id`/`build_id`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_owners: Option<Vec<RuntimeOwnerReplay>>,
+    /// Negotiated attention marks. A first connection seeds them silently;
+    /// a reconnect replays marks newer than the page's own high-water marks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fresh_agent_attention: Option<Vec<FreshAgentAttentionMark>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentAttentionMark {
+    pub provider: String,
+    pub session_id: String,
+    pub session_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_turn_complete_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_waiting_at: Option<i64>,
 }
 
 /// One `ready.runtimeOwners` replay record (kata b8ke reconnect-owner
@@ -2413,6 +2431,7 @@ mod tests {
         // b8ke focused round-3 R3-5: every replay record carries its state
         // truth ("live" | "fenced") — a fenced record adds the typed reason.
         let msg = ServerMessage::Ready(Ready {
+            fresh_agent_attention: None,
             timestamp: "2026-09-09T00:00:00Z".into(),
             boot_id: Some("boot-1".into()),
             server_instance_id: Some("inst-1".into()),
@@ -2455,6 +2474,7 @@ mod tests {
         let back: ServerMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, msg);
         let legacy = ServerMessage::Ready(Ready {
+            fresh_agent_attention: None,
             timestamp: "2026-09-09T00:00:00Z".into(),
             boot_id: Some("boot-1".into()),
             server_instance_id: Some("inst-1".into()),

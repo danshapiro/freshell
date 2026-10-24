@@ -54,23 +54,37 @@ impl FreshClaudeState {
         msg.resume_session_id = None;
 
         match self.reply_live_attach(&msg, &previous, fence, &reply).await {
-            Ok(true) | Err(()) => return,
-            Ok(false) => {}
+            Ok(Some(attached_id)) => {
+                self.notify_turn_interrupted_after_ack(&attached_id, session_type)
+                    .await;
+                return;
+            }
+            Err(()) => return,
+            Ok(None) => {}
         }
         // A competing attach may already be booting this conversation.
         // Wait for it, then inspect the runtime again before launching.
         let _flight = self.wait_resume_flight(&durable).await;
         match self.reply_live_attach(&msg, &previous, fence, &reply).await {
-            Ok(true) | Err(()) => return,
-            Ok(false) => {}
+            Ok(Some(attached_id)) => {
+                self.notify_turn_interrupted_after_ack(&attached_id, session_type)
+                    .await;
+                return;
+            }
+            Err(()) => return,
+            Ok(None) => {}
         }
         match self.resume_untracked(&msg, &durable, fence, true).await {
             Ok(()) => {
                 // This operation advanced its own claim. The incoming
                 // pre-launch fence no longer names its committed owner.
                 match self.reply_live_attach(&msg, &previous, None, &reply).await {
-                    Ok(true) | Err(()) => {}
-                    Ok(false) => attach_error(
+                    Ok(Some(attached_id)) => {
+                        self.notify_turn_interrupted_after_ack(&attached_id, session_type)
+                            .await;
+                    }
+                    Err(()) => {}
+                    Ok(None) => attach_error(
                         &reply,
                         &msg,
                         &previous,
@@ -105,16 +119,20 @@ impl FreshClaudeState {
         previous: &str,
         fence: Option<freshell_ownership::ObservedFence>,
         reply: &FrameSink,
-    ) -> Result<bool, ()> {
+    ) -> Result<Option<String>, ()> {
         let Some(key) = self.resolve_session_key(&msg.session_id).await else {
-            return Ok(false);
+            return Ok(None);
+        };
+        let Some(native_id) = self.sessions.lock().await.get(&key)
+            .map(|runtime| runtime.identity.current()) else {
+            return Ok(None);
         };
         let operation = format!("claude-attach-{}", uuid::Uuid::new_v4());
         let guard = match fence {
             Some(fence) => crate::ownership_lane::arm_adopt_guard(
                 &self.ownership,
                 PROVIDER,
-                &msg.session_id,
+                &native_id,
                 &operation,
                 &freshell_ownership::OwnerIdentity {
                     kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
@@ -129,7 +147,7 @@ impl FreshClaudeState {
             None => crate::ownership_lane::arm_attach_guard(
                 &self.ownership,
                 PROVIDER,
-                &msg.session_id,
+                &native_id,
                 &operation,
                 None,
                 "freshclaude/attach",
@@ -150,28 +168,29 @@ impl FreshClaudeState {
             .lock()
             .await
             .get(&key)
+            .filter(|runtime| runtime.identity.current() == native_id)
             .map(ClaudeSession::current_status);
         let Some(status) = status else {
-            return Ok(false);
+            return Ok(None);
         };
-        if previous != msg.session_id {
+        if previous != native_id {
             reply(
                 self.materialized_message(
                     previous,
-                    &msg.session_id,
+                    &native_id,
                     session_type_str(msg.session_type),
                 )
                 .await,
             );
         }
         reply(status_snapshot_frame(
-            &msg.session_id,
-            &msg.session_id,
+            &native_id,
+            &native_id,
             &status,
             session_type_str(msg.session_type),
         ));
         drop(guard);
-        Ok(true)
+        Ok(Some(native_id))
     }
 }
 

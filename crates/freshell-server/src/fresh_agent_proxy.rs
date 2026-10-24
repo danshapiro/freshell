@@ -491,7 +491,7 @@ impl HostedFreshAgentProxy {
     async fn create(
         self: &Arc<Self>,
         message: freshell_protocol::FreshAgentCreate,
-    ) -> Result<(), ()> {
+    ) -> Result<Option<(SoulId, u64)>, ()> {
         let provider = fresh_provider(&message.provider, message.session_type).ok_or(())?;
         let public_provider = fresh_provider_wire(&provider);
         if let Some(session_ref) = message.session_ref.as_ref() {
@@ -554,7 +554,7 @@ impl HostedFreshAgentProxy {
                     )
                     .await;
                 }
-                return Ok(());
+                return Ok(None);
             }
         }
         let cwd = canonical_cwd(message.cwd.as_deref()).map_err(|_| ())?;
@@ -822,6 +822,7 @@ impl HostedFreshAgentProxy {
                         "Retain provider inputs until dispatch outcome is confirmed");
                 })?
         };
+        let cleanup_receipt = (soul.clone(), launched.view.intent_revision);
         let naming_projection = match message.naming_handle.as_deref() {
             Some(handle) if !handle.trim().is_empty() => {
                 admit_pending_projection(
@@ -863,7 +864,7 @@ impl HostedFreshAgentProxy {
             session_type,
         )
         .await;
-        Ok(())
+        Ok(Some(cleanup_receipt))
     }
 
     async fn resolve_decision(

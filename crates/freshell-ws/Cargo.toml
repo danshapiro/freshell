@@ -107,6 +107,7 @@ sha2 = "0.10"
 libc = "0.2"
 
 [dev-dependencies]
+async-trait = "0.1"
 # The claude rigs (tests/common/claude_rig.rs) give every sidecar their own
 # isolated environment through FreshClaudeState::with_sidecar_environment, a seam
 # that only exists with this feature (dev builds only; production never has it).

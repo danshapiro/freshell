@@ -23,9 +23,11 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use common::claude_rig::{ClaudeRig, RigConnection, RigKind, RigOptions, RIG_FRAME_BUDGET};
+use common::ledger_sink::TurnInterruptedMarkerGate;
 use serde_json::{json, Value};
 
 /// How long a test keeps reading after the exit report before it counts edges: the
@@ -534,6 +536,208 @@ async fn a_resume_create_answers_created_with_its_session_ref_once_the_cli_boote
         "{answer}"
     );
     assert!(rig.ledger_rows("prompt").len() == 1, "no prompt was needed");
+}
+
+/// A restart records an owed turn in the persisted binding row. The first
+/// successful attach after the ledger is reloaded reports that interruption
+/// once, after its snapshot acknowledgement, and does not manufacture an
+/// attention edge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_owed_turn_is_reported_once_after_attach_across_a_server_restart() {
+    let program = json!({ "rules": [{ "on": "msg:prompt", "emit": [
+        { "kind": "completion" },
+    ] }] })
+    .to_string();
+    let marker_gate = Arc::new(TurnInterruptedMarkerGate::new());
+    let mut rig = ClaudeRig::start_with_options(
+        RigKind::Sim,
+        RigOptions {
+            durable_ledger: true,
+            env: vec![("FRESHELL_CLAUDE_SIM_PROGRAM".into(), program)],
+            turn_interrupted_marker_gate: Some(marker_gate.clone()),
+            ..RigOptions::default()
+        },
+    )
+    .await;
+    let mut first = rig.connect().await;
+    let session_id = first.create("create-restart-busy").await;
+    first
+        .send_text(
+            &session_id,
+            "send-restart-busy",
+            "a turn interrupted by restart",
+        )
+        .await;
+    first.wait_for_event("freshAgent.session.init").await;
+
+    let row_before_shutdown = rig
+        .pane_ledger
+        .as_ref()
+        .expect("durable ledger enabled")
+        .load_binding("claude", &session_id)
+        .expect("fresh-agent binding exists before shutdown");
+    assert!(
+        serde_json::to_value(&row_before_shutdown)
+            .expect("binding serializes")
+            .get("turnInterruptedAt")
+            .is_none(),
+        "a live turn is not marked interrupted before shutdown"
+    );
+
+    // Park shutdown inside its real persisted-marker write, then let the
+    // simulator finish the turn. The consumer must already be quiesced, so a
+    // result arriving during disk I/O cannot publish a completion edge while
+    // shutdown still persists the restart marker.
+    let shutdown_state = rig.fresh_claude.clone();
+    let shutdown = tokio::spawn(async move { shutdown_state.shutdown().await });
+    tokio::time::timeout(Duration::from_secs(5), marker_gate.wait_until_entered())
+        .await
+        .expect("shutdown reaches the held marker write");
+    let result_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !rig
+        .ledger_rows("result")
+        .iter()
+        .any(|row| row["sessionId"] == session_id)
+    {
+        assert!(
+            tokio::time::Instant::now() < result_deadline,
+            "the simulated turn did not reach its result while the marker write was held"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    first.read_for(Duration::from_millis(100)).await;
+    let completions_while_marker_write_held = first.events_seen("freshAgent.turn.complete");
+    marker_gate.release();
+    shutdown.await.expect("Claude shutdown task joins");
+    assert_eq!(
+        completions_while_marker_write_held, 0,
+        "a CLI result arriving during the marker write cannot publish a completion edge"
+    );
+
+    rig.restart().await;
+
+    let row_after_reload = rig
+        .pane_ledger
+        .as_ref()
+        .expect("restarted rig reloads its durable ledger")
+        .load_binding("claude", &session_id)
+        .expect("fresh-agent binding survives restart");
+    assert!(
+        serde_json::to_value(&row_after_reload)
+            .expect("binding serializes")
+            .get("turnInterruptedAt")
+            .is_some_and(|value| value.as_i64().is_some()),
+        "shutdown persisted the owed turn marker before tearing down the sidecar"
+    );
+
+    let mut after = rig.connect().await;
+    after.attach(&session_id).await;
+    let notice = after
+        .wait_for("restart interruption notice", |frame| {
+            frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.error"
+                && frame["event"]["code"] == "TURN_INTERRUPTED_BY_RESTART"
+        })
+        .await;
+    assert_eq!(notice["sessionId"], session_id, "{notice}");
+    assert_eq!(notice["event"]["sessionId"], session_id, "{notice}");
+    let acknowledgement_at = after
+        .frames
+        .iter()
+        .position(|frame| {
+            frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.session.snapshot"
+                && frame["event"]["sessionId"] == session_id
+        })
+        .expect("the attach was acknowledged");
+    let notice_at = after
+        .frames
+        .iter()
+        .position(|frame| frame["event"]["code"] == "TURN_INTERRUPTED_BY_RESTART")
+        .expect("the restart notice was delivered");
+    assert!(
+        acknowledgement_at < notice_at,
+        "the interruption notice follows the attach acknowledgement: {:?}",
+        after.frames
+    );
+    assert_eq!(after.events_seen("freshAgent.turn.complete"), 0);
+    assert_eq!(after.events_seen("freshAgent.turn.waiting"), 0);
+
+    let cleared = rig
+        .pane_ledger
+        .as_ref()
+        .expect("durable ledger remains available")
+        .load_binding("claude", &session_id)
+        .expect("binding remains after resume");
+    assert!(
+        serde_json::to_value(&cleared)
+            .expect("binding serializes")
+            .get("turnInterruptedAt")
+            .is_none(),
+        "delivering the restart notice consumes its persisted marker"
+    );
+
+    after.attach(&session_id).await;
+    after.read_for(QUIET).await;
+    assert_eq!(
+        after
+            .frames
+            .iter()
+            .filter(|frame| frame["event"]["code"] == "TURN_INTERRUPTED_BY_RESTART")
+            .count(),
+        1,
+        "a second attach does not repeat the consumed notice: {:?}",
+        after.frames
+    );
+}
+
+/// An idle runtime has no owed work at shutdown, so a later attach does not
+/// report an interruption.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_idle_runtime_does_not_receive_a_restart_interruption_notice() {
+    let mut rig = ClaudeRig::start_with_options(
+        RigKind::Sim,
+        RigOptions {
+            durable_ledger: true,
+            ..RigOptions::default()
+        },
+    )
+    .await;
+    let mut first = rig.connect().await;
+    let session_id = first.create("create-restart-idle").await;
+
+    rig.restart().await;
+    let row_after_reload = rig
+        .pane_ledger
+        .as_ref()
+        .expect("durable ledger enabled")
+        .load_binding("claude", &session_id)
+        .expect("fresh-agent binding survives restart");
+    assert!(
+        serde_json::to_value(&row_after_reload)
+            .expect("binding serializes")
+            .get("turnInterruptedAt")
+            .is_none(),
+        "shutdown does not mark an idle session"
+    );
+
+    let mut after = rig.connect().await;
+    after.attach(&session_id).await;
+    after.read_for(QUIET).await;
+    assert_eq!(
+        after
+            .frames
+            .iter()
+            .filter(|frame| frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.error"
+                && frame["event"]["code"] == "TURN_INTERRUPTED_BY_RESTART")
+            .count(),
+        0,
+        "an idle session does not get an interruption notice: {:?}",
+        after.frames
+    );
+    assert_eq!(after.events_seen("freshAgent.turn.complete"), 0);
+    assert_eq!(after.events_seen("freshAgent.turn.waiting"), 0);
 }
 
 // ── Registration: a session is in the map before its consumer reads a line ────────

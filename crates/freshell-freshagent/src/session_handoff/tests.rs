@@ -5,8 +5,7 @@
 //! late exit still releases), detached completion, abort leaves zero-or-one
 //! owner, the OpenCode invariant, and the kilroy flavor.
 //!
-//! Harness: the inline fake claude sidecar env pattern (copied verbatim from
-//! `cross_kind_liveness.rs::FakeSidecarEnv` — the request-log knob), the
+//! Harness: the production Claude sidecar over the CLI simulator, the
 //! fake `opencode serve` (the `freshagent_session_lease.rs` shape), and the
 //! common sleeper CLI spec so terminal targets genuinely spawn Running PTYs.
 //! `ENV_LOCK` serializes this file's tests (process-global env knobs).
@@ -33,94 +32,35 @@ use super::{
 
 /// Serializes the tests in this file: they mutate process-global env vars
 /// (`FRESHELL_CLAUDE_SIDECAR` / `FRESHELL_CLAUDE_NODE` /
-/// `FAKE_SIDECAR_REQUEST_LOG` / `OPENCODE_CMD` / ...). It is the crate-wide
+/// `OPENCODE_CMD` / ...). It is the crate-wide
 /// [`crate::OPENCODE_ENV_LOCK`] under its historical name — the snapshot
 /// cold-GET tests mutate `OPENCODE_CMD` too and must exclude these.
 use crate::OPENCODE_ENV_LOCK as ENV_LOCK;
 
-// ── fake claude sidecar (request-log knob only; copied from
-//    cross_kind_liveness.rs per the plan's instruction) ──────────────────────
+// ── production Claude sidecar over the contract-tested CLI simulator ─────
 
-const FAKE_CLAUDE_SIDECAR_SOURCE: &str = r#"
-import readline from 'node:readline'
-import fs from 'node:fs'
+struct ClaudeSidecarEnv(crate::claude::tests::ClaudeTestRuntime);
 
-const logPath = process.env.FAKE_SIDECAR_REQUEST_LOG || ''
-function logReq(msg) {
-  if (!logPath) return
-  try { fs.appendFileSync(logPath, JSON.stringify({ pid: process.pid, msg }) + '\n') } catch {}
-}
-
-let counter = 0
-const rl = readline.createInterface({ input: process.stdin, terminal: false })
-rl.on('line', (line) => {
-  const trimmed = line.trim()
-  if (!trimmed) return
-  let msg
-  try { msg = JSON.parse(trimmed) } catch { return }
-  logReq(msg)
-  if (msg.type === 'create') {
-    counter += 1
-    const sessionId = `fake-claude-session-${process.pid}-${counter}`
-    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 }) + '\n')
-    const cliSessionId = msg.boot?.resume || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-    process.stdout.write(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }) + '\n')
-    process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }) + '\n')
-  } else if (msg.type === 'shutdown') {
-    process.exit(0)
-  }
-})
-"#;
-
-struct FakeSidecarEnv {
-    dir: std::path::PathBuf,
-}
-
-impl FakeSidecarEnv {
+impl ClaudeSidecarEnv {
     fn install() -> Self {
-        let dir =
-            std::env::temp_dir().join(format!("freshell-session-handoff-{}", uuid_like_suffix()));
-        std::fs::create_dir_all(&dir).expect("create fake sidecar temp dir");
-        let script = dir.join("fake-claude-sidecar.mjs");
-        std::fs::write(&script, FAKE_CLAUDE_SIDECAR_SOURCE).expect("write fake sidecar");
-        std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
-        std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
-        std::env::set_var("FAKE_SIDECAR_REQUEST_LOG", dir.join("requests.jsonl"));
-        Self { dir }
+        Self(crate::claude::tests::ClaudeTestRuntime::install())
     }
 
     fn create_rows(&self) -> Vec<Value> {
-        let Ok(raw) = std::fs::read_to_string(self.dir.join("requests.jsonl")) else {
-            return Vec::new();
-        };
-        raw.lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str::<Value>(l).expect("request log row parses"))
-            .filter(|r| r["msg"]["type"] == "create")
+        std::fs::read_to_string(self.0.spawn_log_path())
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("actual SDK query log row"))
             .collect()
     }
 
-    /// The sidecar pid that served THIS session's create (the process the
-    /// handoff must reap).
     fn sidecar_pid_for(&self, sid: &str) -> Option<u32> {
         self.create_rows()
             .into_iter()
-            .find(|r| r["msg"]["boot"]["resume"] == sid)
-            .and_then(|r| r["pid"].as_u64())
-            .map(|p| p as u32)
-    }
-}
-
-impl Drop for FakeSidecarEnv {
-    fn drop(&mut self) {
-        for var in [
-            "FRESHELL_CLAUDE_SIDECAR",
-            "FRESHELL_CLAUDE_NODE",
-            "FAKE_SIDECAR_REQUEST_LOG",
-        ] {
-            std::env::remove_var(var);
-        }
-        let _ = std::fs::remove_dir_all(&self.dir);
+            .find(|row| row["options"]["resume"] == sid || row["options"]["sessionId"] == sid)
+            .and_then(|row| row["pid"].as_u64())
+            .map(|pid| pid as u32)
     }
 }
 
@@ -712,7 +652,7 @@ fn handoff_action_contract_defaults_legacy_ack_only_to_clear() {
 async fn unsupported_atomic_handoff_refuses_before_mutation_and_clear_bypasses_preflight() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSidecarEnv::install();
     let hooks = Arc::new(HandoffTestHooks::default());
     hooks
         .force_unsupported_preflight
@@ -927,7 +867,29 @@ async fn await_live_session(state: &crate::FreshClaudeState, sid: &str, want: bo
 /// Establish a live freshclaude owner for `sid` (the fake sidecar path) and
 /// return once the coordinator records it Live.
 async fn establish_fresh_claude_owner(rig: &mut Rig, sid: &str) {
-    rig.fresh_claude.handle_create(create_msg(sid), None).await;
+    // The actual CLI resumes a saved conversation; an arbitrary id is not
+    // a substitute for its transcript. Preserve any scenario's existing file.
+    let store = std::path::PathBuf::from(
+        std::env::var_os("CLAUDE_CONFIG_DIR").expect("isolated Claude store"),
+    );
+    let project = store.join("projects").join("-handoff");
+    std::fs::create_dir_all(&project).unwrap();
+    let file = project.join(format!("{sid}.jsonl"));
+    let already_saved = std::fs::read_dir(store.join("projects"))
+        .unwrap()
+        .flatten()
+        .any(|entry| entry.path().join(format!("{sid}.jsonl")).is_file());
+    if !already_saved {
+        std::fs::write(file, format!("{}\n", json!({
+            "type":"user", "uuid":uuid::Uuid::new_v4().to_string(), "sessionId":sid,
+            "cwd":"/tmp", "promptSource":"sdk", "message":{"role":"user", "content":"saved handoff conversation"},
+        }))).unwrap();
+    }
+    let outcome = rig.fresh_claude.handle_create(create_msg(sid), None).await;
+    assert!(
+        matches!(outcome, crate::ClaudeCreateOutcome::Created { .. }),
+        "{outcome:?}"
+    );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         match rig.ownership.observe("claude", sid).state {
@@ -1078,7 +1040,7 @@ async fn handoff_to_terminal_reaps_sidecar_before_target_start_and_commits_owner
     // snapshot.rs's tests through THEIR lock — hold it too: our own
     // ENV_LOCK only serializes this file against itself.
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let (events, _capture_guard) = tracing_capture::capture();
     // M-1 (round-3 review): hooks installed so the runner's step order is
@@ -1253,7 +1215,7 @@ async fn handoff_target_spawn_failure_leaves_vacant_with_typed_error() {
     // snapshot.rs's tests through THEIR lock — hold it too: our own
     // ENV_LOCK only serializes this file against itself.
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let hooks = Arc::new(HandoffTestHooks::default());
     hooks.fail_target_spawn_once.store(true, Ordering::SeqCst);
@@ -1347,7 +1309,7 @@ async fn handoff_reap_timeout_reprobes_the_prior_and_restores_only_a_live_one() 
     // snapshot.rs's tests through THEIR lock — hold it too: our own
     // ENV_LOCK only serializes this file against itself.
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let hooks = Arc::new(HandoffTestHooks::default());
     let mut rig = build_rig(Some(Arc::clone(&hooks)));
@@ -1437,7 +1399,7 @@ async fn handoff_reap_timeout_with_unconfirmable_prior_ends_vacant_typed() {
     // snapshot.rs's tests through THEIR lock — hold it too: our own
     // ENV_LOCK only serializes this file against itself.
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let hooks = Arc::new(HandoffTestHooks {
         pause_after_enter: Some(tokio::sync::Notify::new()),
@@ -1558,7 +1520,7 @@ async fn handoff_reap_timeout_fences_the_key_until_the_detached_reap_confirms_de
     // snapshot.rs's tests through THEIR lock — hold it too: our own
     // ENV_LOCK only serializes this file against itself.
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let kill_pause = Arc::new(tokio::sync::Notify::new());
     let mut rig = build_rig_with_claude_pauses_and_reap_timeout_ms(
@@ -1715,7 +1677,7 @@ async fn a_watcher_join_error_fences_the_key_until_the_replacement_probe_confirm
     // snapshot.rs's tests through THEIR lock — hold it too: our own
     // ENV_LOCK only serializes this file against itself.
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let kill_pause = Arc::new(tokio::sync::Notify::new());
     let hooks = Arc::new(HandoffTestHooks::default());
@@ -1877,7 +1839,7 @@ async fn a_watcher_join_error_fences_the_key_until_the_replacement_probe_confirm
 async fn handoff_with_a_platform_limited_prior_stop_fences_the_key_typed() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let mut rig = build_rig_with_options(None, None, None, 8_000, None, true);
     establish_fresh_claude_owner(&mut rig, &sid).await;
@@ -1962,7 +1924,7 @@ async fn handoff_with_a_platform_limited_prior_stop_fences_the_key_typed() {
 async fn a_stale_stop_fence_recovers_through_the_handoff_runner() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let mut rig = build_rig(None);
 
@@ -2211,7 +2173,7 @@ impl crate::session_handoff::FlavorWrite for FixedFlavorWriter {
 async fn a_kilroy_to_claude_cli_handoff_preserves_the_kilroy_flavor() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let log: FlavorWriteLog = Arc::new(std::sync::Mutex::new(Vec::new()));
     // The session's current durable flavor is KILROY (the hidden type).
@@ -2250,7 +2212,7 @@ async fn a_kilroy_to_claude_cli_handoff_preserves_the_kilroy_flavor() {
 async fn an_unconfirmed_target_reap_on_the_flavor_failure_fences_then_the_watcher_resolves() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let hooks = Arc::new(HandoffTestHooks::default());
     hooks
@@ -2329,7 +2291,7 @@ async fn an_unconfirmed_target_reap_on_the_flavor_failure_fences_then_the_watche
 async fn a_platform_limited_target_reap_on_the_flavor_failure_fences_typed() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let hooks = Arc::new(HandoffTestHooks::default());
     hooks
@@ -2401,7 +2363,7 @@ fn last_handoff_failed_frame(frames: &[Value]) -> &Value {
 async fn the_unconfirmed_reap_flavor_failure_frame_stays_fenced_never_vacant() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let (sink, _capture_guard) = tracing_capture::capture();
     let sid = uuid::Uuid::new_v4().to_string();
     let hooks = Arc::new(HandoffTestHooks::default());
@@ -2483,7 +2445,7 @@ async fn the_unconfirmed_reap_flavor_failure_frame_stays_fenced_never_vacant() {
 async fn the_platform_limited_reap_failure_frame_stays_fenced_never_vacant() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let (sink, _capture_guard) = tracing_capture::capture();
     let sid = uuid::Uuid::new_v4().to_string();
     let hooks = Arc::new(HandoffTestHooks::default());
@@ -2605,7 +2567,7 @@ async fn the_platform_limited_reap_failure_frame_stays_fenced_never_vacant() {
 async fn the_stale_commit_unconfirmed_reap_frame_stays_fenced_never_vacant() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let (sink, _capture_guard) = tracing_capture::capture();
     let sid = uuid::Uuid::new_v4().to_string();
     let pause = Arc::new(tokio::sync::Notify::new());
@@ -2761,7 +2723,7 @@ async fn the_stale_commit_unconfirmed_reap_frame_stays_fenced_never_vacant() {
 async fn a_watcher_release_mid_failure_window_leaves_the_final_frame_resolved() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let pause = Arc::new(tokio::sync::Notify::new());
     let failure_park = Arc::new(tokio::sync::Notify::new());
@@ -2913,7 +2875,7 @@ async fn a_watcher_release_mid_failure_window_leaves_the_final_frame_resolved() 
 async fn a_foreign_commit_during_the_abort_broadcast_window_is_never_overwritten() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let abort_broadcast_pause = Arc::new(tokio::sync::Notify::new());
     let hooks = Arc::new(HandoffTestHooks {
@@ -3034,7 +2996,7 @@ async fn a_foreign_commit_during_the_abort_broadcast_window_is_never_overwritten
 async fn the_uncommitted_target_reap_never_confirms_on_a_missing_row() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     // A SHORT reap budget: the pid-alive window deterministically fences
     // within the test instead of waiting the production budget.
@@ -3125,7 +3087,7 @@ async fn the_uncommitted_target_reap_never_confirms_on_a_missing_row() {
 async fn the_confirmed_reap_flavor_failure_broadcasts_the_truthful_vacancy() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let (sink, _capture_guard) = tracing_capture::capture();
     let sid = uuid::Uuid::new_v4().to_string();
     let mut rig = build_rig_with_flavor_writer(Arc::new(FailingFlavorWriter));
@@ -3260,7 +3222,7 @@ impl crate::session_handoff::FlavorWrite for TwoPhaseProbeFlavorWriter {
 async fn an_abort_after_the_staged_flavor_precursor_never_persists_the_target_flavor() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let store_dir =
         std::env::temp_dir().join(format!("freshell-r28-f4-store-{}", uuid_like_suffix()));
@@ -3374,7 +3336,7 @@ async fn an_abort_after_the_staged_flavor_precursor_never_persists_the_target_fl
 async fn an_abort_in_the_flavor_window_with_an_unconfirmed_target_teardown_fences_not_vacates() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     // The claude-lane resume gates on transcript presence (the 6b pattern)
     // — the fresh TARGET's resume needs the fake transcript.
@@ -3566,7 +3528,7 @@ impl crate::session_handoff::FlavorWrite for BlockingFlavorWriter {
 async fn a_flavor_write_failure_surfaces_as_the_typed_handoff_failure() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let mut rig = build_rig_with_flavor_writer(Arc::new(FailingFlavorWriter));
     establish_fresh_claude_owner(&mut rig, &sid).await;
@@ -3596,7 +3558,7 @@ async fn a_flavor_write_failure_surfaces_as_the_typed_handoff_failure() {
 async fn the_flavor_write_serializes_consecutive_handoffs_in_generation_order() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let release = Arc::new(tokio::sync::Notify::new());
     let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3675,7 +3637,7 @@ async fn the_flavor_write_serializes_consecutive_handoffs_in_generation_order() 
 async fn the_handoff_commit_writes_the_durable_flavor_server_side() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let mut rig = build_rig(None);
     establish_fresh_claude_owner(&mut rig, &sid).await;
@@ -3722,7 +3684,7 @@ async fn the_handoff_commit_writes_the_durable_flavor_server_side() {
 async fn a_stale_start_fence_recovers_through_the_acknowledged_force_clear() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let mut rig = build_rig_with_options(None, None, None, 8_000, None, true);
 
@@ -3919,7 +3881,7 @@ async fn a_stale_start_fence_recovers_through_the_acknowledged_force_clear() {
 async fn a_platform_limited_fence_recovers_only_through_the_acknowledged_force_clear() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let mut rig = build_rig_with_options(None, None, None, 8_000, None, true);
     establish_fresh_claude_owner(&mut rig, &sid).await;
@@ -4081,7 +4043,7 @@ async fn a_platform_limited_fence_recovers_only_through_the_acknowledged_force_c
 async fn the_cleared_unverified_state_requires_the_acknowledged_start() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let mut rig = build_rig_with_options(None, None, None, 8_000, None, true);
     establish_fresh_claude_owner(&mut rig, &sid).await;
@@ -4190,7 +4152,7 @@ async fn the_cleared_unverified_state_requires_the_acknowledged_start() {
 async fn the_acknowledged_start_reaps_the_live_prior_before_the_new_writer() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let mut rig = build_rig(None);
     establish_fresh_claude_owner(&mut rig, &sid).await;
@@ -4298,7 +4260,7 @@ async fn the_acknowledged_start_reaps_the_live_prior_before_the_new_writer() {
 async fn the_acknowledged_start_over_an_already_dead_prior_proceeds() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let mut rig = build_rig(None);
     establish_fresh_claude_owner(&mut rig, &sid).await;
@@ -4752,7 +4714,7 @@ async fn the_row_removed_but_pid_alive_window_reports_unconfirmed() {
 async fn a_delayed_platform_limited_reap_fences_the_key_and_never_releases() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let kill_pause = Arc::new(tokio::sync::Notify::new());
     // The platform-limited seam + a SHORT reap budget: the parked lane kill
@@ -4834,7 +4796,7 @@ async fn a_delayed_platform_limited_reap_fences_the_key_and_never_releases() {
 async fn handoff_with_an_unconfirmable_claude_tree_fences_the_key_until_the_escalation_lands() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     // The one-round confirmation window: a TERM-immune descendant
     // deterministically outlives it (the SIGKILL escalation is rounds away).
@@ -4973,7 +4935,7 @@ async fn a_prior_restored_after_reap_timeout_still_releases_when_it_later_exits(
     // snapshot.rs's tests through THEIR lock — hold it too: our own
     // ENV_LOCK only serializes this file against itself.
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let hooks = Arc::new(HandoffTestHooks::default());
     let mut rig = build_rig(Some(Arc::clone(&hooks)));
@@ -5023,7 +4985,7 @@ async fn a_wire_fenced_kill_at_the_handoff_generation_converges_after_a_restore(
     // snapshot.rs's tests through THEIR lock — hold it too: our own
     // ENV_LOCK only serializes this file against itself.
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let hooks = Arc::new(HandoffTestHooks::default());
     let mut rig = build_rig(Some(Arc::clone(&hooks)));
@@ -5193,7 +5155,7 @@ async fn handoff_continues_to_consistency_when_client_disconnects() {
     // snapshot.rs's tests through THEIR lock — hold it too: our own
     // ENV_LOCK only serializes this file against itself.
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let hooks = Arc::new(HandoffTestHooks {
         pause_after_enter: Some(tokio::sync::Notify::new()),
@@ -5258,7 +5220,7 @@ async fn handoff_task_abort_leaves_zero_or_one_owner() {
     // snapshot.rs's tests through THEIR lock — hold it too: our own
     // ENV_LOCK only serializes this file against itself.
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let hooks = Arc::new(HandoffTestHooks {
         pause_after_enter: Some(tokio::sync::Notify::new()),
@@ -5370,7 +5332,7 @@ async fn handoff_abort_during_prior_kill_reprobes_and_repairs_the_stamp() {
     // snapshot.rs's tests through THEIR lock — hold it too: our own
     // ENV_LOCK only serializes this file against itself.
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let kill_pause = Arc::new(tokio::sync::Notify::new());
     let mut rig = build_rig_with_claude_pauses(None, Some(Arc::clone(&kill_pause)), None);
@@ -5527,7 +5489,7 @@ async fn handoff_abort_during_target_spawn_reaps_the_uncommitted_terminal() {
     // snapshot.rs's tests through THEIR lock — hold it too: our own
     // ENV_LOCK only serializes this file against itself.
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let pause = Arc::new(tokio::sync::Notify::new());
     let hooks = Arc::new(HandoffTestHooks {
@@ -5635,7 +5597,7 @@ async fn handoff_abort_during_target_spawn_reaps_the_uncommitted_terminal() {
 async fn a_handoff_target_exiting_before_the_commit_never_publishes_live() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     // The claude-lane resume gates on transcript presence (the 6b
     // pattern).
@@ -5707,7 +5669,7 @@ async fn a_handoff_target_exiting_before_the_commit_never_publishes_live() {
     let target_pid = rows
         .iter()
         .rev()
-        .find(|r| r["msg"]["boot"]["resume"] == sid)
+        .find(|r| r["options"]["resume"] == sid || r["options"]["sessionId"] == sid)
         .and_then(|r| r["pid"].as_u64())
         .expect("the target sidecar's create row") as u32;
     let _ = std::process::Command::new("kill")
@@ -5769,7 +5731,7 @@ async fn a_handoff_target_exiting_before_the_commit_never_publishes_live() {
 async fn handoff_abort_of_a_fresh_target_fires_the_failed_transition_repair() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     // The claude-lane resume gates on transcript presence (the 6b pattern):
     // the target's resume of `sid` needs the transcript under
@@ -5879,7 +5841,7 @@ async fn handoff_abort_of_a_fresh_target_fires_the_failed_transition_repair() {
 async fn handoff_abort_during_pre_publication_spawn_fences_until_the_spawn_settles() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let pre_publish_park = Arc::new(tokio::sync::Notify::new());
     let hooks = Arc::new(HandoffTestHooks {
@@ -6007,7 +5969,7 @@ async fn handoff_abort_cleanup_spares_a_same_id_different_provider_terminal() {
     // snapshot.rs's tests through THEIR lock — hold it too: our own
     // ENV_LOCK only serializes this file against itself.
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let pause = Arc::new(tokio::sync::Notify::new());
     let hooks = Arc::new(HandoffTestHooks {
@@ -6132,7 +6094,7 @@ async fn handoff_abort_during_fresh_target_resume_reaps_the_registered_session_a
     // snapshot.rs's tests through THEIR lock — hold it too: our own
     // ENV_LOCK only serializes this file against itself.
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSidecarEnv::install();
     // The claude-lane resume gates on transcript presence (the 6b pattern).
     let store_dir = std::env::temp_dir().join(format!(
         "freshell-handoff-abort-fresh-store-{}",
@@ -6185,7 +6147,7 @@ async fn handoff_abort_during_fresh_target_resume_reaps_the_registered_session_a
     let target_pid = env
         .create_rows()
         .into_iter()
-        .filter(|r| r["msg"]["boot"]["resume"] == sid)
+        .filter(|r| r["options"]["resume"] == sid || r["options"]["sessionId"] == sid)
         .filter_map(|r| r["pid"].as_u64())
         .find(|pid| *pid != prior_pid as u64)
         .expect("the target sidecar's create row") as u32;
@@ -6241,7 +6203,7 @@ async fn the_claude_handoff_target_binding_carries_the_handoff_generation() {
     let _guard = ENV_LOCK.lock().await;
     // The claude-lane env surface is process-global (see the pattern above).
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSidecarEnv::install();
     // The claude-lane resume gates on transcript presence (the 6b pattern).
     let store_dir =
         std::env::temp_dir().join(format!("freshell-handoff-r27-f2-{}", uuid_like_suffix()));
@@ -6256,16 +6218,21 @@ async fn the_claude_handoff_target_binding_carries_the_handoff_generation() {
     std::env::set_var("CLAUDE_CONFIG_DIR", &store_dir);
 
     let mut rig = build_rig(None);
-    // The sink wired BEFORE the seed below; the establish's own
-    // all-blank adoption writes NOTHING (the V7 no-laundering gate), so
-    // the ONLY binding row is the handoff target's.
+    // Creation now records a binding even for default settings. Preserve
+    // that initial receipt and distinguish the later handoff generation.
     let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
     rig.fresh_claude.set_identity_sink(fake.clone());
     establish_fresh_claude_owner(&mut rig, &sid).await;
-    assert!(
-        fake.bindings.lock().unwrap().is_empty(),
-        "fixture: the all-blank establish wrote no binding row"
-    );
+    let initial_generation = rig.ownership.observe("claude", &sid).generation;
+    {
+        let bindings = fake.bindings.lock().unwrap();
+        let initial = bindings
+            .last()
+            .expect("creation records its native binding");
+        assert_eq!(initial.session_id, sid);
+        assert_eq!(initial.observed_epoch, Some(rig.ownership.boot_epoch()));
+        assert_eq!(initial.observed_generation, Some(initial_generation));
+    }
     // Seed the settings record so the TARGET resume's create carries
     // non-default settings — its session-init adoption's binding write is
     // recordable (the settings-bearing row).
@@ -6293,6 +6260,7 @@ async fn the_claude_handoff_target_binding_carries_the_handoff_generation() {
     let committed_generation = {
         let snap = rig.ownership.observe("claude", &sid);
         assert!(matches!(snap.state, OwnershipState::Live { .. }));
+        assert!(snap.generation > initial_generation);
         snap.generation
     };
 
@@ -6374,7 +6342,7 @@ async fn a_terminal_target_binding_failure_fails_the_handoff_typed() {
     let _guard = ENV_LOCK.lock().await;
     // The claude-lane env surface is process-global (see the pattern above).
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSidecarEnv::install();
     // The claude-lane resume gates on transcript presence (the 6b pattern).
     let store_dir =
         std::env::temp_dir().join(format!("freshell-handoff-r27-f3-{}", uuid_like_suffix()));
@@ -6476,7 +6444,7 @@ async fn handoff_abort_holds_the_fence_until_the_uncommitted_target_continuation
     // snapshot.rs's tests through THEIR lock — hold it too: our own
     // ENV_LOCK only serializes this file against itself.
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSidecarEnv::install();
     // The claude-lane resume gates on transcript presence (the 6b pattern).
     let store_dir =
         std::env::temp_dir().join(format!("freshell-handoff-r36-store-{}", uuid_like_suffix()));
@@ -6518,7 +6486,7 @@ async fn handoff_abort_holds_the_fence_until_the_uncommitted_target_continuation
     let target_pid = env
         .create_rows()
         .into_iter()
-        .filter(|r| r["msg"]["boot"]["resume"] == sid)
+        .filter(|r| r["options"]["resume"] == sid || r["options"]["sessionId"] == sid)
         .filter_map(|r| r["pid"].as_u64())
         .find(|pid| *pid != prior_pid as u64)
         .expect("the target sidecar's create row") as u32;
@@ -6630,7 +6598,7 @@ async fn handoff_abort_holds_the_fence_until_the_uncommitted_target_continuation
 async fn an_aborted_from_vacant_platform_limited_target_fences_typed_and_recovers() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     // The claude-lane resume gates on transcript presence (the 6b pattern).
     let store_dir = std::env::temp_dir().join(format!(
         "freshell-handoff-r54a-store-{}",
@@ -6763,7 +6731,7 @@ async fn an_aborted_from_vacant_platform_limited_target_fences_typed_and_recover
 async fn an_aborted_from_vacant_unconfirmed_target_fences_with_a_replacement_watcher() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSidecarEnv::install();
     // The claude-lane resume gates on transcript presence (the 6b pattern).
     let store_dir = std::env::temp_dir().join(format!(
         "freshell-handoff-r54b-store-{}",
@@ -6814,7 +6782,7 @@ async fn an_aborted_from_vacant_unconfirmed_target_fences_with_a_replacement_wat
     let target_pid = env
         .create_rows()
         .into_iter()
-        .filter(|r| r["msg"]["boot"]["resume"] == sid)
+        .filter(|r| r["options"]["resume"] == sid || r["options"]["sessionId"] == sid)
         .filter_map(|r| r["pid"].as_u64())
         .find(|pid| *pid != 0)
         .expect("the target sidecar's create row") as u32;
@@ -6906,7 +6874,7 @@ async fn an_aborted_from_vacant_unconfirmed_target_fences_with_a_replacement_wat
 async fn an_abort_cleanup_broadcasts_the_restored_prior_owner() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let hooks = Arc::new(HandoffTestHooks {
         pause_after_enter: Some(tokio::sync::Notify::new()),
@@ -6948,10 +6916,6 @@ async fn an_abort_cleanup_broadcasts_the_restored_prior_owner() {
     );
 }
 
-/// The fake sidecar's durable id for a create with NO resume boot
-/// (the fresh-create fallback in FAKE_CLAUDE_SIDECAR_SOURCE).
-const FRESH_CREATE_DURABLE_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-
 fn fresh_create_msg(session_type: SessionType) -> FreshAgentCreate {
     FreshAgentCreate {
         pane_id: None,
@@ -6971,9 +6935,7 @@ fn fresh_create_msg(session_type: SessionType) -> FreshAgentCreate {
         resume_session_id: None,
         sandbox: None,
         // b8ke delta round-2 F1: the ORDINARY create — NO explicit
-        // sessionRef. The durable id materializes at sdk.session.init
-        // (the pre-fix tests all created with an explicit sessionRef,
-        // masking the no-adoption defect).
+        // sessionRef. Creation must establish its own durable UUID and owner.
         session_ref: None,
         tab_id: None,
     }
@@ -6992,7 +6954,7 @@ fn fresh_create_msg(session_type: SessionType) -> FreshAgentCreate {
 async fn a_handoff_on_a_superseded_rekeyed_id_resolves_the_canonical_owner() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSidecarEnv::install();
     let canonical = uuid::Uuid::new_v4().to_string();
     let superseded = uuid::Uuid::new_v4().to_string();
     let mut rig = build_rig(None);
@@ -7003,54 +6965,18 @@ async fn a_handoff_on_a_superseded_rekeyed_id_resolves_the_canonical_owner() {
     let sidecar_pid = env.sidecar_pid_for(&superseded);
     assert!(sidecar_pid.is_some(), "the live owner's sidecar pid");
 
-    // A re-key in the FULL production sequence: (1) an in-stream init
-    // naming the NEW durable id publishes the re-key bookkeeping at the LANE
-    // level (cli_index[new] = map key + the session's cli_session_id = new;
-    // the session already carries the old id, so the adoption claims
-    // nothing under the new one), then (2) the registry's own rekey_live
-    // performs the atomic old→new coordinator move, leaving
-    // Aliased{to: canonical} at the superseded key — the COORDINATOR as the
-    // single source of truth (e2r3 F3). Pre-fix this id pair was a
-    // lane-local HashMap nobody hydrated.
-    // (1) The re-key's publication — the REAL lane-level bookkeeping,
-    // driven through the adoption itself.
-    {
-        let map_key = rig
-            .fresh_claude
+    // Use the consumer's actual native reset path: runtime identity, lease,
+    // coordinator owner and retained stamp move together.
+    rig.fresh_claude
+        .test_rekey_conversation(&superseded, &canonical)
+        .await;
+    assert_eq!(
+        rig.fresh_claude
             .test_resolve_session_key(&superseded)
             .await
-            .expect("the live session's map key");
-        rig.fresh_claude
-            .test_adopt_session_init(&canonical, &map_key, "freshclaude")
-            .await;
-    }
-    // (2) The registry's own rekey_live performs the atomic old→new
-    // coordinator move (the same step the rollback's Adopt-path commit
-    // performs), leaving Aliased{to: canonical} at the superseded key —
-    // the COORDINATOR as the single source of truth (e2r3 F3).
-    let rekey_map_key = rig
-        .fresh_claude
-        .test_resolve_session_key(&superseded)
-        .await
-        .expect("the live session's map key");
-    assert!(matches!(
-        rig.ownership.rekey_live(
-            "claude",
-            &superseded,
-            &canonical,
-            &rekey_map_key,
-            freshell_ownership::OwnerIdentity {
-                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
-                terminal_id: None,
-                live_session_key: Some(rekey_map_key.clone()),
-                pid: sidecar_pid,
-                ownership_id: Some("test-rekey-op".into()),
-            },
-            "test-rekey",
-            "test-rekey-op",
-        ),
-        freshell_ownership::CommitOutcome::Committed
-    ));
+            .as_deref(),
+        Some(canonical.as_str())
+    );
 
     // THE e2r2 F1 red/green: the handoff on the SUPERSEDED id resolves the
     // canonical key and stops the prior owner.
@@ -7086,7 +7012,7 @@ async fn a_handoff_on_a_superseded_rekeyed_id_resolves_the_canonical_owner() {
 }
 
 /// 8a. b8ke delta round-2 F1: a NORMALLY created freshclaude session (no
-/// explicit sessionRef) adopts the canonical key at `sdk.session.init` —
+/// explicit sessionRef) establishes its native UUID before acknowledgement —
 /// the coordinator holds authoritative Live{FreshAgent} under the durable
 /// id, every device receives the owner broadcast, and a handoff to the CLI
 /// sees the prior owner, STOPS it (the sidecar is reaped), and transfers
@@ -7094,27 +7020,35 @@ async fn a_handoff_on_a_superseded_rekeyed_id_resolves_the_canonical_owner() {
 /// was never stopped), the handoff "succeeded" over a live second writer,
 /// and no owner frame ever reached the bus.
 #[tokio::test]
-async fn a_fresh_created_claude_session_adopts_the_canonical_key_and_hands_off_atomically() {
+async fn a_fresh_created_claude_session_owns_its_uuid_and_hands_off_atomically() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSidecarEnv::install();
     let mut rig = build_rig(None);
     let _ = drain_runtime_owner_frames(&mut rig.rx);
 
     // The ORDINARY create: no sessionRef, no resume id.
-    rig.fresh_claude
+    let created = rig
+        .fresh_claude
         .handle_create(fresh_create_msg(SessionType::Freshclaude), None)
         .await;
+    let crate::ClaudeCreateOutcome::Created {
+        session_id: durable,
+        ..
+    } = created
+    else {
+        panic!("fresh create failed: {created:?}");
+    };
+    assert!(uuid::Uuid::parse_str(&durable).is_ok());
 
-    // THE F1 ADOPTION: the durable id minted at sdk.session.init becomes
-    // the authoritative Live{FreshAgent} owner. Pre-fix: the key stayed
-    // Vacant forever (this await is the red).
+    // A fresh create owns the UUID that its acknowledgement names. The
+    // handoff must discover and reap that exact prior before transferring it.
     await_cond(
         "the fresh-created session must adopt the canonical key",
         || {
             matches!(
                 rig.ownership
-                    .observe("claude", FRESH_CREATE_DURABLE_ID)
+                    .observe("claude", &durable)
                     .state,
                 OwnershipState::Live { owner, .. }
                     if owner.kind == RuntimeOwnerKind::FreshAgent
@@ -7131,7 +7065,7 @@ async fn a_fresh_created_claude_session_adopts_the_canonical_key_and_hands_off_a
         .find(|f| {
             f["transition"] == "handoff-committed"
                 && f["ownerKind"] == "fresh-agent"
-                && f["sessionId"] == json!(FRESH_CREATE_DURABLE_ID)
+                && f["sessionId"] == json!(&durable)
         })
         .expect("the adoption's authoritative owner frame");
     assert_eq!(committed["provider"], json!("claude"));
@@ -7148,11 +7082,9 @@ async fn a_fresh_created_claude_session_adopts_the_canonical_key_and_hands_off_a
     // the runner sees the prior owner, stops the sidecar, and transfers
     // atomically. Pre-fix: prior=None (Vacant) — the handoff committed a
     // terminal over the LIVE sidecar (two writers).
-    let handle = rig.runner.spawn_handoff(handoff_req_terminal(
-        "claude",
-        FRESH_CREATE_DURABLE_ID,
-        "claude",
-    ));
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &durable, "claude"));
     let result = handle.completion.await.expect("handoff completed");
     assert_eq!(
         result["ok"],
@@ -7160,11 +7092,7 @@ async fn a_fresh_created_claude_session_adopts_the_canonical_key_and_hands_off_a
         "the from-fresh-create handoff must succeed: {result}"
     );
     let terminal_id = result["owner"]["terminalId"].as_str().unwrap().to_string();
-    match rig
-        .ownership
-        .observe("claude", FRESH_CREATE_DURABLE_ID)
-        .state
-    {
+    match rig.ownership.observe("claude", &durable).state {
         OwnershipState::Live { owner, .. } => {
             assert_eq!(owner.kind, RuntimeOwnerKind::Terminal);
             assert_eq!(owner.terminal_id.as_deref(), Some(terminal_id.as_str()));
@@ -7177,27 +7105,36 @@ async fn a_fresh_created_claude_session_adopts_the_canonical_key_and_hands_off_a
 }
 
 /// 8b. b8ke delta round-2 F1 (kilroy): the ORDINARY create shares the
-/// claude lane — a fresh-created KILROY session adopts the canonical key
-/// at `sdk.session.init` the same way (the ownership machinery is
+/// claude lane — a fresh-created KILROY session owns its acknowledged native UUID
+/// the same way (the ownership machinery is
 /// flavor-independent).
 #[tokio::test]
-async fn a_fresh_created_kilroy_session_adopts_the_canonical_key() {
+async fn a_fresh_created_kilroy_session_owns_its_acknowledged_uuid() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let mut rig = build_rig(None);
     let _ = drain_runtime_owner_frames(&mut rig.rx);
 
-    rig.fresh_claude
+    let created = rig
+        .fresh_claude
         .handle_create(fresh_create_msg(SessionType::Kilroy), None)
         .await;
+    let crate::ClaudeCreateOutcome::Created {
+        session_id: durable,
+        ..
+    } = created
+    else {
+        panic!("fresh Kilroy create failed: {created:?}");
+    };
+    assert!(uuid::Uuid::parse_str(&durable).is_ok());
 
     await_cond(
         "the fresh-created kilroy session must adopt the canonical key",
         || {
             matches!(
                 rig.ownership
-                    .observe("claude", FRESH_CREATE_DURABLE_ID)
+                    .observe("claude", &durable)
                     .state,
                 OwnershipState::Live { owner, .. }
                     if owner.kind == RuntimeOwnerKind::FreshAgent
@@ -8404,7 +8341,7 @@ async fn handoff_to_a_kilroy_target_resumes_as_kilroy_on_the_claude_lane() {
     // snapshot.rs's tests through THEIR lock — hold it too: our own
     // ENV_LOCK only serializes this file against itself.
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSidecarEnv::install();
     // The claude-lane resume path gates on transcript presence — install a
     // fake transcript store root for the session.
     let store_dir = std::env::temp_dir().join(format!(
@@ -8460,20 +8397,61 @@ async fn handoff_to_a_kilroy_target_resumes_as_kilroy_on_the_claude_lane() {
     // The prior terminal is dead.
     assert!(rig.registry.terminal_is_dead(&prior_terminal));
 
-    // The created/resumed session's frames carry sessionType "kilroy".
+    // The real CLI emits its stream init when a turn starts. Prove the
+    // resumed consumer keeps Kilroy's flavor using that actual first turn.
+    let sent = rig
+        .fresh_claude
+        .handle_send(freshell_protocol::FreshAgentSend {
+            provider: AgentProvider::Claude,
+            session_id: sid.clone(),
+            session_type: SessionType::Kilroy,
+            text: "prove the Kilroy handoff consumer".into(),
+            cwd: Some("/tmp".into()),
+            images: None,
+            request_id: None,
+            settings: None,
+            observed_epoch: None,
+            observed_generation: None,
+            checkpoint_intent: None,
+        })
+        .await;
+    assert!(
+        matches!(sent, crate::ClaudeSendOutcome::Accepted { .. }),
+        "{sent:?}"
+    );
+
+    // Retain both facts regardless of their relative delivery order. The
+    // consumer can publish its first Kilroy frame before or after the runner's
+    // owner commit; waiting for one must never discard the other.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut saw_kilroy_frame = false;
+    let mut frames = Vec::new();
     while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(250), rig.rx.recv()).await {
+        match tokio::time::timeout_at(deadline, rig.rx.recv()).await {
             Ok(Ok(raw)) => {
-                if raw.contains("\"sessionType\":\"kilroy\"") && raw.contains(&sid) {
+                let frame: Value = serde_json::from_str(&raw).expect("JSON bus frame");
+                if frame["type"] == "session.runtimeOwner"
+                    && frame["sessionId"] == sid
+                    && frame["ownerKind"] == "fresh-agent"
+                {
+                    frames.push(frame.clone());
+                }
+                if frame["type"] == "freshAgent.event"
+                    && frame["sessionType"] == "kilroy"
+                    && frame["sessionId"] == sid
+                {
                     saw_kilroy_frame = true;
+                }
+                if saw_kilroy_frame
+                    && frames
+                        .iter()
+                        .any(|frame| frame["transition"] == "handoff-committed")
+                {
                     break;
                 }
             }
             Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Err(_)) => break,
-            Err(_) => {}
+            Ok(Err(_)) | Err(_) => break,
         }
     }
     assert!(
@@ -8490,7 +8468,6 @@ async fn handoff_to_a_kilroy_target_resumes_as_kilroy_on_the_claude_lane() {
     }
 
     // The broadcast frames carry epoch + ownerKind fresh-agent.
-    let frames = drain_runtime_owner_frames(&mut rig.rx);
     let committed = runtime_owner_frame(&frames, "handoff-committed");
     assert!(committed["epoch"].as_u64().unwrap_or(0) >= 1);
     assert_eq!(committed["ownerKind"], json!("fresh-agent"));
@@ -8649,7 +8626,7 @@ async fn handoff_route_refuses_provider_mismatched_targets_typed() {
     // The fake serve: wrong-lane dispatches that reach the opencode lane
     // resume a session the fake 404s (the "missing" id rule).
     let _serve_env = FakeOpencodeServeEnv::install();
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSidecarEnv::install();
 
     let mut rig = build_rig(None);
     // A LIVE prior for the wrong-mode case: the refusal must leave this
@@ -8868,7 +8845,7 @@ async fn handoff_route_resolves_absent_session_type_when_unambiguous() {
 async fn the_prior_stop_never_confirms_on_a_missing_row() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     // A SHORT reap budget: the pid-alive window deterministically fences
     // within the test.
@@ -8961,7 +8938,7 @@ async fn the_prior_stop_never_confirms_on_a_missing_row() {
 async fn the_replacement_probe_never_confirms_a_terminal_prior_on_a_missing_row() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let _env = ClaudeSidecarEnv::install();
     let rig = build_rig_inner(None, None, None, 10_000, None, false, None, None);
     // The prior's stand-in process: ALIVE, its registry row ABSENT — the
     // exact row-removed-but-not-yet-reaped shape a concurrent kill

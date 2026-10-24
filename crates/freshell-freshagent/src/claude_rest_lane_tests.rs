@@ -72,12 +72,19 @@ async fn line_terminators_only_are_noop_without_a_live_runtime() {
 }
 
 #[tokio::test]
-async fn send_without_a_live_runtime_returns_a_retryable_conflict() {
-    let error = lane(true).send_agent(send("hello\r")).await.unwrap_err();
-    assert_eq!(error.kind, RestLaneErrorKind::Conflict);
-    assert_eq!(error.code, "FRESH_AGENT_SESSION_NOT_LIVE");
-    assert_eq!(error.retryable, Some(true));
-    assert!(error.retry_after_ms.is_some_and(|delay| delay > 0));
+async fn send_for_a_missing_conversation_returns_a_permanent_not_found() {
+    let root = tempfile::tempdir().unwrap();
+    let state = FreshClaudeState::new(Arc::new(tokio::sync::broadcast::channel(32).0))
+        .with_sidecar_environment([(
+            "CLAUDE_CONFIG_DIR".into(),
+            root.path().to_str().unwrap().into(),
+        )]);
+    let lane = ClaudeRestLane::new(state, Arc::new(|| true));
+    let error = lane.send_agent(send("hello\r")).await.unwrap_err();
+    assert_eq!(error.kind, RestLaneErrorKind::NotFound);
+    assert_eq!(error.code, "INVALID_SESSION_ID");
+    assert_eq!(error.retryable, Some(false));
+    assert_eq!(error.retry_after_ms, None);
 }
 
 #[tokio::test]

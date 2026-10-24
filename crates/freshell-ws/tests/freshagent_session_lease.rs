@@ -5,16 +5,17 @@
 //! naming the winner's durable session, no spawn). Expired holders are TREE-killed
 //! (child + ownership sweep) before any release.
 //!
-//! Harness duplicated from `freshagent_claude_attach.rs` per the repo's per-test-file
-//! convention, with the Step 1a fake-sidecar knobs: `FAKE_SIDECAR_CREATE_DELAY_MS`
-//! (slow spawn), `FAKE_SIDECAR_FAIL_ONCE_MARKER` (first create exits nonzero),
-//! `FAKE_SIDECAR_REQUEST_LOG` (JSONL `{pid, msg}` per inbound request — distinct pids ==
-//! spawn count), `FAKE_SIDECAR_SPAWN_GRANDCHILD` (tagged decoy grandchild for the
-//! kill-sweep test). The codex leg points `CODEX_CMD` at the e2e fake app-server.
+//! Claude sessions run the production sidecar over the contract simulator. SDK
+//! initialization gates hold the winner while a competitor arrives; first-launch
+//! crashes and an owned detached descendant exercise failure and expiry cleanup.
+//! The Codex/OpenCode fixtures retain their provider-specific transport seams.
 //!
 //! DESTRUCTIVE SUITE: the expired-lease path kills real processes by recorded pid —
 //! run via `scripts/sandbox-test.sh "cargo test -p freshell-ws --test freshagent_session_lease"`.
 
+mod common;
+
+use common::claude_sim_environment::ClaudeSimEnvironment;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,7 +29,7 @@ use freshell_ws::WsState;
 const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
 
 /// Serializes every test in this file that mutates process-global env vars
-/// (`FRESHELL_CLAUDE_SIDECAR` / `FAKE_SIDECAR_*` / `CODEX_CMD` / lease TTL),
+/// (`CODEX_CMD` / `OPENCODE_CMD` / lease TTL),
 /// mirroring `freshagent_claude_attach.rs`'s convention for the same hazard.
 static LEASE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -114,104 +115,79 @@ fn isolated_codex_env_restores_every_mutated_variable_during_unwind() {
     assert_eq!(after_unwind, original);
 }
 
-// ── fake claude sidecar with the Step 1a knobs ──────────────────────────────────────
-
-const FAKE_CLAUDE_SIDECAR_SOURCE: &str = r#"
-import readline from 'node:readline'
-import fs from 'node:fs'
-import { spawn } from 'node:child_process'
-
-const logPath = process.env.FAKE_SIDECAR_REQUEST_LOG || ''
-function logReq(msg) {
-  if (!logPath) return
-  try { fs.appendFileSync(logPath, JSON.stringify({ pid: process.pid, msg }) + '\n') } catch {}
+// Production sidecar over the contract simulator; pauses/crashes stay at SDK init.
+struct LeaseClaudeRuntime {
+    runtime: ClaudeSimEnvironment,
+    prior_ttl: Option<std::ffi::OsString>,
 }
 
-let counter = 0
-const rl = readline.createInterface({ input: process.stdin, terminal: false })
-rl.on('line', (line) => {
-  const trimmed = line.trim()
-  if (!trimmed) return
-  let msg
-  try { msg = JSON.parse(trimmed) } catch { return }
-  logReq(msg)
-  if (msg.type === 'create') {
-    const failOnce = process.env.FAKE_SIDECAR_FAIL_ONCE_MARKER || ''
-    if (failOnce && !fs.existsSync(failOnce)) {
-      fs.writeFileSync(failOnce, '1')
-      process.exit(1)
-    }
-    if (process.env.FAKE_SIDECAR_SPAWN_GRANDCHILD === '1') {
-      // Detached decoy grandchild inheriting env (so /proc/<pid>/environ carries the
-      // ownership tag the kill sweep scans for). It IGNORES SIGTERM (an ignored signal
-      // stays ignored across exec), so the claude lane's own one-shot SIGTERM reap of
-      // its tagged tree cannot end it: only the expired-lease sweep's SIGKILL
-      // escalation can. It is logged only once the shell has armed the ignore.
-      const gc = spawn('sh', ['-c', 'trap "" TERM; echo armed; exec sleep 300 >/dev/null'], {
-        detached: true,
-        stdio: ['ignore', 'pipe', 'ignore'],
-      })
-      gc.stdout.once('data', () => {
-        gc.stdout.destroy()
-        logReq({ type: 'grandchild', grandchildPid: gc.pid })
-      })
-      gc.unref()
-    }
-    counter += 1
-    const sessionId = `fake-claude-session-${process.pid}-${counter}`
-    const reply = () => {
-      process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 }) + '\n')
-      const cliSessionId = msg.boot?.resume || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-      process.stdout.write(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }) + '\n')
-      process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }) + '\n')
-    }
-    const delayMs = Number(process.env.FAKE_SIDECAR_CREATE_DELAY_MS || 0)
-    if (delayMs > 0) setTimeout(reply, delayMs)
-    else reply()
-  } else if (msg.type === 'send') {
-    process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId: msg.sessionId, status: 'busy' }) + '\n')
-  } else if (msg.type === 'shutdown') {
-    process.exit(0)
-  }
-})
-"#;
-
-/// Fresh temp dir holding the knob-extended fake sidecar; installs the env vars.
-/// Caller must hold [`LEASE_ENV_LOCK`] for the guard's lifetime.
-struct FakeLeaseSidecarEnv {
-    dir: std::path::PathBuf,
-}
-
-impl FakeLeaseSidecarEnv {
-    fn install() -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "freshell-fake-claude-lease-ws-{}",
-            uuid_like_suffix()
-        ));
-        std::fs::create_dir_all(&dir).expect("create fake sidecar temp dir");
-        let script = dir.join("fake-claude-sidecar.mjs");
-        std::fs::write(&script, FAKE_CLAUDE_SIDECAR_SOURCE).expect("write fake sidecar");
-        std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
-        std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
-        std::env::set_var("FAKE_SIDECAR_REQUEST_LOG", dir.join("requests.jsonl"));
-        Self { dir }
+impl LeaseClaudeRuntime {
+    fn new() -> Self {
+        Self {
+            runtime: ClaudeSimEnvironment::new(),
+            prior_ttl: std::env::var_os("FRESHELL_FRESH_AGENT_LEASE_TTL_MS"),
+        }
     }
 
-    fn request_log_rows(&self) -> Vec<Value> {
-        let Ok(raw) = std::fs::read_to_string(self.dir.join("requests.jsonl")) else {
-            return Vec::new();
-        };
-        raw.lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str(l).expect("request log row parses"))
-            .collect()
+    fn hold_initialization(&self) {
+        std::fs::write(self.runtime.dir().join("initialize-gate"), "").unwrap();
+    }
+
+    fn release_initialization(&self) {
+        std::fs::remove_file(self.runtime.dir().join("initialize-gate")).unwrap();
+    }
+
+    fn environment(&self) -> Vec<(String, String)> {
+        let adapter = common::claude_rig::repo_root()
+            .join("test/integration/providers/claude-sdk-lease-runtime.mjs");
+        let mut environment = self.runtime.environment();
+        environment.retain(|(key, _)| key != "FRESHELL_CLAUDE_SDK_QUERY_MODULE");
+        environment.extend([
+            (
+                "FRESHELL_CLAUDE_SDK_QUERY_MODULE".into(),
+                freshell_platform::opencode_plugin::plugin_file_spec(&adapter),
+            ),
+            (
+                "FRESHELL_TEST_CLAUDE_FIRST_LAUNCH".into(),
+                self.runtime
+                    .dir()
+                    .join("first-launch")
+                    .to_string_lossy()
+                    .into(),
+            ),
+            (
+                "FRESHELL_TEST_CLAUDE_INITIALIZATION_GATE".into(),
+                self.runtime
+                    .dir()
+                    .join("initialize-gate")
+                    .to_string_lossy()
+                    .into(),
+            ),
+        ]);
+        if self.runtime.dir().join("crash-first").exists() {
+            environment.push(("FRESHELL_TEST_CLAUDE_CRASH_FIRST".into(), "1".into()));
+        }
+        if self.runtime.dir().join("spawn-decoy").exists() {
+            environment.push(("FRESHELL_TEST_CLAUDE_DECOY".into(), "1".into()));
+        }
+        environment
     }
 
     fn create_rows(&self) -> Vec<Value> {
-        self.request_log_rows()
-            .into_iter()
-            .filter(|r| r["msg"]["type"] == "create")
-            .collect()
+        self.runtime.rows("query")
+    }
+
+    async fn await_row(&self, kind: &str) -> Value {
+        tokio::time::timeout(common::FRAME_BUDGET, async {
+            loop {
+                if let Some(row) = self.runtime.rows(kind).into_iter().next() {
+                    return row;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the real SDK did not record {kind}"))
     }
 
     /// SIGKILL every decoy grandchild this env's sidecars logged that is still
@@ -219,19 +195,16 @@ impl FakeLeaseSidecarEnv {
     /// single-pid kill of its sidecar), so nothing else stops it when a test
     /// ends before the ownership sweep ran — or when a later sidecar spawned
     /// one of its own. Each pid is pinned through a pidfd and must carry this
-    /// env's unique request-log path in `/proc/<pid>/environ`, so a recycled
+    /// env's unique runtime guard path in `/proc/<pid>/environ`, so a recycled
     /// pid is never signalled.
     #[cfg(target_os = "linux")]
     fn kill_logged_decoys(&self) {
         let tag = format!(
-            "FAKE_SIDECAR_REQUEST_LOG={}",
-            self.dir.join("requests.jsonl").display()
+            "FRESHELL_TEST_CLAUDE_RUNTIME_GUARD={}",
+            self.runtime.dir().join("active").display()
         );
-        for row in self.request_log_rows() {
-            if row["msg"]["type"] != "grandchild" {
-                continue;
-            }
-            let Some(pid) = row["msg"]["grandchildPid"].as_i64() else {
+        for row in self.runtime.rows("decoy") {
+            let Some(pid) = row["childPid"].as_i64() else {
                 continue;
             };
             // SAFETY: plain syscalls on an owned descriptor; the pidfd is
@@ -257,39 +230,16 @@ impl FakeLeaseSidecarEnv {
             unsafe { libc::close(pidfd) };
         }
     }
-
-    /// Poll the request log until `pred` matches a row (or the budget expires).
-    async fn await_log_row(&self, budget: Duration, pred: impl Fn(&Value) -> bool) -> Value {
-        let deadline = tokio::time::Instant::now() + budget;
-        loop {
-            if let Some(row) = self.request_log_rows().into_iter().find(&pred) {
-                return row;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "request-log row did not appear within budget"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    }
 }
 
-impl Drop for FakeLeaseSidecarEnv {
+impl Drop for LeaseClaudeRuntime {
     fn drop(&mut self) {
         #[cfg(target_os = "linux")]
         self.kill_logged_decoys();
-        for var in [
-            "FRESHELL_CLAUDE_SIDECAR",
-            "FRESHELL_CLAUDE_NODE",
-            "FAKE_SIDECAR_REQUEST_LOG",
-            "FAKE_SIDECAR_CREATE_DELAY_MS",
-            "FAKE_SIDECAR_FAIL_ONCE_MARKER",
-            "FAKE_SIDECAR_SPAWN_GRANDCHILD",
-            "FRESHELL_FRESH_AGENT_LEASE_TTL_MS",
-        ] {
-            std::env::remove_var(var);
+        match &self.prior_ttl {
+            Some(value) => std::env::set_var("FRESHELL_FRESH_AGENT_LEASE_TTL_MS", value),
+            None => std::env::remove_var("FRESHELL_FRESH_AGENT_LEASE_TTL_MS"),
         }
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -325,10 +275,21 @@ fn test_settings_value() -> serde_json::Value {
 }
 
 async fn spawn_server() -> String {
+    spawn_server_with_claude_environment(None).await
+}
+
+async fn spawn_server_with_claude_environment(
+    environment: Option<Vec<(String, String)>>,
+) -> String {
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let settings =
         Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
+
+    let mut fresh_claude = freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx));
+    if let Some(environment) = environment {
+        fresh_claude = fresh_claude.with_sidecar_environment(environment);
+    }
 
     let state = WsState {
         layout: Default::default(),
@@ -350,7 +311,7 @@ async fn spawn_server() -> String {
             Arc::clone(&broadcast_tx),
             serde_json::json!({ "freshAgent": { "enabled": true } }),
         ),
-        fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
+        fresh_claude,
         fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
             freshell_freshagent::FreshAgentState::new(
                 Arc::clone(&auth_token),
@@ -490,19 +451,19 @@ fn claude_create_resume(request_id: &str, durable: &str) -> Value {
 #[tokio::test]
 async fn two_clients_same_freshagent_session_ref_yield_exactly_one_sidecar() {
     let _guard = LEASE_ENV_LOCK.lock().await;
-    let env = FakeLeaseSidecarEnv::install();
-    std::env::set_var("FAKE_SIDECAR_CREATE_DELAY_MS", "3000"); // second create lands mid-resume
+    let env = LeaseClaudeRuntime::new();
+    env.hold_initialization();
 
     let durable = "d1d1d1d1-d1d1-4d1d-8d1d-d1d1d1d1d1d1";
-    let url = spawn_server().await;
+    env.runtime.seed_transcript(durable);
+    let url = spawn_server_with_claude_environment(Some(env.environment())).await;
     let mut ws_a = connect(&url, true).await;
     let mut ws_b = connect(&url, true).await;
 
     send_json(&mut ws_a, &claude_create_resume("req-lease-a", durable)).await;
     // Gate on the sidecar RECEIVING the create (the winner provably holds the lease and
     // is mid-delay) before the loser fires.
-    env.await_log_row(Duration::from_secs(10), |r| r["msg"]["type"] == "create")
-        .await;
+    env.await_row("query").await;
 
     send_json(&mut ws_b, &claude_create_resume("req-lease-b", durable)).await;
     let failed = await_frame(&mut ws_b, Duration::from_secs(10), |v| {
@@ -512,16 +473,16 @@ async fn two_clients_same_freshagent_session_ref_yield_exactly_one_sidecar() {
     assert_eq!(failed["code"], "SESSION_RESERVED");
     assert_eq!(failed["retryable"], true);
 
+    env.release_initialization();
     // The winner binds.
     let created = await_frame(&mut ws_a, Duration::from_secs(15), |v| {
         v["type"] == "freshAgent.created" && v["requestId"] == "req-lease-a"
     })
     .await;
-    assert!(created["sessionId"].is_string());
+    assert_eq!(created["sessionId"], durable);
 
     // Loser re-sends the SAME create (~the client's 1s floor): the ADOPT arm answers it
     // naming the winner's durable session -- and NO second sidecar spawned.
-    tokio::time::sleep(Duration::from_millis(200)).await;
     send_json(&mut ws_b, &claude_create_resume("req-lease-b", durable)).await;
     let adopted = await_frame(&mut ws_b, Duration::from_secs(10), |v| {
         v["type"] == "freshAgent.created" && v["requestId"] == "req-lease-b"
@@ -549,12 +510,12 @@ async fn two_clients_same_freshagent_session_ref_yield_exactly_one_sidecar() {
 #[tokio::test]
 async fn winner_dies_mid_resume_releases_the_lease_for_the_loser() {
     let _guard = LEASE_ENV_LOCK.lock().await;
-    let env = FakeLeaseSidecarEnv::install();
-    let marker = env.dir.join("fail-once-marker");
-    std::env::set_var("FAKE_SIDECAR_FAIL_ONCE_MARKER", &marker);
+    let env = LeaseClaudeRuntime::new();
+    std::fs::write(env.runtime.dir().join("crash-first"), "").unwrap();
 
     let durable = "d2d2d2d2-d2d2-4d2d-8d2d-d2d2d2d2d2d2";
-    let url = spawn_server().await;
+    env.runtime.seed_transcript(durable);
+    let url = spawn_server_with_claude_environment(Some(env.environment())).await;
     let mut ws_a = connect(&url, true).await;
     let mut ws_b = connect(&url, true).await;
 
@@ -575,7 +536,17 @@ async fn winner_dies_mid_resume_releases_the_lease_for_the_loser() {
         v["type"] == "freshAgent.created" && v["requestId"] == "req-die-b"
     })
     .await;
-    assert!(created["sessionId"].is_string());
+    assert_eq!(created["sessionId"], durable);
+    let queries = env.create_rows();
+    assert_eq!(
+        queries.len(),
+        2,
+        "failed and replacement SDK queries: {queries:?}"
+    );
+    assert_ne!(queries[0]["pid"], queries[1]["pid"]);
+    assert!(queries
+        .iter()
+        .all(|row| row["options"]["resume"] == durable));
 }
 
 /// DESIGN DECISION (owner ratification flagged in the plan's "Validated decisions"):
@@ -588,17 +559,17 @@ async fn winner_dies_mid_resume_releases_the_lease_for_the_loser() {
 #[tokio::test]
 async fn lease_applies_to_legacy_clients_and_retry_converges() {
     let _guard = LEASE_ENV_LOCK.lock().await;
-    let env = FakeLeaseSidecarEnv::install();
-    std::env::set_var("FAKE_SIDECAR_CREATE_DELAY_MS", "3000");
+    let env = LeaseClaudeRuntime::new();
+    env.hold_initialization();
 
     let durable = "d3d3d3d3-d3d3-4d3d-8d3d-d3d3d3d3d3d3";
-    let url = spawn_server().await;
+    env.runtime.seed_transcript(durable);
+    let url = spawn_server_with_claude_environment(Some(env.environment())).await;
     let mut ws_a = connect(&url, false).await; // legacy: no capabilities in hello
     let mut ws_b = connect(&url, false).await;
 
     send_json(&mut ws_a, &claude_create_resume("req-legacy-a", durable)).await;
-    env.await_log_row(Duration::from_secs(10), |r| r["msg"]["type"] == "create")
-        .await;
+    env.await_row("query").await;
 
     send_json(&mut ws_b, &claude_create_resume("req-legacy-b", durable)).await;
     let failed = await_frame(&mut ws_b, Duration::from_secs(10), |v| {
@@ -608,6 +579,7 @@ async fn lease_applies_to_legacy_clients_and_retry_converges() {
     assert_eq!(failed["code"], "SESSION_RESERVED");
     assert_eq!(failed["retryable"], true);
 
+    env.release_initialization();
     await_frame(&mut ws_a, Duration::from_secs(15), |v| {
         v["type"] == "freshAgent.created" && v["requestId"] == "req-legacy-a"
     })
@@ -724,36 +696,38 @@ async fn codex_loser_create_resume_adopts_and_never_clobbers_the_winner() {
 #[tokio::test]
 async fn expired_lease_kill_sweeps_the_sidecar_tree_before_release() {
     let _guard = LEASE_ENV_LOCK.lock().await;
-    let env = FakeLeaseSidecarEnv::install();
+    let env = LeaseClaudeRuntime::new();
     std::env::set_var("FRESHELL_FRESH_AGENT_LEASE_TTL_MS", "100");
-    std::env::set_var("FAKE_SIDECAR_CREATE_DELAY_MS", "5000");
-    std::env::set_var("FAKE_SIDECAR_SPAWN_GRANDCHILD", "1");
+    env.hold_initialization();
+    std::fs::write(env.runtime.dir().join("spawn-decoy"), "").unwrap();
 
     let durable = "d4d4d4d4-d4d4-4d4d-8d4d-d4d4d4d4d4d4";
-    let url = spawn_server().await;
+    env.runtime.seed_transcript(durable);
+    let url = spawn_server_with_claude_environment(Some(env.environment())).await;
     let mut ws_a = connect(&url, true).await;
     let mut ws_b = connect(&url, true).await;
 
     // Client A claims + spawns (kill handle set), never completes within the 100ms TTL.
     send_json(&mut ws_a, &claude_create_resume("req-ttl-a", durable)).await;
-    let grandchild = env
-        .await_log_row(Duration::from_secs(10), |r| {
-            r["msg"]["type"] == "grandchild"
-        })
-        .await;
-    let gpid = grandchild["msg"]["grandchildPid"]
-        .as_i64()
-        .expect("grandchild pid logged");
+    let grandchild = env.await_row("decoy").await;
+    let gpid = grandchild["childPid"].as_i64().expect("decoy pid logged");
     assert!(
         std::path::Path::new(&format!("/proc/{gpid}")).exists(),
         "decoy grandchild must be alive before expiry"
     );
-    // A's sidecar captured its environment at spawn. Client B's replacement sidecar
-    // must be a plain one: no decoy of its own (nothing would ever reap it — the
-    // detached `sleep 300` outlived every run) and no artificial create delay on the
-    // path whose convergence this test times.
-    std::env::remove_var("FAKE_SIDECAR_SPAWN_GRANDCHILD");
-    std::env::remove_var("FAKE_SIDECAR_CREATE_DELAY_MS");
+    let boot = env.await_row("boot").await;
+    assert_eq!(boot["sessionId"], durable);
+    let old_processes = [
+        boot["pid"].as_u64().unwrap(),
+        boot["cliPid"].as_u64().unwrap(),
+        gpid as u64,
+    ]
+    .map(|pid| common::process_probe::ProcessProbe::open(u32::try_from(pid).unwrap()));
+    assert!(old_processes
+        .iter()
+        .all(common::process_probe::ProcessProbe::running));
+    // Faults apply only to the first real query. The replacement performs a
+    // normal SDK initialization and never spawns another detached decoy.
     // Let the TTL expire, then client B contends -> ExpiredNeedsKill -> tree kill.
     tokio::time::sleep(Duration::from_millis(300)).await;
     send_json(&mut ws_b, &claude_create_resume("req-ttl-b", durable)).await;
@@ -770,27 +744,25 @@ async fn expired_lease_kill_sweeps_the_sidecar_tree_before_release() {
         outcome["type"], "freshAgent.created",
         "client B's create must converge after the expired holder's tree kill: {outcome}"
     );
-    assert!(outcome["sessionId"].is_string());
+    assert_eq!(outcome["sessionId"], durable);
 
-    // The DECOY GRANDCHILD was dead (ownership sweep / tree-kill) BEFORE client B's
-    // created landed: the release follows the sweep's confirmation, so it is already
-    // dead now — no polling. NOTE: a dead-but-unreaped ZOMBIE keeps its /proc entry (it
-    // reparents to the container's pid 1, which never reaps it), so "dead" is read from
-    // the stat STATE — gone, Z, or X — not from /proc existence.
-    let grandchild_dead = |pid: i64| -> bool {
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            return true; // gone entirely
-        };
-        matches!(
-            stat.rsplit(')')
-                .next()
-                .and_then(|rest| rest.split_whitespace().next()),
-            Some("Z") | Some("X") | None
-        )
-    };
+    // All old writers are already dead at the new create ACK: release must
+    // follow tree confirmation, including the real simulated CLI and decoy.
     assert!(
-        grandchild_dead(gpid),
-        "grandchild survived B's convergence: a raw single-pid kill orphans the writer (V6)"
+        old_processes
+            .iter()
+            .all(common::process_probe::ProcessProbe::exited),
+        "an old sidecar/CLI/decoy survived replacement ACK"
+    );
+    assert_eq!(
+        env.runtime.rows("decoy").len(),
+        1,
+        "replacement has no extra decoy"
+    );
+    assert_eq!(
+        env.create_rows().len(),
+        2,
+        "one expired and one replacement query"
     );
 }
 
@@ -803,18 +775,18 @@ async fn expired_lease_kill_sweeps_the_sidecar_tree_before_release() {
 #[tokio::test]
 async fn loser_attach_after_winner_binds_converges_to_the_live_session() {
     let _guard = LEASE_ENV_LOCK.lock().await;
-    let env = FakeLeaseSidecarEnv::install();
-    std::env::set_var("FAKE_SIDECAR_CREATE_DELAY_MS", "3000");
+    let env = LeaseClaudeRuntime::new();
+    env.hold_initialization();
 
     let durable = "d5d5d5d5-d5d5-4d5d-8d5d-d5d5d5d5d5d5";
-    let url = spawn_server().await;
+    env.runtime.seed_transcript(durable);
+    let url = spawn_server_with_claude_environment(Some(env.environment())).await;
     let mut ws_a = connect(&url, true).await;
     let mut ws_b = connect(&url, true).await;
 
     // Winner: create-with-resume, slow spawn (holds the lease mid-flight).
     send_json(&mut ws_a, &claude_create_resume("req-att-a", durable)).await;
-    env.await_log_row(Duration::from_secs(10), |r| r["msg"]["type"] == "create")
-        .await;
+    env.await_row("query").await;
 
     // Loser: attach for the SAME durable id mid-spawn.
     let attach = serde_json::json!({
@@ -837,6 +809,7 @@ async fn loser_attach_after_winner_binds_converges_to_the_live_session() {
     );
 
     // Winner binds.
+    env.release_initialization();
     await_frame(&mut ws_a, Duration::from_secs(15), |v| {
         v["type"] == "freshAgent.created" && v["requestId"] == "req-att-a"
     })
@@ -1070,8 +1043,8 @@ async fn opencode_attach_resume_is_serialized_without_touching_the_shared_sideca
 #[tokio::test]
 async fn legacy_reject_freshagent_create() {
     let _guard = LEASE_ENV_LOCK.lock().await;
-    let env = FakeLeaseSidecarEnv::install();
-    let url = spawn_server().await;
+    let env = LeaseClaudeRuntime::new();
+    let url = spawn_server_with_claude_environment(Some(env.environment())).await;
     let mut ws = connect(&url, true).await;
 
     // ejh6 presence (finding 9): rejection fires for any string, including "".

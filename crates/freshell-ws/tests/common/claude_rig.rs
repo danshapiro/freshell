@@ -63,6 +63,9 @@ pub enum RigKind {
 /// local claude lane, no handoff route).
 #[derive(Debug, Clone, Default)]
 pub struct RigOptions {
+    /// Exercise the hosted kernel's in-memory lifecycle without a coordinator
+    /// or identity sink; native files and dead-runtime memory are authoritative.
+    pub unwired_runtime: bool,
     /// REST create/split/send/capture over the shared Claude runtime and layout.
     pub rest_api: bool,
     /// Extra sidecar environment (for example simulator knobs such as
@@ -72,6 +75,9 @@ pub struct RigOptions {
     /// claude lane's identity sink (`common::ledger_sink`), the way main.rs wires
     /// it: sessions leave durable binding rows a later resume reads back.
     pub durable_ledger: bool,
+    /// Hold the next shutdown interruption-marker write until the lifecycle
+    /// test releases it, leaving the real sidecar alive during that window.
+    pub turn_interrupted_marker_gate: Option<Arc<super::ledger_sink::TurnInterruptedMarkerGate>>,
     /// The claude lane runs the way the hosted session host runs it: the lane
     /// selects the hosted Freshell MCP (`with_hosted_mcp`) and its sidecars see
     /// `FRESHELL_HOSTED_FRESH_AGENT=claude`, so the sidecar offers the fixed MCP
@@ -109,6 +115,8 @@ pub struct ClaudeRig {
     /// (for example `has_live_session`).
     pub fresh_claude: freshell_freshagent::FreshClaudeState,
     pub fresh_codex: freshell_freshagent::FreshCodexState,
+    /// The same coordinator the WS dispatcher and Claude lane use.
+    pub ownership: Arc<freshell_ownership::RuntimeOwnershipRegistry>,
     /// The local fake Anthropic endpoint ([`RigKind::Cli`] only), killed on drop.
     _provider: Option<tokio::process::Child>,
     /// What the server was started with, for [`Self::restart`].
@@ -173,7 +181,7 @@ impl ClaudeRig {
                 environment.extend([
                     (
                         "FRESHELL_CLAUDE_SDK_QUERY_MODULE".into(),
-                        path_string(&simulator),
+                        freshell_platform::opencode_plugin::plugin_file_spec(&simulator),
                     ),
                     ("FRESHELL_CLAUDE_SIM_LEDGER".into(), path_string(&ledger)),
                     ("FRESHELL_CLAUDE_SIM_TIME_SCALE".into(), "1".into()),
@@ -232,6 +240,7 @@ impl ClaudeRig {
             http_url,
             fresh_claude,
             fresh_codex,
+            ownership,
             server,
         } = spawn_rig_server(environment.clone(), &options, pane_ledger.clone()).await;
         eprintln!(
@@ -251,6 +260,7 @@ impl ClaudeRig {
             ledger,
             fresh_claude,
             fresh_codex,
+            ownership,
             _provider: provider,
             environment,
             options,
@@ -277,6 +287,7 @@ impl ClaudeRig {
             http_url,
             fresh_claude,
             fresh_codex,
+            ownership,
             server,
         } = spawn_rig_server(self.environment.clone(), &self.options, pane_ledger.clone()).await;
         eprintln!(
@@ -287,6 +298,7 @@ impl ClaudeRig {
         self.http_url = http_url;
         self.fresh_claude = fresh_claude;
         self.fresh_codex = fresh_codex;
+        self.ownership = ownership;
         self.pane_ledger = pane_ledger;
         self.server = server;
     }
@@ -318,14 +330,22 @@ impl ClaudeRig {
     /// `POST <path>` on the rig's server with the auth token and a JSON body; the
     /// status and the JSON answer (`Null` when the body is not JSON).
     pub async fn post_json(&self, path: &str, body: &Value) -> (u16, Value) {
+        Self::request_json_to("POST", &self.http_url, path, body).await
+    }
+
+    pub async fn request_json_to(
+        method: &str,
+        base_url: &str,
+        path: &str,
+        body: &Value,
+    ) -> (u16, Value) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let host = self
-            .http_url
+        let host = base_url
             .strip_prefix("http://")
             .expect("the rig serves http");
         let payload = body.to_string();
         let request = format!(
-            "POST {path} HTTP/1.1\r\nHost: {host}\r\nx-auth-token: {AUTH_TOKEN}\r\n\
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\nx-auth-token: {AUTH_TOKEN}\r\n\
              content-type: application/json\r\ncontent-length: {}\r\nConnection: close\r\n\r\n\
              {payload}",
             payload.len(),
@@ -621,6 +641,7 @@ impl ClaudeRig {
     /// The first sidecar this rig booted dies on its own (SIGKILL of the Node
     /// process): its session is untracked, the state a reload or a handoff
     /// resumes from. Returns once `conn` has read the exit.
+    #[cfg(unix)]
     pub async fn kill_first_sidecar(&self, conn: &mut RigConnection) {
         let pid = self.ledger_rows("boot")[0]["pid"]
             .as_i64()
@@ -674,7 +695,18 @@ impl RigConnection {
 
     /// The first frame (already read or still to come) matching `predicate`.
     pub async fn wait_for(&mut self, what: &str, predicate: impl Fn(&Value) -> bool) -> Value {
-        if let Some(hit) = self.frames.iter().find(|frame| predicate(frame)) {
+        self.wait_for_since(0, what, predicate).await
+    }
+
+    /// A request acknowledgement must be newer than that request, even when
+    /// this connection previously observed the same session and operation.
+    pub async fn wait_for_since(
+        &mut self,
+        start: usize,
+        what: &str,
+        predicate: impl Fn(&Value) -> bool,
+    ) -> Value {
+        if let Some(hit) = self.frames[start..].iter().find(|frame| predicate(frame)) {
             return hit.clone();
         }
         let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
@@ -703,6 +735,7 @@ impl RigConnection {
     /// `extra` fields merged in (a resume, say); returns the answer:
     /// `freshAgent.created`, `freshAgent.create.failed` or a request `error`.
     pub async fn request_create(&mut self, request_id: &str, extra: Value) -> Value {
+        let start = self.frames.len();
         let cwd = path_string(&self.workspace);
         let mut frame = json!({
             "type": "freshAgent.create",
@@ -715,7 +748,7 @@ impl RigConnection {
             frame.extend(extra);
         }
         self.send(frame).await;
-        self.wait_for(&format!("the answer to create {request_id}"), |v| {
+        self.wait_for_since(start, &format!("the answer to create {request_id}"), |v| {
             v["requestId"] == request_id
                 && matches!(
                     v["type"].as_str(),
@@ -784,23 +817,22 @@ impl RigConnection {
         })
     }
 
-    /// The owner pair the client would hold for this pane's session: the latest
-    /// `session.runtimeOwner` frame for the durable id its `session.init` named.
+    /// The current init identifies an existing conversation; before the first
+    /// init, create already supplied the native UUID and its owner record.
     fn observed_owner(&self, session_id: &str) -> Option<(u64, u64)> {
-        let durable = self.frames.iter().rev().find_map(|v| {
-            (v["type"] == "freshAgent.event"
-                && v["event"]["type"] == "freshAgent.session.init"
-                && v["event"]["sessionId"] == session_id)
-                .then(|| v["event"]["cliSessionId"].as_str().map(str::to_string))
-                .flatten()
-        })?;
-        self.frames.iter().rev().find_map(|v| {
-            (v["type"] == "session.runtimeOwner"
-                && v["provider"] == "claude"
-                && v["sessionId"] == durable.as_str())
-            .then(|| Some((v["epoch"].as_u64()?, v["generation"].as_u64()?)))
-            .flatten()
-        })
+        let durable = self
+            .frames
+            .iter()
+            .rev()
+            .find_map(|v| {
+                (v["type"] == "freshAgent.event"
+                    && v["event"]["type"] == "freshAgent.session.init"
+                    && v["event"]["sessionId"] == session_id)
+                    .then(|| v["event"]["cliSessionId"].as_str().map(str::to_string))
+                    .flatten()
+            })
+            .unwrap_or_else(|| session_id.to_string());
+        self.owner_pair(&durable)
     }
 
     /// Top-level `error` frames answering this request id, read so far.
@@ -848,6 +880,7 @@ impl RigConnection {
     /// The pane reattaches to the durable `session_id` (a reload, or the first
     /// attach after a restart); returns once the attach is acknowledged.
     pub async fn attach(&mut self, session_id: &str) {
+        let start = self.frames.len();
         self.send(json!({
             "type": "freshAgent.attach",
             "provider": "claude",
@@ -856,7 +889,7 @@ impl RigConnection {
             "sessionRef": { "provider": "claude", "sessionId": session_id },
         }))
         .await;
-        self.wait_for("the attach acknowledgement", |v| {
+        self.wait_for_since(start, "the attach acknowledgement", |v| {
             v["type"] == "freshAgent.event"
                 && v["event"]["type"] == "freshAgent.session.snapshot"
                 && v["event"]["sessionId"] == session_id
@@ -882,6 +915,7 @@ impl RigConnection {
 
     /// `freshAgent.kill`, then wait for `freshAgent.killed{success:true}`.
     pub async fn kill(&mut self, session_id: &str) {
+        let start = self.frames.len();
         self.send(json!({
             "type": "freshAgent.kill",
             "provider": "claude",
@@ -890,7 +924,9 @@ impl RigConnection {
         }))
         .await;
         let killed = self
-            .wait_for("freshAgent.killed", |v| v["type"] == "freshAgent.killed")
+            .wait_for_since(start, "freshAgent.killed", |v| {
+                v["type"] == "freshAgent.killed" && v["sessionId"] == session_id
+            })
             .await;
         assert_eq!(killed["success"], true, "{killed}");
     }
@@ -983,6 +1019,7 @@ struct RigServer {
     http_url: String,
     fresh_claude: freshell_freshagent::FreshClaudeState,
     fresh_codex: freshell_freshagent::FreshCodexState,
+    ownership: Arc<freshell_ownership::RuntimeOwnershipRegistry>,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -1031,12 +1068,18 @@ async fn spawn_rig_server(
     let mut fresh_claude = freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx))
         .with_sidecar_environment(environment)
         .with_hosted_mcp(options.hosted_claude);
-    fresh_claude.set_ownership(Arc::clone(&ownership));
-    if let Some(ledger) = pane_ledger.as_ref() {
-        fresh_claude.set_identity_sink(Arc::new(super::ledger_sink::LedgerSink::with_ownership(
+    if !options.unwired_runtime {
+        fresh_claude.set_ownership(Arc::clone(&ownership));
+    }
+    if let Some(ledger) = pane_ledger.as_ref().filter(|_| !options.unwired_runtime) {
+        let mut sink = super::ledger_sink::LedgerSink::with_ownership(
             Arc::clone(ledger),
             Some(Arc::clone(&ownership)),
-        )));
+        );
+        if let Some(gate) = options.turn_interrupted_marker_gate.clone() {
+            sink = sink.with_turn_interrupted_marker_gate(gate);
+        }
+        fresh_claude.set_identity_sink(Arc::new(sink));
     }
     let lane = fresh_claude.clone();
     let fresh_agent_state = freshell_freshagent::FreshAgentState::new(
@@ -1173,6 +1216,7 @@ async fn spawn_rig_server(
         http_url: format!("http://{addr}"),
         fresh_claude: lane,
         fresh_codex: state.fresh_codex.clone(),
+        ownership,
         server,
     }
 }

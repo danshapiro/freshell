@@ -6,6 +6,9 @@
 //! it is unreachable from the wire until the dispatch arm exists. Harness duplicated
 //! from that file per the repo's per-test-file convention.
 
+mod common;
+
+use common::claude_sim_environment::ClaudeSimEnvironment;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,131 +20,6 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use freshell_ws::WsState;
 
 const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
-
-/// Serializes every test in this file that mutates process-global env vars
-/// (`FRESHELL_CLAUDE_SIDECAR` / `FRESHELL_CLAUDE_NODE` / `CLAUDE_CONFIG_DIR`),
-/// mirroring `freshagent_claude_kill_interrupt.rs`'s convention for the same hazard.
-static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-// ── fake claude sidecar (resume flavor: created + sdk.session.init + sdk.status) ──
-
-/// A minimal scripted fake claude sidecar (no real SDK, no network, no cost) speaking
-/// the SAME newline-JSON protocol `spawn_sidecar()` drives the vendored package with.
-/// On `create` it replies `created`, then `sdk.session.init` echoing the resume boot's id
-/// as the durable `cliSessionId` (resume continuity -- exactly what the real sidecar's
-/// SDK init does), then `sdk.status idle`; on `send` it emits an `sdk.assistant` content
-/// frame (the Task 10b event-after-rebind knob; the server publishes statuses itself, so
-/// a sidecar status is never forwarded, C17); on `shutdown` it exits. Every inbound request is
-/// appended (with the sidecar's pid) to the JSONL file named by
-/// `FAKE_SIDECAR_REQUEST_LOG` -- distinct pids == spawn count, `msg.type` rows prove
-/// what each sidecar actually received.
-const FAKE_CLAUDE_SIDECAR_SOURCE: &str = r#"
-import readline from 'node:readline'
-import fs from 'node:fs'
-
-const logPath = process.env.FAKE_SIDECAR_REQUEST_LOG || ''
-function logReq(msg) {
-  if (!logPath) return
-  try { fs.appendFileSync(logPath, JSON.stringify({ pid: process.pid, msg }) + '\n') } catch {}
-}
-
-let counter = 0
-const rl = readline.createInterface({ input: process.stdin, terminal: false })
-rl.on('line', (line) => {
-  const trimmed = line.trim()
-  if (!trimmed) return
-  let msg
-  try {
-    msg = JSON.parse(trimmed)
-  } catch {
-    return
-  }
-  logReq(msg)
-  if (msg.type === 'create') {
-    counter += 1
-    const sessionId = `fake-claude-session-${process.pid}-${counter}`
-    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 }) + '\n')
-    const cliSessionId = msg.boot?.resume || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-    process.stdout.write(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }) + '\n')
-    process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }) + '\n')
-  } else if (msg.type === 'send') {
-    process.stdout.write(JSON.stringify({ type: 'sdk.assistant', sessionId: msg.sessionId, content: [{ type: 'text', text: 'pong' }] }) + '\n')
-  } else if (msg.type === 'shutdown') {
-    process.exit(0)
-  }
-})
-"#;
-
-/// A fresh temp dir holding the fake sidecar script, with `FRESHELL_CLAUDE_SIDECAR`/
-/// `FRESHELL_CLAUDE_NODE` pointed at it, PLUS a seeded claude transcript store with
-/// `CLAUDE_CONFIG_DIR` pointed at it. Caller must hold [`CLAUDE_ENV_LOCK`] for the
-/// lifetime of the returned guard.
-struct FakeClaudeResumeEnv {
-    dir: std::path::PathBuf,
-}
-impl FakeClaudeResumeEnv {
-    fn install(durable: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "freshell-fake-claude-resume-ws-{}",
-            uuid_like_suffix()
-        ));
-        std::fs::create_dir_all(&dir).expect("create fake sidecar temp dir");
-        let script = dir.join("fake-claude-sidecar.mjs");
-        std::fs::write(&script, FAKE_CLAUDE_SIDECAR_SOURCE).expect("write fake sidecar");
-        std::env::set_var("FAKE_SIDECAR_REQUEST_LOG", dir.join("requests.jsonl"));
-        // Seed the transcript store: one user line carrying an EXISTING cwd ("/tmp"),
-        // so the resume request goes by durable UUID + original cwd (ledger A15).
-        let store = dir.join("claude-store");
-        let project = store.join("projects").join("-t");
-        std::fs::create_dir_all(&project).expect("create transcript project dir");
-        std::fs::write(
-            project.join(format!("{durable}.jsonl")),
-            r#"{"type":"user","cwd":"/tmp","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
-        )
-        .expect("seed transcript");
-        std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
-        std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
-        std::env::set_var("CLAUDE_CONFIG_DIR", &store);
-        Self { dir }
-    }
-}
-impl FakeClaudeResumeEnv {
-    /// The JSONL request log the fake sidecar appends every inbound request to
-    /// (`{ pid, msg }` per line) -- distinct pids == spawn count.
-    fn request_log_path(&self) -> std::path::PathBuf {
-        self.dir.join("requests.jsonl")
-    }
-
-    fn request_log_rows(&self) -> Vec<Value> {
-        let Ok(raw) = std::fs::read_to_string(self.request_log_path()) else {
-            return Vec::new();
-        };
-        raw.lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str(l).expect("request log row parses"))
-            .collect()
-    }
-}
-
-impl Drop for FakeClaudeResumeEnv {
-    fn drop(&mut self) {
-        std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
-        std::env::remove_var("FRESHELL_CLAUDE_NODE");
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
-        std::env::remove_var("FAKE_SIDECAR_REQUEST_LOG");
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-/// Dependency-free unique suffix (avoids pulling in `uuid` for this test crate).
-fn uuid_like_suffix() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("{nanos}-{:?}", std::thread::current().id())
-}
 
 // ── server harness (duplicated from diag01_lifecycle_events.rs's convention, with
 //    `freshAgent.enabled: true` so `freshAgent.create` actually dispatches) ──
@@ -166,7 +44,7 @@ fn test_settings_value() -> serde_json::Value {
     })
 }
 
-async fn spawn_server() -> String {
+async fn spawn_server(environment: &ClaudeSimEnvironment) -> String {
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let settings =
@@ -192,7 +70,8 @@ async fn spawn_server() -> String {
             Arc::clone(&broadcast_tx),
             serde_json::json!({ "freshAgent": { "enabled": true } }),
         ),
-        fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
+        fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx))
+            .with_sidecar_environment(environment.environment()),
         fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
             freshell_freshagent::FreshAgentState::new(
                 Arc::clone(&auth_token),
@@ -317,7 +196,8 @@ async fn await_frame(
 /// (this test then fails with `await_frame` panicking on its timeout budget).
 #[tokio::test]
 async fn claude_attach_for_untracked_session_emits_lost_session_frame_over_ws() {
-    let url = spawn_server().await;
+    let env = ClaudeSimEnvironment::new();
+    let url = spawn_server(&env).await;
     let mut ws = connect_and_complete_handshake(&url).await;
 
     send_json(
@@ -347,15 +227,15 @@ async fn claude_attach_for_untracked_session_emits_lost_session_frame_over_ws() 
 /// server spawns a sidecar with a resume boot and emits the idle
 /// `freshAgent.session.snapshot` whose `timelineSessionId` is the durable UUID (the
 /// frozen client persists it unvalidated -- NEVER a nanoid), all under the CLIENT's
-/// original session id. Before the fix this attach produced the lost frame instead
+/// canonical native session id. Before the fix this attach produced the lost frame instead
 /// (this test then fails with `await_frame` panicking on its timeout budget).
 #[tokio::test]
 async fn claude_attach_with_resumable_transcript_resumes_and_emits_snapshot_over_ws() {
-    let _guard = CLAUDE_ENV_LOCK.lock().await;
     let durable = "abababab-abab-4bab-8bab-abababababab";
-    let _env = FakeClaudeResumeEnv::install(durable);
+    let env = ClaudeSimEnvironment::new();
+    env.seed_transcript(durable);
 
-    let url = spawn_server().await;
+    let url = spawn_server(&env).await;
     let mut ws = connect_and_complete_handshake(&url).await;
 
     send_json(
@@ -379,37 +259,13 @@ async fn claude_attach_with_resumable_transcript_resumes_and_emits_snapshot_over
     assert_eq!(frame["sessionType"], "freshclaude");
     assert_eq!(frame["event"]["status"], "idle");
     assert_eq!(frame["event"]["timelineSessionId"], durable);
-}
-
-/// Makes a directory unreadable (mode 000) and restores it on drop -- declared
-/// AFTER the env guard so it drops first and the env guard's `remove_dir_all`
-/// can clean up. `None` when the process bypasses permission bits (root), where
-/// the EACCES under test cannot be produced.
-#[cfg(unix)]
-struct UnreadableDir(std::path::PathBuf);
-#[cfg(unix)]
-impl UnreadableDir {
-    fn make(dir: &std::path::Path) -> Option<Self> {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let guard = Self(dir.to_path_buf());
-        if std::fs::read_dir(dir).is_ok() {
-            eprintln!("skipping: euid bypasses permission checks");
-            return None;
-        }
-        Some(guard)
-    }
-}
-#[cfg(unix)]
-impl Drop for UnreadableDir {
-    fn drop(&mut self) {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
-    }
+    assert_eq!(env.rows("query").len(), 1);
+    assert_eq!(env.rows("query")[0]["options"]["resume"], durable);
+    assert_eq!(env.rows("boot")[0]["sessionId"], durable);
 }
 
 /// G28: an attach by durable UUID while the transcript store cannot be READ
-/// (EACCES on `projects/`) must not be adjudicated "lost". The server cannot
+/// (the projects path cannot be traversed) must not be adjudicated "lost". The server cannot
 /// prove the transcript gone, so it answers the transient
 /// `CLAUDE_ATTACH_RESUME_FAILED` error -- never the `INVALID_SESSION_ID` frame
 /// the client folds into `markSessionLost` and starts a recovery for -- and it
@@ -417,14 +273,14 @@ impl Drop for UnreadableDir {
 #[cfg(unix)]
 #[tokio::test]
 async fn claude_attach_with_an_unreadable_store_is_transient_not_lost() {
-    let _guard = CLAUDE_ENV_LOCK.lock().await;
     let durable = "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd";
-    let env = FakeClaudeResumeEnv::install(durable);
-    let Some(_locked) = UnreadableDir::make(&env.dir.join("claude-store").join("projects")) else {
-        return;
-    };
+    let env = ClaudeSimEnvironment::new();
+    std::fs::create_dir_all(env.config_dir()).unwrap();
+    // A loop produces a real traversal error even when the sandbox user may
+    // bypass Unix permission bits. Missing/non-directory paths are clean misses.
+    std::os::unix::fs::symlink("projects", env.config_dir().join("projects")).unwrap();
 
-    let url = spawn_server().await;
+    let url = spawn_server(&env).await;
     let mut ws = connect_and_complete_handshake(&url).await;
 
     send_json(
@@ -455,11 +311,7 @@ async fn claude_attach_with_an_unreadable_store_is_transient_not_lost() {
         "the attach answers with the transient resume failure: {frame}"
     );
 
-    let creates = env
-        .request_log_rows()
-        .into_iter()
-        .filter(|r| r["msg"]["type"] == "create")
-        .count();
+    let creates = env.rows("query").len();
     assert_eq!(
         creates, 0,
         "no sidecar may spawn against an unchecked store"
@@ -471,7 +323,8 @@ async fn claude_attach_with_an_unreadable_store_is_transient_not_lost() {
 /// unit tests bypass) or the client builds the wrong session locator.
 #[tokio::test]
 async fn kilroy_attach_for_untracked_session_emits_lost_session_frame_over_ws() {
-    let url = spawn_server().await;
+    let env = ClaudeSimEnvironment::new();
+    let url = spawn_server(&env).await;
     let mut ws = connect_and_complete_handshake(&url).await;
 
     send_json(
@@ -495,20 +348,14 @@ async fn kilroy_attach_for_untracked_session_emits_lost_session_frame_over_ws() 
     assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID");
 }
 
-// ── Task 10b: claude durable→live resolution (attach rebind + ack, send routing) ──
-//
-// claude keys live sessions by a sidecar-minted placeholder nanoid, while the reconcile
-// attach verdict names the DURABLE ref. On base, `attach{durable}` on a live session is
-// a silent no-op and `send{durable}` misses the sessions map (SESSION_NOT_FOUND) while
-// events keep broadcasting under the placeholder — stranding the pane the fold rebound.
+// Native session identity is established at create, before the CLI's first init.
+// Attach, send and events must all keep addressing that same conversation.
 
-/// The fake sidecar's baked-in durable `cliSessionId` for a create WITHOUT resume.
-const DURABLE_FALLBACK: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-
-/// Drive a claude `freshAgent.create` (no resume) through the fake sidecar; wait for
-/// `freshAgent.session.init` so `cli_index[DURABLE_FALLBACK] = placeholder` is recorded.
-/// Returns the placeholder session id.
-async fn create_live_claude_session(ws: &mut TestWs, request_id: &str) -> String {
+async fn create_live_claude_session(
+    ws: &mut TestWs,
+    env: &ClaudeSimEnvironment,
+    request_id: &str,
+) -> String {
     send_json(
         ws,
         &serde_json::json!({
@@ -516,7 +363,7 @@ async fn create_live_claude_session(ws: &mut TestWs, request_id: &str) -> String
             "requestId": request_id,
             "sessionType": "freshclaude",
             "provider": "claude",
-            "cwd": "/tmp",
+            "cwd": env.workspace(),
         }),
     )
     .await;
@@ -524,28 +371,24 @@ async fn create_live_claude_session(ws: &mut TestWs, request_id: &str) -> String
         v["type"] == "freshAgent.created" && v["requestId"] == request_id
     })
     .await;
-    let placeholder = created["sessionId"]
+    let native_id = created["sessionId"]
         .as_str()
         .expect("created carries sessionId")
         .to_string();
-    await_frame(ws, Duration::from_secs(15), |v| {
-        v["type"] == "freshAgent.event" && v["event"]["type"] == "freshAgent.session.init"
-    })
-    .await;
-    placeholder
+    assert!(uuid::Uuid::parse_str(&native_id).is_ok(), "{created}");
+    assert_eq!(created["sessionRef"]["sessionId"], native_id);
+    assert_eq!(env.rows("boot")[0]["sessionId"], native_id);
+    native_id
 }
 
-/// Attach by the DURABLE id on a LIVE session must REBIND (alias) + ACK — at least one
-/// frame stamped with the durable id must reach the attaching connection. On base the
-/// cli_index-hit arm is a silent no-op (this test then fails on `await_frame`'s budget).
+/// A warm attach acknowledges the same native conversation without a second query.
 #[tokio::test]
-async fn attach_by_durable_id_on_a_live_session_rebinds_and_acks() {
-    let _guard = CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeClaudeResumeEnv::install(DURABLE_FALLBACK);
+async fn attach_by_native_id_on_a_live_session_acks() {
+    let env = ClaudeSimEnvironment::new();
 
-    let url = spawn_server().await;
+    let url = spawn_server(&env).await;
     let mut ws = connect_and_complete_handshake(&url).await;
-    let _placeholder = create_live_claude_session(&mut ws, "req-10b-attach").await;
+    let native_id = create_live_claude_session(&mut ws, &env, "req-10b-attach").await;
 
     let mut ws2 = connect_and_complete_handshake(&url).await;
     send_json(
@@ -553,47 +396,39 @@ async fn attach_by_durable_id_on_a_live_session_rebinds_and_acks() {
         &serde_json::json!({
             "type": "freshAgent.attach",
             "provider": "claude",
-            "sessionId": DURABLE_FALLBACK,
+            "sessionId": native_id,
             "sessionType": "freshclaude",
-            "sessionRef": { "provider": "claude", "sessionId": DURABLE_FALLBACK },
+            "sessionRef": { "provider": "claude", "sessionId": native_id },
         }),
     )
     .await;
 
     let frame = await_frame(&mut ws2, Duration::from_secs(10), |v| {
-        v["sessionId"] == DURABLE_FALLBACK
+        v["sessionId"] == native_id && v["event"]["type"] == "freshAgent.session.snapshot"
     })
     .await;
     assert_eq!(frame["type"], "freshAgent.event");
 
-    // No second sidecar: exactly ONE create row in the fake's request log.
-    let creates = env
-        .request_log_rows()
-        .into_iter()
-        .filter(|r| r["msg"]["type"] == "create")
-        .count();
+    // No second sidecar: exactly one actual SDK query.
+    let creates = env.rows("query").len();
     assert_eq!(creates, 1, "attach-to-live must not spawn a second sidecar");
 }
 
-/// `freshAgent.send` addressed by the DURABLE id must resolve through `cli_index` to the
-/// live session — the sidecar receives the send line and `freshAgent.send.accepted`
-/// lands. On base the sessions-map miss broadcasts SESSION_NOT_FOUND and no accepted
-/// frame ever arrives (this test then fails on `await_frame`'s budget).
+/// A send addressed by the native ID reaches the already live SDK query exactly once.
 #[tokio::test]
-async fn send_by_durable_id_routes_to_the_live_session() {
-    let _guard = CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeClaudeResumeEnv::install(DURABLE_FALLBACK);
+async fn send_by_native_id_routes_to_the_live_session() {
+    let env = ClaudeSimEnvironment::new();
 
-    let url = spawn_server().await;
+    let url = spawn_server(&env).await;
     let mut ws = connect_and_complete_handshake(&url).await;
-    let _placeholder = create_live_claude_session(&mut ws, "req-10b-send").await;
+    let native_id = create_live_claude_session(&mut ws, &env, "req-10b-send").await;
 
     send_json(
         &mut ws,
         &serde_json::json!({
             "type": "freshAgent.send",
             "provider": "claude",
-            "sessionId": DURABLE_FALLBACK,
+            "sessionId": native_id,
             "sessionType": "freshclaude",
             "text": "ping",
             "requestId": "send-10b",
@@ -605,34 +440,36 @@ async fn send_by_durable_id_routes_to_the_live_session() {
         v["type"] == "freshAgent.send.accepted" && v["requestId"] == "send-10b"
     })
     .await;
-    assert_eq!(accepted["sessionId"], DURABLE_FALLBACK);
+    assert_eq!(accepted["sessionId"], native_id);
 
-    // The sidecar answers every `send` with an assistant frame -- awaiting it proves
-    // the sidecar PROCESSED the routed send (the accepted broadcast races the log append).
+    // An actual SDK assistant frame proves the sidecar processed the routed send.
     await_frame(&mut ws, Duration::from_secs(10), |v| {
         v["type"] == "freshAgent.event" && v["event"]["type"] == "freshAgent.assistant"
     })
     .await;
 
-    // The fake sidecar actually received the send line (routing, not just the ack).
-    let sends = env
-        .request_log_rows()
-        .into_iter()
-        .filter(|r| r["msg"]["type"] == "send")
-        .count();
-    assert_eq!(sends, 1, "the live sidecar must receive the routed send");
+    let prompts = env.rows("prompt");
+    assert_eq!(
+        prompts.len(),
+        1,
+        "the SDK must receive exactly one routed send"
+    );
+    assert_eq!(prompts[0]["sessionId"], native_id);
+    assert_eq!(prompts[0]["uuid"], accepted["submittedTurnId"]);
+    assert_eq!(
+        prompts[0]["content"],
+        serde_json::json!([{"type":"text", "text":"ping"}])
+    );
 }
 
-/// After the durable rebind, event envelopes must be stamped with the DURABLE id (the
-/// broadcast stamp flips), or the pane keyed on the durable never receives events.
+/// Event envelopes after a warm attach retain the same native session identity.
 #[tokio::test]
-async fn events_after_durable_rebind_are_stamped_with_the_durable_id() {
-    let _guard = CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeClaudeResumeEnv::install(DURABLE_FALLBACK);
+async fn events_after_native_attach_are_stamped_with_the_native_id() {
+    let env = ClaudeSimEnvironment::new();
 
-    let url = spawn_server().await;
+    let url = spawn_server(&env).await;
     let mut ws = connect_and_complete_handshake(&url).await;
-    let _placeholder = create_live_claude_session(&mut ws, "req-10b-events").await;
+    let native_id = create_live_claude_session(&mut ws, &env, "req-10b-events").await;
 
     let mut ws2 = connect_and_complete_handshake(&url).await;
     send_json(
@@ -640,25 +477,25 @@ async fn events_after_durable_rebind_are_stamped_with_the_durable_id() {
         &serde_json::json!({
             "type": "freshAgent.attach",
             "provider": "claude",
-            "sessionId": DURABLE_FALLBACK,
+            "sessionId": native_id,
             "sessionType": "freshclaude",
-            "sessionRef": { "provider": "claude", "sessionId": DURABLE_FALLBACK },
+            "sessionRef": { "provider": "claude", "sessionId": native_id },
         }),
     )
     .await;
-    // The rebind ack gates the ordering (attach handled before the send below).
+    // The snapshot acknowledgement gates the ordering (attach handled before the send below).
     await_frame(&mut ws2, Duration::from_secs(10), |v| {
-        v["sessionId"] == DURABLE_FALLBACK
+        v["sessionId"] == native_id && v["event"]["type"] == "freshAgent.session.snapshot"
     })
     .await;
 
-    // Drive the fake to emit a content frame (it answers every `send` with one).
+    // Run an actual turn after attach and observe its assistant event.
     send_json(
         &mut ws2,
         &serde_json::json!({
             "type": "freshAgent.send",
             "provider": "claude",
-            "sessionId": DURABLE_FALLBACK,
+            "sessionId": native_id,
             "sessionType": "freshclaude",
             "text": "poke",
             "requestId": "send-10b-events",
@@ -671,8 +508,8 @@ async fn events_after_durable_rebind_are_stamped_with_the_durable_id() {
     })
     .await;
     assert_eq!(
-        event["sessionId"], DURABLE_FALLBACK,
-        "post-rebind envelopes must be stamped with the durable id"
+        event["sessionId"], native_id,
+        "post-attach envelopes must be stamped with the native id"
     );
 }
 
@@ -682,9 +519,8 @@ async fn events_after_durable_rebind_are_stamped_with_the_durable_id() {
 /// rejection rides the freshAgent.error event channel keyed by sessionId.
 #[tokio::test]
 async fn legacy_reject_freshagent_attach() {
-    let _guard = CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeClaudeResumeEnv::install("legacy-durable-id");
-    let url = spawn_server().await;
+    let env = ClaudeSimEnvironment::new();
+    let url = spawn_server(&env).await;
     let mut ws = connect_and_complete_handshake(&url).await;
 
     // ejh6 presence (finding 9): rejection fires for any string, including "".
@@ -718,12 +554,7 @@ async fn legacy_reject_freshagent_attach() {
             "{label}: frozen text: {err}"
         );
     }
-    // V3: this file has NO create_rows(); use request_log_rows() and filter for create rows.
-    let create_count = env
-        .request_log_rows()
-        .into_iter()
-        .filter(|r| r["msg"]["type"] == "create")
-        .count();
+    let create_count = env.rows("query").len();
     assert_eq!(
         create_count, 0,
         "no sidecar may spawn for a rejected legacy attach"

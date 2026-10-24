@@ -1,506 +1,260 @@
-//! Integration-level regression coverage for the claude `freshAgent.kill` /
-//! `freshAgent.interrupt` dispatch gap (review-confirmed parity bug): the
-//! `terminal.rs` `ClientMessage::FreshAgentKill` / `FreshAgentInterrupt` arms only
-//! routed `codex` + `opencode` -- a claude-provider frame fell through the `if`/`else
-//! if` chain and was silently dropped. `FreshClaudeState::handle_kill` already existed
-//! (9eaaf122, unit-tested) but was UNREACHABLE from the real WS dispatch, and its
-//! `create_dedup` cache was therefore never evicted for claude sessions.
-//!
-//! These tests run a REAL axum server (ephemeral loopback port, never 3001/3002) and a
-//! REAL `tokio-tungstenite` client -- the same harness convention as
-//! `diag01_lifecycle_events.rs`/`keepalive.rs` -- so they exercise the actual
-//! `handle_client_text` dispatch rather than calling `FreshClaudeState` methods
-//! directly (that unit-level coverage already exists in `claude.rs`). The claude
-//! sidecar itself is swapped for a minimal scripted fake via the SAME
-//! `FRESHELL_CLAUDE_SIDECAR`/`FRESHELL_CLAUDE_NODE` production env-var overrides
-//! `spawn_sidecar()` already honors -- no network, no cost, no real SDK.
-//!
-//! The load-bearing assertion (kill): a `freshAgent.create` resent with the SAME
-//! `requestId` immediately after an explicit `freshAgent.kill` for the session it
-//! created must mint a **fresh** session id, not replay the killed one -- proof that
-//! the kill dispatch actually reached `FreshClaudeState::handle_kill` (which evicts the
-//! create-dedup cache), not just that a `freshAgent.killed` frame happened to arrive.
-//!
-//! The interrupt coverage mirrors what legacy does
-//! (`server/fresh-agent/adapters/claude/adapter.ts:163-168`'s
-//! `interrupt(sessionId) { mapMissingResult(deps.sdkBridge.interrupt(sessionId), ...) }`,
-//! `server/sdk-bridge.ts:785-793`'s `sp.query.interrupt().catch(warn)`): a known session
-//! with a turn in flight (C18: an idle Stop sends nothing) forwards an `interrupt`
-//! request to the sidecar (observed here via a log file the fake
-//! sidecar appends to -- the process-boundary analog of "the SDK's `query.interrupt()`
-//! was actually invoked"), and legacy's `mapMissingResult` throw (surfaced by
-//! `ws-handler.ts:3513-3514`'s `catch` as an `INTERNAL_ERROR` frame) is mirrored for an
-//! unknown session.
+//! WebSocket kill and interrupt dispatch through the production Claude sidecar.
+//! The contract simulator supplies the SDK boundary and records actual CLI
+//! controls; every test uses an isolated rig and the real WS dispatcher.
 
-use std::io::Write;
-use std::sync::Arc;
+use common::claude_rig::{ClaudeRig, RigKind, RIG_FRAME_BUDGET};
+use serde_json::json;
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
-use serde_json::Value;
-use tokio::net::TcpListener;
-use tokio_tungstenite::tungstenite::Message as WsMessage;
+mod common;
 
-use freshell_ws::WsState;
-
-const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
-
-/// Serializes every test in this file, all of which mutate the process-global
-/// `FRESHELL_CLAUDE_SIDECAR`/`FRESHELL_CLAUDE_NODE` env vars (mirrors `claude.rs`'s
-/// own `CLAUDE_ENV_LOCK` convention for the identical hazard).
+// Retained for the existing control-outcome cases, which also install log capture.
+#[cfg(unix)]
 static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-// ── fake claude sidecar (production wire protocol only: create/interrupt/shutdown) ──
-
-/// A minimal scripted fake claude sidecar -- no real `@anthropic-ai/claude-agent-sdk`,
-/// no network, no cost. Speaks the SAME newline-JSON protocol `spawn_sidecar()` (the
-/// production code, `crates/freshell-freshagent/src/claude.rs`) drives real
-/// `crates/freshell-claude-sidecar/index.mjs` with:
-///   - `{"type":"create",...}` -> replies `{"type":"created",requestId,sessionId}`
-///     with a fresh id every call (never replays), so a genuinely-new spawn is
-///     observable by session id alone.
-///   - `{"type":"send",...}` -> ignored: the turn stays in flight.
-///   - `{"type":"interrupt",sessionId}` -> appends `sessionId` to
-///     `FRESHELL_TEST_CLAUDE_INTERRUPT_LOG` (this test's observable proxy for "the
-///     sidecar's `query.interrupt()` was actually invoked").
-///   - `{"type":"shutdown"}` -> exits (driven by `FreshClaudeState::handle_kill`'s
-///     graceful-shutdown request).
-const FAKE_CLAUDE_SIDECAR_SOURCE: &str = r#"
-import fs from 'node:fs'
-import readline from 'node:readline'
-
-let counter = 0
-const rl = readline.createInterface({ input: process.stdin, terminal: false })
-rl.on('line', (line) => {
-  const trimmed = line.trim()
-  if (!trimmed) return
-  let msg
-  try {
-    msg = JSON.parse(trimmed)
-  } catch {
-    return
-  }
-  if (msg.type === 'create') {
-    counter += 1
-    const sessionId = `fake-claude-session-${process.pid}-${counter}`
-    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 }) + '\n')
-  } else if (msg.type === 'interrupt') {
-    const log = process.env.FRESHELL_TEST_CLAUDE_INTERRUPT_LOG
-    if (log) fs.appendFileSync(log, `${msg.sessionId}\n`)
-    // ep4-r1 F1 wire parity: settle the awaited interrupt (the real sidecar
-    // emits this after query.interrupt() resolves).
-    console.log(JSON.stringify({ type: 'sdk.interrupt_settled', sessionId: msg.sessionId, stopId: msg.stopId, ok: true }))
-  } else if (msg.type === 'shutdown') {
-    process.exit(0)
-  }
-})
-"#;
-
-/// A fresh temp dir holding the fake sidecar script + this test's interrupt-log file,
-/// with `FRESHELL_CLAUDE_SIDECAR`/`FRESHELL_CLAUDE_NODE`/
-/// `FRESHELL_TEST_CLAUDE_INTERRUPT_LOG` pointed at it. Caller must hold
-/// [`CLAUDE_ENV_LOCK`] for the lifetime of the returned guard.
-struct FakeClaudeSidecarEnv {
-    dir: std::path::PathBuf,
-    interrupt_log: std::path::PathBuf,
-}
-impl FakeClaudeSidecarEnv {
-    fn install() -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "freshell-fake-claude-sidecar-ws-{}",
-            uuid_like_suffix()
-        ));
-        std::fs::create_dir_all(&dir).expect("create fake sidecar temp dir");
-        let script = dir.join("fake-claude-sidecar.mjs");
-        std::fs::write(&script, FAKE_CLAUDE_SIDECAR_SOURCE).expect("write fake sidecar");
-        let interrupt_log = dir.join("interrupt.log");
-        std::fs::write(&interrupt_log, "").expect("init interrupt log");
-        std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
-        std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
-        std::env::set_var("FRESHELL_TEST_CLAUDE_INTERRUPT_LOG", &interrupt_log);
-        Self { dir, interrupt_log }
-    }
-
-    fn interrupt_log_contents(&self) -> String {
-        std::fs::read_to_string(&self.interrupt_log).unwrap_or_default()
-    }
-}
-impl Drop for FakeClaudeSidecarEnv {
-    fn drop(&mut self) {
-        std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
-        std::env::remove_var("FRESHELL_CLAUDE_NODE");
-        std::env::remove_var("FRESHELL_TEST_CLAUDE_INTERRUPT_LOG");
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_kill_frame_reaches_handle_kill_and_evicts_the_create_dedup_cache() {
+    let rig = ClaudeRig::start(RigKind::Sim).await;
+    let mut conn = rig.connect().await;
+    let request = "req-claude-ws-kill-dedup";
+    let first = conn.create(request).await;
+    let processes = rig.runtime_processes(&first);
+    conn.kill(&first).await;
+    processes
+        .wait_until_exited("the WS-killed sidecar and CLI")
+        .await;
+    let recreated = conn.request_create(request, json!({})).await;
+    assert_eq!(recreated["type"], "freshAgent.created", "{recreated}");
+    assert_ne!(
+        recreated["sessionId"], first,
+        "kill must evict create dedup, so the same request creates a fresh runtime"
+    );
+    assert_eq!(rig.ledger_rows("query").len(), 2);
+    rig.fresh_claude.shutdown().await;
 }
 
-/// Dependency-free unique suffix (avoids pulling in `uuid` for this test crate).
-fn uuid_like_suffix() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("{nanos}-{:?}", std::thread::current().id())
-}
-
-// ── server harness (duplicated from diag01_lifecycle_events.rs's convention, with
-//    `freshAgent.enabled: true` so `freshAgent.create` actually dispatches) ──
-
-fn test_settings_value() -> serde_json::Value {
-    serde_json::json!({
-        "ai": {},
-        "codingCli": { "enabledProviders": [], "mcpServer": true, "providers": {} },
-        "editor": { "externalEditor": "auto" },
-        "extensions": { "disabled": [] },
-        "freshAgent": { "defaultPlugins": [], "enabled": true, "providers": {} },
-        "logging": { "debug": false },
-        "network": { "configured": true, "host": "127.0.0.1" },
-        "panes": { "defaultNewPane": "ask" },
-        "safety": { "autoKillIdleMinutes": 15 },
-        "sidebar": {
-            "autoGenerateTitles": true,
-            "excludeFirstChatMustStart": false,
-            "excludeFirstChatSubstrings": []
-        },
-        "terminal": { "scrollback": 10000 }
-    })
-}
-
-async fn spawn_server() -> String {
-    let auth_token = Arc::new(AUTH_TOKEN.to_string());
-    let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
-    let settings =
-        Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
-
-    let state = WsState {
-        pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
-        layout: Default::default(),
-        identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
-        terminal_meta: Default::default(),
-        auth_token: Arc::clone(&auth_token),
-        server_instance_id: Arc::new("srv-test".to_string()),
-        boot_id: Arc::new("boot-test".to_string()),
-        settings,
-        handshake_settings: Arc::new(tokio::sync::RwLock::new(
-            serde_json::from_value(test_settings_value()).expect("valid settings fixture"),
-        )),
-        broadcast_tx: Arc::clone(&broadcast_tx),
-        auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
-        auto_resume_cancels: Default::default(),
-        fresh_codex: freshell_freshagent::FreshCodexState::new(
-            Arc::clone(&auth_token),
-            Arc::clone(&broadcast_tx),
-            serde_json::json!({ "freshAgent": { "enabled": true } }),
-        ),
-        fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
-        fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
-            freshell_freshagent::FreshAgentState::new(
-                Arc::clone(&auth_token),
-                Arc::clone(&broadcast_tx),
-            ),
-        ),
-        registry: freshell_terminal::TerminalRegistry::new(),
-        tabs: freshell_ws::tabs::TabsRegistry::new(),
-        screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
-        subagent_interest: Default::default(),
-        host_stats: Default::default(),
-        checkpoint_send: Default::default(),
-        terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-        sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-        cli_commands: Arc::new(Vec::new()),
-        shutdown: Arc::new(tokio::sync::Notify::new()),
-        ping_interval_ms: 30_000,
-        hello_timeout_ms: 5_000,
-        allowed_origins: Arc::new(freshell_ws::origin::default_allowed_origins()),
-        ws_max_payload_bytes: 16 * 1024 * 1024,
-        term09: freshell_ws::backpressure::Term09Config::default(),
-        create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
-        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
-        shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
-        config_fallback: None,
-        opencode_locator: None,
-        codex_locator: None,
-        activity: None,
-        session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
-        reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-        fresh_agent_respawn_counts: Default::default(),
-        ownership: None,
-    };
-
-    let router = freshell_ws::router(state);
-    // Ephemeral loopback port only -- NEVER the self-hosted 3001/3002 ports.
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral loopback port");
-    let addr = listener.local_addr().expect("local addr");
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
-
-    format!("ws://{addr}/ws")
-}
-
-type TestWs =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
-async fn connect_and_complete_handshake(url: &str) -> TestWs {
-    let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
-        .await
-        .expect("ws connect");
-    ws.send(WsMessage::Text(
-        serde_json::json!({
-            "type": "hello",
-            "token": AUTH_TOKEN,
-            "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_interrupt_frame_reaches_the_sidecar_for_a_known_session() {
+    let rig = ClaudeRig::start(RigKind::Sim).await;
+    let mut conn = rig.connect().await;
+    let id = conn.create("req-claude-ws-interrupt").await;
+    conn.send_text(&id, "req-claude-ws-send", "HANG").await;
+    let accepted = conn
+        .wait_for("the accepted turn", |frame| {
+            frame["type"] == "freshAgent.send.accepted"
+                && frame["requestId"] == "req-claude-ws-send"
         })
-        .to_string(),
-    ))
-    .await
-    .expect("send hello");
-
-    // Drain the handshake frames (ready + whatever else precedes it) until `ready`.
-    loop {
-        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
-            .await
-            .expect("handshake message within timeout")
-            .expect("stream not ended")
-            .expect("no ws error");
-        let WsMessage::Text(text) = msg else {
-            continue;
-        };
-        let value: Value = serde_json::from_str(&text).unwrap();
-        if value["type"] == "ready" {
-            break;
+        .await;
+    tokio::time::timeout(RIG_FRAME_BUDGET, async {
+        while !rig
+            .ledger_rows("prompt")
+            .iter()
+            .any(|row| row["sessionId"] == id && row["uuid"] == accepted["submittedTurnId"])
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    }
-    ws
+    })
+    .await
+    .expect("the accepted command reached the simulated CLI");
+    conn.send(
+        json!({"type":"freshAgent.interrupt", "provider":"claude", "sessionType":"freshclaude",
+        "sessionId":id, "requestId":"req-claude-ws-stop"}),
+    )
+    .await;
+    conn.wait_for_event("freshAgent.result").await;
+    let controls = rig.ledger_rows("interrupt");
+    assert_eq!(
+        controls.len(),
+        1,
+        "the production sidecar called SDK interrupt: {controls:?}"
+    );
+    assert_eq!(controls[0]["running"], true);
+    assert_eq!(
+        rig.fresh_claude.live_snapshot_overlay(&id).await["status"],
+        "idle"
+    );
+    assert_eq!(
+        conn.events_seen("freshAgent.turn.complete"),
+        0,
+        "the user's own Stop ends the turn silently"
+    );
+    rig.fresh_claude.shutdown().await;
 }
 
-async fn send_json(ws: &mut TestWs, value: &Value) {
-    ws.send(WsMessage::Text(value.to_string()))
-        .await
-        .expect("send frame");
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_interrupt_frame_errors_for_an_unknown_session() {
+    let rig = ClaudeRig::start(RigKind::Sim).await;
+    let mut conn = rig.connect().await;
+    conn.send(
+        json!({"type":"freshAgent.interrupt", "provider":"claude", "sessionType":"freshclaude",
+        "sessionId":"does-not-exist"}),
+    )
+    .await;
+    let failure = conn.wait_for_event("freshAgent.error").await;
+    assert_eq!(failure["event"]["code"], "INVALID_SESSION_ID", "{failure}");
+    assert_eq!(failure["sessionId"], "does-not-exist");
+    assert!(
+        rig.ledger_rows("query").is_empty(),
+        "an unknown Stop creates no runtime"
+    );
+    rig.fresh_claude.shutdown().await;
 }
 
-/// Drain frames until one matching `predicate` arrives (or the budget expires).
-async fn await_frame(
-    ws: &mut TestWs,
-    budget: Duration,
-    predicate: impl Fn(&Value) -> bool,
-) -> Value {
-    tokio::time::timeout(budget, async {
-        loop {
-            let msg = ws
-                .next()
-                .await
-                .expect("stream not ended")
-                .expect("no ws error");
-            let WsMessage::Text(text) = msg else {
-                continue;
-            };
-            let value: Value = serde_json::from_str(&text).unwrap();
-            if predicate(&value) {
-                return value;
+#[cfg(unix)]
+mod control_outcomes {
+    use super::*;
+    use common::claude_rig::{ClaudeRig, RigKind};
+    use serde_json::json;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_configure_and_interrupt_requests_report_correlated_session_errors() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let rig = ClaudeRig::start(RigKind::Sim).await;
+        let mut conn = rig.connect().await;
+        for session_type in ["freshclaude", "kilroy"] {
+            for control in ["configure", "interrupt"] {
+                let id = uuid::Uuid::new_v4().to_string();
+                let request_id = format!("unknown-{session_type}-{control}");
+                let mut request = json!({"type":format!("freshAgent.{control}"),
+                "provider":"claude", "sessionType":session_type, "sessionId":id, "requestId":request_id});
+                if control == "configure" {
+                    request["settings"] = json!({"model":"sonnet"});
+                }
+                conn.send(request).await;
+                let reply = conn
+                    .wait_for("the unknown control refusal", |frame| {
+                        frame["type"] == "error" || frame["event"]["type"] == "freshAgent.error"
+                    })
+                    .await;
+                assert_eq!(reply["event"]["code"], "INVALID_SESSION_ID", "{reply}");
+                assert_eq!(reply["event"]["requestId"], request_id, "{reply}");
+                assert_eq!(reply["sessionId"], id);
+                assert_eq!(reply["sessionType"], session_type);
+                conn.frames.clear();
             }
         }
-    })
-    .await
-    .expect("expected frame did not arrive within budget")
-}
-
-fn create_frame(request_id: &str) -> Value {
-    serde_json::json!({
-        "type": "freshAgent.create",
-        "requestId": request_id,
-        "sessionType": "freshclaude",
-        "provider": "claude",
-    })
-}
-
-/// **RED before the terminal.rs fix**: a claude-provider `freshAgent.kill` frame falls
-/// through the dispatch's `if is_codex_provider(...) else if ...Opencode` chain with no
-/// claude arm, so `FreshClaudeState::handle_kill` never runs. Two observable
-/// consequences prove the arm now fires (or don't, pre-fix):
-///  1. a `freshAgent.killed{success:true}` frame is broadcast at all (pre-fix: never
-///     arrives -> this test times out), and
-///  2. THE LOAD-BEARING ASSERTION: a duplicate `freshAgent.create` resent with the SAME
-///     `requestId` right after the kill mints a genuinely fresh session id, proving
-///     `handle_kill`'s `create_dedup.clear_for_session` ran (pre-fix: the create-dedup
-///     cache was never touched, so the duplicate replays the OLD session id verbatim --
-///     wrong even though no timeout occurs).
-#[tokio::test]
-async fn claude_kill_frame_reaches_handle_kill_and_evicts_the_create_dedup_cache() {
-    let _guard = CLAUDE_ENV_LOCK.lock().await;
-    let _sidecar = FakeClaudeSidecarEnv::install();
-
-    let url = spawn_server().await;
-    let mut ws = connect_and_complete_handshake(&url).await;
-
-    let request_id = "req-claude-ws-kill-dedup";
-    send_json(&mut ws, &create_frame(request_id)).await;
-    let created = await_frame(&mut ws, Duration::from_secs(10), |v| {
-        v["type"] == "freshAgent.created" && v["requestId"] == request_id
-    })
-    .await;
-    let first_session_id = created["sessionId"].as_str().unwrap().to_string();
-
-    send_json(
-        &mut ws,
-        &serde_json::json!({
-            "type": "freshAgent.kill",
-            "provider": "claude",
-            "sessionId": first_session_id,
-            "sessionType": "freshclaude",
-        }),
-    )
-    .await;
-    // Consequence 1: the `killed` broadcast must arrive at all -- pre-fix, this branch
-    // is never taken (silent no-op) and the test times out here.
-    let killed = await_frame(&mut ws, Duration::from_secs(10), |v| {
-        v["type"] == "freshAgent.killed" && v["sessionId"] == first_session_id
-    })
-    .await;
-    assert_eq!(killed["success"], true, "{killed}");
-
-    // Consequence 2 (load-bearing): resend the SAME requestId. If the kill genuinely
-    // evicted the create-dedup cache, this mints a FRESH session id, not a replay of
-    // `first_session_id`.
-    send_json(&mut ws, &create_frame(request_id)).await;
-    let recreated = await_frame(&mut ws, Duration::from_secs(10), |v| {
-        v["type"] == "freshAgent.created" && v["requestId"] == request_id
-    })
-    .await;
-    assert_ne!(
-        recreated["sessionId"], first_session_id,
-        "a duplicate create after an explicit claude kill must mint a fresh session, \
-         not replay the killed one -- the create_dedup cache was not evicted: {recreated}"
-    );
-}
-
-/// **RED before the terminal.rs fix**: a claude-provider `freshAgent.interrupt` frame
-/// falls through the same dispatch gap. This mirrors what legacy does
-/// (`adapters/claude/adapter.ts:163-168` -> `server/sdk-bridge.ts:785-793`'s
-/// `sp.query.interrupt().catch(warn)`, fire-and-forget with NO confirmation frame on
-/// success): the observable proxy for "the interrupt actually reached the session
-/// machinery" is the fake sidecar's interrupt log, since there is no `query.interrupt()`
-/// broadcast to assert on (matching legacy's silence on success).
-#[tokio::test]
-async fn claude_interrupt_frame_reaches_the_sidecar_for_a_known_session() {
-    let _guard = CLAUDE_ENV_LOCK.lock().await;
-    let sidecar = FakeClaudeSidecarEnv::install();
-
-    let url = spawn_server().await;
-    let mut ws = connect_and_complete_handshake(&url).await;
-
-    let request_id = "req-claude-ws-interrupt";
-    send_json(&mut ws, &create_frame(request_id)).await;
-    let created = await_frame(&mut ws, Duration::from_secs(10), |v| {
-        v["type"] == "freshAgent.created" && v["requestId"] == request_id
-    })
-    .await;
-    let session_id = created["sessionId"].as_str().unwrap().to_string();
-    // A turn in flight (the fake never answers it): C18 sends a Stop only then.
-    send_json(
-        &mut ws,
-        &serde_json::json!({
-            "type": "freshAgent.send",
-            "provider": "claude",
-            "sessionId": session_id,
-            "sessionType": "freshclaude",
-            "requestId": "req-claude-ws-send",
-            "text": "a turn to stop",
-        }),
-    )
-    .await;
-    await_frame(&mut ws, Duration::from_secs(10), |v| {
-        v["type"] == "freshAgent.send.accepted" && v["requestId"] == "req-claude-ws-send"
-    })
-    .await;
-
-    send_json(
-        &mut ws,
-        &serde_json::json!({
-            "type": "freshAgent.interrupt",
-            "provider": "claude",
-            "sessionId": session_id,
-            "sessionType": "freshclaude",
-        }),
-    )
-    .await;
-
-    // Poll the fake sidecar's interrupt log (best-effort bounded wait -- the dispatch is
-    // a detached `tokio::spawn` task, same pattern as create/send/kill). Pre-fix: the
-    // claude branch never runs, so the sidecar never receives the interrupt request and
-    // this loop exhausts its budget with an empty log.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if sidecar.interrupt_log_contents().contains(&session_id) {
-            break;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "the claude sidecar never received the interrupt request for {session_id} \
-                 within budget; log contents: {:?}",
-                sidecar.interrupt_log_contents()
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(rig.ledger_rows("query").is_empty());
+        rig.fresh_claude.shutdown().await;
     }
-}
 
-/// Legacy's `mapMissingResult` throw for an unavailable session
-/// (`adapter.ts:163-168`, surfaced by `ws-handler.ts:3513-3514`'s `catch` as an
-/// `INTERNAL_ERROR` frame) mirrored: an interrupt for a session id this process never
-/// created must produce an `error` frame, not silently vanish.
-#[tokio::test]
-async fn claude_interrupt_frame_errors_for_an_unknown_session() {
-    let _guard = CLAUDE_ENV_LOCK.lock().await;
-    let _sidecar = FakeClaudeSidecarEnv::install();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interrupting_a_dead_session_repeats_exited_without_restarting_it() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let rig = ClaudeRig::start(RigKind::Sim).await;
+        let mut conn = rig.connect().await;
+        let id = conn.create("dead-control-create").await;
+        rig.kill_first_sidecar(&mut conn).await;
+        conn.frames.clear();
+        conn.send(
+            json!({"type":"freshAgent.interrupt", "provider":"claude", "sessionType":"freshclaude",
+        "sessionId":id, "requestId":"dead-control-stop"}),
+        )
+        .await;
+        let reply = conn
+            .wait_for("the dead Stop outcome", |frame| {
+                frame["type"] == "error"
+                    || frame["event"]["type"] == "freshAgent.error"
+                    || frame["event"]["type"] == "freshAgent.status"
+            })
+            .await;
+        assert_eq!(reply["event"]["status"], "exited", "{reply}");
+        assert_eq!(reply["sessionId"], id);
+        assert_eq!(
+            rig.ledger_rows("query").len(),
+            1,
+            "Stop alone must not recover a process"
+        );
+        assert!(!rig.fresh_claude.has_live_session(&id).await);
+        rig.fresh_claude.shutdown().await;
+    }
 
-    let url = spawn_server().await;
-    let mut ws = connect_and_complete_handshake(&url).await;
-
-    send_json(
-        &mut ws,
-        &serde_json::json!({
-            "type": "freshAgent.interrupt",
-            "provider": "claude",
-            "sessionId": "does-not-exist",
-            "sessionType": "freshclaude",
-        }),
-    )
-    .await;
-
-    let frame = await_frame(&mut ws, Duration::from_secs(10), |v| v["type"] == "error").await;
-    assert!(
-        frame["message"]
-            .as_str()
-            .unwrap_or_default()
-            .to_lowercase()
-            .contains("session not found"),
-        "{frame}"
-    );
-}
-
-/// Sanity guard: writing to a closed log path never panics the harness (keeps clippy
-/// happy about the unused `Write` import staying meaningful if the log-append strategy
-/// changes; exercises the same append path production code takes).
-#[test]
-fn interrupt_log_append_is_plain_fs_no_special_handling_needed() {
-    let dir = std::env::temp_dir().join(format!(
-        "freshell-interrupt-log-sanity-{}",
-        uuid_like_suffix()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let log = dir.join("interrupt.log");
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log)
+    async fn refused_interrupt_reports_the_request_and_does_not_silence_completion(reissued: bool) {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let wrapper = tempfile::tempdir().unwrap();
+        let module = wrapper.path().join("refuse-interrupt.mjs");
+        let simulator =
+            common::claude_rig::repo_root().join("test/fixtures/claude-cli-sim/query.mjs");
+        std::fs::write(
+            &module,
+            format!(
+                r#"
+import {{ query as originalQuery }} from {};
+export function query(params) {{
+  const running = originalQuery(params);
+  const interrupt = running.interrupt.bind(running);
+  let calls = 0;
+  running.interrupt = async (...args) => {{
+    calls += 1;
+    if (calls === {}) throw new Error('injected interrupt refusal');
+    return interrupt(...args);
+  }};
+  return running;
+}}
+"#,
+                serde_json::to_string(&format!("file://{}", simulator.display())).unwrap(),
+                if reissued { 2 } else { 1 }
+            ),
+        )
         .unwrap();
-    writeln!(f, "sanity").unwrap();
-    assert!(std::fs::read_to_string(&log).unwrap().contains("sanity"));
-    let _ = std::fs::remove_dir_all(&dir);
+        let logs = common::log_capture::install();
+        let mut extra = vec![("FRESHELL_CLAUDE_SDK_QUERY_MODULE", module.to_str().unwrap())];
+        if reissued {
+            extra.push(("FRESHELL_CLAUDE_SIM_COLD_COMMAND", "queued"));
+        }
+        let rig = ClaudeRig::start_with_env(RigKind::Sim, &extra).await;
+        let mut conn = rig.connect().await;
+        let id = conn.create("refused-stop-create").await;
+        conn.send_text(&id, "the-running-turn", "TOOL:sleep=0.5")
+            .await;
+        if !reissued {
+            conn.wait_for("the running tool", |frame| {
+                frame["event"]["content"]
+                    .as_array()
+                    .is_some_and(|content| content.iter().any(|block| block["type"] == "tool_use"))
+            })
+            .await;
+        }
+        conn.send(
+            json!({"type":"freshAgent.interrupt", "provider":"claude", "sessionType":"freshclaude",
+        "sessionId":id, "requestId":"refused-stop-request"}),
+        )
+        .await;
+        logs.wait_for("the refused interrupt receipt", |event| {
+            event.message == "freshagent.claude.stop"
+                && event.field("session_id") == Some(&id)
+                && event.field("outcome") == Some("refused")
+        })
+        .await;
+        conn.read_for(Duration::from_millis(100)).await;
+        let failure = conn
+            .frames
+            .iter()
+            .find(|frame| frame["event"]["code"] == "CLAUDE_INTERRUPT_FAILED")
+            .expect("a refused Stop must report a nested session error");
+        assert_eq!(failure["event"]["requestId"], "refused-stop-request");
+        conn.wait_for_event("freshAgent.result").await;
+        conn.wait_for_event("freshAgent.turn.complete").await;
+        conn.read_for(Duration::from_millis(50)).await;
+        assert_eq!(
+            conn.events_seen("freshAgent.turn.complete"),
+            1,
+            "the failed Stop never suppresses completion"
+        );
+        assert_eq!(
+            rig.fresh_claude.live_snapshot_overlay(&id).await["status"],
+            "idle"
+        );
+        rig.fresh_claude.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_interrupt_is_visible_and_does_not_silence_the_turns_result() {
+        refused_interrupt_reports_the_request_and_does_not_silence_completion(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_reissued_interrupt_reports_the_original_request_and_does_not_silence_completion(
+    ) {
+        refused_interrupt_reports_the_request_and_does_not_silence_completion(true).await;
+    }
 }

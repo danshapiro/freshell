@@ -2,6 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState, type TouchEve
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { setStatus, setError, setErrorCode, setServerInstanceId, setBootId, setServerRestarted, setLiveTerminalIds, setPlatform, setAvailableClis, setFeatureFlags } from '@/store/connectionSlice'
 import { resetCompletionDedupeBaselines } from '@/store/turnCompletionSlice'
+import { foldReadyFreshAgentAttention } from '@/store/turnCompletionThunks'
 import { setLocalSettings, setServerConfigDir, setServerSettings, localSettingsPlatformDefaults } from '@/store/settingsSlice'
 import {
   markWsSnapshotReceived,
@@ -1367,6 +1368,7 @@ export default function App() {
             // per connection lifetime; a restarted server's newer generations
             // must never be ignored in favor of stale pre-reconnect records.
             foldReadyRuntimeOwners(dispatch, ready.data.runtimeOwners)
+            dispatch(foldReadyFreshAgentAttention(ready.data.freshAgentAttention))
             // pane.reconcile adoption: capability re-captured per connection,
             // and the request re-sent on EVERY ready — a result is not
             // guaranteed (deferral, drop, error frame), so reconnect covers

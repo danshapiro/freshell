@@ -39,6 +39,7 @@
 /// The per-session attention clock and edge builders shared by the fresh-agent
 /// lanes (design 2026-10-22 §3.2, §5.5).
 pub(crate) mod attention;
+pub mod attention_ledger;
 pub mod claude;
 pub mod claude_create_defaults;
 pub(crate) mod claude_dead_sessions;
@@ -92,7 +93,7 @@ pub mod terminal_tabs;
 #[cfg(test)]
 mod test_environment;
 
-pub use claude::{ClaudeCreateOutcome, ClaudeSendOutcome, FreshClaudeState};
+pub use claude::{ClaudeCleanupError, ClaudeCreateOutcome, ClaudeSendOutcome, FreshClaudeState};
 pub use claude_edges::{AttentionObserver, ClaudeTurnEvent};
 pub use claude_turns::TurnOutcome;
 // Kata 09v1 + SYNC-06 + G28: the claude_snapshot items visible outside this
@@ -112,7 +113,7 @@ pub use identity_sink::{
     BindProvenance, ClaimCommit, ClaudeGenesis, CloseAnswer, FreshAgentBindingUpsert,
     FreshAgentSettings, GenesisUpdate, PaneIdentitySink, ProvenanceUpdate, RecordedGenesis,
     SharedPaneIdentitySink, SinkAliasClearWrite, SinkCloseError, SinkCloseWrite, SinkCommitWrite,
-    SinkWrite,
+    SinkMarkTurnInterruptedWrite, SinkTakeTurnInterruptedWrite, SinkWrite,
 };
 pub use opencode_ws::FreshOpencodeState;
 pub use rollback_record::{
@@ -5077,10 +5078,12 @@ async fn create_lane_agent_tab(
     mut request: rest_lane::RestLaneCreate,
     name: Option<String>,
 ) -> Response {
-    let (tab_id, pane_id) = state.layout.create_tab(name.as_deref());
+    let (tab_id, pane_id) = state
+        .layout
+        .create_pending_tab(name.as_deref(), &request.request_id);
     request.tab_id = Some(tab_id.clone());
     request.pane_id = Some(pane_id.clone());
-    let created = match gateway.create_agent(request.clone()).await {
+    let created = match Arc::clone(&gateway).create_agent(request.clone()).await {
         Ok(created) => created,
         Err(error) => {
             state.layout.close_tab(&tab_id);
@@ -5088,37 +5091,38 @@ async fn create_lane_agent_tab(
         }
     };
     let pane_content = rest_lane_create::pane_content(&request, &created);
-    let rest_lane::RestLaneCreate {
-        provider,
-        session_type,
-        cwd,
-        model,
-        effort,
-        ..
-    } = request;
-    register_fresh_agent_tab(
-        state,
-        &tab_id,
-        &pane_id,
-        name.as_deref(),
-        &pane_content,
-        PaneEntry {
-            placeholder_id: created.session_id.clone(),
-            provider,
-            session_type,
-            cwd,
-            model,
-            effort,
-            durable_id: Some(
-                created
-                    .session_ref
-                    .as_ref()
-                    .map(|reference| reference.session_id.clone())
-                    .unwrap_or_else(|| created.session_id.clone()),
-            ),
-        },
-    );
-    broadcast_tab_create(state, &tab_id, &pane_id, name.as_deref(), &pane_content);
+    let published =
+        state
+            .layout
+            .finish_pending_pane(&tab_id, &pane_id, pane_content.clone(), || {
+                register_fresh_agent_tab_cache(
+                    state,
+                    &tab_id,
+                    &pane_id,
+                    name.as_deref(),
+                    PaneEntry {
+                        placeholder_id: created.session_id.clone(),
+                        provider: request.provider.clone(),
+                        session_type: request.session_type.clone(),
+                        cwd: request.cwd.clone(),
+                        model: request.model.clone(),
+                        effort: request.effort.clone(),
+                        durable_id: Some(
+                            created
+                                .session_ref
+                                .as_ref()
+                                .map(|reference| reference.session_id.clone())
+                                .unwrap_or_else(|| created.session_id.clone()),
+                        ),
+                    },
+                );
+                broadcast_tab_create(state, &tab_id, &pane_id, name.as_deref(), &pane_content);
+            });
+    if !published {
+        return state
+            .abandon_rest_create(&gateway, &request, &created)
+            .await;
+    }
     let mut data = json!({"tabId":tab_id,"paneId":pane_id,"sessionId":created.session_id});
     if let Some(reference) = created.session_ref {
         data["sessionRef"] = json!(reference);
@@ -5142,6 +5146,16 @@ fn register_fresh_agent_tab(
     state
         .layout
         .attach_pane_content(tab_id, pane_id, pane_content.clone());
+    register_fresh_agent_tab_cache(state, tab_id, pane_id, name, pane_entry);
+}
+
+fn register_fresh_agent_tab_cache(
+    state: &FreshAgentState,
+    tab_id: &str,
+    pane_id: &str,
+    name: Option<&str>,
+    pane_entry: PaneEntry,
+) {
     state.tabs.lock().expect("tabs mutex").insert(
         tab_id.to_string(),
         TabRecord {
@@ -5188,10 +5202,10 @@ fn pane_entry_for_request(state: &FreshAgentState, pane_id: &str) -> Option<Pane
         && current.session_type == SESSION_TYPE
         && cached.provider == PROVIDER
         && cached.session_type == SESSION_TYPE
-        && current.placeholder_id == cached.placeholder_id
-        && (current.durable_id.as_ref() == Some(&current.placeholder_id)
-            || current.durable_id == cached.durable_id))
-        .then_some(cached)
+        && (current.durable_id == cached.durable_id
+            || (current.placeholder_id == cached.placeholder_id
+                && current.durable_id.as_ref() == Some(&current.placeholder_id))))
+    .then_some(cached)
 }
 
 fn pane_entry_from_content(content: &Value) -> Option<PaneEntry> {

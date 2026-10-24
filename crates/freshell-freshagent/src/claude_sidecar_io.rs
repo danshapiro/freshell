@@ -305,9 +305,9 @@ struct LabelsInner {
     /// `None` for a sidecar process that serves no session (the model catalog probe).
     session_type: Option<String>,
     pid: Option<u32>,
-    /// The session's envelope id handle (the id clients address it by; an
-    /// attach by durable id may change it), once the sidecar has named it.
-    session: OnceLock<Arc<StdMutex<String>>>,
+    /// Read the current native conversation id without depending on the
+    /// runtime's identity representation. Observers never change this reader.
+    session: OnceLock<Arc<dyn Fn() -> String + Send + Sync>>,
 }
 
 impl SidecarLogLabels {
@@ -344,11 +344,11 @@ impl SidecarLogLabels {
         self.inner.pid
     }
 
-    /// Bind the session this sidecar serves, by its shared envelope id
-    /// handle: every later event carries the handle's current value. Logged
+    /// Bind the session this sidecar serves: every later event reads its
+    /// current native id, including after conversation reset. Logged
     /// once, as the join between the sidecar's ownership id and its session.
-    pub(crate) fn bind_session(&self, envelope: &Arc<StdMutex<String>>) {
-        if self.inner.session.set(Arc::clone(envelope)).is_ok() {
+    pub(crate) fn bind_session(&self, current_id: impl Fn() -> String + Send + Sync + 'static) {
+        if self.inner.session.set(Arc::new(current_id)).is_ok() {
             let session_id = self.session_id();
             tracing::info!(
                 provider = PROVIDER,
@@ -361,14 +361,9 @@ impl SidecarLogLabels {
         }
     }
 
-    /// The bound session's current envelope id.
+    /// The bound session's current native id.
     fn session_id(&self) -> Option<String> {
-        self.inner.session.get().map(|envelope| {
-            envelope
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone()
-        })
+        self.inner.session.get().map(|current_id| current_id())
     }
 }
 
@@ -907,12 +902,13 @@ mod tests {
             "unbound until the sidecar names its session"
         );
         let envelope = Arc::new(StdMutex::new("placeholder-id".to_string()));
-        labels.bind_session(&envelope);
+        let current_id = Arc::clone(&envelope);
+        labels.bind_session(move || current_id.lock().unwrap().clone());
         assert_eq!(labels.session_id().as_deref(), Some("placeholder-id"));
         *envelope.lock().unwrap() = "durable-id".to_string();
         assert_eq!(labels.session_id().as_deref(), Some("durable-id"));
         // A second bind changes nothing: one sidecar serves one session.
-        labels.bind_session(&Arc::new(StdMutex::new("other".to_string())));
+        labels.bind_session(|| "other".to_string());
         assert_eq!(labels.session_id().as_deref(), Some("durable-id"));
     }
 
@@ -921,8 +917,9 @@ mod tests {
         let (events, _guard) = capture();
         let labels = labels();
         let envelope = Arc::new(StdMutex::new("session-a".to_string()));
-        labels.bind_session(&envelope);
-        labels.bind_session(&envelope);
+        let current_id = Arc::clone(&envelope);
+        labels.bind_session(move || current_id.lock().unwrap().clone());
+        labels.bind_session(|| "ignored-second-binding".into());
         let bound = with_message(&events, "freshagent.claude.sidecar_bound");
         assert_eq!(bound.len(), 1, "{bound:?}");
         assert_eq!(bound[0].level, Level::INFO);
@@ -1038,7 +1035,7 @@ mod tests {
             .await
             .unwrap();
         wait_until(|| !sidecar_logs(&events).is_empty()).await;
-        labels.bind_session(&Arc::new(StdMutex::new("session-b".to_string())));
+        labels.bind_session(|| "session-b".to_string());
         writer
             .write_all(b"{\"severity\":\"warn\",\"event\":\"configure.failed\"}\n")
             .await

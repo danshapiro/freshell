@@ -13605,6 +13605,7 @@ pub(crate) mod tests {
             let st = st.clone();
             tokio::spawn(async move {
                 st.handle_interrupt(FreshAgentInterrupt {
+                    request_id: None,
                     provider: freshell_protocol::AgentProvider::Codex,
                     session_id: "thread-1".to_string(),
                     session_type: freshell_protocol::SessionType::Freshcodex,
@@ -13656,6 +13657,7 @@ pub(crate) mod tests {
         .await;
 
         st.handle_interrupt(FreshAgentInterrupt {
+            request_id: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: "thread-1".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -13679,6 +13681,7 @@ pub(crate) mod tests {
         let (st, mut rx) = state_with_bus();
 
         st.handle_interrupt(FreshAgentInterrupt {
+            request_id: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: "does-not-exist".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -16231,6 +16234,7 @@ pub(crate) mod tests {
             let st = st.clone();
             tokio::spawn(async move {
                 st.handle_interrupt(FreshAgentInterrupt {
+                    request_id: None,
                     provider: freshell_protocol::AgentProvider::Codex,
                     session_id: "thread-cxi".to_string(),
                     session_type: freshell_protocol::SessionType::Freshcodex,

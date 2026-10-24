@@ -159,3 +159,59 @@ async fn pinned_cli_clear_then_send_keeps_the_new_conversation_working() {
 async fn an_unannounced_init_identity_change_keeps_following_the_healthy_runtime() {
     conversation_reset(RigKind::Sim, true).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resumed_runtime_also_follows_an_unannounced_conversation_reset() {
+    let rig = ClaudeRig::start_with_options(
+        RigKind::Sim,
+        RigOptions {
+            durable_ledger: true,
+            env: vec![(
+                "FRESHELL_CLAUDE_SIM_DROP_CONVERSATION_RESET".into(),
+                "1".into(),
+            )],
+            ..RigOptions::default()
+        },
+    )
+    .await;
+    let mut conn = rig.connect().await;
+    let old = conn.create("create-before-resumed-reset").await;
+    rig.converse(&mut conn, &old, &["before resumed reset"])
+        .await;
+    conn.kill(&old).await;
+    conn.attach(&old).await;
+    let start = conn.frames.len();
+    conn.send_text(&old, "resumed-clear", "/clear").await;
+    let init = conn
+        .wait_for("resumed runtime reset init", |frame| {
+            frame["event"]["type"] == "freshAgent.session.init"
+                && frame["event"]["cliSessionId"]
+                    .as_str()
+                    .is_some_and(|id| id != old)
+        })
+        .await;
+    let new = init["event"]["cliSessionId"].as_str().unwrap().to_string();
+    assert_eq!(
+        init["sessionId"], new,
+        "a resumed consumer follows the native UUID"
+    );
+    assert!(
+        conn.frames[start..].iter().any(|frame| {
+            frame["type"] == "freshAgent.session.materialized"
+                && frame["previousSessionId"] == old
+                && frame["sessionId"] == new
+        }),
+        "the identity correction precedes the new init"
+    );
+    conn.wait_for("clear retires on the resumed identity", |frame| {
+        frame["sessionId"] == new
+            && frame["event"]["type"] == "freshAgent.status"
+            && frame["event"]["status"] == "idle"
+    })
+    .await;
+    rig.converse(&mut conn, &new, &["after resumed reset"])
+        .await;
+    conn.kill(&old).await;
+    assert!(!rig.fresh_claude.has_live_session(&new).await);
+    rig.fresh_claude.shutdown().await;
+}

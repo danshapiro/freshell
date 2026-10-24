@@ -145,6 +145,9 @@ pub struct RestLaneCreated {
     /// table. It is not substituted for the provider's native identity.
     pub session_id: String,
     pub session_ref: Option<freshell_protocol::SessionLocator>,
+    /// Provider-owned identity of a runtime newly started by this create.
+    /// An adopted existing writer has no cleanup token.
+    pub cleanup_token: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -217,6 +220,21 @@ pub trait FreshAgentRestLane: Send + Sync {
         self: std::sync::Arc<Self>,
         request: RestLaneCreate,
     ) -> Result<RestLaneCreated, RestLaneError>;
+
+    async fn abandon_create(
+        &self,
+        _request: &RestLaneCreate,
+        created: &RestLaneCreated,
+    ) -> Result<(), RestLaneError> {
+        if created.cleanup_token.is_none() {
+            return Ok(());
+        }
+        Err(RestLaneError::new(
+            RestLaneErrorKind::Unavailable,
+            "CREATE_CLEANUP_UNAVAILABLE",
+            "the provider could not clean up the abandoned create",
+        ))
+    }
 
     async fn send_agent(&self, request: RestLaneSend) -> Result<RestLaneSendResult, RestLaneError>;
 

@@ -157,6 +157,34 @@ async fn hello_ready(ws: &mut WsClient, capabilities: serde_json::Value) -> serd
     serde_json::from_str(&text).expect("ready is JSON")
 }
 
+#[tokio::test]
+async fn attention_replay_is_echoed_only_when_the_client_opts_in() {
+    let url = spawn_server().await;
+    for (capabilities, opted_in) in [
+        (
+            serde_json::json!({ "freshAgentAttentionReplayV1": true }),
+            true,
+        ),
+        (serde_json::json!({}), false),
+        (
+            serde_json::json!({ "freshAgentAttentionReplayV1": false }),
+            false,
+        ),
+    ] {
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let ready = hello_ready(&mut ws, capabilities).await;
+        assert_eq!(
+            ready["capabilities"]["freshAgentAttentionReplayV1"].as_bool(),
+            opted_in.then_some(true),
+            "{ready}"
+        );
+        assert!(
+            ready.get("freshAgentAttention").is_none(),
+            "empty marks are omitted: {ready}"
+        );
+    }
+}
+
 /// A hello WITH `pacedTerminalReplayV1: true` gets the echo advertised back in
 /// `ready.capabilities` — the full negotiation rail (raw-JSON extraction →
 /// handshake builder gate) at the real socket.
