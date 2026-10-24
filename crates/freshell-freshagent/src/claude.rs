@@ -8004,6 +8004,7 @@ pub(crate) mod tests {
     mod create_binding_tests;
     mod create_cleanup_tests;
     mod deadman_tests;
+    mod real_fixture_tests;
     mod recovery_stop_tests;
     mod recovery_tests;
     mod refusal_tests;
@@ -9265,291 +9266,8 @@ pub(crate) mod tests {
     // per-file locks would NOT serialize against each other.
     pub(crate) static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    /// A minimal scripted fake claude sidecar (no real `@anthropic-ai/claude-agent-sdk`,
-    /// no network, no cost): on `{"type":"create",...}` it appends a marker line to
-    /// `FRESHELL_TEST_CLAUDE_SPAWN_LOG` (so tests can count spawns without a global
-    /// tracing subscriber) and replies with a fresh `{"type":"created","sessionId":...}`;
-    /// on `{"type":"interrupt",sessionId}` it appends `sessionId` to
-    /// `FRESHELL_TEST_CLAUDE_INTERRUPT_LOG` (the observable proxy for "the sidecar's
-    /// `query.interrupt()` was actually invoked", mirroring the real sidecar's
-    /// `handleInterrupt`); on `{"type":"shutdown"}` it exits. Task 2 arms: a magic send
-    /// of `__raise_permission__` emits a canned `sdk.permission.request` (the canUseTool
-    /// stand-in — the fake parks nothing), a magic send of `__set_status__:<status>`
-    /// emits a real `sdk.status` frame (the attach-ack status-arrangement hook),
-    /// `__emit_assistant__` emits a real `sdk.assistant` frame (a turn's RUNNING edge)
-    /// and `__emit_result__` a real `sdk.result` frame (a completed turn's SETTLE edge
-    /// — the real sidecar emits it on every SDK result whatever the subtype), and
-    /// `permission.respond`/`question.respond`/non-magic `send` frames append the full
-    /// received line to `FRESHELL_TEST_CLAUDE_RESPOND_LOG` (the assertion surface for
-    /// the respond/compact handlers' exact stdin frame shapes).
-    const FAKE_CLAUDE_SIDECAR_SOURCE: &str = r#"
-import fs from 'node:fs'
-import readline from 'node:readline'
-
-const spawnLog = process.env.FRESHELL_TEST_CLAUDE_SPAWN_LOG
-const respondLog = process.env.FRESHELL_TEST_CLAUDE_RESPOND_LOG
-// Task 4 review (C1) determinism knob: DEFER every create ANSWER by N ms. The
-// create request is still logged IMMEDIATELY (the spawn-log gate observes the
-// rollback parked inside its respawn), so a test can fire a send while the
-// rollback deterministically waits on `created` — the mid-rollback send
-// interleaving is guaranteed, never luck.
-const deferCreateMs = parseInt(process.env.FRESHELL_TEST_CLAUDE_DEFER_CREATE_MS || '0', 10)
-// Task 4 review (M3) provable-rejection knob: die on create like a spawn-time
-// provider rejection (EOF before `created`).
-const failCreate = process.env.FRESHELL_TEST_CLAUDE_FAIL_CREATE === '1'
-
-let counter = 0
-// The sessions this sidecar hosts; a send to another is answered with the
-// real sidecar's signed session-not-found error.
-const liveSessions = new Set()
-const configuredSettings = new Map()
-// Sessions booted under a server-minted id whose init waits for the first send.
-const deferredInit = new Map()
-const rl = readline.createInterface({ input: process.stdin, terminal: false })
-rl.on('line', (line) => {
-  const trimmed = line.trim()
-  if (!trimmed) return
-  let msg
-  try {
-    msg = JSON.parse(trimmed)
-  } catch {
-    return
-  }
-  if (msg.type === 'create') {
-    // Log the WHOLE create request (one line per create) so tests can both count
-    // spawns AND assert what the sidecar received (e.g. the resume boot).
-    if (spawnLog) {
-      fs.appendFileSync(spawnLog, `${JSON.stringify(msg)}\n`)
-    }
-    const answer = () => {
-      if (failCreate) process.exit(1)
-      counter += 1
-      const sessionId = msg.sessionId ?? `fake-claude-session-${process.pid}-${counter}`
-      liveSessions.add(sessionId)
-      configuredSettings.set(sessionId, { model: msg.model, effort: msg.effort, permissionMode: msg.permissionMode, cwd: msg.cwd })
-      process.stdout.write(JSON.stringify({ type: 'created', sessionId, protocol: 2 }) + '\n')
-      if (msg.sessionId) {
-        // A boot under a server-minted id (a rollback's replacement, a boot
-        // from a genesis): the CLI runs under that id and, like the real CLI
-        // (T1), reports it only once a prompt runs — at the first send.
-        deferredInit.set(sessionId, msg.sessionId)
-        return
-      }
-      // Mirror the real sidecar's post-create init: echo the resume boot's id as the
-      // durable id when present (resume continuity), else a fixed fake uuid.
-      const cliSessionId = msg.boot?.kind === 'fork'
-        ? `fork-${process.pid}-${counter}-0000-4000-8000-000000000000`
-        : (msg.boot?.resume || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
-      console.log(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }))
-      console.log(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }))
-    }
-    if (deferCreateMs > 0) setTimeout(answer, deferCreateMs)
-    else answer()
-  } else if (msg.type === 'configure') {
-    if (respondLog) fs.appendFileSync(respondLog, `${JSON.stringify(msg)}\n`)
-    console.log(JSON.stringify({ type: 'sdk.session.changed', sessionId: msg.sessionId, reason: 'session-commands', commands: [{ name: 'review', description: 'Review changes' }] }))
-    const settings = configuredSettings.get(msg.sessionId) ?? {}
-    const ok = msg.settings?.model !== 'unavailable' && msg.settings?.effort !== 'invalid'
-    if (msg.settings?.model !== 'unavailable') settings.model = msg.settings.model
-    if (ok) Object.assign(settings, msg.settings)
-    console.log(JSON.stringify({ type: 'sdk.configured', sessionId: msg.sessionId, requestId: msg.requestId, ok, settings, message: 'Model or effort is unavailable' }))
-  } else if (msg.type === 'send') {
-    // Test hook: lets tests kill the sidecar THROUGH the public API to exercise
-    // the consumer-exit eviction path (ledger A9).
-    if (msg.text === '__exit__') process.exit(0)
-    const deferredCliId = deferredInit.get(msg.sessionId)
-    if (deferredCliId) {
-      deferredInit.delete(msg.sessionId)
-      console.log(JSON.stringify({ type: 'sdk.session.init', sessionId: msg.sessionId, cliSessionId: deferredCliId, model: 'fake-model', cwd: '/tmp', tools: [] }))
-    }
-    // Magic texts: each emits ONE canned sdk.* line through the real stdout
-    // consumer (the fake reports no command lifecycle, so the turn ledger
-    // settles a result by its old-CLI head fallback).
-    if (msg.text === '__emit_result_error__') {
-      console.log(JSON.stringify({ type: 'sdk.result', sessionId: msg.sessionId, result: 'error_during_execution' }))
-    } else if (!liveSessions.has(msg.sessionId)) {
-      // A send to a session this sidecar does not host is refused before any
-      // CLI sees it, as the real sidecar refuses it (sdk.send.rejected): the
-      // server takes the send back.
-      console.log(JSON.stringify({ type: 'sdk.send.rejected', sessionId: msg.sessionId, uuid: msg.uuid ?? null, code: 'SESSION_NOT_FOUND', message: 'Claude session is no longer available.' }))
-    } else if (msg.text === '__emit_assistant__') {
-      console.log(JSON.stringify({ type: 'sdk.assistant', sessionId: msg.sessionId, content: [{ type: 'text', text: 'noise' }] }))
-    // Task 2 test hook: raise a canned pending permission the approve/deny flow can
-    // respond to. The fake parks nothing — Rust's pending fold is the state under test.
-    } else if (msg.text === '__raise_permission__') {
-      process.stdout.write(JSON.stringify({
-        type: 'sdk.permission.request',
-        sessionId: msg.sessionId,
-        requestId: 'req-1',
-        subtype: 'can_use_tool',
-        tool: { name: 'Bash', input: { command: 'ls' } },
-        toolUseID: 'toolu_fake_1',
-        blockedPath: null,
-        decisionReason: null,
-      }) + '\n')
-    } else if (msg.text.startsWith('__set_status__:')) {
-      // Reconnect-revive hook: emit a real sdk.status frame so a test can arrange a
-      // non-default tracked status through the REAL stdout consumer fold (the attach
-      // ack under test speaks it back).
-      process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId: msg.sessionId, status: msg.text.slice('__set_status__:'.length) }) + '\n')
-    } else if (msg.text === '__emit_assistant__') {
-      // Reconnect-revive hook: emit a real sdk.assistant frame (the real wire shape —
-      // index.mjs:165) so a test can drive the turn ledger's turn evidence ("running").
-      process.stdout.write(JSON.stringify({ type: 'sdk.assistant', sessionId: msg.sessionId, content: [{ type: 'text', text: 'part' }], model: 'fake-model' }) + '\n')
-    } else if (msg.text === '__emit_result__') {
-      // Reconnect-revive hook: emit a real sdk.result frame (the real wire shape —
-      // index.mjs:177) so a test can drive the turn ledger's result settle.
-      process.stdout.write(JSON.stringify({ type: 'sdk.result', sessionId: msg.sessionId, result: 'success', durationMs: 1, costUsd: 0, usage: {} }) + '\n')
-    } else if (respondLog) {
-      // Non-magic sends (e.g. `/compact …`) land in the respond log verbatim so
-      // tests can assert the exact stdin frame shape the compact handler writes.
-      fs.appendFileSync(respondLog, `${JSON.stringify(msg)}\n`)
-    }
-  } else if (msg.type === 'permission.respond' || msg.type === 'question.respond') {
-    if (respondLog) fs.appendFileSync(respondLog, `${JSON.stringify(msg)}\n`)
-  } else if (msg.type === 'interrupt') {
-    const interruptLog = process.env.FRESHELL_TEST_CLAUDE_INTERRUPT_LOG
-    if (interruptLog) fs.appendFileSync(interruptLog, `${msg.sessionId}\n`)
-    // The control receipt (echoing the Stop's id) is written BEFORE the
-    // interrupted turn's own result (sdk.d.ts:3760): the settle frame first,
-    // then the stopped turn's result in the pinned CLI's aborted shape (T11; no
-    // trailing idle: the real sidecar sends none).
-    console.log(JSON.stringify({ type: 'sdk.interrupt_settled', sessionId: msg.sessionId, stopId: msg.stopId, ok: true }))
-    console.log(JSON.stringify({ type: 'sdk.result', sessionId: msg.sessionId, result: 'error_during_execution', subtype: 'error_during_execution', isError: true, terminalReason: 'aborted_streaming', numTurns: 1 }))
-  } else if (msg.type === 'shutdown') {
-    process.exit(0)
-  }
-})
-"#;
-
-    /// A fresh temp dir holding the fake sidecar script + this test's spawn-count log,
-    /// with `FRESHELL_CLAUDE_SIDECAR`/`FRESHELL_CLAUDE_NODE`/
-    /// `FRESHELL_TEST_CLAUDE_SPAWN_LOG` pointed at it. Caller must hold
-    /// [`CLAUDE_ENV_LOCK`] for the lifetime of the returned guard.
-    struct FakeClaudeSidecarEnv {
-        dir: PathBuf,
-        spawn_log: PathBuf,
-        interrupt_log: PathBuf,
-        respond_log: PathBuf,
-    }
-    impl FakeClaudeSidecarEnv {
-        fn install() -> Self {
-            Self::install_with_knobs(None, false)
-        }
-
-        /// `install` + the fake sidecar's scripted knobs (see the source header):
-        /// `defer_create_ms` delays every create ANSWER (the request is logged
-        /// immediately — a test can park the rollback inside its respawn);
-        /// `fail_create` makes every create a spawn-time provider rejection.
-        fn install_with_knobs(defer_create_ms: Option<u64>, fail_create: bool) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "freshell-fake-claude-sidecar-{}",
-                uuid::Uuid::new_v4()
-            ));
-            std::fs::create_dir_all(&dir).expect("create fake sidecar temp dir");
-            let script = dir.join("fake-claude-sidecar.mjs");
-            std::fs::write(&script, FAKE_CLAUDE_SIDECAR_SOURCE).expect("write fake sidecar");
-            let spawn_log = dir.join("spawn.log");
-            std::fs::write(&spawn_log, "").expect("init spawn log");
-            let interrupt_log = dir.join("interrupt.log");
-            std::fs::write(&interrupt_log, "").expect("init interrupt log");
-            let respond_log = dir.join("respond.log");
-            std::fs::write(&respond_log, "").expect("init respond log");
-            std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
-            std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
-            std::env::set_var("FRESHELL_TEST_CLAUDE_SPAWN_LOG", &spawn_log);
-            std::env::set_var("FRESHELL_TEST_CLAUDE_INTERRUPT_LOG", &interrupt_log);
-            std::env::set_var("FRESHELL_TEST_CLAUDE_RESPOND_LOG", &respond_log);
-            match defer_create_ms {
-                Some(ms) => {
-                    std::env::set_var("FRESHELL_TEST_CLAUDE_DEFER_CREATE_MS", ms.to_string())
-                }
-                None => std::env::remove_var("FRESHELL_TEST_CLAUDE_DEFER_CREATE_MS"),
-            }
-            if fail_create {
-                std::env::set_var("FRESHELL_TEST_CLAUDE_FAIL_CREATE", "1");
-            } else {
-                std::env::remove_var("FRESHELL_TEST_CLAUDE_FAIL_CREATE");
-            }
-            Self {
-                dir,
-                spawn_log,
-                interrupt_log,
-                respond_log,
-            }
-        }
-
-        /// Path of the spawn log (one full JSON create-request line per spawn) so tests
-        /// can assert what the sidecar received (e.g. the resume boot).
-        fn spawn_log_path(&self) -> &std::path::Path {
-            &self.spawn_log
-        }
-
-        async fn create_request(&self) -> Value {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-            loop {
-                let text = std::fs::read_to_string(self.spawn_log_path()).unwrap_or_default();
-                if let Some(line) = text.lines().next() {
-                    return serde_json::from_str(line).expect("logged create JSON");
-                }
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "create never reached sidecar"
-                );
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        }
-
-        /// Number of times the fake sidecar has been spawned so far (one marker line per
-        /// process start).
-        fn spawn_count(&self) -> usize {
-            std::fs::read_to_string(&self.spawn_log)
-                .map(|s| s.lines().filter(|l| !l.is_empty()).count())
-                .unwrap_or(0)
-        }
-
-        /// Contents of the interrupt log (one `sessionId` per line the fake sidecar
-        /// received a `{"type":"interrupt",...}` request for).
-        fn interrupt_log_contents(&self) -> String {
-            std::fs::read_to_string(&self.interrupt_log).unwrap_or_default()
-        }
-
-        /// The parsed respond-log lines (one full JSON frame per line the fake sidecar
-        /// received a `permission.respond` / `question.respond` / non-magic `send`
-        /// request for). Bounded-waits for at least `min` lines so the assertion reads
-        /// AFTER the sidecar's append, never racing it.
-        async fn respond_log_frames(&self, min: usize) -> Vec<Value> {
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-            loop {
-                let frames: Vec<Value> = std::fs::read_to_string(&self.respond_log)
-                    .unwrap_or_default()
-                    .lines()
-                    .filter(|l| !l.trim().is_empty())
-                    .map(|l| serde_json::from_str(l).expect("respond log line is JSON"))
-                    .collect();
-                if frames.len() >= min {
-                    return frames;
-                }
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "respond log never reached {min} frame(s)"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-        }
-    }
-    impl Drop for FakeClaudeSidecarEnv {
-        fn drop(&mut self) {
-            std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
-            std::env::remove_var("FRESHELL_CLAUDE_NODE");
-            std::env::remove_var("FRESHELL_TEST_CLAUDE_SPAWN_LOG");
-            std::env::remove_var("FRESHELL_TEST_CLAUDE_INTERRUPT_LOG");
-            std::env::remove_var("FRESHELL_TEST_CLAUDE_RESPOND_LOG");
-            std::env::remove_var("FRESHELL_TEST_CLAUDE_DEFER_CREATE_MS");
-            std::env::remove_var("FRESHELL_TEST_CLAUDE_FAIL_CREATE");
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
-    }
+    mod test_sidecar_env;
+    use test_sidecar_env::ClaudeTestRuntime as FakeClaudeSidecarEnv;
 
     fn send_msg(session_id: &str, text: &str) -> FreshAgentSend {
         FreshAgentSend {
@@ -10127,10 +9845,19 @@ rl.on('line', (line) => {
             snapshot["settings"],
             json!({ "model": "sonnet", "effort": "max", "permissionMode": "plan" })
         );
-        assert_eq!(
-            snapshot["commands"],
-            json!([{ "name": "review", "description": "Review changes" }])
-        );
+        let catalog: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test/fixtures/claude-cli-sim/catalog.json"
+        )))
+        .unwrap();
+        let commands: Vec<Value> = catalog["initializationResult"]["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|command| !matches!(command["name"].as_str(), Some("doctor" | "color")))
+            .cloned()
+            .collect();
+        assert_eq!(snapshot["commands"], json!(commands));
         assert_eq!(
             snapshot["status"], "running",
             "accepted input is busy before the first provider output"
@@ -10150,6 +9877,7 @@ rl.on('line', (line) => {
     async fn failed_effort_records_the_model_that_already_took_effect() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
+        std::env::set_var("FRESHELL_TEST_CLAUDE_REJECT_EFFORT", "invalid");
         let (state, mut rx) = state_with_bus();
         let fake = Arc::new(crate::identity_sink::FakeIdentitySink::default());
         state.set_identity_sink(fake.clone());
@@ -10198,6 +9926,7 @@ rl.on('line', (line) => {
     async fn send_rejects_failed_settings_without_losing_text_or_changing_saved_settings() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
+        std::env::set_var("FRESHELL_TEST_CLAUDE_REJECT_MODEL", "unavailable");
         let (state, mut rx) = state_with_bus();
         let fake = Arc::new(crate::identity_sink::FakeIdentitySink::default());
         state.set_identity_sink(fake.clone());
@@ -19978,11 +19707,11 @@ rl.on('line', (line) => {
         out
     }
 
-    /// A configure applies the settings to the LIVE sidecar session (the fake
-    /// mirrors the real configure lane: setModel + the sdk.configured receipt)
+    /// A configure applies the settings through the production sidecar's SDK
+    /// controls (setModel and the sdk.configured receipt)
     /// and broadcasts `freshAgent.session.metadata` so every device's model
     /// surfaces converge. The ledger row's settings re-snapshot through the
-    /// existing adopt_session_init leg configure_for_send performs.
+    /// existing configure_for_send persistence path.
     #[tokio::test]
     async fn configure_applies_settings_and_broadcasts_session_metadata() {
         let _env_guard = CLAUDE_ENV_LOCK.lock().await;
@@ -20036,13 +19765,14 @@ rl.on('line', (line) => {
         assert_eq!(metadata["event"]["effort"], json!("high"));
     }
 
-    /// The fake sidecar's scripted refusal (model 'unavailable') surfaces on
+    /// An SDK setModel refusal injected at the SDK method boundary surfaces on
     /// the pane-banner error channel with the session's flavour, and NO
     /// metadata converges a value the live session never took.
     #[tokio::test]
     async fn a_refused_configure_surfaces_the_banner_error_and_converges_nothing() {
         let _env_guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
+        std::env::set_var("FRESHELL_TEST_CLAUDE_REJECT_MODEL", "unavailable");
         let (state, rx) = state_with_bus();
         let mut rx = rx;
         state
