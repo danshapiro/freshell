@@ -24,9 +24,17 @@ pub enum ClaudeSendOutcome {
         session_key: String,
         /// The uuid the message runs under: the turn id its user line lands with.
         submitted_turn_id: String,
+        /// The exact runtime that accepted this send; an old end after recovery
+        /// must never settle a send belonging to its replacement.
+        ownership_id: String,
     },
     /// The message was not sent; the sender got a request error with this code.
-    Refused { code: String, message: String },
+    Refused {
+        code: String,
+        message: String,
+        retryable: Option<bool>,
+        owner: Option<crate::ownership_lane::TerminalOwnerFields>,
+    },
 }
 
 impl FreshClaudeState {
@@ -42,6 +50,23 @@ impl FreshClaudeState {
         ClaudeSendOutcome::Refused {
             code: code.to_string(),
             message: message.to_string(),
+            retryable: None,
+            owner: None,
+        }
+    }
+
+    pub(super) fn refuse_reserved_send(
+        &self,
+        request_id: &Option<String>,
+        message: &str,
+        owner: Option<crate::ownership_lane::TerminalOwnerFields>,
+    ) -> ClaudeSendOutcome {
+        self.send_error(request_id, "SESSION_RESERVED", message);
+        ClaudeSendOutcome::Refused {
+            code: "SESSION_RESERVED".into(),
+            message: message.into(),
+            retryable: Some(true),
+            owner,
         }
     }
 

@@ -439,7 +439,9 @@ function handleCreate(req) {
     return
   }
 
-  const sessionId = nanoid()
+  // Rust assigns the durable identity before create. Retain the bare-id
+  // fallback for an older host that has not adopted create-time UUIDs yet.
+  const sessionId = isUuid(req.sessionId) ? req.sessionId : nanoid()
   const abort = new AbortController()
   const state = {
     abort,

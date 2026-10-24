@@ -857,6 +857,8 @@ pub enum AttachGuardOutcome {
     StaleGeneration {
         current_epoch: u64,
         current_generation: u64,
+        /// The state at this atomic decision, for callers reporting its owner.
+        current_state: OwnershipState,
     },
 }
 
@@ -874,10 +876,12 @@ impl std::fmt::Debug for AttachGuardOutcome {
             Self::StaleGeneration {
                 current_epoch,
                 current_generation,
+                current_state,
             } => f
                 .debug_struct("StaleGeneration")
                 .field("current_epoch", current_epoch)
                 .field("current_generation", current_generation)
+                .field("current_state", current_state)
                 .finish(),
         }
     }
@@ -1543,6 +1547,7 @@ impl RuntimeOwnershipRegistry {
                 return AttachGuardOutcome::StaleGeneration {
                     current_epoch: self.epoch,
                     current_generation,
+                    current_state: record.state.clone(),
                 };
             }
         }
@@ -1636,6 +1641,10 @@ impl RuntimeOwnershipRegistry {
             return AttachGuardOutcome::StaleGeneration {
                 current_epoch: self.epoch,
                 current_generation: 0,
+                current_state: inner
+                    .get(&key)
+                    .map(|record| record.state.clone())
+                    .unwrap_or(OwnershipState::Vacant),
             };
         }
         let Some(record) = inner.get_mut(&key) else {
@@ -1701,6 +1710,7 @@ impl RuntimeOwnershipRegistry {
             return AttachGuardOutcome::StaleGeneration {
                 current_epoch: self.epoch,
                 current_generation,
+                current_state: record.state.clone(),
             };
         }
         // (4) THE EXPECTED OWNER — the kind always; every identity field

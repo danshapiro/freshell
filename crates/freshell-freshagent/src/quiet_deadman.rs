@@ -113,6 +113,10 @@ impl QuietDeadman {
         self.stuck_since.is_some()
     }
 
+    pub(crate) fn is_stuck_generation(&self, generation: u64) -> bool {
+        self.generation == generation && self.is_stuck()
+    }
+
     /// Fire iff NOTHING changed since the epoch was armed: the same
     /// generation and deadline, a turn still `in_flight`, not already fired.
     /// Returns whether it fired (and flagged the session stuck).

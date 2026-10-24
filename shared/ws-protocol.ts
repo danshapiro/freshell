@@ -948,6 +948,7 @@ export const FreshAgentSendSchema = z.object({
 
 export const FreshAgentInterruptSchema = z.object({
   type: z.literal('freshAgent.interrupt'),
+  requestId: z.string().optional(),
   sessionId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
@@ -1036,8 +1037,8 @@ export const FreshAgentRecoveryStopSchema = z.object({
   type: z.literal('freshAgent.recovery.stop'),
   requestId: z.string().min(1),
   sessionId: z.string().min(1),
-  sessionType: z.literal('freshcodex'),
-  provider: z.literal('codex'),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode', 'amplifier']),
   observedEpoch: z.number().int().nonnegative().optional(),
   observedGeneration: z.number().int().nonnegative().optional(),
 })
@@ -1047,8 +1048,8 @@ export const FreshAgentRecoveryStoppedSchema = z.object({
   type: z.literal('freshAgent.recovery.stopped'),
   requestId: z.string().min(1),
   sessionId: z.string().min(1),
-  sessionType: z.literal('freshcodex'),
-  provider: z.literal('codex'),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode', 'amplifier']),
   success: z.boolean(),
   code: z.string().optional(),
   message: z.string().optional(),

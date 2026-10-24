@@ -20,6 +20,9 @@ pub enum ClaudeCreateOutcome {
         session_id: String,
         /// The durable conversation, when known (a resume or an adopted session).
         session_ref: Option<SessionLocator>,
+        /// Authority to abandon only the runtime established by this create.
+        /// Live adoption supplies none. This receipt never appears on the wire.
+        cleanup_ownership_id: Option<String>,
     },
     /// No session runs for this create.
     Failed {
@@ -109,6 +112,7 @@ mod tests {
         let created = ClaudeCreateOutcome::Created {
             session_id: "s".into(),
             session_ref: None,
+            cleanup_ownership_id: None,
         };
         assert!(created.create_failed_frame("req-3").is_none());
     }

@@ -158,7 +158,7 @@ function goodClaudeObservation(overrides: Partial<T2Observation> = {}): T2Observ
     sentinelToken: 'freshell-t2-ok',
 
     sessionCreated: true,
-    initialSessionId: 'V1StGXR8Z5jdHi6B_myT0', // bare nanoid (21 url-safe chars)
+    initialSessionId: '11111111-1111-4111-8111-111111111111', // durable at create
     durableSessionId: '11111111-1111-4111-8111-111111111111', // canonical Claude UUID
     sessionRef: { provider: 'claude', sessionId: '11111111-1111-4111-8111-111111111111' },
 
@@ -233,10 +233,10 @@ describe('assertT2Invariants — claude/Haiku (SDK completion edge)', () => {
     expect(report.results.find((r) => r.name === 'provider.emits-completion-signal')!.ok).toBe(false)
   })
 
-  // The claude placeholder is the SDK bridge's bare nanoid — NOT `freshclaude-...`.
+  // Claude uses its durable UUID from create.
   const claudeShapeMutations: Array<{ name: string; invariant: string; patch: Partial<T2Observation> }> = [
-    { name: 'placeholder too short (not a nanoid)', invariant: 'session.created', patch: { initialSessionId: 'x' } },
-    { name: 'placeholder is a UUID (36 chars, must be the durable field)', invariant: 'session.created', patch: { initialSessionId: '11111111-1111-4111-8111-111111111111' } },
+    { name: 'create id is not a UUID', invariant: 'session.created', patch: { initialSessionId: 'x' } },
+    { name: 'create id is a retired nanoid', invariant: 'session.created', patch: { initialSessionId: 'V1StGXR8Z5jdHi6B_myT0' } },
     { name: 'durable id not a UUID', invariant: 'session.durable-id-shape', patch: { durableSessionId: 'not-a-uuid' } },
     { name: 'turn not accepted', invariant: 'turn.accepted', patch: { turnAccepted: false } },
     { name: 'reply not persisted', invariant: 'turn.completed', patch: { turnCompleted: false } },
@@ -256,11 +256,9 @@ describe('assertT2Invariants — claude/Haiku (SDK completion edge)', () => {
     })
   }
 
-  it('accepts the real bare-nanoid placeholder shape and rejects the old aspirational prefix-only id', () => {
-    // A bare nanoid passes; a value that is ONLY the retired `freshclaude-` prefix
-    // with an out-of-range body would not — we assert the real shape is honored.
-    expect(PROVIDER_ID_SHAPES.claude.placeholder.test('V1StGXR8Z5jdHi6B_myT0')).toBe(true)
-    expect(PROVIDER_ID_SHAPES.claude.placeholder.test('11111111-1111-4111-8111-111111111111')).toBe(false)
+  it('accepts a durable UUID from create and rejects a retired nanoid', () => {
+    expect(PROVIDER_ID_SHAPES.claude.placeholder.test('V1StGXR8Z5jdHi6B_myT0')).toBe(false)
+    expect(PROVIDER_ID_SHAPES.claude.placeholder.test('11111111-1111-4111-8111-111111111111')).toBe(true)
     expect(PROVIDER_ID_SHAPES.claude.durable.test('11111111-1111-4111-8111-111111111111')).toBe(true)
   })
 })

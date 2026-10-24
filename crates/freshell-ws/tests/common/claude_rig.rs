@@ -777,23 +777,22 @@ impl RigConnection {
         })
     }
 
-    /// The owner pair the client would hold for this pane's session: the latest
-    /// `session.runtimeOwner` frame for the durable id its `session.init` named.
+    /// The current init identifies an existing conversation; before the first
+    /// init, create already supplied the native UUID and its owner record.
     fn observed_owner(&self, session_id: &str) -> Option<(u64, u64)> {
-        let durable = self.frames.iter().rev().find_map(|v| {
-            (v["type"] == "freshAgent.event"
-                && v["event"]["type"] == "freshAgent.session.init"
-                && v["event"]["sessionId"] == session_id)
-                .then(|| v["event"]["cliSessionId"].as_str().map(str::to_string))
-                .flatten()
-        })?;
-        self.frames.iter().rev().find_map(|v| {
-            (v["type"] == "session.runtimeOwner"
-                && v["provider"] == "claude"
-                && v["sessionId"] == durable.as_str())
-            .then(|| Some((v["epoch"].as_u64()?, v["generation"].as_u64()?)))
-            .flatten()
-        })
+        let durable = self
+            .frames
+            .iter()
+            .rev()
+            .find_map(|v| {
+                (v["type"] == "freshAgent.event"
+                    && v["event"]["type"] == "freshAgent.session.init"
+                    && v["event"]["sessionId"] == session_id)
+                    .then(|| v["event"]["cliSessionId"].as_str().map(str::to_string))
+                    .flatten()
+            })
+            .unwrap_or_else(|| session_id.to_string());
+        self.owner_pair(&durable)
     }
 
     /// Top-level `error` frames answering this request id, read so far.
@@ -998,7 +997,15 @@ async fn spawn_rig_server(
 
     // The ONE ownership coordinator, wired into the WS state and the claude lane
     // the way main.rs wires it.
-    let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+    let epoch = pane_ledger.as_ref().and_then(|ledger| {
+        ledger
+            .reserve_boot_epoch()
+            .expect("reserve the rig server's durable boot epoch")
+    });
+    let ownership = Arc::new(match epoch {
+        Some(epoch) => freshell_ownership::RuntimeOwnershipRegistry::with_epoch(epoch),
+        None => freshell_ownership::RuntimeOwnershipRegistry::new(),
+    });
     let mut fresh_claude = freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx))
         .with_sidecar_environment(environment)
         .with_hosted_mcp(options.hosted_claude);

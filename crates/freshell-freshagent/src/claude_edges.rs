@@ -72,7 +72,12 @@ pub enum ClaudeTurnEvent {
     Waiting { session_key: String, at: i64 },
     /// The session's sidecar ended unrequested; `reason` is why
     /// (`cli_exited`, `stream_error`, `stream_eof` or `sidecar_exited`).
-    Ended { session_key: String, reason: String },
+    Ended {
+        session_key: String,
+        reason: String,
+        /// The runtime that ended, matching the accepted send's ownership id.
+        ownership_id: String,
+    },
 }
 
 /// The two attention edges (AGENTS.md "Agent Status Indicators").
@@ -101,6 +106,7 @@ pub(crate) enum EdgeSource {
     Death,
     /// Pending approvals or questions went from none to some.
     Pending,
+    QuietDeadman,
 }
 
 impl EdgeSource {
@@ -109,6 +115,7 @@ impl EdgeSource {
             Self::Result => "result",
             Self::Death => "death",
             Self::Pending => "pending",
+            Self::QuietDeadman => "quiet_deadman",
         }
     }
 }
@@ -268,13 +275,26 @@ impl ClaudeEdgeHub {
         at
     }
 
+    /// A busy runtime exhausted its quiet window. It still owes its turn;
+    /// this attention edge does not publish a settlement.
+    pub(crate) fn quiet_deadman(&self, record: &EdgeRecord<'_>) -> i64 {
+        self.emit(record, EdgeKind::TurnComplete, EdgeSource::QuietDeadman)
+    }
+
     /// The sidecar ended unrequested: ring when a turn was owed, and publish the
     /// end either way.
-    pub(crate) fn ended(&self, record: &EdgeRecord<'_>, owed: bool, reason: &str) -> Option<i64> {
+    pub(crate) fn ended(
+        &self,
+        record: &EdgeRecord<'_>,
+        owed: bool,
+        reason: &str,
+        ownership_id: &str,
+    ) -> Option<i64> {
         let at = owed.then(|| self.emit(record, EdgeKind::TurnComplete, EdgeSource::Death));
         self.publish(ClaudeTurnEvent::Ended {
             session_key: record.session_key.to_string(),
             reason: reason.to_string(),
+            ownership_id: ownership_id.to_string(),
         });
         at
     }
@@ -425,7 +445,7 @@ mod tests {
 
         let complete = hub.settle(&record, settled(true, TurnOutcome::Completed));
         let waiting = hub.waiting(&record);
-        let death = hub.ended(&record, true, "cli_exited");
+        let death = hub.ended(&record, true, "cli_exited", "owner-1");
         let (complete, death) = (complete.unwrap(), death.unwrap());
         assert!(
             complete < waiting && waiting < death,
@@ -507,7 +527,9 @@ mod tests {
         let result = hub
             .settle(&record, settled(true, TurnOutcome::Completed))
             .unwrap();
-        let death = hub.ended(&record, true, "sidecar_exited").unwrap();
+        let death = hub
+            .ended(&record, true, "sidecar_exited", "owner-1")
+            .unwrap();
         assert_eq!(result, ahead + 1);
         assert_eq!(death, ahead + 2);
     }
@@ -526,7 +548,7 @@ mod tests {
         assert_eq!(silent, None);
         let waiting = hub.waiting(&record);
         assert_eq!(
-            hub.ended(&record, false, "stream_eof"),
+            hub.ended(&record, false, "stream_eof", "owner-1"),
             None,
             "an idle death is silent"
         );
@@ -557,6 +579,7 @@ mod tests {
                 ClaudeTurnEvent::Ended {
                     session_key: "key-1".into(),
                     reason: "stream_eof".into(),
+                    ownership_id: "owner-1".into(),
                 },
             ]
         );

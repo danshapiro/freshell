@@ -3449,7 +3449,7 @@ impl FreshCodexState {
             ) {
                 crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
                 crate::ownership_lane::LaneOpGuard::Unwired => None,
-                crate::ownership_lane::LaneOpGuard::Refused { message } => {
+                crate::ownership_lane::LaneOpGuard::Refused { message, .. } => {
                     tracing::warn!(target: "freshell_freshagent::codex",
                         session_id = %session_id, request_id = ?request_id,
                         "fresh_agent_send_refused: ownership guard refused");
@@ -13605,6 +13605,7 @@ pub(crate) mod tests {
             let st = st.clone();
             tokio::spawn(async move {
                 st.handle_interrupt(FreshAgentInterrupt {
+                    request_id: None,
                     provider: freshell_protocol::AgentProvider::Codex,
                     session_id: "thread-1".to_string(),
                     session_type: freshell_protocol::SessionType::Freshcodex,
@@ -13656,6 +13657,7 @@ pub(crate) mod tests {
         .await;
 
         st.handle_interrupt(FreshAgentInterrupt {
+            request_id: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: "thread-1".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -13679,6 +13681,7 @@ pub(crate) mod tests {
         let (st, mut rx) = state_with_bus();
 
         st.handle_interrupt(FreshAgentInterrupt {
+            request_id: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: "does-not-exist".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -16231,6 +16234,7 @@ pub(crate) mod tests {
             let st = st.clone();
             tokio::spawn(async move {
                 st.handle_interrupt(FreshAgentInterrupt {
+                    request_id: None,
                     provider: freshell_protocol::AgentProvider::Codex,
                     session_id: "thread-cxi".to_string(),
                     session_type: freshell_protocol::SessionType::Freshcodex,

@@ -2163,7 +2163,7 @@ impl FreshOpencodeState {
                 ) {
                     crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
                     crate::ownership_lane::LaneOpGuard::Unwired => None,
-                    crate::ownership_lane::LaneOpGuard::Refused { message } => {
+                    crate::ownership_lane::LaneOpGuard::Refused { message, .. } => {
                         drop(session);
                         tracing::warn!(target: "freshell_freshagent::opencode",
                         session_id = %session_id, request_id = ?request_id,
@@ -3042,7 +3042,7 @@ impl FreshOpencodeState {
                 ) {
                     crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
                     crate::ownership_lane::LaneOpGuard::Unwired => None,
-                    crate::ownership_lane::LaneOpGuard::Refused { message } => {
+                    crate::ownership_lane::LaneOpGuard::Refused { message, .. } => {
                         session.pending_sends.pop_front();
                         tracing::warn!(target: "freshell_freshagent::opencode",
                             session_id = %lookup_id, request_id = ?msg.request_id,
@@ -5258,7 +5258,7 @@ impl FreshOpencodeState {
         ) {
             crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
             crate::ownership_lane::LaneOpGuard::Unwired => None,
-            crate::ownership_lane::LaneOpGuard::Refused { message } => {
+            crate::ownership_lane::LaneOpGuard::Refused { message, .. } => {
                 tracing::warn!(target: "freshell_freshagent::opencode",
                     session_id = %session_id, real_id = %real_id,
                     "fresh_agent_compact_refused: the op guard refused to arm");
@@ -5739,7 +5739,7 @@ impl FreshOpencodeState {
         ) {
             crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
             crate::ownership_lane::LaneOpGuard::Unwired => None,
-            crate::ownership_lane::LaneOpGuard::Refused { message } => {
+            crate::ownership_lane::LaneOpGuard::Refused { message, .. } => {
                 tracing::warn!(target: "freshell_freshagent::opencode",
                     session_id = %msg.session_id, real_id = %real_id,
                     "fresh_agent_fork_refused: the op guard refused to arm");
@@ -6330,7 +6330,7 @@ impl FreshOpencodeState {
         ) {
             crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
             crate::ownership_lane::LaneOpGuard::Unwired => None,
-            crate::ownership_lane::LaneOpGuard::Refused { message } => {
+            crate::ownership_lane::LaneOpGuard::Refused { message, .. } => {
                 tracing::warn!(target: "freshell_freshagent::opencode",
                     session_id = %op.session_id, real_id = %real_id,
                     request_id = %op.request_id,
@@ -16014,6 +16014,7 @@ mod tests {
         // Interrupt promptly, long before the (deliberately slow) natural idle would land.
         tokio::time::sleep(Duration::from_millis(10)).await;
         st.handle_interrupt(FreshAgentInterrupt {
+            request_id: None,
             provider: AgentProvider::Opencode,
             session_id: placeholder.to_string(),
             session_type: SessionType::Freshopencode,
@@ -16129,6 +16130,7 @@ mod tests {
         // abort RPC fails (500).
         tokio::time::sleep(Duration::from_millis(10)).await;
         st.handle_interrupt(FreshAgentInterrupt {
+            request_id: None,
             provider: AgentProvider::Opencode,
             session_id: placeholder.to_string(),
             session_type: SessionType::Freshopencode,
@@ -16365,6 +16367,7 @@ mod tests {
         // interrupt must stay silent — no second bell for a turn that
         // already rang.
         st.handle_interrupt(FreshAgentInterrupt {
+            request_id: None,
             provider: AgentProvider::Opencode,
             session_id: placeholder.to_string(),
             session_type: SessionType::Freshopencode,
@@ -16480,6 +16483,7 @@ mod tests {
             let st = st.clone();
             tokio::spawn(async move {
                 st.handle_interrupt(FreshAgentInterrupt {
+                    request_id: None,
                     provider: AgentProvider::Opencode,
                     session_id: placeholder.to_string(),
                     session_type: SessionType::Freshopencode,
@@ -16619,6 +16623,7 @@ mod tests {
             let st = st.clone();
             tokio::spawn(async move {
                 st.handle_interrupt(FreshAgentInterrupt {
+                    request_id: None,
                     provider: AgentProvider::Opencode,
                     session_id: placeholder.to_string(),
                     session_type: SessionType::Freshopencode,
@@ -16824,6 +16829,7 @@ mod tests {
             let st = st.clone();
             tokio::spawn(async move {
                 st.handle_interrupt(FreshAgentInterrupt {
+                    request_id: None,
                     provider: AgentProvider::Opencode,
                     session_id: placeholder.to_string(),
                     session_type: SessionType::Freshopencode,
@@ -16960,6 +16966,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(25)).await;
 
         st.handle_interrupt(FreshAgentInterrupt {
+            request_id: None,
             provider: AgentProvider::Opencode,
             session_id: placeholder.to_string(),
             session_type: SessionType::Freshopencode,
@@ -19497,6 +19504,7 @@ mod tests {
         // Kill the drive mid-cold-start (the ep4-r5 window): the task is
         // aborted before compact() returns.
         st.handle_interrupt(FreshAgentInterrupt {
+            request_id: None,
             provider: AgentProvider::Opencode,
             session_id: "ses_1".to_string(),
             session_type: SessionType::Freshopencode,
@@ -19590,6 +19598,7 @@ mod tests {
         }
 
         st.handle_interrupt(FreshAgentInterrupt {
+            request_id: None,
             provider: AgentProvider::Opencode,
             session_id: "ses_1".to_string(),
             session_type: SessionType::Freshopencode,
@@ -19678,6 +19687,7 @@ mod tests {
         // destroy MUST stand (the interrupt/kill tests never seeded rollback
         // state; this window is F4's finding).
         st.handle_interrupt(FreshAgentInterrupt {
+            request_id: None,
             provider: AgentProvider::Opencode,
             session_id: "ses_real".to_string(),
             session_type: SessionType::Freshopencode,
@@ -20257,6 +20267,7 @@ mod tests {
         await_summarize_posted(&http).await;
 
         st.handle_interrupt(FreshAgentInterrupt {
+            request_id: None,
             provider: AgentProvider::Opencode,
             session_id: "ses_1".to_string(),
             session_type: SessionType::Freshopencode,
@@ -25877,6 +25888,7 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
             st.handle_interrupt(FreshAgentInterrupt {
+                request_id: None,
                 provider: AgentProvider::Opencode,
                 session_id: "ses_q3".to_string(),
                 session_type: SessionType::Freshopencode,
@@ -25935,6 +25947,7 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
             st.handle_interrupt(FreshAgentInterrupt {
+                request_id: None,
                 provider: AgentProvider::Opencode,
                 session_id: "ses_q8".to_string(),
                 session_type: SessionType::Freshopencode,
@@ -25975,6 +25988,7 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
             st.handle_interrupt(FreshAgentInterrupt {
+                request_id: None,
                 provider: AgentProvider::Opencode,
                 session_id: "ses_q8".to_string(),
                 session_type: SessionType::Freshopencode,
@@ -26044,6 +26058,7 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
             st.handle_interrupt(FreshAgentInterrupt {
+                request_id: None,
                 provider: AgentProvider::Opencode,
                 session_id: "ses_q9".to_string(),
                 session_type: SessionType::Freshopencode,
@@ -26117,6 +26132,7 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
             st.handle_interrupt(FreshAgentInterrupt {
+                request_id: None,
                 provider: AgentProvider::Opencode,
                 session_id: "ses_q10".to_string(),
                 session_type: SessionType::Freshopencode,
@@ -26377,6 +26393,7 @@ mod tests {
                 tokio::time::timeout(
                     std::time::Duration::from_secs(5),
                     st.handle_interrupt(FreshAgentInterrupt {
+                        request_id: None,
                         provider: AgentProvider::Opencode,
                         session_id: "ses_q13".to_string(),
                         session_type: SessionType::Freshopencode,
@@ -26486,6 +26503,7 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             st.handle_interrupt(FreshAgentInterrupt {
+                request_id: None,
                 provider: AgentProvider::Opencode,
                 session_id: "ses_q14".to_string(),
                 session_type: SessionType::Freshopencode,
@@ -26550,6 +26568,7 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             st.handle_interrupt(FreshAgentInterrupt {
+                request_id: None,
                 provider: AgentProvider::Opencode,
                 session_id: "ses_q15".to_string(),
                 session_type: SessionType::Freshopencode,
@@ -26641,6 +26660,7 @@ mod tests {
                 tokio::time::timeout(
                     std::time::Duration::from_secs(5),
                     st.handle_interrupt(FreshAgentInterrupt {
+                        request_id: None,
                         provider: AgentProvider::Opencode,
                         session_id: "ses_q16".to_string(),
                         session_type: SessionType::Freshopencode,
@@ -26654,6 +26674,7 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             st.handle_interrupt(FreshAgentInterrupt {
+                request_id: None,
                 provider: AgentProvider::Opencode,
                 session_id: "ses_q16".to_string(),
                 session_type: SessionType::Freshopencode,
@@ -26738,6 +26759,7 @@ mod tests {
                 tokio::time::timeout(
                     std::time::Duration::from_secs(5),
                     st.handle_interrupt(FreshAgentInterrupt {
+                        request_id: None,
                         provider: AgentProvider::Opencode,
                         session_id: "ses_q17".to_string(),
                         session_type: SessionType::Freshopencode,
@@ -26824,6 +26846,7 @@ mod tests {
                 tokio::time::timeout(
                     std::time::Duration::from_secs(5),
                     st.handle_interrupt(FreshAgentInterrupt {
+                        request_id: None,
                         provider: AgentProvider::Opencode,
                         session_id: "ses_q18".to_string(),
                         session_type: SessionType::Freshopencode,
@@ -26838,6 +26861,7 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             st.handle_interrupt(FreshAgentInterrupt {
+                request_id: None,
                 provider: AgentProvider::Opencode,
                 session_id: "ses_q18".to_string(),
                 session_type: SessionType::Freshopencode,
@@ -26918,6 +26942,7 @@ mod tests {
                 tokio::time::timeout(
                     std::time::Duration::from_secs(5),
                     st.handle_interrupt(FreshAgentInterrupt {
+                        request_id: None,
                         provider: AgentProvider::Opencode,
                         session_id: "ses_q19".to_string(),
                         session_type: SessionType::Freshopencode,
@@ -27039,6 +27064,7 @@ mod tests {
                 tokio::time::timeout(
                     std::time::Duration::from_secs(5),
                     st.handle_interrupt(FreshAgentInterrupt {
+                        request_id: None,
                         provider: AgentProvider::Opencode,
                         session_id: "ses_q20".to_string(),
                         session_type: SessionType::Freshopencode,
@@ -27060,6 +27086,7 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             st.handle_interrupt(FreshAgentInterrupt {
+                request_id: None,
                 provider: AgentProvider::Opencode,
                 session_id: "ses_q20".to_string(),
                 session_type: SessionType::Freshopencode,
@@ -27134,6 +27161,7 @@ mod tests {
                 tokio::time::timeout(
                     std::time::Duration::from_secs(5),
                     st.handle_interrupt(FreshAgentInterrupt {
+                        request_id: None,
                         provider: AgentProvider::Opencode,
                         session_id: "ses_q21".to_string(),
                         session_type: SessionType::Freshopencode,
@@ -27214,6 +27242,7 @@ mod tests {
                 tokio::time::timeout(
                     std::time::Duration::from_secs(5),
                     st.handle_interrupt(FreshAgentInterrupt {
+                        request_id: None,
                         provider: AgentProvider::Opencode,
                         session_id: "ses_q22".to_string(),
                         session_type: SessionType::Freshopencode,
@@ -27228,6 +27257,7 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             st.handle_interrupt(FreshAgentInterrupt {
+                request_id: None,
                 provider: AgentProvider::Opencode,
                 session_id: "ses_q22".to_string(),
                 session_type: SessionType::Freshopencode,
@@ -27313,6 +27343,7 @@ mod tests {
                 tokio::time::timeout(
                     std::time::Duration::from_secs(5),
                     st.handle_interrupt(FreshAgentInterrupt {
+                        request_id: None,
                         provider: AgentProvider::Opencode,
                         session_id: "ses_q23".to_string(),
                         session_type: SessionType::Freshopencode,
@@ -27329,6 +27360,7 @@ mod tests {
                 tokio::time::timeout(
                     std::time::Duration::from_secs(5),
                     st.handle_interrupt(FreshAgentInterrupt {
+                        request_id: None,
                         provider: AgentProvider::Opencode,
                         session_id: "ses_q23".to_string(),
                         session_type: SessionType::Freshopencode,
@@ -27419,6 +27451,7 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             st.handle_interrupt(FreshAgentInterrupt {
+                request_id: None,
                 provider: AgentProvider::Opencode,
                 session_id: "ses_q24".to_string(),
                 session_type: SessionType::Freshopencode,
@@ -27480,6 +27513,7 @@ mod tests {
                 tokio::time::timeout(
                     std::time::Duration::from_secs(5),
                     st.handle_interrupt(FreshAgentInterrupt {
+                        request_id: None,
                         provider: AgentProvider::Opencode,
                         session_id: "ses_q25".to_string(),
                         session_type: SessionType::Freshopencode,
@@ -27585,6 +27619,7 @@ mod tests {
                 tokio::time::timeout(
                     std::time::Duration::from_secs(5),
                     st.handle_interrupt(FreshAgentInterrupt {
+                        request_id: None,
                         provider: AgentProvider::Opencode,
                         session_id: "ses_q26".to_string(),
                         session_type: SessionType::Freshopencode,
@@ -27599,6 +27634,7 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             st.handle_interrupt(FreshAgentInterrupt {
+                request_id: None,
                 provider: AgentProvider::Opencode,
                 session_id: "ses_q26".to_string(),
                 session_type: SessionType::Freshopencode,
@@ -27682,6 +27718,7 @@ mod tests {
                 tokio::time::timeout(
                     std::time::Duration::from_secs(5),
                     st.handle_interrupt(FreshAgentInterrupt {
+                        request_id: None,
                         provider: AgentProvider::Opencode,
                         session_id: "ses_q27".to_string(),
                         session_type: SessionType::Freshopencode,
@@ -27781,6 +27818,7 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             st.handle_interrupt(FreshAgentInterrupt {
+                request_id: None,
                 provider: AgentProvider::Opencode,
                 session_id: "ses_q28".to_string(),
                 session_type: SessionType::Freshopencode,
@@ -27876,6 +27914,7 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             st.handle_interrupt(FreshAgentInterrupt {
+                request_id: None,
                 provider: AgentProvider::Opencode,
                 session_id: "ses_q29".to_string(),
                 session_type: SessionType::Freshopencode,
@@ -27939,6 +27978,7 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             st.handle_interrupt(FreshAgentInterrupt {
+                request_id: None,
                 provider: AgentProvider::Opencode,
                 session_id: "ses_q30".to_string(),
                 session_type: SessionType::Freshopencode,
@@ -28024,6 +28064,7 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             st.handle_interrupt(FreshAgentInterrupt {
+                request_id: None,
                 provider: AgentProvider::Opencode,
                 session_id: "ses_q31".to_string(),
                 session_type: SessionType::Freshopencode,
@@ -28088,6 +28129,7 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             st.handle_interrupt(FreshAgentInterrupt {
+                request_id: None,
                 provider: AgentProvider::Opencode,
                 session_id: "ses_q32".to_string(),
                 session_type: SessionType::Freshopencode,
@@ -28166,6 +28208,7 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             st.handle_interrupt(FreshAgentInterrupt {
+                request_id: None,
                 provider: AgentProvider::Opencode,
                 session_id: "ses_q33".to_string(),
                 session_type: SessionType::Freshopencode,
@@ -28232,6 +28275,7 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             st.handle_interrupt(FreshAgentInterrupt {
+                request_id: None,
                 provider: AgentProvider::Opencode,
                 session_id: "ses_q34".to_string(),
                 session_type: SessionType::Freshopencode,

@@ -1014,6 +1014,8 @@ pub struct FreshAgentSend {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentInterrupt {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     pub provider: AgentProvider,
     pub session_id: String,
     pub session_type: SessionType,
@@ -1104,7 +1106,7 @@ pub struct FreshAgentKill {
     pub observed_generation: Option<u64>,
 }
 
-/// Request-correlated, process-only Codex recovery. A regular
+/// Request-correlated, process-only agent recovery. A regular
 /// `freshAgent.kill` permanently closes the durable session instead.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

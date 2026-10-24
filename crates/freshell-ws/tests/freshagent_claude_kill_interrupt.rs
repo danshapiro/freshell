@@ -82,7 +82,7 @@ rl.on('line', (line) => {
   }
   if (msg.type === 'create') {
     counter += 1
-    const sessionId = `fake-claude-session-${process.pid}-${counter}`
+    const sessionId = msg.sessionId ?? `fake-claude-session-${process.pid}-${counter}`
     process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 }) + '\n')
   } else if (msg.type === 'interrupt') {
     const log = process.env.FRESHELL_TEST_CLAUDE_INTERRUPT_LOG
@@ -473,15 +473,12 @@ async fn claude_interrupt_frame_errors_for_an_unknown_session() {
     )
     .await;
 
-    let frame = await_frame(&mut ws, Duration::from_secs(10), |v| v["type"] == "error").await;
-    assert!(
-        frame["message"]
-            .as_str()
-            .unwrap_or_default()
-            .to_lowercase()
-            .contains("session not found"),
-        "{frame}"
-    );
+    let frame = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["event"]["type"] == "freshAgent.error"
+    })
+    .await;
+    assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID", "{frame}");
+    assert_eq!(frame["sessionId"], "does-not-exist");
 }
 
 /// Sanity guard: writing to a closed log path never panics the harness (keeps clippy
@@ -503,4 +500,166 @@ fn interrupt_log_append_is_plain_fs_no_special_handling_needed() {
     writeln!(f, "sanity").unwrap();
     assert!(std::fs::read_to_string(&log).unwrap().contains("sanity"));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+mod common;
+
+#[cfg(unix)]
+mod control_outcomes {
+    use super::*;
+    use common::claude_rig::{ClaudeRig, RigKind};
+    use serde_json::json;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_configure_and_interrupt_requests_report_correlated_session_errors() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let rig = ClaudeRig::start(RigKind::Sim).await;
+        let mut conn = rig.connect().await;
+        for session_type in ["freshclaude", "kilroy"] {
+            for control in ["configure", "interrupt"] {
+                let id = uuid::Uuid::new_v4().to_string();
+                let request_id = format!("unknown-{session_type}-{control}");
+                let mut request = json!({"type":format!("freshAgent.{control}"),
+                "provider":"claude", "sessionType":session_type, "sessionId":id, "requestId":request_id});
+                if control == "configure" {
+                    request["settings"] = json!({"model":"sonnet"});
+                }
+                conn.send(request).await;
+                let reply = conn
+                    .wait_for("the unknown control refusal", |frame| {
+                        frame["type"] == "error" || frame["event"]["type"] == "freshAgent.error"
+                    })
+                    .await;
+                assert_eq!(reply["event"]["code"], "INVALID_SESSION_ID", "{reply}");
+                assert_eq!(reply["event"]["requestId"], request_id, "{reply}");
+                assert_eq!(reply["sessionId"], id);
+                assert_eq!(reply["sessionType"], session_type);
+                conn.frames.clear();
+            }
+        }
+        assert!(rig.ledger_rows("query").is_empty());
+        rig.fresh_claude.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interrupting_a_dead_session_repeats_exited_without_restarting_it() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let rig = ClaudeRig::start(RigKind::Sim).await;
+        let mut conn = rig.connect().await;
+        let id = conn.create("dead-control-create").await;
+        rig.kill_first_sidecar(&mut conn).await;
+        conn.frames.clear();
+        conn.send(
+            json!({"type":"freshAgent.interrupt", "provider":"claude", "sessionType":"freshclaude",
+        "sessionId":id, "requestId":"dead-control-stop"}),
+        )
+        .await;
+        let reply = conn
+            .wait_for("the dead Stop outcome", |frame| {
+                frame["type"] == "error"
+                    || frame["event"]["type"] == "freshAgent.error"
+                    || frame["event"]["type"] == "freshAgent.status"
+            })
+            .await;
+        assert_eq!(reply["event"]["status"], "exited", "{reply}");
+        assert_eq!(reply["sessionId"], id);
+        assert_eq!(
+            rig.ledger_rows("query").len(),
+            1,
+            "Stop alone must not recover a process"
+        );
+        assert!(!rig.fresh_claude.has_live_session(&id).await);
+        rig.fresh_claude.shutdown().await;
+    }
+
+    async fn refused_interrupt_reports_the_request_and_does_not_silence_completion(reissued: bool) {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let wrapper = tempfile::tempdir().unwrap();
+        let module = wrapper.path().join("refuse-interrupt.mjs");
+        let simulator =
+            common::claude_rig::repo_root().join("test/fixtures/claude-cli-sim/query.mjs");
+        std::fs::write(
+            &module,
+            format!(
+                r#"
+import {{ query as originalQuery }} from {};
+export function query(params) {{
+  const running = originalQuery(params);
+  const interrupt = running.interrupt.bind(running);
+  let calls = 0;
+  running.interrupt = async (...args) => {{
+    calls += 1;
+    if (calls === {}) throw new Error('injected interrupt refusal');
+    return interrupt(...args);
+  }};
+  return running;
+}}
+"#,
+                serde_json::to_string(&format!("file://{}", simulator.display())).unwrap(),
+                if reissued { 2 } else { 1 }
+            ),
+        )
+        .unwrap();
+        let logs = common::log_capture::install();
+        let mut extra = vec![("FRESHELL_CLAUDE_SDK_QUERY_MODULE", module.to_str().unwrap())];
+        if reissued {
+            extra.push(("FRESHELL_CLAUDE_SIM_COLD_COMMAND", "queued"));
+        }
+        let rig = ClaudeRig::start_with_env(RigKind::Sim, &extra).await;
+        let mut conn = rig.connect().await;
+        let id = conn.create("refused-stop-create").await;
+        conn.send_text(&id, "the-running-turn", "TOOL:sleep=0.5")
+            .await;
+        if !reissued {
+            conn.wait_for("the running tool", |frame| {
+                frame["event"]["content"]
+                    .as_array()
+                    .is_some_and(|content| content.iter().any(|block| block["type"] == "tool_use"))
+            })
+            .await;
+        }
+        conn.send(
+            json!({"type":"freshAgent.interrupt", "provider":"claude", "sessionType":"freshclaude",
+        "sessionId":id, "requestId":"refused-stop-request"}),
+        )
+        .await;
+        logs.wait_for("the refused interrupt receipt", |event| {
+            event.message == "freshagent.claude.stop"
+                && event.field("session_id") == Some(&id)
+                && event.field("outcome") == Some("refused")
+        })
+        .await;
+        conn.read_for(Duration::from_millis(100)).await;
+        let failure = conn
+            .frames
+            .iter()
+            .find(|frame| frame["event"]["code"] == "CLAUDE_INTERRUPT_FAILED")
+            .expect("a refused Stop must report a nested session error");
+        assert_eq!(failure["event"]["requestId"], "refused-stop-request");
+        conn.wait_for_event("freshAgent.result").await;
+        conn.wait_for_event("freshAgent.turn.complete").await;
+        conn.read_for(Duration::from_millis(50)).await;
+        assert_eq!(
+            conn.events_seen("freshAgent.turn.complete"),
+            1,
+            "the failed Stop never suppresses completion"
+        );
+        assert_eq!(
+            rig.fresh_claude.live_snapshot_overlay(&id).await["status"],
+            "idle"
+        );
+        rig.fresh_claude.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_interrupt_is_visible_and_does_not_silence_the_turns_result() {
+        refused_interrupt_reports_the_request_and_does_not_silence_completion(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_reissued_interrupt_reports_the_original_request_and_does_not_silence_completion(
+    ) {
+        refused_interrupt_reports_the_request_and_does_not_silence_completion(true).await;
+    }
 }

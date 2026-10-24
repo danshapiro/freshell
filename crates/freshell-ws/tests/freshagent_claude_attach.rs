@@ -59,9 +59,9 @@ rl.on('line', (line) => {
   logReq(msg)
   if (msg.type === 'create') {
     counter += 1
-    const sessionId = `fake-claude-session-${process.pid}-${counter}`
+    const sessionId = msg.sessionId || `fake-claude-session-${process.pid}-${counter}`
     process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 }) + '\n')
-    const cliSessionId = msg.boot?.resume || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const cliSessionId = msg.boot?.resume || sessionId
     process.stdout.write(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }) + '\n')
     process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }) + '\n')
   } else if (msg.type === 'send') {
@@ -375,7 +375,7 @@ async fn claude_attach_with_resumable_transcript_resumes_and_emits_snapshot_over
     })
     .await;
 
-    assert_eq!(frame["sessionId"], "gone-after-restart");
+    assert_eq!(frame["sessionId"], durable);
     assert_eq!(frame["sessionType"], "freshclaude");
     assert_eq!(frame["event"]["status"], "idle");
     assert_eq!(frame["event"]["timelineSessionId"], durable);
@@ -439,21 +439,19 @@ async fn claude_attach_with_an_unreadable_store_is_transient_not_lost() {
     )
     .await;
 
-    // The FIRST answer is decisive: either the lost frame for this pane or the
-    // transient top-level error.
+    // A transient failure stays scoped to this pane and is distinct from
+    // the permanent INVALID_SESSION_ID lost-session response.
     let frame = await_frame(&mut ws, Duration::from_secs(15), |v| {
         (v["type"] == "freshAgent.event" && v["sessionId"] == "pane-with-unreadable-store")
             || v["type"] == "error"
     })
     .await;
     assert_eq!(
-        frame["type"], "error",
+        frame["event"]["type"], "freshAgent.error",
         "an unreadable store must not mark the session lost: {frame}"
     );
     assert!(
-        frame["message"]
-            .as_str()
-            .is_some_and(|m| m.starts_with("CLAUDE_ATTACH_RESUME_FAILED")),
+        frame["event"]["code"] == "CLAUDE_ATTACH_RESUME_FAILED",
         "the attach answers with the transient resume failure: {frame}"
     );
 
@@ -504,12 +502,10 @@ async fn kilroy_attach_for_untracked_session_emits_lost_session_frame_over_ws() 
 // a silent no-op and `send{durable}` misses the sessions map (SESSION_NOT_FOUND) while
 // events keep broadcasting under the placeholder — stranding the pane the fold rebound.
 
-/// The fake sidecar's baked-in durable `cliSessionId` for a create WITHOUT resume.
-const DURABLE_FALLBACK: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+/// An unrelated saved conversation; fresh creates still choose their own UUID.
+const SEEDED_TRANSCRIPT_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
-/// Drive a claude `freshAgent.create` (no resume) through the fake sidecar; wait for
-/// `freshAgent.session.init` so `cli_index[DURABLE_FALLBACK] = placeholder` is recorded.
-/// Returns the placeholder session id.
+/// Create a native session and verify the sidecar repeats its acknowledged UUID.
 async fn create_live_claude_session(ws: &mut TestWs, request_id: &str) -> String {
     send_json(
         ws,
@@ -530,10 +526,11 @@ async fn create_live_claude_session(ws: &mut TestWs, request_id: &str) -> String
         .as_str()
         .expect("created carries sessionId")
         .to_string();
-    await_frame(ws, Duration::from_secs(15), |v| {
+    let init = await_frame(ws, Duration::from_secs(15), |v| {
         v["type"] == "freshAgent.event" && v["event"]["type"] == "freshAgent.session.init"
     })
     .await;
+    assert_eq!(init["event"]["cliSessionId"], placeholder);
     placeholder
 }
 
@@ -543,11 +540,11 @@ async fn create_live_claude_session(ws: &mut TestWs, request_id: &str) -> String
 #[tokio::test]
 async fn attach_by_durable_id_on_a_live_session_rebinds_and_acks() {
     let _guard = CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeClaudeResumeEnv::install(DURABLE_FALLBACK);
+    let env = FakeClaudeResumeEnv::install(SEEDED_TRANSCRIPT_ID);
 
     let url = spawn_server().await;
     let mut ws = connect_and_complete_handshake(&url).await;
-    let _placeholder = create_live_claude_session(&mut ws, "req-10b-attach").await;
+    let durable = create_live_claude_session(&mut ws, "req-10b-attach").await;
 
     let mut ws2 = connect_and_complete_handshake(&url).await;
     send_json(
@@ -555,15 +552,15 @@ async fn attach_by_durable_id_on_a_live_session_rebinds_and_acks() {
         &serde_json::json!({
             "type": "freshAgent.attach",
             "provider": "claude",
-            "sessionId": DURABLE_FALLBACK,
+            "sessionId": durable,
             "sessionType": "freshclaude",
-            "sessionRef": { "provider": "claude", "sessionId": DURABLE_FALLBACK },
+            "sessionRef": { "provider": "claude", "sessionId": durable },
         }),
     )
     .await;
 
     let frame = await_frame(&mut ws2, Duration::from_secs(10), |v| {
-        v["sessionId"] == DURABLE_FALLBACK
+        v["sessionId"] == durable
     })
     .await;
     assert_eq!(frame["type"], "freshAgent.event");
@@ -584,18 +581,18 @@ async fn attach_by_durable_id_on_a_live_session_rebinds_and_acks() {
 #[tokio::test]
 async fn send_by_durable_id_routes_to_the_live_session() {
     let _guard = CLAUDE_ENV_LOCK.lock().await;
-    let env = FakeClaudeResumeEnv::install(DURABLE_FALLBACK);
+    let env = FakeClaudeResumeEnv::install(SEEDED_TRANSCRIPT_ID);
 
     let url = spawn_server().await;
     let mut ws = connect_and_complete_handshake(&url).await;
-    let _placeholder = create_live_claude_session(&mut ws, "req-10b-send").await;
+    let durable = create_live_claude_session(&mut ws, "req-10b-send").await;
 
     send_json(
         &mut ws,
         &serde_json::json!({
             "type": "freshAgent.send",
             "provider": "claude",
-            "sessionId": DURABLE_FALLBACK,
+            "sessionId": durable,
             "sessionType": "freshclaude",
             "text": "ping",
             "requestId": "send-10b",
@@ -607,7 +604,7 @@ async fn send_by_durable_id_routes_to_the_live_session() {
         v["type"] == "freshAgent.send.accepted" && v["requestId"] == "send-10b"
     })
     .await;
-    assert_eq!(accepted["sessionId"], DURABLE_FALLBACK);
+    assert_eq!(accepted["sessionId"], durable);
 
     // The sidecar answers every `send` with an assistant frame -- awaiting it proves
     // the sidecar PROCESSED the routed send (the accepted broadcast races the log append).
@@ -625,16 +622,15 @@ async fn send_by_durable_id_routes_to_the_live_session() {
     assert_eq!(sends, 1, "the live sidecar must receive the routed send");
 }
 
-/// After the durable rebind, event envelopes must be stamped with the DURABLE id (the
-/// broadcast stamp flips), or the pane keyed on the durable never receives events.
+/// A second page's attach keeps subsequent events on the same native UUID.
 #[tokio::test]
 async fn events_after_durable_rebind_are_stamped_with_the_durable_id() {
     let _guard = CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeClaudeResumeEnv::install(DURABLE_FALLBACK);
+    let _env = FakeClaudeResumeEnv::install(SEEDED_TRANSCRIPT_ID);
 
     let url = spawn_server().await;
     let mut ws = connect_and_complete_handshake(&url).await;
-    let _placeholder = create_live_claude_session(&mut ws, "req-10b-events").await;
+    let durable = create_live_claude_session(&mut ws, "req-10b-events").await;
 
     let mut ws2 = connect_and_complete_handshake(&url).await;
     send_json(
@@ -642,15 +638,15 @@ async fn events_after_durable_rebind_are_stamped_with_the_durable_id() {
         &serde_json::json!({
             "type": "freshAgent.attach",
             "provider": "claude",
-            "sessionId": DURABLE_FALLBACK,
+            "sessionId": durable,
             "sessionType": "freshclaude",
-            "sessionRef": { "provider": "claude", "sessionId": DURABLE_FALLBACK },
+            "sessionRef": { "provider": "claude", "sessionId": durable },
         }),
     )
     .await;
     // The rebind ack gates the ordering (attach handled before the send below).
     await_frame(&mut ws2, Duration::from_secs(10), |v| {
-        v["sessionId"] == DURABLE_FALLBACK
+        v["sessionId"] == durable
     })
     .await;
 
@@ -660,7 +656,7 @@ async fn events_after_durable_rebind_are_stamped_with_the_durable_id() {
         &serde_json::json!({
             "type": "freshAgent.send",
             "provider": "claude",
-            "sessionId": DURABLE_FALLBACK,
+            "sessionId": durable,
             "sessionType": "freshclaude",
             "text": "poke",
             "requestId": "send-10b-events",
@@ -673,8 +669,8 @@ async fn events_after_durable_rebind_are_stamped_with_the_durable_id() {
     })
     .await;
     assert_eq!(
-        event["sessionId"], DURABLE_FALLBACK,
-        "post-rebind envelopes must be stamped with the durable id"
+        event["sessionId"], durable,
+        "attaching preserves the native envelope UUID"
     );
 }
 

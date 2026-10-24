@@ -468,7 +468,10 @@ pub mod ownership_lane {
         /// `Live{FreshAgent}` (a terminal owner or a vacated/crashed
         /// shape), or the supplied observed pair is stale. Every arm
         /// answers the lanes' typed `SESSION_RESERVED` surface.
-        Refused { message: String },
+        Refused {
+            message: String,
+            owner: Option<TerminalOwnerFields>,
+        },
     }
 
     /// Arm the reclaim-less op guard (see [`LaneOpGuard`]). The
@@ -509,6 +512,7 @@ pub mod ownership_lane {
                      pre-restart epoch) — the operation aborts typed");
                 return LaneOpGuard::Refused {
                     message: STALE_OP_GUARD_MESSAGE.to_string(),
+                    owner: terminal_owner_fields_from_snapshot(&snap),
                 };
             }
         }
@@ -576,9 +580,11 @@ pub mod ownership_lane {
                          the operation aborts typed; the client re-observes and \
                          retries with the pair"
                     );
+                    let owner = terminal_owner_fields_from_snapshot(&under);
                     drop(guard);
                     return LaneOpGuard::Refused {
                         message: FENCE_REQUIRED_OP_GUARD_MESSAGE.to_string(),
+                        owner,
                     };
                 }
                 // Verify `Live{FreshAgent}` UNDER the guard — stable now
@@ -587,7 +593,7 @@ pub mod ownership_lane {
                 // completed handoff) refuses typed here, never mutating
                 // another kind's session.
                 let under = registry.observe(provider, session_id);
-                match under.state {
+                match &under.state {
                     freshell_ownership::OwnershipState::Live { owner, .. }
                         if owner.kind == RuntimeOwnerKind::FreshAgent =>
                     {
@@ -602,9 +608,11 @@ pub mod ownership_lane {
                             outcome = "refused", failure_reason = "NOT_FRESH_AGENT_LIVE",
                             "the op guard armed over a non-fresh-agent owner — the \
                              operation aborts typed and the guard releases");
+                        let owner = terminal_owner_fields_from_snapshot(&under);
                         drop(guard);
                         LaneOpGuard::Refused {
                             message: KIND_OP_GUARD_MESSAGE.to_string(),
+                            owner,
                         }
                     }
                 }
@@ -621,11 +629,13 @@ pub mod ownership_lane {
                      nothing is mutated");
                 LaneOpGuard::Refused {
                     message: LIFECYCLE_OP_GUARD_MESSAGE.to_string(),
+                    owner: owner_fields_from_state(&state, registry.boot_epoch()),
                 }
             }
             freshell_ownership::AttachGuardOutcome::StaleGeneration {
-                current_epoch: _,
+                current_epoch,
                 current_generation,
+                current_state,
             } => {
                 tracing::warn!(target: "freshell_ownership",
                     operation_id = %operation_id, provider = %provider,
@@ -637,6 +647,7 @@ pub mod ownership_lane {
                      stale) — the operation aborts typed, nothing is mutated");
                 LaneOpGuard::Refused {
                     message: STALE_OP_GUARD_MESSAGE.to_string(),
+                    owner: owner_fields_from_state(&current_state, current_epoch),
                 }
             }
         }
@@ -1728,6 +1739,7 @@ pub mod ownership_lane {
             freshell_ownership::AttachGuardOutcome::StaleGeneration {
                 current_epoch,
                 current_generation,
+                ..
             } => {
                 tracing::warn!(target: "freshell_ownership",
                     operation_id = %operation_id, provider = %provider,
@@ -1789,6 +1801,7 @@ pub mod ownership_lane {
             freshell_ownership::AttachGuardOutcome::StaleGeneration {
                 current_epoch,
                 current_generation,
+                ..
             } => {
                 tracing::warn!(target: "freshell_ownership",
                     operation_id = %operation_id, provider = %provider,
@@ -1915,6 +1928,9 @@ pub mod ownership_lane {
                     owner_epoch: registry.boot_epoch(),
                 })
             }
+            BeginOutcome::Blocked { state, .. } => {
+                owner_fields_from_state(state, registry.as_ref()?.boot_epoch())
+            }
             _ => terminal_owner_fields_from_outcome(registry, outcome),
         }
     }
@@ -1924,7 +1940,14 @@ pub mod ownership_lane {
     pub fn terminal_owner_fields_from_snapshot(
         snapshot: &freshell_ownership::OwnershipSnapshot,
     ) -> Option<TerminalOwnerFields> {
-        match &snapshot.state {
+        owner_fields_from_state(&snapshot.state, snapshot.epoch)
+    }
+
+    fn owner_fields_from_state(
+        state: &freshell_ownership::OwnershipState,
+        epoch: u64,
+    ) -> Option<TerminalOwnerFields> {
+        match state {
             freshell_ownership::OwnershipState::Live {
                 owner, generation, ..
             } => Some(TerminalOwnerFields {
@@ -1933,7 +1956,7 @@ pub mod ownership_lane {
                     RuntimeOwnerKind::FreshAgent => "fresh-agent",
                 },
                 owner_generation: *generation,
-                owner_epoch: snapshot.epoch,
+                owner_epoch: epoch,
             }),
             _ => None,
         }

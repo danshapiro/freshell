@@ -18,7 +18,12 @@ const TARGET: &str = "freshell_freshagent::claude";
 impl FreshClaudeState {
     /// Stop the live session `map_key` (the body of [`Self::handle_interrupt`]).
     /// Returns `false` when no live session is registered under it.
-    pub(super) async fn stop_live_session(&self, map_key: &str, session_type: &str) -> bool {
+    pub(super) async fn stop_live_session(
+        &self,
+        map_key: &str,
+        session_type: &str,
+        request_id: &Option<String>,
+    ) -> bool {
         let mut sessions = self.sessions.lock().await;
         let Some(session) = sessions.get_mut(map_key) else {
             return false;
@@ -35,7 +40,7 @@ impl FreshClaudeState {
             .ledger
             .lock()
             .expect("turn ledger lock")
-            .stop(stop_id.clone());
+            .stop(stop_id.clone(), request_id.clone());
         let Some(armed) = armed else {
             tracing::info!(target: TARGET, provider = PROVIDER, session_id = %stamp,
                 session_type, outcome = "idle",
@@ -64,19 +69,19 @@ impl FreshClaudeState {
             tracing::warn!(target: TARGET, provider = PROVIDER, session_id = %stamp,
                 session_type, stop_id = %stop_id, outcome = "unsent", cause = %error,
                 "freshagent.claude.stop");
-            self.send_error(&None, "CLAUDE_INTERRUPT_FAILED", &error);
+            self.emit_stop_failure(&stamp, session_type, request_id, &error);
         }
         true
     }
 
     /// Send a latched Stop again (design §5.4): it missed a command the CLI was
     /// still starting, which now runs. Written only to the incarnation that
-    /// asked (`sidecar_session_id`): a session re-registered under the same key
-    /// since is not this Stop's.
+    /// asked (`ownership_id`): recovery reuses the durable session id but gives
+    /// the replacement process a different ownership id.
     pub(super) async fn reissue_stop(
         &self,
         map_key: &str,
-        sidecar_session_id: &str,
+        ownership_id: &str,
         stamp: &str,
         session_type: &str,
         reissue: &StopReissue,
@@ -89,30 +94,59 @@ impl FreshClaudeState {
         let mut sessions = self.sessions.lock().await;
         let Some(session) = sessions
             .get_mut(map_key)
-            .filter(|session| session.sidecar_session_id == sidecar_session_id)
+            .filter(|session| session.ownership_id == ownership_id)
         else {
             return;
         };
         let request = json!({
             "type": "interrupt",
-            "sessionId": sidecar_session_id,
+            "sessionId": session.sidecar_session_id,
             "stopId": reissue.reissue_id,
         });
         let writer = session.stdin.clone();
+        let ledger = session.ledger.clone();
         drop(sessions);
         if let Err(error) = writer.write(&request).await {
+            ledger
+                .lock()
+                .expect("turn ledger lock")
+                .stop_unsent(&reissue.stop_id);
             tracing::warn!(target: TARGET, provider = PROVIDER, session_id = %stamp,
                 session_type, stop_id = %reissue.stop_id, outcome = "unsent",
                 cause = %error,
                 "freshagent.claude.stop");
+            self.emit_stop_failure(stamp, session_type, &reissue.request_id, &error);
         }
     }
 
     /// The CLI refused the latched Stop's interrupt: the latch is disarmed and
     /// the turn keeps running (it rings when it ends).
-    pub(super) fn log_stop_refused(&self, stamp: &str, session_type: &str, stop_id: &str) {
+    pub(super) fn report_stop_refused(
+        &self,
+        stamp: &str,
+        session_type: &str,
+        stop_id: &str,
+        request_id: &Option<String>,
+        message: &str,
+    ) {
         tracing::warn!(target: TARGET, provider = PROVIDER, session_id = %stamp,
             session_type, stop_id = %stop_id, outcome = "refused",
             "freshagent.claude.stop");
+        self.emit_stop_failure(stamp, session_type, request_id, message);
+    }
+
+    fn emit_stop_failure(
+        &self,
+        stamp: &str,
+        session_type: &str,
+        request_id: &Option<String>,
+        message: &str,
+    ) {
+        let kind = if session_type == "kilroy" {
+            freshell_protocol::SessionType::Kilroy
+        } else {
+            freshell_protocol::SessionType::Freshclaude
+        };
+        self.emit_control_error(stamp, kind, request_id, "CLAUDE_INTERRUPT_FAILED", message);
     }
 }
