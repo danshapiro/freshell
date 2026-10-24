@@ -18,6 +18,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use freshell_ws::WsState;
 
 pub mod claude_rig;
+pub mod claude_sim_environment;
 pub mod ledger_sink;
 pub mod log_capture;
 pub mod opencode_home;

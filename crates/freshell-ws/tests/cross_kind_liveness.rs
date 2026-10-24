@@ -17,7 +17,7 @@
 //!    is refused with the D7 guard's EXISTING rejection frame
 //!    (`error { code: "RESTORE_UNAVAILABLE" }`), same as a live PTY.
 //!
-//! Harness: the lease-suite fake claude sidecar (request-log knob) + the common
+//! Harness: the production Claude sidecar over the contract CLI simulator + the common
 //! sleeper CLI spec so terminal claude creates genuinely spawn a Running PTY.
 //! Run via `scripts/sandbox-test.sh` per the destructive-suite convention of the
 //! sibling lease suite (shared file-level ruling; the kata-b8ke Task 7 races
@@ -40,90 +40,14 @@ use freshell_freshagent::{FreshAgentBindingUpsert, PaneIdentitySink};
 use freshell_ws::pane_ledger::PaneLedger;
 use freshell_ws::WsState;
 
+use common::claude_sim_environment::ClaudeSimEnvironment;
 use common::ledger_sink::LedgerSink;
 
 const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
 
 /// Serializes the tests in this file: they mutate process-global env vars
-/// (`FRESHELL_CLAUDE_SIDECAR` / `FAKE_SIDECAR_*`).
+/// (Codex/OpenCode process fixtures and terminal spawn controls).
 static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-// ── fake claude sidecar (request-log knob only; duplicated per-file per convention) ──
-
-const FAKE_CLAUDE_SIDECAR_SOURCE: &str = r#"
-import readline from 'node:readline'
-import fs from 'node:fs'
-
-const logPath = process.env.FAKE_SIDECAR_REQUEST_LOG || ''
-function logReq(msg) {
-  if (!logPath) return
-  try { fs.appendFileSync(logPath, JSON.stringify({ pid: process.pid, msg }) + '\n') } catch {}
-}
-
-let counter = 0
-const rl = readline.createInterface({ input: process.stdin, terminal: false })
-rl.on('line', (line) => {
-  const trimmed = line.trim()
-  if (!trimmed) return
-  let msg
-  try { msg = JSON.parse(trimmed) } catch { return }
-  logReq(msg)
-  if (msg.type === 'create') {
-    counter += 1
-    const sessionId = `fake-claude-session-${process.pid}-${counter}`
-    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 }) + '\n')
-    const cliSessionId = msg.boot?.resume || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-    process.stdout.write(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }) + '\n')
-    process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }) + '\n')
-  } else if (msg.type === 'shutdown') {
-    process.exit(0)
-  }
-})
-"#;
-
-struct FakeSidecarEnv {
-    dir: std::path::PathBuf,
-}
-
-impl FakeSidecarEnv {
-    fn install() -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "freshell-cross-kind-liveness-{}",
-            uuid_like_suffix()
-        ));
-        std::fs::create_dir_all(&dir).expect("create fake sidecar temp dir");
-        let script = dir.join("fake-claude-sidecar.mjs");
-        std::fs::write(&script, FAKE_CLAUDE_SIDECAR_SOURCE).expect("write fake sidecar");
-        std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
-        std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
-        std::env::set_var("FAKE_SIDECAR_REQUEST_LOG", dir.join("requests.jsonl"));
-        Self { dir }
-    }
-
-    fn create_rows(&self) -> Vec<Value> {
-        let Ok(raw) = std::fs::read_to_string(self.dir.join("requests.jsonl")) else {
-            return Vec::new();
-        };
-        raw.lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str::<Value>(l).expect("request log row parses"))
-            .filter(|r| r["msg"]["type"] == "create")
-            .collect()
-    }
-}
-
-impl Drop for FakeSidecarEnv {
-    fn drop(&mut self) {
-        for var in [
-            "FRESHELL_CLAUDE_SIDECAR",
-            "FRESHELL_CLAUDE_NODE",
-            "FAKE_SIDECAR_REQUEST_LOG",
-        ] {
-            std::env::remove_var(var);
-        }
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
 
 fn uuid_like_suffix() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -484,6 +408,18 @@ async fn build_ws_state_with_probe(
     freshell_terminal::TerminalRegistry,
     freshell_freshagent::FreshAgentState,
 ) {
+    build_ws_state_with_probe_and_env(cli_commands, probe, None).await
+}
+
+async fn build_ws_state_with_probe_and_env(
+    cli_commands: Vec<freshell_platform::CliCommandSpec>,
+    probe: std::sync::Arc<dyn freshell_ws::existence::SessionExistenceProbe>,
+    environment: Option<&ClaudeSimEnvironment>,
+) -> (
+    WsState,
+    freshell_terminal::TerminalRegistry,
+    freshell_freshagent::FreshAgentState,
+) {
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let settings =
@@ -515,6 +451,9 @@ async fn build_ws_state_with_probe(
     };
 
     let mut fresh_claude = freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx));
+    if let Some(environment) = environment {
+        fresh_claude = fresh_claude.with_sidecar_environment(environment.environment());
+    }
     fresh_claude.set_terminal_liveness(Arc::clone(&terminal_liveness));
     let mut fresh_codex = freshell_freshagent::FreshCodexState::new(
         Arc::clone(&auth_token),
@@ -597,8 +536,18 @@ async fn build_ws_state_with_probe(
 /// and the `WsState` clone (kata b8ke Task 3: the shared ownership
 /// coordinator is minted HERE, exactly like `main.rs` injects it).
 async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry, WsState) {
-    let (state, registry, _fresh_agent_state) =
-        build_ws_state(vec![sleeper_cli_spec("claude")]).await;
+    spawn_server_with_claude(None).await
+}
+
+async fn spawn_server_with_claude(
+    environment: Option<&ClaudeSimEnvironment>,
+) -> (String, freshell_terminal::TerminalRegistry, WsState) {
+    let (state, registry, _fresh_agent_state) = build_ws_state_with_probe_and_env(
+        vec![sleeper_cli_spec("claude")],
+        Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+        environment,
+    )
+    .await;
 
     let router = freshell_ws::router(state.clone());
     // Ephemeral loopback port only -- NEVER the self-hosted 3001/3002 ports.
@@ -643,9 +592,28 @@ async fn spawn_merged_server() -> MergedHarness {
 async fn spawn_merged_server_with_hooks(
     hooks: Arc<freshell_freshagent::HandoffTestHooks>,
 ) -> MergedHarness {
+    spawn_merged_server_with_hooks_and_claude(hooks, None).await
+}
+
+async fn spawn_merged_server_with_claude(environment: &ClaudeSimEnvironment) -> MergedHarness {
+    spawn_merged_server_with_hooks_and_claude(
+        Arc::new(freshell_freshagent::HandoffTestHooks::default()),
+        Some(environment),
+    )
+    .await
+}
+
+async fn spawn_merged_server_with_hooks_and_claude(
+    hooks: Arc<freshell_freshagent::HandoffTestHooks>,
+    environment: Option<&ClaudeSimEnvironment>,
+) -> MergedHarness {
     let cli_commands = Arc::new(vec![sleeper_cli_spec("claude"), sleeper_cli_spec("codex")]);
-    let (state, registry, fresh_agent_state) =
-        build_ws_state(cli_commands.iter().cloned().collect()).await;
+    let (state, registry, fresh_agent_state) = build_ws_state_with_probe_and_env(
+        cli_commands.iter().cloned().collect(),
+        Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+        environment,
+    )
+    .await;
 
     // The snapshot REST door shares the WS door's state slices (main.rs's
     // `SnapshotState::new` wiring: same auth token, same codex/claude
@@ -715,10 +683,20 @@ async fn spawn_merged_server_with_hooks(
 /// exists to guard). The terminal lane shares the same real ledger
 /// through the WsState.
 async fn spawn_merged_server_with_ledger() -> (MergedHarness, Arc<PaneLedger>) {
+    spawn_merged_server_with_ledger_and_claude(None).await
+}
+
+async fn spawn_merged_server_with_ledger_and_claude(
+    environment: Option<&ClaudeSimEnvironment>,
+) -> (MergedHarness, Arc<PaneLedger>) {
     let hooks = Arc::new(freshell_freshagent::HandoffTestHooks::default());
     let cli_commands = Arc::new(vec![sleeper_cli_spec("claude"), sleeper_cli_spec("codex")]);
-    let (state, registry, fresh_agent_state) =
-        build_ws_state(cli_commands.iter().cloned().collect()).await;
+    let (state, registry, fresh_agent_state) = build_ws_state_with_probe_and_env(
+        cli_commands.iter().cloned().collect(),
+        Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+        environment,
+    )
+    .await;
 
     // The REAL ledger (tempdir-rooted) replaces the disabled one BEFORE any
     // write can flow; the fresh states write through the same ledger via the
@@ -1108,9 +1086,9 @@ fn live_pty_count_for_session(
 #[tokio::test]
 async fn freshagent_resume_is_refused_while_a_terminal_pty_owns_the_session() {
     let _guard = ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSimEnvironment::new();
 
-    let (url, _registry, _ws_state) = spawn_server().await;
+    let (url, _registry, _ws_state) = spawn_server_with_claude(Some(&env)).await;
     let mut ws = connect(&url).await;
 
     // 1. A fresh claude terminal reaches Running, owning preallocated session S.
@@ -1170,9 +1148,9 @@ async fn freshagent_resume_is_refused_while_a_terminal_pty_owns_the_session() {
 
     // 3. ZERO sidecar spawns.
     assert!(
-        env.create_rows().is_empty(),
+        env.rows("query").is_empty(),
         "no sidecar may spawn while the terminal owns the session: {:?}",
-        env.create_rows()
+        env.rows("query")
     );
 }
 
@@ -1186,9 +1164,9 @@ async fn freshagent_resume_is_refused_while_a_terminal_pty_owns_the_session() {
 #[tokio::test]
 async fn freshagent_session_ref_resume_is_refused_while_a_terminal_pty_owns_the_session() {
     let _guard = ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSimEnvironment::new();
 
-    let (url, _registry, _ws_state) = spawn_server().await;
+    let (url, _registry, _ws_state) = spawn_server_with_claude(Some(&env)).await;
     let mut ws = connect(&url).await;
 
     // 1. A fresh claude terminal reaches Running, owning preallocated session S.
@@ -1245,9 +1223,9 @@ async fn freshagent_session_ref_resume_is_refused_while_a_terminal_pty_owns_the_
 
     // 3. ZERO sidecar spawns.
     assert!(
-        env.create_rows().is_empty(),
+        env.rows("query").is_empty(),
         "no sidecar may spawn while the terminal owns the session: {:?}",
-        env.create_rows()
+        env.rows("query")
     );
 }
 
@@ -1257,13 +1235,14 @@ async fn freshagent_session_ref_resume_is_refused_while_a_terminal_pty_owns_the_
 #[tokio::test]
 async fn terminal_create_is_refused_while_a_live_sidecar_owns_the_session() {
     let _guard = ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSimEnvironment::new();
 
     let durable = "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd";
-    let (url, registry, _ws_state) = spawn_server().await;
+    env.seed_transcript_at(durable, std::path::Path::new("/tmp"));
+    let (url, registry, _ws_state) = spawn_server_with_claude(Some(&env)).await;
     let mut ws = connect(&url).await;
 
-    // 1. A fresh-agent resume of S goes live (the fake sidecar answers `created`).
+    // 1. A fresh-agent resume of S goes live (the production sidecar boots the saved conversation).
     //    (ejh6 Task 7: sessionRef-only -- a legacy `resumeSessionId` carry is now
     //    rejected at the raw-Value guard, which would break this setup create.)
     send_json(
@@ -1282,7 +1261,7 @@ async fn terminal_create_is_refused_while_a_live_sidecar_owns_the_session() {
         v["type"] == "freshAgent.created" && v["requestId"] == "req-fa-owner-1"
     })
     .await;
-    assert_eq!(env.create_rows().len(), 1, "the sidecar owns S now");
+    assert_eq!(env.rows("query").len(), 1, "the sidecar owns S now");
 
     // 2. A terminal.create restoring the SAME session id (the D7 direct
     //    wire-sessionRef rung) must be refused -- the sidecar is the one writer.
@@ -1334,13 +1313,14 @@ async fn terminal_create_is_refused_while_a_live_sidecar_owns_the_session() {
 #[tokio::test]
 async fn d7_cross_kind_refusal_omits_live_terminal_id() {
     let _guard = ENV_LOCK.lock().await;
-    let env = FakeSidecarEnv::install();
+    let env = ClaudeSimEnvironment::new();
 
     let durable = "abababab-cdcd-4dcd-8dcd-cdcdcdcdcdcd";
-    let (url, registry, _ws_state) = spawn_server().await;
+    env.seed_transcript_at(durable, std::path::Path::new("/tmp"));
+    let (url, registry, _ws_state) = spawn_server_with_claude(Some(&env)).await;
     let mut ws = connect(&url).await;
 
-    // 1. A fresh-agent resume of S goes live (the fake sidecar answers `created`).
+    // 1. A fresh-agent resume of S goes live (the production sidecar boots the saved conversation).
     send_json(
         &mut ws,
         &json!({
@@ -1357,7 +1337,7 @@ async fn d7_cross_kind_refusal_omits_live_terminal_id() {
         v["type"] == "freshAgent.created" && v["requestId"] == "req-fa-owner-d7"
     })
     .await;
-    assert_eq!(env.create_rows().len(), 1, "the sidecar owns S now");
+    assert_eq!(env.rows("query").len(), 1, "the sidecar owns S now");
 
     // 2. The D7 cross-kind refusal: RESTORE_UNAVAILABLE, message names the
     //    session, and NO liveTerminalId (no terminal owns the session).
@@ -1612,10 +1592,11 @@ async fn a_successful_terminal_create_does_not_drop_its_ticket_unarmed() {
 #[tokio::test]
 async fn fresh_agent_create_and_kill_drive_the_shared_coordinator() {
     let _guard = ENV_LOCK.lock().await;
-    let sidecar = FakeSidecarEnv::install(); // SYNC at base — no .await
-    let (url, _registry, ws_state) = spawn_server().await;
+    let sidecar = ClaudeSimEnvironment::new();
+    let (url, _registry, ws_state) = spawn_server_with_claude(Some(&sidecar)).await;
     let mut ws = connect(&url).await;
-    let sid = format!("coord-{}", uuid::Uuid::new_v4());
+    let sid = uuid::Uuid::new_v4().to_string();
+    sidecar.seed_transcript_at(&sid, std::path::Path::new("/tmp"));
     send_json(
         &mut ws,
         &json!({
@@ -1664,9 +1645,10 @@ async fn fresh_agent_create_and_kill_drive_the_shared_coordinator() {
 #[tokio::test]
 async fn concurrent_terminal_and_fresh_agent_start_same_session_ref_yield_one_writer() {
     let _guard = ENV_LOCK.lock().await;
-    let sidecar = FakeSidecarEnv::install(); // SYNC at base — no .await
-    let (url, registry, _ws_state) = spawn_server().await;
-    let sid = format!("race-{}", uuid::Uuid::new_v4());
+    let sidecar = ClaudeSimEnvironment::new();
+    let (url, registry, _ws_state) = spawn_server_with_claude(Some(&sidecar)).await;
+    let sid = uuid::Uuid::new_v4().to_string();
+    sidecar.seed_transcript_at(&sid, std::path::Path::new("/tmp"));
     let mut ws_term = connect(&url).await;
     let mut ws_fresh = connect(&url).await;
 
@@ -1692,9 +1674,9 @@ async fn concurrent_terminal_and_fresh_agent_start_same_session_ref_yield_one_wr
     // two separate <=1 assertions (one sidecar + one PTY would pass those).
     let live_writers = || {
         let creates = sidecar
-            .create_rows()
+            .rows("query")
             .iter()
-            .filter(|r| r["msg"]["boot"]["resume"].as_str() == Some(sid.as_str()))
+            .filter(|r| r["options"]["resume"].as_str() == Some(sid.as_str()))
             .count();
         let ptys = live_pty_count_for_session(&registry, "claude", &sid);
         creates + ptys
@@ -1774,9 +1756,9 @@ async fn concurrent_terminal_and_fresh_agent_start_same_session_ref_yield_one_wr
     // independent: even a transient second writer that spawned and was torn
     // down between two sampler iterations leaves its Created event behind.
     let sidecar_creates = sidecar
-        .create_rows()
+        .rows("query")
         .iter()
-        .filter(|r| r["msg"]["boot"]["resume"].as_str() == Some(sid.as_str()))
+        .filter(|r| r["options"]["resume"].as_str() == Some(sid.as_str()))
         .count();
     assert!(
         pty_spawns.load(std::sync::atomic::Ordering::SeqCst) + sidecar_creates <= 1,
@@ -1789,10 +1771,11 @@ async fn concurrent_terminal_and_fresh_agent_start_same_session_ref_yield_one_wr
 #[tokio::test]
 async fn terminal_create_refusal_names_the_fresh_agent_owner_kind_and_generation() {
     let _guard = ENV_LOCK.lock().await;
-    let _sidecar = FakeSidecarEnv::install(); // SYNC at base — no .await
-    let (url, _registry, _ws_state) = spawn_server().await;
+    let sidecar = ClaudeSimEnvironment::new();
+    let (url, _registry, _ws_state) = spawn_server_with_claude(Some(&sidecar)).await;
     let mut ws = connect(&url).await;
-    let sid = format!("typed-owner-{}", uuid::Uuid::new_v4());
+    let sid = uuid::Uuid::new_v4().to_string();
+    sidecar.seed_transcript_at(&sid, std::path::Path::new("/tmp"));
     // Establish a live freshclaude owner first.
     send_json(
         &mut ws,
@@ -1856,9 +1839,10 @@ async fn terminal_create_refusal_names_the_fresh_agent_owner_kind_and_generation
 #[tokio::test]
 async fn non_negotiated_terminal_create_is_coordinator_fenced() {
     let _guard = ENV_LOCK.lock().await;
-    let _sidecar = FakeSidecarEnv::install(); // SYNC at base — no .await
-    let (url, _registry, _ws_state) = spawn_server().await;
-    let sid = format!("raw-{}", uuid::Uuid::new_v4());
+    let sidecar = ClaudeSimEnvironment::new();
+    let (url, _registry, _ws_state) = spawn_server_with_claude(Some(&sidecar)).await;
+    let sid = uuid::Uuid::new_v4().to_string();
+    sidecar.seed_transcript_at(&sid, std::path::Path::new("/tmp"));
     // A negotiated connection establishes the fresh owner.
     let mut ws_owner = connect(&url).await;
     send_json(
@@ -1985,10 +1969,11 @@ async fn non_negotiated_terminal_create_is_coordinator_fenced() {
 #[tokio::test]
 async fn ready_frame_replays_current_runtime_owners() {
     let _guard = ENV_LOCK.lock().await;
-    let _sidecar = FakeSidecarEnv::install(); // SYNC at base — no .await
-    let (url, _registry, _ws_state) = spawn_server().await;
+    let sidecar = ClaudeSimEnvironment::new();
+    let (url, _registry, _ws_state) = spawn_server_with_claude(Some(&sidecar)).await;
     let mut ws = connect(&url).await;
-    let sid = format!("replay-{}", uuid::Uuid::new_v4());
+    let sid = uuid::Uuid::new_v4().to_string();
+    sidecar.seed_transcript_at(&sid, std::path::Path::new("/tmp"));
     send_json(
         &mut ws,
         &json!({
@@ -2829,9 +2814,10 @@ async fn snapshot_get_for_opencode_never_spawns_the_shared_serve() {
 #[tokio::test]
 async fn fresh_agent_to_terminal_handoff_is_atomic_and_broadcast() {
     let _guard = ENV_LOCK.lock().await;
-    let sidecar = FakeSidecarEnv::install(); // SYNC at base — no .await
-    let mut h = spawn_merged_server().await;
-    let sid = format!("ho-e2e-{}", uuid::Uuid::new_v4());
+    let sidecar = ClaudeSimEnvironment::new();
+    let mut h = spawn_merged_server_with_claude(&sidecar).await;
+    let sid = uuid::Uuid::new_v4().to_string();
+    sidecar.seed_transcript_at(&sid, std::path::Path::new("/tmp"));
     // Fresh owner.
     send_json(
         &mut h.ws,
@@ -2997,23 +2983,11 @@ async fn fresh_agent_to_terminal_handoff_is_atomic_and_broadcast() {
 #[tokio::test]
 async fn terminal_to_fresh_agent_handoff_lands_over_the_unstamped_terminal_row() {
     let _guard = ENV_LOCK.lock().await;
-    let _sidecar = FakeSidecarEnv::install(); // SYNC at base — no .await
-                                              // The claude-lane resume gates on transcript presence (the 6b
-                                              // pattern): the target's resume of `sid` needs the transcript under
-                                              // CLAUDE_CONFIG_DIR.
-    let store_dir =
-        std::env::temp_dir().join(format!("freshell-handoff-ep5-r2-{}", uuid_like_suffix()));
-    let project_dir = store_dir.join("projects").join("slug");
-    std::fs::create_dir_all(&project_dir).expect("create transcript project dir");
-    let sid = format!("ho-rev-{}", uuid::Uuid::new_v4());
-    std::fs::write(
-        project_dir.join(format!("{sid}.jsonl")),
-        "{\"cwd\": \"/tmp\"}\n",
-    )
-    .expect("write fake transcript");
-    std::env::set_var("CLAUDE_CONFIG_DIR", &store_dir);
+    let sidecar = ClaudeSimEnvironment::new();
+    let sid = uuid::Uuid::new_v4().to_string();
+    sidecar.seed_transcript_at(&sid, std::path::Path::new("/tmp"));
 
-    let (mut h, pane_ledger) = spawn_merged_server_with_ledger().await;
+    let (mut h, pane_ledger) = spawn_merged_server_with_ledger_and_claude(Some(&sidecar)).await;
 
     // 1. The TERMINAL owner: an ordinary WS terminal binding (claude mode)
     //    over the durable id — the coordinator's Live{Terminal} and the
@@ -3096,9 +3070,7 @@ async fn terminal_to_fresh_agent_handoff_lands_over_the_unstamped_terminal_row()
     // 4. THE REAL LEDGER: the recovery row became the fresh-agent
     //    target's — pane_kind fresh-agent, the terminal's binding
     //    superseded (pre-ep5-r2 the row stayed the dead terminal's).
-    //    The target's session-init adoption write is ASYNC to the
-    //    runner's commit (the sidecar's sdk.session.init lands after the
-    //    handoff answered) — bounded-poll for the flip.
+    //    Observe the target's authoritative binding over the old terminal row.
     let flipped = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let done = pane_ledger
@@ -3128,12 +3100,9 @@ async fn terminal_to_fresh_agent_handoff_lands_over_the_unstamped_terminal_row()
         "the terminal's binding is superseded: {row:?}"
     );
 
-    // Cleanup: the sidecar target dies with the harness (the fake
-    // sidecar is a short-lived script under the dropped env), and the
-    // terminal row's PTY is reaped through the registry.
+    // The fixture guard closes the real SDK query on drop; the terminal
+    // row's PTY is reaped through the registry.
     h.ws_state.registry.kill(&terminal_id);
-    std::env::remove_var("CLAUDE_CONFIG_DIR");
-    let _ = std::fs::remove_dir_all(store_dir);
 }
 
 /// b8ke focused ep5 r3 F1 (e2e): a SUPERSEDED handoff's stale
@@ -3150,23 +3119,11 @@ async fn terminal_to_fresh_agent_handoff_lands_over_the_unstamped_terminal_row()
 #[tokio::test]
 async fn a_superseded_handoffs_stale_authoritative_write_is_refused_end_to_end() {
     let _guard = ENV_LOCK.lock().await;
-    let _sidecar = FakeSidecarEnv::install(); // SYNC at base — no .await
-                                              // The claude-lane resume gates on transcript presence (the 6b
-                                              // pattern): the target's resume of `sid` needs the transcript under
-                                              // CLAUDE_CONFIG_DIR.
-    let store_dir =
-        std::env::temp_dir().join(format!("freshell-handoff-ep5-r3-{}", uuid_like_suffix()));
-    let project_dir = store_dir.join("projects").join("slug");
-    std::fs::create_dir_all(&project_dir).expect("create transcript project dir");
-    let sid = format!("ho-sup-{}", uuid::Uuid::new_v4());
-    std::fs::write(
-        project_dir.join(format!("{sid}.jsonl")),
-        "{\"cwd\": \"/tmp\"}\n",
-    )
-    .expect("write fake transcript");
-    std::env::set_var("CLAUDE_CONFIG_DIR", &store_dir);
+    let sidecar = ClaudeSimEnvironment::new();
+    let sid = uuid::Uuid::new_v4().to_string();
+    sidecar.seed_transcript_at(&sid, std::path::Path::new("/tmp"));
 
-    let (mut h, pane_ledger) = spawn_merged_server_with_ledger().await;
+    let (mut h, pane_ledger) = spawn_merged_server_with_ledger_and_claude(Some(&sidecar)).await;
 
     // 1. The TERMINAL owner: an ordinary WS terminal binding (claude mode)
     //    over the durable id — the coordinator's Live{Terminal} and the
@@ -3338,8 +3295,6 @@ async fn a_superseded_handoffs_stale_authoritative_write_is_refused_end_to_end()
     // the second terminal's PTY is reaped through the registry.
     h.ws_state.registry.kill(&second_terminal_id);
     let _ = first_terminal_id;
-    std::env::remove_var("CLAUDE_CONFIG_DIR");
-    let _ = std::fs::remove_dir_all(store_dir);
 }
 
 /// b8ke focused ep5 r4 F1 (e2e): the FAILED-TRANSITION REPAIR, end to end
@@ -3357,25 +3312,11 @@ async fn a_superseded_handoffs_stale_authoritative_write_is_refused_end_to_end()
 #[tokio::test]
 async fn the_failed_transition_repair_fences_and_reverts_end_to_end() {
     let _guard = ENV_LOCK.lock().await;
-    let _sidecar = FakeSidecarEnv::install(); // SYNC at base — no .await
-                                              // The claude-lane resume gates on transcript presence (the 6b
-                                              // pattern): the target's resume of `sid` needs the transcript under
-                                              // CLAUDE_CONFIG_DIR.
-    let store_dir = std::env::temp_dir().join(format!(
-        "freshell-handoff-ep5-r4-repair-{}",
-        uuid_like_suffix()
-    ));
-    let project_dir = store_dir.join("projects").join("slug");
-    std::fs::create_dir_all(&project_dir).expect("create transcript project dir");
-    let sid = format!("ho-rep-{}", uuid::Uuid::new_v4());
-    std::fs::write(
-        project_dir.join(format!("{sid}.jsonl")),
-        "{\"cwd\": \"/tmp\"}\n",
-    )
-    .expect("write fake transcript");
-    std::env::set_var("CLAUDE_CONFIG_DIR", &store_dir);
+    let sidecar = ClaudeSimEnvironment::new();
+    let sid = uuid::Uuid::new_v4().to_string();
+    sidecar.seed_transcript_at(&sid, std::path::Path::new("/tmp"));
 
-    let (mut h, pane_ledger) = spawn_merged_server_with_ledger().await;
+    let (mut h, pane_ledger) = spawn_merged_server_with_ledger_and_claude(Some(&sidecar)).await;
 
     // 1. The TERMINAL owner + 2. the FIRST handoff to the FRESH target —
     //    the r2 success flow: the target's authoritative binding lands
@@ -3509,8 +3450,6 @@ async fn the_failed_transition_repair_fences_and_reverts_end_to_end() {
     // Cleanup: the first terminal's row was reaped by the handoff; the
     // fresh target's sidecar dies with the harness.
     let _ = terminal_id;
-    std::env::remove_var("CLAUDE_CONFIG_DIR");
-    let _ = std::fs::remove_dir_all(store_dir);
 }
 
 /// b8ke focused ep5 r5 F1 (e2e): an ORDINARY codex cold resume with
@@ -3530,10 +3469,9 @@ async fn the_failed_transition_repair_fences_and_reverts_end_to_end() {
 #[tokio::test]
 async fn an_ordinary_codex_cold_resume_with_recovered_settings_lands_end_to_end() {
     let _guard = ENV_LOCK.lock().await;
-    let _sidecar = FakeSidecarEnv::install(); // SYNC at base — no .await
-                                              // The isolated codex home + the fake app-server (the lease-suite
-                                              // pattern): the resume spawns a real sidecar subprocess through
-                                              // CODEX_CMD.
+    // The isolated codex home + the fake app-server (the lease-suite
+    // pattern): the resume spawns a real sidecar subprocess through
+    // CODEX_CMD.
     let codex_home = tempfile::tempdir().expect("isolated codex home");
     let prev_codex_home = std::env::var_os("CODEX_HOME");
     let prev_allow = std::env::var_os("FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES");
