@@ -5267,7 +5267,7 @@ impl FreshClaudeState {
             // Consumer exit == this sidecar's stdout closed == the sidecar ended
             // (ledger A9): it exits after reporting its SDK stream's end
             // (`sdk.stream.ended`, G02), or the Node process died. Evict the dead
-            // session and its cli_index entries, identity-guarded: a newer session
+            // session, identity-guarded: a newer session
             // re-registered under the same map key has a different pending-set
             // allocation, even when it reuses a durable sidecar session id, and
             // must not be evicted by this stale consumer.
@@ -9023,21 +9023,19 @@ pub(crate) mod tests {
         }
     }
 
-    /// Wait until the fresh create's adoption has COMMITTED ownership under
-    /// `durable_id`. The adoption publishes the `cli_index` alias and then
-    /// writes the identity binding BEFORE its commit (ext r27 F4: a failed
-    /// binding abandons it pre-commit), and the commit-to-Live plus the
-    /// retained release stamp are one critical section under the stamps
-    /// lock (ext r30 F1) — so neither the alias nor `was_recorded` proves
-    /// the commit: both can be observed while the claim is still Starting
-    /// and the stamp is absent. The stamp is the real condition.
+    /// Wait until the fresh create has committed ownership under `durable_id`.
+    /// Establishment writes the identity binding before committing ownership;
+    /// a failed binding abandons the claim. The commit to Live and retained
+    /// release stamp share the stamps lock, so a recorded binding alone does
+    /// not prove the commit: it can be observed while the claim is Starting.
+    /// The retained stamp is the condition this helper waits for.
     async fn await_create_ownership_committed(st: &FreshClaudeState, durable_id: &str) {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
         while crate::ownership_lane::peek_retained_stamp(&st.ownership_stamps, durable_id).is_none()
         {
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "the create's adoption never committed ownership (no retained stamp)"
+                "the create never committed ownership (no retained stamp)"
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -9134,8 +9132,7 @@ pub(crate) mod tests {
             "the durable ledger row was NOT closed on refusal — the retire \
              log must not name it"
         );
-        // And the runtime is still live in the map (has_live_session keys
-        // through cli_index — the DURABLE id is the index's entry).
+        // And the runtime is still live under its native identity.
         assert!(
             st.has_live_session(fresh_create_durable_id).await,
             "the refused kill left the session live"
@@ -10273,15 +10270,14 @@ pub(crate) mod tests {
         let created = await_claude_created(&mut rx, "req-retire-claude").await;
         let placeholder = created["sessionId"].as_str().unwrap().to_string();
         let durable = "3d3d3d3d-3d3d-4d3d-8d3d-3d3d3d3d3d3d";
-        // Alias the durable id at it (live: the consumer's sdk.session.init fold
-        // writes this mapping; here the test writes it directly, same trick as
-        // attach_rebind_ack_stamps_the_tracked_live_status_not_hardcoded_idle).
+        // Retain a prior native id in the runtime's history, as a conversation
+        // reset does. The close must include this historical durable row.
         st.sessions.lock().await[&placeholder]
             .identity
             .inherit([durable.to_string()]);
 
-        // Kill addressed by the DURABLE id must retire the durable-keyed row
-        // (resolve_session_key walks cli_index to the live map key).
+        // A kill addressed by the historical durable id resolves the same
+        // runtime and retires that durable row.
         st.handle_kill(FreshAgentKill {
             observed_epoch: None,
             observed_generation: None,
@@ -12089,7 +12085,7 @@ pub(crate) mod tests {
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "consumer exit must still evict the dead session and its live cli_index entries"
+                "consumer exit must still evict the dead native runtime"
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
@@ -13114,7 +13110,7 @@ pub(crate) mod tests {
     }
 
     /// The CREATE-resume lane twin: the post-commit kill lands while the lane
-    /// is between commit and the sessions/cli_index inserts — the create
+    /// is between commit and registration in the sessions map — the create
     /// answers failed and nothing registers.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_kill_landing_between_the_commit_and_the_registration_still_closes_the_resumed_create(
@@ -13443,7 +13439,7 @@ pub(crate) mod tests {
 
     /// Finding 2's headline: the kill's alias consult reaches the DURABLE
     /// record — the post-restart shape directly: this process's in-memory
-    /// store, `cli_index`, and sessions map are ALL empty (a restarted server
+    /// sessions map is empty (a restarted server
     /// is exactly that), yet the placeholder→durable mapping survives in the
     /// persisted alias tombstones, so the close names the bare placeholder
     /// and still fences + retires the durable row.
@@ -15461,8 +15457,8 @@ pub(crate) mod tests {
         drop(env);
     }
 
-    /// Ledger A9: consumer exit (== sidecar death) must evict the dead session AND its
-    /// `cli_index` entries — kill/shutdown are NOT the only eviction paths. Without this,
+    /// Ledger A9: consumer exit (sidecar death) must evict the dead runtime;
+    /// kill and shutdown are not the only eviction paths. Without this,
     /// a dead-but-tracked session makes the tracked⇒no-op attach row strand panes forever.
     #[tokio::test]
     async fn consumer_exit_evicts_dead_session_and_index() {
@@ -15473,8 +15469,8 @@ pub(crate) mod tests {
             .await;
         let created_frame = await_claude_created(&mut rx, "req-evict-1").await;
         let created = created_frame["sessionId"].as_str().unwrap().to_string();
-        // Kill the sidecar through the public API (fake exits on text "__exit__"),
-        // then poll (bounded) until the consumer-exit eviction clears BOTH maps.
+        // Kill this fixture's sidecar child, then wait for consumer-exit
+        // eviction to remove the native runtime.
         st.sessions
             .lock()
             .await
@@ -15490,7 +15486,7 @@ pub(crate) mod tests {
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "consumer exit must evict the dead session and its cli_index entries"
+                "consumer exit must evict the dead native runtime"
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
@@ -16036,8 +16032,8 @@ pub(crate) mod tests {
     /// A rollback-fixture live session: a `tee <stdin_log>` child stands in for the
     /// sidecar — every byte the handler writes to its stdin lands in stdin_log (the
     /// "no sidecar churn" oracle for the refusal legs) — registered with
-    /// `cli_session_id` = durable and the cli_index alias, exactly like a
-    /// fully-initialized live session.
+    /// its current native identity set to `durable`, retaining `map_key` in
+    /// its history like a runtime that has changed conversations.
     async fn insert_rollback_fixture_session(
         st: &FreshClaudeState,
         map_key: &str,
