@@ -53,6 +53,7 @@ Package manager: this repo runs on pnpm, pinned exactly (see [Package Manager (p
 
 ## Destructive Test Sandbox
 - Process-kill, config-corruption, and restart-storm suites run inside a disposable Docker sandbox, never directly on host: `scripts/sandbox-test.sh "<command>"` (or `pnpm run test:sandbox "<command>"`).
+- Set `FRESHELL_RUST_TEST_SANDBOX=1` for agent-launched `pnpm run test`, `check`, `verify`, `test:rust`, and `test:source-runtime`; the standard Rust and source-runtime runners honor it. Direct Cargo lanes (`test:server` and `test:integration`) still require the sandbox wrapper.
 - See `docs/development/test-sandbox.md` for the safety guarantees, the `--corpus` read-only real-data flag, and cache-volume management.
 
 ## Amplifier Skills Deployment (machine note)
