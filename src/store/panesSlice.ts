@@ -256,7 +256,9 @@ function normalizePaneContent(
           ...normalizeManagedRuntimeProjection(rawFreshAgent),
           sessionType: input.sessionType,
           provider: input.provider,
-          sessionId: retainedRestoreErrorSessionRef?.sessionId ?? input.sessionId,
+          sessionId: retainedRestoreErrorSessionRef?.provider === 'claude'
+            ? retainedRestoreErrorSessionRef.sessionId
+            : input.sessionId,
           ...(retainedRestoreErrorSessionRef ? { sessionRef: retainedRestoreErrorSessionRef } : {}),
           createRequestId: typeof input.createRequestId === 'string' && input.createRequestId
             ? input.createRequestId

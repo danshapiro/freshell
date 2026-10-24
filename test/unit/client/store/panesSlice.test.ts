@@ -3436,6 +3436,24 @@ describe('panesSlice', () => {
         expect(content.resumeSessionId).toBe(OPENCODE_DURABLE_ID)
       })
 
+      it('retains a non-Claude durable ref without rewriting its distinct live sessionId', () => {
+        const liveSessionId = 'opencode-live-session-handle'
+        const brokenDurable: FreshAgentPaneContent = {
+          ...durableOpencodeContent(),
+          sessionId: liveSessionId,
+          restoreError: DEAD_HANDLE_RESTORE_ERROR,
+        }
+
+        const updated = panesReducer(
+          initialState,
+          initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: brokenDurable }),
+        )
+        const content = freshAgentLeaf(updated)
+        expect(content.sessionRef).toEqual({ provider: 'opencode', sessionId: OPENCODE_DURABLE_ID })
+        expect(content.sessionId).toBe(liveSessionId)
+        expect(content.restoreError).toEqual(DEAD_HANDLE_RESTORE_ERROR)
+      })
+
       it('hydrate: restoreError on a DURABLE incoming identity applies unchanged', () => {
         const brokenDurable: FreshAgentPaneContent = {
           ...durableOpencodeContent(),
