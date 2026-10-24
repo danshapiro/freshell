@@ -11,6 +11,7 @@ import {
   type ProviderQualificationRow,
 } from '../../../scripts/testing/provider-qualification-receipt.js'
 import { RuntimeHarness, type RuntimeFixtureInputs, type SupervisorInstance } from '../../../scripts/testing/runtime-sandbox.js'
+import { preparedRuntimeBinary } from '../../../scripts/testing/runtime-build-preflight.js'
 import { RustServer } from './rust-server.js'
 import type { E2eServerInfo as TestServerInfo } from './server-fixture-support.js'
 import type { QualifiableTerminalProvider } from '../../../scripts/testing/provider-qualification-selection.js'
@@ -518,13 +519,16 @@ export class ManagedRuntimeBrowserRig {
   private buildManagedServer(): string {
     const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
     const qualification = this.pendingQualificationProviders()
-    execFileSync(mise, [
+    const features = this.fixtureFreshAgentModes.length > 0
+      ? 'managed-fresh-agent-fixtures'
+      : qualification.length ? 'managed-provider-qualification' : 'managed-runtime-v1'
+    const prepared = features === 'managed-runtime-v1' ? undefined
+      : preparedRuntimeBinary(this.repoRoot, `server-${features}`)
+    if (!prepared) execFileSync(mise, [
       'exec', 'rust@1.96', '--', 'cargo', 'build', '--release', '-p', 'freshell-server',
-      '--features', this.fixtureFreshAgentModes.length > 0
-        ? 'managed-fresh-agent-fixtures'
-        : qualification.length ? 'managed-provider-qualification' : 'managed-runtime-v1',
+      '--features', features,
     ], { cwd: this.repoRoot, stdio: 'inherit' })
-    const source = path.join(this.repoRoot, 'target', 'release', 'freshell-server')
+    const source = prepared ?? path.join(this.repoRoot, 'target', 'release', 'freshell-server')
     const target = path.join(this.runtime.buildDir, 'freshell-server-managed')
     fs.copyFileSync(source, target)
     fs.chmodSync(target, 0o755)
@@ -534,12 +538,13 @@ export class ManagedRuntimeBrowserRig {
   private buildQualificationSupervisor(): string | undefined {
     if (this.pendingQualificationProviders().length === 0) return undefined
     const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
-    execFileSync(mise, [
+    const prepared = preparedRuntimeBinary(this.repoRoot, 'supervisor-qualification')
+    if (!prepared) execFileSync(mise, [
       'exec', 'rust@1.96', '--', 'cargo', 'build', '--release', '-p', 'freshell-supervisor',
       '--features', 'provider-qualification',
     ], { cwd: this.repoRoot, stdio: 'inherit' })
     const target = path.join(this.runtime.buildDir, 'freshell-supervisor-qualification')
-    fs.copyFileSync(path.join(this.repoRoot, 'target', 'release', 'freshell-supervisor'), target)
+    fs.copyFileSync(prepared ?? path.join(this.repoRoot, 'target', 'release', 'freshell-supervisor'), target)
     fs.chmodSync(target, 0o755)
     return target
   }
