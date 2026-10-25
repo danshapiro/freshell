@@ -83,9 +83,9 @@ async function normalizeOwnedTree(root) {
   }
 }
 
-export async function verifyArtifact(root, metadata = artifactMetadata) {
+export async function verifyArtifact(root, metadata = artifactMetadata, referenceReceipt) {
   const absolute = await fsp.realpath(root)
-  const receipt = JSON.parse(await fsp.readFile(path.join(absolute, 'artifact-receipt.json'), 'utf8'))
+  const receipt = JSON.parse(await fsp.readFile(referenceReceipt ?? path.join(absolute, 'artifact-receipt.json'), 'utf8'))
   if (receipt.integrity !== metadata.integrity || receipt.packageVersion !== metadata.packageVersion || receipt.complete !== true) fail('artifact receipt does not match pinned metadata')
   const files = await inventory(absolute)
   if (JSON.stringify(files) !== JSON.stringify(receipt.files)) fail('artifact bytes/layout/modes changed after verified preparation')
@@ -247,6 +247,50 @@ export async function verifySandbox() {
   }
 }
 
+// Test-only system requirements are isolated to this owned image derivative.
+export async function prepareContractImage(baseImage, owner, contextRoot = path.join(stageRoot, 'image-context')) {
+  if (!/^sha256:[a-f0-9]{64}$/.test(baseImage) || !/^[a-z0-9-]+$/.test(owner)) fail('invalid owned contract image identity')
+  const context = path.join(contextRoot, owner)
+  const baseTag = `freshell-codex-contract-base:${owner}`
+  const tag = `freshell-codex-contract:${owner}`
+  // Complete filesystem setup before acquiring any image tag.
+  await fsp.mkdir(context, { recursive: true, mode: 0o700 })
+  await fsp.writeFile(path.join(context, 'requirements.toml'), CODEX_NETWORK_REQUIREMENTS, { mode: 0o644 })
+  await fsp.writeFile(path.join(context, 'Dockerfile'), `FROM ${baseTag}\nCOPY requirements.toml /etc/codex/requirements.toml\nRUN chmod 755 /etc/codex && chmod 644 /etc/codex/requirements.toml\n`)
+  const inspect = name => {
+    const result = spawnSync('docker', ['image', 'inspect', name], { encoding: 'utf8', timeout: 30_000 })
+    if (result.status === 0) return JSON.parse(result.stdout)[0]
+    if (/No such image/.test(result.stderr)) return undefined
+    throw new Error(`cannot inspect owned image ${name}: ${result.error?.message ?? result.stderr}`)
+  }
+  try {
+    run('docker', ['image', 'tag', baseImage, baseTag])
+    run('docker', ['build', '--pull=false', '--label', `org.freshell.codex-contract-owner=${owner}`, '-t', tag, context], { stdio: ['ignore', 'inherit', 'inherit'] })
+    const image = inspect(tag)
+    if (!/^sha256:[a-f0-9]{64}$/.test(image?.Id ?? '') || image.Config?.Labels?.['org.freshell.codex-contract-owner'] !== owner) fail('built contract image ownership changed')
+    return { baseImage, subdir: owner, image: image.Id, contractImage: { tag, requirementsSha256: digest(CODEX_NETWORK_REQUIREMENTS) } }
+  } catch (error) {
+    // A failed CLI acknowledgement can still have published the image.
+    try {
+      const image = inspect(tag)
+      if (image) {
+        if (image.Config?.Labels?.['org.freshell.codex-contract-owner'] !== owner) fail('failed-build image is no longer owned')
+        run('docker', ['image', 'rm', tag])
+      }
+    } catch (cleanup) {
+      console.error(JSON.stringify({ severity: 'error', event: 'codex_contract_image_cleanup_failed', owner, message: cleanup.message }))
+      throw new AggregateError([error, cleanup], 'Codex contract image preparation and cleanup failed')
+    }
+    throw error
+  } finally {
+    const base = inspect(baseTag)
+    if (base) {
+      if (base.Id !== baseImage) fail('owned temporary base tag changed during preparation')
+      run('docker', ['image', 'rm', baseTag])
+    }
+  }
+}
+
 async function main(args) {
   let result
   if (args[0] === '--output' && args.length === 2) result = await prepareArtifact(args[1])
@@ -267,22 +311,9 @@ async function main(args) {
     await fsp.writeFile(path.join(stageRoot, 'policy-client-prepared.json'), `${JSON.stringify(client)}\n`, { mode: 0o644 })
     result = JSON.parse(run('bash', ['scripts/sandbox-test.sh', 'node scripts/testing/prepare-codex-contract.mjs --stage-prepared'], { stdio: ['ignore', 'pipe', 'inherit'] }))
     result.baseImage = run('docker', ['image', 'inspect', imageTag, '--format', '{{.Id}}']).trim()
-    const context = path.join(stageRoot, 'image-context', result.subdir)
-    await fsp.mkdir(context, { recursive: true, mode: 0o700 })
-    await fsp.writeFile(path.join(context, 'requirements.toml'), CODEX_NETWORK_REQUIREMENTS, { mode: 0o644 })
-    await fsp.writeFile(path.join(stageRoot, 'requirements.toml'), CODEX_NETWORK_REQUIREMENTS, { mode: 0o644 })
-    const baseTag = `freshell-codex-contract-base:${result.subdir}`
-    run('docker', ['image', 'tag', result.baseImage, baseTag])
-    await fsp.writeFile(path.join(context, 'Dockerfile'), `FROM ${baseTag}\nCOPY requirements.toml /etc/codex/requirements.toml\nRUN chmod 755 /etc/codex && chmod 644 /etc/codex/requirements.toml\n`)
-    const tag = `freshell-codex-contract:${result.subdir}`
-    try { run('docker', ['build', '--pull=false', '--label', `org.freshell.codex-contract-owner=${result.subdir}`, '-t', tag, context], { stdio: ['ignore', 'inherit', 'inherit'] }) }
-    finally {
-      const observedBase = run('docker', ['image', 'inspect', baseTag, '--format', '{{.Id}}']).trim()
-      if (observedBase !== result.baseImage) fail('owned temporary base tag changed during preparation')
-      run('docker', ['image', 'rm', baseTag])
-    }
-    result.image = run('docker', ['image', 'inspect', tag, '--format', '{{.Id}}']).trim()
-    result.contractImage = { tag, requirementsSha256: digest(CODEX_NETWORK_REQUIREMENTS) }
+    const derived = await prepareContractImage(result.baseImage, result.subdir)
+    result.image = derived.image
+    result.contractImage = derived.contractImage
     const manifestTemporary = `${stageManifest}.${randomUUID()}.preparing`
     await fsp.writeFile(manifestTemporary, `${JSON.stringify(result, null, 2)}\n`, { mode: 0o644, flag: 'wx' })
     await fsp.rename(manifestTemporary, stageManifest)

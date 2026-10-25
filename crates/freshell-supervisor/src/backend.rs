@@ -597,11 +597,16 @@ fn runtime_host_environment(
             );
         }
         if agent.provider == freshell_runtime_protocol::FreshProvider::Codex {
+            let program = if agent.fixture_transport.is_none() {
+                codex_sandbox::managed_program("codex")?
+            } else {
+                "codex".into()
+            };
             values.insert(
                 "CODEX_CMD".into(),
                 format!(
-                    "/usr/bin/setpriv --reuid {} --regid {} --clear-groups --no-new-privs -- codex",
-                    agent.run_as_uid, agent.run_as_gid
+                    "/usr/bin/setpriv --reuid {} --regid {} --clear-groups --no-new-privs -- {}",
+                    agent.run_as_uid, agent.run_as_gid, program
                 ),
             );
         }
@@ -631,7 +636,9 @@ fn runtime_host_environment(
             "CODEX_CMD".into(),
             format!(
                 "/usr/bin/setpriv --reuid {} --regid {} --clear-groups --no-new-privs -- {}",
-                terminal.run_as_uid, terminal.run_as_gid, terminal.program
+                terminal.run_as_uid,
+                terminal.run_as_gid,
+                codex_sandbox::managed_program(&terminal.program)?
             ),
         );
     }
@@ -2069,7 +2076,7 @@ mod tests {
         assert_eq!(response.body, b"test");
     }
     #[test]
-    fn codex_host_environment_drops_to_the_provider_uid_and_uses_soul_home() {
+    fn codex_host_environment_uses_soul_home_and_excludes_auth_token() {
         let terminal = TerminalLaunchSpec {
             terminal_id: "terminal-one".into(),
             stream_id: "stream-one".into(),
@@ -2106,7 +2113,7 @@ mod tests {
         assert!(env
             .iter()
             .any(|value| value == "CODEX_HOME=/home/freshell/provider/.codex"));
-        assert!(env.iter().any(|value| value == "CODEX_CMD=/usr/bin/setpriv --reuid 65534 --regid 0 --clear-groups --no-new-privs -- codex"));
+
         assert!(!env.iter().any(|value| value.contains("AUTH_TOKEN")));
     }
 

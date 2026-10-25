@@ -49,6 +49,8 @@ pub mod remote_proxy_side_effects;
 
 #[cfg(feature = "real-transport")]
 pub mod launch_lifecycle;
+#[cfg(all(feature = "real-transport", target_os = "linux"))]
+pub mod managed_launch;
 #[cfg(feature = "real-transport")]
 pub mod remote_proxy;
 #[cfg(feature = "real-transport")]

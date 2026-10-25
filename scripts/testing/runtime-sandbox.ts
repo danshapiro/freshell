@@ -254,6 +254,13 @@ export class RuntimeHarness {
     this.browserDir = path.join(this.evidenceDir, 'browser')
   }
 
+  private codexRuntimeVersion(): string {
+    const inventory = JSON.parse(fs.readFileSync(path.join(this.repoRoot, 'docker/runtime/provider-versions.json'), 'utf8'))
+    const version: unknown = inventory?.providers?.codex?.version
+    if (typeof version !== 'string' || version.length === 0) throw new Error('Managed Codex runtime inventory has no version')
+    return version
+  }
+
   async prepare(options: { operatorHome?: string } = {}): Promise<void> {
     fs.rmSync(this.testRoot, { recursive: true, force: true })
     fs.mkdirSync(this.testRoot, { recursive: true, mode: 0o700 })
@@ -277,7 +284,7 @@ export class RuntimeHarness {
               providers: {
                 claude: { status: 'pending-receipt', requiredModel: 'haiku', reasoning: 'lowest' },
                 opencode: { status: 'pending-receipt', version: '1.18.21', modelProvider: 'openai', model: 'openai/gpt-5.6-luna', freeTier: false },
-                codex: { status: 'pending-receipt', version: '0.147.0', requiredModel: 'gpt-5.6-luna', reasoning: 'lowest' },
+                codex: { status: 'pending-receipt', version: this.codexRuntimeVersion(), requiredModel: 'gpt-5.6-luna', reasoning: 'lowest' },
                 amplifier: { status: 'pending-receipt', version: '0.1.1', commit: '1873aa980535c99a743b17172e4231833f6c8741' },
               },
             }

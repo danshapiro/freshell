@@ -34,7 +34,7 @@ RUN npm install --global pnpm@10.34.5 \
 
 FROM ubuntu@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
 ARG CLAUDE_CODE_VERSION=2.1.263
-ARG CODEX_VERSION=0.147.0
+ARG CODEX_VERSION=0.164.0
 ARG OPENCODE_VERSION=1.18.21
 ARG BUN_VERSION=1.4.3
 ARG AMPLIFIER_APP_CLI_COMMIT=1873aa980535c99a743b17172e4231833f6c8741
@@ -75,6 +75,11 @@ RUN apt-get update \
  && /opt/amplifier-src/.venv/bin/python -c 'import importlib.metadata as m; assert m.version("amplifier-app-cli") == "0.1.1"' \
  && /opt/amplifier-src/.venv/bin/python -c 'import importlib.metadata as m; assert m.version("openai") == "2.8.1"; assert m.version("openai-harmony") == "0.0.8"; assert m.version("amplifier-module-provider-vllm") == "1.0.0"' \
  && /lib/x86_64-linux-gnu/libc.so.6 | grep -F '2.39'
+
+COPY docker/runtime/codex-native-sandbox.json /opt/freshell-codex/codex-native-sandbox.json
+COPY docker/runtime/codex-launch.mjs /opt/freshell-codex/launch.mjs
+COPY docker/runtime/codex-assemble.mjs /opt/freshell-codex/codex-assemble.mjs
+RUN FRESHELL_CODEX_BUILD_VERSION="${CODEX_VERSION}" node /opt/freshell-codex/codex-assemble.mjs
 
 # FreshClaude/Kilroy run inside the soul host, so their JS SDK bridge and its
 # pinned dependency must be part of the workload image rather than resolved

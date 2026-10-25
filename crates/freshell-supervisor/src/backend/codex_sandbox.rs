@@ -17,6 +17,10 @@ pub(super) struct Identity {
     pub declared_managed_version: String,
     pub helper_sha256: String,
     pub launch_wrapper: String,
+    pub npm_wrapper: String,
+    pub layout_file: String,
+    pub helper_directory: String,
+    pub npm_entrypoint_sha256: String,
 }
 
 struct Policy {
@@ -29,10 +33,18 @@ pub(super) fn selected(
     terminal: Option<&TerminalLaunchSpec>,
     agent: Option<&FreshAgentLaunchSpec>,
 ) -> bool {
-    terminal.is_some_and(|terminal| terminal.mode == "codex")
-        || agent.is_some_and(|agent| {
-            agent.provider == FreshProvider::Codex && agent.fixture_transport.is_none()
-        })
+    terminal.is_some_and(|terminal| {
+        terminal.mode == "codex"
+            && (terminal.program == "codex"
+                || policy()
+                    .map(|policy| {
+                        terminal.program == policy.identity.npm_wrapper
+                            || terminal.program == policy.identity.launch_wrapper
+                    })
+                    .unwrap_or(true))
+    }) || agent.is_some_and(|agent| {
+        agent.provider == FreshProvider::Codex && agent.fixture_transport.is_none()
+    })
 }
 
 fn parse(raw: &str) -> Result<Policy, String> {
@@ -53,7 +65,10 @@ fn parse(raw: &str) -> Result<Policy, String> {
             .map(str::to_owned)
             .ok_or_else(|| format!("missing native policy field {pointer}"))
     };
-    let profile = resource["profile"].clone();
+    let mut profile = resource["profile"].clone();
+    // Match the canonical bytes used by the executed native fixture profile.
+    // serde_json preserves source key order in this workspace.
+    profile.sort_all_objects();
     let profile_json = serde_json::to_string(&profile).map_err(|error| error.to_string())?;
     let identity = Identity {
         id: field("/id")?,
@@ -64,7 +79,14 @@ fn parse(raw: &str) -> Result<Policy, String> {
             .to_owned(),
         helper_sha256: field("/native/bwrapSha256")?,
         launch_wrapper: field("/native/launchWrapper")?,
+        npm_wrapper: field("/native/npmWrapper")?,
+        layout_file: field("/native/layoutFile")?,
+        helper_directory: field("/native/helperDirectory")?,
+        npm_entrypoint_sha256: field("/native/npmEntrypointSha256")?,
     };
+    if identity.supported_native_version != identity.declared_managed_version {
+        return Err("managed Codex pin and supported native sandbox version differ; rebuild an aligned workload image".into());
+    }
     Ok(Policy {
         identity,
         profile,
@@ -100,6 +122,17 @@ pub(super) fn security_options(
         options.push(policy()?.security_option.clone());
     }
     Ok(options)
+}
+
+pub(super) fn managed_program(program: &str) -> Result<String, BackendError> {
+    let policy = policy()?;
+    Ok(
+        if program == "codex" || program == policy.identity.npm_wrapper {
+            policy.identity.launch_wrapper.clone()
+        } else {
+            program.to_owned()
+        },
+    )
 }
 
 pub(super) fn verify(host: &Value) -> Result<(), BackendError> {

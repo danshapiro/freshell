@@ -62,9 +62,10 @@ async function roots(options) {
   const metadata = options.probeMetadata ?? artifactMetadata
   let staged
   if (fs.existsSync(path.join(repoRoot, '.runtime-build/codex-contract/staged.json'))) staged = JSON.parse(await fsp.readFile(path.join(repoRoot, '.runtime-build/codex-contract/staged.json'), 'utf8'))
-  const artifactRoot = options.artifactRoot ?? process.env.FRESHELL_CODEX_CONTRACT_ROOT ?? (process.env.FRESHELL_SANDBOX_MODE === 'runtime-suite' ? staged?.artifactRoot : undefined)
+  const managed = process.env.FRESHELL_CODEX_MANAGED_CONTRACT === '1' ? JSON.parse(await fsp.readFile(nativeSandboxPolicy().native.layoutFile, 'utf8')) : undefined
+  const artifactRoot = managed?.platformPackageRoot ?? options.artifactRoot ?? process.env.FRESHELL_CODEX_CONTRACT_ROOT ?? (process.env.FRESHELL_SANDBOX_MODE === 'runtime-suite' ? staged?.artifactRoot : undefined)
   if (!artifactRoot) throw new Error('CODEX_CONTRACT_PREREQUISITE: explicit prepared artifact root is missing; no PATH fallback')
-  const artifact = await verifyArtifact(artifactRoot, metadata)
+  const artifact = await verifyArtifact(artifactRoot, metadata, managed ? '/native-reference.json' : undefined)
   let policyClientProbe
   if (!options.probeMetadata && !options.seccompProbeReceipt) {
     const file = options.policyClientProbe ?? process.env.FRESHELL_CODEX_POLICY_CLIENT_PROBE ?? staged?.policyClientProbe?.path
@@ -79,12 +80,12 @@ async function roots(options) {
   const systemConfig = ['/etc/codex/config.toml', '/etc/codex/requirements.toml'].map(file => ({ path: file, present: fs.existsSync(file) }))
   if (systemConfig.some(file => file.present && (file.path !== '/etc/codex/requirements.toml' || fs.readFileSync(file.path, 'utf8') !== CODEX_NETWORK_REQUIREMENTS))) throw new Error('CODEX_CONTRACT_PREREQUISITE: unexpected system Codex configuration in fixture environment')
   const environment = { PATH: process.env.PATH, HOME: path.join(stateRoot, 'home'), CODEX_HOME: await fsp.realpath(path.join(stateRoot, 'codex')), XDG_CONFIG_HOME: path.join(stateRoot, 'xdg-config'), XDG_CACHE_HOME: path.join(stateRoot, 'xdg-cache'), XDG_DATA_HOME: path.join(stateRoot, 'xdg-data'), TMPDIR: path.join(stateRoot, 'tmp'), LANG: 'C.UTF-8', RUST_LOG: 'warn' }
-  if (!options.probeMetadata || options.preferBundledBwrap) {
+  if (!managed && (!options.probeMetadata || options.preferBundledBwrap)) {
     const bundled = artifact.files.filter(file => file.path.endsWith('/codex-resources/bwrap'))
     assert.equal(bundled.length, 1, 'fixture PATH selection needs the single verified bundled bubblewrap resource')
     environment.PATH = `${path.dirname(path.join(artifact.path, bundled[0].path))}:${environment.PATH}`
   }
-  return { artifact, metadata, stateRoot, receiptRoot, environment, workspace: path.join(stateRoot, 'workspace'), systemConfig, staged, policyClientProbe }
+  return { artifact, metadata, managed, stateRoot, receiptRoot, environment, workspace: path.join(stateRoot, 'workspace'), systemConfig, staged, policyClientProbe }
 }
 
 class NativeClient {
@@ -714,10 +715,16 @@ async function driveNetwork(client, capture, flow, context) {
 export async function captureNativeScenario(name, options = {}) {
   assert(scenarios.includes(name), `unknown native scenario ${name}`)
   const context = await roots(options)
-  const capture = { scenario: name, parameters: Object.fromEntries(['historyMode', 'duplicateBodies', 'persistenceMode', 'largeOutput', 'startupCancellation', 'ephemeralParent', 'childApproval', 'approvalControl', 'probeApprovalPolicy', 'probePolicyEffects', 'sandboxMode', 'requirementsGuard'].filter(key => options[key] !== undefined).map(key => [key, options[key]])), probeOnly: options.probeMetadata?.probeOnly === true, binary: { path: path.join(context.artifact.path, context.metadata.executable), version: null, platform: `${process.platform}-${process.arch}`, integrity: context.artifact.integrity }, threadId: null, requests: [], responses: [], serverRequests: [], notifications: [], reads: [], fixtureTraffic: [], observations: {}, frames: [], environment: { uid: process.getuid?.(), gid: process.getgid?.(), groups: process.getgroups?.(), artifact: context.artifact, systemConfig: context.systemConfig, policyClientProbe: context.policyClientProbe, writableRoots: { state: context.stateRoot, receipts: context.receiptRoot }, prerequisites: context.staged ?? null, context: context.environment, ambientBefore: ambientCodex() } }
+  const capture = { scenario: name, parameters: Object.fromEntries(['historyMode', 'duplicateBodies', 'persistenceMode', 'largeOutput', 'startupCancellation', 'ephemeralParent', 'childApproval', 'approvalControl', 'probeApprovalPolicy', 'probePolicyEffects', 'sandboxMode', 'requirementsGuard'].filter(key => options[key] !== undefined).map(key => [key, options[key]])), probeOnly: options.probeMetadata?.probeOnly === true, binary: { path: context.managed?.launchWrapper ?? path.join(context.artifact.path, context.metadata.executable), version: null, platform: `${process.platform}-${process.arch}`, integrity: context.artifact.integrity }, threadId: null, requests: [], responses: [], serverRequests: [], notifications: [], reads: [], fixtureTraffic: [], observations: {}, frames: [], environment: { uid: process.getuid?.(), gid: process.getgid?.(), groups: process.getgroups?.(), artifact: context.artifact, systemConfig: context.systemConfig, policyClientProbe: context.policyClientProbe, writableRoots: { state: context.stateRoot, receipts: context.receiptRoot }, prerequisites: context.staged ?? null, context: context.environment, ambientBefore: ambientCodex() } }
   Object.defineProperty(capture, 'secretValues', { value: new Set(), enumerable: false })
   capture.environment.cloud = Object.fromEntries(['CLOUD_RUN_JOB', 'CLOUD_RUN_EXECUTION', 'CLOUD_RUN_TASK_INDEX', 'CLOUD_RUN_TASK_ATTEMPT'].filter(key => process.env[key] !== undefined).map(key => [key, process.env[key]]))
   if (options.seccompProbeReceipt) capture.environment.seccompProbe = JSON.parse(await fsp.readFile(options.seccompProbeReceipt, 'utf8'))
+  if (context.managed) {
+    capture.environment.managedLayout = context.managed
+    capture.environment.nativeSandboxPolicy = nativeSandboxPolicy()
+    delete capture.environment.nativeSandboxPolicy.profile
+    delete capture.environment.nativeSandboxPolicy.json
+  }
   if (process.env.FRESHELL_CODEX_CONTRACT_POLICY === 'prepared') {
     const declared = nativeSandboxPolicy()
     assert.equal(context.staged?.nativeSandboxPolicy?.id, declared.id)
@@ -1183,7 +1190,8 @@ async function managedVersion(options) {
   const unregister = register()
   const { RuntimeHarness } = await import('../../../scripts/testing/runtime-sandbox.ts')
   const harness = new RuntimeHarness(repoRoot, `codex-contract-${randomUUID()}`, 3)
-  const receiptDir = path.resolve(options.receiptDir ?? path.join(repoRoot, '.runtime-build/codex-contract/managed'))
+  const receiptDir = path.join(path.resolve(options.receiptDir ?? path.join(repoRoot, '.runtime-build/codex-contract/managed')), `run-${randomUUID()}`)
+  console.log(JSON.stringify({ severity: 'info', event: 'codex_managed_receipt_root', path: receiptDir }))
   await fsp.mkdir(receiptDir, { recursive: true, mode: 0o700 })
   await fsp.mkdir(harness.evidenceDir, { recursive: true, mode: 0o700 })
   try {
@@ -1241,7 +1249,8 @@ async function managedVersion(options) {
       return
     }
     assert.equal(output.stdout.trim(), `codex-cli ${artifactMetadata.version}`, 'managed runtime must execute the required Codex release')
-    throw new Error('CODEX_CONTRACT_UNIMPLEMENTED: managed native scenarios have not run; a version receipt is insufficient')
+    const { runManagedContract } = await import('./codex-managed-contract.mjs')
+    await runManagedContract(harness, receiptDir, options)
   } finally { const cleanup = await harness.cleanup(); unregister(); assert.equal(cleanup.ok, true, JSON.stringify(cleanup.errors)) }
 }
 
@@ -1280,8 +1289,8 @@ async function main(args) {
     else if (args[index] === '--approval-control') { options.approvalControl = args[++index]; assert(['stdin', 'network'].includes(options.approvalControl)) }
     else throw new Error(`unknown argument ${args[index]}`)
   }
-  if (options.probePolicyEffects || options.probeApprovalPolicy || options.probeDefaultPolicy || options.legacyLandlock) assert(options.probeMetadata || options.probeSeccomp || options.seccompProbeReceipt, 'probe options require an explicit candidate manifest or declared seccomp probe')
-  if (managed) return managedVersion(options)
+  if (options.probePolicyEffects || options.probeApprovalPolicy || options.probeDefaultPolicy || options.legacyLandlock) assert(managed || process.env.FRESHELL_CODEX_MANAGED_CONTRACT === '1' || options.probeMetadata || options.probeSeccomp || options.seccompProbeReceipt, 'probe options require an explicit candidate manifest or declared seccomp probe')
+  if (managed) return managedVersion({ ...options, scenario })
   for (const [name, selected] of scenario === 'all' ? nativeContractCases() : [[scenario, {}]]) {
     const capture = await captureNativeScenario(name, { ...options, ...selected })
     console.log(JSON.stringify({ severity: 'info', event: 'codex_native_scenario_passed', scenario: name, parameters: capture.parameters, version: capture.binary.version, threadId: capture.threadId }))

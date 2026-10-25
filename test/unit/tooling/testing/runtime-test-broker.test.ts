@@ -374,6 +374,40 @@ describe('managed runtime broker actor storage', () => {
   })
 })
 
+describe('Codex native workload policy admission', () => {
+  it.each(['missing', 'mutated', 'unconfined', 'duplicate', 'extra', 'plain-command', 'other-provider'])('refuses %s policy before forwarding an actual Docker request', async mutation => {
+    const resource = JSON.parse(await fs.readFile(path.resolve('docker/runtime/codex-native-sandbox.json'), 'utf8'))
+    await withHttpBroker(async ({ request, forwarded }) => {
+      const body = JSON.parse(createBody([...ordinaryBinds, actorBind]).toString())
+      body.Env.push(`CODEX_CMD=/usr/bin/setpriv --reuid 65534 --regid 0 --clear-groups --no-new-privs -- ${resource.native.launchWrapper}`)
+      const option = `seccomp=${JSON.stringify(resource.profile)}`
+      body.HostConfig.SecurityOpt.push(option)
+      if (mutation === 'missing') body.HostConfig.SecurityOpt.pop()
+      if (mutation === 'mutated') body.HostConfig.SecurityOpt[1] = `seccomp=${JSON.stringify({ ...resource.profile, defaultErrnoRet: 0 })}`
+      if (mutation === 'unconfined') body.HostConfig.SecurityOpt[1] = 'seccomp=unconfined'
+      if (mutation === 'duplicate') body.HostConfig.SecurityOpt.push(option)
+      if (mutation === 'extra') body.HostConfig.SecurityOpt.push('apparmor=unconfined')
+      if (mutation === 'plain-command') body.Env[1] = 'CODEX_CMD=codex'
+      if (mutation === 'other-provider') body.Env = ['FRESHELL_HOSTED_FRESH_AGENT=claude']
+      const response = await request('POST', '/v1.47/containers/create?name=native-policy-fixture', body)
+      expect(response.status).toBe(403)
+      expect(forwarded).toEqual([])
+    })
+  })
+
+  it('forwards the exact declared policy through the owned HTTP broker', async () => {
+    const resource = JSON.parse(await fs.readFile(path.resolve('docker/runtime/codex-native-sandbox.json'), 'utf8'))
+    await withHttpBroker(async ({ request, forwarded }) => {
+      const body = JSON.parse(createBody([...ordinaryBinds, actorBind]).toString())
+      body.Env.push(`CODEX_CMD=/usr/bin/setpriv --reuid 65534 --regid 0 --clear-groups --no-new-privs -- ${resource.native.launchWrapper}`)
+      body.HostConfig.SecurityOpt.push(`seccomp=${JSON.stringify(resource.profile)}`)
+      const response = await request('POST', '/v1.47/containers/create?name=native-policy-fixture', body)
+      expect(response.status).toBe(201)
+      expect(forwarded).toHaveLength(1)
+    })
+  })
+})
+
 describe('managed MCP mount', () => {
   it('accepts the exact private grant and approved provider root mounts', () => {
     const validate = (body: Buffer): { ok: boolean } => (

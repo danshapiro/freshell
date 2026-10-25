@@ -11,7 +11,11 @@
     "bwrapSha256": "3a81c19ad10a70436529c58e77898e2a447abe80167f813fc20ec34bd9eafdeb",
     "npmWrapper": "/usr/local/bin/codex",
     "launchWrapper": "/opt/freshell-codex/launch",
-    "nodeExecutable": "/usr/local/bin/node"
+    "nodeExecutable": "/usr/local/bin/node",
+    "layoutFile": "/opt/freshell-codex/layout.json",
+    "helperDirectory": "/opt/freshell-codex/bin",
+    "packageRoot": "/usr/local/lib/node_modules/@openai/codex",
+    "npmEntrypointSha256": "61b0194f3bb6534439c8d26a3ed57d0805f84b884588b761795323eeb92fcf70"
   },
   "provenance": {
     "daemonVersion": "29.7.2",

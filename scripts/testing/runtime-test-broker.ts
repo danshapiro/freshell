@@ -3,6 +3,8 @@ import fs from 'node:fs'
 import http, { type IncomingMessage, type ServerResponse } from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
+import codexNativeResource from '../../docker/runtime/codex-native-sandbox.json' with { type: 'json' }
 
 const DOCKER_API_PREFIX = '/v1.47'
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024
@@ -972,7 +974,21 @@ export class RestrictedDockerBroker {
     const capAdd = Array.isArray(host.CapAdd) ? [...host.CapAdd].sort() : []
     const expectedCapAdd = terminalWorkload ? ['CHOWN', 'SETGID', 'SETUID'] : []
     if (JSON.stringify(capAdd) !== JSON.stringify(expectedCapAdd)) return { ok: false, reason: `unexpected host capability additions: ${capAdd.join(',')}` }
-    if (!Array.isArray(host.SecurityOpt) || !host.SecurityOpt.includes('no-new-privileges:true')) return { ok: false, reason: 'no-new-privileges is required' }
+    const commands = Array.isArray(parsed.Env) ? parsed.Env.filter((value: unknown): value is string => typeof value === 'string' && value.startsWith('CODEX_CMD=')) : []
+    const freshProviders = Array.isArray(parsed.Env) ? parsed.Env.filter((value: unknown): value is string => typeof value === 'string' && value.startsWith('FRESHELL_HOSTED_FRESH_AGENT=')) : []
+    const managedCodex = commands.length === 1 && freshProviders.every((value: string) => value === 'FRESHELL_HOSTED_FRESH_AGENT=codex')
+      && commands[0].match(/^CODEX_CMD=\/usr\/bin\/setpriv --reuid [0-9]+ --regid [0-9]+ --clear-groups --no-new-privs -- (\S+)$/)?.[1] === codexNativeResource.native.launchWrapper
+    if (managedCodex) {
+      const options: unknown[] = host.SecurityOpt
+      if (!Array.isArray(options) || options.length !== 2 || options[0] !== 'no-new-privileges:true'
+        || typeof options[1] !== 'string' || !options[1].startsWith('seccomp=')
+        || !isDeepStrictEqual(host.CapDrop, ['ALL'])) return { ok: false, reason: 'managed Codex requires its exact native sandbox policy' }
+      try {
+        if (!isDeepStrictEqual(JSON.parse(options[1].slice('seccomp='.length)), codexNativeResource.profile)) return { ok: false, reason: 'managed Codex native sandbox policy differs' }
+      } catch { return { ok: false, reason: 'managed Codex native sandbox policy is invalid' } }
+    } else if (!isDeepStrictEqual(host.SecurityOpt, ['no-new-privileges:true'])) {
+      return { ok: false, reason: 'ordinary runtime requires its unchanged default sandbox policy' }
+    }
     if (host.RestartPolicy?.Name !== 'no') return { ok: false, reason: 'staging container must start with restart=no' }
     if (!(Number(host.NanoCpus) > 0) || !(Number(host.Memory) > 0) || !(Number(host.PidsLimit) > 0)) {
       return { ok: false, reason: 'CPU/memory/pid limits must be explicit and nonzero' }
