@@ -1040,9 +1040,27 @@ fn provider_truncated(turn: &Value) -> bool {
             Some("commandExecution") => item["aggregatedOutput"]
                 .as_str()
                 .is_some_and(|s| s.contains("... command output truncated for persistence ...")),
-            Some("mcpToolCall") => item["result"].to_string().contains(" chars truncated"),
+            Some("mcpToolCall") => item["result"]["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|content| content["type"] == "text")
+                .filter_map(|content| content["text"].as_str())
+                .any(has_native_mcp_truncation_marker),
             _ => false,
         })
+}
+
+fn has_native_mcp_truncation_marker(text: &str) -> bool {
+    // Codex 0.164 inserts an inline …N chars truncated… marker into saved MCP
+    // text. A mention in prose or non-text result metadata is not that marker.
+    text.split_inclusive('…').skip(1).any(|segment| {
+        segment
+            .strip_suffix(" chars truncated…")
+            .is_some_and(|count| {
+                !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit())
+            })
+    })
 }
 
 #[cfg(test)]
@@ -1263,6 +1281,132 @@ mod tests {
                 .unwrap()
                 .len(),
             100_000
+        );
+    }
+
+    #[test]
+    fn mcp_truncation_mentions_do_not_end_persistence_refresh_or_mislabel_saved_output() {
+        for result in [
+            json!({"content":[{"type":"text","text":"The report says 12 chars truncated by the old formatter."}]}),
+            json!({"content":[{"type":"text","text":"before… chars truncated…after"}]}),
+            json!({"content":[{"type":"text","text":"before…12 chars truncated after"}]}),
+            json!({"content":[{"type":"text","text":"before…12x chars truncated…after"}]}),
+            json!({"content":[{"type":"text","text":"before12 chars truncated…after"}]}),
+            json!({"content":[{"type":"text","text":"ordinary output"}],"structuredContent":{"note":"…12 chars truncated…"}}),
+            json!({"content":[{"type":"text","text":"ordinary output"}],"_meta":{"note":"…12 chars truncated…"}}),
+            json!({"content":[{"type":"resource","resource":{"text":"…12 chars truncated…"}}]}),
+        ] {
+            let saved_item = json!({"type":"mcpToolCall","id":"mcp","server":"fixture","tool":"report","status":"completed","arguments":{},"result":result});
+            let saved_turn = json!({"id":"t","status":"completed","itemsView":"full","items":[saved_item.clone()]});
+            for retained_differs in [false, true] {
+                let mut p = CodexProjection::new("runtime".into(), "thread-1".into());
+                started(&mut p, "t");
+                let mut retained_item = saved_item.clone();
+                if retained_differs {
+                    retained_item["result"] =
+                        json!({"content":[{"type":"text","text":"retained complete result"}]});
+                }
+                item(&mut p, "t", retained_item.clone(), true);
+                ended(&mut p, "t", "completed");
+                for attempt in 1..=3 {
+                    let view = snapshot(&mut p, json!([saved_turn.clone()]));
+                    let state = &view.metadata["turnOutputStates"]["t"];
+                    assert_eq!(view.raw["thread"]["turns"][0]["items"][0], retained_item);
+                    assert_eq!(
+                        state["refreshPending"],
+                        retained_differs && attempt < 3,
+                        "ordinary MCP result must not end persistence refresh: {result}"
+                    );
+                    if retained_differs {
+                        assert_eq!(state["provenance"], "retained");
+                        assert_eq!(state["savedTurns"][0]["items"][0]["result"], result);
+                        assert_eq!(
+                            state["diagnostic"],
+                            if attempt < 3 {
+                                Value::Null
+                            } else {
+                                json!("unsaved")
+                            }
+                        );
+                    } else {
+                        assert_eq!(state["provenance"], "saved");
+                        assert!(
+                            state["diagnostic"].is_null(),
+                            "ordinary MCP result was labeled truncated: {result}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn captured_0164_mcp_truncation_preserves_exact_saved_and_richer_retained_results() {
+        let corpus: Value = serde_json::from_str(include_str!(
+            "../../../../test/fixtures/fresh-agent/codex/native-projection-0.164.json"
+        ))
+        .unwrap();
+        let case = corpus["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| {
+                case["parameters"]["largeOutput"] == true
+                    && case["parameters"]["historyMode"] == "paginated"
+            })
+            .unwrap();
+        let mut native = case["read"].clone();
+        // Isolate MCP so a command's separate persistence marker cannot make
+        // this test pass without recognizing the captured MCP representation.
+        native["thread"]["turns"][0]["items"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|item| item["type"] == "mcpToolCall");
+        let thread = native["thread"]["id"].as_str().unwrap();
+        let turn = native["thread"]["turns"][0]["id"].as_str().unwrap();
+        let mut p = CodexProjection::new("actual-mcp-capture".into(), thread.into());
+        let mut retained_result = Value::Null;
+        for notification in case["notifications"].as_array().unwrap() {
+            let method = notification["method"].as_str().unwrap();
+            let params = &notification["params"];
+            if matches!(method, "turn/started" | "turn/completed")
+                || params["item"]["type"] == "mcpToolCall"
+            {
+                p.apply(method, params).unwrap();
+            }
+            if method == "item/completed" && params["item"]["type"] == "mcpToolCall" {
+                retained_result = params["item"]["result"].clone();
+            }
+        }
+        let saved_result = &native["thread"]["turns"][0]["items"][0]["result"];
+        assert!(saved_result["content"][0]["text"].as_str().unwrap().len() > 64_000);
+        assert!(
+            retained_result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .len()
+                > 128_000
+        );
+        let view = p
+            .accept_native_history(&native, &p.begin_history_read())
+            .unwrap();
+        assert_eq!(view.raw["thread"]["turns"], native["thread"]["turns"]);
+        let state = &view.metadata["turnOutputStates"][turn];
+        assert_eq!(state["provenance"], "saved-and-retained");
+        assert_eq!(state["diagnostic"], "provider-truncated");
+        assert_eq!(state["refreshPending"], false);
+        assert_eq!(
+            state["retainedTurns"][0]["items"][0]["result"],
+            retained_result
+        );
+        let mut cold = CodexProjection::new("cold-mcp-capture".into(), thread.into());
+        let saved = cold
+            .accept_native_history(&native, &cold.begin_history_read())
+            .unwrap();
+        assert_eq!(saved.raw["thread"]["turns"], native["thread"]["turns"]);
+        assert_eq!(
+            saved.metadata["turnOutputStates"][turn],
+            json!({"provenance":"saved","diagnostic":"provider-truncated","refreshPending":false})
         );
     }
 
