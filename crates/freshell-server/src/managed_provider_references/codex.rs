@@ -6,10 +6,15 @@ use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum InputKind {
-    Configuration,
+    Configuration(LayerKind),
     Instructions,
     CompactPrompt,
     ModelCatalog,
+}
+impl InputKind {
+    pub fn is_configuration(self) -> bool {
+        matches!(self, Self::Configuration(_))
+    }
 }
 pub struct SelectedInput {
     pub logical_path: PathBuf,
@@ -32,11 +37,9 @@ pub struct SourceLayer {
 pub fn select_inputs(
     layers: &[SourceLayer],
     home: &Path,
-    profile: Option<&str>,
 ) -> Result<Vec<SelectedInput>, &'static str> {
     let mut selection = Selection {
         home,
-        profile,
         inputs: Vec::new(),
         active: std::collections::BTreeSet::new(),
         metadata_bytes: 0,
@@ -49,7 +52,6 @@ pub fn select_inputs(
 
 struct Selection<'a> {
     home: &'a Path,
-    profile: Option<&'a str>,
     inputs: Vec<SelectedInput>,
     active: std::collections::BTreeSet<(PathBuf, PathBuf)>,
     metadata_bytes: usize,
@@ -95,7 +97,7 @@ impl Selection<'_> {
             return Err("Codex role configuration depth exceeded");
         }
         let logical = normalize(path);
-        let canonical = self.add(logical.clone(), InputKind::Configuration)?;
+        let canonical = self.add(logical.clone(), InputKind::Configuration(kind))?;
         if !enabled {
             return Ok(());
         }
@@ -126,14 +128,6 @@ impl Selection<'_> {
                 .parent()
                 .ok_or("Codex declaring configuration parent unavailable")?;
             self.file_fields(&value, parent)?;
-            if let Some(profile) = self.profile.filter(|_| kind == LayerKind::User) {
-                if let Some(value) = value
-                    .get("profiles")
-                    .and_then(|profiles| profiles.get(profile))
-                {
-                    self.file_fields(value, parent)?;
-                }
-            }
             let mut role_paths = Vec::new();
             let mut role_path_bytes = 0usize;
             if let Some(roles) = value.get("agents").and_then(toml::Value::as_table) {
@@ -627,12 +621,7 @@ pub fn discover(
     if preceding.get("profile").is_some() {
         return Err("Codex legacy profile config is no longer supported; use --profile NAME with NAME.config.toml instead");
     }
-    let legacy = if manifest.named_profile.is_none() {
-        preceding.get("profile").and_then(toml::Value::as_str)
-    } else {
-        None
-    };
-    let inputs = select_inputs(&layers, &manifest.original_home, legacy)?;
+    let inputs = select_inputs(&layers, &manifest.original_home)?;
     resources.sort();
     resources.dedup();
     Ok(Discovery {
@@ -657,6 +646,20 @@ pub struct ApprovalSource {
 pub fn approval_projection(discovery: &Discovery) -> Result<Option<ApprovalProjection>, String> {
     if let Some(name) = &discovery.manifest.named_profile {
         return Err(format!("Codex setting --profile {name} in {} is incompatible: the managed native0.164 app-server owner cannot select that named user configuration", discovery.manifest.codex_home.join(format!("{name}.config.toml")).display()));
+    }
+    // Typed parent requests cannot express a separate role policy. Keep valid
+    // role config intact, and refuse untrusted rather than stripping it and
+    // letting the child inherit a potentially less restrictive parent policy.
+    for input in discovery
+        .inputs
+        .iter()
+        .filter(|input| input.kind == InputKind::Configuration(LayerKind::Role))
+    {
+        let (value, _) = read_config_source(&input.canonical_source)
+            .map_err(|message| format!("{message}: {}", input.logical_path.display()))?;
+        if value.get("approval_policy").and_then(toml::Value::as_str) == Some("untrusted") {
+            return Err(format!("Codex setting approval_policy in {} is incompatible: native0.164 cannot preserve role-specific untrusted through typed parent app-server requests", input.logical_path.display()));
+        }
     }
     use sha2::{Digest, Sha256};
     let mut effective = None;
@@ -713,7 +716,7 @@ pub fn approval_projection(discovery: &Discovery) -> Result<Option<ApprovalProje
     // One physical template can have several logical aliases. Refuse if a
     // disabled or role-only alias would require different bytes.
     for input in &discovery.inputs {
-        if input.kind == InputKind::Configuration
+        if input.kind.is_configuration()
             && sources
                 .iter()
                 .any(|source| source.strip_untrusted && source.canonical == input.canonical_source)
@@ -1084,6 +1087,83 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn prepared_codex_role_untrusted_refuses_before_runtime_reservation() {
+        for parent_policy in ["never", "untrusted"] {
+            for selection in ["declared", "discovered", "nested"] {
+                let owned = tempfile::tempdir().unwrap();
+                let home = owned.path().join("home");
+                let cwd = owned.path().join("workspace");
+                let codex_home = home.join(".codex");
+                std::fs::create_dir_all(codex_home.join("roles")).unwrap();
+                std::fs::create_dir_all(codex_home.join("agents")).unwrap();
+                std::fs::create_dir_all(&cwd).unwrap();
+                let role = codex_home.join(if selection == "discovered" {
+                    "agents/reader.toml"
+                } else {
+                    "roles/reader.toml"
+                });
+                let declaration = match selection {
+                    "declared" => "[agents.reader]\nconfig_file = 'roles/reader.toml'\n",
+                    "discovered" => "",
+                    "nested" => {
+                        std::fs::write(
+                            codex_home.join("roles/parent.toml"),
+                            "[agents.reader]\nconfig_file = 'reader.toml'\n",
+                        )
+                        .unwrap();
+                        "[agents.parent]\nconfig_file = 'roles/parent.toml'\n"
+                    }
+                    _ => unreachable!(),
+                };
+                let config = format!("approval_policy = '{parent_policy}'\n{declaration}");
+                let role_config = "approval_policy = 'untrusted'\nmodel = 'role-model'\n";
+                std::fs::write(codex_home.join("config.toml"), &config).unwrap();
+                std::fs::write(&role, role_config).unwrap();
+                // There is no runtime to accept reservations or native work:
+                // this known incompatibility must be classified from sources.
+                let client = freshell_runtime_client::RuntimeClient::new(
+                    owned.path().join("absent-supervisor.sock"),
+                    "0123456789abcdef",
+                );
+                let soul = freshell_runtime_protocol::SoulId::new();
+                let result = prepare_managed(CodexPreparation {
+                    native_source_runtime:
+                        freshell_platform::codex_inputs::NativeSourceRuntime::AppServer,
+                    client: &client,
+                    soul: &soul,
+                    creation_seed: "role-policy-refusal",
+                    home: &home,
+                    cwd: &cwd,
+                    workspace: &cwd,
+                    original: &|_| None,
+                    args: &[],
+                    references: &[],
+                })
+                .await;
+                let error =
+                    result.expect_err("role-specific untrusted cannot inherit parent policy");
+                assert_eq!(
+                    error.code,
+                    freshell_runtime_protocol::RuntimeErrorCode::InvalidRequest,
+                    "{parent_policy}/{selection}: {}",
+                    error.message
+                );
+                assert!(
+                    error.message.contains("approval_policy")
+                        && error.message.contains(role.to_str().unwrap()),
+                    "{}",
+                    error.message
+                );
+                assert_eq!(std::fs::read_to_string(&role).unwrap(), role_config);
+                assert_eq!(
+                    std::fs::read_to_string(codex_home.join("config.toml")).unwrap(),
+                    config
+                );
+            }
+        }
+    }
+
     #[test]
     fn prepared_codex_legacy_profile_is_refused_before_approval_projection() {
         let owned = tempfile::tempdir().unwrap();
@@ -1129,9 +1209,7 @@ mod tests {
             file.set_times(std::fs::FileTimes::new().set_accessed(unread))
                 .unwrap();
             let rejected = match kind {
-                "selection" => {
-                    select_inputs(&[layer(path.clone(), true)], owned.path(), None).is_err()
-                }
+                "selection" => select_inputs(&[layer(path.clone(), true)], owned.path()).is_err(),
                 "configuration" => read_config(&path).is_err(),
                 "plugin" => is_agent_plugin(&root).is_err(),
                 _ => unreachable!(),
@@ -1168,7 +1246,7 @@ mod tests {
             }
             match kind {
                 "selection" => assert_eq!(
-                    select_inputs(&[layer(path, true)], owned.path(), None)
+                    select_inputs(&[layer(path, true)], owned.path())
                         .unwrap()
                         .len(),
                     1
@@ -1215,8 +1293,7 @@ mod tests {
         };
         let raw = document(8191, false);
         std::fs::write(&configuration, &raw).unwrap();
-        let selected =
-            select_inputs(&[layer(configuration.clone(), true)], owned.path(), None).unwrap();
+        let selected = select_inputs(&[layer(configuration.clone(), true)], owned.path()).unwrap();
         assert_eq!(selected.len(), 8192);
         assert_eq!(
             selected
@@ -1226,16 +1303,14 @@ mod tests {
                 .sum::<usize>(),
             8 * 1024 * 1024
         );
-        assert!(selected
-            .iter()
-            .all(|input| input.kind == InputKind::Configuration));
+        assert!(selected.iter().all(|input| input.kind.is_configuration()));
         assert!(selected[1..]
             .iter()
             .all(|input| input.logical_path == role && input.canonical_source == role));
         let metadata_overflow = root.join("m".repeat(length));
         std::fs::write(&metadata_overflow, document(8191, true)).unwrap();
         assert_eq!(
-            select_inputs(&[layer(metadata_overflow, true)], owned.path(), None).err(),
+            select_inputs(&[layer(metadata_overflow, true)], owned.path()).err(),
             Some("Codex selected input metadata budget exceeded")
         );
         let event_overflow = root.join("e".repeat(length));
@@ -1246,7 +1321,7 @@ mod tests {
             .set_times(std::fs::FileTimes::new().set_accessed(unread))
             .unwrap();
         assert_eq!(
-            select_inputs(&[layer(event_overflow, true)], owned.path(), None).err(),
+            select_inputs(&[layer(event_overflow, true)], owned.path()).err(),
             Some("Codex selected role event budget exceeded")
         );
         assert_eq!(
@@ -2023,11 +2098,9 @@ mod tests {
             "[[skills.config]]\npath = 'absent-skill'\nenabled = false\n",
         )
         .unwrap();
-        let inputs = select_inputs(&[layer(config,true)],owned.path(),None).expect("native disabled path selectors do not require an existing file or grant a new skill discovery root");
+        let inputs = select_inputs(&[layer(config,true)],owned.path()).expect("native disabled path selectors do not require an existing file or grant a new skill discovery root");
         assert_eq!(inputs.len(), 1);
-        assert!(inputs
-            .iter()
-            .all(|input| input.kind == InputKind::Configuration));
+        assert!(inputs.iter().all(|input| input.kind.is_configuration()));
     }
 
     #[test]
@@ -2042,12 +2115,8 @@ mod tests {
         std::fs::write(root.join("agents/z.md"), b"Z_INSTRUCTIONS").unwrap();
         std::fs::write(nested.join("a.md"), b"A_NESTED_INSTRUCTIONS").unwrap();
         std::fs::write(nested.join("not-a-role.json"), b"not a TOML role").unwrap();
-        let selected = select_inputs(
-            &[layer(root.join("config.toml"), true)],
-            fixture.path(),
-            None,
-        )
-        .unwrap();
+        let selected =
+            select_inputs(&[layer(root.join("config.toml"), true)], fixture.path()).unwrap();
         let instructions = selected
             .iter()
             .filter(|input| input.kind == InputKind::Instructions)
@@ -2056,13 +2125,9 @@ mod tests {
         assert_eq!(instructions,vec![digest(&nested.join("a.md")),digest(&root.join("agents/z.md"))],
             "native recursive role discovery must retain each role's declaring parent in sorted file order");
         assert_eq!(
-            select_inputs(
-                &[layer(root.join("config.toml"), false)],
-                fixture.path(),
-                None
-            )
-            .unwrap()
-            .len(),
+            select_inputs(&[layer(root.join("config.toml"), false)], fixture.path(),)
+                .unwrap()
+                .len(),
             1,
             "disabled project configuration must not activate its discovered role inputs"
         );
@@ -2086,7 +2151,7 @@ mod tests {
             "[agents.worker]\nconfig_file='./agents/declared.toml'\n",
         )
         .unwrap();
-        let selected = select_inputs(&[layer(config, true)], fixture.path(), None).unwrap();
+        let selected = select_inputs(&[layer(config, true)], fixture.path()).unwrap();
         assert_eq!(
             selected
                 .iter()
@@ -2108,7 +2173,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_provider_codex_typed_inputs_keep_each_logical_role_and_profile_origin() {
+    fn managed_provider_codex_typed_inputs_keep_logical_origins_without_legacy_profiles() {
         let fixture = tempfile::tempdir().unwrap();
         let home = fixture.path().join("home");
         let logical = fixture.path().join("project/.codex");
@@ -2121,12 +2186,13 @@ mod tests {
         std::fs::write(logical.join("instructions.md"), "logical-layer").unwrap();
         std::fs::write(actual.join("instructions.md"), "wrong-storage-origin").unwrap();
         std::fs::write(logical.join("roles/instructions.md"), "logical-role").unwrap();
-        std::fs::write(logical.join("profile.md"), "selected-profile").unwrap();
+        std::fs::write(logical.join("compact.md"), "root-compact-prompt").unwrap();
         std::fs::write(logical.join("skills/SKILL.md"), "selected-skill").unwrap();
         std::fs::write(
             actual.join("layer.toml"),
             r#"
 model_instructions_file = "./instructions.md"
+experimental_compact_prompt_file = "./compact.md"
 notify = ["./missing-command", "./missing-argument"]
 [mcp_servers.fixture]
 command = "./missing-command"
@@ -2135,7 +2201,7 @@ cwd = "./missing-cwd"
 [agents.worker]
 config_file = "./roles/worker.toml"
 [profiles.chosen]
-experimental_compact_prompt_file = "./profile.md"
+experimental_compact_prompt_file = "./missing-profile.md"
 [profiles.unselected]
 model_instructions_file = "./missing-unselected.md"
 [[skills.config]]
@@ -2152,12 +2218,7 @@ enabled = false
         std::os::unix::fs::symlink(actual.join("layer.toml"), logical.join("config.toml")).unwrap();
         std::os::unix::fs::symlink(actual.join("role.toml"), logical.join("roles/worker.toml"))
             .unwrap();
-        let selected = select_inputs(
-            &[layer(logical.join("config.toml"), true)],
-            &home,
-            Some("chosen"),
-        )
-        .unwrap();
+        let selected = select_inputs(&[layer(logical.join("config.toml"), true)], &home).unwrap();
         let instructions = selected
             .iter()
             .filter(|input| input.kind == InputKind::Instructions)
@@ -2173,7 +2234,7 @@ enabled = false
         assert!(selected
             .iter()
             .any(|input| input.kind == InputKind::CompactPrompt
-                && digest(&input.canonical_source) == digest(&logical.join("profile.md"))));
+                && digest(&input.canonical_source) == digest(&logical.join("compact.md"))));
         assert!(
             !selected
                 .iter()
@@ -2193,19 +2254,19 @@ enabled = false
         let path = fixture.path().join("config.toml");
         std::fs::write(&path, "[agents.loop]\nconfig_file='./config.toml'\n").unwrap();
         assert_eq!(
-            select_inputs(&[layer(path.clone(), true)], fixture.path(), None).err(),
+            select_inputs(&[layer(path.clone(), true)], fixture.path()).err(),
             Some("Codex role configuration cycle detected")
         );
         std::fs::write(&path, "model_instructions_file='./missing'\n").unwrap();
-        let disabled = select_inputs(&[layer(path.clone(), false)], fixture.path(), None).unwrap();
+        let disabled = select_inputs(&[layer(path.clone(), false)], fixture.path()).unwrap();
         assert_eq!(disabled.len(), 1);
-        assert!(disabled[0].kind == InputKind::Configuration);
+        assert!(disabled[0].kind.is_configuration());
         std::fs::write(
             &path,
             "model_instructions_file='PRIVATE_INVALID_TOML_SENTINEL\n",
         )
         .unwrap();
-        let error = select_inputs(&[layer(path, true)], fixture.path(), None)
+        let error = select_inputs(&[layer(path, true)], fixture.path())
             .err()
             .unwrap();
         assert_eq!(error, "Codex selected configuration TOML is invalid");
@@ -2234,7 +2295,6 @@ path='./missing-user-only-selector'
                 kind: LayerKind::Project,
             }],
             fixture.path(),
-            Some("chosen"),
         )
         .unwrap();
         assert_eq!(selected.len(), 2);

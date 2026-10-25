@@ -1,7 +1,7 @@
 //! Native-selected ordinary inputs use the shared resource copier and
 //! existing exact mounts. No configuration payload enters callback metadata.
 use super::{private_directory, write_private_bytes};
-use crate::managed_provider_references::codex::{discover, InputKind};
+use crate::managed_provider_references::codex::discover;
 use freshell_platform::{codex_inputs::CodexInputManifest, provider_environment::CopySelection};
 use freshell_runtime_protocol::*;
 use std::{
@@ -41,12 +41,12 @@ pub(super) fn prepare(
     let configurations = discovery
         .inputs
         .iter()
-        .filter(|input| input.kind == InputKind::Configuration)
+        .filter(|input| input.kind.is_configuration())
         .map(|input| (input.logical_path.clone(), input.canonical_source.clone()))
         .collect();
     let mut ordinary = discovery.resource_roots.clone();
     for input in &discovery.inputs {
-        if input.kind != InputKind::Configuration
+        if !input.kind.is_configuration()
             && !ordinary
                 .iter()
                 .any(|root| input.logical_path.starts_with(root))

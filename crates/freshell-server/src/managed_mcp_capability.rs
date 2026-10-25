@@ -8545,6 +8545,106 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
     }
 
     #[test]
+    fn prepared_codex_role_refusal_keeps_prior_grant_and_inputs() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let cwd = owned.path().join("workspace");
+        std::fs::create_dir_all(home.join(".codex/roles")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let config =
+            "approval_policy = 'never'\n[agents.reader]\nconfig_file = 'roles/reader.toml'\n";
+        let role = home.join(".codex/roles/reader.toml");
+        let valid_role = "approval_policy = 'on-request'\n";
+        std::fs::write(home.join(".codex/config.toml"), config).unwrap();
+        std::fs::write(&role, valid_role).unwrap();
+        let context = crate::managed_provider_bootstrap::provider_launch_context_from_home(
+            "codex", &cwd, &home, None,
+        )
+        .unwrap()
+        .unwrap();
+        let directory = owned.path().join("control/mcp-capabilities");
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = CapabilityStore::default();
+        let soul = SoulId::new();
+        let endpoint = "http://host.docker.internal:4000";
+        let manifest = freshell_platform::codex_inputs::CodexInputManifest {
+            native_source_runtime: freshell_platform::codex_inputs::NativeSourceRuntime::AppServer,
+            version: 1,
+            original_home: home.clone(),
+            cwd: cwd.clone(),
+            codex_home: home.join(".codex"),
+            named_profile: None,
+        };
+        let issue = || {
+            store.issue(
+                soul.clone(),
+                &directory,
+                endpoint.into(),
+                Some(("codex", &home, &[])),
+                OpencodeEphemeralInput {
+                    codex_manifest: Some(&manifest),
+                    launch_context: Some(&context),
+                    cwd: Some(&cwd),
+                    workspace: Some(&cwd),
+                    ..Default::default()
+                },
+                None,
+            )
+        };
+        let prior = issue().unwrap();
+        let incarnation = IncarnationId::new();
+        store
+            .activate(
+                &prior.grant_id,
+                soul.clone(),
+                incarnation.clone(),
+                &directory,
+                endpoint,
+            )
+            .unwrap();
+        store
+            .commit_preparation(&prior.grant_id, &soul, &incarnation, &directory)
+            .unwrap();
+        let prior_path = grant_path(&directory, &prior.grant_id).unwrap();
+        let prior_bytes = std::fs::read(&prior_path).unwrap();
+        let prior_stage = staged_provider_root_path(&directory, &prior.grant_id).unwrap();
+        let descriptor: freshell_runtime_protocol::PreparedProviderInputs = serde_json::from_slice(
+            &std::fs::read(prior_stage.join(".freshell/prepared-inputs.json")).unwrap(),
+        )
+        .unwrap();
+        let role_bind = descriptor
+            .config_binds
+            .iter()
+            .find(|bind| bind.logical_destination == role.to_str().unwrap())
+            .unwrap();
+        let prepared_role = prior_stage.join(&role_bind.source_relative_path);
+        assert_eq!(std::fs::read_to_string(&prepared_role).unwrap(), valid_role);
+
+        let rejected_role = "approval_policy = 'untrusted'\n";
+        std::fs::write(&role, rejected_role).unwrap();
+        let error = issue().expect_err("unrepresentable role policy must not publish a generation");
+        assert!(
+            error.contains("approval_policy") && error.contains(role.to_str().unwrap()),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&prior_path).unwrap(), prior_bytes);
+        assert_eq!(std::fs::read_to_string(prepared_role).unwrap(), valid_role);
+        assert_eq!(std::fs::read_to_string(&role).unwrap(), rejected_role);
+        assert_eq!(
+            std::fs::read_to_string(home.join(".codex/config.toml")).unwrap(),
+            config
+        );
+        assert_eq!(store.grants.lock().unwrap().len(), 1);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_dir(prior_stage.parent().unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn prepared_codex_nonprojected_policy_stays_under_native_authority() {
         let owned = tempfile::tempdir().unwrap();
         let home = owned.path().join("home");
@@ -8919,11 +9019,8 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             };
             std::fs::write(home.join(".codex/config.toml"), &raw).unwrap();
             std::fs::write(home.join(".codex/instructions.md"), "home-input").unwrap();
-            std::fs::write(
-                home.join(".codex/agents/nested/reader.toml"),
-                "model_instructions_file = 'instructions.md'\n",
-            )
-            .unwrap();
+            let role_config = "approval_policy = 'on-request'\nmodel = 'role-model'\nmodel_instructions_file = 'instructions.md'\n";
+            std::fs::write(home.join(".codex/agents/nested/reader.toml"), role_config).unwrap();
             std::fs::write(
                 home.join(".codex/agents/nested/instructions.md"),
                 "role-input",
@@ -8999,6 +9096,17 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                 "Codex selected layers and typed resources must be accepted as one generation",
             );
             let stage = staged_provider_root_path(&directory, &capability.grant_id).unwrap();
+            let role_path = home.join(".codex/agents/nested/reader.toml");
+            let role_bind = inputs
+                .config_binds
+                .iter()
+                .find(|bind| bind.logical_destination == role_path.to_str().unwrap())
+                .expect("valid child policy must be published with its own configuration");
+            assert_eq!(
+                std::fs::read_to_string(stage.join(&role_bind.source_relative_path)).unwrap(),
+                role_config
+            );
+            assert_eq!(std::fs::read_to_string(&role_path).unwrap(), role_config);
             if untrusted_policy {
                 let bind = inputs
                     .config_binds
