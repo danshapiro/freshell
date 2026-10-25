@@ -1,6 +1,8 @@
 import { createSlice, type PayloadAction } from '@reduxjs/toolkit'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import { isLiveBlockLanded, landedTranscript, type LandedTranscript } from '@/lib/fresh-agent-landed-transcript'
+import { applyFreshAgentTranscriptPatch, bindTranscriptProjection, freezeTranscriptProjection, hydrateTranscriptProjection, readTranscriptProjection } from '@/lib/fresh-agent-transcript-projection'
+import type { FreshAgentSnapshot, FreshAgentTranscriptPatch } from '@shared/fresh-agent-contract'
 import {
   markSessionLost,
   materializeSession,
@@ -66,6 +68,9 @@ function clearTail(session: FreshAgentLiveSession): void {
   if (session.blocks.length > 0) session.blocks = []
   if (session.expectedTurnIds.length > 0) session.expectedTurnIds = []
   if (session.retry) delete session.retry
+  delete session.unboundTranscriptPatches
+  delete session.unboundTranscriptWatermarks
+  if (session.projection) session.projection = freezeTranscriptProjection(session.projection)
 }
 
 function clearTailsFor(state: FreshAgentLiveState, payload: SessionMutationPayload): void {
@@ -83,7 +88,7 @@ function isViewed(state: FreshAgentLiveState, key: string): boolean {
  */
 function endTurnsFor(state: FreshAgentLiveState, payload: SessionMutationPayload): void {
   for (const key of tailKeysFor(state, payload)) {
-    if (!isViewed(state, key)) {
+    if (!isViewed(state, key) && !state.bySession[key].projection) {
       delete state.bySession[key]
       continue
     }
@@ -151,6 +156,78 @@ const freshAgentLiveSlice = createSlice({
   name: 'freshAgentLive',
   initialState,
   reducers: {
+    /** Authoritative init/snapshot binding; arbitrary patches cannot change incarnation. */
+    transcriptProjectionBound(state, action: PayloadAction<FreshAgentSessionLocator & { projectionId: string; historyGeneration: number }>) {
+      const { projectionId, historyGeneration, ...locator } = action.payload
+      const session = sessionFor(state, locator)
+      const previous = session.projection
+      // A later incarnation is accepted through the view's fenced snapshot
+      // request. Delayed init frames cannot replace an already-bound source.
+      if (previous && previous.id !== projectionId) return
+      if (previous?.id === projectionId && previous.historyGeneration >= historyGeneration) return
+      session.projection = bindTranscriptProjection(previous, projectionId, historyGeneration)
+      for (const patch of session.unboundTranscriptPatches ?? []) {
+        if (patch.projectionId === projectionId) session.projection = applyFreshAgentTranscriptPatch(session.projection, patch)
+      }
+      const watermark = session.unboundTranscriptWatermarks?.[JSON.stringify([projectionId, historyGeneration])]
+      if (watermark?.gap) {
+        session.projection.needsResnapshot = true
+        session.projection.eventRevision = Math.max(session.projection.eventRevision, watermark.revision)
+      }
+      delete session.unboundTranscriptPatches
+      delete session.unboundTranscriptWatermarks
+    },
+    transcriptPatchApplied(state, action: PayloadAction<FreshAgentSessionLocator & { patch: FreshAgentTranscriptPatch }>) {
+      const { patch, ...locator } = action.payload
+      const session = sessionFor(state, locator)
+      if (session.projection?.id === patch.projectionId) session.projection = applyFreshAgentTranscriptPatch(session.projection, patch)
+      else {
+        // Buffer a bounded reconnect race without adopting its source. The
+        // authoritative init/snapshot chooses which incarnation may replay.
+        const pending = session.unboundTranscriptPatches ??= []
+        const watermarks = session.unboundTranscriptWatermarks ??= {}
+        const key = JSON.stringify([patch.projectionId, patch.historyGeneration])
+        const watermark = watermarks[key] ??= { revision: 0, gap: false }
+        watermark.revision = Math.max(watermark.revision, ...patch.ops.map((op) => op.revision))
+        if (pending.length < 64 && JSON.stringify(pending).length + JSON.stringify(patch).length <= 64 * 1024) pending.push(patch)
+        else watermark.gap = true
+      }
+    },
+    transcriptProjectionSnapshotReceived(state, action: PayloadAction<FreshAgentSessionLocator & { snapshot: FreshAgentSnapshot }>) {
+      const { snapshot, ...locator } = action.payload
+      const metadata = readTranscriptProjection(snapshot)
+      if (!metadata) return
+      const session = sessionFor(state, locator)
+      if (!session.projection || session.projection.id !== metadata.id || session.projection.historyGeneration < metadata.historyGeneration) {
+        session.projection = bindTranscriptProjection(session.projection, metadata.id, metadata.historyGeneration)
+      }
+      session.projection = hydrateTranscriptProjection(session.projection, snapshot)
+      for (const patch of session.unboundTranscriptPatches ?? []) {
+        if (patch.projectionId === metadata.id) session.projection = applyFreshAgentTranscriptPatch(session.projection, patch)
+      }
+      const watermark = session.unboundTranscriptWatermarks?.[JSON.stringify([metadata.id, metadata.historyGeneration])]
+      if (watermark?.gap && metadata.eventRevision < watermark.revision) {
+        session.projection.needsResnapshot = true
+        session.projection.eventRevision = Math.max(session.projection.eventRevision, watermark.revision)
+      }
+      delete session.unboundTranscriptPatches
+      delete session.unboundTranscriptWatermarks
+      const projection = session.projection
+      if (projection.historyGeneration !== metadata.historyGeneration) return
+      const accepted = new Set([...metadata.eventOwnedTurnIds, ...metadata.nativePreviewTurnIds, ...metadata.nativeFinalTurnIds])
+      for (const id of Object.keys(projection.frozenTurns ?? {})) if (!accepted.has(id)) delete projection.frozenTurns![id]
+      for (const id of metadata.nativeFinalTurnIds ?? []) {
+        (projection.settledTurns ??= {})[id] = true
+        const rows = new Set(projection.turnRows?.[id] ?? [])
+        projection.turns = projection.turns.filter((row) => !rows.has(row.turnId))
+        if (projection.turnRows) delete projection.turnRows[id]
+        if (metadata.turnOutputStates[id]?.diagnostic !== 'interrupted' && projection.frozenTurns) delete projection.frozenTurns[id]
+      }
+    },
+    codexMetadataReceived(state, action: PayloadAction<FreshAgentSessionLocator & { metadata: Record<string, unknown> }>) {
+      const { metadata, ...locator } = action.payload
+      sessionFor(state, locator).codexMetadata = metadata
+    },
     /** A batch of stream events for one session, in arrival order. */
     streamOpsApplied(state, action: PayloadAction<FreshAgentSessionLocator & { ops: LiveStreamOp[] }>) {
       const { ops, ...locator } = action.payload
@@ -297,6 +374,10 @@ const freshAgentLiveSlice = createSlice({
 })
 
 export const {
+  transcriptProjectionBound,
+  transcriptPatchApplied,
+  transcriptProjectionSnapshotReceived,
+  codexMetadataReceived,
   assistantBlockBound,
   liveNoticeReceived,
   liveRetrySet,

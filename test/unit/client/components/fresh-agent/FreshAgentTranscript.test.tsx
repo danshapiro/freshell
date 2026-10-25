@@ -23,6 +23,26 @@ vi.mock('@/components/markdown/LazyMarkdown', async () => {
 describe('FreshAgentTranscript', () => {
   afterEach(() => cleanup())
 
+  it.each([
+    [{ provenance: 'saved', diagnostic: 'interrupted', refreshPending: false }, 'Only saved output remains.'],
+    [{ provenance: 'retained', diagnostic: 'unsaved', refreshPending: false }, 'Saved output could not be confirmed.'],
+    [{ provenance: 'saved-and-retained', diagnostic: 'provider-truncated', refreshPending: false }, 'Codex shortened the saved tool output.'],
+    [{ provenance: 'preview', refreshPending: false }, 'Native preview.'],
+    [{ provenance: 'retained', refreshPending: true }, 'Waiting for saved history.'],
+  ] as const)('renders finite output provenance %j', (outputState, text) => {
+    render(<FreshAgentTranscript showTranscriptMinimap={false} turns={[{ id: 't', turnId: 't', role: 'assistant', summary: '', items: [{ id: 'a', kind: 'text', text: 'Available output' }], outputState }]} />)
+    expect(screen.getByRole('note', { name: 'Output persistence' })).toHaveTextContent(text)
+    expect(screen.getAllByText('Available output')).toHaveLength(1)
+  })
+
+  it('keeps richer retained output in a disclosure within the saved turn group', async () => {
+    render(<FreshAgentTranscript showTranscriptMinimap={false} turns={[{ id: 't', turnId: 't', role: 'assistant', summary: '', items: [{ id: 'a', kind: 'text', text: 'Saved body' }], outputState: { provenance: 'saved-and-retained', diagnostic: 'interrupted', refreshPending: false, retainedItems: [{ id: 'retained', kind: 'text', text: 'Unfinished retained body' }] } }]} />)
+    expect(screen.getAllByLabelText('Assistant transcript turn')).toHaveLength(1)
+    fireEvent.click(screen.getByText('Retained output', { selector: 'summary' }))
+    expect(await screen.findByText('Unfinished retained body')).toBeVisible()
+    expect(screen.getByText('Saved body')).toBeVisible()
+  })
+
   it('renders normalized text turns', () => {
     render(
       <FreshAgentTranscript

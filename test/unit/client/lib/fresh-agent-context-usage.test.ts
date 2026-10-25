@@ -6,8 +6,15 @@ import {
   resolveFreshAgentContextUsage,
   guardContextUsageTokenSummary,
   collectFreshAgentContextUsageKeys,
+  latestCodexUsage,
 } from '@/lib/fresh-agent-context-usage'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
+
+it('preserves the native latest and cumulative samples without counting token subsets twice', () => {
+  expect(latestCodexUsage({ last: { totalTokens: 20, inputTokens: 15, cachedInputTokens: 8, outputTokens: 5, reasoningOutputTokens: 3 }, total: { totalTokens: 200, inputTokens: 150, outputTokens: 50 }, modelContextWindow: 258400 })).toEqual({ observed: true, latestTokens: 20, totalTokens: 200, modelContextWindow: 258400 })
+  expect(latestCodexUsage({ last: { totalTokens: 0 }, total: { totalTokens: 0 } })).toEqual({ observed: true, latestTokens: 0, totalTokens: 0 })
+  expect(latestCodexUsage(undefined)).toEqual({ observed: false })
+})
 
 // Fixture style mirrors PaneContainer.test.tsx's makeSession/makeContent
 // builders: minimal objects carrying only the fields under test, cast to the

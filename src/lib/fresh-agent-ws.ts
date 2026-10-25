@@ -12,7 +12,8 @@ import { revokeFreshAgentAttention } from '@/store/turnCompletionAttention'
 import type { ObservedOwnerFence } from '@/store/selectors/runtimeOwner'
 import { streamBatcherFor } from '@/lib/fresh-agent-stream-batcher'
 import type { LiveBlockKind, LiveNotice, LiveNoticeLevel, LiveRateLimit, LiveRetry, LiveStreamOp } from '@/store/freshAgentLiveTypes'
-import { assistantBlockBound, liveNoticeReceived, liveRetrySet, transcriptAnnounced } from '@/store/freshAgentLiveSlice'
+import { assistantBlockBound, liveNoticeReceived, liveRetrySet, transcriptAnnounced, transcriptProjectionBound, transcriptPatchApplied, codexMetadataReceived } from '@/store/freshAgentLiveSlice'
+import { FreshAgentTranscriptPatchSchema } from '@shared/fresh-agent-contract'
 import {
   addPermissionRequest,
   addQuestionRequest,
@@ -467,6 +468,12 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
   if (event.type !== 'freshAgent.stream') streamBatcherFor(dispatch).flush(locator)
 
   switch (event.type) {
+    case 'freshAgent.transcript.patch': {
+      const parsed = FreshAgentTranscriptPatchSchema.safeParse(event)
+      if (parsed.success && parsed.data.sessionId === sessionId) dispatch(transcriptPatchApplied({ ...locator, patch: parsed.data }))
+      else log.warn('dropping malformed native transcript patch', { sessionId })
+      return true
+    }
     case 'freshAgent.session.snapshot':
       dispatch(observeFreshAgentSession(locator))
       dispatch(sessionSnapshotReceived({
@@ -486,6 +493,10 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       }
       return true
     case 'freshAgent.session.init':
+      if (typeof event.projectionId === 'string' && Number.isSafeInteger(event.historyGeneration)) {
+        dispatch(transcriptProjectionBound({ ...locator, projectionId: event.projectionId, historyGeneration: event.historyGeneration as number }))
+        if (!['cliSessionId', 'model', 'effort', 'cwd', 'tools'].some((key) => key in event)) return true
+      }
       dispatch(sessionInit({
         ...locator,
         cliSessionId: event.cliSessionId as string | undefined,
@@ -496,6 +507,7 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       }))
       return true
     case 'freshAgent.session.metadata':
+      if (isObject(event.codex)) dispatch(codexMetadataReceived({ ...locator, metadata: event.codex }))
       dispatch(sessionMetadataReceived({
         ...locator,
         cliSessionId: event.cliSessionId as string | undefined,

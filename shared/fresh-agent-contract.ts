@@ -41,6 +41,8 @@ export const FreshAgentCapabilitiesSchema = z.object({
 }).strict()
 
 export const FreshAgentTokenUsageSchema = z.object({
+  observed: z.boolean().optional(),
+  modelContextWindow: z.number().int().nonnegative().optional(),
   inputTokens: z.number().int().nonnegative(),
   outputTokens: z.number().int().nonnegative(),
   cachedTokens: z.number().int().nonnegative().optional(),
@@ -113,6 +115,7 @@ export const FreshAgentTranscriptItemSchema = z.discriminatedUnion('kind', [
   z.object({
     id: z.string().min(1),
     kind: z.literal('file_change'),
+    output: z.string().optional(),
     status: z.enum(['running', 'completed', 'failed', 'declined']),
     changes: z.array(z.record(z.string(), z.unknown())),
     extensions: z.record(z.string(), z.unknown()).optional(),
@@ -120,6 +123,7 @@ export const FreshAgentTranscriptItemSchema = z.discriminatedUnion('kind', [
   z.object({
     id: z.string().min(1),
     kind: z.literal('mcp_tool'),
+    progress: z.string().optional(),
     server: z.string(),
     tool: z.string(),
     status: z.enum(['running', 'completed', 'failed']),
@@ -226,6 +230,13 @@ export const FreshAgentTurnSchema = z.object({
   messageId: z.string().min(1).optional(),
   ordinal: z.number().int().nonnegative().optional(),
   source: z.enum(['durable', 'live', 'server']).optional(),
+  outputState: z.object({
+    provenance: z.enum(['saved', 'retained', 'saved-and-retained', 'preview']),
+    diagnostic: z.enum(['interrupted', 'unsaved', 'provider-truncated']).optional(),
+    refreshPending: z.boolean(),
+    retainedItems: z.array(FreshAgentTranscriptItemSchema).optional(),
+    savedItems: z.array(FreshAgentTranscriptItemSchema).optional(),
+  }).strict().optional(),
   role: z.enum(['user', 'assistant', 'system', 'tool']).optional(),
   timestamp: z.string().optional(),
   model: z.string().optional(),
@@ -260,6 +271,23 @@ export const FreshAgentTurnSchema = z.object({
   // presentation. Never stamped on live turns[].
   restorable: z.boolean().optional(),
 }).strict()
+
+const EventRevisionSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
+const TranscriptPatchBase = { revision: EventRevisionSchema, nativeTurnId: z.string().min(1) }
+export const FreshAgentTranscriptPatchSchema = z.object({
+  type: z.literal('freshAgent.transcript.patch').optional(),
+  sessionId: z.string().min(1),
+  projectionId: z.string().min(1),
+  historyGeneration: EventRevisionSchema,
+  ops: z.array(z.discriminatedUnion('op', [
+    z.object({ ...TranscriptPatchBase, op: z.literal('resetTurn'), turns: z.array(FreshAgentTurnSchema), completedItemIds: z.array(z.string()).optional(), nonAppendableItemIds: z.array(z.string()).optional() }).strict(),
+    z.object({ ...TranscriptPatchBase, op: z.literal('upsertItem'), row: FreshAgentTurnSchema, item: FreshAgentTranscriptItemSchema, complete: z.boolean().optional() }).strict(),
+    z.object({ ...TranscriptPatchBase, op: z.literal('appendItem'), rowId: z.string().min(1), itemId: z.string().min(1), field: z.enum(['text', 'output', 'summary', 'content']), index: z.number().int().nonnegative().max(1023).nullable().optional(), text: z.string() }).strict(),
+    z.object({ ...TranscriptPatchBase, op: z.literal('settleTurn'), status: z.string().optional() }).strict(),
+  ])),
+}).strict()
+
+export type FreshAgentTranscriptPatch = z.infer<typeof FreshAgentTranscriptPatchSchema>
 
 // Claude's permission update (the SDK's `PermissionUpdate`): what the CLI
 // suggests on an approval, and what "Allow and don't ask again" sends back as
@@ -335,6 +363,7 @@ export const FreshAgentDiffSummarySchema = z.object({
   path: z.string().optional(),
   title: z.string().optional(),
   status: z.string().optional(),
+  diff: z.string().optional(),
 }).strict()
 
 export const FreshAgentChildThreadSchema = z.object({
@@ -444,6 +473,7 @@ export const FRESH_AGENT_CONTRACT_SCHEMA_NAMES = [
   'FreshAgentSettingsSchema',
   'FreshAgentTranscriptItemSchema',
   'FreshAgentTurnSchema',
+  'FreshAgentTranscriptPatchSchema',
   'FreshAgentPendingApprovalSchema',
   'FreshAgentPendingQuestionSchema',
   'FreshAgentWorktreeSchema',

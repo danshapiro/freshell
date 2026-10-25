@@ -13,6 +13,12 @@ vi.mock('@/components/markdown/LazyMarkdown', async () => {
 describe('FreshAgentItemCard', () => {
   afterEach(() => cleanup())
 
+  it('shows native file-change output progress in its tool disclosure', () => {
+    render(<FreshAgentItemCard item={{ id: 'files', kind: 'file_change', status: 'running', changes: [], output: 'Applying patch' }} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Edit tool call' }))
+    expect(screen.getByText('Applying patch')).toBeVisible()
+  })
+
   it('renders markdown text while preserving XSS defenses through the markdown renderer', () => {
     const { container } = render(
       <FreshAgentItemCard

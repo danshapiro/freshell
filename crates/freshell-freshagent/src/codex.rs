@@ -85,6 +85,7 @@ use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySi
 mod controls;
 mod metadata;
 pub(crate) mod native_history;
+mod projection;
 
 /// Unified agent names (Task 2): the ambient `CODEX_HOME` fallback for the
 /// durability-driven pending bind when the app-server's own initialize
@@ -248,6 +249,7 @@ const STATUS_RANG_TURN_IDS_CAP: usize = 8;
 /// guard, and emission barrier for the same thread to the same task.
 struct CodexConsumerRuntime {
     thread_id: String,
+    projection: Arc<StdMutex<projection::CodexProjection>>,
     active_turn: Arc<StdMutex<Option<String>>>,
     /// The session's USER-interrupt marker: the interrupt control lane arms it,
     /// the consumer's subscription consumes it at the `interrupted` completion,
@@ -475,6 +477,7 @@ struct CodexCreateRecord {
 /// One live freshcodex session: the app-server client, its owned sidecar, and the
 /// normalized create-time settings a later `send` re-uses.
 struct CodexSession {
+    projection: Arc<StdMutex<projection::CodexProjection>>,
     client: Arc<CodexAppServerClient>,
     /// Normalized model (`normalizeFreshcodexModel`), reused verbatim on `send`.
     model: String,
@@ -2809,6 +2812,10 @@ impl FreshCodexState {
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
         let event_emission_gate = Arc::new(TokioMutex::new(()));
+        let projection = Arc::new(StdMutex::new(projection::CodexProjection::new(
+            mint_ownership_id(),
+            thread_id.to_string(),
+        )));
         let (created_tx, created_rx) = oneshot::channel();
         let consumer = self.spawn_consumer_after(
             notifs,
@@ -2824,6 +2831,7 @@ impl FreshCodexState {
                 compact_in_flight: compact_in_flight.clone(),
                 compact_turn_id: compact_turn_id.clone(),
                 event_emission_gate: event_emission_gate.clone(),
+                projection: projection.clone(),
             },
             Some(created_rx),
         );
@@ -2868,6 +2876,7 @@ impl FreshCodexState {
                 history_mode,
                 turn_lock: Arc::new(TokioMutex::new(())),
                 event_emission_gate,
+                projection,
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -4289,6 +4298,11 @@ impl FreshCodexState {
                 *compact_turn_id.lock().expect("compact_turn_id mutex") = None;
             }
             self.emit_fresh_agent_error(&session_id, "CODEX_COMPACT_FAILED", &err.to_string());
+        } else if let Some(session) = self.sessions.lock().await.get(&session_id) {
+            let mut p = session.projection.lock().expect("codex projection lock");
+            let ops = p.invalidate_history(&[]);
+            broadcast_codex_event(&session_id, p.patch(ops), &self.broadcast_tx);
+            broadcast_codex_event(&session_id, p.metadata_event(), &self.broadcast_tx);
         }
     }
 
@@ -4645,6 +4659,18 @@ impl FreshCodexState {
                 ));
             }
             return;
+        }
+
+        if let Some(session) = self.sessions.lock().await.get(&thread_id) {
+            let mut p = session.projection.lock().expect("codex projection lock");
+            let removed_native_ids: Vec<String> = raw_turns
+                .iter()
+                .skip_while(|turn| turn["id"] != before_turn_id)
+                .filter_map(|turn| turn["id"].as_str().map(str::to_owned))
+                .collect();
+            let ops = p.invalidate_history(&removed_native_ids);
+            broadcast_codex_event(&thread_id, p.patch(ops), &self.broadcast_tx);
+            broadcast_codex_event(&thread_id, p.metadata_event(), &self.broadcast_tx);
         }
 
         // Converge siblings + revoke attention (decisions 6/10). The broadcast
@@ -6810,6 +6836,10 @@ impl FreshCodexState {
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
         let event_emission_gate = Arc::new(TokioMutex::new(()));
+        let projection = Arc::new(StdMutex::new(projection::CodexProjection::new(
+            mint_ownership_id(),
+            session_id.to_string(),
+        )));
         let exited = Arc::new(AtomicBool::new(false));
         let consumer = self.spawn_consumer(
             notifs,
@@ -6825,6 +6855,7 @@ impl FreshCodexState {
                 compact_in_flight: compact_in_flight.clone(),
                 compact_turn_id: compact_turn_id.clone(),
                 event_emission_gate: event_emission_gate.clone(),
+                projection: projection.clone(),
             },
         );
         let (kill_tx, kill_rx) = oneshot::channel();
@@ -6875,6 +6906,7 @@ impl FreshCodexState {
                     history_mode: read_rollout_history_mode(session_id),
                     turn_lock: Arc::new(TokioMutex::new(())),
                     event_emission_gate,
+                    projection,
                     consumer,
                     kill_tx: Some(kill_tx),
                     watcher,
@@ -7121,6 +7153,10 @@ impl FreshCodexState {
         let compact_turn_id = Arc::new(StdMutex::new(None));
         let event_emission_gate = Arc::new(TokioMutex::new(()));
         let exited = Arc::new(AtomicBool::new(false));
+        let projection = Arc::new(StdMutex::new(projection::CodexProjection::new(
+            mint_ownership_id(),
+            new_thread_id.to_string(),
+        )));
         let consumer = self.spawn_consumer(
             notifs,
             CodexConsumerRuntime {
@@ -7135,6 +7171,7 @@ impl FreshCodexState {
                 compact_in_flight: compact_in_flight.clone(),
                 compact_turn_id: compact_turn_id.clone(),
                 event_emission_gate: event_emission_gate.clone(),
+                projection: projection.clone(),
             },
         );
         let (kill_tx, kill_rx) = oneshot::channel();
@@ -7176,6 +7213,7 @@ impl FreshCodexState {
                     history_mode: Some(HistoryMode::Paginated),
                     turn_lock: Arc::new(TokioMutex::new(())),
                     event_emission_gate,
+                    projection,
                     consumer,
                     kill_tx: Some(kill_tx),
                     watcher,
@@ -7561,6 +7599,7 @@ impl FreshCodexState {
             compact_in_flight,
             compact_turn_id,
             event_emission_gate,
+            projection,
         } = runtime;
         let broadcast_tx = self.broadcast_tx.clone();
         // The deadman feed needs the state handle (window config + waiter spawn); a
@@ -7582,7 +7621,18 @@ impl FreshCodexState {
             let mut subscription = CodexSubscription::new(thread_id.clone())
                 .with_user_interrupt_pending(user_interrupt_pending)
                 .with_last_turn_complete_at(last_turn_complete_at.clone());
-            while let Some(notification) = notifs.recv().await {
+            let mut projection_announced = false;
+            let mut patch_tick = tokio::time::interval(Duration::from_millis(33));
+            patch_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                let notification = tokio::select! {
+                    notification = notifs.recv() => match notification { Some(n) => n, None => break },
+                    _ = patch_tick.tick() => {
+                        let _emission = event_emission_gate.lock().await;
+                        flush_codex_projection(&projection, &thread_id, &broadcast_tx);
+                        continue;
+                    }
+                };
                 // Unified agent names (Task 3): an upstream `thread/name/updated`
                 // is a NATIVE title observation — automatic provider metadata,
                 // folded at the store's current location revision. It emits no
@@ -7635,6 +7685,7 @@ impl FreshCodexState {
                 // turn. Every notification capable of emitting a wire frame stays
                 // behind the barrier below.
                 if matches!(&notification, CodexNotification::TurnStarted(_)) {
+                    project_codex_notification(&projection, &notification);
                     let events = reduce_notification(
                         &mut subscription,
                         notification,
@@ -7658,6 +7709,55 @@ impl FreshCodexState {
                 // also ensures an immediate completion cannot retire a just-started
                 // turn before handle_send has recorded its returned turn id.
                 let _emission = event_emission_gate.lock().await;
+                // A native item is projected before lifecycle/control emission.
+                // Appends wait at most 33 ms; every boundary flushes in order.
+                let append = matches!(&notification, CodexNotification::Other { method, .. } if method.ends_with("Delta") || method.ends_with("/delta"));
+                if !append {
+                    flush_codex_projection(&projection, &thread_id, &broadcast_tx);
+                }
+                let has_patch = project_codex_notification(&projection, &notification);
+                if has_patch {
+                    if !projection_announced {
+                        let p = projection.lock().expect("codex projection lock");
+                        broadcast_codex_event(
+                            &thread_id,
+                            json!({"type":"freshAgent.session.init","sessionId":thread_id,"projectionId":p.id,"historyGeneration":p.history_generation}),
+                            &broadcast_tx,
+                        );
+                        projection_announced = true;
+                    }
+                    if !append {
+                        flush_codex_projection(&projection, &thread_id, &broadcast_tx);
+                    }
+                }
+                if let CodexNotification::Other {
+                    method,
+                    params: Some(params),
+                } = &notification
+                {
+                    if params["threadId"] == thread_id
+                        && matches!(
+                            method.as_str(),
+                            "thread/tokenUsage/updated" | "turn/plan/updated" | "turn/diff/updated"
+                        )
+                    {
+                        let p = projection.lock().expect("codex projection lock");
+                        broadcast_codex_event(&thread_id, p.metadata_event(), &broadcast_tx);
+                    }
+                    if params["threadId"] == thread_id && method == "error" {
+                        // Retry notices never replace the lifecycle's failed-turn
+                        // result. Only native diagnostics are shown, never payloads.
+                        let message = params["error"]["message"]
+                            .as_str()
+                            .unwrap_or("Codex reported a provider error");
+                        let event = if params["willRetry"] == true {
+                            json!({"type":"freshAgent.retry","attempt":params["retryAttempt"].as_u64().unwrap_or(1),"error":message})
+                        } else {
+                            json!({"type":"freshAgent.notice","level":"error","code":"CODEX_PROVIDER_ERROR","message":message})
+                        };
+                        broadcast_codex_event(&thread_id, event, &broadcast_tx);
+                    }
+                }
                 if state
                     .consume_control_notification(&thread_id, &notification)
                     .await
@@ -7727,6 +7827,7 @@ impl FreshCodexState {
                     }
                 }
             }
+            flush_codex_projection(&projection, &thread_id, &broadcast_tx);
             state.clear_controls(&thread_id).await;
         })
     }
@@ -7880,14 +7981,84 @@ impl FreshCodexState {
         // this port previously had no fallback at all, so ANY such rejection became an
         // unconditional 500. Retry once with `includeTurns:false`, matching the reference
         // exactly (still a valid, if turn-less, snapshot).
-        let raw = match client.read_thread(thread_id, true).await {
-            Ok(raw) => raw,
-            Err(err) if is_codex_include_turns_unavailable(&err) => client
-                .read_thread(thread_id, false)
-                .await
-                .map_err(CodexSnapshotError::AppServer)?,
-            Err(err) => return Err(CodexSnapshotError::AppServer(err)),
-        };
+        let projection = self
+            .sessions
+            .lock()
+            .await
+            .get(thread_id)
+            .filter(|session| Arc::ptr_eq(&session.client, &client))
+            .map(|session| session.projection.clone())
+            .ok_or(CodexSnapshotError::NotFound)?;
+        let mut selected = None;
+        for _ in 0..3 {
+            let owner = self.ownership_snapshot(PROVIDER, thread_id);
+            let fence = {
+                let mut p = projection.lock().expect("codex projection lock");
+                p.bind_owner(owner.epoch, owner.generation);
+                // A read cannot cut through a coalesced append. Publish the
+                // entire pending batch before capturing its consumed prefix;
+                // future batches then contain only events after this fence.
+                if let Some(patch) = p.take_patch() {
+                    broadcast_codex_event(thread_id, patch, &self.broadcast_tx);
+                }
+                p.begin_history_read()
+            };
+            let read = match client.read_thread(thread_id, true).await {
+                Ok(raw) => Ok(raw),
+                Err(err) if is_codex_include_turns_unavailable(&err) => {
+                    client.read_thread(thread_id, false).await
+                }
+                Err(err) => Err(err),
+            };
+            let current = self.sessions.lock().await.get(thread_id).map(|session| {
+                (
+                    Arc::ptr_eq(&session.client, &client)
+                        && Arc::ptr_eq(&session.projection, &projection),
+                    session.exited.load(Ordering::SeqCst),
+                )
+            });
+            if !current.is_some_and(|(same, _)| same) {
+                return Err(CodexSnapshotError::HandoffInProgress {
+                    generation: self.ownership_snapshot(PROVIDER, thread_id).generation,
+                });
+            }
+            let owner_after = self.ownership_snapshot(PROVIDER, thread_id);
+            let mut p = projection.lock().expect("codex projection lock");
+            p.bind_owner(owner_after.epoch, owner_after.generation);
+            if !p.matches_fence(&fence) {
+                continue;
+            }
+            let projected = match read {
+                Ok(raw) => p.accept_native_history(&raw, &fence),
+                Err(err) => {
+                    if !p.has_usable_history() {
+                        return Err(CodexSnapshotError::AppServer(err));
+                    }
+                    if current.is_some_and(|(_, exited)| exited) {
+                        p.freeze_active("interrupted");
+                    }
+                    tracing::warn!(provider=PROVIDER, session_id=thread_id, projection_id=%p.id, "freshagent.codex.history_unavailable");
+                    if let Some(patch) = p.take_patch() {
+                        broadcast_codex_event(thread_id, patch, &self.broadcast_tx);
+                    }
+                    let retained_fence = p.begin_history_read();
+                    p.unavailable_history(&retained_fence)
+                }
+            };
+            match projected {
+                Ok(snapshot) => {
+                    selected = Some(snapshot);
+                    break;
+                }
+                Err(_) => {
+                    tracing::debug!(provider=PROVIDER, session_id=thread_id, projection_id=%p.id, "freshagent.codex.stale_history_reread")
+                }
+            }
+        }
+        let projected = selected.ok_or_else(|| CodexSnapshotError::HandoffInProgress {
+            generation: self.ownership_snapshot(PROVIDER, thread_id).generation,
+        })?;
+        let raw = projected.raw;
         // U-1 repair (wedged-sidecar deadman): a thread restored MID-TURN has no
         // adapter-observed `turn/started` (this process never saw one), so
         // `active_turn` is empty and the quiet deadman would never arm. When the FRESH
@@ -7974,6 +8145,10 @@ impl FreshCodexState {
             stuck,
         )
         .map_err(CodexSnapshotError::Protocol)?;
+        projection
+            .lock()
+            .expect("codex projection lock")
+            .overlay(&mut snapshot, projected.metadata);
         self.overlay_controls(thread_id, &mut snapshot).await;
         if let Some(session) = self.sessions.lock().await.get(thread_id) {
             let mut settings = Map::new();
@@ -8868,6 +9043,10 @@ impl FreshCodexState {
         let compact_turn_id = Arc::new(StdMutex::new(None));
         let event_emission_gate = Arc::new(TokioMutex::new(()));
         let exited = Arc::new(AtomicBool::new(false));
+        let projection = Arc::new(StdMutex::new(projection::CodexProjection::new(
+            mint_ownership_id(),
+            thread_id.to_string(),
+        )));
         let consumer = self.spawn_consumer(
             notifs,
             CodexConsumerRuntime {
@@ -8882,6 +9061,7 @@ impl FreshCodexState {
                 compact_in_flight: compact_in_flight.clone(),
                 compact_turn_id: compact_turn_id.clone(),
                 event_emission_gate: event_emission_gate.clone(),
+                projection: projection.clone(),
             },
         );
         let (kill_tx, kill_rx) = oneshot::channel();
@@ -8919,6 +9099,7 @@ impl FreshCodexState {
                 history_mode,
                 turn_lock: Arc::new(TokioMutex::new(())),
                 event_emission_gate,
+                projection,
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -9013,6 +9194,10 @@ impl FreshCodexState {
                 history_mode: Some(HistoryMode::Paginated),
                 turn_lock: Arc::new(TokioMutex::new(())),
                 event_emission_gate: Arc::new(TokioMutex::new(())),
+                projection: Arc::new(StdMutex::new(projection::CodexProjection::new(
+                    mint_ownership_id(),
+                    thread_id.to_string(),
+                ))),
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -9272,15 +9457,18 @@ fn map_codex_item(item_id: &str, item: &Value, item_type: &str) -> Result<Vec<Va
                 .and_then(Value::as_array)
                 .map(|arr| arr.iter().filter(|change| change.is_object()).cloned().collect())
                 .unwrap_or_default();
-            Ok(vec![json!({
+            let mut mapped = json!({
                 "id": item_id,
                 "kind": "file_change",
                 "status": codex_normalize_command_status(item.get("status").and_then(Value::as_str)),
                 "changes": changes,
                 "extensions": { "codex": item },
-            })])
+            });
+            if let Some(output) = item["aggregatedOutput"].as_str() { mapped["output"] = json!(output); }
+            Ok(vec![mapped])
         }
-        "mcpToolCall" => Ok(vec![json!({
+        "mcpToolCall" => {
+            let mut mapped = json!({
             "id": item_id,
             "kind": "mcp_tool",
             "server": item.get("server").and_then(Value::as_str).unwrap_or(""),
@@ -9289,7 +9477,10 @@ fn map_codex_item(item_id: &str, item: &Value, item_type: &str) -> Result<Vec<Va
             "arguments": item.get("arguments").cloned().unwrap_or(Value::Null),
             "result": item.get("result").cloned().unwrap_or(Value::Null),
             "error": item.get("error").cloned().unwrap_or(Value::Null),
-        })]),
+            });
+            if let Some(progress) = item["progress"].as_str() { mapped["progress"] = json!(progress); }
+            Ok(vec![mapped])
+        },
         "dynamicToolCall" => Ok(vec![json!({
             "id": item_id,
             "kind": "dynamic_tool",
@@ -9531,13 +9722,9 @@ fn summarize_codex_items(items: &[Value]) -> (String, &'static str) {
 /// `normalizeCodexThreadSnapshot` (`normalize.ts:748-787`): map a raw `thread/read` result
 /// into the `FreshAgentSnapshotSchema` shape.
 ///
-/// `tokenUsage` is always the zero-fallback (`normalize.ts:774-779`'s `?? {...zeros}` branch):
-/// `CodexThreadReadResultSchema` (`protocol.ts:258-259`) is `{ thread: CodexThreadSchema }`, and
-/// neither `CodexThreadSchema` (`protocol.ts:148-167`) nor anywhere else in the codex app-server
-/// RPC surface exposes a `tokenUsage` field -- confirmed by inspection of the full protocol
-/// schema, not by omission. The reference's `rawSnapshot.tokenUsage` is therefore ALWAYS
-/// `undefined` on this path too; this is not a Rust-side gap, it is the reference's own honest
-/// zero, faithfully reproduced.
+/// `thread/read` carries no measured usage. The base snapshot stays explicitly
+/// unobserved; a tracked session overlays the actual native usage notification
+/// (total counters plus its separate latest sample) from its projection.
 fn build_codex_snapshot_json(
     thread_id: &str,
     raw: &Value,
@@ -9606,7 +9793,11 @@ fn build_codex_snapshot_json(
     // NOT per-raw-turn, it is the display row's position in the final transcript.
     let turns: Vec<Value> = raw_turns
         .iter()
-        .map(|raw_turn| build_codex_turn_json(raw_turn, 0))
+        .map(|raw_turn| {
+            let mut rows = build_codex_turn_json(raw_turn, 0)?;
+            projection::stamp_saved_output_state(raw_turn, &mut rows);
+            Ok(rows)
+        })
         .collect::<Result<Vec<Vec<Value>>, String>>()?
         .into_iter()
         .flatten()
@@ -9654,6 +9845,7 @@ fn build_codex_snapshot_json(
             },
         },
         "tokenUsage": {
+            "observed": false,
             "inputTokens": 0,
             "outputTokens": 0,
             "cachedTokens": 0,
@@ -11074,6 +11266,82 @@ fn reduce_notification(
 
 /// Map an adapter event to a `freshAgent.event` wire frame (sdk-events.ts normalization:
 /// `sdk.*` → `freshAgent.*`). Returns the pre-serialized JSON, or `None` on a serialize error.
+fn project_codex_notification(
+    projection: &Arc<StdMutex<projection::CodexProjection>>,
+    notification: &CodexNotification,
+) -> bool {
+    let (method, params) = match notification {
+        CodexNotification::Other { method, params } => {
+            (method.as_str(), params.clone().unwrap_or(Value::Null))
+        }
+        CodexNotification::TurnStarted(event) => {
+            ("turn/started", Value::Object(event.params.clone()))
+        }
+        CodexNotification::TurnCompleted(event) => {
+            ("turn/completed", Value::Object(event.params.clone()))
+        }
+        CodexNotification::ThreadClosed { thread_id } => {
+            let mut p = projection.lock().expect("codex projection lock");
+            if p.owns_thread(thread_id) {
+                p.freeze_active("interrupted");
+            }
+            return false;
+        }
+        CodexNotification::ThreadStatusChanged { thread_id, status } => {
+            let mut p = projection.lock().expect("codex projection lock");
+            if p.owns_thread(thread_id)
+                && normalize_codex_thread_status(status) == CodexStatus::Exited
+            {
+                p.freeze_active("interrupted");
+            }
+            return false;
+        }
+        _ => return false,
+    };
+    let mut p = projection.lock().expect("codex projection lock");
+    match p.apply(method, &params) {
+        Ok(ops) => {
+            let has_ops = !ops.is_empty();
+            p.enqueue(ops);
+            has_ops
+        }
+        Err(error) => {
+            tracing::warn!(provider=PROVIDER, projection_id=%p.id, method=%error.method, native_turn_id=?error.turn_id, native_item_id=?error.item_id, reason=error.reason, "freshagent.codex.projection_refused");
+            false
+        }
+    }
+}
+
+fn broadcast_codex_event(
+    thread_id: &str,
+    event: Value,
+    tx: &tokio::sync::broadcast::Sender<String>,
+) {
+    let msg = ServerMessage::FreshAgentEvent(FreshAgentEvent {
+        provider: PROVIDER.to_owned(),
+        session_type: SESSION_TYPE.to_owned(),
+        session_id: thread_id.to_owned(),
+        event,
+    });
+    if let Ok(frame) = serde_json::to_string(&msg) {
+        let _ = tx.send(frame);
+    }
+}
+
+fn flush_codex_projection(
+    projection: &Arc<StdMutex<projection::CodexProjection>>,
+    thread_id: &str,
+    tx: &tokio::sync::broadcast::Sender<String>,
+) {
+    let patch = projection
+        .lock()
+        .expect("codex projection lock")
+        .take_patch();
+    if let Some(patch) = patch {
+        broadcast_codex_event(thread_id, patch, tx);
+    }
+}
+
 fn adapter_event_to_frame(event: &CodexAdapterEvent, thread_id: &str) -> Option<String> {
     let inner = match event {
         CodexAdapterEvent::StatusSnapshot {
@@ -12047,6 +12315,10 @@ pub(crate) mod tests {
                 history_mode: Some(HistoryMode::Paginated),
                 turn_lock: Arc::new(TokioMutex::new(())),
                 event_emission_gate: Arc::new(TokioMutex::new(())),
+                projection: Arc::new(StdMutex::new(projection::CodexProjection::new(
+                    mint_ownership_id(),
+                    thread_id.to_string(),
+                ))),
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -12104,6 +12376,10 @@ pub(crate) mod tests {
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
         let event_emission_gate = Arc::new(TokioMutex::new(()));
+        let projection = Arc::new(StdMutex::new(projection::CodexProjection::new(
+            mint_ownership_id(),
+            thread_id.to_string(),
+        )));
         let consumer = state.spawn_consumer(
             notifs,
             CodexConsumerRuntime {
@@ -12118,6 +12394,7 @@ pub(crate) mod tests {
                 compact_in_flight: compact_in_flight.clone(),
                 compact_turn_id: compact_turn_id.clone(),
                 event_emission_gate: event_emission_gate.clone(),
+                projection: projection.clone(),
             },
         );
         let (kill_tx, kill_rx) = oneshot::channel();
@@ -12156,6 +12433,7 @@ pub(crate) mod tests {
                 history_mode: Some(HistoryMode::Paginated),
                 turn_lock: Arc::new(TokioMutex::new(())),
                 event_emission_gate,
+                projection,
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -14172,6 +14450,10 @@ pub(crate) mod tests {
                 history_mode: Some(HistoryMode::Paginated),
                 turn_lock: Arc::new(TokioMutex::new(())),
                 event_emission_gate: Arc::new(TokioMutex::new(())),
+                projection: Arc::new(StdMutex::new(projection::CodexProjection::new(
+                    mint_ownership_id(),
+                    "thread-stall".to_string(),
+                ))),
                 consumer,
                 kill_tx: None,
                 watcher,
@@ -15248,6 +15530,15 @@ pub(crate) mod tests {
         // window, with the busy truth carried by compact-1's window bit alone.
         peer.respond(&compact_id, json!({}));
         compact_1.await.expect("compact-1 task");
+
+        // Accepted compaction advances the transcript history fence before
+        // another request can observe this window. Consume those additive
+        // projection frames; the refusal below must still beat every RPC.
+        let projection: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(projection["event"]["type"], "freshAgent.transcript.patch");
+        assert_eq!(projection["event"]["historyGeneration"], 1);
+        let metadata: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(metadata["event"]["type"], "freshAgent.session.metadata");
 
         // Compact-2 in the window: REFUSED BUSY_TURN with ZERO RPCs reaching
         // the app-server (the red shape instead issues a second
@@ -26493,7 +26784,13 @@ pub(crate) mod tests {
         assert_eq!(snapshot["capabilities"]["interrupt"], json!(false));
         assert_eq!(snapshot["tokenUsage"]["inputTokens"], json!(0));
         assert_eq!(snapshot["pendingApprovals"], json!([]));
-        assert_eq!(snapshot["extensions"]["codex"], json!({}));
+        assert_eq!(snapshot["tokenUsage"]["observed"], false);
+        let projection = &snapshot["extensions"]["codex"]["projection"];
+        assert!(projection["id"].as_str().is_some_and(|id| !id.is_empty()));
+        assert_eq!(projection["eventRevision"], 0);
+        assert_eq!(projection["historyGeneration"], 0);
+        assert_eq!(projection["nativeFinalTurnIds"], json!(["turn-1"]));
+        assert_eq!(projection["turnRows"]["turn-1"], json!(["turn-1"]));
 
         // kata z7j7: codex honors all four settings knobs per send (merged over
         // the session baseline before turn/start).

@@ -252,6 +252,7 @@ export function itemToToolDisplay(item: FreshAgentTranscriptItem): FreshAgentToo
       id: item.id,
       name: 'Edit',
       input: { changes: item.changes },
+      output: item.output,
       isError: item.status === 'failed',
       status: item.status === 'running' ? 'running' : 'complete',
     }
@@ -261,7 +262,7 @@ export function itemToToolDisplay(item: FreshAgentTranscriptItem): FreshAgentToo
       id: item.id,
       name: `${item.server}/${item.tool}`,
       input: asRecord(item.arguments) ?? { arguments: item.arguments },
-      output: item.result !== undefined ? formatJson(item.result) : item.error !== undefined ? formatJson(item.error) : undefined,
+      output: item.status === 'running' && item.progress ? item.progress : item.result !== undefined ? formatJson(item.result) : item.error !== undefined ? formatJson(item.error) : undefined,
       isError: item.status === 'failed',
       status: item.status === 'running' ? 'running' : 'complete',
     }

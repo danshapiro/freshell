@@ -1,4 +1,5 @@
 import {
+  forwardRef,
   useCallback,
   useEffect,
   useMemo,
@@ -120,17 +121,20 @@ import { FreshAgentApprovalBanner } from './FreshAgentApprovalBanner'
 import { FreshAgentApprovalCard } from './FreshAgentApprovalCard'
 import { FreshAgentOpenSessionContext } from './FreshAgentItemCard'
 import FreshAgentQuestionBanner from './FreshAgentQuestionBanner'
-import { FreshAgentTranscript, type FreshAgentTranscriptHandle } from './FreshAgentTranscript'
+import { FreshAgentTranscript, type FreshAgentTranscriptHandle, type FreshAgentTranscriptProps } from './FreshAgentTranscript'
+import { mergeFreshAgentTranscriptProjection, readTranscriptProjection } from '@/lib/fresh-agent-transcript-projection'
+import { transcriptProjectionSnapshotReceived } from '@/store/freshAgentLiveSlice'
 import { FreshAgentLiveTail, liveTailShowsContent } from './FreshAgentLiveTail'
 import { useTranscriptLandings } from './useTranscriptLandings'
 import { landedTranscriptOf } from '@/lib/fresh-agent-landed-transcript'
-import { withSharedTurns } from '@/lib/fresh-agent-turn-sharing'
+import { withSharedTurns, shareUnchangedTurns } from '@/lib/fresh-agent-turn-sharing'
 import { formatFreshAgentNotice } from '@/lib/fresh-agent-notice'
 import { buildAllowDecision, type FreshAgentApprovalDecision } from '@/lib/fresh-agent-permission-updates'
 import type { FreshAgentTurnRewindAvailability } from './FreshAgentTurnActions'
 import { FreshAgentComposer, type FreshAgentComposerHandle } from './FreshAgentComposer'
 import { FreshAgentDiffPanel } from './FreshAgentDiffPanel'
-import { FreshAgentSidebar } from './FreshAgentSidebar'
+import { FreshAgentSidebar, readCodexPlan } from './FreshAgentSidebar'
+import { latestCodexUsage } from '@/lib/fresh-agent-context-usage'
 import { FreshAgentStatusStrip } from './FreshAgentStatusStrip'
 import {
   classifyHiddenPaneEvent,
@@ -159,6 +163,24 @@ const IDLE_INCOMPLETE_RETRY_DELAY_MS = 1_000
 const REVEAL_REFRESH_MAX_WAIT_MS = 15_000
 const log = createLogger('FreshAgentView')
 let nextSnapshotAuditView = 0
+
+// Token-rate subscriptions stay inside the transcript, outside the pane and
+// general session slice. Hidden panes retain data without rendering each token.
+const ProjectedFreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, FreshAgentTranscriptProps & {
+  snapshot: FreshAgentSnapshot | null
+  sessionKey?: string
+  hidden: boolean
+}>(function ProjectedFreshAgentTranscript({ snapshot, sessionKey, hidden, turns: savedTurns, localEcho, ...props }, ref) {
+  const projection = useAppSelector((state) => !hidden && sessionKey ? state.freshAgentLive?.bySession[sessionKey]?.projection : undefined)
+  const previousTurns = useRef<FreshAgentTurn[]>([])
+  const turns = useMemo(() => {
+    const next = snapshot ? mergeFreshAgentTranscriptProjection(snapshot, projection) : projection?.turns ?? savedTurns
+    previousTurns.current = shareUnchangedTurns(previousTurns.current, next)
+    return previousTurns.current
+  }, [snapshot, projection, savedTurns])
+  const echoLanded = localEcho && turns.some((row) => row.role === 'user' && (row.nativeTurnId === localEcho.turnId || row.turnId === localEcho.turnId))
+  return <FreshAgentTranscript {...props} ref={ref} turns={turns} localEcho={echoLanded ? undefined : localEcho} />
+})
 type SnapshotAuditStage = 'refresh_requested' | 'effect_skipped' | 'request_captured' | 'request_queued'
   | 'run_started' | 'native_started' | 'native_completed' | 'native_failed' | 'soul_started'
   | 'outcome_received' | 'currentness_checked' | 'identity_rejected' | 'display_committed'
@@ -449,6 +471,7 @@ function mergeSnapshotForDisplay(
   const previousIdentity = getSnapshotIdentity(previous)
   const nextIdentity = getSnapshotIdentity(next)
   if (!previousIdentity || previousIdentity !== nextIdentity) return next
+  if (readTranscriptProjection(next)) return next
   // Cold native reads report an idle, vacant owner without reading turns.
   // That absence cannot erase loaded intervention history, including while the
   // live actor resumes. An authoritative empty result may still replace it.
@@ -3348,6 +3371,13 @@ export function FreshAgentView({
       }
       const snapshotIdentity = currentAutoTitleIdentityRef.current
       const resolved = next as FreshAgentSnapshot
+      const projectionMetadata = readTranscriptProjection(resolved)
+      const projectionLocator = { sessionType: requestSessionType, provider, sessionId }
+      const liveProjection = appStore.getState().freshAgentLive?.bySession[makeFreshAgentSessionKey(projectionLocator)]?.projection
+      if (projectionMetadata && liveProjection?.id === projectionMetadata.id && liveProjection.historyGeneration > projectionMetadata.historyGeneration) {
+        requestSnapshotRefresh('reconnect')
+        return
+      }
       const resolvedHasUserTurns = freshAgentSnapshotHasUserTurn(resolved)
       if (!resolvedHasUserTurns && !autoTitleSentRef.current) {
         autoTitleFreshBoundaryRef.current = true
@@ -3365,6 +3395,7 @@ export function FreshAgentView({
       ))
       const snapshotAccepted = displaySnapshot !== previousSnapshot
       if (snapshotAccepted) snapshotRequestAuthorityRef.current.applied = requestSerial
+      if (snapshotAccepted && projectionMetadata) dispatch(transcriptProjectionSnapshotReceived({ ...projectionLocator, snapshot: resolved }))
       const snapshotStatusAuthoritative = !requestReadOnly && !historyOnly && (provider === 'codex'
         || resolved.extensions?.[provider]?.statusFromLiveState === true)
       const outgoing = outgoingTurnRef.current
@@ -3395,7 +3426,9 @@ export function FreshAgentView({
         && revealRefreshVersionRef.current === snapshotDirtyVersionRef.current
         && refreshSerial === snapshotRefreshSerialRef.current
       )
-      const revealRevisionIsFresh = snapshotDirtyBaseRevisionRef.current === null
+      const projectionRevisionIsFresh = projectionMetadata && liveProjection?.id === projectionMetadata.id && projectionMetadata.eventRevision >= liveProjection.eventRevision
+      const revealRevisionIsFresh = liveProjection?.needsResnapshot ? projectionRevisionIsFresh : snapshotDirtyBaseRevisionRef.current === null
+        || projectionRevisionIsFresh
         || typeof resolved.revision !== 'number'
         || resolved.revision > snapshotDirtyBaseRevisionRef.current
       if (revealRefreshIsCurrent && revealRevisionIsFresh) {
@@ -3467,7 +3500,7 @@ export function FreshAgentView({
       // bounded re-poll instead of permanently going quiet.
       if (
         displaySnapshot.status === 'idle'
-        && echoStillPending
+        && (echoStillPending || Object.values(projectionMetadata?.turnOutputStates ?? {}).some((state) => state.refreshPending))
         && idleIncompleteRetryCountRef.current < IDLE_INCOMPLETE_MAX_RETRIES
       ) {
         idleIncompleteRetryCountRef.current += 1
@@ -3477,7 +3510,7 @@ export function FreshAgentView({
             requestSnapshotRefresh('idle-incomplete')
           }, IDLE_INCOMPLETE_RETRY_DELAY_MS)
         }
-      } else if (!echoStillPending) {
+      } else if (!echoStillPending && !Object.values(projectionMetadata?.turnOutputStates ?? {}).some((state) => state.refreshPending)) {
         idleIncompleteRetryCountRef.current = 0
       }
       const fresh = paneContentRef.current
@@ -3978,6 +4011,19 @@ export function FreshAgentView({
     ? makeFreshAgentSessionKey({ sessionId: paneContent.sessionId, sessionType: paneContent.sessionType, provider: paneContent.provider })
     : undefined
   const landedTranscript = useMemo(() => landedTranscriptOf(snapshot), [snapshot])
+  const rawCodexLiveMetadata = useAppSelector((state) => liveSessionKey ? state.freshAgentLive?.bySession[liveSessionKey]?.codexMetadata : undefined)
+  const boundProjectionIdentity = useAppSelector((state) => {
+    const projection = liveSessionKey ? state.freshAgentLive?.bySession[liveSessionKey]?.projection : undefined
+    return projection ? `${projection.id}:${projection.historyGeneration}` : undefined
+  })
+  const codexLiveMetadata = rawCodexLiveMetadata && (typeof rawCodexLiveMetadata.projectionId !== 'string' || `${rawCodexLiveMetadata.projectionId}:${rawCodexLiveMetadata.historyGeneration}` === boundProjectionIdentity)
+    ? rawCodexLiveMetadata : undefined
+  const projectionNeedsResnapshot = useAppSelector((state) => !hidden && liveSessionKey ? state.freshAgentLive?.bySession[liveSessionKey]?.projection?.needsResnapshot : false)
+  useEffect(() => {
+    if (!projectionNeedsResnapshot) return
+    markSnapshotDirty()
+    requestRevealRefresh(true)
+  }, [projectionNeedsResnapshot, markSnapshotDirty, requestRevealRefresh])
   const liveTailActive = useAppSelector((state) => (
     liveSessionKey ? liveTailShowsContent(state.freshAgentLive?.bySession[liveSessionKey], landedTranscript) : false
   ))
@@ -4425,12 +4471,20 @@ export function FreshAgentView({
     const worktrees = snapshot?.worktrees ?? []
     const childThreads = snapshot?.childThreads ?? []
     const diffs = snapshot?.diffs ?? []
+    const nativeDiff = codexLiveMetadata?.diff
+    const projectedDiffs = isRecord(nativeDiff) && typeof nativeDiff.id === 'string' && typeof nativeDiff.diff === 'string'
+      ? [...diffs.filter((diff) => !diff.id.startsWith('codex-turn:')), { id: nativeDiff.id, title: 'Turn changes', diff: nativeDiff.diff }]
+      : codexLiveMetadata && 'diff' in codexLiveMetadata ? diffs.filter((diff) => !diff.id.startsWith('codex-turn:')) : diffs
+    const codexPlan = readCodexPlan(codexLiveMetadata && 'plan' in codexLiveMetadata ? codexLiveMetadata.plan : snapshot?.extensions?.codex?.plan)
+    const codexUsage = paneContent.provider === 'codex' ? latestCodexUsage(codexLiveMetadata && 'usage' in codexLiveMetadata ? codexLiveMetadata.usage : snapshot?.extensions?.codex?.usage) : undefined
     const codexReview = readCodexReview(snapshot?.extensions?.codex?.review)
     const codexFork = readCodexFork(snapshot?.extensions?.codex?.fork)
     const hasSidebarMetadata = worktrees.length > 0
       || childThreads.length > 0
       || Boolean(codexReview)
       || Boolean(codexFork)
+      || Boolean(codexPlan)
+      || Boolean(codexUsage)
     // b8ke ext r32 F3: a DIVERGED/transition pane has NO interrupt
     // affordance — the pane is a pure observer (the runtime-owner state
     // owns the session; an old-kind interrupt would at best fail the
@@ -4785,7 +4839,7 @@ export function FreshAgentView({
                 />
               ))}
               <FreshAgentDiffPanel
-                diffs={diffs}
+                diffs={projectedDiffs}
                 // Same resolution as the !command exec escape: the pane's
                 // starting directory, falling back to the LIVE session cwd
                 // so a resumed/API-created pane without an initialCwd still
@@ -4810,7 +4864,16 @@ export function FreshAgentView({
                       Showing retained conversation history. Older turns or large content were omitted from this view. The saved conversation has not been changed.
                     </div>
                   ) : null}
-                  <FreshAgentTranscript
+                  {isRecord(snapshot?.extensions?.codex?.projection) && isRecord(snapshot.extensions.codex.projection.availability) && snapshot.extensions.codex.projection.availability.status === 'unavailable' ? (
+                    <div role="note" className="px-4 py-2 text-xs text-muted-foreground">
+                      Saved history is temporarily unavailable. Showing available retained output.{' '}
+                      <button type="button" className="underline" onClick={() => requestSnapshotRefresh('manual')}>Retry history</button>
+                    </div>
+                  ) : null}
+                  <ProjectedFreshAgentTranscript
+                    snapshot={snapshot}
+                    sessionKey={liveSessionKey}
+                    hidden={Boolean(hidden)}
                     ref={transcriptRef}
                     presentationPaused={revealRefreshBlocking}
                     paneId={paneId}
@@ -4986,6 +5049,8 @@ export function FreshAgentView({
             childThreads={childThreads}
             codexReview={codexReview}
             codexFork={codexFork}
+            codexPlan={codexPlan}
+            codexUsage={codexUsage}
           />
         </div>
       </div>
@@ -5013,6 +5078,7 @@ export function FreshAgentView({
     isRestoring,
     landedTranscript,
     liveSessionKey,
+    codexLiveMetadata,
     liveTailActive,
     loadError,
     managedRecoveryPending,

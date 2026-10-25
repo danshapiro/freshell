@@ -58,6 +58,23 @@ function createFreshAgentPaneStore(seenActionTypes: string[] = []) {
 }
 
 describe('fresh-agent-ws', () => {
+  it('routes native patches outside the session slice and fences complete items and stale init incarnations', () => {
+    const store = createFreshAgentStore()
+    const outer = { type: 'freshAgent.event' as const, sessionId: 'native-live', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    const send = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, { ...outer, event })
+    send({ type: 'freshAgent.session.init', sessionId: outer.sessionId, projectionId: 'p', historyGeneration: 0 })
+    const sessions = store.getState().freshAgent.sessions
+    const row = { id: 't', turnId: 't', role: 'assistant', summary: '', items: [{ id: 'a', kind: 'text', text: '' }] }
+    send({ type: 'freshAgent.transcript.patch', sessionId: outer.sessionId, projectionId: 'p', historyGeneration: 0, ops: [{ op: 'resetTurn', nativeTurnId: 't', turns: [row], revision: 1 }, { op: 'appendItem', nativeTurnId: 't', rowId: 't', itemId: 'a', field: 'text', text: 'Hel', revision: 2 }] })
+    const key = 'freshcodex:codex:native-live'
+    expect(store.getState().freshAgentLive.bySession[key].projection?.turns[0].items[0]).toMatchObject({ text: 'Hel' })
+    expect(store.getState().freshAgent.sessions).toBe(sessions)
+    send({ type: 'freshAgent.transcript.patch', sessionId: outer.sessionId, projectionId: 'foreign', historyGeneration: 0, ops: [{ op: 'resetTurn', nativeTurnId: 'other', turns: [row], revision: 100 }] })
+    send({ type: 'freshAgent.session.init', sessionId: outer.sessionId, projectionId: 'late-old-incarnation', historyGeneration: 0 })
+    expect(store.getState().freshAgentLive.bySession[key].projection?.id).toBe('p')
+    send({ type: 'freshAgent.transcript.patch', sessionId: outer.sessionId, projectionId: 'p', historyGeneration: 0, ops: [{ op: 'upsertItem', nativeTurnId: 't', row: { ...row, items: [] }, item: { id: 'a', kind: 'text', text: 'Hello' }, complete: true, revision: 3 }, { op: 'appendItem', nativeTurnId: 't', rowId: 't', itemId: 'a', field: 'text', text: 'lo', revision: 4 }] })
+    expect(store.getState().freshAgentLive.bySession[key].projection?.turns[0].items).toEqual([{ id: 'a', kind: 'text', text: 'Hello' }])
+  })
   beforeEach(() => {
     _resetCancelledCreates()
   })

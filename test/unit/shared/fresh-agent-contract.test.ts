@@ -9,6 +9,7 @@ import {
   FreshAgentSessionCommandSchema,
   FreshAgentSnapshotSchema,
   FreshAgentTranscriptItemSchema,
+  FreshAgentTranscriptPatchSchema,
   FreshAgentTurnBodySchema,
   FreshAgentTurnPageSchema,
   FreshAgentTurnSchema,
@@ -25,6 +26,21 @@ import {
 } from '../../fixtures/fresh-agent/codex/contract-fixtures.js'
 
 describe('fresh-agent shared contract schemas', () => {
+  it('validates native delta patches and rejects unsafe revisions or malformed operations', () => {
+    const patch = { type: 'freshAgent.transcript.patch', sessionId: 'thread', projectionId: 'runtime', historyGeneration: 0, ops: [{ op: 'appendItem', nativeTurnId: 'turn', rowId: 'turn:row-1', itemId: 'answer', field: 'text', text: '🙂', revision: 1 }] }
+    expect(FreshAgentTranscriptPatchSchema.parse(patch).ops[0]).toMatchObject({ text: '🙂', revision: 1 })
+    expect(FreshAgentTranscriptPatchSchema.safeParse({ ...patch, ops: [{ ...patch.ops[0], revision: Number.MAX_SAFE_INTEGER + 1 }] }).success).toBe(false)
+    expect(FreshAgentTranscriptPatchSchema.safeParse({ ...patch, ops: [{ ...patch.ops[0], field: 'credentials' }] }).success).toBe(false)
+    expect(FreshAgentTranscriptPatchSchema.safeParse({ ...patch, ops: [{ ...patch.ops[0], op: 'replaceEverything' }] }).success).toBe(false)
+  })
+
+  it('preserves observed zero usage, native model limit, supplied diff and finite interrupted provenance', () => {
+    const parsed = FreshAgentSnapshotSchema.parse({ ...codexContractSnapshot, tokenUsage: { observed: true, inputTokens: 0, outputTokens: 0, totalTokens: 0, modelContextWindow: 258400 }, diffs: [{ id: 'turn:t', title: 'Turn changes', diff: '+native' }], turns: [{ id: 't', turnId: 't', summary: '', items: [], outputState: { provenance: 'saved', diagnostic: 'interrupted', refreshPending: false } }] })
+    expect(parsed.tokenUsage.observed).toBe(true)
+    expect(parsed.tokenUsage.modelContextWindow).toBe(258400)
+    expect(parsed.diffs[0].diff).toBe('+native')
+    expect(parsed.turns[0].outputState?.diagnostic).toBe('interrupted')
+  })
   it('parses Claude and Codex snapshots through one shared durable contract', () => {
     const claudeSnapshot = FreshAgentSnapshotSchema.parse(claudeContractSnapshot)
     expect(claudeSnapshot.sessionType).toBe('freshclaude')

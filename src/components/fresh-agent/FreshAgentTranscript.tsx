@@ -1031,6 +1031,14 @@ export function FreshAgentTurnArticle({
         </div>
       ) : null}
       <div className="fresh-agent-transcript-copy space-y-1.5">
+        {turn.outputState && (turn.outputState.provenance !== 'saved' || turn.outputState.diagnostic) ? (
+          <div role="note" aria-label="Output persistence" className="my-1 text-xs text-muted-foreground">
+            {turn.outputState.provenance === 'saved-and-retained' ? 'Saved output and retained output.' : turn.outputState.provenance === 'retained' ? 'Retained output.' : turn.outputState.provenance === 'preview' ? 'Native preview.' : 'Saved output.'}{' '}
+            {turn.outputState.diagnostic === 'interrupted' ? (turn.outputState.provenance === 'saved' ? 'Interrupted. Only saved output remains.' : 'Interrupted.') : turn.outputState.diagnostic === 'unsaved' ? 'Saved output could not be confirmed.' : turn.outputState.diagnostic === 'provider-truncated' ? 'Codex shortened the saved tool output.' : turn.outputState.refreshPending ? 'Waiting for saved history.' : null}
+            {turn.outputState.retainedItems?.length ? <details><summary>Retained output</summary>{turn.outputState.retainedItems.map((item) => <FreshAgentItemCard key={item.id} item={item} />)}</details> : null}
+            {turn.outputState.savedItems?.length ? <details><summary>Saved representation</summary>{turn.outputState.savedItems.map((item) => <FreshAgentItemCard key={item.id} item={item} />)}</details> : null}
+          </div>
+        ) : null}
         {blocks.length > 0 ? (
           <TurnBlocks
             blocks={blocks}

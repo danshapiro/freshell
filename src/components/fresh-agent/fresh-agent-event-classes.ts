@@ -39,6 +39,7 @@ export const TRANSCRIPT_INVALIDATING_FRESH_AGENT_EVENTS: ReadonlySet<string> = n
   'freshAgent.error',
   'freshAgent.assistant',
   'freshAgent.stream',
+  'freshAgent.transcript.patch',
   'freshAgent.session.rolledBack',
   'freshAgent.session.redone',
   'freshAgent.rolledBack',

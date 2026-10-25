@@ -19,7 +19,9 @@ import freshAgentLiveReducer, {
   transcriptAnnounced,
   transcriptExpectationsDropped,
   transcriptLanded,
+  transcriptProjectionSnapshotReceived,
 } from '@/store/freshAgentLiveSlice'
+import { FreshAgentSnapshotSchema } from '@shared/fresh-agent-contract'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
 import { LIVE_STREAM_FLUSH_MS, streamBatcherFor } from '@/lib/fresh-agent-stream-batcher'
 import type { LiveStreamOp } from '@/store/freshAgentLiveTypes'
@@ -58,6 +60,38 @@ function streamTurn(store: Store) {
 }
 
 describe('freshAgentLive slice (transcript-live D3)', () => {
+  const codexLocator = { sessionId: 'codex-reconnect', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+  const codexKey = 'freshcodex:codex:codex-reconnect'
+  const codexSnapshot = (revision = 2) => FreshAgentSnapshotSchema.parse({ sessionType: 'freshcodex', provider: 'codex', threadId: codexLocator.sessionId, revision: 0, status: 'running', capabilities: { send: false, interrupt: true, approvals: false, questions: false, fork: false }, tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 }, turns: [{ id: 't', turnId: 't', role: 'assistant', summary: '', items: [{ id: 'a', kind: 'text', text: 'Hel' }] }], extensions: { codex: { projection: { id: 'p', historyGeneration: 0, eventRevision: revision, eventOwnedTurnIds: ['t'], nativePreviewTurnIds: [], nativeFinalTurnIds: [], turnRows: { t: ['t'] }, turnOutputStates: {} } } } })
+
+  it('buffers a reconnect delta without adopting its source, then applies it to the captured event-owned prefix', () => {
+    const store = createStore()
+    handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...codexLocator, event: { type: 'freshAgent.transcript.patch', sessionId: codexLocator.sessionId, projectionId: 'p', historyGeneration: 0, ops: [{ op: 'appendItem', nativeTurnId: 't', rowId: 't', itemId: 'a', field: 'text', text: 'lo', revision: 3 }] } })
+    expect(tail(store, codexKey).projection).toBeUndefined()
+    store.dispatch(transcriptProjectionSnapshotReceived({ ...codexLocator, snapshot: codexSnapshot() }))
+    expect(tail(store, codexKey).projection?.turns[0].items).toEqual([{ id: 'a', kind: 'text', text: 'Hello' }])
+  })
+
+  it('flags a bounded reconnect-buffer gap until a current authoritative event prefix arrives', () => {
+    const store = createStore()
+    for (let revision = 3; revision < 100; revision++) handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...codexLocator, event: { type: 'freshAgent.transcript.patch', sessionId: codexLocator.sessionId, projectionId: 'p', historyGeneration: 0, ops: [{ op: 'appendItem', nativeTurnId: 't', rowId: 't', itemId: 'a', field: 'text', text: 'x'.repeat(2048), revision }] } })
+    store.dispatch(transcriptProjectionSnapshotReceived({ ...codexLocator, snapshot: codexSnapshot() }))
+    expect(tail(store, codexKey).projection?.needsResnapshot).toBe(true)
+    store.dispatch(transcriptProjectionSnapshotReceived({ ...codexLocator, snapshot: codexSnapshot(99) }))
+    expect(tail(store, codexKey).projection?.needsResnapshot).not.toBe(true)
+    expect(tail(store, codexKey).projection?.turns[0].items).toEqual([{ id: 'a', kind: 'text', text: 'Hel' }])
+  })
+
+  it('host loss preserves a prior failure and freezes completed output as unconfirmed rather than changing it to an interruption', () => {
+    const store = createStore()
+    const snapshot = codexSnapshot()
+    snapshot.turns[0].error = { name: 'ProviderError', message: 'The native turn failed' }
+    store.dispatch(transcriptProjectionSnapshotReceived({ ...codexLocator, snapshot }))
+    handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...codexLocator, event: { type: 'freshAgent.transcript.patch', sessionId: codexLocator.sessionId, projectionId: 'p', historyGeneration: 0, ops: [{ op: 'settleTurn', nativeTurnId: 't', status: 'failed', revision: 3 }] } })
+    expect(tail(store, codexKey).projection?.turns[0].outputState?.diagnostic).not.toBe('interrupted')
+    store.dispatch(markSessionLost(codexLocator))
+    expect(tail(store, codexKey).projection?.turns[0]).toMatchObject({ error: { message: 'The native turn failed' }, outputState: { diagnostic: 'unsaved', refreshPending: false } })
+  })
   it('binds each assistant message to the first unbound streamed block of its message id and kind', () => {
     const store = createStore()
     streamTurn(store)
