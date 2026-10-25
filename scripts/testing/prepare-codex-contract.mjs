@@ -8,6 +8,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
+import { CODEX_NETWORK_REQUIREMENTS } from '../../test/integration/providers/codex-local-provider.mjs'
 
 export const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 export const artifactMetadata = JSON.parse(fs.readFileSync(path.join(repoRoot, 'test/fixtures/coding-cli/codex-native-artifact.json'), 'utf8'))
@@ -185,8 +186,13 @@ export async function verifySandbox() {
   const policy = nativeSandboxPolicy()
   const hostPolicy = await fsp.readFile(path.join(stageRoot, 'codex-policy.json'))
   if (`sha256:${digest(hostPolicy)}` !== policy.profileSha256 || manifest.nativeSandboxPolicy?.profileSha256 !== policy.profileSha256) fail('prepared Codex native policy is absent or stale')
-  const image = run('docker', ['image', 'inspect', imageTag, '--format', '{{.Id}}']).trim()
-  if (manifest.image !== image) fail('sandbox image changed since connected warmup')
+  const baseImage = run('docker', ['image', 'inspect', imageTag, '--format', '{{.Id}}']).trim()
+  if ((manifest.baseImage ?? manifest.image) !== baseImage) fail('sandbox image changed since connected warmup')
+  const image = manifest.image
+  if (manifest.contractImage) {
+    const observed = JSON.parse(run('docker', ['image', 'inspect', image]))[0]
+    if (observed.Id !== image || observed.Config?.Labels?.['org.freshell.codex-contract-owner'] !== manifest.subdir || manifest.contractImage.requirementsSha256 !== digest(CODEX_NETWORK_REQUIREMENTS)) fail('owned Codex test image or system prerequisites changed')
+  }
   for (const volume of ['freshell-sandbox-cargo-target', 'freshell-sandbox-node-modules', 'freshell-sandbox-sidecar-node-modules', 'freshell-sandbox-mcp-node-modules']) run('docker', ['volume', 'inspect', volume])
   const name = `freshcodex-verifier-${randomUUID()}`
   const args = ['run', '--rm', '--name', name, '--label', `org.freshell.codex-contract=${name}`, '--read-only', '--network', 'none', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', `${manifest.uid}:${manifest.gid}`, '--entrypoint', 'node', '-v', `${repoRoot}:/workspace:ro`, '-v', 'freshell-sandbox-cargo-target:/freshell-test-artifacts:ro', '-v', 'freshell-sandbox-node-modules:/workspace/node_modules:ro', image, '/workspace/scripts/testing/prepare-codex-contract.mjs', '--verify-prepared']
@@ -215,7 +221,23 @@ async function main(args) {
     await prepareArtifact(path.join(stageRoot, 'artifact'))
     await preparePolicy()
     result = JSON.parse(run('bash', ['scripts/sandbox-test.sh', 'node scripts/testing/prepare-codex-contract.mjs --stage-prepared'], { stdio: ['ignore', 'pipe', 'inherit'] }))
-    result.image = run('docker', ['image', 'inspect', imageTag, '--format', '{{.Id}}']).trim()
+    result.baseImage = run('docker', ['image', 'inspect', imageTag, '--format', '{{.Id}}']).trim()
+    const context = path.join(stageRoot, 'image-context', result.subdir)
+    await fsp.mkdir(context, { recursive: true, mode: 0o700 })
+    await fsp.writeFile(path.join(context, 'requirements.toml'), CODEX_NETWORK_REQUIREMENTS, { mode: 0o644 })
+    await fsp.writeFile(path.join(stageRoot, 'requirements.toml'), CODEX_NETWORK_REQUIREMENTS, { mode: 0o644 })
+    const baseTag = `freshell-codex-contract-base:${result.subdir}`
+    run('docker', ['image', 'tag', result.baseImage, baseTag])
+    await fsp.writeFile(path.join(context, 'Dockerfile'), `FROM ${baseTag}\nCOPY requirements.toml /etc/codex/requirements.toml\nRUN chmod 755 /etc/codex && chmod 644 /etc/codex/requirements.toml\n`)
+    const tag = `freshell-codex-contract:${result.subdir}`
+    try { run('docker', ['build', '--pull=false', '--label', `org.freshell.codex-contract-owner=${result.subdir}`, '-t', tag, context], { stdio: ['ignore', 'inherit', 'inherit'] }) }
+    finally {
+      const observedBase = run('docker', ['image', 'inspect', baseTag, '--format', '{{.Id}}']).trim()
+      if (observedBase !== result.baseImage) fail('owned temporary base tag changed during preparation')
+      run('docker', ['image', 'rm', baseTag])
+    }
+    result.image = run('docker', ['image', 'inspect', tag, '--format', '{{.Id}}']).trim()
+    result.contractImage = { tag, requirementsSha256: digest(CODEX_NETWORK_REQUIREMENTS) }
     await fsp.writeFile(stageManifest, `${JSON.stringify(result, null, 2)}\n`)
     await verifySandbox()
   } else fail('usage: --output ABS | --sandbox | --stage-prepared | --verify-sandbox')

@@ -27,4 +27,47 @@ describe('Codex 0.164.0 release contract through an isolated Responses provider'
       expect(capture.fixtureTraffic.length).toBeGreaterThan(0)
     }, 180_000,
   )
+  it.each(['read-only', 'workspace-write'])('executes restricted never policy with actual %s effects', async sandboxMode => {
+    const capture = await captureNativeScenario('approval-policy-restricted-exec', { sandboxMode, probeApprovalPolicy: 'never', probePolicyEffects: true, timeoutMs: 120_000 })
+    expect(capture.observations.restrictedCommandExecuted).toBe(true)
+    expect(capture.observations.policyEffects).toEqual(expect.objectContaining({ outsideWrite: false, gitWrite: false, codexWrite: false, networkRequests: 0 }))
+    expect(capture.observations.workspaceWritePresent).toBe(sandboxMode === 'workspace-write')
+  }, 180_000)
+
+  it.each(['stdin', 'network'])('executes actual %s approval effects and cancellation', async approvalControl => {
+    const capture = await captureNativeScenario('approval-policy-restricted-exec', { approvalControl, timeoutMs: 120_000 })
+    expect(capture.passed).toBe(true)
+    expect(approvalControl === 'stdin' ? capture.observations.stdinCases.length : capture.observations.networkCases.length).toBe(approvalControl === 'stdin' ? 4 : 5)
+  }, 180_000)
+
+  it('cancels genuine MCP startup without inventing a turn terminal', async () => {
+    const capture = await captureNativeScenario('active-input-stop', { startupCancellation: true, timeoutMs: 120_000 })
+    expect(capture.observations.startupCancellation.nativeStartupResult.status).toBe('cancelled')
+    expect(capture.fixtureTraffic).toHaveLength(0)
+  }, 180_000)
+
+  it('reads ephemeral child metadata without taking a writer role', async () => {
+    const capture = await captureNativeScenario('parent-child-read', { ephemeralParent: true, timeoutMs: 120_000 })
+    expect(capture.observations.childAvailability).toBe('ephemeral_history_unavailable')
+    expect(capture.observations.childObserverMethods.every((method: string) => method === 'thread/read')).toBe(true)
+  }, 180_000)
+
+  it.each(['legacy', 'paginated'])('captures actual large command and MCP persistence in %s history', async historyMode => {
+    const capture = await captureNativeScenario('mcp-form-url', { historyMode, largeOutput: true, timeoutMs: 120_000 })
+    expect(capture.observations.largeOutputReads.map((read: any) => read.label)).toEqual(['warm', 'cold-resume'])
+  }, 180_000)
+
+  it.each(['legacy', 'paginated'])('captures delayed persistence and finite failed refresh in %s history', async historyMode => {
+    const capture = await captureNativeScenario('text-history', { historyMode, persistenceMode: 'delayed', timeoutMs: 120_000 })
+    expect(capture.observations.boundedRefresh).toHaveLength(3)
+    expect(capture.observations.retainedCompletedText).toBe('First fragment and final fragment')
+    expect(['saved-after-owned-blocker-release-and-cold-recovery', 'retained-unsaved-provider-unavailable-refresh-stopped']).toContain(capture.observations.persistenceState)
+  }, 180_000)
+
+  it.each(['legacy', 'paginated'])('captures genuinely missing persistence after owned exit in %s history', async historyMode => {
+    const capture = await captureNativeScenario('text-history', { historyMode, persistenceMode: 'missing', timeoutMs: 120_000 })
+    expect(capture.observations.coldMissingFaultRemoved).toBe(true)
+    expect(capture.observations.coldRecoveryState).toBe('saved-history-unavailable-no-invented-fragments')
+  }, 180_000)
+
 })

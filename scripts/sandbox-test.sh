@@ -140,14 +140,29 @@ else
   if [ "${RUNTIME_SUITE}" -eq 1 ]; then
     case "${CMD}" in
       'node test/integration/providers/codex-cli-contract.mjs --scenario all' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario mcp-form-url --history-mode paginated --large-output' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario mcp-form-url --history-mode legacy --large-output' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario active-input-stop' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario active-input-stop --startup-cancellation' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario approval-policy-restricted-exec --approval-control stdin' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario approval-policy-restricted-exec --approval-control network' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario text-history --history-mode paginated --persistence-mode delayed' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario text-history --history-mode legacy --persistence-mode delayed' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario text-history --history-mode legacy --persistence-mode missing' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario text-history --history-mode paginated --persistence-mode missing' | \
       'node test/integration/providers/codex-cli-contract.mjs --scenario approval-policy-restricted-exec')
         node "${REPO_ROOT}/scripts/testing/prepare-codex-contract.mjs" --verify-sandbox >/dev/null
         CODEX_NATIVE_CONTRACT=1
+        IMAGE_TAG="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).image)' "${REPO_ROOT}/.runtime-build/codex-contract/staged.json")"
         ;;
     esac
   fi
 
   if ! docker image inspect "${IMAGE_TAG}" >/dev/null 2>&1; then
+    if [ "${CODEX_NATIVE_CONTRACT}" -eq 1 ]; then
+      echo '[sandbox] prepared Codex contract image is unavailable; connected preparation is required' >&2
+      exit 2
+    fi
     echo "[sandbox] image ${IMAGE_TAG} not found, building it first..." >&2
     "${REPO_ROOT}/scripts/sandbox-build.sh"
   fi

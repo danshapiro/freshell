@@ -126,6 +126,10 @@ RUN cargo --version && rustc --version
 # overwrite the staged artifacts.
 COPY . .
 
+# This controlled test-only requirements layer enables the native network
+# approval controller. No production runtime image receives it.
+RUN node --input-type=module -e 'import fs from "node:fs"; import { CODEX_NETWORK_REQUIREMENTS } from "./test/integration/providers/codex-local-provider.mjs"; fs.mkdirSync("/etc/codex", { recursive: true }); fs.writeFileSync("/etc/codex/requirements.toml", CODEX_NETWORK_REQUIREMENTS, { mode: 0o644 })'
+
 # Check the assembled runtime tree after all staged artifacts are present.
 # With --runtime-root the guard checks the required Rust/client/tools files and
 # executable, scans only shipped dist/, target/, and node_modules/ roots,
@@ -135,6 +139,7 @@ RUN scripts/verify-container-layout.sh --fixture /app --runtime-root
 
 ENV FRESHELL_E2E_RUST_SERVER_BIN=/app/target/release/freshell-server
 ENV FRESHELL_CODEX_CONTRACT_ROOT=/opt/freshell-test-providers/codex/0.164.0-linux-x64
+ENV FRESHELL_CODEX_CONTRACT_CAPTURE_STDOUT=1
 
 # COPY's requested mode can still be narrowed by rootless build/ACL metadata.
 # Normalize the copied artifact in the image layer so the final unprivileged

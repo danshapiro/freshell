@@ -4,14 +4,30 @@ import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
+import http from 'node:http'
 import { spawn, spawnSync } from 'node:child_process'
 import { createInterface } from 'node:readline'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { artifactMetadata, repoRoot, verifyArtifact, ambientCodex, verifySandbox, nativeSandboxPolicy } from '../../../scripts/testing/prepare-codex-contract.mjs'
-import { createCodexLocalProvider, MCP_FORM_CONTENT } from './codex-local-provider.mjs'
+import { createCodexLocalProvider, MCP_FORM_CONTENT, MCP_LARGE_TEXT, CODEX_NETWORK_REQUIREMENTS } from './codex-local-provider.mjs'
 
 const scenarios = ['text-history', 'active-input-stop', 'parent-child-read', 'plan-question-controls', 'mcp-form-url', 'model-effort-usage', 'approval-policy-restricted-exec']
+export function nativeContractCases() {
+  const cases = []
+  for (const historyMode of ['legacy', 'paginated']) {
+    cases.push(['text-history', { historyMode }], ['text-history', { historyMode, duplicateBodies: true }])
+  }
+  for (const name of scenarios.filter(name => name !== 'text-history')) cases.push([name, {}])
+  for (const sandboxMode of ['read-only', 'workspace-write']) cases.push(['approval-policy-restricted-exec', { sandboxMode, probeApprovalPolicy: 'never', probePolicyEffects: true }])
+  for (const approvalControl of ['stdin', 'network']) cases.push(['approval-policy-restricted-exec', { approvalControl }])
+  cases.push(['active-input-stop', { startupCancellation: true }], ['parent-child-read', { ephemeralParent: true }])
+  for (const historyMode of ['legacy', 'paginated']) {
+    cases.push(['mcp-form-url', { historyMode, largeOutput: true }])
+    for (const persistenceMode of ['delayed', 'missing']) cases.push(['text-history', { historyMode, persistenceMode }])
+  }
+  return cases
+}
 const deadline = (promise, ms, label) => {
   let timer
   return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`CODEX_CONTRACT_TIMEOUT: ${label}`)), ms) })]).finally(() => clearTimeout(timer))
@@ -20,6 +36,25 @@ function deferred() {
   let resolve
   const promise = new Promise(done => { resolve = done })
   return { promise, resolve }
+}
+function sanitizedCapture(value, secrets, key = '') {
+  if (typeof value === 'string') {
+    if (/^(?:authorization|api_?key|access_?token|password|secret)$/i.test(key)) return '[redacted]'
+    let result = value.replace(/data:image\/[a-zA-Z0-9.+-]+;base64,[a-zA-Z0-9+/=]+/g, '[uploaded image omitted]')
+    for (const secret of secrets) if (secret) result = result.replaceAll(secret, '[redacted]')
+    return result
+  }
+  if (Array.isArray(value)) return value.map(item => sanitizedCapture(item, secrets))
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, sanitizedCapture(item, secrets, name)]))
+  return value
+}
+
+function exportCloudCapture(capture, json) {
+  const id = randomUUID()
+  const partSize = 16_000
+  const parts = Math.ceil(json.length / partSize)
+  for (let part = 0; part < parts; part++) process.stdout.write(`${JSON.stringify({ severity: 'INFO', event: 'codex_native_capture_part', id, scenario: capture.scenario, part, parts, payload: json.slice(part * partSize, (part + 1) * partSize) })}\n`)
+  process.stdout.write(`${JSON.stringify({ severity: 'INFO', event: 'codex_native_capture_complete', id, scenario: capture.scenario, parts, bytes: Buffer.byteLength(json), sha256: createHash('sha256').update(json).digest('hex'), passed: capture.passed, version: capture.binary.version, uid: capture.environment.uid, gid: capture.environment.gid, platform: capture.binary.platform, requestCount: capture.requests.length, fixtureRequestCount: capture.fixtureTraffic.length })}\n`)
 }
 
 async function roots(options) {
@@ -35,7 +70,7 @@ async function roots(options) {
   await fsp.mkdir(receiptRoot, { recursive: true, mode: 0o700 })
   for (const directory of ['home', 'codex', 'xdg-config', 'xdg-cache', 'xdg-data', 'workspace', 'tmp']) await fsp.mkdir(path.join(stateRoot, directory), { mode: 0o700 })
   const systemConfig = ['/etc/codex/config.toml', '/etc/codex/requirements.toml'].map(file => ({ path: file, present: fs.existsSync(file) }))
-  if (systemConfig.some(file => file.present)) throw new Error('CODEX_CONTRACT_PREREQUISITE: unexpected system Codex configuration in fixture environment')
+  if (systemConfig.some(file => file.present && (file.path !== '/etc/codex/requirements.toml' || fs.readFileSync(file.path, 'utf8') !== CODEX_NETWORK_REQUIREMENTS))) throw new Error('CODEX_CONTRACT_PREREQUISITE: unexpected system Codex configuration in fixture environment')
   const environment = { PATH: process.env.PATH, HOME: path.join(stateRoot, 'home'), CODEX_HOME: await fsp.realpath(path.join(stateRoot, 'codex')), XDG_CONFIG_HOME: path.join(stateRoot, 'xdg-config'), XDG_CACHE_HOME: path.join(stateRoot, 'xdg-cache'), XDG_DATA_HOME: path.join(stateRoot, 'xdg-data'), TMPDIR: path.join(stateRoot, 'tmp'), LANG: 'C.UTF-8', RUST_LOG: 'warn' }
   if (!options.probeMetadata || options.preferBundledBwrap) {
     const bundled = artifact.files.filter(file => file.path.endsWith('/codex-resources/bwrap'))
@@ -51,8 +86,11 @@ class NativeClient {
     this.pending = new Map()
     this.waiters = new Set()
     this.nextId = 1
+    this.secretControls = new Map()
     this.child = spawn(binary, ['app-server'], { cwd: context.workspace, env: context.environment, stdio: ['pipe', 'pipe', 'pipe'] })
-    if (capture.environment.seccompProbe || capture.environment.nativeSandboxPolicy) {
+    this.connectionId = (capture.connections ??= []).length
+    capture.connections.push({ id: this.connectionId, pid: this.child.pid, binary })
+    if (!capture.probeOnly || capture.environment.seccompProbe || capture.environment.nativeSandboxPolicy) {
       const observed = new Map((capture.observations.executedSandboxHelpers ?? []).map(helper => [helper.pid, helper]))
       this.helperWatcher = setInterval(() => {
         const visit = pid => {
@@ -74,6 +112,7 @@ class NativeClient {
     }
     this.exit = new Promise(resolve => this.child.once('exit', (code, signal) => {
       capture.processExit = { code, signal }
+      ;(capture.processExits ??= []).push({ connectionId: this.connectionId, pid: this.child.pid, code, signal })
       clearInterval(this.helperWatcher)
       for (const entry of this.pending.values()) entry.reject(new Error(`owned Codex exited: ${code}/${signal}`))
       resolve({ code, signal })
@@ -82,28 +121,46 @@ class NativeClient {
     createInterface({ input: this.child.stdout }).on('line', line => {
       let frame
       try { frame = JSON.parse(line) } catch { return }
-      capture.frames.push({ index: capture.frames.length, direction: 'native', frame })
+      capture.frames.push({ index: capture.frames.length, connectionId: this.connectionId, direction: 'native', frame })
       if (frame.id !== undefined && !frame.method) {
         capture.responses.push(frame)
         const entry = this.pending.get(frame.id)
-        if (entry) { this.pending.delete(frame.id); if (frame.error) entry.reject(Object.assign(new Error(frame.error.message), { nativeError: frame.error })); else entry.resolve(frame.result) }
+        if (entry?.delayDelivery) { entry.nativeReply = frame; entry.receivedIndex = capture.frames.length - 1 }
+        else if (entry) { this.pending.delete(frame.id); if (frame.error) entry.reject(Object.assign(new Error(frame.error.message), { nativeError: frame.error })); else entry.resolve(frame.result) }
       } else if (frame.method && frame.id !== undefined) {
         capture.serverRequests.push(frame)
+        if (frame.method === 'item/tool/requestUserInput') this.secretControls.set(frame.id, { questions: new Set((frame.params.questions ?? []).filter(question => question.isSecret).map(question => question.id)) })
+        if (frame.method === 'mcpServer/elicitation/request') this.secretControls.set(frame.id, { fields: new Set(Object.entries(frame.params.requestedSchema?.properties ?? {}).filter(([, schema]) => schema.format === 'password' || schema.writeOnly === true).map(([name]) => name)) })
         this.onServerRequest?.(frame)
       }
       else capture.notifications.push(frame)
       for (const waiter of [...this.waiters]) if (waiter.predicate(frame)) { this.waiters.delete(waiter); waiter.resolve(frame) }
     })
   }
-  send(frame) { this.capture.frames.push({ index: this.capture.frames.length, direction: 'client', frame }); this.child.stdin.write(`${JSON.stringify(frame)}\n`) }
-  request(method, params = {}, timeoutMs = 30_000) {
+  send(frame) {
+    const secret = this.secretControls.get(frame.id)
+    for (const question of secret?.questions ?? []) for (const value of frame.result?.answers?.[question]?.answers ?? []) if (typeof value === 'string' && value) this.capture.secretValues.add(value)
+    for (const field of secret?.fields ?? []) { const value = frame.result?.content?.[field]; if (typeof value === 'string' && value) this.capture.secretValues.add(value) }
+    if (frame.id !== undefined && frame.result !== undefined) this.secretControls.delete(frame.id)
+    this.capture.frames.push({ index: this.capture.frames.length, connectionId: this.connectionId, direction: 'client', frame })
+    this.child.stdin.write(`${JSON.stringify(frame)}\n`)
+  }
+  request(method, params = {}, timeoutMs = 30_000, delayDelivery = false) {
     const id = this.nextId++
     const frame = { id, method, params }
     this.capture.requests.push(frame)
-    return deadline(new Promise((resolve, reject) => { this.pending.set(id, { resolve, reject }); this.send(frame) }), timeoutMs, method)
+    return deadline(new Promise((resolve, reject) => { this.pending.set(id, { resolve, reject, delayDelivery }); this.send(frame) }), timeoutMs, method)
   }
-  wait(predicate, timeoutMs = 30_000) {
-    const existing = this.capture.frames.find(entry => entry.direction === 'native' && predicate(entry.frame))
+  releaseReply(id) {
+    const entry = this.pending.get(id)
+    assert(entry?.nativeReply, 'only an actually received native response can be delivered')
+    this.pending.delete(id)
+    ;(this.capture.observations.delayedControllerReplies ??= []).push({ connectionId: this.connectionId, requestId: id, nativeReceiptIndex: entry.receivedIndex, controllerReleaseIndex: this.capture.frames.length })
+    if (entry.nativeReply.error) entry.reject(Object.assign(new Error(entry.nativeReply.error.message), { nativeError: entry.nativeReply.error }))
+    else entry.resolve(entry.nativeReply.result)
+  }
+  wait(predicate, timeoutMs = 30_000, minimumIndex = 0) {
+    const existing = this.capture.frames.find(entry => entry.connectionId === this.connectionId && entry.index >= minimumIndex && entry.direction === 'native' && predicate(entry.frame))
     if (existing) return Promise.resolve(existing.frame)
     let waiter
     return deadline(new Promise(resolve => { waiter = { predicate, resolve }; this.waiters.add(waiter) }), timeoutMs, 'native notification').finally(() => this.waiters.delete(waiter))
@@ -208,6 +265,83 @@ function mcpResponse(record, flow) {
   return { text: 'First fragment and final fragment' }
 }
 
+function largeOutputResponse(record, flow, context) {
+  const current = flow.current
+  const step = current.step++
+  if (step === 0) return advertisedCall(record, 'exec_command', { cmd: `python3 '${context.largeCommand}'`, shell: '/bin/sh', login: false, max_output_tokens: 100000, yield_time_ms: 1000 }, 'large_command')
+  if (!current.commandDone) {
+    const output = toolOutput(record, current.polls ? `call_large_poll_${current.polls}` : 'call_large_command')
+    const running = output.match(/Process running with session ID (\d+)/)
+    if (running) {
+      current.polls = (current.polls ?? 0) + 1
+      return advertisedCall(record, 'write_stdin', { session_id: Number(running[1]), chars: '', max_output_tokens: 100000, yield_time_ms: 1000 }, `large_poll_${current.polls}`)
+    }
+    assert.match(output, /Process exited with code 0/)
+    current.commandDone = true
+    return advertisedCall(record, 'large_result', {}, 'large_mcp')
+  }
+  assert.match(toolOutput(record, 'call_large_mcp'), /F1_MCP_STRUCTURED/)
+  return { text: 'First fragment and final fragment' }
+}
+
+function largeSavedItems(read, turnId) {
+  return read.thread.turns.filter(turn => turn.id === turnId).flatMap(turn => turn.items)
+}
+async function verifyLargeOutput(capture, read, context, turnId, label, historyMode) {
+  const live = capture.notifications.filter(frame => frame.method === 'item/completed' && frame.params?.turnId === turnId).map(frame => frame.params.item)
+  const command = live.find(item => item.type === 'commandExecution' && item.id === 'call_large_command')
+  assert.equal(command?.exitCode, 0)
+  assert.equal(Buffer.byteLength(command.aggregatedOutput), 128 * 1024)
+  assert(command.aggregatedOutput.startsWith('F1_COMMAND_HEAD\n'))
+  assert(command.aggregatedOutput.endsWith('\nF1_COMMAND_TAIL\n'))
+  const mcp = live.find(item => item.type === 'mcpToolCall')
+  assert.equal(mcp?.status, 'completed')
+  assert.equal(mcp.result.content[0].text, MCP_LARGE_TEXT)
+  assert.equal(mcp.result.structuredContent.fixture, 'F1_MCP_STRUCTURED')
+  assert.equal(mcp.result._meta['fixture/result'], 'F1_MCP_META')
+  const items = largeSavedItems(read, turnId)
+  const savedCommand = items.find(item => item.type === 'commandExecution')
+  const savedMcp = items.find(item => item.type === 'mcpToolCall')
+  assert(savedMcp, 'native history must preserve its actual ordinary MCP result')
+  const order = items.map(item => ({ id: item.id, type: item.type }))
+  assert.equal(order[0].type, 'userMessage')
+  if (savedCommand) assert(order.findIndex(item => item.type === 'commandExecution') < order.findIndex(item => item.type === 'mcpToolCall'))
+  assert(order.findIndex(item => item.type === 'mcpToolCall') < order.findIndex(item => item.type === 'agentMessage'))
+  if (historyMode === 'paginated') {
+    assert(savedCommand, 'paginated canonical command history must be present')
+    assert.equal(savedCommand.id, command.id)
+    assert(Buffer.byteLength(savedCommand.aggregatedOutput) <= 65536)
+    assert(savedCommand.aggregatedOutput.includes('\n... command output truncated for persistence ...\n'))
+    assert(savedCommand.aggregatedOutput.startsWith('F1_COMMAND_HEAD\n'))
+    assert(savedCommand.aggregatedOutput.endsWith('\nF1_COMMAND_TAIL\n'))
+    assert.match(savedMcp.result.content[0].text, /…\d+ chars truncated…/u)
+    assert.equal(savedMcp.result.structuredContent, null)
+    assert.equal(savedMcp.result._meta, null)
+    assert.notDeepEqual(savedMcp.result, mcp.result)
+    const rollout = read.thread.path
+    assert(rollout.startsWith(context.environment.CODEX_HOME + '/sessions/'), 'read only the actual owned native rollout')
+    const records = (await fsp.readFile(rollout, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+    const core = records.filter(record => record.type === 'event_msg' && record.payload?.type === 'item_completed').map(record => record.payload.item)
+    const coreCommand = core.find(item => item.id === command.id && item.type === 'CommandExecution')
+    const coreMcp = core.find(item => item.id === mcp.id && item.type === 'McpToolCall')
+    assert(coreCommand && coreMcp, 'actual paginated canonical tool records are required')
+    assert(Buffer.byteLength(coreCommand.aggregated_output) <= 65536)
+    assert(Buffer.byteLength(JSON.stringify(coreMcp.result)) <= 65536)
+    assert.equal(coreMcp.result.isError, false)
+    assert(!('structuredContent' in coreMcp.result))
+    assert(!('_meta' in coreMcp.result))
+    capture.observations.canonicalSavedTools = { command: coreCommand, mcp: coreMcp }
+  } else {
+    assert.deepEqual(savedMcp.result, mcp.result, 'Legacy ordinary MCP result retains its actual full native form')
+    const rollout = read.thread.path
+    assert(rollout.startsWith(context.environment.CODEX_HOME + '/sessions/'))
+    const records = (await fsp.readFile(rollout, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+    capture.observations.legacySavedToolRecords = records.filter(record => record.type === 'event_msg' && /exec|mcp/i.test(record.payload?.type ?? ''))
+    capture.observations.legacyCommandHistoryAvailability = savedCommand ? 'present' : 'native-history-item-unavailable-with-live-output-retained'
+  }
+  ;(capture.observations.largeOutputReads ??= []).push({ label, historyMode, order, retained: { command, mcp }, saved: { command: savedCommand, mcp: savedMcp }, state: historyMode === 'paginated' ? 'saved-provider-truncated-with-richer-retained-output' : 'actual-legacy-saved-representation' })
+}
+
 async function driveMcp(client, capture, flow, context) {
   capture.observations.elicitationCases = []
   let last
@@ -227,9 +361,17 @@ async function driveMcp(client, capture, flow, context) {
     assert.equal(terminal.params.turn.status, 'completed')
     capture.reads.push({ label: `mcp-${route}`, body: await client.request('thread/read', { threadId: capture.threadId, includeTurns: true }) })
   }
+  flow.current = { id: 'held', route: 'form', hold: true, step: 0 }
+  const held = await client.request('turn/start', { threadId: capture.threadId, input: [{ type: 'text', text: 'Leave the owned MCP form pending for a controlled Stop.' }] })
+  const pending = await client.wait(frame => frame.method === 'mcpServer/elicitation/request' && frame.params?.turnId === held.turn.id)
+  await client.request('turn/interrupt', { threadId: capture.threadId, turnId: held.turn.id })
+  const cancelled = await client.wait(frame => frame.method === 'turn/completed' && frame.params?.turn?.id === held.turn.id)
+  assert.equal(cancelled.params.turn.status, 'interrupted')
+  const resolved = await client.wait(frame => frame.method === 'serverRequest/resolved' && frame.params?.requestId === pending.id && frame.params.threadId === capture.threadId)
+  capture.observations.cancelledMcpControl = { requestId: pending.id, turnId: held.turn.id, resolved: resolved.params }
   const trace = (await fsp.readFile(context.mcpTrace, 'utf8')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
   capture.observations.mcpTraffic = trace
-  assert.equal(trace.filter(record => record.event === 'elicitation_result').length, 12)
+  assert.equal(trace.filter(record => record.event === 'elicitation_result' && record.sequence === 'matrix').length, 12)
   assert(!trace.some(record => record.event === 'fixture_error'), 'ordinary MCP route must return actual native responses without fixture errors')
   const initialized = trace.find(record => record.direction === 'native' && record.frame?.method === 'initialize')
   assert(initialized, 'configured MCP server must actually initialize')
@@ -238,10 +380,262 @@ async function driveMcp(client, capture, flow, context) {
   return last
 }
 
+function toolOutput(record, callId) {
+  const output = record.body.input.findLast(item => item.type === 'function_call_output' && item.call_id === callId)?.output
+  assert(output !== undefined, `actual native tool result missing for ${callId}`)
+  return typeof output === 'string' ? output : output.filter(item => item.type === 'input_text').map(item => item.text).join('\n')
+}
+
+function stdinResponse(record, flow, capture, context) {
+  const current = flow.current
+  assert(current, 'stdin model exchange must belong to an actual selected turn')
+  const step = current.step++
+  if (current.kind === 'stdin-open') {
+    if (step === 0) return advertisedCall(record, 'request_permissions', { reason: 'Allow writes only to the fixture terminal result directory.', permissions: { file_system: { write: [path.join(context.workspace, 'allowed')] } } }, `permissions_${current.id}`)
+    if (step === 1) {
+      toolOutput(record, `call_permissions_${current.id}`)
+      return advertisedCall(record, 'exec_command', { cmd: '/bin/bash --noprofile --norc', shell: '/bin/sh', login: false, tty: true, yield_time_ms: 250 }, `open_${current.id}`)
+    }
+    const output = toolOutput(record, `call_open_${current.id}`)
+    const match = output.match(/Process running with session ID (\d+)/)
+    assert(match, 'PTY session handle must come from actual native execution')
+    flow.sessionId = Number(match[1])
+    return { text: 'First fragment and final fragment' }
+  }
+  if (current.kind === 'stdin-cancel') return advertisedCall(record, 'write_stdin', { session_id: flow.sessionId, chars: 'printf cancelled > allowed/cancelled-marker\n', yield_time_ms: 1000 }, 'stdin_cancel')
+  if (step === 0) return advertisedCall(record, 'write_stdin', { session_id: flow.sessionId, chars: '', yield_time_ms: 1000 }, 'stdin_empty')
+  if (step === 1) {
+    toolOutput(record, 'call_stdin_empty')
+    current.emptyPollReturned = true
+    return advertisedCall(record, 'write_stdin', { session_id: flow.sessionId, chars: 'REJECTED=1; printf denied > allowed/denied-marker\n', yield_time_ms: 1000 }, 'stdin_denied')
+  }
+  if (step === 2) {
+    capture.observations.deniedStdinResult = toolOutput(record, 'call_stdin_denied')
+    return advertisedCall(record, 'write_stdin', { session_id: flow.sessionId, chars: "if test -v REJECTED || test -e allowed/denied-marker; then exit 19; fi; printf accepted > allowed/accepted-marker; printf 'STDIN_ACCEPTED\\n'; exit\n", yield_time_ms: 1000 }, 'stdin_accepted')
+  }
+  const output = toolOutput(record, 'call_stdin_accepted')
+  assert.match(output, /Process exited with code 0/)
+  capture.observations.acceptedStdinResult = output
+  return { text: 'First fragment and final fragment' }
+}
+
+async function driveStdin(client, capture, flow, context) {
+  capture.observations.stdinCases = []
+  const open = async id => {
+    flow.current = { id, kind: 'stdin-open', step: 0 }
+    const turn = await client.request('turn/start', { threadId: capture.threadId, approvalPolicy: 'on-request', input: [{ type: 'text', text: 'Grant the narrow owned directory and open a real sandboxed PTY.' }] })
+    const permission = await client.wait(frame => frame.method === 'item/permissions/requestApproval' && frame.params?.turnId === turn.turn.id)
+    const requested = permission.params.permissions
+    assert(JSON.stringify(requested).includes(path.join(context.workspace, 'allowed')))
+    client.send({ id: permission.id, result: { permissions: requested, scope: 'turn', strictAutoReview: false } })
+    await client.wait(frame => frame.method === 'turn/completed' && frame.params?.turn?.id === turn.turn.id)
+    assert(Number.isSafeInteger(flow.sessionId))
+    const item = capture.notifications.find(frame => frame.method === 'item/started' && frame.params?.turnId === turn.turn.id && frame.params.item?.type === 'commandExecution')?.params.item
+    assert(item, 'actual PTY command item identity is required')
+    capture.observations.stdinCases.push({ kind: 'open', turnId: turn.turn.id, sessionId: flow.sessionId, itemId: item.id, permissionRequestId: permission.id })
+    return { turn, item }
+  }
+  const first = await open('first')
+  flow.current = { id: 'write', kind: 'stdin-write', step: 0 }
+  const write = await client.request('turn/start', { threadId: capture.threadId, approvalPolicy: 'on-request', input: [{ type: 'text', text: 'Poll the terminal, deny one input, then approve a separate input.' }] })
+  const denied = await client.wait(frame => frame.method === 'item/commandExecution/requestApproval' && frame.params?.kind === 'writeStdin' && frame.params.turnId === write.turn.id)
+  assert.equal(flow.current.emptyPollReturned, true, 'empty polling must finish without stdin review')
+  assert.equal(denied.params.itemId, first.item.id)
+  assert(!fs.existsSync(path.join(context.workspace, 'allowed/denied-marker')))
+  client.send({ id: denied.id, result: { decision: 'decline' } })
+  const accepted = await client.wait(frame => frame.method === 'item/commandExecution/requestApproval' && frame.params?.kind === 'writeStdin' && frame.params.turnId === write.turn.id && frame.id !== denied.id)
+  assert.equal(accepted.params.itemId, first.item.id)
+  assert.notEqual(accepted.params.approvalId, denied.params.approvalId)
+  assert(!fs.existsSync(path.join(context.workspace, 'allowed/accepted-marker')))
+  assert(!fs.existsSync(path.join(context.workspace, 'allowed/denied-marker')))
+  client.send({ id: accepted.id, result: { decision: 'accept' } })
+  const terminal = await client.wait(frame => frame.method === 'turn/completed' && frame.params?.turn?.id === write.turn.id)
+  assert.equal(terminal.params.turn.status, 'completed')
+  assert.equal(await fsp.readFile(path.join(context.workspace, 'allowed/accepted-marker'), 'utf8'), 'accepted')
+  assert(!fs.existsSync(path.join(context.workspace, 'allowed/denied-marker')))
+  capture.observations.stdinCases.push({ kind: 'write', turnId: write.turn.id, itemId: first.item.id, deniedRequestId: denied.id, acceptedRequestId: accepted.id, deniedApprovalId: denied.params.approvalId, acceptedApprovalId: accepted.params.approvalId, acceptedFile: 'accepted', deniedFilePresent: false })
+  const second = await open('cancel')
+  flow.current = { id: 'cancel', kind: 'stdin-cancel', step: 0 }
+  const cancelling = await client.request('turn/start', { threadId: capture.threadId, approvalPolicy: 'on-request', input: [{ type: 'text', text: 'Cancel the separate pending stdin write without changing the owned terminal.' }] })
+  const pending = await client.wait(frame => frame.method === 'item/commandExecution/requestApproval' && frame.params?.kind === 'writeStdin' && frame.params.turnId === cancelling.turn.id)
+  client.send({ id: pending.id, result: { decision: 'cancel' } })
+  const cancelled = await client.wait(frame => frame.method === 'turn/completed' && frame.params?.turn?.id === cancelling.turn.id)
+  assert.equal(cancelled.params.turn.status, 'interrupted')
+  assert(!fs.existsSync(path.join(context.workspace, 'allowed/cancelled-marker')))
+  capture.observations.stdinCases.push({ kind: 'cancel', turnId: cancelling.turn.id, requestId: pending.id, sessionId: flow.sessionId, filePresent: false, terminalExitInferred: false })
+  return second.turn
+}
+
+async function driveNativeRaces(client, capture, flow) {
+  const cases = capture.observations.stopRaceCases = []
+  const terminalFor = id => client.wait(frame => frame.method === 'turn/completed' && frame.params?.turn?.id === id)
+  const input = text => ({ threadId: capture.threadId, input: [{ type: 'text', text }] })
+  const outcome = promise => promise.then(result => ({ result }), error => { assert(error.nativeError); return { nativeError: error.nativeError } })
+  const hold = () => { const release = deferred(); flow.current = { kind: 'race', release }; return release }
+  const frameIndex = (id, direction) => capture.frames.find(entry => entry.connectionId === client.connectionId && entry.direction === direction && entry.frame.id === id && !entry.frame.method)?.index
+  let release = hold()
+  const pendingRequest = client.nextId
+  const start = client.request('turn/start', input('Pending-start Stop native race.'))
+  const startupStopId = client.nextId
+  const emptyStop = outcome(client.request('turn/interrupt', { threadId: capture.threadId, turnId: '' }))
+  const accepted = await start
+  const startupStop = await emptyStop
+  // Empty-ID success is submission only. Bind the actual admitted ID and
+  // obtain its own terminal; a second explicit cancellation is attributed.
+  const knownTerminal = capture.notifications.find(frame => frame.method === 'turn/completed' && frame.params?.turn?.id === accepted.turn.id)
+  const followupStop = knownTerminal ? null : await outcome(client.request('turn/interrupt', { threadId: capture.threadId, turnId: accepted.turn.id }))
+  const pendingTerminal = knownTerminal ?? await terminalFor(accepted.turn.id)
+  release.resolve()
+  cases.push({ kind: 'start-outstanding-at-stop-issuance', startRequestId: pendingRequest, emptyStopRequestId: startupStopId, startReplyIndex: frameIndex(pendingRequest, 'native'), stopReplyIndex: frameIndex(startupStopId, 'native'), turnId: accepted.turn.id, startupStop, followupStop, terminal: pendingTerminal.params.turn })
+  let previous = accepted.turn.id
+  for (const ordering of ['release-then-stop', 'stop-then-release']) {
+    release = hold()
+    const turn = await client.request('turn/start', input(`Natural completion/Stop race: ${ordering}.`))
+    await client.wait(frame => frame.method === 'item/agentMessage/delta' && frame.params?.turnId === turn.turn.id)
+    let stopping
+    if (ordering === 'release-then-stop') { release.resolve(); stopping = outcome(client.request('turn/interrupt', { threadId: capture.threadId, turnId: turn.turn.id })) }
+    else { stopping = outcome(client.request('turn/interrupt', { threadId: capture.threadId, turnId: turn.turn.id })); release.resolve() }
+    const stop = await stopping
+    const terminal = await terminalFor(turn.turn.id)
+    assert(['completed', 'interrupted'].includes(terminal.params.turn.status))
+    cases.push({ kind: 'native-natural-completion-race', ordering, turnId: turn.turn.id, stop, terminal: terminal.params.turn })
+    previous = turn.turn.id
+  }
+  release = hold()
+  const current = await client.request('turn/start', input('A stale Stop must not affect this distinct active native turn.'))
+  await client.wait(frame => frame.method === 'item/agentMessage/delta' && frame.params?.turnId === current.turn.id)
+  assert.notEqual(current.turn.id, previous)
+  const stale = await nativeRefusal(client, 'turn/interrupt', { threadId: capture.threadId, turnId: previous })
+  const steer = await client.request('turn/steer', { threadId: capture.threadId, expectedTurnId: current.turn.id, input: [{ type: 'text', text: 'Keep the actual new native turn active.' }] })
+  assert.equal(steer.turnId, current.turn.id)
+  await client.request('turn/interrupt', { threadId: capture.threadId, turnId: current.turn.id })
+  const currentTerminal = await terminalFor(current.turn.id)
+  release.resolve()
+  cases.push({ kind: 'stale-stop-after-turnover', staleTurnId: previous, currentTurnId: current.turn.id, nativeRefusal: stale, steer, terminal: currentTerminal.params.turn })
+  release = hold()
+  const since = capture.frames.length
+  const delayedStartId = client.nextId
+  const delayedStart = client.request('turn/start', input('Real native output before delayed controller acceptance delivery.'), 30_000, true)
+  const started = await client.wait(frame => frame.method === 'turn/started', 30_000, since)
+  const delta = await client.wait(frame => frame.method === 'item/agentMessage/delta' && frame.params?.turnId === started.params.turn.id, 30_000, since)
+  assert(delta.params.delta.length > 0)
+  client.releaseReply(delayedStartId)
+  const delayedAccepted = await delayedStart
+  assert.equal(delayedAccepted.turn.id, started.params.turn.id)
+  const stopId = client.nextId
+  const ambiguous = client.request('turn/interrupt', { threadId: capture.threadId, turnId: delayedAccepted.turn.id }, 50, true).then(() => assert.fail('controller response is deliberately withheld'), error => ({ message: error.message }))
+  const terminal = await terminalFor(delayedAccepted.turn.id)
+  const timeout = await ambiguous
+  assert.match(timeout.message, /TIMEOUT/)
+  assert.equal(capture.requests.at(-1).method, 'turn/interrupt', 'a local deadline must not replay or issue successor input')
+  client.releaseReply(stopId)
+  release.resolve()
+  cases.push({ kind: 'controller-delivery-loss-with-progressing-native-consumer', turnId: delayedAccepted.turn.id, startRequestId: delayedStartId, stopRequestId: stopId, timeout, terminal: terminal.params.turn, promptReplayCount: 0, nativeReceiptOrderPreserved: true })
+  flow.current = null
+  const final = await client.request('turn/start', input('New work only after exact native terminal resolution.'))
+  const completed = await terminalFor(final.turn.id)
+  assert.equal(completed.params.turn.status, 'completed')
+  const lateStop = await nativeRefusal(client, 'turn/interrupt', { threadId: capture.threadId, turnId: final.turn.id })
+  cases.push({ kind: 'completed-then-late-stop', turnId: final.turn.id, nativeRefusal: lateStop, terminal: completed.params.turn })
+  capture.observations.nativeStartResponseOrder = capture.requests.filter(frame => frame.method === 'turn/start').map(request => {
+    const reply = capture.frames.find(entry => entry.connectionId === client.connectionId && entry.direction === 'native' && entry.frame.id === request.id && entry.frame.result?.turn)
+    const turnId = reply?.frame.result.turn.id
+    const firstEvent = capture.frames.find(entry => entry.connectionId === client.connectionId && entry.direction === 'native' && entry.frame.method && (entry.frame.params?.turnId === turnId || entry.frame.params?.turn?.id === turnId))
+    return { requestId: request.id, turnId, rawReplyIndex: reply?.index, firstNativeEventIndex: firstEvent?.index, nativeEventBeforeReply: firstEvent?.index < reply?.index }
+  })
+  return final
+}
+
+async function networkFixture(context) {
+  const hits = []
+  const listeners = []
+  for (let index = 0; index < 3; index++) {
+    const server = http.createServer((request, response) => {
+      hits.push({ listener: index, path: request.url, peer: request.socket.remoteAddress })
+      response.end('NATIVE_NETWORK_ALLOWED')
+    })
+    await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
+    listeners.push(server)
+  }
+  const reservation = http.createServer()
+  await new Promise((resolve, reject) => { reservation.once('error', reject); reservation.listen(0, '127.0.0.1', resolve) })
+  const proxyPort = reservation.address().port
+  await new Promise(resolve => reservation.close(resolve))
+  const helper = path.join(context.workspace, 'network-canary.py')
+  await fsp.writeFile(helper, `import os, socket, sys, urllib.parse
+proxy = urllib.parse.urlparse(os.environ['HTTP_PROXY'])
+target = sys.argv[1]
+s = socket.create_connection((proxy.hostname, proxy.port), timeout=20)
+s.settimeout(20)
+s.sendall(('GET ' + target + ' HTTP/1.1\\r\\nHost: ' + urllib.parse.urlparse(target).netloc + '\\r\\nConnection: close\\r\\n\\r\\n').encode())
+chunks = []
+while True:
+    data = s.recv(65536)
+    if not data: break
+    chunks.append(data)
+body = b''.join(chunks)
+print(body.decode(errors='replace'))
+sys.exit(0 if b'NATIVE_NETWORK_ALLOWED' in body else 23)
+`)
+  return { hits, helper, proxyPort, urls: listeners.map(server => `http://127.0.0.1:${server.address().port}/canary/${randomUUID()}`), close: () => Promise.all(listeners.map(server => new Promise(resolve => { server.closeAllConnections(); server.close(resolve) }))) }
+}
+
+function networkResponse(record, flow, capture, context) {
+  const current = flow.current
+  assert(current, 'network command must belong to the actual selected turn')
+  const step = current.step++
+  if (step === 0) return advertisedCall(record, 'exec_command', { cmd: `python3 '${context.network.helper}' '${current.url}'`, shell: '/bin/sh', login: false, yield_time_ms: 1000, max_output_tokens: 2000 }, `network_${current.id}`)
+  const callId = current.polls ? `call_network_poll_${current.id}_${current.polls}` : `call_network_${current.id}`
+  const output = toolOutput(record, callId)
+  const running = output.match(/Process running with session ID (\d+)/)
+  if (running) {
+    current.polls = (current.polls ?? 0) + 1
+    return advertisedCall(record, 'write_stdin', { session_id: Number(running[1]), chars: '', yield_time_ms: 1000, max_output_tokens: 2000 }, `network_poll_${current.id}_${current.polls}`)
+  }
+  current.output = output
+  if (['once', 'session', 'cached'].includes(current.id)) { assert.match(output, /Process exited with code 0/); assert.match(output, /NATIVE_NETWORK_ALLOWED/) }
+  return { text: 'First fragment and final fragment' }
+}
+
+async function driveNetwork(client, capture, flow, context) {
+  capture.observations.networkCases = []
+  let last
+  for (const [index, id, decision] of [[0, 'once', 'accept'], [0, 'session', 'acceptForSession'], [0, 'cached', null], [1, 'declined', 'decline'], [2, 'cancelled', 'cancel']]) {
+    const beforeHits = context.network.hits.length
+    const current = { id, step: 0, url: context.network.urls[index] }
+    flow.current = current
+    const turn = await client.request('turn/start', { threadId: capture.threadId, approvalPolicy: 'on-request', permissions: 'fixture_network', input: [{ type: 'text', text: `Run the controlled ${id} native network decision.` }] })
+    let approval
+    if (decision) {
+      approval = await client.wait(frame => frame.method === 'item/commandExecution/requestApproval' && frame.params?.turnId === turn.turn.id && frame.params.networkApprovalContext)
+      assert.equal(approval.params.kind, 'command')
+      assert.equal(approval.params.networkApprovalContext.host, '127.0.0.1')
+      assert.equal(approval.params.networkApprovalContext.protocol, 'http')
+      assert.equal(context.network.hits.length, beforeHits, 'network traffic must wait for the actual native decision')
+      if (decision !== 'decline') assert(approval.params.availableDecisions.includes(decision), 'decision must be offered by native Codex')
+      // Native supports Decline as a controller response while its network UI
+      // list intentionally omits it. Preserve both facts without inventing a UI choice.
+      client.send({ id: approval.id, result: { decision } })
+    }
+    const terminal = await client.wait(frame => frame.method === 'turn/completed' && frame.params?.turn?.id === turn.turn.id)
+    assert.equal(terminal.params.turn.status, decision === 'cancel' ? 'interrupted' : 'completed')
+    if (decision === 'decline') assert.match(current.output, /rejected by user/i)
+    const requests = capture.serverRequests.filter(frame => frame.method === 'item/commandExecution/requestApproval' && frame.params?.turnId === turn.turn.id)
+    assert.equal(requests.length, decision ? 1 : 0, 'session grant must prevent only the matching repeated native request')
+    assert.equal(context.network.hits.length - beforeHits, ['decline', 'cancel'].includes(decision) ? 0 : 1)
+    capture.observations.networkCases.push({ id, turnId: turn.turn.id, requestId: approval?.id ?? null, approvalId: approval?.params.approvalId ?? null, listener: index, decision, decisionSource: decision === 'decline' ? 'supported-controller-response-not-advertised' : 'offered-native-decision', availableDecisions: approval?.params.availableDecisions ?? [], hits: context.network.hits.length - beforeHits, output: current.output ?? null, terminal: terminal.params.turn.status })
+    if (decision !== 'cancel') last = turn
+  }
+  capture.observations.networkCanaryHits = context.network.hits
+  return last
+}
+
 export async function captureNativeScenario(name, options = {}) {
   assert(scenarios.includes(name), `unknown native scenario ${name}`)
   const context = await roots(options)
-  const capture = { scenario: name, probeOnly: options.probeMetadata?.probeOnly === true, binary: { path: path.join(context.artifact.path, context.metadata.executable), version: null, platform: `${process.platform}-${process.arch}`, integrity: context.artifact.integrity }, threadId: null, requests: [], responses: [], serverRequests: [], notifications: [], reads: [], fixtureTraffic: [], observations: {}, frames: [], environment: { uid: process.getuid?.(), gid: process.getgid?.(), groups: process.getgroups?.(), artifact: context.artifact, systemConfig: context.systemConfig, writableRoots: { state: context.stateRoot, receipts: context.receiptRoot }, prerequisites: context.staged ?? null, context: context.environment, ambientBefore: ambientCodex() } }
+  const capture = { scenario: name, parameters: Object.fromEntries(['historyMode', 'duplicateBodies', 'persistenceMode', 'largeOutput', 'startupCancellation', 'ephemeralParent', 'approvalControl', 'probeApprovalPolicy', 'probePolicyEffects', 'sandboxMode'].filter(key => options[key] !== undefined).map(key => [key, options[key]])), probeOnly: options.probeMetadata?.probeOnly === true, binary: { path: path.join(context.artifact.path, context.metadata.executable), version: null, platform: `${process.platform}-${process.arch}`, integrity: context.artifact.integrity }, threadId: null, requests: [], responses: [], serverRequests: [], notifications: [], reads: [], fixtureTraffic: [], observations: {}, frames: [], environment: { uid: process.getuid?.(), gid: process.getgid?.(), groups: process.getgroups?.(), artifact: context.artifact, systemConfig: context.systemConfig, writableRoots: { state: context.stateRoot, receipts: context.receiptRoot }, prerequisites: context.staged ?? null, context: context.environment, ambientBefore: ambientCodex() } }
+  Object.defineProperty(capture, 'secretValues', { value: new Set(), enumerable: false })
+  capture.environment.cloud = Object.fromEntries(['CLOUD_RUN_JOB', 'CLOUD_RUN_EXECUTION', 'CLOUD_RUN_TASK_INDEX', 'CLOUD_RUN_TASK_ATTEMPT'].filter(key => process.env[key] !== undefined).map(key => [key, process.env[key]]))
   if (options.seccompProbeReceipt) capture.environment.seccompProbe = JSON.parse(await fsp.readFile(options.seccompProbeReceipt, 'utf8'))
   if (process.env.FRESHELL_CODEX_CONTRACT_POLICY === 'prepared') {
     const declared = nativeSandboxPolicy()
@@ -283,7 +677,9 @@ export async function captureNativeScenario(name, options = {}) {
     fixture = await createCodexLocalProvider(async record => {
       const step = modelStep++
       if (name === 'plan-question-controls') return questionResponse(record, controlFlow, capture)
-      if (name === 'mcp-form-url') return mcpResponse(record, controlFlow)
+      if (name === 'mcp-form-url') return options.largeOutput ? largeOutputResponse(record, controlFlow, context) : mcpResponse(record, controlFlow)
+      if (options.approvalControl === 'stdin') return stdinResponse(record, controlFlow, capture, context)
+      if (options.approvalControl === 'network') return networkResponse(record, controlFlow, capture, context)
       if (name === 'parent-child-read') {
         const childInput = record.body.input.some(item => item.role === 'user' && JSON.stringify(item.content).includes('freshell-child-native-probe'))
         if (childInput) {
@@ -299,6 +695,7 @@ export async function captureNativeScenario(name, options = {}) {
         await parentStream.promise
         return { text: 'First fragment and final fragment' }
       }
+      if (name === 'active-input-stop' && controlFlow.current?.kind === 'race') { const current = controlFlow.current; return { text: 'First fragment and final fragment', pauseAfterDelta: () => current.release.promise } }
       if (name === 'active-input-stop' && step === 0) return { text: 'Interrupted native fragment', pauseAfterDelta: () => new Promise(resolve => { releaseStream = resolve }) }
       if (name === 'text-history' && options.duplicateBodies) return { items: [0, 1].map(index => ({ id: `msg_duplicate_${index}`, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'First fragment and final fragment', annotations: [] }] })) }
       const commands = [options.sandboxMode === 'workspace-write' ? 'cat contract-input.txt && printf codex-workspace-write > contract-output.txt' : 'cat contract-input.txt']
@@ -328,18 +725,29 @@ export async function captureNativeScenario(name, options = {}) {
       return { text: 'First fragment and final fragment' }
     })
     let extraConfig = options.legacyLandlock ? '[features]\nuse_legacy_landlock = true\n' : ''
-    if (['plan-question-controls', 'mcp-form-url'].includes(name)) {
+    if (['plan-question-controls', 'mcp-form-url'].includes(name) || options.approvalControl || options.startupCancellation) {
       const catalogPath = path.join(context.stateRoot, 'models.json')
-      await fsp.writeFile(catalogPath, JSON.stringify({ models: [{ slug: 'contract-model', display_name: 'Contract model', description: 'Owned loopback native contract', default_reasoning_level: 'low', supported_reasoning_levels: [{ effort: 'low', description: 'Contract effort' }], shell_type: 'disabled', visibility: 'list', supported_in_api: true, priority: 0, support_verbosity: false, truncation_policy: { mode: 'tokens', limit: 10000 }, context_window: 128000, experimental_supported_tools: ['request_user_input_async'], supports_search_tool: false, tool_mode: 'direct', use_responses_lite: false, model_messages: { instructions_template: "Follow the user's request using the available tools." } }] }))
+      await fsp.writeFile(catalogPath, JSON.stringify({ models: [{ slug: 'contract-model', display_name: 'Contract model', description: 'Owned loopback native contract', default_reasoning_level: 'low', supported_reasoning_levels: [{ effort: 'low', description: 'Contract effort' }], shell_type: options.approvalControl || options.largeOutput ? 'unified_exec' : 'disabled', visibility: 'list', supported_in_api: true, priority: 0, support_verbosity: false, truncation_policy: { mode: 'tokens', limit: 10000 }, context_window: 128000, experimental_supported_tools: ['request_user_input_async'], supports_search_tool: false, tool_mode: 'direct', use_responses_lite: false, model_messages: { instructions_template: "Follow the user's request using the available tools." } }] }))
       extraConfig = `model_catalog_json = ${JSON.stringify(catalogPath)}\nweb_search = "disabled"\n[features]\napps = false\ndefault_mode_request_user_input = true\nauth_elicitation = true\nnon_prefixed_mcp_tool_names = false\n[tools.experimental_request_user_input]\nenabled = true\n`
-      if (name === 'mcp-form-url') {
+      if (options.approvalControl || options.largeOutput) extraConfig = extraConfig.replace('[tools.experimental_request_user_input]', 'unified_exec = true\nunified_exec_tty = true\nwrite_stdin_approval = true\nexec_permission_approvals = true\nrequest_permissions_tool = true\n[tools.experimental_request_user_input]')
+      if (name === 'mcp-form-url' || options.startupCancellation) {
         context.mcpTrace = path.join(context.stateRoot, 'mcp-traffic.jsonl')
         await fsp.writeFile(context.mcpTrace, '', { mode: 0o600 })
-        extraConfig += `\n[mcp_servers.contract]\ncommand = ${JSON.stringify(process.execPath)}\nargs = ${JSON.stringify([path.join(repoRoot, 'test/integration/providers/codex-local-provider.mjs'), '--mcp-fixture', context.mcpTrace, fixture.baseUrl.replace(/\/v1$/, '')])}\nenabled = true\nrequired = true\nstartup_readiness = "connection"\nstartup_timeout_sec = 15\ntool_timeout_sec = 120\n`
+        extraConfig += `\n[mcp_servers.contract]\ncommand = ${JSON.stringify(process.execPath)}\nargs = ${JSON.stringify([path.join(repoRoot, 'test/integration/providers/codex-local-provider.mjs'), options.startupCancellation ? '--mcp-startup-fixture' : '--mcp-fixture', context.mcpTrace, fixture.baseUrl.replace(/\/v1$/, '')])}\nenabled = true\nrequired = ${!options.startupCancellation}\nstartup_readiness = "connection"\nstartup_timeout_sec = ${options.startupCancellation ? 90 : 15}\ntool_timeout_sec = 120\n`
       }
     }
+    if (options.approvalControl === 'network') {
+      context.network = await networkFixture(context)
+      extraConfig = `default_permissions = "fixture_network"\napproval_policy = "on-request"\napprovals_reviewer = "user"\n${extraConfig}\n[permissions.fixture_network.filesystem]\n":minimal" = "read"\n${JSON.stringify(context.workspace)} = "read"\n${JSON.stringify(context.artifact.path)} = "read"\n[permissions.fixture_network.network]\nenabled = true\nmode = "limited"\nallow_local_binding = true\n[features.network_proxy]\nenabled = true\nproxy_url = "http://127.0.0.1:${context.network.proxyPort}"\nenable_socks5 = false\nenable_socks5_udp = false\nallow_upstream_proxy = false\nallow_local_binding = true\nmode = "limited"\ncredential_broker = false\n`
+    }
     await configure(context, fixture.baseUrl, extraConfig)
-    const restricted = name === 'approval-policy-restricted-exec'
+    const restricted = name === 'approval-policy-restricted-exec' && !options.approvalControl
+    if (options.largeOutput) {
+      context.largeCommand = path.join(context.workspace, 'large-output.py')
+      await fsp.writeFile(context.largeCommand, "import sys\nhead=b'F1_COMMAND_HEAD\\n'\ntail=b'\\nF1_COMMAND_TAIL\\n'\nsys.stdout.buffer.write(head+b'x'*(128*1024-len(head)-len(tail))+tail)\nsys.stdout.buffer.flush()\n")
+      controlFlow.current = { kind: 'large-output', step: 0 }
+    }
+    if (options.approvalControl === 'stdin') await fsp.mkdir(path.join(context.workspace, 'allowed'))
     if (restricted) {
       await fsp.writeFile(path.join(context.workspace, 'contract-input.txt'), 'codex-restricted-command-ran\n')
       if (options.probePolicyEffects) {
@@ -371,7 +779,7 @@ export async function captureNativeScenario(name, options = {}) {
     }
     client = new NativeClient(capture.binary.path, context, capture)
     client.onServerRequest = frame => {
-      if (frame.method === 'item/commandExecution/requestApproval') {
+      if (frame.method === 'item/commandExecution/requestApproval' && !options.approvalControl) {
         const decision = frame.params.command?.includes('denied-by-user') ? 'cancel' : 'accept'
         const approval = { id: frame.id, params: frame.params, decision }
         capture.observations.commandApproval ??= approval
@@ -387,14 +795,40 @@ export async function captureNativeScenario(name, options = {}) {
       capture.observations.models = await client.request('model/list', { includeHidden: false, limit: 100 })
       assert(capture.observations.models.data.length > 0, 'release model discovery must return actual metadata')
     }
-    const policy = options.probeApprovalPolicy ?? (restricted ? 'untrusted' : name === 'mcp-form-url' ? 'on-request' : 'never')
+    const policy = options.probeApprovalPolicy ?? (restricted ? 'untrusted' : name === 'mcp-form-url' || options.approvalControl ? 'on-request' : 'never')
     const sandboxMode = options.sandboxMode ?? 'read-only'
-    const started = await client.request('thread/start', { cwd: context.workspace, model: 'contract-model', modelProvider: 'contract-loopback', approvalPolicy: policy, sandbox: sandboxMode, experimentalRawEvents: false, persistExtendedHistory: true, ephemeral: options.ephemeralParent ?? false, ...(options.historyMode ? { historyMode: options.historyMode } : {}) })
+    const started = await client.request('thread/start', { cwd: context.workspace, model: 'contract-model', modelProvider: 'contract-loopback', approvalPolicy: policy, ...(options.approvalControl === 'network' ? { permissions: 'fixture_network' } : { sandbox: sandboxMode }), experimentalRawEvents: false, persistExtendedHistory: true, ephemeral: options.ephemeralParent ?? false, ...(options.historyMode ? { historyMode: options.historyMode } : {}) })
     capture.threadId = started.thread.id
     capture.observations.threadStart = started
+    if (options.persistenceMode) {
+      assert.equal(name, 'text-history')
+      context.persistenceBlocker = path.join(context.environment.CODEX_HOME, 'sessions')
+      assert(!fs.existsSync(context.persistenceBlocker), 'persistence fault requires the native first-materialization parent to be absent')
+      await fsp.writeFile(context.persistenceBlocker, 'owned native recorder materialization blocker', { flag: 'wx', mode: 0o600 })
+      capture.observations.persistenceFault = { kind: 'owned-file-blocks-native-directory', path: context.persistenceBlocker, mode: options.persistenceMode }
+    }
     assert.equal(started.approvalPolicy, policy, 'typed native policy must remain effective')
+    if (options.startupCancellation) {
+      const starting = await client.wait(frame => frame.method === 'mcpServer/startupStatus/updated' && frame.params?.threadId === capture.threadId && frame.params.name === 'contract' && frame.params.status === 'starting')
+      const initialized = await deadline((async () => {
+        for (;;) {
+          const records = (await fsp.readFile(context.mcpTrace, 'utf8')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+          const held = records.find(record => record.event === 'startup_initialize_held')
+          if (held) return held
+          await new Promise(resolve => setTimeout(resolve, 10))
+        }
+      })(), 15_000, 'actual held MCP initialize')
+      const ack = await client.request('turn/interrupt', { threadId: capture.threadId, turnId: '' })
+      const settled = await client.wait(frame => frame.method === 'mcpServer/startupStatus/updated' && frame.params?.threadId === capture.threadId && frame.params.name === 'contract' && frame.params.status === 'cancelled')
+      assert.equal(fixture.traffic.length, 0, 'startup cancellation must precede any model work')
+      assert(!capture.requests.some(frame => frame.method === 'turn/start'))
+      assert(!capture.notifications.some(frame => frame.method === 'turn/completed'), 'startup has its own native result, never an invented turn terminal')
+      capture.observations.startupCancellation = { starting: starting.params, actualInitialize: initialized, acknowledgement: ack, nativeStartupResult: settled.params, modelRequestCount: fixture.traffic.length }
+      capture.passed = true
+      return capture
+    }
     const sandboxPolicy = sandboxMode === 'workspace-write' ? { type: 'workspaceWrite', writableRoots: [context.workspace], networkAccess: options.probeNetworkEnabled ?? false, excludeTmpdirEnvVar: true, excludeSlashTmp: true } : { type: 'readOnly', networkAccess: options.probeNetworkEnabled ?? false }
-    let turn = name === 'plan-question-controls' ? await driveQuestions(client, capture, controlFlow) : name === 'mcp-form-url' ? await driveMcp(client, capture, controlFlow, context) : await client.request('turn/start', { threadId: capture.threadId, approvalPolicy: policy, ...(restricted && !options.probeDefaultPolicy ? { sandboxPolicy } : {}), input: [{ type: 'text', text: 'Run the controlled contract scenario.' }] })
+    let turn = options.approvalControl === 'network' ? await driveNetwork(client, capture, controlFlow, context) : options.approvalControl === 'stdin' ? await driveStdin(client, capture, controlFlow, context) : name === 'plan-question-controls' ? await driveQuestions(client, capture, controlFlow) : name === 'mcp-form-url' && !options.largeOutput ? await driveMcp(client, capture, controlFlow, context) : await client.request('turn/start', { threadId: capture.threadId, approvalPolicy: policy, ...(restricted && !options.probeDefaultPolicy ? { sandboxPolicy } : {}), input: [{ type: 'text', text: 'Run the controlled contract scenario.' }] })
     capture.observations.startedTurnId = turn.turn.id
     if (name === 'parent-child-read') {
       const spawned = await client.wait(frame => frame.method === 'item/completed' && frame.params?.item?.type === 'collabAgentToolCall' && frame.params.item.receiverThreadIds?.length > 0)
@@ -449,10 +883,73 @@ export async function captureNativeScenario(name, options = {}) {
     }
     const completed = await client.wait(frame => frame.method === 'turn/completed' && frame.params?.turn?.id === turn.turn.id, options.timeoutMs ?? 120_000)
     capture.observations.completedTurn = completed.params.turn
+    if (name === 'active-input-stop') turn = await driveNativeRaces(client, capture, controlFlow)
     if (name === 'parent-child-read' && options.ephemeralParent) {
       capture.observations.ephemeralParentReadRefusal = await nativeRefusal(client, 'thread/read', { threadId: capture.threadId, includeTurns: true })
       capture.observations.childObserverMethods = capture.requests.filter(frame => frame.params.threadId === capture.observations.childId).map(frame => frame.method)
       assert(capture.observations.childObserverMethods.every(method => method === 'thread/read'))
+      capture.passed = true
+      return capture
+    }
+    if (options.persistenceMode) {
+      const event = await client.wait(frame => frame.method === 'item/completed' && frame.params?.turnId === turn.turn.id && frame.params.item?.type === 'agentMessage')
+      assert.equal(event.params.item.text, 'First fragment and final fragment')
+      capture.observations.retainedCompletedText = event.params.item.text
+      capture.observations.boundedRefresh = []
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const body = await client.request('thread/read', { threadId: capture.threadId, includeTurns: true }, 5000)
+          capture.reads.push({ label: `blocked-refresh-${attempt}`, body })
+          capture.observations.boundedRefresh.push({ attempt, status: 'read', savedText: assistantText(body, turn.turn.id) })
+        } catch (error) {
+          capture.observations.boundedRefresh.push({ attempt, status: error.nativeError ? 'native-error' : 'timeout-or-exit', error: error.nativeError ?? error.message })
+        }
+      }
+      assert((await fsp.stat(context.persistenceBlocker)).isFile(), 'native recorder must still be unable to create its rollout directory')
+      capture.observations.persistenceState = 'retained-unsaved-refresh-stopped'
+      if (options.persistenceMode === 'missing') {
+        await client.close()
+        capture.observations.persistenceOwnedExit = capture.processExit
+        await fsp.unlink(context.persistenceBlocker)
+        capture.observations.coldMissingFaultRemoved = true
+        client = new NativeClient(capture.binary.path, context, capture)
+        await client.request('initialize', { clientInfo: { name: 'freshell_codex_missing_persistence', version: '1.0.0' }, capabilities })
+        client.send({ method: 'initialized', params: {} })
+        capture.observations.coldMissingRead = await nativeRefusal(client, 'thread/read', { threadId: capture.threadId, includeTurns: true })
+        capture.observations.coldRecoveryState = 'saved-history-unavailable-no-invented-fragments'
+        capture.passed = true
+        return capture
+      }
+      await fsp.unlink(context.persistenceBlocker)
+      {
+        const flush = await client.request('turn/start', { threadId: capture.threadId, input: [{ type: 'text', text: 'Flush the actual pending native recorder after its owned parent becomes available.' }] })
+        await client.wait(frame => frame.method === 'turn/completed' && frame.params?.turn?.id === flush.turn.id)
+        capture.observations.persistenceFlushTurnId = flush.turn.id
+      }
+      try {
+        const recovered = await client.request('thread/read', { threadId: capture.threadId, includeTurns: true })
+        capture.reads.push({ label: 'released-blocker-warm-read', body: recovered })
+        capture.observations.releasedWarmText = assistantText(recovered, turn.turn.id)
+      } catch (error) {
+        assert(error.nativeError, 'recovery availability failure must come from native')
+        capture.observations.releasedWarmReadError = error.nativeError
+      }
+      capture.observations.persistenceState = 'owned-blocker-released-native-recovery-pending'
+      await client.close()
+      client = new NativeClient(capture.binary.path, context, capture)
+      await client.request('initialize', { clientInfo: { name: 'freshell_codex_delayed_persistence', version: '1.0.0' }, capabilities })
+      client.send({ method: 'initialized', params: {} })
+      try {
+        await client.request('thread/resume', { threadId: capture.threadId, cwd: context.workspace, approvalPolicy: policy, sandbox: sandboxMode, persistExtendedHistory: true })
+        const recovered = await client.request('thread/read', { threadId: capture.threadId, includeTurns: true })
+        capture.reads.push({ label: 'released-blocker-cold-read', body: recovered })
+        assert.equal(assistantText(recovered, turn.turn.id), event.params.item.text)
+        capture.observations.persistenceState = 'saved-after-owned-blocker-release-and-cold-recovery'
+      } catch (error) {
+        assert(error.nativeError, 'recovery must either supply the exact native body or an actual native availability error')
+        capture.observations.releasedColdReadError = error.nativeError
+        capture.observations.persistenceState = 'retained-unsaved-provider-unavailable-refresh-stopped'
+      }
       capture.passed = true
       return capture
     }
@@ -467,6 +964,7 @@ export async function captureNativeScenario(name, options = {}) {
     }
     const expectedAssistantText = parentCompletedMessages?.join('\n') ?? Array(options.duplicateBodies ? 2 : 1).fill('First fragment and final fragment').join('\n')
     assert.equal(capture.observations.finalAssistantText, expectedAssistantText)
+    if (options.largeOutput) await verifyLargeOutput(capture, read, context, turn.turn.id, 'warm', options.historyMode)
     capture.observations.finalItems = read.thread.turns.filter(nativeTurn => nativeTurn.id === turn.turn.id).flatMap(nativeTurn => nativeTurn.items)
     if (name === 'model-effort-usage') {
       const usage = capture.notifications.filter(frame => frame.method === 'thread/tokenUsage/updated' && frame.params?.turnId === turn.turn.id).at(-1)?.params.tokenUsage
@@ -476,7 +974,7 @@ export async function captureNativeScenario(name, options = {}) {
       assert.equal(fixture.traffic[0].body.model, 'contract-model')
       assert.equal(fixture.traffic[0].body.reasoning.effort, 'low')
     }
-    if (name === 'approval-policy-restricted-exec') {
+    if (restricted) {
       const commandItems = capture.notifications.filter(frame => frame.method === 'item/completed' && frame.params?.item?.type === 'commandExecution').map(frame => frame.params.item)
       capture.observations.commandItems = commandItems
       capture.observations.workspaceWritePresent = fs.existsSync(path.join(context.workspace, 'contract-output.txt'))
@@ -507,18 +1005,19 @@ export async function captureNativeScenario(name, options = {}) {
           capture.observations.policyEffects.userDeniedWrite = fs.existsSync(path.join(context.workspace, 'denied-by-user.txt'))
         }
       }
-    } else if (!['text-history', 'active-input-stop', 'model-effort-usage', 'parent-child-read', 'plan-question-controls', 'mcp-form-url'].includes(name)) {
+    } else if (!['text-history', 'active-input-stop', 'model-effort-usage', 'parent-child-read', 'plan-question-controls', 'mcp-form-url'].includes(name) && !options.approvalControl) {
       throw new Error(`CODEX_CONTRACT_UNIMPLEMENTED: ${name}; text-only execution does not establish this scenario`)
     }
     await client.close()
     client = new NativeClient(capture.binary.path, context, capture)
     await client.request('initialize', { clientInfo: { name: 'freshell_codex_contract_resume', version: '1.0.0' }, capabilities })
     client.send({ method: 'initialized', params: {} })
-    const resumedThread = await client.request('thread/resume', { threadId: capture.threadId, cwd: context.workspace, approvalPolicy: policy, sandbox: sandboxMode, persistExtendedHistory: true })
+    const resumedThread = await client.request('thread/resume', { threadId: capture.threadId, cwd: context.workspace, approvalPolicy: policy, ...(options.approvalControl === 'network' ? { permissions: 'fixture_network' } : { sandbox: sandboxMode }), persistExtendedHistory: true })
     capture.observations.resumeApprovalPolicy = resumedThread.approvalPolicy
     assert.equal(resumedThread.approvalPolicy, policy)
     const resumed = await client.request('thread/read', { threadId: capture.threadId, includeTurns: true })
     capture.reads.push({ label: 'cold-resume', body: resumed })
+    if (options.largeOutput) await verifyLargeOutput(capture, resumed, context, turn.turn.id, 'cold-resume', options.historyMode)
     capture.observations.resumedAssistantText = assistantText(resumed, turn.turn.id)
     assert.equal(capture.observations.resumedAssistantText, capture.observations.finalAssistantText)
     if (name === 'parent-child-read') {
@@ -546,6 +1045,7 @@ export async function captureNativeScenario(name, options = {}) {
         if (policy === 'untrusted') assert(capture.observations.commandApprovals.some(approval => approval.decision === 'cancel'), 'denied command must receive an actual native cancellation')
       }
     }
+    if (options.approvalControl === 'network') assert.equal(capture.observations.networkCases?.length, 5, 'native network once/session/no-repeat/decline/cancel evidence is required')
     capture.passed = true
   } catch (error) {
     capture.passed = false
@@ -557,12 +1057,16 @@ export async function captureNativeScenario(name, options = {}) {
     releaseStream?.()
     childStream.resolve()
     parentStream.resolve()
+    if (context.network) await context.network.close()
     if (fixture) { capture.fixtureTraffic = fixture.traffic; await fixture.close() }
     if (context.mcpTrace && fs.existsSync(context.mcpTrace)) capture.observations.mcpTraffic = (await fsp.readFile(context.mcpTrace, 'utf8')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
     capture.environment.ambientAfter = ambientCodex()
     assert.equal(capture.environment.ambientAfter, capture.environment.ambientBefore)
-    await fsp.writeFile(path.join(context.receiptRoot, `${name}-${randomUUID()}.json`), `${JSON.stringify(capture, null, 2)}\n`, { mode: 0o600 })
-    if (options.emitReceipt) process.stdout.write(`${JSON.stringify({ nativeCapture: true, capture })}\n`)
+    const persisted = sanitizedCapture(capture, capture.secretValues)
+    const json = JSON.stringify(persisted)
+    await fsp.writeFile(path.join(context.receiptRoot, `${name}-${randomUUID()}.json`), `${json}\n`, { mode: 0o600 })
+    if (options.emitReceipt) process.stdout.write(`${JSON.stringify({ nativeCapture: true, capture: persisted })}\n`)
+    if (process.env.FRESHELL_CODEX_CONTRACT_CAPTURE_STDOUT === '1') exportCloudCapture(persisted, json)
   }
   return capture
 }
@@ -657,16 +1161,20 @@ async function main(args) {
     else if (args[index] === '--probe-uid') options.probeUid = args[++index]
     else if (args[index] === '--probe-bundled-bwrap') options.preferBundledBwrap = true
     else if (args[index] === '--history-mode') { options.historyMode = args[++index]; assert(['legacy', 'paginated'].includes(options.historyMode)) }
+    else if (args[index] === '--persistence-mode') { options.persistenceMode = args[++index]; assert(['delayed', 'missing'].includes(options.persistenceMode)) }
     else if (args[index] === '--duplicate-bodies') options.duplicateBodies = true
+    else if (args[index] === '--large-output') options.largeOutput = true
+    else if (args[index] === '--startup-cancellation') options.startupCancellation = true
     else if (args[index] === '--ephemeral-parent') options.ephemeralParent = true
     else if (args[index] === '--probe-network-enabled') options.probeNetworkEnabled = true
+    else if (args[index] === '--approval-control') { options.approvalControl = args[++index]; assert(['stdin', 'network'].includes(options.approvalControl)) }
     else throw new Error(`unknown argument ${args[index]}`)
   }
   if (options.probePolicyEffects || options.probeApprovalPolicy || options.probeDefaultPolicy || options.legacyLandlock) assert(options.probeMetadata || options.probeSeccomp || options.seccompProbeReceipt, 'probe options require an explicit candidate manifest or declared seccomp probe')
   if (managed) return managedVersion(options)
-  for (const name of scenario === 'all' ? scenarios : [scenario]) {
-    const capture = await captureNativeScenario(name, options)
-    console.log(JSON.stringify({ severity: 'info', event: 'codex_native_scenario_passed', scenario: name, version: capture.binary.version, threadId: capture.threadId }))
+  for (const [name, selected] of scenario === 'all' ? nativeContractCases() : [[scenario, {}]]) {
+    const capture = await captureNativeScenario(name, { ...options, ...selected })
+    console.log(JSON.stringify({ severity: 'info', event: 'codex_native_scenario_passed', scenario: name, parameters: capture.parameters, version: capture.binary.version, threadId: capture.threadId }))
   }
 }
 

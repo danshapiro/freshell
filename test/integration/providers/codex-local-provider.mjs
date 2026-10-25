@@ -6,10 +6,12 @@ import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import assert from 'node:assert/strict'
 
+export const MCP_LARGE_TEXT = 'F1_MCP_HEAD\n' + 'm'.repeat(128 * 1024) + '\nF1_MCP_TAIL'
 export const MCP_FORM_CONTENT = { name: 'fixture', count: 2.5, enabled: true, color: 'blue' }
+export const CODEX_NETWORK_REQUIREMENTS = '[experimental_network]\nenabled = true\nallow_local_binding = true\nallow_upstream_proxy = false\n'
 const FORM_SCHEMA = { type: 'object', properties: { name: { type: 'string', title: 'Name' }, count: { type: 'number', title: 'Count' }, enabled: { type: 'boolean', title: 'Enabled' }, color: { type: 'string', title: 'Color', enum: ['blue', 'green'] } }, required: ['name', 'count', 'enabled', 'color'] }
 
-function serveMcpFixture(tracePath, url) {
+function serveMcpFixture(tracePath, url, holdStartup = false) {
   const pending = new Map()
   let nextId = 1
   const trace = record => fs.appendFileSync(tracePath, `${JSON.stringify(record)}\n`, { mode: 0o600 })
@@ -31,9 +33,13 @@ function serveMcpFixture(tracePath, url) {
       return
     }
     if (frame.id === undefined) return
+    if (frame.method === 'initialize' && holdStartup) { trace({ event: 'startup_initialize_held', id: frame.id }); return }
     if (frame.method === 'initialize') send({ id: frame.id, result: { protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'freshell-contract', version: '1' } } })
     else if (frame.method === 'ping') send({ id: frame.id, result: {} })
-    else if (frame.method === 'tools/list') send({ id: frame.id, result: { tools: [{ name: 'elicit', description: 'Run the selected native elicitation fixture.', inputSchema: { type: 'object', properties: { route: { type: 'string', enum: ['form', 'openai/form', 'openaiForm', 'url'] }, sequence: { type: 'string', enum: ['matrix', 'hold'] } }, required: ['route', 'sequence'], additionalProperties: false }, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true } }] } })
+    else if (frame.method === 'tools/list') send({ id: frame.id, result: { tools: [{ name: 'large_result', description: 'Return a bounded native persistence fixture.', inputSchema: { type: 'object', properties: {}, additionalProperties: false }, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true } }, { name: 'elicit', description: 'Run the selected native elicitation fixture.', inputSchema: { type: 'object', properties: { route: { type: 'string', enum: ['form', 'openai/form', 'openaiForm', 'url'] }, sequence: { type: 'string', enum: ['matrix', 'hold'] } }, required: ['route', 'sequence'], additionalProperties: false }, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true } }] } })
+    else if (frame.method === 'tools/call' && frame.params.name === 'large_result') {
+      send({ id: frame.id, result: { content: [{ type: 'text', text: MCP_LARGE_TEXT }], structuredContent: { fixture: 'F1_MCP_STRUCTURED', count: 1 }, isError: false, _meta: { 'fixture/result': 'F1_MCP_META' } } })
+    }
     else if (frame.method === 'tools/call') {
       const { route, sequence } = frame.params.arguments
       const results = []
@@ -41,7 +47,7 @@ function serveMcpFixture(tracePath, url) {
         const method = route === 'openai/form' ? 'openai/form' : route === 'openaiForm' ? 'openai/elicitation/create' : 'elicitation/create'
         const params = route === 'url' ? { mode: 'url', message: 'Open the fixture page, then choose an action.', url: `${url}/elicitation/example`, elicitationId: `fixture-url-${nextId}` } : { ...(route === 'openai/form' ? {} : { mode: 'form' }), message: 'Fixture form', requestedSchema: FORM_SCHEMA }
         const result = await request(method, params)
-        trace({ event: 'elicitation_result', route, expectedAction: action, result })
+        trace({ event: 'elicitation_result', route, sequence, expectedAction: action, result })
         if (result.action !== action) throw new Error(`MCP route ${route} returned the wrong action`)
         if (action === 'accept' && route !== 'url') assert.deepEqual(result.content, MCP_FORM_CONTENT, 'MCP form content must preserve typed native answers')
         results.push(result)
@@ -53,7 +59,7 @@ function serveMcpFixture(tracePath, url) {
     let frame
     try { frame = JSON.parse(line) } catch { return }
     handle(frame).catch(error => {
-      trace({ event: 'fixture_error', message: error.message })
+      trace({ event: frame.params?.arguments?.sequence === 'hold' ? 'fixture_request_cancelled' : 'fixture_error', message: error.message })
       if (frame.id !== undefined) send({ id: frame.id, error: { code: -32603, message: error.message } })
     })
   })
@@ -118,4 +124,4 @@ export async function createCodexLocalProvider(handler) {
   }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url) && process.argv[2] === '--mcp-fixture') serveMcpFixture(process.argv[3], process.argv[4])
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url) && ['--mcp-fixture', '--mcp-startup-fixture'].includes(process.argv[2])) serveMcpFixture(process.argv[3], process.argv[4], process.argv[2] === '--mcp-startup-fixture')
