@@ -133,6 +133,20 @@ else
   fi
   CMD="$1"
 
+  # Only the closed native Codex contract entrypoint receives its declared
+  # sandbox construction policy. Every other runtime suite keeps Docker's
+  # existing default. Verify before the install-capable entrypoint can run.
+  CODEX_NATIVE_CONTRACT=0
+  if [ "${RUNTIME_SUITE}" -eq 1 ]; then
+    case "${CMD}" in
+      'node test/integration/providers/codex-cli-contract.mjs --scenario all' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario approval-policy-restricted-exec')
+        node "${REPO_ROOT}/scripts/testing/prepare-codex-contract.mjs" --verify-sandbox >/dev/null
+        CODEX_NATIVE_CONTRACT=1
+        ;;
+    esac
+  fi
+
   if ! docker image inspect "${IMAGE_TAG}" >/dev/null 2>&1; then
     echo "[sandbox] image ${IMAGE_TAG} not found, building it first..." >&2
     "${REPO_ROOT}/scripts/sandbox-build.sh"
@@ -370,6 +384,12 @@ if [ "${RUNTIME_SUITE}" -eq 1 ]; then
     --security-opt no-new-privileges
     -e FRESHELL_SANDBOX_MODE=runtime-suite
   )
+  if [ "${CODEX_NATIVE_CONTRACT:-0}" -eq 1 ]; then
+    DOCKER_ARGS+=(
+      --security-opt "seccomp=${REPO_ROOT}/.runtime-build/codex-contract/codex-policy.json"
+      -e FRESHELL_CODEX_CONTRACT_POLICY=prepared
+    )
+  fi
   if [ "${CHECKPOINT_FIXTURE}" -eq 1 ]; then
     DOCKER_ARGS+=(-e FRESHELL_SANDBOX_CHECKPOINT_FIXTURE=1)
   fi

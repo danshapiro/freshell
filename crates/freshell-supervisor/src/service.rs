@@ -4427,6 +4427,7 @@ fn map_registry(error: RegistryError) -> RuntimeError {
 fn map_backend(error: BackendError) -> RuntimeError {
     let code = match &error {
         BackendError::OwnershipMismatch(_) => RuntimeErrorCode::OwnershipMismatch,
+        BackendError::CodexIncompatible(_) => RuntimeErrorCode::InvalidRequest,
         BackendError::Unavailable(_) | BackendError::DockerHttp { .. } => {
             RuntimeErrorCode::BackendUnavailable
         }
@@ -4442,6 +4443,9 @@ fn backend_failure_diagnostic(error: &BackendError) -> serde_json::Value {
         BackendError::DockerHttp { status, body } => ("docker_http", Some(*status), body.as_str()),
         BackendError::Malformed(detail) => ("malformed", None, detail.as_str()),
         BackendError::InvalidConfig(detail) => ("invalid_config", None, detail.as_str()),
+        BackendError::CodexIncompatible(detail) => {
+            ("codex_configuration_incompatible", None, detail.as_str())
+        }
     };
     const MAX_DETAIL_CHARS: usize = 512;
     let redacted = freshell_runtime_observability::scrub(detail, "");

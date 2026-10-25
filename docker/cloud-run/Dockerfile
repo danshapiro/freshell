@@ -38,6 +38,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 COPY extensions/ ./extensions/
 COPY docker/runtime/provider-versions.json ./docker/runtime/provider-versions.json
+COPY docker/runtime/codex-native-sandbox.json ./docker/runtime/codex-native-sandbox.json
 RUN FRESHELL_BUILD_COMMIT="$FRESHELL_BUILD_COMMIT" cargo build --release -p freshell-server --locked
 
 # ---------------------------------------------------------------------------
@@ -68,6 +69,7 @@ RUN npm install -g pnpm@10.34.5 \
   && pnpm install --frozen-lockfile --ignore-scripts
 
 COPY . .
+RUN node scripts/testing/prepare-codex-contract.mjs --output /opt/freshell-test-providers/codex/0.164.0-linux-x64
 RUN FRESHELL_BUILD_COMMIT="$FRESHELL_BUILD_COMMIT" pnpm run build:client && pnpm run build:tools
 
 # ---------------------------------------------------------------------------
@@ -113,6 +115,7 @@ COPY --from=node-builder /app/node_modules ./node_modules
 # The pinned Claude contract exercises the isolated sidecar package directly.
 # Its node_modules links back to the root pnpm store copied above.
 COPY --from=node-builder /app/crates/freshell-claude-sidecar/node_modules ./crates/freshell-claude-sidecar/node_modules
+COPY --from=node-builder /opt/freshell-test-providers/codex/0.164.0-linux-x64 /opt/freshell-test-providers/codex/0.164.0-linux-x64
 
 # Fail the image build if the copied test toolchain cannot execute in this
 # Debian runtime. A container-level test checks the configured runtime user.
@@ -131,6 +134,7 @@ COPY . .
 RUN scripts/verify-container-layout.sh --fixture /app --runtime-root
 
 ENV FRESHELL_E2E_RUST_SERVER_BIN=/app/target/release/freshell-server
+ENV FRESHELL_CODEX_CONTRACT_ROOT=/opt/freshell-test-providers/codex/0.164.0-linux-x64
 
 # COPY's requested mode can still be narrowed by rootless build/ACL metadata.
 # Normalize the copied artifact in the image layer so the final unprivileged
@@ -142,6 +146,10 @@ RUN chmod 755 /usr/local/bin/e2e-entrypoint.sh \
 # The browser test harness needs an unprivileged user for permission checks.
 RUN chown -R node:node /app
 USER node
+
+# Verify the complete copied native tree as the final runtime identity,
+# including /opt ancestors outside /app's ownership adjustment.
+RUN node --input-type=module -e 'import { verifyArtifact } from "./scripts/testing/prepare-codex-contract.mjs"; await verifyArtifact(process.env.FRESHELL_CODEX_CONTRACT_ROOT)'
 
 # Verify the final runtime user can read, syntax-check, and execute the exact
 # entrypoint artifact. `--dry-run` exits before Playwright and exercises the
