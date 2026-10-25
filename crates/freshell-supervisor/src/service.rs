@@ -62,6 +62,7 @@ struct McpCapabilityRequest<'a> {
     workspace: Option<&'a str>,
     auth_lookup_authority: Option<&'a str>,
     claude_recovery_source: Option<&'a freshell_runtime_protocol::ClaudeRecoverySourceBinding>,
+    codex_source_runtime: Option<freshell_platform::codex_inputs::NativeSourceRuntime>,
     cwd: Option<&'a str>,
     prior_context: Option<&'a freshell_runtime_protocol::ProviderLaunchContext>,
     provider_secret_references: Option<&'a [freshell_runtime_protocol::ProviderSecretReference]>,
@@ -2328,6 +2329,7 @@ impl Supervisor {
                 workspace: None,
                 auth_lookup_authority: None,
                 claude_recovery_source: None,
+                codex_source_runtime: None,
                 cwd: None,
                 prior_context: None,
                 provider_secret_references: None,
@@ -2551,6 +2553,37 @@ impl Supervisor {
         cwd: &str,
         workspace: &str,
     ) -> Result<freshell_runtime_protocol::PreparedProviderContext, RuntimeError> {
+        let codex_source_runtime = if provider == "codex" {
+            use freshell_platform::codex_inputs::NativeSourceRuntime;
+            let incompatible =
+                || {
+                    RuntimeError::new(RuntimeErrorCode::InvalidRequest,
+                "Codex replacement current consumer is invalid; retain inputs and reconcile")
+                };
+            if start.context.provider != "codex" {
+                return Err(incompatible());
+            }
+            Some(
+                match (
+                    start.context.prior_handle.fresh_agent(),
+                    start.context.prior_handle.terminal(),
+                ) {
+                    (Some(spec), None)
+                        if spec.provider == freshell_runtime_protocol::FreshProvider::Codex =>
+                    {
+                        spec.validate()?;
+                        NativeSourceRuntime::AppServer
+                    }
+                    (None, Some(spec)) if spec.mode == "codex" => {
+                        spec.validate()?;
+                        NativeSourceRuntime::Tui
+                    }
+                    _ => return Err(incompatible()),
+                },
+            )
+        } else {
+            None
+        };
         let tui_source = match &context.preparation {
             freshell_runtime_protocol::ProviderPreparation::Opencode { tui_source, .. } => {
                 tui_source.as_ref()
@@ -2586,6 +2619,7 @@ impl Supervisor {
                 workspace: Some(workspace),
                 auth_lookup_authority: Some(&scope.key),
                 claude_recovery_source: claude_recovery_source.as_ref(),
+                codex_source_runtime,
                 cwd: Some(cwd),
                 prior_context: Some(context),
                 provider_secret_references: Some(references),
@@ -2625,6 +2659,7 @@ impl Supervisor {
                 "workspace": request.workspace,
                 "authLookupAuthority": request.auth_lookup_authority,
                 "claudeRecoverySource": request.claude_recovery_source,
+                "codexSourceRuntime": request.codex_source_runtime,
                 "cwd":request.cwd,
                 "priorContext":request.prior_context,
                 "providerSecretReferences":request.provider_secret_references,

@@ -6,7 +6,8 @@
 use freshell_freshagent::naming::{admit_pending_projection, session_projection, SessionNaming};
 use freshell_freshagent::rest_lane::{
     FreshAgentRestLane, RestLaneCapture, RestLaneCaptureError, RestLaneCaptureResult,
-    RestLaneCreate, RestLaneCreated, RestLaneSend, RestLaneSendResult,
+    RestLaneCreate, RestLaneCreated, RestLaneError, RestLaneErrorKind, RestLaneSend,
+    RestLaneSendResult,
 };
 use freshell_protocol::session_names::NamedProvider;
 use freshell_protocol::{
@@ -193,14 +194,19 @@ impl HostedFreshAgentProxy {
         match command {
             HostedFreshAgentCommand::Create(message) => {
                 let request_id = message.request_id.clone();
-                if self.create(message).await.is_err() {
-                    tracing::warn!(request_id, "fresh_agent.create.failed");
+                if let Err(mut error) = self.create(message).await {
+                    tracing::warn!(request_id, code=%error.code, "fresh_agent.create.failed");
+                    if error.code == "FRESH_AGENT_UNAVAILABLE" {
+                        error.code = "FRESH_AGENT_CREATE_FAILED".into();
+                        error.message = "managed fresh-agent host could not be created".into();
+                        error.retryable = Some(true);
+                    }
                     self.send(ServerMessage::FreshAgentCreateFailed(
                         FreshAgentCreateFailed {
-                            code: "FRESH_AGENT_CREATE_FAILED".into(),
-                            message: "managed fresh-agent host could not be created".into(),
+                            code: error.code,
+                            message: error.message,
                             request_id,
-                            retryable: Some(true),
+                            retryable: error.retryable,
                             owner_kind: None,
                             owner_generation: None,
                             owner_epoch: None,
@@ -491,12 +497,12 @@ impl HostedFreshAgentProxy {
     async fn create(
         self: &Arc<Self>,
         message: freshell_protocol::FreshAgentCreate,
-    ) -> Result<Option<(SoulId, u64)>, ()> {
+    ) -> Result<Option<(SoulId, u64)>, RestLaneError> {
         let provider = fresh_provider(&message.provider, message.session_type).ok_or(())?;
         let public_provider = fresh_provider_wire(&provider);
         if let Some(session_ref) = message.session_ref.as_ref() {
             if session_ref.provider != public_provider {
-                return Err(());
+                return Err(().into());
             }
             let inventory = self.client.inventory().await.map_err(|_| ())?;
             let view = inventory
@@ -622,6 +628,8 @@ impl HostedFreshAgentProxy {
             let original = |name: &str| std::env::var(name).ok();
             let context = crate::managed_provider_references::codex::prepare_managed(
                 crate::managed_provider_references::codex::CodexPreparation {
+                    native_source_runtime:
+                        freshell_platform::codex_inputs::NativeSourceRuntime::AppServer,
                     client: &self.client,
                     soul: &soul,
                     creation_seed: &message.request_id,
@@ -635,7 +643,15 @@ impl HostedFreshAgentProxy {
             )
             .await
             .map_err(|error| {
-                tracing::warn!(event="fresh_agent.create.provider_inputs_failed",%error);
+                tracing::warn!(event="fresh_agent.create.provider_inputs_failed", provider="codex", request_id=%message.request_id, code=?error.code, message=%error.message);
+                let configuration = error.code == RuntimeErrorCode::InvalidRequest;
+                let mut refusal = RestLaneError::new(
+                    if configuration { RestLaneErrorKind::BadRequest } else { RestLaneErrorKind::Unavailable },
+                    if configuration { "INVALID_REQUEST" } else { "CODEX_PREPARATION_UNAVAILABLE" },
+                    error.message,
+                );
+                refusal.retryable = Some(!configuration);
+                refusal
             })?;
             (context.mcp_capability.clone().ok_or(())?, Some(context))
         } else if matches!(provider, FreshProvider::Claude | FreshProvider::Kilroy) {

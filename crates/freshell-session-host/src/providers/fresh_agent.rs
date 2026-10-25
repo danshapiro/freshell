@@ -530,6 +530,7 @@ impl FreshAgentTransport for HostedTransport {
                 acceptance_ambiguous: false,
             })?;
         *self.profile.lock().expect("profile lock") = Some(profile.clone());
+        let permission_mode = profile.effective_permission_mode().map(str::to_owned);
         let profile = profile.clone();
         let mut outcomes = self.send_outcomes.subscribe();
         let send = FreshAgentSend {
@@ -546,7 +547,7 @@ impl FreshAgentTransport for HostedTransport {
                 cwd: Some(profile.cwd),
                 effort: profile.effort,
                 model: profile.model,
-                permission_mode: profile.permission_mode,
+                permission_mode,
                 sandbox: profile.sandbox.as_deref().and_then(parse_sandbox),
             }),
             checkpoint_intent: logical_attempt_id.map(|logical_attempt_id| {
@@ -1124,7 +1125,7 @@ fn create_request_for_profile(profile: &FreshAgentProfile) -> FreshAgentCreate {
                     model_id: selection.model_id.clone(),
                 })
         }),
-        permission_mode: profile.permission_mode.clone(),
+        permission_mode: profile.effective_permission_mode().map(str::to_owned),
         plugins: profile.plugins.clone(),
         provider: Some(provider),
         resume_session_id: None,
@@ -2829,6 +2830,7 @@ mod tests {
                         ProviderPreparation::Codex {
                             tui_args,
                             sidecar_args,
+                            ..
                         } => !tui_args.is_empty() || !sidecar_args.is_empty(),
                         ProviderPreparation::Opencode {
                             tui_config,
@@ -3034,12 +3036,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn prepared_codex_approval_intent_reaches_create_without_becoming_explicit() {
+        let mut profile = parity_profile(FreshProvider::Codex);
+        profile.permission_mode = None;
+        let mut context =
+            serde_json::to_value(profile.provider_launch_context.as_ref().unwrap()).unwrap();
+        context["preparation"]["codex"]["approval_default"] = json!({
+            "policy":"untrusted", "logicalSource":"/original/.codex/config.toml",
+            "canonicalSource":"/original/.codex/config.toml", "sourceSha256":"a".repeat(64)
+        });
+        profile.provider_launch_context = Some(
+            serde_json::from_value(context)
+                .expect("prepared native policy descriptor must survive the protocol boundary"),
+        );
+        assert_eq!(
+            create_request_for_profile(&profile)
+                .permission_mode
+                .as_deref(),
+            Some("untrusted")
+        );
+        assert!(
+            profile.permission_mode.is_none(),
+            "inherited policy must remain distinguishable from explicit settings"
+        );
+        let replayed: FreshAgentProfile =
+            serde_json::from_slice(&serde_json::to_vec(&profile).unwrap()).unwrap();
+        assert_eq!(
+            create_request_for_profile(&replayed)
+                .permission_mode
+                .as_deref(),
+            Some("untrusted")
+        );
+        profile.permission_mode = Some("never".into());
+        assert_eq!(
+            create_request_for_profile(&profile)
+                .permission_mode
+                .as_deref(),
+            Some("never")
+        );
+    }
+
     fn parity_profile(provider: FreshProvider) -> FreshAgentProfile {
         let preparation = match provider {
             FreshProvider::Claude => ProviderPreparation::Claude {
                 mcp_args: Vec::new(),
             },
             FreshProvider::Codex => ProviderPreparation::Codex {
+                approval_default: None,
                 tui_args: Vec::new(),
                 sidecar_args: Vec::new(),
             },
@@ -3543,6 +3587,7 @@ mod tests {
                 ProviderPreparation::Codex {
                     ref tui_args,
                     ref sidecar_args,
+                    ..
                 } => !tui_args.is_empty() || !sidecar_args.is_empty(),
                 ProviderPreparation::Opencode {
                     ref tui_config,
@@ -3582,6 +3627,7 @@ mod tests {
                 ProviderPreparation::Codex {
                     ref tui_args,
                     ref sidecar_args,
+                    ..
                 } => !tui_args.is_empty() || !sidecar_args.is_empty(),
                 ProviderPreparation::Opencode {
                     ref tui_config,
@@ -3651,6 +3697,7 @@ mod tests {
                     mcp_args: Vec::new(),
                 },
                 FreshProvider::Codex => ProviderPreparation::Codex {
+                    approval_default: None,
                     tui_args: Vec::new(),
                     sidecar_args: vec!["-c".into(), "fixture_option=true".into()],
                 },
@@ -3769,6 +3816,7 @@ mod tests {
                     ProviderPreparation::Codex {
                         tui_args,
                         sidecar_args,
+                        ..
                     },
                 ) => {
                     assert!(

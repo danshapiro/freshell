@@ -77,6 +77,10 @@ export async function createCodexLocalProvider(handler) {
       const parsed = body ? JSON.parse(body) : null
       const record = { index: traffic.length, method: request.method, path: request.url, loopback: request.socket.remoteAddress === '127.0.0.1', body: parsed }
       traffic.push(record)
+      if (request.method === 'GET' && request.url === '/elicitation/example' && record.loopback) {
+        response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }).end('<!doctype html><title>Owned elicitation fixture</title><p>The page is open. The native decision is still separate.</p>')
+        return
+      }
       if (request.method !== 'POST' || request.url !== '/v1/responses' || !record.loopback) {
         response.writeHead(404).end(); return
       }

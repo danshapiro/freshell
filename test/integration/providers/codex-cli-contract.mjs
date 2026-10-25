@@ -9,7 +9,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { createHash, randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
-import { artifactMetadata, repoRoot, verifyArtifact, ambientCodex, verifySandbox, nativeSandboxPolicy } from '../../../scripts/testing/prepare-codex-contract.mjs'
+import { artifactMetadata, repoRoot, verifyArtifact, ambientCodex, verifySandbox, nativeSandboxPolicy, verifyPolicyClientProbe } from '../../../scripts/testing/prepare-codex-contract.mjs'
 import { createCodexLocalProvider, MCP_FORM_CONTENT, MCP_LARGE_TEXT, CODEX_NETWORK_REQUIREMENTS } from './codex-local-provider.mjs'
 
 const scenarios = ['text-history', 'active-input-stop', 'parent-child-read', 'plan-question-controls', 'mcp-form-url', 'model-effort-usage', 'approval-policy-restricted-exec']
@@ -20,8 +20,9 @@ export function nativeContractCases() {
   }
   for (const name of scenarios.filter(name => name !== 'text-history')) cases.push([name, {}])
   for (const sandboxMode of ['read-only', 'workspace-write']) cases.push(['approval-policy-restricted-exec', { sandboxMode, probeApprovalPolicy: 'never', probePolicyEffects: true }])
+  cases.push(['approval-policy-restricted-exec', { requirementsGuard: true }])
   for (const approvalControl of ['stdin', 'network']) cases.push(['approval-policy-restricted-exec', { approvalControl }])
-  cases.push(['active-input-stop', { startupCancellation: true }], ['parent-child-read', { ephemeralParent: true }])
+  cases.push(['active-input-stop', { startupCancellation: true }], ['parent-child-read', { ephemeralParent: true }], ['parent-child-read', { childApproval: true }])
   for (const historyMode of ['legacy', 'paginated']) {
     cases.push(['mcp-form-url', { historyMode, largeOutput: true }])
     for (const persistenceMode of ['delayed', 'missing']) cases.push(['text-history', { historyMode, persistenceMode }])
@@ -64,6 +65,12 @@ async function roots(options) {
   const artifactRoot = options.artifactRoot ?? process.env.FRESHELL_CODEX_CONTRACT_ROOT ?? (process.env.FRESHELL_SANDBOX_MODE === 'runtime-suite' ? staged?.artifactRoot : undefined)
   if (!artifactRoot) throw new Error('CODEX_CONTRACT_PREREQUISITE: explicit prepared artifact root is missing; no PATH fallback')
   const artifact = await verifyArtifact(artifactRoot, metadata)
+  let policyClientProbe
+  if (!options.probeMetadata && !options.seccompProbeReceipt) {
+    const file = options.policyClientProbe ?? process.env.FRESHELL_CODEX_POLICY_CLIENT_PROBE ?? staged?.policyClientProbe?.path
+    assert(file, 'CODEX_CONTRACT_PREREQUISITE: required real-client policy probe is missing')
+    policyClientProbe = await verifyPolicyClientProbe(file, staged?.policyClientProbe?.path === file ? staged.policyClientProbe.sha256 : undefined)
+  }
   const stateBase = options.stateRoot ?? (process.env.FRESHELL_SANDBOX_MODE === 'runtime-suite' ? staged?.stateRoot : undefined) ?? os.tmpdir()
   const stateRoot = await fsp.mkdtemp(path.join(stateBase, 'codex-contract-'))
   const receiptRoot = path.resolve(options.receiptDir ?? (process.env.FRESHELL_SANDBOX_MODE === 'runtime-suite' ? staged?.receiptRoot : undefined) ?? path.join(stateRoot, 'receipts'))
@@ -77,19 +84,19 @@ async function roots(options) {
     assert.equal(bundled.length, 1, 'fixture PATH selection needs the single verified bundled bubblewrap resource')
     environment.PATH = `${path.dirname(path.join(artifact.path, bundled[0].path))}:${environment.PATH}`
   }
-  return { artifact, metadata, stateRoot, receiptRoot, environment, workspace: path.join(stateRoot, 'workspace'), systemConfig, staged }
+  return { artifact, metadata, stateRoot, receiptRoot, environment, workspace: path.join(stateRoot, 'workspace'), systemConfig, staged, policyClientProbe }
 }
 
 class NativeClient {
-  constructor(binary, context, capture) {
+  constructor(binary, context, capture, args = ['app-server']) {
     this.capture = capture
     this.pending = new Map()
     this.waiters = new Set()
     this.nextId = 1
     this.secretControls = new Map()
-    this.child = spawn(binary, ['app-server'], { cwd: context.workspace, env: context.environment, stdio: ['pipe', 'pipe', 'pipe'] })
+    this.child = spawn(binary, args, { cwd: context.workspace, env: context.environment, stdio: ['pipe', 'pipe', 'pipe'] })
     this.connectionId = (capture.connections ??= []).length
-    capture.connections.push({ id: this.connectionId, pid: this.child.pid, binary })
+    capture.connections.push({ id: this.connectionId, pid: this.child.pid, binary, args })
     if (!capture.probeOnly || capture.environment.seccompProbe || capture.environment.nativeSandboxPolicy) {
       const observed = new Map((capture.observations.executedSandboxHelpers ?? []).map(helper => [helper.pid, helper]))
       this.helperWatcher = setInterval(() => {
@@ -170,6 +177,66 @@ class NativeClient {
     if (this.child.exitCode === null) this.child.kill('SIGTERM')
     try { await deadline(this.exit, 5000, 'owned process exit') } catch { this.child.kill('SIGKILL'); await deadline(this.exit, 5000, 'owned process kill') }
   }
+}
+
+async function nativeRequirementsGuard(context, capture) {
+  const { path: file } = context.policyClientProbe
+  capture.observations.policyClientProbe = context.policyClientProbe
+  const requirementFile = path.join(context.stateRoot, 'strict-requirements.toml')
+  await fsp.writeFile(requirementFile, `allowed_approval_policies = ["never"]\n${CODEX_NETWORK_REQUIREMENTS}`, { mode: 0o600 })
+  const reservation = http.createServer()
+  await new Promise(resolve => reservation.listen(0, '127.0.0.1', resolve))
+  const port = reservation.address().port
+  await new Promise(resolve => reservation.close(resolve))
+  const readiness = () => new Promise(resolve => {
+    const request = http.get(`http://127.0.0.1:${port}/readyz`, response => { response.resume(); resolve(response.statusCode === 200) })
+    request.on('error', () => resolve(false)); request.setTimeout(1000, () => request.destroy())
+  })
+  const helper = path.join(context.artifact.path, 'vendor/x86_64-unknown-linux-musl/codex-resources/bwrap')
+  // This matches native's proc-preflight fallback: retain the fresh user/PID/
+  // IPC namespaces and inherited recursive root procfs, omit only --proc.
+  const args = ['--unshare-user', '--unshare-pid', '--unshare-ipc', '--die-with-parent', '--new-session',
+    '--ro-bind', '/', '/', '--bind', context.stateRoot, context.stateRoot,
+    '--ro-bind', requirementFile, '/etc/codex/requirements.toml', '--dev', '/dev',
+    '--chdir', context.workspace, '--cap-drop', 'ALL', '--uid', String(process.getuid()), '--gid', String(process.getgid()),
+    '--', capture.binary.path, 'app-server', '--listen', `ws://127.0.0.1:${port}`]
+  const native = new NativeClient(helper, context, capture, args)
+  try {
+    await deadline((async () => {
+      while (!await readiness()) {
+        assert.equal(native.child.exitCode, null, capture.stderr)
+        await new Promise(resolve => setTimeout(resolve, 50))
+      }
+    })(), 15_000, 'isolated native requirements listener')
+    const receipt = path.join(context.stateRoot, 'policy-client-proof.json')
+    const probe = spawn(file, ['--exact', 'app_server::tests::native_requirements_refuse_untrusted_before_work', '--nocapture'], {
+      cwd: context.workspace, env: { ...context.environment, FRESHELL_CODEX_POLICY_PROBE_URL: `ws://127.0.0.1:${port}`, FRESHELL_CODEX_POLICY_PROBE_RECEIPT: receipt }, stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stdout = '', stderr = ''
+    probe.stdout.on('data', bytes => { stdout += bytes }); probe.stderr.on('data', bytes => { stderr += bytes })
+    const exited = new Promise((resolve, reject) => { probe.once('exit', (code, signal) => resolve({ code, signal })); probe.once('error', reject) })
+    let result
+    try { result = await deadline(exited, 30_000, 'real production policy client') }
+    finally { if (probe.exitCode === null && probe.signalCode === null) { probe.kill('SIGKILL'); await exited } }
+    assert.equal(result.code, 0, `${stdout}\n${stderr}`)
+    assert.match(stdout, /1 passed; 0 failed/)
+    const proof = JSON.parse(await fsp.readFile(receipt, 'utf8'))
+    assert.deepEqual(proof.refusedRoutes, ['create', 'resume', 'fork', 'send'])
+    assert.equal(proof.workRequests, 0)
+    for (const entry of proof.frames) {
+      const direction = entry.direction === 'controller' ? 'client' : 'native'
+      const frame = entry.frame
+      capture.frames.push({ index: capture.frames.length, connectionId: native.connectionId, direction, frame })
+      if (direction === 'client' && frame.method && frame.id !== undefined) capture.requests.push(frame)
+      else if (direction === 'native' && frame.id !== undefined) capture.responses.push(frame)
+      else if (direction === 'native' && frame.method) capture.notifications.push(frame)
+    }
+    capture.observations.requirementsGuard = { ...proof, frames: undefined, result, stdout, stderr, requirementsSha256: createHash('sha256').update(await fsp.readFile(requirementFile)).digest('hex') }
+    assert(capture.requests.every(frame => ['initialize', 'configRequirements/read'].includes(frame.method)))
+    assert.equal(capture.requests.filter(frame => frame.method === 'configRequirements/read').length, 4)
+  } finally { await native.close() }
+  assert.equal(await readiness(), false, 'owned PID namespace and native listener must settle after launcher exit')
+  capture.observations.requirementsGuard.ownedListenerSettled = true
 }
 
 function assistantText(read, nativeTurnId) {
@@ -344,6 +411,7 @@ async function verifyLargeOutput(capture, read, context, turnId, label, historyM
 
 async function driveMcp(client, capture, flow, context) {
   capture.observations.elicitationCases = []
+  capture.observations.urlOpenCases = []
   let last
   for (const route of ['form', 'openai/form', 'openaiForm', 'url']) {
     const current = { id: route.replaceAll('/', '_'), route, step: 0 }
@@ -353,6 +421,17 @@ async function driveMcp(client, capture, flow, context) {
       const already = new Set(capture.observations.elicitationCases.filter(record => record.turnId === last.turn.id).map(record => record.requestId))
       const request = await client.wait(frame => frame.method === 'mcpServer/elicitation/request' && frame.params?.turnId === last.turn.id && !already.has(frame.id))
       assert.equal(request.params.mode, route)
+      if (route === 'url') {
+        const opened = await fetch(request.params.url)
+        assert.equal(opened.status, 200, 'the owned URL must actually open before a separate native decision')
+        await opened.text()
+        const pending = await client.request('thread/read', { threadId: capture.threadId, includeTurns: true })
+        capture.reads.push({ label: `url-opened-awaiting-${action}`, body: pending })
+        const turn = pending.thread.turns.find(turn => turn.id === last.turn.id)
+        assert.equal(turn.status, 'inProgress', 'opening the URL must not complete the native pending control')
+        assert(!capture.notifications.some(frame => frame.method === 'serverRequest/resolved' && frame.params?.requestId === request.id && frame.params.threadId === capture.threadId))
+        capture.observations.urlOpenCases.push({ requestId: request.id, elicitationId: request.params.elicitationId, turnId: last.turn.id, openedStatus: opened.status, pendingTurnStatus: turn.status, explicitActionStillRequired: action })
+      }
       const result = { action, ...(action === 'accept' && route !== 'url' ? { content: MCP_FORM_CONTENT, _meta: { 'fixture/response': 'accepted' } } : {}) }
       client.send({ id: request.id, result })
       capture.observations.elicitationCases.push({ route, action, requestId: request.id, turnId: last.turn.id, elicitationId: request.params.elicitationId ?? null })
@@ -602,7 +681,9 @@ async function driveNetwork(client, capture, flow, context) {
   let last
   for (const [index, id, decision] of [[0, 'once', 'accept'], [0, 'session', 'acceptForSession'], [0, 'cached', null], [1, 'declined', 'decline'], [2, 'cancelled', 'cancel']]) {
     const beforeHits = context.network.hits.length
-    const current = { id, step: 0, url: context.network.urls[index] }
+    const target = new URL(context.network.urls[index])
+    target.pathname = `/canary/${id}/${randomUUID()}`
+    const current = { id, step: 0, url: target.href }
     flow.current = current
     const turn = await client.request('turn/start', { threadId: capture.threadId, approvalPolicy: 'on-request', permissions: 'fixture_network', input: [{ type: 'text', text: `Run the controlled ${id} native network decision.` }] })
     let approval
@@ -633,7 +714,7 @@ async function driveNetwork(client, capture, flow, context) {
 export async function captureNativeScenario(name, options = {}) {
   assert(scenarios.includes(name), `unknown native scenario ${name}`)
   const context = await roots(options)
-  const capture = { scenario: name, parameters: Object.fromEntries(['historyMode', 'duplicateBodies', 'persistenceMode', 'largeOutput', 'startupCancellation', 'ephemeralParent', 'approvalControl', 'probeApprovalPolicy', 'probePolicyEffects', 'sandboxMode'].filter(key => options[key] !== undefined).map(key => [key, options[key]])), probeOnly: options.probeMetadata?.probeOnly === true, binary: { path: path.join(context.artifact.path, context.metadata.executable), version: null, platform: `${process.platform}-${process.arch}`, integrity: context.artifact.integrity }, threadId: null, requests: [], responses: [], serverRequests: [], notifications: [], reads: [], fixtureTraffic: [], observations: {}, frames: [], environment: { uid: process.getuid?.(), gid: process.getgid?.(), groups: process.getgroups?.(), artifact: context.artifact, systemConfig: context.systemConfig, writableRoots: { state: context.stateRoot, receipts: context.receiptRoot }, prerequisites: context.staged ?? null, context: context.environment, ambientBefore: ambientCodex() } }
+  const capture = { scenario: name, parameters: Object.fromEntries(['historyMode', 'duplicateBodies', 'persistenceMode', 'largeOutput', 'startupCancellation', 'ephemeralParent', 'childApproval', 'approvalControl', 'probeApprovalPolicy', 'probePolicyEffects', 'sandboxMode', 'requirementsGuard'].filter(key => options[key] !== undefined).map(key => [key, options[key]])), probeOnly: options.probeMetadata?.probeOnly === true, binary: { path: path.join(context.artifact.path, context.metadata.executable), version: null, platform: `${process.platform}-${process.arch}`, integrity: context.artifact.integrity }, threadId: null, requests: [], responses: [], serverRequests: [], notifications: [], reads: [], fixtureTraffic: [], observations: {}, frames: [], environment: { uid: process.getuid?.(), gid: process.getgid?.(), groups: process.getgroups?.(), artifact: context.artifact, systemConfig: context.systemConfig, policyClientProbe: context.policyClientProbe, writableRoots: { state: context.stateRoot, receipts: context.receiptRoot }, prerequisites: context.staged ?? null, context: context.environment, ambientBefore: ambientCodex() } }
   Object.defineProperty(capture, 'secretValues', { value: new Set(), enumerable: false })
   capture.environment.cloud = Object.fromEntries(['CLOUD_RUN_JOB', 'CLOUD_RUN_EXECUTION', 'CLOUD_RUN_TASK_INDEX', 'CLOUD_RUN_TASK_ATTEMPT'].filter(key => process.env[key] !== undefined).map(key => [key, process.env[key]]))
   if (options.seccompProbeReceipt) capture.environment.seccompProbe = JSON.parse(await fsp.readFile(options.seccompProbeReceipt, 'utf8'))
@@ -663,6 +744,7 @@ export async function captureNativeScenario(name, options = {}) {
   let client
   let fixture
   let modelStep = 0
+  let childModelStep = 0
   let releaseStream
   const childRequested = deferred()
   const childStream = deferred()
@@ -684,6 +766,18 @@ export async function captureNativeScenario(name, options = {}) {
         const childInput = record.body.input.some(item => item.role === 'user' && JSON.stringify(item.content).includes('freshell-child-native-probe'))
         if (childInput) {
           childRequested.resolve()
+          if (options.childApproval) {
+            if (childModelStep++ === 0) {
+              const names = record.body.tools.flatMap(tool => tool.type === 'namespace' ? tool.tools.map(member => member.name) : [tool.name])
+              const name = ['exec_command', 'shell_command', 'shell'].find(name => names.includes(name))
+              assert(name, 'actual native child must advertise an execution tool')
+              const args = name === 'exec_command' ? { cmd: 'cat contract-input.txt', shell: '/bin/sh', login: false, max_output_tokens: 1000 } : name === 'shell' ? { command: ['sh', '-c', 'cat contract-input.txt'] } : { command: 'cat contract-input.txt' }
+              return advertisedCall(record, name, args, 'child_contract_command')
+            }
+            const output = toolOutput(record, 'call_child_contract_command')
+            assert.match(output, /codex-child-untrusted-command-ran/)
+            capture.observations.childCommandOutput = output
+          }
           return { text: 'Exact child final answer.', pauseAfterDelta: () => childStream.promise }
         }
         if (step === 0) {
@@ -708,7 +802,7 @@ export async function captureNativeScenario(name, options = {}) {
         const quote = value => `'${value.replaceAll("'", "'\\''")}'`
         const networkScript = `import socket; s=socket.create_connection(('127.0.0.1', ${new URL(fixture.baseUrl).port}), timeout=2); s.sendall(b'GET /native-network-canary HTTP/1.0\\r\\n\\r\\n'); print(s.recv(128))`
         commands.push(`printf forbidden-outside > ${quote(path.join(context.stateRoot, 'outside/forbidden.txt'))}`, 'printf forbidden-git > .git/freshell-contract-denied', 'printf forbidden-codex > .codex/freshell-contract-denied', `python3 -c ${quote(networkScript)}`)
-        if (options.seccompProbeReceipt) commands.push('printf forbidden-agents > .agents/freshell-contract-denied', `printf forbidden-home > ${quote(path.join(context.environment.HOME, 'forbidden.txt'))}`, `printf forbidden-state > ${quote(path.join(context.environment.CODEX_HOME, 'forbidden.txt'))}`, `printf forbidden-tmpdir > ${quote(path.join(context.environment.TMPDIR, 'forbidden.txt'))}`, 'printf forbidden-global-temp > /tmp/freshell-codex-excluded-temp', ...(options.sandboxMode === 'read-only' ? ['printf forbidden-workspace > contract-readonly-forbidden.txt'] : []))
+        commands.push('printf forbidden-agents > .agents/freshell-contract-denied', `printf forbidden-home > ${quote(path.join(context.environment.HOME, 'forbidden.txt'))}`, `printf forbidden-state > ${quote(path.join(context.environment.CODEX_HOME, 'forbidden.txt'))}`, `printf forbidden-tmpdir > ${quote(path.join(context.environment.TMPDIR, 'forbidden.txt'))}`, 'printf forbidden-global-temp > /tmp/freshell-codex-excluded-temp', ...(options.sandboxMode === 'read-only' ? ['printf forbidden-workspace > contract-readonly-forbidden.txt'] : []))
       }
       const deniedStep = options.probePolicyEffects && step === commands.length + 1
       if (name === 'approval-policy-restricted-exec' && (step < commands.length || deniedStep)) {
@@ -741,6 +835,7 @@ export async function captureNativeScenario(name, options = {}) {
       extraConfig = `default_permissions = "fixture_network"\napproval_policy = "on-request"\napprovals_reviewer = "user"\n${extraConfig}\n[permissions.fixture_network.filesystem]\n":minimal" = "read"\n${JSON.stringify(context.workspace)} = "read"\n${JSON.stringify(context.artifact.path)} = "read"\n[permissions.fixture_network.network]\nenabled = true\nmode = "limited"\nallow_local_binding = true\n[features.network_proxy]\nenabled = true\nproxy_url = "http://127.0.0.1:${context.network.proxyPort}"\nenable_socks5 = false\nenable_socks5_udp = false\nallow_upstream_proxy = false\nallow_local_binding = true\nmode = "limited"\ncredential_broker = false\n`
     }
     await configure(context, fixture.baseUrl, extraConfig)
+    if (options.childApproval) await fsp.writeFile(path.join(context.workspace, 'contract-input.txt'), 'codex-child-untrusted-command-ran\n')
     const restricted = name === 'approval-policy-restricted-exec' && !options.approvalControl
     if (options.largeOutput) {
       context.largeCommand = path.join(context.workspace, 'large-output.py')
@@ -757,7 +852,7 @@ export async function captureNativeScenario(name, options = {}) {
         await fsp.mkdir(path.join(context.workspace, '.agents'))
         await fsp.mkdir(path.join(context.stateRoot, 'outside'), { mode: 0o700 })
         capture.observations.gitCommonDir = spawnSync('git', ['rev-parse', '--git-common-dir'], { cwd: context.workspace, env: context.environment, encoding: 'utf8', timeout: 15_000 }).stdout.trim()
-        if (options.seccompProbeReceipt) {
+        {
           const mountRoot = path.join(context.stateRoot, 'raw-mount-attempt')
           await fsp.mkdir(mountRoot)
           const mounted = spawnSync('mount', ['-t', 'tmpfs', 'tmpfs', mountRoot], { env: context.environment, encoding: 'utf8', timeout: 15_000 })
@@ -774,8 +869,14 @@ export async function captureNativeScenario(name, options = {}) {
         assert.equal(fixture.traffic.length, 0, 'public config rejection must precede model work')
       }
       // Only this owned fixture configuration is rewritten. Production source
-      // projection is a later gate, and is never claimed by this native probe.
+      // copying is qualified separately through the production source-precedence path.
       await configure(context, fixture.baseUrl, extraConfig)
+    }
+    if (options.requirementsGuard) {
+      await nativeRequirementsGuard(context, capture)
+      assert.equal(fixture.traffic.length, 0, 'a refused policy cannot reach model work')
+      capture.passed = true
+      return capture
     }
     client = new NativeClient(capture.binary.path, context, capture)
     client.onServerRequest = frame => {
@@ -795,7 +896,7 @@ export async function captureNativeScenario(name, options = {}) {
       capture.observations.models = await client.request('model/list', { includeHidden: false, limit: 100 })
       assert(capture.observations.models.data.length > 0, 'release model discovery must return actual metadata')
     }
-    const policy = options.probeApprovalPolicy ?? (restricted ? 'untrusted' : name === 'mcp-form-url' || options.approvalControl ? 'on-request' : 'never')
+    const policy = options.probeApprovalPolicy ?? (restricted || options.childApproval ? 'untrusted' : name === 'mcp-form-url' || options.approvalControl ? 'on-request' : 'never')
     const sandboxMode = options.sandboxMode ?? 'read-only'
     const started = await client.request('thread/start', { cwd: context.workspace, model: 'contract-model', modelProvider: 'contract-loopback', approvalPolicy: policy, ...(options.approvalControl === 'network' ? { permissions: 'fixture_network' } : { sandbox: sandboxMode }), experimentalRawEvents: false, persistExtendedHistory: true, ephemeral: options.ephemeralParent ?? false, ...(options.historyMode ? { historyMode: options.historyMode } : {}) })
     capture.threadId = started.thread.id
@@ -857,6 +958,12 @@ export async function captureNativeScenario(name, options = {}) {
       })(), 30_000, 'child native completion/saving')
       capture.reads.push({ label: 'child-settled', body: childSettled })
       capture.observations.childFinalText = options.ephemeralParent ? null : assistantText(childSettled)
+      if (options.childApproval) {
+        const request = capture.serverRequests.find(frame => frame.method === 'item/commandExecution/requestApproval' && frame.params?.itemId === 'call_child_contract_command')
+        assert(request, 'spawned child must actually retain the parent untrusted approval policy')
+        assert.equal(request.params.threadId, childId, 'approval must identify the actual native child')
+        capture.observations.childApprovalPolicyProof = { parentPolicy: policy, childId, requestId: request.id, approvalId: request.params.approvalId ?? null, request: request.params, actualToolOutput: capture.observations.childCommandOutput }
+      }
       parentStream.resolve()
     }
     if (name === 'active-input-stop') {
@@ -991,7 +1098,7 @@ export async function captureNativeScenario(name, options = {}) {
           codexWrite: fs.existsSync(path.join(context.workspace, '.codex/freshell-contract-denied')),
           networkRequests: fixture.traffic.filter(request => request.path === '/native-network-canary').length,
         }
-        if (options.seccompProbeReceipt) Object.assign(capture.observations.policyEffects, {
+        Object.assign(capture.observations.policyEffects, {
           agentsWrite: fs.existsSync(path.join(context.workspace, '.agents/freshell-contract-denied')),
           homeWrite: fs.existsSync(path.join(context.environment.HOME, 'forbidden.txt')),
           stateWrite: fs.existsSync(path.join(context.environment.CODEX_HOME, 'forbidden.txt')),
@@ -1165,6 +1272,9 @@ async function main(args) {
     else if (args[index] === '--duplicate-bodies') options.duplicateBodies = true
     else if (args[index] === '--large-output') options.largeOutput = true
     else if (args[index] === '--startup-cancellation') options.startupCancellation = true
+    else if (args[index] === '--missing-policy-client-probe') options.policyClientProbe = '/freshell-missing-policy-client-probe'
+    else if (args[index] === '--requirements-guard') options.requirementsGuard = true
+    else if (args[index] === '--child-approval') options.childApproval = true
     else if (args[index] === '--ephemeral-parent') options.ephemeralParent = true
     else if (args[index] === '--probe-network-enabled') options.probeNetworkEnabled = true
     else if (args[index] === '--approval-control') { options.approvalControl = args[++index]; assert(['stdin', 'network'].includes(options.approvalControl)) }

@@ -4,6 +4,11 @@ import { describe, expect, it } from 'vitest'
 import { captureNativeScenario } from './codex-cli-contract.mjs'
 
 describe('Codex 0.164.0 release contract through an isolated Responses provider', () => {
+  it('refuses a missing real-client prerequisite before opening a native thread', async () => {
+    await expect(captureNativeScenario('text-history', { policyClientProbe: '/freshell-missing-policy-client-probe' }))
+      .rejects.toThrow(/freshell-missing-policy-client-probe/)
+  }, 180_000)
+
   it.each(['legacy', 'paginated'])('retains the actual final answer through %s history and a cold resume', async historyMode => {
     const capture = await captureNativeScenario('text-history', { historyMode, timeoutMs: 120_000 })
     expect(capture.binary.version).toBe('0.164.0')
@@ -30,8 +35,16 @@ describe('Codex 0.164.0 release contract through an isolated Responses provider'
   it.each(['read-only', 'workspace-write'])('executes restricted never policy with actual %s effects', async sandboxMode => {
     const capture = await captureNativeScenario('approval-policy-restricted-exec', { sandboxMode, probeApprovalPolicy: 'never', probePolicyEffects: true, timeoutMs: 120_000 })
     expect(capture.observations.restrictedCommandExecuted).toBe(true)
-    expect(capture.observations.policyEffects).toEqual(expect.objectContaining({ outsideWrite: false, gitWrite: false, codexWrite: false, networkRequests: 0 }))
+    expect(capture.observations.policyEffects).toEqual(expect.objectContaining({ outsideWrite: false, gitWrite: false, codexWrite: false, agentsWrite: false, homeWrite: false, stateWrite: false, excludedTmpdirWrite: false, excludedGlobalTempWrite: false, networkRequests: 0 }))
     expect(capture.observations.workspaceWritePresent).toBe(sandboxMode === 'workspace-write')
+  }, 180_000)
+
+  it('refuses untrusted work through the real Rust client under actual native requirements', async () => {
+    const capture = await captureNativeScenario('approval-policy-restricted-exec', { requirementsGuard: true, timeoutMs: 120_000 })
+    expect(capture.observations.requirementsGuard.refusedRoutes).toEqual(['create', 'resume', 'fork', 'send'])
+    expect(capture.observations.requirementsGuard.workRequests).toBe(0)
+    expect(capture.observations.requirementsGuard.ownedListenerSettled).toBe(true)
+    expect(capture.fixtureTraffic).toHaveLength(0)
   }, 180_000)
 
   it.each(['stdin', 'network'])('executes actual %s approval effects and cancellation', async approvalControl => {
@@ -68,6 +81,13 @@ describe('Codex 0.164.0 release contract through an isolated Responses provider'
     const capture = await captureNativeScenario('text-history', { historyMode, persistenceMode: 'missing', timeoutMs: 120_000 })
     expect(capture.observations.coldMissingFaultRemoved).toBe(true)
     expect(capture.observations.coldRecoveryState).toBe('saved-history-unavailable-no-invented-fragments')
+  }, 180_000)
+
+  it('preserves native untrusted intent in the spawned child without a writer takeover', async () => {
+    const capture = await captureNativeScenario('parent-child-read', { childApproval: true, timeoutMs: 120_000 })
+    expect(capture.observations.childApprovalPolicyProof.parentPolicy).toBe('untrusted')
+    expect(capture.observations.childApprovalPolicyProof.request.threadId).toBe(capture.observations.childId)
+    expect(capture.observations.childObserverMethods.every((method: string) => method === 'thread/read')).toBe(true)
   }, 180_000)
 
 })

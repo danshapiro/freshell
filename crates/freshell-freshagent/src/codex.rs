@@ -5027,6 +5027,26 @@ impl FreshCodexState {
             None,
         );
 
+        // The minted child identity and its existing ownership/cancellation
+        // guards are now armed. Refuse a changed policy through the same
+        // post-archive containment as every later startup failure, before spawn.
+        if let Err(error) = CodexAppServerClient::check_effective_approval_policy(
+            &fork_result,
+            parent_permission_mode.as_deref(),
+            "thread/fork",
+        ) {
+            tracing::warn!(event="freshagent.codex.fork_policy_refused", parent_session_id=%parent_id, session_id=%child_id, error=%error);
+            self.fail_fork_after_archive(
+                &parent_client,
+                &child_id,
+                &parent_id,
+                &reply_sink,
+                &error.to_string(),
+            )
+            .await;
+            return;
+        }
+
         // ── post-archive (failure containment applies to every step below) ──
         let fork_spawn_slot = Arc::clone(&fork_start_pid_slot);
         let fork_spawn_state = self.clone();
@@ -16705,6 +16725,150 @@ pub(crate) mod tests {
             st.sessions.lock().await.is_empty(),
             "no fork machinery ran for an unknown parent"
         );
+    }
+
+    #[tokio::test]
+    async fn handle_fork_policy_mismatch_refuses_before_child_spawn_and_settles_cleanup() {
+        // Existing ENV_LOCK/configure_fake_codex_cmd make accidental RED-path
+        // spawns hermetic; this test does not need to launch a parent app-server.
+        let _env = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+
+        let (mut st, _rx, fake) = state_with_sink();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+
+        const PARENT: &str = "parent-untrusted-fork";
+        const CHILD: &str = "child-policy-mismatch";
+        let mut ticket = match st.begin_lane_claim_at(PARENT, "seed-parent", None, "test") {
+            crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+            _ => panic!("parent seed must grant"),
+        };
+        assert!(st
+            .commit_lane_claim_at(&mut ticket, PARENT, PARENT, None)
+            .is_ok());
+
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let parent_client = Arc::new(client);
+        insert_fake_session(
+            &st,
+            PARENT,
+            parent_client.clone(),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-policy-fork-parent",
+        )
+        .await;
+        {
+            let mut sessions = st.sessions.lock().await;
+            sessions.get_mut(PARENT).unwrap().permission_mode = Some("untrusted".into());
+        }
+        let parent_before = registry.observe(PROVIDER, PARENT);
+        let capture = tracing_capture::capture_by_session("fork-policy-test-unused");
+        let (sink, captured) = capturing_sink();
+        let driver = tokio::spawn({
+            let st = st.clone();
+            async move {
+                st.handle_fork(fork_msg(PARENT, "fork-policy", None), None, sink)
+                    .await;
+            }
+        });
+
+        answer_initialize(&peer).await;
+        let (requirements_id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "configRequirements/read");
+        peer.respond(&requirements_id, json!({"requirements": null}));
+
+        let (fork_id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/fork");
+        assert_eq!(params["threadId"], PARENT);
+        assert_eq!(params["approvalPolicy"], "untrusted");
+        peer.respond(
+            &fork_id,
+            json!({
+                "thread": {"id": CHILD},
+                "approvalPolicy": "never"
+            }),
+        );
+
+        let (archive_id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/archive");
+        assert_eq!(params["threadId"], CHILD);
+        peer.respond(&archive_id, json!({}));
+
+        // The established post-archive containment must now run. Keep its
+        // response pending so guard ordering is observable without a sleep.
+        let (cleanup_id, method, params) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), peer.expect_request())
+                .await
+                .expect("mismatched fork must enter guarded post-archive cleanup");
+        assert_eq!(method, "thread/unarchive");
+        assert_eq!(params["threadId"], CHILD);
+        let child_during_cleanup = registry.observe(PROVIDER, CHILD);
+        assert!(child_during_cleanup.generation > 0);
+        assert!(matches!(
+            child_during_cleanup.state,
+            freshell_ownership::OwnershipState::Starting { .. }
+        ));
+
+        // A witnessed, still-running cleanup must survive the normal stale
+        // start sweep; this fails if cancellation/settle was armed too late.
+        let recovered = registry.recover_stale_starts(0, 0);
+        assert!(!recovered.iter().any(|entry| entry.session_id == CHILD));
+        assert!(matches!(
+            registry.observe(PROVIDER, CHILD).state,
+            freshell_ownership::OwnershipState::Starting { .. }
+        ));
+
+        peer.respond(&cleanup_id, json!({}));
+        tokio::time::timeout(std::time::Duration::from_secs(2), driver)
+            .await
+            .expect("fork refusal settles")
+            .expect("fork task");
+
+        assert_single_fork_error_frame(
+            &captured_frames(&captured),
+            PARENT,
+            "INTERNAL_ERROR",
+            "approval_policy untrusted",
+        );
+        let child_after = registry.observe(PROVIDER, CHILD);
+        assert_eq!(child_after.generation, child_during_cleanup.generation);
+        assert!(matches!(
+            child_after.state,
+            freshell_ownership::OwnershipState::Vacant
+        ));
+
+        let parent_after = registry.observe(PROVIDER, PARENT);
+        assert_eq!(parent_after.epoch, parent_before.epoch);
+        assert_eq!(parent_after.generation, parent_before.generation);
+        assert_eq!(parent_after.state, parent_before.state);
+        {
+            let sessions = st.sessions.lock().await;
+            assert_eq!(sessions.len(), 1);
+            let parent = sessions.get(PARENT).unwrap();
+            assert!(Arc::ptr_eq(&parent.client, &parent_client));
+            assert_eq!(parent.permission_mode.as_deref(), Some("untrusted"));
+            assert!(!parent.exited.load(Ordering::SeqCst));
+            assert!(!sessions.contains_key(CHILD));
+        }
+        assert_eq!(spawn_count(&capture), 0);
+        assert!(st.fork_in_flight.try_acquire(PARENT).is_some());
+        assert!(!fake
+            .bindings
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|row| row.session_id == CHILD));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.next_frame())
+                .await
+                .is_err()
+        );
+
+        peer.disconnect();
+        st.shutdown().await;
     }
 
     #[tokio::test]

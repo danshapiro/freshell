@@ -639,6 +639,8 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                 };
                 let context = crate::managed_provider_references::codex::prepare_managed(
                     crate::managed_provider_references::codex::CodexPreparation {
+                        native_source_runtime:
+                            freshell_platform::codex_inputs::NativeSourceRuntime::Tui,
                         client: &self.client,
                         soul: &soul_id,
                         creation_seed: create_key,
@@ -650,7 +652,8 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                         references: &provider_secret_references,
                     },
                 )
-                .await?;
+                .await
+                .map_err(|error| error.message)?;
                 (context.mcp_capability.clone(), Some(context))
             } else if request.mode == "claude" {
                 let home = original_provider_home(&request.env)?;

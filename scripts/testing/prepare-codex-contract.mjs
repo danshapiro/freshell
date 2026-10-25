@@ -157,8 +157,47 @@ async function stagePrepared() {
   const preparedPolicy = await fsp.readFile(path.join(stageRoot, 'codex-policy.json'), 'utf8')
   if (`sha256:${digest(preparedPolicy)}` !== policy.profileSha256) fail('connected prepared policy is stale or corrupt')
   await fsp.writeFile(path.join(owned, 'codex-policy.json'), preparedPolicy, { mode: 0o644 })
-  const manifest = { complete: true, subdir, root: `/freshell-test-artifacts/${subdir}`, artifactRoot: `/freshell-test-artifacts/${subdir}/artifact`, stateRoot: `/freshell-test-artifacts/${subdir}/state`, receiptRoot: `/freshell-test-artifacts/${subdir}/receipts`, nativeSandboxPolicy: { id: policy.id, profileSha256: policy.profileSha256, path: `/freshell-test-artifacts/${subdir}/codex-policy.json` }, fingerprint, uid: process.getuid(), gid: process.getgid(), image: null }
+  const client = JSON.parse(await fsp.readFile(path.join(stageRoot, 'policy-client-prepared.json'), 'utf8'))
+  if (client.source !== 'freshell-codex-native-policy-client-test' || !client.cargoFeatures?.includes('native-policy-qualification') || !/^\/freshell-test-artifacts\/targets\/[a-f0-9]{12}\/debug\/deps\/freshell_codex-[a-f0-9]{16}$/.test(client.path)) fail('completed connected policy client is unavailable')
+  await verifyPolicyClientProbe(client.path.replace('/freshell-test-artifacts/', '/workspace/target/'), client.sha256)
+  const probe = path.join(owned, 'policy-client-probe')
+  await fsp.copyFile(client.path.replace('/freshell-test-artifacts/', '/workspace/target/'), probe)
+  await fsp.chmod(probe, 0o755)
+  await fsp.writeFile(`${probe}.sha256`, `${client.sha256}\n`, { mode: 0o644 })
+  await verifyPolicyClientProbe(probe, client.sha256)
+  const manifest = { complete: true, subdir, root: `/freshell-test-artifacts/${subdir}`, artifactRoot: `/freshell-test-artifacts/${subdir}/artifact`, stateRoot: `/freshell-test-artifacts/${subdir}/state`, receiptRoot: `/freshell-test-artifacts/${subdir}/receipts`, nativeSandboxPolicy: { id: policy.id, profileSha256: policy.profileSha256, path: `/freshell-test-artifacts/${subdir}/codex-policy.json` }, policyClientProbe: { path: `/freshell-test-artifacts/${subdir}/policy-client-probe`, sha256: client.sha256 }, fingerprint, uid: process.getuid(), gid: process.getgid(), image: null }
   return manifest
+}
+
+export async function verifyPolicyClientProbe(file, expectedSha256) {
+  if (!path.isAbsolute(file)) fail('native policy client probe requires an explicit absolute path')
+  const ancestors = checkAncestors(file)
+  const stat = await fsp.stat(file)
+  if (!stat.isFile()) fail('native policy client probe is not a regular executable')
+  const sha256 = digest(await fsp.readFile(file))
+  const expected = expectedSha256 ?? (await fsp.readFile(`${file}.sha256`, 'utf8')).split(/\s+/)[0]
+  if (!/^[a-f0-9]{64}$/.test(expected) || sha256 !== expected) fail('native policy client probe bytes changed')
+  return { path: file, sha256, bytes: stat.size, ancestors }
+}
+
+async function preparePolicyClientProbe(targetKey) {
+  if (repoRoot !== '/workspace' || !/^[a-f0-9]{12}$/.test(targetKey)) fail('policy client compilation requires the connected owned wrapper')
+  const target = `/workspace/target/targets/${targetKey}`
+  await fsp.mkdir(target, { recursive: true })
+  const temporary = await fsp.mkdtemp(path.join(target, '.codex-policy-build-'))
+  console.error(JSON.stringify({ severity: 'info', event: 'codex_policy_client_build_started', target }))
+  try {
+    // This connected step compiles a prerequisite; it runs no tests/native work.
+    const output = run('cargo', ['test', '--locked', '-p', 'freshell-codex', '--features', 'native-policy-qualification', '--lib', '--no-run', '--message-format=json'], {
+      env: { ...process.env, CARGO_TARGET_DIR: target, CARGO_BUILD_JOBS: '3', TMPDIR: temporary },
+    })
+    const artifacts = output.trim().split('\n').map(line => JSON.parse(line)).filter(item => item.reason === 'compiler-artifact' && item.target?.name === 'freshell_codex' && item.profile?.test === true && item.executable && item.features?.includes('native-policy-qualification'))
+    if (artifacts.length !== 1) fail('connected compilation did not produce exactly one real-client test executable')
+    const artifact = artifacts[0]
+    const file = await verifyPolicyClientProbe(artifact.executable, digest(await fsp.readFile(artifact.executable)))
+    console.error(JSON.stringify({ severity: 'info', event: 'codex_policy_client_build_finished', sha256: file.sha256, bytes: file.bytes }))
+    return { path: artifact.executable.replace('/workspace/target/', '/freshell-test-artifacts/'), sha256: file.sha256, cargoFeatures: artifact.features, source: 'freshell-codex-native-policy-client-test' }
+  } finally { await fsp.rm(temporary, { recursive: true, force: true }) }
 }
 
 async function verifyPrepared() {
@@ -168,6 +207,8 @@ async function verifyPrepared() {
   const state = await fsp.readFile('/workspace/node_modules/.sandbox-deps-state', 'utf8')
   if (!state.includes(`fingerprint=${manifest.fingerprint}\n`) || !state.includes('manager_version=10.34.5\n')) fail('sandbox dependency cache is absent or stale')
   const artifact = await verifyArtifact(manifest.artifactRoot)
+  if (manifest.policyClientProbe?.path !== `${manifest.root}/policy-client-probe`) fail('required real-client policy probe is absent or escaped its owned stage')
+  await verifyPolicyClientProbe(manifest.policyClientProbe.path, manifest.policyClientProbe.sha256)
   const policy = nativeSandboxPolicy()
   if (manifest.nativeSandboxPolicy?.id !== policy.id || manifest.nativeSandboxPolicy?.profileSha256 !== policy.profileSha256 || manifest.nativeSandboxPolicy.path !== `${manifest.root}/codex-policy.json`) fail('offline native sandbox policy is absent, incompatible or stale')
   const policyBytes = await fsp.readFile(manifest.nativeSandboxPolicy.path)
@@ -214,12 +255,16 @@ async function main(args) {
     if (metadata.probeOnly !== true) fail('candidate artifact requires an explicit probe-only manifest')
     result = await prepareArtifact(args[1], metadata)
   }
+  else if (args.length === 2 && args[0] === '--prepare-policy-client-probe') result = await preparePolicyClientProbe(args[1])
   else if (args.length === 1 && args[0] === '--stage-prepared') result = await stagePrepared()
   else if (args.length === 1 && args[0] === '--verify-prepared') result = await verifyPrepared()
   else if (args.length === 1 && args[0] === '--verify-sandbox') result = await verifySandbox()
   else if (args.length === 1 && args[0] === '--sandbox') {
     await prepareArtifact(path.join(stageRoot, 'artifact'))
     await preparePolicy()
+    const targetKey = digest(repoRoot).slice(0, 12)
+    const client = JSON.parse(run('bash', ['scripts/sandbox-test.sh', `node scripts/testing/prepare-codex-contract.mjs --prepare-policy-client-probe ${targetKey}`], { stdio: ['ignore', 'pipe', 'inherit'] }))
+    await fsp.writeFile(path.join(stageRoot, 'policy-client-prepared.json'), `${JSON.stringify(client)}\n`, { mode: 0o644 })
     result = JSON.parse(run('bash', ['scripts/sandbox-test.sh', 'node scripts/testing/prepare-codex-contract.mjs --stage-prepared'], { stdio: ['ignore', 'pipe', 'inherit'] }))
     result.baseImage = run('docker', ['image', 'inspect', imageTag, '--format', '{{.Id}}']).trim()
     const context = path.join(stageRoot, 'image-context', result.subdir)
@@ -238,7 +283,9 @@ async function main(args) {
     }
     result.image = run('docker', ['image', 'inspect', tag, '--format', '{{.Id}}']).trim()
     result.contractImage = { tag, requirementsSha256: digest(CODEX_NETWORK_REQUIREMENTS) }
-    await fsp.writeFile(stageManifest, `${JSON.stringify(result, null, 2)}\n`)
+    const manifestTemporary = `${stageManifest}.${randomUUID()}.preparing`
+    await fsp.writeFile(manifestTemporary, `${JSON.stringify(result, null, 2)}\n`, { mode: 0o644, flag: 'wx' })
+    await fsp.rename(manifestTemporary, stageManifest)
     await verifySandbox()
   } else fail('usage: --output ABS | --sandbox | --stage-prepared | --verify-sandbox')
   process.stdout.write(`${JSON.stringify(result)}\n`)

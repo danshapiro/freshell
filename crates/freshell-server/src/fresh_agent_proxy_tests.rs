@@ -33,6 +33,7 @@ fn managed_provider_fresh_codex_retains_terminal_and_native_sidecar_arguments() 
     let args = crate::managed_provider_bootstrap::managed_codex_mcp_args().unwrap();
     let context = freshell_runtime_protocol::ProviderLaunchContext {
         preparation: freshell_runtime_protocol::ProviderPreparation::Codex {
+            approval_default: None,
             tui_args: args.clone(),
             sidecar_args: args.clone(),
         },
@@ -44,6 +45,7 @@ fn managed_provider_fresh_codex_retains_terminal_and_native_sidecar_arguments() 
     let freshell_runtime_protocol::ProviderPreparation::Codex {
         tui_args,
         sidecar_args,
+        ..
     } = context.preparation
     else {
         panic!("Codex preparation missing")
@@ -153,6 +155,149 @@ fn configure_proxy(
         ownership: OnceLock::new(),
     });
     (proxy, receiver)
+}
+
+async fn hosted_codex_preparation_refusal_case(rest: bool, operational: bool) {
+    let mut environment = crate::test_env_lock::TestEnv::lock().await;
+    let owned = tempfile::tempdir().unwrap();
+    let home = owned.path().join("home");
+    let workspace = owned.path().join("workspace");
+    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    let source = home.join(".codex/config.toml");
+    std::fs::write(
+        &source,
+        if operational {
+            "approval_policy = 'never'\n"
+        } else {
+            "profile = 'legacy'\n"
+        },
+    )
+    .unwrap();
+    environment.set("HOME", &home);
+    environment.set("CODEX_HOME", home.join(".codex"));
+    let socket = owned.path().join("supervisor.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let observed = calls.clone();
+    let (stop, mut stopping) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        loop {
+            let accepted = tokio::select! { _ = &mut stopping => break, accepted = listener.accept() => accepted };
+            let (mut stream, _) = accepted.unwrap();
+            let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            observed.lock().await.push(request.body.clone());
+            let result = match request.body {
+                AdminCommand::Health => Ok(AdminResult::Health { control_epoch: 1, installation_id: InstallationId::new() }),
+                AdminCommand::ReserveProviderInputs(_input) if operational => {
+                    Err(freshell_runtime_protocol::RuntimeError::new(RuntimeErrorCode::BackendUnavailable, "owned supervisor unavailable"))
+                }
+                AdminCommand::ReserveProviderInputs(input) => Ok(AdminResult::ProviderInputReservation(serde_json::from_value(serde_json::json!({
+                    "reservationId":"owned-config-reservation", "installationId":InstallationId::new(),
+                    "soulId":input.soul_id,"provider":input.provider,"creationSeedRef":input.creation_seed_ref,
+                    "intentRevision":0,"providerVolumeName":"owned-provider-volume","imageRef":"fixture-image",
+                    "hostBinaryPath":"/opt/freshell-session-host","hostBinarySha256":"a".repeat(64),
+                    "observation":{"kind":"absent","daemonId":"owned-test-daemon"}
+                })).unwrap())),
+                other => panic!("configuration refusal must not launch or mutate runtime ownership: {other:?}"),
+            };
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: request.request_id,
+                    result,
+                },
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let (proxy, mut receiver) = configure_proxy(&socket, HashMap::new());
+    let request_id = "codex-configuration-refusal";
+    if rest {
+        let error = proxy
+            .clone()
+            .create_agent(RestLaneCreate {
+                request_id: request_id.into(),
+                provider: "codex".into(),
+                session_type: "freshcodex".into(),
+                cwd: Some(workspace.to_str().unwrap().into()),
+                model: Some("original-model".into()),
+                effort: Some("high".into()),
+                permission_mode: Some("untrusted".into()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("unsupported native source must refuse before launch");
+        assert_eq!(
+            error.kind,
+            freshell_freshagent::rest_lane::RestLaneErrorKind::BadRequest
+        );
+        assert_eq!(error.code, "INVALID_REQUEST");
+        assert_eq!(error.retryable, Some(false));
+        assert!(
+            error.message.contains("profile") && error.message.contains(source.to_str().unwrap()),
+            "{}",
+            error.message
+        );
+    } else {
+        let message = serde_json::from_value(serde_json::json!({
+            "requestId":request_id,"sessionType":"freshcodex","provider":"codex", "cwd":workspace,
+            "model":"original-model","effort":"high","permissionMode":"untrusted","sandbox":"read-only"
+        })).unwrap();
+        proxy
+            .clone()
+            .handle(HostedFreshAgentCommand::Create(message))
+            .await;
+        let frame: serde_json::Value = serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
+        assert_eq!(frame["type"], "freshAgent.create.failed");
+        assert_eq!(frame["requestId"], request_id);
+        if operational {
+            assert_ne!(
+                frame["code"], "INVALID_REQUEST",
+                "a supervisor outage is not invalid user configuration"
+            );
+            assert_eq!(frame["retryable"], true);
+            assert!(frame["message"]
+                .as_str()
+                .unwrap()
+                .contains("owned supervisor unavailable"));
+        } else {
+            assert_eq!(frame["code"], "INVALID_REQUEST");
+            assert_eq!(frame["retryable"], false);
+            let message = frame["message"].as_str().unwrap();
+            assert!(
+                message.contains("profile") && message.contains(source.to_str().unwrap()),
+                "{message}"
+            );
+        }
+        assert!(
+            receiver.try_recv().is_err(),
+            "one initiating-request failure, no created event"
+        );
+    }
+    stop.send(()).unwrap();
+    settled(server).await;
+    assert!(!calls
+        .lock()
+        .await
+        .iter()
+        .any(|command| matches!(command, AdminCommand::Launch(_))));
+    assert!(proxy.aliases.lock().await.is_empty());
+    assert!(proxy.pollers.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn hosted_codex_preparation_refusal_reaches_the_initiating_request() {
+    hosted_codex_preparation_refusal_case(false, false).await;
+}
+#[tokio::test]
+async fn hosted_codex_preparation_refusal_keeps_rest_configuration_diagnostics() {
+    hosted_codex_preparation_refusal_case(true, false).await;
+}
+#[tokio::test]
+async fn hosted_codex_preparation_refusal_distinguishes_control_outage() {
+    hosted_codex_preparation_refusal_case(false, true).await;
 }
 
 /// The fake supervisor must have served every expected request by now; a
@@ -1446,7 +1591,8 @@ async fn real_gateway_outage_preserves_exact_cold_native_history_without_live_au
     ] {
         assert_eq!(
             snapshot_route_value(&app, kind, provider, id).await.0,
-            axum::http::StatusCode::SERVICE_UNAVAILABLE
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{kind}/{id} must have unavailable exact native source"
         );
     }
     // Exact-looking names cannot substitute for a readable, matching native source.
@@ -1454,7 +1600,7 @@ async fn real_gateway_outage_preserves_exact_cold_native_history_without_live_au
     std::fs::write(&wrong_codex, std::fs::read(&codex_path).unwrap()).unwrap();
     let unreadable_claude =
         claude_path.with_file_name("55555555-5555-4555-8555-555555555555.jsonl");
-    std::fs::write(&unreadable_claude, [0xff, 0xfe]).unwrap();
+    std::fs::write(&unreadable_claude, [0xff, 0xfe, b'\n']).unwrap();
     for (kind, provider, id) in [
         ("freshcodex", "codex", "wrong-native"),
         (
@@ -1465,7 +1611,8 @@ async fn real_gateway_outage_preserves_exact_cold_native_history_without_live_au
     ] {
         assert_eq!(
             snapshot_route_value(&app, kind, provider, id).await.0,
-            axum::http::StatusCode::SERVICE_UNAVAILABLE
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{kind}/{id} must have unavailable exact native source"
         );
     }
     for (path, (bytes, modified)) in paths.iter().zip(before) {

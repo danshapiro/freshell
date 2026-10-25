@@ -140,10 +140,14 @@ else
   if [ "${RUNTIME_SUITE}" -eq 1 ]; then
     case "${CMD}" in
       'node test/integration/providers/codex-cli-contract.mjs --scenario all' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario text-history --missing-policy-client-probe' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario mcp-form-url' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario parent-child-read --child-approval' | \
       'node test/integration/providers/codex-cli-contract.mjs --scenario mcp-form-url --history-mode paginated --large-output' | \
       'node test/integration/providers/codex-cli-contract.mjs --scenario mcp-form-url --history-mode legacy --large-output' | \
       'node test/integration/providers/codex-cli-contract.mjs --scenario active-input-stop' | \
       'node test/integration/providers/codex-cli-contract.mjs --scenario active-input-stop --startup-cancellation' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario approval-policy-restricted-exec --requirements-guard' | \
       'node test/integration/providers/codex-cli-contract.mjs --scenario approval-policy-restricted-exec --approval-control stdin' | \
       'node test/integration/providers/codex-cli-contract.mjs --scenario approval-policy-restricted-exec --approval-control network' | \
       'node test/integration/providers/codex-cli-contract.mjs --scenario text-history --history-mode paginated --persistence-mode delayed' | \

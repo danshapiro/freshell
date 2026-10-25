@@ -1063,6 +1063,7 @@ async fn current_provider_preparation_reopens_the_same_fresh_conversation() {
                 mcp_args: Vec::new(),
             },
             FreshProvider::Codex => ProviderPreparation::Codex {
+                approval_default: None,
                 tui_args: Vec::new(),
                 sidecar_args: Vec::new(),
             },

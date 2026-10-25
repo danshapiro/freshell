@@ -1695,6 +1695,7 @@ mod tests {
         let owned = tempfile::tempdir().unwrap();
         std::fs::create_dir(owned.path().join(".freshell")).unwrap();
         let manifest = freshell_platform::codex_inputs::CodexInputManifest {
+            native_source_runtime: freshell_platform::codex_inputs::NativeSourceRuntime::Tui,
             version: 1,
             original_home: "/absent-original-home".into(),
             cwd: "/absent-original-workspace".into(),
@@ -1711,6 +1712,7 @@ mod tests {
         };
         let context = ProviderLaunchContext {
             preparation: ProviderPreparation::Codex {
+                approval_default: None,
                 tui_args: vec![],
                 sidecar_args: vec![],
             },

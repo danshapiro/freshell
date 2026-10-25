@@ -330,6 +330,7 @@ function successResult(method, params) {
       platformOs: 'linux',
     }
   }
+  if (method === 'configRequirements/read') return { requirements: behavior.configRequirements ?? null }
   if (method === 'thread/start') {
     const threadId = behavior.threadStartThreadId
       || (behavior.uniqueThreadIds === true
@@ -347,7 +348,7 @@ function successResult(method, params) {
       model: 'fixture-model',
       modelProvider: 'openai',
       instructionSources: [],
-      approvalPolicy: 'never',
+      approvalPolicy: behavior.effectiveApprovalPolicy ?? params?.approvalPolicy ?? 'never',
       approvalsReviewer: 'user',
       sandbox: params?.sandbox ?? 'danger-full-access',
     }
@@ -366,7 +367,7 @@ function successResult(method, params) {
       model: 'fixture-model',
       modelProvider: 'openai',
       instructionSources: [],
-      approvalPolicy: 'never',
+      approvalPolicy: behavior.effectiveApprovalPolicy ?? params?.approvalPolicy ?? 'never',
       approvalsReviewer: 'user',
       sandbox: params?.sandbox ?? 'danger-full-access',
     }
@@ -414,7 +415,7 @@ function successResult(method, params) {
       model: params?.model ?? 'fixture-model',
       modelProvider: 'openai',
       instructionSources: [],
-      approvalPolicy: 'never',
+      approvalPolicy: behavior.effectiveApprovalPolicy ?? params?.approvalPolicy ?? 'never',
       approvalsReviewer: 'user',
       sandbox: params?.sandbox ?? 'danger-full-access',
     }

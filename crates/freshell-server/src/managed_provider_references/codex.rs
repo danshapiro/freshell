@@ -317,6 +317,7 @@ fn normalize(path: &Path) -> PathBuf {
 }
 
 pub(crate) struct CodexPreparation<'a> {
+    pub native_source_runtime: freshell_platform::codex_inputs::NativeSourceRuntime,
     pub client: &'a freshell_runtime_client::RuntimeClient,
     pub soul: &'a freshell_runtime_protocol::SoulId,
     pub creation_seed: &'a str,
@@ -330,8 +331,10 @@ pub(crate) struct CodexPreparation<'a> {
 
 pub(crate) async fn prepare_managed(
     request: CodexPreparation<'_>,
-) -> Result<freshell_runtime_protocol::ProviderLaunchContext, String> {
+) -> Result<freshell_runtime_protocol::ProviderLaunchContext, freshell_runtime_protocol::RuntimeError>
+{
     let CodexPreparation {
+        native_source_runtime,
         client,
         soul,
         creation_seed,
@@ -342,6 +345,19 @@ pub(crate) async fn prepare_managed(
         args,
         references,
     } = request;
+    let invalid = |message: String| {
+        freshell_runtime_protocol::RuntimeError::new(
+            freshell_runtime_protocol::RuntimeErrorCode::InvalidRequest,
+            message,
+        )
+    };
+    let unavailable = |message: String| {
+        freshell_runtime_protocol::RuntimeError::new(
+            freshell_runtime_protocol::RuntimeErrorCode::BackendUnavailable,
+            message,
+        )
+    };
+    let manifest = (|| -> Result<freshell_platform::codex_inputs::CodexInputManifest, String> {
     let codex_home =
         if let Some(selected) = original("CODEX_HOME").filter(|value| !value.is_empty()) {
             let selected = PathBuf::from(selected);
@@ -366,16 +382,34 @@ pub(crate) async fn prepare_managed(
         .map(|pair| pair[1].clone())
         .next_back();
     let manifest = freshell_platform::codex_inputs::CodexInputManifest {
+        native_source_runtime,
         version: 1,
         original_home: home.into(),
         cwd: cwd.into(),
         codex_home,
         named_profile,
     };
+    manifest.validate().map_err(str::to_string)?;
+    if let Some(name) = &manifest.named_profile {
+        return Err(format!("Codex setting --profile {name} in {} is incompatible with managed Codex0.164: its app-server cannot select that named user configuration", manifest.codex_home.join(format!("{name}.config.toml")).display()));
+    }
+    Ok(manifest)
+    })().map_err(invalid)?;
+    // Classify known source refusals before control provisioning. The actual
+    // staging operation still rechecks bytes and owns generation cleanup.
+    let discovery = discover(manifest.clone()).map_err(|message| {
+        invalid(format!(
+            "{message}; source {}",
+            manifest.codex_home.join("config.toml").display()
+        ))
+    })?;
+    approval_projection(&discovery).map_err(invalid)?;
+    drop(discovery);
     let mcp = crate::managed_provider_bootstrap::managed_codex_mcp_args()
-        .ok_or("managed Codex MCP preparation unavailable")?;
+        .ok_or_else(|| unavailable("managed Codex MCP preparation unavailable".into()))?;
     let context = freshell_runtime_protocol::ProviderLaunchContext {
         preparation: freshell_runtime_protocol::ProviderPreparation::Codex {
+            approval_default: None,
             tui_args: mcp.clone(),
             sidecar_args: mcp,
         },
@@ -388,12 +422,14 @@ pub(crate) async fn prepare_managed(
     let reservation = client
         .reserve_provider_inputs(soul.clone(), "codex".into(), creation_seed.into())
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| unavailable(error.to_string()))?;
     if reservation.provider != "codex"
         || &reservation.soul_id != soul
         || reservation.creation_seed_ref != creation_seed
     {
-        return Err("Codex selected resource reservation does not match this creation".into());
+        return Err(unavailable(
+            "Codex selected resource reservation does not match this creation".into(),
+        ));
     }
     crate::managed_mcp_capability::issue_prepared_provider_context(
         "codex",
@@ -409,12 +445,14 @@ pub(crate) async fn prepare_managed(
             ..Default::default()
         },
     )
+    .map_err(unavailable)
 }
 
 pub struct Discovery {
     pub manifest: freshell_platform::codex_inputs::CodexInputManifest,
     pub inputs: Vec<SelectedInput>,
     pub resource_roots: Vec<PathBuf>,
+    pub layers: Vec<SourceLayer>,
 }
 
 pub fn discover(
@@ -586,6 +624,9 @@ pub fn discover(
             }
         }
     }
+    if preceding.get("profile").is_some() {
+        return Err("Codex legacy profile config is no longer supported; use --profile NAME with NAME.config.toml instead");
+    }
     let legacy = if manifest.named_profile.is_none() {
         preceding.get("profile").and_then(toml::Value::as_str)
     } else {
@@ -598,7 +639,102 @@ pub fn discover(
         manifest,
         inputs,
         resource_roots: resources,
+        layers,
     })
+}
+
+/// A bounded recipe for transforming only owned public config copies. The
+/// original effective root policy is resolved before any declaration is omitted.
+pub struct ApprovalProjection {
+    pub default: freshell_runtime_protocol::CodexApprovalDefault,
+    pub sources: Vec<ApprovalSource>,
+}
+pub struct ApprovalSource {
+    pub canonical: PathBuf,
+    pub sha256: String,
+    pub strip_untrusted: bool,
+}
+pub fn approval_projection(discovery: &Discovery) -> Result<Option<ApprovalProjection>, String> {
+    if let Some(name) = &discovery.manifest.named_profile {
+        return Err(format!("Codex setting --profile {name} in {} is incompatible: the managed native0.164 app-server owner cannot select that named user configuration", discovery.manifest.codex_home.join(format!("{name}.config.toml")).display()));
+    }
+    use sha2::{Digest, Sha256};
+    let mut effective = None;
+    let mut sources = Vec::new();
+    let mut transformed_logical = std::collections::BTreeSet::new();
+    for layer in discovery.layers.iter().filter(|layer| layer.enabled) {
+        let canonical = std::fs::canonicalize(&layer.logical_path).map_err(|_| {
+            format!(
+                "Codex approval_policy source unavailable: {}",
+                layer.logical_path.display()
+            )
+        })?;
+        let (value, bytes) = read_config_source(&canonical)
+            .map_err(|message| format!("{message}: {}", layer.logical_path.display()))?;
+        if value.get("profile").is_some() {
+            return Err(format!("Codex setting profile in {} is incompatible: legacy profile config is no longer supported", layer.logical_path.display()));
+        }
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let declared = value.get("approval_policy");
+        let policy = declared.and_then(toml::Value::as_str);
+        if !sources
+            .iter()
+            .any(|source: &ApprovalSource| source.canonical == canonical)
+        {
+            sources.push(ApprovalSource {
+                canonical: canonical.clone(),
+                sha256: sha256.clone(),
+                strip_untrusted: policy == Some("untrusted"),
+            });
+        }
+        if declared.is_none() {
+            continue;
+        }
+        effective = Some(freshell_runtime_protocol::CodexApprovalDefault {
+            policy: policy.unwrap_or_default().into(),
+            logical_source: layer
+                .logical_path
+                .to_str()
+                .ok_or("Codex approval source is not UTF-8")?
+                .into(),
+            canonical_source: canonical
+                .to_str()
+                .ok_or("Codex approval source is not UTF-8")?
+                .into(),
+            source_sha256: sha256.clone(),
+        });
+        if policy == Some("untrusted") {
+            transformed_logical.insert(normalize(&layer.logical_path));
+        }
+    }
+    if !sources.iter().any(|source| source.strip_untrusted) {
+        return Ok(None);
+    }
+    // One physical template can have several logical aliases. Refuse if a
+    // disabled or role-only alias would require different bytes.
+    for input in &discovery.inputs {
+        if input.kind == InputKind::Configuration
+            && sources
+                .iter()
+                .any(|source| source.strip_untrusted && source.canonical == input.canonical_source)
+            && !transformed_logical.contains(&normalize(&input.logical_path))
+        {
+            return Err(format!("Codex approval_policy in {} cannot be faithfully projected: an inactive or role alias shares its source", input.logical_path.display()));
+        }
+    }
+    let default = effective.ok_or("Codex approval_policy declaring source unavailable")?;
+    if discovery.manifest.native_source_runtime
+        != freshell_platform::codex_inputs::NativeSourceRuntime::AppServer
+    {
+        return Err(format!("Codex setting approval_policy in {} is incompatible with the terminal CLI: native0.164 can preserve untrusted only through typed app-server requests", default.logical_source));
+    }
+    if !default.validate() {
+        return Err(format!(
+            "Codex approval_policy source metadata is incompatible: {}",
+            default.logical_source
+        ));
+    }
+    Ok(Some(ApprovalProjection { default, sources }))
 }
 
 fn add_rule_resources(root: &Path, resources: &mut Vec<PathBuf>) -> Result<(), &'static str> {
@@ -801,6 +937,9 @@ fn exists(path: &Path) -> Result<bool, &'static str> {
     }
 }
 fn read_config(path: &Path) -> Result<toml::Value, &'static str> {
+    read_config_source(path).map(|(value, _)| value)
+}
+fn read_config_source(path: &Path) -> Result<(toml::Value, Vec<u8>), &'static str> {
     use std::io::Read;
     let metadata =
         std::fs::metadata(path).map_err(|_| "Codex selected configuration is unavailable")?;
@@ -821,7 +960,8 @@ fn read_config(path: &Path) -> Result<toml::Value, &'static str> {
     }
     let raw =
         std::str::from_utf8(&bytes).map_err(|_| "Codex selected configuration is not UTF-8")?;
-    toml::from_str(raw).map_err(|_| "Codex selected configuration TOML is invalid")
+    let value = toml::from_str(raw).map_err(|_| "Codex selected configuration TOML is invalid")?;
+    Ok((value, bytes))
 }
 fn merge(target: &mut toml::Value, value: toml::Value) {
     if let (Some(target), Some(value)) = (target.as_table_mut(), value.as_table()) {
@@ -942,6 +1082,32 @@ mod tests {
             enabled,
             kind: LayerKind::User,
         }
+    }
+
+    #[test]
+    fn prepared_codex_legacy_profile_is_refused_before_approval_projection() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let cwd = owned.path().join("workspace");
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(
+            home.join(".codex/config.toml"),
+            "profile = 'legacy'\n[profiles.legacy]\napproval_policy = 'untrusted'\n",
+        )
+        .unwrap();
+        let result = discover(freshell_platform::codex_inputs::CodexInputManifest {
+            native_source_runtime: freshell_platform::codex_inputs::NativeSourceRuntime::Tui,
+            version: 1,
+            original_home: home.clone(),
+            cwd,
+            codex_home: home.join(".codex"),
+            named_profile: None,
+        });
+        assert!(
+            matches!(result, Err(error) if error.contains("legacy profile config is no longer supported")),
+            "unsupported native selector must not be projected into a different policy"
+        );
     }
 
     #[test]
@@ -1170,6 +1336,7 @@ mod tests {
             let rule = canonical.join(".codex/rules/probe.rules");
             std::fs::write(&rule, case).unwrap();
             let found = discover(CodexInputManifest {
+                native_source_runtime: freshell_platform::codex_inputs::NativeSourceRuntime::Tui,
                 version: 1,
                 original_home: home,
                 cwd: logical.join("nested"),
@@ -1239,6 +1406,7 @@ mod tests {
             )
             .unwrap();
             let found = discover(CodexInputManifest {
+                native_source_runtime: freshell_platform::codex_inputs::NativeSourceRuntime::Tui,
                 version: 1,
                 original_home: home,
                 cwd,
@@ -1302,6 +1470,7 @@ mod tests {
             .unwrap();
         }
         let found = discover(CodexInputManifest {
+            native_source_runtime: freshell_platform::codex_inputs::NativeSourceRuntime::Tui,
             version: 1,
             original_home: home,
             cwd,
@@ -1370,6 +1539,7 @@ mod tests {
                 .unwrap();
             }
             let manifest = CodexInputManifest {
+                native_source_runtime: freshell_platform::codex_inputs::NativeSourceRuntime::Tui,
                 version: 1,
                 original_home: home,
                 cwd,
@@ -1455,6 +1625,7 @@ mod tests {
             )
             .unwrap();
             let found = discover(CodexInputManifest {
+                native_source_runtime: freshell_platform::codex_inputs::NativeSourceRuntime::Tui,
                 version: 1,
                 original_home: home.clone(),
                 cwd: cwd.clone(),
@@ -1496,6 +1667,7 @@ mod tests {
         )
         .unwrap();
         let disabled = discover(CodexInputManifest {
+            native_source_runtime: freshell_platform::codex_inputs::NativeSourceRuntime::Tui,
             version: 1,
             original_home: home.clone(),
             cwd,
@@ -1544,6 +1716,7 @@ mod tests {
         .unwrap();
         for (index, expected) in ["local", "zzz", "1.10.0"].into_iter().enumerate() {
             let found = discover(CodexInputManifest {
+                native_source_runtime: freshell_platform::codex_inputs::NativeSourceRuntime::Tui,
                 version: 1,
                 original_home: home.clone(),
                 cwd: cwd.clone(),
@@ -1625,6 +1798,7 @@ mod tests {
             .unwrap();
         }
         let found = discover(CodexInputManifest {
+            native_source_runtime: freshell_platform::codex_inputs::NativeSourceRuntime::Tui,
             version: 1,
             original_home: home,
             cwd,
@@ -1727,6 +1901,7 @@ mod tests {
         {
             std::fs::write(plugin.join("plugin.json"), unrelated).unwrap();
             let found = discover(CodexInputManifest {
+                native_source_runtime: freshell_platform::codex_inputs::NativeSourceRuntime::Tui,
                 version: 1,
                 original_home: home.clone(),
                 cwd: cwd.clone(),
@@ -1767,6 +1942,7 @@ mod tests {
         )
         .unwrap();
         let error = discover(CodexInputManifest {
+            native_source_runtime: freshell_platform::codex_inputs::NativeSourceRuntime::Tui,
             version: 1,
             original_home: home,
             cwd,
@@ -1799,6 +1975,7 @@ mod tests {
         )
         .unwrap();
         let error = discover(CodexInputManifest {
+            native_source_runtime: freshell_platform::codex_inputs::NativeSourceRuntime::Tui,
             version: 1,
             original_home: home.clone(),
             cwd,
@@ -1825,6 +2002,7 @@ mod tests {
         )
         .unwrap();
         let error = discover(CodexInputManifest {
+            native_source_runtime: freshell_platform::codex_inputs::NativeSourceRuntime::Tui,
             version: 1,
             original_home: home.clone(),
             cwd,

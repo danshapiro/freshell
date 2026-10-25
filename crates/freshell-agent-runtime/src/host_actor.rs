@@ -76,6 +76,22 @@ pub struct FreshAgentProfile {
 }
 
 impl FreshAgentProfile {
+    pub fn effective_permission_mode(&self) -> Option<&str> {
+        self.permission_mode.as_deref().or_else(|| {
+            if self.provider != FreshProvider::Codex {
+                return None;
+            }
+            match &self.provider_launch_context.as_ref()?.preparation {
+                freshell_runtime_protocol::ProviderPreparation::Codex {
+                    approval_default, ..
+                } => approval_default
+                    .as_ref()
+                    .map(|default| default.policy.as_str()),
+                _ => None,
+            }
+        })
+    }
+
     /// Folds per-turn settings into the durable launch profile: every
     /// provided field replaces the stored one, absent fields keep it.
     pub fn apply_turn_settings(&mut self, settings: &FreshAgentTurnSettings) {

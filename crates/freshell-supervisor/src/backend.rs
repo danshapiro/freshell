@@ -2331,6 +2331,7 @@ mod tests {
         let context = ProviderLaunchContext {
             prepared_inputs: Some(inputs),
             preparation: ProviderPreparation::Codex {
+                approval_default: None,
                 tui_args: vec![],
                 sidecar_args: vec![],
             },

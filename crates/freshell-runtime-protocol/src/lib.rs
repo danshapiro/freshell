@@ -1022,6 +1022,35 @@ pub struct ProviderLaunchContext {
     pub config: Vec<ProviderConfigReference>,
 }
 
+/// Effective approval intent from the original active Codex config layers.
+/// Only owned public copies omit the deprecated declaration; typed requests
+/// retain this policy and its declaring source across preparation and replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CodexApprovalDefault {
+    pub policy: String,
+    pub logical_source: String,
+    pub canonical_source: String,
+    pub source_sha256: String,
+}
+impl CodexApprovalDefault {
+    pub fn validate(&self) -> bool {
+        matches!(self.policy.as_str(), "untrusted" | "on-request" | "never")
+            && [&self.logical_source, &self.canonical_source]
+                .iter()
+                .all(|source| {
+                    source.len() <= 4096
+                        && std::path::Path::new(source).is_absolute()
+                        && !source.chars().any(char::is_control)
+                })
+            && self.source_sha256.len() == 64
+            && self
+                .source_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProviderPreparation {
@@ -1031,6 +1060,8 @@ pub enum ProviderPreparation {
     Codex {
         tui_args: Vec<String>,
         sidecar_args: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approval_default: Option<CodexApprovalDefault>,
     },
     Opencode {
         project_config: Vec<ProviderConfigReference>,
@@ -1126,7 +1157,14 @@ impl ProviderLaunchContext {
             ProviderPreparation::Codex {
                 tui_args,
                 sidecar_args,
+                approval_default,
             } => {
+                if approval_default
+                    .as_ref()
+                    .is_some_and(|policy| !policy.validate())
+                {
+                    return Err(invalid());
+                }
                 let valid_recipe = |args: &[String]| {
                     args.len() == 6
                         && args[0] == "-c"
@@ -2032,6 +2070,24 @@ impl TerminalLaunchSpec {
                 RuntimeErrorCode::InvalidRequest,
                 "managed terminal launch exceeds argv/env/bootstrap bounds",
             ));
+        }
+        if self.mode == "codex" {
+            let projected = self
+                .provider_launch_context
+                .as_ref()
+                .is_some_and(|context| {
+                    matches!(
+                        &context.preparation,
+                        ProviderPreparation::Codex {
+                            approval_default: Some(_),
+                            ..
+                        }
+                    )
+                });
+            if self.provider_permission_mode.as_deref() == Some("untrusted") || projected {
+                return Err(RuntimeError::new(RuntimeErrorCode::InvalidRequest,
+                    "Codex providerPermissionMode/approval_policy untrusted is incompatible with the native0.164 terminal CLI; this prepared intent requires Freshcodex typed app-server requests"));
+            }
         }
         validate_managed_terminal_args(&self.mode, &self.args)?;
         for name in self.env.keys() {
@@ -4279,6 +4335,23 @@ mod tests {
             ProviderSecretProfile::LegacyAmplifierOnecliAnthropicHaikuLow
         );
         assert_eq!(reference.source_path, "/private/keys.env");
+    }
+
+    #[test]
+    fn codex_terminal_untrusted_request_is_refused_before_dispatch() {
+        let mut spec: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+            "terminalId":"terminal", "streamId":"stream", "mode":"codex", "program":"codex", "args":[], "env":{}, "cwd":"/workspace", "runAsUid":65534, "runAsGid":0, "cols":80, "rows":24, "projectKey":"project", "workspacePath":"/workspace", "providerPermissionMode":"untrusted"
+        })).unwrap();
+        let error = spec
+            .validate()
+            .expect_err("the native terminal CLI cannot preserve typed untrusted request intent");
+        assert!(
+            error.message.contains("providerPermissionMode") && error.message.contains("untrusted")
+        );
+        for policy in ["on-request", "never"] {
+            spec.provider_permission_mode = Some(policy.into());
+            spec.validate().unwrap();
+        }
     }
 
     #[test]
