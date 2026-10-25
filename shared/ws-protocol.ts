@@ -1144,6 +1144,11 @@ export const ReconcilePaneSchema = z.object({
   resumeSessionId: z.string().optional(),
   /** Informational only — never trusted. */
   status: z.string().optional(),
+  /** Name reliability: the pane's persisted pre-durable naming handle
+   *  (`terminal.create.namingHandle`). Additive optional. A restarted server's
+   *  managed adoption binds a zero-turn soul's row to it; the verdict ladder
+   *  ignores it. */
+  namingHandle: z.string().min(1).optional(),
 })
 
 export const PaneReconcileRequestSchema = z.object({
@@ -1677,6 +1682,10 @@ export type TerminalSessionAssociatedMessage = {
    * client-validated; old clients ignore it and keep the conflict veto).
    */
   previousSessionId?: string
+  /** The server's current naming binding after association. Unlike the
+   * client redirect cache, this distinguishes spent and still-pending
+   * handles immediately after a reload. Optional for older servers. */
+  nameRef?: SessionNameRef
 }
 
 export type TerminalCodexDurabilityUpdatedMessage = {

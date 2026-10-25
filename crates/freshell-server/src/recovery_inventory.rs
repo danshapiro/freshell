@@ -10,6 +10,9 @@ use freshell_ws::pane_ledger::{
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
+#[path = "recovery_inventory_titles.rs"]
+mod titles;
+
 pub struct DeviceUnion {
     pub device_id: String,
     pub union_doc: Value,
@@ -1007,7 +1010,7 @@ pub fn build_inventory(
                             eff_str,
                             pane_live
                         ));
-                        json!({
+                        let mut pane_projection = json!({
                             "paneId": pane["paneId"], "kind": pane["kind"],
                             "mode": payload.get("mode").cloned().unwrap_or(Value::Null),
                             "shell": payload.get("shell").cloned().unwrap_or(Value::Null),
@@ -1016,7 +1019,11 @@ pub fn build_inventory(
                             "sessionRef": eff_ref.unwrap_or(Value::Null),
                             "ledgerState": ledger_state,
                             "live": pane_live,
-                        })
+                        });
+                        // Name reliability (Task 9): the pane's title and
+                        // user flag ride along (display data, not substance).
+                        titles::forward_pane_names(pane, &mut pane_projection);
+                        pane_projection
                     })
                     .collect();
                 // Unified agent names (Task 6): the tab's stable
@@ -1026,6 +1033,7 @@ pub fn build_inventory(
                 let mut tab_projection = serde_json::Map::new();
                 tab_projection.insert("tabKey".to_string(), rec["tabKey"].clone());
                 tab_projection.insert("tabName".to_string(), rec["tabName"].clone());
+                titles::forward_tab_user_flag(rec, &mut tab_projection);
                 if rec.get("nameSource").is_some_and(|v| !v.is_null()) {
                     tab_projection.insert("nameSource".to_string(), rec["nameSource"].clone());
                 }

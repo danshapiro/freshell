@@ -41,6 +41,20 @@
 //! Neither settings dirty-merging nor a process mutex is sufficient — two
 //! real processes serialize through the file lock alone.
 //!
+//! Name reads take no lock (name-reliability Task 11,
+//! `session_name_store_view`): they answer from the adopted view after a
+//! stat of the document against the stamp the view was adopted from; only
+//! a changed stamp (or an elapsed 30 s full-check window) runs the locked
+//! full-read adoption above, and a read never queues behind a commit. It
+//! takes this store's local turn only if the turn is free (a turn held by
+//! one of this process's own transactions means that transaction is about
+//! to adopt or replace the document and update the view itself), then
+//! tries the document lock for at most 10 ms, which rides out a momentary
+//! hold by another participant. When either is busy it answers from the
+//! adopted view (`class` `local_turn_busy` or `lock_busy`), and a later
+//! read or the 2 s tick adopts the change; the tick's full read queues for
+//! the local turn like every transaction.
+//!
 //! Task 2 constructs this store in `main.rs`; Tasks 3–4 consume
 //! [`SessionNames::try_background_guard`] for the serial worker.
 
@@ -71,8 +85,8 @@ use freshell_protocol::native_location::{NativeAcquisition, NativeLocation, Nati
 use freshell_protocol::session_names::{
     LegacyCandidateScope, LegacyImportResult, LegacyNameCandidate, LegacyNameImport,
     LegacyNameTarget, LegacyProtectionEvidence, NameIntent, NameRevision, NameSource,
-    NamedProvider, SessionNameRecord, SessionNameRedirect, SessionNameRef, SessionNameUpdate,
-    MAX_NAME_REVISION,
+    NamedProvider, RenameOutcome, RenameOutcomeReason, SessionNameRecord, SessionNameRedirect,
+    SessionNameRef, SessionNameUpdate, MAX_NAME_REVISION,
 };
 use freshell_ws::tabs_persist::atomic_write_durable;
 use serde::{Deserialize, Serialize};
@@ -84,9 +98,61 @@ use crate::session_name_generation::{
     GenerationClaim, GenerationOutcome, GenerationWorkItem, IndexedNameInput,
 };
 
+// Name-reliability Task 3: the post-migration import policy and the
+// import-owned bind-collision rule. A child module so it reads the document
+// internals without widening their visibility.
+#[path = "session_name_import_policy.rs"]
+mod session_name_import_policy;
+
+// Name-reliability Task 4: the native-observation, automation-rename and
+// self-heal rules, and the batched sweep maintenance transaction. Child
+// modules for the same reason as the import policy.
+#[path = "session_name_apply.rs"]
+mod session_name_apply;
+#[path = "session_name_policy.rs"]
+mod session_name_policy;
+#[path = "session_name_sweep_batch.rs"]
+mod session_name_sweep_batch;
+// Name-reliability Task 5: the first-message fallback, re-absorb at rest
+// and the prompt-input guard.
+#[path = "session_name_first_message.rs"]
+mod session_name_first_message;
+// Name-reliability Task 6: claim/fold attempt accounting (refunds, fold-side
+// exhaustion).
+#[path = "session_name_generation_series.rs"]
+mod session_name_generation_series;
+// Name-reliability Task 11: lock-free name reads served from the adopted
+// view, and the cheap cross-process stamp peek.
+#[path = "session_name_store_view.rs"]
+mod session_name_store_view;
+// Name-reliability Task 12: the `session_names.name_changed` event log.
+#[path = "session_name_continuation.rs"]
+mod session_name_continuation;
+#[path = "session_name_events.rs"]
+mod session_name_events;
+#[path = "session_name_publish.rs"]
+mod session_name_publish;
+use session_name_apply::{indexed_key, replace_automatic, wire_source, with_outcome};
+use session_name_events::{AdoptedChanges, NameChangeCause, NameChangeEvent, UncertainCommits};
+use session_name_first_message::{first_message_fallback, InputRefusals, RefusalSite, SeriesPlan};
+use session_name_store_view::{DocumentStamp, FullCheck};
+use session_name_sweep_batch::StagedNativeBaselines;
+pub(crate) use session_name_sweep_batch::{
+    SweepMaintenanceItem, SweepMaintenanceQueue, SweepMaintenanceReport, SweepWork,
+};
+
 #[cfg(test)]
 #[path = "session_names_tests.rs"]
 mod tests;
+// Name-reliability Task 5: the first-message fallback, wrapper-text and
+// generation-input rules, end to end through the store and the sweep.
+#[cfg(test)]
+#[path = "session_name_plan_activity_tests.rs"]
+mod plan_activity_tests;
+
+#[cfg(test)]
+#[path = "session_name_continuation_tests.rs"]
+mod continuation_tests;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -282,6 +348,13 @@ struct NativeWriteState {
     /// revision at claim time for documents written before the stamp existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     series_epoch: Option<NameRevision>,
+    /// Name-reliability Task 4: the last valid, current-location native
+    /// title the provider reported for this record (never a placeholder or
+    /// other default label). A native observation equal to it is an echo —
+    /// provenance only, even when it would raise rank — so an echo can never
+    /// undo an automation or user rename. Internal; never on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_native_title: Option<String>,
 }
 
 /// Persisted fair-scheduling cursor (Task 3/4's serial worker alternates
@@ -301,9 +374,14 @@ struct SchedulingCursor {
 /// interrupted between chunks leaves the receipt open so the next boot
 /// resumes. `winning_evidence` retains, per record key, the winning
 /// migration candidate — while a record is migration-owned, a later
-/// previously-offline import compares against this retained evidence with
-/// the same deterministic total order, so import arrival order can never
-/// pick a different winner.
+/// pre-completion import (a browser import that arrived before the boot
+/// finished, or a resumed boot chunk) compares against this retained
+/// evidence and replaces it only on a strict win, and a bind
+/// collision consults it to let an import-owned default label give way.
+/// Once `completed` is committed, browser imports are acknowledged without
+/// any effect (`session_name_import_policy`), so no later import compares
+/// against it. The bookkeeping (`acknowledged_candidate_ids`, the evidence)
+/// is never pruned: an older binary sharing the document still relies on it.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MigrationReceipts {
@@ -507,6 +585,26 @@ enum Decision<T> {
 struct PublishSpec {
     key: String,
     changed: bool,
+    /// Name-reliability Task 12: why the saved name changed, logged after
+    /// the commit (`session_name_events`). `None` for status-only publishes.
+    change: Option<NameChangeEvent>,
+}
+
+impl PublishSpec {
+    /// A record whose saved name changed for `change`'s reason.
+    fn changed(key: String, change: NameChangeEvent) -> Self {
+        Self {
+            key,
+            changed: true,
+            change: Some(change),
+        }
+    }
+
+    fn change_entry(&self) -> Option<(&str, &NameChangeEvent)> {
+        self.change
+            .as_ref()
+            .map(|change| (self.key.as_str(), change))
+    }
 }
 
 /// Context handed to every decision closure.
@@ -516,13 +614,22 @@ struct TxnMeta {
     /// ([`TestHook::NativeRetryFloorMs`]); always `None` in production (the
     /// helper is test-only).
     native_retry_floor: Option<i64>,
+    /// Name-reliability Task 4: the store's staged native baselines (read
+    /// as if persisted; written by the decisions that only stage).
+    staged_baselines: Arc<StagedNativeBaselines>,
+    /// Name-reliability Task 5: the prompt-input guard's drops in this
+    /// transaction, logged once it commits.
+    input_refusals: InputRefusals,
 }
 
 /// The adopted read model: the parsed document plus a digest of the exact
-/// bytes it was adopted from (equal-generation-different-content detection).
+/// bytes it was adopted from (equal-generation-different-content detection)
+/// and the stamp of the file they came from (name-reliability Task 11: the
+/// lock-free reads' cross-process peek; `None` until stamped).
 struct Adopted {
     document: StoredDocument,
     digest: [u8; 32],
+    stamp: Option<DocumentStamp>,
 }
 
 struct NamesCore {
@@ -535,7 +642,17 @@ struct NamesCore {
     /// here (FIFO) before contending for the cross-process sidecar lock.
     local_turn: Arc<tokio::sync::Mutex<()>>,
     view: RwLock<Arc<Adopted>>,
+    /// Name-reliability Task 11: when the view was last confirmed against
+    /// the whole document (bounds how long an equal stamp is trusted).
+    full_check: FullCheck,
     tx: broadcast::Sender<SessionNameUpdate>,
+    /// Name-reliability Task 4: native baselines observed but not yet
+    /// persisted (the sweep maintenance batch persists them).
+    staged_baselines: Arc<StagedNativeBaselines>,
+    /// This store's last commit whose durable replace ended uncertain, so
+    /// the transaction that confirms it logs its name changes with their own
+    /// causes (`session_name_events`).
+    uncertain_commits: UncertainCommits,
 }
 
 /// Proof that the holder owns this store's local transaction turn; the strict
@@ -547,9 +664,15 @@ impl NamesCore {
         self.view.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
-    fn set_view(&self, document: StoredDocument, digest: [u8; 32]) {
-        *self.view.write().unwrap_or_else(|p| p.into_inner()) =
-            Arc::new(Adopted { document, digest })
+    /// Install the view the whole document was just read or written as
+    /// (always under the document lock), which also confirms it.
+    fn set_view(&self, document: StoredDocument, digest: [u8; 32], stamp: Option<DocumentStamp>) {
+        *self.view.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(Adopted {
+            document,
+            digest,
+            stamp,
+        });
+        self.full_check.mark();
     }
 
     fn publish(&self, updates: Vec<SessionNameUpdate>) {
@@ -646,8 +769,12 @@ impl SessionNames {
             view: RwLock::new(Arc::new(Adopted {
                 document: StoredDocument::initial(),
                 digest: [0; 32],
+                stamp: None,
             })),
+            full_check: FullCheck::default(),
             tx,
+            staged_baselines: Arc::new(StagedNativeBaselines::default()),
+            uncertain_commits: UncertainCommits::default(),
         });
         // Reconcile/initialize the current document before success — the same
         // strict path every transaction takes (this is a blocking boot call).
@@ -709,12 +836,13 @@ impl SessionNames {
         }))
     }
 
-    /// The common full-document adoption path before all name-dependent
-    /// reads and reconnect snapshots: re-read the entire document under the
-    /// lock (never an mtime shortcut), reconcile an unfamiliar generation's
-    /// durability, adopt it, and publish the delta to subscribers. Returns
-    /// every record as updates (bootstrap/snapshot shape: each carries the
-    /// full redirect list).
+    /// The unconditional full-document adoption: re-read the entire
+    /// document under the lock (no stamp shortcut), reconcile an unfamiliar
+    /// generation's durability, adopt it, and publish the delta to
+    /// subscribers. Returns every record as updates (bootstrap/snapshot
+    /// shape: each carries the full redirect list). The publisher's lag
+    /// recovery uses it; name reads and the 2 s tick use the cheap stamp
+    /// peek instead (`session_name_store_view`, name-reliability Task 11).
     pub(crate) fn refresh_current(&self) -> NameFuture<Vec<SessionNameUpdate>> {
         let core = Arc::clone(&self.core);
         Box::pin(spawn_txn(core, move |doc, _meta| {
@@ -771,8 +899,19 @@ impl SessionNames {
     /// accepted-Freshell-AI classifications; the HTTP route rejects the
     /// whole family, so an arbitrary caller can never assert them. The
     /// import itself never completes the migration — the runner's final
-    /// [`SessionNames::complete_legacy_migration`] does.
+    /// [`SessionNames::complete_legacy_migration`] does. Once that receipt
+    /// has committed, a non-boot import is acknowledged in full and writes
+    /// nothing at all (no backup, record or stored id; name-reliability
+    /// Task 3).
     pub(crate) fn import_legacy(&self, input: LegacyNameImport) -> NameFuture<LegacyImportResult> {
+        // `completed` never reverts, so once this store's view shows it a
+        // browser import is answered without the document lock or a
+        // re-read; a stale view falls through to the transaction, whose
+        // decision applies the same rule.
+        if !is_boot_import_id(&input.import_id) && self.migration_completed() {
+            let result = session_name_import_policy::post_completion_acknowledge(&input);
+            return Box::pin(async move { result });
+        }
         let core = Arc::clone(&self.core);
         let backup_dir = core
             .data_dir
@@ -784,8 +923,9 @@ impl SessionNames {
     }
 
     /// Durable generation work-claim seam (Task 4's worker dispatches through
-    /// this): persist an attempt's start before any provider call, consuming
-    /// one of the bounded three starts and exhausting the series at the cap.
+    /// this): persist an attempt's start before any provider call, charging
+    /// one of the bounded three starts. The claim never exhausts the series
+    /// or drops its input — the fold decides (name-reliability Task 6).
     /// `Ok(None)` = the series is not claimable right now (absent, not yet
     /// due, already in flight, exhausted, or the record's accepted source
     /// is protected) — nothing was consumed.
@@ -809,7 +949,9 @@ impl SessionNames {
     /// answer generated from older input must not be accepted), and the
     /// accepted source is below Freshell AI; empty/failed outcomes schedule
     /// the bounded retry (30s after failure 1, five minutes after failure
-    /// 2) without consuming another start.
+    /// 2) without consuming another start, or exhaust the series at the
+    /// cap; capability and quota outcomes refund the start
+    /// (name-reliability Task 6).
     // Tasks 3–4 seam: the generation worker lands next.
     #[allow(dead_code)]
     pub(crate) fn fold_generation_outcome(
@@ -914,8 +1056,11 @@ impl SessionNames {
     /// its input fingerprint the targeted first-message lookup has no
     /// remaining eligibility value — an armed-unexhausted named opencode
     /// session never pays the transcript read again on every pass).
-    /// Bounds the targeted first-message lookups: an input-carrying,
-    /// exhausted, or protected session never pays a transcript read.
+    /// One of the two conditions that gate the sweep's targeted
+    /// first-message lookups (with [`Self::needs_first_message_input`],
+    /// name-reliability Task 5): an input-carrying, exhausted, or protected
+    /// session pays a transcript read only while its NAME can still use the
+    /// message, and the sweep remembers each answer across passes.
     pub(crate) fn needs_generation_input(&self, target: &SessionNameRef) -> bool {
         let view = self.core.current_view();
         let document = &view.document;
@@ -933,6 +1078,29 @@ impl SessionNames {
                 series.status != GenerationStatus::Exhausted && series.input_fingerprint.is_none()
             }
         }
+    }
+
+    /// Name-reliability Task 5 (C5): whether a scoped session's record can
+    /// still use its first user message as a NAME — true when no record
+    /// exists yet, the record is below `first_message`, or the record is a
+    /// self-heal record (a junk default label) under the index row's folder
+    /// `cwd`. The sweep's targeted OpenCode first-message lookup runs when
+    /// this OR [`Self::needs_generation_input`] holds, so a session stuck on
+    /// its folder name gets the lookup even after generation stopped
+    /// needing input. A lock-free read of the adopted view.
+    pub(crate) fn needs_first_message_input(
+        &self,
+        target: &SessionNameRef,
+        cwd: Option<&str>,
+    ) -> bool {
+        let view = self.core.current_view();
+        let document = &view.document;
+        let (resolved, _) = document.resolve_ref(target);
+        document
+            .record_at(&name_ref_key(&resolved))
+            .is_none_or(|record| {
+                session_name_first_message::record_needs_first_message(record, cwd)
+            })
     }
 
     /// Task 4 dispatch re-check: whether the target's CURRENT accepted
@@ -957,9 +1125,16 @@ impl SessionNames {
     /// history. With `absorb`, a present first user message populates the
     /// series' input fingerprint/excerpt at rest (Idle — never eligible):
     /// the boot snapshot must not arm generation for every historical
-    /// session, while a genuinely newly observed message (a later pass, or
-    /// an explicit open's bind) arms it. An existing record is returned
-    /// unchanged — hydration never touches established names.
+    /// session. Wrapper or derived text is never absorbed (name-reliability
+    /// Task 5). The absorbed series arms only on an explicit open — the
+    /// bind's explicit-open hook, or the `Opened` edge of a session open in
+    /// a live terminal; a changed message that a later pass's index feeds
+    /// re-absorbs at rest instead (`session_name_first_message::plan_series`),
+    /// and a newly observed message arms only a session with no series yet.
+    /// An existing record is returned unchanged — except a self-heal record
+    /// (name-reliability Task 4: a junk default label), which the ladder's
+    /// first allowed rung replaces (no series is created or absorbed on that
+    /// path).
     pub(crate) fn hydrate_indexed(
         &self,
         input: IndexedNameInput,
@@ -972,72 +1147,112 @@ impl SessionNames {
     }
 
     /// Delta-review round 3, finding 2 — the adopted-view pre-check for the
-    /// sweep's hydration feed, in the [`needs_generation_input`] pattern (a
-    /// lock-free read of the current in-memory view). TRUE means the strict
-    /// hydrate transaction is still needed; FALSE means the view PROVES it
-    /// would be a no-op Read, so the sweep skips transacting.
+    /// sweep's hydration feed, in the [`Self::needs_generation_input`] pattern (a
+    /// lock-free read of the current in-memory view). Any answer but
+    /// [`SweepWork::None`] means the strict hydrate transaction is still
+    /// needed; `None` means the view PROVES it would be a no-op Read, so the
+    /// sweep skips transacting. Runs the SAME
+    /// `plan_hydrate` the transaction applies (name-reliability Task 4, C2),
+    /// so the pre-check and the apply can never drift.
     ///
-    /// View-accuracy argument (why skipping cannot miss a foreign process's
-    /// change): the strict hydrate decision's ONLY work is the
-    /// record-absent branch — a record present in the re-read document makes
-    /// it return Read unchanged, before `absorb` is even consulted (the
-    /// absorb lives in the insert branch only). A record present in the
-    /// adopted view is therefore present in every LATER on-disk generation:
-    /// records for durable session keys are never removed (the single
-    /// `records.remove` is the pending→durable bind retiring the PENDING
-    /// key), every persisted mutation increments documentGeneration, and a
-    /// foreign document lacking the record would need a lower or
-    /// content-rewritten equal generation — both fenced as loud Persistence
-    /// errors by the strict path. So the only effect of a stale view is
-    /// transacting unnecessarily (the safe direction); a settled session
-    /// stays settled across foreign commits. A first-boot fsync per
-    /// genuinely-new record remains — that is real durable work, paid once
-    /// per session ever, not once per pass.
-    pub(crate) fn hydrate_indexed_pending(&self, input: &IndexedNameInput) -> bool {
-        let target = SessionNameRef::Session {
-            provider: input.provider,
-            session_id: input.session_id.clone(),
-        };
-        let key = name_ref_key(&target);
-        self.core.current_view().document.record_at(&key).is_none()
+    /// Staleness (name-reliability Task 4, C3): a record's stored rank CAN
+    /// decrease — a heal moves a junk `provider_ai` name to `first_message`
+    /// and a junk `first_message` name to `directory` — so "settled on the
+    /// view" is not permanent. The remaining safety direction: a stale
+    /// adopted view only DELAYS work, it never loses it. A record present in
+    /// the view is present in every later generation (durable session keys
+    /// are never removed; a foreign document lacking the record would need a
+    /// lower or content-rewritten equal generation, both fenced as loud
+    /// Persistence errors), so the insert is never skipped wrongly; and a
+    /// foreign writer that stores a junk name (in practice only an older
+    /// binary sharing the data dir) is seen at the next adopted-view refresh
+    /// — the unconditional 2 s tick, a bootstrap read, or any local
+    /// transaction — after which the pre-check reports the heal. A
+    /// first-boot fsync per genuinely-new record remains — real durable
+    /// work, paid once per session ever, not once per pass.
+    ///
+    /// The answer classifies the work for the sweep: an insert of a new
+    /// record is per-row work ([`SweepWork::Immediate`]); a self-heal
+    /// replacement rides the pass's maintenance batch
+    /// ([`SweepWork::Maintenance`]).
+    pub(crate) fn hydrate_work(&self, input: &IndexedNameInput) -> SweepWork {
+        let view = self.core.current_view();
+        match session_name_policy::plan_hydrate(&view.document, input) {
+            None => SweepWork::None,
+            Some(session_name_policy::HydratePlan::Insert { .. }) => SweepWork::Immediate,
+            Some(session_name_policy::HydratePlan::Heal { .. }) => SweepWork::Maintenance,
+        }
     }
 
     /// Delta-review round 3, finding 2 — the adopted-view pre-check for the
-    /// sweep's activity feed: TRUE means the strict activity transaction
-    /// would still change something (or the target has no record, so the
-    /// transaction must surface its NotFound exactly as before); FALSE
-    /// means the view PROVES a no-op Read. Runs the SAME
-    /// [`plan_activity`] policy the transaction applies, so the pre-check
-    /// and the apply can never drift.
+    /// sweep's activity feed: any answer but [`SweepWork::None`] means the
+    /// strict activity transaction would still change something (or the
+    /// target has no record, so the transaction must surface its NotFound
+    /// exactly as before); `None` means the view PROVES a no-op Read. Runs
+    /// the SAME
+    /// [`plan_activity`] policy the transaction applies — the activity's
+    /// folder included (name-reliability Task 4, C1) — so the pre-check and
+    /// the apply can never drift.
     ///
-    /// Cross-process staleness: the plan is monotone-safe in both
-    /// directions. A record's source rank never decreases (offers only
-    /// raise; manual wins; migration only raises), so a foreign commit can
-    /// never make a plan-noop into plan-pending through the offer arm. The
-    /// arming arm becomes pending only when the series' input fingerprint
-    /// differs from the fed message — a foreign process moving the
-    /// fingerprint away means ITS transaction armed the series with a newer
-    /// message (work exists and will run; the input changed, not lost), and
-    /// the next pass after any adopted-view refresh (the unconditional 2s
-    /// tick, bootstrap reads, or any local transaction's adoption) re-arms
-    /// this process's feed if the index message moved. A genuinely new
-    /// record is always "pending" here, so a foreign process's hydration is
-    /// never skipped over.
-    pub(crate) fn activity_pending(&self, input: &NameActivity) -> bool {
+    /// Cross-process staleness (name-reliability Task 4, C3): a record's
+    /// stored rank CAN decrease (the self-heal rule replaces a junk
+    /// `provider_ai` name with the first message), so a foreign commit can
+    /// turn a plan-noop into plan-pending through the offer arm — in
+    /// practice only an older binary storing a junk name. The safety
+    /// direction that remains: a stale view only DELAYS that work; the next
+    /// pass after any adopted-view refresh (the unconditional 2 s tick,
+    /// bootstrap reads, or any local transaction's adoption) sees the junk
+    /// name and heals it. The arming arm becomes pending only when the
+    /// series' input fingerprint differs from the fed message — a foreign
+    /// process moving the fingerprint away means ITS transaction armed the
+    /// series with a newer message (work exists and will run; the input
+    /// changed, not lost). A genuinely new record is always "pending" here,
+    /// so a foreign process's hydration is never skipped over.
+    ///
+    /// The answer classifies the work for the sweep: a plan that is only
+    /// maintenance — a self-heal replacement (Task 4), a re-derived first
+    /// message re-absorbed at rest, or refused wrapper input dropped
+    /// (Task 5) — rides the pass's maintenance batch
+    /// ([`SweepWork::Maintenance`]); anything that arms generation, raises a
+    /// real name's rank, or must surface NotFound transacts on its own
+    /// ([`SweepWork::Immediate`]). Every non-boot pass feeds each indexed
+    /// session's first message, and an open or resumed session's message
+    /// now offers the fallback too, so the plan settles (None) once the
+    /// name and the series' input agree with the message.
+    pub(crate) fn activity_work(&self, input: &NameActivity) -> SweepWork {
         let view = self.core.current_view();
         let Ok((key, _record)) = required_record(&view.document, &input.target) else {
-            return true;
+            return SweepWork::Immediate;
         };
         if !freshell_freshagent::naming::is_unified_agent_mode(Some(&input.mode), None) {
-            return false;
+            return SweepWork::None;
         }
-        !plan_activity(
+        let plan = plan_activity(
             &view.document,
             &key,
             input.reason,
             input.first_user_message.as_deref(),
-        )
-        .is_noop()
+            input.cwd.as_deref(),
+        );
+        if plan.is_noop() {
+            SweepWork::None
+        } else if plan.is_maintenance() {
+            SweepWork::Maintenance
+        } else {
+            SweepWork::Immediate
+        }
+    }
+
+    /// Test seam: whether [`Self::hydrate_work`] reports any work.
+    #[cfg(test)]
+    pub(crate) fn hydrate_indexed_pending(&self, input: &IndexedNameInput) -> bool {
+        self.hydrate_work(input) != SweepWork::None
+    }
+
+    /// Test seam: whether [`Self::activity_work`] reports any work.
+    #[cfg(test)]
+    pub(crate) fn activity_pending(&self, input: &NameActivity) -> bool {
+        self.activity_work(input) != SweepWork::None
     }
 
     /// Task 3: the store's CURRENT verified location revision for `target`
@@ -1223,23 +1438,59 @@ impl SessionNames {
     }
 }
 
-impl SessionNaming for SessionNames {
-    fn get(&self, refs: Vec<SessionNameRef>) -> NameFuture<Vec<SessionNameUpdate>> {
+impl SessionNames {
+    /// Name-reliability Task 4 (test seam): the native baseline staged in
+    /// memory for `target`, if any.
+    #[cfg(test)]
+    pub(crate) fn staged_native_baseline(&self, target: &SessionNameRef) -> Option<String> {
+        let (resolved, _) = self.core.current_view().document.resolve_ref(target);
+        self.core.staged_baselines.title(&name_ref_key(&resolved))
+    }
+
+    /// Name-reliability Task 4: whether any native baseline waits for the
+    /// sweep maintenance batch.
+    pub(crate) fn has_staged_native_baselines(&self) -> bool {
+        !self.core.staged_baselines.is_empty()
+    }
+
+    /// Name-reliability Task 4 (LB-B1): the sweep pass's ONE maintenance
+    /// transaction — the queued self-heal items (at most
+    /// [`SWEEP_MAINTENANCE_BATCH`]; the queue counts the rest as deferred)
+    /// re-planned on the fresh document, then staged native baselines in
+    /// the remaining room, summarized in one INFO line once it committed.
+    /// Nothing queued and nothing staged answers at once, without a
+    /// transaction.
+    pub(crate) fn sweep_maintenance(
+        &self,
+        batch: impl Into<SweepMaintenanceQueue>,
+    ) -> NameFuture<SweepMaintenanceReport> {
+        let batch = batch.into();
+        if batch.is_empty() && !self.has_staged_native_baselines() {
+            return Box::pin(async { Ok(SweepMaintenanceReport::default()) });
+        }
         let core = Arc::clone(&self.core);
-        Box::pin(spawn_txn(core, move |doc, _meta| {
-            let mut updates = Vec::new();
-            for target in &refs {
-                let (resolved, traversed) = doc.resolve_ref(target);
-                let key = name_ref_key(&resolved);
-                if let Some(mut update) = update_for_key(doc, &key, false, RedirectScope::None) {
-                    if let Some(redirect) = traversed {
-                        update.redirects.push(redirect);
-                    }
-                    updates.push(update);
-                }
-            }
-            Ok(Decision::Read(updates))
-        }))
+        Box::pin(async move {
+            let data_dir = core.data_dir.clone();
+            let report = spawn_txn(core, move |doc, meta| {
+                session_name_sweep_batch::sweep_maintenance_decision(doc, meta, batch)
+            })
+            .await?;
+            // Summarized only once committed (or settled as a Read).
+            report.log_committed(&data_dir);
+            Ok(report)
+        })
+    }
+}
+
+impl SessionNaming for SessionNames {
+    /// Name-reliability Task 11: served from the adopted view after the
+    /// stamp peek — no document lock, no re-parse while nothing changed
+    /// (`session_name_store_view`).
+    fn get(&self, refs: Vec<SessionNameRef>) -> NameFuture<Vec<SessionNameUpdate>> {
+        Box::pin(session_name_store_view::read_names(
+            Arc::clone(&self.core),
+            refs,
+        ))
     }
 
     fn ensure_pending(&self, input: PendingNameInput) -> NameFuture<SessionNameUpdate> {
@@ -1253,6 +1504,26 @@ impl SessionNaming for SessionNames {
         let core = Arc::clone(&self.core);
         Box::pin(spawn_txn(core, move |doc, meta| {
             bind_pending_decision(doc, meta, input)
+        }))
+    }
+
+    fn ensure_session(
+        &self,
+        target: SessionNameRef,
+        cwd: Option<String>,
+    ) -> NameFuture<SessionNameUpdate> {
+        Box::pin(spawn_txn(Arc::clone(&self.core), move |doc, _meta| {
+            session_name_continuation::ensure_session(doc, target, cwd)
+        }))
+    }
+
+    fn continue_session(
+        &self,
+        source: SessionNameRef,
+        target: SessionNameRef,
+    ) -> NameFuture<Option<SessionNameUpdate>> {
+        Box::pin(spawn_txn(Arc::clone(&self.core), move |doc, meta| {
+            session_name_continuation::continue_session(doc, meta.now_ms, source, target)
         }))
     }
 
@@ -1509,19 +1780,34 @@ async fn await_local_turn(core: &NamesCore) -> LocalTurn {
     turn
 }
 
-fn run_txn_sync<T, F>(core: &NamesCore, _turn: &LocalTurn, f: F) -> Result<T, NameError>
+fn run_txn_sync<T, F>(core: &NamesCore, turn: &LocalTurn, f: F) -> Result<T, NameError>
 where
     F: FnOnce(&mut StoredDocument, &TxnMeta) -> Result<Decision<T>, NameError>,
 {
-    let _guard = acquire_document_lock(&core.lock_path)?;
+    let guard = acquire_document_lock(&core.lock_path)?;
+    run_txn_locked(core, turn, guard, f)
+}
+
+/// The transaction body, run while the caller holds this store's local turn
+/// and `_guard` holds the document lock (the reads' short-wait adoption
+/// takes both its own way, `session_name_store_view`).
+fn run_txn_locked<T, F>(
+    core: &NamesCore,
+    _turn: &LocalTurn,
+    _guard: HeldSidecarLock,
+    f: F,
+) -> Result<T, NameError>
+where
+    F: FnOnce(&mut StoredDocument, &TxnMeta) -> Result<Decision<T>, NameError>,
+{
     count_store_transaction_for_test(&core.data_dir);
     test_hold_once(&core.data_dir);
 
-    let raw = std::fs::read(&core.doc_path);
-    let (mut document, raw_digest, first_init) = match raw {
-        Ok(bytes) => {
+    let raw = session_name_store_view::read_with_stamp(&core.doc_path);
+    let (mut document, raw_digest, raw_stamp, first_init) = match raw {
+        Ok((bytes, stamp)) => {
             let digest = digest_bytes(&bytes);
-            (parse_document(&bytes)?, digest, false)
+            (parse_document(&bytes)?, digest, Some(stamp), false)
         }
         Err(e) if e.kind() == ErrorKind::NotFound => {
             // A missing document is initialization ONLY for a store with no
@@ -1536,7 +1822,7 @@ where
                         .into(),
                 ));
             }
-            (StoredDocument::initial(), [0u8; 32], true)
+            (StoredDocument::initial(), [0u8; 32], None, true)
         }
         Err(e) => {
             return Err(NameError::Persistence(format!(
@@ -1564,10 +1850,24 @@ where
             reconcile_durability(&core.doc_path, &core.data_dir)?;
         }
     }
+    // The name changes since the adopted view — another participant's
+    // commits, and this store's own uncertain one — captured before this
+    // decision mutates the document (name-reliability Task 12).
+    let adopted = if first_init {
+        AdoptedChanges::default()
+    } else {
+        core.uncertain_commits.adopted_changes(
+            &core.current_view().document,
+            &document,
+            &raw_digest,
+        )
+    };
 
     let meta = TxnMeta {
         now_ms: effective_now_ms(&core.data_dir),
         native_retry_floor: take_native_retry_floor(&core.data_dir),
+        staged_baselines: Arc::clone(&core.staged_baselines),
+        input_refusals: InputRefusals::default(),
     };
     let decision = f(&mut document, &meta)?;
 
@@ -1582,16 +1882,46 @@ where
                 write_durable(core, &document, &bytes, digest)?;
                 return Ok(value);
             }
-            adopt_if_newer(core, document, raw_digest, true);
+            // A staged baseline another participant already persisted (or
+            // whose record is gone) is no longer pending work.
+            core.staged_baselines.prune_persisted(&document);
+            if adopt_if_newer(core, document, raw_digest, raw_stamp, true) {
+                core.uncertain_commits.log_adopted(adopted);
+            } else {
+                // The file still holds the adopted generation.
+                session_name_store_view::confirm_view(core, raw_stamp);
+            }
             Ok(value)
         }
         Decision::Write { value, publish } => {
+            let prior = core.current_view();
             document.document_generation += 1;
             let bytes = serialize_document(&document)?;
             let digest = digest_bytes(&bytes);
-            write_durable(core, &document, &bytes, digest)?;
+            if let Err(error) = write_durable(core, &document, &bytes, digest) {
+                if matches!(error, NameError::CommitUncertain(_)) {
+                    // The replacement landed but is unconfirmed: its name
+                    // changes are logged by the transaction that confirms it.
+                    core.uncertain_commits.remember(
+                        adopted,
+                        document,
+                        digest,
+                        publish.iter().filter_map(PublishSpec::change_entry),
+                    );
+                }
+                return Err(error);
+            }
+            core.staged_baselines.prune_persisted(&document);
+            // Committed: log the adopted and the own name changes.
+            core.uncertain_commits.log_adopted(adopted);
+            session_name_events::log_name_changes(
+                &document,
+                publish.iter().filter_map(PublishSpec::change_entry),
+            );
+            meta.input_refusals.log_committed();
             // Publish while the lock is still held: local generation order.
-            let updates = materialize_publish(&document, &publish);
+            let updates =
+                session_name_publish::committed_updates(&prior.document, &document, &publish);
             core.publish(updates);
             Ok(value)
         }
@@ -1629,7 +1959,10 @@ fn write_durable(
             "injected post-replace failure: the replacement may not be durable".into(),
         ));
     }
-    core.set_view(document.clone(), digest);
+    // Still under the lock, so the stamp is the file just written (a failed
+    // stat leaves the view unstamped: the next peek re-reads).
+    let stamp = session_name_store_view::stat_stamp(&core.doc_path).ok();
+    core.set_view(document.clone(), digest, stamp);
     Ok(())
 }
 
@@ -1640,6 +1973,7 @@ fn adopt_if_newer(
     core: &NamesCore,
     document: StoredDocument,
     digest: [u8; 32],
+    stamp: Option<DocumentStamp>,
     publish_delta: bool,
 ) -> bool {
     let prior = core.current_view();
@@ -1647,7 +1981,7 @@ fn adopt_if_newer(
         return false;
     }
     let delta = delta_updates(&prior.document, &document);
-    core.set_view(document, digest);
+    core.set_view(document, digest, stamp);
     if publish_delta {
         core.publish(delta);
     }
@@ -1724,6 +2058,8 @@ fn update_for_key(
         redirects,
         changed,
         native_sync: native_sync_projection(document, key),
+        // Rename responses set their own outcome; nothing else carries one.
+        outcome: None,
     })
 }
 
@@ -1923,6 +2259,14 @@ pub(crate) enum TestHook {
     /// advance virtual time without sleeping. Data-dir-keyed like every
     /// other hook, so parallel tests never cross-contaminate.
     ClockOffsetMs(i64),
+    /// Name-reliability Task 11: shorten (or lengthen) the stamp peek's
+    /// periodic full-check interval for the data dir. Persists until
+    /// cleared, like the clock offset.
+    FullCheckIntervalMs(u64),
+    /// Name-reliability Task 11: lengthen (or shorten) how long a name read
+    /// waits for a busy document lock before answering from the adopted
+    /// view. Persists until cleared, like the clock offset.
+    ReadLockWaitMs(u64),
 }
 
 /// Readiness sentinel written by `HoldLock` hooks while the document lock is
@@ -2158,23 +2502,18 @@ fn read_update(document: &StoredDocument, key: &str) -> SessionNameUpdate {
 }
 
 /// The commit-decision shape: the post-commit value update plus the publish
-/// list (records publish only when their accepted value changed;
-/// bookkeeping-only generations publish nothing).
+/// list (records publish only when their accepted value changed — `change`
+/// says why; bookkeeping-only generations pass `None` and publish nothing).
 fn commit_decision(
     document: &StoredDocument,
     key: &str,
-    changed: bool,
+    change: Option<NameChangeEvent>,
 ) -> Decision<SessionNameUpdate> {
-    let value = update_after_commit(document, key, changed, RedirectScope::ToRecord)
+    let value = update_after_commit(document, key, change.is_some(), RedirectScope::ToRecord)
         .expect("the record resolves");
-    let publish = if changed {
-        vec![PublishSpec {
-            key: key.to_string(),
-            changed: true,
-        }]
-    } else {
-        Vec::new()
-    };
+    let publish = change
+        .map(|change| vec![PublishSpec::changed(key.to_string(), change)])
+        .unwrap_or_default();
     Decision::Write { value, publish }
 }
 
@@ -2192,6 +2531,7 @@ fn commit_decision_publishing_status(
         publish: vec![PublishSpec {
             key: key.to_string(),
             changed: false,
+            change: None,
         }],
     }
 }
@@ -2267,16 +2607,6 @@ fn directory_fallback_name(cwd: Option<&str>, provider: &NamedProvider) -> Strin
         .and_then(basename_segment)
         .unwrap_or_else(|| label.clone());
     validate_name(&candidate).unwrap_or(label)
-}
-
-/// The first-message fallback title (the existing 50-char extraction).
-fn first_message_fallback(message: &str) -> Option<String> {
-    let title = freshell_sessions::text::extract_title_from_message(message, 50);
-    if title.is_empty() {
-        None
-    } else {
-        Some(title)
-    }
 }
 
 /// Bounded first-message excerpt retained for generation (existing prompt cap).
@@ -2588,9 +2918,10 @@ fn ensure_pending_decision(
     document.records.insert(key.clone(), record);
     let value = update_after_commit(document, &key, true, RedirectScope::None)
         .expect("the freshly inserted record resolves");
+    let change = NameChangeEvent::new(NameChangeCause::EnsurePending, None, None);
     Ok(Decision::Write {
         value,
-        publish: vec![PublishSpec { key, changed: true }],
+        publish: vec![PublishSpec::changed(key, change)],
     })
 }
 
@@ -2612,24 +2943,70 @@ fn rename_decision(
             });
         }
     }
-    // UI Rename always conveys user intent; automation defaults to an
-    // automatic suggestion (provider_ai rank — it can never freeze a name).
-    let source = if input.intent == NameIntent::User {
-        NameSource::Manual
-    } else {
-        NameSource::ProviderAi
-    };
-    if offer_mut(document, &key, name, source, meta.now_ms)? {
-        let record = document
-            .record_at(&key)
-            .cloned()
-            .expect("the accepted record resolves");
-        if source_is_writable(record.source) {
+    if input.intent == NameIntent::User {
+        // UI Rename always conveys user intent: it always wins (an identical
+        // manual rename is not a new decision and changes nothing).
+        let change = NameChangeEvent::new(NameChangeCause::ManualRename, Some(&record), None);
+        let outcome = if offer_mut(document, &key, name, NameSource::Manual, meta.now_ms)? {
+            let record = document
+                .record_at(&key)
+                .cloned()
+                .expect("the accepted record resolves");
             reset_native_series(document, &key, &record);
+            return Ok(with_outcome(
+                commit_decision(document, &key, Some(change)),
+                RenameOutcome {
+                    applied: true,
+                    reason: None,
+                },
+            ));
+        } else {
+            RenameOutcome {
+                applied: true,
+                reason: Some(RenameOutcomeReason::Unchanged),
+            }
+        };
+        return Ok(with_outcome(
+            Decision::Read(read_update(document, &key)),
+            outcome,
+        ));
+    }
+    // Automation (omitted/`automatic` intent): recorded at `provider_ai`,
+    // equal rank allowed, never over a protected name and never a default
+    // label for the target (name-reliability Task 4).
+    let verdict =
+        session_name_policy::automation_rename_decision(&record, &name, input.cwd.as_deref());
+    match verdict {
+        session_name_policy::AutomationRenameVerdict::Apply => {
+            let change = NameChangeEvent::new(
+                NameChangeCause::AutomationRename,
+                Some(&record),
+                input.cwd.as_deref(),
+            );
+            replace_automatic(document, &key, name, NameSource::ProviderAi)?;
+            Ok(with_outcome(
+                commit_decision(document, &key, Some(change)),
+                verdict.outcome(),
+            ))
         }
-        Ok(commit_decision(document, &key, true))
-    } else {
-        Ok(Decision::Read(read_update(document, &key)))
+        session_name_policy::AutomationRenameVerdict::Unchanged => Ok(with_outcome(
+            Decision::Read(read_update(document, &key)),
+            verdict.outcome(),
+        )),
+        session_name_policy::AutomationRenameVerdict::Refused(reason) => {
+            tracing::info!(
+                target: "freshell_server::session_names",
+                op = "rename",
+                name_ref = %key,
+                source = %wire_source(record.source),
+                reason = ?reason,
+                "session_names.automation_rename_refused"
+            );
+            Ok(with_outcome(
+                Decision::Read(read_update(document, &key)),
+                verdict.outcome(),
+            ))
+        }
     }
 }
 
@@ -2640,7 +3017,7 @@ fn offer_decision(
     name: &str,
     source: NameSource,
 ) -> Result<Decision<SessionNameUpdate>, NameError> {
-    let (key, _record) = required_record(document, target)?;
+    let (key, prior) = required_record(document, target)?;
     let name = validate_name(name)?;
     if offer_mut(document, &key, name, source, meta.now_ms)? {
         let record = document
@@ -2650,7 +3027,8 @@ fn offer_decision(
         if source_is_writable(record.source) {
             reset_native_series(document, &key, &record);
         }
-        Ok(commit_decision(document, &key, true))
+        let change = NameChangeEvent::new(NameChangeCause::of_offer(source), Some(&prior), None);
+        Ok(commit_decision(document, &key, Some(change)))
     } else {
         Ok(Decision::Read(read_update(document, &key)))
     }
@@ -2707,8 +3085,9 @@ fn bind_pending_decision(
 
     // Rank decides the collision: manual/manual compares actual manual
     // revisions; equal automatic ranks favor the durable record; migration
-    // protection rides the rank order. Losing evidence is retained in
-    // recovery, never active.
+    // protection rides the rank order — except that an import-owned default
+    // label ("Tab 4") always gives way to the live pending record (Task 3).
+    // Losing evidence is retained in recovery, never active.
     let (winner, loser) = match &existing {
         None => (pending_record.clone(), None),
         Some(current) => {
@@ -2718,6 +3097,10 @@ fn bind_pending_decision(
                 pending_record.manual_revision.unwrap_or(0) > current.manual_revision.unwrap_or(0)
             } else {
                 source_rank(pending_record.source) > source_rank(current.source)
+                    || session_name_import_policy::import_owned_label_loses_bind(
+                        document,
+                        &target_key,
+                    )
             };
             if pending_wins {
                 (pending_record.clone(), Some(current.clone()))
@@ -2773,127 +3156,118 @@ fn bind_pending_decision(
     // the session. An unattempted absorbed series (hydration installed the
     // fingerprint at rest so history alone never schedules the paid title)
     // becomes eligible now; an attempted series keeps its own schedule, and
-    // a protected winner keeps generation stopped.
+    // a protected winner keeps generation stopped. Name-reliability Task 5:
+    // a series whose stored input is wrapper or derived text stays Idle and
+    // drops it (never armed from it).
     if !source_is_protected(record.source) {
         if let Some(series) = document.generation.get_mut(&target_key) {
-            if series.status == GenerationStatus::Idle
-                && series.consumed == 0
-                && series.input_fingerprint.is_some()
-            {
-                series.status = GenerationStatus::Eligible;
-                series.next_due = None;
-            }
+            session_name_first_message::explicit_open(series, &meta.input_refusals);
         }
     }
 
-    Ok(commit_decision(document, &target_key, true))
+    // The session's saved name before the bind (none: the bind creates it).
+    let cause = if existing.is_some() {
+        NameChangeCause::BindCollision
+    } else {
+        NameChangeCause::Bind
+    };
+    let change = NameChangeEvent::new(cause, existing.as_ref(), None).with_from_ref(&pending_key);
+    Ok(commit_decision(document, &target_key, Some(change)))
 }
 
 /// The pure pre-evaluation of one activity against a document snapshot:
 /// exactly what the strict activity transaction would change, without
 /// mutating. Shared by [`activity_decision`] (the transaction's apply path)
-/// and the sweep's adopted-view pre-check ([`SessionNames::activity_pending`]),
+/// and the sweep's adopted-view pre-check ([`SessionNames::activity_work`]),
 /// so the apply and the skip can never drift apart.
 struct ActivityPlan {
-    /// The first-message fallback that would raise the record's rank.
+    /// The first-message fallback that would replace the record's name.
     offer_fallback: Option<String>,
-    /// The (fingerprint, excerpt) that would (re)arm the generation series.
-    arm: Option<(String, String)>,
+    /// The fallback replaces a self-heal record WITHOUT raising its rank
+    /// (name-reliability Task 4): maintenance work the sweep may batch.
+    offer_heals: bool,
+    /// What the activity does to the generation series
+    /// (`session_name_first_message::plan_series`).
+    series: Option<SeriesPlan>,
 }
 
 impl ActivityPlan {
     fn is_noop(&self) -> bool {
-        self.offer_fallback.is_none() && self.arm.is_none()
+        self.offer_fallback.is_none() && self.series.is_none()
+    }
+
+    /// Only maintenance (name-reliability Tasks 4–5): a self-heal
+    /// replacement, an input re-absorbed at rest, a refused input dropped —
+    /// nothing that arms generation or raises a real name. The sweep may
+    /// batch it.
+    fn is_maintenance(&self) -> bool {
+        let series_maintenance = self.series.as_ref().is_none_or(|plan| !plan.arms());
+        let offer_maintenance = self.offer_fallback.is_none() || self.offer_heals;
+        !self.is_noop() && series_maintenance && offer_maintenance
     }
 }
 
 /// Evaluate the activity acceptance/arming conditions (delta-review round 3,
-/// finding 2, extracted verbatim from the former inline decision so the
-/// pre-check and the transaction share ONE policy). Callers apply the
-/// unified-mode scope admission BEFORE planning:
-/// - the first-message fallback offer runs only for accepted/index user
-///   messages, only when the extraction is a valid name, and only when it
-///   would RAISE rank (an automatic offer never overwrites an equal rank);
-/// - arming is skipped for protected sources, duplicate delivery (same input
-///   fingerprint) and exhausted series; Opened/Resumed arm only an
-///   unattempted series, except the boot-absorbed Idle series an explicit
-///   open may still arm.
+/// finding 2: the pre-check and the transaction share ONE policy). Callers
+/// apply the unified-mode scope admission BEFORE planning:
+/// - the first-message fallback is offered for EVERY reason that carries a
+///   first user message — accepted, indexed, opened and resumed alike
+///   (name-reliability Task 5, D4: an open terminal pane's session no longer
+///   keeps its folder name when AI naming fails) — only when the extraction
+///   is a valid name that is not a default or derived label (never wrapper
+///   text, RC12), and only when the automatic-offer rule accepts it
+///   (`session_name_policy`): it RAISES a real name's rank, or it replaces a
+///   self-heal record (a junk default label, classified with the activity's
+///   own `cwd`) — Task 4 — the latter only when the message can be the
+///   session's first (`session_name_first_message::fallback_may_self_heal`:
+///   an accepted send carries the current message, not the first);
+/// - the series plan (`session_name_first_message::plan_series`) is skipped
+///   for protected sources; it arms on new input or an explicit open of an
+///   unattempted series, re-absorbs a re-derived indexed message at rest,
+///   and drops refused (wrapper) input — Task 5.
 fn plan_activity(
     document: &StoredDocument,
     key: &str,
     reason: NameActivityReason,
     first_user_message: Option<&str>,
+    cwd: Option<&str>,
 ) -> ActivityPlan {
-    let Some(record) = document.record_at(key) else {
-        return ActivityPlan {
-            offer_fallback: None,
-            arm: None,
-        };
-    };
     let mut plan = ActivityPlan {
         offer_fallback: None,
-        arm: None,
+        offer_heals: false,
+        series: None,
     };
-    if matches!(
-        reason,
-        NameActivityReason::AcceptedUserMessage | NameActivityReason::IndexUserMessage
-    ) {
-        if let Some(message) = first_user_message {
-            if let Some(fallback) = first_message_fallback(message) {
-                if validate_name(&fallback).is_ok()
-                    && source_rank(NameSource::FirstMessage) > source_rank(record.source)
-                {
-                    plan.offer_fallback = Some(fallback);
-                }
-            }
+    let Some(record) = document.record_at(key) else {
+        return plan;
+    };
+    if let Some(fallback) = first_user_message.and_then(first_message_fallback) {
+        let applies = if session_name_first_message::fallback_may_self_heal(document, key, reason) {
+            session_name_policy::automatic_offer_applies
+        } else {
+            session_name_policy::rank_raise_applies
+        };
+        if validate_name(&fallback).is_ok()
+            && applies(record, &fallback, NameSource::FirstMessage, cwd)
+        {
+            plan.offer_heals = source_rank(NameSource::FirstMessage) <= source_rank(record.source);
+            plan.offer_fallback = Some(fallback);
         }
     }
     if !source_is_protected(record.source) {
-        if let Some(message) = first_user_message.map(str::trim).filter(|m| !m.is_empty()) {
-            let unattempted_only = match reason {
-                NameActivityReason::AcceptedUserMessage | NameActivityReason::IndexUserMessage => {
-                    true
-                }
-                NameActivityReason::Opened | NameActivityReason::Resumed => document
-                    .generation
-                    .get(key)
-                    .is_none_or(|series| series.consumed == 0),
-            };
-            if unattempted_only {
-                let fingerprint = fingerprint_message(message);
-                let needs_arm = match document.generation.get(key) {
-                    None => true,
-                    Some(series) => {
-                        if series.input_fingerprint.as_deref() != Some(fingerprint.as_str()) {
-                            true
-                        } else {
-                            // "Explicit open/resume may arm an unattempted
-                            // series": the boot snapshot's absorbed series
-                            // (Idle, consumed == 0) rests until the user
-                            // actually opens the session — the same message
-                            // then arms it. An attempted series (Eligible
-                            // retry, InFlight, Exhausted) never resets.
-                            reason == NameActivityReason::Opened
-                                && series.status == GenerationStatus::Idle
-                                && series.consumed == 0
-                        }
-                    }
-                };
-                if needs_arm {
-                    // An exhausted series never re-arms (the apply path's
-                    // own guard, mirrored so the pre-check is view-accurate).
-                    let exhausted = document
-                        .generation
-                        .get(key)
-                        .is_some_and(|series| series.status == GenerationStatus::Exhausted);
-                    if !exhausted {
-                        plan.arm = Some((fingerprint, excerpt_of(message)));
-                    }
-                }
-            }
-        }
+        plan.series =
+            session_name_first_message::plan_series(document, key, reason, first_user_message);
     }
     plan
+}
+
+/// What applying one activity changed (shared by the per-row transaction
+/// and the sweep maintenance batch).
+struct ActivityApplied {
+    key: String,
+    /// The saved name changed, and why (name-reliability Task 12).
+    change: Option<NameChangeEvent>,
+    /// Generation bookkeeping changed (a persisted, invisible advance).
+    bookkeeping: bool,
 }
 
 fn activity_decision(
@@ -2901,72 +3275,77 @@ fn activity_decision(
     meta: &TxnMeta,
     input: NameActivity,
 ) -> Result<Decision<SessionNameUpdate>, NameError> {
+    let applied = apply_activity(document, meta, input)?;
+    if let Some(change) = applied.change {
+        Ok(commit_decision(document, &applied.key, Some(change)))
+    } else if applied.bookkeeping {
+        // Bookkeeping-only commit: a generation advance with no visible text.
+        Ok(commit_decision(document, &applied.key, None))
+    } else {
+        Ok(Decision::Read(read_update(document, &applied.key)))
+    }
+}
+
+/// Apply one activity exactly as [`plan_activity`] planned it: the planned
+/// fallback is installed as decided — never re-offered through the strict
+/// raise, which refuses the equal-rank self-heal the plan allowed (C1) —
+/// and the planned arm advances the series.
+fn apply_activity(
+    document: &mut StoredDocument,
+    meta: &TxnMeta,
+    input: NameActivity,
+) -> Result<ActivityApplied, NameError> {
     let NameActivity {
         target,
         mode,
         event_id: _event_id,
         reason,
         first_user_message,
-        cwd: _cwd,
+        cwd,
     } = input;
-    let (key, _record) = required_record(document, &target)?;
+    let (key, prior) = required_record(document, &target)?;
+    let mut applied = ActivityApplied {
+        key: key.clone(),
+        change: None,
+        bookkeeping: false,
+    };
 
     // Scope admission (Task 4): only the unified coding-agent modes ever
     // enter the generator — kilroy (despite sharing the Claude runtime),
     // excluded providers, and shells keep their existing naming approach.
     if !freshell_freshagent::naming::is_unified_agent_mode(Some(&mode), None) {
-        return Ok(Decision::Read(read_update(document, &key)));
+        return Ok(applied);
     }
 
-    let plan = plan_activity(document, &key, reason, first_user_message.as_deref());
+    let plan = plan_activity(
+        document,
+        &key,
+        reason,
+        first_user_message.as_deref(),
+        cwd.as_deref(),
+    );
     if plan.is_noop() {
-        return Ok(Decision::Read(read_update(document, &key)));
+        return Ok(applied);
     }
 
-    let mut changed = false;
     if let Some(fallback) = plan.offer_fallback {
-        changed = offer_mut(
+        replace_automatic(document, &key, fallback, NameSource::FirstMessage)?;
+        applied.change = Some(NameChangeEvent::new(
+            NameChangeCause::FirstMessageFallback,
+            Some(&prior),
+            cwd.as_deref(),
+        ));
+    }
+
+    if let Some(series_plan) = plan.series {
+        applied.bookkeeping = session_name_first_message::apply_series_plan(
             document,
             &key,
-            fallback,
-            NameSource::FirstMessage,
-            meta.now_ms,
-        )?;
+            series_plan,
+            &meta.input_refusals,
+        );
     }
-
-    let mut armed_or_updated = false;
-    if let Some((fingerprint, excerpt)) = plan.arm {
-        let series = document
-            .generation
-            .entry(key.clone())
-            .or_insert_with(|| GenerationState {
-                status: GenerationStatus::Eligible,
-                series_id: Uuid::new_v4().to_string(),
-                input_fingerprint: None,
-                excerpt: None,
-                attempt_ids: Vec::new(),
-                attempt_starts: Vec::new(),
-                consumed: 0,
-                next_due: None,
-                exhausted_at: None,
-            });
-        if series.status != GenerationStatus::Exhausted {
-            series.status = GenerationStatus::Eligible;
-            series.input_fingerprint = Some(fingerprint);
-            series.excerpt = Some(excerpt);
-            series.next_due = None;
-            armed_or_updated = true;
-        }
-    }
-
-    if changed {
-        Ok(commit_decision(document, &key, true))
-    } else if armed_or_updated {
-        // Bookkeeping-only commit: a generation advance with no visible text.
-        Ok(commit_decision(document, &key, false))
-    } else {
-        Ok(Decision::Read(read_update(document, &key)))
-    }
+    Ok(applied)
 }
 
 fn observe_native_decision(
@@ -2981,7 +3360,7 @@ fn observe_native_decision(
         location_revision,
         event_id,
     } = input;
-    let (key, _record) = required_record(document, &target)?;
+    let (key, record) = required_record(document, &target)?;
 
     // An old-location observation is provenance only: it can never mark the
     // current location synchronized or fold a stale title into the name.
@@ -2994,6 +3373,10 @@ fn observe_native_decision(
     let stale = location_revision < verified_revision;
 
     let mut changed = false;
+    // Name-reliability Task 4: the baseline this observation records, if
+    // any (a valid, current-location, non-placeholder title that differs
+    // from the record's last one).
+    let mut new_baseline: Option<String> = None;
     // An invalid observation title (an external rename over the accepted-name
     // cap, or control characters) never fails the transaction: only the
     // offer and the divergence rearm are skipped for the invalid text.
@@ -3005,7 +3388,22 @@ fn observe_native_decision(
         NativeNameOrigin::Snapshot | NativeNameOrigin::ProviderAi => {
             if !stale {
                 if let Some(name) = valid_title.clone() {
-                    changed = offer_mut(document, &key, name, NameSource::ProviderAi, meta.now_ms)?;
+                    // The native rule (`session_name_policy`): placeholders
+                    // and other default labels are provenance only, an echo
+                    // of the baseline never changes the name, the first
+                    // observation only records the baseline, and a changed
+                    // title replaces an unprotected provider-level name.
+                    let baseline = meta.staged_baselines.effective(document, &key);
+                    let plan = session_name_policy::native_offer_decision(
+                        &record,
+                        baseline.as_deref(),
+                        &name,
+                    );
+                    if plan.replace {
+                        replace_automatic(document, &key, name, NameSource::ProviderAi)?;
+                        changed = true;
+                    }
+                    new_baseline = plan.new_baseline;
                 }
             }
         }
@@ -3086,12 +3484,32 @@ fn observe_native_decision(
             at: meta.now_ms,
             stale,
         });
+        // A new baseline rides this real commit (and supersedes any staged
+        // one for the record).
+        if let Some(baseline) = new_baseline {
+            entry.last_native_title = Some(baseline);
+            meta.staged_baselines.remove(&key);
+        }
     } else {
+        // A baseline that changes nothing else never makes its own commit:
+        // it is staged in memory, and the sweep maintenance batch persists it
+        // (LB-B1). Losing it at a restart only means the next observation
+        // records it again.
+        if let Some(baseline) = new_baseline {
+            tracing::debug!(
+                target: "freshell_server::session_names",
+                op = "observe_native",
+                name_ref = %key,
+                "session_names.native_baseline_staged"
+            );
+            meta.staged_baselines.stage(document, &key, baseline);
+        }
         return Ok(Decision::Read(read_update(document, &key)));
     }
 
     if changed {
-        Ok(commit_decision(document, &key, true))
+        let change = NameChangeEvent::new(NameChangeCause::NativeObservation, Some(&record), None);
+        Ok(commit_decision(document, &key, Some(change)))
     } else {
         // A status-only update publishes the unchanged record with its new
         // nativeSync projection; clients fold it by documentGeneration.
@@ -3197,22 +3615,26 @@ fn claim_generation_start_decision(
             return Ok(Decision::Read(None));
         }
     }
-    // Persist the start before dispatch; empty/invalid answers and
-    // interrupted starts consume it.
+    // Name-reliability Task 5, the prompt-input guard's last line: wrapper
+    // or derived text is never sent to the model. The claim refuses it
+    // without consuming a start and drops the input, so the series rests
+    // and the worker is never offered it again.
+    if session_name_first_message::drop_refused_input(
+        series,
+        RefusalSite::Claim,
+        &meta.input_refusals,
+    ) {
+        return Ok(Decision::Write {
+            value: None,
+            publish: Vec::new(),
+        });
+    }
+    // Persist the start before dispatch; the fold decides whether it
+    // counted (name-reliability Task 6).
     let series_id = series.series_id.clone();
     let input_fingerprint = series.input_fingerprint.clone();
     let excerpt = series.excerpt.clone();
-    series.consumed += 1;
-    series.attempt_ids.push(attempt_id.to_string());
-    series.attempt_starts.push(meta.now_ms);
-    let consumed = series.consumed;
-    if series.consumed >= MAX_GENERATION_STARTS {
-        series.status = GenerationStatus::Exhausted;
-        series.exhausted_at = Some(meta.now_ms);
-        series.excerpt = None;
-    } else {
-        series.status = GenerationStatus::InFlight;
-    }
+    let consumed = session_name_generation_series::charge_start(series, attempt_id, meta.now_ms);
     // The persisted alternating class cursor: this claim served generation.
     document.scheduling_cursor.last_class = Some("generation".to_string());
     let _value = update_after_commit(document, &key, false, RedirectScope::ToRecord)
@@ -3250,9 +3672,20 @@ fn fold_generation_outcome_decision(
         return Ok(Decision::Read(read_update(document, &key)));
     }
     // The input-fingerprint guard: a re-armed series keeps its series id, so
-    // a late answer generated from older input must not be accepted.
+    // a late answer generated from older input must not be accepted — but
+    // the start it was charged still settles (name-reliability Task 6).
     if series.input_fingerprint.as_deref() != Some(input_fingerprint) {
-        return Ok(Decision::Read(read_update(document, &key)));
+        return Ok(
+            if session_name_generation_series::settle_superseded_start(
+                series,
+                &outcome,
+                meta.now_ms,
+            ) {
+                commit_decision(document, &key, None)
+            } else {
+                Decision::Read(read_update(document, &key))
+            },
+        );
     }
     // A protected winner (manual, migration-protected, accepted Freshell AI)
     // rejects late output — and stops the series for good.
@@ -3260,7 +3693,7 @@ fn fold_generation_outcome_decision(
         series.status = GenerationStatus::Idle;
         series.next_due = None;
         series.excerpt = None;
-        return Ok(commit_decision(document, &key, false));
+        return Ok(commit_decision(document, &key, None));
     }
     // An INVALID answer — a control character inside the reply (the
     // transport trims and caps but never strips them), an oversize or
@@ -3279,6 +3712,8 @@ fn fold_generation_outcome_decision(
     match outcome {
         GenerationOutcome::Answer(answer) => {
             let name = validate_name(&answer)?;
+            let change = NameChangeEvent::new(NameChangeCause::Generation, Some(&record), None)
+                .with_series(series_id);
             if offer_mut(document, &key, name, NameSource::FreshellAi, meta.now_ms)? {
                 {
                     let series = document
@@ -3296,27 +3731,27 @@ fn fold_generation_outcome_decision(
                     .cloned()
                     .expect("the accepted record resolves");
                 reset_native_series(document, &key, &record);
-                Ok(commit_decision(document, &key, true))
+                Ok(commit_decision(document, &key, Some(change)))
             } else {
                 Ok(Decision::Read(read_update(document, &key)))
             }
         }
         GenerationOutcome::Empty | GenerationOutcome::Failed(_) => {
-            // The attempt was charged at the claim; schedule the remaining
-            // delay from this fold. At the cap the series stays exhausted
-            // (the claim already exhausted it) — nothing more to schedule.
-            if series.status == GenerationStatus::Exhausted
-                || series.consumed >= MAX_GENERATION_STARTS
-            {
-                series.status = GenerationStatus::Exhausted;
-                series.next_due = None;
-                series.excerpt = None;
+            // The attempt was charged at the claim and counted: exhaust at
+            // the cap, else schedule the remaining delay from this fold.
+            session_name_generation_series::settle_consumed_start(series, meta.now_ms);
+            Ok(commit_decision(document, &key, None))
+        }
+        GenerationOutcome::CapabilityUnavailable { attempt_id }
+        | GenerationOutcome::Throttled { attempt_id } => {
+            // Name-reliability Task 6: the request never had a fair chance
+            // (refused credential, permission, proxy or quota): give the
+            // start back and keep the input.
+            if session_name_generation_series::refund_start(series, &attempt_id, meta.now_ms) {
+                Ok(commit_decision(document, &key, None))
             } else {
-                series.status = GenerationStatus::Eligible;
-                series.next_due =
-                    Some(meta.now_ms + generation_retry_delay_ms(series.consumed).unwrap_or(0));
+                Ok(Decision::Read(read_update(document, &key)))
             }
-            Ok(commit_decision(document, &key, false))
         }
     }
 }
@@ -3360,50 +3795,42 @@ fn hydrate_indexed_decision(
     input: IndexedNameInput,
     absorb: bool,
 ) -> Result<Decision<SessionNameUpdate>, NameError> {
+    let key = indexed_key(&input);
+    // The ONE hydration plan (name-reliability Task 4, C2), shared with the
+    // sweep's pre-check. The free fallbacks: a provider-authored title, then
+    // the first-message extraction, then the directory basename (the
+    // ensure_pending fallback). Round-2 carried finding F2 (adjudicated): a
+    // provider title that FAILS accepted-name validation (over the
+    // 200-scalar cap, or control characters) is an unusable rung, not a
+    // failed hydration — the ladder falls through exactly like an absent
+    // title. An abort would leave the session with NO canonical record while
+    // the ~5s sweep re-failed and re-logged it every pass.
+    let (name, source) = match session_name_policy::plan_hydrate(document, &input) {
+        // An established record (or a pending handle already bound to this
+        // durable session through a redirect) is returned unchanged.
+        None => return Ok(Decision::Read(read_update(document, &key))),
+        // A self-heal record: the allowed rung replaces the junk name; no
+        // generation series is created or absorbed on this path.
+        Some(session_name_policy::HydratePlan::Heal { name, source }) => {
+            let change = NameChangeEvent::new(
+                NameChangeCause::Hydrate,
+                document.record_at(&key),
+                input.cwd.as_deref(),
+            );
+            replace_automatic(document, &key, name, source)?;
+            return Ok(commit_decision(document, &key, Some(change)));
+        }
+        Some(session_name_policy::HydratePlan::Insert { name, source }) => (name, source),
+    };
     let IndexedNameInput {
         provider,
         session_id,
-        cwd,
         first_user_message,
-        provider_title,
+        ..
     } = input;
     let target = SessionNameRef::Session {
         provider,
         session_id,
-    };
-    let key = name_ref_key(&target);
-    // An established record (or a pending handle already bound to this
-    // durable session through a redirect) is returned unchanged — hydration
-    // never touches existing names.
-    if document.record_at(&key).is_some() {
-        return Ok(Decision::Read(read_update(document, &key)));
-    }
-    // The free fallbacks: a provider-authored title, then the first-message
-    // extraction, then the directory basename (the ensure_pending fallback).
-    // Round-2 carried finding F2 (adjudicated): a provider title that FAILS
-    // accepted-name validation (over the 200-scalar cap, or control
-    // characters) is an unusable rung, not a failed hydration — the ladder
-    // falls through exactly like an absent title. An abort would leave the
-    // session with NO canonical record while the ~5s sweep re-failed and
-    // re-logged it every pass.
-    let (name, source) = if let Some(title) = provider_title
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .filter(|t| validate_name(t).is_ok())
-    {
-        (title.to_string(), NameSource::ProviderAi)
-    } else if let Some(message) = first_user_message
-        .as_deref()
-        .and_then(first_message_fallback)
-        .filter(|fallback| validate_name(fallback).is_ok())
-    {
-        (message, NameSource::FirstMessage)
-    } else {
-        (
-            directory_fallback_name(cwd.as_deref(), &provider),
-            NameSource::Directory,
-        )
     };
     let revision = document.allocate_revision()?;
     document.records.insert(
@@ -3425,10 +3852,12 @@ fn hydrate_indexed_decision(
     // genuinely new session), no series is created here: the activity feed
     // right after arms it with the newly observed message.
     if absorb {
+        // Name-reliability Task 5: wrapper or derived text is never absorbed
+        // as AI-naming input.
         if let Some(message) = first_user_message
             .as_deref()
             .map(str::trim)
-            .filter(|m| !m.is_empty())
+            .filter(|m| session_name_first_message::is_generation_input(m))
         {
             document.generation.insert(
                 key.clone(),
@@ -3449,9 +3878,10 @@ fn hydrate_indexed_decision(
     let _ = meta;
     let value = update_after_commit(document, &key, true, RedirectScope::None)
         .expect("the freshly inserted record resolves");
+    let change = NameChangeEvent::new(NameChangeCause::Hydrate, None, None);
     Ok(Decision::Write {
         value,
-        publish: vec![PublishSpec { key, changed: true }],
+        publish: vec![PublishSpec::changed(key, change)],
     })
 }
 
@@ -3764,7 +4194,7 @@ fn fold_native_outcome_decision(
     if before != after {
         Ok(commit_decision_publishing_status(document, &key))
     } else {
-        Ok(commit_decision(document, &key, false))
+        Ok(commit_decision(document, &key, None))
     }
 }
 
@@ -3840,15 +4270,21 @@ fn classify_legacy_candidate(
     }
 }
 
-/// The core the deterministic total order compares. `Less` means `a` wins.
+/// The core the candidate order compares. `Less` means `a` wins.
 ///
 /// Order: source rank (manual > legacy_protected > freshell_ai >
 /// provider_ai > first_message > directory), then — within proven manual —
 /// trustworthy explicit-rename recency (later first, dated ahead of
 /// undated), then scope (session > pane > source_tab > terminal >
-/// derived), then ascending evidence key and candidate id. Generic
-/// updatedAt/mtime/layout timestamps never reach `explicit_rename_at`, so
-/// they can never order here.
+/// derived). Nothing else orders: candidates equal on all three compare
+/// `Equal`, and the apply path replaces only on a strict win, so the
+/// incumbent stays — a browser window or device id (the evidence key and
+/// candidate id carry them) never displaces an installed name (Task 3).
+/// Within one boot an id can still pick among exact equals:
+/// [`order_boot_legacy_candidates`] breaks comparator ties by candidate id,
+/// so the lowest id for a target installs first and stays (the same one on
+/// every boot). Generic updatedAt/mtime/layout timestamps never reach
+/// `explicit_rename_at`, so they can never order here.
 fn compare_classified_candidates(
     a: &ClassifiedLegacyCandidate,
     b: &ClassifiedLegacyCandidate,
@@ -3870,15 +4306,7 @@ fn compare_classified_candidates(
             (None, None) => {}
         }
     }
-    let scope = legacy_scope_rank(b.scope).cmp(&legacy_scope_rank(a.scope));
-    if scope != std::cmp::Ordering::Equal {
-        return scope;
-    }
-    let evidence = a.evidence_key.cmp(&b.evidence_key);
-    if evidence != std::cmp::Ordering::Equal {
-        return evidence;
-    }
-    a.candidate_id.cmp(&b.candidate_id)
+    legacy_scope_rank(b.scope).cmp(&legacy_scope_rank(a.scope))
 }
 
 /// Scope tie-break: session > pane > source_tab > terminal > derived.
@@ -3977,7 +4405,7 @@ fn resolve_legacy_target(
 
 /// Apply one classified candidate against the current document state:
 /// install a missing record, or compare against the existing record /
-/// retained winning migration evidence with the deterministic total order.
+/// retained winning migration evidence, replacing only on a strict win.
 /// Post-migration protection: a record whose accepted source is manual,
 /// legacy-protected or accepted Freshell AI (or which moved after the
 /// migration installed it through a protected decision) can never be
@@ -4001,8 +4429,10 @@ fn apply_legacy_candidate(
     let candidate_wins = match document.migration.winning_evidence.get(&key) {
         Some(evidence) if current.revision == evidence.installed_revision => {
             // Still migration-owned: compare against the retained winning
-            // evidence with the same total order — import arrival order
-            // can never pick a different winner.
+            // evidence. Only a strict win (higher rank, a later proven
+            // rename, or a wider scope) replaces it; an equal candidate —
+            // e.g. the same label kind from another window — leaves the
+            // incumbent.
             let retained = ClassifiedLegacyCandidate {
                 name: evidence.name.clone(),
                 source: evidence.source,
@@ -4134,15 +4564,18 @@ pub(crate) fn is_boot_import_id(import_id: &str) -> bool {
 }
 
 /// Order the trusted boot lane's gathered candidates best-first by the
-/// deterministic total order (`compare_classified_candidates`), so the
-/// consolidation's ≤100-candidate import chunks keep a stable membership
-/// across boots (the create-once per-import backups and the per-candidate
-/// acknowledgment replay both key off the chunk ids). Sequential
-/// application against the retained winning evidence is already
-/// permutation-invariant — the ordering is the belt that guarantees no
-/// cross-chunk comparison is ever decided by arrival order. Comparator-
-/// equal candidates are interchangeable in every compared field (the final
-/// tiebreak is the candidate id), so the stable sort needs no extra key.
+/// candidate order (`compare_classified_candidates`), then by candidate id,
+/// so the consolidation's ≤100-candidate import chunks keep a stable
+/// membership across boots (the create-once per-import backups and the
+/// per-candidate acknowledgment replay both key off the chunk ids). Higher
+/// rank or scope wins whatever the arrival order; among comparator-equal
+/// candidates the first one applied stays (strict-win apply). The
+/// candidate-id key makes that order, and so the batching, the same on
+/// every boot, and it also decides which of several comparator-equal
+/// candidates for one target is applied first: the lowest candidate id
+/// installs and stays. Candidate ids embed storage keys and device ids, so
+/// among exact equals this one choice is made by an id; it never displaces
+/// a name that is already installed.
 pub(crate) fn order_boot_legacy_candidates(candidates: &mut [LegacyNameCandidate]) {
     let mut classified: Vec<(ClassifiedLegacyCandidate, LegacyNameCandidate)> = candidates
         .iter()
@@ -4153,7 +4586,10 @@ pub(crate) fn order_boot_legacy_candidates(candidates: &mut [LegacyNameCandidate
             )
         })
         .collect();
-    classified.sort_by(|a, b| compare_classified_candidates(&a.0, &b.0));
+    classified.sort_by(|a, b| {
+        compare_classified_candidates(&a.0, &b.0)
+            .then_with(|| a.0.candidate_id.cmp(&b.0.candidate_id))
+    });
     for (slot, (_, candidate)) in candidates.iter_mut().zip(classified) {
         *slot = candidate;
     }
@@ -4169,35 +4605,28 @@ pub(crate) fn order_boot_legacy_candidates(candidates: &mut [LegacyNameCandidate
 /// chunk acknowledged ([`SessionNames::complete_legacy_migration`]), so
 /// canonical readers stop consulting migrated legacy fields exactly when
 /// the whole consolidation finished (the physical cleanup that follows is
-/// idempotently retried at boot).
+/// idempotently retried at boot). After completion a non-boot import never
+/// reaches the backup or the candidates: it is a `Read` that acknowledges
+/// every candidate id (`session_name_import_policy::post_completion_acknowledge`).
 fn import_legacy_decision(
     document: &mut StoredDocument,
     meta: &TxnMeta,
     backup_dir: &Path,
     input: LegacyNameImport,
 ) -> Result<Decision<LegacyImportResult>, NameError> {
-    if input.version != 1 {
-        return Err(NameError::InvalidName(
-            "unsupported legacy-name import version".into(),
-        ));
-    }
-    if input.import_id.trim().is_empty() {
-        return Err(NameError::InvalidName(
-            "a legacy-name import must carry its retry-stable importId".into(),
-        ));
-    }
-    if input.candidates.len() > NAME_MIGRATION_IMPORT_CANDIDATE_LIMIT {
-        return Err(NameError::InvalidName(format!(
-            "a legacy-name import batches at most {} candidates",
-            NAME_MIGRATION_IMPORT_CANDIDATE_LIMIT
-        )));
+    session_name_import_policy::validate_import_envelope(&input)?;
+
+    let trusted_boot = is_boot_import_id(&input.import_id);
+    // Name-reliability Task 3: after the consolidation completed, a browser
+    // import is acknowledged and writes nothing (no backup, no stored ids).
+    if document.migration.completed && !trusted_boot {
+        return session_name_import_policy::post_completion_acknowledge(&input).map(Decision::Read);
     }
 
     // Immutable create-once backup BEFORE any acknowledgment: a failure
     // here retains every original and acknowledges nothing.
     write_import_backup_once(backup_dir, &input, meta.now_ms)?;
 
-    let trusted_boot = is_boot_import_id(&input.import_id);
     let mut acknowledged: Vec<String> = Vec::with_capacity(input.candidates.len());
     let mut newly_acknowledged = false;
     let mut publish: Vec<PublishSpec> = Vec::new();
@@ -4236,13 +4665,16 @@ fn import_legacy_decision(
             continue;
         };
         let classified = classify_legacy_candidate(trusted_boot, candidate);
+        let change = NameChangeEvent::new(
+            NameChangeCause::Import,
+            document.record_at(&name_ref_key(&resolved)),
+            None,
+        )
+        .with_import(&input.import_id, &classified.evidence_key);
         let outcome = apply_legacy_candidate(document, resolved, &classified)?;
         if let Some(key) = outcome.key {
             if outcome.changed {
-                publish.push(PublishSpec {
-                    key: key.clone(),
-                    changed: true,
-                });
+                publish.push(PublishSpec::changed(key.clone(), change));
                 names.push(
                     update_after_commit(document, &key, true, RedirectScope::ToRecord)
                         .expect("the winning record resolves"),

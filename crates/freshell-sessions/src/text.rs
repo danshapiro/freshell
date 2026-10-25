@@ -107,6 +107,21 @@ pub fn normalize_first_user_message(content: &str) -> Option<String> {
     }
 }
 
+// Name-reliability Task 5 (RC12): both lists below also carry the tool
+// wrapper blocks coding CLIs serialize as `role:"user"` records that no
+// person typed (V5 checked every one against real transcripts on this host):
+// - Codex's own model-context fragments, written next to
+//   `environment_context`: `recommended_plugins`, `user_shell_command`,
+//   `user_action`;
+// - Claude Code's slash-command family (an `isMeta` caveat record, then the
+//   command's name/message/args, then its output) and its `system-reminder`
+//   blocks.
+// `bash-input`/`bash-stdout`/`bash-stderr` are deliberately absent: no
+// transcript on this host carries them; add them only with evidence. Every
+// consumer of `extract_user_authored_text` (titles, search, the AI prompt,
+// first messages, Claude's user-message count) and the name classifier's
+// leading-tag check (`starts_with_context_tag`, with its TypeScript copy in
+// `shared/name-evidence.ts`, kept in step by the shared fixture) sees them.
 const USER_CONTEXT_TAGS: &[&str] = &[
     "environment_context",
     "system_context",
@@ -117,10 +132,20 @@ const USER_CONTEXT_TAGS: &[&str] = &[
     "permissions",
     "collaboration_mode",
     "skills_instructions",
+    "recommended_plugins",
+    "user_shell_command",
+    "user_action",
+    "local-command-caveat",
+    "command-name",
+    "command-message",
+    "command-args",
+    "local-command-stdout",
+    "local-command-stderr",
+    "system-reminder",
 ];
 
 // The subset used by the leading `<tag[>\s]` system-context check (matches the alternation
-// in the first `isSystemContext` regex).
+// in the first `isSystemContext` regex, plus the tool wrapper tags above).
 const SYSTEM_CONTEXT_LEAD_TAGS: &[&str] = &[
     "environment_context",
     "system_context",
@@ -131,7 +156,40 @@ const SYSTEM_CONTEXT_LEAD_TAGS: &[&str] = &[
     "permissions",
     "collaboration_mode",
     "skills_instructions",
+    "recommended_plugins",
+    "user_shell_command",
+    "user_action",
+    "local-command-caveat",
+    "command-name",
+    "command-message",
+    "command-args",
+    "local-command-stdout",
+    "local-command-stderr",
+    "system-reminder",
 ];
+
+/// Whether `text` (after trimming) opens with a known system-context tag:
+/// `<tag>` or `<tag ` for a tag in `SYSTEM_CONTEXT_LEAD_TAGS`,
+/// case-insensitive (`/^<(environment_context|...)[>\s]/i`, the first
+/// `isSystemContext` alternation). This is ONLY the leading-tag check; the
+/// rest of [`is_system_context`] also flags text a person may use as a name
+/// (`$ cmd`, `1, 2, 3`), so the name classifier
+/// (`crate::name_evidence`) uses this check alone.
+pub fn starts_with_context_tag(text: &str) -> bool {
+    let Some(rest) = text.trim().strip_prefix('<') else {
+        return false;
+    };
+    let lower = rest.to_ascii_lowercase();
+    SYSTEM_CONTEXT_LEAD_TAGS.iter().any(|tag| {
+        // ASCII lowercasing keeps byte offsets, and the tag is ASCII, so
+        // `tag.len()` is a char boundary of `rest` whenever it matched.
+        lower.starts_with(tag)
+            && rest[tag.len()..]
+                .chars()
+                .next()
+                .is_some_and(|next| next == '>' || next.is_whitespace())
+    })
+}
 
 /// `server/coding-cli/utils.ts` `isSystemContext`.
 pub fn is_system_context(text: &str) -> bool {
@@ -141,17 +199,8 @@ pub fn is_system_context(text: &str) -> bool {
     }
 
     // /^<(environment_context|...)[>\s]/i
-    if let Some(rest) = trimmed.strip_prefix('<') {
-        let lower = rest.to_ascii_lowercase();
-        for tag in SYSTEM_CONTEXT_LEAD_TAGS {
-            if lower.starts_with(tag) {
-                if let Some(next) = rest[tag.len()..].chars().next() {
-                    if next == '>' || next.is_whitespace() {
-                        return true;
-                    }
-                }
-            }
-        }
+    if starts_with_context_tag(trimmed) {
+        return true;
     }
 
     // /^#\s*(AGENTS|Instructions?|System)/i
@@ -561,5 +610,212 @@ mod char_boundary_tests {
             let _ = normalize_first_user_message(s);
             let _ = extract_user_authored_text(s);
         }
+    }
+}
+
+/// Name-reliability Task 5 (RC12): the tool wrapper blocks Codex and Claude
+/// Code serialize as `role:"user"` records are system context, never the
+/// user's words. A record holding only the block yields no user text; a
+/// record whose block is followed by the user's own sentence keeps exactly
+/// that sentence; and the name classifier's leading-tag check sees the tag.
+#[cfg(test)]
+mod wrapper_tag_tests {
+    use super::*;
+
+    const USER_SENTENCE: &str = "Fix the sardine importer";
+
+    fn assert_wrapper_block(block: &str) {
+        assert_eq!(
+            extract_user_authored_text(block),
+            None,
+            "a record holding only {block:?} has no user-authored text"
+        );
+        assert_eq!(
+            extract_user_authored_text(&format!("{block}\n{USER_SENTENCE}")),
+            Some(USER_SENTENCE.to_string()),
+            "the user's sentence after {block:?} is kept"
+        );
+        assert!(
+            starts_with_context_tag(block),
+            "the leading-tag check recognizes {block:?}"
+        );
+    }
+
+    // Codex's own model-context fragments (V5: the Codex 0.163.0 binary
+    // writes them next to `environment_context`).
+    #[test]
+    fn extract_user_authored_text_skips_recommended_plugins() {
+        assert_wrapper_block(
+            "<recommended_plugins>\n- github: review pull requests\n</recommended_plugins>",
+        );
+    }
+
+    #[test]
+    fn extract_user_authored_text_skips_user_shell_command() {
+        assert_wrapper_block(
+            "<user_shell_command>\n<command>echo hi</command>\n<result>\nhi\nExit code: 0\n</result>\n</user_shell_command>",
+        );
+    }
+
+    #[test]
+    fn extract_user_authored_text_skips_user_action() {
+        assert_wrapper_block(
+            "<user_action>\n  <context>User initiated a review task. Here's the full review output from reviewer model.</context>\n  <action>review</action>\n</user_action>",
+        );
+    }
+
+    // Claude Code's slash-command family (V5: real transcripts write the
+    // caveat as an `isMeta` record, then the command, then its output).
+    #[test]
+    fn extract_user_authored_text_skips_local_command_caveat() {
+        assert_wrapper_block(
+            "<local-command-caveat>Caveat: The messages below were generated by the user while running local commands. DO NOT respond to these messages or otherwise consider them in your response unless the user explicitly asks you to.</local-command-caveat>",
+        );
+    }
+
+    #[test]
+    fn extract_user_authored_text_skips_command_name() {
+        assert_wrapper_block("<command-name>/model</command-name>");
+    }
+
+    #[test]
+    fn extract_user_authored_text_skips_command_message() {
+        assert_wrapper_block("<command-message>model</command-message>");
+    }
+
+    #[test]
+    fn extract_user_authored_text_skips_command_args() {
+        assert_wrapper_block("<command-args>opus</command-args>");
+    }
+
+    #[test]
+    fn extract_user_authored_text_skips_local_command_stdout() {
+        assert_wrapper_block("<local-command-stdout>Set model to opus</local-command-stdout>");
+    }
+
+    #[test]
+    fn extract_user_authored_text_skips_local_command_stderr() {
+        assert_wrapper_block(
+            "<local-command-stderr>Error: unknown model \"opux\"</local-command-stderr>",
+        );
+    }
+
+    #[test]
+    fn extract_user_authored_text_skips_system_reminder() {
+        assert_wrapper_block(
+            "<system-reminder>\nThe user opened the file src/main.rs in the IDE.\n</system-reminder>",
+        );
+    }
+
+    /// The command family's full block, as one record carries it: name,
+    /// message and args (an empty args block included) in one part.
+    #[test]
+    fn extract_user_authored_text_skips_a_whole_command_block() {
+        assert_eq!(
+            extract_user_authored_text(
+                "<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>"
+            ),
+            None
+        );
+    }
+
+    /// V5's mixed record: ONE user record whose parts are the caveat, a
+    /// slash command, its output, then a plain sentence. Only the sentence
+    /// is the user's.
+    #[test]
+    fn extract_user_authored_text_mixed_wrapper_record_keeps_the_sentence() {
+        let sentence =
+            "Keep the effort high for the rest of this refactor and explain each step briefly.";
+        let record = [
+            "<local-command-caveat>Caveat: The messages below were generated by the user while running local commands. DO NOT respond to these messages or otherwise consider them in your response unless the user explicitly asks you to.</local-command-caveat>",
+            "<command-name>/effort</command-name>\n            <command-message>effort</command-message>\n            <command-args>high</command-args>",
+            "<local-command-stdout>Set effort level to high</local-command-stdout>",
+            sentence,
+        ]
+        .join("\n");
+        assert_eq!(
+            extract_user_authored_text(&record),
+            Some(sentence.to_string())
+        );
+    }
+
+    /// The real Claude shape end to end through the transcript parser: an
+    /// `isMeta` caveat record, a `/model` command record, its stdout record,
+    /// then the prompt. The index's first user message is the prompt.
+    #[test]
+    fn extract_user_authored_text_real_claude_command_shape_yields_the_prompt() {
+        let session_id = "5a5a5a5a-0000-4000-8000-000000000005";
+        let record = |uuid: &str, extra: serde_json::Value| {
+            let mut base = serde_json::json!({
+                "cwd": "/home/dan/code/sardines",
+                "sessionId": session_id,
+                "version": "2.1.23",
+                "gitBranch": "main",
+                "timestamp": "2026-10-20T10:00:00.000Z",
+                "uuid": uuid,
+            });
+            for (key, value) in extra.as_object().expect("record fields") {
+                base[key] = value.clone();
+            }
+            serde_json::to_string(&base).expect("record serializes")
+        };
+        let transcript = [
+            record(
+                "u-caveat",
+                serde_json::json!({
+                    "type": "user",
+                    "isMeta": true,
+                    "message": {"role": "user", "content": "<local-command-caveat>Caveat: The messages below were generated by the user while running local commands. DO NOT respond to these messages or otherwise consider them in your response unless the user explicitly asks you to.</local-command-caveat>"},
+                }),
+            ),
+            record(
+                "u-command",
+                serde_json::json!({
+                    "type": "user",
+                    "message": {"role": "user", "content": "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args></command-args>"},
+                }),
+            ),
+            record(
+                "u-stdout",
+                serde_json::json!({
+                    "type": "user",
+                    "message": {"role": "user", "content": "<local-command-stdout>Set model to opus</local-command-stdout>"},
+                }),
+            ),
+            record(
+                "u-prompt",
+                serde_json::json!({
+                    "type": "user",
+                    "message": {"role": "user", "content": USER_SENTENCE},
+                }),
+            ),
+            record(
+                "a-reply",
+                serde_json::json!({
+                    "type": "assistant",
+                    "message": {"role": "assistant", "content": [{"type": "text", "text": "On it."}]},
+                }),
+            ),
+        ]
+        .join("\n");
+        let parsed = crate::parse::parse_session_content(
+            &transcript,
+            &crate::parse::ParseSessionOptions::default(),
+        );
+        assert_eq!(parsed.first_user_message.as_deref(), Some(USER_SENTENCE));
+        assert_eq!(parsed.title.as_deref(), Some(USER_SENTENCE));
+    }
+
+    /// Pins of what must NOT change: text that merely contains a tag, an
+    /// unknown tag, and the shell tags no transcript on this host carries.
+    #[test]
+    fn extract_user_authored_text_keeps_real_text_around_tags() {
+        assert_eq!(
+            extract_user_authored_text("Fix <b>bold</b> rendering"),
+            Some("Fix <b>bold</b> rendering".to_string())
+        );
+        assert!(!starts_with_context_tag("<systemic> review"));
+        assert!(!starts_with_context_tag("<command-names> list"));
+        assert!(!starts_with_context_tag("<bash-input>ls</bash-input>"));
     }
 }

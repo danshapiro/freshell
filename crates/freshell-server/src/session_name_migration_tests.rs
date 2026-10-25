@@ -5,9 +5,9 @@
 //! transaction, the store, or the settings ladder. The behaviors protected
 //! here are the plan's consolidation contract:
 //!
-//! * deterministic conflict resolution — import permutations (both orders,
-//!   both devices) choose the same winner by the total order, never arrival
-//!   order;
+//! * deterministic conflict resolution — rank, proven rename recency and
+//!   scope pick the same winner in every import order; among equal
+//!   candidates the incumbent stays (window/device ids never decide);
 //! * classification — a proven explicit session rename is manual; an old
 //!   protected flag (automation→manual-flag path included) is
 //!   `legacy_protected` with `legacyOrigin:"unknown"`, never manual, never
@@ -23,7 +23,8 @@
 //! * scope-only cleanup never deletes summary/archive/delete/description
 //!   rows and never touches unsupported providers;
 //! * late/repeated/browser-only imports cannot beat a post-migration
-//!   manual or accepted-Freshell-AI name;
+//!   manual or accepted-Freshell-AI name; once the consolidation completed
+//!   they are acknowledged without any effect (name-reliability Task 3);
 //! * unresolved/ambiguous evidence stays recovery-only;
 //! * an initial fallback installation never blocks a later explicit legacy
 //!   import.
@@ -651,9 +652,8 @@ async fn post_migration_kilroy_titles_survive_the_late_evidence_pass() {
     drop(tmp);
 }
 
-/// Scope + evidence-key tie-breaks: session > pane > source_tab > terminal >
-/// derived, then ascending evidenceKey — the same winner from either import
-/// order.
+/// Scope tie-break: session > pane > source_tab > terminal > derived — the
+/// same winner from either import order.
 #[tokio::test]
 async fn same_rank_conflicts_resolve_deterministically_across_orders() {
     let (tmp, home) = fresh_home();
@@ -741,8 +741,8 @@ async fn explicit_rename_times_order_manual_candidates_and_generic_times_do_not(
 
     // Both are untrusted imports: the store must not honor the explicit-
     // rename claims from the HTTP lane at all — both become legacy
-    // protected, and the tie-break falls to evidence key/id, not the
-    // claimed times.
+    // protected, and the claimed times never order them (the equal
+    // candidates keep whichever installed first).
     let result = names
         .import_legacy(browser_import(
             "times-1",
@@ -1216,6 +1216,7 @@ async fn late_legacy_imports_cannot_beat_post_migration_names() {
             name: "Fresh User Rename".into(),
             intent: NameIntent::User,
             if_revision: None,
+            cwd: None,
         })
         .await
         .unwrap();
@@ -1291,31 +1292,36 @@ async fn late_legacy_imports_cannot_beat_post_migration_names() {
     drop(tmp);
 }
 
-/// An initial fallback installation never blocks a later explicit legacy
-/// import: a boot that installed only a low-rank fallback still accepts a
-/// higher-rank legacy candidate from a late device.
+/// An initial fallback installation never blocks a higher-rank legacy
+/// candidate that arrives BEFORE the consolidation completes: a boot chunk
+/// that installed only a low-rank fallback (the boot was interrupted before
+/// its receipt committed) still accepts a late device's flagged label.
 #[tokio::test]
 async fn initial_fallback_installation_does_not_block_later_legacy_import() {
     let (tmp, home) = fresh_home();
-    seed_config(
-        &home,
-        json!({
-            "claude:s1": { "titleOverride": "dir-name", "titleSource": "dir" },
-        }),
-        json!({}),
-    );
-    let settings = Arc::new(store_at(&home));
     let names = open_store(&home).await;
-    let metadata = open_metadata(&home).await;
 
-    run_session_name_consolidation(consolidation_inputs(
-        &home,
-        names.clone(),
-        settings.clone(),
-        metadata.clone(),
-        TerminalIdentityRegistry::new(),
-    ))
-    .await;
+    // The interrupted boot's chunk: the gathered `titleSource:"dir"`
+    // fallback for claude:s1, imported under the trusted boot lane without
+    // the completion receipt.
+    names
+        .import_legacy(LegacyNameImport {
+            version: 1,
+            import_id: NAME_MIGRATION_BOOT_IMPORT_ID.to_string(),
+            evidence: vec![],
+            candidates: vec![candidate(
+                "boot-dir-1",
+                session_target(NamedProvider::Claude, "s1"),
+                "dir-name",
+                NameSource::Directory,
+                LegacyCandidateScope::Session,
+                "session-override:claude:s1",
+                LegacyProtectionEvidence::None,
+            )],
+        })
+        .await
+        .unwrap();
+    assert!(!names.migration_completed());
     let update = record_of(&names, NamedProvider::Claude, "s1")
         .await
         .unwrap();
@@ -1345,9 +1351,69 @@ async fn initial_fallback_installation_does_not_block_later_legacy_import() {
     drop(tmp);
 }
 
+/// Name-reliability Task 3: once the real consolidation runner has
+/// completed, a late device's import is acknowledged and changes nothing —
+/// the installed fallback stays for the normal naming flows to replace.
+#[tokio::test]
+async fn a_late_device_import_after_consolidation_leaves_the_fallback_unchanged() {
+    let (tmp, home) = fresh_home();
+    seed_config(
+        &home,
+        json!({
+            "claude:s1": { "titleOverride": "dir-name", "titleSource": "dir" },
+        }),
+        json!({}),
+    );
+    let settings = Arc::new(store_at(&home));
+    let names = open_store(&home).await;
+    let metadata = open_metadata(&home).await;
+
+    run_session_name_consolidation(consolidation_inputs(
+        &home,
+        names.clone(),
+        settings.clone(),
+        metadata.clone(),
+        TerminalIdentityRegistry::new(),
+    ))
+    .await;
+    assert!(names.migration_completed());
+    let installed = record_of(&names, NamedProvider::Claude, "s1")
+        .await
+        .unwrap();
+    assert_eq!(installed.record.name, "dir-name");
+    assert_eq!(installed.record.source, NameSource::Directory);
+
+    let result = names
+        .import_legacy(browser_import(
+            "late-after-completion",
+            vec![candidate(
+                "up-1",
+                session_target(NamedProvider::Claude, "s1"),
+                "User Flagged Pane",
+                NameSource::Manual,
+                LegacyCandidateScope::Pane,
+                "envelope-up#tab#pane",
+                LegacyProtectionEvidence::LegacyFlag,
+            )],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(result.acknowledged, vec!["up-1".to_string()]);
+    assert!(result.names.is_empty());
+    let after = record_of(&names, NamedProvider::Claude, "s1")
+        .await
+        .unwrap();
+    assert_eq!(after.record.name, "dir-name");
+    assert_eq!(after.record.source, NameSource::Directory);
+    assert_eq!(after.record.revision, installed.record.revision);
+    drop(tmp);
+}
+
 /// Simultaneous imports serialize under the strict transaction: racing two
-/// imports (different devices, same target) both acknowledge and leave a
-/// single coherent winner, whichever transaction lands first.
+/// imports (different devices, same target, equal rank and scope) both
+/// acknowledge and leave a single coherent winner — whichever transaction
+/// landed first. The other device's equal candidate never replaces it
+/// (window/device ids never decide a name, Task 3).
 #[tokio::test]
 async fn simultaneous_imports_serialize_and_converge() {
     let (tmp, home) = fresh_home();
@@ -1372,8 +1438,8 @@ async fn simultaneous_imports_serialize_and_converge() {
         LegacyProtectionEvidence::LegacyFlag,
     );
 
-    let import_a = names.import_legacy(browser_import("race-import-a", vec![device_a]));
-    let import_b = names.import_legacy(browser_import("race-import-b", vec![device_b]));
+    let import_a = names.import_legacy(browser_import("race-import-a", vec![device_a.clone()]));
+    let import_b = names.import_legacy(browser_import("race-import-b", vec![device_b.clone()]));
     let (a, b) = tokio::join!(import_a, import_b);
     let a = a.unwrap();
     let b = b.unwrap();
@@ -1381,12 +1447,34 @@ async fn simultaneous_imports_serialize_and_converge() {
     assert_eq!(b.acknowledged, vec!["race-b".to_string()]);
 
     // Both are legacy_protected pane candidates for the same target: the
-    // deterministic total order picks ONE winner by evidence key
-    // ("envelope-a…" < "envelope-b…" — the earlier evidence key wins).
+    // first install allocated the store's first revision, and the second
+    // (equal) candidate was acknowledged without a replacement.
     let update = record_of(&names, NamedProvider::Claude, "s1")
         .await
         .unwrap();
-    assert_eq!(update.record.name, "Device A Label");
+    assert!(
+        ["Device A Label", "Device B Label"].contains(&update.record.name.as_str()),
+        "one device's label won: {:?}",
+        update.record.name
+    );
+    assert_eq!(update.record.source, NameSource::LegacyProtected);
+    assert_eq!(
+        update.record.revision, 1,
+        "exactly one install: the equal candidate never replaced it"
+    );
+
+    // Re-delivering both imports (either order) keeps the same winner.
+    for import in [
+        browser_import("race-import-b", vec![device_b]),
+        browser_import("race-import-a", vec![device_a]),
+    ] {
+        names.import_legacy(import).await.unwrap();
+        let again = record_of(&names, NamedProvider::Claude, "s1")
+            .await
+            .unwrap();
+        assert_eq!(again.record.name, update.record.name);
+        assert_eq!(again.record.revision, update.record.revision);
+    }
     drop(tmp);
 }
 

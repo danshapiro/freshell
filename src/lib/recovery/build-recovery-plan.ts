@@ -7,9 +7,9 @@ import {
   type FreshAgentSessionType,
 } from '@shared/fresh-agent'
 import { remapTabNameSource, resolveInitialTabNameSource, parsePaneNamingIdentityInput } from '@/lib/tab-name-source'
+import { restoredTabNames } from '@/lib/restored-tab-names'
 import type { RecoveryInventory, RecoveryPane, LedgerOnlyEntry } from './types'
 import type { TabNameSource } from '@shared/session-names'
-
 
 function terminalContent(p: {
   mode: string | null
@@ -150,8 +150,20 @@ export interface RecoveryTabPlan {
    * from the restored layout's initial content.
    */
   nameSource?: TabNameSource
+  /**
+   * Name reliability (Task 9, D7): true when a person renamed this tab, so
+   * the restored name stays protected from automatic titles. Restored only
+   * for a tab that is not session-owned (a session-owned tab's name follows
+   * its saved session record).
+   */
+  titleSetByUser?: boolean
   layout: PaneNode
+  /** The recorded pane titles, keyed by the RESTORED pane ids (remapped
+   * through the old→new pane-id map). Scoped agent panes never get one:
+   * their saved session record names them. */
   paneTitles: Record<string, string>
+  /** The panes a person renamed, keyed like `paneTitles`. */
+  paneTitleSetByUser: Record<string, boolean>
   /**
    * Focused-episode-6 round 5 (Finding F1): the plan's LIVE terminal panes
    * reattach to their still-running server terminals — one-shot
@@ -386,7 +398,8 @@ export function buildRecoveryPlan(
       // restore mints fresh ids through this map so the recorded nameSource
       // remaps to the pane that now holds the source content.
       const paneIdMap = new Map<string, string>()
-      for (const p of t.panes.filter(isRestorablePane)) {
+      const restoredPanes = t.panes.filter(isRestorablePane)
+      for (const p of restoredPanes) {
         const paneId = options.preserveIdsForMachine ? p.paneId : paneIdMap.get(p.paneId) ?? nanoid()
         paneIdMap.set(p.paneId, paneId)
         const content = paneContent(p, Boolean(options.preserveIdsForMachine))
@@ -414,26 +427,30 @@ export function buildRecoveryPlan(
         }
         leaves.push(node)
       }
-      return { tab: t, leaves, liveTerminalReattach, paneIdMap }
+      return { tab: t, leaves, liveTerminalReattach, paneIdMap, restoredPanes }
     })
     .filter(({ leaves }) => leaves.length > 0)
-    .map(({ tab: t, leaves, liveTerminalReattach, paneIdMap }) => {
+    .map(({ tab: t, leaves, liveTerminalReattach, paneIdMap, restoredPanes }) => {
+      const tabId = options.preserveIdsForMachine
+        ? preservedTabId(t.tabKey, options.preserveIdsForMachine)
+        : nanoid()
+      const layout = chain(leaves)
       // Unified agent names (Task 6): remap the recorded pointer through the
       // explicit old→new pane-id map; an unresolvable pointer (its pane was
       // dropped from the restore, or the record predates the field) derives
       // from the rebuilt layout's initial content instead of a stale id.
       const nameSource = t.nameSource
-        ? remapTabNameSource(t.nameSource, paneIdMap) ?? resolveInitialTabNameSource(chain(leaves))
+        ? remapTabNameSource(t.nameSource, paneIdMap) ?? resolveInitialTabNameSource(layout)
         : undefined
       return {
-        tabId: options.preserveIdsForMachine
-          ? preservedTabId(t.tabKey, options.preserveIdsForMachine)
-          : nanoid(),
+        tabId,
         title: t.tabName || 'Recovered',
         sourceTabKey: t.tabKey,
         ...(nameSource ? { nameSource } : {}),
-        layout: chain(leaves),
-        paneTitles: {},
+        layout,
+        // Name reliability (Task 9, D7): the recorded pane titles and rename
+        // flags (the shared rebuild rules, `src/lib/restored-tab-names.ts`).
+        ...restoredTabNames({ tab: t, tabId, recordedPanes: restoredPanes, layout, paneIdMap, nameSource }),
         ...(liveTerminalReattach.length ? { liveTerminalReattach } : {}),
       }
     })

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
+import { configureStore } from '@reduxjs/toolkit'
 import {
   findRecordByTabKey,
   jumpToRecord,
@@ -8,9 +9,20 @@ import {
   type TabsRegistryGroups,
 } from '@/lib/tab-registry-open'
 import type { RegistryTabRecord } from '@/store/tabRegistryTypes'
-import { addTab, setActiveTab } from '@/store/tabsSlice'
-import { addPane, initLayout } from '@/store/panesSlice'
+import tabsReducer, { addTab, setActiveTab } from '@/store/tabsSlice'
+import panesReducer, { initCopiedLayout, initLayout } from '@/store/panesSlice'
+import type { PaneNode } from '@/store/paneTypes'
 import type { AppDispatch } from '@/store/store'
+import { sessionNameLifecycleMiddleware } from '@/store/sessionNameLifecycleMiddleware'
+import { savedNameTabTitleMirrorMiddleware } from '@/store/savedNameTabTitleMirror'
+import sessionNamesReducer, { receiveSessionNames } from '@/store/sessionNamesSlice'
+
+function buildNamingStore() {
+  return configureStore({
+    reducer: { tabs: tabsReducer, panes: panesReducer, sessionNames: sessionNamesReducer },
+    middleware: (getDefault) => getDefault().concat(savedNameTabTitleMirrorMiddleware, sessionNameLifecycleMiddleware),
+  })
+}
 
 function makeRecord(overrides: Partial<RegistryTabRecord> = {}): RegistryTabRecord {
   return {
@@ -69,6 +81,46 @@ describe('findRecordByTabKey', () => {
 })
 
 describe('openRecordAsUnlinkedCopy', () => {
+  it.each(['shell', 'claude'])('keeps a recorded naming source after a first %s pane through real lifecycle folds', (mode) => {
+    const store = buildNamingStore()
+    store.dispatch(receiveSessionNames(['other', 'billing'].map((sessionId, index) => ({
+      record: { ref: { kind: 'session' as const, provider: 'claude' as const, sessionId }, name: `${sessionId} name`, source: 'manual' as const, revision: index + 1 },
+      redirects: [], documentGeneration: 2, changed: true,
+    }))))
+    const record = makeRecord({
+      nameSource: { kind: 'session', paneId: 'agent-second' },
+      panes: [
+        { paneId: 'first', kind: 'terminal', payload: { mode, ...(mode === 'claude' ? { sessionRef: { provider: 'claude', sessionId: 'other' } } : {}) } },
+        { paneId: 'agent-second', kind: 'terminal', payload: { mode: 'claude', sessionRef: { provider: 'claude', sessionId: 'billing' } } },
+      ],
+    })
+
+    openRecordAsUnlinkedCopy(record, { dispatch: store.dispatch })
+
+    const state = store.getState()
+    const tab = state.tabs.tabs[0]
+    const layout = state.panes.layouts[tab.id]
+    if (layout.type !== 'split' || layout.children[1].type !== 'leaf') throw new Error('expected both recorded panes')
+    expect(tab.nameSource).toEqual({ kind: 'session', paneId: layout.children[1].id })
+    expect(tab.title).toBe('billing name')
+    expect(state.panes.activePane[tab.id]).toBe(layout.children[1].id)
+  })
+
+  it('preserves same-server live terminal handles while installing the complete copy', () => {
+    const store = buildNamingStore()
+    const record = makeRecord({ panes: [{
+      paneId: 'live-shell', kind: 'terminal',
+      payload: { mode: 'shell', liveTerminal: { terminalId: 'still-running', serverInstanceId: 'srv-1' } },
+    }] })
+
+    openRecordAsUnlinkedCopy(record, { dispatch: store.dispatch, localServerInstanceId: 'srv-1' })
+
+    const state = store.getState()
+    expect(state.panes.layouts[state.tabs.tabs[0].id]).toMatchObject({
+      type: 'leaf', content: { kind: 'terminal', terminalId: 'still-running', serverInstanceId: 'srv-1' },
+    })
+  })
+
   it('creates a new tab with a terminal fallback layout when the record has no panes', () => {
     const dispatch = vi.fn() as unknown as AppDispatch
     const onOpened = vi.fn()
@@ -82,24 +134,29 @@ describe('openRecordAsUnlinkedCopy', () => {
       status: 'creating',
       serverInstanceId: 'srv-1',
     })
-    expect(calls[1].type).toBe(initLayout.type)
-    expect(calls[1].payload.content).toMatchObject({ kind: 'terminal', mode: 'shell' })
+    expect(calls[1].type).toBe(initCopiedLayout.type)
+    expect(calls[1].payload.layout.content).toMatchObject({ kind: 'terminal', mode: 'shell' })
     expect(onOpened).toHaveBeenCalledTimes(1)
   })
 
   it('adds one pane per extra snapshot', () => {
-    const dispatch = vi.fn() as unknown as AppDispatch
+    const store = buildNamingStore()
     const record = makeRecord({
       panes: [
         { paneId: 'p1', kind: 'terminal', title: 'sh', payload: {} },
         { paneId: 'p2', kind: 'browser', title: 'docs', payload: {} },
       ],
     })
-    openRecordAsUnlinkedCopy(record, { dispatch })
+    openRecordAsUnlinkedCopy(record, { dispatch: store.dispatch })
 
-    const calls = (dispatch as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0])
-    expect(calls.map((a) => a.type)).toEqual([addTab.type, initLayout.type, addPane.type])
-    expect(calls[2].payload.newContent).toMatchObject({ kind: 'browser' })
+    const state = store.getState()
+    const tabId = state.tabs.tabs[0].id
+    const layout = state.panes.layouts[tabId]
+    if (layout.type !== 'split') throw new Error('expected both recorded panes')
+    expect(layout.children[0]).toMatchObject({ type: 'leaf', content: { kind: 'terminal' } })
+    expect(layout.children[1]).toMatchObject({ type: 'leaf', content: { kind: 'browser' } })
+    expect(state.panes.paneTitles[tabId]).toEqual({ [layout.children[0].id]: 'sh', [layout.children[1].id]: 'docs' })
+    expect(state.panes.activePane[tabId]).toBe(layout.children[1].id)
   })
 
   it('remaps a session-owned record nameSource through the explicit old->new pane-id map', () => {
@@ -117,8 +174,8 @@ describe('openRecordAsUnlinkedCopy', () => {
     expect(calls[0].type).toBe(addTab.type)
     // The copy remints every pane id; the pointer must follow the source
     // pane's NEW id, not the stale recorded one.
-    const firstNewPaneId = calls[1].payload.paneId
-    const secondNewPaneId = calls[2].payload.newPaneId
+    const firstNewPaneId = calls[1].payload.layout.children[0].id
+    const secondNewPaneId = calls[1].payload.layout.children[1].id
     expect(firstNewPaneId).toBeTruthy()
     expect(secondNewPaneId).toBeTruthy()
     expect(firstNewPaneId).not.toBe('p1')
@@ -153,7 +210,7 @@ describe('openRecordAsUnlinkedCopy', () => {
     })
     openRecordAsUnlinkedCopy(record, { dispatch })
     const calls = (dispatch as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0])
-    expect(calls[1].payload.content).toMatchObject({
+    expect(calls[1].payload.layout.content).toMatchObject({
       kind: 'terminal',
       mode: 'claude',
       namingHandle: 'nh-copy-1',
@@ -198,6 +255,156 @@ describe('openPaneInNewTab', () => {
     expect(calls[0].payload.title).not.toContain('Research sprint')
     expect(calls[0].payload.title).not.toContain('·')
     expect(calls[0].payload.title).toBe('Refactor planner')
+  })
+})
+
+// Name reliability (plan Task 14; Task 9 receipt, open concern 3): opening a
+// registry record from the Tabs view restores pane names and their "user
+// renamed" protection exactly as the Task 9 new-window rebuild does — titles
+// remapped to the new pane ids, a flag only together with its title, no
+// title for a scoped agent pane, and the tab's own flag only on a tab that is
+// not session-owned.
+describe('registry opens keep pane names', () => {
+  function buildStore() {
+    return configureStore({ reducer: { tabs: tabsReducer, panes: panesReducer } })
+  }
+
+  type Store = ReturnType<typeof buildStore>
+
+  function leafIds(node: PaneNode | undefined): string[] {
+    if (!node) return []
+    if (node.type === 'leaf') return [node.id]
+    return [...leafIds(node.children[0]), ...leafIds(node.children[1])]
+  }
+
+  /** The tab the open created (the last one) with its leaves in order. */
+  function openedTab(store: Store) {
+    const state = store.getState()
+    const tab = state.tabs.tabs[state.tabs.tabs.length - 1]
+    return {
+      tab,
+      leaves: leafIds(state.panes.layouts[tab.id]),
+      titles: state.panes.paneTitles[tab.id] ?? {},
+      flags: state.panes.paneTitleSetByUser?.[tab.id] ?? {},
+    }
+  }
+
+  it('a copy restores pane titles and rename flags through the pane-id remap, and the tab flag', () => {
+    const store = buildStore()
+    const record = makeRecord({
+      tabName: 'MyShellTab',
+      titleSetByUser: true,
+      paneCount: 3,
+      panes: [
+        { paneId: 'p1', kind: 'terminal', title: 'KeepMePane', titleSetByUser: true, payload: { mode: 'shell' } },
+        { paneId: 'p2', kind: 'terminal', title: 'dan@host: ~', payload: { mode: 'shell' } },
+        { paneId: 'p3', kind: 'browser', title: 'Team docs', titleSetByUser: true, payload: { url: 'https://example.com/docs' } },
+      ],
+    })
+
+    openRecordAsUnlinkedCopy(record, { dispatch: store.dispatch })
+
+    const { tab, leaves, titles, flags } = openedTab(store)
+    expect(tab.title).toBe('MyShellTab')
+    expect(tab.titleSetByUser).toBe(true)
+    expect(leaves).toHaveLength(3)
+    expect(leaves).not.toContain('p1')
+    const [first, second, third] = leaves
+    expect(titles).toEqual({ [first]: 'KeepMePane', [second]: 'dan@host: ~', [third]: 'Team docs' })
+    expect(flags).toEqual({ [first]: true, [third]: true })
+  })
+
+  it('a copy never restores a rename flag without its title', () => {
+    const store = buildStore()
+    const record = makeRecord({
+      paneCount: 2,
+      panes: [
+        { paneId: 'p1', kind: 'terminal', titleSetByUser: true, payload: { mode: 'shell' } },
+        { paneId: 'p2', kind: 'terminal', title: '', titleSetByUser: true, payload: { mode: 'shell' } },
+      ],
+    })
+
+    openRecordAsUnlinkedCopy(record, { dispatch: store.dispatch })
+
+    const { leaves, titles, flags } = openedTab(store)
+    expect(flags).toEqual({})
+    // Each pane keeps the default title its creation gave it.
+    expect(titles).toEqual({ [leaves[0]]: 'Shell', [leaves[1]]: 'Shell' })
+  })
+
+  it('a copy of a session-owned agent tab restores no agent pane title and no tab flag', () => {
+    const store = buildStore()
+    const record = makeRecord({
+      tabName: 'Refactor planner',
+      titleSetByUser: true,
+      nameSource: { kind: 'session', paneId: 'p-agent' },
+      paneCount: 2,
+      panes: [
+        {
+          paneId: 'p-agent',
+          kind: 'terminal',
+          title: 'Refactor planner',
+          titleSetByUser: true,
+          payload: { mode: 'claude', sessionRef: { provider: 'claude', sessionId: 'sess-1' } },
+        },
+        { paneId: 'p-shell', kind: 'terminal', title: 'KeepMePane', titleSetByUser: true, payload: { mode: 'shell' } },
+      ],
+    })
+
+    openRecordAsUnlinkedCopy(record, { dispatch: store.dispatch })
+
+    const { tab, leaves, titles, flags } = openedTab(store)
+    expect(tab.nameSource).toEqual({ kind: 'session', paneId: leaves[0] })
+    expect(tab.titleSetByUser).toBeUndefined()
+    // The agent pane's saved session record names it; the recorded label is
+    // an old alias and never comes back as a pane title.
+    expect(titles[leaves[0]]).not.toBe('Refactor planner')
+    expect(flags[leaves[0]]).toBeUndefined()
+    expect(titles[leaves[1]]).toBe('KeepMePane')
+    expect(flags[leaves[1]]).toBe(true)
+  })
+
+  it('a pane opened in its own tab keeps its title and rename flag', () => {
+    const store = buildStore()
+    const record = makeRecord({
+      tabName: 'MyShellTab',
+      titleSetByUser: true,
+      paneCount: 2,
+      panes: [
+        { paneId: 'p1', kind: 'terminal', title: 'sh', payload: { mode: 'shell' } },
+        { paneId: 'p2', kind: 'terminal', title: 'KeepMePane', titleSetByUser: true, payload: { mode: 'shell' } },
+      ],
+    })
+
+    openPaneInNewTab(record, record.panes[1], { dispatch: store.dispatch })
+
+    const { tab, leaves, titles, flags } = openedTab(store)
+    expect(leaves).toHaveLength(1)
+    expect(leaves[0]).not.toBe('p2')
+    expect(titles).toEqual({ [leaves[0]]: 'KeepMePane' })
+    expect(flags).toEqual({ [leaves[0]]: true })
+    // A new tab: the record tab's own rename flag is not its flag.
+    expect(tab.titleSetByUser).toBeUndefined()
+  })
+
+  it('a scoped agent pane opened in its own tab gets no stored title', () => {
+    const store = buildStore()
+    const record = makeRecord({
+      nameSource: { kind: 'session', paneId: 'p-agent' },
+      panes: [{
+        paneId: 'p-agent',
+        kind: 'terminal',
+        title: 'Refactor planner',
+        titleSetByUser: true,
+        payload: { mode: 'claude', sessionRef: { provider: 'claude', sessionId: 'sess-1' } },
+      }],
+    })
+
+    openPaneInNewTab(record, record.panes[0], { dispatch: store.dispatch })
+
+    const { leaves, titles, flags } = openedTab(store)
+    expect(titles[leaves[0]]).not.toBe('Refactor planner')
+    expect(flags).toEqual({})
   })
 })
 

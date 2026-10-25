@@ -125,6 +125,73 @@ function createStore(mode: TerminalPaneContent['mode']) {
   return { store, tabId, paneId, paneContent, terminalId }
 }
 
+/** A tab whose naming source is a Claude pane (session-owned), split with
+ * the shell pane under test; or, with `owned: false`, the same split as a
+ * legacy tab. */
+function createSplitStore(opts: { owned: boolean }) {
+  const tabId = 'tab-1'
+  const paneId = 'pane-shell'
+  const terminalId = 'term-shell'
+  const paneContent: TerminalPaneContent = {
+    kind: 'terminal',
+    createRequestId: 'req-shell',
+    status: 'running',
+    mode: 'shell',
+    shell: 'system',
+    terminalId,
+    initialCwd: '/home/dan/code/freshell',
+  }
+  const claudeContent: TerminalPaneContent = {
+    kind: 'terminal',
+    createRequestId: 'req-claude',
+    status: 'running',
+    mode: 'claude',
+    terminalId: 'term-claude',
+    sessionRef: { provider: 'claude', sessionId: 'sess-1' },
+  }
+  const root: PaneNode = {
+    type: 'split',
+    id: 'split-1',
+    direction: 'horizontal',
+    sizes: [50, 50],
+    children: [
+      { type: 'leaf', id: 'pane-claude', content: claudeContent },
+      { type: 'leaf', id: paneId, content: paneContent },
+    ],
+  }
+  const store = configureStore({
+    reducer: {
+      tabs: tabsReducer,
+      panes: panesReducer,
+      settings: settingsReducer,
+      connection: connectionReducer,
+      extensions: extensionsReducer,
+    },
+    preloadedState: {
+      tabs: {
+        tabs: [{
+          id: tabId,
+          mode: 'claude',
+          status: 'running',
+          title: 'LotL',
+          createRequestId: 'req-claude',
+          nameSource: opts.owned ? { kind: 'session', paneId: 'pane-claude' } : { kind: 'legacy' },
+        }],
+        activeTabId: tabId,
+      },
+      panes: {
+        layouts: { [tabId]: root },
+        activePane: { [tabId]: paneId },
+        paneTitles: { [tabId]: { [paneId]: 'Shell' } },
+      },
+      settings: { settings: { ...defaultSettings }, status: 'loaded' },
+      connection: { status: 'ready', error: null },
+      extensions: { entries: [] },
+    } as any,
+  })
+  return { store, tabId, paneId, paneContent, terminalId }
+}
+
 async function renderAndGetTitleCb(store: ReturnType<typeof createStore>['store'], paneContent: TerminalPaneContent, tabId: string, paneId: string) {
   const view = render(
     <Provider store={store}>
@@ -199,6 +266,77 @@ describe('TerminalView OSC title scope', () => {
     // registry title never rewrites the pane, and it can never name a tab.
     expect(store.getState().tabs.tabs[0].title).toBe('freshell')
     expect(store.getState().panes.paneTitles[tabId][paneId]).toBe('freshell')
+  })
+
+  it('an OSC title from a shell pane inside a session-owned tab does not retitle the tab', async () => {
+    const { store, paneContent, tabId, paneId } = createSplitStore({ owned: true })
+    const { titleCb: fire } = await renderAndGetTitleCb(store, paneContent, tabId, paneId)
+
+    act(() => fire('vim README.md'))
+
+    // The shell pane still tracks its program; the session-owned tab keeps
+    // its saved-name mirror.
+    expect(store.getState().panes.paneTitles[tabId][paneId]).toBe('vim README.md')
+    expect(store.getState().tabs.tabs[0].title).toBe('LotL')
+  })
+
+  it('an OSC title from a shell pane inside a legacy split tab still retitles the tab', async () => {
+    const { store, paneContent, tabId, paneId } = createSplitStore({ owned: false })
+    const { titleCb: fire } = await renderAndGetTitleCb(store, paneContent, tabId, paneId)
+
+    act(() => fire('vim README.md'))
+
+    expect(store.getState().tabs.tabs[0].title).toBe('vim README.md')
+  })
+
+  it('a registry title for a shell pane inside a session-owned tab does not retitle the tab', async () => {
+    const { store, paneContent, tabId, paneId, terminalId } = createSplitStore({ owned: true })
+    await renderAndGetTitleCb(store, paneContent, tabId, paneId)
+    const onMessage = wsMocks.onMessage.mock.calls[wsMocks.onMessage.mock.calls.length - 1]?.[0]
+    expect(onMessage).toBeTypeOf('function')
+
+    act(() => {
+      onMessage({ type: 'terminal.title.updated', terminalId, title: 'Registry title' })
+    })
+
+    expect(store.getState().panes.paneTitles[tabId][paneId]).toBe('Registry title')
+    expect(store.getState().tabs.tabs[0].title).toBe('LotL')
+  })
+
+  it('the exit suffix never touches a session-owned tab', async () => {
+    const { store, paneContent, tabId, paneId, terminalId } = createSplitStore({ owned: true })
+    await renderAndGetTitleCb(store, paneContent, tabId, paneId)
+    const onMessage = wsMocks.onMessage.mock.calls[wsMocks.onMessage.mock.calls.length - 1]?.[0]
+    expect(onMessage).toBeTypeOf('function')
+
+    act(() => {
+      onMessage({ type: 'terminal.attach.ready', terminalId, headSeq: 0, replayFromSeq: 1, replayToSeq: 0 })
+    })
+    act(() => {
+      onMessage({ type: 'terminal.exit', terminalId, exitCode: 0 })
+    })
+
+    const tab = store.getState().tabs.tabs[0]
+    expect(tab.status).toBe('exited')
+    expect(tab.title).toBe('LotL')
+  })
+
+  it('the exit suffix still marks a legacy split tab', async () => {
+    const { store, paneContent, tabId, paneId, terminalId } = createSplitStore({ owned: false })
+    await renderAndGetTitleCb(store, paneContent, tabId, paneId)
+    const onMessage = wsMocks.onMessage.mock.calls[wsMocks.onMessage.mock.calls.length - 1]?.[0]
+    expect(onMessage).toBeTypeOf('function')
+
+    act(() => {
+      onMessage({ type: 'terminal.attach.ready', terminalId, headSeq: 0, replayFromSeq: 1, replayToSeq: 0 })
+    })
+    act(() => {
+      onMessage({ type: 'terminal.exit', terminalId, exitCode: 0 })
+    })
+
+    const tab = store.getState().tabs.tabs[0]
+    expect(tab.status).toBe('exited')
+    expect(tab.title).toBe('LotL (exit 0)')
   })
 
   it('ignores a stale title callback after its terminal instance is disposed', async () => {

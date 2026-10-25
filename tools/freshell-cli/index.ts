@@ -9,6 +9,7 @@ import { runCommand as sendKeysCommand } from './commands/sendKeys.js'
 import { partitionSendKeysArgs } from './send-keys-args.js'
 import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../node-client-runtime/codex-restore-contract.js'
 import { freshAgentResumeProvider, renderCliHelp, resolveCanonicalAction, unsupportedInvocationResult } from '../node-client-runtime/action-capabilities.js'
+import { renameNotAppliedMessage } from '../node-client-runtime/rename-outcome.js'
 
 type Flags = Record<string, string | boolean>
 
@@ -545,6 +546,8 @@ async function main() {
       if (message) writeError(message)
       const res = await client.patch(`/api/tabs/${encodeURIComponent(tab.id)}`, { name, nameIntent })
       writeJson(res)
+      const notApplied = renameNotAppliedMessage(res)
+      if (notApplied) writeError(notApplied)
       return
     }
     case 'has-tab': {
@@ -664,6 +667,8 @@ async function main() {
 
       const res = await client.patch(`/api/panes/${encodeURIComponent(resolved.pane.id)}`, { name, nameIntent })
       writeJson(res)
+      const notApplied = renameNotAppliedMessage(res)
+      if (notApplied) writeError(notApplied)
       return
     }
     case 'kill-pane': {

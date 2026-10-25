@@ -196,6 +196,26 @@ describe('SessionNameUpdateSchema', () => {
     expect(parsed.record.source).toBe('freshell_ai')
   })
 
+  it('keeps a rename outcome, and tolerates its absence or an unknown shape (name-reliability Task 4)', () => {
+    const base = {
+      record: { ref: { kind: 'session', provider: 'claude', sessionId: 's1' }, name: 'LotL', source: 'manual', revision: 3 },
+      documentGeneration: 4,
+      redirects: [],
+      changed: false,
+    }
+    expect(SessionNameUpdateSchema.parse({ ...base, outcome: { applied: false, reason: 'protected_name' } }).outcome)
+      .toEqual({ applied: false, reason: 'protected_name' })
+    expect(SessionNameUpdateSchema.parse({ ...base, outcome: { applied: true, reason: 'unchanged' } }).outcome)
+      .toEqual({ applied: true, reason: 'unchanged' })
+    expect(SessionNameUpdateSchema.parse({ ...base, outcome: { applied: true } }).outcome).toEqual({ applied: true })
+    expect(SessionNameUpdateSchema.parse(base).outcome).toBeUndefined()
+    // A newer server's reason (or a malformed outcome) never rejects the update.
+    const future = SessionNameUpdateSchema.safeParse({ ...base, outcome: { applied: false, reason: 'later_reason' } })
+    expect(future.success).toBe(true)
+    expect(future.success && future.data.outcome).toBeUndefined()
+    expect(SessionNameUpdateSchema.safeParse({ ...base, outcome: 'nonsense' }).success).toBe(true)
+  })
+
   it('requires the changed flag and a record', () => {
     const record = {
       ref: { kind: 'pending', id: 'h' },

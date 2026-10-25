@@ -28,6 +28,7 @@
 // process the exit-surfacing path would treat as exited.
 
 import fs from 'node:fs'
+import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -142,6 +143,17 @@ function writeFirstUserMessage(sessionId, prompt) {
   }
 }
 
+// With a title sequence the row starts with the placeholder title real
+// opencode writes until it names the session (`New session - <ISO>`);
+// FAKE_OPENCODE_UNNAMED=1 keeps that placeholder for good (a session
+// opencode never names, e.g. its own title call failed: name-reliability
+// Task 5's first-message journey); otherwise the historical fixture title
+// (the session id) is kept.
+function initialSessionTitle(sessionId) {
+  const placeholder = titleSequence.length > 0 || process.env.FAKE_OPENCODE_UNNAMED === '1'
+  return placeholder ? `New session - ${new Date().toISOString()}` : sessionId
+}
+
 function writeSessionRow(sessionId, cwd) {
   const dataHome = opencodeDataHome()
   fs.mkdirSync(dataHome, { recursive: true })
@@ -159,11 +171,94 @@ function writeSessionRow(sessionId, cwd) {
         (id, project_id, parent_id, slug, directory, title, version, model,
          time_created, time_updated, time_archived)
        VALUES (?, ?, NULL, ?, ?, ?, 'fake-opencode-terminal-e2e', ?, ?, ?, NULL)`,
-    ).run(sessionId, `proj-${sessionId}`, sessionId, cwd, sessionId, 'fake-model', now, now)
+    ).run(sessionId, `proj-${sessionId}`, sessionId, cwd, initialSessionTitle(sessionId), 'fake-model', now, now)
   } finally {
     db.close()
   }
 }
+
+// Name-reliability Task 4: FAKE_OPENCODE_TITLE_SEQUENCE (pipe-separated
+// titles) turns on a minimal embedded `opencode serve` surface on the
+// pane's `--hostname`/`--port` — exactly what the server's CLI opencode lane
+// attaches to (`crates/freshell-ws/src/opencode_lane.rs`: `/global/health`
+// with a 1.18 version, the `/event` SSE stream acked by `server.connected`,
+// `/session/status`, `/permission`, `/question`). After the first prompt
+// creates the session row, each title is written to the row and emitted as
+// a `session.updated` event (`properties.info.{id,title}`), ~300 ms apart,
+// starting FAKE_OPENCODE_TITLE_SEQUENCE_DELAY_MS (default 2500) after the
+// prompt so the pane's naming binding exists. Like the real serve, the
+// final title is re-reported on later session updates (every 2 s here).
+// Off by default: every other spec keeps the plain terminal fake.
+const titleSequence = (process.env.FAKE_OPENCODE_TITLE_SEQUENCE ?? '')
+  .split('|')
+  .map((title) => title.trim())
+  .filter(Boolean)
+const titleEventClients = new Set()
+
+function broadcastTitleEvent(payload) {
+  const frame = `data: ${JSON.stringify(payload)}\n\n`
+  for (const client of Array.from(titleEventClients)) {
+    if (client.destroyed) {
+      titleEventClients.delete(client)
+      continue
+    }
+    client.write(frame)
+  }
+}
+
+function setSessionTitle(sessionId, title) {
+  const db = new DatabaseSync(path.join(opencodeDataHome(), 'opencode.db'))
+  try {
+    db.exec('PRAGMA busy_timeout = 5000')
+    db.prepare('UPDATE session SET title = ?, time_updated = ? WHERE id = ?').run(title, Date.now(), sessionId)
+  } finally {
+    db.close()
+  }
+}
+
+function startTitleServer() {
+  const hostname = argValue('--hostname') ?? '127.0.0.1'
+  const port = Number(argValue('--port'))
+  if (titleSequence.length === 0 || !Number.isFinite(port) || port <= 0) return
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url ?? '/', `http://${hostname}:${port}`)
+    const json = (status, body) => {
+      res.writeHead(status, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(body))
+    }
+    if (url.pathname === '/global/health') return json(200, { healthy: true, version: '1.18.11' })
+    if (url.pathname === '/session/status') return json(200, {})
+    if (url.pathname === '/permission' || url.pathname === '/question') return json(200, [])
+    if (url.pathname === '/event' || url.pathname === '/global/event') {
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' })
+      titleEventClients.add(res)
+      res.write(`data: ${JSON.stringify({ type: 'server.connected', properties: {} })}\n\n`)
+      req.on('close', () => titleEventClients.delete(res))
+      return
+    }
+    return json(404, { error: `fake opencode terminal: no route ${url.pathname}` })
+  })
+  server.listen(port, hostname)
+  server.unref?.()
+}
+
+function runTitleSequence(sessionId) {
+  if (titleSequence.length === 0) return
+  const delay = Number(process.env.FAKE_OPENCODE_TITLE_SEQUENCE_DELAY_MS ?? 2500)
+  const emit = (title) => {
+    setSessionTitle(sessionId, title)
+    broadcastTitleEvent({ type: 'session.updated', properties: { sessionID: sessionId, info: { id: sessionId, title } } })
+  }
+  titleSequence.forEach((title, index) => {
+    setTimeout(() => emit(title), delay + index * 300).unref?.()
+  })
+  const last = titleSequence[titleSequence.length - 1]
+  setTimeout(() => {
+    setInterval(() => emit(last), 2000).unref?.()
+  }, delay + titleSequence.length * 300).unref?.()
+}
+
+startTitleServer()
 
 const resumeSessionId = argValue('--session')
 
@@ -189,6 +284,7 @@ if (resumeSessionId) {
     const prompt = String(firstPrompt ?? '').trim()
     if (prompt.length > 0) writeFirstUserMessage(sessionId, prompt)
     process.stdout.write(`opencode: session ${sessionId} started\r\n`)
+    runTitleSequence(sessionId)
   }
 
   let sessionCreated = false

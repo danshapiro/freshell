@@ -354,12 +354,23 @@ async fn scoped_session_rename(
                 .into_response()
         }
     };
+    // Name-reliability Task 4 (LB-B8): the session index row's folder.
+    let cwd = crate::session_name_routes::rename_target_cwd(
+        &target,
+        &state.identity,
+        state.index.as_deref(),
+    );
     let update = match crate::session_name_routes::rename_through_authority(
         sink.as_ref(),
-        target,
-        name.to_string(),
-        intent,
-        if_revision,
+        freshell_freshagent::naming::RenameNameInput {
+            target,
+            name: name.to_string(),
+            intent,
+            if_revision,
+            cwd,
+        },
+        &state.identity,
+        state.index.as_deref(),
     )
     .await
     {
@@ -569,8 +580,10 @@ async fn scoped_generate_title(
     };
     if let Some(generator) = &state.generation_wake {
         // Ensure already-eligible unattempted work: the wake makes the
-        // worker's next pass immediate. Never replenishes anything.
-        generator.notify_capability_change();
+        // worker's next pass immediate. Never replenishes anything, and
+        // never clears the naming pause (name-reliability Task 6: only a
+        // key change does).
+        generator.wake();
     }
     match record {
         Some(record) => Json(json!({

@@ -3,6 +3,7 @@ import { reconcileTerminalSessionRefByTerminalId } from '@/store/panesSlice'
 import { updateSessionActivity } from '@/store/sessionActivitySlice'
 import { receiveSessionNames } from '@/store/sessionNamesSlice'
 import { bootstrapSessionNames } from '@/lib/session-names'
+import { spentPendingNamingHandles } from '@/lib/terminal-naming-rebind'
 import {
   buildTerminalDurableSessionRefUpdate,
   flushPersistedLayoutNow,
@@ -14,6 +15,7 @@ import { sanitizeSessionRef, type SessionRef } from '@shared/session-contract'
 
 type Dispatch = (action: any) => unknown
 type SessionAssociationState = Pick<RootState, 'panes' | 'tabs' | 'sessionActivity'>
+  & Partial<Pick<RootState, 'sessionNames'>>
 
 /**
  * Shared ratchet-only migration core: copy the activity stored under one
@@ -165,12 +167,14 @@ export function reconcileTerminalSessionAssociation({
   terminalId,
   sessionRef: rawSessionRef,
   previousSessionId,
+  nameRef,
 }: {
   dispatch: Dispatch
   getState: () => SessionAssociationState
   terminalId?: string
   sessionRef?: unknown
   previousSessionId?: string
+  nameRef?: unknown
 }): TerminalSessionAssociationReconcileStatus {
   if (!terminalId) return 'ignored'
   const sessionRef = sanitizeSessionRef(rawSessionRef)
@@ -181,10 +185,12 @@ export function reconcileTerminalSessionAssociation({
   let conflictingPane = false
   let shouldFlush = false
   const matchedSinglePaneTabs: Array<{ tabId: string; content: TerminalPaneContent }> = []
+  const matchedContents: TerminalPaneContent[] = []
   for (const [tabId, layout] of Object.entries(state.panes.layouts)) {
     const matches: Array<{ paneId: string; content: TerminalPaneContent }> = []
     collectMatchingTerminalPanes(layout, terminalId, matches)
     if (matches.length === 0) continue
+    for (const { content } of matches) matchedContents.push(content)
 
     matchedAnyPane = true
     // A server-authoritative rebind (previousSessionId names the ref being
@@ -244,7 +250,21 @@ export function reconcileTerminalSessionAssociation({
 
   if (!matchedAnyPane) return 'ignored'
 
-  dispatch(reconcileTerminalSessionRefByTerminalId({ terminalId, sessionRef }))
+  // Name reliability (Task 10, G45): the rebind token rides along so the
+  // reducer adopts the server's current naming binding, even before cached
+  // redirects load. Older servers omit it: their pending handle is released
+  // only once the cache proves the server spent it; an unspent handle stays.
+  const isRebind = typeof previousSessionId === 'string' && previousSessionId.length > 0
+  const spentNamingHandles = isRebind
+    ? spentPendingNamingHandles(matchedContents, state.sessionNames?.redirects)
+    : []
+  dispatch(reconcileTerminalSessionRefByTerminalId({
+    terminalId,
+    sessionRef,
+    ...(isRebind ? { previousSessionId } : {}),
+    ...(spentNamingHandles.length > 0 ? { spentNamingHandles } : {}),
+    ...(nameRef !== undefined ? { nameRef } : {}),
+  }))
 
   // Unified agent names (Task 5): the accepted rebind also moves the pane's
   // NAMING binding — the display selector resolves through the pane content's

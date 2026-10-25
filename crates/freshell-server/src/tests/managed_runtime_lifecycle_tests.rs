@@ -177,7 +177,7 @@ async fn directory_fixture_with_retry(
         .await
         .unwrap()
         .unwrap_or_else(|| managed_descriptor_from_view(&view, None).unwrap());
-    registry.register_managed(descriptor);
+    registry.register_managed(descriptor, "Shell".to_string());
     let read = registry
         .refresh_managed_output("directory-retained", 65536)
         .await

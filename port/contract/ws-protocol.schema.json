@@ -452,6 +452,10 @@
                     "minLength": 1,
                     "type": "string"
                   },
+                  "namingHandle": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
                   "paneKey": {
                     "minLength": 1,
                     "type": "string"
@@ -522,6 +526,10 @@
             "capabilities": {
               "additionalProperties": false,
               "properties": {
+                "freshAgentAttentionReplayV1": {
+                  "const": true,
+                  "type": "boolean"
+                },
                 "managedRuntimeV1": {
                   "const": true,
                   "type": "boolean"
@@ -2223,6 +2231,9 @@
               ],
               "type": "string"
             },
+            "requestId": {
+              "type": "string"
+            },
             "sessionId": {
               "minLength": 1,
               "type": "string"
@@ -3826,6 +3837,9 @@
               ],
               "type": "string"
             },
+            "requestId": {
+              "type": "string"
+            },
             "sessionId": {
               "minLength": 1,
               "type": "string"
@@ -4724,6 +4738,9 @@
           ],
           "type": "string"
         },
+        "requestId": {
+          "type": "string"
+        },
         "sessionId": {
           "minLength": 1,
           "type": "string"
@@ -4881,7 +4898,12 @@
           "type": "integer"
         },
         "provider": {
-          "const": "codex",
+          "enum": [
+            "claude",
+            "codex",
+            "opencode",
+            "amplifier"
+          ],
           "type": "string"
         },
         "requestId": {
@@ -4893,7 +4915,12 @@
           "type": "string"
         },
         "sessionType": {
-          "const": "freshcodex",
+          "enum": [
+            "freshclaude",
+            "freshcodex",
+            "kilroy",
+            "freshopencode"
+          ],
           "type": "string"
         },
         "type": {
@@ -4921,7 +4948,12 @@
           "type": "string"
         },
         "provider": {
-          "const": "codex",
+          "enum": [
+            "claude",
+            "codex",
+            "opencode",
+            "amplifier"
+          ],
           "type": "string"
         },
         "requestId": {
@@ -4933,7 +4965,12 @@
           "type": "string"
         },
         "sessionType": {
-          "const": "freshcodex",
+          "enum": [
+            "freshclaude",
+            "freshcodex",
+            "kilroy",
+            "freshopencode"
+          ],
           "type": "string"
         },
         "success": {
@@ -5241,6 +5278,10 @@
         "capabilities": {
           "additionalProperties": false,
           "properties": {
+            "freshAgentAttentionReplayV1": {
+              "const": true,
+              "type": "boolean"
+            },
             "managedRuntimeV1": {
               "const": true,
               "type": "boolean"
@@ -7958,6 +7999,10 @@
                 "minLength": 1,
                 "type": "string"
               },
+              "namingHandle": {
+                "minLength": 1,
+                "type": "string"
+              },
               "paneKey": {
                 "minLength": 1,
                 "type": "string"
@@ -8234,6 +8279,10 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
+        "freshAgentAttentionReplayV1": {
+          "const": true,
+          "type": "boolean"
+        },
         "managedRuntimeV1": {
           "const": true,
           "type": "boolean"
@@ -8277,6 +8326,10 @@
           "type": "string"
         },
         "mode": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "namingHandle": {
           "minLength": 1,
           "type": "string"
         },

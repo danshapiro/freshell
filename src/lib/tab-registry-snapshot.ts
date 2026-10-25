@@ -86,19 +86,29 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
   }
 }
 
+type CollectPaneSnapshotsOptions = {
+  /** Name reliability (Task 9): the tab's per-pane "user renamed" flags. A
+   * renamed pane's snapshot carries `titleSetByUser: true`, so a window
+   * rebuilt from the registry keeps the name protected; an automatic title
+   * carries no flag. */
+  paneTitleSetByUser?: Record<string, boolean>
+  annotatePayload?: (paneId: string) => { sessionKeys?: string[]; busySessionKeys?: string[] } | undefined
+}
+
 export function collectPaneSnapshots(
   node: PaneNode | undefined,
   serverInstanceId: string,
   paneTitles?: Record<string, string>,
-  annotatePayload?: (paneId: string) => { sessionKeys?: string[]; busySessionKeys?: string[] } | undefined,
+  options: CollectPaneSnapshotsOptions = {},
 ): RegistryPaneSnapshot[] {
   if (!node) return []
   if (node.type === 'leaf') {
-    const annotation = annotatePayload?.(node.id)
+    const annotation = options.annotatePayload?.(node.id)
     return [{
       paneId: node.id,
       kind: node.content.kind,
       title: paneTitles?.[node.id],
+      ...(options.paneTitleSetByUser?.[node.id] === true ? { titleSetByUser: true } : {}),
       payload: {
         ...stripPanePayload(node.content, serverInstanceId),
         ...(annotation?.sessionKeys?.length ? { sessionKeys: annotation.sessionKeys } : {}),
@@ -107,8 +117,8 @@ export function collectPaneSnapshots(
     }]
   }
   return [
-    ...collectPaneSnapshots(node.children[0], serverInstanceId, paneTitles, annotatePayload),
-    ...collectPaneSnapshots(node.children[1], serverInstanceId, paneTitles, annotatePayload),
+    ...collectPaneSnapshots(node.children[0], serverInstanceId, paneTitles, options),
+    ...collectPaneSnapshots(node.children[1], serverInstanceId, paneTitles, options),
   ]
 }
 
@@ -117,6 +127,8 @@ type SnapshotRecordInput = {
   layout: PaneNode
   serverInstanceId: string
   paneTitles?: Record<string, string>
+  /** Name reliability (Task 9): the tab's per-pane "user renamed" flags. */
+  paneTitleSetByUser?: Record<string, boolean>
   extensions?: ClientExtensionEntry[]
   deviceId: string
   deviceLabel: string
@@ -131,9 +143,12 @@ export function buildOpenTabRegistryRecord(input: SnapshotRecordInput): Registry
     input.layout,
     input.serverInstanceId,
     input.paneTitles,
-    paneIdentityActivity
-      ? (paneId) => paneIdentityActivity.get(paneId)
-      : undefined,
+    {
+      paneTitleSetByUser: input.paneTitleSetByUser,
+      annotatePayload: paneIdentityActivity
+        ? (paneId) => paneIdentityActivity.get(paneId)
+        : undefined,
+    },
   )
   return {
     tabKey: `${input.deviceId}:${input.tab.id}`,
@@ -161,7 +176,9 @@ export function buildClosedTabRegistryRecord(input: SnapshotRecordInput): Regist
   // Closed/tombstone records are never stamped with pane identity activity:
   // input.paneIdentityActivity is accepted by the shared input shape but
   // deliberately not forwarded (rings are an open-tab concern).
-  const paneSnapshots = collectPaneSnapshots(input.layout, input.serverInstanceId, input.paneTitles)
+  const paneSnapshots = collectPaneSnapshots(input.layout, input.serverInstanceId, input.paneTitles, {
+    paneTitleSetByUser: input.paneTitleSetByUser,
+  })
   return {
     tabKey: `${input.deviceId}:${input.tab.id}`,
     tabId: input.tab.id,

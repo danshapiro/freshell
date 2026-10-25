@@ -74,6 +74,28 @@ describe('finalizeCodingAgentSessionName', () => {
     expect(store.getState().panes.paneTitles[tabId][paneId]).toBe('Add a logout button to the header')
   })
 
+  it('a kilroy finalize never retitles a session-owned tab (one ownership gate for every legacy writer)', async () => {
+    apiPost.mockResolvedValue({ title: 'Fix login redirect', source: 'ai' })
+    const store = configureStore({ reducer: { tabs: tabsReducer, panes: panesReducer } })
+    // The tab's naming source points at its pane, so the tab is
+    // session-owned: its stored title is the saved-name mirror, never a
+    // legacy write target.
+    store.dispatch(addTab({ id: 'owned', title: 'LotL', mode: 'claude', nameSource: { kind: 'session', paneId: 'owned-pane' } }))
+    store.dispatch(initLayout({
+      tabId: 'owned',
+      paneId: 'owned-pane',
+      content: { kind: 'fresh-agent', sessionType: 'kilroy', provider: 'claude', sessionId: 'sess-1', createRequestId: 'r', status: 'idle' },
+    }))
+
+    await store.dispatch(finalizeCodingAgentSessionName({
+      tabId: 'owned', paneId: 'owned-pane', provider: 'claude', sessionType: 'kilroy', sessionId: 'sess-1', firstMessage: 'please fix the login redirect bug',
+    }) as never)
+
+    // The kilroy pane keeps its legacy pane naming; the tab title is untouched.
+    expect(store.getState().panes.paneTitles.owned['owned-pane']).toBe('Fix login redirect')
+    expect(store.getState().tabs.tabs[0].title).toBe('LotL')
+  })
+
   it('writes the kilroy pane title as an auto source (not a user freeze)', async () => {
     apiPost.mockResolvedValue({ title: 'Server Title', source: 'first-message' })
     const { store, tabId, paneId } = singlePaneStore('kilroy')

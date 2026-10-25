@@ -36,13 +36,38 @@ pub trait SessionNaming: Send + Sync {
     /// Idempotent: re-ensuring a bound handle resolves its durable record.
     fn ensure_pending(&self, input: PendingNameInput) -> NameFuture<SessionNameUpdate>;
 
+    /// Admit a known session that has no name yet (for example immediately
+    /// after an in-pane conversation switch). Existing records are unchanged.
+    fn ensure_session(
+        &self,
+        _target: SessionNameRef,
+        _cwd: Option<String>,
+    ) -> NameFuture<SessionNameUpdate> {
+        Box::pin(async { Err(naming_unavailable("durable session admission")) })
+    }
+
+    /// Seed an internal continuation once from its source's saved name.
+    /// Durable identities remain independent: no redirect is created, an
+    /// existing child is unchanged, and an unnamed source produces no name.
+    /// Ordinary forks and new conversations must never call this operation.
+    fn continue_session(
+        &self,
+        _source: SessionNameRef,
+        _target: SessionNameRef,
+    ) -> NameFuture<Option<SessionNameUpdate>> {
+        Box::pin(async { Ok(None) })
+    }
+
     /// Atomically transfer a pending record onto its verified durable
     /// provider/session identity (rejecting prospective evidence).
     fn bind_pending(&self, input: BindNameInput) -> NameFuture<SessionNameUpdate>;
 
     /// Rename with intent. `user` is the explicit human boundary (manual
-    /// source); `automatic` is an agent suggestion (provider_ai rank that can
-    /// never freeze a name). Optional `if_revision` is compare-and-set.
+    /// source, always applied); `automatic` is an agent suggestion recorded
+    /// at provider_ai rank, refused over a protected name or for a default
+    /// or derived label (classified with `cwd`). The answer's `outcome`
+    /// says whether the rename applied. Optional `if_revision` is
+    /// compare-and-set.
     fn rename(&self, input: RenameNameInput) -> NameFuture<SessionNameUpdate>;
 
     /// Fold server-side coding-agent session activity: first-message
@@ -90,13 +115,18 @@ pub struct BindNameInput {
     pub acquisition: NativeAcquisition,
 }
 
-/// `rename` input.
+/// `rename` input. `cwd` (name-reliability Task 4) is the best-known folder
+/// of the rename's target — the terminal row's cwd for the pane, tab and
+/// terminal routes, the session index row's cwd for the session-key routes —
+/// so an automation rename to the target's own folder name is classified as
+/// a derived label and refused. `None` recognizes folder-free labels only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenameNameInput {
     pub target: SessionNameRef,
     pub name: String,
     pub intent: NameIntent,
     pub if_revision: Option<NameRevision>,
+    pub cwd: Option<String>,
 }
 
 /// Why activity arrived. `AcceptedUserMessage`/`IndexUserMessage` may carry a
@@ -611,8 +641,15 @@ pub async fn session_projection(
 /// stamps the observation with the store's CURRENT verified location
 /// revision for the target before folding it — a genuinely stale observation
 /// (from a superseded route) is then provenance-only, exactly the plan's
-/// old-location rule. `None` when no authority is wired or the fold failed —
-/// an observation never blocks or fails the provider lane.
+/// old-location rule. `None` when no authority is wired, the title is a
+/// provider placeholder, or the inline attempt did not apply — an
+/// observation never blocks or fails the provider lane.
+///
+/// Name-reliability Task 4: a provider placeholder ("New session - <ISO>")
+/// never reaches the store, and the observation makes ONE inline attempt; a
+/// busy or failing store hands it to the background retrier
+/// ([`crate::native_observation_retry`]), so the relay never waits for a
+/// retry and an older title can never land after a newer one.
 pub async fn observe_native_live(
     sink: &Option<Arc<dyn SessionNaming>>,
     target: SessionNameRef,
@@ -621,21 +658,24 @@ pub async fn observe_native_live(
     event_id: Option<String>,
 ) -> Option<SessionNameUpdate> {
     let sink = sink.as_ref()?;
-    let location_revision = sink
-        .current_location_revision(&target)
-        .await
-        .inspect_err(|error| log_name_error("current_location_revision", &target, error))
-        .ok()?;
-    sink.observe_native(NativeNameObservation {
-        target: target.clone(),
-        title: title.to_string(),
-        origin,
-        location_revision,
-        event_id,
-    })
-    .await
-    .inspect_err(|error| log_name_error("observe_native", &target, error))
-    .ok()
+    if is_placeholder_for_target(&target, title) {
+        return None;
+    }
+    let ticket = crate::native_observation_retry::reserve(sink, &target);
+    crate::native_observation_retry::submit(ticket, title.to_string(), origin, event_id).await
+}
+
+/// Whether `title` is a provider placeholder for the target's provider (a
+/// pending target's provider is not known yet: any provider's placeholder).
+pub fn is_placeholder_for_target(target: &SessionNameRef, title: &str) -> bool {
+    match target {
+        SessionNameRef::Session { provider, .. } => {
+            freshell_sessions::is_provider_placeholder_title(provider.as_str(), title)
+        }
+        SessionNameRef::Pending { .. } => {
+            freshell_sessions::is_provider_placeholder_title("opencode", title)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -665,18 +705,67 @@ pub(crate) mod test_support {
     pub(crate) struct RecordingSink {
         pub renames: Mutex<Vec<RenameNameInput>>,
         pub activities: Mutex<Vec<NameActivity>>,
+        /// Name-reliability Task 4: every `observe_native` call, in arrival
+        /// order (failed ones included).
+        pub observe_attempts: Mutex<Vec<NativeNameObservation>>,
+        /// Name-reliability Task 4: the observations the sink ACCEPTED (an
+        /// injected failure is not accepted), in the order their
+        /// transactions finished.
+        pub observed: std::sync::Arc<Mutex<Vec<NativeNameObservation>>>,
+        /// Name-reliability Task 4 review: the next `observe_native` call
+        /// waits on this before it finishes (a slow store transaction).
+        observe_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        /// Name-reliability Task 4: failures answered by the next
+        /// `observe_native` calls, front first (a stalled store).
+        pub observe_failures: Mutex<std::collections::VecDeque<NameError>>,
+        /// Name-reliability Task 4: the answer of `current_location_revision`
+        /// (the trait default's ceiling unless a test moves it).
+        pub location_revision: std::sync::atomic::AtomicU64,
         records: Mutex<Vec<(SessionNameRef, SessionNameRecord)>>,
         redirects: Mutex<Vec<(SessionNameRef, SessionNameRef)>>,
     }
 
     impl RecordingSink {
         pub fn new() -> std::sync::Arc<Self> {
-            std::sync::Arc::new(Self {
-                renames: Mutex::new(Vec::new()),
-                activities: Mutex::new(Vec::new()),
-                records: Mutex::new(Vec::new()),
-                redirects: Mutex::new(Vec::new()),
-            })
+            std::sync::Arc::new(Self::default())
+        }
+
+        /// Make the next `count` observations fail with `LockUnavailable`.
+        pub fn fail_next_observations(&self, count: usize) {
+            let mut failures = self.observe_failures.lock().unwrap();
+            for _ in 0..count {
+                failures.push_back(NameError::LockUnavailable(
+                    "injected: the document lock stayed busy".into(),
+                ));
+            }
+        }
+
+        /// Make the next `observe_native` call wait inside its transaction
+        /// until the returned sender fires (or is dropped).
+        pub fn block_next_observation(&self) -> tokio::sync::oneshot::Sender<()> {
+            let (release, gate) = tokio::sync::oneshot::channel();
+            *self.observe_gate.lock().unwrap() = Some(gate);
+            release
+        }
+
+        /// The titles of the observations the sink accepted, in order.
+        pub fn observed_titles(&self) -> Vec<String> {
+            self.observed
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|observation| observation.title.clone())
+                .collect()
+        }
+
+        /// The titles of every attempted observation, in order.
+        pub fn attempted_titles(&self) -> Vec<String> {
+            self.observe_attempts
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|observation| observation.title.clone())
+                .collect()
         }
 
         fn resolve(&self, target: &SessionNameRef) -> Option<SessionNameRef> {
@@ -727,6 +816,7 @@ pub(crate) mod test_support {
                 document_generation,
                 changed,
                 native_sync: None,
+                outcome: None,
             }
         }
 
@@ -882,6 +972,10 @@ pub(crate) mod test_support {
         }
 
         fn observe_native(&self, input: NativeNameObservation) -> NameFuture<SessionNameUpdate> {
+            self.observe_attempts.lock().unwrap().push(input.clone());
+            if let Some(error) = self.observe_failures.lock().unwrap().pop_front() {
+                return Box::pin(async move { Err(error) });
+            }
             let answer = match self.record_of(&input.target) {
                 Some(record) => Ok(self.update_for(record, false)),
                 None => Err(NameError::NotFound(format!(
@@ -889,7 +983,27 @@ pub(crate) mod test_support {
                     name_ref_debug_key(&input.target)
                 ))),
             };
-            Box::pin(async move { answer })
+            let gate = self.observe_gate.lock().unwrap().take();
+            let observed = std::sync::Arc::clone(&self.observed);
+            Box::pin(async move {
+                if let Some(gate) = gate {
+                    let _ = gate.await;
+                }
+                if answer.is_ok() {
+                    observed.lock().unwrap().push(input);
+                }
+                answer
+            })
+        }
+
+        fn current_location_revision(
+            &self,
+            _target: &SessionNameRef,
+        ) -> NameFuture<freshell_protocol::session_names::NameRevision> {
+            let revision = self
+                .location_revision
+                .load(std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { Ok(revision) })
         }
 
         fn record_acquisition(
@@ -913,9 +1027,24 @@ pub(crate) mod test_support {
             Self {
                 renames: Mutex::new(Vec::new()),
                 activities: Mutex::new(Vec::new()),
+                observe_attempts: Mutex::new(Vec::new()),
+                observed: std::sync::Arc::new(Mutex::new(Vec::new())),
+                observe_gate: Mutex::new(None),
+                observe_failures: Mutex::new(std::collections::VecDeque::new()),
+                location_revision: std::sync::atomic::AtomicU64::new(
+                    freshell_protocol::session_names::MAX_NAME_REVISION,
+                ),
                 records: Mutex::new(Vec::new()),
                 redirects: Mutex::new(Vec::new()),
             }
+        }
+    }
+
+    /// Seed a record directly (tests that observe a durable session the
+    /// sink never admitted).
+    impl RecordingSink {
+        pub fn seed_record(&self, record: SessionNameRecord) {
+            self.set_record(record.name_ref.clone(), record);
         }
     }
 
@@ -1179,6 +1308,7 @@ mod tests {
             name: "Named Before Identity".into(),
             intent: NameIntent::User,
             if_revision: None,
+            cwd: None,
         })
         .await
         .unwrap();

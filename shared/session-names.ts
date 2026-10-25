@@ -180,13 +180,32 @@ export const NativeSyncSchema = z.object({
 })
 export type NativeSync = z.infer<typeof NativeSyncSchema>
 
-/** The common response/broadcast shape for every naming operation. */
+/**
+ * Why a rename did not change the saved name (name-reliability Task 4):
+ * an automation rename never replaces a protected name (`protected_name`)
+ * and never saves a default or derived label (`default_label`);
+ * `unchanged` means the saved name already is the requested text.
+ */
+export const RenameOutcomeReasonSchema = z.enum(['protected_name', 'default_label', 'unchanged'])
+export type RenameOutcomeReason = z.infer<typeof RenameOutcomeReasonSchema>
+
+/** Whether a rename applied. Rename RESPONSES carry it; broadcasts never do. */
+export const RenameOutcomeSchema = z.object({
+  applied: z.boolean(),
+  reason: RenameOutcomeReasonSchema.optional(),
+})
+export type RenameOutcome = z.infer<typeof RenameOutcomeSchema>
+
+/** The common response/broadcast shape for every naming operation. A
+ * malformed or newer-server `outcome` is dropped, never a reason to reject
+ * the update it rides on. */
 export const SessionNameUpdateSchema = z.object({
   record: SessionNameRecordSchema,
   documentGeneration: NameRevisionSchema,
   redirects: z.array(SessionNameRedirectSchema),
   changed: z.boolean(),
   nativeSync: NativeSyncSchema.optional(),
+  outcome: RenameOutcomeSchema.optional().catch(undefined),
 })
 export type SessionNameUpdate = z.infer<typeof SessionNameUpdateSchema>
 

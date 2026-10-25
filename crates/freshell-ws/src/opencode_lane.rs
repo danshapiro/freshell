@@ -1463,6 +1463,198 @@ mod tests {
         assert!(!version_in_tested_range("2.0.0"));
     }
 
+    /// Name-reliability Task 4: a naming store that refuses (lock busy) the
+    /// next `fail` observations, recording every attempt and every accepted
+    /// title. Only `observe_native` is exercised.
+    #[derive(Default)]
+    struct TitleSink {
+        fail: AtomicUsize,
+        attempts: Mutex<Vec<String>>,
+        accepted: Mutex<Vec<String>>,
+    }
+
+    impl freshell_freshagent::naming::SessionNaming for TitleSink {
+        fn get(
+            &self,
+            _refs: Vec<freshell_protocol::SessionNameRef>,
+        ) -> freshell_freshagent::naming::NameFuture<Vec<freshell_protocol::SessionNameUpdate>>
+        {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn ensure_pending(
+            &self,
+            _input: freshell_freshagent::naming::PendingNameInput,
+        ) -> freshell_freshagent::naming::NameFuture<freshell_protocol::SessionNameUpdate> {
+            Box::pin(async { Err(freshell_freshagent::naming::naming_unavailable("test")) })
+        }
+        fn bind_pending(
+            &self,
+            _input: freshell_freshagent::naming::BindNameInput,
+        ) -> freshell_freshagent::naming::NameFuture<freshell_protocol::SessionNameUpdate> {
+            Box::pin(async { Err(freshell_freshagent::naming::naming_unavailable("test")) })
+        }
+        fn rename(
+            &self,
+            _input: freshell_freshagent::naming::RenameNameInput,
+        ) -> freshell_freshagent::naming::NameFuture<freshell_protocol::SessionNameUpdate> {
+            Box::pin(async { Err(freshell_freshagent::naming::naming_unavailable("test")) })
+        }
+        fn activity(
+            &self,
+            _input: freshell_freshagent::naming::NameActivity,
+        ) -> freshell_freshagent::naming::NameFuture<freshell_protocol::SessionNameUpdate> {
+            Box::pin(async { Err(freshell_freshagent::naming::naming_unavailable("test")) })
+        }
+        fn observe_native(
+            &self,
+            input: freshell_freshagent::naming::NativeNameObservation,
+        ) -> freshell_freshagent::naming::NameFuture<freshell_protocol::SessionNameUpdate> {
+            self.attempts.lock().unwrap().push(input.title.clone());
+            let refuse = self
+                .fail
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            if refuse {
+                return Box::pin(async {
+                    Err(freshell_freshagent::naming::NameError::LockUnavailable(
+                        "injected: the document lock stayed busy".into(),
+                    ))
+                });
+            }
+            self.accepted.lock().unwrap().push(input.title.clone());
+            let record = freshell_protocol::session_names::SessionNameRecord {
+                name_ref: input.target,
+                name: input.title,
+                source: freshell_protocol::session_names::NameSource::ProviderAi,
+                revision: 2,
+                manual_revision: None,
+                renamed_at: None,
+                legacy_origin: None,
+            };
+            Box::pin(async move {
+                Ok(freshell_protocol::SessionNameUpdate {
+                    record,
+                    document_generation: 2,
+                    redirects: Vec::new(),
+                    changed: true,
+                    native_sync: None,
+                    outcome: None,
+                })
+            })
+        }
+        fn record_acquisition(
+            &self,
+            _target: freshell_protocol::SessionNameRef,
+            _acquisition: freshell_protocol::native_location::NativeAcquisition,
+        ) -> freshell_freshagent::naming::NameFuture<freshell_protocol::SessionNameUpdate> {
+            Box::pin(async { Err(freshell_freshagent::naming::naming_unavailable("test")) })
+        }
+    }
+
+    /// Name-reliability Task 4 (the CLI lane's `NativeTitleObserver` seam
+    /// that `main.rs` wires): `session.updated` titles fold through the
+    /// naming store without ever stalling the lane. The placeholder never
+    /// reaches the store, the real title's locked inline attempt hands off
+    /// to the background retry, and the event after the titles reaches the
+    /// hub at once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn naming_title_observer_folds_titles_without_stalling_the_lane() {
+        let sink = Arc::new(TitleSink::default());
+        sink.fail.store(1, Ordering::SeqCst);
+        let observer = crate::opencode_title_naming::naming_title_observer(
+            crate::identity::TerminalIdentityRegistry::new(),
+            Some(sink.clone() as Arc<dyn freshell_freshagent::naming::SessionNaming>),
+        );
+        let log: CallLog = Arc::new(Mutex::new(Vec::new()));
+        let http = Arc::new(FakeLaneHttp {
+            log: log.clone(),
+            respond: Box::new(|url| {
+                if url.ends_with("/global/health") {
+                    return Ok((200, json!({ "healthy": true, "version": "1.18.11" })));
+                }
+                if url.ends_with("/session/status") {
+                    return Ok((200, json!({})));
+                }
+                Ok((404, json!({})))
+            }),
+        });
+        let stream = Arc::new(FakeLaneStream {
+            log,
+            scripts: Mutex::new(VecDeque::from([StreamScript {
+                buffered: vec![],
+                live: vec![
+                    parsed(json!({
+                        "type": "session.updated",
+                        "properties": { "info": {
+                            "id": "ses-title",
+                            "title": "New session - 2026-10-20T00:09:25.350Z"
+                        } }
+                    })),
+                    parsed(json!({
+                        "type": "session.updated",
+                        "properties": { "info": {
+                            "id": "ses-title",
+                            "title": "Publishing blocked by token error"
+                        } }
+                    })),
+                    parsed(json!({
+                        "type": "session.idle",
+                        "properties": { "sessionID": "ses-title" }
+                    })),
+                ],
+                finish: false,
+            }])),
+        });
+        let deps = Arc::new(OpencodeLaneDeps {
+            http,
+            events: stream,
+            native_title_observer: Some(observer),
+        });
+        let (hub, _rx) = hub();
+        (hub.registry_observer())(freshell_terminal::ActivityEvent::Created {
+            terminal_id: "t-title".into(),
+            mode: "opencode".into(),
+            resume_session_id: Some("ses-title".into()),
+            at: 1_000,
+        });
+        hub.register_opencode_lane_for_tests("t-title", 1);
+        let (_lane, _verify_tx) =
+            spawn_opencode_lane(deps, hub.clone(), "t-title".into(), "http://fake".into(), 1);
+
+        // Snapshot, then the idle that followed both titles — promptly.
+        let ingress = wait_for_ingress(&hub, 2, 1_000).await;
+        assert!(
+            matches!(
+                ingress[1].3,
+                OpencodeLaneEvent::SessionIdle { ref session_id } if session_id == "ses-title"
+            ),
+            "{ingress:?}"
+        );
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while sink.accepted.lock().unwrap().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the background retry never folded the real title: {:?}",
+                sink.attempts.lock().unwrap()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            sink.accepted.lock().unwrap().clone(),
+            vec!["Publishing blocked by token error".to_string()]
+        );
+        assert!(
+            !sink
+                .attempts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|title| title.starts_with("New session - ")),
+            "the placeholder never reached the store"
+        );
+    }
+
     /// The cycle shape: health gate (two 500s, then healthy) → two-phase
     /// connect → `/session/status` snapshot → buffered-frame flush. The
     /// snapshot is noted BEFORE the buffered `session.idle`, connect

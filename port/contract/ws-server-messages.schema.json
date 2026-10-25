@@ -3061,6 +3061,9 @@
         "capabilities": {
           "additionalProperties": false,
           "properties": {
+            "freshAgentAttentionReplayV1": {
+              "type": "boolean"
+            },
             "managedRuntimeV1": {
               "type": "boolean"
             },
@@ -3081,6 +3084,34 @@
             }
           },
           "type": "object"
+        },
+        "freshAgentAttention": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "lastTurnCompleteAt": {
+                "type": "number"
+              },
+              "lastWaitingAt": {
+                "type": "number"
+              },
+              "provider": {
+                "type": "string"
+              },
+              "sessionId": {
+                "type": "string"
+              },
+              "sessionType": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider",
+              "sessionId"
+            ],
+            "type": "object"
+          },
+          "type": "array"
         },
         "runtimeOwners": {
           "items": {
@@ -3354,6 +3385,26 @@
             "desiredRevision",
             "locationRevision",
             "status"
+          ],
+          "type": "object"
+        },
+        "outcome": {
+          "additionalProperties": false,
+          "properties": {
+            "applied": {
+              "type": "boolean"
+            },
+            "reason": {
+              "enum": [
+                "protected_name",
+                "default_label",
+                "unchanged"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "applied"
           ],
           "type": "object"
         },
@@ -3880,6 +3931,25 @@
                       },
                       "effort": {
                         "type": "string"
+                      },
+                      "modelEffortLevels": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "levels": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          },
+                          "modelId": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "levels",
+                          "modelId"
+                        ],
+                        "type": "object"
                       },
                       "modelSelection": {
                         "anyOf": [
@@ -5640,6 +5710,53 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
+        "nameRef": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "kind": {
+                  "const": "pending",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "kind"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "const": "session",
+                  "type": "string"
+                },
+                "provider": {
+                  "enum": [
+                    "codex",
+                    "claude",
+                    "opencode"
+                  ],
+                  "type": "string"
+                },
+                "sessionId": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "provider",
+                "sessionId"
+              ],
+              "type": "object"
+            }
+          ]
+        },
         "previousSessionId": {
           "type": "string"
         },

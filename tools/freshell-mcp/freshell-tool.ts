@@ -9,6 +9,7 @@ import { z } from 'zod'
 import { createApiClient, resolveConfig, type ApiClient } from './http-client.js'
 import { translateKeys } from '../node-client-runtime/keys.js'
 import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../node-client-runtime/codex-restore-contract.js'
+import { renameNotAppliedMessage } from '../node-client-runtime/rename-outcome.js'
 import {
   ACTION_ALIASES,
   freshAgentResumeProvider,
@@ -419,6 +420,18 @@ function resolveNameIntent(params: Record<string, unknown> | undefined): 'user' 
   throw new Error("nameIntent must be 'user' or 'automatic'")
 }
 
+/**
+ * Name-reliability Task 4: a rename the server did not apply (a protected
+ * name, a default label) is surfaced as a top-level `warning` in the tool
+ * result, so the calling agent sees it without digging into the nested
+ * update; an applied rename returns the response unchanged.
+ */
+function withRenameOutcome(response: unknown): unknown {
+  const notApplied = renameNotAppliedMessage(response)
+  if (!notApplied || !response || typeof response !== 'object' || Array.isArray(response)) return response
+  return { ...(response as Record<string, unknown>), warning: notApplied }
+}
+
 export async function executeAction(
   action: string,
   params?: Record<string, unknown>,
@@ -516,7 +529,7 @@ async function routeAction(
         : undefined
       const { tab } = await resolveTabTarget(target)
       if (!tab) return { error: target ? `Tab '${target}' not found` : 'No active tab found', hint: "Run action 'list-tabs' to see available tabs." }
-      return c.patch(`/api/tabs/${encodeURIComponent(tab.id)}`, { name, nameIntent })
+      return withRenameOutcome(await c.patch(`/api/tabs/${encodeURIComponent(tab.id)}`, { name, nameIntent }))
     }
     case 'has-tab': {
       const target = requireParam(params, 'target')
@@ -565,7 +578,7 @@ async function routeAction(
         : undefined
       const { pane } = await resolvePaneTarget(target)
       if (!pane) return { error: target ? `Pane '${target}' not found` : 'No active pane found', hint: "Run action 'list-panes' to see available panes." }
-      return c.patch(`/api/panes/${encodeURIComponent(pane.id)}`, { name, nameIntent })
+      return withRenameOutcome(await c.patch(`/api/panes/${encodeURIComponent(pane.id)}`, { name, nameIntent }))
     }
     case 'kill-pane': {
       const target = requireParam(params, 'target')

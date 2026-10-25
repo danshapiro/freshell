@@ -211,6 +211,41 @@ describe('tabRegistrySync', () => {
     stop()
   })
 
+  it('pushes the pane user flag with each renamed pane (name reliability, Task 9)', () => {
+    state = {
+      ...state,
+      panes: {
+        ...state.panes,
+        paneTitles: { 'tab-1': { 'pane-1': 'KeepMePane' } },
+        paneTitleSetByUser: { 'tab-1': { 'pane-1': true } },
+      },
+    }
+    const stop = startTabRegistrySync(createStore() as any, ws)
+
+    const pushed = ws.sendTabsSyncPush.mock.calls[0][0].records as Array<{ tabId: string; panes: Array<Record<string, unknown>> }>
+    const pane = pushed.find((record) => record.tabId === 'tab-1')?.panes[0]
+    expect(pane).toMatchObject({ paneId: 'pane-1', title: 'KeepMePane', titleSetByUser: true })
+
+    // Renaming the pane is a snapshot change: the next interval push sends it.
+    ws.sendTabsSyncPush.mockClear()
+    state = {
+      ...state,
+      panes: {
+        ...state.panes,
+        paneTitles: { 'tab-1': { 'pane-1': 'user@host: ~' } },
+        paneTitleSetByUser: {},
+      },
+    }
+    vi.advanceTimersByTime(SYNC_INTERVAL_MS)
+    expect(ws.sendTabsSyncPush).toHaveBeenCalledTimes(1)
+    const repushed = ws.sendTabsSyncPush.mock.calls[0][0].records as Array<{ tabId: string; panes: Array<Record<string, unknown>> }>
+    const automatic = repushed.find((record) => record.tabId === 'tab-1')?.panes[0]
+    expect(automatic?.title).toBe('user@host: ~')
+    expect(automatic).not.toHaveProperty('titleSetByUser')
+
+    stop()
+  })
+
   it('publishes materialized fresh-agent session refs instead of stale placeholders', () => {
     state = {
       ...state,

@@ -67,6 +67,7 @@ pub mod layout_tree;
 pub mod model_capabilities;
 pub mod naming;
 pub mod native_history;
+pub mod native_observation_retry;
 pub mod opencode_ws;
 pub mod pane_ops;
 mod pane_resize;
@@ -78,10 +79,13 @@ mod process_probe;
 /// The wedged-runtime quiet deadman shared by the fresh-agent lanes (design
 /// 2026-10-22 §3.2, §5.6).
 pub(crate) mod quiet_deadman;
+mod rename_response;
+mod rename_target_cwd;
 pub mod rest_lane;
 pub(crate) mod rest_lane_create;
 mod rest_lane_sync;
 pub mod rollback_record;
+mod scoped_name_rename;
 pub mod session_handoff;
 pub mod session_lease;
 pub mod session_metadata;
@@ -89,6 +93,7 @@ pub mod snapshot;
 pub mod spawn_gate;
 pub(crate) mod summary;
 pub mod target_resolver;
+pub mod terminal_name_binding;
 pub mod terminal_tabs;
 #[cfg(test)]
 mod test_environment;
@@ -2241,6 +2246,12 @@ pub struct FreshAgentState {
     /// wired (the Option-until-wired convention): creates proceed, only the
     /// meta seeding is skipped.
     pub(crate) terminal_created_hook: Option<TerminalCreatedHook>,
+    /// Name reliability (Task 10): the shared identity table the REST door's
+    /// terminal naming bind writes through (`freshell-server`'s `main.rs`
+    /// injects the WebSocket door's identity binder, so both doors bind the
+    /// SAME table). `None` until wired: REST binds still write the registry
+    /// row and this state's handle stash.
+    pub(crate) terminal_name_binder: Option<Arc<dyn terminal_name_binding::TerminalNameBinder>>,
     /// The `GET`/`POST /api/fresh-agent/model-capabilities/*` registry
     /// ([`model_capabilities`]): cwd-keyed TTL cache + single-flight coalescing
     /// over the transient opencode catalog probe, plus the static codex/claude
@@ -2452,6 +2463,7 @@ impl FreshAgentState {
             sidecar_liveness: None,
             layout: layout_store::LayoutStore::default(),
             terminal_created_hook: None,
+            terminal_name_binder: None,
             model_capabilities: Arc::new(model_capabilities::ModelCapabilityRegistry::new(
                 Arc::new(model_capabilities::OpencodeCatalogProbe::default()),
             )),
@@ -2816,6 +2828,16 @@ impl FreshAgentState {
     /// (e.g. [`Self::with_shared_sessions_revision`]).
     pub fn with_terminal_created_hook(mut self, hook: TerminalCreatedHook) -> Self {
         self.terminal_created_hook = Some(hook);
+        self
+    }
+
+    /// Name reliability (Task 10): wire the shared identity table the REST
+    /// door's terminal naming bind writes (see the field doc).
+    pub fn with_terminal_name_binder(
+        mut self,
+        binder: Arc<dyn terminal_name_binding::TerminalNameBinder>,
+    ) -> Self {
+        self.terminal_name_binder = Some(binder);
         self
     }
 
@@ -5050,6 +5072,7 @@ async fn create_tab(
                                 name: seed.to_string(),
                                 intent: freshell_protocol::session_names::NameIntent::Automatic,
                                 if_revision: None,
+                                cwd: cwd.clone(),
                             })
                             .await
                         {
@@ -5715,6 +5738,7 @@ async fn resume_session_ref_tab(
                 name: seed.to_string(),
                 intent: freshell_protocol::session_names::NameIntent::Automatic,
                 if_revision: None,
+                cwd: cwd.clone(),
             })
             .await
         {
@@ -5838,8 +5862,16 @@ pub(crate) fn resolve_pane_name_target(
             target: None,
         });
     }
-    // Unified agent names (Task 8, the T6-R3 sender-repair consequence): the
-    // pane's canonical binding rungs — `nameRef`, then the PRE-DURABLE
+    // The terminal's current naming binding is authoritative while the
+    // browser layout catches up with an in-pane conversation switch.
+    if let Some(target) = scoped_name_rename::terminal_binding(state, content) {
+        return Some(PaneNameResolution {
+            scoped: true,
+            target: Some(target),
+        });
+    }
+    // Without a live terminal binding, use the client's canonical rungs
+    // (including fresh-agent panes): `nameRef`, then the PRE-DURABLE
     // `namingHandle`, then the durable `sessionRef`, then the create-lane
     // stash — in EXACTLY the client's approved order
     // (`resolvePaneNameRef`, sessionNameSelectors). The pre-durable handle
@@ -6008,6 +6040,14 @@ pub(crate) fn effective_pane_name_resolution(
     body: &Value,
 ) -> Option<PaneNameResolution> {
     let capture = scoped_capture_of(body);
+    if let Some(target) =
+        scoped_name_rename::legacy_prebind_target(state, pane_id, capture.as_ref())
+    {
+        return Some(PaneNameResolution {
+            scoped: true,
+            target: Some(target),
+        });
+    }
     match resolve_pane_name_target(state, pane_id) {
         Some(resolution) if resolution.scoped => Some(PaneNameResolution {
             scoped: true,
@@ -6101,7 +6141,23 @@ pub(crate) async fn rename_scoped_session(
     if let Some(expected) = body.get("expectedNameRef") {
         let expected_ref: Option<freshell_protocol::session_names::SessionNameRef> =
             serde_json::from_value(expected.clone()).ok();
-        if expected_ref.as_ref() != Some(&target) {
+        let capture_matches = match scoped_name_rename::capture_matches(
+            state,
+            expected_ref.as_ref(),
+            &target,
+        )
+        .await
+        {
+            Ok(matches) => matches,
+            Err(error) => {
+                naming::log_name_error("rename_capture", &target, &error);
+                return scoped_name_error_response(
+                    &error,
+                    &serde_json::to_value(&target).unwrap_or(Value::Null),
+                );
+            }
+        };
+        if !capture_matches {
             return (
                 StatusCode::CONFLICT,
                 Json(json!({
@@ -6162,89 +6218,24 @@ pub(crate) async fn rename_scoped_session(
             "session naming is unavailable on this server".to_string(),
         );
     };
-    match sink
-        .rename(naming::RenameNameInput {
+    // Name-reliability Task 4 (LB-B8): the pane's best-known folder.
+    let cwd = pane_id.and_then(|pane_id| rename_target_cwd::pane_rename_cwd(state, pane_id));
+    match scoped_name_rename::rename(
+        state,
+        sink.as_ref(),
+        pane_id,
+        naming::RenameNameInput {
             target: target.clone(),
             name: name.clone(),
             intent,
             if_revision,
-        })
-        .await
+            cwd: cwd.clone(),
+        },
+    )
+    .await
     {
-        Ok(update) => {
-            let mut data = Map::new();
-            if let Some(tab_id) = tab_id {
-                data.insert("tabId".into(), json!(tab_id));
-            }
-            if let Some(pane_id) = pane_id {
-                data.insert("paneId".into(), json!(pane_id));
-            }
-            data.insert(
-                "nameRef".into(),
-                serde_json::to_value(&update.record.name_ref).unwrap_or(Value::Null),
-            );
-            data.insert(
-                "sessionName".into(),
-                serde_json::to_value(&update).unwrap_or(Value::Null),
-            );
-            ok_json(Value::Object(data), "session renamed")
-        }
+        Ok(update) => rename_response::scoped_rename_response(tab_id, pane_id, &update),
         Err(error) => {
-            // Unified agent names (Task 8 acceptance): the pre-bind
-            // fallback. A fresh claude pane's content carries the
-            // PROSPECTIVE preallocated sessionRef (both create doors put
-            // it there before any transcript exists), so the primary
-            // session-target rename answers NotFound until the first
-            // message materializes the identity. The pane's own naming
-            // binding pre-bind is its PENDING handle — resolve that and
-            // retry once. The `expectedNameRef` capture guard already
-            // passed against the pane's visible binding, and the 404
-            // itself proves no established record exists to have switched
-            // conversations from, so the retry needs no second guard.
-            if matches!(error, naming::NameError::NotFound(_))
-                && matches!(
-                    target,
-                    freshell_protocol::session_names::SessionNameRef::Session { .. }
-                )
-            {
-                if let Some(pane_id) = pane_id {
-                    if let Some(pending) = resolve_pane_pending_binding(state, pane_id) {
-                        match sink
-                            .rename(naming::RenameNameInput {
-                                target: pending.clone(),
-                                name,
-                                intent,
-                                if_revision,
-                            })
-                            .await
-                        {
-                            Ok(update) => {
-                                let mut data = Map::new();
-                                if let Some(tab_id) = tab_id {
-                                    data.insert("tabId".into(), json!(tab_id));
-                                }
-                                data.insert("paneId".into(), json!(pane_id));
-                                data.insert(
-                                    "nameRef".into(),
-                                    serde_json::to_value(&update.record.name_ref)
-                                        .unwrap_or(Value::Null),
-                                );
-                                data.insert(
-                                    "sessionName".into(),
-                                    serde_json::to_value(&update).unwrap_or(Value::Null),
-                                );
-                                return ok_json(Value::Object(data), "session renamed");
-                            }
-                            Err(retry_error) => {
-                                naming::log_name_error("rename", &pending, &retry_error);
-                                let target_value =
-                                    serde_json::to_value(&pending).unwrap_or(Value::Null);
-                                return scoped_name_error_response(&retry_error, &target_value);
-                            }
-                        }
-                    }
-                }
-            }
             naming::log_name_error("rename", &target, &error);
             let target_value = serde_json::to_value(&target).unwrap_or(Value::Null);
             scoped_name_error_response(&error, &target_value)

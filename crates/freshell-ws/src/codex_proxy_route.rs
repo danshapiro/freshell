@@ -768,6 +768,7 @@ mod tests {
                     document_generation: 1,
                     changed: true,
                     native_sync: None,
+                    outcome: None,
                 })
             })
         }

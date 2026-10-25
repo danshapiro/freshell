@@ -96,6 +96,12 @@ uuid = { version = "1", features = ["v4"] }
 # provider (`ring`) is actually installed; see freshell-protocol's Cargo.toml
 # for the `rustls-tls-no-provider` hazard this deliberately avoids.
 reqwest = { version = "0.13", default-features = false, features = ["stream", "rustls"] }
+# Name-reliability Task 6: an untrusted certificate is told apart from a
+# refused connection by downcasting reqwest's error chain to
+# `rustls::Error::InvalidCertificate` (`gemini_failure.rs`). The version
+# reqwest already resolves in the workspace lock (no new crate); no
+# provider features, only the error type.
+rustls = { version = "0.23.41", default-features = false, features = ["std"] }
 # Decode the base64 PNG the UI returns in `ui.screenshot.result` before writing it
 # (POST /api/screenshots). Already resolved in the workspace lock (no new download).
 base64 = "0.22"

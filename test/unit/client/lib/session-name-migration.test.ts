@@ -16,26 +16,24 @@ const apiMocks = vi.hoisted(() => ({
 vi.mock('@/lib/api', () => ({ api: { post: apiMocks.post }, ApiError: apiMocks.ApiError }))
 
 import {
-  captureLegacyNameEvidence,
-  captureLegacyLayoutEnvelope,
   collectLegacyPendingHandleAssignments,
-  ensureLegacyNameCapturesForFlush,
   importLegacyNames,
-  isLegacyNameCaptureSourceKey,
   legacyPendingNamingHandle,
-  listCapturedMigrationEnvelopes,
   prepareLegacyNameImports,
-  registerLegacyNameSubmitGate,
-  resetLegacyNameCaptureFailureForTests,
-  SESSION_NAME_MIGRATION_KEY_PREFIX,
   stripScopedPaneTitleMetadata,
   stripSessionOwnedTabFreezeFlags,
   submitPendingLegacyNameImports,
 } from '@/lib/session-name-migration'
 import {
+  isCaptureDone,
+  isGenuinePreMigrationSource,
+  listCapturedMigrationEnvelopes,
+  runOneTimeLegacyCapture,
+  SESSION_NAME_MIGRATION_KEY_PREFIX,
+} from '@/lib/legacy-name-capture-policy'
+import {
   parsePersistedLayoutRaw,
 } from '@/store/persistedState'
-import { LAYOUT_STORAGE_KEY_PREFIX } from '@/store/window-layout-keys'
 
 // ── fixtures ─────────────────────────────────────────────────────────────────
 
@@ -114,174 +112,123 @@ function envelopeKeysIn(storage: Storage): string[] {
   return keys
 }
 
-/** A localStorage stub that can be made to fail setItem. */
-function failingStorage(): Storage & { failSetItem: (fail: boolean) => void } {
-  const map = new Map<string, string>()
-  const storage = {
-    fail: false,
-    get length() { return map.size },
-    key(index: number) { return Array.from(map.keys())[index] ?? null },
-    getItem(key: string) { return map.get(key) ?? null },
-    setItem(key: string, value: string) {
-      if ((storage as unknown as { fail: boolean }).fail) {
-        throw new Error('quota')
-      }
-      map.set(key, value)
-    },
-    removeItem(key: string) { map.delete(key) },
-    clear() { map.clear() },
-    failSetItem(fail: boolean) { (storage as unknown as { fail: boolean }).fail = fail },
-  }
-  return storage as Storage & { failSetItem: (fail: boolean) => void }
-}
-
 beforeEach(() => {
   localStorage.clear()
   apiMocks.post.mockReset()
-  registerLegacyNameSubmitGate(() => false)
-  resetLegacyNameCaptureFailureForTests()
 })
+
+/** The captured envelopes as prepare/submit evidence. */
+function capturedEvidence(): Array<{ storageKey: string; raw: string }> {
+  return listCapturedMigrationEnvelopes(localStorage).map((e) => ({ storageKey: e.storageKey, raw: e.raw }))
+}
 
 // ── capture ─────────────────────────────────────────────────────────────────
 
 describe('legacy-name capture', () => {
-  it('captures every supported raw source under its own per-importId envelope key', () => {
+  it('captures only the genuine pre-migration sources, each under its own per-importId envelope key', () => {
+    // The five genuine pre-migration sources …
+    localStorage.setItem('freshell.layout.v3', layoutEnvelope())
+    localStorage.setItem('freshell.layout.v3.bak', layoutEnvelope({ persistedAt: 2 }))
+    localStorage.setItem('freshell.layout.pre-migration-raw.v1', layoutEnvelope({ persistedAt: 3 }))
+    localStorage.setItem('freshell.tabs.v2', layoutEnvelope({ persistedAt: 4 }))
+    localStorage.setItem('freshell.panes.v2', layoutEnvelope({ persistedAt: 5 }))
+    // … and what the current client writes itself, never captured.
     localStorage.setItem('freshell.layout.v3.window-a', layoutEnvelope())
-    localStorage.setItem('freshell.layout.v3', layoutEnvelope()) // legacy bare
-    localStorage.setItem('freshell.layout.v3.bak', layoutEnvelope()) // legacy backup
     localStorage.setItem('freshell.layout.v3.window-a.bak', layoutEnvelope())
     localStorage.setItem('freshell.layout.pre-migration-raw.v1.window-a', layoutEnvelope())
-    localStorage.setItem('freshell.tabs.v2', layoutEnvelope())
-    localStorage.setItem('freshell.panes.v2', layoutEnvelope())
-    // Non-sources never captured.
     localStorage.setItem('freshell.layout.v3.window-a.fresh-agent-centralization-commit', '{}')
     localStorage.setItem('freshell.browser-preferences.v1', '{}')
 
-    const evidence = captureLegacyNameEvidence(localStorage)
+    runOneTimeLegacyCapture(localStorage)
 
-    expect(evidence).toHaveLength(7)
     const envelopes = listCapturedMigrationEnvelopes(localStorage)
-    expect(envelopes).toHaveLength(7)
+    expect(envelopes).toHaveLength(5)
     for (const envelope of envelopes) {
       expect(localStorage.getItem(`${SESSION_NAME_MIGRATION_KEY_PREFIX}.${envelope.importId}`))
         .toBe(JSON.stringify(envelope))
+      // The raw bytes are preserved verbatim.
+      expect(envelope.raw).toBe(localStorage.getItem(envelope.storageKey))
     }
-    // The raw bytes are preserved verbatim.
     expect(envelopes.map((envelope) => envelope.storageKey).sort()).toEqual([
-      'freshell.layout.pre-migration-raw.v1.window-a',
+      'freshell.layout.pre-migration-raw.v1',
       'freshell.layout.v3',
       'freshell.layout.v3.bak',
-      'freshell.layout.v3.window-a',
-      'freshell.layout.v3.window-a.bak',
       'freshell.panes.v2',
       'freshell.tabs.v2',
     ])
   })
 
-  it('is idempotent — running twice never duplicates envelopes', () => {
-    localStorage.setItem('freshell.layout.v3.window-a', layoutEnvelope())
-    captureLegacyNameEvidence(localStorage)
-    const first = listCapturedMigrationEnvelopes(localStorage)
-    const evidence = captureLegacyNameEvidence(localStorage)
-    expect(evidence).toHaveLength(first.length)
-    expect(listCapturedMigrationEnvelopes(localStorage)).toHaveLength(first.length)
-  })
-
-  it('is retry-stable: the same source keeps its importId; a changed raw gets a NEW envelope and the original bytes survive', () => {
-    localStorage.setItem('freshell.layout.v3.window-a', layoutEnvelope())
-    captureLegacyNameEvidence(localStorage)
+  it('captures at most once — a second window boot never duplicates, rewrites or re-captures changed bytes', () => {
+    localStorage.setItem('freshell.layout.v3', layoutEnvelope())
+    runOneTimeLegacyCapture(localStorage)
     const first = listCapturedMigrationEnvelopes(localStorage)
     expect(first).toHaveLength(1)
 
-    // Same bytes: no change.
-    captureLegacyNameEvidence(localStorage)
+    // Same bytes (a second window boots on the same device): no change.
+    runOneTimeLegacyCapture(localStorage)
     expect(listCapturedMigrationEnvelopes(localStorage)).toEqual(first)
 
-    // Changed bytes (a sanitized flush): the original envelope is never
-    // overwritten — a new immutable envelope joins it.
-    localStorage.setItem('freshell.layout.v3.window-a', layoutEnvelope({ persistedAt: 9999 }))
-    captureLegacyNameEvidence(localStorage)
-    const after = listCapturedMigrationEnvelopes(localStorage)
-    expect(after).toHaveLength(2)
-    expect(after.map((envelope) => envelope.raw)).toContain(layoutEnvelope())
+    // Changed bytes under the same key: still no second envelope, and the
+    // first envelope keeps its original bytes.
+    localStorage.setItem('freshell.layout.v3', layoutEnvelope({ persistedAt: 9999 }))
+    runOneTimeLegacyCapture(localStorage)
+    expect(listCapturedMigrationEnvelopes(localStorage)).toEqual(first)
+    expect(first[0].raw).toBe(layoutEnvelope())
   })
 
-  it('two starting windows never overwrite each other (per-importId keys, no shared blob)', () => {
-    // Two independent storage realms model two windows of one origin.
-    const windowA = failingStorage()
-    const windowB = failingStorage()
-    windowA.setItem('freshell.layout.v3.window-a', layoutEnvelope())
-    windowB.setItem('freshell.layout.v3.window-b', layoutEnvelope({ persistedAt: 5 }))
-
-    captureLegacyNameEvidence(windowA)
-    captureLegacyNameEvidence(windowB)
-
-    const a = listCapturedMigrationEnvelopes(windowA)
-    const b = listCapturedMigrationEnvelopes(windowB)
-    expect(a).toHaveLength(1)
-    expect(b).toHaveLength(1)
-    expect(a[0].importId).not.toBe(b[0].importId)
-    // A second window's capture cannot clobber the first's envelope.
-    const aFirst = `${SESSION_NAME_MIGRATION_KEY_PREFIX}.${a[0].importId}`
-    expect(windowA.getItem(aFirst)).toBe(JSON.stringify(a[0]))
-  })
-
-  it('keeps the source and stays retryable when an envelope write fails', () => {
+  it('a capture write failure never throws, logs legacy_name_capture_failed, keeps the source, and the next ready submit marks the device done without sending', async () => {
     ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = true // the failure path logs
-    const storage = failingStorage()
-    storage.setItem('freshell.layout.v3.window-a', layoutEnvelope())
-    storage.failSetItem(true)
-    expect(() => captureLegacyNameEvidence(storage)).not.toThrow()
-    // The source is untouched.
-    expect(storage.getItem('freshell.layout.v3.window-a')).toBe(layoutEnvelope())
-    // A retry once writable succeeds.
-    storage.failSetItem(false)
-    captureLegacyNameEvidence(storage)
-    expect(listCapturedMigrationEnvelopes(storage)).toHaveLength(1)
-  })
+    localStorage.setItem('freshell.layout.v3', layoutEnvelope())
+    const realSetItem = Storage.prototype.setItem
+    const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (this: Storage, key: string, value: string) {
+      if (key.startsWith(`${SESSION_NAME_MIGRATION_KEY_PREFIX}.`)) throw new Error('quota')
+      realSetItem.call(this, key, value)
+    })
+    try {
+      expect(() => runOneTimeLegacyCapture(localStorage)).not.toThrow()
+    } finally {
+      setItem.mockRestore()
+    }
+    // The source is untouched, nothing was captured, and the device is not
+    // done yet.
+    expect(localStorage.getItem('freshell.layout.v3')).toBe(layoutEnvelope())
+    expect(listCapturedMigrationEnvelopes(localStorage)).toHaveLength(0)
+    expect(isCaptureDone(localStorage)).toBe(false)
+    const logged = vi.mocked(console.error).mock.calls.find((args) => args.includes('legacy_name_capture_failed'))
+    expect(logged?.find((arg) => typeof arg === 'object' && arg !== null))
+      .toMatchObject({ storageKey: 'freshell.layout.v3', reason: expect.any(String) })
 
-  it('gates the persistence flush on capture success — a failing capture defers, the retry recaptures and clears', () => {
-    ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = true // the failure path logs
-    const storage = failingStorage()
-    storage.setItem('freshell.layout.v3.window-a', layoutEnvelope())
-    // Healthy: an O(1) yes with nothing pending.
-    expect(ensureLegacyNameCapturesForFlush(storage)).toBe(true)
-
-    // The boot capture fails (quota): the gate must defer the flush while
-    // the uncaptured legacy bytes still sit in their source key.
-    storage.failSetItem(true)
-    captureLegacyNameEvidence(storage)
-    expect(ensureLegacyNameCapturesForFlush(storage)).toBe(false)
-    expect(storage.getItem('freshell.layout.v3.window-a')).toBe(layoutEnvelope())
-
-    // The write heals: the gate's re-capture lands the envelope FIRST,
-    // then reports the flush safe (the legacy bytes are now backed up).
-    storage.failSetItem(false)
-    expect(ensureLegacyNameCapturesForFlush(storage)).toBe(true)
-    const envelopes = listCapturedMigrationEnvelopes(storage)
-    expect(envelopes).toHaveLength(1)
-    expect(envelopes[0].storageKey).toBe('freshell.layout.v3.window-a')
-    expect(envelopes[0].raw).toBe(layoutEnvelope())
-    // And the recovered gate stays O(1) healthy.
-    expect(ensureLegacyNameCapturesForFlush(storage)).toBe(true)
-  })
-
-  it('captures an OLD envelope delivered later via crossTabSync before sanitization, and submits only through the ready gate', async () => {
-    localStorage.setItem('freshell.layout.v3.window-a', layoutEnvelope())
-    const foreignRaw = layoutEnvelope({ persistedAt: 42 })
-    // Gate closed: captured, no submit.
-    captureLegacyLayoutEnvelope('freshell.layout.v3.window-b', foreignRaw)
-    expect(listCapturedMigrationEnvelopes(localStorage).map((e) => e.storageKey))
-      .toContain('freshell.layout.v3.window-b')
-    expect(apiMocks.post).not.toHaveBeenCalled()
-    // Gate open: the pending evidence (including the mid-session capture)
-    // submits.
+    // The connection-ready submit finds nothing pending: the evidence is
+    // dropped and the device is done, so no later boot captures it.
     apiMocks.post.mockResolvedValue({ acknowledged: [], names: [] })
-    registerLegacyNameSubmitGate(() => true)
-    captureLegacyLayoutEnvelope('freshell.layout.v3.window-c', layoutEnvelope({ persistedAt: 77 }))
-    // The fire-and-forget submit runs on the microtask queue.
-    await new Promise((resolve) => setTimeout(resolve, 0))
-    expect(apiMocks.post).toHaveBeenCalled()
+    await submitPendingLegacyNameImports()
+    expect(apiMocks.post).not.toHaveBeenCalled()
+    expect(isCaptureDone(localStorage)).toBe(true)
+    runOneTimeLegacyCapture(localStorage)
+    expect(listCapturedMigrationEnvelopes(localStorage)).toHaveLength(0)
+  })
+
+  it('an envelope an old client window adds later is never submitted, and is deleted', async () => {
+    localStorage.setItem('freshell.layout.v3', layoutEnvelope())
+    runOneTimeLegacyCapture(localStorage)
+    // An old client still open after the deploy copies its live per-window
+    // layout into a migration envelope.
+    localStorage.setItem(`${SESSION_NAME_MIGRATION_KEY_PREFIX}.old-window`, JSON.stringify({
+      version: 1,
+      importId: 'old-window',
+      storageKey: 'freshell.layout.v3.window-old',
+      raw: layoutEnvelope({ persistedAt: 42 }),
+      capturedAt: 1,
+    }))
+    apiMocks.post.mockResolvedValue({ acknowledged: [], names: [] })
+
+    await submitPendingLegacyNameImports()
+
+    // Only the genuine bare-key envelope was submitted.
+    expect(apiMocks.post).toHaveBeenCalledTimes(1)
+    const body = apiMocks.post.mock.calls[0][1] as { evidence: Array<{ storageKey: string }> }
+    expect(body.evidence.map((e) => e.storageKey)).toEqual(['freshell.layout.v3'])
+    expect(localStorage.getItem(`${SESSION_NAME_MIGRATION_KEY_PREFIX}.old-window`)).toBeNull()
   })
 })
 
@@ -289,13 +236,9 @@ describe('legacy-name capture', () => {
 
 describe('legacy-name candidate preparation', () => {
   it('extracts flagged pane and source-tab candidates and bare automatic labels with their claims', () => {
-    localStorage.setItem('freshell.layout.v3.window-a', layoutEnvelope())
-    captureLegacyNameEvidence(localStorage)
-    const imports = prepareLegacyNameImports(
-      listCapturedMigrationEnvelopes(localStorage).map((e) => ({
-        storageKey: e.storageKey, raw: e.raw,
-      })),
-    )
+    localStorage.setItem('freshell.layout.v3', layoutEnvelope())
+    runOneTimeLegacyCapture(localStorage)
+    const imports = prepareLegacyNameImports(capturedEvidence())
     expect(imports).toHaveLength(1)
     const candidates = imports[0].candidates
     // The flagged pane alias claims legacy-flag protection.
@@ -339,8 +282,70 @@ describe('legacy-name candidate preparation', () => {
         paneTitleSetByUser: {},
       },
     })
-    const imports = prepareLegacyNameImports([{ storageKey: 'freshell.layout.v3.window-a', raw }])
+    const imports = prepareLegacyNameImports([{ storageKey: 'freshell.layout.v3', raw }])
     expect(imports).toHaveLength(0)
+  })
+
+  it('extracts no candidate from default or derived labels', () => {
+    const cwd = '/home/dan/code/freshell'
+    const scoped = (paneId: string, mode: string, sessionId: string): unknown => ({
+      type: 'leaf',
+      id: paneId,
+      content: {
+        kind: 'terminal',
+        mode,
+        createRequestId: `req-${paneId}`,
+        initialCwd: cwd,
+        sessionRef: { provider: mode, sessionId },
+      },
+    })
+    const labelled: Array<[string, string, string | undefined]> = [
+      // [tab title, mode, pane title]
+      ['Tab 7', 'claude', 'Tab 7'],
+      ['freshell', 'claude', 'freshell'],
+      ['OpenCode agent', 'opencode', 'OpenCode agent'],
+      ['Claude CLI', 'claude', 'Claude CLI'],
+      ['Billing bug', 'claude', undefined],
+      ['Tab 9', 'codex', 'Invoice rounding'],
+    ]
+    const tabs: Array<Record<string, unknown>> = []
+    const layouts: Record<string, unknown> = {}
+    const paneTitles: Record<string, Record<string, string>> = {}
+    labelled.forEach(([tabTitle, mode, paneTitle], index) => {
+      const tabId = `t${index}`
+      tabs.push({ id: tabId, title: tabTitle })
+      layouts[tabId] = scoped(`p${index}`, mode, `sess-${index}`)
+      if (paneTitle) paneTitles[tabId] = { [`p${index}`]: paneTitle }
+    })
+    const raw = JSON.stringify({
+      version: 4,
+      tabs: { activeTabId: 't0', tabs },
+      panes: { version: 7, layouts, paneTitles, paneTitleSetByUser: {} },
+    })
+
+    const imports = prepareLegacyNameImports([{ storageKey: 'freshell.layout.v3', raw }])
+    const candidates = imports.flatMap((one) => one.candidates)
+    expect(candidates.map((c) => [c.scope, c.name]).sort()).toEqual([
+      ['pane', 'Invoice rounding'],
+      ['source_tab', 'Billing bug'],
+    ])
+  })
+
+  it("skips a session-owned tab's title entirely — it is a display copy, not evidence", () => {
+    const raw = JSON.stringify({
+      version: 4,
+      tabs: {
+        activeTabId: 't',
+        tabs: [{ id: 't', title: 'Billing bug', nameSource: { kind: 'session', paneId: 'pane-1' } }],
+      },
+      panes: {
+        version: 7,
+        layouts: { t: scopedTerminalPane('sess-owned') },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+    })
+    expect(prepareLegacyNameImports([{ storageKey: 'freshell.layout.v3', raw }])).toEqual([])
   })
 
   it('derives a retry-stable legacy-pending namingHandle for an unbound scoped pane and persists the assignment', () => {
@@ -354,21 +359,20 @@ describe('legacy-name candidate preparation', () => {
         paneTitleSetByUser: { t: { 'pane-unbound': true } },
       },
     })
-    localStorage.setItem('freshell.layout.v3.window-a', raw)
-    captureLegacyNameEvidence(localStorage)
-    const evidence = listCapturedMigrationEnvelopes(localStorage)
-      .map((e) => ({ storageKey: e.storageKey, raw: e.raw }))
+    localStorage.setItem('freshell.layout.v3', raw)
+    runOneTimeLegacyCapture(localStorage)
+    const evidence = capturedEvidence()
 
     const assignments = collectLegacyPendingHandleAssignments(evidence)
     expect(assignments).toHaveLength(1)
     expect(assignments[0].namingHandle).toBe(legacyPendingNamingHandle({
-      storageKey: 'freshell.layout.v3.window-a',
-      windowId: 'window-a',
+      storageKey: 'freshell.layout.v3',
+      windowId: null,
       paneId: 'pane-unbound',
       createRequestId: 'req-unbound',
     }))
     expect(JSON.parse(assignments[0].namingHandle)).toEqual([
-      'legacy-pending', 'freshell.layout.v3.window-a', 'window-a', 'pane-unbound', 'req-unbound',
+      'legacy-pending', 'freshell.layout.v3', null, 'pane-unbound', 'req-unbound',
     ])
 
     // The candidate targets the derived pending handle.
@@ -402,7 +406,7 @@ describe('legacy-name candidate preparation', () => {
       panes: { version: 7, layouts, paneTitles, paneTitleSetByUser: {} },
     })
     const imports = prepareLegacyNameImports([
-      { storageKey: 'freshell.layout.v3.window-big', raw },
+      { storageKey: 'freshell.layout.v3', raw },
     ])
     expect(imports).toHaveLength(2)
     expect(imports[0].candidates).toHaveLength(100)
@@ -415,11 +419,11 @@ describe('legacy-name candidate preparation', () => {
 
 describe('legacy-name import submission', () => {
   function seedPending(): void {
-    localStorage.setItem('freshell.layout.v3.window-a', layoutEnvelope())
-    captureLegacyNameEvidence(localStorage)
+    localStorage.setItem('freshell.layout.v3', layoutEnvelope())
+    runOneTimeLegacyCapture(localStorage)
   }
 
-  it('submits pending imports, marks acknowledged ids, and skips acknowledged evidence', async () => {
+  it('submits pending imports, deletes the acknowledged envelope, and marks the device done', async () => {
     seedPending()
     apiMocks.post.mockResolvedValue({
       acknowledged: ['c-1'],
@@ -427,17 +431,27 @@ describe('legacy-name import submission', () => {
     })
     await submitPendingLegacyNameImports()
     expect(apiMocks.post).toHaveBeenCalledTimes(1)
-    const body = apiMocks.post.mock.calls[0][1] as { importId: string }
+    expect(listCapturedMigrationEnvelopes(localStorage)).toHaveLength(0)
+    expect(isCaptureDone(localStorage)).toBe(true)
     // Acknowledged: a second submit is a no-op.
     await submitPendingLegacyNameImports()
     expect(apiMocks.post).toHaveBeenCalledTimes(1)
   })
 
-  it('marks candidate-free envelopes acknowledged (nothing to import) without a request', async () => {
-    localStorage.setItem('freshell.layout.v3.window-a', '{corrupt')
-    captureLegacyNameEvidence(localStorage)
+  it('retires candidate-free envelopes (nothing to import) without a request', async () => {
+    // A genuine legacy layout holding only a shell tab: captured, but it
+    // yields no candidate.
+    localStorage.setItem('freshell.layout.v3', JSON.stringify({
+      version: 4,
+      tabs: { activeTabId: 'tab-shell', tabs: [{ id: 'tab-shell', title: 'Shell Tab' }] },
+      panes: { version: 7, layouts: { 'tab-shell': shellPane() }, paneTitles: {}, paneTitleSetByUser: {} },
+    }))
+    runOneTimeLegacyCapture(localStorage)
+    expect(listCapturedMigrationEnvelopes(localStorage)).toHaveLength(1)
     await submitPendingLegacyNameImports()
     expect(apiMocks.post).not.toHaveBeenCalled()
+    expect(listCapturedMigrationEnvelopes(localStorage)).toHaveLength(0)
+    expect(isCaptureDone(localStorage)).toBe(true)
     await submitPendingLegacyNameImports()
     expect(apiMocks.post).not.toHaveBeenCalled()
   })
@@ -448,10 +462,12 @@ describe('legacy-name import submission', () => {
     apiMocks.post.mockRejectedValue(new Error('network down'))
     await expect(submitPendingLegacyNameImports()).rejects.toThrow('network down')
     expect(listCapturedMigrationEnvelopes(localStorage)).toHaveLength(1)
+    expect(isCaptureDone(localStorage)).toBe(false)
     // Retry once the server answers.
     apiMocks.post.mockResolvedValue({ acknowledged: [], names: [] })
     await submitPendingLegacyNameImports()
     expect(apiMocks.post).toHaveBeenCalledTimes(2)
+    expect(isCaptureDone(localStorage)).toBe(true)
     await submitPendingLegacyNameImports()
     expect(apiMocks.post).toHaveBeenCalledTimes(2)
   })
@@ -475,12 +491,12 @@ describe('legacy-name import submission', () => {
       layouts[tabId] = scopedTerminalPane(`sess-${index}`)
       paneTitles[tabId] = { 'pane-1': `P ${index}` }
     }
-    localStorage.setItem('freshell.layout.v3.window-big', JSON.stringify({
+    localStorage.setItem('freshell.layout.v3', JSON.stringify({
       version: 4,
       tabs: { activeTabId: 'tab-0', tabs },
       panes: { version: 7, layouts, paneTitles, paneTitleSetByUser: {} },
     }))
-    captureLegacyNameEvidence(localStorage)
+    runOneTimeLegacyCapture(localStorage)
     apiMocks.post.mockResolvedValue({ acknowledged: [], names: [] })
 
     await submitPendingLegacyNameImports()
@@ -502,12 +518,12 @@ describe('legacy-name import submission', () => {
       layouts[tabId] = scopedTerminalPane(`sess-${index}`)
       paneTitles[tabId] = { 'pane-1': `P ${index}` }
     }
-    localStorage.setItem('freshell.layout.v3.window-chunked', JSON.stringify({
+    localStorage.setItem('freshell.layout.v3', JSON.stringify({
       version: 4,
       tabs: { activeTabId: 'tab-0', tabs },
       panes: { version: 7, layouts, paneTitles, paneTitleSetByUser: {} },
     }))
-    captureLegacyNameEvidence(localStorage)
+    runOneTimeLegacyCapture(localStorage)
     const base = listCapturedMigrationEnvelopes(localStorage)[0].importId
     const postedImportIds = () =>
       apiMocks.post.mock.calls.map(([, body]) => (body as { importId: string }).importId)
@@ -536,7 +552,8 @@ describe('legacy-name import submission', () => {
     apiMocks.post.mockClear()
     await submitPendingLegacyNameImports()
     expect(apiMocks.post).not.toHaveBeenCalled()
-    expect(listCapturedMigrationEnvelopes(localStorage)).toHaveLength(1)
+    expect(listCapturedMigrationEnvelopes(localStorage)).toHaveLength(0)
+    expect(isCaptureDone(localStorage)).toBe(true)
   })
 
   it('pairs chunks to envelopes by evidence — an importId containing "--" never breaks the retirement bookkeeping', async () => {
@@ -561,7 +578,7 @@ describe('legacy-name import submission', () => {
     localStorage.setItem(`${SESSION_NAME_MIGRATION_KEY_PREFIX}.edge--case`, JSON.stringify({
       version: 1,
       importId: 'edge--case',
-      storageKey: 'freshell.layout.v3.window-dash',
+      storageKey: 'freshell.layout.v3',
       raw,
       capturedAt: 1,
     }))
@@ -683,19 +700,39 @@ describe('the one client sanitizer', () => {
 // ── capture-source taxonomy ──────────────────────────────────────────────────
 
 describe('capture-source key taxonomy', () => {
-  it('accepts the supported raw sources and rejects everything else', () => {
-    expect(isLegacyNameCaptureSourceKey('freshell.layout.v3')).toBe(true)
-    expect(isLegacyNameCaptureSourceKey('freshell.layout.v3.bak')).toBe(true)
-    expect(isLegacyNameCaptureSourceKey('freshell.layout.v3.window-a')).toBe(true)
-    expect(isLegacyNameCaptureSourceKey('freshell.layout.v3.window-a.bak')).toBe(true)
-    expect(isLegacyNameCaptureSourceKey(`${LAYOUT_STORAGE_KEY_PREFIX}.window-a.backup-before-fresh-agent-centralization`)).toBe(true)
-    expect(isLegacyNameCaptureSourceKey('freshell.layout.pre-migration-raw.v1.window-a')).toBe(true)
-    expect(isLegacyNameCaptureSourceKey('freshell.tabs.v2')).toBe(true)
-    expect(isLegacyNameCaptureSourceKey('freshell.panes.v2')).toBe(true)
-    expect(isLegacyNameCaptureSourceKey('freshell.layout.v3.window-a.fresh-agent-centralization-commit')).toBe(false)
-    expect(isLegacyNameCaptureSourceKey('freshell.layout.v3.window-a.fresh-agent-centralization-pending')).toBe(false)
-    expect(isLegacyNameCaptureSourceKey('freshell.session-names.migration.v1.abc')).toBe(false)
-    expect(isLegacyNameCaptureSourceKey('freshell.browser-preferences.v1')).toBe(false)
-    expect(isLegacyNameCaptureSourceKey('freshell.layout.legacy-adopted.v1')).toBe(false)
+  it('accepts only the genuine pre-migration keys holding a pre-names raw', () => {
+    const preNames = layoutEnvelope()
+    for (const key of [
+      'freshell.layout.v3',
+      'freshell.layout.v3.bak',
+      'freshell.layout.pre-migration-raw.v1',
+      'freshell.tabs.v2',
+      'freshell.panes.v2',
+    ]) {
+      expect(isGenuinePreMigrationSource(key, preNames), key).toBe(true)
+    }
+    // Live per-window keys and every channel the current client writes.
+    for (const key of [
+      'freshell.layout.v3.window-a',
+      'freshell.layout.v3.window-a.bak',
+      'freshell.layout.v3.window-a.backup-before-fresh-agent-centralization',
+      'freshell.layout.v3.backup-before-fresh-agent-centralization',
+      'freshell.layout.pre-migration-raw.v1.window-a',
+      'freshell.layout.v3.window-a.fresh-agent-centralization-commit',
+      'freshell.layout.v3.window-a.fresh-agent-centralization-pending',
+      'freshell.session-names.migration.v1.abc',
+      'freshell.session-names.capture-done.v1',
+      'freshell.browser-preferences.v1',
+      'freshell.layout.legacy-adopted.v1',
+    ]) {
+      expect(isGenuinePreMigrationSource(key, preNames), key).toBe(false)
+    }
+    // A genuine key whose bytes are missing, corrupt, or already carry
+    // unified-names fields.
+    expect(isGenuinePreMigrationSource('freshell.layout.v3', null)).toBe(false)
+    expect(isGenuinePreMigrationSource('freshell.layout.v3', '{corrupt')).toBe(false)
+    expect(isGenuinePreMigrationSource('freshell.layout.v3', JSON.stringify({
+      tabs: { tabs: [{ id: 't', title: 'x', nameSource: { kind: 'legacy' } }] },
+    }))).toBe(false)
   })
 })

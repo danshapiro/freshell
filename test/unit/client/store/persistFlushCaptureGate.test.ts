@@ -1,18 +1,16 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 
-// Unified agent names (Task 7 review M2) — the capture-failure window: the
-// migration module's side-effect capture runs at import time, so this file
-// defines its localStorage mock and arms the envelope-write failure BEFORE
-// dynamically importing any store module. The flush gate under test: a
-// persistence flush must never rewrite a capture-source key while its
-// current raw bytes are uncaptured — the legacy labels survive for retry.
+// Name reliability (Task 2, RC10) — a full browser storage must never block
+// a layout save. The migration module's one-time capture runs at import
+// time, so this file defines its localStorage mock and arms the failure
+// BEFORE dynamically importing any store module: every write under
+// `freshell.session-names.*` throws (quota), every other write succeeds.
 //
-// Import ORDER matters and mirrors main.tsx: the capture module loads FIRST
-// (its init capture fails against the armed mock), and the fresh-agent
-// commit marker is pre-pinned for the seeded raw so the storage migration
-// (self-executing at import, pulled in through layout-health) treats it as
-// already migrated and leaves the source bytes untouched — the persistence
-// flush is then the ONLY writer of the layout key in this test.
+// Import ORDER mirrors main.tsx: the capture module loads FIRST (its capture
+// of the waiting genuine legacy key fails against the armed mock), then the
+// persistence middleware and the tabs slice. The layout save that follows
+// must land regardless, and the failed capture must be reported as a
+// structured error.
 
 const apiMocks = vi.hoisted(() => ({
   post: vi.fn(),
@@ -31,17 +29,17 @@ vi.mock('@/lib/api', () => ({ api: { post: apiMocks.post }, ApiError: apiMocks.A
 
 const WINDOW_ID = 'persist-flush-capture-gate-tests'
 const LAYOUT_KEY = `freshell.layout.v3.${WINDOW_ID}`
-const ENVELOPE_PREFIX = 'freshell.session-names.migration.v1.'
+const SESSION_NAMES_PREFIX = 'freshell.session-names.'
 
 const storageMap = new Map<string, string>()
-let failEnvelopeWrites = false
+let failSessionNamesWrites = false
 const localStorageMock = {
   get length() { return storageMap.size },
   key(index: number) { return Array.from(storageMap.keys())[index] ?? null },
   getItem: (key: string) => storageMap.get(key) ?? null,
   setItem(key: string, value: string) {
-    if (failEnvelopeWrites && key.startsWith(ENVELOPE_PREFIX)) {
-      throw new Error('quota exceeded')
+    if (failSessionNamesWrites && key.startsWith(SESSION_NAMES_PREFIX)) {
+      throw new DOMException('The quota has been exceeded.', 'QuotaExceededError')
     }
     storageMap.set(key, value)
   },
@@ -54,7 +52,9 @@ Object.defineProperty(globalThis, 'localStorage', {
   configurable: true,
 })
 
-/** A legacy layout raw with a scoped claude pane carrying a title alias. */
+/** A genuine pre-migration layout (the bare legacy key) with a scoped
+ * claude pane carrying a user label: real legacy evidence waiting to be
+ * captured. */
 function legacyLayoutRaw(): string {
   return JSON.stringify({
     version: 4,
@@ -87,73 +87,57 @@ function legacyLayoutRaw(): string {
 
 beforeEach(() => {
   storageMap.clear()
-  failEnvelopeWrites = false
+  failSessionNamesWrites = false
   apiMocks.post.mockReset()
   sessionStorage.setItem('freshell.layout-window-id.v1', WINDOW_ID)
   ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = true // the failure paths log
 })
 
-describe('the persistence flush gate keeps uncaptured legacy labels alive', () => {
-  it('defers the layout flush while the evidence capture keeps failing, then flushes after the retry captures', async () => {
-    const legacyRaw = legacyLayoutRaw()
-    storageMap.set(LAYOUT_KEY, legacyRaw)
+describe('the layout save is never blocked by legacy-name capture', () => {
+  it('a quota-failing capture never blocks the layout flush', async () => {
+    storageMap.set('freshell.layout.v3', legacyLayoutRaw())
 
-    // Boot: the migration module's init capture runs, but every envelope
-    // write fails (quota). The source key keeps its legacy bytes.
-    failEnvelopeWrites = true
-    const migration = await import('@/lib/session-name-migration')
-    expect(migration.listCapturedMigrationEnvelopes(localStorageMock)).toHaveLength(0)
-    expect(storageMap.get(LAYOUT_KEY)).toBe(legacyRaw)
-
-    // Pre-pin the fresh-agent commit marker for the seeded raw so the
-    // import-time storage migration classifies it already-migrated.
-    const persisted = await import('@/store/persistedState')
-    const wlk = await import('@/store/window-layout-keys')
-    const hash = persisted.hashPersistedLayoutRaw(legacyRaw)
-    storageMap.set(wlk.getWindowFreshAgentCommitMarkerKey(), JSON.stringify({
-      version: 1,
-      migration: persisted.LAYOUT_FRESH_AGENT_MIGRATION_ID,
-      backupKey: persisted.LAYOUT_FRESH_AGENT_BACKUP_KEY,
-      originalHash: hash,
-      migratedHash: hash,
-      committedAt: 1234,
-    }))
+    // Boot: the capture runs at import, and every session-names write
+    // fails (quota) — for the whole test, not just at boot.
+    failSessionNamesWrites = true
+    await import('@/lib/session-name-migration')
+    const envelopeKeys = Array.from(storageMap.keys()).filter((key) => key.startsWith(SESSION_NAMES_PREFIX))
+    expect(envelopeKeys).toEqual([])
 
     const { persistMiddleware, resetPersistFlushListenersForTests } =
       await import('@/store/persistMiddleware')
-    const { default: tabsReducer, addTab } = await import('@/store/tabsSlice')
+    const { default: tabsReducer, addTab, updateTab } = await import('@/store/tabsSlice')
     const { configureStore } = await import('@reduxjs/toolkit')
 
-    // The storage migration (self-executing at import) must have left the
-    // source bytes untouched — the flush is the only writer under test.
-    expect(storageMap.get(LAYOUT_KEY)).toBe(legacyRaw)
-
     vi.useFakeTimers()
-    resetPersistFlushListenersForTests()
-    const store = configureStore({
-      reducer: { tabs: tabsReducer },
-      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+    try {
+      resetPersistFlushListenersForTests()
+      const store = configureStore({
+        reducer: { tabs: tabsReducer },
+        middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+      })
+
+      // The user renames a shell tab; the debounced flush must save it even
+      // though the capture keeps failing.
+      store.dispatch(addTab({ id: 'tab-shell', mode: 'shell' }))
+      store.dispatch(updateTab({ id: 'tab-shell', updates: { title: 'Renamed Shell Tab', titleSetByUser: true } }))
+      vi.runAllTimers()
+
+      const flushedRaw = storageMap.get(LAYOUT_KEY)
+      expect(flushedRaw).toBeTruthy()
+      const flushed = JSON.parse(flushedRaw!) as { tabs: { tabs: Array<{ id: string; title?: string }> } }
+      expect(flushed.tabs.tabs.find((tab) => tab.id === 'tab-shell')?.title).toBe('Renamed Shell Tab')
+    } finally {
+      vi.useRealTimers()
+    }
+
+    // The failed capture was reported as a structured error naming the key
+    // (never its bytes).
+    const logged = vi.mocked(console.error).mock.calls.find((args) => args.includes('legacy_name_capture_failed'))
+    expect(logged).toBeTruthy()
+    expect(logged?.find((arg) => typeof arg === 'object' && arg !== null)).toEqual({
+      storageKey: 'freshell.layout.v3',
+      reason: 'QuotaExceededError',
     })
-
-    // A flush fires (debounced) while the capture is STILL failing: the
-    // gate must defer the layout write — the uncaptured legacy labels
-    // survive untouched for the retry.
-    store.dispatch(addTab({ mode: 'shell' }))
-    vi.runAllTimers()
-    expect(storageMap.get(LAYOUT_KEY)).toBe(legacyRaw)
-
-    // Quota frees up: the next flush re-captures the source bytes FIRST,
-    // then proceeds — the legacy label now lives in its immutable
-    // recovery envelope.
-    failEnvelopeWrites = false
-    store.dispatch(addTab({ mode: 'shell' }))
-    vi.runAllTimers()
-    const flushedRaw = storageMap.get(LAYOUT_KEY)
-    expect(flushedRaw).not.toBe(legacyRaw)
-    const envelopes = migration.listCapturedMigrationEnvelopes(localStorageMock)
-    expect(
-      envelopes.some((envelope) => envelope.storageKey === LAYOUT_KEY && envelope.raw === legacyRaw),
-    ).toBe(true)
-    vi.useRealTimers()
   })
 })

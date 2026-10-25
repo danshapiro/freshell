@@ -70,7 +70,17 @@ pub struct AutoTitleSweepState {
     /// messages (no paid titles across history); later passes feed activity
     /// so genuinely newly observed messages arm generation.
     pub index_hydrated: Arc<std::sync::atomic::AtomicBool>,
+    /// Name-reliability Task 5 (C5): the targeted OpenCode first-message
+    /// lookups' memo, kept ACROSS passes (keyed by session id + the index
+    /// row's last activity).
+    pub first_message_lookups: FirstMessageLookupMemo,
 }
+
+// Name-reliability Task 5 (C5): the targeted OpenCode first-message lookup
+// and its cross-pass memo.
+#[path = "auto_title_sweep_lookup.rs"]
+mod first_message_lookup;
+pub use first_message_lookup::FirstMessageLookupMemo;
 
 /// Minimum age before a cwd's git enrichment is re-run when its terminal-set
 /// signature is unchanged (throttled refresh so dirty-status drift still
@@ -187,6 +197,11 @@ pub struct SweepSession {
     /// `session.gitBranch ?? current.branch`, `terminal-metadata-service.ts:195`,
     /// then live git wins in `enrichFromCwd`, `:283`).
     pub git_branch: Option<String>,
+    /// The index row's last activity (`IndexedSession::last_activity_at`):
+    /// it moves whenever the session's transcript does, so it keys the
+    /// sweep's cross-pass first-message lookup memo (name-reliability
+    /// Task 5, C5).
+    pub last_activity_at: i64,
 }
 
 /// One of Node's two `terminal.title.updated` emit sites (the sweep push and
@@ -416,6 +431,9 @@ pub async fn run_auto_title_pass(state: &AutoTitleSweepState, sessions: &[SweepS
         // later pass re-proves against the (refreshed) view, so foreign
         // changes always resurface through the existing refresh discipline.
         let mut settled_this_pass: HashSet<String> = HashSet::new();
+        // Name-reliability Task 4 (LB-B1): self-heal replacements ride ONE
+        // maintenance transaction after the row loop.
+        let mut maintenance = crate::session_names::SweepMaintenanceQueue::default();
         for s in sessions {
             let Some(provider) =
                 freshell_freshagent::naming::named_provider_for(Some(&s.provider), None)
@@ -439,26 +457,21 @@ pub async fn run_auto_title_pass(state: &AutoTitleSweepState, sessions: &[SweepS
                 session_id: s.session_id.clone(),
             };
             // OpenCode already-named sessions carry no first message in the
-            // bounded listing: the targeted lookup serves eligibility, but
-            // only while the session's generation can still use input (an
-            // exhausted or protected session never pays the read again).
+            // bounded listing: the targeted lookup serves it, but only while
+            // the store can still use it — as generation input, or as a name
+            // for a record below `first_message` or stuck on a junk label
+            // under this row's folder (name-reliability Task 5, C5). Answers
+            // are remembered across passes per (session, row activity), so a
+            // session with no user message is read once, not every pass; a
+            // failed read is retried after a short window.
             let first_user_message = match s.first_user_message.clone() {
                 Some(message) => Some(message),
                 None => {
                     if provider == freshell_protocol::session_names::NamedProvider::Opencode
-                        && names.needs_generation_input(&target)
+                        && (names.needs_generation_input(&target)
+                            || names.needs_first_message_input(&target, s.cwd.as_deref()))
                     {
-                        if let Some(index) = state.index.clone() {
-                            let session_id = s.session_id.clone();
-                            tokio::task::spawn_blocking(move || {
-                                index.opencode_first_user_message(&session_id)
-                            })
-                            .await
-                            .ok()
-                            .flatten()
-                        } else {
-                            None
-                        }
+                        first_message_lookup::opencode_first_message(state, s).await
                     } else {
                         None
                     }
@@ -486,19 +499,31 @@ pub async fn run_auto_title_pass(state: &AutoTitleSweepState, sessions: &[SweepS
             // Delta-review round 3, finding 2 — the adopted-view pre-checks:
             // a settled session (hydrated record, absorbed/duplicate message,
             // no pending work) must not pay a strict cross-process store
-            // transaction per pass. `hydrate_indexed_pending`/
-            // `activity_pending` prove the no-op from the in-memory view
-            // (the same plan the transaction applies); a stale view can only
-            // make the pre-check transact unnecessarily, never skip real
-            // work — the store's own doc comments carry the full argument.
+            // transaction per pass. `hydrate_work`/`activity_work` prove the
+            // no-op from the in-memory view (the same plan the transaction
+            // applies); a stale view can only delay work, never lose it —
+            // the store's own doc comments carry the full argument. A
+            // self-heal replacement (name-reliability Task 4) is queued for
+            // the pass's ONE maintenance transaction instead of its own.
             let mut transacted = false;
-            if names.hydrate_indexed_pending(&input) {
-                transacted = true;
-                if let Err(error) = names
-                    .hydrate_indexed(input.clone(), hydrating && !explicitly_open)
-                    .await
-                {
-                    freshell_freshagent::naming::log_name_error("hydrate_indexed", &target, &error);
+            let mut deferred_hydrate = None;
+            match names.hydrate_work(&input) {
+                crate::session_names::SweepWork::None => {}
+                crate::session_names::SweepWork::Immediate => {
+                    transacted = true;
+                    if let Err(error) = names
+                        .hydrate_indexed(input.clone(), hydrating && !explicitly_open)
+                        .await
+                    {
+                        freshell_freshagent::naming::log_name_error(
+                            "hydrate_indexed",
+                            &target,
+                            &error,
+                        );
+                    }
+                }
+                crate::session_names::SweepWork::Maintenance => {
+                    deferred_hydrate = Some(input.clone());
                 }
             }
             // The boot pass arms only explicitly open sessions; every later
@@ -522,21 +547,66 @@ pub async fn run_auto_title_pass(state: &AutoTitleSweepState, sessions: &[SweepS
                     cwd: s.cwd.clone(),
                 });
             }
+            let mut deferred_activity = None;
             if let Some(activity) = activity {
                 // Re-checked AFTER the hydrate above: a boot-pass hydration
                 // that just created/absorbed makes this a provable no-op on
                 // the now-current view (no duplicate arming transaction).
-                if names.activity_pending(&activity) {
-                    transacted = true;
-                    if let Err(error) = names.activity(activity).await {
-                        freshell_freshagent::naming::log_name_error("activity", &target, &error);
+                match names.activity_work(&activity) {
+                    crate::session_names::SweepWork::None => {}
+                    crate::session_names::SweepWork::Immediate => {
+                        transacted = true;
+                        if let Err(error) = names.activity(activity).await {
+                            freshell_freshagent::naming::log_name_error(
+                                "activity", &target, &error,
+                            );
+                        }
+                        // The activity may itself have healed the record: a
+                        // deferred hydration heal re-checks the current view.
+                        if deferred_hydrate.as_ref().is_some_and(|input| {
+                            names.hydrate_work(input)
+                                != crate::session_names::SweepWork::Maintenance
+                        }) {
+                            deferred_hydrate = None;
+                        }
+                    }
+                    crate::session_names::SweepWork::Maintenance => {
+                        deferred_activity = Some(activity);
                     }
                 }
             }
-            if !transacted {
-                // Proven settled on the adopted view: memo so a repeated row
-                // later in THIS pass never re-evaluates.
+            let queued = deferred_hydrate.is_some() || deferred_activity.is_some();
+            if queued {
+                // Into this pass's batch, or left for a later pass's
+                // pre-checks when the batch is full.
+                maintenance.push(crate::session_names::SweepMaintenanceItem {
+                    hydrate: deferred_hydrate,
+                    activity: deferred_activity,
+                });
+            }
+            if !transacted || queued {
+                // Proven settled on the adopted view (or already queued for
+                // the batch): memo so a repeated row later in THIS pass never
+                // re-evaluates or queues the same record twice.
                 settled_this_pass.insert(session_key);
+            }
+        }
+        state.first_message_lookups.retain_sessions(
+            &sessions
+                .iter()
+                .map(|s| s.session_id.as_str())
+                .collect::<HashSet<&str>>(),
+        );
+        if !maintenance.is_empty() || names.has_staged_native_baselines() {
+            if let Err(error) = names.sweep_maintenance(maintenance).await {
+                tracing::warn!(
+                    target: "freshell_server::session_names",
+                    op = "sweep_maintenance",
+                    name_ref = "-",
+                    revision = error.log_revision(),
+                    class = %error.code(),
+                    "session_names.operation_failed: {error}"
+                );
             }
         }
     }
@@ -814,6 +884,7 @@ pub fn spawn_auto_title_sweep(
                         first_user_message: s.first_user_message.clone(),
                         title_source: s.title_source.clone(),
                         git_branch: s.git_branch.clone(),
+                        last_activity_at: s.last_activity_at,
                     }
                 })
                 .collect();
@@ -912,6 +983,7 @@ mod tests {
             metadata: crate::session_metadata::SessionMetadataStore::new(dir),
             index,
             index_hydrated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            first_message_lookups: Default::default(),
         };
         (state, rx)
     }
@@ -935,6 +1007,7 @@ mod tests {
             first_user_message: first.map(str::to_string),
             title_source: None,
             git_branch: None,
+            last_activity_at: 0,
         }
     }
 
@@ -1525,6 +1598,7 @@ mod tests {
                     first_user_message: s.first_user_message.clone(),
                     title_source: s.title_source.clone(),
                     git_branch: s.git_branch.clone(),
+                    last_activity_at: s.last_activity_at,
                 }
             })
             .collect();
@@ -1832,6 +1906,89 @@ mod tests {
                 .await
                 .is_some(),
             "the new session's record installed"
+        );
+    }
+
+    /// Name-reliability Task 4: the sweep pre-checks re-offer to a junk
+    /// saved name. A provider-level "Tab 23" heals to the session's first
+    /// message within at most two passes (boot, then one later pass), a
+    /// manual "Tab 8" stays exactly as it is, and once healed a further pass
+    /// transacts zero times.
+    #[tokio::test]
+    async fn sweep_heals_a_default_label_and_then_settles() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = crate::session_names::SessionNames::open(dir.path().to_path_buf()).unwrap();
+        let (state, _rx) = sweep_state_with(dir.path(), None, Some(names.clone()), None);
+        let junk = scoped_session_ref("claude", "s-junk");
+        let manual = scoped_session_ref("claude", "s-manual");
+        names
+            .hydrate_indexed(
+                crate::session_name_generation::IndexedNameInput {
+                    provider: freshell_protocol::session_names::NamedProvider::Claude,
+                    session_id: "s-junk".into(),
+                    cwd: Some("/x/proj".into()),
+                    first_user_message: Some("Fix the sardine importer".into()),
+                    provider_title: Some("Tab 23".into()),
+                },
+                true,
+            )
+            .await
+            .unwrap();
+        names
+            .hydrate_indexed(
+                crate::session_name_generation::IndexedNameInput {
+                    provider: freshell_protocol::session_names::NamedProvider::Claude,
+                    session_id: "s-manual".into(),
+                    cwd: Some("/x/proj".into()),
+                    first_user_message: Some("Plan the offsite".into()),
+                    provider_title: None,
+                },
+                true,
+            )
+            .await
+            .unwrap();
+        names
+            .rename(freshell_freshagent::naming::RenameNameInput {
+                target: manual.clone(),
+                name: "Tab 8".into(),
+                intent: freshell_protocol::session_names::NameIntent::User,
+                if_revision: None,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        let manual_before = naming_record(&names, manual.clone()).await.unwrap().record;
+        let rows = [
+            session(
+                "claude",
+                "s-junk",
+                "/x/proj",
+                Some("Fix the sardine importer"),
+            ),
+            session("claude", "s-manual", "/x/proj", Some("Plan the offsite")),
+        ];
+
+        // Boot pass, then one later pass.
+        run_auto_title_pass(&state, &rows).await;
+        run_auto_title_pass(&state, &rows).await;
+        let healed = naming_record(&names, junk.clone()).await.unwrap().record;
+        assert_eq!(healed.name, "Fix the sardine importer");
+        assert_eq!(
+            healed.source,
+            freshell_protocol::session_names::NameSource::FirstMessage
+        );
+        assert_eq!(
+            naming_record(&names, manual.clone()).await.unwrap().record,
+            manual_before,
+            "a manual Tab 8 is never touched"
+        );
+
+        let before = crate::session_names::test_store_transaction_count(dir.path());
+        run_auto_title_pass(&state, &rows).await;
+        assert_eq!(
+            crate::session_names::test_store_transaction_count(dir.path()),
+            before,
+            "healed and settled: a further pass transacts zero times"
         );
     }
 

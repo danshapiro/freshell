@@ -32,6 +32,11 @@ use freshell_protocol::session_names::{
 use super::SessionNamesState;
 use crate::session_names::SessionNames;
 
+#[path = "session_name_known_target_tests.rs"]
+mod known_target_tests;
+#[path = "session_name_prebind_route_tests.rs"]
+mod prebind_route_tests;
+
 /// Same fake transport as `sessions_tests`'s: the wired-in result IS the
 /// Gemini reply. NO live Gemini calls in tests, ever.
 struct FakeGemini(Result<String, String>);
@@ -64,6 +69,7 @@ fn names_state(home: &std::path::Path) -> SessionNamesState {
         auth_token: Arc::new("tok".to_string()),
         names,
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+        index: None,
     }
 }
 
@@ -115,8 +121,19 @@ fn sessions_router_state(
 /// and a seeded single-pane layout whose pane content is the given scoped
 /// content (carrying `sessionRef` so the route resolves the durable record).
 fn fresh_router(names: &Arc<SessionNames>, pane_content: Value) -> Router {
+    fresh_router_with_registry(names, pane_content, None)
+}
+
+fn fresh_router_with_registry(
+    names: &Arc<SessionNames>,
+    pane_content: Value,
+    registry: Option<freshell_terminal::TerminalRegistry>,
+) -> Router {
     let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
-    let state = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+    let mut state = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+    if let Some(registry) = registry {
+        state = state.with_terminal_registry(registry);
+    }
     state.set_session_naming(names.clone());
     let sync: freshell_protocol::UiLayoutSync = serde_json::from_value(json!({
         "tabs": [{ "id": "t1", "title": "First" }],
@@ -456,6 +473,438 @@ async fn every_surface_renames_the_same_durable_record_across_all_six_modes() {
     }
 }
 
+/// Name-reliability Task 4: an automation rename reports whether it
+/// applied, at each route's own nesting — the canonical route answers the
+/// update itself (`outcome`), the session and terminal routes nest it under
+/// `sessionName`, and the fresh-agent pane/tab routes under
+/// `data.sessionName`. A protected name answers `protected_name` on every
+/// surface; a rename to the target's own folder name answers
+/// `default_label`, classified with the best-known folder each surface has
+/// (an identity row's cwd for the canonical route, the pane content's
+/// `initialCwd` for the pane route).
+#[tokio::test]
+async fn automation_rename_outcome_reaches_every_route_response() {
+    let home = temp_home();
+    let state = names_state(&home);
+    let names = state.names.clone();
+    let protected_id = "eeee5555-0000-4000-8000-000000000005";
+    let folder_id = "ffff6666-0000-4000-8000-000000000006";
+    admit_pending(
+        &names,
+        "handle-protected",
+        NamedProvider::Claude,
+        Some("/w"),
+    )
+    .await;
+    bind_verified(
+        &names,
+        "handle-protected",
+        NamedProvider::Claude,
+        protected_id,
+    )
+    .await;
+    let protected = SessionNameRef::Session {
+        provider: NamedProvider::Claude,
+        session_id: protected_id.to_string(),
+    };
+    names
+        .rename(RenameNameInput {
+            target: protected.clone(),
+            name: "LotL".into(),
+            intent: NameIntent::User,
+            if_revision: None,
+            cwd: None,
+        })
+        .await
+        .expect("the user names it");
+    let refused = json!({ "applied": false, "reason": "protected_name" });
+
+    // 1. The canonical route: the update itself.
+    let (status, body) = patch(
+        super::router(state.clone()),
+        "/api/session-names",
+        json!({
+            "target": { "kind": "session", "provider": "claude", "sessionId": protected_id },
+            "name": "Agent suggestion",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], refused, "canonical: {body}");
+    assert_eq!(body["record"]["name"], "LotL");
+
+    // 2. The session route: `sessionName.outcome`.
+    let (status, body) = patch(
+        sessions_router(&home, &names),
+        &format!("/api/sessions/{protected_id}?provider=claude"),
+        json!({ "titleOverride": "Agent suggestion" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["sessionName"]["outcome"], refused, "session: {body}");
+
+    // 3. The terminal route: `sessionName.outcome`.
+    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
+    let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+    identity.set_session_naming(names.clone());
+    identity.upsert(
+        "term-out",
+        Some("claude"),
+        Some(protected_id),
+        Some("/w"),
+        1_000,
+    );
+    identity.set_name_binding("term-out", Some(protected.clone()), None);
+    let terminals = crate::terminals::router(crate::terminals::TerminalsState {
+        auth_token: Arc::new("tok".to_string()),
+        settings: crate::settings_store::SettingsStore::load(Some(&home), vec!["claude".into()]),
+        registry: freshell_terminal::TerminalRegistry::new(),
+        broadcast_tx: Arc::new(tx),
+        terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        identity,
+    });
+    let (status, body) = patch(
+        terminals,
+        "/api/terminals/term-out",
+        json!({ "titleOverride": "Agent suggestion" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["sessionName"]["outcome"], refused, "terminal: {body}");
+
+    // 4 + 5. The fresh-agent pane and tab routes: `data.sessionName.outcome`.
+    let content = scoped_pane_content("claude", "claude", protected_id);
+    for (uri, label) in [("/api/panes/p1", "pane"), ("/api/tabs/t1", "tab")] {
+        let (status, body) = patch(
+            fresh_router(&names, content.clone()),
+            uri,
+            json!({ "name": "Agent suggestion" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{label}: {body}");
+        assert_eq!(
+            body["data"]["sessionName"]["outcome"], refused,
+            "{label}: {body}"
+        );
+        assert_eq!(
+            body["message"], "session name not applied: protected_name",
+            "{label}: the message never claims a refused rename happened: {body}"
+        );
+    }
+    let still = names.get(vec![protected.clone()]).await.unwrap();
+    assert_eq!(still[0].record.name, "LotL", "no surface changed the name");
+
+    // The folder rule, through the canonical route (an identity row bound to
+    // the session knows its cwd) and the pane route (its `initialCwd`).
+    admit_pending(&names, "handle-folder", NamedProvider::Claude, Some("/w")).await;
+    bind_verified(&names, "handle-folder", NamedProvider::Claude, folder_id).await;
+    let folder_target = SessionNameRef::Session {
+        provider: NamedProvider::Claude,
+        session_id: folder_id.to_string(),
+    };
+    let canonical_state = names_state_sharing(&state);
+    canonical_state.identity.upsert(
+        "term-folder",
+        Some("claude"),
+        Some(folder_id),
+        Some("/home/dan/code/freshell"),
+        1_000,
+    );
+    canonical_state
+        .identity
+        .set_name_binding("term-folder", Some(folder_target.clone()), None);
+    let (status, body) = patch(
+        super::router(canonical_state),
+        "/api/session-names",
+        json!({
+            "target": { "kind": "session", "provider": "claude", "sessionId": folder_id },
+            "name": "freshell",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["outcome"],
+        json!({ "applied": false, "reason": "default_label" }),
+        "canonical folder rule: {body}"
+    );
+
+    let mut folder_content = scoped_pane_content("claude", "claude", folder_id);
+    folder_content["initialCwd"] = json!("/home/dan/code/freshell");
+    let (status, body) = patch(
+        fresh_router(&names, folder_content),
+        "/api/panes/p1",
+        json!({ "name": "freshell" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["data"]["sessionName"]["outcome"],
+        json!({ "applied": false, "reason": "default_label" }),
+        "pane folder rule: {body}"
+    );
+    assert_eq!(
+        body["message"], "session name not applied: default_label",
+        "pane folder rule: {body}"
+    );
+    let folder_record = names.get(vec![folder_target]).await.unwrap();
+    assert_eq!(
+        folder_record[0].record.name, "w",
+        "the folder name never applied"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// The pane route's pre-bind retry (a pane whose prospective sessionRef has
+/// no record yet renames through its pending handle) answers the same
+/// outcome-derived message: a refused automation rename says it was not
+/// applied, an applied one that the session was renamed.
+#[tokio::test]
+async fn a_pending_retry_rename_message_follows_its_outcome() {
+    let home = temp_home();
+    let state = names_state(&home);
+    let names = state.names.clone();
+    admit_pending(
+        &names,
+        "handle-zero-turn",
+        NamedProvider::Claude,
+        Some("/w"),
+    )
+    .await;
+    let pending = SessionNameRef::Pending {
+        id: "handle-zero-turn".to_string(),
+    };
+    names
+        .rename(RenameNameInput {
+            target: pending.clone(),
+            name: "Billing".into(),
+            intent: NameIntent::User,
+            if_revision: None,
+            cwd: None,
+        })
+        .await
+        .expect("the user names the zero-turn pane");
+    admit_pending(&names, "handle-fresh", NamedProvider::Claude, Some("/w")).await;
+    let zero_turn_pane = |handle: &str, session_id: &str| {
+        let mut content = scoped_pane_content("claude", "claude", session_id);
+        content["namingHandle"] = json!(handle);
+        content
+    };
+
+    let (status, body) = patch(
+        fresh_router(
+            &names,
+            zero_turn_pane("handle-zero-turn", "aaaa1111-0000-4000-8000-00000000000a"),
+        ),
+        "/api/panes/p1",
+        json!({ "name": "Agent suggestion" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["data"]["nameRef"],
+        serde_json::to_value(&pending).unwrap(),
+        "the rename went through the pending handle: {body}"
+    );
+    assert_eq!(
+        body["data"]["sessionName"]["outcome"],
+        json!({ "applied": false, "reason": "protected_name" }),
+        "{body}"
+    );
+    assert_eq!(
+        body["message"], "session name not applied: protected_name",
+        "{body}"
+    );
+
+    let (status, body) = patch(
+        fresh_router(
+            &names,
+            zero_turn_pane("handle-fresh", "bbbb2222-0000-4000-8000-00000000000b"),
+        ),
+        "/api/panes/p1",
+        json!({ "name": "Agent suggestion" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["data"]["sessionName"]["outcome"]["applied"],
+        json!(true),
+        "{body}"
+    );
+    assert_eq!(body["message"], "session renamed", "{body}");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A switched conversation may be visible before the session index names it.
+/// A retained pre-create handle belongs to the old conversation and cannot
+/// authorize redirecting a rename back to it.
+#[tokio::test]
+async fn rename_after_switch_admits_the_new_session_and_never_renames_a_spent_handle() {
+    for uri in ["/api/panes/p1", "/api/tabs/t1"] {
+        for retained_handle in [false, true] {
+            let home = temp_home();
+            let names = names_state(&home).names;
+            admit_pending(&names, "spent", NamedProvider::Claude, Some("/w")).await;
+            let old =
+                bind_verified(&names, "spent", NamedProvider::Claude, "old-conversation").await;
+            let mut content = scoped_pane_content("claude", "claude", "new-conversation");
+            content["nameRef"] =
+                json!({"kind": "session", "provider": "claude", "sessionId": "new-conversation"});
+            if retained_handle {
+                content["namingHandle"] = json!("spent");
+            }
+            let (status, body) = patch(
+                fresh_router(&names, content), uri,
+                json!({"name": "New billing conversation", "nameIntent": "user", "expectedNameRef": {
+                    "kind": "session", "provider": "claude", "sessionId": "new-conversation"
+                }}),
+            ).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{uri}, handle={retained_handle}: {body}"
+            );
+            assert_eq!(
+                body["data"]["sessionName"]["record"]["name"], "New billing conversation",
+                "{body}"
+            );
+            assert_eq!(
+                body["data"]["nameRef"]["sessionId"], "new-conversation",
+                "{body}"
+            );
+            let old_after = names.get(vec![old.record.name_ref.clone()]).await.unwrap();
+            assert_eq!(
+                old_after[0].record, old.record,
+                "the old name must stay untouched"
+            );
+            std::fs::remove_dir_all(&home).ok();
+        }
+    }
+}
+
+#[tokio::test]
+async fn captureless_rename_after_switch_uses_registry_before_a_stale_layout() {
+    for uri in ["/api/panes/p1", "/api/tabs/t1"] {
+        for mixed_pending in [false, true] {
+            let home = temp_home();
+            let names = names_state(&home).names;
+            admit_pending(&names, "old-handle", NamedProvider::Claude, Some("/w")).await;
+            let old = bind_verified(
+                &names,
+                "old-handle",
+                NamedProvider::Claude,
+                "old-conversation",
+            )
+            .await;
+            let mut content = scoped_pane_content(
+                "claude",
+                "claude",
+                if mixed_pending {
+                    "new-conversation"
+                } else {
+                    "old-conversation"
+                },
+            );
+            content["nameRef"] = if mixed_pending {
+                json!({"kind": "pending", "id": "old-handle"})
+            } else {
+                serde_json::to_value(&old.record.name_ref).unwrap()
+            };
+            content["namingHandle"] = json!("old-handle");
+            content["terminalId"] = json!("T-switched");
+            let registry = freshell_terminal::TerminalRegistry::new();
+            registry.register_headless(freshell_terminal::registry::HeadlessTerminal {
+                terminal_id: "T-switched".into(),
+                stream_id: "stream".into(),
+                mode: "claude".into(),
+                resume_session_id: Some("new-conversation".into()),
+                create_request_id: None,
+                created_at: None,
+            });
+            let new_ref = SessionNameRef::Session {
+                provider: NamedProvider::Claude,
+                session_id: "new-conversation".into(),
+            };
+            registry.set_naming("T-switched", Some(new_ref.clone()), None);
+            let (status, body) = patch(
+                fresh_router_with_registry(&names, content, Some(registry)),
+                uri,
+                json!({"name": "Name after switch", "nameIntent": "user"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(
+                body["data"]["nameRef"],
+                serde_json::to_value(new_ref).unwrap(),
+                "captureless rename must follow the terminal's new session"
+            );
+            assert_eq!(
+                names.get(vec![old.record.name_ref.clone()]).await.unwrap()[0].record,
+                old.record
+            );
+            std::fs::remove_dir_all(home).ok();
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_materialized_registry_accepts_its_own_pending_capture_and_keeps_revision_guards() {
+    let home = temp_home();
+    let names = names_state(&home).names;
+    let admitted = admit_pending(&names, "materialized", NamedProvider::Claude, Some("/w")).await;
+    let bound = bind_verified(
+        &names,
+        "materialized",
+        NamedProvider::Claude,
+        "same-conversation",
+    )
+    .await;
+    let mut content = scoped_pane_content("claude", "claude", "same-conversation");
+    content["nameRef"] = json!({"kind": "pending", "id": "materialized"});
+    content["namingHandle"] = json!("materialized");
+    content["terminalId"] = json!("T-materialized");
+    let registry = freshell_terminal::TerminalRegistry::new();
+    registry.register_headless(freshell_terminal::registry::HeadlessTerminal {
+        terminal_id: "T-materialized".into(),
+        stream_id: "stream".into(),
+        mode: "claude".into(),
+        resume_session_id: Some("same-conversation".into()),
+        create_request_id: None,
+        created_at: None,
+    });
+    registry.set_naming("T-materialized", Some(bound.record.name_ref.clone()), None);
+    let router = fresh_router_with_registry(&names, content, Some(registry));
+    let body = |revision| {
+        json!({"name": "Accepted same conversation", "nameIntent": "user",
+        "expectedNameRef": {"kind": "pending", "id": "materialized"}, "ifRevision": revision})
+    };
+    let (status, conflict) = patch(
+        router.clone(),
+        "/api/panes/p1",
+        body(admitted.record.revision),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+    assert_eq!(conflict["error"], "NAME_REVISION_CONFLICT");
+    let (status, accepted) = patch(router, "/api/panes/p1", body(bound.record.revision)).await;
+    assert_eq!(status, StatusCode::OK, "{accepted}");
+    assert_eq!(
+        accepted["data"]["nameRef"],
+        serde_json::to_value(bound.record.name_ref).unwrap()
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
+/// A second state over the SAME store with its own (empty) identity table.
+fn names_state_sharing(state: &SessionNamesState) -> SessionNamesState {
+    SessionNamesState {
+        auth_token: Arc::clone(&state.auth_token),
+        names: state.names.clone(),
+        identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+        index: None,
+    }
+}
+
 /// A pending pane renamed BEFORE its durable identity exists keeps the name
 /// through the verified bind: the pre-durable rename targets the pending
 /// handle, and the bind transfers it onto the durable record atomically (the
@@ -609,6 +1058,7 @@ async fn scoped_reset_is_refused_on_every_surface() {
             name: "Protected".into(),
             intent: NameIntent::User,
             if_revision: None,
+            cwd: None,
         })
         .await
         .unwrap();
@@ -1132,6 +1582,7 @@ async fn two_store_participants_converge_through_unconditional_refresh() {
         name: "Renamed By A".into(),
         intent: NameIntent::User,
         if_revision: None,
+        cwd: None,
     })
     .await
     .unwrap();
@@ -1185,6 +1636,7 @@ async fn a_foreign_status_only_native_sync_transition_republishes_on_adoption() 
         name: "Manually Named".into(),
         intent: NameIntent::User,
         if_revision: None,
+        cwd: None,
     })
     .await
     .unwrap();
@@ -1306,6 +1758,42 @@ async fn read_route_chunks_and_omits_unknown_refs() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// Name-reliability Task 11 (RC9): the read route answers from the adopted
+/// view — it runs no `refresh_current` full-document rebuild and no locked
+/// read, so a page reload burst never queues on the document lock.
+#[tokio::test]
+async fn read_route_does_not_call_refresh_current() {
+    let home = temp_home();
+    let state = names_state(&home);
+    admit_pending(
+        &state.names,
+        "handle-tally",
+        NamedProvider::Claude,
+        Some("/w"),
+    )
+    .await;
+    let data_dir = std::fs::canonicalize(home.join(".freshell")).unwrap();
+    let before = crate::session_names::test_store_transaction_count(&data_dir);
+
+    let (status, body) = post_read(
+        super::router(state.clone()),
+        json!([{ "kind": "pending", "id": "handle-tally" }]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["names"].as_array().unwrap().len(),
+        1,
+        "the read resolves the record: {body}"
+    );
+    assert_eq!(
+        crate::session_names::test_store_transaction_count(&data_dir),
+        before,
+        "the read route took no store transaction"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// A session whose identity was verified under one native location and is
 /// then verified under a NEW location (same provider/session — a supported
 /// relocation) RETAINS its name; a non-target session's record is untouched.
@@ -1324,6 +1812,7 @@ async fn verified_relocation_retains_the_name_and_leaves_non_targets_untouched()
             name: "Kept Through Move".into(),
             intent: NameIntent::User,
             if_revision: None,
+            cwd: None,
         })
         .await
         .unwrap();
@@ -1550,6 +2039,106 @@ async fn import_endpoint_acknowledges_per_candidate_and_resolves_terminals() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Name-reliability Task 3: once the one-time consolidation is complete, an
+/// old browser's import is answered 200 with every candidate acknowledged,
+/// and nothing is written — no record, no stored candidate id, no backup
+/// file, no document generation.
+#[tokio::test]
+async fn import_route_after_completion_acknowledges_without_writing() {
+    let home = temp_home();
+    let state = names_state(&home);
+    state
+        .names
+        .hydrate_indexed(
+            crate::session_name_generation::IndexedNameInput {
+                provider: NamedProvider::Claude,
+                session_id: "sess-1".into(),
+                cwd: Some("/w/work".into()),
+                first_user_message: None,
+                provider_title: None,
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    state.names.complete_legacy_migration().await.unwrap();
+    let data_dir = home.join(".freshell");
+    let document = |dir: &std::path::Path| -> Value {
+        serde_json::from_slice(&std::fs::read(dir.join("session-names.json")).unwrap()).unwrap()
+    };
+    let before = document(&data_dir);
+
+    let router = super::router(state.clone());
+    let body = json!({
+        "version": 1,
+        "importId": "old-client-window-import",
+        "evidence": [
+            { "storageKey": "freshell.layout.v3.layout-window-a", "raw": "{\"version\":4}" }
+        ],
+        "candidates": [
+            {
+                "id": "c-1",
+                "target": { "kind": "session", "provider": "claude", "sessionId": "sess-1" },
+                "name": "Tab 23",
+                "source": "provider_ai",
+                "scope": "source_tab",
+                "evidenceKey": "freshell.layout.v3.layout-window-a#tab-1",
+                "protectionEvidence": "none"
+            },
+            {
+                "id": "c-2",
+                "target": { "kind": "session", "provider": "claude", "sessionId": "sess-2" },
+                "name": "ms-people-summit",
+                "source": "legacy_protected",
+                "scope": "source_tab",
+                "evidenceKey": "freshell.layout.v3.layout-window-a#tab-2",
+                "protectionEvidence": "legacy_flag"
+            }
+        ]
+    });
+    let (status, response) = post_import(router, body).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        response["acknowledged"],
+        json!(["c-1", "c-2"]),
+        "{response}"
+    );
+    assert_eq!(response["names"], json!([]), "{response}");
+
+    let after = document(&data_dir);
+    assert_eq!(
+        after["documentGeneration"], before["documentGeneration"],
+        "the import wrote no document generation"
+    );
+    assert_eq!(
+        after, before,
+        "the document is byte-for-byte the same value"
+    );
+    let record = state
+        .names
+        .get(vec![SessionNameRef::Session {
+            provider: NamedProvider::Claude,
+            session_id: "sess-1".into(),
+        }])
+        .await
+        .unwrap();
+    assert_eq!(record[0].record.name, "work");
+    assert!(state
+        .names
+        .get(vec![SessionNameRef::Session {
+            provider: NamedProvider::Claude,
+            session_id: "sess-2".into(),
+        }])
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(
+        !data_dir.join("name-migration-v1").join("imports").exists(),
+        "no per-import backup file"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 

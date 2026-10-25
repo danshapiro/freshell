@@ -55,7 +55,10 @@ unsafe fn install_process_trace_capture() {
 /// inspect tracing events read it and filter by values unique to their own
 /// fixture, because every test in the binary feeds the same buffer.
 pub(crate) fn captured_trace_events() -> CapturedTraceEvents {
-    process_capture().clone()
+    let events = process_capture().clone();
+    // Recompute interest after the process-wide subscriber is installed.
+    tracing::callsite::rebuild_interest_cache();
+    events
 }
 
 fn process_capture() -> &'static CapturedTraceEvents {
@@ -129,6 +132,8 @@ fn is_captured(metadata: &tracing::Metadata<'_>) -> bool {
         "freshell_server::session_names" => {
             level == tracing::Level::WARN || level == tracing::Level::INFO
         }
+        // Only first-message lookup failures are retained in on_event.
+        "freshell_server::auto_title_sweep" => level == tracing::Level::WARN,
         _ => false,
     }
 }
@@ -206,6 +211,72 @@ where
             return;
         }
 
+        if metadata.target() == "freshell_server::auto_title_sweep"
+            && visitor.message.split(':').next()
+                != Some("session_names.first_message_lookup_failed")
+        {
+            return;
+        }
+
+        self.events.0.lock().unwrap().push(CapturedTraceEvent {
+            level: *metadata.level(),
+            message: visitor.message,
+            fields: visitor.fields,
+        });
+    }
+}
+
+/// A capture for the CURRENT THREAD only: a scoped default subscriber that
+/// keeps every event (any level) whose target starts with `target_prefix`,
+/// until the returned guard drops. Tests that count log lines use it so a
+/// test running in parallel cannot add lines to their count; everything the
+/// test drives must run on its own thread (a current-thread runtime).
+pub(crate) fn scoped_trace_capture(
+    target_prefix: &'static str,
+) -> (tracing::subscriber::DefaultGuard, CapturedTraceEvents) {
+    use tracing_subscriber::prelude::*;
+
+    // While exactly one dispatcher is registered, tracing-core decides a
+    // call site's interest from the CALLING thread's default dispatcher
+    // (its "just one" shortcut). So when this capture is the only
+    // dispatcher, a call site first reached on another test's thread (which
+    // has no subscriber) caches "never", and this capture silently misses
+    // that site's events for the rest of the run. A second dispatcher that
+    // is never dropped (and is interested in nothing) keeps tracing-core on
+    // the path that asks every live dispatcher.
+    static ANCHOR: OnceLock<tracing::Dispatch> = OnceLock::new();
+    ANCHOR.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+
+    let events = CapturedTraceEvents::default();
+    let subscriber = tracing_subscriber::registry().with(ScopedCaptureLayer {
+        target_prefix,
+        events: events.clone(),
+    });
+    let guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
+    (guard, events)
+}
+
+struct ScopedCaptureLayer {
+    target_prefix: &'static str,
+    events: CapturedTraceEvents,
+}
+
+impl<S> tracing_subscriber::Layer<S> for ScopedCaptureLayer
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let metadata = event.metadata();
+        if !metadata.target().starts_with(self.target_prefix) {
+            return;
+        }
+        let mut visitor = TraceFieldVisitor::default();
+        event.record(&mut visitor);
         self.events.0.lock().unwrap().push(CapturedTraceEvent {
             level: *metadata.level(),
             message: visitor.message,

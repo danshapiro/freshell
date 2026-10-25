@@ -1097,6 +1097,42 @@ describe('App WS bootstrap recovery', () => {
     expect(store.getState().tabs.tabs.find(tab => tab.id === 'inventory-live-tab')?.status).toBe('running')
   })
 
+  it('a managed inventory status refresh never changes the tab recency', async () => {
+    // Name reliability (Task 8, D6): every ready re-sends terminal.inventory,
+    // and the managed status it folds into the tab is a runtime fact, not a
+    // user action — it must not tilt cross-window last-writer-wins.
+    const store = createStore({
+      tabs: [{ id: 'inventory-recency-tab', mode: 'shell', status: 'creating', title: 'Tab 1', createdAt: 1_000, updatedAt: 1_000 }],
+      panes: {
+        layouts: {
+          'inventory-recency-tab': {
+            type: 'leaf', id: 'inventory-recency-pane', content: {
+              kind: 'terminal', mode: 'shell', status: 'creating',
+              terminalId: 'inventory-recency-terminal', streamId: 'inventory-recency-stream',
+              createRequestId: 'inventory-recency-create', soulId: 'inventory-recency-soul',
+            },
+          },
+        },
+        activePane: { 'inventory-recency-tab': 'inventory-recency-pane' },
+      },
+    })
+    render(<Provider store={store}><App /></Provider>)
+    await waitFor(() => expect(messageHandler).toBeTypeOf('function'))
+
+    act(() => messageHandler?.({
+      type: 'terminal.inventory',
+      terminals: [{
+        terminalId: 'inventory-recency-terminal', mode: 'shell', status: 'running',
+        runtimeStatus: 'running', soulId: 'inventory-recency-soul', incarnationId: 'inventory-recency-incarnation',
+      }],
+    }))
+
+    const tab = store.getState().tabs.tabs.find(candidate => candidate.id === 'inventory-recency-tab')
+    expect(tab?.status).toBe('running')
+    expect(tab?.updatedAt).toBe(1_000)
+    expect(tab?.title).toBe('Tab 1')
+  })
+
   it.each([
     { recoveryState: 'blocked', runtimeStatus: 'blocked', expectedStatus: 'error' },
     { recoveryState: 'lost', runtimeStatus: 'exited', expectedStatus: 'error' },

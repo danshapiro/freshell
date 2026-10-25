@@ -154,6 +154,8 @@ function createTestStore(options?: {
     mode?: string
     lastInputAt?: number
     status?: 'running' | 'creating' | 'exited' | 'error'
+    title?: string
+    nameSource?: Tab['nameSource']
   }>
   panes?: {
     layouts: Record<string, PaneNode>
@@ -2279,6 +2281,101 @@ describe('Sidebar Component - Session-Centric Display', () => {
       if (layout?.type === 'leaf' && layout.content.kind === 'terminal') {
         expect(layout.content.terminalId).toBe('orphan-terminal-id')
       }
+    })
+  })
+
+  describe('tab titles on a session click (name reliability, Task 7)', () => {
+    // A kilroy row is not a scoped (Claude/Codex/OpenCode) row, so its click
+    // takes the legacy retitle path. Its pane sits in a split tab next to a
+    // Claude pane.
+    const kilroySessionId = sessionId('kilroy-in-split')
+    const claudeSessionId = sessionId('claude-in-split')
+
+    function kilroyProjects(): ProjectGroup[] {
+      return [{
+        projectPath: '/home/user/project',
+        sessions: [{
+          sessionId: kilroySessionId,
+          projectPath: '/home/user/project',
+          lastActivityAt: Date.now(),
+          title: 'Kilroy work',
+          cwd: '/home/user/project',
+          sessionType: 'kilroy',
+        }],
+      }]
+    }
+
+    function splitPanes() {
+      return {
+        layouts: {
+          'tab-split': {
+            type: 'split',
+            id: 'split-1',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              {
+                type: 'leaf',
+                id: 'pane-claude',
+                content: {
+                  kind: 'terminal',
+                  mode: 'claude',
+                  createRequestId: 'req-claude',
+                  status: 'running',
+                  sessionRef: { provider: 'claude', sessionId: claudeSessionId },
+                },
+              },
+              {
+                type: 'leaf',
+                id: 'pane-kilroy',
+                content: {
+                  kind: 'fresh-agent',
+                  sessionType: 'kilroy',
+                  provider: 'claude',
+                  createRequestId: 'req-kilroy',
+                  status: 'idle',
+                  sessionRef: { provider: 'claude', sessionId: kilroySessionId },
+                },
+              },
+            ],
+          },
+        } as Record<string, PaneNode>,
+        activePane: { 'tab-split': 'pane-claude' },
+        paneTitles: {},
+      }
+    }
+
+    async function clickKilroyRow(store: ReturnType<typeof createTestStore>) {
+      renderSidebar(store, [])
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+      fireEvent.click(screen.getByText('Kilroy work').closest('button')!)
+      // The click focused the existing pane and wrote its pane title.
+      expect(store.getState().panes.activePane['tab-split']).toBe('pane-kilroy')
+      expect(store.getState().panes.paneTitles['tab-split']?.['pane-kilroy']).toBe('Kilroy work')
+    }
+
+    it('retitles a legacy tab holding the clicked session', async () => {
+      const store = createTestStore({
+        projects: kilroyProjects(),
+        tabs: [{ id: 'tab-split', mode: 'claude', title: 'mixed work', nameSource: { kind: 'legacy' } }],
+        panes: splitPanes(),
+        activeTabId: 'tab-split',
+      })
+      await clickKilroyRow(store)
+      expect(store.getState().tabs.tabs[0].title).toBe('Kilroy work')
+    })
+
+    it('never retitles a session-owned tab holding the clicked session', async () => {
+      const store = createTestStore({
+        projects: kilroyProjects(),
+        tabs: [{ id: 'tab-split', mode: 'claude', title: 'LotL', nameSource: { kind: 'session', paneId: 'pane-claude' } }],
+        panes: splitPanes(),
+        activeTabId: 'tab-split',
+      })
+      await clickKilroyRow(store)
+      expect(store.getState().tabs.tabs[0].title).toBe('LotL')
     })
   })
 

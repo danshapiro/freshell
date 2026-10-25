@@ -443,6 +443,10 @@ async fn apply_claude_signal(state: &WsState, sig: &ClaudeSignal) -> SignalDispo
             }
         }
     }
+    // Name reliability (Task 10, G45): a conversation switch moved the
+    // identity's durable ref; the terminal row's binding follows it and the
+    // row adopts the new session's own name.
+    crate::terminal_naming::follow_identity_switch(state, &sig.terminal_id).await;
     state.registry.set_meta(
         &sig.terminal_id,
         None,

@@ -2867,7 +2867,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         };
         match registry.launch_managed(managed).await {
             Ok(descriptor) => {
-                registry.register_managed(descriptor);
+                registry.register_managed(descriptor, mode_label(&mode, cli.as_ref()));
                 Ok(())
             }
             Err(error) => Err(std::io::Error::other(format!(
@@ -3426,90 +3426,84 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
     // the client's pane state can target pre-identity renames. A resume
     // create names through the durable session's own record instead (the
     // hook receives that nameRef). Unwired sinks proceed unnamed.
-    let (mut naming_handle, mut naming_name_ref) = (None, None);
-    if let Some(provider) = crate::naming::named_provider_for(Some(mode.as_str()), None) {
-        if let Some(sink) = state.naming() {
-            match accepted_session_ref
+    //
+    // Name reliability (Task 10): the admission runs through the shared
+    // terminal naming bind (WS parity): the identity table and the registry
+    // row are bound together, a resume reads the session's saved name into
+    // the row, and a transient store error is retried and deferred to the
+    // reconcile tick with the binding kept.
+    let naming_outcome = crate::terminal_name_binding::bind_rest_terminal_naming(
+        &state,
+        &registry,
+        &terminal_id,
+        crate::terminal_name_binding::NamingBindHint {
+            mode: mode.clone(),
+            cwd: spec.cwd.clone(),
+            // A managed descriptor's session counts only when it is not this
+            // create's own (prospective) preallocated `--session-id`.
+            resume_session_id: accepted_session_ref
                 .as_ref()
-                .filter(|sref| sref.provider == provider.as_str())
+                .filter(|sref| sref.provider == mode)
                 .map(|sref| sref.session_id.clone())
+                .or_else(|| {
+                    crate::terminal_name_binding::managed_reused_session(
+                        &registry,
+                        &terminal_id,
+                        resume_session_id
+                            .as_deref()
+                            .filter(|_| claude_fresh_prealloc),
+                    )
+                }),
+            naming_handle: body
+                .get("namingHandle")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            fallback_title: mode_label(&mode, cli.as_ref()),
+        },
+    )
+    .await;
+    let naming_name_ref = naming_outcome
+        .binding()
+        .map(|binding| binding.name_ref.clone());
+    let naming_handle = naming_outcome
+        .binding()
+        .and_then(|binding| binding.naming_handle.clone());
+    if let Some(handle) = naming_handle.as_deref() {
+        pane_content["namingHandle"] = json!(handle);
+    }
+    // Unified agent names (Task 2 review, I3): the CLI-supplied `name`
+    // seeds a freshly admitted pending record with the SAME intent default
+    // as the fresh-agent create lane (`lib.rs` `create_tab`'s seed —
+    // automatic: an agent/API suggestion never acquires a user rename's
+    // permanence), so the saved name agrees with the layout title. Logged,
+    // never blocking.
+    if let (
+        crate::terminal_name_binding::NamingBindOutcome::Bound { .. },
+        Some(handle),
+        Some(sink),
+    ) = (&naming_outcome, naming_handle.as_deref(), state.naming())
+    {
+        if let Some(seed) = body
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let pending = freshell_protocol::session_names::SessionNameRef::Pending {
+                id: handle.to_string(),
+            };
+            match sink
+                .rename(crate::naming::RenameNameInput {
+                    target: pending.clone(),
+                    name: seed.to_string(),
+                    intent: freshell_protocol::session_names::NameIntent::Automatic,
+                    if_revision: None,
+                    cwd: spec.cwd.clone(),
+                })
+                .await
             {
-                Some(session_id) => {
-                    naming_name_ref =
-                        Some(freshell_protocol::session_names::SessionNameRef::Session {
-                            provider,
-                            session_id,
-                        });
-                }
-                None => {
-                    let handle = body
-                        .get("namingHandle")
-                        .and_then(Value::as_str)
-                        .filter(|h| !h.trim().is_empty())
-                        .map(str::to_string)
-                        .unwrap_or_else(|| format!("nh-{}", Uuid::new_v4().simple()));
-                    let pending = freshell_protocol::session_names::SessionNameRef::Pending {
-                        id: handle.clone(),
-                    };
-                    match sink
-                        .ensure_pending(crate::naming::PendingNameInput {
-                            handle: handle.clone(),
-                            provider,
-                            cwd: spec.cwd.clone(),
-                        })
-                        .await
-                    {
-                        Ok(update) => {
-                            state.stash_naming_handle(&terminal_id, &handle);
-                            pane_content["namingHandle"] = json!(handle);
-                            naming_handle = Some(handle);
-                            // Task 8 acceptance (WS parity): report the
-                            // Pending binding as the row's name_ref too —
-                            // `freshell-server`'s hook wiring writes it onto
-                            // the shared identity registry, where the 2s
-                            // tick's `pending_naming_binds()` lane reads it.
-                            // Without it, a REST-created scoped pane's
-                            // record can never transfer at materialization
-                            // (the WS door's `admit_create_naming` stamps
-                            // exactly this).
-                            naming_name_ref = Some(pending.clone());
-                            // Unified agent names (Task 2 review, I3): the
-                            // CLI-supplied `name` seeds the admitted record
-                            // with the SAME intent default as the fresh-agent
-                            // create lane (`lib.rs` `create_tab`'s seed —
-                            // automatic: an agent/API suggestion never
-                            // acquires a user rename's permanence), so the
-                            // saved name agrees with the layout title.
-                            // Logged, never blocking.
-                            if let Some(seed) = body
-                                .get("name")
-                                .and_then(Value::as_str)
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                            {
-                                if let Err(error) = sink
-                                    .rename(crate::naming::RenameNameInput {
-                                        target: pending,
-                                        name: seed.to_string(),
-                                        intent:
-                                            freshell_protocol::session_names::NameIntent::Automatic,
-                                        if_revision: None,
-                                    })
-                                    .await
-                                {
-                                    crate::naming::log_name_error(
-                                        "rename",
-                                        &update.record.name_ref,
-                                        &error,
-                                    );
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            crate::naming::log_name_error("ensure_pending", &pending, &error);
-                        }
-                    }
-                }
+                Ok(update) => registry.update_session_name(&terminal_id, &update.record),
+                Err(error) => crate::naming::log_name_error("rename", &pending, &error),
             }
         }
     }
@@ -3994,6 +3988,11 @@ pub(crate) async fn wait_for(
 // Slice 1 route tests (docs/plans/2026-07-18-agent-api-mcp-parity-spec.md §8.1)
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Name reliability (Task 10): the REST door's terminal naming tests.
+#[cfg(test)]
+#[path = "terminal_tabs_naming_tests.rs"]
+mod naming_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4039,7 +4038,7 @@ mod tests {
             .clone()
     }
 
-    fn state_with_registry() -> FreshAgentState {
+    pub(super) fn state_with_registry() -> FreshAgentState {
         // Every REST test that can reach an amplifier create flows through
         // this constructor — isolate at the choke point (Task 11 Step 1).
         let _ = isolate_amplifier_home();
@@ -4048,7 +4047,7 @@ mod tests {
             .with_terminal_registry(freshell_terminal::TerminalRegistry::new())
     }
 
-    fn app(state: FreshAgentState) -> Router {
+    pub(super) fn app(state: FreshAgentState) -> Router {
         crate::router(state)
     }
 
@@ -4066,7 +4065,12 @@ mod tests {
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
-    async fn post(router: Router, uri: &str, body: Value, auth: bool) -> (StatusCode, Value) {
+    pub(super) async fn post(
+        router: Router,
+        uri: &str,
+        body: Value,
+        auth: bool,
+    ) -> (StatusCode, Value) {
         let mut req = Request::builder()
             .method("POST")
             .uri(uri)

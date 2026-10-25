@@ -6532,6 +6532,7 @@ mod send_outcome;
 pub use send_outcome::ClaudeSendOutcome;
 
 mod attach;
+mod continuation_name;
 mod establish;
 mod fork;
 mod genesis;
