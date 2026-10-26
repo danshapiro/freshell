@@ -27,7 +27,10 @@ test('Freshcodex observes the exact child read-only and restores the selection a
     { id: 'image-output', type: 'imageGeneration', status: 'completed', result: outputImage, savedPath: outputImage },
     { id: 'spawn', type: 'collabAgentToolCall', tool: 'spawnAgent', status: 'completed', senderThreadId: parentId, receiverThreadIds: [childId], agentsStates: { [childId]: { status: 'completed', message: 'Child finished', model: 'child-model' } } },
   ] }] }
-  const child = { id: childId, parentThreadId: parentId, ephemeral: false, status: { type: 'idle' }, turns: [{ id: 'child-turn', status: 'completed', items: [{ id: 'child-answer', type: 'agentMessage', text: 'Exact observed child answer' }] }] }
+  const child = { id: childId, parentThreadId: parentId, ephemeral: false, status: { type: 'idle' }, turns: [
+    { id: 'child-turn', status: 'completed', itemsView: 'full', items: [{ id: 'child-answer', type: 'agentMessage', text: 'Exact observed child answer' }] },
+    { id: 'preview-turn', status: 'interrupted', itemsView: 'summary', items: [{ id: 'child-preview', type: 'agentMessage', summary: 'Partial child preview' }] },
+  ] }
   const server = new RustServer({ env: {
     CODEX_CMD: wrapper,
     FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES: '1',
@@ -59,12 +62,15 @@ test('Freshcodex observes the exact child read-only and restores the selection a
     await open.click({ timeout: 15_000 })
     const observer = page.getByRole('dialog', { name: 'Child conversation' })
     await expect(observer.getByText('Exact observed child answer', { exact: true })).toBeVisible()
+    await expect(observer.getByText('Partial child preview', { exact: true })).toBeVisible()
+    await expect(observer.getByRole('note', { name: 'Output persistence' })).toHaveText('Native preview. Interrupted.')
     await expect(observer.getByRole('textbox')).toHaveCount(0)
     await expect(observer.getByRole('button', { name: /send|stop|configure|resume/i })).toHaveCount(0)
     await page.reload()
     await harness.waitForHarness()
     await harness.waitForConnection()
     await expect(observer.getByText('Exact observed child answer', { exact: true })).toBeVisible({ timeout: 30_000 })
+    await expect(observer.getByRole('note', { name: 'Output persistence' })).toHaveText('Native preview. Interrupted.')
     await expect(pane.getByText('Parent conversation remains available', { exact: true })).toHaveCount(1)
     await observer.getByRole('button', { name: 'Close child conversation' }).click()
     await expect(observer).toHaveCount(0)

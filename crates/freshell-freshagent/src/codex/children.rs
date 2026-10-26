@@ -144,6 +144,7 @@ impl FreshCodexState {
                 false,
             ));
         }
+        stamp_child_history_previews(&mut snapshot, &raw)?;
         stamp_readonly_child(&mut snapshot, &parent);
         // Availability does not imply a turn completed or persisted every token.
         snapshot["extensions"]["codex"]["childHistory"] = json!({
@@ -196,6 +197,36 @@ impl FreshCodexState {
         }
         Ok(())
     }
+}
+
+fn stamp_child_history_previews(snapshot: &mut Value, raw: &Value) -> Result<(), ChildReadError> {
+    let preview_ids: std::collections::HashSet<String> = raw["thread"]["turns"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|turn| turn["itemsView"] == "summary")
+        .map(|turn| build_codex_turn_json(turn, 0))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ChildReadError::SourceUnavailable)?
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row["id"].as_str().map(str::to_owned))
+        .collect();
+    for row in snapshot["turns"].as_array_mut().into_iter().flatten() {
+        if row["id"]
+            .as_str()
+            .is_some_and(|id| preview_ids.contains(id))
+        {
+            // Keep native interruption/truncation diagnostics, while never
+            // presenting a provider summary as the complete saved body.
+            if row.get("outputState").is_none() {
+                row["outputState"] = json!({});
+            }
+            row["outputState"]["provenance"] = json!("preview");
+            row["outputState"]["refreshPending"] = json!(false);
+        }
+    }
+    Ok(())
 }
 
 pub fn stamp_readonly_child(snapshot: &mut Value, parent: &str) {
@@ -446,6 +477,34 @@ mod tests {
         state.shutdown().await;
         let _ = driver.await.unwrap();
         assert!(matches!(result,Err(ChildReadError::SourceUnavailable)),"temporary source failure must not become pending or permanently missing history: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn child_read_native_summary_is_preview_separate_from_readable_availability() {
+        let (state,driver) = fixture(json!({"thread":{"id":"child","parentThreadId":"parent","status":{"type":"idle"},"turns":[{"id":"summary-turn","status":"interrupted","itemsView":"summary","items":[{"id":"preview","type":"agentMessage","summary":"Native child preview"}]}]}})).await;
+        let value = state
+            .read_child("parent", "child", None, None)
+            .await
+            .unwrap();
+        state.shutdown().await;
+        let _ = driver.await.unwrap();
+        assert_eq!(value["status"], "saved");
+        assert_eq!(
+            value["snapshot"]["turns"][0]["items"][0]["text"],
+            "Native child preview"
+        );
+        assert_eq!(
+            value["snapshot"]["turns"][0]["outputState"]["provenance"],
+            "preview"
+        );
+        assert_eq!(
+            value["snapshot"]["turns"][0]["outputState"]["diagnostic"],
+            "interrupted"
+        );
+        assert_eq!(
+            value["snapshot"]["turns"][0]["outputState"]["refreshPending"],
+            false
+        );
     }
 
     #[tokio::test]
