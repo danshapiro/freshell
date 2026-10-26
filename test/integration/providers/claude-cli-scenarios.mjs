@@ -380,7 +380,15 @@ export const SCENARIOS = {
     await s.waitForResults(1)
     const resultAt = Date.now()
     const appeared = await ctx.pollTranscript(X, 4000)
-    ctx.observe('transcriptAfterFirstResult', { msAfterResult: appeared ? Date.now() - resultAt : null, shape: transcriptShape(appeared) })
+    const msAfterResult = appeared ? Date.now() - resultAt : null
+    const assistantUuid = ctx.need(s.messages(message => message.type === 'assistant' && !message.parent_tool_use_id).at(-1)?.uuid, 'first-turn assistant UUID')
+    // File appearance can precede the final assistant append. Preserve that
+    // timing observation, but compare history only once this exact turn saved.
+    const saved = ctx.need(
+      await ctx.pollTranscript(X, 4000, 1, lines => lines.some(line => line.type === 'assistant' && line.uuid === assistantUuid)),
+      `first-turn assistant ${assistantUuid} saved for session ${X} within 4000ms`,
+    )
+    ctx.observe('transcriptAfterFirstResult', { msAfterResult, shape: transcriptShape(saved) })
     s.push('second prompt', 'u2')
     await s.waitForResults(2)
     await s.waitForCount(isStateIdle, 2, 3000, 'idle')
@@ -853,6 +861,21 @@ export const SCENARIOS = {
 
 export const SCENARIO_NAMES = Object.keys(SCENARIOS)
 
+/** Poll until the saved lines satisfy the requested count and optional predicate. */
+export async function pollTranscript(fixture, trace, id, ms, minLines = 1, predicate) {
+  const started = Date.now()
+  while (Date.now() - started <= ms) {
+    const lines = await fixture.readTranscript(id)
+    if (lines && lines.length >= minLines && (!predicate || predicate(lines))) {
+      trace.add({ k: 'transcript-seen', id, lines: lines.length })
+      return lines
+    }
+    await sleep(50)
+  }
+  trace.add({ k: 'transcript-missing', id })
+  return null
+}
+
 /** Load the `query` export of the target. */
 async function loadTarget(target, repoRoot) {
   if (target === 'real') {
@@ -909,20 +932,7 @@ export async function runScenario(target, name, { repoRoot = DEFAULT_REPO_ROOT }
       return value
     },
     files: () => fixture.transcripts(),
-    /** Poll until the saved lines satisfy the requested count and optional predicate. */
-    async pollTranscript(id, ms, minLines = 1, predicate) {
-      const started = Date.now()
-      while (Date.now() - started <= ms) {
-        const lines = await fixture.readTranscript(id)
-        if (lines && lines.length >= minLines && (!predicate || predicate(lines))) {
-          trace.add({ k: 'transcript-seen', id, lines: lines.length })
-          return lines
-        }
-        await sleep(50)
-      }
-      trace.add({ k: 'transcript-missing', id })
-      return null
-    },
+    pollTranscript: (...args) => pollTranscript(fixture, trace, ...args),
   }
   let failure
   try {
