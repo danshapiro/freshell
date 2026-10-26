@@ -87,6 +87,9 @@ mod controls;
 mod metadata;
 pub(crate) mod native_history;
 mod projection;
+pub(crate) mod turn_state;
+use turn_state::{CodexTurnState, DispatchToken, NativeSettlement, StopDisposition};
+type SharedCodexTurnState = Arc<StdMutex<CodexTurnState>>;
 
 /// Unified agent names (Task 2): the ambient `CODEX_HOME` fallback for the
 /// durability-driven pending bind when the app-server's own initialize
@@ -249,6 +252,7 @@ const STATUS_RANG_TURN_IDS_CAP: usize = 8;
 /// explicit: every lifecycle path must give the reducer, quiet-deadman, compact
 /// guard, and emission barrier for the same thread to the same task.
 struct CodexConsumerRuntime {
+    turn_state: SharedCodexTurnState,
     thread_id: String,
     projection: Arc<StdMutex<projection::CodexProjection>>,
     active_turn: Arc<StdMutex<Option<String>>>,
@@ -300,6 +304,46 @@ struct CodexConsumerRuntime {
     compact_in_flight: Arc<AtomicBool>,
     compact_turn_id: Arc<StdMutex<Option<String>>>,
     event_emission_gate: Arc<TokioMutex<()>>,
+}
+
+async fn wait_for_codex_stop_resolution(turns: &SharedCodexTurnState) {
+    loop {
+        let changed = turns.lock().expect("codex turn state").changed.clone();
+        let notified = changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !turns
+            .lock()
+            .expect("codex turn state")
+            .has_unresolved_stop()
+        {
+            return;
+        }
+        #[cfg(test)]
+        turns
+            .lock()
+            .expect("codex turn state")
+            .waiting_for_stop
+            .notify_one();
+        notified.await;
+    }
+}
+
+fn publish_codex_interrupt_refusal(
+    turns: &SharedCodexTurnState,
+    dispatch: DispatchToken,
+    turn_id: &str,
+    publish: impl FnOnce(),
+) -> bool {
+    let mut state = turns.lock().expect("codex turn state");
+    if !state.interrupt_refused(dispatch, turn_id) {
+        return false;
+    }
+    // Gate waiters may wake during the transition, but cannot acquire state
+    // and admit a newer Stop until its compatibility publication is complete.
+    // Production publication only writes the atomic attention marker.
+    publish();
+    true
 }
 
 /// Seed the quiet window from `FRESHELL_FRESHCODEX_QUIET_WINDOW_MS` (positive integer
@@ -479,6 +523,7 @@ struct CodexCreateRecord {
 /// One live freshcodex session: the app-server client, its owned sidecar, and the
 /// normalized create-time settings a later `send` re-uses.
 struct CodexSession {
+    turn_state: SharedCodexTurnState,
     projection: Arc<StdMutex<projection::CodexProjection>>,
     client: Arc<CodexAppServerClient>,
     /// Normalized model (`normalizeFreshcodexModel`), reused verbatim on `send`.
@@ -490,21 +535,11 @@ struct CodexSession {
     sandbox: Option<String>,
     /// Raw create permissionMode (e.g. `never`) → the turn's `approvalPolicy`.
     permission_mode: Option<String>,
-    /// Legacy `activeTurnByThread.get(sessionId)` mirror (adapter.ts:295,980,1009,1027): set
-    /// immediately after `turn/start` resolves (`handle_send`), cleared on a successful
-    /// `handle_interrupt` and whenever the notification consumer observes the turn/thread end
-    /// (`reduce_notification`). Lets `freshAgent.interrupt` target the in-flight turn.
+    /// Compatibility target for native/compact lifecycle consumers. Owed work
+    /// and Stop ownership live in `turn_state`; an interrupt ACK never clears it.
     active_turn: Arc<StdMutex<Option<String>>>,
-    /// The per-session USER-interrupt marker (opencode's `turn_aborted`
-    /// precedent): `handle_interrupt` arms it BEFORE issuing `turn/interrupt`
-    /// (and disarms it again when the RPC fails — the interrupt never landed),
-    /// the consumer's subscription consumes it at the `interrupted`
-    /// completion, and the consumer's `turn/started` fold CLEARS it (the
-    /// full opencode dispatch-clear discipline — a stale armed marker never
-    /// crosses a turn boundary). ONE `Arc` shared by this session record (the
-    /// interrupt lane) and the consumer's [`CodexSubscription`] (the guard),
-    /// so a user interrupt is silent while an automation/rollback-forced
-    /// `interrupted` still rings the unified attention edge.
+    /// Compatibility attention marker. Arm before native Stop; disarm only on
+    /// a proven pre-submission refusal or the matching terminal/new-turn fold.
     user_interrupt_pending: Arc<AtomicBool>,
     /// Delta-r1 F2: the compact-window busy truth. `thread/compact/start`'s answer
     /// carries no turn id, and the REAL 0.147.0 sequence returns the RPC BEFORE
@@ -591,24 +626,11 @@ struct CodexSession {
     /// into the consumer ([`reduce_notification`]), the exit watcher
     /// ([`spawn_exit_watcher`]), and the snapshot path ([`FreshCodexState::get_snapshot`]).
     quiet_deadman: Arc<StdMutex<QuietDeadman>>,
-    /// The lane's turn-in-flight AUTHORITY (the round-2 review finding): armed at
-    /// `start_turn` DISPATCH -- BEFORE awaiting the response -- so the
-    /// independently-running exit watcher and quiet deadman classify the turn as
-    /// in flight even while the response is still outstanding (a post-response
-    /// arm would miss a crash in that window). Mirrored at every `active_turn`
-    /// mutation, so it is a superset of `active_turn` between dispatch and the
-    /// crash/kill retirement points: SET alongside the consumer's
-    /// `turn/started` adoption and the snapshot's mid-flight seed, CLEARED at
-    /// every turn-end observation (the thread leaving running/starting, the
-    /// active turn's completion, `thread_closed`, a successful user
-    /// interrupt) and on a failed dispatch the sidecar survived (the
-    /// kill/crash arms retire the latch WITHOUT clearing `active_turn`, so a
-    /// post-kill/post-crash `active_turn` can outlive the latch; an
-    /// exit-induced dispatch failure instead leaves the latch armed for the
-    /// crash arm's swap-and-mint — a bare Err-arm retirement would land
-    /// before the crash arm and swallow the crash edge). The crash self-heal
-    /// arm reads and retires it (the crash IS the turn end it observes); a
-    /// requested kill retires it silently (the user initiated that turn end).
+    /// Compatibility in-flight/attention latch for existing crash, compact and
+    /// quiet-deadman consumers. Dispatch and matching native terminal evidence
+    /// mirror the identity-owned `turn_state`; interrupt acknowledgement does
+    /// not retire work. Existing lifecycle-loss attention dedup remains separate
+    /// from proving terminal delivery/owned-process settlement.
     turn_in_flight: Arc<AtomicBool>,
     /// The-usual SDD focused-r1 FR1-1: the per-session RETIRED-TURN slot.
     /// A terminal thread status retires the active-turn TRACKER while the
@@ -2815,6 +2837,7 @@ impl FreshCodexState {
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
         let event_emission_gate = Arc::new(TokioMutex::new(()));
+        let turn_state = Arc::new(StdMutex::new(CodexTurnState::default()));
         let projection = Arc::new(StdMutex::new(projection::CodexProjection::new(
             mint_ownership_id(),
             thread_id.to_string(),
@@ -2823,6 +2846,7 @@ impl FreshCodexState {
         let consumer = self.spawn_consumer_after(
             notifs,
             CodexConsumerRuntime {
+                turn_state: turn_state.clone(),
                 thread_id: thread_id.clone(),
                 active_turn: active_turn.clone(),
                 user_interrupt_pending: user_interrupt_pending.clone(),
@@ -2847,7 +2871,7 @@ impl FreshCodexState {
         // b8ke focused round-2 R2-1: the condemned-prior tag (the pid was
         // captured above for the coordinator commit).
         let sidecar_ownership_id = ownership_id.clone();
-        let watcher = spawn_exit_watcher(
+        let watcher = spawn_exit_watcher_tracking_turns(
             child,
             ownership_id,
             thread_id.clone(),
@@ -2861,11 +2885,13 @@ impl FreshCodexState {
             last_turn_complete_at.clone(),
             Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
+            Some(turn_state.clone()),
         );
 
         self.sessions.lock().await.insert(
             thread_id.clone(),
             CodexSession {
+                turn_state: turn_state.clone(),
                 client,
                 model: model.clone(),
                 effort: effort.clone(),
@@ -4038,81 +4064,105 @@ impl FreshCodexState {
 
     // ── freshAgent.interrupt (WS) ────────────────────────────────────────────
 
-    /// Handle a `freshAgent.interrupt` for codex: issue `turn/interrupt` for the tracked
-    /// active turn (`activeTurnByThread.get(sessionId)`, adapter.ts:1009) and clear it on
-    /// success (adapter.ts:1027). There is NO wire ack on success — the app-server's
-    /// resulting `turn/completed{interrupted}` notification flows through the existing
-    /// STATUS-GUARDED consumer (`reduce_notification` -> `CodexSubscription::on_turn_completed`),
-    /// which emits the idle `freshAgent.session.snapshot` with NO `freshAgent.turn.complete`
-    /// edge: the interrupt is USER-initiated, so this lane arms the per-session
-    /// `user_interrupt_pending` marker BEFORE the RPC (opencode's `turn_aborted`
-    /// precedent) and disarms it again when the RPC fails (the interrupt never
-    /// landed — a later NON-user `interrupted` must still ring the unified edge).
-    /// A completion the marker did not cover (automation/rollback-forced) rings. The
-    /// marker is bounded to the CURRENT turn: the consumer clears it at the next
-    /// `turn/started` on the thread (the full opencode dispatch-clear discipline),
-    /// so an armed marker whose `interrupted` completion never arrived cannot
-    /// cross a turn boundary and silence a later turn's non-user `interrupted`.
-    /// Mirrors `ws-handler.ts:3503-3516` (fire-and-forget; `INTERNAL_ERROR` on failure).
+    /// Stop the exact owned dispatch/native turn, or latch Stop until its
+    /// native ID is known. An RPC acknowledgement resolves issuance only;
+    /// matching native terminal evidence settles work. An ambiguous response
+    /// retains both the intent and the new-start gate until proven recovery.
     pub async fn handle_interrupt(&self, msg: FreshAgentInterrupt) {
-        let session_id = msg.session_id.clone();
-
-        let looked_up = {
-            let guard = self.sessions.lock().await;
-            guard.get(&session_id).map(|s| {
-                (
-                    s.client.clone(),
-                    s.active_turn.clone(),
-                    s.turn_in_flight.clone(),
-                    s.user_interrupt_pending.clone(),
-                    // FR1-1: the retire helper clears the retired-turn slot
-                    // with the tracker + latch (a user-initiated interrupt
-                    // leaves no idle→completed gap to bridge). (E3R1: the
-                    // durable already-rang set is deliberately NOT cleared
-                    // — a stale entry can only gate its own turn's late
-                    // duplicate.)
-                    s.retired_turn_id.clone(),
-                )
-            })
-        };
-        let Some((client, active_turn, turn_in_flight, user_interrupt_pending, retired_turn_id)) =
-            looked_up
-        else {
-            self.send_error(&None, "SESSION_NOT_FOUND", "codex session not found");
-            return;
-        };
-
-        let turn_id = active_turn.lock().expect("active_turn mutex").clone();
-        let Some(turn_id) = turn_id else {
-            // adapter.ts:1017-1019 — no tracked active turn to target.
+        let session_id = msg.session_id;
+        let handles = self.sessions.lock().await.get(&session_id).map(|s| {
+            (
+                s.client.clone(),
+                s.turn_state.clone(),
+                s.active_turn.clone(),
+                s.user_interrupt_pending.clone(),
+            )
+        });
+        let Some((client, turns, active, marker)) = handles else {
             self.send_error(
-                &None,
-                "CODEX_INTERRUPT_FAILED",
-                &format!("No active Codex turn is tracked for {session_id}."),
+                &msg.request_id,
+                "SESSION_NOT_FOUND",
+                "codex session not found",
             );
             return;
         };
+        let disposition = {
+            let active = active.lock().expect("active_turn mutex").clone();
+            let mut state = turns.lock().expect("codex turn state");
+            if let Some(id) = active.as_deref() {
+                state.observe_started(id);
+            }
+            state.request_stop()
+        };
+        match disposition {
+            StopDisposition::Interrupt { dispatch, turn_id } => {
+                marker.store(true, Ordering::SeqCst);
+                self.issue_codex_interrupt(&session_id, client, turns, dispatch, turn_id)
+                    .await;
+            }
+            StopDisposition::Latched => {
+                tracing::info!(provider=PROVIDER, session_id=%session_id, "freshagent.codex.stop_latched");
+            }
+            StopDisposition::None => {
+                if !turns.lock().expect("codex turn state").has_owed_work() {
+                    self.send_error(
+                        &msg.request_id,
+                        "CODEX_INTERRUPT_FAILED",
+                        &format!("No active Codex turn is tracked for {session_id}."),
+                    );
+                }
+            }
+        }
+    }
 
-        // Arm the USER-interrupt marker BEFORE the RPC: the resulting
-        // `turn/completed{interrupted}` consumes it in the guard and stays
-        // silent. Set-first closes the race with a completion the app-server
-        // pushes immediately after processing the interrupt.
-        user_interrupt_pending.store(true, Ordering::SeqCst);
-        match client.interrupt_turn(&session_id, &turn_id).await {
+    async fn issue_codex_interrupt(
+        &self,
+        session_id: &str,
+        client: Arc<CodexAppServerClient>,
+        turns: SharedCodexTurnState,
+        dispatch: DispatchToken,
+        turn_id: String,
+    ) {
+        // Native validates the ID then queues an unqualified core interrupt.
+        // Keep new-start issuance closed until THIS operation is resolved, even
+        // if natural completion wins while its reply is held or lost.
+        let marker = self
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .filter(|s| Arc::ptr_eq(&s.client, &client))
+            .map(|s| s.user_interrupt_pending.clone());
+        if let Some(marker) = &marker {
+            marker.store(true, Ordering::SeqCst);
+        }
+        match client.interrupt_turn(session_id, &turn_id).await {
             Ok(()) => {
-                // adapter.ts:1027 — the turn is over from this call's perspective; the
-                // resulting turn/completed notification also clears it (redundant, harmless).
-                // The user-initiated interrupt ends the turn SILENTLY: retire the
-                // in-flight latch too, so a later idle crash cannot ring for a turn
-                // that already ended at the user's own hand.
-                retire_observed_turn_end(&active_turn, &turn_in_flight, &retired_turn_id);
+                turns
+                    .lock()
+                    .expect("codex turn state")
+                    .interrupt_ack(dispatch, &turn_id);
+                tracing::info!(provider=PROVIDER, session_id, native_turn_id=%turn_id, dispatch=?dispatch, "freshagent.codex.interrupt_acknowledged");
             }
             Err(err) => {
-                // The interrupt never landed — disarm so a later NON-user
-                // `interrupted` completion is not silently swallowed (the
-                // opencode abort-failure discipline).
-                user_interrupt_pending.store(false, Ordering::SeqCst);
-                self.send_error(&None, "CODEX_INTERRUPT_FAILED", &err.to_string());
+                let refused = err.is_not_submitted();
+                if refused {
+                    publish_codex_interrupt_refusal(&turns, dispatch, &turn_id, || {
+                        if let Some(marker) = marker {
+                            marker.store(false, Ordering::SeqCst);
+                        }
+                    });
+                }
+                tracing::warn!(provider=PROVIDER, session_id, native_turn_id=%turn_id, dispatch=?dispatch, refused, error=%err, "freshagent.codex.interrupt_failed");
+                self.emit_fresh_agent_error(
+                    session_id,
+                    if refused {
+                        "CODEX_INTERRUPT_FAILED"
+                    } else {
+                        "CODEX_INTERRUPT_AMBIGUOUS"
+                    },
+                    &err.to_string(),
+                );
             }
         }
     }
@@ -6845,6 +6895,7 @@ impl FreshCodexState {
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
         let event_emission_gate = Arc::new(TokioMutex::new(()));
+        let turn_state = Arc::new(StdMutex::new(CodexTurnState::default()));
         let projection = Arc::new(StdMutex::new(projection::CodexProjection::new(
             mint_ownership_id(),
             session_id.to_string(),
@@ -6853,6 +6904,7 @@ impl FreshCodexState {
         let consumer = self.spawn_consumer(
             notifs,
             CodexConsumerRuntime {
+                turn_state: turn_state.clone(),
                 thread_id: session_id.to_string(),
                 active_turn: active_turn.clone(),
                 user_interrupt_pending: user_interrupt_pending.clone(),
@@ -6871,7 +6923,7 @@ impl FreshCodexState {
         // b8ke focused round-2 R2-1: the condemned-prior identity (pid + tag).
         let sidecar_pid = child.id();
         let sidecar_ownership_id = ownership_id.clone();
-        let watcher = spawn_exit_watcher(
+        let watcher = spawn_exit_watcher_tracking_turns(
             child,
             ownership_id,
             session_id.to_string(),
@@ -6885,6 +6937,7 @@ impl FreshCodexState {
             last_turn_complete_at.clone(),
             Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
+            Some(turn_state.clone()),
         );
 
         // `HashMap::insert` on an existing key overwrites in place, dropping the old (dead
@@ -6898,6 +6951,7 @@ impl FreshCodexState {
             guard.insert(
                 session_id.to_string(),
                 CodexSession {
+                    turn_state: turn_state.clone(),
                     client,
                     model: model.clone(),
                     effort: effort.clone(),
@@ -7161,6 +7215,7 @@ impl FreshCodexState {
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
         let event_emission_gate = Arc::new(TokioMutex::new(()));
+        let turn_state = Arc::new(StdMutex::new(CodexTurnState::default()));
         let exited = Arc::new(AtomicBool::new(false));
         let projection = Arc::new(StdMutex::new(projection::CodexProjection::new(
             mint_ownership_id(),
@@ -7169,6 +7224,7 @@ impl FreshCodexState {
         let consumer = self.spawn_consumer(
             notifs,
             CodexConsumerRuntime {
+                turn_state: turn_state.clone(),
                 thread_id: new_thread_id.clone(),
                 active_turn: active_turn.clone(),
                 user_interrupt_pending: user_interrupt_pending.clone(),
@@ -7187,7 +7243,7 @@ impl FreshCodexState {
         // b8ke focused round-2 R2-1: the condemned-prior identity (pid + tag).
         let sidecar_pid = child.id();
         let sidecar_ownership_id = ownership_id.clone();
-        let watcher = spawn_exit_watcher(
+        let watcher = spawn_exit_watcher_tracking_turns(
             child,
             ownership_id,
             new_thread_id.clone(),
@@ -7201,6 +7257,7 @@ impl FreshCodexState {
             last_turn_complete_at.clone(),
             Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
+            Some(turn_state.clone()),
         );
 
         {
@@ -7209,6 +7266,7 @@ impl FreshCodexState {
             guard.insert(
                 new_thread_id.clone(),
                 CodexSession {
+                    turn_state: turn_state.clone(),
                     client,
                     model: model.clone(),
                     effort: effort.clone(),
@@ -7597,6 +7655,7 @@ impl FreshCodexState {
         created_gate: Option<oneshot::Receiver<()>>,
     ) -> tokio::task::JoinHandle<()> {
         let CodexConsumerRuntime {
+            turn_state,
             thread_id,
             active_turn,
             user_interrupt_pending,
@@ -7610,6 +7669,13 @@ impl FreshCodexState {
             event_emission_gate,
             projection,
         } = runtime;
+        let seeded = active_turn.lock().expect("active_turn mutex").clone();
+        if let Some(id) = seeded.as_deref() {
+            turn_state
+                .lock()
+                .expect("codex turn state")
+                .observe_started(id);
+        }
         let broadcast_tx = self.broadcast_tx.clone();
         // The deadman feed needs the state handle (window config + waiter spawn); a
         // clone is all-Arc, cheap, and adds no lifecycle coupling (the state is the
@@ -7698,6 +7764,7 @@ impl FreshCodexState {
                     let events = reduce_notification(
                         &mut subscription,
                         notification,
+                        &turn_state,
                         &active_turn,
                         &turn_in_flight,
                         &quiet_deadman,
@@ -7782,6 +7849,7 @@ impl FreshCodexState {
                 let events = reduce_notification(
                     &mut subscription,
                     notification,
+                    &turn_state,
                     &active_turn,
                     &turn_in_flight,
                     &quiet_deadman,
@@ -7793,7 +7861,18 @@ impl FreshCodexState {
                     &last_turn_complete_at,
                     &broadcast_tx,
                 );
-                for event in events {
+                for mut event in events {
+                    if turn_state
+                        .lock()
+                        .expect("codex turn state")
+                        .has_stopping_work()
+                    {
+                        if let CodexAdapterEvent::StatusSnapshot { status, .. } = &mut event {
+                            if *status == CodexStatus::Idle {
+                                *status = CodexStatus::Running;
+                            }
+                        }
+                    }
                     // DIAG-01: the positive turn-complete chime only -- session_id
                     // alone, never the turn's text/response content.
                     if let CodexAdapterEvent::TurnComplete { session_id, .. } = &event {
@@ -7990,13 +8069,13 @@ impl FreshCodexState {
         // this port previously had no fallback at all, so ANY such rejection became an
         // unconditional 500. Retry once with `includeTurns:false`, matching the reference
         // exactly (still a valid, if turn-less, snapshot).
-        let projection = self
+        let (projection, turn_state) = self
             .sessions
             .lock()
             .await
             .get(thread_id)
             .filter(|session| Arc::ptr_eq(&session.client, &client))
-            .map(|session| session.projection.clone())
+            .map(|session| (session.projection.clone(), session.turn_state.clone()))
             .ok_or(CodexSnapshotError::NotFound)?;
         let mut selected = None;
         for _ in 0..3 {
@@ -8068,6 +8147,27 @@ impl FreshCodexState {
             generation: self.ownership_snapshot(PROVIDER, thread_id).generation,
         })?;
         let raw = projected.raw;
+        {
+            let mut turns = turn_state.lock().expect("codex turn state");
+            for turn in raw["thread"]["turns"].as_array().into_iter().flatten() {
+                let Some(id) = turn["id"].as_str() else {
+                    continue;
+                };
+                let terminal = match turn["status"].as_str() {
+                    Some("completed") => Some(NativeSettlement::Completed),
+                    Some("interrupted") => Some(NativeSettlement::Interrupted),
+                    Some("failed") => Some(NativeSettlement::Failed),
+                    Some("inProgress") => {
+                        turns.observe_started(id);
+                        None
+                    }
+                    _ => None,
+                };
+                if let Some(terminal) = terminal {
+                    turns.settle_native(id, terminal);
+                }
+            }
+        }
         // U-1 repair (wedged-sidecar deadman): a thread restored MID-TURN has no
         // adapter-observed `turn/started` (this process never saw one), so
         // `active_turn` is empty and the quiet deadman would never arm. When the FRESH
@@ -8158,6 +8258,13 @@ impl FreshCodexState {
             .lock()
             .expect("codex projection lock")
             .overlay(&mut snapshot, projected.metadata);
+        if snapshot["status"] == "idle"
+            && turn_state.lock().expect("codex turn state").has_owed_work()
+        {
+            snapshot["status"] = json!("running");
+            snapshot["capabilities"]["send"] = json!(false);
+            snapshot["capabilities"]["interrupt"] = json!(true);
+        }
         self.overlay_controls(thread_id, &mut snapshot).await;
         if let Some(session) = self.sessions.lock().await.get(thread_id) {
             let mut settings = Map::new();
@@ -9051,6 +9158,7 @@ impl FreshCodexState {
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
         let event_emission_gate = Arc::new(TokioMutex::new(()));
+        let turn_state = Arc::new(StdMutex::new(CodexTurnState::default()));
         let exited = Arc::new(AtomicBool::new(false));
         let projection = Arc::new(StdMutex::new(projection::CodexProjection::new(
             mint_ownership_id(),
@@ -9059,6 +9167,7 @@ impl FreshCodexState {
         let consumer = self.spawn_consumer(
             notifs,
             CodexConsumerRuntime {
+                turn_state: turn_state.clone(),
                 thread_id: thread_id.to_string(),
                 active_turn: active_turn.clone(),
                 user_interrupt_pending: user_interrupt_pending.clone(),
@@ -9077,7 +9186,7 @@ impl FreshCodexState {
         // b8ke focused round-2 R2-1: the condemned-prior identity (pid + tag).
         let sidecar_pid = child.id();
         let sidecar_ownership_id = ownership_id.clone();
-        let watcher = spawn_exit_watcher(
+        let watcher = spawn_exit_watcher_tracking_turns(
             child,
             ownership_id,
             thread_id.to_string(),
@@ -9091,10 +9200,12 @@ impl FreshCodexState {
             last_turn_complete_at.clone(),
             Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
+            Some(turn_state.clone()),
         );
         self.sessions.lock().await.insert(
             thread_id.to_string(),
             CodexSession {
+                turn_state: turn_state.clone(),
                 client,
                 model,
                 effort,
@@ -9155,6 +9266,7 @@ impl FreshCodexState {
         cmd.kill_on_drop(true);
         let child = cmd.spawn().expect("spawn sleep fixture");
 
+        let turn_state = Arc::new(StdMutex::new(CodexTurnState::default()));
         let consumer = tokio::spawn(async {});
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
@@ -9171,7 +9283,7 @@ impl FreshCodexState {
         // b8ke focused round-2 R2-1: the condemned-prior identity (pid + tag).
         let sidecar_pid = child.id();
         let sidecar_ownership_id = format!("codex-sidecar-test-snapshot-router-{thread_id}");
-        let watcher = spawn_exit_watcher(
+        let watcher = spawn_exit_watcher_tracking_turns(
             child,
             format!("codex-sidecar-test-snapshot-router-{thread_id}"),
             thread_id.to_string(),
@@ -9185,10 +9297,12 @@ impl FreshCodexState {
             last_turn_complete_at.clone(),
             Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
+            Some(turn_state.clone()),
         );
         self.sessions.lock().await.insert(
             thread_id.to_string(),
             CodexSession {
+                turn_state: turn_state.clone(),
                 client,
                 model: "gpt-5.3-codex-spark".to_string(),
                 effort: None,
@@ -10102,6 +10216,24 @@ fn watcher_stop_not_confirmed() -> crate::session_handoff::StopResult {
     }
 }
 
+fn with_codex_turn_exit_confirmation(
+    confirmation: std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'static>>,
+    turns: Option<SharedCodexTurnState>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'static>> {
+    Box::pin(async move {
+        let confirmed = confirmation.await;
+        if confirmed {
+            if let Some(turns) = turns {
+                turns
+                    .lock()
+                    .expect("codex turn state")
+                    .settle_native("", NativeSettlement::OwnedExit);
+            }
+        }
+        confirmed
+    })
+}
+
 /// Continue an incomplete Codex tree reap after the bounded watcher window. The first
 /// watcher pass has already stopped the direct child; this continuation keeps probing the
 /// recorded incarnation and tagged descendants until the complete writer tree is confirmed
@@ -10244,8 +10376,60 @@ fn detach_codex_confirmation(
     Box::pin(async move { settled_rx.await.unwrap_or(false) })
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_exit_watcher(
+    child: tokio::process::Child,
+    ownership_id: String,
+    thread_id: String,
+    broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+    kill_rx: oneshot::Receiver<()>,
+    exited: Arc<AtomicBool>,
+    leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
+    quiet_deadman: Arc<StdMutex<QuietDeadman>>,
+    // The session's turn-in-flight latch (the dispatch-time authority) + its
+    // shared turn-complete clock: the crash self-heal arm mints the unified
+    // attention edge for a turn in flight at crash time on the session's ONE
+    // clock; a requested kill retires the latch silently.
+    turn_in_flight: Arc<AtomicBool>,
+    // FR1-1: the session's retired-turn slot — both terminal arms (the
+    // requested kill, the crash self-heal) end the turn, so the slot's
+    // idle→completed bridge dies with the latch: a respawned incarnation's
+    // fresh notifications must never consult a pre-teardown slot.
+    // (E3R1: the durable already-rang set is deliberately NOT threaded
+    // into the watcher — teardown voids would reopen the gate for a
+    // buffered late completion folding after the exit, and a respawned
+    // incarnation never consults the pre-teardown set anyway: every
+    // respawn site constructs FRESH Arcs.)
+    retired_turn_id: Arc<StdMutex<Option<String>>>,
+    last_turn_complete_at: Arc<StdMutex<Option<i64>>>,
+    condemned_priors: Arc<
+        StdMutex<HashMap<String, crate::session_lease::CondemnedRuntimeIdentity>>,
+    >,
+    // kata b8ke Task 3: release the retained coordinator stamp on exit with
+    // its fenced claim (None when the lane is unwired — pre-existing tests).
+    ownership: Option<crate::ownership_lane::OwnershipWatch>,
+) -> tokio::task::JoinHandle<crate::session_handoff::StopResult> {
+    spawn_exit_watcher_tracking_turns(
+        child,
+        ownership_id,
+        thread_id,
+        broadcast_tx,
+        kill_rx,
+        exited,
+        leases,
+        quiet_deadman,
+        turn_in_flight,
+        retired_turn_id,
+        last_turn_complete_at,
+        condemned_priors,
+        ownership,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_exit_watcher_tracking_turns(
     mut child: tokio::process::Child,
     ownership_id: String,
     thread_id: String,
@@ -10276,6 +10460,7 @@ pub(crate) fn spawn_exit_watcher(
     // kata b8ke Task 3: release the retained coordinator stamp on exit with
     // its fenced claim (None when the lane is unwired — pre-existing tests).
     ownership: Option<crate::ownership_lane::OwnershipWatch>,
+    turn_state: Option<SharedCodexTurnState>,
 ) -> tokio::task::JoinHandle<crate::session_handoff::StopResult> {
     // wfah: the thread id is fixed by the time the watcher is constructed at
     // every successful spawn site; enrich the durable record once, here.
@@ -10335,6 +10520,7 @@ pub(crate) fn spawn_exit_watcher(
                     false
                 };
                 if confirmed {
+                    if let Some(turns) = &turn_state { turns.lock().expect("codex turn state").settle_native("", NativeSettlement::OwnedExit); }
                     cleanup_confirmed_codex_teardown(
                         &leases,
                         ownership.as_ref(),
@@ -10382,6 +10568,7 @@ pub(crate) fn spawn_exit_watcher(
                             )
                         })
                         .unwrap_or_else(|| Box::pin(async { false }));
+                    let confirmation = with_codex_turn_exit_confirmation(confirmation, turn_state.clone());
                     crate::session_handoff::StopResult::NotConfirmed {
                         confirmation: wrap_codex_confirmation_with_cleanup(
                             confirmation,
@@ -10415,6 +10602,7 @@ pub(crate) fn spawn_exit_watcher(
                     false
                 };
                 let stop_result = if confirmed {
+                    if let Some(turns) = &turn_state { turns.lock().expect("codex turn state").settle_native("", NativeSettlement::OwnedExit); }
                     cleanup_confirmed_codex_teardown(
                         &leases,
                         ownership.as_ref(),
@@ -10466,6 +10654,7 @@ pub(crate) fn spawn_exit_watcher(
                             )
                         })
                         .unwrap_or_else(|| Box::pin(async { false }));
+                    let confirmation = with_codex_turn_exit_confirmation(confirmation, turn_state.clone());
                     let confirmation = wrap_codex_confirmation_with_cleanup(
                         confirmation,
                         ownership_id.clone(),
@@ -10750,6 +10939,7 @@ fn disarm_codex_quiet(
 fn reduce_notification(
     subscription: &mut CodexSubscription,
     notification: CodexNotification,
+    turn_state: &SharedCodexTurnState,
     active_turn: &Arc<StdMutex<Option<String>>>,
     turn_in_flight: &Arc<AtomicBool>,
     quiet_deadman: &Arc<StdMutex<QuietDeadman>>,
@@ -10886,6 +11076,7 @@ fn reduce_notification(
                         // `active_turn` guard, and dropped before the
                         // `quiet_deadman` lock below (the file-wide order is
                         // `quiet_deadman` outer / `active_turn`-tier inner).
+                        turn_state.lock().expect("codex turn state").observe_idle();
                         let retired_tracker_id =
                             active_turn.lock().expect("active_turn mutex").take();
                         if let Some(id) = retired_tracker_id {
@@ -10917,6 +11108,19 @@ fn reduce_notification(
             // the retired-turn latch each have their narrower FIFO-safe
             // ownership exceptions below.
             if event.thread_id == subscription.session_id() {
+                let terminal = match freshell_codex::turn_status(&event.params).as_deref() {
+                    Some("completed") => Some(NativeSettlement::Completed),
+                    Some("interrupted") => Some(NativeSettlement::Interrupted),
+                    Some("failed") => Some(NativeSettlement::Failed),
+                    Some("inProgress") => return subscription.on_turn_completed(&event, now_ms()),
+                    _ => None,
+                };
+                if let (Some(turn_id), Some(terminal)) = (event.turn_id.as_deref(), terminal) {
+                    turn_state
+                        .lock()
+                        .expect("codex turn state")
+                        .settle_native(turn_id, terminal);
+                }
                 // Scoped: the `active_turn` guard must be dropped BEFORE the
                 // quiet-deadman disarm below (the file-wide lock order is
                 // `quiet_deadman` outer / `active_turn` inner — never lock
@@ -11164,7 +11368,43 @@ fn reduce_notification(
                     // `interrupted` (e.g. the app-server completed the turn
                     // as `completed`) must never cross the turn boundary and
                     // silence a later NON-user `interrupted` (a missed bell).
-                    subscription.clear_user_interrupt();
+                    let disposition = turn_state
+                        .lock()
+                        .expect("codex turn state")
+                        .observe_started(turn_id);
+                    let user_stopped = turn_state
+                        .lock()
+                        .expect("codex turn state")
+                        .user_stop_turn_id()
+                        == Some(turn_id.as_str());
+                    if !user_stopped {
+                        subscription.clear_user_interrupt();
+                    }
+                    if let StopDisposition::Interrupt { dispatch, turn_id } = disposition {
+                        let state = state.clone();
+                        let turns = turn_state.clone();
+                        let session_id = event.thread_id.clone();
+                        tokio::spawn(async move {
+                            let client = state
+                                .sessions
+                                .lock()
+                                .await
+                                .get(&session_id)
+                                .filter(|session| Arc::ptr_eq(&session.turn_state, &turns))
+                                .map(|session| session.client.clone());
+                            if let Some(client) = client {
+                                state
+                                    .issue_codex_interrupt(
+                                        &session_id,
+                                        client,
+                                        turns,
+                                        dispatch,
+                                        turn_id,
+                                    )
+                                    .await;
+                            }
+                        });
+                    }
                     // `handle_send` records the provider-returned turn id before its
                     // matching `turn/started` notification necessarily reaches this
                     // consumer. Treat that direct record as authoritative over a
@@ -12284,6 +12524,7 @@ pub(crate) mod tests {
         ownership_id: &str,
     ) -> tokio::sync::broadcast::Receiver<String> {
         // no-op consumer: these tests drive the reducer/RPC surfaces directly.
+        let turn_state = Arc::new(StdMutex::new(CodexTurnState::default()));
         let consumer = tokio::spawn(async {});
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
@@ -12302,7 +12543,7 @@ pub(crate) mod tests {
         let last_turn_complete_at: Arc<StdMutex<Option<i64>>> = Arc::new(StdMutex::new(None));
         let sidecar_pid = child.id();
         let sidecar_ownership_id = ownership_id.to_string();
-        let watcher = spawn_exit_watcher(
+        let watcher = spawn_exit_watcher_tracking_turns(
             child,
             ownership_id.to_string(),
             thread_id.to_string(),
@@ -12316,10 +12557,12 @@ pub(crate) mod tests {
             last_turn_complete_at.clone(),
             Arc::clone(&state.condemned_priors),
             None,
+            Some(turn_state.clone()),
         );
         state.sessions.lock().await.insert(
             thread_id.to_string(),
             CodexSession {
+                turn_state: turn_state.clone(),
                 client,
                 model: "gpt-5.3-codex-spark".to_string(),
                 effort: None,
@@ -12395,6 +12638,7 @@ pub(crate) mod tests {
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
         let event_emission_gate = Arc::new(TokioMutex::new(()));
+        let turn_state = Arc::new(StdMutex::new(CodexTurnState::default()));
         let projection = Arc::new(StdMutex::new(projection::CodexProjection::new(
             mint_ownership_id(),
             thread_id.to_string(),
@@ -12402,6 +12646,7 @@ pub(crate) mod tests {
         let consumer = state.spawn_consumer(
             notifs,
             CodexConsumerRuntime {
+                turn_state: turn_state.clone(),
                 thread_id: thread_id.to_string(),
                 active_turn: active_turn.clone(),
                 user_interrupt_pending: user_interrupt_pending.clone(),
@@ -12420,7 +12665,7 @@ pub(crate) mod tests {
         let exited = Arc::new(AtomicBool::new(false));
         let sidecar_pid = child.id();
         let sidecar_ownership_id = ownership_id.to_string();
-        let watcher = spawn_exit_watcher(
+        let watcher = spawn_exit_watcher_tracking_turns(
             child,
             ownership_id.to_string(),
             thread_id.to_string(),
@@ -12434,10 +12679,12 @@ pub(crate) mod tests {
             last_turn_complete_at.clone(),
             Arc::clone(&state.condemned_priors),
             None,
+            Some(turn_state.clone()),
         );
         state.sessions.lock().await.insert(
             thread_id.to_string(),
             CodexSession {
+                turn_state: turn_state.clone(),
                 client,
                 model: "gpt-5.3-codex-spark".to_string(),
                 effort: None,
@@ -13895,7 +14142,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn handle_interrupt_issues_rpc_for_tracked_turn_and_clears_it() {
+    async fn handle_interrupt_issues_rpc_for_tracked_turn_and_retains_it_until_terminal_evidence() {
         let (transport, peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
         let client = Arc::new(client);
@@ -13944,9 +14191,9 @@ pub(crate) mod tests {
 
         driver.await.expect("handle_interrupt task");
         assert_eq!(
-            *active_turn.lock().unwrap(),
-            None,
-            "active turn cleared on a successful interrupt (adapter.ts:1027)"
+            active_turn.lock().unwrap().as_deref(),
+            Some("turn-1"),
+            "successful interrupt acknowledgement cannot settle a native turn"
         );
     }
 
@@ -14448,12 +14695,14 @@ pub(crate) mod tests {
         // A session whose watcher never resolves (the stalled teardown) and
         // whose kill_tx is absent — the teardown block parks on the watcher
         // join forever.
+        let turn_state = Arc::new(StdMutex::new(CodexTurnState::default()));
         let consumer = tokio::spawn(async {});
         let watcher = tokio::spawn(std::future::pending::<crate::session_handoff::StopResult>());
         let exited = Arc::new(AtomicBool::new(false));
         st.sessions.lock().await.insert(
             "thread-stall".to_string(),
             CodexSession {
+                turn_state: turn_state.clone(),
                 client,
                 sidecar_pid: None,
                 sidecar_ownership_id: String::new(),
