@@ -2174,7 +2174,8 @@ mod tests {
 
     #[tokio::test]
     async fn task6_fork_recovery_uses_transport_owner_after_a_lost_native_identity_edge() {
-        let fixture = native_codex_fixture(json!({"recordTurns":true,"liveTranscript":true})).await;
+        let mut fixture =
+            native_codex_fixture(json!({"recordTurns":true,"liveTranscript":true})).await;
         let transport = fixture.transport.clone();
         let parent = transport
             .start(&fixture.profile)
@@ -2207,7 +2208,19 @@ mod tests {
             )
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let frame: Value =
+                    serde_json::from_str(&fixture.diagnostic.recv().await.unwrap()).unwrap();
+                if frame["sessionId"].as_str() == Some(child.as_str())
+                    && frame["event"]["type"] == "freshAgent.turn.complete"
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("observe the child's final native edge before releasing capacity");
         let recovered = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if let Some(AgentEvent::Provider { payload }) = events.recv().await {

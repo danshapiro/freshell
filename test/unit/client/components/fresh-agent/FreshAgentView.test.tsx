@@ -15143,12 +15143,18 @@ describe('task6 retained source against in-flight native history', () => {
     await expectRenderedText('Saved native Codex answer')
     const held = createDeferred<unknown>()
     const later = createDeferred<unknown>()
-    apiMock.getFreshAgentThreadSnapshot.mockReturnValueOnce(held.promise).mockReturnValue(later.promise)
+    const heldStarted = vi.fn(() => held.promise)
+    apiMock.getFreshAgentThreadSnapshot.mockImplementationOnce(heldStarted).mockReturnValue(later.promise)
     const reset = {type:'freshAgent.event',...locator,event:{type:'freshAgent.host.journal.reset'}}
-    act(() => {for (const handler of handlers) handler(reset)})
-    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === held.promise)).toBe(true))
     const message = {type:'freshAgent.event',...locator,event:{type:'freshAgent.host.backpressure',retainedState:{source:{projectionId:'current-source',ownerEpoch:0,ownerGeneration:0,soulId:'soul',incarnationId:'incarnation',hostBootId:'host'},snapshot,pendingControls:[],attentionMarks:[]}}}
     try {
+      // Establish the older read at the scheduler's actual entry boundary.
+      // Advancing its debounce avoids making this race depend on wall time.
+      vi.useFakeTimers()
+      act(() => {for (const handler of [...handlers]) handler(reset)})
+      await act(async () => {await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS)})
+      expect(heldStarted).toHaveBeenCalledTimes(1)
+      vi.useRealTimers()
       act(() => {handleFreshAgentMessage(store.dispatch,message as never);for (const handler of handlers) handler(message)})
       await expectRenderedText('Newest retained source output')
       await act(async () => held.resolve(stale))
@@ -15156,7 +15162,7 @@ describe('task6 retained source against in-flight native history', () => {
       expect(screen.getByText('Newest retained source output')).toBeVisible()
       expect(screen.queryByText('Obsolete source history')).not.toBeInTheDocument()
       expect(sentFreshAgentMessages('freshAgent.send')).toEqual([])
-    } finally {cleanup();await act(async () => {held.resolve(stale);later.resolve(snapshot)})}
+    } finally {vi.useRealTimers();cleanup();await act(async () => {held.resolve(stale);later.resolve(snapshot)})}
   })
 })
 
