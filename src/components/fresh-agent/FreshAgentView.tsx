@@ -248,6 +248,7 @@ type PendingSendMetadata = {
   checkpointOutcome?: CheckpointTurnAvailability
   submittedTurnId?: string
   legacyAccepted?: boolean
+  deliveryAmbiguous?: boolean
   /** The exact text of the freshAgent.send frame -- retained as the resend
    * payload for the lost-session retry (Task 10). Never read back from the
    * local echo. */
@@ -1146,6 +1147,7 @@ export function FreshAgentView({
   const [outgoingTurnVersion, refreshOutgoingTurn] = useReducer((value: number) => value + 1, 0)
   // Transient, self-clearing banner for action feedback (rewind, shell errors).
   const [notice, setNotice] = useState<string | null>(null)
+  const deliveryNoticeRef = useRef<string | null>(null)
   const [modelDialogOpen, setModelDialogOpen] = useState(false)
   const closeModelDialog = useCallback(() => setModelDialogOpen(false), [])
   const openModelDialog = useCallback(() => setModelDialogOpen(true), [])
@@ -3130,8 +3132,17 @@ export function FreshAgentView({
         // pending-metadata entry, the stale local echo (dual-write), and the
         // optimistic `running` status.
         const failedText = pendingSendMetadataRef.current.get(failedRequestId)?.text
-        pendingSendMetadataRef.current.delete(failedRequestId)
-        if (outgoingTurnRef.current?.requestId === failedRequestId) {
+        const ambiguous = current.provider === 'codex'
+          && typeof message.message === 'string' && message.message.startsWith('CODEX_DELIVERY_AMBIGUOUS:')
+        if (ambiguous && pendingSendMetadataRef.current.get(failedRequestId)?.deliveryAmbiguous) return
+        if (ambiguous) {
+          // Keep the receipt and queue reservation: a lost response can follow
+          // accepted native input. Only later lifecycle/history evidence may
+          // release it. A snapshot read never replays the prompt.
+          recordPendingSendMetadata(failedRequestId, { deliveryAmbiguous: true })
+          requestSnapshotRefresh('poll')
+        } else pendingSendMetadataRef.current.delete(failedRequestId)
+        if (!ambiguous && outgoingTurnRef.current?.requestId === failedRequestId) {
           outgoingTurnRef.current = null
           refreshOutgoingTurn()
         }
@@ -3144,9 +3155,13 @@ export function FreshAgentView({
         // G05 (C09): a claude send the server refused was never sent — for
         // example its session ended — so the text goes back into the
         // composer with the reason instead of vanishing with the echo.
-        if (current.provider === 'claude' && failedText) {
+        if ((current.provider === 'claude' || current.provider === 'codex') && failedText) {
           composerRef.current?.restoreText(failedText)
-          setNotice(`Message not sent: ${sendFailureReason(message.message)}`)
+          const failureNotice = ambiguous
+            ? `Delivery uncertain (${failedRequestId}): ${sendFailureReason(message.message)}. Check the conversation before sending again.`
+            : `Message not sent: ${sendFailureReason(message.message)}`
+          deliveryNoticeRef.current = ambiguous ? failureNotice : null
+          setNotice(failureNotice)
           log.warn('fresh_agent.send_refused', {
             provider: current.provider,
             sessionType: current.sessionType,
@@ -4194,7 +4209,7 @@ export function FreshAgentView({
   }, [effectiveStatus, hidden, isBusy, managedRecoveryPending, ownerDivergence, paneContent.sessionId, requestSnapshotRefresh])
 
   useEffect(() => {
-    if (!notice) return
+    if (!notice || notice === deliveryNoticeRef.current) return
     const timer = window.setTimeout(() => setNotice(null), 6000)
     return () => window.clearTimeout(timer)
   }, [notice])

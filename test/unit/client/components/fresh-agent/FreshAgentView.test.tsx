@@ -1396,6 +1396,27 @@ describe('FreshAgentView', () => {
       expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
     })
 
+    it('holds queued Codex input after ambiguous delivery without replaying the original', async () => {
+      const queue = await setup('idle')
+      queue.send('Original uncertain input')
+      queue.send('Later queued input')
+      const first = sentFreshAgentMessages('freshAgent.send')[0]
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: first.requestId,
+        message: 'CODEX_DELIVERY_AMBIGUOUS: response was lost' }))
+      await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('Original uncertain input'))
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      expect(screen.getByText(`Delivery uncertain (${first.requestId}): response was lost. Check the conversation before sending again.`)).toBeInTheDocument()
+      act(() => listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: first.requestId,
+        message: 'CODEX_DELIVERY_AMBIGUOUS: response was lost' }))
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('Original uncertain input')
+      queue.status('running')
+      queue.status('idle')
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+      expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Later queued input' })
+    })
+
     it('advances after a fast interrupted turn whose status updates share one render', async () => {
       const queue = await setup('idle')
       queue.send('First message')
@@ -10252,6 +10273,8 @@ describe('FreshAgentView', () => {
     ['freshclaude', 'INVALID_SESSION_ID', 'The Claude agent process for this session exited. Resume the session to continue.',
       'The Claude agent process for this session exited. Resume the session to continue.'],
     ['kilroy', 'INTERNAL_ERROR', 'SESSION_NOT_FOUND: claude session not found', 'claude session not found'],
+    ['freshcodex', 'SESSION_RESERVED', 'Another resume for this session is in flight', 'Another resume for this session is in flight'],
+    ['freshcodex', 'INTERNAL_ERROR', 'CODEX_DELIVERY_AMBIGUOUS: native response was lost', 'native response was lost'],
   ] as const)('puts a refused %s send back into the composer and says why (%s)', async (sessionType, code, message, reason) => {
     const store = createStore()
     let onMessage: ((message: Record<string, unknown>) => void) | undefined
@@ -10266,16 +10289,17 @@ describe('FreshAgentView', () => {
       turns: [],
     })
     const durable = '0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d'
+    const provider = sessionType === 'freshcodex' ? 'codex' : 'claude'
     store.dispatch(initLayout({
       tabId: 'tab-1',
       paneId: 'pane-1',
       content: {
         kind: 'fresh-agent',
         sessionType,
-        provider: 'claude',
+        provider,
         createRequestId: `req-${sessionType}-refused`,
         sessionId: `${sessionType}-pane-refused`,
-        sessionRef: { provider: 'claude', sessionId: durable },
+        sessionRef: { provider, sessionId: durable },
         status: 'idle',
       },
     }))
@@ -10293,13 +10317,16 @@ describe('FreshAgentView', () => {
     })
     const sendFrame = sentFreshAgentMessages('freshAgent.send').at(-1)
     expect(composer).toHaveValue('')
+    if (provider === 'codex') fireEvent.change(composer, { target: { value: 'newer draft' } })
 
     act(() => {
       onMessage?.({ type: 'error', code, message, requestId: sendFrame?.requestId, timestamp: new Date().toISOString() })
     })
 
-    await waitFor(() => expect(composer).toHaveValue('please keep this'))
-    expect(screen.getByText(`Message not sent: ${reason}`)).toBeInTheDocument()
+    await waitFor(() => expect(composer).toHaveValue(provider === 'codex' ? 'please keep this\nnewer draft' : 'please keep this'))
+    expect(screen.getByText(message.startsWith('CODEX_DELIVERY_AMBIGUOUS:')
+      ? `Delivery uncertain (${sendFrame?.requestId}): ${reason}. Check the conversation before sending again.`
+      : `Message not sent: ${reason}`)).toBeInTheDocument()
     expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
   })
 
