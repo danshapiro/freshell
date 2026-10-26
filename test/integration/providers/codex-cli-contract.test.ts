@@ -44,6 +44,7 @@ describe('Codex 0.164.0 release contract through an isolated Responses provider'
     expect(capture.observations.requirementsGuard.refusedRoutes).toEqual(['create', 'resume', 'fork', 'send'])
     expect(capture.observations.requirementsGuard.workRequests).toBe(0)
     expect(capture.observations.requirementsGuard.ownedListenerSettled).toBe(true)
+    expect(capture.processCloses).toEqual(capture.processExits)
     expect(capture.fixtureTraffic).toHaveLength(0)
   }, 180_000)
 

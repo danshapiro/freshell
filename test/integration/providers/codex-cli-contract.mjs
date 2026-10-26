@@ -88,7 +88,7 @@ async function roots(options) {
   return { artifact, metadata, managed, stateRoot, receiptRoot, environment, workspace: path.join(stateRoot, 'workspace'), systemConfig, staged, policyClientProbe }
 }
 
-class NativeClient {
+export class NativeClient {
   constructor(binary, context, capture, args = ['app-server']) {
     this.capture = capture
     this.pending = new Map()
@@ -123,6 +123,10 @@ class NativeClient {
       ;(capture.processExits ??= []).push({ connectionId: this.connectionId, pid: this.child.pid, code, signal })
       clearInterval(this.helperWatcher)
       for (const entry of this.pending.values()) entry.reject(new Error(`owned Codex exited: ${code}/${signal}`))
+      resolve({ code, signal })
+    }))
+    this.closed = new Promise(resolve => this.child.once('close', (code, signal) => {
+      ;(capture.processCloses ??= []).push({ connectionId: this.connectionId, pid: this.child.pid, code, signal })
       resolve({ code, signal })
     }))
     this.child.stderr.on('data', bytes => { capture.stderr = `${capture.stderr ?? ''}${bytes.toString()}`.slice(-64 * 1024) })
@@ -175,8 +179,11 @@ class NativeClient {
   }
   async close() {
     this.child.stdin.end()
-    if (this.child.exitCode === null) this.child.kill('SIGTERM')
+    if (this.child.exitCode === null && this.child.signalCode === null) this.child.kill('SIGTERM')
     try { await deadline(this.exit, 5000, 'owned process exit') } catch { this.child.kill('SIGKILL'); await deadline(this.exit, 5000, 'owned process kill') }
+    // The bubblewrap launcher can exit before its PID namespace finishes
+    // teardown. Its descendants inherit these pipes; join their closure too.
+    await deadline(this.closed, 5000, `owned process stdio close pid=${this.child.pid} exit=${this.child.exitCode} signal=${this.child.signalCode}`)
   }
 }
 
