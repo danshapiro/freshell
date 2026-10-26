@@ -248,6 +248,28 @@ it('retains an MCP form from a snapshot and sends a separate typed answer', asyn
   expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.elicitation.respond', requestId: '41', action: 'accept', content: { token: ' exact, token! ' } }))
 })
 
+it.each(['freshAgent.elicitation.request', 'freshAgent.elicitation.cancelled'])('refreshes an idle native form from %s without waiting for a turn or poll', async (eventType) => {
+  const request = { requestId: 'live-elicitation', mode: 'form', serverName: 'contract', message: 'Live form', fields: [{ id: 'name', title: 'Live name', type: 'string', required: true }] }
+  const before = eventType === 'freshAgent.elicitation.request' ? [] : [request]
+  const after = eventType === 'freshAgent.elicitation.request' ? [request] : []
+  apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...snapshot(CODEX, [], 1), status: 'idle', pendingElicitations: before })
+  const store = createStore(CODEX)
+  await mount(store)
+  expect(screen.queryAllByRole('region', { name: 'Request from contract' })).toHaveLength(before.length)
+  const reads = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+  apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...snapshot(CODEX, [], 2), status: 'idle', pendingElicitations: after })
+  const message = { type: 'freshAgent.event', ...CODEX, event: { ...request, type: eventType } }
+  act(() => {
+    handleFreshAgentMessage(store.dispatch, message)
+    for (const handler of wsMock.handlers) handler(message)
+  })
+  await advance(SNAPSHOT_DEBOUNCE_MS)
+  await advance(0)
+  expect(screen.queryAllByRole('region', { name: 'Request from contract' })).toHaveLength(after.length)
+  expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(reads + 1)
+  expect(wsMock.send.mock.calls.filter(([frame]) => frame.type === 'freshAgent.elicitation.respond' || frame.type === 'freshAgent.send')).toHaveLength(0)
+})
+
 it('native approvals expose only offered actions and no pane auto-grant', async () => {
   apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...snapshot(CODEX, [], 1), pendingApprovals: [{ requestId: '41', toolName: 'Bash', native: { networkApprovalContext: { host: 'example.com', protocol: 'https' }, availableDecisions: ['accept', 'cancel'] } }] })
   await mount(createStore(CODEX))

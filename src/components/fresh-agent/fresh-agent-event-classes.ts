@@ -7,18 +7,24 @@
 
 export const FRESH_AGENT_BUSY_STATUSES: ReadonlySet<string> = new Set(['running', 'compacting'])
 
+// Pending approval/question/elicitation cards change the pane surface without
+// making its transcript stale. Hidden panes owe a non-blocking reveal refresh.
+export const SURFACE_INVALIDATING_FRESH_AGENT_EVENTS: ReadonlySet<string> = new Set([
+  'freshAgent.permission.request',
+  'freshAgent.permission.cancelled',
+  'freshAgent.question.request',
+  'freshAgent.question.cancelled',
+  'freshAgent.elicitation.request',
+  'freshAgent.elicitation.cancelled',
+])
+
 // Events that re-drive the pane's snapshot while it is visible.
 export const SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS: ReadonlySet<string> = new Set([
+  ...SURFACE_INVALIDATING_FRESH_AGENT_EVENTS,
   'freshAgent.session.changed',
   'freshAgent.session.snapshot',
   'freshAgent.result',
   'freshAgent.turn.complete',
-  'freshAgent.permission.request',
-  'freshAgent.permission.cancelled',
-  'freshAgent.question.request',
-  // A provider-cancelled question must also re-drive the snapshot, so the card clears
-  // even if the freshAgent.question.cancelled fold races (fresh-eyes round-3 F3).
-  'freshAgent.question.cancelled',
   // kata 1wxv: rollback converges through the invalidating snapshot — the marker
   // bucket, the active prefix, and rollback{canRedo,undoneDepth} all ride it.
   'freshAgent.session.rolledBack',
@@ -44,18 +50,6 @@ export const TRANSCRIPT_INVALIDATING_FRESH_AGENT_EVENTS: ReadonlySet<string> = n
   'freshAgent.session.redone',
   'freshAgent.rolledBack',
   'freshAgent.redone',
-])
-
-// Approval and question lifecycle events change only the pane surface (the
-// cards rendered from the snapshot's pendingApprovals/pendingQuestions). A
-// hidden pane owes a non-blocking refresh for them on reveal; they must not
-// take the blocking transcript path, whose overlay clears only on a newer
-// transcript revision that an approval never produces.
-export const SURFACE_INVALIDATING_FRESH_AGENT_EVENTS: ReadonlySet<string> = new Set([
-  'freshAgent.permission.request',
-  'freshAgent.permission.cancelled',
-  'freshAgent.question.request',
-  'freshAgent.question.cancelled',
 ])
 
 export type HiddenPaneEventClass = 'transcript' | 'surface' | 'none'
