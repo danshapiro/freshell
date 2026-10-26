@@ -31,6 +31,7 @@ export const ReadyMessageSchema = z.object({
     sessionType: z.string().optional(),
     lastTurnCompleteAt: z.number().finite().optional(),
     lastWaitingAt: z.number().finite().optional(),
+    lastQuestionAvailableAt: z.number().finite().optional(),
   })).optional().catch(undefined),
   // kata b8ke: the handshake's runtime-owner replay (additive/optional —
   // old servers omit it). Same ready-frame doctrine: `.catch(undefined)`

@@ -1,13 +1,24 @@
 import { createContext, memo, useContext, useMemo, useState } from 'react'
 import { Ban, Check, ChevronRight, Loader2, X } from 'lucide-react'
+import FreshAgentQuestionBanner from './FreshAgentQuestionBanner.js'
 import DiffView from '@/components/fresh-agent/shared/DiffView'
 import { formatThoughtDuration } from '@/components/fresh-agent/shared/format-duration'
 import { getToolPreview } from '@/components/fresh-agent/shared/tool-preview'
 import { LazyMarkdown } from '@/components/markdown/LazyMarkdown'
+import { asyncQuestionKey, type AsyncQuestionAnswer, type AsyncQuestionAnswerStatus } from '@/lib/fresh-agent-async-questions'
 import type { FreshAgentTranscriptItem } from '@shared/fresh-agent-contract'
 import { cn } from '@/lib/utils'
 import { childActivitySummary } from './shared/child-activity.js'
 import type { FreshAgentChildParent } from './FreshAgentChildObserver.js'
+
+export const FreshAgentAsyncQuestionContext = createContext<{ onAnswer?: (answer: AsyncQuestionAnswer) => void; statuses?: Record<string, AsyncQuestionAnswerStatus> }>({})
+const ASYNC_ANSWER_STATUS: Record<AsyncQuestionAnswerStatus, string> = {
+  draft: 'Answer draft is in the composer',
+  sending: 'Sending answer as a message',
+  accepted: 'Answer accepted as a message',
+  refused: 'Answer not sent; your draft is in the composer.',
+  ambiguous: 'Answer delivery uncertain; review the composer before sending again.',
+}
 
 function formatJson(value: unknown): string {
   if (typeof value === 'string') return value
@@ -410,10 +421,14 @@ function FreshAgentThinkingDisclosure({ text }: { text: string }) {
 export const FreshAgentItemCard = memo(function FreshAgentItemCard({
   item,
   markdown = false,
+  onAnswerQuestion,
 }: {
   item: FreshAgentTranscriptItem
   markdown?: boolean
+  onAnswerQuestion?: (answer: AsyncQuestionAnswer) => void
 }) {
+  const asyncQuestions = useContext(FreshAgentAsyncQuestionContext)
+  const answerQuestion = onAnswerQuestion ?? asyncQuestions.onAnswer
   if (item.kind === 'text' || item.kind === 'thinking') {
     if (item.kind === 'thinking') {
       return <FreshAgentThinkingDisclosure text={item.text} />
@@ -422,7 +437,26 @@ export const FreshAgentItemCard = memo(function FreshAgentItemCard({
     const questions = Array.isArray(native?.questions) ? native.questions : []
     return <>{renderText(item.text, markdown)}{questions.map((question, index) => {
       const value = asRecord(question)
-      return value && typeof value.title === 'string' ? <div key={index} className="px-2 py-1"><p>{value.title}</p>{Array.isArray(value.options) ? <ul>{value.options.filter((option): option is string => typeof option === 'string').map((option, i) => <li key={i}>{option}</li>)}</ul> : null}</div> : null
+      if (!value || typeof value.title !== 'string') return null
+      const itemId = typeof native?.itemId === 'string' ? native.itemId : item.id
+      const questionId = typeof value.id === 'string' ? value.id : String(index)
+      const status = asyncQuestions.statuses?.[asyncQuestionKey(itemId, questionId)]
+      if (native?.delivery === 'async' && answerQuestion) {
+        const options = Array.isArray(value.options)
+          ? value.options.filter((option): option is string => typeof option === 'string').map((label) => ({ label, description: '' }))
+          : []
+        return (
+          <div key={questionId} className="my-2">
+            <FreshAgentQuestionBanner
+              providerLabel="Codex"
+              question={{ questions: [{ id: questionId, header: 'Reply as a message', question: value.title, options, multiSelect: false, isOther: true }] }}
+              onAnswer={(answers) => answerQuestion({ itemId, questionId, question: value.title as string, text: answers[questionId] })}
+            />
+            {status ? <p role="status" className="text-xs">{ASYNC_ANSWER_STATUS[status]}</p> : null}
+          </div>
+        )
+      }
+      return <div key={index} className="px-2 py-1"><p>{value.title}</p>{Array.isArray(value.options) ? <ul>{value.options.filter((option): option is string => typeof option === 'string').map((option, i) => <li key={i}>{option}</li>)}</ul> : null}</div>
     })}</>
   }
 

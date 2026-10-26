@@ -7,7 +7,7 @@ import { consumeCancelledCreate, consumeCreateRoute, rememberCreateRoute } from 
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { KILL_FAILED_MESSAGE } from '@/lib/kill-ack'
 import { materializeFreshAgentSession as materializeFreshAgentPaneSession } from '@/store/panesSlice'
-import { applyFreshAgentCompletion, applyFreshAgentWaiting, observeFreshAgentSession, rekeyFreshAgentAttention } from '@/store/turnCompletionThunks'
+import { applyFreshAgentCompletion, applyFreshAgentWaiting, applyFreshAgentQuestionAvailable, observeFreshAgentSession, rekeyFreshAgentAttention } from '@/store/turnCompletionThunks'
 import { revokeFreshAgentAttention } from '@/store/turnCompletionAttention'
 import type { ObservedOwnerFence } from '@/store/selectors/runtimeOwner'
 import { streamBatcherFor } from '@/lib/fresh-agent-stream-batcher'
@@ -17,6 +17,8 @@ import { FreshAgentTranscriptPatchSchema } from '@shared/fresh-agent-contract'
 import {
   addPermissionRequest,
   addQuestionRequest,
+  addElicitationRequest,
+  removeElicitation,
   applyRuntimeOwner,
   clearPendingCreateFailure,
   createFailed,
@@ -540,6 +542,10 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       }))
       return true
     }
+    case 'freshAgent.question.available': {
+      if (typeof event.at === 'number' && Number.isFinite(event.at)) dispatch(applyFreshAgentQuestionAvailable({ provider: locator.provider, sessionId, at: event.at }))
+      return true
+    }
     case 'freshAgent.turn.waiting': {
       if (typeof event.at !== 'number' || !Number.isFinite(event.at)) {
         log.warn('dropping malformed freshAgent.turn.waiting without a numeric at', { sessionId, at: event.at })
@@ -623,6 +629,7 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         requestId: event.requestId as string,
         toolName: tool?.name,
         input: tool?.input,
+        ...(event.native && typeof event.native === 'object' ? { native: event.native as Record<string, unknown> } : {}),
         providerRequest: {
           subtype: event.subtype,
           tool,
@@ -641,8 +648,15 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         ...locator,
         requestId: event.requestId as string,
         questions: event.questions as never,
+        ...(typeof event.isBlocking === 'boolean' ? { isBlocking: event.isBlocking } : {}),
         providerRequest: event,
       }))
+      return true
+    case 'freshAgent.elicitation.request':
+      dispatch(addElicitationRequest({ ...locator, ...event, requestId: event.requestId as string } as never))
+      return true
+    case 'freshAgent.elicitation.cancelled':
+      dispatch(removeElicitation({ ...locator, requestId: event.requestId as string }))
       return true
     case 'freshAgent.question.cancelled':
       // Provider-originated cancellation: the Rust claude/kilroy slice forwards

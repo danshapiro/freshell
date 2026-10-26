@@ -5,6 +5,7 @@ import type {
 import type {
   FreshAgentPendingApproval,
   FreshAgentPendingQuestion,
+  FreshAgentPendingElicitation,
   FreshAgentRequestId,
   FreshAgentSnapshot,
   FreshAgentTurn,
@@ -123,6 +124,7 @@ export type FreshAgentSessionState = FreshAgentSessionLocator & {
   streamingActive: boolean
   pendingPermissions: Record<string, FreshAgentPermissionRequest>
   pendingQuestions: Record<string, FreshAgentQuestionRequest>
+  pendingElicitations?: Record<string, FreshAgentPendingElicitation>
   totalCostUsd: number
   totalInputTokens: number
   totalOutputTokens: number

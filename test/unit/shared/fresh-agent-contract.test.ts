@@ -1,3 +1,4 @@
+import { FreshAgentClientMessageSchema } from '../../../shared/ws-protocol.js'
 import { describe, expect, it } from 'vitest'
 
 import {
@@ -461,4 +462,23 @@ describe('durable opencode error projection (turn-level and tool-level)', () => 
       status: 'failed', arguments: {}, contentItems: null, success: null, error: 42,
     }).success).toBe(false)
   })
+})
+
+
+it('keeps native question flags and retained MCP forms in the durable contract', () => {
+  const parsed = FreshAgentSnapshotSchema.parse({ ...codexContractSnapshot, pendingQuestions: [{ requestId: '51', isBlocking: false, questions: [{ id: 'token', question: 'Token?', isOther: false, isSecret: true }] }], pendingElicitations: [{ requestId: '41', mode: 'openaiForm', serverName: 'contract', message: 'Form', fields: [{ id: 'enabled', title: 'Enabled', type: 'boolean', required: true }] }] })
+  expect(parsed.pendingQuestions[0]).toMatchObject({ isBlocking: false, questions: [{ isOther: false, isSecret: true }] })
+  expect(parsed.pendingElicitations[0]).toMatchObject({ mode: 'openaiForm', fields: [{ type: 'boolean' }] })
+})
+
+
+it('keeps elicitation replies separate from string-valued question answers and rejects nested content', () => {
+  const locator = { provider: 'codex', sessionType: 'freshcodex', sessionId: 'native-thread', requestId: '41' }
+  const frame = { ...locator, type: 'freshAgent.elicitation.respond', action: 'accept', content: { token: ' exact, answer! ', count: 3, enabled: false, colors: ['blue', 'green'] } }
+  expect(FreshAgentClientMessageSchema.parse(frame)).toEqual(frame)
+  for (const action of ['decline', 'cancel']) expect(FreshAgentClientMessageSchema.safeParse({ ...frame, action, content: null }).success).toBe(true)
+  expect(FreshAgentClientMessageSchema.safeParse({ ...frame, content: { nested: { value: 'unsupported' } } }).success).toBe(false)
+  expect(FreshAgentClientMessageSchema.safeParse({ ...frame, action: 'other' }).success).toBe(false)
+  const question = { ...locator, type: 'freshAgent.question.respond', answers: { token: ' exact, answer! ' } }
+  expect(FreshAgentClientMessageSchema.parse(question)).toEqual(question)
 })

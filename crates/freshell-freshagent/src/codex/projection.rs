@@ -193,6 +193,29 @@ impl CodexProjection {
         self.thread_id == id
     }
 
+    /// Exact native spawn membership, without starting or resuming a child writer.
+    pub(super) fn knows_child_thread(&self, id: &str) -> bool {
+        self.turns
+            .iter()
+            .map(|turn| &turn.raw)
+            .chain(
+                self.last_native
+                    .iter()
+                    .flat_map(|native| native["thread"]["turns"].as_array().into_iter().flatten()),
+            )
+            .flat_map(|turn| turn["items"].as_array().into_iter().flatten())
+            .any(|item| {
+                item["type"] == "collabAgentToolCall"
+                    && item["tool"] == "spawnAgent"
+                    && item["senderThreadId"] == self.thread_id
+                    && item["receiverThreadIds"]
+                        .as_array()
+                        .is_some_and(|children| {
+                            children.iter().any(|child| child.as_str() == Some(id))
+                        })
+            })
+    }
+
     pub(super) fn matches_fence(&self, fence: &SnapshotReadFence) -> bool {
         fence.projection_id == self.id
             && fence.owner_epoch == self.owner_epoch

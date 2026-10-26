@@ -70,6 +70,8 @@ export type FreshAgentComposerHandle = {
    * typed since (never overwriting it), focus, caret to end.
    */
   restoreText: (text: string) => void
+  /** Replace one contextual answer line, preserving every unrelated draft line. */
+  upsertTextLine: (prefix: string, text: string) => void
 }
 
 /**
@@ -270,6 +272,16 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
     },
     restoreText: (value: string) => {
       setText((current) => (current.trim() ? `${value}\n${current}` : value))
+      focusAtEnd()
+    },
+    upsertTextLine: (prefix: string, value: string) => {
+      if (disabled) return
+      setText((current) => {
+        const lines = current.split('\n')
+        const index = lines.findIndex((line) => line.startsWith(prefix))
+        if (index < 0) return current.trim() ? `${value}\n${current}` : value
+        return lines.flatMap((line, i) => i === index ? [value] : line.startsWith(prefix) ? [] : [line]).join('\n')
+      })
       focusAtEnd()
     },
   }), [disabled, focusAtEnd])

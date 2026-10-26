@@ -119,9 +119,12 @@ import type { FreshAgentTurn } from '@shared/fresh-agent-contract'
 import { finalizeCodingAgentSessionName } from '@/store/codingAgentNaming'
 import { FreshAgentApprovalBanner } from './FreshAgentApprovalBanner'
 import { FreshAgentApprovalCard } from './FreshAgentApprovalCard'
-import { FreshAgentOpenSessionContext, FreshAgentObserveChildContext } from './FreshAgentItemCard'
+import { FreshAgentOpenSessionContext, FreshAgentObserveChildContext } from './FreshAgentItemCard.js'
 import { FreshAgentChildObserver, type FreshAgentChildParent } from './FreshAgentChildObserver.js'
-import FreshAgentQuestionBanner from './FreshAgentQuestionBanner'
+import FreshAgentQuestionBanner from './FreshAgentQuestionBanner.js'
+import { FreshAgentAsyncQuestionContext } from './FreshAgentItemCard.js'
+import { asyncQuestionKey, asyncQuestionDraftPrefix, asyncQuestionKeysInText, formatAsyncQuestionAnswer, type AsyncQuestionAnswerStatus } from '@/lib/fresh-agent-async-questions'
+import FreshAgentElicitationBanner from './FreshAgentElicitationBanner.js'
 import { FreshAgentTranscript, type FreshAgentTranscriptHandle, type FreshAgentTranscriptProps } from './FreshAgentTranscript'
 import { mergeFreshAgentTranscriptProjection, readTranscriptProjection } from '@/lib/fresh-agent-transcript-projection'
 import { transcriptProjectionSnapshotReceived } from '@/store/freshAgentLiveSlice'
@@ -242,6 +245,7 @@ function sameLocalEcho(a: LocalEcho | null | undefined, b: LocalEcho | null | un
 }
 
 type PendingSendMetadata = {
+  asyncQuestionKeys?: string[]
   checkpointAvailabilityScope?: string
   checkpointWorkspace?: NonNullable<FreshAgentPaneContent['checkpointWorkspace']>
   logicalAttemptId?: string
@@ -1160,6 +1164,8 @@ export function FreshAgentView({
   const localEchoRef = useRef<LocalEcho | null>(null)
   localEchoRef.current = localEcho
   const pendingSendMetadataRef = useRef<Map<string, PendingSendMetadata>>(new Map())
+  const [asyncQuestionStatuses, setAsyncQuestionStatuses] = useState<Record<string, AsyncQuestionAnswerStatus>>({})
+
   const [checkpointAvailabilityByTurn, setCheckpointAvailabilityByTurn] = useState<Map<string, CheckpointTurnAvailability>>(
     () => checkpointAvailabilityMap(paneContent),
   )
@@ -2136,6 +2142,7 @@ export function FreshAgentView({
     commitSnapshot(null)
     setLoadError(null)
     setQueuedMessages([])
+    setAsyncQuestionStatuses({})
     setLocalEcho(null)
     alwaysAllowToolsRef.current.clear()
     pendingAutoTitleBySessionIdRef.current.clear()
@@ -3058,6 +3065,7 @@ export function FreshAgentView({
           ? message.submittedTurnId
           : undefined
         const pending = pendingSendMetadataRef.current.get(message.requestId)
+        if (pending?.asyncQuestionKeys?.length) setAsyncQuestionStatuses((previous) => ({ ...previous, ...Object.fromEntries(pending.asyncQuestionKeys!.map((key) => [key, 'accepted' as const])) }))
         if (pending && !pending.checkpointOutcome) {
           // Older servers may accept a send without the additive outcome
           // frame. Keep that turn honest and rewind disabled after acceptance.
@@ -3132,8 +3140,10 @@ export function FreshAgentView({
         // pending-metadata entry, the stale local echo (dual-write), and the
         // optimistic `running` status.
         const failedText = pendingSendMetadataRef.current.get(failedRequestId)?.text
+        const asyncQuestionKeys = pendingSendMetadataRef.current.get(failedRequestId)?.asyncQuestionKeys
         const ambiguous = current.provider === 'codex'
           && typeof message.message === 'string' && message.message.startsWith('CODEX_DELIVERY_AMBIGUOUS:')
+        if (asyncQuestionKeys?.length) setAsyncQuestionStatuses((previous) => ({ ...previous, ...Object.fromEntries(asyncQuestionKeys.map((key) => [key, ambiguous ? 'ambiguous' as const : 'refused' as const])) }))
         if (ambiguous && pendingSendMetadataRef.current.get(failedRequestId)?.deliveryAmbiguous) return
         if (ambiguous) {
           // Keep the receipt and queue reservation: a lost response can follow
@@ -4165,6 +4175,15 @@ export function FreshAgentView({
   // old-kind send the server's generation fence would refuse with a
   // misleading failure instead of the pane's recoverable attach action.
   const composerDisabled = snapshotHistoryOnly || managedRecoveryActive || !paneContent.sessionId || sessionEnded || (!canSend && !isBusy) || Boolean(ownerDivergence)
+  const asyncQuestionContext = useMemo(() => ({
+    statuses: asyncQuestionStatuses,
+    onAnswer: (answer: Parameters<typeof formatAsyncQuestionAnswer>[0]) => {
+      if (composerDisabled) return
+      const key = asyncQuestionKey(answer.itemId, answer.questionId)
+      setAsyncQuestionStatuses((previous) => ({ ...previous, [key]: 'draft' }))
+      composerRef.current?.upsertTextLine(asyncQuestionDraftPrefix(answer.itemId, answer.questionId), formatAsyncQuestionAnswer(answer))
+    },
+  }), [asyncQuestionStatuses, composerDisabled])
 
   useEffect(() => {
     const outgoing = outgoingTurnRef.current
@@ -4227,8 +4246,11 @@ export function FreshAgentView({
     const checkpointScope = checkpointAvailabilityScope(current)
     // Retain the outgoing text only in transient retry metadata. Durable
     // checkpoint outcomes contain no prompt text or provider payloads.
+    const asyncQuestionKeys = asyncQuestionKeysInText(text)
+    if (asyncQuestionKeys.length) setAsyncQuestionStatuses((previous) => ({ ...previous, ...Object.fromEntries(asyncQuestionKeys.map((key) => [key, 'sending' as const])) }))
     recordPendingSendMetadata(requestId, {
       text,
+      asyncQuestionKeys,
       logicalAttemptId,
       checkpointAvailabilityScope: checkpointScope,
       ...(current.checkpointWorkspace ? { checkpointWorkspace: current.checkpointWorkspace } : {}),
@@ -4304,7 +4326,7 @@ export function FreshAgentView({
     if (!current.sessionId || current.provider === 'claude') return
     const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
     for (const approval of pendingApprovalsFromSnapshot) {
-      if (approval.toolName && alwaysAllowToolsRef.current.has(approval.toolName)) {
+      if (!approval.native && approval.toolName && alwaysAllowToolsRef.current.has(approval.toolName)) {
         sendFreshAgentMessage({
           type: 'freshAgent.approval.respond',
           sessionId: current.sessionId,
@@ -4824,12 +4846,17 @@ export function FreshAgentView({
                   approval={approval}
                   disabled={!paneContent.sessionId}
                   onRespond={(decision) => respondToApproval(approval.requestId, decision)}
-                  onAlwaysAllow={paneContent.provider === 'claude' ? undefined : (toolName) => {
+                  onAlwaysAllow={paneContent.provider === 'claude' || approval.native ? undefined : (toolName) => {
                     alwaysAllowToolsRef.current.add(toolName)
                     respondToApproval(approval.requestId, buildAllowDecision())
                   }}
                 />
               ))}
+              {(snapshot?.pendingElicitations ?? []).map((request) => <FreshAgentElicitationBanner key={String(request.requestId)} request={request} disabled={!paneContent.sessionId} onRespond={(action, content) => {
+                if (!paneContent.sessionId) return
+                dispatch(dismissTabGreen(tabId))
+                sendFreshAgentMessage({ type: 'freshAgent.elicitation.respond', sessionId: paneContent.sessionId, sessionType: paneContent.sessionType, provider: paneContent.provider, requestId: request.requestId, action, content })
+              }} />)}
               {pendingQuestions.map((question) => (
                 <FreshAgentQuestionBanner
                   key={String(question.requestId)}
@@ -4841,6 +4868,8 @@ export function FreshAgentView({
                       header: entry.header ?? 'Question',
                       options: entry.options ?? [],
                       multiSelect: entry.multiSelect === true,
+                      ...(entry.isOther !== undefined ? { isOther: entry.isOther } : {}),
+                      ...(entry.isSecret !== undefined ? { isSecret: entry.isSecret } : {}),
                     })),
                   }}
                   providerLabel={questionAgentLabel}
@@ -4870,6 +4899,7 @@ export function FreshAgentView({
                 onComment={(text) => composerRef.current?.insertText(text)}
               />
             </div>
+            <FreshAgentAsyncQuestionContext.Provider value={asyncQuestionContext}>
             <FreshAgentOpenSessionContext.Provider value={openDelegationSession}>
               <div
                 className="relative min-h-0 flex-1"
@@ -4997,6 +5027,7 @@ export function FreshAgentView({
                 ) : null}
               </div>
             </FreshAgentOpenSessionContext.Provider>
+            </FreshAgentAsyncQuestionContext.Provider>
             {/* Every fresh-agent pane gets the strip (unknown state included):
                 the model chip opens the shared model dialog and the strip owns
                 the bottom-chrome divider (the composer draws no border-top). */}
@@ -5080,6 +5111,7 @@ export function FreshAgentView({
       </FreshAgentObserveChildContext.Provider>
     )
   }, [
+    asyncQuestionContext,
     canSend,
     claudeSession?.restoreFailureMessage,
     activeStyle,

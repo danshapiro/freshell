@@ -9,6 +9,7 @@ import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import type { SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import type {
   FreshAgentPermissionRequest,
+  FreshAgentRequestId,
   FreshAgentQuestionRequest,
   FreshAgentSessionState,
   FreshAgentSessionStatus,
@@ -73,6 +74,7 @@ function createSession(locator: FreshAgentSessionPayload, status: FreshAgentSess
     streamingActive: false,
     pendingPermissions: {},
     pendingQuestions: {},
+    pendingElicitations: {},
     totalCostUsd: 0,
     totalInputTokens: 0,
     totalOutputTokens: 0,
@@ -377,6 +379,7 @@ const freshAgentSlice = createSlice({
       session.pendingQuestions = Object.fromEntries(
         snapshot.pendingQuestions.map((question) => [String(question.requestId), question]),
       )
+      session.pendingElicitations = Object.fromEntries((snapshot.pendingElicitations ?? []).map((request) => [String(request.requestId), request]))
       session.totalInputTokens = snapshot.tokenUsage.inputTokens
       session.totalOutputTokens = snapshot.tokenUsage.outputTokens
       session.totalCostUsd = snapshot.tokenUsage.costUsd ?? 0
@@ -424,6 +427,15 @@ const freshAgentSlice = createSlice({
       const key = resolveSessionKey(state, action.payload)
       if (!key) return
       delete state.sessions[key].pendingQuestions[String(action.payload.requestId)]
+    },
+
+    addElicitationRequest(state, action: PayloadAction<SessionMutationPayload & NonNullable<FreshAgentSessionState['pendingElicitations']>[string]>) {
+      const session = resolveOrEnsureSession(state, action.payload)
+      if (session) (session.pendingElicitations ??= {})[String(action.payload.requestId)] = action.payload
+    },
+    removeElicitation(state, action: PayloadAction<SessionMutationPayload & { requestId: FreshAgentRequestId }>) {
+      const key = resolveSessionKey(state, action.payload)
+      if (key) delete state.sessions[key].pendingElicitations?.[String(action.payload.requestId)]
     },
 
     sessionError(state, action: PayloadAction<SessionMutationPayload & { code?: string; message: string }>) {
@@ -712,6 +724,8 @@ const freshAgentSlice = createSlice({
 export const {
   addPermissionRequest,
   addQuestionRequest,
+  addElicitationRequest,
+  removeElicitation,
   applyRuntimeOwner,
   applyRuntimeOwnerFenceRefresh,
   applyRefusalFence,

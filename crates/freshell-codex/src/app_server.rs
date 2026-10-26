@@ -313,6 +313,7 @@ impl CodexAppServerClient {
             "clientInfo": { "name": "freshell", "version": "1.0.0" },
             "capabilities": {
                 "experimentalApi": true,
+                "extensions": {"openai/form": {}, "openai/elicitation": {"form": {}}, "openai/standard-form-input": {}},
                 "optOutNotificationMethods": ["thread/started"],
             },
         });

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import { appReducers } from '@/store/appReducers'
@@ -24,6 +24,8 @@ const wsMock = vi.hoisted(() => ({
 const apiMock = vi.hoisted(() => ({
   getFreshAgentThreadSnapshot: vi.fn(),
 }))
+
+vi.mock('@/components/markdown/LazyMarkdown', () => ({ LazyMarkdown: ({ content }: { content: string }) => <span>{content}</span> }))
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -232,4 +234,101 @@ describe('FreshAgentView approvals (client-alerts G20)', () => {
       expect.objectContaining({ provider: 'codex', requestId: 'req-2', decision: { behavior: 'allow' } }),
     ])
   })
+})
+
+
+it('retains an MCP form from a snapshot and sends a separate typed answer', async () => {
+  const current = { ...snapshot(CODEX, [], 1), pendingElicitations: [{ requestId: '41', mode: 'form', serverName: 'contract', message: 'Enter credentials', fields: [{ id: 'token', type: 'string', title: 'Token', required: true, secret: true }], providerRequest: { id: 41, method: 'mcpServer/elicitation/request' } }] }
+  apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(current)
+  await mount(createStore(CODEX))
+  const token = screen.getByLabelText('Token')
+  expect(token).toHaveAttribute('type', 'password')
+  fireEvent.change(token, { target: { value: ' exact, token! ' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Continue', exact: true }))
+  expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.elicitation.respond', requestId: '41', action: 'accept', content: { token: ' exact, token! ' } }))
+})
+
+it('native approvals expose only offered actions and no pane auto-grant', async () => {
+  apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...snapshot(CODEX, [], 1), pendingApprovals: [{ requestId: '41', toolName: 'Bash', native: { networkApprovalContext: { host: 'example.com', protocol: 'https' }, availableDecisions: ['accept', 'cancel'] } }] })
+  await mount(createStore(CODEX))
+  expect(screen.getByRole('alert', { name: 'Permission request for Bash' })).toHaveTextContent('example.com')
+  expect(screen.queryByRole('button', { name: /always allow/i })).not.toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: 'Deny tool use' })).not.toBeInTheDocument()
+  fireEvent.click(within(screen.getByRole('alert', { name: 'Permission request for Bash' })).getByRole('button', { name: 'Stop', exact: true }))
+  expect(responds().at(-1)).toMatchObject({ requestId: '41', decision: { nativeDecision: 'cancel' } })
+})
+
+
+it.each([true, false])('answers async questions through the ordinary composer and waits for ordinary acceptance (native turn ID: %s)', async (hasTurnId) => {
+  const current = { ...snapshot(CODEX, [], 1), status: 'idle', turns: [{ id: 'native-turn:row-1', turnId: 'native-turn', role: 'assistant', summary: '', items: [{ id: 'async-item', kind: 'text', text: 'I can keep working.', extensions: { codex: { delivery: 'async', itemId: 'native-async-item', questions: [{ title: 'Where?', options: ['Staging', 'Production'] }] } } }] }] }
+  apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(current)
+  const store = createStore(CODEX)
+  await mount(store)
+  fireEvent.click(screen.getByRole('button', { name: 'Staging', exact: true }))
+  const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+  expect((composer as HTMLTextAreaElement).value).toContain('native-async-item')
+  expect((composer as HTMLTextAreaElement).value).toContain('Staging')
+  expect(wsMock.send.mock.calls.some(([m]) => m.type === 'freshAgent.question.respond')).toBe(false)
+  fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+  await advance(0)
+  const sent = wsMock.send.mock.calls.map(([m]) => m).find((m) => m.type === 'freshAgent.send')
+  expect(sent).toMatchObject({ text: expect.stringContaining('Staging') })
+  expect(screen.queryByText('Answer accepted as a message')).not.toBeInTheDocument()
+  act(() => { for (const handler of wsMock.handlers) handler({ type: 'freshAgent.send.accepted', ...CODEX, requestId: sent.requestId, ...(hasTurnId ? { submittedTurnId: 'ordinary-next-turn' } : {}) }) })
+  expect(screen.getByText('Answer accepted as a message')).toBeVisible()
+})
+
+it('changing an unsent async choice updates that answer and preserves the ordinary draft', async () => {
+  apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...snapshot(CODEX, [], 1), status: 'idle', turns: [{ id: 'native-turn', turnId: 'native-turn', role: 'assistant', summary: '', items: [{ id: 'async-item', kind: 'text', text: 'Work continues', extensions: { codex: { delivery: 'async', itemId: 'native-async-item', questions: [{ title: 'Where?', options: ['Staging', 'Production'] }] } } }] }] })
+  await mount(createStore(CODEX))
+  const composer = screen.getByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+  fireEvent.change(composer, { target: { value: 'Keep my ordinary note' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Staging', exact: true }))
+  fireEvent.click(screen.getByRole('button', { name: 'Production', exact: true }))
+  expect(composer.value).toContain('Keep my ordinary note')
+  expect(composer.value).toContain('Production')
+  expect(composer.value).not.toContain('Staging')
+  expect(wsMock.send.mock.calls.some(([message]) => message.type === 'freshAgent.send' || message.type === 'freshAgent.question.respond')).toBe(false)
+})
+
+it('restores an ordinary async-answer draft silently and associates acceptance only after explicit Send', async () => {
+  apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...snapshot(CODEX, [], 1), status: 'idle', turns: [{ id: 'native-turn', turnId: 'native-turn', role: 'assistant', summary: '', items: [{ id: 'async-item', kind: 'text', text: 'Work continues', extensions: { codex: { delivery: 'async', itemId: 'native-async-item', questions: [{ title: 'Where?', options: ['Staging'] }] } } }] }] })
+  const store = createStore(CODEX)
+  await mount(store)
+  fireEvent.click(screen.getByRole('button', { name: 'Staging', exact: true }))
+  cleanup()
+  resetSnapshotSchedulerForTests()
+  await mount(store)
+  const composer = screen.getByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+  expect(composer.value).toContain('native-async-item')
+  expect(wsMock.send.mock.calls.filter(([message]) => message.type === 'freshAgent.send')).toHaveLength(0)
+  fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+  await advance(0)
+  const sent = wsMock.send.mock.calls.map(([message]) => message).find((message) => message.type === 'freshAgent.send')
+  expect(sent.text).toContain('Staging')
+  act(() => { for (const handler of wsMock.handlers) handler({ type: 'freshAgent.send.accepted', ...CODEX, requestId: sent.requestId, submittedTurnId: 'ordinary-next-turn' }) })
+  expect(screen.getByText('Answer accepted as a message')).toBeVisible()
+  expect(wsMock.send.mock.calls.filter(([message]) => message.type === 'freshAgent.question.respond')).toHaveLength(0)
+})
+
+it.each([
+  ['SESSION_RESERVED', 'Another resume is in flight', 'Answer not sent; your draft is in the composer.'],
+  ['INTERNAL_ERROR', 'CODEX_DELIVERY_AMBIGUOUS: response was lost', 'Answer delivery uncertain; review the composer before sending again.'],
+])('retains an ordinary async answer and its delivery indication after %s', async (code, message, indication) => {
+  apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...snapshot(CODEX, [], 1), status: 'idle', turns: [{ id: 'native-turn', turnId: 'native-turn', role: 'assistant', summary: '', items: [{ id: 'async-item', kind: 'text', text: 'Work continues', extensions: { codex: { delivery: 'async', itemId: 'native-async-item', questions: [{ title: 'Where?', options: ['Staging'] }] } } }] }] })
+  await mount(createStore(CODEX))
+  fireEvent.click(screen.getByRole('button', { name: 'Staging', exact: true }))
+  const composer = screen.getByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+  const original = composer.value
+  fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+  await advance(0)
+  const sent = wsMock.send.mock.calls.map(([frame]) => frame).find((frame) => frame.type === 'freshAgent.send')
+  fireEvent.change(composer, { target: { value: 'A newer ordinary draft' } })
+  act(() => { for (const handler of wsMock.handlers) handler({ type: 'error', requestId: sent.requestId, code, message }) })
+  expect(composer).toHaveValue(`${original}\nA newer ordinary draft`)
+  expect(screen.getByText(indication)).toBeVisible()
+  expect(screen.queryByText('Answer accepted as a message')).not.toBeInTheDocument()
+  await advance(1000)
+  expect(wsMock.send.mock.calls.filter(([frame]) => frame.type === 'freshAgent.send')).toHaveLength(1)
+  expect(wsMock.send.mock.calls.filter(([frame]) => frame.type === 'freshAgent.question.respond')).toHaveLength(0)
 })

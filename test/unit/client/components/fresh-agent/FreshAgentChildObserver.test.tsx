@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { FreshAgentAsyncQuestionContext } from '@/components/fresh-agent/FreshAgentItemCard'
 import { FreshAgentChildObserver } from '@/components/fresh-agent/FreshAgentChildObserver'
 import { api } from '@/lib/api'
 import { codexContractSnapshot } from '../../../../fixtures/fresh-agent/codex/contract-fixtures.js'
@@ -20,6 +21,21 @@ describe('FreshAgentChildObserver', () => {
     expect(api.post).not.toHaveBeenCalled()
     expect(screen.queryByRole('textbox')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /send|stop|configure|resume/i })).not.toBeInTheDocument()
+  })
+
+  it('keeps child async questions read-only even under a parent answer context', async () => {
+    const onParentAnswer = vi.fn()
+    const response = readable()
+    response.snapshot.turns[0].items = [{ id: 'child-question', kind: 'text', text: 'A child asks', extensions: { codex: { itemId: 'native-child-question', delivery: 'async', questions: [{ title: 'Child question?', options: ['Child choice'] }] } } }] as never
+    vi.mocked(api.get).mockResolvedValue(response)
+    render(<FreshAgentAsyncQuestionContext.Provider value={{ onAnswer: onParentAnswer }}><FreshAgentChildObserver parent={parent} childThreadId="child" onClose={vi.fn()} /></FreshAgentAsyncQuestionContext.Provider>)
+    expect(await screen.findByText('Child question?')).toBeVisible()
+    const choice = screen.queryByRole('button', { name: 'Child choice', exact: true })
+    if (choice) fireEvent.click(choice)
+    expect(onParentAnswer).not.toHaveBeenCalled()
+    expect(choice).not.toBeInTheDocument()
+    expect(screen.getByText('Child choice')).toBeVisible()
+    expect(api.post).not.toHaveBeenCalled()
   })
 
   it('retains already available content during a source rebind, then refreshes it without changing identity', async () => {
@@ -95,6 +111,32 @@ describe('FreshAgentChildObserver', () => {
     expect(screen.queryByText('Exact observed child')).not.toBeInTheDocument()
     fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' })
     expect(onClose).toHaveBeenCalledTimes(1)
+    unmount()
+    expect(opener).toHaveFocus()
+    opener.remove()
+  })
+
+  it('contains Tab and Shift-Tab, uses the latest Escape callback, and returns focus to its opener', async () => {
+    vi.mocked(api.get).mockResolvedValue(readable())
+    const opener = document.createElement('button')
+    document.body.append(opener)
+    opener.focus()
+    const initialClose = vi.fn()
+    const latestClose = vi.fn()
+    const { rerender, unmount } = render(<FreshAgentChildObserver parent={parent} childThreadId="child" onClose={initialClose} />)
+    await screen.findByText('Exact observed child')
+    const close = screen.getByRole('button', { name: 'Close child conversation' })
+    const lastControl = screen.getByRole('button', { name: 'Copy turn', exact: true })
+    expect(close).toHaveFocus()
+    fireEvent.keyDown(close, { key: 'Tab', shiftKey: true })
+    expect(lastControl).toHaveFocus()
+    fireEvent.keyDown(lastControl, { key: 'Tab' })
+    expect(close).toHaveFocus()
+    rerender(<FreshAgentChildObserver parent={parent} childThreadId="child" onClose={latestClose} />)
+    expect(close).toHaveFocus()
+    fireEvent.keyDown(lastControl, { key: 'Escape' })
+    expect(initialClose).not.toHaveBeenCalled()
+    expect(latestClose).toHaveBeenCalledTimes(1)
     unmount()
     expect(opener).toHaveFocus()
     opener.remove()

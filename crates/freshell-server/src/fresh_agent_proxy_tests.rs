@@ -2197,3 +2197,77 @@ async fn hosted_configure_reaches_the_owning_host_through_the_real_supervisor() 
     assert_eq!(recovered.effort.as_deref(), Some("high"));
     assert_eq!(recovered.permission_mode.as_deref(), Some("default"));
 }
+
+#[tokio::test]
+async fn task5_hosted_elicitation_for_other_providers_is_explicitly_unsupported() {
+    let dir = tempfile::tempdir().unwrap();
+    let (proxy, mut receiver) = configure_proxy(
+        &dir.path().join("absent-host.sock"),
+        HashMap::from([(
+            ("claude".into(), "claude-thread".into()),
+            SoulId::parse("claude-soul").unwrap(),
+        )]),
+    );
+    proxy.handle(HostedFreshAgentCommand::Elicitation(serde_json::from_value(serde_json::json!({"provider":"claude","sessionType":"freshclaude","sessionId":"claude-thread","requestId":"41","action":"decline","content":null})).unwrap())).await;
+    let frame: serde_json::Value = serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
+    assert_eq!(frame["event"]["code"], "UNSUPPORTED_CAPABILITY");
+    assert!(frame["event"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("elicitation"));
+}
+
+#[tokio::test]
+async fn task5_hosted_elicitation_reuses_resolve_with_tagged_typed_content_and_opaque_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("elicitation.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let mut ids = Vec::new();
+        while ids.len() < 2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            let result = match request.body {
+                AdminCommand::Health => AdminResult::Health {
+                    control_epoch: 77,
+                    installation_id: InstallationId::new(),
+                },
+                AdminCommand::FreshAgentResolve(resolve) => {
+                    assert_eq!(resolve.soul_id.as_str(), "codex-soul");
+                    assert_eq!(resolve.expected_control_epoch, Some(77));
+                    assert_eq!(
+                        resolve.decision,
+                        serde_json::json!({"elicitation":{"action":"accept","content":{"count":3,"enabled":false}}})
+                    );
+                    ids.push(resolve.decision_id);
+                    AdminResult::FreshAgentCommand {
+                        state: freshell_runtime_protocol::CommandState::ProviderAcked,
+                    }
+                }
+                other => panic!("unexpected control opcode: {other:?}"),
+            };
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: request.request_id,
+                    result: Ok(result),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        ids
+    });
+    let (proxy, mut receiver) = configure_proxy(
+        &socket,
+        HashMap::from([(
+            ("codex".into(), "public-thread".into()),
+            SoulId::parse("codex-soul").unwrap(),
+        )]),
+    );
+    for id in ["41", "\"41\""] {
+        proxy.clone().handle(HostedFreshAgentCommand::Elicitation(serde_json::from_value(serde_json::json!({"provider":"codex","sessionType":"freshcodex","sessionId":"public-thread","requestId":id,"action":"accept","content":{"count":3,"enabled":false}})).unwrap())).await;
+    }
+    assert_eq!(settled(server).await, vec!["41", "\"41\""]);
+    assert!(receiver.try_recv().is_err());
+}

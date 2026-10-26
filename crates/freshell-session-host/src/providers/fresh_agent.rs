@@ -16,9 +16,9 @@ use freshell_freshagent::rollback_record::{RollbackDirection, RollbackModeReq, R
 use freshell_freshagent::{FreshAgentState, FreshClaudeState, FreshCodexState, FreshOpencodeState};
 use freshell_protocol::{
     AgentProvider, FreshAgentApprovalRespond, FreshAgentCheckpointIntent, FreshAgentCompact,
-    FreshAgentConfigure, FreshAgentCreate, FreshAgentFork, FreshAgentInterrupt, FreshAgentKill,
-    FreshAgentQuestionRespond, FreshAgentSend, FreshAgentSendSettings, ServerMessage,
-    SessionLocator, SessionType, StringOrNumber,
+    FreshAgentConfigure, FreshAgentCreate, FreshAgentElicitationRespond, FreshAgentFork,
+    FreshAgentInterrupt, FreshAgentKill, FreshAgentQuestionRespond, FreshAgentSend,
+    FreshAgentSendSettings, ServerMessage, SessionLocator, SessionType, StringOrNumber,
 };
 use freshell_runtime_protocol::{
     AgentEvent, FreshAgentCapture, FreshAgentFixtureTransport, FreshAgentLaunchSpec,
@@ -744,6 +744,40 @@ impl FreshAgentTransport for HostedTransport {
                 acceptance_ambiguous: false,
             })?;
         let request_id = StringOrNumber::Str(decision_id.to_string());
+        if let Some(elicitation) = decision.get("elicitation") {
+            let message = FreshAgentElicitationRespond {
+                provider: self.provider_wire(),
+                session_id,
+                session_type: self.session_type(),
+                request_id,
+                cwd: None,
+                action: serde_json::from_value(elicitation["action"].clone()).map_err(|_| {
+                    DispatchFailure {
+                        message: "invalid elicitation action".into(),
+                        acceptance_ambiguous: false,
+                    }
+                })?,
+                content: serde_json::from_value(elicitation["content"].clone()).map_err(|_| {
+                    DispatchFailure {
+                        message: "invalid elicitation content".into(),
+                        acceptance_ambiguous: false,
+                    }
+                })?,
+            };
+            return match &self.state {
+                ProviderState::Codex(state) => {
+                    if state.try_handle_elicitation_respond(message).await {
+                        Ok(())
+                    } else {
+                        Err(DispatchFailure { message:"Codex did not accept this elicitation response; the request remains pending.".into(), acceptance_ambiguous:false })
+                    }
+                }
+                _ => Err(DispatchFailure {
+                    message: "provider has no elicitation flow".into(),
+                    acceptance_ambiguous: false,
+                }),
+            };
+        }
         if let Some(answers) = decision.get("answers").and_then(Value::as_object) {
             let answers = answers
                 .iter()
@@ -759,7 +793,11 @@ impl FreshAgentTransport for HostedTransport {
             };
             match &self.state {
                 ProviderState::Claude(state) => state.handle_question_respond(message).await,
-                ProviderState::Codex(state) => state.handle_question_respond(message).await,
+                ProviderState::Codex(state) => {
+                    if !state.try_handle_question_respond(message).await {
+                        return Err(DispatchFailure {message:"Codex did not accept this question answer; the request remains pending.".into(),acceptance_ambiguous:false});
+                    }
+                }
                 ProviderState::Opencode { .. } => {
                     return Err(DispatchFailure {
                         message: "provider has no question flow".into(),
@@ -778,7 +816,11 @@ impl FreshAgentTransport for HostedTransport {
             };
             match &self.state {
                 ProviderState::Claude(state) => state.handle_approval_respond(message).await,
-                ProviderState::Codex(state) => state.handle_approval_respond(message).await,
+                ProviderState::Codex(state) => {
+                    if !state.try_handle_approval_respond(message).await {
+                        return Err(DispatchFailure {message:"Codex did not accept this approval decision; the request remains pending.".into(),acceptance_ambiguous:false});
+                    }
+                }
                 ProviderState::Opencode { .. } => {
                     return Err(DispatchFailure {
                         message: "provider has no approval flow".into(),
@@ -1300,6 +1342,7 @@ fn spawn_broadcast_bridge(
                 }
                 if event_type.contains("permission.request")
                     || event_type.contains("question.request")
+                    || event_type == "freshAgent.elicitation.request"
                 {
                     if let Some(request_id) = event.get("requestId").and_then(|value| match value {
                         Value::String(value) => Some(value.clone()),
@@ -1502,6 +1545,139 @@ mod tests {
     use super::*;
 
     static OPENCODE_SNAPSHOT_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    async fn task5_durable_native_control(
+        method: &str,
+        params: Value,
+        event_type: &str,
+        invalid_answer: Value,
+        valid_answer: Value,
+    ) {
+        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs")
+            .canonicalize()
+            .unwrap();
+        let keys = [
+            "CODEX_CMD",
+            "CODEX_HOME",
+            "FAKE_CODEX_APP_SERVER_BEHAVIOR",
+            "FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES",
+        ];
+        let _environment = SnapshotProviderEnv(
+            keys.iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        );
+        let exec_dir = tempfile::tempdir_in(
+            std::env::var_os("FRESHELL_TEST_EXECUTABLE_TMP_DIR")
+                .expect("owned executable fixture root"),
+        )
+        .unwrap();
+        let wrapper = exec_dir.path().join("codex.mjs");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/usr/bin/env node\nimport {};\n",
+                serde_json::to_string(&fixture).unwrap()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("CODEX_CMD", wrapper);
+        let codex_home = dir.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::env::set_var("CODEX_HOME", codex_home);
+        std::env::set_var("FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES", "1");
+        std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR",json!({"recordTurns":true,"serverRequestsByPrompt":{"ask":{"id":41,"method":method,"params":params}}}).to_string());
+        let transport = HostedTransport::new(FreshProvider::Codex).await;
+        let mut profile = parity_profile(FreshProvider::Codex);
+        profile.cwd = dir.path().to_string_lossy().into();
+        profile.native_session_id = None;
+        profile.session_ref = None;
+        profile.plugins = None;
+        profile.provider_launch_context = None;
+        profile.provider_secret_references.clear();
+        profile.model = Some("gpt-5.3-codex-spark".into());
+        profile.model_selection = None;
+        profile.effort = None;
+        profile.permission_mode = Some("never".into());
+        let mut diagnostic = transport.provider_frames.subscribe();
+        let actor = FreshAgentHostActor::open(dir.path().join("actor"), profile, transport.clone())
+            .await
+            .unwrap_or_else(|error| {
+                let mut frames = Vec::new();
+                while let Ok(frame) = diagnostic.try_recv() {
+                    frames.push(frame);
+                }
+                panic!("hosted native fixture startup failed: {error:?}; {frames:?}")
+            });
+        actor
+            .dispatch(RequestId::parse("ask-native").unwrap(), "ask".into(), None)
+            .await
+            .unwrap_or_else(|error| {
+                let mut frames = Vec::new();
+                while let Ok(frame) = diagnostic.try_recv() {
+                    frames.push(frame);
+                }
+                panic!("hosted native fixture send failed: {error:?}; {frames:?}")
+            });
+        let pending=tokio::time::timeout(Duration::from_secs(5),async {
+            loop {
+                if let Some(event)=actor.read_events(0,256).await.events.into_iter().find(|entry| matches!(&entry.event, AgentEvent::PermissionRequested {payload,..} if payload["type"]==event_type)) {break event;}
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("native elicitation must enter the durable pending-decision path before a user click");
+        let AgentEvent::PermissionRequested {
+            decision_id,
+            payload,
+        } = pending.event
+        else {
+            unreachable!()
+        };
+        assert_eq!(payload["providerRequest"]["id"], 41);
+        // Reading from a reconnect's cursor yields the exact same public/native IDs.
+        assert!(actor.read_events(0,256).await.events.iter().any(|entry| matches!(&entry.event,AgentEvent::PermissionRequested{decision_id:id,payload:p} if id==&decision_id && p==&payload)));
+        let invalid = actor.resolve_permission(&decision_id, invalid_answer).await;
+        assert!(
+            invalid.is_err(),
+            "an invalid native answer must not resolve its durable decision"
+        );
+        assert!(!actor.read_events(0,256).await.events.iter().any(|entry|matches!(&entry.event,AgentEvent::DecisionResolved{decision_id:id} if id==&decision_id)));
+        actor
+            .resolve_permission(&decision_id, valid_answer.clone())
+            .await
+            .unwrap();
+        actor
+            .resolve_permission(&decision_id, valid_answer)
+            .await
+            .unwrap();
+        actor.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn task5_durable_native_elicitation_survives_reconnect_and_invalid_answer() {
+        task5_durable_native_control("mcpServer/elicitation/request",json!({"serverName":"contract","mode":"form","message":"Hosted form","requestedSchema":{"type":"object","properties":{"count":{"type":"integer","minimum":1}},"required":["count"]}}),"freshAgent.elicitation.request",json!({"elicitation":{"action":"accept","content":{"count":0}}}),json!({"elicitation":{"action":"accept","content":{"count":2}}})).await;
+    }
+    #[tokio::test]
+    async fn task5_durable_native_question_keeps_a_rejected_answer_pending() {
+        task5_durable_native_control("item/tool/requestUserInput",json!({"isBlocking":false,"questions":[{"id":"choice","header":"Choice","question":"Pick","isOther":false,"options":[{"label":"A","description":"Alpha"}]}]}),"freshAgent.question.request",json!({"answers":{"choice":"unoffered"}}),json!({"answers":{"choice":"A"}})).await;
+    }
+    #[tokio::test]
+    async fn task5_durable_native_approval_keeps_an_unoffered_decision_pending() {
+        task5_durable_native_control(
+            "item/commandExecution/requestApproval",
+            json!({"availableDecisions":["cancel"]}),
+            "freshAgent.permission.request",
+            json!({"behavior":"allow"}),
+            json!({"nativeDecision":"cancel"}),
+        )
+        .await;
+    }
 
     #[tokio::test]
     async fn managed_provider_claude_native_identity_uses_actual_adapter_event_name() {

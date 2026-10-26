@@ -344,3 +344,18 @@ describe('formatThoughtDuration', () => {
     expect(formatThoughtDuration(3_720_000)).toBe('1h 2m')
   })
 })
+
+
+describe('true asynchronous Codex questions', () => {
+  afterEach(cleanup)
+  const item = { id: 'async-item', kind: 'text' as const, text: 'I can keep working.', extensions: { codex: { itemId: 'native-async-item', delivery: 'async', questions: [{ title: 'Where?', options: ['Staging', 'Production'] }, { title: 'Deadline?', options: null }] } } }
+  it('offers contextual choices and free entry without fabricating native control IDs', () => {
+    const onAnswerQuestion = vi.fn()
+    render(<FreshAgentItemCard item={item} onAnswerQuestion={onAnswerQuestion} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Staging', exact: true }))
+    expect(onAnswerQuestion).toHaveBeenCalledWith({ itemId: 'native-async-item', questionId: '0', question: 'Where?', text: 'Staging' })
+    fireEvent.change(screen.getByLabelText('Deadline?'), { target: { value: '  Friday, 5 pm!  ' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Submit', exact: true }))
+    expect(onAnswerQuestion).toHaveBeenLastCalledWith({ itemId: 'native-async-item', questionId: '1', question: 'Deadline?', text: '  Friday, 5 pm!  ' })
+  })
+})

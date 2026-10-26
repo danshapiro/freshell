@@ -2178,6 +2178,14 @@ async fn handle_client_text(
             }
             true
         }
+        ClientMessage::FreshAgentElicitationRespond(respond) => {
+            let fresh_codex = state.fresh_codex.clone();
+            tokio::spawn(
+                async move { fresh_codex.handle_elicitation_respond(respond).await }
+                    .instrument(tracing::Span::current()),
+            );
+            true
+        }
         ClientMessage::FreshAgentQuestionRespond(respond) => {
             if respond.provider == freshell_protocol::AgentProvider::Codex {
                 let fresh_codex = state.fresh_codex.clone();
@@ -9554,6 +9562,13 @@ pub(crate) fn fresh_agent_control_refusal(message: &ClientMessage) -> Option<Ser
         ClientMessage::FreshAgentApprovalRespond(m) => (
             !matches!(m.provider, AgentProvider::Claude | AgentProvider::Codex),
             "Approvals are",
+            m.provider,
+            m.session_id.as_str(),
+            m.session_type,
+        ),
+        ClientMessage::FreshAgentElicitationRespond(m) => (
+            m.provider != AgentProvider::Codex,
+            "MCP elicitation is",
             m.provider,
             m.session_id.as_str(),
             m.session_type,

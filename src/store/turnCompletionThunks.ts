@@ -16,8 +16,10 @@ function completionDedupeKey(provider: string, sessionId: string): string {
   return `${provider}:${sessionId}`
 }
 
-function waitingDedupeKey(provider: string, sessionId: string): string {
-  return `${completionDedupeKey(provider, sessionId)}#waiting`
+type FreshAgentAttentionKind = 'complete' | 'waiting' | 'question'
+const FRESH_AGENT_ATTENTION_KINDS = ['complete', 'waiting', 'question'] as const
+function attentionDedupeKey(provider: string, sessionId: string, kind: FreshAgentAttentionKind): string {
+  return `${completionDedupeKey(provider, sessionId)}${kind === 'complete' ? '' : `#${kind}`}`
 }
 
 type FreshAgentPaneLocation = {
@@ -30,13 +32,13 @@ function attentionDedupeKeys(
   provider: string,
   sessionId: string,
   location: FreshAgentPaneLocation | undefined,
-  waiting: boolean,
+  kind: FreshAgentAttentionKind,
 ): string[] {
   const sessionKeys = new Set([
     ...(location?.sessionKeys ?? []),
     completionDedupeKey(provider, sessionId),
   ])
-  return [...sessionKeys].map((key) => waiting ? `${key}#waiting` : key)
+  return [...sessionKeys].map((key) => kind === 'complete' ? key : `${key}#${kind}`)
 }
 
 function newestKnownAt(state: RootState, terminalIds: string[]): number | undefined {
@@ -60,8 +62,8 @@ export function observeFreshAgentSession(payload: { provider: string; sessionId:
     const location = findFreshAgentPaneBySessionKey(
       getState(), completionDedupeKey(payload.provider, payload.sessionId),
     )
-    for (const waiting of [false, true]) {
-      const terminalIds = attentionDedupeKeys(payload.provider, payload.sessionId, location, waiting)
+    for (const kind of FRESH_AGENT_ATTENTION_KINDS) {
+      const terminalIds = attentionDedupeKeys(payload.provider, payload.sessionId, location, kind)
       for (const terminalId of terminalIds) {
         dispatch(advanceCompletionBaseline({ terminalId, at: 0 }))
       }
@@ -77,10 +79,10 @@ export function rekeyFreshAgentAttention(payload: { provider: string; previousSe
     const nextKey = completionDedupeKey(payload.provider, payload.sessionId)
     const location = findFreshAgentPaneBySessionKey(state, previousKey)
       ?? findFreshAgentPaneBySessionKey(state, nextKey)
-    for (const waiting of [false, true]) {
+    for (const kind of FRESH_AGENT_ATTENTION_KINDS) {
       const terminalIds = [...new Set([
-        ...attentionDedupeKeys(payload.provider, payload.previousSessionId, location, waiting),
-        ...attentionDedupeKeys(payload.provider, payload.sessionId, location, waiting),
+        ...attentionDedupeKeys(payload.provider, payload.previousSessionId, location, kind),
+        ...attentionDedupeKeys(payload.provider, payload.sessionId, location, kind),
       ])]
       const at = newestKnownAt(state, terminalIds) ?? 0
       advanceAttentionAliases(dispatch, terminalIds, at)
@@ -96,11 +98,12 @@ export function foldReadyFreshAgentAttention(marks: ReadyMessage['freshAgentAtte
       const location = findFreshAgentPaneBySessionKey(
         getState(), completionDedupeKey(mark.provider, mark.sessionId),
       )
-      for (const [waiting, at, apply] of [
-        [false, mark.lastTurnCompleteAt, applyFreshAgentCompletion],
-        [true, mark.lastWaitingAt, applyFreshAgentWaiting],
+      for (const [kind, at, apply] of [
+        ['complete', mark.lastTurnCompleteAt, applyFreshAgentCompletion],
+        ['waiting', mark.lastWaitingAt, applyFreshAgentWaiting],
+        ['question', mark.lastQuestionAvailableAt, applyFreshAgentQuestionAvailable],
       ] as const) {
-        const terminalIds = attentionDedupeKeys(mark.provider, mark.sessionId, location, waiting)
+        const terminalIds = attentionDedupeKeys(mark.provider, mark.sessionId, location, kind)
         const known = newestKnownAt(getState(), terminalIds)
         if (known === undefined) {
           advanceAttentionAliases(dispatch, terminalIds, at ?? 0)
@@ -123,14 +126,14 @@ export function foldReadyFreshAgentAttention(marks: ReadyMessage['freshAgentAtte
 
 function applyFreshAgentAttentionEdge(
   payload: ApplyFreshAgentCompletionPayload,
-  waiting: boolean,
+  kind: FreshAgentAttentionKind,
 ) {
   return (dispatch: AppDispatch, getState: () => RootState): void => {
     dispatch(observeFreshAgentSession(payload))
     const state = getState()
     const sessionKey = completionDedupeKey(payload.provider, payload.sessionId)
     const location = findFreshAgentPaneBySessionKey(state, sessionKey)
-    const terminalIds = attentionDedupeKeys(payload.provider, payload.sessionId, location, waiting)
+    const terminalIds = attentionDedupeKeys(payload.provider, payload.sessionId, location, kind)
     const known = newestKnownAt(state, terminalIds)
 
     if (!location) {
@@ -145,7 +148,7 @@ function applyFreshAgentAttentionEdge(
     dispatch(recordTurnComplete({
       tabId: location.tabId,
       paneId: location.paneId,
-      terminalId: waiting ? waitingDedupeKey(payload.provider, payload.sessionId) : sessionKey,
+      terminalId: attentionDedupeKey(payload.provider, payload.sessionId, kind),
       at: payload.at,
     }))
     advanceAttentionAliases(dispatch, terminalIds, payload.at)
@@ -239,7 +242,7 @@ export type ApplyFreshAgentCompletionPayload = {
  * values are dropped by the same baseline as live edges.
  */
 export function applyFreshAgentCompletion(payload: ApplyFreshAgentCompletionPayload) {
-  return applyFreshAgentAttentionEdge(payload, false)
+  return applyFreshAgentAttentionEdge(payload, 'complete')
 }
 
 export type ApplyFreshAgentWaitingPayload = {
@@ -260,7 +263,12 @@ export type ApplyFreshAgentWaitingPayload = {
  * waiting edge, and prevents a reconnect from ringing the same approval twice.
  */
 export function applyFreshAgentWaiting(payload: ApplyFreshAgentWaitingPayload) {
-  return applyFreshAgentAttentionEdge(payload, true)
+  return applyFreshAgentAttentionEdge(payload, 'waiting')
+}
+
+/** Actionable async content has its own replay mark and never means native work is paused. */
+export function applyFreshAgentQuestionAvailable(payload: ApplyFreshAgentWaitingPayload) {
+  return applyFreshAgentAttentionEdge(payload, 'question')
 }
 
 function findFreshAgentPaneBySessionKey(

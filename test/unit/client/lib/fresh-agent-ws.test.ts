@@ -1463,3 +1463,20 @@ describe('runtime-owner folds (kata b8ke)', () => {
     expect(sent.observedGeneration).toBeUndefined()
   })
 })
+
+
+it('rings server-authored async question attention once without pending controls or changing work status', () => {
+  const actions: Array<{ type: string }> = []
+  const store = configureStore({ reducer: { freshAgent: freshAgentReducer, panes: panesReducer, turnCompletion: turnCompletionReducer }, middleware: (getDefault) => getDefault().concat(() => (next) => (action) => { actions.push(action as { type: string }); return next(action) }) })
+  const locator = { sessionId: 'async-thread', sessionType: 'freshcodex', provider: 'codex' } as const
+  store.dispatch(initLayout({ tabId: 'async-tab', paneId: 'async-pane', content: { kind: 'fresh-agent', ...locator, createRequestId: 'async-create', status: 'running' } }))
+  handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.status', status: 'running' } })
+  const available = { type: 'freshAgent.event' as const, ...locator, event: { type: 'freshAgent.question.available', itemId: 'async-item', awaited: false, at: 1234 } }
+  expect(handleFreshAgentMessage(store.dispatch, available)).toBe(true)
+  handleFreshAgentMessage(store.dispatch, available)
+  const session = store.getState().freshAgent.sessions['freshcodex:codex:async-thread']
+  expect(session.status).toBe('running')
+  expect(session.pendingQuestions).toEqual({})
+  expect(actions.filter((action) => action.type === 'turnCompletion/recordTurnComplete')).toHaveLength(1)
+  expect(store.getState().panes.activePane['async-tab']).toBe('async-pane')
+})

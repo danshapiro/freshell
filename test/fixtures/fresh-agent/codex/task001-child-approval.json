@@ -1,0 +1,89 @@
+{
+  "source": "Task001 actual Codex 0.164.0 capture d0c5507d-ae0a-4557-aac7-3811b5e36605.json, native frames 19, 21, 36",
+  "frames": [
+    {
+      "method": "item/completed",
+      "params": {
+        "item": {
+          "type": "collabAgentToolCall",
+          "id": "call_native_child",
+          "tool": "spawnAgent",
+          "status": "completed",
+          "senderThreadId": "01a17436-329e-7f72-8506-9f1c328abcec",
+          "receiverThreadIds": [
+            "01a17436-32e2-7b60-be71-f13d0e023464"
+          ],
+          "prompt": "freshell-child-native-probe: return the controlled child answer.",
+          "model": "contract-model",
+          "reasoningEffort": "low",
+          "agentsStates": {
+            "01a17436-32e2-7b60-be71-f13d0e023464": {
+              "status": "pendingInit",
+              "message": null
+            }
+          }
+        },
+        "threadId": "01a17436-329e-7f72-8506-9f1c328abcec",
+        "turnId": "01a17436-32ab-77e1-bd1d-04f0ac1f4ff5",
+        "completedAtMs": 1792951071462
+      },
+      "emittedAtMs": 1792951071463
+    },
+    {
+      "method": "turn/started",
+      "params": {
+        "threadId": "01a17436-32e2-7b60-be71-f13d0e023464",
+        "turn": {
+          "id": "01a17436-32e4-7c00-afb7-baad4e048e86",
+          "rootTurnId": "01a17436-32ab-77e1-bd1d-04f0ac1f4ff5",
+          "items": [],
+          "itemsView": "notLoaded",
+          "status": "inProgress",
+          "error": null,
+          "startedAt": 1792951071,
+          "completedAt": null,
+          "durationMs": null
+        }
+      },
+      "emittedAtMs": 1792951071467
+    },
+    {
+      "method": "item/commandExecution/requestApproval",
+      "id": 0,
+      "params": {
+        "kind": "command",
+        "threadId": "01a17436-32e2-7b60-be71-f13d0e023464",
+        "turnId": "01a17436-32e4-7c00-afb7-baad4e048e86",
+        "itemId": "call_child_contract_command",
+        "startedAtMs": 1792951071521,
+        "environmentId": "local",
+        "command": "/usr/bin/sh -c 'cat contract-input.txt'",
+        "cwd": "/tmp/codex-contract-7cVoCH/workspace",
+        "commandActions": [
+          {
+            "type": "read",
+            "command": "cat contract-input.txt",
+            "name": "contract-input.txt",
+            "path": "/tmp/codex-contract-7cVoCH/workspace/contract-input.txt"
+          }
+        ],
+        "proposedExecpolicyAmendment": [
+          "cat",
+          "contract-input.txt"
+        ],
+        "availableDecisions": [
+          "accept",
+          {
+            "acceptWithExecpolicyAmendment": {
+              "execpolicy_amendment": [
+                "cat",
+                "contract-input.txt"
+              ]
+            }
+          },
+          "cancel"
+        ]
+      }
+    }
+  ]
+}

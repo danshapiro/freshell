@@ -20,6 +20,9 @@ fn fresh_agent_sample(kind: &str) -> serde_json::Value {
         "freshAgent.compact" => json!({"requestId": "compact-1"}),
         "freshAgent.approval.respond" => json!({"requestId": 7, "decision": {"allow": true}}),
         "freshAgent.question.respond" => json!({"requestId": "q-1", "answers": {"q": "a"}}),
+        "freshAgent.elicitation.respond" => {
+            json!({"requestId": "41", "action": "decline", "content": null})
+        }
         "freshAgent.kill" => json!({}),
         "freshAgent.recovery.stop" => json!({"requestId": "stop-1"}),
         "freshAgent.fork" => json!({"requestId": "fork-1"}),
@@ -49,6 +52,7 @@ fn command_wire_type(command: &HostedFreshAgentCommand) -> &'static str {
         HostedFreshAgentCommand::RecoveryStop(_) => "freshAgent.recovery.stop",
         HostedFreshAgentCommand::Approval(_) => "freshAgent.approval.respond",
         HostedFreshAgentCommand::Question(_) => "freshAgent.question.respond",
+        HostedFreshAgentCommand::Elicitation(_) => "freshAgent.elicitation.respond",
         HostedFreshAgentCommand::Compact(_) => "freshAgent.compact",
         HostedFreshAgentCommand::Fork(_) => "freshAgent.fork",
         HostedFreshAgentCommand::Undo(_) => "freshAgent.undo",

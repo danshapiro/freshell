@@ -22,13 +22,13 @@ test('Freshcodex observes the exact child read-only and restores the selection a
   await fs.writeFile(wrapper, `#!/usr/bin/env node\nimport ${JSON.stringify(source)}\n`)
   await fs.chmod(wrapper, 0o755)
   const parent = { id: parentId, ephemeral: false, status: { type: 'idle' }, turns: [{ id: 'parent-turn', status: 'completed', items: [
-    { id: 'parent-answer', type: 'agentMessage', text: 'Parent conversation remains available' },
+    { id: 'parent-answer', type: 'agentMessage', text: 'Parent conversation remains available', delivery: 'async', questions: [{ title: 'Parent question?', options: ['Parent choice'] }] },
     { id: 'denied', type: 'commandExecution', command: 'touch blocked', status: 'declined', aggregatedOutput: 'User declined', exitCode: null },
     { id: 'image-output', type: 'imageGeneration', status: 'completed', result: outputImage, savedPath: outputImage },
     { id: 'spawn', type: 'collabAgentToolCall', tool: 'spawnAgent', status: 'completed', senderThreadId: parentId, receiverThreadIds: [childId], agentsStates: { [childId]: { status: 'completed', message: 'Child finished', model: 'child-model' } } },
   ] }] }
   const child = { id: childId, parentThreadId: parentId, ephemeral: false, status: { type: 'idle' }, turns: [
-    { id: 'child-turn', status: 'completed', itemsView: 'full', items: [{ id: 'child-answer', type: 'agentMessage', text: 'Exact observed child answer' }] },
+    { id: 'child-turn', status: 'completed', itemsView: 'full', items: [{ id: 'child-answer', type: 'agentMessage', text: 'Exact observed child answer', delivery: 'async', questions: [{ title: 'Child question?', options: ['Child choice'] }] }] },
     { id: 'preview-turn', status: 'interrupted', itemsView: 'summary', items: [{ id: 'child-preview', type: 'agentMessage', summary: 'Partial child preview' }] },
   ] }
   const server = new RustServer({ env: {
@@ -45,6 +45,10 @@ test('Freshcodex observes the exact child read-only and restores the selection a
     const owned = await createFreshE2ePage(browser, info)
     context = owned.context
     const page = owned.page
+    const inputs: Array<Record<string, unknown>> = []
+    page.on('websocket', (socket) => socket.on('framesent', (frame) => {
+      try { const value = JSON.parse(String(frame.payload)); if (value.type === 'freshAgent.send' || value.type === 'freshAgent.question.respond') inputs.push(value) } catch { /* unrelated frame */ }
+    }))
     await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
     const harness = new TestHarness(page)
     await harness.waitForHarness()
@@ -57,6 +61,8 @@ test('Freshcodex observes the exact child read-only and restores the selection a
     await directory.press('Enter')
     const pane = page.locator('[data-context="fresh-agent"]').last()
     await expect(pane.getByText('Parent conversation remains available', { exact: true })).toBeVisible({ timeout: 30_000 })
+    await pane.getByRole('button', { name: 'Parent choice', exact: true }).click()
+    await expect(pane.getByRole('textbox', { name: 'Chat message input' })).toHaveValue(/parent-answer/)
     const before = await fs.readFile(operations, 'utf8')
     const open = pane.getByRole('button', { name: `Observe child ${childId}`, exact: true }).first()
     await open.click({ timeout: 15_000 })
@@ -64,8 +70,22 @@ test('Freshcodex observes the exact child read-only and restores the selection a
     await expect(observer.getByText('Exact observed child answer', { exact: true })).toBeVisible()
     await expect(observer.getByText('Partial child preview', { exact: true })).toBeVisible()
     await expect(observer.getByRole('note', { name: 'Output persistence' })).toHaveText('Native preview. Interrupted.')
+    await expect(observer.getByText('Child question?', { exact: true })).toBeVisible()
+    await expect(observer.getByText('Child choice', { exact: true })).toBeVisible()
+    await expect(observer.getByRole('button', { name: 'Child choice', exact: true })).toHaveCount(0)
     await expect(observer.getByRole('textbox')).toHaveCount(0)
     await expect(observer.getByRole('button', { name: /send|stop|configure|resume/i })).toHaveCount(0)
+    const close = observer.getByRole('button', { name: 'Close child conversation' })
+    await expect(close).toBeFocused()
+    await page.keyboard.press('Shift+Tab')
+    await expect(observer.getByRole('button', { name: 'Copy turn', exact: true }).last()).toBeFocused()
+    await page.keyboard.press('Tab')
+    await expect(close).toBeFocused()
+    await page.keyboard.press('Escape')
+    await expect(observer).toHaveCount(0)
+    await expect(open).toBeFocused()
+    await open.click()
+    await expect(observer.getByText('Exact observed child answer', { exact: true })).toBeVisible()
     await page.reload()
     await harness.waitForHarness()
     await harness.waitForConnection()
@@ -86,6 +106,12 @@ test('Freshcodex observes the exact child read-only and restores the selection a
     const prior = before.split('\n').filter(Boolean).map((line) => JSON.parse(line))
     expect(rows.filter((row) => row.method === 'thread/start')).toHaveLength(prior.filter((row) => row.method === 'thread/start').length)
     expect(rows.filter((row) => row.params?.threadId === childId && row.method !== 'thread/read')).toEqual([])
+    expect(inputs).toEqual([])
+    await expect(pane.getByRole('textbox', { name: 'Chat message input' })).toHaveValue(/parent-answer/)
+    await pane.getByRole('button', { name: 'Send', exact: true }).click()
+    await expect.poll(() => inputs.length).toBe(1)
+    expect(inputs[0]).toMatchObject({ type: 'freshAgent.send', text: expect.stringContaining('Parent choice') })
+    await expect(pane.getByText('Answer accepted as a message', { exact: true })).toBeVisible()
   } finally {
     await context?.close().catch(() => {})
     await server.stop()

@@ -359,6 +359,20 @@ impl HostedFreshAgentProxy {
                 )
                 .await;
             }
+            HostedFreshAgentCommand::Elicitation(message) => {
+                if message.provider != AgentProvider::Codex {
+                    self.error_event_code(
+                        &message.provider,
+                        &message.session_id,
+                        message.session_type,
+                        "UNSUPPORTED_CAPABILITY",
+                        "MCP elicitation is not supported for this provider.",
+                    );
+                    return;
+                }
+                self.resolve_decision(message.provider, message.session_id, message.session_type, decision_id(message.request_id),
+                    serde_json::json!({"elicitation":{"action":message.action,"content":message.content}})).await;
+            }
             HostedFreshAgentCommand::Question(message) => {
                 self.resolve_decision(
                     message.provider,

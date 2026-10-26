@@ -84,6 +84,7 @@ use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySi
 
 pub mod children;
 mod controls;
+mod elicitation;
 mod metadata;
 pub(crate) mod native_history;
 mod projection;
@@ -7753,6 +7754,9 @@ impl FreshCodexState {
                         continue;
                     }
                 };
+                state
+                    .observe_child_control_turn(&thread_id, &projection, &notification)
+                    .await;
                 // Unified agent names (Task 3): an upstream `thread/name/updated`
                 // is a NATIVE title observation — automatic provider metadata,
                 // folded at the store's current location revision. It emits no
@@ -7880,7 +7884,7 @@ impl FreshCodexState {
                     }
                 }
                 if state
-                    .consume_control_notification(&thread_id, &notification)
+                    .consume_control_notification(&thread_id, &notification, &projection)
                     .await
                 {
                     // A control-consumed notification (an approval/question
@@ -7998,6 +8002,9 @@ impl FreshCodexState {
     /// armed window) and the epoch hasn't already fired. Used by [`Self::get_snapshot`]
     /// after it seeds an observed mid-flight turn (the U-1 repair).
     fn arm_codex_quiet_if_absent(&self, thread_id: &str, quiet: &Arc<StdMutex<QuietDeadman>>) {
+        if self.awaited_control_count(thread_id) != 0 {
+            return;
+        }
         let window_ms = self.codex_quiet_window_ms();
         let Some(generation) = quiet
             .lock()
@@ -8038,7 +8045,7 @@ impl FreshCodexState {
         // "Turn still in flight" reads the dispatch-time latch — the lane's
         // turn-in-flight authority — at the deadline.
         let fired = crate::quiet_deadman::wait_for_quiet_deadline(&quiet, generation, || {
-            turn_in_flight.load(Ordering::SeqCst)
+            turn_in_flight.load(Ordering::SeqCst) && self.awaited_control_count(&thread_id) == 0
         })
         .await;
         if !fired {
@@ -9589,7 +9596,7 @@ fn map_codex_item(item_id: &str, item: &Value, item_type: &str) -> Result<Vec<Va
                 .unwrap_or("");
             let mut mapped = json!({ "id": item_id, "kind": "text", "text": text });
             if item_type == "agentMessage" && (item["phase"].is_string() || item["questions"].is_array()) {
-                mapped["extensions"] = json!({"codex": {"phase": item["phase"], "questions": item["questions"]}});
+                mapped["extensions"] = json!({"codex": {"phase": item["phase"], "questions": item["questions"], "delivery":item["delivery"], "itemId":item_id}});
             }
             Ok(vec![mapped])
         }
@@ -10894,7 +10901,10 @@ fn note_codex_activity(
     let window = Duration::from_millis(window_ms);
     let feed = {
         let mut q = quiet.lock().expect("quiet deadman lock");
-        q.feed(turn_in_flight.load(Ordering::SeqCst), window)
+        q.feed(
+            turn_in_flight.load(Ordering::SeqCst) && state.awaited_control_count(thread_id) == 0,
+            window,
+        )
     };
     if feed.resolved {
         tracing::info!(provider = PROVIDER, session_id = %thread_id, phase = "resolved", "freshagent.codex.quiet_deadman");

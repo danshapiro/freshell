@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom'
 import { FreshAgentChildObservationSchema, type FreshAgentChildRead, type FreshAgentChildObservation, type FreshAgentSnapshot } from '@shared/fresh-agent-contract'
 import { api } from '@/lib/api'
 import { createLogger } from '@/lib/client-logger'
+import { FreshAgentAsyncQuestionContext } from './FreshAgentItemCard.js'
 import { FreshAgentTranscript } from './FreshAgentTranscript.js'
 
 export type FreshAgentChildParent = Omit<FreshAgentChildRead, 'childThreadId'> & { provider: 'codex'; sessionType: 'freshcodex' }
@@ -62,6 +63,7 @@ export function FreshAgentChildObserver({ parent, childThreadId, onClose }: { pa
   const availability = ephemeral ? 'Codex does not expose history for this ephemeral child. Its activity remains in the parent conversation.' : observation?.status === 'unavailable' ? 'Child history is unavailable.' : observation?.status === 'pending' ? 'Waiting for child history to be saved.' : observation?.status === 'live' ? 'Observed live child history. Observation does not control the child.' : observation?.status === 'saved' ? 'Saved child history.' : 'Reading child history.'
   return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+      {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- The modal container owns Escape and focus wrapping for its native controls, following ConfirmModal; keyboard and focus-return behavior is covered by observer tests. */}
       <section role="dialog" aria-modal="true" aria-label="Child conversation" className="flex max-h-[90vh] w-full max-w-4xl flex-col rounded border bg-background shadow-xl" onKeyDown={(event) => {
         if (event.key === 'Escape') { event.stopPropagation(); onClose() }
         if (event.key === 'Tab') {
@@ -76,7 +78,7 @@ export function FreshAgentChildObserver({ parent, childThreadId, onClose }: { pa
           {snapshot && stale ? `Previously available content. ${availability}` : availability}
           {!ephemeral && observation && observation.status !== 'pending' ? <button type="button" className="ml-2 underline" onClick={() => setRefresh((value) => value + 1)}>Refresh child history</button> : null}
         </div>
-        {snapshot ? <div className="min-h-0 overflow-auto"><FreshAgentTranscript turns={snapshot.turns} agentLabel="Freshcodex" sessionId={childThreadId} canFork={false} canRollback={false} canRedo={false} showTranscriptMinimap={false} /></div> : null}
+        {snapshot ? <FreshAgentAsyncQuestionContext.Provider value={{}}><div className="min-h-0 overflow-auto"><FreshAgentTranscript turns={snapshot.turns} agentLabel="Freshcodex" sessionId={childThreadId} canFork={false} canRollback={false} canRedo={false} showTranscriptMinimap={false} /></div></FreshAgentAsyncQuestionContext.Provider> : null}
       </section>
     </div>, document.body,
   )
