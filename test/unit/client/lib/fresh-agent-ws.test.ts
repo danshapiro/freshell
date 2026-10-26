@@ -105,6 +105,12 @@ describe('fresh-agent-ws', () => {
     const projection=store.getState().freshAgentLive.bySession['freshcodex:codex:patch-gap'].projection
     expect(projection?.needsResnapshot).toBe(true)
     expect(projection?.turns[0].items[0]).toMatchObject({text:'Known prefix'})
+    send({type:'freshAgent.transcript.patch',sessionId:'patch-gap',projectionId:'p',historyGeneration:0,afterRevision:7,ops:[{op:'appendItem',nativeTurnId:'t',rowId:'t',itemId:'a',field:'text',text:' another unbased suffix',revision:8}]})
+    expect(store.getState().freshAgentLive.bySession['freshcodex:codex:patch-gap'].projection?.turns[0].items[0]).toMatchObject({text:'Known prefix'})
+    send({type:'freshAgent.host.backpressure',retainedState:{source:{projectionId:'p',ownerEpoch:0,ownerGeneration:0,soulId:'soul',incarnationId:'incarnation',hostBootId:'host'},snapshot:{...savedCodexNativeHistory,threadId:'patch-gap',turns:[{id:'t',turnId:'t',role:'assistant',summary:'',items:[{id:'a',kind:'text',text:'The authoritative complete prefix'}]}],extensions:{codex:{projection:{id:'p',historyGeneration:0,eventRevision:8,eventOwnedTurnIds:['t'],nativePreviewTurnIds:[],nativeFinalTurnIds:[],turnRows:{t:['t']},turnOutputStates:{t:{provenance:'retained',refreshPending:false}},settledTurnIds:[]}}}},pendingControls:[],attentionMarks:[]}})
+    const recovered=store.getState().freshAgentLive.bySession['freshcodex:codex:patch-gap'].projection
+    expect(recovered?.needsResnapshot).toBe(false)
+    expect(recovered?.turns[0].items[0]).toMatchObject({text:'The authoritative complete prefix'})
   })
   beforeEach(() => {
     _resetCancelledCreates()

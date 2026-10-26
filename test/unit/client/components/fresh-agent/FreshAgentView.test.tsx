@@ -15178,6 +15178,40 @@ describe('task6 retired source lifetime', () => {
   }, 45_000)
 })
 
+describe('task6 gap recovery after the final frame', () => {
+  it('keeps current rows and requests the latest prefix when an in-flight recovery response predates the final patch', async () => {
+    const native=FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
+    const locator={provider:'codex' as const,sessionType:'freshcodex' as const,sessionId:native.threadId}
+    const snapshot=(revision:number,text:string)=>FreshAgentSnapshotSchema.parse({...native,status:'running',turns:[{id:'gap-row',turnId:'gap-row',role:'assistant',summary:'',items:[{id:'gap-answer',kind:'text',text}]}],extensions:{codex:{projection:{id:'gap-source',historyGeneration:0,eventRevision:revision,eventOwnedTurnIds:['gap-turn'],nativePreviewTurnIds:[],nativeFinalTurnIds:[],turnRows:{'gap-turn':['gap-row']},turnOutputStates:{'gap-turn':{provenance:'retained',refreshPending:false}},settledTurnIds:[]}}}})
+    const initial=snapshot(1,'Known visible prefix')
+    const stale=snapshot(7,'Covered through revision seven')
+    const latest=snapshot(8,'Authoritative output through the final revision eight')
+    const store=createStore()
+    const handlers=new Set<(message:any)=>void>()
+    wsMock.onMessage.mockImplementation((handler)=>{handlers.add(handler);return()=>{handlers.delete(handler)}})
+    const receive=(event:Record<string,unknown>)=>{const message={type:'freshAgent.event',...locator,event};handleFreshAgentMessage(store.dispatch,message as never);for(const handler of handlers)handler(message)}
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(initial)
+    store.dispatch(initLayout({tabId:'tab-1',paneId:'pane-1',content:{kind:'fresh-agent',...locator,createRequestId:'gap-final-prefix',status:'running'}}))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    await expectRenderedText('Known visible prefix')
+    const held=createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockClear()
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValueOnce(held.promise).mockResolvedValue(latest)
+    const patch=(afterRevision:number,revision:number)=>({type:'freshAgent.transcript.patch',sessionId:native.threadId,projectionId:'gap-source',historyGeneration:0,afterRevision,ops:[{op:'appendItem',nativeTurnId:'gap-turn',rowId:'gap-row',itemId:'gap-answer',field:'text',text:' unbased suffix',revision}]})
+    try {
+      act(()=>receive(patch(4,7)))
+      await waitFor(()=>expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+      act(()=>receive(patch(7,8)))
+      // No more transport/provider frames arrive after this final patch.
+      await act(async()=>held.resolve(stale))
+      await expectRenderedText('Authoritative output through the final revision eight')
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+      expect(store.getState().freshAgentLive.bySession[`freshcodex:codex:${native.threadId}`].projection?.needsResnapshot).toBe(false)
+      expect(sentFreshAgentMessages('freshAgent.send')).toEqual([])
+    } finally {cleanup();await act(async()=>held.resolve(stale))}
+  })
+})
+
 describe('task6 owner context assessment', () => {
   it('uses the current owner fence for child reads and the current parent when retrying after rebind', async () => {
     const native=FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)

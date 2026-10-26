@@ -3402,9 +3402,14 @@ export function FreshAgentView({
       const liveSession = appStore.getState().freshAgentLive?.bySession[makeFreshAgentSessionKey(projectionLocator)]
       const liveProjection = liveSession?.projection
       if (projectionMetadata && liveSession?.retiredProjectionIds?.[projectionMetadata.id] === true) return
-      if (projectionMetadata && liveProjection?.id === projectionMetadata.id && liveProjection.historyGeneration > projectionMetadata.historyGeneration) {
-        requestSnapshotRefresh('reconnect')
-        return
+      if (projectionMetadata && liveProjection?.id === projectionMetadata.id) {
+        const olderHistory = liveProjection.historyGeneration > projectionMetadata.historyGeneration
+        const missingCoverage = liveProjection.historyGeneration === projectionMetadata.historyGeneration
+          && liveProjection.needsResnapshot && projectionMetadata.eventRevision < liveProjection.eventRevision
+        if (olderHistory || missingCoverage) {
+          requestSnapshotRefresh(olderHistory ? 'reconnect' : 'event')
+          return
+        }
       }
       const resolvedHasUserTurns = freshAgentSnapshotHasUserTurn(resolved)
       if (!resolvedHasUserTurns && !autoTitleSentRef.current) {

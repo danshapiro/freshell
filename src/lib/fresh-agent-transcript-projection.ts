@@ -30,7 +30,9 @@ export function applyFreshAgentTranscriptPatch(state: TranscriptProjection, inpu
   if (patch.projectionId !== state.id || patch.historyGeneration < state.historyGeneration) return state
   // Appends can be coalesced across several revisions. The producer states
   // their consumed prefix explicitly; a jump in the final revision is legal.
-  if (patch.afterRevision !== undefined && patch.afterRevision > state.eventRevision) {
+  // After a gap, consumed revisions describe coverage owed to the client.
+  // They cannot authorize another append until a snapshot covers that prefix.
+  if (state.needsResnapshot || patch.afterRevision !== undefined && patch.afterRevision > state.eventRevision) {
     return { ...state, needsResnapshot: true, eventRevision: Math.max(state.eventRevision, ...patch.ops.map((op) => op.revision)) }
   }
   const next: TranscriptProjection = patch.historyGeneration > state.historyGeneration
