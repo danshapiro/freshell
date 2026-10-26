@@ -124,7 +124,17 @@ mod tdd_recovery {
 
     #[tokio::test]
     async fn held_stop_consumes_terminal_with_dispatch_lock_held_and_blocks_later_start() {
-        let mut h = Harness::ordinary(Some("old")).await;
+        let mut h = Harness::ordinary(None).await;
+        h.accept_initial("old-accepted", "old").await;
+        let state = h.state.clone();
+        let mut steer = Box::pin(state.handle_send(input("old-refused-steer", "adjust old")));
+        pending(steer.as_mut()).await;
+        let (id, method, params) = h.request().await;
+        assert_eq!(method, "turn/steer");
+        assert_eq!(params["expectedTurnId"], "old");
+        h.peer.respond_error(&id, -32600, "expected active turn id `old` but found `other`");
+        steer.await;
+        h.event(|w| w["type"] == "error" && w["requestId"] == "old-refused-steer").await;
         let state = h.state.clone();
         let mut interrupt = Box::pin(state.handle_interrupt(stop()));
         pending(interrupt.as_mut()).await;
