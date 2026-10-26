@@ -3564,7 +3564,13 @@ impl FreshCodexState {
         turn_in_flight.store(true, Ordering::SeqCst);
         note_codex_activity(self, &session_id, &turn_in_flight, &quiet_deadman);
 
-        let submitted_turn_id = match client.start_turn(params).await {
+        let expected_turn_id = active_turn.lock().expect("active_turn mutex").clone();
+        let result = if let Some(expected) = expected_turn_id.as_deref() {
+            client.steer_turn(&session_id, expected, params.input).await
+        } else {
+            client.start_turn(params).await
+        };
+        let submitted_turn_id = match result {
             Ok(started) => {
                 // adapter.ts:980 -- track the active turn immediately (before any
                 // turn/started notification), so a fast-follow interrupt has a target.

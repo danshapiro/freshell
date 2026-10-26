@@ -319,9 +319,8 @@ mod tdd_recovery {
         assert_eq!(accepted.last().unwrap()["submittedTurnId"], "shared");
         h.terminal("shared", "completed");
         let mut frames = h.event(|w| w["event"]["type"] == "freshAgent.turn.complete").await;
-        h.terminal("shared", "completed");
         // A later status notification on the consumer FIFO is the explicit
-        // barrier proving both duplicate terminal frames have been folded.
+        // barrier proving the single native terminal has been fully folded.
         h.peer.emit_notification("thread/status/changed", json!({"threadId":THREAD,"status":{"type":"idle"}}));
         frames.extend(h.idle().await);
         assert_eq!(h.snapshot().await["capabilities"]["send"], true);

@@ -20,6 +20,37 @@ use freshell_codex::{
 const THREAD_ID: &str = "019810de-1e5f-7db3-9c47-1c2a3b4c5d6e";
 
 #[tokio::test]
+async fn active_input_uses_expected_id_steer_without_turn_settings_and_returns_the_same_turn() {
+    let (transport, peer) = new_channel_transport();
+    let (client, _) = CodexAppServerClient::connect(transport);
+    let driver = tokio::spawn(async move {
+        client
+            .steer_turn(
+                THREAD_ID,
+                "turn-owned",
+                vec![json!({"type":"text","text":"follow up"})],
+            )
+            .await
+            .unwrap()
+    });
+    let (init, method, _) = peer.expect_request().await;
+    assert_eq!(method, "initialize");
+    peer.respond(
+        &init,
+        json!({"userAgent":"fixture","codexHome":"/h","platformFamily":"u","platformOs":"l"}),
+    );
+    peer.expect_notification().await;
+    let (id, method, params) = peer.expect_request().await;
+    assert_eq!(method, "turn/steer");
+    assert_eq!(
+        params,
+        json!({"threadId":THREAD_ID,"expectedTurnId":"turn-owned","input":[{"type":"text","text":"follow up"}]})
+    );
+    peer.respond(&id, json!({"turnId":"turn-owned"}));
+    assert_eq!(driver.await.unwrap().turn_id, "turn-owned");
+}
+
+#[tokio::test]
 async fn interrupt_turn_rpc_then_interrupted_completion_snapshots_without_chime() {
     let (transport, peer) = new_channel_transport();
     let (client, mut notifs) = CodexAppServerClient::connect(transport);
