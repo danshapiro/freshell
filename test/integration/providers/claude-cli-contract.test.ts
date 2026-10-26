@@ -503,6 +503,15 @@ describe(`pinned Claude CLI ${PINNED_CLI_VERSION} contract (real CLI, loopback p
     })
     expect(results(r, 'S').map((m) => m.subtype)).toEqual(['success'])
     expect(results(r, 'M').map((m) => m.subtype)).toEqual(['success'])
+    for (const [session, uuid] of [['S', 'u1'], ['M', 'u2']]) {
+      const events = eventsOf(r, session)
+      const close = at(events, event => event.k === 'close')
+      const terminal = events.slice(0, close).filter(event => event.k === 'msg')
+        .map(event => event.m).filter(message => isResult(message) || message.type === 'command_lifecycle' || isState('idle')(message))
+        .slice(-3)
+      expect(terminal.map(message => isResult(message) ? 'result' : message.state)).toEqual(['result', 'completed', 'idle'])
+      expect(terminal[1].command_uuid).toBe(uuid)
+    }
   }, SCENARIO_TIMEOUT)
 })
 

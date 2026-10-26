@@ -364,7 +364,7 @@ function transcriptShape(lines) {
   }))
 }
 
-const SCENARIOS = {
+export const SCENARIOS = {
   /** T1 T2 T3 T7 T8: fresh boot with our session id, settings before the first prompt, two turns. */
   async boot(ctx) {
     const X = ctx.uuid('X')
@@ -760,6 +760,9 @@ const SCENARIOS = {
     })
     s.push('MCP:call=mcp__freshell__context', 'u1')
     await s.waitForResults(1, 30_000)
+    // A result precedes command completion and the queue's idle frame. Closing
+    // here would truncate the real trace according to pipe delivery timing.
+    ctx.need(await s.waitForCount(isStateIdle, 1, 10_000, 'MCP connected idle'), 'MCP connected idle')
     ctx.observe('connected', mcpTurnShape(s))
     const seen = JSON.parse(await fs.readFile(report, 'utf8'))
     delete seen.pid
@@ -769,6 +772,7 @@ const SCENARIOS = {
     const m = ctx.open('M')
     m.push('MCP:call=mcp__freshell__freshell', 'u2')
     await m.waitForResults(1, 30_000)
+    ctx.need(await m.waitForCount(isStateIdle, 1, 10_000, 'MCP missing tool idle'), 'MCP missing tool idle')
     ctx.observe('missing', mcpTurnShape(m))
     await m.close()
   },
