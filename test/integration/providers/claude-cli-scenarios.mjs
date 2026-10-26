@@ -116,7 +116,7 @@ function createInput() {
   }
 }
 
-class Session {
+export class Session {
   constructor(ctx, label, { options = {}, env = {}, permissions } = {}) {
     this.ctx = ctx
     this.label = label
@@ -303,8 +303,29 @@ class Session {
     return this.child?.pid
   }
 
-  async close() {
-    if (!this.closed) this.ctx.trace.add({ s: this.label, k: 'close' })
+  close() {
+    this.closing ??= this.closeAfterSuccessfulDrain()
+    return this.closing
+  }
+
+  async closeAfterSuccessfulDrain() {
+    // A successful result is followed by command completion and the queue's
+    // idle frame on a later pipe delivery. Keep that tail inside the capture.
+    // Cancellation/error results and deliberate mid-turn closes retain their
+    // immediate-close semantics; they do not promise this successful drain.
+    const resultAt = this.frames.findLastIndex((m) => m.type === 'result' && !m.parent_tool_use_id)
+    const result = this.frames[resultAt]
+    const startedAt = this.frames.findLastIndex((m) => !m.parent_tool_use_id && (
+      (m.type === 'command_lifecycle' && m.state === 'started')
+      || (m.type === 'system' && (m.subtype === 'init' || (m.subtype === 'session_state_changed' && m.state === 'running')))))
+    let drainError
+    if (result?.subtype === 'success' && result.is_error === false
+      && (result.terminal_reason === undefined || result.terminal_reason === 'completed') && startedAt < resultAt) {
+      const drained = await this.waitFor((m) => isStateIdle(m) && this.frames.indexOf(m) > resultAt,
+        10_000, 'successful result idle')
+      if (!drained) drainError = new Error(`successful result for session ${result.session_id} did not reach idle within 10000ms`)
+    }
+    this.ctx.trace.add({ s: this.label, k: 'close' })
     this.closed = true
     this.input.end()
     try { this.query.close() } catch { /* already closed */ }
@@ -313,6 +334,7 @@ class Session {
       this.child.kill('SIGKILL')
       await Promise.race([new Promise((resolve) => this.child.once('exit', resolve)), sleep(3000)])
     }
+    if (drainError) throw drainError
   }
 }
 
@@ -768,9 +790,6 @@ export const SCENARIOS = {
     })
     s.push('MCP:call=mcp__freshell__context', 'u1')
     await s.waitForResults(1, 30_000)
-    // A result precedes command completion and the queue's idle frame. Closing
-    // here would truncate the real trace according to pipe delivery timing.
-    ctx.need(await s.waitForCount(isStateIdle, 1, 10_000, 'MCP connected idle'), 'MCP connected idle')
     ctx.observe('connected', mcpTurnShape(s))
     const seen = JSON.parse(await fs.readFile(report, 'utf8'))
     delete seen.pid
@@ -780,7 +799,6 @@ export const SCENARIOS = {
     const m = ctx.open('M')
     m.push('MCP:call=mcp__freshell__freshell', 'u2')
     await m.waitForResults(1, 30_000)
-    ctx.need(await m.waitForCount(isStateIdle, 1, 10_000, 'MCP missing tool idle'), 'MCP missing tool idle')
     ctx.observe('missing', mcpTurnShape(m))
     await m.close()
   },
