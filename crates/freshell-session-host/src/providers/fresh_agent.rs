@@ -77,6 +77,7 @@ struct HostedTransport {
     suppressed_kills: Arc<std::sync::Mutex<HashSet<String>>>,
     event_tx: mpsc::Sender<AgentEvent>,
     event_rx: std::sync::Mutex<Option<mpsc::Receiver<AgentEvent>>>,
+    _bridge: BroadcastBridgeTasks,
     #[cfg(test)]
     test_delegate: Option<Arc<dyn HostedTransportTestDelegate>>,
 }
@@ -242,10 +243,14 @@ impl HostedTransport {
         let (send_outcomes, _) = broadcast::channel(64);
         let (kill_outcomes, _) = broadcast::channel(64);
         let suppressed_kills = Arc::new(std::sync::Mutex::new(HashSet::new()));
-        spawn_broadcast_bridge(
+        let bridge = spawn_broadcast_bridge(
             provider.clone(),
             broadcast_rx,
             BroadcastBridgeOutputs {
+                retained_codex: match &state {
+                    ProviderState::Codex(state) => Some(state.clone()),
+                    _ => None,
+                },
                 created: created_tx,
                 native: native_tx.clone(),
                 events: event_tx.clone(),
@@ -268,6 +273,7 @@ impl HostedTransport {
             suppressed_kills,
             event_tx,
             event_rx: std::sync::Mutex::new(Some(event_rx)),
+            _bridge: bridge,
             #[cfg(test)]
             test_delegate: None,
         })
@@ -1053,6 +1059,21 @@ impl FreshAgentTransport for HostedTransport {
         })
     }
 
+    async fn retained_state(&self) -> Result<Option<Value>, String> {
+        let ProviderState::Codex(state) = &self.state else {
+            return Ok(None);
+        };
+        let native_id = self.session_id.lock().await.clone();
+        match native_id {
+            Some(id) => state
+                .retained_state(&id)
+                .await
+                .map(Some)
+                .map_err(|error| format!("codex retained state unavailable: {error:?}")),
+            None => Ok(None),
+        }
+    }
+
     async fn snapshot(&self) -> Result<Value, String> {
         #[cfg(test)]
         if let Some(delegate) = self.test_delegate.as_ref() {
@@ -1208,6 +1229,7 @@ fn create_request_for_profile(profile: &FreshAgentProfile) -> FreshAgentCreate {
 }
 
 struct BroadcastBridgeOutputs {
+    retained_codex: Option<FreshCodexState>,
     created: watch::Sender<Option<Result<String, ()>>>,
     native: watch::Sender<Option<String>>,
     events: mpsc::Sender<AgentEvent>,
@@ -1216,12 +1238,25 @@ struct BroadcastBridgeOutputs {
     suppressed_kills: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
+struct BroadcastBridgeTasks {
+    recovery: tokio::task::JoinHandle<()>,
+    forward: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for BroadcastBridgeTasks {
+    fn drop(&mut self) {
+        self.recovery.abort();
+        self.forward.abort();
+    }
+}
+
 fn spawn_broadcast_bridge(
     provider: FreshProvider,
     mut receiver: broadcast::Receiver<String>,
     outputs: BroadcastBridgeOutputs,
-) {
+) -> BroadcastBridgeTasks {
     let BroadcastBridgeOutputs {
+        retained_codex,
         created,
         native,
         events,
@@ -1236,13 +1271,111 @@ fn spawn_broadcast_bridge(
     // id and announces nothing. The identity watch records the id last
     // announced (a fork's transport records its child there, C14).
     let claude = matches!(provider, FreshProvider::Claude | FreshProvider::Kilroy);
-    tokio::spawn(async move {
+    // One coalesced recovery slot, independent of later provider traffic.
+    let (recovery, mut recovery_rx) = watch::channel(None::<Value>);
+    let recovery_events = events.clone();
+    let recovery_native = native.clone();
+    let recovery_provider = provider.clone();
+    let mut retained_changes = retained_codex
+        .as_ref()
+        .map(|state| state.subscribe_retained_state(""));
+    let recovery_task = tokio::spawn(async move {
+        loop {
+            let loss = tokio::select! {
+                result = recovery_rx.changed() => { if result.is_err() {break;} true },
+                _ = async { match &mut retained_changes { Some(changes) => { let _ = changes.changed().await; }, None => std::future::pending::<()>().await } } => false,
+                _ = recovery_events.closed() => break,
+            };
+            if !loss && recovery_events.capacity() > 0 {
+                continue;
+            }
+            let Ok(permit) = recovery_events.reserve().await else {
+                break;
+            };
+            let mut payload = recovery_rx.borrow_and_update().clone();
+            if let Some(changes) = &mut retained_changes {
+                changes.borrow_and_update();
+            }
+            let mut pending = Vec::new();
+            if let Some(state) = &retained_codex {
+                let mut ids = recovery_native
+                    .borrow()
+                    .clone()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                // A dropped materialization may also have dropped the native
+                // identity edge. Resolve only registered retained sources.
+                ids.extend(
+                    state
+                        .attention_marks()
+                        .await
+                        .into_iter()
+                        .map(|mark| mark.session_id),
+                );
+                for session_id in ids {
+                    if let Ok(retained) = state.retained_state(&session_id).await {
+                        pending = retained["pendingControls"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default();
+                        let dropped = payload
+                            .as_ref()
+                            .and_then(|frame| frame["event"]["dropped"].as_u64())
+                            .unwrap_or(1);
+                        let mut frame = bridge_recovery_frame(
+                            &recovery_provider,
+                            "freshcodex",
+                            &session_id,
+                            dropped,
+                        );
+                        frame["event"]["retainedState"] = retained;
+                        payload = Some(frame);
+                        break;
+                    }
+                }
+            }
+            let Some(payload) = payload else { continue };
+            tracing::warn!(
+                provider = recovery_provider.as_str(),
+                session_id = payload["sessionId"].as_str().unwrap_or_default(),
+                dropped = payload["event"]["dropped"].as_u64().unwrap_or_default(),
+                retained = payload["event"]["retainedState"].is_object(),
+                "freshagent.host.bridge_recovered"
+            );
+            permit.send(AgentEvent::Provider { payload });
+            for payload in pending {
+                if let Some(decision_id) = payload["requestId"].as_str() {
+                    if recovery_events
+                        .send(AgentEvent::PermissionRequested {
+                            decision_id: decision_id.to_owned(),
+                            payload,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    let forward_task = tokio::spawn(async move {
         let mut dropped = 0u64;
+        let mut last_route: Option<(String, String)> = None;
         loop {
             let frame = match receiver.recv().await {
                 Ok(frame) => frame,
                 Err(broadcast::error::RecvError::Lagged(count)) => {
                     dropped = dropped.saturating_add(count);
+                    if let Some((session_id, session_type)) = &last_route {
+                        recovery.send_replace(Some(bridge_recovery_frame(
+                            &provider,
+                            session_type,
+                            session_id,
+                            dropped,
+                        )));
+                        dropped = 0;
+                    }
                     continue;
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -1250,6 +1383,11 @@ fn spawn_broadcast_bridge(
             let Ok(value) = serde_json::from_str::<Value>(&frame) else {
                 continue;
             };
+            if let (Some(session_id), Some(session_type)) =
+                (value["sessionId"].as_str(), value["sessionType"].as_str())
+            {
+                last_route = Some((session_id.to_owned(), session_type.to_owned()));
+            }
             if let Some(outcome) = parse_send_outcome(&value) {
                 let _ = send_outcomes.send(outcome);
             }
@@ -1363,26 +1501,44 @@ fn spawn_broadcast_bridge(
                     }
                 }
             }
-            if dropped > 0
-                && events
-                    .try_send(AgentEvent::Provider {
-                        payload: json!({"type":"freshAgent.host.backpressure","dropped":dropped}),
-                    })
-                    .is_ok()
-            {
-                dropped = 0;
-            }
             if captured_decision {
                 continue;
             }
             if events
-                .try_send(AgentEvent::Provider { payload: value })
+                .try_send(AgentEvent::Provider {
+                    payload: value.clone(),
+                })
                 .is_err()
             {
                 dropped = dropped.saturating_add(1);
             }
+            if dropped > 0 {
+                if let Some(session_id) = value["sessionId"].as_str() {
+                    recovery.send_replace(Some(bridge_recovery_frame(
+                        &provider,
+                        value["sessionType"].as_str().unwrap_or("freshcodex"),
+                        session_id,
+                        dropped,
+                    )));
+                    dropped = 0;
+                }
+            }
         }
     });
+    BroadcastBridgeTasks {
+        recovery: recovery_task,
+        forward: forward_task,
+    }
+}
+
+fn bridge_recovery_frame(
+    provider: &FreshProvider,
+    session_type: &str,
+    session_id: &str,
+    dropped: u64,
+) -> Value {
+    json!({"type":"freshAgent.event", "provider":if matches!(provider, FreshProvider::Kilroy) {"claude"} else {provider.as_str()},
+        "sessionType":session_type,"sessionId":session_id,"event":{"type":"freshAgent.host.backpressure","dropped":dropped}})
 }
 
 /// The claude conversation a `freshAgent.created` names in its `sessionRef`.
@@ -1546,13 +1702,31 @@ mod tests {
 
     static OPENCODE_SNAPSHOT_ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
-    async fn task5_durable_native_control(
-        method: &str,
-        params: Value,
-        event_type: &str,
-        invalid_answer: Value,
-        valid_answer: Value,
-    ) {
+    #[tokio::test]
+    async fn task6_dropping_transport_closes_its_owned_bridge_without_more_provider_frames() {
+        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let transport = HostedTransport::new(FreshProvider::Codex).await;
+        let mut events = transport.take_event_stream().unwrap();
+        // No native process/session was started. Dropping this transport must
+        // release its producers even when the consumer is still waiting.
+        drop(transport);
+        let final_event = tokio::time::timeout(Duration::from_millis(300), events.recv())
+            .await
+            .expect("owned bridge must close without another provider frame");
+        assert!(final_event.is_none());
+    }
+
+    struct NativeCodexFixture {
+        transport: Arc<HostedTransport>,
+        profile: FreshAgentProfile,
+        diagnostic: broadcast::Receiver<String>,
+        dir: tempfile::TempDir,
+        _exec_dir: tempfile::TempDir,
+        _environment: SnapshotProviderEnv,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    async fn native_codex_fixture(behavior: Value) -> NativeCodexFixture {
         let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1593,7 +1767,7 @@ mod tests {
         std::fs::create_dir_all(&codex_home).unwrap();
         std::env::set_var("CODEX_HOME", codex_home);
         std::env::set_var("FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES", "1");
-        std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR",json!({"recordTurns":true,"serverRequestsByPrompt":{"ask":{"id":41,"method":method,"params":params}}}).to_string());
+        std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR", behavior.to_string());
         let transport = HostedTransport::new(FreshProvider::Codex).await;
         let mut profile = parity_profile(FreshProvider::Codex);
         profile.cwd = dir.path().to_string_lossy().into();
@@ -1606,7 +1780,30 @@ mod tests {
         profile.model_selection = None;
         profile.effort = None;
         profile.permission_mode = Some("never".into());
-        let mut diagnostic = transport.provider_frames.subscribe();
+        let diagnostic = transport.provider_frames.subscribe();
+        NativeCodexFixture {
+            transport,
+            profile,
+            diagnostic,
+            dir,
+            _exec_dir: exec_dir,
+            _environment,
+            _lock,
+        }
+    }
+
+    async fn task5_durable_native_control(
+        method: &str,
+        params: Value,
+        event_type: &str,
+        invalid_answer: Value,
+        valid_answer: Value,
+    ) {
+        let mut fixture = native_codex_fixture(json!({"recordTurns":true,"serverRequestsByPrompt":{"ask":{"id":41,"method":method,"params":params}}})).await;
+        let transport = fixture.transport.clone();
+        let profile = fixture.profile.clone();
+        let dir = &fixture.dir;
+        let diagnostic = &mut fixture.diagnostic;
         let actor = FreshAgentHostActor::open(dir.path().join("actor"), profile, transport.clone())
             .await
             .unwrap_or_else(|error| {
@@ -1680,6 +1877,462 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task6_final_loss_recovers_native_retained_transcript_and_attention() {
+        let mut fixture =
+            native_codex_fixture(json!({"recordTurns":true,"liveTranscript":true})).await;
+        let transport = fixture.transport.clone();
+        let profile = fixture.profile.clone();
+        let diagnostic = &mut fixture.diagnostic;
+        transport.start(&profile).await.unwrap();
+        let mut events = transport.take_event_stream().unwrap();
+        while events.try_recv().is_ok() {}
+        while transport
+            .event_tx
+            .try_send(AgentEvent::Provider {
+                payload: json!({"occupied":true}),
+            })
+            .is_ok()
+        {}
+        transport
+            .dispatch(
+                &RequestId::parse("retained-send").unwrap(),
+                "retained prompt",
+                &profile,
+            )
+            .await
+            .unwrap();
+        let completion = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let frame: Value = serde_json::from_str(&diagnostic.recv().await.unwrap()).unwrap();
+                if frame["event"]["type"] == "freshAgent.turn.complete" {
+                    break frame["event"]["at"].clone();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        // There are no more native frames; only draining the bounded output
+        // channel is allowed to drive recovery of this final completion.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let recovered = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(AgentEvent::Provider { payload }) = events.recv().await {
+                    if payload["event"]["type"] == "freshAgent.host.backpressure" {
+                        break payload;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let snapshot = &recovered["event"]["retainedState"]["snapshot"];
+        let marks = &recovered["event"]["retainedState"]["attentionMarks"];
+        let retained = serde_json::to_string(snapshot).unwrap();
+        let native_id = transport.session_id.lock().await.clone().unwrap();
+        transport.clone().stop().await.unwrap();
+        assert!(
+            retained.contains("Native streaming fragment and final answer"),
+            "recover exact event-owned body without thread/read: {recovered}"
+        );
+        assert_eq!(snapshot["threadId"], native_id);
+        assert_eq!(marks[0]["lastTurnCompleteAt"], completion);
+        assert_eq!(
+            snapshot["extensions"]["codex"]["projection"]["turnOutputStates"]
+                .as_object()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn task6_journal_reset_reads_authoritative_source_after_final_native_frame() {
+        let mut fixture =
+            native_codex_fixture(json!({"recordTurns":true,"liveTranscript":true})).await;
+        let transport = fixture.transport.clone();
+        let profile = fixture.profile.clone();
+        let dir = &fixture.dir;
+        let diagnostic = &mut fixture.diagnostic;
+        let actor = FreshAgentHostActor::open_with_bounds(
+            dir.path().join("actor"),
+            profile,
+            transport.clone(),
+            256 * 1024,
+            8,
+        )
+        .await
+        .unwrap();
+        actor
+            .dispatch(
+                RequestId::parse("reset-send").unwrap(),
+                "retained prompt".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let frame: Value = serde_json::from_str(&diagnostic.recv().await.unwrap()).unwrap();
+                if frame["event"]["type"] == "freshAgent.turn.complete" {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        for index in 0..20 {
+            actor
+                .record_event(AgentEvent::Provider {
+                    payload: json!({"noise":index}),
+                })
+                .await
+                .unwrap();
+        }
+        let batch = actor.read_events(1, 8).await;
+        assert!(batch.reset_required);
+        let batch = serde_json::to_value(batch).unwrap();
+        actor.stop().await.unwrap();
+        assert!(serde_json::to_string(&batch["retainedState"]["snapshot"]).unwrap().contains("Native streaming fragment and final answer"), "journal reset must read the provider source even after its history was evicted: {batch}");
+        assert!(
+            batch["retainedState"]["attentionMarks"][0]["lastTurnCompleteAt"]
+                .as_i64()
+                .is_some()
+        );
+    }
+
+    async fn task6_recover_final_native_question(blocking: Option<bool>) {
+        let witness = tempfile::tempdir().unwrap();
+        let operations = witness.path().join("native-operations.jsonl");
+        let behavior = if let Some(blocking) = blocking {
+            json!({"recordTurns":true,"liveTranscript":true,"appendThreadOperationLogPath":operations,"serverRequestsByPrompt":{"ask":{"id":51,"method":"item/tool/requestUserInput","params":{"isBlocking":blocking,"questions":[{"id":"choice","header":"Choice","question":"Where?","options":null}]}}}})
+        } else {
+            json!({"appendThreadOperationLogPath":operations,"overrides":{"turn/start":{"result":{"turn":{"id":"ongoing-turn","status":"inProgress"}}}},"notificationsAfterMethods":{"turn/start":[{"method":"turn/started","params":{"threadId":"thread-new-1","turn":{"id":"ongoing-turn","status":"inProgress"}}},{"method":"item/completed","params":{"threadId":"thread-new-1","turnId":"ongoing-turn","item":{"id":"async-final","type":"agentMessage","text":"Ongoing work with an async question","delivery":"async","questions":[{"title":"Where?","options":["Staging"]}]}}}]}})
+        };
+        let mut fixture = native_codex_fixture(behavior).await;
+        let transport = fixture.transport.clone();
+        transport.start(&fixture.profile).await.unwrap();
+        let mut events = transport.take_event_stream().unwrap();
+        while events.try_recv().is_ok() {}
+        let reads_before = std::fs::read_to_string(&operations)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains("thread/read"))
+            .count();
+        while transport
+            .event_tx
+            .try_send(AgentEvent::Provider {
+                payload: json!({"occupied":true}),
+            })
+            .is_ok()
+        {}
+        transport
+            .dispatch(
+                &RequestId::parse("final-question").unwrap(),
+                "ask",
+                &fixture.profile,
+            )
+            .await
+            .unwrap();
+        let kind = if blocking.is_some() {
+            "freshAgent.turn.waiting"
+        } else {
+            "freshAgent.question.available"
+        };
+        let at = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let frame: Value =
+                    serde_json::from_str(&fixture.diagnostic.recv().await.unwrap()).unwrap();
+                if frame["event"]["type"] == kind {
+                    break frame["event"]["at"].clone();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        // No native frames follow the final waiting/action edge. Only releasing
+        // downstream capacity can restore the dropped content and current control.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (recovery, decisions) = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut recovery = None;
+            let mut decisions = std::collections::BTreeMap::new();
+            loop {
+                match events.recv().await.unwrap() {
+                    AgentEvent::Provider { payload }
+                        if payload["event"]["retainedState"].is_object() =>
+                    {
+                        recovery = Some(payload["event"]["retainedState"].clone())
+                    }
+                    AgentEvent::PermissionRequested {
+                        decision_id,
+                        payload,
+                    } => {
+                        decisions.insert(decision_id, payload);
+                    }
+                    _ => {}
+                }
+                if recovery.is_some() && (blocking.is_none() || !decisions.is_empty()) {
+                    break (recovery.unwrap(), decisions);
+                }
+            }
+        })
+        .await
+        .expect("the final native question must recover without another provider frame");
+        let reads_after = std::fs::read_to_string(&operations)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains("thread/read"))
+            .count();
+        let mut drained = None;
+        if blocking.is_some() {
+            let decision = decisions.keys().next().unwrap();
+            transport
+                .resolve_permission(decision, json!({"answers":{"choice":"Staging"}}))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let frame: Value =
+                        serde_json::from_str(&fixture.diagnostic.recv().await.unwrap()).unwrap();
+                    if frame["event"]["type"] == "freshAgent.turn.complete" {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            drained = transport.retained_state().await.unwrap();
+        }
+        transport.clone().stop().await.unwrap();
+        assert_eq!(
+            reads_after, reads_before,
+            "bridge recovery must not invoke native history merely to repair loss"
+        );
+        assert_eq!(recovery["snapshot"]["status"], "running");
+        let mark = &recovery["attentionMarks"][0];
+        assert!(mark.get("lastTurnCompleteAt").is_none());
+        if let Some(blocking) = blocking {
+            assert_eq!(mark["lastWaitingAt"], at);
+            assert_eq!(recovery["pendingControls"].as_array().unwrap().len(), 1);
+            assert_eq!(recovery["pendingControls"][0]["isBlocking"], blocking);
+            assert_eq!(
+                decisions.len(),
+                1,
+                "duplicate recovery deliveries retain one actual decision identity"
+            );
+            assert_eq!(
+                decisions.values().next().unwrap()["providerRequest"]["id"],
+                51
+            );
+            assert!(drained.unwrap()["attentionMarks"][0].get("lastWaitingAt").is_none(),"the recovered question remains answerable and its final awaited drain clears waiting");
+        } else {
+            assert_eq!(mark["lastQuestionAvailableAt"], at);
+            assert!(mark.get("lastWaitingAt").is_none());
+            assert!(recovery["pendingControls"].as_array().unwrap().is_empty());
+            assert!(
+                decisions.is_empty(),
+                "async transcript content must never become a durable permission decision"
+            );
+            assert!(serde_json::to_string(&recovery["snapshot"])
+                .unwrap()
+                .contains("Ongoing work with an async question"));
+        }
+    }
+
+    #[tokio::test]
+    async fn task6_final_false_flag_question_recovers_an_answerable_decision() {
+        task6_recover_final_native_question(Some(false)).await;
+    }
+    #[tokio::test]
+    async fn task6_final_blocking_question_recovers_an_answerable_decision() {
+        task6_recover_final_native_question(Some(true)).await;
+    }
+    #[tokio::test]
+    async fn task6_final_async_content_recovers_without_a_permission_or_waiting() {
+        task6_recover_final_native_question(None).await;
+    }
+
+    #[tokio::test]
+    async fn task6_final_completion_overrides_cached_active_native_history_without_an_rpc() {
+        let witness = tempfile::tempdir().unwrap();
+        let release = witness.path().join("release-turn");
+        let operations = witness.path().join("operations.jsonl");
+        let mut fixture=native_codex_fixture(json!({"recordTurns":true,"liveTranscript":true,"waitForTurnReleasePath":release,"appendThreadOperationLogPath":operations})).await;
+        let transport = fixture.transport.clone();
+        transport.start(&fixture.profile).await.unwrap();
+        let mut events = transport.take_event_stream().unwrap();
+        transport
+            .dispatch(
+                &RequestId::parse("cached-active").unwrap(),
+                "run",
+                &fixture.profile,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let frame: Value =
+                    serde_json::from_str(&fixture.diagnostic.recv().await.unwrap()).unwrap();
+                if frame["event"]["type"] == "freshAgent.transcript.patch"
+                    && frame.to_string().contains("Native streaming fragment")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let active = transport.snapshot().await.unwrap();
+        assert_eq!(
+            active["status"], "running",
+            "precondition: exact native history was cached while genuinely active"
+        );
+        let reads_before = std::fs::read_to_string(&operations)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("thread/read"))
+            .count();
+        while events.try_recv().is_ok() {}
+        while transport
+            .event_tx
+            .try_send(AgentEvent::Provider {
+                payload: json!({"occupied":true}),
+            })
+            .is_ok()
+        {}
+        std::fs::write(&release, b"complete native turn").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let frame: Value =
+                    serde_json::from_str(&fixture.diagnostic.recv().await.unwrap()).unwrap();
+                if frame["event"]["type"] == "freshAgent.turn.complete" {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let recovered = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(AgentEvent::Provider { payload }) = events.recv().await {
+                    if payload["event"]["retainedState"].is_object() {
+                        break payload["event"]["retainedState"].clone();
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let reads_after = std::fs::read_to_string(operations)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("thread/read"))
+            .count();
+        transport.clone().stop().await.unwrap();
+        assert_eq!(reads_after, reads_before);
+        assert_eq!(
+            recovered["snapshot"]["status"], "idle",
+            "a final completion is authoritative over an earlier active native read: {recovered}"
+        );
+        assert_eq!(recovered["snapshot"]["capabilities"]["send"], true);
+        assert_eq!(recovered["snapshot"]["capabilities"]["interrupt"], false);
+    }
+
+    #[tokio::test]
+    async fn task6_upstream_lag_ending_in_a_control_recovers_without_later_frames() {
+        let (bus, rx) = broadcast::channel(1);
+        let (created, _) = watch::channel(None);
+        let (native, _) = watch::channel(Some("thread-upstream".to_string()));
+        let (events, mut event_rx) = mpsc::channel(1);
+        events
+            .send(AgentEvent::Provider {
+                payload: json!({"occupied":true}),
+            })
+            .await
+            .unwrap();
+        let (send_outcomes, _) = broadcast::channel(8);
+        let (kill_outcomes, _) = broadcast::channel(8);
+        let _bridge = spawn_broadcast_bridge(
+            FreshProvider::Codex,
+            rx,
+            BroadcastBridgeOutputs {
+                retained_codex: None,
+                created,
+                native,
+                events,
+                send_outcomes,
+                kill_outcomes,
+                suppressed_kills: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            },
+        );
+        let request = |id: &str| {
+            json!({"type":"freshAgent.event","provider":"codex","sessionType":"freshcodex","sessionId":"thread-upstream","event":{"type":"freshAgent.question.request","requestId":id}}).to_string()
+        };
+        bus.send(request("first-control")).unwrap();
+        // The first durable conversion waits for the full downstream queue.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        for _ in 0..10 {
+            bus.send(request("final-control")).unwrap();
+        }
+        let recovered = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(AgentEvent::Provider { payload }) = event_rx.recv().await {
+                    if payload["event"]["type"] == "freshAgent.host.backpressure" {
+                        break payload;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(recovered.is_ok(),"lag before the journal must recover even when the last retained frame is a durable control and the provider becomes silent");
+    }
+
+    #[tokio::test]
+    async fn task6_final_dropped_frame_recovers_without_another_provider_frame() {
+        let (bus, rx) = broadcast::channel(8);
+        let (created, _) = watch::channel(None);
+        let (native, _) = watch::channel(Some("thread-final".to_string()));
+        let (events, mut event_rx) = mpsc::channel(1);
+        events
+            .send(AgentEvent::Provider {
+                payload: json!({"occupied":true}),
+            })
+            .await
+            .unwrap();
+        let (send_outcomes, _) = broadcast::channel(8);
+        let (kill_outcomes, _) = broadcast::channel(8);
+        let _bridge = spawn_broadcast_bridge(
+            FreshProvider::Codex,
+            rx,
+            BroadcastBridgeOutputs {
+                retained_codex: None,
+                created,
+                native,
+                events,
+                send_outcomes,
+                kill_outcomes,
+                suppressed_kills: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            },
+        );
+        bus.send(json!({"type":"freshAgent.event","provider":"codex","sessionType":"freshcodex","sessionId":"thread-final","event":{"type":"freshAgent.turn.complete","at":100}}).to_string()).unwrap();
+        // Leave capacity unavailable while the bridge consumes its only input.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        event_rx.recv().await.unwrap();
+        let recovery = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("a final drop must independently await capacity and recover")
+            .unwrap();
+        let AgentEvent::Provider { payload } = recovery else {
+            panic!("routed recovery event")
+        };
+        assert_eq!(payload["type"], "freshAgent.event");
+        assert_eq!(payload["provider"], "codex");
+        assert_eq!(payload["sessionType"], "freshcodex");
+        assert_eq!(payload["sessionId"], "thread-final");
+        assert_eq!(payload["event"]["type"], "freshAgent.host.backpressure");
+    }
+
+    #[tokio::test]
     async fn managed_provider_claude_native_identity_uses_actual_adapter_event_name() {
         let (bus, rx) = broadcast::channel(8);
         let (created, _) = watch::channel(None);
@@ -1687,10 +2340,11 @@ mod tests {
         let (events, mut event_rx) = mpsc::channel(8);
         let (send_outcomes, _) = broadcast::channel(8);
         let (kill_outcomes, _) = broadcast::channel(8);
-        spawn_broadcast_bridge(
+        let _bridge = spawn_broadcast_bridge(
             FreshProvider::Claude,
             rx,
             BroadcastBridgeOutputs {
+                retained_codex: None,
                 created,
                 native,
                 events,

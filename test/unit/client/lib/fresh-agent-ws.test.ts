@@ -1,3 +1,4 @@
+import savedCodexNativeHistory from '../../../fixtures/managed-native-history/codex.json'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import freshAgentReducer, { materializeSession, sessionCreated } from '@/store/freshAgentSlice'
@@ -74,6 +75,36 @@ describe('fresh-agent-ws', () => {
     expect(store.getState().freshAgentLive.bySession[key].projection?.id).toBe('p')
     send({ type: 'freshAgent.transcript.patch', sessionId: outer.sessionId, projectionId: 'p', historyGeneration: 0, ops: [{ op: 'upsertItem', nativeTurnId: 't', row: { ...row, items: [] }, item: { id: 'a', kind: 'text', text: 'Hello' }, complete: true, revision: 3 }, { op: 'appendItem', nativeTurnId: 't', rowId: 't', itemId: 'a', field: 'text', text: 'lo', revision: 4 }] })
     expect(store.getState().freshAgentLive.bySession[key].projection?.turns[0].items).toEqual([{ id: 'a', kind: 'text', text: 'Hello' }])
+  })
+  it('task6 applies retained output immediately and rejects a retired source after replacement', () => {
+    const store = createFreshAgentStore()
+    const outer = { type: 'freshAgent.event' as const, provider: 'codex' as const, sessionType: 'freshcodex' as const, sessionId: savedCodexNativeHistory.threadId }
+    const send = (id: string, text: string, incarnationId: string) => handleFreshAgentMessage(store.dispatch, { ...outer,
+      event: { type: 'freshAgent.host.backpressure', retainedState: {
+        source: { projectionId: id, ownerEpoch: 0, ownerGeneration: 0, soulId: 'soul', incarnationId, hostBootId: incarnationId },
+        snapshot: { ...savedCodexNativeHistory, turns: [{ id:'t',turnId:'t',role:'assistant',summary:'',items:[{id:'answer',kind:'text',text}] }], extensions: { codex: { projection: {
+          id,historyGeneration:0,eventRevision:10,eventOwnedTurnIds:['t'],nativePreviewTurnIds:[],nativeFinalTurnIds:[],turnRows:{t:['t']},turnOutputStates:{t:{provenance:'retained',diagnostic:'unsaved',refreshPending:false}},settledTurnIds:['t'],completedItems:{t:['answer']},
+        } } } }, pendingControls: [], attentionMarks: [],
+      } },
+    })
+    send('p1','Recovered final output','incarnation-one')
+    const key = `freshcodex:codex:${outer.sessionId}`
+    expect(store.getState().freshAgentLive.bySession[key]?.projection?.turns[0].items[0]).toMatchObject({text:'Recovered final output'})
+    send('p2','Replacement output','incarnation-two')
+    send('p1','Late retired output','incarnation-one')
+    expect(store.getState().freshAgentLive.bySession[key]?.projection?.id).toBe('p2')
+    expect(store.getState().freshAgentLive.bySession[key]?.projection?.turns[0].items[0]).toMatchObject({text:'Replacement output'})
+  })
+  it('task6 detects a missing consumed patch prefix without applying an unbased append', () => {
+    const store = createFreshAgentStore()
+    const outer = {type:'freshAgent.event' as const,provider:'codex' as const,sessionType:'freshcodex' as const,sessionId:'patch-gap'}
+    const send=(event:Record<string,unknown>) => handleFreshAgentMessage(store.dispatch,{...outer,event})
+    send({type:'freshAgent.session.init',projectionId:'p',historyGeneration:0})
+    send({type:'freshAgent.transcript.patch',sessionId:'patch-gap',projectionId:'p',historyGeneration:0,ops:[{op:'resetTurn',nativeTurnId:'t',revision:1,turns:[{id:'t',turnId:'t',role:'assistant',summary:'',items:[{id:'a',kind:'text',text:'Known prefix'}]}]}]})
+    send({type:'freshAgent.transcript.patch',sessionId:'patch-gap',projectionId:'p',historyGeneration:0,afterRevision:4,ops:[{op:'appendItem',nativeTurnId:'t',rowId:'t',itemId:'a',field:'text',text:' unbased suffix',revision:7}]})
+    const projection=store.getState().freshAgentLive.bySession['freshcodex:codex:patch-gap'].projection
+    expect(projection?.needsResnapshot).toBe(true)
+    expect(projection?.turns[0].items[0]).toMatchObject({text:'Known prefix'})
   })
   beforeEach(() => {
     _resetCancelledCreates()

@@ -38,6 +38,7 @@ pub(super) struct PendingControls {
     waiting_clock: crate::attention::AttentionClock,
     async_question_turn: Option<String>,
     async_question_ids: HashSet<String>,
+    async_actions: HashMap<(String, String), i64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -222,10 +223,67 @@ impl FreshCodexState {
             .store(pending.requests.len(), Ordering::SeqCst);
         if pending.requests.is_empty() {
             controls.last_waiting_at.store(0, Ordering::SeqCst);
+            self.attention.clear_waiting(session_id);
         }
         if let Some((_, quiet, in_flight, _, _)) = self.quiet_handles(session_id).await {
             note_codex_activity(self, session_id, &in_flight, &quiet);
         }
+    }
+
+    pub(super) async fn contextual_answer_targets(
+        &self,
+        session_id: &str,
+        text: &str,
+    ) -> HashMap<(String, String), i64> {
+        let keys = text
+            .lines()
+            .filter_map(|line| {
+                let value: Value =
+                    serde_json::from_str(line.strip_prefix("Answer to Codex question: ")?).ok()?;
+                value["question"].as_str()?;
+                value["answer"].as_str()?;
+                Some((
+                    value["itemId"].as_str()?.to_owned(),
+                    value["questionId"].as_str()?.to_owned(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        if keys.is_empty() {
+            return HashMap::new();
+        }
+        let controls = self
+            .controls
+            .lock()
+            .expect("codex controls registry")
+            .get(session_id)
+            .cloned();
+        let Some(controls) = controls else {
+            return HashMap::new();
+        };
+        let pending = controls.lock().await;
+        keys.into_iter()
+            .filter_map(|key| pending.async_actions.get(&key).map(|at| (key, *at)))
+            .collect()
+    }
+
+    pub(super) async fn acknowledge_contextual_answers(
+        &self,
+        session_id: &str,
+        targets: HashMap<(String, String), i64>,
+    ) {
+        if targets.is_empty() {
+            return;
+        }
+        let controls = self.session_controls(session_id).await;
+        let mut pending = controls.lock().await;
+        pending
+            .async_actions
+            .retain(|key, at| targets.get(key) != Some(at));
+        let available = pending.async_actions.values().copied().max().unwrap_or(0);
+        controls
+            .last_question_available_at
+            .store(available, Ordering::SeqCst);
+        self.notify_retained();
     }
 
     /// Ready-frame marks read retained runtime state only. They never hydrate or resume native history.
@@ -238,26 +296,52 @@ impl FreshCodexState {
             .map(|(id, session)| (id.clone(), session.last_turn_complete_at.clone()))
             .collect::<Vec<_>>();
         let controls = self.controls.lock().expect("codex controls registry");
-        sessions
+        let mut marks: std::collections::BTreeMap<
+            String,
+            freshell_protocol::FreshAgentAttentionMark,
+        > = self
+            .attention
+            .snapshot()
             .into_iter()
-            .map(|(id, complete)| {
-                let retained = controls.get(&id);
-                let waiting = retained.map_or(0, |controls| {
-                    controls.last_waiting_at.load(Ordering::SeqCst)
-                });
-                let available = retained.map_or(0, |controls| {
-                    controls.last_question_available_at.load(Ordering::SeqCst)
-                });
+            .map(|mark| {
+                let id = mark.session_id.clone();
+                (
+                    id,
+                    freshell_protocol::FreshAgentAttentionMark {
+                        provider: PROVIDER.into(),
+                        session_type: mark.session_type,
+                        session_id: mark.session_id,
+                        last_turn_complete_at: mark.last_turn_complete_at,
+                        last_waiting_at: mark.last_waiting_at,
+                        last_question_available_at: None,
+                    },
+                )
+            })
+            .collect();
+        for (id, complete) in sessions {
+            let mark = marks.entry(id.clone()).or_insert_with(|| {
                 freshell_protocol::FreshAgentAttentionMark {
                     provider: PROVIDER.into(),
                     session_type: SESSION_TYPE.into(),
                     session_id: id,
-                    last_turn_complete_at: *complete.lock().expect("attention complete clock"),
-                    last_waiting_at: (waiting > 0).then_some(waiting),
-                    last_question_available_at: (available > 0).then_some(available),
+                    last_turn_complete_at: None,
+                    last_waiting_at: None,
+                    last_question_available_at: None,
                 }
-            })
-            .collect()
+            });
+            mark.last_turn_complete_at = mark
+                .last_turn_complete_at
+                .max(*complete.lock().expect("attention complete clock"));
+        }
+        for (id, mark) in &mut marks {
+            if let Some(retained) = controls.get(id) {
+                let waiting = retained.last_waiting_at.load(Ordering::SeqCst);
+                let available = retained.last_question_available_at.load(Ordering::SeqCst);
+                mark.last_waiting_at = (waiting > 0).then_some(waiting);
+                mark.last_question_available_at = (available > 0).then_some(available);
+            }
+        }
+        marks.into_values().collect()
     }
 
     fn control_event(&self, session_id: &str, event: Value) {
@@ -289,6 +373,34 @@ impl FreshCodexState {
             .clear();
         self.publish_control_membership(session_id, &controls, &pending)
             .await;
+    }
+
+    /// Retire only operations owned by this exact source. A late old consumer
+    /// cannot cancel a replacement incarnation's controls with reused IDs.
+    pub(super) async fn clear_source_controls(
+        &self,
+        session_id: &str,
+        source: &Arc<ControlSource>,
+    ) {
+        let controls = self.session_controls(session_id).await;
+        let mut pending = controls.lock().await;
+        let source = Arc::downgrade(source);
+        pending.requests.retain(|request| {
+            if std::sync::Weak::ptr_eq(&request.source, &source) {
+                self.cancelled_control(session_id, request);
+                false
+            } else {
+                true
+            }
+        });
+        controls
+            .child_turns
+            .lock()
+            .expect("child control turns")
+            .retain(|_, child| !std::sync::Weak::ptr_eq(&child.source, &source));
+        self.publish_control_membership(session_id, &controls, &pending)
+            .await;
+        self.notify_retained();
     }
 
     pub(super) async fn overlay_controls(&self, session_id: &str, snapshot: &mut Value) {
@@ -418,6 +530,7 @@ impl FreshCodexState {
                 if was_empty {
                     let at = pending.waiting_clock.mint();
                     controls.last_waiting_at.store(at, Ordering::SeqCst);
+                    self.attention.record_waiting(session_id, SESSION_TYPE, at);
                     self.control_event(session_id, json!({ "type": "freshAgent.turn.waiting", "sessionId": session_id, "at": at }));
                 }
                 tracing::info!(
@@ -463,6 +576,15 @@ impl FreshCodexState {
                 }
                 if pending.async_question_ids.insert(item_id.into()) {
                     let at = pending.waiting_clock.mint();
+                    for (index, question) in questions.iter().enumerate() {
+                        if question["title"].is_string() {
+                            let id = question["id"]
+                                .as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| index.to_string());
+                            pending.async_actions.insert((item_id.to_owned(), id), at);
+                        }
+                    }
                     controls
                         .last_question_available_at
                         .store(at, Ordering::SeqCst);
@@ -637,7 +759,13 @@ impl FreshCodexState {
         let Some(session) = sessions.get(session_id) else {
             return false;
         };
-        if !Arc::ptr_eq(&session.client, native_client) || !Arc::ptr_eq(&session.projection, source)
+        if session.exited.load(Ordering::SeqCst)
+            || source
+                .lock()
+                .expect("codex projection lock")
+                .source_retired()
+            || !Arc::ptr_eq(&session.client, native_client)
+            || !Arc::ptr_eq(&session.projection, source)
         {
             return false;
         }

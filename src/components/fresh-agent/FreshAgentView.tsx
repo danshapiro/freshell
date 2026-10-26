@@ -3399,7 +3399,9 @@ export function FreshAgentView({
       const resolved = next as FreshAgentSnapshot
       const projectionMetadata = readTranscriptProjection(resolved)
       const projectionLocator = { sessionType: requestSessionType, provider, sessionId }
-      const liveProjection = appStore.getState().freshAgentLive?.bySession[makeFreshAgentSessionKey(projectionLocator)]?.projection
+      const liveSession = appStore.getState().freshAgentLive?.bySession[makeFreshAgentSessionKey(projectionLocator)]
+      const liveProjection = liveSession?.projection
+      if (projectionMetadata && liveSession?.retiredProjectionIds?.[projectionMetadata.id] === true) return
       if (projectionMetadata && liveProjection?.id === projectionMetadata.id && liveProjection.historyGeneration > projectionMetadata.historyGeneration) {
         requestSnapshotRefresh('reconnect')
         return
@@ -4037,6 +4039,19 @@ export function FreshAgentView({
     ? makeFreshAgentSessionKey({ sessionId: paneContent.sessionId, sessionType: paneContent.sessionType, provider: paneContent.provider })
     : undefined
   const landedTranscript = useMemo(() => landedTranscriptOf(snapshot), [snapshot])
+  const retainedSnapshot = useAppSelector((state) => liveSessionKey ? state.freshAgentLive?.bySession[liveSessionKey]?.retainedSnapshot : undefined)
+  useEffect(() => {
+    if (!retainedSnapshot) return
+    // A provider-retained source supersedes history requests already in flight.
+    snapshotRequestAuthorityRef.current.applied = ++snapshotRequestAuthorityRef.current.next
+    commitSnapshot(retainedSnapshot)
+    snapshotDirtyRef.current = false
+    snapshotDirtyBaseRevisionRef.current = null
+    setSnapshotDirty(false)
+    setSnapshotRevealError(null)
+    if (!hiddenRef.current) requestSnapshotRefresh('event')
+    else surfaceRefreshOwedRef.current = true
+  }, [retainedSnapshot, commitSnapshot, requestSnapshotRefresh])
   const rawCodexLiveMetadata = useAppSelector((state) => liveSessionKey ? state.freshAgentLive?.bySession[liveSessionKey]?.codexMetadata : undefined)
   const boundProjectionIdentity = useAppSelector((state) => {
     const projection = liveSessionKey ? state.freshAgentLive?.bySession[liveSessionKey]?.projection : undefined
@@ -4047,9 +4062,8 @@ export function FreshAgentView({
   const projectionNeedsResnapshot = useAppSelector((state) => !hidden && liveSessionKey ? state.freshAgentLive?.bySession[liveSessionKey]?.projection?.needsResnapshot : false)
   useEffect(() => {
     if (!projectionNeedsResnapshot) return
-    markSnapshotDirty()
-    requestRevealRefresh(true)
-  }, [projectionNeedsResnapshot, markSnapshotDirty, requestRevealRefresh])
+    requestSnapshotRefresh('event')
+  }, [projectionNeedsResnapshot, requestSnapshotRefresh])
   const liveTailActive = useAppSelector((state) => (
     liveSessionKey ? liveTailShowsContent(state.freshAgentLive?.bySession[liveSessionKey], landedTranscript) : false
   ))
@@ -4500,6 +4514,8 @@ export function FreshAgentView({
     }))
   }, [dispatch, freshOpenCodeRouteCwd, paneContent.checkpointWorkspace])
 
+  const runtimeOwnerEpoch = runtimeOwner?.epoch
+  const runtimeOwnerGeneration = runtimeOwner?.generation
   const content = useMemo(() => {
     const retainedHistory = snapshot?.extensions?.[snapshot.provider]?.nativeHistoryRetention
     const partialHistory = isRecord(retainedHistory) && retainedHistory.partial === true
@@ -4597,7 +4613,7 @@ export function FreshAgentView({
 
     const childParent: FreshAgentChildParent | undefined = paneContent.provider === 'codex' && paneContent.sessionType === 'freshcodex' && contextSessionId ? {
       provider: 'codex', sessionType: 'freshcodex', parentSessionId: effectiveSessionRef(paneContent)?.sessionId ?? snapshot?.threadId ?? contextSessionId,
-      ...(runtimeOwner ? { observedEpoch: runtimeOwner.epoch, observedGeneration: runtimeOwner.generation } : {}),
+      ...(runtimeOwnerEpoch !== undefined && runtimeOwnerGeneration !== undefined ? { observedEpoch: runtimeOwnerEpoch, observedGeneration: runtimeOwnerGeneration } : {}),
     } : undefined
     const closeChild = () => dispatch(mergePaneContent({ tabId, paneId, updates: { observedChildThreadId: undefined } }))
     return (
@@ -5160,8 +5176,9 @@ export function FreshAgentView({
     restartStuckSidecar,
     rewindToTurn,
     openDelegationSession,
-    runtimeOwner?.epoch,
-    runtimeOwner?.generation,
+    runtimeOwnerEpoch,
+    runtimeOwnerGeneration,
+    requestSnapshotRefresh,
     runShellCommand,
     sessionEnded,
     sessionErrorMessage,

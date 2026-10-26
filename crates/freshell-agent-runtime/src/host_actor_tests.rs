@@ -125,6 +125,16 @@ impl FreshAgentTransport for SnapshotTransport {
         }
         Ok(self.value.clone())
     }
+    async fn retained_state(&self) -> Result<Option<Value>, String> {
+        let retained = self.value.get("retainedState").cloned();
+        if retained.is_some() {
+            if let Some((entered, release)) = &self.pause {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
+        Ok(retained)
+    }
     async fn read_child(&self, _: &str) -> Result<Value, String> {
         self.snapshot().await
     }
@@ -2006,4 +2016,107 @@ async fn configure_without_an_effort_keeps_the_profile_on_the_providers_effort()
             case.provider
         );
     }
+}
+
+#[tokio::test]
+async fn task6_covered_head_precedes_retained_await_so_a_final_event_remains_readable() {
+    let dir = tempfile::tempdir().unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let transport = Arc::new(SnapshotTransport {
+        value: serde_json::json!({"retainedState":{"snapshot":{"turns":[]}}}),
+        live: std::sync::atomic::AtomicBool::new(true),
+        exit_during_read: false,
+        initial_native: Some("native-held".into()),
+        registered: None,
+        pause: Some((entered.clone(), release.clone())),
+    });
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Codex, "held-source", None),
+        transport,
+    )
+    .await
+    .unwrap();
+    actor.record_event(AgentEvent::Provider{payload:serde_json::json!({"type":"freshAgent.event","event":{"type":"freshAgent.status","status":"running"}})}).await.unwrap();
+    let read = tokio::spawn({
+        let actor = actor.clone();
+        async move { actor.read_events(0, 64).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified())
+        .await
+        .unwrap();
+    let final_sequence=actor.record_event(AgentEvent::Provider{payload:serde_json::json!({"type":"freshAgent.event","event":{"type":"freshAgent.turn.complete","at":200}})}).await.unwrap();
+    release.notify_one();
+    let first = read.await.unwrap();
+    assert!(
+        first.head < final_sequence,
+        "the covered head must be captured before the held provider read"
+    );
+    assert_eq!(
+        first.retained_state.as_ref().unwrap()["snapshot"]["turns"],
+        serde_json::json!([])
+    );
+    let next = actor.read_events(first.head, 64).await;
+    assert!(next.events.iter().any(|entry|entry.sequence==final_sequence && matches!(&entry.event,AgentEvent::Provider{payload} if payload["event"]["type"]=="freshAgent.turn.complete")),"advancing through the retained prefix must not skip the final concurrent event");
+    actor.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn task6_default_unsupported_provider_keeps_the_existing_event_wire_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = FakeTransport::new("legacy-native");
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Claude, "legacy", None),
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let batch = actor.read_events(0, 64).await;
+    assert!(batch.retained_state.is_none());
+    assert!(serde_json::to_value(batch)
+        .unwrap()
+        .get("retainedState")
+        .is_none());
+    assert_eq!(transport.dispatches.load(Ordering::SeqCst), 0);
+    actor.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn task6_large_retained_body_stays_out_of_the_small_durable_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = "retained body ".repeat(200_000);
+    let retained = serde_json::json!({"snapshot":{"turns":[{"text":body}]}});
+    let transport = Arc::new(SnapshotTransport {
+        value: serde_json::json!({"retainedState":retained}),
+        live: std::sync::atomic::AtomicBool::new(true),
+        exit_during_read: false,
+        initial_native: Some("body-native".into()),
+        registered: None,
+        pause: None,
+    });
+    let actor = FreshAgentHostActor::open_with_bounds(
+        dir.path(),
+        profile(FreshProvider::Codex, "body-store", None),
+        transport,
+        1024,
+        8,
+    )
+    .await
+    .unwrap();
+    actor.record_event(AgentEvent::Provider{payload:serde_json::json!({"type":"freshAgent.event","event":{"type":"freshAgent.host.backpressure","retainedState":retained}})}).await.expect("a multi-MiB retained body must not consume the 1KiB event journal budget");
+    let batch = actor.read_events(0, 8).await;
+    assert!(
+        batch.retained_state == Some(retained),
+        "the same body is reconstructed from the provider source on read"
+    );
+    assert!(
+        std::fs::metadata(dir.path().join("fresh-agent-state.json"))
+            .unwrap()
+            .len()
+            < 64 * 1024,
+        "only the small recovery edge belongs in durable actor state"
+    );
+    actor.stop().await.unwrap();
 }

@@ -99,6 +99,9 @@ pub(crate) fn hosted_route(message: &ClientMessage) -> HostedRoute {
 }
 
 pub trait HostedFreshAgentGateway: Send + Sync {
+    fn attention_marks(&self) -> BoxFuture<'_, Vec<freshell_protocol::FreshAgentAttentionMark>> {
+        Box::pin(async { Vec::new() })
+    }
     fn dispatch(self: Arc<Self>, command: HostedFreshAgentCommand) -> BoxFuture<'static, ()>;
 }
 
@@ -111,6 +114,13 @@ pub fn install_gateway(gateway: Arc<dyn HostedFreshAgentGateway>) -> Result<(), 
     GATEWAY
         .set(gateway)
         .map_err(|_| "hosted fresh-agent gateway is already installed")
+}
+
+pub(crate) async fn retained_attention_marks() -> Vec<freshell_protocol::FreshAgentAttentionMark> {
+    match GATEWAY.get() {
+        Some(gateway) => gateway.attention_marks().await,
+        None => Vec::new(),
+    }
 }
 
 pub(crate) fn dispatch_if_installed(message: &ClientMessage) -> bool {

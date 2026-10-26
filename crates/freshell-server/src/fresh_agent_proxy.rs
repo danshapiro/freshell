@@ -1024,6 +1024,11 @@ impl HostedFreshAgentProxy {
         let proxy = Arc::clone(self);
         tokio::spawn(async move {
             let mut cursor = 0;
+            let mut source_before = if provider == "codex" {
+                proxy.current_source(&soul).await
+            } else {
+                None
+            };
             loop {
                 match proxy
                     .client
@@ -1031,6 +1036,46 @@ impl HostedFreshAgentProxy {
                     .await
                 {
                     Ok(batch) => {
+                        if let Some(retained) = batch.retained_state {
+                            let after = proxy.current_source(&soul).await;
+                            let valid = source_before.as_ref().zip(after.as_ref()).is_some_and(
+                                |(before, after)| {
+                                    same_retained_host(before, after)
+                                        && retained_matches_view(&retained, before)
+                                        && retained_matches_view(&retained, after)
+                                },
+                            );
+                            source_before = after;
+                            if !valid {
+                                tracing::warn!(provider, soul_id=%soul, "freshagent.gateway.retained_source_changed");
+                                cursor = 0;
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                continue;
+                            }
+                            let presentation = proxy
+                                .presentation_ids
+                                .lock()
+                                .await
+                                .get(&soul)
+                                .cloned()
+                                .unwrap_or_else(|| presentation_session_id.clone());
+                            proxy.forward_retained(
+                                retained,
+                                &provider,
+                                &presentation,
+                                &session_type,
+                                if batch.reset_required {
+                                    "freshAgent.host.journal.reset"
+                                } else {
+                                    "freshAgent.host.backpressure"
+                                },
+                            );
+                            // The retained source covers the complete current prefix,
+                            // including journal entries older than this bounded page.
+                            cursor = batch.head;
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            continue;
+                        }
                         if batch.reset_required {
                             proxy.send(ServerMessage::FreshAgentEvent(FreshAgentEvent {
                                 event: serde_json::json!({
@@ -1085,6 +1130,64 @@ impl HostedFreshAgentProxy {
         true
     }
 
+    async fn current_source(
+        &self,
+        soul: &SoulId,
+    ) -> Option<freshell_runtime_protocol::RuntimeView> {
+        self.client
+            .inventory()
+            .await
+            .ok()?
+            .into_iter()
+            .find(|view| &view.soul_id == soul && view.desired_state == DesiredState::Running)
+    }
+
+    fn forward_retained(
+        &self,
+        mut retained: serde_json::Value,
+        provider: &str,
+        presentation: &str,
+        session_type: &str,
+        event_type: &str,
+    ) {
+        retained["source"]["nativeSessionId"] = retained["snapshot"]["threadId"].clone();
+        if let Some(ownership) = self.ownership.get() {
+            let canonical = ownership.resolve_canonical(provider, presentation);
+            let owner = ownership.observe(provider, &canonical);
+            retained["source"]["ownerEpoch"] = serde_json::json!(owner.epoch);
+            retained["source"]["ownerGeneration"] = serde_json::json!(owner.generation);
+        }
+        freshell_agent_runtime::snapshot_projection::project_hosted_rest_snapshot(
+            &mut retained["snapshot"],
+            provider,
+            session_type,
+        );
+        for mark in retained["attentionMarks"]
+            .as_array_mut()
+            .into_iter()
+            .flatten()
+        {
+            mark["sessionId"] = serde_json::json!(presentation);
+        }
+        self.send(ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            provider: provider.into(),
+            session_type: session_type.into(),
+            session_id: presentation.into(),
+            event: serde_json::json!({"type":event_type,"retainedState":retained}),
+        }));
+        for payload in retained["pendingControls"].as_array().into_iter().flatten() {
+            self.forward_host_event(
+                AgentEvent::PermissionRequested {
+                    decision_id: payload["requestId"].as_str().unwrap_or_default().into(),
+                    payload: payload.clone(),
+                },
+                provider,
+                presentation,
+                session_type,
+            );
+        }
+    }
+
     async fn replay_once(
         &self,
         soul: SoulId,
@@ -1092,9 +1195,35 @@ impl HostedFreshAgentProxy {
         presentation_session_id: &str,
         session_type: &str,
     ) {
-        let Ok(batch) = self.client.fresh_agent_events(soul, 0, 4096).await else {
+        let before = if provider == "codex" {
+            self.current_source(&soul).await
+        } else {
+            None
+        };
+        let Ok(batch) = self.client.fresh_agent_events(soul.clone(), 0, 4096).await else {
             return;
         };
+        if let Some(retained) = batch.retained_state {
+            let after = self.current_source(&soul).await;
+            if before
+                .as_ref()
+                .zip(after.as_ref())
+                .is_some_and(|(before, after)| {
+                    same_retained_host(before, after)
+                        && retained_matches_view(&retained, before)
+                        && retained_matches_view(&retained, after)
+                })
+            {
+                self.forward_retained(
+                    retained,
+                    provider,
+                    presentation_session_id,
+                    session_type,
+                    "freshAgent.host.backpressure",
+                );
+            }
+            return;
+        }
         for event in batch.events {
             self.forward_host_event(event.event, provider, presentation_session_id, session_type);
         }
@@ -1196,6 +1325,70 @@ fn named_provider(provider: &FreshProvider) -> NamedProvider {
 }
 
 impl HostedFreshAgentGateway for HostedFreshAgentProxy {
+    fn attention_marks(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Vec<freshell_protocol::FreshAgentAttentionMark>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let Ok(views) = self.client.inventory().await else {
+                return Vec::new();
+            };
+            let mut marks = Vec::new();
+            for before in views.into_iter().filter(|view| {
+                view.provider.as_deref() == Some("codex")
+                    && view.fresh_agent_session_type.as_deref() == Some("freshcodex")
+                    && view.desired_state == DesiredState::Running
+            }) {
+                let Ok(batch) = self
+                    .client
+                    .fresh_agent_events(before.soul_id.clone(), 0, 1)
+                    .await
+                else {
+                    continue;
+                };
+                let Some(retained) = batch.retained_state else {
+                    continue;
+                };
+                let Some(after) = self.current_source(&before.soul_id).await else {
+                    continue;
+                };
+                if !same_retained_host(&before, &after)
+                    || !retained_matches_view(&retained, &before)
+                    || !retained_matches_view(&retained, &after)
+                {
+                    continue;
+                }
+                let presentation = self
+                    .presentation_ids
+                    .lock()
+                    .await
+                    .get(&before.soul_id)
+                    .cloned()
+                    .or(before.fresh_agent_session_id.clone())
+                    .or(before.native_session_id.clone());
+                let Some(presentation) = presentation else {
+                    continue;
+                };
+                if let Ok(current) = serde_json::from_value::<
+                    Vec<freshell_protocol::FreshAgentAttentionMark>,
+                >(retained["attentionMarks"].clone())
+                {
+                    marks.extend(
+                        current
+                            .into_iter()
+                            .filter(|mark| {
+                                mark.provider == "codex" && mark.session_type == "freshcodex"
+                            })
+                            .map(|mut mark| {
+                                mark.session_id = presentation.clone();
+                                mark
+                            }),
+                    );
+                }
+            }
+            marks
+        })
+    }
     fn dispatch(
         self: Arc<Self>,
         command: HostedFreshAgentCommand,
@@ -1389,6 +1582,30 @@ fn fresh_agent_error_payload(code: &str, message: &str) -> serde_json::Value {
         "code":code,
         "message":message,
     })
+}
+
+fn same_retained_host(
+    before: &freshell_runtime_protocol::RuntimeView,
+    after: &freshell_runtime_protocol::RuntimeView,
+) -> bool {
+    before.soul_id == after.soul_id
+        && before.incarnation_id == after.incarnation_id
+        && before.host_boot_id == after.host_boot_id
+}
+
+fn retained_matches_view(
+    retained: &serde_json::Value,
+    view: &freshell_runtime_protocol::RuntimeView,
+) -> bool {
+    retained["source"]["soulId"].as_str() == Some(view.soul_id.as_str())
+        && retained["source"]["incarnationId"].as_str() == Some(view.incarnation_id.as_str())
+        && view
+            .host_boot_id
+            .as_ref()
+            .is_some_and(|boot| retained["source"]["hostBootId"].as_str() == Some(boot.as_str()))
+        && retained["snapshot"]["provider"] == "codex"
+        && retained["snapshot"]["sessionType"] == "freshcodex"
+        && retained["snapshot"]["threadId"].as_str() == view.native_session_id.as_deref()
 }
 
 fn rewrite_presentation_id(payload: &mut serde_json::Value, presentation_id: &str) {

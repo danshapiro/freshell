@@ -83,9 +83,15 @@ export type LiveNotice = {
 }
 
 import type { TranscriptProjection } from '@/lib/fresh-agent-transcript-projection'
-import type { FreshAgentTranscriptPatch } from '@shared/fresh-agent-contract'
+import type { FreshAgentSnapshot, FreshAgentTranscriptPatch } from '@shared/fresh-agent-contract'
 
 export type FreshAgentLiveSession = {
+  retainedSnapshot?: FreshAgentSnapshot
+  retainedSourceKey?: string
+  /** Small identity tombstones live until this session scope is removed.
+   * Transcript bodies and patch buffers have their own finite bounds. */
+  retiredRetainedSourceKeys?: Record<string, true>
+  retiredProjectionIds?: Record<string, true>
   projection?: TranscriptProjection
   codexMetadata?: Record<string, unknown>
   unboundTranscriptPatches?: FreshAgentTranscriptPatch[]

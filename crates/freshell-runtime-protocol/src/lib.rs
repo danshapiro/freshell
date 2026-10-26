@@ -1994,6 +1994,8 @@ pub struct AgentJournalEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentEventBatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_state: Option<serde_json::Value>,
     pub retained_from: u64,
     pub head: u64,
     pub reset_required: bool,

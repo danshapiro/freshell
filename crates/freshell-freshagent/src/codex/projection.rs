@@ -125,6 +125,7 @@ pub(super) struct ProjectionSnapshot {
     pub metadata: Value,
 }
 
+#[derive(Clone)]
 pub(super) struct CodexProjection {
     pub id: String,
     thread_id: String,
@@ -133,6 +134,8 @@ pub(super) struct CodexProjection {
     pub history_generation: u64,
     revision: u64,
     active_turn: Option<String>,
+    retired: bool,
+    live_status: Option<String>,
     turns: Vec<EventTurn>,
     // Membership fences outlive payload retention. They are never the eight-turn
     // attention cache: old native identities cannot reopen a historical operation.
@@ -146,6 +149,7 @@ pub(super) struct CodexProjection {
     pub plan: Option<Value>,
     pub diff: Option<Value>,
     pending_ops: Vec<Value>,
+    pending_after_revision: Option<u64>,
 }
 
 impl CodexProjection {
@@ -158,6 +162,8 @@ impl CodexProjection {
             history_generation: 0,
             revision: 0,
             active_turn: None,
+            retired: false,
+            live_status: None,
             turns: vec![],
             known_turns: HashSet::new(),
             turn_order: vec![],
@@ -169,6 +175,7 @@ impl CodexProjection {
             plan: None,
             diff: None,
             pending_ops: vec![],
+            pending_after_revision: None,
         }
     }
 
@@ -228,8 +235,13 @@ impl CodexProjection {
     }
 
     pub(super) fn patch(&self, ops: Vec<Value>) -> Value {
+        let after_revision = ops
+            .first()
+            .and_then(|op| op["revision"].as_u64())
+            .unwrap_or(self.revision)
+            .saturating_sub(1);
         json!({"type":"freshAgent.transcript.patch", "sessionId":self.thread_id,
-            "projectionId":self.id, "historyGeneration":self.history_generation, "ops":ops})
+            "projectionId":self.id, "historyGeneration":self.history_generation, "afterRevision":after_revision, "ops":ops})
     }
 
     pub(super) fn metadata_event(&self) -> Value {
@@ -237,6 +249,12 @@ impl CodexProjection {
     }
 
     pub(super) fn enqueue(&mut self, ops: Vec<Value>) {
+        if self.pending_ops.is_empty() {
+            self.pending_after_revision = ops
+                .first()
+                .and_then(|op| op["revision"].as_u64())
+                .map(|revision| revision.saturating_sub(1));
+        }
         for op in ops {
             if let Some(last) = self.pending_ops.last_mut() {
                 if last["op"] == "appendItem"
@@ -259,7 +277,13 @@ impl CodexProjection {
             None
         } else {
             let ops = std::mem::take(&mut self.pending_ops);
-            Some(self.patch(ops))
+            let after_revision = self
+                .pending_after_revision
+                .take()
+                .expect("pending patch prefix");
+            let mut patch = self.patch(ops);
+            patch["afterRevision"] = json!(after_revision);
+            Some(patch)
         }
     }
 
@@ -335,6 +359,58 @@ impl CodexProjection {
                         .any(|turn| turn["id"] == id && turn["status"] == "inProgress")
                 })
             })
+    }
+
+    pub(super) fn observe_status(&mut self, status: &str) {
+        if !self.retired {
+            self.live_status = Some(status.to_owned());
+        }
+    }
+
+    pub(super) fn live_status(&self) -> Option<&str> {
+        self.live_status.as_deref()
+    }
+
+    /// A new source can disclose the prior source's finite evidence. It never
+    /// inherits pending operations, revision baselines, or append authority.
+    pub(super) fn inherit_finite_history(&mut self, prior: &Self) {
+        if self.thread_id != prior.thread_id {
+            return;
+        }
+        let mut finite = prior.clone();
+        finite.freeze_active("interrupted");
+        for turn in &mut finite.turns {
+            if !turn.terminal {
+                turn.raw["status"] = json!("interrupted");
+            }
+            turn.terminal = true;
+            turn.save_reads = MAX_SAVE_READS;
+            if let Some(id) = turn.raw["id"].as_str() {
+                finite.terminal_turns.insert(id.to_owned());
+            }
+        }
+        finite.trim_frozen();
+        self.turns = finite.turns;
+        self.known_turns = finite.known_turns;
+        self.turn_order = finite.turn_order;
+        self.terminal_turns = finite.terminal_turns;
+        self.removed_turns = finite.removed_turns;
+        self.last_native = finite.last_native;
+        self.history_generation = finite.history_generation;
+        self.usage = finite.usage;
+        self.plan = finite.plan;
+        self.diff = finite.diff;
+        self.live_status = Some("idle".into());
+    }
+
+    pub(super) fn source_retired(&self) -> bool {
+        self.retired
+    }
+
+    pub(super) fn retire_source(&mut self) {
+        self.retired = true;
+        self.live_status = Some("exited".into());
+        self.freeze_active("interrupted");
     }
 
     pub(super) fn freeze_active(&mut self, status: &str) {
@@ -414,6 +490,9 @@ impl CodexProjection {
         method: &str,
         params: &Value,
     ) -> Result<Vec<Value>, ProjectionError> {
+        if self.retired {
+            return Ok(vec![]);
+        }
         if params.get("threadId").and_then(Value::as_str) != Some(&self.thread_id) {
             return Ok(vec![]);
         }
@@ -699,6 +778,23 @@ impl CodexProjection {
         }
         self.last_native = Some(raw.clone());
         self.build_snapshot(raw, fence, false)
+    }
+
+    /// Clone the current projection so recovery never advances native-read
+    /// settlement counters or changes the append baseline.
+    pub(super) fn retained_snapshot(
+        &self,
+        unavailable: bool,
+    ) -> Result<ProjectionSnapshot, SnapshotStale> {
+        let mut retained = self.clone();
+        let raw = self.last_native.clone().unwrap_or_else(
+            || json!({"thread":{"id":self.thread_id,"status":{"type":"idle"},"turns":[]}}),
+        );
+        retained.build_snapshot(
+            &raw,
+            &self.begin_history_read(),
+            unavailable || self.retired,
+        )
     }
 
     pub(super) fn unavailable_history(

@@ -2271,3 +2271,130 @@ async fn task5_hosted_elicitation_reuses_resolve_with_tagged_typed_content_and_o
     assert_eq!(settled(server).await, vec!["41", "\"41\""]);
     assert!(receiver.try_recv().is_err());
 }
+
+async fn task6_gateway_source_scenario(scenario: &'static str) {
+    let replaced = scenario != "current" && scenario != "ready-current";
+    let ready = scenario.starts_with("ready-");
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("retained-gateway.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let read_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server_read_started = read_started.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let envelope: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            let result = match envelope.body {
+                AdminCommand::Health => AdminResult::Health { control_epoch:7, installation_id:InstallationId::new() },
+                AdminCommand::Inventory => AdminResult::Inventory(vec![serde_json::from_value(serde_json::json!({
+                    "soulId":"retained-soul", "incarnationId":if scenario == "before-incarnation" || matches!(scenario,"after-incarnation" | "ready-after-incarnation") && server_read_started.load(std::sync::atomic::Ordering::SeqCst) {"replacement-incarnation"} else {"original-incarnation"},
+                    "hostBootId":if scenario == "after-boot" && server_read_started.load(std::sync::atomic::Ordering::SeqCst) {"replacement-boot"} else {"original-boot"}, "launchState":"running","cleanupState":"none","intentRevision":1,"executionGeneration":1,"desiredState":"running","recoveryState":"live","durabilityState":"unknown","allocationState":"allocated","evidenceRevision":0,"successfulRecoveriesInWindow":0,
+                    "provider":"codex","nativeSessionId":if scenario == "before-native" {"replacement-native"} else {"native-owned"},"freshAgentSessionId":"public-owned","freshAgentSessionType":"freshcodex"
+                })).unwrap()]),
+                AdminCommand::FreshAgentReadEvents(_) => {
+                    server_read_started.store(true,std::sync::atomic::Ordering::SeqCst);
+                    AdminResult::FreshAgentEvents(serde_json::from_value(serde_json::json!({
+                        "retainedFrom":10,"head":10,"resetRequired":true,
+                        "retainedState":{"source":{"soulId":"retained-soul","incarnationId":"original-incarnation","hostBootId":"original-boot","projectionId":"source-projection","ownerEpoch":0,"ownerGeneration":0},
+                        "snapshot":{"provider":"codex","sessionType":"freshcodex","threadId":"native-owned","turns":[{"text":"Latest retained body"}]},
+                        "attentionMarks":[{"provider":"codex","sessionType":"freshcodex","sessionId":"native-owned","lastTurnCompleteAt":100}],"pendingControls":[]},
+                        "events":if replaced {serde_json::json!([{"sequence":10,"event":{"kind":"provider","data":{"payload":{"type":"freshAgent.event","provider":"codex","sessionType":"freshcodex","sessionId":"native-owned","event":{"type":"freshAgent.notice","message":"stale native source"}}}}}])} else {serde_json::json!([])}
+                    })).unwrap())
+                }
+                other => panic!("recovery must read retained source, never native history or resume: {other:?}"),
+            };
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: envelope.request_id,
+                    result: Ok(result),
+                },
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let proxy = snapshot_outage_proxy(&socket);
+    if ready {
+        let marks = proxy.attention_marks().await;
+        server.abort();
+        let _ = server.await;
+        if replaced {
+            assert!(marks.is_empty(), "ready must reject a replaced source");
+        } else {
+            assert_eq!(marks.len(), 1);
+            assert_eq!(marks[0].session_id, "public-owned");
+            assert_eq!(marks[0].last_turn_complete_at, Some(100));
+        }
+        return;
+    }
+    let mut frames = proxy.broadcast.subscribe();
+    proxy
+        .start_poller(
+            SoulId::parse("retained-soul").unwrap(),
+            "codex".into(),
+            "public-owned".into(),
+            "freshcodex".into(),
+        )
+        .await;
+    let first = tokio::time::timeout(Duration::from_millis(750), async {
+        loop {
+            let value: serde_json::Value =
+                serde_json::from_str(&frames.recv().await.unwrap()).unwrap();
+            if value["event"]["type"] != "freshAgent.host.journal.reset" || !replaced {
+                break value;
+            }
+        }
+    })
+    .await;
+    server.abort();
+    let _ = server.await;
+    assert!(
+        read_started.load(std::sync::atomic::Ordering::SeqCst),
+        "actual controller event read must run"
+    );
+    if replaced {
+        assert!(
+            first.is_err(),
+            "a source replaced during the read must not forward its old events: {first:?}"
+        );
+    } else {
+        let first =
+            first.expect("journal reset must independently deliver retained provider state");
+        assert_eq!(first["sessionId"], "public-owned");
+        assert_eq!(
+            first["event"]["retainedState"]["snapshot"]["turns"][0]["text"], "Latest retained body",
+            "gateway must apply the authoritative retained source immediately: {first}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn task6_gateway_applies_authoritative_source_on_journal_reset() {
+    task6_gateway_source_scenario("current").await;
+}
+#[tokio::test]
+async fn task6_gateway_rechecks_source_after_controller_read() {
+    task6_gateway_source_scenario("after-incarnation").await;
+}
+
+#[tokio::test]
+async fn task6_gateway_rejects_an_old_source_at_admission() {
+    task6_gateway_source_scenario("before-incarnation").await;
+}
+#[tokio::test]
+async fn task6_gateway_rechecks_host_boot_after_controller_read() {
+    task6_gateway_source_scenario("after-boot").await;
+}
+#[tokio::test]
+async fn task6_gateway_rejects_mismatched_native_identity() {
+    task6_gateway_source_scenario("before-native").await;
+}
+#[tokio::test]
+async fn task6_gateway_ready_uses_current_provider_retained_attention() {
+    task6_gateway_source_scenario("ready-current").await;
+}
+#[tokio::test]
+async fn task6_gateway_ready_rejects_a_replaced_provider_source() {
+    task6_gateway_source_scenario("ready-after-incarnation").await;
+}

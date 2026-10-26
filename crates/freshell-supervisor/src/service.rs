@@ -2188,7 +2188,33 @@ impl Supervisor {
             )
             .await?
         {
-            HostResult::FreshAgentEvents(events) => {
+            HostResult::FreshAgentEvents(mut events) => {
+                let current = self
+                    .registry
+                    .active_handle_for_soul(soul_id.clone())
+                    .await
+                    .map_err(map_registry)?;
+                if current.incarnation_id() != handle.incarnation_id() {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::OwnershipMismatch,
+                        "fresh-agent events owner changed",
+                    ));
+                }
+                if let Some(retained) = &mut events.retained_state {
+                    let after = self
+                        .authenticate_host(current.incarnation_id(), current.runtime_dir())
+                        .await?;
+                    if after.host_boot_id != host.host_boot_id {
+                        return Err(RuntimeError::new(
+                            RuntimeErrorCode::OwnershipMismatch,
+                            "fresh-agent retained source boot changed",
+                        ));
+                    }
+                    retained["source"]["soulId"] = serde_json::json!(soul_id);
+                    retained["source"]["incarnationId"] =
+                        serde_json::json!(handle.incarnation_id());
+                    retained["source"]["hostBootId"] = serde_json::json!(host.host_boot_id);
+                }
                 for event in &events.events {
                     if let freshell_runtime_protocol::AgentEvent::Started { native_session_id } =
                         &event.event
@@ -3318,7 +3344,8 @@ where
         reply.result,
         Ok(AdminResult::FreshAgentHistory(_)
             | AdminResult::FreshAgentSnapshot(_)
-            | AdminResult::FreshAgentChildSnapshot(_))
+            | AdminResult::FreshAgentChildSnapshot(_)
+            | AdminResult::FreshAgentEvents(_))
     ) {
         freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES
     } else {
@@ -3552,7 +3579,9 @@ pub(crate) async fn request_host_reply(
             .map_err(|error| unreachable(error.to_string()))?;
         let reply_limit = if matches!(
             envelope.body,
-            HostCommand::FreshAgentReadSnapshot { .. } | HostCommand::FreshAgentReadChild { .. }
+            HostCommand::FreshAgentReadSnapshot { .. }
+                | HostCommand::FreshAgentReadChild { .. }
+                | HostCommand::FreshAgentReadEvents { .. }
         ) {
             freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES
         } else {

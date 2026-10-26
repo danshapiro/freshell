@@ -21,6 +21,8 @@ export const SURFACE_INVALIDATING_FRESH_AGENT_EVENTS: ReadonlySet<string> = new 
 // Events that re-drive the pane's snapshot while it is visible.
 export const SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS: ReadonlySet<string> = new Set([
   ...SURFACE_INVALIDATING_FRESH_AGENT_EVENTS,
+  'freshAgent.host.backpressure',
+  'freshAgent.host.journal.reset',
   'freshAgent.session.changed',
   'freshAgent.session.snapshot',
   'freshAgent.result',
@@ -39,6 +41,8 @@ export const SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS: ReadonlySet<string> = new
 // hidden pane immediately usable when its last transcript snapshot is still
 // current.
 export const TRANSCRIPT_INVALIDATING_FRESH_AGENT_EVENTS: ReadonlySet<string> = new Set([
+  'freshAgent.host.backpressure',
+  'freshAgent.host.journal.reset',
   'freshAgent.session.changed',
   'freshAgent.result',
   'freshAgent.turn.complete',

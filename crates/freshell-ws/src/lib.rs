@@ -659,6 +659,7 @@ pub async fn build_handshake_with_capabilities(
     let fresh_agent_attention = if fresh_agent_attention_replay_v1 {
         let mut marks = state.fresh_claude.attention_marks();
         marks.extend(state.fresh_codex.attention_marks().await);
+        marks.extend(hosted_fresh_agent::retained_attention_marks().await);
         (!marks.is_empty()).then_some(marks)
     } else {
         None

@@ -46,6 +46,15 @@ function sessionFor(state: FreshAgentLiveState, locator: FreshAgentSessionLocato
   return state.bySession[key]
 }
 
+function retireRetainedSource(session: FreshAgentLiveSession): void {
+  if (session.retainedSourceKey) {
+    session.retiredRetainedSourceKeys ??= {}
+    session.retiredRetainedSourceKeys[session.retainedSourceKey] = true
+  }
+  delete session.retainedSourceKey
+  delete session.retainedSnapshot
+}
+
 /** Session keys are `${sessionType}:${provider}:${sessionId}`; the id may itself contain ':'. */
 function sessionIdOfKey(key: string): string {
   return key.split(':').slice(2).join(':')
@@ -193,11 +202,27 @@ const freshAgentLiveSlice = createSlice({
         else watermark.gap = true
       }
     },
-    transcriptProjectionSnapshotReceived(state, action: PayloadAction<FreshAgentSessionLocator & { snapshot: FreshAgentSnapshot }>) {
-      const { snapshot, ...locator } = action.payload
+    transcriptProjectionSnapshotReceived(state, action: PayloadAction<FreshAgentSessionLocator & { snapshot: FreshAgentSnapshot; retainedSourceKey?: string }>) {
+      const { snapshot, retainedSourceKey, ...locator } = action.payload
       const metadata = readTranscriptProjection(snapshot)
       if (!metadata) return
       const session = sessionFor(state, locator)
+      if (session.retiredProjectionIds?.[metadata.id] === true) return
+      if (retainedSourceKey) {
+        if (session.retiredRetainedSourceKeys?.[retainedSourceKey] === true) return
+        if (session.projection?.id === metadata.id && (session.projection.historyGeneration > metadata.historyGeneration
+          || session.projection.historyGeneration === metadata.historyGeneration && session.projection.eventRevision > metadata.eventRevision)) return
+        if (session.retainedSourceKey && session.retainedSourceKey !== retainedSourceKey) {
+          retireRetainedSource(session)
+        }
+        session.retainedSourceKey = retainedSourceKey
+        session.retainedSnapshot = snapshot
+      }
+      if (session.projection && session.projection.id !== metadata.id) {
+        session.retiredProjectionIds ??= {}
+        session.retiredProjectionIds[session.projection.id] = true
+        if (!retainedSourceKey) retireRetainedSource(session)
+      }
       if (!session.projection || session.projection.id !== metadata.id || session.projection.historyGeneration < metadata.historyGeneration) {
         session.projection = bindTranscriptProjection(session.projection, metadata.id, metadata.historyGeneration)
       }

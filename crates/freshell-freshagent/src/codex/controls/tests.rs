@@ -1513,3 +1513,265 @@ async fn task5_control_diagnostics_keep_locators_and_severity_without_secret_pay
     peer.disconnect();
     state.shutdown().await;
 }
+
+async fn task6_shutdown(state: &FreshCodexState, peer: ChannelPeer) {
+    // ChannelTransport recv holds its mutex until the owning peer closes.
+    // Close exactly once before waiting for the consumer and sidecar watcher.
+    drop(peer);
+    tokio::time::timeout(Duration::from_secs(10), state.shutdown())
+        .await
+        .expect("fixture shutdown");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn task6_native_death_retains_finite_output_and_completion_but_no_dead_control() {
+    let (transport, peer) = freshell_codex::new_channel_transport();
+    let (client, notifications) = CodexAppServerClient::connect(transport);
+    let (state, mut rx) = state_with_bus();
+    let child = spawn_sleeper();
+    let pid = child.id().unwrap();
+    insert_fake_session_with_real_consumer(
+        &state,
+        "thread-1",
+        Arc::new(client),
+        Arc::new(StdMutex::new(Some("turn-1".into()))),
+        notifications,
+        child,
+        "codex-task6-death",
+    )
+    .await;
+    peer.emit_notification(
+        "turn/started",
+        json!({"threadId":"thread-1","turn":{"id":"turn-1","status":"inProgress"}}),
+    );
+    peer.emit_notification("item/started",json!({"threadId":"thread-1","turnId":"turn-1","item":{"id":"answer","type":"agentMessage","text":""}}));
+    peer.emit_notification("item/agentMessage/delta",json!({"threadId":"thread-1","turnId":"turn-1","itemId":"answer","delta":"Available interrupted output"}));
+    peer.request_client(&RequestId::Int(91),"item/tool/requestUserInput",json!({"threadId":"thread-1","turnId":"turn-1","itemId":"question","isBlocking":false,"questions":[{"id":"choice","header":"Choice","question":"Pick","options":null}]}));
+    loop {
+        if event(&mut rx).await["type"] == "freshAgent.turn.waiting" {
+            break;
+        }
+    }
+    // This exact PID is the fixture child just transferred to its watcher.
+    // The entire test runs in the strict disposable process-kill sandbox.
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    let complete = loop {
+        let next = event(&mut rx).await;
+        if next["type"] == "freshAgent.turn.complete" {
+            break next;
+        }
+    };
+    let retained = state.retained_state("thread-1").await.unwrap();
+    let before = retained["snapshot"]["turns"].clone();
+    peer.emit_notification(
+        "item/agentMessage/delta",
+        json!({"threadId":"thread-1","turnId":"turn-1","itemId":"answer","delta":" late append"}),
+    );
+    peer.emit_notification(
+        "turn/started",
+        json!({"threadId":"thread-1","turn":{"id":"late-dead-turn","status":"inProgress"}}),
+    );
+    peer.emit_notification("item/started",json!({"threadId":"thread-1","turnId":"late-dead-turn","item":{"id":"late-dead-item","type":"agentMessage","text":"Queued dead source must stay finite"}}));
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let after = state.retained_state("thread-1").await.unwrap();
+    task6_shutdown(&state, peer).await;
+    assert!(
+        retained["pendingControls"].as_array().unwrap().is_empty(),
+        "dead native controls must be drained before the completion can be replayed: {retained}"
+    );
+    assert!(retained["attentionMarks"][0].get("lastWaitingAt").is_none());
+    assert_eq!(
+        retained["attentionMarks"][0]["lastTurnCompleteAt"],
+        complete["at"]
+    );
+    assert_eq!(
+        retained["snapshot"]["extensions"]["codex"]["projection"]["turnOutputStates"]["turn-1"]
+            ["diagnostic"],
+        "interrupted"
+    );
+    assert!(serde_json::to_string(&before)
+        .unwrap()
+        .contains("Available interrupted output"));
+    assert_eq!(
+        after["snapshot"]["turns"], before,
+        "late buffered appends cannot reopen a dead source"
+    );
+}
+
+#[tokio::test]
+async fn task6_admission_continues_the_retained_completion_clock_floor() {
+    let (transport, peer) = freshell_codex::new_channel_transport();
+    let (client, notifications) = CodexAppServerClient::connect(transport);
+    let (state, mut rx) = state_with_bus();
+    let floor = crate::rollback_record::now_ms() + 60_000;
+    state
+        .attention
+        .record_turn_complete("thread-1", SESSION_TYPE, floor);
+    insert_fake_session_with_real_consumer(
+        &state,
+        "thread-1",
+        Arc::new(client),
+        Arc::new(StdMutex::new(Some("turn-1".into()))),
+        notifications,
+        spawn_sleeper(),
+        "codex-task6-clock",
+    )
+    .await;
+    peer.emit_notification(
+        "turn/started",
+        json!({"threadId":"thread-1","turn":{"id":"turn-1","status":"inProgress"}}),
+    );
+    peer.emit_notification(
+        "turn/completed",
+        json!({"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}),
+    );
+    let complete = loop {
+        let next = event(&mut rx).await;
+        if next["type"] == "freshAgent.turn.complete" {
+            break next;
+        }
+    };
+    task6_shutdown(&state, peer).await;
+    assert!(complete["at"].as_i64().unwrap()>floor,"an admitted incarnation must not regress below the retained clock even if wall time moved backwards: {complete}");
+}
+
+#[tokio::test]
+async fn task6_retained_source_preserves_synthesized_stuck_status_without_native_read() {
+    let (state, peer, mut rx) = runtime().await;
+    state.set_codex_quiet_window_ms_for_tests(80);
+    peer.emit_notification(
+        "turn/started",
+        json!({"threadId":"thread-1","turn":{"id":"turn-1","status":"inProgress"}}),
+    );
+    peer.emit_notification("item/started", json!({"threadId":"thread-1","turnId":"turn-1","item":{"id":"partial","type":"agentMessage","text":"Available quiet output"}}));
+    let complete = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let value = event(&mut rx).await;
+            if value["type"] == "freshAgent.turn.complete" {
+                break value;
+            }
+        }
+    })
+    .await
+    .expect("actual quiet deadline produces an attention edge");
+    let retained = state.retained_state("thread-1").await.unwrap();
+    let unsolicited = tokio::time::timeout(Duration::from_millis(30), peer.next_raw_frame()).await;
+    task6_shutdown(&state, peer).await;
+    assert_eq!(
+        retained["snapshot"]["status"], "stuck",
+        "retained recovery must preserve the authoritative quiet deadline status"
+    );
+    assert_eq!(
+        retained["attentionMarks"][0]["lastTurnCompleteAt"],
+        complete["at"]
+    );
+    assert!(retained["pendingControls"].as_array().unwrap().is_empty());
+    assert!(retained["snapshot"]
+        .to_string()
+        .contains("Available quiet output"));
+    assert!(
+        unsolicited.is_err(),
+        "a retained read cannot hydrate native history"
+    );
+}
+
+async fn task6_send_context_answer(
+    state: &FreshCodexState,
+    peer: &ChannelPeer,
+    question_id: &str,
+    outcome: &str,
+) {
+    let text = format!(
+        "Answer to Codex question: {}",
+        json!({"itemId":"async-answerable","questionId":question_id,"question":"A contextual question","answer":"Chosen ordinary answer"})
+    );
+    let request_id = format!("answer-{question_id}");
+    let send = tokio::spawn({
+        let state = state.clone();
+        let text = text.clone();
+        async move {
+            state.handle_send(serde_json::from_value(json!({"provider":"codex","sessionType":"freshcodex","sessionId":"thread-1","requestId":request_id,"text":text})).unwrap()).await
+        }
+    });
+    let wire = tokio::time::timeout(Duration::from_secs(3), async {
+        let (mut id, mut method, mut params) = peer.expect_request().await;
+        if method == "initialize" {
+            peer.respond(&id, json!({}));
+            peer.expect_notification().await;
+            (id, method, params) = peer.expect_request().await;
+        }
+        (id, method, params)
+    })
+    .await
+    .expect("explicit ordinary answer reaches native transport");
+    assert_eq!(wire.1, "turn/steer");
+    assert_eq!(wire.2["input"][0]["text"], text);
+    match outcome {
+        "accepted" => peer.respond(&wire.0, json!({"turnId":"turn-1"})),
+        "refused" => peer.respond_error(&wire.0, -32600, "native input refused"),
+        "ambiguous" => peer.respond(&wire.0, json!({})),
+        _ => unreachable!(),
+    }
+    tokio::time::timeout(Duration::from_secs(3), send)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+async fn task6_context_answer_outcome(outcome: &str) {
+    let (state, peer, mut rx) = runtime().await;
+    peer.emit_notification(
+        "turn/started",
+        json!({"threadId":"thread-1","turn":{"id":"turn-1","status":"inProgress"}}),
+    );
+    peer.emit_notification("item/completed",json!({"threadId":"thread-1","turnId":"turn-1","item":{"id":"async-answerable","type":"agentMessage","text":"Ongoing work with contextual choices","delivery":"async","questions":[{"id":"one","title":"First?"},{"id":"two","title":"Second?"}]}}));
+    loop {
+        if event(&mut rx).await["type"] == "freshAgent.question.available" {
+            break;
+        }
+    }
+    let original = state.attention_marks().await[0].last_question_available_at;
+    task6_send_context_answer(&state, &peer, "one", outcome).await;
+    let after_one = state.attention_marks().await[0].clone();
+    if outcome == "accepted" {
+        task6_send_context_answer(&state, &peer, "two", outcome).await;
+    }
+    let after_two = state.attention_marks().await[0].clone();
+    let controls = state.retained_control_events("thread-1").await;
+    let unsolicited = tokio::time::timeout(Duration::from_millis(30), peer.next_raw_frame()).await;
+    task6_shutdown(&state, peer).await;
+    assert_eq!(
+        after_one.last_question_available_at, original,
+        "answering one question must preserve the remaining independent action"
+    );
+    assert_eq!(
+        after_two.last_question_available_at,
+        if outcome == "accepted" {
+            None
+        } else {
+            original
+        },
+        "only accepted contextual input clears its action; refusal and uncertainty preserve it"
+    );
+    assert!(after_one.last_waiting_at.is_none() && after_two.last_waiting_at.is_none());
+    assert!(after_two.last_turn_complete_at.is_none());
+    assert!(
+        controls.is_empty(),
+        "async content never becomes a durable native decision"
+    );
+    assert!(unsolicited.is_err(),"ordinary answers must never be automatically retried or converted to native control replies");
+}
+#[tokio::test]
+async fn task6_accepted_contextual_answers_clear_only_their_actions() {
+    task6_context_answer_outcome("accepted").await;
+}
+#[tokio::test]
+async fn task6_refused_contextual_answer_preserves_action_attention() {
+    task6_context_answer_outcome("refused").await;
+}
+#[tokio::test]
+async fn task6_ambiguous_contextual_answer_preserves_action_without_resend() {
+    task6_context_answer_outcome("ambiguous").await;
+}

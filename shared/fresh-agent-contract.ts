@@ -284,6 +284,7 @@ export const FreshAgentTranscriptPatchSchema = z.object({
   sessionId: z.string().min(1),
   projectionId: z.string().min(1),
   historyGeneration: EventRevisionSchema,
+  afterRevision: EventRevisionSchema.optional(),
   ops: z.array(z.discriminatedUnion('op', [
     z.object({ ...TranscriptPatchBase, op: z.literal('resetTurn'), turns: z.array(FreshAgentTurnSchema), completedItemIds: z.array(z.string()).optional(), nonAppendableItemIds: z.array(z.string()).optional() }).strict(),
     z.object({ ...TranscriptPatchBase, op: z.literal('upsertItem'), row: FreshAgentTurnSchema, item: FreshAgentTranscriptItemSchema, complete: z.boolean().optional() }).strict(),

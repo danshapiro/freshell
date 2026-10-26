@@ -302,7 +302,9 @@ async fn handle_connection(mut stream: UnixStream, state: Arc<HostState>) -> Res
     }
     let limit = if matches!(
         result,
-        Ok(HostResult::FreshAgentSnapshot(_) | HostResult::FreshAgentChildSnapshot(_))
+        Ok(HostResult::FreshAgentSnapshot(_)
+            | HostResult::FreshAgentChildSnapshot(_)
+            | HostResult::FreshAgentEvents(_))
     ) {
         freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES
     } else {

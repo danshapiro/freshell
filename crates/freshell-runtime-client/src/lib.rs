@@ -1180,6 +1180,7 @@ impl RuntimeClient {
             AdminCommand::FreshAgentReadHistory(_)
                 | AdminCommand::FreshAgentReadSnapshot(_)
                 | AdminCommand::FreshAgentReadChild(_)
+                | AdminCommand::FreshAgentReadEvents(_)
         ) {
             freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES
         } else {
@@ -1657,6 +1658,85 @@ mod tests {
             .await;
         let _ = server.await.unwrap();
         assert_eq!(actual.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn task6_retained_event_reply_preserves_body_above_the_old_control_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("retained.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let expected = serde_json::json!({"retainedFrom":1,"head":1,"resetRequired":true,"events":[],"retainedState":{"snapshot":{"turns":[{"text":"x".repeat(2*freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES)}]}}});
+        let sent: freshell_runtime_protocol::AgentEventBatch =
+            serde_json::from_value(expected.clone()).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let envelope: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            assert!(matches!(
+                envelope.body,
+                AdminCommand::FreshAgentReadEvents(_)
+            ));
+            freshell_runtime_protocol::write_frame_with_limit(
+                &mut stream,
+                &AdminReply {
+                    request_id: envelope.request_id,
+                    result: Ok(AdminResult::FreshAgentEvents(sent)),
+                },
+                freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES,
+            )
+            .await
+            .unwrap();
+        });
+        let client = RuntimeClient::new(&socket, "0123456789abcdef");
+        *client.control_epoch.write().await = Some(1);
+        let actual = client
+            .fresh_agent_events(SoulId::parse("large-retained").unwrap(), 0, 1)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert!(
+            serde_json::to_value(actual).unwrap() == expected,
+            "the actual retained event caller must round-trip the entire 2MiB body"
+        );
+    }
+
+    #[tokio::test]
+    async fn task6_retained_reply_stays_bounded_and_ordinary_control_budget_stays_small() {
+        use tokio::io::AsyncWriteExt;
+        for retained in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("bounded.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let budget = if retained {
+                freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES
+            } else {
+                freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES
+            };
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let _: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+                stream
+                    .write_all(&((budget + 1) as u32).to_be_bytes())
+                    .await
+                    .unwrap();
+            });
+            let client = RuntimeClient::new(&socket, "0123456789abcdef");
+            *client.control_epoch.write().await = Some(1);
+            let body = if retained {
+                AdminCommand::FreshAgentReadEvents(
+                    freshell_runtime_protocol::FreshAgentReadEventsRequest {
+                        soul_id: SoulId::parse("bounded").unwrap(),
+                        after_sequence: 0,
+                        max_events: 1,
+                        expected_control_epoch: Some(1),
+                    },
+                )
+            } else {
+                AdminCommand::Inventory
+            };
+            let actual = client.request(RequestId::new(), body).await;
+            server.await.unwrap();
+            assert!(matches!(actual,Err(ClientError::Protocol(message)) if message==freshell_runtime_protocol::FrameError::TooLarge.to_string()),"oversized lengths must be rejected by the caller's exact budget before reading any body");
+        }
     }
 
     #[tokio::test]

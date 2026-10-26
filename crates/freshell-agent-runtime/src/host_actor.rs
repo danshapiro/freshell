@@ -301,6 +301,10 @@ pub trait FreshAgentTransport: Send + Sync {
     async fn capture(&self, _max_bytes: usize) -> Result<FreshAgentCapture, String> {
         Err("provider does not expose a hosted snapshot".into())
     }
+    /// Optional authoritative in-memory source. No native RPC or runtime creation.
+    async fn retained_state(&self) -> Result<Option<Value>, String> {
+        Ok(None)
+    }
     async fn snapshot(&self) -> Result<Value, String> {
         Err("provider does not expose a hosted snapshot".into())
     }
@@ -1169,7 +1173,16 @@ impl FreshAgentHostActor {
         Ok(value)
     }
 
-    pub async fn record_event(&self, event: AgentEvent) -> Result<u64, ActorError> {
+    pub async fn record_event(&self, mut event: AgentEvent) -> Result<u64, ActorError> {
+        // The provider owns retained bodies. The bounded journal keeps only the
+        // invalidation edge; reads reconcile against the current source.
+        if let AgentEvent::Provider { payload } = &mut event {
+            if payload["event"]["type"] == "freshAgent.host.backpressure" {
+                if let Some(event) = payload["event"].as_object_mut() {
+                    event.remove("retainedState");
+                }
+            }
+        }
         let mut state = self.state.lock().await;
         let sequence =
             push_event_bounded(&mut state, event, self.event_byte_cap, self.event_count_cap)?;
@@ -1313,20 +1326,34 @@ impl FreshAgentHostActor {
     }
 
     pub async fn read_events(&self, after: u64, max_events: usize) -> EventBatch {
-        let state = self.state.lock().await;
-        let max_events = max_events.clamp(1, self.event_count_cap);
-        EventBatch {
-            retained_from: state.retained_from,
-            head: state.next_sequence.saturating_sub(1),
-            reset_required: after.saturating_add(1) < state.retained_from,
-            events: state
-                .events
-                .iter()
-                .filter(|event| event.sequence > after)
-                .take(max_events)
-                .cloned()
-                .collect(),
+        let mut batch = {
+            let state = self.state.lock().await;
+            let max_events = max_events.clamp(1, self.event_count_cap);
+            EventBatch {
+                retained_state: None,
+                retained_from: state.retained_from,
+                head: state.next_sequence.saturating_sub(1),
+                reset_required: after.saturating_add(1) < state.retained_from,
+                events: state
+                    .events
+                    .iter()
+                    .filter(|event| event.sequence > after)
+                    .take(max_events)
+                    .cloned()
+                    .collect(),
+            }
+        };
+        if after == 0 || batch.reset_required || batch.events.iter().any(|entry|
+            matches!(&entry.event, AgentEvent::Provider { payload } if payload["event"]["type"] == "freshAgent.host.backpressure")) {
+            batch.retained_state = match self.transport.retained_state().await {
+                Ok(retained) => retained,
+                Err(error) => {
+                    tracing::warn!(%error, "freshagent.host.retained_read_failed");
+                    None
+                }
+            };
         }
+        batch
     }
 
     pub async fn interrupt(&self) -> Result<(), ActorError> {

@@ -28,6 +28,11 @@ export function applyFreshAgentTranscriptPatch(state: TranscriptProjection, inpu
   if (!parsed.success) return state
   const patch = parsed.data
   if (patch.projectionId !== state.id || patch.historyGeneration < state.historyGeneration) return state
+  // Appends can be coalesced across several revisions. The producer states
+  // their consumed prefix explicitly; a jump in the final revision is legal.
+  if (patch.afterRevision !== undefined && patch.afterRevision > state.eventRevision) {
+    return { ...state, needsResnapshot: true, eventRevision: Math.max(state.eventRevision, ...patch.ops.map((op) => op.revision)) }
+  }
   const next: TranscriptProjection = patch.historyGeneration > state.historyGeneration
     ? { id: state.id, historyGeneration: patch.historyGeneration, eventRevision: state.eventRevision, turns: [], turnRows: {}, closedItems: {}, settledTurns: {}, removedTurns: {}, turnRevisions: {}, deferredOps: [] }
     : { ...state, turns: [...state.turns], turnRows: { ...state.turnRows }, closedItems: { ...state.closedItems }, settledTurns: { ...state.settledTurns }, removedTurns: { ...state.removedTurns }, turnRevisions: { ...state.turnRevisions }, deferredOps: [...state.deferredOps ?? []], turnOrder: [...state.turnOrder ?? []], nonAppendableItemIds: { ...state.nonAppendableItemIds } }

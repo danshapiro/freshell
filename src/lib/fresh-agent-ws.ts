@@ -1,4 +1,5 @@
 import type { AppDispatch } from '@/store/store'
+import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/fresh-agent'
 import type { SessionRef } from '@shared/session-contract'
 import type { FreshAgentRecoveryStoppedMessage, ReadyMessage, SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
@@ -12,8 +13,8 @@ import { revokeFreshAgentAttention } from '@/store/turnCompletionAttention'
 import type { ObservedOwnerFence } from '@/store/selectors/runtimeOwner'
 import { streamBatcherFor } from '@/lib/fresh-agent-stream-batcher'
 import type { LiveBlockKind, LiveNotice, LiveNoticeLevel, LiveRateLimit, LiveRetry, LiveStreamOp } from '@/store/freshAgentLiveTypes'
-import { assistantBlockBound, liveNoticeReceived, liveRetrySet, transcriptAnnounced, transcriptProjectionBound, transcriptPatchApplied, codexMetadataReceived } from '@/store/freshAgentLiveSlice'
-import { FreshAgentTranscriptPatchSchema } from '@shared/fresh-agent-contract'
+import { assistantBlockBound, liveNoticeReceived, liveRetrySet, transcriptAnnounced, transcriptProjectionBound, transcriptPatchApplied, codexMetadataReceived, transcriptProjectionSnapshotReceived } from '@/store/freshAgentLiveSlice'
+import { FreshAgentSnapshotSchema, FreshAgentTranscriptPatchSchema } from '@shared/fresh-agent-contract'
 import {
   addPermissionRequest,
   addQuestionRequest,
@@ -470,6 +471,42 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
   if (event.type !== 'freshAgent.stream') streamBatcherFor(dispatch).flush(locator)
 
   switch (event.type) {
+    case 'freshAgent.host.backpressure':
+    case 'freshAgent.host.journal.reset': {
+      const retained = event.retainedState
+      if (!isObject(retained) || !isObject(retained.source)) return true
+      const source = retained.source
+      const parsed = FreshAgentSnapshotSchema.safeParse(retained.snapshot)
+      if (!parsed.success || parsed.data.provider !== locator.provider || parsed.data.sessionType !== locator.sessionType
+        || parsed.data.threadId !== (source.nativeSessionId ?? sessionId)
+        || !isObject(parsed.data.extensions?.codex?.projection)
+        || parsed.data.extensions.codex.projection.id !== source.projectionId) return true
+      const snapshot = parsed.data
+      const sourceKey = JSON.stringify([source.soulId, source.incarnationId, source.hostBootId, source.projectionId])
+      dispatch((innerDispatch, getState) => {
+        const root = getState()
+        const owner = root.freshAgent.runtimeOwners?.[`${locator.provider}:${sessionId}`]
+        if (owner && (owner.epoch !== source.ownerEpoch || owner.generation !== source.ownerGeneration || owner.ownerKind !== 'fresh-agent')) return
+        const soul = root.managedRuntime?.souls.find((soul) => soul.soulId === source.soulId)
+        if (soul && (soul.incarnationId !== source.incarnationId || soul.hostBootId && soul.hostBootId !== source.hostBootId)) return
+        innerDispatch(transcriptProjectionSnapshotReceived({ ...locator, snapshot, retainedSourceKey: sourceKey }))
+        const live = getState().freshAgentLive?.bySession[makeFreshAgentSessionKey(locator)]
+        if (live?.retainedSourceKey !== sourceKey || live.retainedSnapshot !== snapshot) return
+        const status = (['creating', 'starting', 'connected', 'running', 'idle', 'compacting', 'exited', 'stuck'] as const).find((status) => status === snapshot.status)
+        if (status) innerDispatch(sessionSnapshotReceived({ ...locator, status, latestTurnId: snapshot.latestTurnId ?? null, revision: snapshot.revision }))
+        for (const control of Array.isArray(retained.pendingControls) ? retained.pendingControls : []) {
+          if (isObject(control)) handleFreshAgentTransportEvent(innerDispatch, { ...msg, event: control })
+        }
+        for (const mark of Array.isArray(retained.attentionMarks) ? retained.attentionMarks : []) {
+          if (!isObject(mark)) continue
+          for (const [field, apply] of [['lastTurnCompleteAt', applyFreshAgentCompletion], ['lastWaitingAt', applyFreshAgentWaiting], ['lastQuestionAvailableAt', applyFreshAgentQuestionAvailable]] as const) {
+            const at = mark[field]
+            if (typeof at === 'number' && Number.isFinite(at)) innerDispatch(apply({ provider: locator.provider, sessionId, at }))
+          }
+        }
+      })
+      return true
+    }
     case 'freshAgent.transcript.patch': {
       const parsed = FreshAgentTranscriptPatchSchema.safeParse(event)
       if (parsed.success && parsed.data.sessionId === sessionId) dispatch(transcriptPatchApplied({ ...locator, patch: parsed.data }))

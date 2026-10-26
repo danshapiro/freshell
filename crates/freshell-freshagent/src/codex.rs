@@ -367,6 +367,8 @@ pub struct FreshCodexState {
     /// threadId → live codex session (client + settings + owned sidecar).
     sessions: Arc<TokioMutex<HashMap<String, CodexSession>>>,
     child_reads: Arc<TokioMutex<HashMap<(String, String, String), u8>>>,
+    retained_changed: Arc<tokio::sync::watch::Sender<u64>>,
+    attention: Arc<crate::attention_ledger::AttentionLedger>,
     /// The `settings.freshAgent.enabled` gate the WS `freshAgent.create` requires
     /// (default off; flipped true by `PATCH /api/settings`, as a real freshcodex user does).
     fresh_agent_enabled: Arc<AtomicBool>,
@@ -804,6 +806,8 @@ impl FreshCodexState {
             broadcast_tx,
             sessions: Arc::new(TokioMutex::new(HashMap::new())),
             child_reads: Arc::new(TokioMutex::new(HashMap::new())),
+            retained_changed: Arc::new(tokio::sync::watch::channel(0).0),
+            attention: Arc::new(crate::attention_ledger::AttentionLedger::default()),
             fresh_agent_enabled: Arc::new(AtomicBool::new(enabled)),
             settings: Arc::new(TokioMutex::new(settings)),
             auth_token,
@@ -1848,7 +1852,134 @@ impl FreshCodexState {
         }
     }
 
+    async fn retain_native_exit(&self, session_id: &str, ownership_id: &str) {
+        let projection = self
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .filter(|session| session.sidecar_ownership_id == ownership_id)
+            .map(|session| session.projection.clone());
+        if let Some(projection) = projection {
+            projection
+                .lock()
+                .expect("codex projection lock")
+                .retire_source();
+            self.clear_source_controls(session_id, &projection).await;
+        }
+    }
+
+    fn notify_retained(&self) {
+        self.retained_changed
+            .send_modify(|version| *version = version.wrapping_add(1));
+    }
+
+    /// A coalesced wakeup, never a history cursor or a provider RPC.
+    pub fn subscribe_retained_state(&self, _session_id: &str) -> tokio::sync::watch::Receiver<u64> {
+        self.retained_changed.subscribe()
+    }
+
+    /// Current native facts, including unfinished event-owned output. Reading
+    /// this source cannot create/resume a runtime or wait for native history.
+    pub async fn retained_state(&self, session_id: &str) -> Result<Value, RetainedStateError> {
+        let (projection, turns, exited, history_mode, quiet) = self
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .map(|s| {
+                (
+                    s.projection.clone(),
+                    s.turn_state.clone(),
+                    s.exited.clone(),
+                    s.history_mode,
+                    s.quiet_deadman.clone(),
+                )
+            })
+            .ok_or(CodexSnapshotError::NotFound)?;
+        let owner = self.ownership_snapshot(PROVIDER, session_id);
+        let stuck = quiet.lock().expect("quiet deadman lock").is_stuck();
+        let mut snapshot = {
+            let p = projection.lock().expect("codex projection lock");
+            let mut retained = p
+                .retained_snapshot(exited.load(Ordering::SeqCst))
+                .map_err(|_| CodexSnapshotError::NotFound)?;
+            if let Some(status) = p.live_status() {
+                if matches!(status, "idle" | "running" | "stuck") {
+                    retained.raw["thread"]["status"] =
+                        json!({"type":if status == "idle" {"idle"} else {"active"}});
+                }
+            }
+            let mut snapshot = build_codex_snapshot_json(
+                session_id,
+                &retained.raw,
+                false,
+                history_mode,
+                None,
+                stuck,
+            )
+            .map_err(CodexSnapshotError::Protocol)?;
+            p.overlay(&mut snapshot, retained.metadata);
+            snapshot
+        };
+        if turns.lock().expect("codex turn state").has_owed_work() && !exited.load(Ordering::SeqCst)
+        {
+            snapshot["status"] = json!(if stuck { "stuck" } else { "running" });
+            snapshot["capabilities"]["send"] = json!(false);
+            snapshot["capabilities"]["interrupt"] = json!(true);
+        }
+        if exited.load(Ordering::SeqCst) {
+            snapshot["status"] = json!("exited");
+        }
+        self.overlay_controls(session_id, &mut snapshot).await;
+        let pending = self.retained_control_events(session_id).await;
+        let marks = self
+            .attention_marks()
+            .await
+            .into_iter()
+            .filter(|m| m.session_id == session_id)
+            .collect::<Vec<_>>();
+        let after = self.ownership_snapshot(PROVIDER, session_id);
+        if owner.epoch != after.epoch
+            || owner.generation != after.generation
+            || !self
+                .sessions
+                .lock()
+                .await
+                .get(session_id)
+                .is_some_and(|s| Arc::ptr_eq(&s.projection, &projection))
+        {
+            return Err(CodexSnapshotError::HandoffInProgress {
+                generation: after.generation,
+            });
+        }
+        Ok(
+            json!({"source":{"projectionId":snapshot["extensions"]["codex"]["projection"]["id"],"ownerEpoch":owner.epoch,"ownerGeneration":owner.generation},"snapshot":snapshot,"attentionMarks":marks,"pendingControls":pending}),
+        )
+    }
+
     fn broadcast(&self, msg: &ServerMessage) {
+        match msg {
+            ServerMessage::FreshAgentCreated(created) => {
+                self.attention.observe(&created.session_id, SESSION_TYPE)
+            }
+            ServerMessage::FreshAgentSessionMaterialized(materialized) => {
+                self.attention
+                    .alias(&materialized.previous_session_id, &materialized.session_id);
+                let mut controls = self.controls.lock().expect("codex controls registry");
+                if let Some(retained) = controls.get(&materialized.previous_session_id).cloned() {
+                    controls.insert(materialized.session_id.clone(), retained);
+                }
+            }
+            ServerMessage::FreshAgentKilled(killed) if killed.success => {
+                self.attention.forget(&killed.session_id)
+            }
+            ServerMessage::FreshAgentRecoveryStopped(stopped) if stopped.success => {
+                self.attention.forget(&stopped.session_id)
+            }
+            _ => {}
+        }
+        self.notify_retained();
         if let Ok(frame) = serde_json::to_string(msg) {
             let _ = self.broadcast_tx.send(frame);
         }
@@ -2887,6 +3018,7 @@ impl FreshCodexState {
             Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
             Some(turn_state.clone()),
+            Some(self.clone()),
         );
 
         self.sessions.lock().await.insert(
@@ -3622,6 +3754,7 @@ impl FreshCodexState {
             tracing::warn!(error = %err, session = %session_id, "freshagent.codex.destroy_redo_on_submit_failed");
         }
 
+        let contextual_answers = self.contextual_answer_targets(&session_id, &msg.text).await;
         turn_in_flight.store(true, Ordering::SeqCst);
         note_codex_activity(self, &session_id, &turn_in_flight, &quiet_deadman);
         let result = if let Some(expected) = expected_turn_id.as_deref() {
@@ -3675,6 +3808,8 @@ impl FreshCodexState {
                 return;
             }
         };
+        self.acknowledge_contextual_answers(&session_id, contextual_answers)
+            .await;
         drop(ownership_guard);
 
         // Only persist choices once the provider has accepted them. Failed sends
@@ -6946,6 +7081,19 @@ impl FreshCodexState {
             mint_ownership_id(),
             session_id.to_string(),
         )));
+        let prior_projection = self
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .map(|session| session.projection.clone());
+        if let Some(prior) = prior_projection {
+            projection
+                .lock()
+                .expect("codex projection lock")
+                .inherit_finite_history(&prior.lock().expect("prior codex projection lock"));
+        }
+
         let exited = Arc::new(AtomicBool::new(false));
         let consumer = self.spawn_consumer(
             notifs,
@@ -6984,6 +7132,7 @@ impl FreshCodexState {
             Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
             Some(turn_state.clone()),
+            Some(self.clone()),
         );
 
         // `HashMap::insert` on an existing key overwrites in place, dropping the old (dead
@@ -7304,6 +7453,7 @@ impl FreshCodexState {
             Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
             Some(turn_state.clone()),
+            Some(self.clone()),
         );
 
         {
@@ -7726,6 +7876,19 @@ impl FreshCodexState {
         // The deadman feed needs the state handle (window config + waiter spawn); a
         // clone is all-Arc, cheap, and adds no lifecycle coupling (the state is the
         // server-global `FreshCodexState`, alive for the process's whole life anyway).
+        let retained_floor = self
+            .attention
+            .snapshot()
+            .into_iter()
+            .find(|mark| mark.session_id == thread_id)
+            .and_then(|mark| mark.last_turn_complete_at);
+        {
+            let mut clock = last_turn_complete_at
+                .lock()
+                .expect("attention complete clock");
+            *clock = (*clock).max(retained_floor);
+        }
+        self.attention.observe(&thread_id, SESSION_TYPE);
         let state = self.clone();
         tokio::spawn(async move {
             if let Some(gate) = created_gate {
@@ -7754,6 +7917,13 @@ impl FreshCodexState {
                         continue;
                     }
                 };
+                if projection
+                    .lock()
+                    .expect("codex projection lock")
+                    .source_retired()
+                {
+                    continue;
+                }
                 state
                     .observe_child_control_turn(&thread_id, &projection, &notification)
                     .await;
@@ -7841,6 +8011,7 @@ impl FreshCodexState {
                     flush_codex_projection(&projection, &thread_id, &broadcast_tx);
                 }
                 let has_patch = project_codex_notification(&projection, &notification);
+                state.notify_retained();
                 if has_patch {
                     if !projection_announced {
                         let p = projection.lock().expect("codex projection lock");
@@ -7924,7 +8095,10 @@ impl FreshCodexState {
                     }
                     // DIAG-01: the positive turn-complete chime only -- session_id
                     // alone, never the turn's text/response content.
-                    if let CodexAdapterEvent::TurnComplete { session_id, .. } = &event {
+                    if let CodexAdapterEvent::TurnComplete { session_id, at } = &event {
+                        state
+                            .attention
+                            .record_turn_complete(session_id, SESSION_TYPE, *at);
                         tracing::info!(provider = PROVIDER, session_id = %session_id, "freshagent.turn.complete");
                         // Unified agent names (Task 2): a completed turn wrote
                         // history, so the thread's rollout has materialized —
@@ -7958,14 +8132,23 @@ impl FreshCodexState {
                             );
                         }
                     }
+                    if let CodexAdapterEvent::StatusSnapshot { status, .. }
+                    | CodexAdapterEvent::Status { status, .. } = &event
+                    {
+                        projection
+                            .lock()
+                            .expect("codex projection lock")
+                            .observe_status(status.as_str());
+                    }
                     let frame = adapter_event_to_frame(&event, &thread_id);
                     if let Some(frame) = frame {
+                        state.notify_retained();
                         let _ = broadcast_tx.send(frame);
                     }
                 }
             }
             flush_codex_projection(&projection, &thread_id, &broadcast_tx);
-            state.clear_controls(&thread_id).await;
+            state.clear_source_controls(&thread_id, &projection).await;
         })
     }
 
@@ -8069,6 +8252,7 @@ impl FreshCodexState {
             &thread_id,
             &self.broadcast_tx,
             "quiet_deadman",
+            Some(&self),
         );
     }
 
@@ -9253,6 +9437,7 @@ impl FreshCodexState {
             Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
             Some(turn_state.clone()),
+            Some(self.clone()),
         );
         self.sessions.lock().await.insert(
             thread_id.to_string(),
@@ -9350,6 +9535,7 @@ impl FreshCodexState {
             Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
             Some(turn_state.clone()),
+            Some(self.clone()),
         );
         self.sessions.lock().await.insert(
             thread_id.to_string(),
@@ -9435,6 +9621,9 @@ pub enum CodexSnapshotError {
     /// Stopping). Typed refusal — a read-only GET never races a transition.
     HandoffInProgress { generation: u64 },
 }
+
+/// Retained reads share the existing source/ownership/protocol refusal contract.
+pub type RetainedStateError = CodexSnapshotError;
 
 impl std::fmt::Display for CodexSnapshotError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -10477,6 +10666,7 @@ pub(crate) fn spawn_exit_watcher(
         condemned_priors,
         ownership,
         None,
+        None,
     )
 }
 
@@ -10513,6 +10703,7 @@ fn spawn_exit_watcher_tracking_turns(
     // its fenced claim (None when the lane is unwired — pre-existing tests).
     ownership: Option<crate::ownership_lane::OwnershipWatch>,
     turn_state: Option<SharedCodexTurnState>,
+    retained_state: Option<FreshCodexState>,
 ) -> tokio::task::JoinHandle<crate::session_handoff::StopResult> {
     // wfah: the thread id is fixed by the time the watcher is constructed at
     // every successful spawn site; enrich the durable record once, here.
@@ -10727,6 +10918,9 @@ fn spawn_exit_watcher_tracking_turns(
                 // PR-4: flip the lazy-restart flag BEFORE broadcasting, so a client that
                 // reacts to the `exited` status by immediately sending/attaching never
                 // races ahead of `ensure_session_alive` observing a stale `false`.
+                if let Some(state) = &retained_state {
+                    state.retain_native_exit(&thread_id, &ownership_id).await;
+                }
                 exited.store(true, Ordering::SeqCst);
                 let event = CodexAdapterEvent::Status {
                     session_id: thread_id.clone(),
@@ -10760,6 +10954,7 @@ fn spawn_exit_watcher_tracking_turns(
                         &thread_id,
                         &broadcast_tx,
                         "crash_self_heal",
+                        retained_state.as_ref(),
                     );
                 }
                 stop_result
@@ -11087,6 +11282,7 @@ fn reduce_notification(
                             subscription.session_id(),
                             broadcast_tx,
                             "system_error_status",
+                            Some(state),
                         );
                         let rang_turn_id = active_turn
                             .lock()
@@ -11541,6 +11737,7 @@ fn reduce_notification(
                         subscription.session_id(),
                         broadcast_tx,
                         "thread_closed",
+                        Some(state),
                     );
                 }
                 let rang_turn_id = active_turn
@@ -11706,9 +11903,16 @@ fn mint_synthesized_attention_edge(
     thread_id: &str,
     broadcast_tx: &tokio::sync::broadcast::Sender<String>,
     source: &'static str,
+    state: Option<&FreshCodexState>,
 ) {
     let clock = crate::attention::AttentionClock::from(Arc::clone(last_turn_complete_at));
     let at = crate::attention::mint_synthesized_edge(&clock, PROVIDER, thread_id, source);
+    if let Some(state) = state {
+        state
+            .attention
+            .record_turn_complete(thread_id, SESSION_TYPE, at);
+        state.notify_retained();
+    }
     let event = CodexAdapterEvent::TurnComplete {
         session_id: thread_id.to_string(),
         at,
@@ -12612,6 +12816,7 @@ pub(crate) mod tests {
             Arc::clone(&state.condemned_priors),
             None,
             Some(turn_state.clone()),
+            Some(state.clone()),
         );
         state.sessions.lock().await.insert(
             thread_id.to_string(),
@@ -12734,6 +12939,7 @@ pub(crate) mod tests {
             Arc::clone(&state.condemned_priors),
             None,
             Some(turn_state.clone()),
+            Some(state.clone()),
         );
         state.sessions.lock().await.insert(
             thread_id.to_string(),
