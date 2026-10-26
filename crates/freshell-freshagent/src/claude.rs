@@ -16296,6 +16296,71 @@ rl.on('line', (line) => {
         // Even failed compaction settles its own command before rollback reopens.
         await_frame_of_inner_type(&mut rx, "freshAgent.result").await;
         await_ledger_busy(&st, &session_id, false).await;
+        // The simulator, like the CLI, flushes JSONL independently of result.
+        // Synchronize this fixture on its actual send identity and native point;
+        // a publicly advertised point without that backing is a product failure.
+        let compact_frames = env.request_frames_of_type("send", 1).await;
+        let compact_uuid = compact_frames[0]["uuid"]
+            .as_str()
+            .expect("compact send UUID")
+            .to_owned();
+        let point = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let public = st
+                    .get_snapshot(SessionType::Freshclaude, &session_id)
+                    .await
+                    .ok();
+                let advertised = public.as_ref().is_some_and(|snapshot| {
+                    snapshot["turns"].as_array().is_some_and(|turns| {
+                        turns.iter().any(|turn| turn["turnId"] == compact_uuid)
+                    })
+                });
+                let saved = st
+                    .effective_transcript(&session_id)
+                    .await
+                    .ok()
+                    .filter(|saved| {
+                        saved.source_path.is_some()
+                            && saved
+                                .text
+                                .lines()
+                                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                                .any(|line| line["type"] == "user" && line["uuid"] == compact_uuid)
+                    });
+                let point = saved.and_then(|saved| {
+                    let exact = crate::claude_snapshot::resolve_resume_point(
+                        &saved.text,
+                        &session_id,
+                        crate::claude_snapshot::ResumeTarget::ToTurn(compact_uuid.clone()),
+                    )
+                    .ok()?;
+                    let step = crate::claude_snapshot::resolve_resume_point(
+                        &saved.text,
+                        &session_id,
+                        crate::claude_snapshot::ResumeTarget::Step,
+                    )
+                    .ok()?;
+                    assert_eq!(step.resume_at_uuid, exact.resume_at_uuid);
+                    assert_eq!(step.prompt_text, exact.prompt_text);
+                    Some(step)
+                });
+                assert!(
+                    !advertised || point.is_some(),
+                    "public compact rollback point has no persisted native backing"
+                );
+                if let Some(point) = point {
+                    break point;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "compact send {compact_uuid} never became a persisted rollback point under {}",
+                env.dir.display()
+            )
+        });
         let (sink2, captured2) = capturing_sink();
         st.handle_rollback(
             rollback_op(&session_id, "rb-compact-2", RollbackDirection::Undo),
@@ -16306,6 +16371,15 @@ rl.on('line', (line) => {
         assert_eq!(
             frames2[0]["event"]["type"], "freshAgent.rolledBack",
             "{frames2:?}"
+        );
+        assert_eq!(frames2[0]["event"]["removedPromptText"], point.prompt_text);
+        assert_eq!(
+            frames2[0]["event"]["removedTurnIds"],
+            json!(point
+                .removed_turns
+                .iter()
+                .filter_map(|turn| turn["turnId"].as_str())
+                .collect::<Vec<_>>())
         );
         let replacement = frames2[0]["event"]["newSessionId"].as_str().unwrap();
         assert_eq!(
