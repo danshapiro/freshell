@@ -329,6 +329,23 @@ async fn wait_for_codex_stop_resolution(turns: &SharedCodexTurnState) {
     }
 }
 
+fn publish_codex_interrupt_refusal(
+    turns: &SharedCodexTurnState,
+    dispatch: DispatchToken,
+    turn_id: &str,
+    publish: impl FnOnce(),
+) -> bool {
+    let mut state = turns.lock().expect("codex turn state");
+    if !state.interrupt_refused(dispatch, turn_id) {
+        return false;
+    }
+    // Gate waiters may wake during the transition, but cannot acquire state
+    // and admit a newer Stop until its compatibility publication is complete.
+    // Production publication only writes the atomic attention marker.
+    publish();
+    true
+}
+
 /// Seed the quiet window from `FRESHELL_FRESHCODEX_QUIET_WINDOW_MS` (positive integer
 /// milliseconds; missing or unparseable falls back to [`DEFAULT_CODEX_QUIET_WINDOW_MS`]).
 fn codex_quiet_window_ms_from_env() -> u64 {
@@ -4174,16 +4191,12 @@ impl FreshCodexState {
             }
             Err(err) => {
                 let refused = err.is_not_submitted();
-                let disarmed = refused
-                    && turns
-                        .lock()
-                        .expect("codex turn state")
-                        .interrupt_refused(dispatch, &turn_id);
-                if disarmed {
-                    // Only this operation's proven refusal can retract the marker.
-                    if let Some(marker) = marker {
-                        marker.store(false, Ordering::SeqCst);
-                    }
+                if refused {
+                    publish_codex_interrupt_refusal(&turns, dispatch, &turn_id, || {
+                        if let Some(marker) = marker {
+                            marker.store(false, Ordering::SeqCst);
+                        }
+                    });
                 }
                 tracing::warn!(provider=PROVIDER, session_id, native_turn_id=%turn_id, dispatch=?dispatch, refused, error=%err, "freshagent.codex.interrupt_failed");
                 self.emit_fresh_agent_error(
@@ -19514,6 +19527,64 @@ pub(crate) mod tests {
             st.sessions.lock().await.contains_key("thread-1"),
             "the session stays mapped after an unrequested exit"
         );
+    }
+
+    #[test]
+    fn task4_refusal_marker_publication_cannot_clear_a_newer_stop() {
+        let turns = Arc::new(StdMutex::new(CodexTurnState::default()));
+        let marker = Arc::new(AtomicBool::new(true));
+        let old = {
+            let mut state = turns.lock().unwrap();
+            let old = state.begin_dispatch("old");
+            state.accept(old, "old");
+            state.request_stop();
+            state.settle_native("old", NativeSettlement::Completed);
+            old
+        };
+        let (entered, at_publication) = std::sync::mpsc::channel();
+        let (release, may_publish) = std::sync::mpsc::channel();
+        let publisher = {
+            let turns = turns.clone();
+            let marker = marker.clone();
+            std::thread::spawn(move || {
+                publish_codex_interrupt_refusal(&turns, old, "old", || {
+                    // This is the actual compatibility publication boundary, held
+                    // with deterministic barriers, not a delayed native ACK model.
+                    entered.send(()).unwrap();
+                    may_publish.recv_timeout(Duration::from_secs(5)).unwrap();
+                    marker.store(false, Ordering::SeqCst);
+                })
+            })
+        };
+        at_publication.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut admitted_new = false;
+        let blocked = match turns.try_lock() {
+            Ok(mut state) => {
+                let new = state.begin_dispatch("new");
+                state.accept(new, "new");
+                state.request_stop();
+                marker.store(true, Ordering::SeqCst);
+                admitted_new = true;
+                false
+            }
+            Err(std::sync::TryLockError::WouldBlock) => true,
+            Err(error) => panic!("unexpected state-lock failure: {error}"),
+        };
+        release.send(()).unwrap();
+        assert!(publisher.join().unwrap());
+        if !admitted_new {
+            let mut state = turns.lock().unwrap();
+            let new = state.begin_dispatch("new");
+            state.accept(new, "new");
+            state.request_stop();
+            marker.store(true, Ordering::SeqCst);
+        }
+        assert!(
+            marker.load(Ordering::SeqCst),
+            "an old refusal publication must never clear the newer Stop marker"
+        );
+        assert!(blocked, "new dispatch/Stop cannot acquire ownership before the old compatibility publication completes");
+        assert_eq!(turns.lock().unwrap().user_stop_turn_id(), Some("new"));
     }
 
     fn task4_stop(session_id: &str) -> FreshAgentInterrupt {
