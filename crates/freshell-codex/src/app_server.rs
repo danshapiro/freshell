@@ -130,6 +130,30 @@ impl std::fmt::Display for CodexAppServerError {
 
 impl std::error::Error for CodexAppServerError {}
 
+impl CodexAppServerError {
+    /// Evidence-backed pre-admission refusals in the supported native protocol.
+    /// Internal errors, transport failures and lost replies can follow accepted
+    /// work, so callers must preserve their delivery receipt as ambiguous.
+    pub fn is_not_submitted(&self) -> bool {
+        match self {
+            Self::Rpc { method, error } => {
+                method == "initialize"
+                    || method == "configRequirements/read"
+                    || matches!(error.code, -32601 | -32602)
+                    || (error.code == -32600
+                        && (error.message.starts_with("no active turn to ")
+                            || error.message.starts_with("expected active turn id")))
+            }
+            Self::Timeout { method, .. }
+            | Self::Closed { method }
+            | Self::Transport { method, .. }
+            | Self::InvalidResponse { method, .. } => {
+                matches!(method.as_str(), "initialize" | "configRequirements/read")
+            }
+        }
+    }
+}
+
 /// `thread/start` params (`CodexThreadStartInput`, `client.ts:80-83`; adapter create,
 /// `adapter.ts:825-830`). The client adds `experimentalRawEvents:false` +
 /// `persistExtendedHistory:true` (`client.ts:170-174`).
@@ -584,7 +608,35 @@ impl CodexAppServerClient {
         Ok(StartedTurn { turn_id })
     }
 
-    /// `turn/interrupt` (`client.ts:433-439`).
+    /// Active input belongs to the exact native turn the caller observed.
+    /// Native steer accepts no setting overrides and returns that same turn ID.
+    pub async fn steer_turn(
+        &self,
+        thread_id: &str,
+        expected_turn_id: &str,
+        input: Vec<Value>,
+    ) -> Result<StartedTurn, CodexAppServerError> {
+        let result = self
+            .request(
+                "turn/steer",
+                json!({"threadId": thread_id, "expectedTurnId": expected_turn_id, "input": input}),
+            )
+            .await?;
+        let turn_id = result
+            .get("turnId")
+            .and_then(Value::as_str)
+            .filter(|id| *id == expected_turn_id)
+            .ok_or_else(|| CodexAppServerError::InvalidResponse {
+                method: "turn/steer".into(),
+                detail: "missing or mismatched turnId".into(),
+            })?;
+        Ok(StartedTurn {
+            turn_id: turn_id.into(),
+        })
+    }
+
+    /// `turn/interrupt` (`client.ts:433-439`). A successful reply acknowledges
+    /// submission only; it is never terminal-turn evidence.
     pub async fn interrupt_turn(
         &self,
         thread_id: &str,
@@ -1004,6 +1056,57 @@ pub fn new_channel_transport() -> (Arc<ChannelTransport>, ChannelPeer) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_native_pre_admission_errors_are_refusals() {
+        for message in [
+            "no active turn to steer",
+            "no active turn to interrupt",
+            "expected active turn id `old` but found `new`",
+        ] {
+            assert!(CodexAppServerError::Rpc {
+                method: "turn/steer".into(),
+                error: RpcError {
+                    code: -32600,
+                    message: message.into(),
+                    data: None
+                }
+            }
+            .is_not_submitted());
+        }
+        for error in [
+            CodexAppServerError::Rpc {
+                method: "turn/start".into(),
+                error: RpcError {
+                    code: -32603,
+                    message: "internal failure".into(),
+                    data: None,
+                },
+            },
+            CodexAppServerError::Timeout {
+                method: "turn/start".into(),
+                timeout_ms: 100,
+            },
+            CodexAppServerError::Closed {
+                method: "turn/steer".into(),
+            },
+            CodexAppServerError::Transport {
+                method: "turn/interrupt".into(),
+                message: "lost transport reply".into(),
+            },
+            CodexAppServerError::InvalidResponse {
+                method: "turn/start".into(),
+                detail: "missing result".into(),
+            },
+        ] {
+            assert!(!error.is_not_submitted(), "{error}");
+        }
+        assert!(CodexAppServerError::Timeout {
+            method: "initialize".into(),
+            timeout_ms: 100
+        }
+        .is_not_submitted());
+    }
 
     #[cfg(feature = "native-policy-qualification")]
     #[tokio::test]

@@ -9,7 +9,11 @@ import { openPanePicker } from '../helpers/pane-picker.js'
 
 const source = fileURLToPath(new URL('../../fixtures/coding-cli/codex-app-server/fake-app-server.mjs', import.meta.url))
 
-test('Freshcodex retains a refused prompt with its delivery reason', async ({ browser }) => {
+for (const delivery of [
+  { name: 'refused', code: -32602, message: 'This input was refused before admission' },
+  { name: 'ambiguous', code: -32603, message: 'The native response was lost after possible admission' },
+] as const) {
+test(`Freshcodex retains a ${delivery.name} prompt with its delivery reason`, async ({ browser }) => {
   test.setTimeout(180_000)
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'freshcodex-delivery-'))
   const wrapper = path.join(root, 'codex.mjs')
@@ -18,7 +22,7 @@ test('Freshcodex retains a refused prompt with its delivery reason', async ({ br
   const server = new RustServer({ env: {
     CODEX_CMD: wrapper,
     FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES: '1',
-    FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({ overrides: { 'turn/start': { error: { code: -32602, message: 'This input was refused before admission' } } } }),
+    FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({ overrides: { 'turn/start': { error: { code: delivery.code, message: delivery.message } } } }),
   }, setupHome: async (home) => {
     await fs.mkdir(path.join(home, '.freshell'), { recursive: true })
     await fs.writeFile(path.join(home, '.freshell/config.json'), JSON.stringify({ version: 1, settings: { freshAgent: { enabled: true }, codingCli: { enabledProviders: ['codex'] } } }))
@@ -45,10 +49,17 @@ test('Freshcodex retains a refused prompt with its delivery reason', async ({ br
     await input.fill('Keep the original prompt')
     await pane.getByRole('button', { name: 'Send', exact: true }).click()
     await expect(input).toHaveValue('Keep the original prompt', { timeout: 15_000 })
-    await expect(pane.getByText(/Message not sent:.*refused before admission/)).toBeVisible()
+    if (delivery.name === 'refused') {
+      await expect(pane.getByText(/Message not sent:.*refused before admission/)).toBeVisible()
+      await expect(pane.getByRole('button', { name: 'Send', exact: true })).toBeEnabled()
+    } else {
+      await expect(pane.getByText(/Delivery uncertain \(.+\):.*native response was lost/)).toBeVisible()
+      await expect(pane.getByRole('button', { name: 'Stop', exact: true })).toBeVisible()
+    }
   } finally {
     await context?.close().catch(() => {})
     await server.stop()
     await fs.rm(root, { recursive: true, force: true })
   }
 })
+}
