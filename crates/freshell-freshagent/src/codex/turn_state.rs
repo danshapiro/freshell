@@ -115,6 +115,7 @@ impl CodexTurnState {
             return false;
         }
         fact.delivery = Delivery::Refused;
+        fact.settlement = None;
         if self
             .stop
             .as_ref()
@@ -138,13 +139,6 @@ impl CodexTurnState {
         if self.stop.is_some() {
             return StopDisposition::Latched;
         }
-        if self
-            .active
-            .as_ref()
-            .is_some_and(|id| self.user_stop.as_ref() == Some(id))
-        {
-            return StopDisposition::None;
-        }
         let Some(fact) = self
             .facts
             .iter()
@@ -155,6 +149,12 @@ impl CodexTurnState {
         };
         let dispatch = fact.token;
         let target = self.active.clone().or_else(|| fact.turn_id.clone());
+        if target
+            .as_ref()
+            .is_some_and(|id| self.user_stop.as_ref() == Some(id))
+        {
+            return StopDisposition::None;
+        }
         self.stop = Some(StopOperation {
             dispatch,
             turn_id: target.clone(),
@@ -322,6 +322,49 @@ impl CodexTurnState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_acknowledged_stop_stays_deduplicated_through_the_native_idle_gap() {
+        let mut s = CodexTurnState::default();
+        let old = s.begin_dispatch("old");
+        s.accept(old, "old");
+        assert_eq!(
+            s.request_stop(),
+            StopDisposition::Interrupt {
+                dispatch: old,
+                turn_id: "old".into()
+            }
+        );
+        s.interrupt_ack(old, "old");
+        s.observe_idle();
+        assert_eq!(
+            s.request_stop(),
+            StopDisposition::None,
+            "thread idle must not re-arm the same acknowledged Stop"
+        );
+        let new = s.begin_dispatch("new");
+        s.accept(new, "new");
+        assert_eq!(
+            s.request_stop(),
+            StopDisposition::Interrupt {
+                dispatch: new,
+                turn_id: "new".into()
+            }
+        );
+    }
+
+    #[test]
+    fn native_completion_during_a_pending_steer_cannot_assign_an_outcome_to_a_later_refusal() {
+        let mut s = CodexTurnState::default();
+        let old = s.begin_dispatch("old");
+        s.accept(old, "old");
+        let steer = s.begin_dispatch("steer");
+        s.settle_native("old", NativeSettlement::Completed);
+        assert!(s.reject(steer));
+        assert_eq!(s.facts().back().unwrap().delivery, Delivery::Refused);
+        assert_eq!(s.facts().back().unwrap().settlement, None);
+        assert!(!s.has_owed_work());
+    }
 
     #[test]
     fn rejected_initial_dispatch_releases_its_latched_stop_without_owing_work() {

@@ -3515,20 +3515,6 @@ impl FreshCodexState {
             return;
         }
 
-        // Decision 5 (codex/opencode/claude share this helper): any new
-        // submission permanently destroys redo. AWAITED before the turn goes
-        // out; a ledger write failure is logged but never blocks the send.
-        if let Some(err) = crate::rollback_record::destroy_redo_on_submit(
-            &self.identity_sink(),
-            PROVIDER,
-            &session_id,
-            now_ms(),
-        )
-        .await
-        {
-            tracing::warn!(error = %err, session = %session_id, "freshagent.codex.destroy_redo_on_submit_failed");
-        }
-
         // Re-normalize model/effort on send (adapter.ts:961-963) — idempotent for stored values.
         let model = normalize_freshcodex_model(Some(&model));
         let effort = normalize_freshcodex_effort(Some(&model), effort.as_deref());
@@ -3620,6 +3606,20 @@ impl FreshCodexState {
         } else {
             None
         };
+
+        // Decision 5 (codex/opencode/claude share this helper): any new
+        // submission permanently destroys redo. AWAITED before the turn goes
+        // out; a ledger write failure is logged but never blocks the send.
+        if let Some(err) = crate::rollback_record::destroy_redo_on_submit(
+            &self.identity_sink(),
+            PROVIDER,
+            &session_id,
+            now_ms(),
+        )
+        .await
+        {
+            tracing::warn!(error = %err, session = %session_id, "freshagent.codex.destroy_redo_on_submit_failed");
+        }
 
         turn_in_flight.store(true, Ordering::SeqCst);
         note_codex_activity(self, &session_id, &turn_in_flight, &quiet_deadman);
@@ -29405,11 +29405,24 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn checkpoint_send_with_stale_fence_is_refused_for_an_already_running_codex_session() {
         let _guard = ENV_LOCK.lock().await;
-        let (mut st, mut rx) = state_with_bus();
+        let (mut st, mut rx, sink) = state_with_sink();
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         st.set_ownership(Arc::clone(&registry));
         configure_fake_codex_cmd("{}");
         let thread_id = create_real_fake_session(&st, &mut rx).await;
+        let mut rollback = crate::rollback_record::RollbackRecord::empty(1);
+        rollback.push_entry(
+            crate::rollback_record::RollbackEntry {
+                removed_turns: vec![json!({"id":"owned-history"})],
+                prompt_text: "retained".into(),
+                at_ms: 2,
+                epoch: 0,
+            },
+            3,
+        );
+        sink.record_rollback(PROVIDER, &thread_id, rollback.clone())
+            .await
+            .unwrap();
         let before = registry.observe(PROVIDER, &thread_id);
         let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_handoff(
             PROVIDER,
@@ -29440,7 +29453,7 @@ pub(crate) mod tests {
         st.handle_send(FreshAgentSend {
             request_id: Some("req-stale-checkpoint-codex".into()),
             provider: freshell_protocol::AgentProvider::Codex,
-            session_id: thread_id,
+            session_id: thread_id.clone(),
             session_type: freshell_protocol::SessionType::Freshcodex,
             text: "delayed checkpoint prompt".into(),
             images: None,
@@ -29462,6 +29475,11 @@ pub(crate) mod tests {
             saw_reserved |= frame.to_string().contains("SESSION_RESERVED");
             saw_accepted |= frame.to_string().contains("freshAgent.send.accepted");
         }
+        assert_eq!(
+            sink.load_rollback(PROVIDER, &thread_id),
+            Some(rollback),
+            "a stale refused send cannot mutate saved rollback state before its ownership guard"
+        );
         assert!(saw_reserved, "the stale owner fence is refused typed");
         assert!(
             !saw_accepted,
