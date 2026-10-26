@@ -15062,6 +15062,37 @@ describe('task6 hosted recovery in the mounted view', () => {
 })
 
 describe('task6 retained source against in-flight native history', () => {
+  it('refreshes saved native history at an unchanged event prefix', async () => {
+    const native = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
+    const store = createStore()
+    const locator = { provider: 'codex' as const, sessionType: 'freshcodex' as const, sessionId: native.threadId }
+    const handlers = new Set<(message: any) => void>()
+    wsMock.onMessage.mockImplementation((handler) => { handlers.add(handler); return () => { handlers.delete(handler) } })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(native)
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: { kind: 'fresh-agent', ...locator, createRequestId: 'same-event-prefix', status: 'idle' } }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    await expectRenderedText('Saved native Codex answer')
+    const retained = FreshAgentSnapshotSchema.parse({ ...native, turns: [{ id: 'clock-row', turnId: 'clock-row', role: 'assistant', summary: '', items: [{ id: 'clock-answer', kind: 'text', text: 'Retained before native persistence' }] }], extensions: { codex: { projection: {
+      id: 'clock-source', historyGeneration: 0, eventRevision: 10, eventOwnedTurnIds: ['clock-turn'], nativePreviewTurnIds: [], nativeFinalTurnIds: [], turnRows: { 'clock-turn': ['clock-row'] }, turnOutputStates: { 'clock-turn': { provenance: 'retained', refreshPending: true } },
+    } } } })
+    const saved = FreshAgentSnapshotSchema.parse({ ...retained, turns: [{ ...retained.turns[0], items: [{ id: 'clock-answer', kind: 'text', text: 'Later exact saved native history' }] }], extensions: { codex: { projection: {
+      ...retained.extensions.codex.projection, eventOwnedTurnIds: [], nativeFinalTurnIds: ['clock-turn'], turnOutputStates: { 'clock-turn': { provenance: 'saved', refreshPending: false } },
+    } } } })
+    const held = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValue(held.promise)
+    apiMock.getFreshAgentThreadSnapshot.mockClear()
+    const message = { type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.host.backpressure', retainedState: { source: { projectionId: 'clock-source', ownerEpoch: 0, ownerGeneration: 0, soulId: 'soul', incarnationId: 'incarnation', hostBootId: 'host' }, snapshot: retained, pendingControls: [], attentionMarks: [] } } }
+    try {
+      act(() => { handleFreshAgentMessage(store.dispatch, message as never); for (const handler of handlers) handler(message) })
+      await expectRenderedText('Retained before native persistence')
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+      await act(async () => held.resolve(saved))
+      await expectRenderedText('Later exact saved native history')
+      expect(screen.queryByText('Retained before native persistence')).not.toBeInTheDocument()
+      expect(sentFreshAgentMessages('freshAgent.send')).toEqual([])
+    } finally { cleanup(); await act(async () => held.resolve(saved)) }
+  })
+
   it('keeps the accepted source when an older native history request finishes afterwards', async () => {
     const native = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
     const store = createStore()

@@ -1378,7 +1378,7 @@ async function captureCodexLaneDiagnostics(
       type: frame.event.type, status: frame.event.status,
       projectionId: frame.event.projectionId, historyGeneration: frame.event.historyGeneration,
       afterRevision: frame.event.afterRevision,
-      ops: frame.event.ops?.map((op: any) => ({ type: op.type, revision: op.revision, nativeTurnId: op.nativeTurnId })),
+      ops: frame.event.ops?.map((op: any) => ({ op: op.op, revision: op.revision, nativeTurnId: op.nativeTurnId })),
       source: frame.event.retainedState?.source,
       snapshot: summarizeSnapshot(frame.event.retainedState?.snapshot),
     },
@@ -1536,7 +1536,8 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       await page.reload()
       await expect(approval).toHaveCount(1)
       await expect(approval).toBeVisible()
-      await approval.getByRole('button', { name: 'Allow tool use', exact: true }).click()
+      expect(readJsonl(lane.responseLogPath)).toHaveLength(0)
+      await approval.getByRole('button', { name: 'Allow', exact: true }).click()
       await expect.poll(() => readJsonl(lane.responseLogPath)).toContainEqual({ id: 501, result: { decision: 'accept' } })
       await expect(approval).toBeHidden()
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -1550,10 +1551,11 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       await sendComposerText(page, 'Deny an edit')
       const edit = page.getByRole('alert', { name: 'Permission request for Edit' })
       await expect(edit).toBeVisible()
-      await edit.getByRole('button', { name: 'Deny tool use', exact: true }).click()
+      await edit.getByRole('button', { name: 'Decline', exact: true }).click()
       await expect.poll(() => readJsonl(lane.responseLogPath)).toContainEqual({ id: 502, result: { decision: 'decline' } })
       await expect(edit).toBeHidden()
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      console.log('TASK006_NATIVE_APPROVAL_CONTRACT', JSON.stringify({ test: test.info().title, normalizedNativeResponses: readJsonl(lane.responseLogPath) }))
     } catch (error) {
       await captureCodexLaneDiagnostics(page, lane).catch((diagnosticError) => console.log('TASK006_CODEX_DIAGNOSTIC_FAILED', String(diagnosticError)))
       throw error
@@ -1563,33 +1565,59 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
     }
   })
 
-  // Decision D3 (client-alerts G20): codex keeps its client-only bypass,
-  // labelled for what it is. (The claude lane's former "Always Allow" case is
-  // replaced by Claude's own "Allow and don't ask again", pinned with no
-  // client auto-answer in freshclaude-approvals-rust.spec.ts.)
-  test('Always allow (pane) auto-answers the second raise for that tool', async ({ page }) => {
+  // Native grants belong to Codex's offered decision, rather than a generic
+  // pane-local tool bypass. A subsequent native request still needs a choice.
+  test('Codex native session approval forwards an offered decision and keeps later requests user-gated', async ({ page }) => {
     const lane = await bootCodexLane(page, { serverRequestsByPrompt: {
-      'Approve tests': { id: 601, method: 'item/commandExecution/requestApproval', params: { command: 'npm test', reason: 'Run project tests' } },
-      'Approve a build': { id: 602, method: 'item/commandExecution/requestApproval', params: { command: 'npm run build', reason: 'Build the project' } },
+      'Approve tests': { id: 601, method: 'item/commandExecution/requestApproval', params: { command: 'npm test', reason: 'Run project tests', availableDecisions: ['accept', 'acceptForSession', 'decline', 'cancel'] } },
+      'Approve a build': { id: 602, method: 'item/commandExecution/requestApproval', params: { command: 'npm run build', reason: 'Build the project', availableDecisions: ['decline', 'cancel'] } },
     } })
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
       await sendComposerText(page, 'Approve tests')
       const approval = page.getByRole('alert', { name: 'Permission request for Bash' })
       await expect(approval).toBeVisible()
-      const always = approval.getByRole('button', { name: 'Always allow Bash in this pane', exact: true })
-      await expect(always).toHaveAttribute('title', 'Until this pane reloads')
-      await always.click()
-      await expect.poll(() => readJsonl(lane.responseLogPath)).toContainEqual({ id: 601, result: { decision: 'accept' } })
+      const beforeReload = (await fetchSnapshot(lane.info, 'freshcodex', 'codex', 'thread-new-1')).pendingApprovals[0]
+      expect(beforeReload).toMatchObject({ providerRequest: { id: 601, method: 'item/commandExecution/requestApproval' }, native: { availableDecisions: ['accept', 'acceptForSession', 'decline', 'cancel'] } })
+      expect(readJsonl(lane.responseLogPath)).toEqual([])
+      await expect(approval.getByRole('button', { name: 'Always allow Bash in this pane', exact: true })).toHaveCount(0)
+      expect((await lane.harness.getSentWsMessages() as any[]).filter((frame) => frame.type === 'freshAgent.send' && frame.text === 'Approve tests')).toHaveLength(1)
+      await page.reload()
+      await expect(approval).toHaveCount(1)
+      await expect(approval).toBeVisible()
+      const afterReload = (await fetchSnapshot(lane.info, 'freshcodex', 'codex', 'thread-new-1')).pendingApprovals[0]
+      expect(afterReload.requestId).toBe(beforeReload.requestId)
+      expect(afterReload.native.availableDecisions).toEqual(['accept', 'acceptForSession', 'decline', 'cancel'])
+      expect(readJsonl(lane.responseLogPath)).toEqual([])
+      await approval.getByRole('button', { name: 'Allow for this session', exact: true }).click()
+      await expect.poll(() => readJsonl(lane.responseLogPath)).toEqual([{ id: 601, result: { decision: 'acceptForSession' } }])
       await expect(approval).toBeHidden()
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
 
-      // The second request for Bash is answered by the pane, with no click.
+      // The provider raises a different command with a narrower offer. The
+      // first session choice does not authorize a client-side automatic reply.
       await sendComposerText(page, 'Approve a build')
-      await expect.poll(() => readJsonl(lane.responseLogPath), { timeout: 15_000, message: 'the second raise is answered without a click' })
-        .toContainEqual({ id: 602, result: { decision: 'accept' } })
+      await expect(approval).toHaveCount(1)
+      await expect(approval).toBeVisible()
+      const second = (await fetchSnapshot(lane.info, 'freshcodex', 'codex', 'thread-new-1')).pendingApprovals[0]
+      expect(second).toMatchObject({ providerRequest: { id: 602, method: 'item/commandExecution/requestApproval' }, native: { availableDecisions: ['decline', 'cancel'] } })
+      await expect(approval.getByRole('button', { name: 'Allow', exact: true })).toHaveCount(0)
+      await expect(approval.getByRole('button', { name: 'Allow for this session', exact: true })).toHaveCount(0)
+      await expect(approval.getByRole('button', { name: 'Always allow Bash in this pane', exact: true })).toHaveCount(0)
+      expect(readJsonl(lane.responseLogPath)).toEqual([{ id: 601, result: { decision: 'acceptForSession' } }])
+      expect((await lane.harness.getSentWsMessages() as any[]).filter((frame) => frame.type === 'freshAgent.approval.respond' && frame.requestId === second.requestId)).toEqual([])
+      await approval.getByRole('button', { name: 'Decline', exact: true }).click()
+      await expect.poll(() => readJsonl(lane.responseLogPath)).toEqual([{ id: 601, result: { decision: 'acceptForSession' } }, { id: 602, result: { decision: 'decline' } }])
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
       await expect(approval).toBeHidden()
+      expect((await lane.harness.getSentWsMessages() as any[]).filter((frame) => frame.type === 'freshAgent.send' && frame.text === 'Approve a build')).toHaveLength(1)
+      const recorded = JSON.parse(await fs.readFile(path.join(lane.info.homeDir, '.codex', 'fake-turns', 'thread-new-1.json'), 'utf8'))
+      expect(recorded).toHaveLength(2)
+      console.log('TASK006_NATIVE_APPROVAL_CONTRACT', JSON.stringify({
+        test: test.info().title,
+        normalizedRequests: [beforeReload, afterReload, second].map((request) => ({ requestId: request.requestId, providerRequest: request.providerRequest, availableDecisions: request.native.availableDecisions })),
+        normalizedNativeResponses: readJsonl(lane.responseLogPath), recordedTurns: recorded.length,
+      }))
     } catch (error) {
       await captureCodexLaneDiagnostics(page, lane).catch((diagnosticError) => console.log('TASK006_CODEX_DIAGNOSTIC_FAILED', String(diagnosticError)))
       throw error

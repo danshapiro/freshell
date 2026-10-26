@@ -73,6 +73,12 @@ impl EventTurn {
     }
 
     fn native_can_finish_unobserved_items(&self, native: &Value, legacy: bool) -> bool {
+        // Lifecycle notifications establish status, not an empty body. When
+        // no item was observed, the caller's full terminal native read owns
+        // the body; there is no event content whose equality it must prove.
+        if self.raw["items"].as_array().is_some_and(Vec::is_empty) {
+            return true;
+        }
         let mut candidate = self.raw.clone();
         let mut saved = native.clone();
         let mut finalizable = HashSet::new();
