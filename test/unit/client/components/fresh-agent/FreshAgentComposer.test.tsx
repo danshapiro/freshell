@@ -34,6 +34,29 @@ describe('FreshAgentComposer', () => {
   })
   afterEach(() => cleanup())
 
+  it('loads a restored ordinary draft when the native storage key binds after mount without sending it', () => {
+    const onSend = vi.fn()
+    const draft = 'Answer to Codex question: {"itemId":"parent-answer","questionId":"0","question":"Where?","answer":"Staging"}'
+    window.sessionStorage.setItem('native-session-draft', draft)
+    const { rerender } = render(<FreshAgentComposer storageKey="restoring-placeholder" disabled onSend={onSend} />)
+    expect(getInput()).toHaveValue('')
+    rerender(<FreshAgentComposer storageKey="native-session-draft" onSend={onSend} />)
+    expect(getInput()).toHaveValue(draft)
+    expect(window.sessionStorage.getItem('native-session-draft')).toBe(draft)
+    expect(onSend).not.toHaveBeenCalled()
+  })
+
+  it('keeps newer unsent text when the native storage key binds', () => {
+    window.sessionStorage.setItem('native-session-draft', 'An older stored draft')
+    const onSend = vi.fn()
+    const { rerender } = render(<FreshAgentComposer storageKey="restoring-placeholder" onSend={onSend} />)
+    fireEvent.change(getInput(), { target: { value: 'A newer unsent draft' } })
+    rerender(<FreshAgentComposer storageKey="native-session-draft" onSend={onSend} />)
+    expect(getInput()).toHaveValue('A newer unsent draft')
+    expect(window.sessionStorage.getItem('native-session-draft')).toBe('A newer unsent draft')
+    expect(onSend).not.toHaveBeenCalled()
+  })
+
   it('blocks shell escapes without a Rust shell route', () => {
     const onSend = vi.fn()
     render(<FreshAgentComposer commands={GROUPED_COMMANDS} onSend={onSend} />)

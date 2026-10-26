@@ -225,6 +225,7 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
     if (!storageKey || typeof window === 'undefined') return ''
     return window.sessionStorage.getItem(storageKey) ?? ''
   })
+  const draftStorageKeyRef = useRef(storageKey)
   const [menuMode, setMenuMode] = useState<MenuMode | null>(null)
   const [filter, setFilter] = useState('')
   const [highlightedIndex, setHighlightedIndex] = useState(0)
@@ -308,7 +309,18 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
   const menuLength = menuMode === 'files' ? fileSuggestions.length : visibleRows.length
 
   useEffect(() => {
+    const keyChanged = draftStorageKeyRef.current !== storageKey
+    draftStorageKeyRef.current = storageKey
     if (!storageKey || typeof window === 'undefined') return
+    if (keyChanged && !text) {
+      const saved = window.sessionStorage.getItem(storageKey)
+      if (saved) {
+        // Restores can bind the native session after this composer mounts.
+        // Hydrate its existing ordinary draft before an empty value can erase it.
+        setText((current) => current || saved)
+        return
+      }
+    }
     if (text) {
       window.sessionStorage.setItem(storageKey, text)
     } else {
