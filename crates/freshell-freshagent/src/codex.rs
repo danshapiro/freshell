@@ -3384,6 +3384,11 @@ impl FreshCodexState {
             Err(EnsureAliveError::Reserved) => {
                 // Task 13 (D8): another create/attach holds this sessionRef -- the
                 // retryable non-lost error channel; the client re-drive converges.
+                self.send_error(
+                    &request_id,
+                    "SESSION_RESERVED",
+                    "Another resume for this session is in flight",
+                );
                 self.emit_fresh_agent_error(
                     &session_id,
                     "SESSION_RESERVED",
@@ -3427,6 +3432,7 @@ impl FreshCodexState {
             guard.get(&session_id).map(|s| {
                 (
                     s.client.clone(),
+                    s.turn_state.clone(),
                     s.active_turn.clone(),
                     s.turn_in_flight.clone(),
                     // FR1-1: the install-site void of the retired-turn slot.
@@ -3444,6 +3450,7 @@ impl FreshCodexState {
         };
         let Some((
             client,
+            turn_state,
             active_turn,
             turn_in_flight,
             retired_turn_id,
@@ -3468,36 +3475,7 @@ impl FreshCodexState {
         // this lock, the send simply waits, then proceeds and destroys redo
         // ("send waits, rollback wins, then destroys").
         let _turn = turn_lock.lock().await;
-
-        // The checkpoint workspace barrier can park a send outside this
-        // handler while ownership changes. Recheck the captured wire fence
-        // after the turn lock so a delayed send cannot reach a replacement
-        // owner of the same thread id. Keep the coordinator guard through the
-        // turn/start request; ordinary legacy sends without a fence retain
-        // their existing behavior.
-        let ownership_guard = if msg.checkpoint_intent.is_some() || send_fence.is_some() {
-            let owner_key = self.resolve_ownership_key(&session_id);
-            match crate::ownership_lane::arm_reclaimless_op_guard(
-                &self.ownership,
-                PROVIDER,
-                &owner_key,
-                &format!("send-{}", uuid::Uuid::new_v4()),
-                send_fence,
-                "freshcodex/send",
-            ) {
-                crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
-                crate::ownership_lane::LaneOpGuard::Unwired => None,
-                crate::ownership_lane::LaneOpGuard::Refused { message, .. } => {
-                    tracing::warn!(target: "freshell_freshagent::codex",
-                        session_id = %session_id, request_id = ?request_id,
-                        "fresh_agent_send_refused: ownership guard refused");
-                    self.send_error(&request_id, "SESSION_RESERVED", &message);
-                    return;
-                }
-            }
-        } else {
-            None
-        };
+        wait_for_codex_stop_resolution(&turn_state).await;
 
         // Read defaults after acquiring the turn lock: a queued send inherits the
         // last accepted settings, while this message's explicit choices win.
@@ -3537,20 +3515,6 @@ impl FreshCodexState {
             return;
         }
 
-        // Decision 5 (codex/opencode/claude share this helper): any new
-        // submission permanently destroys redo. AWAITED before the turn goes
-        // out; a ledger write failure is logged but never blocks the send.
-        if let Some(err) = crate::rollback_record::destroy_redo_on_submit(
-            &self.identity_sink(),
-            PROVIDER,
-            &session_id,
-            now_ms(),
-        )
-        .await
-        {
-            tracing::warn!(error = %err, session = %session_id, "freshagent.codex.destroy_redo_on_submit_failed");
-        }
-
         // Re-normalize model/effort on send (adapter.ts:961-963) — idempotent for stored values.
         let model = normalize_freshcodex_model(Some(&model));
         let effort = normalize_freshcodex_effort(Some(&model), effort.as_deref());
@@ -3573,80 +3537,140 @@ impl FreshCodexState {
             approval_policy: permission_mode.as_deref().map(|p| json!(p)),
         };
 
-        // The app-server can write a terminal notification immediately after its
-        // turn/start response. Hold the session-local emission gate from before that
-        // RPC through the accepted broadcast below, so the client first receives the
-        // request-correlated submittedTurnId and then the completion-derived frames.
-        let _event_emission = event_emission_gate.lock().await;
+        // The emission barrier keeps acceptance before terminal publication.
+        // Recheck Stop while atomically recording dispatch ownership: a Stop
+        // arriving after the first wait must either block issuance or latch on
+        // this exact new dispatch. No consumer lock is held across the wait.
+        let (_event_emission, expected_turn_id, dispatch) = loop {
+            let emission = event_emission_gate.lock().await;
+            let active = active_turn.lock().expect("active_turn mutex").clone();
+            let selected = {
+                let mut turns = turn_state.lock().expect("codex turn state");
+                if let Some(active) = active.as_deref() {
+                    turns.observe_started(active);
+                }
+                if turns.has_unresolved_stop() {
+                    None
+                } else {
+                    if turns.has_owned_exit() {
+                        self.send_error(&request_id, "SESSION_RESERVED", "The owned Codex runtime exited while this input waited; refresh before sending again");
+                        return;
+                    }
+                    let expected = turns.active_turn_id().map(str::to_owned);
+                    if expected.is_none() && turns.has_unknown_delivery() {
+                        self.send_error(&request_id, "CODEX_DELIVERY_AMBIGUOUS", "Earlier input has unresolved native delivery; recover or inspect the conversation before sending again");
+                        return;
+                    }
+                    Some((
+                        expected,
+                        turns.begin_dispatch(request_id.as_deref().unwrap_or_default()),
+                    ))
+                }
+            };
+            if let Some((expected, dispatch)) = selected {
+                break (emission, expected, dispatch);
+            }
+            drop(emission);
+            wait_for_codex_stop_resolution(&turn_state).await;
+        };
+        // The checkpoint workspace barrier can park a send outside this
+        // handler while ownership changes. Recheck the captured wire fence
+        // after the turn lock so a delayed send cannot reach a replacement
+        // owner of the same thread id. Keep the coordinator guard through the
+        // turn/start request; ordinary legacy sends without a fence retain
+        // their existing behavior.
+        let ownership_guard = if msg.checkpoint_intent.is_some() || send_fence.is_some() {
+            let owner_key = self.resolve_ownership_key(&session_id);
+            match crate::ownership_lane::arm_reclaimless_op_guard(
+                &self.ownership,
+                PROVIDER,
+                &owner_key,
+                &format!("send-{}", uuid::Uuid::new_v4()),
+                send_fence,
+                "freshcodex/send",
+            ) {
+                crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
+                crate::ownership_lane::LaneOpGuard::Unwired => None,
+                crate::ownership_lane::LaneOpGuard::Refused { message, .. } => {
+                    tracing::warn!(target: "freshell_freshagent::codex",
+                        session_id = %session_id, request_id = ?request_id,
+                        "fresh_agent_send_refused: ownership guard refused");
+                    turn_state
+                        .lock()
+                        .expect("codex turn state")
+                        .reject(dispatch);
+                    self.send_error(&request_id, "SESSION_RESERVED", &message);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
 
-        // The turn-in-flight latch + quiet window arm at DISPATCH time -- BEFORE
-        // awaiting the response: the independently-running exit watcher and the
-        // quiet-deadman waiter must classify this turn as in flight even while
-        // the response is still outstanding (a crash in that window ends a real
-        // dispatched turn; a post-response arm would classify it idle and miss
-        // the crash edge, or arm the deadman after the sidecar is already
-        // gone). The response-failure arm below disarms both ONLY when the
-        // sidecar is not known-dead.
+        // Decision 5 (codex/opencode/claude share this helper): any new
+        // submission permanently destroys redo. AWAITED before the turn goes
+        // out; a ledger write failure is logged but never blocks the send.
+        if let Some(err) = crate::rollback_record::destroy_redo_on_submit(
+            &self.identity_sink(),
+            PROVIDER,
+            &session_id,
+            now_ms(),
+        )
+        .await
+        {
+            tracing::warn!(error = %err, session = %session_id, "freshagent.codex.destroy_redo_on_submit_failed");
+        }
+
         turn_in_flight.store(true, Ordering::SeqCst);
         note_codex_activity(self, &session_id, &turn_in_flight, &quiet_deadman);
-
-        let expected_turn_id = active_turn.lock().expect("active_turn mutex").clone();
         let result = if let Some(expected) = expected_turn_id.as_deref() {
             client.steer_turn(&session_id, expected, params.input).await
         } else {
             client.start_turn(params).await
         };
-        let submitted_turn_id = match result {
+        let (submitted_turn_id, latched_stop) = match result {
             Ok(started) => {
-                // adapter.ts:980 -- track the active turn immediately (before any
-                // turn/started notification), so a fast-follow interrupt has a target.
-                *active_turn.lock().expect("active_turn mutex") = Some(started.turn_id.clone());
-                // FR1-1 (stale-slot protection): the new turn's install VOIDS
-                // the retired-turn slot a PREVIOUS turn's idle retirement may
-                // have left — a late completion for that older turn must never
-                // retire THIS turn's crash latch. The emission gate (held above
-                // across the RPC) keeps the consumer from folding any
-                // completion in this window, so the two writes are serialized
-                // against the reducer. The slot guard is sequenced with (never
-                // nested inside) the tracker guard.
+                let mut turns = turn_state.lock().expect("codex turn state");
+                let latched_stop = turns.accept(dispatch, &started.turn_id);
+                let active = turns.active_turn_id().map(str::to_owned);
+                let owed = turns.has_owed_work();
+                drop(turns);
+                *active_turn.lock().expect("active_turn mutex") = active;
+                turn_in_flight.store(owed, Ordering::SeqCst);
                 *retired_turn_id.lock().expect("retired_turn_id mutex") = None;
-                // E3R1 (durable already-rang set): the install deliberately
-                // does NOT touch the set. The pre-fix install VOID reopened
-                // the gate for a PRIOR turn's late completion after a
-                // lifecycle-loss mint — a double bell. A stale set entry is
-                // safe: the gate matches turn ids, so it can never gate THIS
-                // new turn's own completion.
-                // A turn is now in flight: refresh the quiet window off the
-                // response (the sidecar has provably accepted the turn; the
-                // deadline resets from this lane-visible proof).
                 note_codex_activity(self, &session_id, &turn_in_flight, &quiet_deadman);
-                started.turn_id
+                (started.turn_id, latched_stop)
             }
             Err(err) => {
-                // The dispatch/response failed. Retire the latch + disarm the
-                // dispatch-time window ONLY when the sidecar is NOT known-dead:
-                // an exit-induced failure (the production crash shape — the
-                // sidecar dies mid-dispatch and the transport's read loop fails
-                // the pending request with a connection-closed error) must
-                // LEAVE the latch armed so the exit watcher's crash arm owns
-                // the turn-end classification. This arm has no awaits, so a
-                // bare retirement would land before the crash arm's swap
-                // (which sits behind disarm + the `exited` broadcast + an
-                // awaited kill-and-confirm) and swallow the crash edge with
-                // near-certainty. The crash arm is guaranteed to run for a
-                // dead child; if it already ran, its swap minted the edge and
-                // leaving the now-false latch untouched is harmless. A
-                // requested kill also retires the latch silently and
-                // unconditionally, so a close-induced failure can never
-                // out-live it. Ordinary rejections (a live sidecar's RPC
-                // error, a timeout) still retire promptly.
-                let exit_induced = exited.load(Ordering::SeqCst)
-                    || matches!(err, CodexAppServerError::Closed { .. });
-                if !exit_induced {
-                    turn_in_flight.store(false, Ordering::SeqCst);
+                let mut refused = err.is_not_submitted();
+                let owed = {
+                    let mut turns = turn_state.lock().expect("codex turn state");
+                    if refused {
+                        refused = turns.reject(dispatch);
+                    } else {
+                        turns.mark_ambiguous(dispatch);
+                    }
+                    turns.has_owed_work()
+                };
+                // An owned-exit watcher retains crash-attention authority.
+                if !exited.load(Ordering::SeqCst) {
+                    turn_in_flight.store(owed, Ordering::SeqCst);
                     note_codex_activity(self, &session_id, &turn_in_flight, &quiet_deadman);
                 }
-                self.send_error(&request_id, "CODEX_TURN_START_FAILED", &err.to_string());
+                let code = if refused {
+                    "CODEX_TURN_START_FAILED"
+                } else {
+                    "CODEX_DELIVERY_AMBIGUOUS"
+                };
+                let receipt = turn_state
+                    .lock()
+                    .expect("codex turn state")
+                    .facts()
+                    .iter()
+                    .find(|fact| fact.token == dispatch)
+                    .map(|fact| fact.request_id.clone());
+                tracing::warn!(provider=PROVIDER, session_id=%session_id, request_id=?receipt, dispatch=?dispatch, expected_turn_id=?expected_turn_id, refused, error=%err, "freshagent.codex.send_failed");
+                self.send_error(&request_id, code, &err.to_string());
                 return;
             }
         };
@@ -3796,6 +3820,27 @@ impl FreshCodexState {
             self.broadcast(&accepted);
         }
 
+        if expected_turn_id.is_some() && msg.settings.is_some() {
+            broadcast_codex_event(
+                &session_id,
+                json!({"type":"freshAgent.notice", "level":"info", "code":"CODEX_SETTINGS_STAGED", "message":"Settings are saved for the next turn; active input keeps this turn's settings."}),
+                &self.broadcast_tx,
+            );
+        }
+        // Release both serialization locks before Stop RPC work. The consumer
+        // must remain free to observe terminal evidence while Stop is pending.
+        drop(_event_emission);
+        drop(_turn);
+        if let StopDisposition::Interrupt { dispatch, turn_id } = latched_stop {
+            self.issue_codex_interrupt(
+                &session_id,
+                client.clone(),
+                turn_state.clone(),
+                dispatch,
+                turn_id,
+            )
+            .await;
+        }
         if let Some((request_id, logical_attempt_id)) = checkpoint_identity_request {
             drop(
                 self.spawn_checkpoint_identity_probe(CodexCheckpointIdentityProbe {
@@ -19485,6 +19530,552 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn task4_refusal_marker_publication_cannot_clear_a_newer_stop() {
+        let turns = Arc::new(StdMutex::new(CodexTurnState::default()));
+        let marker = Arc::new(AtomicBool::new(true));
+        let old = {
+            let mut state = turns.lock().unwrap();
+            let old = state.begin_dispatch("old");
+            state.accept(old, "old");
+            state.request_stop();
+            state.settle_native("old", NativeSettlement::Completed);
+            old
+        };
+        let (entered, at_publication) = std::sync::mpsc::channel();
+        let (release, may_publish) = std::sync::mpsc::channel();
+        let publisher = {
+            let turns = turns.clone();
+            let marker = marker.clone();
+            std::thread::spawn(move || {
+                publish_codex_interrupt_refusal(&turns, old, "old", || {
+                    // This is the actual compatibility publication boundary, held
+                    // with deterministic barriers, not a delayed native ACK model.
+                    entered.send(()).unwrap();
+                    may_publish.recv_timeout(Duration::from_secs(5)).unwrap();
+                    marker.store(false, Ordering::SeqCst);
+                })
+            })
+        };
+        at_publication.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut admitted_new = false;
+        let blocked = match turns.try_lock() {
+            Ok(mut state) => {
+                let new = state.begin_dispatch("new");
+                state.accept(new, "new");
+                state.request_stop();
+                marker.store(true, Ordering::SeqCst);
+                admitted_new = true;
+                false
+            }
+            Err(std::sync::TryLockError::WouldBlock) => true,
+            Err(error) => panic!("unexpected state-lock failure: {error}"),
+        };
+        release.send(()).unwrap();
+        assert!(publisher.join().unwrap());
+        if !admitted_new {
+            let mut state = turns.lock().unwrap();
+            let new = state.begin_dispatch("new");
+            state.accept(new, "new");
+            state.request_stop();
+            marker.store(true, Ordering::SeqCst);
+        }
+        assert!(
+            marker.load(Ordering::SeqCst),
+            "an old refusal publication must never clear the newer Stop marker"
+        );
+        assert!(blocked, "new dispatch/Stop cannot acquire ownership before the old compatibility publication completes");
+        assert_eq!(turns.lock().unwrap().user_stop_turn_id(), Some("new"));
+    }
+
+    fn task4_stop(session_id: &str) -> FreshAgentInterrupt {
+        FreshAgentInterrupt {
+            session_id: session_id.into(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            provider: freshell_protocol::AgentProvider::Codex,
+            request_id: None,
+            cwd: None,
+        }
+    }
+
+    async fn task4_no_native_frame(peer: &freshell_codex::ChannelPeer) {
+        let mut next = Box::pin(peer.next_raw_frame());
+        let pending = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(next.as_mut(), cx).is_pending())
+        })
+        .await;
+        assert!(
+            pending,
+            "the native issuance gate must have issued no frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn task4_held_stop_allows_terminal_consumption_but_blocks_new_start_until_its_reply() {
+        let (st, mut rx) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-held",
+            Arc::new(client),
+            Arc::new(StdMutex::new(Some("old".into()))),
+            notifs,
+            spawn_sleeper(),
+            "task4-held",
+        )
+        .await;
+        let stop = {
+            let st = st.clone();
+            tokio::spawn(async move { st.handle_interrupt(task4_stop("thread-held")).await })
+        };
+        answer_initialize(&peer).await;
+        let (stop_id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "turn/interrupt");
+        // Hold the exact dispatch serialization lock while terminal evidence
+        // is consumed. A consumer that waits for this lock cannot release the
+        // issuance gate, and this deterministic barrier would fail.
+        let dispatch_lock = st
+            .sessions
+            .lock()
+            .await
+            .get("thread-held")
+            .unwrap()
+            .turn_lock
+            .clone();
+        let dispatch_guard = dispatch_lock.lock().await;
+        peer.emit_notification(
+            "turn/completed",
+            json!({"threadId":"thread-held", "turn":{"id":"old","status":"completed"}}),
+        );
+        let terminal = collect_frames_until(&mut rx, Duration::from_secs(2), |w| {
+            w["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        assert!(
+            terminal.matched,
+            "consumer must progress with Stop RPC held"
+        );
+        drop(dispatch_guard);
+        let turns = st
+            .sessions
+            .lock()
+            .await
+            .get("thread-held")
+            .unwrap()
+            .turn_state
+            .clone();
+        assert!(!turns.lock().unwrap().has_owed_work());
+        assert!(turns.lock().unwrap().has_unresolved_stop());
+        let waiting = turns.lock().unwrap().waiting_for_stop.clone();
+        let next = {
+            let st = st.clone();
+            tokio::spawn(async move { st.handle_send(send_msg("thread-held", "new input")).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), waiting.notified())
+            .await
+            .unwrap();
+        task4_no_native_frame(&peer).await;
+        peer.respond(&stop_id, json!({}));
+        stop.await.unwrap();
+        let (start_id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        peer.respond(&start_id, json!({"turn":{"id":"new"}}));
+        next.await.unwrap();
+        // Adversarial old replies after a supported resolved rollover; this is
+        // deliberately not described as normal native ACK ordering.
+        peer.respond(&stop_id, json!({}));
+        peer.emit_notification(
+            "turn/completed",
+            json!({"threadId":"thread-held", "turn":{"id":"old","status":"interrupted"}}),
+        );
+        peer.emit_notification(
+            "thread/name/updated",
+            json!({"threadId":"thread-held","name":"consumer barrier"}),
+        );
+        let stop_new = {
+            let st = st.clone();
+            tokio::spawn(async move { st.handle_interrupt(task4_stop("thread-held")).await })
+        };
+        let (new_stop, method, params) = peer.expect_request().await;
+        assert_eq!(method, "turn/interrupt");
+        assert_eq!(params["turnId"], "new");
+        assert!(turns.lock().unwrap().has_owed_work());
+        peer.respond(&new_stop, json!({}));
+        stop_new.await.unwrap();
+        assert!(turns.lock().unwrap().has_owed_work());
+        drop(peer);
+        st.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn task4_stop_before_start_acceptance_interrupts_once_and_preserves_acceptance_order() {
+        let (st, mut rx) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-pending",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            notifs,
+            spawn_sleeper(),
+            "task4-pending",
+        )
+        .await;
+        let send = {
+            let st = st.clone();
+            tokio::spawn(async move { st.handle_send(send_msg("thread-pending", "first")).await })
+        };
+        answer_initialize(&peer).await;
+        let (start_id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        st.handle_interrupt(task4_stop("thread-pending")).await;
+        task4_no_native_frame(&peer).await;
+        peer.respond(&start_id, json!({"turn":{"id":"accepted"}}));
+        let (stop_id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "turn/interrupt");
+        assert_eq!(params["turnId"], "accepted");
+        peer.emit_notification(
+            "turn/completed",
+            json!({"threadId":"thread-pending","turn":{"id":"accepted","status":"interrupted"}}),
+        );
+        peer.respond(&stop_id, json!({}));
+        send.await.unwrap();
+        let frames = collect_frames_until(&mut rx, Duration::from_secs(2), |w| {
+            w["event"]["type"] == "freshAgent.session.snapshot" && w["event"]["status"] == "idle"
+        })
+        .await;
+        assert!(frames.matched);
+        let accepted = frames
+            .frames
+            .iter()
+            .position(|w| w["type"] == "freshAgent.send.accepted")
+            .unwrap();
+        let terminal = frames
+            .frames
+            .iter()
+            .position(|w| w["event"]["type"] == "freshAgent.session.snapshot")
+            .unwrap();
+        assert!(accepted < terminal);
+        task4_no_native_frame(&peer).await;
+        assert!(!st
+            .sessions
+            .lock()
+            .await
+            .get("thread-pending")
+            .unwrap()
+            .turn_state
+            .lock()
+            .unwrap()
+            .has_owed_work());
+        drop(peer);
+        st.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn task4_unknown_start_delivery_is_not_replayed_and_native_evidence_can_recover_it() {
+        let (st, mut rx) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-unknown",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            notifs,
+            spawn_sleeper(),
+            "task4-unknown",
+        )
+        .await;
+        let send = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                let mut msg = send_msg("thread-unknown", "original");
+                msg.request_id = Some("delivery-receipt".into());
+                st.handle_send(msg).await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        peer.respond_error(&id, -32603, "internal failure after possible admission");
+        send.await.unwrap();
+        let failed = collect_frames_until(&mut rx, Duration::from_secs(2), |w| {
+            w["type"] == "error" && w["requestId"] == "delivery-receipt"
+        })
+        .await;
+        assert!(failed.matched);
+        assert!(failed.frames.last().unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("CODEX_DELIVERY_AMBIGUOUS:"));
+        let turns = st
+            .sessions
+            .lock()
+            .await
+            .get("thread-unknown")
+            .unwrap()
+            .turn_state
+            .clone();
+        assert!(turns.lock().unwrap().has_owed_work());
+        st.handle_send(send_msg("thread-unknown", "later input"))
+            .await;
+        task4_no_native_frame(&peer).await;
+        peer.emit_notification(
+            "turn/started",
+            json!({"threadId":"thread-unknown","turn":{"id":"recovered","status":"inProgress"}}),
+        );
+        peer.emit_notification(
+            "turn/completed",
+            json!({"threadId":"thread-unknown","turn":{"id":"recovered","status":"completed"}}),
+        );
+        assert!(
+            collect_frames_until(&mut rx, Duration::from_secs(2), |w| w["event"]["type"]
+                == "freshAgent.turn.complete")
+            .await
+            .matched
+        );
+        assert!(!turns.lock().unwrap().has_owed_work());
+        assert_eq!(
+            turns.lock().unwrap().facts().front().unwrap().request_id,
+            "delivery-receipt"
+        );
+        drop(peer);
+        st.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn task4_ambiguous_stop_timeout_keeps_issuance_closed_after_terminal_evidence() {
+        let (st, mut rx) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) =
+            CodexAppServerClient::connect_with_timeout(transport, Duration::from_millis(100));
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-timeout",
+            Arc::new(client),
+            Arc::new(StdMutex::new(Some("old".into()))),
+            notifs,
+            spawn_sleeper(),
+            "task4-timeout",
+        )
+        .await;
+        let stop = {
+            let st = st.clone();
+            tokio::spawn(async move { st.handle_interrupt(task4_stop("thread-timeout")).await })
+        };
+        answer_initialize(&peer).await;
+        let (_id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "turn/interrupt");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_millis(200)).await;
+        stop.await.unwrap();
+        tokio::time::resume();
+        peer.emit_notification(
+            "turn/completed",
+            json!({"threadId":"thread-timeout","turn":{"id":"old","status":"interrupted"}}),
+        );
+        assert!(
+            collect_frames_until(&mut rx, Duration::from_secs(2), |w| w["event"]["type"]
+                == "freshAgent.session.snapshot"
+                && w["event"]["status"] == "idle")
+            .await
+            .matched
+        );
+        let turns = st
+            .sessions
+            .lock()
+            .await
+            .get("thread-timeout")
+            .unwrap()
+            .turn_state
+            .clone();
+        assert!(!turns.lock().unwrap().has_owed_work());
+        assert!(turns.lock().unwrap().has_unresolved_stop());
+        let waiting = turns.lock().unwrap().waiting_for_stop.clone();
+        let send = {
+            let st = st.clone();
+            tokio::spawn(async move { st.handle_send(send_msg("thread-timeout", "later")).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), waiting.notified())
+            .await
+            .unwrap();
+        task4_no_native_frame(&peer).await;
+        drop(peer);
+        st.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(2), send)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !turns.lock().unwrap().has_unresolved_stop(),
+            "confirmed owned exit resolves the outstanding operation"
+        );
+    }
+
+    #[tokio::test]
+    async fn task4_ack_and_idle_cannot_make_rest_sendable_before_matching_terminal_evidence() {
+        let (st, mut rx) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-rest",
+            Arc::new(client),
+            Arc::new(StdMutex::new(Some("old".into()))),
+            notifs,
+            spawn_sleeper(),
+            "task4-rest",
+        )
+        .await;
+        let stop = {
+            let st = st.clone();
+            tokio::spawn(async move { st.handle_interrupt(task4_stop("thread-rest")).await })
+        };
+        answer_initialize(&peer).await;
+        let (id, _, _) = peer.expect_request().await;
+        peer.respond(&id, json!({}));
+        stop.await.unwrap();
+        peer.emit_notification(
+            "thread/status/changed",
+            json!({"threadId":"thread-rest","status":{"type":"idle"}}),
+        );
+        let status = collect_frames_until(&mut rx, Duration::from_secs(2), |w| {
+            w["event"]["type"] == "freshAgent.session.snapshot"
+        })
+        .await;
+        assert_eq!(status.frames.last().unwrap()["event"]["status"], "running");
+        let snapshot = {
+            let st = st.clone();
+            tokio::spawn(async move { st.get_snapshot("thread-rest", None).await.unwrap() })
+        };
+        let (id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "thread/read");
+        peer.respond(
+            &id,
+            json!({"thread":{"id":"thread-rest","status":"idle","turns":[]}}),
+        );
+        let snapshot = snapshot.await.unwrap();
+        assert_eq!(snapshot["status"], "running");
+        assert_eq!(snapshot["capabilities"]["send"], false);
+        peer.emit_notification(
+            "turn/completed",
+            json!({"threadId":"thread-rest","turn":{"id":"old","status":"interrupted"}}),
+        );
+        assert!(
+            collect_frames_until(&mut rx, Duration::from_secs(2), |w| w["event"]["status"]
+                == "idle")
+            .await
+            .matched
+        );
+        let snapshot = {
+            let st = st.clone();
+            tokio::spawn(async move { st.get_snapshot("thread-rest", None).await.unwrap() })
+        };
+        let (id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "thread/read");
+        peer.respond(
+            &id,
+            json!({"thread":{"id":"thread-rest","status":"idle","turns":[]}}),
+        );
+        assert_eq!(snapshot.await.unwrap()["capabilities"]["send"], true);
+        drop(peer);
+        st.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn task4_interrupt_ack_does_not_settle_owed_work() {
+        let (st, _) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-ack",
+            Arc::new(client),
+            Arc::new(StdMutex::new(Some("old".into()))),
+            notifs,
+            spawn_sleeper(),
+            "task4-ack",
+        )
+        .await;
+        let interrupt = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_interrupt(FreshAgentInterrupt {
+                    session_id: "thread-ack".into(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    request_id: None,
+                    cwd: None,
+                })
+                .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "turn/interrupt");
+        assert_eq!(params["turnId"], "old");
+        peer.respond(&id, json!({}));
+        interrupt.await.unwrap();
+        let owed = st
+            .sessions
+            .lock()
+            .await
+            .get("thread-ack")
+            .unwrap()
+            .turn_in_flight
+            .load(Ordering::SeqCst);
+        assert!(
+            owed,
+            "interrupt ACK proves submission, never terminal settlement"
+        );
+        drop(peer);
+        st.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn task4_active_input_steers_expected_turn_and_rejection_preserves_it() {
+        let (st, _) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-steer",
+            Arc::new(client),
+            Arc::new(StdMutex::new(Some("old".into()))),
+            notifs,
+            spawn_sleeper(),
+            "task4-steer",
+        )
+        .await;
+        let send = {
+            let st = st.clone();
+            tokio::spawn(async move { st.handle_send(send_msg("thread-steer", "adjust")).await })
+        };
+        answer_initialize(&peer).await;
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "turn/steer");
+        assert_eq!(params["expectedTurnId"], "old");
+        assert!(
+            params.get("model").is_none(),
+            "steer cannot override turn settings"
+        );
+        peer.respond_error(
+            &id,
+            -32600,
+            "expected active turn id `old` but found `different`",
+        );
+        send.await.unwrap();
+        let guard = st.sessions.lock().await;
+        let session = guard.get("thread-steer").unwrap();
+        assert!(session.turn_in_flight.load(Ordering::SeqCst));
+        assert_eq!(session.active_turn.lock().unwrap().as_deref(), Some("old"));
+        drop(guard);
+        drop(peer);
+        st.shutdown().await;
+    }
+
     #[tokio::test]
     async fn onexit_self_heal_rings_the_edge_for_a_crash_during_the_start_turn_dispatch_window() {
         // The round-2 review's core crash scenario: the sidecar dies AFTER the
@@ -28790,12 +29381,20 @@ pub(crate) mod tests {
         })
         .await;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut correlated_refusal = false;
         loop {
             let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
                 .await
                 .expect("a frame within budget")
                 .map(|raw| serde_json::from_str(&raw).expect("json frame"))
                 .expect("the bus stays open");
+            if frame["type"] == "error" && frame["requestId"] == "req-r8-stale-send" {
+                assert!(frame["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("SESSION_RESERVED:"));
+                correlated_refusal = true;
+            }
             if frame["type"] == "freshAgent.event"
                 && frame["event"]["type"] == json!("freshAgent.error")
                 && frame["event"]["code"] == json!("SESSION_RESERVED")
@@ -28811,16 +29410,33 @@ pub(crate) mod tests {
                 "the stale send never answered typed: {frame}"
             );
         }
+        assert!(
+            correlated_refusal,
+            "the pane refusal must also release its request-owned composer"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn checkpoint_send_with_stale_fence_is_refused_for_an_already_running_codex_session() {
         let _guard = ENV_LOCK.lock().await;
-        let (mut st, mut rx) = state_with_bus();
+        let (mut st, mut rx, sink) = state_with_sink();
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         st.set_ownership(Arc::clone(&registry));
         configure_fake_codex_cmd("{}");
         let thread_id = create_real_fake_session(&st, &mut rx).await;
+        let mut rollback = crate::rollback_record::RollbackRecord::empty(1);
+        rollback.push_entry(
+            crate::rollback_record::RollbackEntry {
+                removed_turns: vec![json!({"id":"owned-history"})],
+                prompt_text: "retained".into(),
+                at_ms: 2,
+                epoch: 0,
+            },
+            3,
+        );
+        sink.record_rollback(PROVIDER, &thread_id, rollback.clone())
+            .await
+            .unwrap();
         let before = registry.observe(PROVIDER, &thread_id);
         let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_handoff(
             PROVIDER,
@@ -28851,7 +29467,7 @@ pub(crate) mod tests {
         st.handle_send(FreshAgentSend {
             request_id: Some("req-stale-checkpoint-codex".into()),
             provider: freshell_protocol::AgentProvider::Codex,
-            session_id: thread_id,
+            session_id: thread_id.clone(),
             session_type: freshell_protocol::SessionType::Freshcodex,
             text: "delayed checkpoint prompt".into(),
             images: None,
@@ -28873,6 +29489,11 @@ pub(crate) mod tests {
             saw_reserved |= frame.to_string().contains("SESSION_RESERVED");
             saw_accepted |= frame.to_string().contains("freshAgent.send.accepted");
         }
+        assert_eq!(
+            sink.load_rollback(PROVIDER, &thread_id),
+            Some(rollback),
+            "a stale refused send cannot mutate saved rollback state before its ownership guard"
+        );
         assert!(saw_reserved, "the stale owner fence is refused typed");
         assert!(
             !saw_accepted,

@@ -372,6 +372,11 @@ function successResult(method, params) {
       sandbox: params?.sandbox ?? 'danger-full-access',
     }
   }
+  if (method === 'turn/steer') {
+    // Native 0.164 active input adds to the expected turn; it does not
+    // manufacture a second turn or apply turn/start setting overrides.
+    return { turnId: params?.expectedTurnId }
+  }
   if (method === 'turn/start') {
     if (behavior.recordTurns) {
       const threadId = params?.threadId || 'thread-new-1'

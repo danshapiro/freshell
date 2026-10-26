@@ -26,11 +26,20 @@ mod tdd_recovery {
             answer_initialize(&peer).await;
             init.await.unwrap().unwrap();
             insert_fake_session_with_real_consumer(
-                &state, THREAD, client,
+                &state,
+                THREAD,
+                client,
                 Arc::new(StdMutex::new(active.map(str::to_owned))),
-                notifs, spawn_sleeper(), "task004-recovery-owned-child",
-            ).await;
-            Self { state, peer, events }
+                notifs,
+                spawn_sleeper(),
+                "task004-recovery-owned-child",
+            )
+            .await;
+            Self {
+                state,
+                peer,
+                events,
+            }
         }
 
         async fn ordinary(active: Option<&str>) -> Self {
@@ -38,25 +47,36 @@ mod tdd_recovery {
         }
 
         async fn request(&self) -> (freshell_codex::RequestId, String, Value) {
-            tokio::time::timeout(BUDGET, self.peer.expect_request()).await
+            tokio::time::timeout(BUDGET, self.peer.expect_request())
+                .await
                 .expect("controller must issue the expected native request")
         }
 
         fn terminal(&self, turn: &str, status: &str) {
-            self.peer.emit_notification("turn/completed", json!({
-                "threadId": THREAD, "turn": {"id": turn, "status": status}
-            }));
+            self.peer.emit_notification(
+                "turn/completed",
+                json!({
+                    "threadId": THREAD, "turn": {"id": turn, "status": status}
+                }),
+            );
         }
 
         async fn event(&mut self, predicate: impl Fn(&Value) -> bool) -> Vec<Value> {
             let frames = collect_frames_until(&mut self.events, BUDGET, predicate).await;
-            assert!(frames.matched, "expected controller event; observed {:?}", frames.frames);
+            assert!(
+                frames.matched,
+                "expected controller event; observed {:?}",
+                frames.frames
+            );
             frames.frames
         }
 
         async fn idle(&mut self) -> Vec<Value> {
-            self.event(|w| w["event"]["type"] == "freshAgent.session.snapshot"
-                && w["event"]["status"] == "idle").await
+            self.event(|w| {
+                w["event"]["type"] == "freshAgent.session.snapshot"
+                    && w["event"]["status"] == "idle"
+            })
+            .await
         }
 
         async fn snapshot(&self) -> Value {
@@ -69,9 +89,12 @@ mod tdd_recovery {
             let (id, method, params) = self.request().await;
             assert_eq!(method, "thread/read");
             assert_eq!(params["includeTurns"], true);
-            self.peer.respond(&id, json!({"thread": {
-                "id": THREAD, "status": {"type":status}, "turns": []
-            }}));
+            self.peer.respond(
+                &id,
+                json!({"thread": {
+                    "id": THREAD, "status": {"type":status}, "turns": []
+                }}),
+            );
             snapshot.await.unwrap().unwrap()
         }
 
@@ -83,8 +106,8 @@ mod tdd_recovery {
             assert_eq!(method, "turn/start");
             self.peer.respond(&id, json!({"turn":{"id":turn}}));
             send.await.unwrap();
-            self.event(|w| w["type"] == "freshAgent.send.accepted"
-                && w["requestId"] == request).await;
+            self.event(|w| w["type"] == "freshAgent.send.accepted" && w["requestId"] == request)
+                .await;
         }
 
         async fn finish(self) {
@@ -113,13 +136,17 @@ mod tdd_recovery {
     // transport. This makes no-frame assertions deterministic, without sleeps or
     // instrumentation of the implementation's private ownership state.
     async fn pending<F: Future>(mut future: Pin<&mut F>) {
-        assert!(std::future::poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx).is_pending())).await);
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx).is_pending())).await
+        );
     }
 
     async fn no_frame(peer: &freshell_codex::ChannelPeer) {
         let mut next = Box::pin(peer.next_raw_frame());
-        assert!(std::future::poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx).is_pending())).await,
-            "no native request may escape the unresolved operation gate");
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx).is_pending())).await,
+            "no native request may escape the unresolved operation gate"
+        );
     }
 
     #[tokio::test]
@@ -132,21 +159,35 @@ mod tdd_recovery {
         let (id, method, params) = h.request().await;
         assert_eq!(method, "turn/steer");
         assert_eq!(params["expectedTurnId"], "old");
-        h.peer.respond_error(&id, -32600, "expected active turn id `old` but found `other`");
+        h.peer.respond_error(
+            &id,
+            -32600,
+            "expected active turn id `old` but found `other`",
+        );
         steer.await;
-        h.event(|w| w["type"] == "error" && w["requestId"] == "old-refused-steer").await;
+        h.event(|w| w["type"] == "error" && w["requestId"] == "old-refused-steer")
+            .await;
         let state = h.state.clone();
         let mut interrupt = Box::pin(state.handle_interrupt(stop()));
         pending(interrupt.as_mut()).await;
         let (stop_id, method, params) = h.request().await;
         assert_eq!(method, "turn/interrupt");
         assert_eq!(params["turnId"], "old");
-        let lock = h.state.sessions.lock().await.get(THREAD).unwrap().turn_lock.clone();
+        let lock = h
+            .state
+            .sessions
+            .lock()
+            .await
+            .get(THREAD)
+            .unwrap()
+            .turn_lock
+            .clone();
         let held = lock.lock().await;
         h.terminal("old", "completed");
         // Natural completion progresses even while both Stop and dispatch lock
         // are held; it settles only old work and does not resolve Stop issuance.
-        h.event(|w| w["event"]["type"] == "freshAgent.turn.complete").await;
+        h.event(|w| w["event"]["type"] == "freshAgent.turn.complete")
+            .await;
         drop(held);
         let state = h.state.clone();
         let mut later = Box::pin(state.handle_send(input("later", "next")));
@@ -178,15 +219,23 @@ mod tdd_recovery {
                 request = h.peer.expect_request() => request,
                 _ = send.as_mut() => panic!("pending Stop must interrupt the accepted returned ID"),
             }
-        }).await.expect("returned-ID interrupt must be issued");
+        })
+        .await
+        .expect("returned-ID interrupt must be issued");
         assert_eq!(method, "turn/interrupt");
         assert_eq!(params["turnId"], "returned");
         h.terminal("returned", "interrupted");
         h.peer.respond(&id, json!({}));
         send.await;
         let frames = h.idle().await;
-        let accepted = frames.iter().position(|w| w["type"] == "freshAgent.send.accepted").unwrap();
-        let completed = frames.iter().position(|w| w["event"]["type"] == "freshAgent.session.snapshot").unwrap();
+        let accepted = frames
+            .iter()
+            .position(|w| w["type"] == "freshAgent.send.accepted")
+            .unwrap();
+        let completed = frames
+            .iter()
+            .position(|w| w["event"]["type"] == "freshAgent.session.snapshot")
+            .unwrap();
         assert!(accepted < completed, "acceptance must precede completion");
         no_frame(&h.peer).await;
         assert_eq!(h.snapshot().await["capabilities"]["send"], true);
@@ -201,11 +250,19 @@ mod tdd_recovery {
         pending(send.as_mut()).await;
         let (id, method, _) = h.request().await;
         assert_eq!(method, "turn/start");
-        h.peer.respond_error(&id, -32603, "failure after possible admission");
+        h.peer
+            .respond_error(&id, -32603, "failure after possible admission");
         send.await;
-        let frames = h.event(|w| w["type"] == "error" && w["requestId"] == "unknown-start").await;
-        assert!(frames.last().unwrap()["message"].as_str().unwrap().starts_with("CODEX_DELIVERY_AMBIGUOUS:"),
-            "uncertain native start must be reported as ambiguous");
+        let frames = h
+            .event(|w| w["type"] == "error" && w["requestId"] == "unknown-start")
+            .await;
+        assert!(
+            frames.last().unwrap()["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("CODEX_DELIVERY_AMBIGUOUS:"),
+            "uncertain native start must be reported as ambiguous"
+        );
         assert_eq!(h.snapshot().await["capabilities"]["send"], false);
         h.finish().await;
     }
@@ -217,19 +274,28 @@ mod tdd_recovery {
         let mut send = Box::pin(state.handle_send(input("unknown-start", "original")));
         pending(send.as_mut()).await;
         let (id, _, _) = h.request().await;
-        h.peer.respond_error(&id, -32603, "failure after possible admission");
+        h.peer
+            .respond_error(&id, -32603, "failure after possible admission");
         send.await;
         // Polling a second real send must finish with refusal and no provider
         // request, preserving the first delivery. No original-input retry occurs.
         let state = h.state.clone();
         let mut later = Box::pin(state.handle_send(input("later", "follow-up")));
-        let completed = std::future::poll_fn(|cx| Poll::Ready(later.as_mut().poll(cx).is_ready())).await;
-        assert!(completed, "unknown start must refuse later input instead of issuing a native request");
+        let completed =
+            std::future::poll_fn(|cx| Poll::Ready(later.as_mut().poll(cx).is_ready())).await;
+        assert!(
+            completed,
+            "unknown start must refuse later input instead of issuing a native request"
+        );
         no_frame(&h.peer).await;
         drop(later);
-        h.peer.emit_notification("turn/started", json!({"threadId":THREAD,"turn":{"id":"recovered","status":"inProgress"}}));
+        h.peer.emit_notification(
+            "turn/started",
+            json!({"threadId":THREAD,"turn":{"id":"recovered","status":"inProgress"}}),
+        );
         h.terminal("recovered", "completed");
-        h.event(|w| w["event"]["type"] == "freshAgent.turn.complete").await;
+        h.event(|w| w["event"]["type"] == "freshAgent.turn.complete")
+            .await;
         assert_eq!(h.snapshot().await["capabilities"]["send"], true);
         h.accept_initial("after-evidence", "next").await;
         h.finish().await;
@@ -257,7 +323,9 @@ mod tdd_recovery {
         // lost response/transport is never used as evidence of process death.
         drop(h.peer);
         h.state.shutdown().await;
-        tokio::time::timeout(BUDGET, later).await.expect("owned exit releases waiter");
+        tokio::time::timeout(BUDGET, later)
+            .await
+            .expect("owned exit releases waiter");
     }
 
     #[tokio::test]
@@ -269,10 +337,17 @@ mod tdd_recovery {
         let (id, _, _) = h.request().await;
         h.peer.respond(&id, json!({}));
         interrupt.await;
-        h.peer.emit_notification("thread/status/changed", json!({"threadId":THREAD,"status":{"type":"idle"}}));
-        h.event(|w| w["event"]["type"] == "freshAgent.session.snapshot").await;
+        h.peer.emit_notification(
+            "thread/status/changed",
+            json!({"threadId":THREAD,"status":{"type":"idle"}}),
+        );
+        h.event(|w| w["event"]["type"] == "freshAgent.session.snapshot")
+            .await;
         let snapshot = h.snapshot().await;
-        assert_eq!(snapshot["status"], "running", "ACK plus idle is not matching native terminal evidence");
+        assert_eq!(
+            snapshot["status"], "running",
+            "ACK plus idle is not matching native terminal evidence"
+        );
         assert_eq!(snapshot["capabilities"]["send"], false);
         assert_eq!(snapshot["capabilities"]["interrupt"], true);
         h.terminal("old", "interrupted");
@@ -297,10 +372,19 @@ mod tdd_recovery {
         // are deliberately adversarial, not normal native ACK ordering.
         h.peer.respond(&old_stop, json!({}));
         h.terminal("old", "interrupted");
-        h.peer.emit_notification("thread/status/changed", json!({"threadId":THREAD,"status":{"type":"active"}}));
-        h.event(|w| w["event"]["type"] == "freshAgent.session.snapshot" && w["event"]["status"] == "running").await;
+        h.peer.emit_notification(
+            "thread/status/changed",
+            json!({"threadId":THREAD,"status":{"type":"active"}}),
+        );
+        h.event(|w| {
+            w["event"]["type"] == "freshAgent.session.snapshot" && w["event"]["status"] == "running"
+        })
+        .await;
         let snapshot = h.snapshot_status("active").await;
-        assert_eq!(snapshot["capabilities"]["send"], false, "new turn remains busy after old duplicates");
+        assert_eq!(
+            snapshot["capabilities"]["send"], false,
+            "new turn remains busy after old duplicates"
+        );
         let state = h.state.clone();
         let mut interrupt = Box::pin(state.handle_interrupt(stop()));
         pending(interrupt.as_mut()).await;
@@ -322,20 +406,39 @@ mod tdd_recovery {
         let (id, method, params) = h.request().await;
         assert_eq!(method, "turn/steer");
         assert_eq!(params["expectedTurnId"], "shared");
-        assert_eq!(params.as_object().unwrap().len(), 3, "steer carries no setting overrides");
+        assert_eq!(
+            params.as_object().unwrap().len(),
+            3,
+            "steer carries no setting overrides"
+        );
         h.peer.respond(&id, json!({"turnId":"shared"}));
         send.await;
-        let accepted = h.event(|w| w["type"] == "freshAgent.send.accepted" && w["requestId"] == "steer-request").await;
+        let accepted = h
+            .event(|w| w["type"] == "freshAgent.send.accepted" && w["requestId"] == "steer-request")
+            .await;
         assert_eq!(accepted.last().unwrap()["submittedTurnId"], "shared");
         h.terminal("shared", "completed");
-        let mut frames = h.event(|w| w["event"]["type"] == "freshAgent.turn.complete").await;
+        let mut frames = h
+            .event(|w| w["event"]["type"] == "freshAgent.turn.complete")
+            .await;
         // A later status notification on the consumer FIFO is the explicit
         // barrier proving the single native terminal has been fully folded.
-        h.peer.emit_notification("thread/status/changed", json!({"threadId":THREAD,"status":{"type":"idle"}}));
+        h.peer.emit_notification(
+            "thread/status/changed",
+            json!({"threadId":THREAD,"status":{"type":"idle"}}),
+        );
         frames.extend(h.idle().await);
         assert_eq!(h.snapshot().await["capabilities"]["send"], true);
-        while let Ok(raw) = h.events.try_recv() { frames.push(serde_json::from_str(&raw).unwrap()); }
-        assert_eq!(frames.iter().filter(|w| w["event"]["type"] == "freshAgent.turn.complete").count(), 1);
+        while let Ok(raw) = h.events.try_recv() {
+            frames.push(serde_json::from_str(&raw).unwrap());
+        }
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|w| w["event"]["type"] == "freshAgent.turn.complete")
+                .count(),
+            1
+        );
         h.finish().await;
     }
 
@@ -347,10 +450,19 @@ mod tdd_recovery {
         let mut send = Box::pin(state.handle_send(input("refused-steer", "adjust")));
         pending(send.as_mut()).await;
         let (id, _, _) = h.request().await;
-        h.peer.respond_error(&id, -32600, "expected active turn id `old` but found `other`");
+        h.peer.respond_error(
+            &id,
+            -32600,
+            "expected active turn id `old` but found `other`",
+        );
         send.await;
-        h.event(|w| w["type"] == "error" && w["requestId"] == "refused-steer").await;
-        assert_eq!(h.snapshot().await["capabilities"]["send"], false, "rejection of second dispatch cannot settle the first");
+        h.event(|w| w["type"] == "error" && w["requestId"] == "refused-steer")
+            .await;
+        assert_eq!(
+            h.snapshot().await["capabilities"]["send"],
+            false,
+            "rejection of second dispatch cannot settle the first"
+        );
         let state = h.state.clone();
         let mut interrupt = Box::pin(state.handle_interrupt(stop()));
         pending(interrupt.as_mut()).await;
@@ -371,7 +483,8 @@ mod tdd_recovery {
         h.state.handle_interrupt(stop()).await;
         h.peer.respond_error(&id, -32602, "invalid input");
         send.await;
-        h.event(|w| w["type"] == "error" && w["requestId"] == "rejected").await;
+        h.event(|w| w["type"] == "error" && w["requestId"] == "rejected")
+            .await;
         assert_eq!(h.snapshot().await["capabilities"]["send"], true);
         h.state.handle_interrupt(stop()).await;
         no_frame(&h.peer).await;
@@ -385,13 +498,24 @@ mod tdd_recovery {
         let mut send = Box::pin(state.handle_send(input("early-events", "first")));
         pending(send.as_mut()).await;
         let (id, _, _) = h.request().await;
-        h.peer.emit_notification("turn/started", json!({"threadId":THREAD,"turn":{"id":"early","status":"inProgress"}}));
+        h.peer.emit_notification(
+            "turn/started",
+            json!({"threadId":THREAD,"turn":{"id":"early","status":"inProgress"}}),
+        );
         h.terminal("early", "completed");
         h.peer.respond(&id, json!({"turn":{"id":"early"}}));
         send.await;
-        let frames = h.event(|w| w["event"]["type"] == "freshAgent.turn.complete").await;
-        let accepted = frames.iter().position(|w| w["type"] == "freshAgent.send.accepted").unwrap();
-        let terminal = frames.iter().position(|w| w["event"]["type"] == "freshAgent.session.snapshot").unwrap();
+        let frames = h
+            .event(|w| w["event"]["type"] == "freshAgent.turn.complete")
+            .await;
+        let accepted = frames
+            .iter()
+            .position(|w| w["type"] == "freshAgent.send.accepted")
+            .unwrap();
+        let terminal = frames
+            .iter()
+            .position(|w| w["event"]["type"] == "freshAgent.session.snapshot")
+            .unwrap();
         assert!(accepted < terminal);
         assert_eq!(h.snapshot().await["capabilities"]["send"], true);
         h.finish().await;
@@ -408,8 +532,11 @@ mod tdd_recovery {
         assert_eq!(params["turnId"], "");
         h.peer.respond(&id, json!({}));
         interrupt.await;
-        assert_eq!(h.snapshot().await["capabilities"]["send"], false,
-            "empty startup ACK promises no terminal event and cannot settle work");
+        assert_eq!(
+            h.snapshot().await["capabilities"]["send"],
+            false,
+            "empty startup ACK promises no terminal event and cannot settle work"
+        );
         h.finish().await;
     }
 
@@ -421,13 +548,18 @@ mod tdd_recovery {
         let mut send = Box::pin(state.handle_send(input("unknown-steer", "adjust")));
         pending(send.as_mut()).await;
         let (id, _, _) = h.request().await;
-        h.peer.respond_error(&id, -32603, "failure after possible steer admission");
+        h.peer
+            .respond_error(&id, -32603, "failure after possible steer admission");
         send.await;
-        assert_eq!(h.snapshot().await["capabilities"]["send"], false,
-            "unknown steer receipt cannot make the accepted native turn idle");
+        assert_eq!(
+            h.snapshot().await["capabilities"]["send"],
+            false,
+            "unknown steer receipt cannot make the accepted native turn idle"
+        );
         no_frame(&h.peer).await;
         h.terminal("old", "completed");
-        h.event(|w| w["event"]["type"] == "freshAgent.turn.complete").await;
+        h.event(|w| w["event"]["type"] == "freshAgent.turn.complete")
+            .await;
         assert_eq!(h.snapshot().await["capabilities"]["send"], true);
         h.finish().await;
     }
@@ -442,11 +574,16 @@ mod tdd_recovery {
         let (id, _, _) = h.request().await;
         h.peer.respond_error(&id, -32600, "no active turn to steer");
         send.await;
-        h.event(|w| w["type"] == "error" && w["requestId"] == "no-active").await;
-        assert_eq!(h.snapshot().await["capabilities"]["send"], false,
-            "a no-active refusal of steer does not settle earlier accepted input");
+        h.event(|w| w["type"] == "error" && w["requestId"] == "no-active")
+            .await;
+        assert_eq!(
+            h.snapshot().await["capabilities"]["send"],
+            false,
+            "a no-active refusal of steer does not settle earlier accepted input"
+        );
         h.terminal("old", "completed");
-        h.event(|w| w["event"]["type"] == "freshAgent.turn.complete").await;
+        h.event(|w| w["event"]["type"] == "freshAgent.turn.complete")
+            .await;
         assert_eq!(h.snapshot().await["capabilities"]["send"], true);
         h.finish().await;
     }
@@ -459,16 +596,28 @@ mod tdd_recovery {
         let mut send = Box::pin(state.handle_send(input("refused-duplicate", "adjust")));
         pending(send.as_mut()).await;
         let (id, _, _) = h.request().await;
-        h.peer.emit_notification("turn/started", json!({"threadId":THREAD,"turn":{"id":"old","status":"inProgress"}}));
+        h.peer.emit_notification(
+            "turn/started",
+            json!({"threadId":THREAD,"turn":{"id":"old","status":"inProgress"}}),
+        );
         h.peer.respond_error(&id, -32600, "no active turn to steer");
         send.await;
-        let mut frames = h.event(|w| w["type"] == "error" && w["requestId"] == "refused-duplicate").await;
+        let mut frames = h
+            .event(|w| w["type"] == "error" && w["requestId"] == "refused-duplicate")
+            .await;
         h.terminal("old", "completed");
-        frames.extend(h.event(|w| w["event"]["type"] == "freshAgent.turn.complete").await);
-        assert!(!frames.iter().any(|w| w["type"] == "freshAgent.send.accepted" && w["requestId"] == "refused-duplicate"),
-            "duplicate native start cannot acknowledge a refused delivery");
+        frames.extend(
+            h.event(|w| w["event"]["type"] == "freshAgent.turn.complete")
+                .await,
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|w| w["type"] == "freshAgent.send.accepted"
+                    && w["requestId"] == "refused-duplicate"),
+            "duplicate native start cannot acknowledge a refused delivery"
+        );
         assert_eq!(h.snapshot().await["capabilities"]["send"], true);
         h.finish().await;
     }
-
 }
