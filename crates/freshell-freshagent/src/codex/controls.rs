@@ -8,6 +8,7 @@ use freshell_protocol::{
 use std::collections::HashSet;
 
 pub(super) type ControlRegistry = Arc<StdMutex<HashMap<String, Arc<SessionControls>>>>;
+type ControlSource = StdMutex<projection::CodexProjection>;
 
 #[derive(Default)]
 pub(super) struct SessionControls {
@@ -21,6 +22,7 @@ pub(super) struct SessionControls {
 struct ChildControlTurn {
     turn_id: String,
     native_client: Arc<CodexAppServerClient>,
+    source: std::sync::Weak<ControlSource>,
 }
 impl SessionControls {
     async fn lock(&self) -> tokio::sync::MutexGuard<'_, PendingControls> {
@@ -52,6 +54,7 @@ struct PendingRequest {
     public: Value,
     kind: ControlKind,
     native_client: Arc<CodexAppServerClient>,
+    source: std::sync::Weak<ControlSource>,
 }
 
 fn request_key(id: &RequestId) -> String {
@@ -69,6 +72,7 @@ fn normalize_request(
     method: &str,
     params: &Value,
     native_client: Arc<CodexAppServerClient>,
+    source: &Arc<ControlSource>,
 ) -> Option<PendingRequest> {
     // Native IDs can be reused after resolution or a sidecar restart. The public
     // key identifies this operation; the original typed ID stays on its client.
@@ -163,6 +167,7 @@ fn normalize_request(
         params: params.clone(),
         public,
         native_client,
+        source: Arc::downgrade(source),
         kind: if question {
             ControlKind::Question
         } else if method == "mcpServer/elicitation/request" {
@@ -348,20 +353,20 @@ impl FreshCodexState {
         };
         match notification {
             CodexNotification::ServerRequest { id, method, params } => {
-                let turn_matches = self
-                    .control_scope_matches(session_id, params, &client, false)
+                let scope_matches = self
+                    .control_scope_matches(session_id, params, &client, source, false)
                     .await;
-                if !turn_matches {
+                if !scope_matches {
                     let _ = client.reject_request(id, "Request does not belong to this native conversation or active child turn").await;
                     self.emit_fresh_agent_error(
                         session_id,
                         "REQUEST_UNAVAILABLE",
-                        "This Codex request belongs to a retired turn.",
+                        "This Codex request no longer belongs to the active native conversation or child turn.",
                     );
                     return true;
                 }
                 let Some(mut request) =
-                    normalize_request(id.clone(), method, params, client.clone())
+                    normalize_request(id.clone(), method, params, client.clone(), source)
                 else {
                     tracing::warn!(
                         provider = PROVIDER,
@@ -396,6 +401,7 @@ impl FreshCodexState {
                     if previous.method == request.method
                         && previous.params == request.params
                         && Arc::ptr_eq(&previous.native_client, &request.native_client)
+                        && std::sync::Weak::ptr_eq(&previous.source, &request.source)
                     {
                         // Repeated native delivery and snapshot replay refer to
                         // the same unresolved operation, including its public key.
@@ -444,7 +450,7 @@ impl FreshCodexState {
                 };
                 if questions.is_empty()
                     || !self
-                        .control_scope_matches(session_id, params, &client, true)
+                        .control_scope_matches(session_id, params, &client, source, true)
                         .await
                 {
                     return false;
@@ -467,7 +473,7 @@ impl FreshCodexState {
             CodexNotification::Other { method, params } if method == "serverRequest/resolved" => {
                 if let Some(params) = params {
                     if self
-                        .control_scope_matches(session_id, params, &client, false)
+                        .control_scope_matches(session_id, params, &client, source, false)
                         .await
                     {
                         let controls = self.session_controls(session_id).await;
@@ -496,6 +502,7 @@ impl FreshCodexState {
                             session_id,
                             &json!({"threadId":event.thread_id,"turnId":event.turn_id}),
                             &client,
+                            source,
                             false,
                         )
                         .await)
@@ -541,6 +548,7 @@ impl FreshCodexState {
                         session_id,
                         &json!({"threadId":thread_id}),
                         &client,
+                        source,
                         false,
                     )
                     .await =>
@@ -612,6 +620,7 @@ impl FreshCodexState {
                 ChildControlTurn {
                     turn_id: turn_id.clone(),
                     native_client: client,
+                    source: Arc::downgrade(source),
                 },
             );
     }
@@ -621,13 +630,15 @@ impl FreshCodexState {
         session_id: &str,
         params: &Value,
         native_client: &Arc<CodexAppServerClient>,
+        source: &Arc<ControlSource>,
         allow_retired: bool,
     ) -> bool {
         let sessions = self.sessions.lock().await;
         let Some(session) = sessions.get(session_id) else {
             return false;
         };
-        if !Arc::ptr_eq(&session.client, native_client) {
+        if !Arc::ptr_eq(&session.client, native_client) || !Arc::ptr_eq(&session.projection, source)
+        {
             return false;
         }
         let Some(thread_id) = params.get("threadId").and_then(Value::as_str) else {
@@ -635,14 +646,6 @@ impl FreshCodexState {
         };
         let turn_id = params.get("turnId").and_then(Value::as_str);
         if thread_id != session_id {
-            if !session
-                .projection
-                .lock()
-                .expect("codex projection lock")
-                .knows_child_thread(thread_id)
-            {
-                return false;
-            }
             let controls = self
                 .controls
                 .lock()
@@ -657,6 +660,10 @@ impl FreshCodexState {
                     .get(thread_id)
                     .is_some_and(|child| {
                         Arc::ptr_eq(&child.native_client, native_client)
+                            // The native relationship was proved at child start.
+                            // Display eviction must not erase that proof, and a
+                            // weak reference must not retain old display payloads.
+                            && child.source.upgrade().is_some_and(|proof| Arc::ptr_eq(&proof, source))
                             && turn_id.is_none_or(|id| child.turn_id == id)
                     })
             });
@@ -664,10 +671,15 @@ impl FreshCodexState {
         let Some(turn_id) = turn_id else {
             return true;
         };
-        session.active_turn.lock().expect("active turn").as_deref() == Some(turn_id)
-            // Async content remains actionable after its turn completes. A new
-            // awaited native RPC must still belong to the current active turn.
-            || allow_retired && session
+        let active_matches =
+            session.active_turn.lock().expect("active turn").as_deref() == Some(turn_id);
+        if active_matches {
+            return true;
+        }
+        // Drop the active-turn guard before consulting the retired slot. Async
+        // content can remain actionable there; awaited RPCs require a live turn.
+        allow_retired
+            && session
                 .retired_turn_id
                 .lock()
                 .expect("retired turn")
@@ -796,9 +808,23 @@ impl FreshCodexState {
             return false;
         };
         let request = &pending.requests[index];
+        let Some(source) = request.source.upgrade() else {
+            self.emit_fresh_agent_error(
+                session_id,
+                "REQUEST_UNAVAILABLE",
+                "This Codex request belongs to an earlier native source.",
+            );
+            return false;
+        };
         if !Arc::ptr_eq(&client, &request.native_client)
             || !self
-                .control_scope_matches(session_id, &request.params, &request.native_client, false)
+                .control_scope_matches(
+                    session_id,
+                    &request.params,
+                    &request.native_client,
+                    &source,
+                    false,
+                )
                 .await
         {
             self.emit_fresh_agent_error(

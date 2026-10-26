@@ -293,6 +293,160 @@ async fn task5_child_relationship_requires_the_exact_native_parent_sender() {
     state.shutdown().await;
 }
 
+#[tokio::test]
+async fn task5_child_control_survives_real_parent_display_eviction_without_restoring_rows() {
+    // Deliberate bounded continuation after the captured relationship, not a
+    // claim that the Task001 capture contains forty subsequent parent turns.
+    let (state, peer, mut rx, frames) = child_control_runtime().await;
+    let parent = frames[0]["params"]["threadId"].as_str().unwrap();
+    let parent_turn = frames[0]["params"]["turnId"].as_str().unwrap();
+    let child = frames[2]["params"]["threadId"].as_str().unwrap();
+    peer.request_client(
+        &RequestId::Int(0),
+        frames[2]["method"].as_str().unwrap(),
+        frames[2]["params"].clone(),
+    );
+    let request = child_approval_event(&mut rx).await;
+    peer.emit_notification(
+        "turn/completed",
+        json!({"threadId":parent,"turn":{"id":parent_turn,"status":"completed","items":[]}}),
+    );
+    loop {
+        if event(&mut rx).await["type"] == "freshAgent.turn.complete" {
+            break;
+        }
+    }
+    for index in 0..40 {
+        let turn = format!("later-parent-turn-{index}");
+        peer.emit_notification(
+            "turn/started",
+            json!({"threadId":parent,"turn":{"id":turn,"status":"inProgress","items":[]}}),
+        );
+        peer.emit_notification("item/completed", json!({"threadId":parent,"turnId":turn,"item":{"id":format!("later-parent-item-{index}"),"type":"agentMessage","text":"Parent continuation"}}));
+        peer.emit_notification(
+            "turn/completed",
+            json!({"threadId":parent,"turn":{"id":turn,"status":"completed","items":[]}}),
+        );
+        loop {
+            let next = event(&mut rx).await;
+            assert_ne!(next["type"], "freshAgent.permission.cancelled");
+            if next["type"] == "freshAgent.turn.complete" {
+                break;
+            }
+        }
+    }
+    let source = state.sessions.lock().await[parent].projection.clone();
+    assert!(
+        !source.lock().unwrap().knows_child_thread(child),
+        "the actual projection must have evicted the old spawn payload"
+    );
+    assert_eq!(
+        state.retained_control_events(parent).await[0]["requestId"],
+        request["requestId"]
+    );
+    assert!(state.try_handle_approval_respond(serde_json::from_value(json!({"provider":"codex","sessionType":"freshcodex","sessionId":parent,"requestId":request["requestId"],"decision":{"nativeDecision":"cancel"}})).unwrap()).await, "display retention must not invalidate the still-awaited child control");
+    assert_eq!(
+        peer.next_raw_frame().await.unwrap(),
+        json!({"id":0,"result":{"decision":"cancel"}})
+    );
+    assert!(
+        !source.lock().unwrap().knows_child_thread(child),
+        "answering must not revive the evicted display row"
+    );
+    assert_eq!(state.sessions.lock().await.len(), 1);
+    peer.disconnect();
+    state.shutdown().await;
+}
+
+async fn replace_child_control_source(
+    state: &FreshCodexState,
+    parent: &str,
+    frames: &[Value],
+) -> Arc<StdMutex<projection::CodexProjection>> {
+    let source = Arc::new(StdMutex::new(projection::CodexProjection::new(
+        "replacement-parent-source".into(),
+        parent.into(),
+    )));
+    source
+        .lock()
+        .unwrap()
+        .apply(frames[0]["method"].as_str().unwrap(), &frames[0]["params"])
+        .unwrap();
+    state
+        .sessions
+        .lock()
+        .await
+        .get_mut(parent)
+        .unwrap()
+        .projection = source.clone();
+    let child_start = freshell_codex::protocol::classify_notification(
+        frames[1]["method"].as_str().unwrap(),
+        Some(&frames[1]["params"]),
+    );
+    state
+        .observe_child_control_turn(parent, &source, &child_start)
+        .await;
+    source
+}
+
+#[tokio::test]
+async fn task5_old_child_answer_cannot_cross_projection_replacement_with_reused_native_scope() {
+    let (state, peer, mut rx, frames) = child_control_runtime().await;
+    let parent = frames[0]["params"]["threadId"].as_str().unwrap();
+    peer.request_client(
+        &RequestId::Int(0),
+        frames[2]["method"].as_str().unwrap(),
+        frames[2]["params"].clone(),
+    );
+    let request = child_approval_event(&mut rx).await;
+    let source = replace_child_control_source(&state, parent, &frames).await;
+    assert!(source
+        .lock()
+        .unwrap()
+        .knows_child_thread(frames[2]["params"]["threadId"].as_str().unwrap()));
+    assert!(!state.try_handle_approval_respond(serde_json::from_value(json!({"provider":"codex","sessionType":"freshcodex","sessionId":parent,"requestId":request["requestId"],"decision":{"nativeDecision":"cancel"}})).unwrap()).await, "the old operation must stay bound to its original projection even if a new source proves the same child IDs");
+    assert_eq!(state.retained_control_events(parent).await.len(), 1);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), peer.next_raw_frame())
+            .await
+            .is_err()
+    );
+    peer.disconnect();
+    state.shutdown().await;
+}
+
+#[tokio::test]
+async fn task5_reissued_child_rpc_on_new_projection_gets_a_new_public_operation_key() {
+    let (state, peer, mut rx, frames) = child_control_runtime().await;
+    let parent = frames[0]["params"]["threadId"].as_str().unwrap();
+    peer.request_client(
+        &RequestId::Int(0),
+        frames[2]["method"].as_str().unwrap(),
+        frames[2]["params"].clone(),
+    );
+    let original = child_approval_event(&mut rx).await;
+    let source = replace_child_control_source(&state, parent, &frames).await;
+    let notification = CodexNotification::ServerRequest {
+        id: RequestId::Int(0),
+        method: frames[2]["method"].as_str().unwrap().into(),
+        params: frames[2]["params"].clone(),
+    };
+    assert!(
+        state
+            .consume_control_notification(parent, &notification, &source)
+            .await
+    );
+    let current = state.retained_control_events(parent).await;
+    assert_eq!(current.len(), 1);
+    assert_ne!(
+        current[0]["requestId"], original["requestId"],
+        "source replacement must not reuse the old public answer key"
+    );
+    assert_eq!(current[0]["providerRequest"]["id"], 0);
+    peer.disconnect();
+    state.shutdown().await;
+}
+
 async fn event(rx: &mut tokio::sync::broadcast::Receiver<String>) -> Value {
     let frame = tokio::time::timeout(Duration::from_secs(3), rx.recv())
         .await
