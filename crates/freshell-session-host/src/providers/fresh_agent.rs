@@ -1792,6 +1792,70 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn task6_production_actor_owns_native_forwarding_through_fork_without_factory_handles() {
+        let NativeCodexFixture {
+            transport,
+            profile,
+            diagnostic: _,
+            dir,
+            _exec_dir,
+            _environment,
+            _lock,
+        } = native_codex_fixture(json!({"recordTurns":true})).await;
+        // Move the factory's only transport handle into the real production
+        // actor. No direct fixture handle can keep its bridge guard alive.
+        let actor = FreshAgentHostActor::open(dir.path().join("actor"), profile, transport)
+            .await
+            .unwrap();
+        let parent = actor.profile().await.native_session_id.unwrap();
+        for (request, text, expected_rows) in [
+            ("parent-send", "actor parent turn", 2),
+            ("child-send", "actor child turn", 4),
+        ] {
+            let before = actor.read_events(0, 256).await.head;
+            actor
+                .dispatch(RequestId::parse(request).unwrap(), text.into(), None)
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let batch = actor.read_events(before, 256).await;
+                    if batch.events.iter().any(|entry| matches!(&entry.event,
+                        AgentEvent::Provider {payload} if payload["event"]["type"] == "freshAgent.turn.complete")) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the actor must retain its bridge through native completion");
+            let snapshot = actor.snapshot().await.unwrap();
+            assert_eq!(
+                snapshot["turns"].as_array().unwrap().len(),
+                expected_rows,
+                "{snapshot}"
+            );
+            assert_eq!(snapshot["status"], "idle");
+            if request == "parent-send" {
+                let fork = actor
+                    .fork(
+                        RequestId::parse("actor-fork").unwrap(),
+                        parent.clone(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert_ne!(fork.child_session_id, parent);
+                assert_eq!(
+                    actor.profile().await.native_session_id,
+                    Some(fork.child_session_id)
+                );
+            }
+        }
+        actor.stop().await.unwrap();
+    }
+
     async fn task5_durable_native_control(
         method: &str,
         params: Value,

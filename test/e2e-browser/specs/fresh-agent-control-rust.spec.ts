@@ -1330,6 +1330,66 @@ function readCodexOps(opLogPath: string): any[] {
   return readJsonl(opLogPath)
 }
 
+/** Bounded fixture-only diagnostics; never include control bodies or answers. */
+async function captureCodexLaneDiagnostics(
+  page: Page,
+  lane: Awaited<ReturnType<typeof bootCodexLane>>,
+): Promise<void> {
+  const rows = (turns: any[] = []) => turns.map((turn) => ({
+    id: turn.turnId, nativeTurnId: turn.nativeTurnId, role: turn.role,
+    items: (turn.items ?? []).map((item: any) => ({ id: item.id, kind: item.kind, textBytes: typeof item.text === 'string' ? item.text.length : undefined })),
+  }))
+  const summarizeMetadata = (metadata: any) => metadata && ({
+    ...metadata,
+    turnOutputStates: Object.fromEntries(Object.entries(metadata.turnOutputStates ?? {}).map(([id, output]: [string, any]) => [id, {
+      provenance: output.provenance, diagnostic: output.diagnostic, refreshPending: output.refreshPending,
+      savedTurns: rows(output.savedTurns), retainedTurns: rows(output.retainedTurns),
+    }])),
+  })
+  const summarizeSnapshot = (snapshot: any) => snapshot && ({
+    threadId: snapshot.threadId, status: snapshot.status, revision: snapshot.revision,
+    turns: rows(snapshot.turns),
+    projection: summarizeMetadata(snapshot.extensions?.codex?.projection),
+  })
+  const result = await Promise.allSettled([
+    fetchSnapshot(lane.info, 'freshcodex', 'codex', 'thread-new-1'),
+    lane.harness.getReceivedWsMessages(),
+    lane.harness.getState(),
+    page.locator('[data-context="fresh-agent"]').last().getByRole('button').allTextContents(),
+  ])
+  const value = (index: number): any => {
+    const item = result[index]
+    return item.status === 'fulfilled' ? item.value : { diagnosticError: String(item.reason) }
+  }
+  const state = value(2)
+  const live = Object.values(state?.freshAgentLive?.bySession ?? {}).map((session: any) => ({
+    sessionId: session.sessionId,
+    retainedSourceKey: session.retainedSourceKey,
+    retainedSnapshot: summarizeSnapshot(session.retainedSnapshot),
+    projection: session.projection && {
+      id: session.projection.id, historyGeneration: session.projection.historyGeneration,
+      eventRevision: session.projection.eventRevision, needsResnapshot: session.projection.needsResnapshot,
+      turns: rows(session.projection.turns), turnRows: session.projection.turnRows,
+    },
+  }))
+  const frames = Array.isArray(value(1)) ? value(1).slice(-100).map((frame: any) => ({
+    type: frame.type, sessionId: frame.sessionId, provider: frame.provider,
+    event: frame.event && {
+      type: frame.event.type, status: frame.event.status,
+      projectionId: frame.event.projectionId, historyGeneration: frame.event.historyGeneration,
+      afterRevision: frame.event.afterRevision,
+      ops: frame.event.ops?.map((op: any) => ({ type: op.type, revision: op.revision, nativeTurnId: op.nativeTurnId })),
+      source: frame.event.retainedState?.source,
+      snapshot: summarizeSnapshot(frame.event.retainedState?.snapshot),
+    },
+  })) : value(1)
+  console.log('TASK006_CODEX_STATE_DIAGNOSTIC', JSON.stringify({
+    test: test.info().title, nativeOperations: readCodexOps(lane.opLogPath).slice(-100),
+    restSnapshot: summarizeSnapshot(value(0)), forwardedFrames: frames,
+    live, sessions: Object.values(state?.freshAgent?.sessions ?? {}).map((session: any) => ({ sessionId: session.sessionId, status: session.status })), visibleButtonLabels: value(3),
+  }))
+}
+
 /** Read a freshAgent session's status from the harness store — the exact
  * `agentSession.status` the stuck card's `effectiveStatus` renders from. */
 async function readFreshAgentSessionStatus(
@@ -1494,6 +1554,9 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       await expect.poll(() => readJsonl(lane.responseLogPath)).toContainEqual({ id: 502, result: { decision: 'decline' } })
       await expect(edit).toBeHidden()
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+    } catch (error) {
+      await captureCodexLaneDiagnostics(page, lane).catch((diagnosticError) => console.log('TASK006_CODEX_DIAGNOSTIC_FAILED', String(diagnosticError)))
+      throw error
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
@@ -1527,6 +1590,9 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
         .toContainEqual({ id: 602, result: { decision: 'accept' } })
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
       await expect(approval).toBeHidden()
+    } catch (error) {
+      await captureCodexLaneDiagnostics(page, lane).catch((diagnosticError) => console.log('TASK006_CODEX_DIAGNOSTIC_FAILED', String(diagnosticError)))
+      throw error
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
@@ -1659,6 +1725,9 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       await expect(pane).toContainText('review-1')
       await expect(pane).toContainText('pending')
       await expect(pane).toContainText('thread-parent-1')
+    } catch (error) {
+      await captureCodexLaneDiagnostics(page, lane).catch((diagnosticError) => console.log('TASK006_CODEX_DIAGNOSTIC_FAILED', String(diagnosticError)))
+      throw error
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
@@ -1696,6 +1765,9 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       // Usable after compact: a follow-up prompt mints exactly the next turn
       // (two recorded turns -> four display rows).
       await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 4, 'codex post-compact turn')
+    } catch (error) {
+      await captureCodexLaneDiagnostics(page, lane).catch((diagnosticError) => console.log('TASK006_CODEX_DIAGNOSTIC_FAILED', String(diagnosticError)))
+      throw error
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
@@ -1770,6 +1842,9 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
         )
       expect(mutationsAgainstParent, 'no post-fork mutation against the source thread').toEqual([])
       expect(await readRollout(lane.info.homeDir, 'thread-new-1')).toBe(parentRolloutBefore)
+    } catch (error) {
+      await captureCodexLaneDiagnostics(page, lane).catch((diagnosticError) => console.log('TASK006_CODEX_DIAGNOSTIC_FAILED', String(diagnosticError)))
+      throw error
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
@@ -1939,6 +2014,9 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
         }, { timeout: 30_000, message: 'post-restart resume+read evidence for BOTH source and child' })
         .toBe(true)
       sourceRestartWs.close()
+    } catch (error) {
+      await captureCodexLaneDiagnostics(page, lane).catch((diagnosticError) => console.log('TASK006_CODEX_DIAGNOSTIC_FAILED', String(diagnosticError)))
+      throw error
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
@@ -2033,6 +2111,9 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       await expect.poll(async () =>
         (await fetchSnapshot(lane.info, 'freshcodex', 'codex', threadId))?.turns?.length,
       { timeout: 15_000 }).toBe(turnsAfter.length + 2)
+    } catch (error) {
+      await captureCodexLaneDiagnostics(page, lane).catch((diagnosticError) => console.log('TASK006_CODEX_DIAGNOSTIC_FAILED', String(diagnosticError)))
+      throw error
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
@@ -2067,6 +2148,9 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       // exactly the false positive the bound exists to prevent.
       await page.waitForTimeout(Math.max(0, 11_000 - (Date.now() - sentAt)))
       await expect(stuckAlert).toHaveCount(0)
+    } catch (error) {
+      await captureCodexLaneDiagnostics(page, lane).catch((diagnosticError) => console.log('TASK006_CODEX_DIAGNOSTIC_FAILED', String(diagnosticError)))
+      throw error
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
@@ -2128,6 +2212,9 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
         expect(turns[0]?.start?.model).not.toBe(turns[1]?.start?.model)
         expect(turns[0]?.start?.effort).not.toBe(turns[1]?.start?.effort)
       }).toPass({ timeout: 15_000 })
+    } catch (error) {
+      await captureCodexLaneDiagnostics(page, lane).catch((diagnosticError) => console.log('TASK006_CODEX_DIAGNOSTIC_FAILED', String(diagnosticError)))
+      throw error
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
