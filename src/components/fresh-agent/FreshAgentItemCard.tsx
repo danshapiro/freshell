@@ -302,6 +302,7 @@ export function itemToToolDisplay(item: FreshAgentTranscriptItem): FreshAgentToo
       references: outputReferences(item.result),
       isError: item.status === 'failed',
       status: item.status === 'running' ? 'running' : 'complete',
+      nativeOutcome: true,
     }
   }
   if (item.kind === 'dynamic_tool') {

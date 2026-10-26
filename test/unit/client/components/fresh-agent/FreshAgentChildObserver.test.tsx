@@ -32,6 +32,23 @@ describe('FreshAgentChildObserver', () => {
     expect(api.post).not.toHaveBeenCalled()
   })
 
+  it('preserves explicit running native MCP outcomes when read-only history becomes unavailable', async () => {
+    const response = readable('live')
+    const live = { ...response, snapshot: { ...response.snapshot, status: 'running', turns: [{ id: 'tools', turnId: 'tools', role: 'assistant', summary: '', items: [
+      { id: 'first', kind: 'mcp_tool', server: 'native', tool: 'first', status: 'running', arguments: {} },
+      { id: 'second', kind: 'mcp_tool', server: 'native', tool: 'second', status: 'running', arguments: {} },
+    ] }] } }
+    vi.mocked(api.get).mockResolvedValueOnce(live).mockRejectedValue(new Error('source unavailable'))
+    const { rerender } = render(<FreshAgentChildObserver parent={parent} childThreadId="child" onClose={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Toggle activity details' }))
+    expect(screen.getAllByLabelText('running')).toHaveLength(2)
+    expect(screen.queryByLabelText('complete')).not.toBeInTheDocument()
+    rerender(<FreshAgentChildObserver parent={{ ...parent, observedGeneration: 8 }} childThreadId="child" onClose={vi.fn()} />)
+    expect(await screen.findByText(/previously available content/i)).toBeVisible()
+    expect(screen.getAllByLabelText('running')).toHaveLength(2)
+    expect(screen.queryByLabelText('complete')).not.toBeInTheDocument()
+  })
+
   it('makes pending materialization finite and can later read saved content', async () => {
     vi.useFakeTimers()
     vi.mocked(api.get).mockResolvedValue({ parentThreadId: 'parent', childThreadId: 'child', status: 'pending', reason: 'history_unmaterialized', retryable: true })
