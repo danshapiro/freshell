@@ -11766,6 +11766,7 @@ fn now_iso() -> String {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    include!("codex/task004_tdd_recovery_tests.rs");
     use super::*;
     use crate::identity_sink::PaneIdentitySink;
     use crate::summary::{SUMMARY_KIND_AUTHORED, SUMMARY_KIND_ECHO};
