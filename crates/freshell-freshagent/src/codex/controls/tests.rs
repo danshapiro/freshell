@@ -837,6 +837,76 @@ async fn task5_approval_cannot_grant_a_decision_native_did_not_offer() {
 }
 
 #[tokio::test]
+async fn task5_approval_without_offered_decisions_refuses_session_grant_and_allows_retry() {
+    let (state, peer, mut rx) = runtime().await;
+    for native_id in [RequestId::Int(92), RequestId::Str("92".into())] {
+        peer.request_client(
+            &native_id,
+            "item/commandExecution/requestApproval",
+            json!({"threadId":"thread-1","turnId":"turn-1","itemId":"command-92","command":"npm test"}),
+        );
+        let request = event(&mut rx).await;
+        assert_eq!(request["type"], "freshAgent.permission.request");
+        assert_eq!(event(&mut rx).await["type"], "freshAgent.turn.waiting");
+        let before = snapshot(&state, &peer).await;
+        assert_eq!(before["pendingApprovals"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            before["pendingApprovals"][0]["requestId"],
+            request["requestId"]
+        );
+        assert_eq!(
+            before["pendingApprovals"][0]["providerRequest"]["id"],
+            native_id.to_json()
+        );
+        assert_eq!(state.awaited_control_count("thread-1"), 1);
+        let response = |decision| {
+            serde_json::from_value(json!({
+                "provider":"codex","sessionType":"freshcodex","sessionId":"thread-1",
+                "requestId":request["requestId"],"decision":{"nativeDecision":decision}
+            }))
+            .unwrap()
+        };
+
+        state
+            .handle_approval_respond(response("acceptForSession"))
+            .await;
+        let refused = event(&mut rx).await;
+        assert_eq!(refused["type"], "freshAgent.error");
+        assert_eq!(refused["code"], "INVALID_ANSWER");
+        assert_eq!(refused["sessionId"], "thread-1");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), peer.next_raw_frame())
+                .await
+                .is_err(),
+            "an unoffered session grant must not answer the native RPC"
+        );
+        assert_eq!(
+            snapshot(&state, &peer).await["pendingApprovals"],
+            before["pendingApprovals"]
+        );
+        assert_eq!(state.awaited_control_count("thread-1"), 1);
+
+        state.handle_approval_respond(response("accept")).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), peer.next_raw_frame())
+                .await
+                .expect("the supported retry answers the original native RPC")
+                .unwrap(),
+            json!({"id":native_id.to_json(),"result":{"decision":"accept"}})
+        );
+        let cancelled = event(&mut rx).await;
+        assert_eq!(cancelled["type"], "freshAgent.permission.cancelled");
+        assert_eq!(cancelled["requestId"], request["requestId"]);
+        assert_eq!(snapshot(&state, &peer).await["pendingApprovals"], json!([]));
+        assert_eq!(state.awaited_control_count("thread-1"), 0);
+    }
+    peer.disconnect();
+    tokio::time::timeout(Duration::from_secs(3), state.shutdown())
+        .await
+        .expect("owned controls fixture shuts down");
+}
+
+#[tokio::test]
 async fn task5_stale_turn_control_is_refused_before_it_becomes_answerable() {
     let (state, peer, mut rx) = runtime().await;
     peer.request_client(
