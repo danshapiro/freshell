@@ -15005,3 +15005,33 @@ describe('task delegation open-session link (freshopencode tui parity)', () => {
     })
   })
 })
+
+describe('Codex child observation in the parent view', () => {
+  it('persists only the selected child, preserves the parent draft and actions, and reopens without a child lifecycle', async () => {
+    const native = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
+    const childId = '22222222-2222-4222-8222-222222222222'
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...native, childThreads: [{ id: childId, threadId: childId, origin: 'spawnAgent' }] })
+    apiMock.get.mockImplementation((url: string) => Promise.resolve(url.includes('/children/') ? {
+      parentThreadId: native.threadId, childThreadId: childId, status: 'saved', snapshot: { ...native, threadId: childId, turns: [{ id: 'child-answer', turnId: 'child-answer', role: 'assistant', summary: '', items: [{ id: 'child-text', kind: 'text', text: 'Read-only child answer' }] }] },
+    } : { checkpoints: [] }))
+    const store = createStore()
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: { kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex', sessionId: native.threadId, sessionRef: { provider: 'codex', sessionId: native.threadId }, createRequestId: 'parent-observe', status: 'idle' } }))
+    const mounted = render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    const input = await screen.findByRole('textbox', { name: 'Chat message input' })
+    fireEvent.change(input, { target: { value: 'Parent draft survives observation' } })
+    fireEvent.click(await screen.findByRole('button', { name: `Observe child ${childId}` }))
+    expect(await screen.findByText('Read-only child answer')).toBeVisible()
+    expect(input).toHaveValue('Parent draft survives observation')
+    expect(getFreshAgentPaneContent(store)).toMatchObject({ sessionId: native.threadId, observedChildThreadId: childId })
+    fireEvent.click(screen.getByRole('button', { name: 'Close child conversation' }))
+    expect(screen.queryByRole('dialog', { name: 'Child conversation' })).not.toBeInTheDocument()
+    expect(getFreshAgentPaneContent(store).observedChildThreadId).toBeUndefined()
+    fireEvent.click(screen.getByRole('button', { name: `Observe child ${childId}` }))
+    expect(await screen.findByText('Read-only child answer')).toBeVisible()
+    mounted.unmount()
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    expect(await screen.findByText('Read-only child answer')).toBeVisible()
+    expect(getFreshAgentPaneContent(store).sessionRef).toEqual({ provider: 'codex', sessionId: native.threadId })
+    expect(wsMock.send.mock.calls.map(([message]) => message).filter((message) => message.sessionId === childId || message.sessionRef?.sessionId === childId)).toEqual([])
+  })
+})

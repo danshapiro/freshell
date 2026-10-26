@@ -351,6 +351,12 @@ function normalizeTerminalContent(content: Record<string, unknown>): Record<stri
 }
 
 function normalizeFreshAgentContent(content: Record<string, unknown>): Record<string, unknown> {
+  // Only the native child selection is durable. Bodies and ownership fences
+  // are read again through the parent's current provider after reload.
+  if ('observedChildThreadId' in content && (content.provider !== 'codex' || typeof content.observedChildThreadId !== 'string' || !content.observedChildThreadId.trim())) {
+    const { observedChildThreadId: _invalidChild, ...rest } = content
+    content = rest
+  }
   const checkpointOutcomes = normalizeFreshAgentCheckpointOutcomes(
     content.checkpointOutcomes,
     typeof content.createRequestId === 'string' ? content.createRequestId : undefined,

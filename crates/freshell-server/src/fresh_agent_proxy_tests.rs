@@ -6,6 +6,131 @@ use freshell_runtime_protocol::{
 };
 use tokio::net::UnixListener;
 
+#[tokio::test]
+async fn child_route_reads_only_the_parent_provider_volume_and_fences_replaced_sources() {
+    use tower::ServiceExt;
+    let mut env = crate::test_env_lock::TestEnv::lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    isolate_snapshot_env(&mut env, dir.path());
+    let local = dir
+        .path()
+        .join("configured-codex/sessions/rollout-child-native.jsonl");
+    std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+    let gateway_history = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"child-native\",\"cwd\":\"/gateway\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Wrong gateway child\"}]}}\n";
+    std::fs::write(&local, gateway_history).unwrap();
+    for scenario in [
+        "saved",
+        "live",
+        "replaced-owner",
+        "wrong-child",
+        "unrelated",
+    ] {
+        let socket = dir.path().join(format!("child-{scenario}.sock"));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let mut inventories = 0;
+            let mut methods = vec![];
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let envelope: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+                let mut done = false;
+                let result = match envelope.body {
+                    AdminCommand::Health => Ok(AdminResult::Health {
+                        control_epoch: 7,
+                        installation_id: InstallationId::new(),
+                    }),
+                    AdminCommand::Inventory => {
+                        inventories += 1;
+                        done = inventories == 2;
+                        Ok(AdminResult::Inventory(vec![serde_json::from_value(serde_json::json!({
+                            "soulId":"parent-root-soul","incarnationId":if scenario == "replaced-owner" && inventories == 2 {"new-owner"} else {"original-owner"},
+                            "launchState":"running","cleanupState":"none","intentRevision":1,"executionGeneration":1,"desiredState":"running","recoveryState":"live","durabilityState":"unknown","allocationState":"allocated","evidenceRevision":0,"successfulRecoveriesInWindow":0,
+                            "provider":"codex","nativeSessionId":"parent-native","freshAgentSessionId":"parent-alias","freshAgentSessionType":"freshcodex"
+                        })).unwrap()]))
+                    }
+                    AdminCommand::FreshAgentReadChild(request) => {
+                        methods.push("read_child");
+                        assert_eq!(request.soul_id.as_str(), "parent-root-soul");
+                        assert_eq!(request.child_thread_id, "child-native");
+                        assert_eq!(request.expected_control_epoch, Some(7));
+                        if scenario == "unrelated" {
+                            done = true;
+                            Err(freshell_runtime_protocol::RuntimeError::new(
+                                RuntimeErrorCode::InvalidRequest,
+                                "child is unrelated",
+                            ))
+                        } else {
+                            Ok(AdminResult::FreshAgentChildSnapshot(
+                                serde_json::json!({"parentThreadId":"parent-native","childThreadId":if scenario == "wrong-child" {"foreign-child"} else {"child-native"},"status":if scenario == "live" {"live"} else {"saved"},"snapshot":{"threadId":"child-native","provider":"codex","sessionType":"freshcodex","turns":[{"text":"Provider volume child"}],"capabilities":{"send":true,"interrupt":true,"fork":true,"undo":true},"pendingApprovals":[],"pendingQuestions":[],"extensions":{}}}),
+                            ))
+                        }
+                    }
+                    other => panic!("observer attempted an unexpected root operation: {other:?}"),
+                };
+                write_frame(
+                    &mut stream,
+                    &AdminReply {
+                        request_id: envelope.request_id,
+                        result,
+                    },
+                )
+                .await
+                .unwrap();
+                if done {
+                    return methods;
+                }
+            }
+        });
+        let (broadcast, _) = broadcast::channel(16);
+        let broadcast = Arc::new(broadcast);
+        let owner =
+            freshell_freshagent::FreshAgentState::new(Arc::new("tok".into()), broadcast.clone());
+        owner
+            .set_hosted_rest_gateway(snapshot_outage_proxy(&socket))
+            .unwrap();
+        let app = freshell_freshagent::snapshot::router(
+            freshell_freshagent::snapshot::SnapshotState::new(
+                Arc::new("tok".into()),
+                freshell_freshagent::FreshCodexState::new(
+                    Arc::new("tok".into()),
+                    broadcast.clone(),
+                    serde_json::json!({}),
+                ),
+                owner,
+                freshell_freshagent::FreshClaudeState::new(broadcast),
+            ),
+        );
+        let response = app.oneshot(axum::http::Request::builder().uri("/api/fresh-agent/threads/freshcodex/codex/parent-alias/children/child-native").header("x-auth-token","tok").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 32 * 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let methods = tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(methods, vec!["read_child"]);
+        if matches!(scenario, "saved" | "live") {
+            assert_eq!(
+                body["snapshot"]["turns"][0]["text"],
+                "Provider volume child"
+            );
+            assert_eq!(body["parentThreadId"], "parent-native");
+            assert_eq!(body["status"], scenario);
+            assert_eq!(body["snapshot"]["capabilities"]["send"], false);
+            assert_eq!(body["snapshot"]["capabilities"]["fork"], false);
+        } else {
+            assert_eq!(body["reason"], "source_unavailable");
+            assert!(body.get("snapshot").is_none());
+        }
+        assert!(!body.to_string().contains("Wrong gateway child"));
+    }
+    assert_eq!(std::fs::read_to_string(local).unwrap(), gateway_history);
+}
+
 #[test]
 fn managed_provider_fresh_claude_retains_validated_mcp_recipe() {
     let args = vec!["--mcp-config".into(), ".claude/freshell-mcp.json".into()];

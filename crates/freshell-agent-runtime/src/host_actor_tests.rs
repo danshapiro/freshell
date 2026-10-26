@@ -125,6 +125,53 @@ impl FreshAgentTransport for SnapshotTransport {
         }
         Ok(self.value.clone())
     }
+    async fn read_child(&self, _: &str) -> Result<Value, String> {
+        self.snapshot().await
+    }
+}
+
+#[tokio::test]
+async fn child_observation_preserves_actor_state_and_rejects_cross_parent_child_and_liveness() {
+    for scenario in [
+        "saved",
+        "live",
+        "wrong-parent",
+        "wrong-child",
+        "exit-during-read",
+        "oversized",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = Arc::new(SnapshotTransport {
+            value: serde_json::json!({"parentThreadId":if scenario == "wrong-parent" {"foreign"} else {"parent-native"},"childThreadId":if scenario == "wrong-child" {"foreign"} else {"child-native"},"status":if scenario == "live" {"live"} else {"saved"},"snapshot":{"threadId":"child-native","provider":"codex","turns":if scenario == "oversized" {"x".repeat(freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES)} else {"Exact observed body".into()}}}),
+            live: std::sync::atomic::AtomicBool::new(true),
+            exit_during_read: scenario == "exit-during-read",
+            initial_native: Some("parent-native".into()),
+            registered: None,
+            pause: None,
+        });
+        let actor = FreshAgentHostActor::open(
+            dir.path(),
+            profile(FreshProvider::Codex, "child-store", None),
+            transport,
+        )
+        .await
+        .unwrap();
+        let before = fs::read(dir.path().join("fresh-agent-state.json")).unwrap();
+        let result = actor.read_child("child-native").await;
+        assert_eq!(
+            result.is_ok(),
+            matches!(scenario, "saved" | "live"),
+            "{scenario}"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("fresh-agent-state.json")).unwrap(),
+            before
+        );
+        assert_eq!(
+            actor.profile().await.native_session_id.as_deref(),
+            Some("parent-native")
+        );
+    }
 }
 
 #[tokio::test]

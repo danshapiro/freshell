@@ -4,6 +4,7 @@ import {
   FRESH_AGENT_CONTRACT_SCHEMA_NAMES,
   FreshAgentActionResultSchema,
   FreshAgentCapabilitiesSchema,
+  FreshAgentChildObservationSchema,
   FreshAgentContractErrorSchema,
   FreshAgentRequestIdSchema,
   FreshAgentSessionCommandSchema,
@@ -26,6 +27,18 @@ import {
 } from '../../fixtures/fresh-agent/codex/contract-fixtures.js'
 
 describe('fresh-agent shared contract schemas', () => {
+  it('requires the exact child body only for readable observations and preserves finite unavailable states', () => {
+    const identity = { parentThreadId: 'parent', childThreadId: codexContractSnapshot.threadId }
+    const saved = FreshAgentChildObservationSchema.parse({ ...identity, status: 'saved', snapshot: codexContractSnapshot })
+    expect(saved.status).toBe('saved')
+    for (const reason of ['ephemeral_history_unavailable', 'history_unavailable', 'source_unavailable']) {
+      const unavailable = { ...identity, status: 'unavailable', reason, retryable: reason === 'source_unavailable' }
+      expect(FreshAgentChildObservationSchema.safeParse(unavailable).success).toBe(true)
+      expect(FreshAgentChildObservationSchema.safeParse({ ...unavailable, snapshot: codexContractSnapshot }).success).toBe(false)
+    }
+    expect(FreshAgentChildObservationSchema.safeParse({ ...identity, status: 'pending', reason: 'history_unmaterialized', retryable: true }).success).toBe(true)
+    expect(FreshAgentChildObservationSchema.safeParse({ ...identity, childThreadId: 'wrong', status: 'live', snapshot: codexContractSnapshot }).success).toBe(false)
+  })
   it('validates native delta patches and rejects unsafe revisions or malformed operations', () => {
     const patch = { type: 'freshAgent.transcript.patch', sessionId: 'thread', projectionId: 'runtime', historyGeneration: 0, ops: [{ op: 'appendItem', nativeTurnId: 'turn', rowId: 'turn:row-1', itemId: 'answer', field: 'text', text: '🙂', revision: 1 }] }
     expect(FreshAgentTranscriptPatchSchema.parse(patch).ops[0]).toMatchObject({ text: '🙂', revision: 1 })

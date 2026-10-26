@@ -23,6 +23,27 @@ vi.mock('@/components/markdown/LazyMarkdown', async () => {
 describe('FreshAgentTranscript', () => {
   afterEach(() => cleanup())
 
+  it('shows native asynchronous choices when the agent message has no text body', () => {
+    render(<FreshAgentTranscript turns={[{ id: 'choices', turnId: 'choices', role: 'assistant', summary: '', items: [{ id: 'choice-item', kind: 'text', text: '', extensions: { codex: { questions: [{ title: 'Choose next step', options: ['Inspect', 'Verify'] }] } } }] }]} />)
+    expect(screen.getByText('Choose next step')).toBeVisible()
+    expect(screen.getByText('Inspect')).toBeVisible()
+    expect(screen.getByText('Verify')).toBeVisible()
+  })
+
+  it.each(['running', 'completed', 'failed', 'declined'] as const)('preserves %s command and file outcomes in the transcript', (status) => {
+    render(<FreshAgentTranscript expandTools isStreaming={status === 'running'} turns={[{ id: 'native', turnId: 'native', role: 'assistant', summary: '', items: [
+      { id: 'command', kind: 'command', command: 'check files', status, output: 'Command output', exitCode: status === 'failed' ? 17 : null },
+      { id: 'patch', kind: 'file_change', status, changes: [{ path: '/tmp/result.txt' }] },
+    ] }]} />)
+    const label = { running: 'running', completed: 'complete', failed: 'error', declined: 'declined' }[status]
+    expect(screen.getAllByLabelText(label)).toHaveLength(2)
+    if (status !== 'completed') expect(screen.queryByLabelText('complete')).not.toBeInTheDocument()
+    const command = screen.getByRole('button', { name: 'Bash tool call' })
+    if (command.getAttribute('aria-expanded') !== 'true') fireEvent.click(command)
+    expect(screen.getByText('Command output')).toBeVisible()
+    if (status === 'failed') expect(screen.getByText('Exit code: 17')).toBeVisible()
+  })
+
   it.each([
     [{ provenance: 'saved', diagnostic: 'interrupted', refreshPending: false }, 'Only saved output remains.'],
     [{ provenance: 'retained', diagnostic: 'unsaved', refreshPending: false }, 'Saved output could not be confirmed.'],

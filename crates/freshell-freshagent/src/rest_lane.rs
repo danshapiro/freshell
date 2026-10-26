@@ -200,6 +200,14 @@ pub struct RestLaneSnapshot {
     pub session_type: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestLaneChildRead {
+    pub parent_session_id: String,
+    pub child_thread_id: String,
+    pub observed_epoch: Option<u64>,
+    pub observed_generation: Option<u64>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RestLaneSnapshotError {
     OwnershipUnavailable,
@@ -208,6 +216,12 @@ pub enum RestLaneSnapshotError {
 
 #[async_trait]
 pub trait FreshAgentRestLane: Send + Sync {
+    async fn read_child(
+        &self,
+        _request: RestLaneChildRead,
+    ) -> Result<Option<Value>, crate::codex::children::ChildReadError> {
+        Err(crate::codex::children::ChildReadError::SourceUnavailable)
+    }
     /// None leaves genuinely unmanaged threads on their existing read path.
     /// A hosted read failure must never fall back to saved history as live truth.
     async fn snapshot(

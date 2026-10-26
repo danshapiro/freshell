@@ -119,7 +119,8 @@ import type { FreshAgentTurn } from '@shared/fresh-agent-contract'
 import { finalizeCodingAgentSessionName } from '@/store/codingAgentNaming'
 import { FreshAgentApprovalBanner } from './FreshAgentApprovalBanner'
 import { FreshAgentApprovalCard } from './FreshAgentApprovalCard'
-import { FreshAgentOpenSessionContext } from './FreshAgentItemCard'
+import { FreshAgentOpenSessionContext, FreshAgentObserveChildContext } from './FreshAgentItemCard'
+import { FreshAgentChildObserver, type FreshAgentChildParent } from './FreshAgentChildObserver.js'
 import FreshAgentQuestionBanner from './FreshAgentQuestionBanner'
 import { FreshAgentTranscript, type FreshAgentTranscriptHandle, type FreshAgentTranscriptProps } from './FreshAgentTranscript'
 import { mergeFreshAgentTranscriptProjection, readTranscriptProjection } from '@/lib/fresh-agent-transcript-projection'
@@ -4557,7 +4558,13 @@ export function FreshAgentView({
       })
     }
 
+    const childParent: FreshAgentChildParent | undefined = paneContent.provider === 'codex' && paneContent.sessionType === 'freshcodex' && contextSessionId ? {
+      provider: 'codex', sessionType: 'freshcodex', parentSessionId: effectiveSessionRef(paneContent)?.sessionId ?? snapshot?.threadId ?? contextSessionId,
+      ...(runtimeOwner ? { observedEpoch: runtimeOwner.epoch, observedGeneration: runtimeOwner.generation } : {}),
+    } : undefined
+    const closeChild = () => dispatch(mergePaneContent({ tabId, paneId, updates: { observedChildThreadId: undefined } }))
     return (
+      <FreshAgentObserveChildContext.Provider value={childParent ? { parent: childParent, onObserve: (action) => dispatch(mergePaneContent({ tabId, paneId, updates: { observedChildThreadId: action.childThreadId } })) } : undefined}>
       <div
         ref={paneRootRef}
         tabIndex={-1}
@@ -5053,7 +5060,9 @@ export function FreshAgentView({
             codexUsage={codexUsage}
           />
         </div>
+        {childParent && paneContent.observedChildThreadId ? <FreshAgentObserveChildContext.Provider value={undefined}><FreshAgentChildObserver parent={childParent} childThreadId={paneContent.observedChildThreadId} onClose={closeChild} /></FreshAgentObserveChildContext.Provider> : null}
       </div>
+      </FreshAgentObserveChildContext.Provider>
     )
   }, [
     canSend,
@@ -5104,6 +5113,8 @@ export function FreshAgentView({
     restartStuckSidecar,
     rewindToTurn,
     openDelegationSession,
+    runtimeOwner?.epoch,
+    runtimeOwner?.generation,
     runShellCommand,
     sessionEnded,
     sessionErrorMessage,

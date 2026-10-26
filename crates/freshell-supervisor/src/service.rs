@@ -586,6 +586,15 @@ impl Supervisor {
                     self.fresh_agent_snapshot(request.soul_id).await?,
                 ))
             }
+            AdminCommand::FreshAgentReadChild(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::FreshAgentChildSnapshot(
+                    self.fresh_agent_read_child(request.soul_id, request.child_thread_id)
+                        .await?,
+                ))
+            }
             AdminCommand::FreshAgentResolve(request) => {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
@@ -2020,6 +2029,71 @@ impl Supervisor {
         Ok(snapshot)
     }
 
+    async fn fresh_agent_read_child(
+        &self,
+        soul_id: SoulId,
+        child_thread_id: String,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
+        let _guard = lifecycle_lock.lock().await;
+        let handle = self
+            .registry
+            .active_handle_for_soul(soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let agent = handle.fresh_agent().ok_or_else(|| {
+            RuntimeError::new(
+                RuntimeErrorCode::UnsupportedWorkload,
+                "soul is not a hosted fresh-agent",
+            )
+        })?;
+        let provider = if agent.provider == freshell_runtime_protocol::FreshProvider::Kilroy {
+            "claude"
+        } else {
+            agent.provider.as_str()
+        };
+        let host = self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await?;
+        let result = self
+            .send_authenticated_host_command(
+                handle.incarnation_id().clone(),
+                handle.runtime_dir(),
+                &host,
+                HostCommand::FreshAgentReadChild {
+                    child_thread_id: child_thread_id.clone(),
+                    incarnation_id: handle.incarnation_id().clone(),
+                },
+            )
+            .await?;
+        let HostResult::FreshAgentChildSnapshot(snapshot) = result else {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::HostAuthenticationFailed,
+                "unexpected fresh-agent snapshot reply",
+            ));
+        };
+        let current = self
+            .registry
+            .active_handle_for_soul(soul_id)
+            .await
+            .map_err(map_registry)?;
+        if current.incarnation_id() != handle.incarnation_id() {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::OwnershipMismatch,
+                "fresh-agent snapshot owner changed",
+            ));
+        }
+        if provider != "codex"
+            || snapshot["childThreadId"].as_str() != Some(child_thread_id.as_str())
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::OwnershipMismatch,
+                "fresh-agent child snapshot identity mismatch",
+            ));
+        }
+        Ok(snapshot)
+    }
+
     async fn fresh_agent_resolve(
         &self,
         soul_id: SoulId,
@@ -3242,7 +3316,9 @@ where
     drop(supervisor);
     let limit = if matches!(
         reply.result,
-        Ok(AdminResult::FreshAgentHistory(_) | AdminResult::FreshAgentSnapshot(_))
+        Ok(AdminResult::FreshAgentHistory(_)
+            | AdminResult::FreshAgentSnapshot(_)
+            | AdminResult::FreshAgentChildSnapshot(_))
     ) {
         freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES
     } else {
@@ -3474,7 +3550,10 @@ pub(crate) async fn request_host_reply(
         write_frame(&mut stream, envelope)
             .await
             .map_err(|error| unreachable(error.to_string()))?;
-        let reply_limit = if matches!(envelope.body, HostCommand::FreshAgentReadSnapshot { .. }) {
+        let reply_limit = if matches!(
+            envelope.body,
+            HostCommand::FreshAgentReadSnapshot { .. } | HostCommand::FreshAgentReadChild { .. }
+        ) {
             freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES
         } else {
             freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES
@@ -3681,8 +3760,8 @@ mod host_ipc_timeout_tests {
     use tokio::net::UnixListener;
 
     #[tokio::test]
-    async fn snapshot_host_reply_preserves_large_history_and_controls_stay_bounded() {
-        for snapshot_read in [true, false] {
+    async fn snapshot_and_child_host_replies_preserve_large_history_and_controls_stay_bounded() {
+        for (snapshot_read, child_read) in [(true, false), (true, true), (false, false)] {
             let dir = tempfile::tempdir().unwrap();
             let socket = dir.path().join("host.sock");
             let listener = UnixListener::bind(&socket).unwrap();
@@ -3698,16 +3777,23 @@ mod host_ipc_timeout_tests {
                     &mut stream,
                     &freshell_runtime_protocol::HostReply {
                         request_id: envelope.request_id,
-                        result: Ok(freshell_runtime_protocol::HostResult::FreshAgentSnapshot(
-                            sent,
-                        )),
+                        result: Ok(if child_read {
+                            freshell_runtime_protocol::HostResult::FreshAgentChildSnapshot(sent)
+                        } else {
+                            freshell_runtime_protocol::HostResult::FreshAgentSnapshot(sent)
+                        }),
                     },
                     freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES,
                 )
                 .await
             });
             let id = IncarnationId::parse("large-incarnation").unwrap();
-            let command = if snapshot_read {
+            let command = if child_read {
+                HostCommand::FreshAgentReadChild {
+                    incarnation_id: id,
+                    child_thread_id: "native-child".into(),
+                }
+            } else if snapshot_read {
                 HostCommand::FreshAgentReadSnapshot { incarnation_id: id }
             } else {
                 HostCommand::Status { incarnation_id: id }
@@ -3719,7 +3805,11 @@ mod host_ipc_timeout_tests {
             )
             .await;
             let _ = server.await.unwrap();
-            if snapshot_read {
+            if child_read {
+                assert!(
+                    matches!(reply.unwrap().result.unwrap(), freshell_runtime_protocol::HostResult::FreshAgentChildSnapshot(value) if value == expected)
+                );
+            } else if snapshot_read {
                 assert!(
                     matches!(reply.unwrap().result.unwrap(), freshell_runtime_protocol::HostResult::FreshAgentSnapshot(value) if value == expected)
                 );

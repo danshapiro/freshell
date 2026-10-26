@@ -73,6 +73,7 @@ export const FreshAgentTranscriptItemSchema = z.discriminatedUnion('kind', [
     id: z.string().min(1),
     kind: z.literal('text'),
     text: z.string(),
+    extensions: z.record(z.string(), z.unknown()).optional(),
   }).strict(),
   z.object({
     id: z.string().min(1),
@@ -148,7 +149,11 @@ export const FreshAgentTranscriptItemSchema = z.discriminatedUnion('kind', [
   z.object({
     id: z.string().min(1),
     kind: z.literal('task_delegation'),
-    status: z.enum(['running', 'completed', 'failed']),
+    status: z.enum(['running', 'completed', 'failed', 'interrupted']),
+    provider: FreshAgentRuntimeProviderSchema.optional(),
+    nativeStatus: z.string().nullable().optional(),
+    model: z.string().optional(),
+    reasoningEffort: z.string().optional(),
     title: z.string(),
     description: z.string().optional(),
     subagent: z.string().optional(),
@@ -371,6 +376,10 @@ export const FreshAgentChildThreadSchema = z.object({
   threadId: z.string().min(1),
   origin: z.string(),
   title: z.string().optional(),
+  status: z.string().optional(),
+  model: z.string().optional(),
+  result: z.string().optional(),
+  error: z.string().optional(),
   receiverThreadIds: z.array(z.string().min(1)).optional(),
 }).strict()
 
@@ -427,6 +436,27 @@ export const FreshAgentSnapshotSchema = FreshAgentThreadLocatorSchema.extend({
   // and old servers/clients keep parsing unchanged (graceful absence).
   commands: z.array(FreshAgentSessionCommandSchema).readonly().optional(),
 }).strict()
+
+export const FreshAgentChildReadSchema = z.object({
+  parentSessionId: z.string().min(1),
+  childThreadId: z.string().min(1),
+  observedEpoch: z.number().int().nonnegative().optional(),
+  observedGeneration: z.number().int().nonnegative().optional(),
+}).strict()
+
+const ChildIdentity = { parentThreadId: z.string().min(1), childThreadId: z.string().min(1) }
+export const FreshAgentChildObservationSchema = z.discriminatedUnion('status', [
+  z.object({ ...ChildIdentity, status: z.literal('live'), snapshot: FreshAgentSnapshotSchema }).strict(),
+  z.object({ ...ChildIdentity, status: z.literal('saved'), snapshot: FreshAgentSnapshotSchema }).strict(),
+  z.object({ ...ChildIdentity, status: z.literal('pending'), reason: z.literal('history_unmaterialized'), retryable: z.literal(true) }).strict(),
+  z.object({ ...ChildIdentity, status: z.literal('unavailable'), reason: z.enum(['ephemeral_history_unavailable', 'history_unavailable', 'source_unavailable']), retryable: z.boolean() }).strict(),
+]).superRefine((value, context) => {
+  if ('snapshot' in value && (value.snapshot.threadId !== value.childThreadId || value.snapshot.provider !== 'codex' || value.snapshot.sessionType !== 'freshcodex')) {
+    context.addIssue({ code: 'custom', message: 'Child snapshot identity mismatch', path: ['snapshot'] })
+  }
+})
+export type FreshAgentChildRead = z.infer<typeof FreshAgentChildReadSchema>
+export type FreshAgentChildObservation = z.infer<typeof FreshAgentChildObservationSchema>
 
 export const FreshAgentTurnPageSchema = FreshAgentThreadLocatorSchema.extend({
   revision: z.number().int().nonnegative(),

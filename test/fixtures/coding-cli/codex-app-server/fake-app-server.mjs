@@ -464,6 +464,8 @@ function successResult(method, params) {
     return {}
   }
   if (method === 'thread/read') {
+    const scriptedThread = behavior.threadReadResults?.[params?.threadId]
+    if (scriptedThread) return { thread: scriptedThread }
     const thread = makeThread(params?.threadId, {
       ...params,
       includeTurns: params?.includeTurns === true,
@@ -920,7 +922,9 @@ wss.on('connection', (socket) => {
     setTimeout(async () => {
       await writeBytes(process.stdout, floodStdoutBytes)
       await writeBytes(process.stderr, floodStderrBytes)
-      const result = override?.result ?? successResult(method, message.params)
+      const result = method === 'thread/read' && behavior.threadReadResults?.[message.params?.threadId]
+        ? successResult(method, message.params)
+        : override?.result ?? successResult(method, message.params)
       // Durable witnesses land BEFORE the RPC response (kata rb5h). socket.send copies
       // the frame into the kernel synchronously, so on a loaded multi-core host a client
       // on another core can observe the response and assert the witness files while THIS

@@ -2665,6 +2665,15 @@ pub struct FreshAgentReadSnapshotRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct FreshAgentReadChildRequest {
+    pub soul_id: SoulId,
+    pub child_thread_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TerminalResizeRequest {
     pub soul_id: SoulId,
     pub cols: u16,
@@ -2959,6 +2968,7 @@ pub enum AdminCommand {
     FreshAgentReadEvents(FreshAgentReadEventsRequest),
     FreshAgentReadHistory(FreshAgentReadHistoryRequest),
     FreshAgentReadSnapshot(FreshAgentReadSnapshotRequest),
+    FreshAgentReadChild(FreshAgentReadChildRequest),
     RuntimeMetrics(RuntimeMetricsRequest),
     ProbeRecovery(RecoveryProbeRequest),
     Recover(RecoverRequest),
@@ -3473,6 +3483,7 @@ pub enum AdminResult {
     FreshAgentEvents(AgentEventBatch),
     FreshAgentHistory(serde_json::Value),
     FreshAgentSnapshot(serde_json::Value),
+    FreshAgentChildSnapshot(serde_json::Value),
     RuntimeMetrics(RuntimeMetrics),
     RecoveryProbe(RecoveryProbe),
     Recovery(RecoveryResult),
@@ -3591,6 +3602,10 @@ pub enum HostCommand {
     FreshAgentReadSnapshot {
         incarnation_id: IncarnationId,
     },
+    FreshAgentReadChild {
+        incarnation_id: IncarnationId,
+        child_thread_id: String,
+    },
     FreshAgentResolve {
         incarnation_id: IncarnationId,
         decision_id: String,
@@ -3655,6 +3670,7 @@ pub enum HostResult {
     FreshAgentEvents(AgentEventBatch),
     RuntimeMetrics(RuntimeMetrics),
     FreshAgentSnapshot(serde_json::Value),
+    FreshAgentChildSnapshot(serde_json::Value),
     Status {
         host_boot_id: HostBootId,
         worker_pid: Option<u32>,
@@ -4465,6 +4481,36 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn child_read_wire_retains_parent_soul_and_exact_child_without_writer_parameters() {
+        let request = FreshAgentReadChildRequest {
+            soul_id: SoulId::parse("parent-soul").unwrap(),
+            child_thread_id: "native-child".into(),
+            expected_control_epoch: Some(8),
+        };
+        let encoded =
+            serde_json::to_value(AdminCommand::FreshAgentReadChild(request.clone())).unwrap();
+        let decoded: AdminCommand = serde_json::from_value(encoded).unwrap();
+        assert!(matches!(decoded,AdminCommand::FreshAgentReadChild(value) if value == request));
+        let host = HostCommand::FreshAgentReadChild {
+            incarnation_id: IncarnationId::parse("parent-incarnation").unwrap(),
+            child_thread_id: "native-child".into(),
+        };
+        let decoded: HostCommand =
+            serde_json::from_value(serde_json::to_value(host).unwrap()).unwrap();
+        assert!(
+            matches!(decoded,HostCommand::FreshAgentReadChild {child_thread_id,..} if child_thread_id == "native-child")
+        );
+        let observation = serde_json::json!({"parentThreadId":"parent-native","childThreadId":"native-child","status":"unavailable","reason":"ephemeral_history_unavailable","retryable":false});
+        let decoded: HostResult = serde_json::from_value(
+            serde_json::to_value(HostResult::FreshAgentChildSnapshot(observation.clone())).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            matches!(decoded,HostResult::FreshAgentChildSnapshot(value) if value == observation)
+        );
     }
 
     #[test]

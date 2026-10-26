@@ -4,6 +4,87 @@ use super::*;
 
 #[async_trait::async_trait]
 impl FreshAgentRestLane for HostedFreshAgentProxy {
+    async fn read_child(
+        &self,
+        request: freshell_freshagent::rest_lane::RestLaneChildRead,
+    ) -> Result<Option<serde_json::Value>, freshell_freshagent::codex::children::ChildReadError>
+    {
+        use freshell_freshagent::codex::children::{stamp_readonly_child, ChildReadError};
+        let ownership = self.ownership.get().map(|registry| {
+            let id = registry.resolve_canonical("codex", &request.parent_session_id);
+            registry.observe("codex", &id)
+        });
+        if ownership.as_ref().is_some_and(|owner| {
+            request
+                .observed_epoch
+                .is_some_and(|epoch| epoch != owner.epoch)
+                || request
+                    .observed_generation
+                    .is_some_and(|generation| generation != owner.generation)
+        }) {
+            return Err(ChildReadError::SourceUnavailable);
+        }
+        let inventory = self
+            .client
+            .inventory()
+            .await
+            .map_err(|_| ChildReadError::SourceUnavailable)?;
+        // The child is deliberately never looked up as a root soul.
+        let Some(view) = inventory.iter().rev().find(|view| {
+            view.provider.as_deref() == Some("codex")
+                && view.fresh_agent_session_type.as_deref() == Some("freshcodex")
+                && (view.fresh_agent_session_id.as_deref() == Some(&request.parent_session_id)
+                    || view.native_session_id.as_deref() == Some(&request.parent_session_id))
+        }) else {
+            return Ok(None);
+        };
+        let parent = view
+            .native_session_id
+            .as_deref()
+            .ok_or(ChildReadError::SourceUnavailable)?;
+        let mut value = self.client.fresh_agent_read_child(view.soul_id.clone(), request.child_thread_id.clone()).await.map_err(|error| {
+            tracing::warn!(provider="codex", soul_id=%view.soul_id, session_id=parent, child_thread_id=%request.child_thread_id, code=?error.runtime_code(), "fresh_agent.hosted_child_unavailable");
+            ChildReadError::SourceUnavailable
+        })?;
+        let inventory_after = self
+            .client
+            .inventory()
+            .await
+            .map_err(|_| ChildReadError::SourceUnavailable)?;
+        let latest = inventory_after
+            .iter()
+            .rev()
+            .find(|row| row.soul_id == view.soul_id)
+            .ok_or(ChildReadError::SourceUnavailable)?;
+        let owner_changed =
+            self.ownership
+                .get()
+                .zip(ownership.as_ref())
+                .is_some_and(|(registry, before)| {
+                    let id = registry.resolve_canonical("codex", &request.parent_session_id);
+                    let after = registry.observe("codex", &id);
+                    after.epoch != before.epoch
+                        || after.generation != before.generation
+                        || after.state != before.state
+                });
+        if owner_changed
+            || !same_snapshot_source(view, latest)
+            || value["parentThreadId"].as_str() != Some(parent)
+            || value["childThreadId"].as_str() != Some(request.child_thread_id.as_str())
+        {
+            return Err(ChildReadError::SourceUnavailable);
+        }
+        if let Some(snapshot) = value.get_mut("snapshot") {
+            if snapshot["threadId"].as_str() != Some(request.child_thread_id.as_str())
+                || snapshot["provider"] != "codex"
+                || snapshot["sessionType"] != "freshcodex"
+            {
+                return Err(ChildReadError::SourceUnavailable);
+            }
+            stamp_readonly_child(snapshot, parent);
+        }
+        Ok(Some(value))
+    }
     async fn snapshot(
         &self,
         request: freshell_freshagent::rest_lane::RestLaneSnapshot,

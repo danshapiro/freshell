@@ -46,6 +46,13 @@ test('Freshcodex shows native text and command progress before completion, then 
     const pane = page.locator('[data-context="fresh-agent"]').last()
     const input = pane.getByRole('textbox', { name: 'Chat message input' })
     await expect(input).toBeEnabled({ timeout: 30_000 })
+    await pane.locator('input[type="file"]').setInputFiles([
+      { name: 'native-upload.png', mimeType: 'image/png', buffer: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jR1UAAAAASUVORK5CYII=', 'base64') },
+      { name: 'native-notes.txt', mimeType: 'text/plain', buffer: Buffer.from('Uploaded fixture notes') },
+    ])
+    await expect(pane.getByRole('list', { name: 'Attachments' }).getByText('native-upload.png')).toBeVisible()
+    await expect(pane.getByRole('list', { name: 'Attachments' }).getByText('native-notes.txt')).toBeVisible()
+    await expect(pane.getByLabel('uploading')).toHaveCount(0)
     await input.fill('Show native live progress')
     await pane.getByRole('button', { name: 'Send' }).click()
     await expect.poll(async () => (await fs.readFile(nativeLog, 'utf8')).includes('item/agentMessage/delta')).toBe(true)
@@ -73,9 +80,11 @@ test('Freshcodex shows native text and command progress before completion, then 
     await harness.waitForHarness()
     await harness.waitForConnection()
     await expect(page.getByText('Native streaming fragment and final answer', { exact: true })).toHaveCount(1, { timeout: 30_000 })
+    await expect(page.getByLabel('You transcript turn').filter({ hasText: 'native-upload.png' })).toHaveCount(1)
+    await expect(page.getByLabel('You transcript turn').filter({ hasText: 'native-notes.txt' })).toHaveCount(1)
   } finally {
     await fs.writeFile(release, 'release').catch(() => {})
-    await context?.close()
+    await context?.close().catch(() => {})
     await server.stop()
     await fs.rm(root, { recursive: true, force: true })
   }

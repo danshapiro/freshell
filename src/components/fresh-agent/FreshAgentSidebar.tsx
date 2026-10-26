@@ -1,4 +1,6 @@
 import type { CodexLatestUsage } from '@/lib/fresh-agent-context-usage'
+import { FreshAgentChildLink } from './FreshAgentItemCard.js'
+import { childActivitySummary } from './shared/child-activity.js'
 
 type CodexPlan = { explanation?: string; plan: Array<{ step: string; status: 'pending' | 'inProgress' | 'completed' }> }
 
@@ -18,7 +20,7 @@ export function FreshAgentSidebar({
   codexUsage,
 }: {
   worktrees: Array<{ id: string; path: string; branch?: string }>
-  childThreads: Array<{ id: string; threadId: string; origin?: string; title?: string }>
+  childThreads: Array<{ id: string; threadId: string; origin?: string; title?: string; status?: string; model?: string; result?: string; error?: string }>
   codexReview?: { id?: string; status?: string }
   codexFork?: { parentThreadId?: string }
   codexPlan?: CodexPlan
@@ -85,7 +87,7 @@ export function FreshAgentSidebar({
           <div className="fresh-agent-sidebar-title mb-2 text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Child Threads</div>
           <ul className="fresh-agent-sidebar-list space-y-1 text-sm">
             {childThreads.map((thread) => (
-              <li key={thread.id}>{thread.title ?? thread.threadId}</li>
+              <li key={thread.id}><span>{thread.title ?? thread.threadId}</span><p className="text-xs text-muted-foreground">{childActivitySummary(thread)}</p><FreshAgentChildLink childThreadId={thread.threadId} /></li>
             ))}
           </ul>
         </section>

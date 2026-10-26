@@ -305,6 +305,10 @@ pub trait FreshAgentTransport: Send + Sync {
         Err("provider does not expose a hosted snapshot".into())
     }
 
+    async fn read_child(&self, _child_thread_id: &str) -> Result<Value, String> {
+        Err("provider does not expose child observation".into())
+    }
+
     /// A registered zero-turn identity is transport-owned, not a durable native identity.
     /// Only transports that can prove their current local registration opt in.
     async fn registered_snapshot_identity(&self) -> Option<String> {
@@ -1127,6 +1131,42 @@ impl FreshAgentHostActor {
             ));
         }
         Ok(snapshot)
+    }
+
+    pub async fn read_child(&self, child_thread_id: &str) -> Result<Value, ActorError> {
+        let before = self.profile().await;
+        if before.provider != FreshProvider::Codex
+            || before.native_session_id.is_none()
+            || !self.transport.is_live().await
+        {
+            return Err(ActorError::NativeIdentityMismatch);
+        }
+        let value = self
+            .transport
+            .read_child(child_thread_id)
+            .await
+            .map_err(ActorError::Transport)?;
+        let after = self.profile().await;
+        if before.native_session_id != after.native_session_id
+            || !self.transport.is_live().await
+            || value["parentThreadId"].as_str() != before.native_session_id.as_deref()
+            || value["childThreadId"].as_str() != Some(child_thread_id)
+            || (value.get("snapshot").is_some()
+                && (value["snapshot"]["threadId"].as_str() != Some(child_thread_id)
+                    || value["snapshot"]["provider"] != "codex"))
+        {
+            return Err(ActorError::NativeIdentityMismatch);
+        }
+        if serde_json::to_vec(&value)
+            .map_err(|error| ActorError::Transport(error.to_string()))?
+            .len()
+            > freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES - 4096
+        {
+            return Err(ActorError::Transport(
+                "child observation exceeds history reply frame limit".into(),
+            ));
+        }
+        Ok(value)
     }
 
     pub async fn record_event(&self, event: AgentEvent) -> Result<u64, ActorError> {

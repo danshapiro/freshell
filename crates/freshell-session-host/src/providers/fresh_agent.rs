@@ -1033,6 +1033,21 @@ impl FreshAgentTransport for HostedTransport {
         Ok(snapshot)
     }
 
+    async fn read_child(&self, child_thread_id: &str) -> Result<Value, String> {
+        #[cfg(test)]
+        if let Some(delegate) = self.test_delegate.as_ref() {
+            return delegate.read_child(child_thread_id).await;
+        }
+        let parent = self.current_native_id().await?;
+        match &self.state {
+            ProviderState::Codex(state) => state
+                .read_child(&parent, child_thread_id, None, None)
+                .await
+                .map_err(|error| format!("codex child observation unavailable: {error:?}")),
+            _ => Err("provider does not expose child observation".into()),
+        }
+    }
+
     async fn registered_snapshot_identity(&self) -> Option<String> {
         if self.provider != FreshProvider::Opencode
             || self.native_rx.lock().await.borrow().is_some()

@@ -82,6 +82,7 @@ use crate::summary::{
 };
 use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
 
+pub mod children;
 mod controls;
 mod metadata;
 pub(crate) mod native_history;
@@ -320,6 +321,7 @@ pub struct FreshCodexState {
     broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
     /// threadId → live codex session (client + settings + owned sidecar).
     sessions: Arc<TokioMutex<HashMap<String, CodexSession>>>,
+    child_reads: Arc<TokioMutex<HashMap<(String, String, String), u8>>>,
     /// The `settings.freshAgent.enabled` gate the WS `freshAgent.create` requires
     /// (default off; flipped true by `PATCH /api/settings`, as a real freshcodex user does).
     fresh_agent_enabled: Arc<AtomicBool>,
@@ -778,6 +780,7 @@ impl FreshCodexState {
             sidecar_launch_context: CodexSidecarLaunchContext::default(),
             broadcast_tx,
             sessions: Arc::new(TokioMutex::new(HashMap::new())),
+            child_reads: Arc::new(TokioMutex::new(HashMap::new())),
             fresh_agent_enabled: Arc::new(AtomicBool::new(enabled)),
             settings: Arc::new(TokioMutex::new(settings)),
             auth_token,
@@ -9319,7 +9322,8 @@ fn codex_normalize_command_status(status: Option<&str>) -> &'static str {
         Some("inProgress") => "running",
         Some("declined") => "declined",
         Some("failed") => "failed",
-        _ => "completed",
+        Some("completed") => "completed",
+        _ => "running",
     }
 }
 
@@ -9328,7 +9332,8 @@ fn codex_normalize_tool_status(status: Option<&str>) -> &'static str {
     match status {
         Some("inProgress") => "running",
         Some("failed") => "failed",
-        _ => "completed",
+        Some("completed") => "completed",
+        _ => "running",
     }
 }
 
@@ -9370,6 +9375,18 @@ fn codex_user_message_text_parts(item: &Value) -> Vec<(usize, String)> {
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_string()
+                    } else if matches!(part_type, Some("image" | "localImage" | "input_image")) {
+                        let reference = part["path"]
+                            .as_str()
+                            .or(part["url"].as_str())
+                            .or(part["image_url"].as_str())
+                            .unwrap_or("");
+                        // Never place inline image bytes in a transcript string.
+                        if reference.is_empty() || reference.starts_with("data:") {
+                            "Image attachment".to_string()
+                        } else {
+                            format!("Image: {reference}")
+                        }
                     } else {
                         format!("[{}]", part_type.unwrap_or("input"))
                     };
@@ -9387,29 +9404,10 @@ fn codex_user_message_text_parts(item: &Value) -> Vec<(usize, String)> {
     vec![(0, String::new())]
 }
 
-/// `normalizeCodexItem` (`normalize.ts:238-473`): map ONE raw codex thread item into its
-/// `FreshAgentTranscriptItemSchema`-shaped item(s). Every `CodexThreadItemTypeSchema` variant
-/// (`protocol.ts:113-129`) is covered.
-///
-/// DELIBERATE DEVIATION from legacy for an unrecognized `type`: the reference's
-/// `readCodexThreadItemType`/`assertNever` both throw `Unsupported Codex thread item type:
-/// ${value}` (`normalize.ts:141-147,123-125`), which `router.ts`'s catch-all turns into a bare
-/// 500 for the ENTIRE thread (`router.ts:165-166`) -- legacy would 500 here too, so this is not
-/// a port regression, but it is a real bug either way. The real codex CLI (observed: 0.144.5)
-/// emits `subAgentActivity`, an item type absent from BOTH the frozen legacy protocol
-/// (`protocol.ts:113-129`, 16 variants) and current `origin/main`. Hard-failing an entire
-/// historical thread over one item type neither codebase has caught up to yet makes the
-/// snapshot endpoint unusable for real transcripts -- proven against real staging data (a
-/// genuinely readable thread 500'd solely because of one `subAgentActivity` item). So an
-/// unrecognized item type returns `Ok(vec![])` (the item is silently omitted; every other item
-/// in the thread still renders) instead of `Err`. This mirrors the opencode side's existing
-/// precedent: an unrecognized opencode part also degrades to `[]`, not a hard error (see
-/// `opencode_item_from_part`).
-///
-/// Unlike the reference, a missing `item.id` does NOT throw (`readCodexItemId`,
-/// `normalize.ts:149-156`) -- the caller ([`build_codex_turn_json`]) already falls back to a
-/// synthetic `{turnId}:item-{index}` id, matching this module's existing tolerant-read
-/// convention elsewhere (documented divergence, not a silent one).
+/// Normalize the visible Codex 0.164 thread items into the shared transcript.
+/// Unknown future items emit a structured diagnostic and are omitted before
+/// role bookkeeping, so they cannot make a blank conversation row or fail
+/// otherwise readable history. Missing IDs use the caller's stable synthetic ID.
 fn map_codex_item(item_id: &str, item: &Value, item_type: &str) -> Result<Vec<Value>, String> {
     match item_type {
         "userMessage" => Ok(codex_user_message_text_parts(item)
@@ -9424,7 +9422,11 @@ fn map_codex_item(item_id: &str, item: &Value, item_type: &str) -> Result<Vec<Va
                 .and_then(Value::as_str)
                 .or_else(|| item.get("summary").and_then(Value::as_str))
                 .unwrap_or("");
-            Ok(vec![json!({ "id": item_id, "kind": "text", "text": text })])
+            let mut mapped = json!({ "id": item_id, "kind": "text", "text": text });
+            if item_type == "agentMessage" && (item["phase"].is_string() || item["questions"].is_array()) {
+                mapped["extensions"] = json!({"codex": {"phase": item["phase"], "questions": item["questions"]}});
+            }
+            Ok(vec![mapped])
         }
         "reasoning" => {
             let summary = codex_string_array(item.get("summary"));
@@ -9515,6 +9517,24 @@ fn map_codex_item(item_id: &str, item: &Value, item_type: &str) -> Result<Vec<Va
                 "agentsStates": agents_states,
             })])
         }
+        "subAgentActivity" => {
+            let Some(child) = item["agentThreadId"].as_str().filter(|id| !id.is_empty()) else {
+                tracing::warn!(provider=PROVIDER, native_item_id=item_id, item_type, reason="missing_child_identity", "freshagent.codex.item_unavailable");
+                return Ok(vec![]);
+            };
+            let status = match item["kind"].as_str() {
+                Some("completed") => "completed",
+                Some("interrupted") => "interrupted",
+                _ => "running",
+            };
+            let mut mapped = json!({"id":item_id, "kind":"task_delegation", "status":status, "title":format!("Child agent {}", item["agentPath"].as_str().unwrap_or(child)), "childSessionId":child, "provider":"codex", "nativeStatus":item["kind"]});
+            for field in ["model", "reasoningEffort"] {
+                if let Some(value) = item[field].as_str() { mapped[field] = json!(value); }
+            }
+            Ok(vec![mapped])
+        }
+        "functionCallOutput" => Ok(vec![json!({"id":item_id, "kind":"tool_result", "toolUseId":item_id, "content":item.get("output").cloned().unwrap_or_else(|| json!("Function output unavailable")), "isError":false})]),
+        "sleep" => Ok(vec![json!({"id":item_id, "kind":"dynamic_tool", "tool":"Sleep", "status":"completed", "arguments":{"durationMs":item["durationMs"]}})]),
         "webSearch" => Ok(vec![json!({
             "id": item_id,
             "kind": "web_search",
@@ -9555,16 +9575,14 @@ fn map_codex_item(item_id: &str, item: &Value, item_type: &str) -> Result<Vec<Va
         // DELIBERATE DEVIATION: unrecognized item type -> skip, don't error the whole thread.
         // See the doc comment above for the full rationale (real codex 0.144.5's
         // `subAgentActivity`, unknown to both frozen legacy and current `origin/main`).
-        _ => Ok(vec![]),
+        _ => {
+            tracing::warn!(provider=PROVIDER, native_item_id=item_id, item_type, reason="unsupported_native_item", "freshagent.codex.item_unavailable");
+            Ok(vec![])
+        },
     }
 }
 
-/// `classifyCodexItemRole(item)` (`normalize.ts:475-501`): every `CodexThreadItemTypeSchema`
-/// variant maps to exactly one display role. The caller ([`build_codex_turn_json`]) classifies
-/// EVERY raw item, INCLUDING ones [`map_codex_item`] mapped to an empty item list
-/// (unrecognized types) -- the catch-all arm IS reachable there and decides whether that item
-/// pushes a zero-item display row -- so the catch-all is a runtime path, not just a
-/// compile-time safety net (it still matches the reference's `assertNever` default in spirit).
+/// Select the display role of a successfully mapped native item.
 fn classify_codex_item_role(item_type: &str) -> &'static str {
     match item_type {
         "userMessage" => "user",
@@ -9574,6 +9592,9 @@ fn classify_codex_item_role(item_type: &str) -> &'static str {
         | "mcpToolCall"
         | "dynamicToolCall"
         | "collabAgentToolCall"
+        | "subAgentActivity"
+        | "functionCallOutput"
+        | "sleep"
         | "webSearch"
         | "imageView"
         | "imageGeneration" => "tool",
@@ -9887,21 +9908,9 @@ struct CodexPendingRow {
     items: Vec<Value>,
 }
 
-/// `normalizeCodexDisplayTurns` (`normalize.ts:600-684`), restricted to this committed-turns
-/// REST READ path (`getSnapshot`, `adapter.ts:1082-1122`): SPLIT one raw codex `turn` record
-/// (`makeThread`/real app-server shape: `{id, status, error?, items:[{type,id,...}], ...}`)
-/// into MULTIPLE `FreshAgentTurnSchema`-shaped display turns, one per maximal run of
-/// contiguous-same-role raw items (`classifyCodexItemRole`, `normalize.ts:475-501` --
-/// ported as [`classify_codex_item_role`]). Every raw item is mapped via [`map_codex_item`]
-/// (the full `normalizeCodexItem` switch, `normalize.ts:238-473`) before being folded into its
-/// row. DELIBERATE DEVIATION: an unrecognized item type no longer fails the turn -- per
-/// [`map_codex_item`]'s doc comment, it maps to an empty item list. The loop does NOT skip it:
-/// its role is still classified (the catch-all arm of [`classify_codex_item_role`] yields
-/// `assistant`) and folded into `has_assistant_output`/`has_user_output`/`all_items_are_user`,
-/// and when that role differs from the previous row's a new row is pushed whose `items` is the
-/// empty list -- a ZERO-ITEM display row with a BLANK summary (`summarize_codex_items(&[])`
-/// returns `""`). When the role matches the previous row, `row.items.extend(mapped)` extends by
-/// nothing and no empty row appears. Every other item in the turn still renders normally.
+/// Split each raw native turn into maximal runs of contiguous display roles.
+/// Unknown or unsupported items are omitted before role bookkeeping; they
+/// never manufacture an empty assistant or user row.
 ///
 /// A turn-level `error` (`normalize.ts:509-519,640-641`) or a completed turn whose only items
 /// are `user`-role with no `assistant` output (`normalize.ts:642-652`) each APPEND A NEW
@@ -9952,6 +9961,9 @@ fn build_codex_turn_json(raw_turn: &Value, ordinal: usize) -> Result<Vec<Value>,
             .map(str::to_string)
             .unwrap_or_else(|| format!("{turn_id}:item-{index}"));
         let mapped = map_codex_item(&item_id, item, item_type)?;
+        if mapped.is_empty() {
+            continue;
+        }
         let role = classify_codex_item_role(item_type);
         match role {
             "assistant" => has_assistant_output = true,
@@ -26924,6 +26936,67 @@ pub(crate) mod tests {
     // -- Batch D PR-6: rich transcript items for the codex snapshot endpoint --
 
     #[test]
+    fn native_child_activity_function_output_and_sleep_remain_visible() {
+        for (native, status) in [
+            ("started", "running"),
+            ("interacted", "running"),
+            ("interrupted", "interrupted"),
+            ("completed", "completed"),
+        ] {
+            let mapped = map_codex_item("activity", &json!({"type":"subAgentActivity", "id":"activity", "agentPath":"/reviewer", "agentThreadId":"exact-child", "kind":native, "model":"native-model"}), "subAgentActivity").unwrap();
+            assert_eq!(
+                mapped.len(),
+                1,
+                "native activity must remain visible: {native}"
+            );
+            assert_eq!(mapped[0]["childSessionId"], "exact-child");
+            assert_eq!(mapped[0]["status"], status);
+            assert_eq!(mapped[0]["model"], "native-model");
+        }
+        for output in [
+            json!("Exact function output"),
+            json!([{"type":"input_text","text":"Typed function output"},{"type":"input_image","image_url":"/tmp/output.png"},{"type":"future","result":"visible value"}]),
+        ] {
+            let mapped = map_codex_item(
+                "function-output",
+                &json!({"output":output}),
+                "functionCallOutput",
+            )
+            .unwrap();
+            assert_eq!(mapped[0]["kind"], "tool_result");
+            assert_eq!(mapped[0]["toolUseId"], "function-output");
+            assert_eq!(mapped[0]["content"], output);
+        }
+        let sleep = map_codex_item("sleep", &json!({"durationMs":1250}), "sleep").unwrap();
+        assert_eq!(sleep[0]["tool"], "Sleep");
+        assert_eq!(sleep[0]["arguments"]["durationMs"], 1250);
+    }
+
+    #[test]
+    fn native_images_keep_paths_and_unknown_items_never_create_blank_rows() {
+        let mapped = map_codex_item("image-user", &json!({"content":[{"type":"localImage","path":"/tmp/upload.png"},{"type":"image","url":"https://example.test/image.png"}]}), "userMessage").unwrap();
+        assert!(mapped[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("/tmp/upload.png"));
+        assert!(mapped[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("https://example.test/image.png"));
+        let turns = build_codex_turn_json(
+            &json!({"id":"unknown-turn","items":[{"type":"futureVariant","id":"future"}]}),
+            0,
+        )
+        .unwrap();
+        assert!(
+            turns.is_empty()
+                || turns
+                    .iter()
+                    .all(|turn| !turn["items"].as_array().unwrap().is_empty())
+        );
+    }
+
+    #[test]
     fn map_codex_item_command_execution_renders_command_kind_with_exact_schema_keys() {
         let item = json!({
             "type": "commandExecution",
@@ -27047,7 +27120,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             mapped[1],
-            json!({ "id": "item-6:part:1", "kind": "text", "text": "[image]" })
+            json!({ "id": "item-6:part:1", "kind": "text", "text": "Image attachment" })
         );
     }
 

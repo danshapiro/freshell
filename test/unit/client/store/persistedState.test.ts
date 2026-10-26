@@ -25,6 +25,17 @@ const codexDurability = {
 }
 
 describe('persistedState parsers', () => {
+  it('restores a Codex observer selection under the parent identity and drops malformed selections', () => {
+    for (const selection of ['native-child', [], '', null]) {
+      const content = { kind: 'fresh-agent', provider: 'codex', sessionType: 'freshcodex', sessionRef: { provider: 'codex', sessionId: '11111111-1111-4111-8111-111111111111' }, createRequestId: 'parent-create', status: 'idle', observedChildThreadId: selection }
+      const parsed = parsePersistedPanesRaw(JSON.stringify({ version: PANES_SCHEMA_VERSION, layouts: { parent: { type: 'leaf', id: 'parent-pane', content } }, activePane: { parent: 'parent-pane' } }))
+      const restored = (parsed!.layouts.parent as any).content
+      expect(restored.sessionRef).toEqual(content.sessionRef)
+      expect(restored.createRequestId).toBe('parent-create')
+      expect(restored.observedChildThreadId).toBe(selection === 'native-child' ? 'native-child' : undefined)
+      expect(Object.keys(parsed!.layouts)).toEqual(['parent'])
+    }
+  })
   it('uses v2 namespaced storage and broadcast keys', () => {
     expect(TABS_STORAGE_KEY).toBe('freshell.tabs.v2')
     expect(PANES_STORAGE_KEY).toBe('freshell.panes.v2')

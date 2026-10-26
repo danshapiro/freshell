@@ -300,7 +300,10 @@ async fn handle_connection(mut stream: UnixStream, state: Arc<HostState>) -> Res
             serde_json::json!({"errorCode":error.code,"message":error.message}),
         );
     }
-    let limit = if matches!(result, Ok(HostResult::FreshAgentSnapshot(_))) {
+    let limit = if matches!(
+        result,
+        Ok(HostResult::FreshAgentSnapshot(_) | HostResult::FreshAgentChildSnapshot(_))
+    ) {
         freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES
     } else {
         freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES
@@ -731,6 +734,24 @@ async fn dispatch(
                         .ok_or_else(unsupported_fresh_agent)?;
                     Ok(HostResult::FreshAgentSnapshot(
                         actor.snapshot().await.map_err(map_actor_error)?,
+                    ))
+                }
+                HostCommand::FreshAgentReadChild {
+                    incarnation_id,
+                    child_thread_id,
+                } => {
+                    ensure_incarnation(&incarnation_id, state)?;
+                    let actor = state
+                        .fresh_agent
+                        .lock()
+                        .await
+                        .clone()
+                        .ok_or_else(unsupported_fresh_agent)?;
+                    Ok(HostResult::FreshAgentChildSnapshot(
+                        actor
+                            .read_child(&child_thread_id)
+                            .await
+                            .map_err(map_actor_error)?,
                     ))
                 }
                 HostCommand::FreshAgentResolve {
@@ -10258,6 +10279,13 @@ mod tests {
             )
         }
 
+        async fn read_child(&self, child_thread_id: &str) -> Result<serde_json::Value, String> {
+            assert_eq!(child_thread_id, "fixture-child");
+            Ok(
+                serde_json::json!({"parentThreadId":"fixture-native-thread","childThreadId":child_thread_id,"status":"saved","snapshot":{"threadId":child_thread_id,"provider":"codex","sessionType":"freshcodex","turns":[{"text":"x".repeat(2 * freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES)}]}}),
+            )
+        }
+
         async fn stop(self: Arc<Self>) -> Result<(), String> {
             self.stops.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -10454,6 +10482,84 @@ mod tests {
             assert_eq!(logged["stage"], "session_host");
             assert_eq!(logged["request_id"], "configure-log");
         }
+    }
+
+    #[tokio::test]
+    async fn authenticated_child_observation_uses_parent_actor_and_large_read_reply_without_dispatch(
+    ) {
+        let state = test_host_state();
+        let transport = Arc::new(RpcFixtureTransport {
+            dispatches: AtomicUsize::new(0),
+            checkpoint_attempts: std::sync::Mutex::new(Vec::new()),
+            decisions: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            captures: AtomicUsize::new(0),
+            stops: AtomicUsize::new(0),
+        });
+        let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+            state.state_dir.join("child-observer"),
+            FreshAgentProfile {
+                provider: FreshProvider::Codex,
+                runtime_variant: "freshcodex".into(),
+                cwd: "/workspace".into(),
+                model: None,
+                effort: None,
+                permission_mode: None,
+                sandbox: None,
+                provider_store_id: "parent-volume".into(),
+                native_session_id: None,
+                plugins: None,
+                model_selection: None,
+                session_ref: None,
+                provider_launch_context: None,
+                provider_secret_references: vec![],
+            },
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+        let before = actor.profile().await;
+        *state.fresh_agent.lock().await = Some(actor.clone());
+        let (mut client_stream, server_stream) = UnixStream::pair().unwrap();
+        let serving = tokio::spawn(handle_connection(server_stream, state.clone()));
+        write_frame(
+            &mut client_stream,
+            &authenticated_host_envelope(
+                &state,
+                HostCommand::FreshAgentReadChild {
+                    incarnation_id: state.incarnation_id.clone(),
+                    child_thread_id: "fixture-child".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let reply: HostReply = freshell_runtime_protocol::read_frame_with_limit(
+            &mut client_stream,
+            freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES,
+        )
+        .await
+        .unwrap();
+        serving.await.unwrap().unwrap();
+        let HostResult::FreshAgentChildSnapshot(value) = reply.result.unwrap() else {
+            panic!("expected child observation");
+        };
+        assert_eq!(value["parentThreadId"], "fixture-native-thread");
+        assert_eq!(
+            value["snapshot"]["turns"][0]["text"]
+                .as_str()
+                .unwrap()
+                .len(),
+            2 * freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES
+        );
+        assert_eq!(
+            actor.profile().await.native_session_id,
+            before.native_session_id
+        );
+        assert_eq!(transport.dispatches.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.decisions.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.operations.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.stops.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

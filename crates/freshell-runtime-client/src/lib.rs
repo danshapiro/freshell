@@ -890,6 +890,38 @@ impl RuntimeClient {
         }
     }
 
+    pub async fn fresh_agent_read_child(
+        &self,
+        soul_id: SoulId,
+        child_thread_id: String,
+    ) -> Result<serde_json::Value, ClientError> {
+        let mut request = freshell_runtime_protocol::FreshAgentReadChildRequest {
+            soul_id,
+            child_thread_id,
+            expected_control_epoch: Some(self.current_epoch().await?),
+        };
+        let original = request.clone();
+        match self
+            .request(RequestId::new(), AdminCommand::FreshAgentReadChild(request))
+            .await
+        {
+            Ok(AdminResult::FreshAgentChildSnapshot(snapshot)) => Ok(snapshot),
+            Err(error) if error.runtime_code() == Some(RuntimeErrorCode::StaleControlEpoch) => {
+                request = original;
+                request.expected_control_epoch = Some(self.health().await?.0);
+                match self
+                    .request(RequestId::new(), AdminCommand::FreshAgentReadChild(request))
+                    .await?
+                {
+                    AdminResult::FreshAgentChildSnapshot(snapshot) => Ok(snapshot),
+                    _ => Err(ClientError::UnexpectedResult),
+                }
+            }
+            Ok(_) => Err(ClientError::UnexpectedResult),
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn fresh_agent_resolve(
         &self,
         soul_id: SoulId,
@@ -1145,7 +1177,9 @@ impl RuntimeClient {
         let mut stream = UnixStream::connect(self.socket_path.as_ref()).await?;
         let reply_limit = if matches!(
             body,
-            AdminCommand::FreshAgentReadHistory(_) | AdminCommand::FreshAgentReadSnapshot(_)
+            AdminCommand::FreshAgentReadHistory(_)
+                | AdminCommand::FreshAgentReadSnapshot(_)
+                | AdminCommand::FreshAgentReadChild(_)
         ) {
             freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES
         } else {
@@ -1185,6 +1219,7 @@ mod tests {
     enum FreshAgentReadKind {
         Snapshot,
         History,
+        Child,
     }
 
     impl FreshAgentReadKind {
@@ -1196,6 +1231,11 @@ mod tests {
             match self {
                 Self::Snapshot => client.fresh_agent_snapshot(soul).await,
                 Self::History => client.fresh_agent_history(soul).await,
+                Self::Child => {
+                    client
+                        .fresh_agent_read_child(soul, "native-child".into())
+                        .await
+                }
             }
         }
 
@@ -1203,6 +1243,7 @@ mod tests {
             match self {
                 Self::Snapshot => AdminResult::FreshAgentSnapshot(value),
                 Self::History => AdminResult::FreshAgentHistory(value),
+                Self::Child => AdminResult::FreshAgentChildSnapshot(value),
             }
         }
 
@@ -1212,6 +1253,10 @@ mod tests {
                     (&read.soul_id, read.expected_control_epoch)
                 }
                 (AdminCommand::FreshAgentReadHistory(read), Self::History) => {
+                    (&read.soul_id, read.expected_control_epoch)
+                }
+                (AdminCommand::FreshAgentReadChild(read), Self::Child) => {
+                    assert_eq!(read.child_thread_id, "native-child");
                     (&read.soul_id, read.expected_control_epoch)
                 }
                 _ => panic!("expected the original exact read operation: {envelope:?}"),
@@ -1443,8 +1488,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_agent_child_read_refresh_preserves_exact_parent_and_child_and_large_body() {
+        assert_read_epoch_refresh_preserves_source(FreshAgentReadKind::Child).await;
+    }
+
+    #[tokio::test]
     async fn fresh_agent_reads_stop_after_second_stale_epoch() {
-        for kind in [FreshAgentReadKind::Snapshot, FreshAgentReadKind::History] {
+        for kind in [
+            FreshAgentReadKind::Snapshot,
+            FreshAgentReadKind::History,
+            FreshAgentReadKind::Child,
+        ] {
             let (actual, requests, cached) = scripted_fresh_agent_read(
                 kind,
                 vec![
@@ -1470,7 +1524,11 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_agent_reads_do_not_retry_other_runtime_errors() {
-        for kind in [FreshAgentReadKind::Snapshot, FreshAgentReadKind::History] {
+        for kind in [
+            FreshAgentReadKind::Snapshot,
+            FreshAgentReadKind::History,
+            FreshAgentReadKind::Child,
+        ] {
             for code in [
                 RuntimeErrorCode::HostUnreachable,
                 RuntimeErrorCode::OwnershipMismatch,
@@ -1490,7 +1548,11 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_agent_reads_propagate_health_error_without_retrying_the_read() {
-        for kind in [FreshAgentReadKind::Snapshot, FreshAgentReadKind::History] {
+        for kind in [
+            FreshAgentReadKind::Snapshot,
+            FreshAgentReadKind::History,
+            FreshAgentReadKind::Child,
+        ] {
             let (actual, requests, cached) = scripted_fresh_agent_read(
                 kind,
                 vec![
@@ -1517,7 +1579,11 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_agent_reads_reject_unexpected_initial_health_and_retry_results() {
-        for kind in [FreshAgentReadKind::Snapshot, FreshAgentReadKind::History] {
+        for kind in [
+            FreshAgentReadKind::Snapshot,
+            FreshAgentReadKind::History,
+            FreshAgentReadKind::Child,
+        ] {
             for stage in 0..3 {
                 let mut replies = Vec::new();
                 if stage > 0 {
@@ -1547,7 +1613,11 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_agent_reads_keep_healthy_live_and_history_provenance_without_refresh() {
-        for kind in [FreshAgentReadKind::Snapshot, FreshAgentReadKind::History] {
+        for kind in [
+            FreshAgentReadKind::Snapshot,
+            FreshAgentReadKind::History,
+            FreshAgentReadKind::Child,
+        ] {
             let expected = source_snapshot(kind);
             let (actual, requests, cached) =
                 scripted_fresh_agent_read(kind, vec![Ok(kind.reply(expected.clone()))]).await;

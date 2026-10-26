@@ -12,6 +12,7 @@ import {
   FreshAgentRetryRow,
   FreshAgentToolBlock,
   itemToToolDisplay,
+  outputReferences,
   stripSystemReminders,
   type FreshAgentToolDisplay,
 } from './FreshAgentItemCard'
@@ -149,7 +150,7 @@ function buildActivity(
           previewOverride: item.title,
           output: item.result,
           isError: item.status === 'failed',
-          status: item.status === 'running' ? 'running' : 'complete',
+          status: item.status === 'completed' ? 'complete' : item.status,
         },
       })
       continue
@@ -168,6 +169,7 @@ function buildActivity(
           tool: {
             ...existing.tool,
             output: formatJson(item.content),
+            references: outputReferences(item.content),
             isError: item.isError,
             status: 'complete',
           },
@@ -181,6 +183,7 @@ function buildActivity(
             id: item.id,
             name: 'Result',
             output: formatJson(item.content),
+            references: outputReferences(item.content),
             isError: item.isError,
             status: 'complete',
           },
@@ -261,7 +264,10 @@ export type TurnLayout = { blocks: RenderBlock[] }
 /** Mirrors FreshAgentItemCard's null-render path for text items: a text item
  * that renders nothing must not close an open line (nothing visibly between). */
 function rendersVisibly(item: FreshAgentTranscriptItem): boolean {
-  if (item.kind === 'text') return stripSystemReminders(item.text).trim().length > 0
+  if (item.kind === 'text') {
+    const codex = item.extensions?.codex as { questions?: unknown } | undefined
+    return stripSystemReminders(item.text).trim().length > 0 || (Array.isArray(codex?.questions) && codex.questions.length > 0)
+  }
   return true
 }
 
@@ -508,6 +514,7 @@ function normalizeActivityRows(rows: ActivityRow[], live: boolean): ActivityRow[
     if (
       row.type !== 'tool'
       || row.tool.status !== 'running'
+      || row.tool.nativeOutcome === true
       || row.tool.id === activeRunningToolId
     ) {
       return row

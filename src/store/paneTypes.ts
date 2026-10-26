@@ -495,6 +495,8 @@ export type FreshAgentPaneContent = {
   status: SdkSessionStatus
   resumeSessionId?: string
   sessionRef?: SessionLocator
+  /** Parent-scoped display selection; never a child runtime identity. */
+  observedChildThreadId?: string
   /** Runtime-only server locality for same-server matching; never part of canonical durable identity. */
   serverInstanceId?: string
   /** Explicit restore failure when no canonical durable target exists. */

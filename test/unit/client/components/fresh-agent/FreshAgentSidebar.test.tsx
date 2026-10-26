@@ -1,8 +1,18 @@
-import { afterEach, expect, it } from 'vitest'
-import { cleanup, render, screen } from '@testing-library/react'
+import { afterEach, expect, it, vi } from 'vitest'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { FreshAgentSidebar } from '@/components/fresh-agent/FreshAgentSidebar'
+import { FreshAgentObserveChildContext } from '@/components/fresh-agent/FreshAgentItemCard'
 
 afterEach(cleanup)
+
+it('observes the selected Codex identity with its parent fence from the child panel', () => {
+  const parent = { parentSessionId: 'parent', provider: 'codex', sessionType: 'freshcodex', observedEpoch: 1, observedGeneration: 2 } as const
+  const onObserve = vi.fn()
+  render(<FreshAgentObserveChildContext.Provider value={{ parent, onObserve }}><FreshAgentSidebar worktrees={[]} childThreads={[{ id: 'child', threadId: 'child', status: 'failed', error: 'Child failure', model: 'child-model' }]} /></FreshAgentObserveChildContext.Provider>)
+  expect(screen.getByText(/Child failure/)).toHaveTextContent('child-model')
+  fireEvent.click(screen.getByRole('button', { name: 'Observe child child' }))
+  expect(onObserve).toHaveBeenCalledWith({ type: 'observe-child', parent, childThreadId: 'child' })
+})
 
 it('renders the latest plan and step statuses, replacing earlier progress', () => {
   const props: any = { worktrees: [], childThreads: [], codexPlan: { explanation: 'Work in order', plan: [{ step: 'Inspect', status: 'inProgress' }, { step: 'Verify', status: 'pending' }] } }

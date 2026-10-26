@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { FreshAgentItemCard, FreshAgentDelegationBlock, FreshAgentOpenSessionContext, FreshAgentToolBlock, stripSystemReminders } from '@/components/fresh-agent/FreshAgentItemCard'
+import { FreshAgentItemCard, FreshAgentDelegationBlock, FreshAgentOpenSessionContext, FreshAgentObserveChildContext, FreshAgentToolBlock, stripSystemReminders } from '@/components/fresh-agent/FreshAgentItemCard'
 import { formatThoughtDuration } from '@/components/fresh-agent/shared/format-duration'
 
 vi.mock('@/components/markdown/LazyMarkdown', async () => {
@@ -12,6 +12,38 @@ vi.mock('@/components/markdown/LazyMarkdown', async () => {
 
 describe('FreshAgentItemCard', () => {
   afterEach(() => cleanup())
+
+  it('shows the actual native sleep duration in the activity preview', () => {
+    render(<FreshAgentItemCard item={{ id: 'sleep', kind: 'dynamic_tool', tool: 'Sleep', status: 'completed', arguments: { durationMs: 1250 } }} />)
+    expect(screen.getByText('1250 ms')).toBeVisible()
+  })
+
+  it('keeps each collaboration receiver outcome and selects its exact child without a resume action', () => {
+    const onObserve = vi.fn(), openSession = vi.fn()
+    const parent = { parentSessionId: 'parent', provider: 'codex', sessionType: 'freshcodex', observedEpoch: 8, observedGeneration: 9 } as const
+    render(<FreshAgentOpenSessionContext.Provider value={openSession}><FreshAgentObserveChildContext.Provider value={{ parent, onObserve }}><FreshAgentItemCard item={{ id: 'collab', kind: 'collab_agent', tool: 'wait', status: 'completed', senderThreadId: 'parent', receiverThreadIds: ['child-one', 'child-two'], agentsStates: { 'child-one': { status: 'completed', result: 'First result', model: 'first-model' }, 'child-two': { status: 'failed', error: 'Second error', model: 'second-model' } } }} /></FreshAgentObserveChildContext.Provider></FreshAgentOpenSessionContext.Provider>)
+    expect(screen.getByText(/First result/)).toHaveTextContent('first-model')
+    expect(screen.getByText(/Second error/)).toHaveTextContent('second-model')
+    fireEvent.click(screen.getByRole('button', { name: 'Observe child child-two' }))
+    expect(onObserve).toHaveBeenCalledWith({ type: 'observe-child', parent, childThreadId: 'child-two' })
+    expect(openSession).not.toHaveBeenCalled()
+  })
+
+  it('renders saved native choices and keeps image output accessible through authenticated file links', () => {
+    render(<><FreshAgentItemCard item={{ id: 'choices', kind: 'text', text: 'Choose next', extensions: { codex: { phase: 'commentary', questions: [{ title: 'Next step?', options: ['Inspect', 'Verify'] }] } } }} /><FreshAgentItemCard item={{ id: 'image', kind: 'image_generation', status: 'completed', result: 'native-result', savedPath: '/tmp/generated output.png' }} /></>)
+    expect(screen.getByText('Next step?')).toBeVisible()
+    expect(screen.getByText('Inspect')).toBeVisible()
+    expect(screen.getByText('Verify')).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'ImageGeneration tool call' }))
+    expect(screen.getByRole('link', { name: '/tmp/generated output.png' })).toHaveAttribute('href', '/api/files/raw?path=%2Ftmp%2Fgenerated%20output.png')
+  })
+
+  it('renders a declined command as declined rather than completed', () => {
+    render(<FreshAgentItemCard item={{ id: 'cmd-denied', kind: 'command', command: 'touch blocked', status: 'declined', output: 'User declined', exitCode: null }} />)
+    expect(screen.getByLabelText('declined')).toBeInTheDocument()
+    expect(screen.queryByLabelText('complete')).not.toBeInTheDocument()
+    expect(screen.getByText(/declined/i)).toBeInTheDocument()
+  })
 
   it('shows native file-change output progress in its tool disclosure', () => {
     render(<FreshAgentItemCard item={{ id: 'files', kind: 'file_change', status: 'running', changes: [], output: 'Applying patch' }} />)
