@@ -10252,6 +10252,7 @@ describe('FreshAgentView', () => {
     ['freshclaude', 'INVALID_SESSION_ID', 'The Claude agent process for this session exited. Resume the session to continue.',
       'The Claude agent process for this session exited. Resume the session to continue.'],
     ['kilroy', 'INTERNAL_ERROR', 'SESSION_NOT_FOUND: claude session not found', 'claude session not found'],
+    ['freshcodex', 'SESSION_RESERVED', 'Another resume for this session is in flight', 'Another resume for this session is in flight'],
   ] as const)('puts a refused %s send back into the composer and says why (%s)', async (sessionType, code, message, reason) => {
     const store = createStore()
     let onMessage: ((message: Record<string, unknown>) => void) | undefined
@@ -10266,16 +10267,17 @@ describe('FreshAgentView', () => {
       turns: [],
     })
     const durable = '0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d'
+    const provider = sessionType === 'freshcodex' ? 'codex' : 'claude'
     store.dispatch(initLayout({
       tabId: 'tab-1',
       paneId: 'pane-1',
       content: {
         kind: 'fresh-agent',
         sessionType,
-        provider: 'claude',
+        provider,
         createRequestId: `req-${sessionType}-refused`,
         sessionId: `${sessionType}-pane-refused`,
-        sessionRef: { provider: 'claude', sessionId: durable },
+        sessionRef: { provider, sessionId: durable },
         status: 'idle',
       },
     }))

@@ -19230,6 +19230,50 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn task4_interrupt_ack_does_not_settle_owed_work() {
+        let (st, _) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session_with_real_consumer(&st, "thread-ack", Arc::new(client),
+            Arc::new(StdMutex::new(Some("old".into()))), notifs, spawn_sleeper(), "task4-ack").await;
+        let interrupt = { let st = st.clone(); tokio::spawn(async move {
+            st.handle_interrupt(FreshAgentInterrupt { session_id: "thread-ack".into(), session_type: Some(SESSION_TYPE.into()), provider: Some(PROVIDER.into()), request_id: None, cwd: None }).await;
+        }) };
+        answer_initialize(&peer).await;
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "turn/interrupt");
+        assert_eq!(params["turnId"], "old");
+        peer.respond(&id, json!({}));
+        interrupt.await.unwrap();
+        let owed = st.sessions.lock().await.get("thread-ack").unwrap().turn_in_flight.load(Ordering::SeqCst);
+        assert!(owed, "interrupt ACK proves submission, never terminal settlement");
+        st.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn task4_active_input_steers_expected_turn_and_rejection_preserves_it() {
+        let (st, _) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session_with_real_consumer(&st, "thread-steer", Arc::new(client),
+            Arc::new(StdMutex::new(Some("old".into()))), notifs, spawn_sleeper(), "task4-steer").await;
+        let send = { let st = st.clone(); tokio::spawn(async move { st.handle_send(send_msg("thread-steer", "adjust")).await }) };
+        answer_initialize(&peer).await;
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "turn/steer");
+        assert_eq!(params["expectedTurnId"], "old");
+        assert!(params.get("model").is_none(), "steer cannot override turn settings");
+        peer.respond_error(&id, -32600, "expected turn does not match active turn");
+        send.await.unwrap();
+        let guard = st.sessions.lock().await;
+        let session = guard.get("thread-steer").unwrap();
+        assert!(session.turn_in_flight.load(Ordering::SeqCst));
+        assert_eq!(session.active_turn.lock().unwrap().as_deref(), Some("old"));
+        drop(guard);
+        st.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn onexit_self_heal_rings_the_edge_for_a_crash_during_the_start_turn_dispatch_window() {
         // The round-2 review's core crash scenario: the sidecar dies AFTER the
         // `turn/start` dispatch was written but BEFORE its response is processed
