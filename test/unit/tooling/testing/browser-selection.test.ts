@@ -1,7 +1,8 @@
-import { execFileSync, spawnSync } from 'node:child_process'
+import { spawnSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 import path from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { performance } from 'node:perf_hooks'
+import { describe, expect, it, vi } from 'vitest'
 import { LOCAL_ONLY_SPECS } from '../../../e2e-browser/playwright.config.js'
 import { CLOUD_SKIP_SPECS, CLOUD_SKIP_TITLES } from '../../../e2e-browser/playwright.cloud.config.js'
 import { createE2eServerHandle } from '../../../e2e-browser/helpers/external-target.js'
@@ -31,6 +32,23 @@ function cleanEnvironment(overrides: Record<string, string> = {}): NodeJS.Proces
   return { ...env, ...overrides }
 }
 
+function runDiscovery(args: string[], env: NodeJS.ProcessEnv, timeoutMs = 40_000) {
+  const started = performance.now()
+  const result = spawnSync(process.execPath, args, {
+    cwd: projectRoot, env, encoding: 'utf8', timeout: timeoutMs, killSignal: 'SIGKILL',
+  })
+  const durationMs = Math.round(performance.now() - started)
+  if (result.error || result.signal) {
+    const timedOut = (result.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT'
+    const failure = timedOut ? `timed out after ${timeoutMs}ms` : 'failed'
+    const context = `CI=${env.CI ?? 'unset'}, elapsed=${durationMs}ms, signal=${result.signal}`
+    console.error(JSON.stringify({ severity: 'error', event: 'playwright.discovery.failed',
+      args, ci: env.CI ?? null, timeoutMs, durationMs, signal: result.signal, error: result.error?.message }))
+    throw new Error(`Playwright discovery ${failure}: ${args.join(' ')} (${context})\n${result.stderr}`, { cause: result.error })
+  }
+  return { ...result, durationMs }
+}
+
 function resolvedConfig(configPath: string, env: NodeJS.ProcessEnv): ResolvedProject[] {
   const script = String.raw`
 const { loadConfigFromFile } = require(process.argv[1])
@@ -50,12 +68,9 @@ loadConfigFromFile(process.argv[2]).then((config) => {
   process.exitCode = 1
 })
 `
-  const output = execFileSync(process.execPath, ['-e', script, configLoader, configPath], {
-    cwd: projectRoot,
-    env,
-    encoding: 'utf8',
-  })
-  return JSON.parse(output) as ResolvedProject[]
+  const result = runDiscovery(['-e', script, configLoader, configPath], env)
+  if (result.status !== 0) throw new Error(`Playwright config resolution failed:\n${result.stdout}\n${result.stderr}`)
+  return JSON.parse(result.stdout) as ResolvedProject[]
 }
 
 function listedProjects(
@@ -63,25 +78,27 @@ function listedProjects(
   configPath = playwrightConfig,
   selectors: string[] = [],
 ): { output: string; labels: string[]; tests: number; files: number } {
-  const output = execFileSync(process.execPath, [
+  const result = runDiscovery([
     playwrightCli,
     'test',
     '--config', configPath,
     '--list',
     ...selectors,
-  ], {
-    cwd: projectRoot,
-    env,
-    encoding: 'utf8',
-  })
+  ], env)
+  if (result.status !== 0) throw new Error(`Playwright list failed:\n${result.stdout}\n${result.stderr}`)
+  const output = result.stdout
   const total = output.match(/Total: (\d+) tests? in (\d+) files?/)
   if (!total) throw new Error(`Playwright list output did not include a total:\n${output}`)
-  return {
+  const listed = {
     output,
     labels: [...new Set([...output.matchAll(/^\s*\[([^\]]+)] ›/gm)].map((match) => match[1]))],
     tests: Number(total[1]),
     files: Number(total[2]),
   }
+  console.info(JSON.stringify({ severity: 'info', event: 'playwright.discovery.listed',
+    config: path.basename(configPath), ci: env.CI ?? null, selectors, durationMs: result.durationMs,
+    projects: listed.labels, tests: listed.tests, files: listed.files }))
+  return listed
 }
 
 // Playwright --list roster lines have the exact shape
@@ -96,6 +113,21 @@ function listedSpecFiles(output: string): Set<string> {
 }
 
 describe('browser selection non-vacuity', () => {
+  it('bounds a stalled discovery subprocess and identifies its command', () => {
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      expect(() => runDiscovery(['-e', 'setTimeout(() => {}, 1000)'], cleanEnvironment(), 50))
+        .toThrow(/Playwright discovery timed out after 50ms.*-e/)
+      expect(errorLog).toHaveBeenCalledTimes(1)
+      expect(JSON.parse(errorLog.mock.calls[0][0] as string)).toMatchObject({
+        severity: 'error', event: 'playwright.discovery.failed', timeoutMs: 50,
+        error: expect.stringContaining('ETIMEDOUT'),
+      })
+    } finally {
+      errorLog.mockRestore()
+    }
+  })
+
   it('discovers the managed external cases only through their paired dedicated Cloud project', () => {
     const spec = 'managed-provider-environment-external.spec.ts'
     const ordinary = listedProjects(cleanEnvironment(), cloudConfig)
@@ -112,8 +144,8 @@ describe('browser selection non-vacuity', () => {
     expect(selected.files).toBe(1)
     expect([...listedSpecFiles(selected.output)]).toEqual([spec])
     // The source exists now: ordinary projects still cannot execute it.
-    const ordinaryExplicit = spawnSync(process.execPath, [playwrightCli, 'test', '--config', cloudConfig,
-      '--list', '--project=chromium', spec], { cwd: projectRoot, env: paired, encoding: 'utf8' })
+    const ordinaryExplicit = runDiscovery([playwrightCli, 'test', '--config', cloudConfig,
+      '--list', '--project=chromium', spec], paired)
     expect(ordinaryExplicit.status).toBe(1)
   }, 90_000)
 
@@ -135,8 +167,8 @@ describe('browser selection non-vacuity', () => {
     expect(selected.tests).toBe(5)
     expect(selected.files).toBe(1)
     expect([...listedSpecFiles(selected.output)]).toEqual([spec])
-    const ordinaryExplicit = spawnSync(process.execPath, [playwrightCli, 'test', '--config', cloudConfig,
-      '--list', '--project=chromium', spec], { cwd: projectRoot, env: paired, encoding: 'utf8' })
+    const ordinaryExplicit = runDiscovery([playwrightCli, 'test', '--config', cloudConfig,
+      '--list', '--project=chromium', spec], paired)
     expect(ordinaryExplicit.status).toBe(1)
   }, 90_000)
 
@@ -144,13 +176,15 @@ describe('browser selection non-vacuity', () => {
     const env = cleanEnvironment({ FRESHELL_E2E_EXTERNAL_FIXTURE_KIND: 'managed-environment',
       FRESHELL_E2E_TARGET_URL: 'https://fixture.invalid', FRESHELL_E2E_TARGET_TOKEN: 'synthetic-selection-token',
       ...(pairing === 'mismatched' ? { FRESHELL_CODE_CHECKPOINT_FIXTURE: '{}' } : {}) })
-    const listed = spawnSync(process.execPath, [playwrightCli, 'test', '--config', cloudConfig, '--list',
-      '--project=chromium-external-target', 'managed-provider-environment-external.spec.ts'],
-      { cwd: projectRoot, env, encoding: 'utf8' })
+    const listed = runDiscovery([playwrightCli, 'test', '--config', cloudConfig, '--list',
+      '--project=chromium-external-target', 'managed-provider-environment-external.spec.ts'], env)
     expect(listed.status).toBe(1)
     expect(`${listed.stdout}\n${listed.stderr}`).toContain('matching fixture pair')
   })
 
+  // Two full discovery scans import every browser spec. Their measured cloud
+  // runtime exceeds the generic 30s unit-test budget; each child remains bounded
+  // at 40s, with 90s for both scans and their roster assertions.
   it('selects a non-vacuous Chromium lane and all CI application projects', () => {
     const chromium = listedProjects(cleanEnvironment())
     expect(chromium.labels).toEqual(['chromium'])
@@ -190,7 +224,7 @@ describe('browser selection non-vacuity', () => {
     expect(ci.labels).toEqual(['chromium', 'firefox', 'webkit'])
     const retiredProjectNames = [`legacy${'-chromium'}`, `rust${'-chromium'}`]
     expect(ci.output).not.toMatch(new RegExp(`${retiredProjectNames.join('|')}|Total:\\s*0 tests in`, 'i'))
-  })
+  }, 90_000)
 
   it('creates Rust fixtures and selects the supported cloud projects', async () => {
     const server = await createE2eServerHandle({})
@@ -247,13 +281,13 @@ describe('browser selection non-vacuity', () => {
     // An ALL-skip focused invocation fails LOUDLY (exit 1, "No tests
     // found") instead of silently reading as a green zero-test run — a
     // vacuous focused cloud proof can never masquerade as coverage.
-    const allSkip = spawnSync(process.execPath, [
+    const allSkip = runDiscovery([
       playwrightCli,
       'test',
       '--config', cloudConfig,
       '--list',
       'test/e2e-browser/specs/truly-idle-alerting.spec.ts',
-    ], { cwd: projectRoot, env: cleanEnvironment(), encoding: 'utf8' })
+    ], cleanEnvironment())
     expect(allSkip.status).toBe(1)
     expect(`${allSkip.stdout}\n${allSkip.stderr}`).toContain('No tests found')
 
