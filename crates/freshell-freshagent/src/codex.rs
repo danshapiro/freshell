@@ -19631,6 +19631,18 @@ pub(crate) mod tests {
         answer_initialize(&peer).await;
         let (stop_id, method, _) = peer.expect_request().await;
         assert_eq!(method, "turn/interrupt");
+        // Hold the exact dispatch serialization lock while terminal evidence
+        // is consumed. A consumer that waits for this lock cannot release the
+        // issuance gate, and this deterministic barrier would fail.
+        let dispatch_lock = st
+            .sessions
+            .lock()
+            .await
+            .get("thread-held")
+            .unwrap()
+            .turn_lock
+            .clone();
+        let dispatch_guard = dispatch_lock.lock().await;
         peer.emit_notification(
             "turn/completed",
             json!({"threadId":"thread-held", "turn":{"id":"old","status":"completed"}}),
@@ -19643,6 +19655,7 @@ pub(crate) mod tests {
             terminal.matched,
             "consumer must progress with Stop RPC held"
         );
+        drop(dispatch_guard);
         let turns = st
             .sessions
             .lock()
