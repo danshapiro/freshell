@@ -170,6 +170,21 @@ impl AttentionLedger {
             .collect()
     }
 
+    /// Identities joined by an actual materialization edge. A missing identity
+    /// has no candidates; unrelated retained conversations are never a fallback.
+    pub(crate) fn aliases_for(&self, id: &str) -> Vec<String> {
+        let inner = self.inner.lock().expect("attention ledger lock");
+        let Some(group) = inner.entries.get(id).map(|entry| entry.group) else {
+            return Vec::new();
+        };
+        inner
+            .entries
+            .values()
+            .filter(|entry| entry.group == group)
+            .map(|entry| entry.mark.session_id.clone())
+            .collect()
+    }
+
     fn trim(inner: &mut Inner, capacity: usize) {
         while inner.entries.len() > capacity {
             let oldest_group = inner

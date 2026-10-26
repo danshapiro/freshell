@@ -1882,6 +1882,24 @@ impl FreshCodexState {
     /// Current native facts, including unfinished event-owned output. Reading
     /// this source cannot create/resume a runtime or wait for native history.
     pub async fn retained_state(&self, session_id: &str) -> Result<Value, RetainedStateError> {
+        let resolved = {
+            let sessions = self.sessions.lock().await;
+            if sessions.contains_key(session_id) {
+                session_id.to_owned()
+            } else {
+                let mut aliases = self
+                    .attention
+                    .aliases_for(session_id)
+                    .into_iter()
+                    .filter(|id| sessions.contains_key(id));
+                let resolved = aliases.next().ok_or(CodexSnapshotError::NotFound)?;
+                if aliases.next().is_some() {
+                    return Err(CodexSnapshotError::NotFound);
+                }
+                resolved
+            }
+        };
+        let session_id = resolved.as_str();
         let (projection, turns, exited, history_mode, quiet) = self
             .sessions
             .lock()

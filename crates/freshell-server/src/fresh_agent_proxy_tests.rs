@@ -2398,3 +2398,149 @@ async fn task6_gateway_ready_uses_current_provider_retained_attention() {
 async fn task6_gateway_ready_rejects_a_replaced_provider_source() {
     task6_gateway_source_scenario("ready-after-incarnation").await;
 }
+
+async fn task6_gateway_recovery_receipts(
+    replay: bool,
+    replace_on_continuation: bool,
+    replace_native: bool,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("recovery-receipts.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let pages = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_pages = pages.clone();
+    let receipts = vec![
+        serde_json::json!({"type":"freshAgent.send.accepted","provider":"codex","sessionType":"freshcodex","sessionId":"native-owned","requestId":"accepted-answer","submittedTurnId":"native-turn"}),
+        serde_json::json!({"type":"freshAgent.send.accepted","provider":"codex","sessionType":"freshcodex","sessionId":"native-owned","requestId":"accepted-ordinary","submittedTurnId":"ordinary-turn"}),
+        serde_json::json!({"type":"error","code":"INTERNAL_ERROR","message":"CODEX_TURN_START_FAILED: native input refused","timestamp":"2026-10-26T00:00:00.000Z","requestId":"refused-answer"}),
+        serde_json::json!({"type":"error","code":"INTERNAL_ERROR","message":"CODEX_DELIVERY_AMBIGUOUS: native response was lost","timestamp":"2026-10-26T00:00:00.000Z","requestId":"ambiguous-answer"}),
+        serde_json::json!({"type":"freshAgent.event","provider":"codex","sessionType":"freshcodex","sessionId":"native-owned","event":{"type":"checkpointTurnIdentity","requestId":"accepted-answer","logicalAttemptId":"logical-owned","sessionId":"native-owned","nativeTurnId":"native-turn","displayTurnId":"native-turn:row-0"}}),
+        serde_json::json!({"type":"freshAgent.checkpoint.outcome","provider":"codex","sessionType":"freshcodex","sessionId":"native-owned","requestId":"accepted-answer","logicalAttemptId":"logical-owned","status":"available","checkpointId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","nativeTurnId":"native-turn","displayTurnId":"native-turn:row-0"}),
+        serde_json::json!({"type":"freshAgent.event","provider":"codex","sessionType":"freshcodex","sessionId":"native-owned","event":{"type":"freshAgent.rolledBack","requestId":"undo-owned","removedPromptText":"restore the exact prompt"}}),
+        serde_json::json!({"type":"freshAgent.event","provider":"codex","sessionType":"freshcodex","sessionId":"native-owned","event":{"type":"freshAgent.error","requestId":"undo-refused","code":"BUSY_TURN","message":"The agent is still working."}}),
+    ];
+    let expected = receipts.clone();
+    let server = tokio::spawn(async move {
+        let mut payloads = vec![
+            AgentEvent::Provider {
+                payload: serde_json::json!({"type":"freshAgent.event","provider":"codex","sessionType":"freshcodex","sessionId":"native-owned","event":{"type":"freshAgent.transcript.patch","text":"stale transcript must not replay"}}),
+            },
+            AgentEvent::PermissionRequested {
+                decision_id: "stale-control".into(),
+                payload: serde_json::json!({"type":"freshAgent.question.request","requestId":"stale-control"}),
+            },
+        ];
+        payloads.extend(
+            receipts
+                .into_iter()
+                .map(|payload| AgentEvent::Provider { payload }),
+        );
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let envelope: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            let result = match envelope.body {
+                AdminCommand::Health => AdminResult::Health {control_epoch:7,installation_id:InstallationId::new()},
+                AdminCommand::Inventory => AdminResult::Inventory(vec![serde_json::from_value(serde_json::json!({
+                    "soulId":"retained-soul","incarnationId":if replace_on_continuation && !replace_native && server_pages.load(std::sync::atomic::Ordering::SeqCst)>=2 {"replacement-incarnation"} else {"original-incarnation"},"hostBootId":"original-boot","launchState":"running","cleanupState":"none","intentRevision":1,"executionGeneration":1,"desiredState":"running","recoveryState":"live","durabilityState":"unknown","allocationState":"allocated","evidenceRevision":0,"successfulRecoveriesInWindow":0,"provider":"codex","nativeSessionId":if replace_on_continuation && replace_native && server_pages.load(std::sync::atomic::Ordering::SeqCst)>=2 {"replacement-native"} else {"native-owned"},"freshAgentSessionId":"public-owned","freshAgentSessionType":"freshcodex"
+                })).unwrap()]),
+                AdminCommand::FreshAgentReadEvents(request) => {
+                    server_pages.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+                    AdminResult::FreshAgentEvents(freshell_runtime_protocol::AgentEventBatch {
+                    retained_state:(request.after_sequence==0).then(||serde_json::json!({
+                        "source":{"soulId":"retained-soul","incarnationId":"original-incarnation","hostBootId":"original-boot","projectionId":"source-projection","ownerEpoch":0,"ownerGeneration":0},
+                        "snapshot":{"provider":"codex","sessionType":"freshcodex","threadId":"native-owned","turns":[]},"attentionMarks":[],
+                        "pendingControls":[{"type":"freshAgent.question.request","requestId":"current-control"}]
+                    })),
+                    retained_from:1,head:payloads.len() as u64,reset_required:request.after_sequence==0,
+                    // The controller's own bound can be smaller than the requested
+                    // page. Receipts deliberately lie beyond the first page.
+                    events:payloads.iter().enumerate().filter(|(index,_)|(*index as u64)+1>request.after_sequence).take(request.max_events.min(2) as usize).map(|(index,event)|freshell_runtime_protocol::AgentJournalEvent {sequence:index as u64+1,event:event.clone()}).collect(),
+                })},
+                other => panic!("recovery must only read events and source identity: {other:?}"),
+            };
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: envelope.request_id,
+                    result: Ok(result),
+                },
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let proxy = snapshot_outage_proxy(&socket);
+    let mut frames = proxy.broadcast.subscribe();
+    let soul = SoulId::parse("retained-soul").unwrap();
+    if replay {
+        proxy
+            .replay_once(soul, "codex", "public-owned", "freshcodex")
+            .await;
+    } else {
+        proxy
+            .start_poller(
+                soul,
+                "codex".into(),
+                "public-owned".into(),
+                "freshcodex".into(),
+            )
+            .await;
+    }
+    let mut observed = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while observed.len() < expected.len() + 2 {
+        let Ok(Ok(frame)) = tokio::time::timeout_at(deadline, frames.recv()).await else {
+            break;
+        };
+        observed.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
+    }
+    server.abort();
+    let _ = server.await;
+    assert!(
+        pages.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "the real Unix controller must serve continuation pages"
+    );
+    assert_eq!(observed.len(),if replace_on_continuation {2} else {expected.len()+2},"retained recovery must deliver every request receipt across bounded pages, only under the current owner: {observed:?}");
+    assert_eq!(
+        observed[0]["event"]["retainedState"]["snapshot"]["threadId"],
+        "native-owned"
+    );
+    assert_eq!(observed[1]["event"]["requestId"], "current-control");
+    for (actual, mut expected) in observed.into_iter().skip(2).zip(expected) {
+        rewrite_presentation_id(&mut expected, "public-owned");
+        assert_eq!(
+            actual, expected,
+            "keep exact request/attempt/native IDs and refusal/ambiguity reasons"
+        );
+    }
+}
+
+#[tokio::test]
+async fn task6_gateway_poller_preserves_request_receipts_beyond_retained_first_page() {
+    task6_gateway_recovery_receipts(false, false, false).await;
+}
+
+#[tokio::test]
+async fn task6_gateway_replay_preserves_request_receipts_beyond_retained_first_page() {
+    task6_gateway_recovery_receipts(true, false, false).await;
+}
+
+#[tokio::test]
+async fn task6_gateway_poller_fences_receipts_after_source_changes_between_pages() {
+    task6_gateway_recovery_receipts(false, true, false).await;
+}
+
+#[tokio::test]
+async fn task6_gateway_replay_fences_receipts_after_source_changes_between_pages() {
+    task6_gateway_recovery_receipts(true, true, false).await;
+}
+
+#[tokio::test]
+async fn task6_gateway_poller_fences_receipts_after_native_changes_between_pages() {
+    task6_gateway_recovery_receipts(false, true, true).await;
+}
+
+#[tokio::test]
+async fn task6_gateway_replay_fences_receipts_after_native_changes_between_pages() {
+    task6_gateway_recovery_receipts(true, true, true).await;
+}

@@ -15034,6 +15034,41 @@ describe('task delegation open-session link (freshopencode tui parity)', () => {
 })
 
 describe('task6 hosted recovery in the mounted view', () => {
+  it.each(['accepted', 'refused', 'ambiguous'] as const)('keeps per-request async answer %s visible after retained recovery', async (outcome) => {
+    const native = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
+    const snapshot = {...native,status:'idle',capabilities:{...native.capabilities,send:true,interrupt:true},extensions:{codex:{ownerKind:'fresh-agent',statusFromLiveState:true}},turns:[{id:'async-turn',turnId:'async-turn',role:'assistant',summary:'',items:[{id:'async-answer',kind:'text',text:'Work can continue.',extensions:{codex:{itemId:'async-answer',delivery:'async',questions:[{id:'where',title:'Where?',options:['Staging']}]}}}]}]}
+    const store = createStore()
+    const locator = {provider:'codex' as const,sessionType:'freshcodex' as const,sessionId:native.threadId}
+    const handlers = new Set<(message:any)=>void>()
+    wsMock.onMessage.mockImplementation((handler)=>{handlers.add(handler);return()=>{handlers.delete(handler)}})
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(snapshot)
+    store.dispatch(initLayout({tabId:'tab-1',paneId:'pane-1',content:{kind:'fresh-agent',...locator,createRequestId:'receipt-view',status:'idle'}}))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    fireEvent.click(await screen.findByRole('button',{name:'Staging',exact:true}))
+    const composer = screen.getByRole('textbox',{name:'Chat message input'})
+    const draft = (composer as HTMLTextAreaElement).value
+    expect(draft).toContain('Answer to Codex question:')
+    fireEvent.click(screen.getByRole('button',{name:'Send',exact:true}))
+    await waitFor(()=>expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1))
+    const sent = sentFreshAgentMessages('freshAgent.send')[0]
+    expect(screen.getByText('Sending answer as a message')).toBeInTheDocument()
+    const held = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValue(held.promise)
+    const retained = {...snapshot,extensions:{codex:{projection:{id:'receipt-source',historyGeneration:0,eventRevision:10,eventOwnedTurnIds:['async-turn'],nativePreviewTurnIds:[],nativeFinalTurnIds:[],turnRows:{'async-turn':['async-turn']},turnOutputStates:{},settledTurnIds:[]}}}}
+    const deliver = (message:any)=>act(()=>{handleFreshAgentMessage(store.dispatch,message);for(const handler of handlers)handler(message)})
+    try {
+      deliver({type:'freshAgent.event',...locator,event:{type:'freshAgent.host.backpressure',retainedState:{source:{projectionId:'receipt-source',ownerEpoch:0,ownerGeneration:0,soulId:'soul',incarnationId:'incarnation',hostBootId:'host'},snapshot:retained,pendingControls:[],attentionMarks:[]}}})
+      await expectRenderedText('Work can continue.')
+      // A fresh transcript cannot decide this request's outcome.
+      expect(screen.getByText('Sending answer as a message')).toBeInTheDocument()
+      deliver(outcome==='accepted'?{type:'freshAgent.send.accepted',...locator,requestId:sent.requestId,submittedTurnId:'native-receipt-turn'}:{type:'error',code:'INTERNAL_ERROR',requestId:sent.requestId,message:outcome==='ambiguous'?'CODEX_DELIVERY_AMBIGUOUS: native response was lost':'CODEX_TURN_START_FAILED: native input refused'})
+      await waitFor(()=>expect(screen.getByText(outcome==='accepted'?'Answer accepted as a message':outcome==='ambiguous'?'Answer delivery uncertain; review the composer before sending again.':'Answer not sent; your draft is in the composer.')).toBeInTheDocument())
+      if(outcome!=='accepted') expect(composer).toHaveValue(draft)
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      expect(sentFreshAgentMessages('freshAgent.question.respond')).toHaveLength(0)
+    } finally {cleanup();await act(async()=>held.resolve(retained))}
+  })
+
   it.each(['freshAgent.host.backpressure', 'freshAgent.host.journal.reset'])('shows retained rows on %s while the native history refresh is pending', async (kind) => {
     const native = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
     const store = createStore()

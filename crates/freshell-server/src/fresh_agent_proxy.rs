@@ -1024,6 +1024,7 @@ impl HostedFreshAgentProxy {
         let proxy = Arc::clone(self);
         tokio::spawn(async move {
             let mut cursor = 0;
+            let mut retained_through = 0;
             let mut source_before = if provider == "codex" {
                 proxy.current_source(&soul).await
             } else {
@@ -1036,22 +1037,23 @@ impl HostedFreshAgentProxy {
                     .await
                 {
                     Ok(batch) => {
-                        if let Some(retained) = batch.retained_state {
+                        if batch.retained_state.is_some() || cursor < retained_through {
                             let after = proxy.current_source(&soul).await;
-                            let valid = source_before.as_ref().zip(after.as_ref()).is_some_and(
-                                |(before, after)| {
-                                    same_retained_host(before, after)
-                                        && retained_matches_view(&retained, before)
-                                        && retained_matches_view(&retained, after)
-                                },
+                            let valid = retained_batch_matches_source(
+                                source_before.as_ref(),
+                                after.as_ref(),
+                                batch.retained_state.as_ref(),
                             );
                             source_before = after;
                             if !valid {
                                 tracing::warn!(provider, soul_id=%soul, "freshagent.gateway.retained_source_changed");
                                 cursor = 0;
+                                retained_through = 0;
                                 tokio::time::sleep(Duration::from_millis(50)).await;
                                 continue;
                             }
+                        }
+                        if let Some(retained) = batch.retained_state {
                             let presentation = proxy
                                 .presentation_ids
                                 .lock()
@@ -1070,13 +1072,10 @@ impl HostedFreshAgentProxy {
                                     "freshAgent.host.backpressure"
                                 },
                             );
-                            // The retained source covers the complete current prefix,
-                            // including journal entries older than this bounded page.
-                            cursor = batch.head;
-                            tokio::time::sleep(Duration::from_millis(50)).await;
-                            continue;
-                        }
-                        if batch.reset_required {
+                            // Projection and controls are covered, but request receipts
+                            // still have to drain through every bounded journal page.
+                            retained_through = retained_through.max(batch.head);
+                        } else if batch.reset_required {
                             proxy.send(ServerMessage::FreshAgentEvent(FreshAgentEvent {
                                 event: serde_json::json!({
                                     "type":"freshAgent.host.journal.reset",
@@ -1087,8 +1086,16 @@ impl HostedFreshAgentProxy {
                                 session_type: session_type.clone(),
                             }));
                         }
+                        if batch.events.is_empty() {
+                            cursor = cursor.max(batch.head);
+                        }
                         for event in batch.events {
                             cursor = cursor.max(event.sequence);
+                            if event.sequence <= retained_through
+                                && !is_request_receipt(&event.event)
+                            {
+                                continue;
+                            }
                             // Provider-native identity is nested provider state. The public
                             // routing alias changes only through an explicit same-soul fork
                             // transition or durable inventory reconciliation, never merely
@@ -1195,25 +1202,36 @@ impl HostedFreshAgentProxy {
         presentation_session_id: &str,
         session_type: &str,
     ) {
-        let before = if provider == "codex" {
+        let mut before = if provider == "codex" {
             self.current_source(&soul).await
         } else {
             None
         };
-        let Ok(batch) = self.client.fresh_agent_events(soul.clone(), 0, 4096).await else {
-            return;
-        };
-        if let Some(retained) = batch.retained_state {
-            let after = self.current_source(&soul).await;
-            if before
-                .as_ref()
-                .zip(after.as_ref())
-                .is_some_and(|(before, after)| {
-                    same_retained_host(before, after)
-                        && retained_matches_view(&retained, before)
-                        && retained_matches_view(&retained, after)
-                })
-            {
+        let mut cursor = 0;
+        let mut replay_through = None;
+        let mut retained_through = 0;
+        loop {
+            let Ok(batch) = self
+                .client
+                .fresh_agent_events(soul.clone(), cursor, 4096)
+                .await
+            else {
+                return;
+            };
+            let replay_through = *replay_through.get_or_insert(batch.head);
+            if batch.retained_state.is_some() || cursor < retained_through {
+                let after = self.current_source(&soul).await;
+                let valid = retained_batch_matches_source(
+                    before.as_ref(),
+                    after.as_ref(),
+                    batch.retained_state.as_ref(),
+                );
+                before = after;
+                if !valid {
+                    return;
+                }
+            }
+            if let Some(retained) = batch.retained_state {
                 self.forward_retained(
                     retained,
                     provider,
@@ -1221,11 +1239,28 @@ impl HostedFreshAgentProxy {
                     session_type,
                     "freshAgent.host.backpressure",
                 );
+                retained_through = retained_through.max(batch.head);
             }
-            return;
-        }
-        for event in batch.events {
-            self.forward_host_event(event.event, provider, presentation_session_id, session_type);
+            if batch.events.is_empty() {
+                return;
+            }
+            for event in batch.events {
+                if event.sequence > replay_through {
+                    return;
+                }
+                cursor = cursor.max(event.sequence);
+                if event.sequence > retained_through || is_request_receipt(&event.event) {
+                    self.forward_host_event(
+                        event.event,
+                        provider,
+                        presentation_session_id,
+                        session_type,
+                    );
+                }
+            }
+            if cursor >= replay_through {
+                return;
+            }
         }
     }
 
@@ -1591,6 +1626,50 @@ fn same_retained_host(
     before.soul_id == after.soul_id
         && before.incarnation_id == after.incarnation_id
         && before.host_boot_id == after.host_boot_id
+}
+
+/// Retained projection/control state does not carry request acknowledgements.
+/// Keep only these receipts when superseding the journal's display prefix.
+fn is_request_receipt(event: &AgentEvent) -> bool {
+    let AgentEvent::Provider { payload } = event else {
+        return false;
+    };
+    let receipt = if payload["type"] == "freshAgent.event"
+        && matches!(
+            payload["event"]["type"].as_str(),
+            Some(
+                "checkpointTurnIdentity"
+                    | "freshAgent.rolledBack"
+                    | "freshAgent.redone"
+                    | "freshAgent.error"
+            )
+        ) {
+        &payload["event"]
+    } else if matches!(
+        payload["type"].as_str(),
+        Some("freshAgent.send.accepted" | "error" | "freshAgent.checkpoint.outcome")
+    ) {
+        payload
+    } else {
+        return false;
+    };
+    receipt["requestId"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty())
+}
+
+fn retained_batch_matches_source(
+    before: Option<&freshell_runtime_protocol::RuntimeView>,
+    after: Option<&freshell_runtime_protocol::RuntimeView>,
+    retained: Option<&serde_json::Value>,
+) -> bool {
+    before.zip(after).is_some_and(|(before, after)| {
+        same_retained_host(before, after)
+            && before.native_session_id == after.native_session_id
+            && retained.is_none_or(|retained| {
+                retained_matches_view(retained, before) && retained_matches_view(retained, after)
+            })
+    })
 }
 
 fn retained_matches_view(

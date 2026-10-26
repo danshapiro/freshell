@@ -1710,7 +1710,8 @@ async fn task6_send_context_answer(
     assert_eq!(wire.2["input"][0]["text"], text);
     match outcome {
         "accepted" => peer.respond(&wire.0, json!({"turnId":"turn-1"})),
-        "refused" => peer.respond_error(&wire.0, -32600, "native input refused"),
+        "refused" => peer.respond_error(&wire.0, -32602, "native input refused"),
+        "rpc-invalid" => peer.respond_error(&wire.0, -32600, "native input refused"),
         "ambiguous" => peer.respond(&wire.0, json!({})),
         _ => unreachable!(),
     }
@@ -1739,6 +1740,26 @@ async fn task6_context_answer_outcome(outcome: &str) {
         task6_send_context_answer(&state, &peer, "two", outcome).await;
     }
     let after_two = state.attention_marks().await[0].clone();
+    let receipts = std::iter::from_fn(|| rx.try_recv().ok())
+        .map(|frame| serde_json::from_str::<Value>(&frame).unwrap())
+        .filter(|frame| frame["requestId"] == "answer-one" || frame["requestId"] == "answer-two")
+        .collect::<Vec<_>>();
+    assert_eq!(receipts.len(), if outcome == "accepted" { 2 } else { 1 });
+    for receipt in &receipts {
+        if outcome == "accepted" {
+            assert_eq!(receipt["type"], "freshAgent.send.accepted");
+            assert_eq!(receipt["submittedTurnId"], "turn-1");
+            assert_eq!(receipt["sessionId"], "thread-1");
+        } else {
+            assert_eq!(receipt["type"], "error");
+            let prefix = if outcome == "refused" {
+                "CODEX_TURN_START_FAILED:"
+            } else {
+                "CODEX_DELIVERY_AMBIGUOUS:"
+            };
+            assert!(receipt["message"].as_str().unwrap().starts_with(prefix), "the public receipt must distinguish explicit refusal and uncertain admission: {receipt}");
+        }
+    }
     let controls = state.retained_control_events("thread-1").await;
     let unsolicited = tokio::time::timeout(Duration::from_millis(30), peer.next_raw_frame()).await;
     task6_shutdown(&state, peer).await;
@@ -1774,4 +1795,44 @@ async fn task6_refused_contextual_answer_preserves_action_attention() {
 #[tokio::test]
 async fn task6_ambiguous_contextual_answer_preserves_action_without_resend() {
     task6_context_answer_outcome("ambiguous").await;
+}
+
+#[tokio::test]
+async fn task6_invalid_request_contextual_answer_preserves_exact_ambiguity_without_resend() {
+    task6_context_answer_outcome("rpc-invalid").await;
+}
+
+#[tokio::test]
+async fn task6_retained_read_follows_only_its_materialized_identity() {
+    let (state, peer, mut rx) = runtime().await;
+    peer.emit_notification(
+        "turn/started",
+        json!({"threadId":"thread-1","turn":{"id":"turn-1","status":"inProgress"}}),
+    );
+    peer.emit_notification("item/completed",json!({"threadId":"thread-1","turnId":"turn-1","item":{"id":"alias-output","type":"agentMessage","text":"Owned materialized output"}}));
+    loop {
+        let patch = event(&mut rx).await;
+        if patch["type"] == "freshAgent.transcript.patch"
+            && patch.to_string().contains("Owned materialized output")
+        {
+            break;
+        }
+    }
+    state.attention.observe("materialization-old", SESSION_TYPE);
+    state.broadcast(&serde_json::from_value(json!({"type":"freshAgent.session.materialized","provider":"codex","sessionType":"freshcodex","previousSessionId":"materialization-old","sessionId":"thread-1"})).unwrap());
+    // Losing that first materialization must not force a scan of all sessions.
+    let retained = state.retained_state("materialization-old").await;
+    let unrelated = state.retained_state("unrelated-owner").await;
+    task6_shutdown(&state, peer).await;
+    let retained = retained.expect(
+        "a retained read must follow its actual materialization alias without another frame",
+    );
+    assert_eq!(retained["snapshot"]["threadId"], "thread-1");
+    assert!(retained["snapshot"]
+        .to_string()
+        .contains("Owned materialized output"));
+    assert!(
+        unrelated.is_err(),
+        "an arbitrary missing identity must never discover another registered source"
+    );
 }

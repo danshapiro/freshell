@@ -64,7 +64,7 @@ struct HostedTransport {
     /// journal); an operation subscribes to read the provider's answer.
     provider_frames: Arc<broadcast::Sender<String>>,
     profile: std::sync::Mutex<Option<FreshAgentProfile>>,
-    session_id: Mutex<Option<String>>,
+    session_id: Arc<Mutex<Option<String>>>,
     created_rx: Mutex<watch::Receiver<Option<Result<String, ()>>>>,
     native_rx: Mutex<watch::Receiver<Option<String>>>,
     /// The native identity's writer, shared with the bridge: a claude fork
@@ -243,10 +243,12 @@ impl HostedTransport {
         let (send_outcomes, _) = broadcast::channel(64);
         let (kill_outcomes, _) = broadcast::channel(64);
         let suppressed_kills = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let session_id = Arc::new(Mutex::new(None));
         let bridge = spawn_broadcast_bridge(
             provider.clone(),
             broadcast_rx,
             BroadcastBridgeOutputs {
+                owned_session: Some(session_id.clone()),
                 retained_codex: match &state {
                     ProviderState::Codex(state) => Some(state.clone()),
                     _ => None,
@@ -264,7 +266,7 @@ impl HostedTransport {
             state,
             provider_frames: broadcast_tx,
             profile: std::sync::Mutex::new(None),
-            session_id: Mutex::new(None),
+            session_id,
             created_rx: Mutex::new(created_rx),
             native_rx: Mutex::new(native_rx),
             native_tx,
@@ -1229,6 +1231,7 @@ fn create_request_for_profile(profile: &FreshAgentProfile) -> FreshAgentCreate {
 }
 
 struct BroadcastBridgeOutputs {
+    owned_session: Option<Arc<Mutex<Option<String>>>>,
     retained_codex: Option<FreshCodexState>,
     created: watch::Sender<Option<Result<String, ()>>>,
     native: watch::Sender<Option<String>>,
@@ -1256,6 +1259,7 @@ fn spawn_broadcast_bridge(
     outputs: BroadcastBridgeOutputs,
 ) -> BroadcastBridgeTasks {
     let BroadcastBridgeOutputs {
+        owned_session,
         retained_codex,
         created,
         native,
@@ -1298,39 +1302,35 @@ fn spawn_broadcast_bridge(
             }
             let mut pending = Vec::new();
             if let Some(state) = &retained_codex {
-                let mut ids = recovery_native
-                    .borrow()
-                    .clone()
-                    .into_iter()
-                    .collect::<Vec<_>>();
-                // A dropped materialization may also have dropped the native
-                // identity edge. Resolve only registered retained sources.
-                ids.extend(
-                    state
-                        .attention_marks()
-                        .await
-                        .into_iter()
-                        .map(|mark| mark.session_id),
-                );
-                for session_id in ids {
-                    if let Ok(retained) = state.retained_state(&session_id).await {
-                        pending = retained["pendingControls"]
-                            .as_array()
-                            .cloned()
-                            .unwrap_or_default();
-                        let dropped = payload
-                            .as_ref()
-                            .and_then(|frame| frame["event"]["dropped"].as_u64())
-                            .unwrap_or(1);
-                        let mut frame = bridge_recovery_frame(
-                            &recovery_provider,
-                            "freshcodex",
-                            &session_id,
-                            dropped,
-                        );
-                        frame["event"]["retainedState"] = retained;
-                        payload = Some(frame);
-                        break;
+                let owned = match &owned_session {
+                    Some(session) => session.lock().await.clone(),
+                    None => None,
+                };
+                if let Some(session_id) = owned.or_else(|| recovery_native.borrow().clone()) {
+                    match state.retained_state(&session_id).await {
+                        Ok(retained) => {
+                            pending = retained["pendingControls"]
+                                .as_array()
+                                .cloned()
+                                .unwrap_or_default();
+                            let dropped = payload
+                                .as_ref()
+                                .and_then(|frame| frame["event"]["dropped"].as_u64())
+                                .unwrap_or(1);
+                            let mut frame = bridge_recovery_frame(
+                                &recovery_provider,
+                                "freshcodex",
+                                retained["snapshot"]["threadId"]
+                                    .as_str()
+                                    .unwrap_or(&session_id),
+                                dropped,
+                            );
+                            frame["event"]["retainedState"] = retained;
+                            payload = Some(frame);
+                        }
+                        Err(error) => {
+                            tracing::warn!(provider=recovery_provider.as_str(),session_id,error=?error,"freshagent.host.retained_source_unavailable")
+                        }
                     }
                 }
             }
@@ -1716,6 +1716,156 @@ mod tests {
         assert!(final_event.is_none());
     }
 
+    // The real host actor drains the tested bridge; startup is already complete
+    // in the native fixture, so this adapter only hands over its owned stream.
+    struct StartedBridgeTransport {
+        native: String,
+        events: std::sync::Mutex<Option<mpsc::Receiver<AgentEvent>>>,
+    }
+
+    #[async_trait]
+    impl FreshAgentTransport for StartedBridgeTransport {
+        async fn start(&self, _: &FreshAgentProfile) -> Result<TransportStart, String> {
+            Ok(TransportStart {
+                native_session_id: Some(self.native.clone()),
+            })
+        }
+        async fn dispatch(
+            &self,
+            _: &RequestId,
+            _: &str,
+            _: &FreshAgentProfile,
+        ) -> Result<DispatchAck, DispatchFailure> {
+            unreachable!()
+        }
+        async fn resolve_permission(&self, _: &str, _: Value) -> Result<(), DispatchFailure> {
+            Err(DispatchFailure {
+                message: "this actor does not own that decision".into(),
+                acceptance_ambiguous: false,
+            })
+        }
+        async fn interrupt(&self) -> Result<(), String> {
+            unreachable!()
+        }
+        async fn stop(self: Arc<Self>) -> Result<(), String> {
+            Ok(())
+        }
+        fn take_event_stream(&self) -> Option<mpsc::Receiver<AgentEvent>> {
+            self.events.lock().unwrap().take()
+        }
+    }
+
+    #[tokio::test]
+    async fn task6_recovery_does_not_journal_another_sessions_pending_decision() {
+        let mut fixture = native_codex_fixture(json!({"recordTurns":true,"serverRequestsByPrompt":{"ask":{"id":71,"method":"item/tool/requestUserInput","params":{"isBlocking":true,"questions":[{"id":"choice","header":"Choice","question":"Other session only?","options":null}]}}}})).await;
+        let transport = fixture.transport.clone();
+        transport.start(&fixture.profile).await.unwrap();
+        transport
+            .dispatch(
+                &RequestId::parse("other-pending").unwrap(),
+                "ask",
+                &fixture.profile,
+            )
+            .await
+            .unwrap();
+        let other_control = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let frame: Value =
+                    serde_json::from_str(&fixture.diagnostic.recv().await.unwrap()).unwrap();
+                if frame["event"]["type"] == "freshAgent.question.request" {
+                    break frame["event"].clone();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let ProviderState::Codex(state) = &transport.state else {
+            unreachable!()
+        };
+        let state = state.clone();
+        let mut owned_profile = fixture.profile.clone();
+        owned_profile.native_session_id = Some("thread-owned-2".into());
+        state
+            .handle_create(create_request_for_profile(&owned_profile), None)
+            .await;
+        assert!(
+            state.retained_state("thread-owned-2").await.is_ok(),
+            "both native sessions must actually be registered"
+        );
+        state.handle_kill(serde_json::from_value(json!({"provider":"codex","sessionType":"freshcodex","sessionId":"thread-owned-2"})).unwrap()).await;
+        assert!(state.retained_state("thread-owned-2").await.is_err());
+        assert_eq!(
+            state.retained_state("thread-new-1").await.unwrap()["pendingControls"][0],
+            other_control
+        );
+
+        let (bus, receiver) = broadcast::channel(8);
+        let (events, stream) = mpsc::channel(1);
+        events
+            .send(AgentEvent::Provider {
+                payload: json!({"occupied":true}),
+            })
+            .await
+            .unwrap();
+        let (native, _) = watch::channel(Some("thread-owned-2".into()));
+        let (created, _) = watch::channel(None);
+        let bridge = spawn_broadcast_bridge(
+            FreshProvider::Codex,
+            receiver,
+            BroadcastBridgeOutputs {
+                owned_session: None,
+                retained_codex: Some(state.clone()),
+                created,
+                native,
+                events: events.clone(),
+                send_outcomes: broadcast::channel(8).0,
+                kill_outcomes: broadcast::channel(8).0,
+                suppressed_kills: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            },
+        );
+        bus.send(json!({"type":"freshAgent.event","provider":"codex","sessionType":"freshcodex","sessionId":"thread-owned-2","event":{"type":"freshAgent.notice","message":"last dropped frame"}}).to_string()).unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let actor = FreshAgentHostActor::open(
+            fixture.dir.path().join("isolated-actor"),
+            owned_profile,
+            Arc::new(StartedBridgeTransport {
+                native: "thread-owned-2".into(),
+                events: std::sync::Mutex::new(Some(stream)),
+            }),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(3),async {
+            loop {
+                if actor.read_events(0,256).await.events.iter().any(|entry|matches!(&entry.event,AgentEvent::Provider {payload} if payload["event"]["type"]=="freshAgent.host.backpressure")) {break;}
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("capacity alone must settle the final lost frame");
+        // No later provider frame is emitted. Allow the recovered durable-control
+        // conversion to finish, then inspect the actual actor journal/decision API.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let batch = actor.read_events(0, 256).await;
+        let resolution = actor
+            .resolve_permission(
+                other_control["requestId"].as_str().unwrap(),
+                json!({"answers":{"choice":"wrong actor"}}),
+            )
+            .await;
+        drop(bridge);
+        drop(events);
+        actor.stop().await.unwrap();
+        transport.stop().await.unwrap();
+        assert!(!batch.events.iter().any(|entry|matches!(&entry.event,AgentEvent::PermissionRequested {..})),"another registered source must never become this actor's durable pending decision: {batch:?}");
+        assert!(
+            matches!(
+                resolution,
+                Err(freshell_agent_runtime::host_actor::ActorError::UnknownDecision)
+            ),
+            "the foreign decision must not exist in this actor: {resolution:?}"
+        );
+        assert!(!batch.events.iter().any(|entry|matches!(&entry.event,AgentEvent::Provider {payload} if payload["event"]["retainedState"]["snapshot"]["threadId"]=="thread-new-1")),"a recovery marker cannot carry another source's transcript");
+    }
+
     struct NativeCodexFixture {
         transport: Arc<HostedTransport>,
         profile: FreshAgentProfile,
@@ -1965,9 +2115,15 @@ mod tests {
             )
             .await
             .unwrap();
+        let mut accepted = None;
         let completion = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let frame: Value = serde_json::from_str(&diagnostic.recv().await.unwrap()).unwrap();
+                if frame["type"] == "freshAgent.send.accepted"
+                    && frame["requestId"] == "retained-send"
+                {
+                    accepted = Some(frame.clone());
+                }
                 if frame["event"]["type"] == "freshAgent.turn.complete" {
                     break frame["event"]["at"].clone();
                 }
@@ -1994,6 +2150,13 @@ mod tests {
         let retained = serde_json::to_string(snapshot).unwrap();
         let native_id = transport.session_id.lock().await.clone().unwrap();
         transport.clone().stop().await.unwrap();
+        let accepted = accepted.expect(
+            "the real ordinary send must emit its correlated native receipt before completion",
+        );
+        assert_eq!(accepted["sessionId"], native_id);
+        assert!(accepted["submittedTurnId"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()));
         assert!(
             retained.contains("Native streaming fragment and final answer"),
             "recover exact event-owned body without thread/read: {recovered}"
@@ -2007,6 +2170,62 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn task6_fork_recovery_uses_transport_owner_after_a_lost_native_identity_edge() {
+        let fixture = native_codex_fixture(json!({"recordTurns":true,"liveTranscript":true})).await;
+        let transport = fixture.transport.clone();
+        let parent = transport
+            .start(&fixture.profile)
+            .await
+            .unwrap()
+            .native_session_id
+            .unwrap();
+        let mut events = transport.take_event_stream().unwrap();
+        let child = transport
+            .fork(&RequestId::parse("recovery-fork").unwrap(), &parent, None)
+            .await
+            .unwrap()
+            .child_session_id;
+        // The explicit fork already committed the child owner. Simulate losing
+        // its native identity frame while keeping the old watch value.
+        transport.native_tx.send_replace(Some(parent));
+        while events.try_recv().is_ok() {}
+        while transport
+            .event_tx
+            .try_send(AgentEvent::Provider {
+                payload: json!({"occupied":true}),
+            })
+            .is_ok()
+        {}
+        transport
+            .dispatch(
+                &RequestId::parse("child-final-send").unwrap(),
+                "child output",
+                &fixture.profile,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let recovered = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(AgentEvent::Provider { payload }) = events.recv().await {
+                    if payload["event"]["retainedState"].is_object() {
+                        break payload["event"]["retainedState"].clone();
+                    }
+                }
+            }
+        })
+        .await;
+        transport.stop().await.unwrap();
+        let recovered = recovered.expect(
+            "a committed fork owner must recover its final output without another provider frame",
+        );
+        assert_eq!(recovered["snapshot"]["threadId"], child);
+        assert!(recovered["snapshot"]
+            .to_string()
+            .contains("Native streaming fragment and final answer"));
     }
 
     #[tokio::test]
@@ -2320,6 +2539,7 @@ mod tests {
             FreshProvider::Codex,
             rx,
             BroadcastBridgeOutputs {
+                owned_session: None,
                 retained_codex: None,
                 created,
                 native,
@@ -2369,6 +2589,7 @@ mod tests {
             FreshProvider::Codex,
             rx,
             BroadcastBridgeOutputs {
+                owned_session: None,
                 retained_codex: None,
                 created,
                 native,
@@ -2408,6 +2629,7 @@ mod tests {
             FreshProvider::Claude,
             rx,
             BroadcastBridgeOutputs {
+                owned_session: None,
                 retained_codex: None,
                 created,
                 native,
