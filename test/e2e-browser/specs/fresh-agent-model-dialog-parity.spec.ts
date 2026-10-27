@@ -53,11 +53,36 @@ test('Codex discovers only the bound runtime and preserves search and exact sett
 test('Codex picker waits for ordinary create and shows honest failure with exact saved input', async ({ freshellPage, page, terminal }) => {
   await terminal.waitForTerminal()
   let probes = 0
+  const contexts: Record<string, string>[] = []
+  const snapshotRequests: string[] = []
+  const paneFacts = () => page.evaluate(() => {
+    const harness = window.__FRESHELL_TEST_HARNESS__!
+    const state = harness.getState()
+    const tabId = state.tabs.activeTabId!
+    const paneId = state.panes.activePane[tabId]
+    const layout = state.panes.layouts[tabId]
+    const pane = layout?.type === 'leaf' ? layout.content : undefined
+    if (pane?.kind !== 'fresh-agent') return { paneId, kind: pane?.kind }
+    const keys = [pane.sessionId, pane.sessionRef?.sessionId].filter(Boolean).map(id => `codex:${id}`)
+    return { paneId, sessionId: pane.sessionId, sessionRef: pane.sessionRef,
+      resumeSessionId: pane.resumeSessionId, status: pane.status, cwd: pane.initialCwd,
+      model: pane.model, effort: pane.effort, serverInstanceId: pane.serverInstanceId,
+      owners: Object.fromEntries(Object.entries(state.freshAgent.runtimeOwners).filter(([key]) => keys.includes(key))),
+      lifecycleFrames: (harness.getSentWsMessages?.() ?? []).filter((message: any) =>
+        ['freshAgent.create', 'freshAgent.attach'].includes(message?.type)).map((message: any) =>
+        ({type:message.type,requestId:message.requestId,sessionId:message.sessionId})),
+    }
+  })
   await page.route('**/api/fresh-agent/model-capabilities/freshcodex**', async (route) => {
     probes++
+    contexts.push(Object.fromEntries(new URL(route.request().url()).searchParams))
     await route.fulfill({ json: codexCatalog })
   })
   await installPane(page, 'codex')
+  await page.route('**/api/fresh-agent/threads/**', async route => {
+    snapshotRequests.push(new URL(route.request().url()).pathname)
+    await route.fallback()
+  })
   const setStatus = async (status: string, sessionId?: string) => page.evaluate(({ status, sessionId }) => {
     const harness = window.__FRESHELL_TEST_HARNESS__!
     const state = harness.getState()
@@ -69,6 +94,7 @@ test('Codex picker waits for ordinary create and shows honest failure with exact
     } } })
   }, { status, sessionId })
   await setStatus('creating')
+  console.log('task007-pending-fixture-before-open ' + JSON.stringify(await paneFacts()))
   await page.getByRole('button', { name: /^Model:.*change model$/ }).click()
   const dialog = page.getByRole('dialog', { name: 'Model and thinking level' })
   await expect(dialog.getByRole('status')).toContainText(/waiting.*runtime/i)
@@ -77,12 +103,12 @@ test('Codex picker waits for ordinary create and shows honest failure with exact
   await setStatus('idle', 'acknowledged-native')
   await expect(dialog.getByRole('option', { name: 'Provider Current' })).toBeVisible()
   await expect(dialog.getByRole('searchbox')).toHaveValue('provider')
-  expect(probes).toBe(1)
+  expect(probes, JSON.stringify({contexts,snapshotRequests,pane:await paneFacts()})).toBe(1)
   await setStatus('create-failed')
   await expect(dialog.getByRole('status')).toContainText(/catalog unavailable/i)
   await dialog.getByRole('searchbox').fill('')
   await expect(dialog.getByRole('button', { name: /Use saved-custom.*xhigh/ })).toBeEnabled()
-  expect(probes).toBe(1)
+  expect(probes, JSON.stringify({contexts,snapshotRequests,pane:await paneFacts()})).toBe(1)
 })
 
 async function installPane(page: Page, provider: 'claude' | 'codex') {
