@@ -4,6 +4,7 @@ import { createPortal } from 'react-dom'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { mergePaneContent } from '@/store/panesSlice'
+import { resolveCanonicalPaneSession, selectSessionRuntimeOwner } from '@/store/selectors/runtimeOwner'
 import { saveServerSettingsPatch } from '@/store/settingsThunks'
 import { sendFreshAgentConfigure } from '@/lib/fresh-agent-configure'
 import { getFreshAgentModelCapabilities } from '@/lib/api'
@@ -36,7 +37,9 @@ import type {
   FreshAgentModelCapabilities,
   FreshAgentModelCapabilitiesResponse,
   FreshAgentModelCapability,
+  FreshAgentCodexCatalogContext,
 } from '@shared/fresh-agent-model-capabilities'
+import { FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE } from '@shared/fresh-agent-models'
 import { highestThinkingLevelId, orderThinkingLevelIds } from '@shared/fresh-agent-thinking-levels'
 
 const MAX_RENDERED_MODEL_ROWS = 250
@@ -109,7 +112,17 @@ export function FreshAgentModelDialog({
   const searchRef = useRef<HTMLInputElement>(null)
   const previousFocusRef = useRef<HTMLElement | null>(null)
 
-  const probeKey = `${sessionType}:${cwdKey}`
+  const runtimeOwner = useAppSelector((state) => {
+    const canonical = resolveCanonicalPaneSession(state,paneContent)
+    return canonical ? selectSessionRuntimeOwner(state,canonical.provider,canonical.sessionId) : undefined
+  })
+  const codexContext = useMemo<FreshAgentCodexCatalogContext | undefined>(() => sessionType === 'freshcodex' && paneContent.sessionId ? {
+    sessionId:paneContent.sessionId,
+    ...(paneContent.sessionRef ? {sessionRef:paneContent.sessionRef} : {}),
+    cwd:paneContent.initialCwd,
+    ...(runtimeOwner ? {observedEpoch:runtimeOwner.epoch,observedGeneration:runtimeOwner.generation} : {}),
+  } : undefined,[sessionType,paneContent.sessionId,paneContent.sessionRef,paneContent.initialCwd,runtimeOwner])
+  const probeKey = JSON.stringify([sessionType,cwdKey,codexContext,paneContent.serverInstanceId])
   const [probeResult, setProbeResult] = useState<{
     key: string
     response: FreshAgentModelCapabilitiesResponse
@@ -121,17 +134,21 @@ export function FreshAgentModelDialog({
   const [highlightedRowKey, setHighlightedRowKey] = useState<string | undefined>(undefined)
   const [highlightedLevelIndex, setHighlightedLevelIndex] = useState(0)
   const [recentModels, setRecentModels] = useState<FreshAgentModelCapability[]>([])
+  const [stagedModel,setStagedModel] = useState<FreshAgentModelCapability>()
+  const [exactModelInput,setExactModelInput] = useState('')
 
-  // freshopencode + the claude providers (freshclaude/kilroy): probe the
-  // cwd-scoped live catalog each time the dialog opens (the settings popover
-  // makes the same call; the server caches it for 5 minutes). freshcodex
-  // never probes — its static table is synchronously known.
+  // A Codex pane probes only after ordinary creation supplies its bound context.
   useEffect(() => {
-    if (!open || sessionType === 'freshcodex') return
+    if (!open) return
+    if (sessionType === 'freshcodex' && !codexContext) {
+      setProbeResult(undefined)
+      setProbing(false)
+      return
+    }
     let cancelled = false
     setProbeResult(undefined)
     setProbing(true)
-    void getFreshAgentModelCapabilities(sessionType, { cwd: paneContent.initialCwd })
+    void getFreshAgentModelCapabilities(sessionType, { cwd: paneContent.initialCwd, ...(codexContext ? {codexContext} : {}) })
       .then((result) => {
         if (!cancelled) setProbeResult({ key: probeKey, response: result })
       })
@@ -151,14 +168,36 @@ export function FreshAgentModelDialog({
         if (!cancelled) setProbing(false)
       })
     return () => { cancelled = true }
-  }, [open, sessionType, paneContent.provider, paneContent.initialCwd, probeKey])
+  }, [open, sessionType, paneContent.provider, paneContent.initialCwd, probeKey, codexContext])
 
   const staticCapabilities = useMemo(() => getFreshAgentStaticModelCapabilities(sessionType), [sessionType])
-  const capabilities = useMemo<FreshAgentModelCapabilities | undefined>(() => sessionType === 'freshopencode'
-    ? (probe?.ok ? probe : undefined)
-    : paneContent.provider === 'claude' && staticCapabilities
-      ? mergeClaudeModelCapabilities(staticCapabilities, probe?.ok === true ? probe : undefined)
-      : staticCapabilities, [sessionType, paneContent.provider, staticCapabilities, probe])
+  const capabilities = useMemo<FreshAgentModelCapabilities | undefined>(() => {
+    if (sessionType === 'freshcodex') {
+      const native = probe?.ok && probe.runtimeProvider === 'codex' && probe.sessionType === 'freshcodex' ? probe : undefined
+      const models = (native?.models ?? []).map((row) => row.id === effectiveModelId && effectiveEffort && !row.supportedEffortLevels.includes(effectiveEffort)
+        ? {...row,supportsEffort:true,supportedEffortLevels:[...row.supportedEffortLevels,effectiveEffort]} : row)
+      if (effectiveModelId && !models.some((row) => row.id === effectiveModelId)) {
+        models.push({id:effectiveModelId,displayName:paneContent.modelLabel?.modelId === effectiveModelId ? paneContent.modelLabel.label
+          : FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE.freshcodex.find((row) => row.value === effectiveModelId)?.label ?? effectiveModelId,
+          provider:'codex',source:{id:'current-selection',displayName:'Current selection'},supportsEffort:Boolean(effectiveEffort),
+          supportedEffortLevels:effectiveEffort ? [effectiveEffort] : [],supportsAdaptiveThinking:false})
+      }
+      if (stagedModel) {
+        const index = models.findIndex((row) => row.id === stagedModel.id)
+        if (index < 0) models.push(stagedModel)
+        else models[index] = stagedModel
+      }
+      return {...(native ?? {sessionType:'freshcodex',runtimeProvider:'codex',status:'fresh',fetchedAt:0}),models}
+    }
+    return sessionType === 'freshopencode' ? (probe?.ok ? probe : undefined)
+      : paneContent.provider === 'claude' && staticCapabilities
+        ? mergeClaudeModelCapabilities(staticCapabilities,probe?.ok ? probe : undefined) : staticCapabilities
+  },[sessionType,paneContent.provider,paneContent.modelLabel,staticCapabilities,probe,effectiveModelId,effectiveEffort,stagedModel])
+  const codexCatalogStatus = sessionType !== 'freshcodex' ? undefined
+    : !codexContext ? (paneContent.status === 'create-failed' ? 'Model catalog unavailable: the Codex runtime was not created.' : 'Waiting for the Codex runtime…')
+      : probing ? 'Loading model catalog…'
+        : probe?.ok === false ? 'Model catalog unavailable. Exact settings are preserved.'
+          : probe?.ok && !probe.models.some((row) => row.id === effectiveModelId) ? 'Current selection is unavailable in this catalog. Exact settings are preserved.' : undefined
   // Catalog-unavailable stays opencode-only: claude panes degrade to their
   // static rows (the same fallback the settings popover uses) instead of
   // closing with the unavailable notice.
@@ -189,8 +228,10 @@ export function FreshAgentModelDialog({
       const index = rows.findIndex((row) => row.kind === 'level' && row.id === lastUsed)
       if (index >= 0) return index
     }
-    return rows.length - 1
-  }, [effectiveEffort, effectiveModelId, lastUsedLevelFor])
+    const defaultEffort = capabilities?.models.find((model) => model.id === modelId)?.defaultEffort
+    const defaultIndex = rows.findIndex((row) => row.kind === 'level' && row.id === defaultEffort)
+    return defaultIndex >= 0 ? defaultIndex : rows.length - 1
+  }, [effectiveEffort, effectiveModelId, lastUsedLevelFor, capabilities])
 
   // Reset only when opening or changing panes, never when an asynchronous
   // catalog arrives while the user is typing or choosing a level.
@@ -199,6 +240,8 @@ export function FreshAgentModelDialog({
     setActiveColumn('models')
     setHighlightedRowKey(undefined)
     setHighlightedLevelIndex(0)
+    setStagedModel(undefined)
+    setExactModelInput('')
   }, [open, paneId, cwdKey, sessionType])
 
   useEffect(() => {
@@ -213,7 +256,7 @@ export function FreshAgentModelDialog({
       if (current && (paneContent.provider !== 'claude' || existing.length > 0)) {
         recordFreshAgentModelUse(mruProvider, current, cwdKey)
       }
-      if (paneContent.provider !== 'claude' || probe?.ok) {
+      if (paneContent.provider === 'opencode' || (paneContent.provider === 'claude' && probe?.ok)) {
         pruneFreshAgentModelMru(mruProvider, capabilities, cwdKey)
       }
       recent = buildFreshAgentVisibleMru(mruProvider, {
@@ -292,9 +335,10 @@ export function FreshAgentModelDialog({
 
   // The highlighted model row: the user's staged selection while it stays
   // visible, else the pane's effective current model, else the first row.
-  const highlightedRow = flatModelRows.find((row) => row.key === highlightedRowKey && highlightedRowKey !== undefined)
+  const highlightedRow = useMemo(() => flatModelRows.find((row) => row.key === highlightedRowKey && highlightedRowKey !== undefined)
     ?? flatModelRows.find((row) => row.model.id === effectiveModelId)
-    ?? flatModelRows[0]
+    ?? (sessionType === 'freshcodex' && stagedModel ? {key:`catalog:${stagedModel.id}`,model:stagedModel} : undefined)
+    ?? flatModelRows[0], [flatModelRows, highlightedRowKey, effectiveModelId, sessionType, stagedModel])
   const highlightedModel = highlightedRow?.model
   const levelRows: LevelRow[] = highlightedModel ? levelRowsForModel(highlightedModel) : []
   // The level highlight is user-set only when the highlighted model row is
@@ -317,10 +361,11 @@ export function FreshAgentModelDialog({
     : undefined
 
   const selectModelRow = useCallback((row: ModelRow) => {
+    if (sessionType === 'freshcodex') setStagedModel(row.model)
     setHighlightedRowKey(row.key)
     setHighlightedLevelIndex(preselectLevelIndex(levelRowsForModel(row.model), row.model.id))
     setActiveColumn('models')
-  }, [preselectLevelIndex])
+  }, [preselectLevelIndex,sessionType])
 
   const moveModelHighlight = useCallback((delta: 1 | -1) => {
     if (flatModelRows.length === 0 || !highlightedRow) return
@@ -494,6 +539,22 @@ export function FreshAgentModelDialog({
             onKeyDown={handleSearchKeyDown}
           />
         </div>
+        {codexCatalogStatus ? <p role="status" className="px-3 py-2 text-xs text-muted-foreground">{codexCatalogStatus}</p> : null}
+        {sessionType === 'freshcodex' ? <div className="grid grid-cols-2 gap-2 px-3 pb-2 text-xs">
+          <label>Exact model ID<input aria-label="Exact model ID" value={exactModelInput} className="w-full rounded border bg-background px-2 py-1" onChange={(event) => {
+            const id = event.target.value.trim()
+            setExactModelInput(event.target.value)
+            if (!id) return
+            const row: FreshAgentModelCapability = {id,displayName:id,provider:'codex',supportsEffort:Boolean(effectiveEffort),supportedEffortLevels:effectiveEffort ? [effectiveEffort] : [],supportsAdaptiveThinking:false,source:{id:'exact-selection',displayName:'Exact selection'}}
+            setStagedModel(row); setHighlightedRowKey(`catalog:${id}`); setHighlightedLevelIndex(0)
+          }} /></label>
+          <label>Reasoning effort<input aria-label="Reasoning effort" value={highlightedLevelRow?.kind === 'level' ? highlightedLevelRow.id : ''} className="w-full rounded border bg-background px-2 py-1" onChange={(event) => {
+            if (!highlightedModel) return
+            const effort = event.target.value.trim()
+            setStagedModel({...highlightedModel,supportsEffort:Boolean(effort),supportedEffortLevels:effort ? [effort] : []})
+            setHighlightedRowKey(`catalog:${highlightedModel.id}`); setHighlightedLevelIndex(0)
+          }} /></label>
+        </div> : null}
         {!capabilities ? (
           <p role="status" className="px-3 py-2 text-xs text-muted-foreground">
             Loading model catalog…
@@ -541,6 +602,7 @@ export function FreshAgentModelDialog({
                       : undefined
                 const isHighlighted = row === highlightedLevelRow
                 const stageLevel = () => {
+                  if (sessionType === 'freshcodex' && highlightedModel) setStagedModel(highlightedModel)
                   if (highlightedRow && !highlightedIsUserStaged) setHighlightedRowKey(highlightedRow.key)
                   setHighlightedLevelIndex(index)
                   setActiveColumn('levels')

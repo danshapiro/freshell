@@ -1579,6 +1579,9 @@ async fn main() -> ExitCode {
     fresh_opencode_state.set_terminal_liveness(terminal_liveness);
     let fresh_claude_state = fresh_claude_state;
     let fresh_codex_state = fresh_codex_state;
+    fresh_agent_state
+        .set_codex_catalog_state(fresh_codex_state.clone())
+        .expect("one shared registered Codex state");
     let fresh_opencode_state = fresh_opencode_state;
 
     // kata b8ke Task 3: the bounded Starting-state timeout watchdog (5s

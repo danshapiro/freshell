@@ -2667,6 +2667,16 @@ pub struct FreshAgentReadSnapshotRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct FreshAgentModelCatalogRequest {
+    pub soul_id: SoulId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FreshAgentReadChildRequest {
     pub soul_id: SoulId,
     pub child_thread_id: String,
@@ -2970,6 +2980,7 @@ pub enum AdminCommand {
     FreshAgentReadEvents(FreshAgentReadEventsRequest),
     FreshAgentReadHistory(FreshAgentReadHistoryRequest),
     FreshAgentReadSnapshot(FreshAgentReadSnapshotRequest),
+    FreshAgentModelCatalog(FreshAgentModelCatalogRequest),
     FreshAgentReadChild(FreshAgentReadChildRequest),
     RuntimeMetrics(RuntimeMetricsRequest),
     ProbeRecovery(RecoveryProbeRequest),
@@ -3485,6 +3496,7 @@ pub enum AdminResult {
     FreshAgentEvents(AgentEventBatch),
     FreshAgentHistory(serde_json::Value),
     FreshAgentSnapshot(serde_json::Value),
+    FreshAgentModelCatalog(serde_json::Value),
     FreshAgentChildSnapshot(serde_json::Value),
     RuntimeMetrics(RuntimeMetrics),
     RecoveryProbe(RecoveryProbe),
@@ -3604,6 +3616,10 @@ pub enum HostCommand {
     FreshAgentReadSnapshot {
         incarnation_id: IncarnationId,
     },
+    FreshAgentModelCatalog {
+        incarnation_id: IncarnationId,
+        cwd: Option<String>,
+    },
     FreshAgentReadChild {
         incarnation_id: IncarnationId,
         child_thread_id: String,
@@ -3672,6 +3688,7 @@ pub enum HostResult {
     FreshAgentEvents(AgentEventBatch),
     RuntimeMetrics(RuntimeMetrics),
     FreshAgentSnapshot(serde_json::Value),
+    FreshAgentModelCatalog(serde_json::Value),
     FreshAgentChildSnapshot(serde_json::Value),
     Status {
         host_boot_id: HostBootId,

@@ -4,6 +4,64 @@ use super::*;
 
 #[async_trait::async_trait]
 impl FreshAgentRestLane for HostedFreshAgentProxy {
+    async fn model_catalog_source(
+        &self,
+        context: freshell_freshagent::model_capabilities::CodexCatalogContext,
+    ) -> Result<
+        freshell_freshagent::model_capabilities::CodexCatalogSource,
+        freshell_freshagent::model_capabilities::CapabilityError,
+    > {
+        use freshell_freshagent::model_capabilities::{
+            runtime_pending, source_changed, CodexCatalogSource,
+        };
+        let requested = context.native_reference()?;
+        let ownership = self.ownership.get().cloned();
+        let owner = ownership.as_ref().map(|registry| {
+            let id = registry.resolve_canonical("codex", requested);
+            registry.observe("codex", &id)
+        });
+        if owner.as_ref().is_some_and(|owner| {
+            context.observed_epoch.is_some_and(|v| v != owner.epoch)
+                || context
+                    .observed_generation
+                    .is_some_and(|v| v != owner.generation)
+        }) {
+            return Err(source_changed());
+        }
+        let inventory = self
+            .client
+            .inventory()
+            .await
+            .map_err(|_| runtime_pending())?;
+        let view = inventory
+            .iter()
+            .rev()
+            .find(|view| {
+                view.provider.as_deref() == Some("codex")
+                    && view.fresh_agent_session_type.as_deref() == Some("freshcodex")
+                    && (view.fresh_agent_session_id.as_deref() == Some(requested)
+                        || view.native_session_id.as_deref() == Some(requested))
+            })
+            .ok_or_else(runtime_pending)?;
+        if view.native_session_id.is_none()
+            || view.launch_state != freshell_runtime_protocol::LaunchState::Running
+            || view.recovery_state != freshell_runtime_protocol::RecoveryState::Live
+            || view.desired_state != DesiredState::Running
+        {
+            return Err(runtime_pending());
+        }
+        let key = catalog_source_key(view, owner.as_ref());
+        Ok(CodexCatalogSource {
+            key,
+            probe: Arc::new(HostedCodexCatalogProbe {
+                client: self.client.clone(),
+                view: view.clone(),
+                context,
+                ownership,
+                owner,
+            }),
+        })
+    }
     async fn read_child(
         &self,
         request: freshell_freshagent::rest_lane::RestLaneChildRead,
@@ -354,6 +412,82 @@ impl FreshAgentRestLane for HostedFreshAgentProxy {
             native_session_id: capture.native_session_id,
             text: capture.text,
             truncated: capture.truncated,
+        })
+    }
+}
+
+fn catalog_source_key(
+    view: &freshell_runtime_protocol::RuntimeView,
+    owner: Option<&freshell_ownership::OwnershipSnapshot>,
+) -> String {
+    serde_json::json!([
+        "codex",
+        view.soul_id,
+        view.incarnation_id,
+        view.host_boot_id,
+        view.execution_generation,
+        view.intent_revision,
+        view.native_session_id,
+        view.fresh_agent_session_id,
+        view.fresh_agent_session_type,
+        view.recovery_state,
+        view.desired_state,
+        owner.map(|o| (o.epoch, o.generation, format!("{:?}", o.state)))
+    ])
+    .to_string()
+}
+
+struct HostedCodexCatalogProbe {
+    client: RuntimeClient,
+    view: freshell_runtime_protocol::RuntimeView,
+    context: freshell_freshagent::model_capabilities::CodexCatalogContext,
+    ownership: Option<Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
+    owner: Option<freshell_ownership::OwnershipSnapshot>,
+}
+
+impl freshell_freshagent::model_capabilities::ModelCatalogProbe for HostedCodexCatalogProbe {
+    fn probe<'a>(
+        &'a self,
+        cwd: Option<&'a str>,
+    ) -> freshell_opencode::serve::BoxFuture<'a, freshell_freshagent::model_capabilities::CatalogOut>
+    {
+        Box::pin(async move {
+            use freshell_freshagent::model_capabilities::{
+                codex_capabilities, source_changed, CapabilityError,
+            };
+            let value = self.client.fresh_agent_model_catalog(self.view.soul_id.clone(),cwd.map(str::to_string)).await.map_err(|error| {
+                tracing::warn!(provider="codex",session_id=?self.view.native_session_id,soul_id=%self.view.soul_id,code=?error.runtime_code(),"fresh_agent.hosted_catalog_unavailable");
+                CapabilityError {code:"CAPABILITY_PROBE_FAILED".into(),message:"The conversation's Codex model catalog is unavailable".into(),retryable:true}
+            })?;
+            let inventory = self
+                .client
+                .inventory()
+                .await
+                .map_err(|_| source_changed())?;
+            let current = inventory
+                .iter()
+                .rev()
+                .find(|row| row.soul_id == self.view.soul_id)
+                .ok_or_else(source_changed)?;
+            let owner = self.ownership.as_ref().map(|registry| {
+                let id = registry.resolve_canonical(
+                    "codex",
+                    self.context.native_reference().expect("validated context"),
+                );
+                registry.observe("codex", &id)
+            });
+            if !same_snapshot_source(&self.view, current)
+                || catalog_source_key(current, owner.as_ref())
+                    != catalog_source_key(&self.view, self.owner.as_ref())
+            {
+                return Err(source_changed());
+            }
+            let rows = serde_json::from_value(value).map_err(|_| CapabilityError {
+                code: "CAPABILITY_PAYLOAD_INVALID".into(),
+                message: "Codex host returned an invalid model catalog".into(),
+                retryable: true,
+            })?;
+            Ok(codex_capabilities(rows))
         })
     }
 }

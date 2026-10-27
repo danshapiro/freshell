@@ -31,7 +31,7 @@ describe('fresh-agent registry', () => {
 })
 
 describe('resolveFreshAgentPaneCreateEffort', () => {
-  it('keeps claude/codex falling back to the registry default effort', () => {
+  it('keeps the Claude fallback and leaves omitted Codex effort to its native default', () => {
     expect(resolveFreshAgentPaneCreateEffort({
       sessionType: 'freshclaude',
       provider: 'claude',
@@ -45,7 +45,7 @@ describe('resolveFreshAgentPaneCreateEffort', () => {
       model: 'gpt-5.5',
       providerEffort: undefined,
       fallbackEffort: 'max',
-    })).toBe('max')
+    })).toBeUndefined()
   })
 
   it('passes an explicit freshopencode provider default through for live-catalog models', () => {
@@ -165,7 +165,7 @@ describe('resolveFreshAgentPaneModelDefaults', () => {
     ['kilroy: registry default when nothing is saved', 'kilroy', undefined, undefined, 'opus[1m]', true],
     ['codex: saved default wins', 'freshcodex', saved('gpt-5.6-luna'), 'gpt-5.6-terra', 'gpt-5.6-luna', true],
     ['codex: runtime CLI model when nothing is saved', 'freshcodex', undefined, 'gpt-5.6-terra', 'gpt-5.6-terra', true],
-    ['codex: unknown saved model normalizes to the codex default', 'freshcodex', saved('gpt-unknown'), undefined, 'gpt-6-astra', true],
+    ['codex: unknown saved model preserves exact intent for native validation', 'freshcodex', saved('gpt-unknown'), undefined, 'gpt-unknown', true],
     ['codex: registry default when nothing is configured', 'freshcodex', undefined, undefined, 'gpt-6-astra', true],
     ['opencode: saved default persists', 'freshopencode', saved('umans/kimi'), undefined, 'umans/kimi', true],
     ['opencode: runtime CLI model persists', 'freshopencode', undefined, 'umans/kimi', 'umans/kimi', true],

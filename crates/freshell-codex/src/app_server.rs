@@ -250,6 +250,18 @@ impl Drop for CodexAppServerClient {
 }
 
 impl CodexAppServerClient {
+    pub async fn is_initialized(&self) -> bool {
+        self.init.lock().await.is_some()
+    }
+
+    /// Read visible model metadata from this connection's own provider context.
+    pub async fn list_models(&self, cursor: Option<&str>) -> Result<Value, CodexAppServerError> {
+        let mut params = json!({"includeHidden":false,"limit":100});
+        if let Some(cursor) = cursor {
+            params["cursor"] = json!(cursor);
+        }
+        self.request("model/list", params).await
+    }
     /// Wire a client to a transport with the default request timeout and the
     /// [`SNAPSHOT_READ_TIMEOUT_MS`] read budget. Returns the client plus the
     /// [`CodexNotification`] stream the background consumer feeds (the adapter's

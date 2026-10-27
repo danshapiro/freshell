@@ -308,6 +308,9 @@ pub trait FreshAgentTransport: Send + Sync {
     async fn snapshot(&self) -> Result<Value, String> {
         Err("provider does not expose a hosted snapshot".into())
     }
+    async fn model_catalog(&self, _cwd: Option<&str>) -> Result<Value, String> {
+        Err("provider does not expose a model catalog".into())
+    }
 
     async fn read_child(&self, _child_thread_id: &str) -> Result<Value, String> {
         Err("provider does not expose child observation".into())
@@ -1135,6 +1138,40 @@ impl FreshAgentHostActor {
             ));
         }
         Ok(snapshot)
+    }
+
+    pub async fn model_catalog(&self, cwd: Option<&str>) -> Result<Value, ActorError> {
+        let before = self.profile().await;
+        if before.provider != FreshProvider::Codex
+            || before.native_session_id.is_none()
+            || !self.transport.is_live().await
+        {
+            return Err(ActorError::NativeIdentityMismatch);
+        }
+        let value = self
+            .transport
+            .model_catalog(cwd)
+            .await
+            .map_err(ActorError::Transport)?;
+        let after = self.profile().await;
+        if before.native_session_id != after.native_session_id
+            || before.provider_store_id != after.provider_store_id
+            || before.provider != after.provider
+            || before.cwd != after.cwd
+            || !self.transport.is_live().await
+        {
+            return Err(ActorError::NativeIdentityMismatch);
+        }
+        if serde_json::to_vec(&value)
+            .map_err(|e| ActorError::Transport(e.to_string()))?
+            .len()
+            > freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES - 4096
+        {
+            return Err(ActorError::Transport(
+                "model catalog exceeds control reply frame limit".into(),
+            ));
+        }
+        Ok(value)
     }
 
     pub async fn read_child(&self, child_thread_id: &str) -> Result<Value, ActorError> {

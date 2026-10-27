@@ -49,7 +49,7 @@ impl RuntimeBackend for NoBackend {
     }
 }
 
-struct RunningFreshClaude {
+struct RunningFreshAgent {
     _root: tempfile::TempDir,
     supervisor: Supervisor,
     soul: SoulId,
@@ -57,7 +57,10 @@ struct RunningFreshClaude {
     runtime_dir: std::path::PathBuf,
 }
 
-async fn running_fresh_claude() -> RunningFreshClaude {
+async fn running_fresh_claude() -> RunningFreshAgent {
+    running_fresh_provider(FreshProvider::Claude).await
+}
+async fn running_fresh_provider(provider: FreshProvider) -> RunningFreshAgent {
     let root = tempfile::tempdir().unwrap();
     let workspace = std::fs::canonicalize(root.path()).unwrap();
     let registry = Registry::open(root.path().join("registry"), None).unwrap();
@@ -65,7 +68,7 @@ async fn running_fresh_claude() -> RunningFreshClaude {
     let prepared = registry
         .prepare_launch(LaunchPreparation {
             soul_id: soul.clone(),
-            provider: "claude".into(),
+            provider: provider.as_str().into(),
             provider_store_id: "fresh-store".into(),
             native_session_id: None,
             creation_seed_ref: "configure-seed".into(),
@@ -78,9 +81,19 @@ async fn running_fresh_claude() -> RunningFreshClaude {
             terminal: None,
             fresh_agent: Some(FreshAgentLaunchSpec {
                 session_id: "fresh-session".into(),
-                provider: FreshProvider::Claude,
-                session_type: "freshclaude".into(),
-                runtime_variant: "claude-agent-sdk".into(),
+                provider: provider.clone(),
+                session_type: if provider == FreshProvider::Codex {
+                    "freshcodex"
+                } else {
+                    "freshclaude"
+                }
+                .into(),
+                runtime_variant: if provider == FreshProvider::Codex {
+                    "codex-app-server"
+                } else {
+                    "claude-agent-sdk"
+                }
+                .into(),
                 provider_store_id: "fresh-store".into(),
                 cwd: workspace.to_string_lossy().into_owned(),
                 workspace_path: workspace.to_string_lossy().into_owned(),
@@ -149,7 +162,7 @@ async fn running_fresh_claude() -> RunningFreshClaude {
         },
     )
     .unwrap();
-    RunningFreshClaude {
+    RunningFreshAgent {
         _root: root,
         supervisor,
         soul,
@@ -162,6 +175,12 @@ async fn running_fresh_claude() -> RunningFreshClaude {
 fn fake_host(
     runtime_dir: &std::path::Path,
 ) -> (Arc<StdMutex<Vec<HostCommand>>>, tokio::task::JoinHandle<()>) {
+    fake_host_with_boot_change(runtime_dir, false)
+}
+fn fake_host_with_boot_change(
+    runtime_dir: &std::path::Path,
+    change_boot: bool,
+) -> (Arc<StdMutex<Vec<HostCommand>>>, tokio::task::JoinHandle<()>) {
     let secret = b"synthetic-host-secret";
     std::fs::write(runtime_dir.join("secret"), secret).unwrap();
     let listener = UnixListener::bind(runtime_dir.join("host.sock")).unwrap();
@@ -169,6 +188,7 @@ fn fake_host(
     let received = Arc::new(StdMutex::new(Vec::new()));
     let log = Arc::clone(&received);
     let task = tokio::spawn(async move {
+        let mut hello_count = 0;
         loop {
             let Ok((mut socket, _)) = listener.accept().await else {
                 return;
@@ -179,12 +199,26 @@ fn fake_host(
                 HostCommand::Hello {
                     incarnation_id,
                     challenge,
-                } => HostResult::Hello {
-                    host_boot_id: boot.clone(),
-                    proof: host_proof(secret, &challenge, &boot, &incarnation_id),
-                    capabilities: vec![],
-                    effective_limits: crate::checkpoints::tests::limits(),
-                },
+                } => {
+                    hello_count += 1;
+                    let current = if change_boot && hello_count > 1 {
+                        HostBootId::new()
+                    } else {
+                        boot.clone()
+                    };
+                    HostResult::Hello {
+                        host_boot_id: current.clone(),
+                        proof: host_proof(secret, &challenge, &current, &incarnation_id),
+                        capabilities: vec![],
+                        effective_limits: crate::checkpoints::tests::limits(),
+                    }
+                }
+                HostCommand::FreshAgentModelCatalog { cwd, .. } => {
+                    assert_eq!(cwd.as_deref(), Some("/bound/project"));
+                    HostResult::FreshAgentModelCatalog(
+                        serde_json::json!([{"id":"provider-current","displayName":"Provider Current","supportedEffortLevels":["ultra"],"defaultEffort":"ultra"}]),
+                    )
+                }
                 HostCommand::FreshAgentConfigure { .. } => HostResult::FreshAgentCommand {
                     state: CommandState::ProviderAcked,
                     native_session_id: Some("native-claude".into()),
@@ -436,4 +470,93 @@ fn host_configure_gets_the_fresh_agent_command_budget() {
     assert!(!uses_fresh_agent_command_budget(&HostCommand::Status {
         incarnation_id: IncarnationId::new(),
     }));
+}
+
+#[tokio::test]
+async fn admin_model_catalog_uses_authenticated_current_host_and_preserves_recovery_settings() {
+    for scenario in ["live", "stale-epoch", "replaced-boot", "wrong-provider"] {
+        let fixture = running_fresh_provider(if scenario == "wrong-provider" {
+            FreshProvider::Claude
+        } else {
+            FreshProvider::Codex
+        })
+        .await;
+        let (received, host) =
+            fake_host_with_boot_change(&fixture.runtime_dir, scenario == "replaced-boot");
+        let before = fixture
+            .supervisor
+            .registry
+            .recovery_context(fixture.soul.clone())
+            .await
+            .unwrap()
+            .fresh_agent;
+        let epoch = fixture.supervisor.registry.control_epoch();
+        let mut request = Envelope::new(
+            RequestId::new(),
+            ControlRole::Web,
+            AdminCommand::FreshAgentModelCatalog(FreshAgentModelCatalogRequest {
+                soul_id: fixture.soul.clone(),
+                cwd: Some("/bound/project".into()),
+                expected_control_epoch: Some(if scenario == "stale-epoch" {
+                    epoch + 1
+                } else {
+                    epoch
+                }),
+            }),
+        );
+        request.auth = Some(SECRET.into());
+        let reply = fixture.supervisor.dispatch(request).await;
+        host.abort();
+        let _ = host.await;
+        match scenario {
+            "live" => assert!(
+                matches!(reply.result.unwrap(),AdminResult::FreshAgentModelCatalog(value) if value[0]["id"]=="provider-current" && value[0]["defaultEffort"]=="ultra")
+            ),
+            "stale-epoch" => assert_eq!(
+                reply.result.unwrap_err().code,
+                RuntimeErrorCode::StaleControlEpoch
+            ),
+            "wrong-provider" => assert_eq!(
+                reply.result.unwrap_err().code,
+                RuntimeErrorCode::UnsupportedOperation
+            ),
+            _ => assert_eq!(
+                reply.result.unwrap_err().code,
+                RuntimeErrorCode::OwnershipMismatch
+            ),
+        }
+        let commands = received.lock().unwrap();
+        if scenario == "stale-epoch" || scenario == "wrong-provider" {
+            assert!(commands.is_empty());
+        } else {
+            assert_eq!(
+                commands
+                    .iter()
+                    .filter(|c| matches!(c, HostCommand::FreshAgentModelCatalog { .. }))
+                    .count(),
+                1
+            );
+            assert!(commands.iter().all(|c| matches!(
+                c,
+                HostCommand::Hello { .. } | HostCommand::FreshAgentModelCatalog { .. }
+            )));
+            for command in commands.iter() {
+                if let HostCommand::FreshAgentModelCatalog { incarnation_id, .. } = command {
+                    assert_eq!(incarnation_id, &fixture.incarnation);
+                }
+            }
+        }
+        drop(commands);
+        let after = fixture
+            .supervisor
+            .registry
+            .recovery_context(fixture.soul.clone())
+            .await
+            .unwrap()
+            .fresh_agent;
+        assert_eq!(
+            before, after,
+            "catalog reads must never reconfigure recovery"
+        );
+    }
 }

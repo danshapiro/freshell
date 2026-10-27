@@ -5,6 +5,18 @@ import { buildFreshAgentPaneContent } from '@/lib/fresh-agent-create-content'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 
 describe('fresh-agent create defaults shared with REST', () => {
+  it('leaves an omitted Codex effort to the installed model instead of fabricating max for a custom model', () => {
+    const defaults = createDefaultServerSettings()
+    const content = buildFreshAgentPaneContent({
+      entry: resolveFreshAgentType('freshcodex')!, createRequestId: 'native-default',
+      codingCliSettings: defaults.codingCli,
+      freshAgentSettings: {...defaults.freshAgent,providers:{...defaults.freshAgent.providers,
+        freshcodex:{modelSelection:{kind:'exact',modelId:'provider-current'}},
+      }},
+    })
+    expect(content.model).toBe('provider-current')
+    expect(content.effort).toBeUndefined()
+  })
   it('creates Codex with the exact saved custom model and native effort', () => {
     const defaults = createDefaultServerSettings()
     const content = buildFreshAgentPaneContent({

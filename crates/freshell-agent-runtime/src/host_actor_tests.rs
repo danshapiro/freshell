@@ -138,6 +138,56 @@ impl FreshAgentTransport for SnapshotTransport {
     async fn read_child(&self, _: &str) -> Result<Value, String> {
         self.snapshot().await
     }
+    async fn model_catalog(&self, _: Option<&str>) -> Result<Value, String> {
+        self.snapshot().await
+    }
+}
+
+#[tokio::test]
+async fn model_catalog_preserves_actor_state_and_fences_liveness_size_and_replaced_native_source() {
+    for scenario in ["live", "exited", "oversized", "replaced"] {
+        let dir = tempfile::tempdir().unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let transport = Arc::new(SnapshotTransport {
+            value: serde_json::json!([{"id":"provider-current","displayName":if scenario=="oversized" {"x".repeat(freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES)} else {"Provider Current".into()}}]),
+            live: std::sync::atomic::AtomicBool::new(true),
+            exit_during_read: scenario == "exited",
+            initial_native: Some("catalog-native".into()),
+            registered: None,
+            pause: if scenario == "replaced" {
+                Some((entered.clone(), release.clone()))
+            } else {
+                None
+            },
+        });
+        let actor = FreshAgentHostActor::open(
+            dir.path(),
+            profile(FreshProvider::Codex, "catalog-store", None),
+            transport,
+        )
+        .await
+        .unwrap();
+        let before = fs::read(dir.path().join("fresh-agent-state.json")).unwrap();
+        let read = tokio::spawn({
+            let actor = actor.clone();
+            async move { actor.model_catalog(Some("/workspace")).await }
+        });
+        if scenario == "replaced" {
+            entered.notified().await;
+            // Fixture-only replacement while the read is held; this does not
+            // grant native identity mutation or claim crash recovery coverage.
+            actor.state.lock().await.profile.native_session_id = Some("replacement-native".into());
+            release.notify_one();
+        }
+        let result = read.await.unwrap();
+        assert_eq!(result.is_ok(), scenario == "live", "{scenario}: {result:?}");
+        assert_eq!(
+            fs::read(dir.path().join("fresh-agent-state.json")).unwrap(),
+            before,
+            "a catalog is not a durable command or writer transition"
+        );
+    }
 }
 
 #[tokio::test]

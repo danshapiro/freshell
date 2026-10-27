@@ -78,7 +78,7 @@ test('Codex picker waits for ordinary create and shows honest failure with exact
   await expect(dialog.getByRole('option', { name: 'Provider Current' })).toBeVisible()
   await expect(dialog.getByRole('searchbox')).toHaveValue('provider')
   expect(probes).toBe(1)
-  await setStatus('error')
+  await setStatus('create-failed')
   await expect(dialog.getByRole('status')).toContainText(/catalog unavailable/i)
   await dialog.getByRole('searchbox').fill('')
   await expect(dialog.getByRole('button', { name: /Use saved-custom.*xhigh/ })).toBeEnabled()
@@ -147,12 +147,16 @@ test('Claude model search survives catalog loading and remembers a selected thin
 
 test('Codex cancels a staged model change and preserves its current thinking level', async ({ freshellPage, page, terminal }) => {
   await terminal.waitForTerminal()
+  await page.route('**/api/fresh-agent/model-capabilities/freshcodex**',route=>route.fulfill({json:{...codexCatalog,models:[
+    {id:FRESHCODEX_DEFAULT_MODEL,displayName:'GPT-6 Astra',provider:'codex',supportsEffort:true,supportedEffortLevels:['low','high','xhigh'],defaultEffort:'high',supportsAdaptiveThinking:false},
+    ...codexCatalog.models,
+  ]}}))
   await installPane(page, 'codex')
   const chip = page.getByRole('button', { name: /^Model:.*change model$/ })
   await chip.click()
   const dialog = page.getByRole('dialog', { name: 'Model and thinking level' })
   await expect(dialog.getByRole('button', { name: 'Use GPT-6 Astra · low' })).toBeVisible()
-  await dialog.getByRole('option', { name: /GPT-5.6 Sol/ }).click()
+  await dialog.getByRole('option', { name: 'Provider Current', exact:true }).click()
   await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
   await chip.click()
   await dialog.getByRole('button', { name: 'Use GPT-6 Astra · low' }).click()

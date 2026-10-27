@@ -2243,12 +2243,13 @@ pub struct FreshAgentState {
     pub(crate) terminal_created_hook: Option<TerminalCreatedHook>,
     /// The `GET`/`POST /api/fresh-agent/model-capabilities/*` registry
     /// ([`model_capabilities`]): cwd-keyed TTL cache + single-flight coalescing
-    /// over the transient opencode catalog probe, plus the static codex/claude
-    /// catalogs. Constructed with the REAL transport probe in
+    /// over the transient OpenCode / Claude SDK catalog probes and bound
+    /// Codex runtime sources. Constructed with the REAL transport probe in
     /// [`Self::new`] (there is no wiring ceremony — unlike the Option-until-
     /// wired fields above, production construction is unconditional); tests
     /// install a scripted probe via [`Self::with_model_capability_probe`].
     pub(crate) model_capabilities: Arc<model_capabilities::ModelCapabilityRegistry>,
+    pub(crate) codex_catalog: Arc<std::sync::OnceLock<FreshCodexState>>,
     /// Task-3 child-session join (freshopencode TUI parity): child session id
     /// → the parent session id whose live watcher exists (Stage-2 ledger
     /// LB-2/LB-8). A watcher self-removes its entry on exit, so every parent
@@ -2452,6 +2453,7 @@ impl FreshAgentState {
             sidecar_liveness: None,
             layout: layout_store::LayoutStore::default(),
             terminal_created_hook: None,
+            codex_catalog: Arc::new(std::sync::OnceLock::new()),
             model_capabilities: Arc::new(model_capabilities::ModelCapabilityRegistry::new(
                 Arc::new(model_capabilities::OpencodeCatalogProbe::default()),
             )),
@@ -2606,6 +2608,12 @@ impl FreshAgentState {
         &self,
     ) -> std::sync::Arc<model_capabilities::ModelCapabilityRegistry> {
         self.model_capabilities.clone()
+    }
+
+    pub fn set_codex_catalog_state(&self, state: FreshCodexState) -> Result<(), &'static str> {
+        self.codex_catalog
+            .set(state)
+            .map_err(|_| "Codex catalog state already installed")
     }
 
     /// Wire the P1.13 identity-event sink (set-once; later calls are no-ops).

@@ -1976,6 +1976,93 @@ impl FreshCodexState {
         )
     }
 
+    async fn catalog_binding(
+        &self,
+        context: &crate::model_capabilities::CodexCatalogContext,
+    ) -> Result<(String, Arc<CodexAppServerClient>), crate::model_capabilities::CapabilityError>
+    {
+        use crate::model_capabilities::{runtime_pending, source_changed};
+        let requested = context.native_reference()?;
+        let id = self
+            .ownership
+            .as_ref()
+            .map(|registry| registry.resolve_canonical(PROVIDER, requested))
+            .unwrap_or_else(|| requested.to_string());
+        let owner = self.ownership_snapshot(PROVIDER, &id);
+        if self.ownership.is_some()
+            && !matches!(&owner.state, freshell_ownership::OwnershipState::Live {owner,..} if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent)
+        {
+            return Err(runtime_pending());
+        }
+        if context.observed_epoch.is_some_and(|v| v != owner.epoch)
+            || context
+                .observed_generation
+                .is_some_and(|v| v != owner.generation)
+        {
+            return Err(source_changed());
+        }
+        let (key, client, exited) = {
+            let sessions = self.sessions.lock().await;
+            let session = sessions.get(&id).ok_or_else(runtime_pending)?;
+            (
+                json!([
+                    "codex",
+                    id,
+                    session.sidecar_ownership_id,
+                    format!("{:p}", Arc::as_ptr(&session.client)),
+                    format!("{:p}", Arc::as_ptr(&session.projection)),
+                    session.cwd,
+                    owner.epoch,
+                    owner.generation,
+                    format!("{:?}", owner.state)
+                ])
+                .to_string(),
+                session.client.clone(),
+                session.exited.load(Ordering::SeqCst),
+            )
+        };
+        if exited || !client.is_initialized().await {
+            return Err(runtime_pending());
+        }
+        Ok((key, client))
+    }
+
+    /// Registered-client discovery only: never spawn, resume, read saved history,
+    /// or search attention aliases to manufacture a catalog authority.
+    pub async fn model_catalog_source(
+        &self,
+        context: crate::model_capabilities::CodexCatalogContext,
+    ) -> Result<
+        crate::model_capabilities::CodexCatalogSource,
+        crate::model_capabilities::CapabilityError,
+    > {
+        let (key, _) = self.catalog_binding(&context).await?;
+        Ok(crate::model_capabilities::CodexCatalogSource {
+            key: key.clone(),
+            probe: Arc::new(LocalCodexCatalogProbe {
+                state: self.clone(),
+                context,
+                expected_source: key,
+            }),
+        })
+    }
+
+    pub async fn model_catalog(
+        &self,
+        context: crate::model_capabilities::CodexCatalogContext,
+    ) -> Result<Value, crate::model_capabilities::CapabilityError> {
+        use crate::model_capabilities::{codex_probe_error, source_changed};
+        let (key, client) = self.catalog_binding(&context).await?;
+        let models = freshell_codex::catalog::read_models(&client).await.map_err(|error| {
+            tracing::warn!(provider=PROVIDER,session_id=%context.session_id,cause=%error,"freshagent.codex.catalog_unavailable");
+            codex_probe_error(error)
+        })?;
+        if self.catalog_binding(&context).await?.0 != key {
+            return Err(source_changed());
+        }
+        Ok(serde_json::to_value(models).expect("native catalog rows serialize"))
+    }
+
     fn broadcast(&self, msg: &ServerMessage) {
         match msg {
             ServerMessage::FreshAgentCreated(created) => {
@@ -2132,7 +2219,16 @@ impl FreshCodexState {
             None => crate::identity_sink::FreshAgentSettings::default(),
         };
         let cwd = msg.cwd.clone().or(rec.cwd);
-        let raw_model = msg.model.clone().or(rec.model);
+        let raw_model = msg
+            .model
+            .clone()
+            .or_else(|| {
+                msg.model_selection
+                    .as_ref()
+                    .and_then(|s| s.as_ref())
+                    .map(|s| s.model_id.clone())
+            })
+            .or(rec.model);
         let model = normalize_freshcodex_model(raw_model.as_deref());
         let raw_effort = msg.effort.clone().or(rec.effort);
         let effort = normalize_freshcodex_effort(Some(&model), raw_effort.as_deref());
@@ -2143,8 +2239,8 @@ impl FreshCodexState {
             return;
         }
 
-        // Validate the effort maps to the codex wire vocabulary (adapter create calls
-        // toCodexReasoningEffort purely to reject unsupported efforts before spawning).
+        // Keep nonempty native values for native validation; discovery is not
+        // exhaustive for custom providers.
         if let Err(err) = to_codex_reasoning_effort(effort.as_deref()) {
             self.fail_create(&request_id, "FRESH_AGENT_CREATE_FAILED", &err.to_string());
             return;
@@ -3669,6 +3765,19 @@ impl FreshCodexState {
         // Re-normalize model/effort on send (adapter.ts:961-963) — idempotent for stored values.
         let model = normalize_freshcodex_model(Some(&model));
         let effort = normalize_freshcodex_effort(Some(&model), effort.as_deref());
+        let effort = if effort.as_deref() == Some("max") {
+            match freshell_codex::catalog::read_models(&client).await {
+                Ok(catalog) => Some(freshell_codex::catalog::resolve_legacy_effort(
+                    &model, "max", &catalog,
+                )),
+                Err(error) => {
+                    tracing::warn!(provider=PROVIDER, session_id=%session_id, request_id=?request_id, cause=%error, "freshagent.codex.effort_catalog_unavailable");
+                    effort
+                }
+            }
+        } else {
+            effort
+        };
         let wire_effort = match to_codex_reasoning_effort(effort.as_deref()) {
             Ok(value) => value,
             Err(err) => {
@@ -3682,7 +3791,7 @@ impl FreshCodexState {
             input: codex_user_input(&msg.text, msg.images.as_deref()),
             cwd: turn_cwd.clone(),
             model: Some(model.clone()),
-            // DEV-0003: none/minimal/low/medium/high forwarded VERBATIM; max/xhigh → xhigh.
+            // Preserve exact native intent, with only the advertised legacy alias above.
             effort: wire_effort,
             sandbox_policy: sandbox.as_deref().map(sandbox_policy_value),
             approval_policy: permission_mode.as_deref().map(|p| json!(p)),
@@ -4156,8 +4265,8 @@ impl FreshCodexState {
     /// re-snapshot the durable binding row, and broadcast
     /// `freshAgent.session.metadata` so every device's model surfaces converge
     /// immediately. Explicit choices win over the stored values, exactly like
-    /// `handle_send`'s settings merge; the effort is wire-validated up front
-    /// so the record never holds a value the next turn could not send.
+    /// `handle_send`'s settings merge. Nonempty effort strings stay exact for
+    /// native validation on the next turn.
     ///
     /// No busy refusal: recording mid-turn is safe — the in-flight turn keeps
     /// the parameters it already started with, and the next turn picks up the
@@ -12285,6 +12394,27 @@ fn now_iso() -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if month <= 2 { year + 1 } else { year };
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}.{millis:03}Z")
+}
+
+struct LocalCodexCatalogProbe {
+    state: FreshCodexState,
+    context: crate::model_capabilities::CodexCatalogContext,
+    expected_source: String,
+}
+impl crate::model_capabilities::ModelCatalogProbe for LocalCodexCatalogProbe {
+    fn probe<'a>(
+        &'a self,
+        _cwd: Option<&'a str>,
+    ) -> freshell_opencode::serve::BoxFuture<'a, crate::model_capabilities::CatalogOut> {
+        Box::pin(async move {
+            if self.state.catalog_binding(&self.context).await?.0 != self.expected_source {
+                return Err(crate::model_capabilities::source_changed());
+            }
+            let rows = self.state.model_catalog(self.context.clone()).await?;
+            let models = serde_json::from_value(rows).expect("typed native catalog rows");
+            Ok(crate::model_capabilities::codex_capabilities(models))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -29161,7 +29291,11 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn model_catalog_only_maps_legacy_max_when_selected_model_advertises_xhigh_without_max() {
         let _guard = ENV_LOCK.lock().await;
-        for (levels, expected) in [(vec!["xhigh"], "xhigh"), (vec!["xhigh", "max"], "max"), (vec!["ultra"], "max")] {
+        for (levels, expected) in [
+            (vec!["xhigh"], "xhigh"),
+            (vec!["xhigh", "max"], "max"),
+            (vec!["ultra"], "max"),
+        ] {
             let temp = tempfile::tempdir().unwrap();
             let log = temp.path().join("native-requests.jsonl");
             configure_fake_codex_cmd(&json!({"appendRequestLogPath": log,"modelCatalogPages":[{"data":[{
@@ -29174,17 +29308,123 @@ pub(crate) mod tests {
             create.model = Some("gpt-6-astra".into());
             create.effort = Some("max".into());
             st.handle_create(create, None).await;
-            let created = collect_frames_until(&mut rx, Duration::from_secs(10), |f| f["type"] == "freshAgent.created").await;
-            let id = created.frames.iter().find(|f| f["type"] == "freshAgent.created").unwrap()["sessionId"].as_str().unwrap();
+            let created = collect_frames_until(&mut rx, Duration::from_secs(10), |f| {
+                f["type"] == "freshAgent.created"
+            })
+            .await;
+            let id = created
+                .frames
+                .iter()
+                .find(|f| f["type"] == "freshAgent.created")
+                .unwrap()["sessionId"]
+                .as_str()
+                .unwrap();
             st.handle_send(send_msg(id, "legacy max selection")).await;
-            let _ = collect_frames_until(&mut rx, Duration::from_secs(5), |f| f["type"] == "freshAgent.send.accepted").await;
+            let _ = collect_frames_until(&mut rx, Duration::from_secs(5), |f| {
+                f["type"] == "freshAgent.send.accepted"
+            })
+            .await;
             st.shutdown().await;
-            let requests: Vec<Value> = std::fs::read_to_string(log).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect();
-            let turn = requests.iter().find(|r|r["method"]=="turn/start").unwrap();
-            assert_eq!(turn["params"]["effort"], expected, "installed levels: {levels:?}");
+            let requests: Vec<Value> = std::fs::read_to_string(log)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let turn = requests
+                .iter()
+                .find(|r| r["method"] == "turn/start")
+                .unwrap();
+            assert_eq!(
+                turn["params"]["effort"], expected,
+                "installed levels: {levels:?}"
+            );
         }
         std::env::remove_var("CODEX_CMD");
         std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_catalog_omission_preserves_exact_choice_and_native_refusal_is_typed_without_retry(
+    ) {
+        let _guard = ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("native-requests.jsonl");
+        configure_fake_codex_cmd(&json!({"appendRequestLogPath":log,"modelCatalogPages":[{"data":[],"nextCursor":null}],"overrides":{"turn/start":{"error":{"code":-32602,"message":"Native provider rejected provider-current effort ultra"}}}}).to_string());
+        let (st, mut rx) = state_with_bus();
+        let mut create = create_msg("native-model-refusal-create");
+        create.model = Some("provider-current".into());
+        create.effort = Some("ultra".into());
+        st.handle_create(create, None).await;
+        let created = collect_frames_until(&mut rx, Duration::from_secs(10), |frame| {
+            frame["type"] == "freshAgent.created"
+        })
+        .await;
+        let id = created
+            .frames
+            .iter()
+            .find(|frame| frame["type"] == "freshAgent.created")
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let catalog = st
+            .model_catalog(crate::model_capabilities::CodexCatalogContext {
+                session_id: id.clone(),
+                session_ref: None,
+                cwd: None,
+                observed_epoch: None,
+                observed_generation: None,
+            })
+            .await
+            .unwrap();
+        let mut send = send_msg(&id, "Native must validate the exact choice");
+        send.request_id = Some("native-model-refusal-send".into());
+        st.handle_send(send).await;
+        let failed = collect_frames_until(&mut rx, Duration::from_secs(5), |frame| {
+            frame["type"] == "error" && frame["requestId"] == "native-model-refusal-send"
+        })
+        .await;
+        st.shutdown().await;
+        std::env::remove_var("CODEX_CMD");
+        std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
+        assert_eq!(catalog, json!([]));
+        assert!(failed.matched, "{:?}", failed.frames);
+        let error = failed
+            .frames
+            .iter()
+            .find(|frame| frame["requestId"] == "native-model-refusal-send")
+            .unwrap();
+        assert!(error["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("CODEX_TURN_START_FAILED:"));
+        assert!(error["message"]
+            .as_str()
+            .unwrap()
+            .contains("Native provider rejected provider-current effort ultra"));
+        assert!(!failed
+            .frames
+            .iter()
+            .any(|frame| frame["type"] == "freshAgent.send.accepted"));
+        let requests: Vec<Value> = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let turns: Vec<_> = requests
+            .iter()
+            .filter(|frame| frame["method"] == "turn/start")
+            .collect();
+        assert_eq!(turns.len(), 1, "no retry or replacement of exact intent");
+        assert_eq!(turns[0]["params"]["model"], "provider-current");
+        assert_eq!(turns[0]["params"]["effort"], "ultra");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|frame| frame["method"] == "thread/start")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -29192,38 +29432,93 @@ pub(crate) mod tests {
         let _guard = ENV_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let log = temp.path().join("native-requests.jsonl");
-        configure_fake_codex_cmd(&json!({"appendRequestLogPath": log, "recordTurns": true}).to_string());
+        configure_fake_codex_cmd(
+            &json!({"appendRequestLogPath": log, "recordTurns": true}).to_string(),
+        );
         let (st, mut rx) = state_with_bus();
         let mut create = create_msg("native-model-create");
-        create.model_selection = Some(Some(freshell_protocol::ModelSelection { kind: "exact".into(), model_id: "provider-current".into() }));
+        create.model_selection = Some(Some(freshell_protocol::ModelSelection {
+            kind: "exact".into(),
+            model_id: "provider-current".into(),
+        }));
         create.effort = Some("ultra".into());
         st.handle_create(create, None).await;
-        let created = collect_frames_until(&mut rx, Duration::from_secs(10), |f| f["type"] == "freshAgent.created").await;
-        let session_id = created.frames.iter().find(|f| f["type"] == "freshAgent.created").unwrap()["sessionId"].as_str().unwrap().to_string();
-        st.handle_send(send_msg(&session_id, "first native choice")).await;
-        let _ = collect_frames_until(&mut rx, Duration::from_secs(5), |f| f["event"]["type"] == "freshAgent.turn.complete").await;
-        st.handle_configure(configure_msg(&session_id, Some("provider-current"), Some("ultra"))).await;
-        st.handle_send(send_msg(&session_id, "configured native choice")).await;
-        let _ = collect_frames_until(&mut rx, Duration::from_secs(5), |f| f["event"]["type"] == "freshAgent.turn.complete").await;
+        let created = collect_frames_until(&mut rx, Duration::from_secs(10), |f| {
+            f["type"] == "freshAgent.created"
+        })
+        .await;
+        let session_id = created
+            .frames
+            .iter()
+            .find(|f| f["type"] == "freshAgent.created")
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        st.handle_send(send_msg(&session_id, "first native choice"))
+            .await;
+        let _ = collect_frames_until(&mut rx, Duration::from_secs(5), |f| {
+            f["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        st.handle_configure(configure_msg(
+            &session_id,
+            Some("provider-current"),
+            Some("ultra"),
+        ))
+        .await;
+        st.handle_send(send_msg(&session_id, "configured native choice"))
+            .await;
+        let _ = collect_frames_until(&mut rx, Duration::from_secs(5), |f| {
+            f["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
         let (sink, fork_frames) = capturing_sink();
-        st.handle_fork(fork_msg(&session_id, "native-model-fork", None), None, sink).await;
+        st.handle_fork(fork_msg(&session_id, "native-model-fork", None), None, sink)
+            .await;
         let forked = captured_frames(&fork_frames);
-        let child = forked.iter().find(|f|f["type"]=="freshAgent.forked").unwrap()["sessionId"].as_str().unwrap().to_string();
-        st.handle_send(send_msg(&child, "forked native choice")).await;
-        let _ = collect_frames_until(&mut rx, Duration::from_secs(5), |f| f["event"]["type"] == "freshAgent.turn.complete").await;
+        let child = forked
+            .iter()
+            .find(|f| f["type"] == "freshAgent.forked")
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        st.handle_send(send_msg(&child, "forked native choice"))
+            .await;
+        let _ = collect_frames_until(&mut rx, Duration::from_secs(5), |f| {
+            f["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
         simulate_unrequested_crash(&st, &session_id).await;
-        st.handle_send(send_msg(&session_id, "resumed native choice")).await;
-        let _ = collect_frames_until(&mut rx, Duration::from_secs(10), |f| f["type"] == "freshAgent.send.accepted").await;
+        st.handle_send(send_msg(&session_id, "resumed native choice"))
+            .await;
+        let _ = collect_frames_until(&mut rx, Duration::from_secs(10), |f| {
+            f["type"] == "freshAgent.send.accepted"
+        })
+        .await;
         st.shutdown().await;
         std::env::remove_var("CODEX_CMD");
         std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
-        let requests: Vec<Value> = std::fs::read_to_string(log).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        let requests: Vec<Value> = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
         for method in ["thread/start", "thread/resume", "thread/fork", "turn/start"] {
-            let rows: Vec<_> = requests.iter().filter(|row| row["method"] == method).collect();
-            assert!(!rows.is_empty(), "native method not exercised: {method}: {requests:?}");
+            let rows: Vec<_> = requests
+                .iter()
+                .filter(|row| row["method"] == method)
+                .collect();
+            assert!(
+                !rows.is_empty(),
+                "native method not exercised: {method}: {requests:?}"
+            );
             for row in rows {
                 assert_eq!(row["params"]["model"], "provider-current", "{method}");
-                if method == "turn/start" { assert_eq!(row["params"]["effort"], "ultra"); }
+                if method == "turn/start" {
+                    assert_eq!(row["params"]["effort"], "ultra");
+                }
             }
         }
     }
@@ -29311,11 +29606,9 @@ pub(crate) mod tests {
         assert_eq!(metadata["event"]["effort"], json!("high"));
     }
 
-    /// An unknown-menu effort clamps to the model's menu default (the same
-    /// two-stage normalization `handle_send` applies), and the broadcast
-    /// carries the CLAMPED value — the record never holds a raw pick.
+    /// An opaque native effort is retained for the next turn and broadcast.
     #[tokio::test(flavor = "multi_thread")]
-    async fn configure_normalizes_the_effort_before_recording_it() {
+    async fn configure_preserves_native_effort_before_recording_it() {
         let (st, rx) = state_with_bus();
         let mut rx = rx;
         inserted_session(&st, "thread-cfg-clamp").await;
@@ -29333,8 +29626,8 @@ pub(crate) mod tests {
         };
         assert_eq!(
             effort.as_deref(),
-            Some("max"),
-            "an unknown-menu effort clamps to gpt-5.3-codex-spark's default"
+            Some("bogus"),
+            "native validation, not a static menu, decides support"
         );
         let frames = drain(&mut rx).await;
         let metadata = frames
@@ -29344,7 +29637,7 @@ pub(crate) mod tests {
                     && f["event"]["type"] == "freshAgent.session.metadata"
             })
             .expect("a metadata frame is broadcast");
-        assert_eq!(metadata["event"]["effort"], json!("max"));
+        assert_eq!(metadata["event"]["effort"], json!("bogus"));
     }
 
     /// An idempotent configure (same effective pair) stays silent on the bus.

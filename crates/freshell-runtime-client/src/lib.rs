@@ -854,6 +854,44 @@ impl RuntimeClient {
         }
     }
 
+    pub async fn fresh_agent_model_catalog(
+        &self,
+        soul_id: SoulId,
+        cwd: Option<String>,
+    ) -> Result<serde_json::Value, ClientError> {
+        let mut request = freshell_runtime_protocol::FreshAgentModelCatalogRequest {
+            soul_id,
+            cwd,
+            expected_control_epoch: Some(self.current_epoch().await?),
+        };
+        let original = request.clone();
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::FreshAgentModelCatalog(request),
+            )
+            .await
+        {
+            Ok(AdminResult::FreshAgentModelCatalog(snapshot)) => Ok(snapshot),
+            Err(error) if error.runtime_code() == Some(RuntimeErrorCode::StaleControlEpoch) => {
+                request = original;
+                request.expected_control_epoch = Some(self.health().await?.0);
+                match self
+                    .request(
+                        RequestId::new(),
+                        AdminCommand::FreshAgentModelCatalog(request),
+                    )
+                    .await?
+                {
+                    AdminResult::FreshAgentModelCatalog(snapshot) => Ok(snapshot),
+                    _ => Err(ClientError::UnexpectedResult),
+                }
+            }
+            Ok(_) => Err(ClientError::UnexpectedResult),
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn fresh_agent_snapshot(
         &self,
         soul_id: SoulId,
@@ -1221,6 +1259,7 @@ mod tests {
         Snapshot,
         History,
         Child,
+        Catalog,
     }
 
     impl FreshAgentReadKind {
@@ -1232,6 +1271,11 @@ mod tests {
             match self {
                 Self::Snapshot => client.fresh_agent_snapshot(soul).await,
                 Self::History => client.fresh_agent_history(soul).await,
+                Self::Catalog => {
+                    client
+                        .fresh_agent_model_catalog(soul, Some("/owned/project".into()))
+                        .await
+                }
                 Self::Child => {
                     client
                         .fresh_agent_read_child(soul, "native-child".into())
@@ -1244,6 +1288,7 @@ mod tests {
             match self {
                 Self::Snapshot => AdminResult::FreshAgentSnapshot(value),
                 Self::History => AdminResult::FreshAgentHistory(value),
+                Self::Catalog => AdminResult::FreshAgentModelCatalog(value),
                 Self::Child => AdminResult::FreshAgentChildSnapshot(value),
             }
         }
@@ -1260,6 +1305,10 @@ mod tests {
                     assert_eq!(read.child_thread_id, "native-child");
                     (&read.soul_id, read.expected_control_epoch)
                 }
+                (AdminCommand::FreshAgentModelCatalog(read), Self::Catalog) => {
+                    assert_eq!(read.cwd.as_deref(), Some("/owned/project"));
+                    (&read.soul_id, read.expected_control_epoch)
+                }
                 _ => panic!("expected the original exact read operation: {envelope:?}"),
             };
             assert_eq!(soul, &SoulId::parse("owned-read-soul").unwrap());
@@ -1272,6 +1321,81 @@ mod tests {
             control_epoch: 2,
             installation_id: InstallationId::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn model_catalog_retries_only_stale_epoch_with_exact_soul_and_cwd() {
+        let kind = FreshAgentReadKind::Catalog;
+        let expected =
+            serde_json::json!([{"id":"provider-current","supportedEffortLevels":["ultra"]}]);
+        let (actual, requests, cached) = scripted_fresh_agent_read(
+            kind,
+            vec![
+                Err(RuntimeError::new(
+                    RuntimeErrorCode::StaleControlEpoch,
+                    "old",
+                )),
+                Ok(epoch_health()),
+                Ok(kind.reply(expected.clone())),
+            ],
+        )
+        .await;
+        assert_refreshed_read(kind, &requests);
+        assert_eq!(cached, Some(2));
+        assert_eq!(actual.unwrap(), expected);
+        let (actual, requests, cached) = scripted_fresh_agent_read(
+            kind,
+            vec![Ok(AdminResult::FreshAgentSnapshot(serde_json::json!({})))],
+        )
+        .await;
+        assert_cached_read(kind, &requests, cached);
+        assert!(matches!(actual, Err(ClientError::UnexpectedResult)));
+        let (actual, requests, cached) = scripted_fresh_agent_read(
+            kind,
+            vec![Err(RuntimeError::new(
+                RuntimeErrorCode::HostUnreachable,
+                "down",
+            ))],
+        )
+        .await;
+        assert_cached_read(kind, &requests, cached);
+        assert_eq!(
+            actual.unwrap_err().runtime_code(),
+            Some(RuntimeErrorCode::HostUnreachable)
+        );
+    }
+
+    #[tokio::test]
+    async fn model_catalog_reply_keeps_the_ordinary_control_frame_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("catalog.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            assert!(matches!(
+                request.body,
+                AdminCommand::FreshAgentModelCatalog(_)
+            ));
+            freshell_runtime_protocol::write_frame_with_limit(
+                &mut stream,
+                &AdminReply {
+                    request_id: request.request_id,
+                    result: Ok(AdminResult::FreshAgentModelCatalog(serde_json::json!([
+                        "x".repeat(2 * freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES)
+                    ]))),
+                },
+                freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES,
+            )
+            .await
+        });
+        let client = RuntimeClient::new(&socket, "0123456789abcdef");
+        *client.control_epoch.write().await = Some(1);
+        let actual = client
+            .fresh_agent_model_catalog(SoulId::parse("catalog-owned").unwrap(), None)
+            .await;
+        let _ = server.await.unwrap();
+        assert!(actual.is_err());
     }
 
     #[tokio::test]

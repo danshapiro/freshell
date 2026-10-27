@@ -726,6 +726,24 @@ async fn dispatch(
                             .map_err(map_actor_error)?,
                     ))
                 }
+                HostCommand::FreshAgentModelCatalog {
+                    incarnation_id,
+                    cwd,
+                } => {
+                    ensure_incarnation(&incarnation_id, state)?;
+                    let actor = state
+                        .fresh_agent
+                        .lock()
+                        .await
+                        .clone()
+                        .ok_or_else(unsupported_fresh_agent)?;
+                    Ok(HostResult::FreshAgentModelCatalog(
+                        actor
+                            .model_catalog(cwd.as_deref())
+                            .await
+                            .map_err(map_actor_error)?,
+                    ))
+                }
                 HostCommand::FreshAgentReadSnapshot { incarnation_id } => {
                     ensure_incarnation(&incarnation_id, state)?;
                     let actor = state
@@ -10281,6 +10299,13 @@ mod tests {
             )
         }
 
+        async fn model_catalog(&self, cwd: Option<&str>) -> Result<serde_json::Value, String> {
+            assert_eq!(cwd, Some("/workspace"));
+            Ok(
+                serde_json::json!([{"id":"rpc-catalog","displayName":"RPC Catalog","supportedEffortLevels":["ultra"],"defaultEffort":"ultra","inputModalities":["text"]}]),
+            )
+        }
+
         async fn read_child(&self, child_thread_id: &str) -> Result<serde_json::Value, String> {
             assert_eq!(child_thread_id, "fixture-child");
             Ok(
@@ -10554,6 +10579,77 @@ mod tests {
                 .len(),
             2 * freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES
         );
+        assert_eq!(
+            actor.profile().await.native_session_id,
+            before.native_session_id
+        );
+        assert_eq!(transport.dispatches.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.decisions.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.operations.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.stops.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn authenticated_model_catalog_reads_the_parent_actor_without_starting_work() {
+        let state = test_host_state();
+        let transport = Arc::new(RpcFixtureTransport {
+            dispatches: AtomicUsize::new(0),
+            checkpoint_attempts: std::sync::Mutex::new(Vec::new()),
+            decisions: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            captures: AtomicUsize::new(0),
+            stops: AtomicUsize::new(0),
+        });
+        let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+            state.state_dir.join("catalog-observer"),
+            FreshAgentProfile {
+                provider: FreshProvider::Codex,
+                runtime_variant: "freshcodex".into(),
+                cwd: "/workspace".into(),
+                model: None,
+                effort: None,
+                permission_mode: None,
+                sandbox: None,
+                provider_store_id: "parent-volume".into(),
+                native_session_id: None,
+                plugins: None,
+                model_selection: None,
+                session_ref: None,
+                provider_launch_context: None,
+                provider_secret_references: vec![],
+            },
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+        let before = actor.profile().await;
+        *state.fresh_agent.lock().await = Some(actor.clone());
+        let (mut client_stream, server_stream) = UnixStream::pair().unwrap();
+        let serving = tokio::spawn(handle_connection(server_stream, state.clone()));
+        write_frame(
+            &mut client_stream,
+            &authenticated_host_envelope(
+                &state,
+                HostCommand::FreshAgentModelCatalog {
+                    incarnation_id: state.incarnation_id.clone(),
+                    cwd: Some("/workspace".into()),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let reply: HostReply = freshell_runtime_protocol::read_frame_with_limit(
+            &mut client_stream,
+            freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
+        )
+        .await
+        .unwrap();
+        serving.await.unwrap().unwrap();
+        let HostResult::FreshAgentModelCatalog(value) = reply.result.unwrap() else {
+            panic!("expected model catalog");
+        };
+        assert_eq!(value[0]["id"], "rpc-catalog");
+        assert_eq!(value[0]["defaultEffort"], "ultra");
         assert_eq!(
             actor.profile().await.native_session_id,
             before.native_session_id

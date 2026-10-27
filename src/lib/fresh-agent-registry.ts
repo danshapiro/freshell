@@ -45,7 +45,7 @@ export type FreshAgentRegistryEntry = {
   icon: React.ComponentType<{ className?: string }>
   defaultModel?: string
   defaultPermissionMode: string
-  defaultEffort: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+  defaultEffort: string
   settingsVisibility: {
     model: boolean
     permissionMode: boolean
@@ -319,6 +319,7 @@ export function resolveFreshAgentPaneCreateEffort(args: {
   modelEffortLevels?: readonly string[]
 }): string | undefined {
   const { sessionType, provider, model, providerEffort, fallbackEffort, modelEffortLevels } = args
+  if (provider === 'codex') return normalizeFreshAgentEffort(sessionType,provider,model,providerEffort)
   if (usesStampedEffortLevels(sessionType, provider, model, modelEffortLevels)) {
     return clampEffortToStampedLevels(modelEffortLevels, providerEffort ?? fallbackEffort)
   }

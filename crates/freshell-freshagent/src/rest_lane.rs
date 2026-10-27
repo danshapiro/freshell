@@ -216,6 +216,15 @@ pub enum RestLaneSnapshotError {
 
 #[async_trait]
 pub trait FreshAgentRestLane: Send + Sync {
+    async fn model_catalog_source(
+        &self,
+        _context: crate::model_capabilities::CodexCatalogContext,
+    ) -> Result<
+        crate::model_capabilities::CodexCatalogSource,
+        crate::model_capabilities::CapabilityError,
+    > {
+        Err(crate::model_capabilities::runtime_pending())
+    }
     async fn read_child(
         &self,
         _request: RestLaneChildRead,

@@ -332,7 +332,7 @@ function successResult(method, params) {
   }
   if (method === 'configRequirements/read') return { requirements: behavior.configRequirements ?? null }
   if (method === 'model/list') {
-    const pages = behavior.modelCatalogPages ?? [{ data: [
+    const pages = behavior.modelCatalogPagesByCwd?.[process.cwd()] ?? behavior.modelCatalogPages ?? [{ data: [
       { id: 'native-record', model: 'provider-current', displayName: 'Provider Current',
         supportedReasoningEfforts: [{ reasoningEffort: 'none' }, { reasoningEffort: 'ultra' }],
         defaultReasoningEffort: 'ultra', inputModalities: ['text', 'image'] },
@@ -815,7 +815,7 @@ wss.on('connection', (socket) => {
     }
     const method = message.method
     if (behavior.appendRequestLogPath) {
-      fs.appendFileSync(behavior.appendRequestLogPath, JSON.stringify({ method, params: message.params, codexHome: getCodexHome() }) + '\n')
+      fs.appendFileSync(behavior.appendRequestLogPath, JSON.stringify({ method, params: message.params, codexHome: getCodexHome(), cwd: process.cwd() }) + '\n')
     }
 
     if (

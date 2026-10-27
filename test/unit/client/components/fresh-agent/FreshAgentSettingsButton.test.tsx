@@ -328,6 +328,11 @@ describe('FreshAgentSettingsButton', () => {
   })
 
   it('opens the shared dialog from the freshcodex Change… button and persists the committed choice', async () => {
+    getFreshAgentModelCapabilitiesSpy.mockResolvedValue({
+      ok: true, sessionType: 'freshcodex', runtimeProvider: 'codex', status: 'fresh', fetchedAt: 1_234,
+      models: [{ id: 'gpt-5.6-luna', displayName: 'GPT-5.6 Luna', provider: 'codex', supportsEffort: true,
+        supportedEffortLevels: ['none', 'low', 'medium', 'high', 'xhigh', 'max'], supportsAdaptiveThinking: false }],
+    })
     const store = createStore()
     seedPane(store, {
       sessionType: 'freshcodex',
@@ -341,7 +346,7 @@ describe('FreshAgentSettingsButton', () => {
     fireEvent.click(screen.getByRole('button', { name: /Change/ }))
 
     await screen.findByRole('dialog', { name: 'Model and thinking level' })
-    fireEvent.click(screen.getByRole('option', { name: /GPT-5\.6 Luna/ }))
+    fireEvent.click(await screen.findByRole('option', { name: /GPT-5\.6 Luna/ }))
     const levelsList = screen.getByRole('listbox', { name: 'Thinking levels for GPT-5.6 Luna' })
     const lowOption = Array.from(levelsList.querySelectorAll('[role="option"]')).find((el) => el.textContent?.includes('low'))
     expect(lowOption).toBeDefined()

@@ -578,6 +578,15 @@ impl Supervisor {
                         .await?,
                 ))
             }
+            AdminCommand::FreshAgentModelCatalog(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::FreshAgentModelCatalog(
+                    self.fresh_agent_model_catalog(request.soul_id, request.cwd)
+                        .await?,
+                ))
+            }
             AdminCommand::FreshAgentReadSnapshot(request) => {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
@@ -1968,6 +1977,70 @@ impl Supervisor {
         }
     }
 
+    async fn fresh_agent_model_catalog(
+        &self,
+        soul_id: SoulId,
+        cwd: Option<String>,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
+        let _guard = lifecycle_lock.lock().await;
+        let handle = self
+            .registry
+            .active_handle_for_soul(soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let agent = handle.fresh_agent().ok_or_else(|| {
+            RuntimeError::new(
+                RuntimeErrorCode::UnsupportedWorkload,
+                "soul is not a hosted fresh-agent",
+            )
+        })?;
+        if agent.provider != freshell_runtime_protocol::FreshProvider::Codex {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::UnsupportedOperation,
+                "model catalog requires a bound Codex runtime",
+            ));
+        }
+        let host = self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await?;
+        let reply = self
+            .send_authenticated_host_command(
+                handle.incarnation_id().clone(),
+                handle.runtime_dir(),
+                &host,
+                HostCommand::FreshAgentModelCatalog {
+                    incarnation_id: handle.incarnation_id().clone(),
+                    cwd,
+                },
+            )
+            .await?;
+        let HostResult::FreshAgentModelCatalog(value) = reply else {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::HostAuthenticationFailed,
+                "unexpected model catalog reply",
+            ));
+        };
+        let current = self
+            .registry
+            .active_handle_for_soul(soul_id)
+            .await
+            .map_err(map_registry)?;
+        let after = self
+            .authenticate_host(current.incarnation_id(), current.runtime_dir())
+            .await?;
+        if current.incarnation_id() != handle.incarnation_id()
+            || current.fresh_agent() != handle.fresh_agent()
+            || host.host_boot_id != after.host_boot_id
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::OwnershipMismatch,
+                "model catalog source changed",
+            ));
+        }
+        Ok(value)
+    }
+
     async fn fresh_agent_snapshot(
         &self,
         soul_id: SoulId,
@@ -3344,6 +3417,7 @@ where
         reply.result,
         Ok(AdminResult::FreshAgentHistory(_)
             | AdminResult::FreshAgentSnapshot(_)
+            | AdminResult::FreshAgentModelCatalog(_)
             | AdminResult::FreshAgentChildSnapshot(_)
             | AdminResult::FreshAgentEvents(_))
     ) {

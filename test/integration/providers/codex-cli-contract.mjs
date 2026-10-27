@@ -247,6 +247,75 @@ async function nativeRequirementsGuard(context, capture) {
   capture.observations.requirementsGuard.ownedListenerSettled = true
 }
 
+async function nativeCatalogProbe(context,capture,fixture) {
+  const trafficStart=fixture.traffic.length
+  const reservation=http.createServer()
+  await new Promise(resolve=>reservation.listen(0,'127.0.0.1',resolve))
+  const port=reservation.address().port
+  await new Promise(resolve=>reservation.close(resolve))
+  const native=new NativeClient(capture.binary.path,context,capture,['app-server','--listen',`ws://127.0.0.1:${port}`])
+  const ready=()=>new Promise(resolve=>{
+    const request=http.get(`http://127.0.0.1:${port}/readyz`,response=>{response.resume();resolve(response.statusCode===200)})
+    request.on('error',()=>resolve(false));request.setTimeout(1000,()=>request.destroy())
+  })
+  try {
+    await deadline((async()=>{
+      while (!await ready()) {
+        assert.equal(native.child.exitCode,null,capture.stderr)
+        await new Promise(resolve=>setTimeout(resolve,50))
+      }
+    })(),15_000,'owned model-catalog native listener')
+    const receipt=path.join(context.stateRoot,'catalog-client-proof.json')
+    const probe=spawn(context.policyClientProbe.path,['--exact','catalog::native_tests::native_catalog_and_opaque_effort_use_initialized_client','--nocapture'],{
+      cwd:context.workspace,env:{...context.environment,FRESHELL_CODEX_CATALOG_PROBE_URL:`ws://127.0.0.1:${port}`,FRESHELL_CODEX_CATALOG_PROBE_RECEIPT:receipt},stdio:['ignore','pipe','pipe'],
+    })
+    let stdout='',stderr=''
+    probe.stdout.on('data',bytes=>{stdout+=bytes});probe.stderr.on('data',bytes=>{stderr+=bytes})
+    const exited=new Promise((resolve,reject)=>{probe.once('exit',(code,signal)=>resolve({code,signal}));probe.once('error',reject)})
+    let result
+    try { result=await deadline(exited,120_000,'real production catalog client') }
+    finally { if (probe.exitCode===null && probe.signalCode===null) {probe.kill('SIGKILL');await exited} }
+    assert.equal(result.code,0,`${stdout}\n${stderr}`)
+    assert.match(stdout,/1 passed; 0 failed/)
+    const proof=JSON.parse(await fsp.readFile(receipt,'utf8'))
+    assert(proof.models.length>0)
+    assert.equal(proof.nativeAcceptedFutureEffort,true)
+    assert(proof.futureEffortCompletedTurn)
+    assert.equal(proof.nativeExactLifecycleAccepted,true)
+    assert.equal(proof.completedTurns.length,4)
+    const traffic=fixture.traffic.slice(trafficStart)
+    assert.equal(traffic.length,7,'four lifecycle turns, one future-effort turn and two advertised-setting turns must each reach the controlled provider once')
+    assert(traffic.slice(0,5).every(request=>request.body.model==='provider-current'),'custom native model work must use the exact model omitted from the catalog')
+    // Record both boundaries: native receives exact public effort strings,
+    // and its downstream HTTP reasoning can depend on the selected model.
+    const nativeTurns=proof.frames.filter(entry=>entry.direction==='controller' && entry.frame.method==='turn/start')
+    assert.equal(nativeTurns.length,7)
+    assert(nativeTurns.slice(0,4).every(entry=>entry.frame.params.effort==='ultra'))
+    assert.equal(nativeTurns[4].frame.params.effort,'future-unadvertised-native-effort')
+    assert.equal(traffic[4].body.reasoning.effort,'future-unadvertised-native-effort')
+    const advertised=proof.advertisedSelection
+    assert(proof.models.some(model=>model.id===advertised.model.id))
+    assert.equal(advertised.turns.length,2)
+    const matchedAdvertisedSettings=advertised.turns.map((turn,index)=>{
+      const nativeRequest=nativeTurns[index+5].frame.params
+      const http=traffic[index+5].body
+      assert(advertised.model.supportedEffortLevels.includes(turn.effort))
+      assert.equal(nativeRequest.model,advertised.model.id)
+      assert.equal(nativeRequest.effort,turn.effort)
+      assert.equal(nativeRequest.approvalPolicy,'never')
+      assert.equal(http.model,advertised.model.id)
+      assert(turn.turnId)
+      return {...turn,nativeRequest,http}
+    })
+    const methods=proof.frames.filter(entry=>entry.direction==='controller' && entry.frame.id!==undefined).map(entry=>entry.frame.method)
+    assert.equal(methods.filter(method=>method==='initialize').length,1)
+    const firstWork=methods.indexOf('thread/start')
+    assert(firstWork>0 && methods.slice(0,firstWork).every(method=>['initialize','model/list'].includes(method)))
+    capture.observations.productionCatalogClient={...proof,result,stdout,stderr,fixtureRequestCount:traffic.length,nativeHttpEfforts:traffic.map(request=>request.body.reasoning.effort),matchedAdvertisedSettings}
+  } finally {await native.close()}
+  assert.equal(await ready(),false,'owned native catalog listener must close')
+}
+
 function assistantText(read, nativeTurnId) {
   return read.thread.turns.filter(turn => !nativeTurnId || turn.id === nativeTurnId).flatMap(turn => turn.items.filter(item => item.type === 'agentMessage').map(item => item.text)).join('\n')
 }
@@ -892,6 +961,7 @@ export async function captureNativeScenario(name, options = {}) {
       capture.passed = true
       return capture
     }
+    if (name === 'model-effort-usage') await nativeCatalogProbe(context,capture,fixture)
     client = new NativeClient(capture.binary.path, context, capture)
     client.onServerRequest = frame => {
       if (frame.method === 'item/commandExecution/requestApproval' && !options.approvalControl) {
@@ -1092,8 +1162,9 @@ export async function captureNativeScenario(name, options = {}) {
       assert.equal(usage?.last?.totalTokens, 15, 'usage must come from the actual model completion')
       capture.observations.latestUsage = usage.last
       capture.observations.usageLabel = 'Latest usage'
-      assert.equal(fixture.traffic[0].body.model, 'contract-model')
-      assert.equal(fixture.traffic[0].body.reasoning.effort, 'low')
+      const primaryFirst=fixture.traffic[capture.observations.productionCatalogClient.fixtureRequestCount]
+      assert.equal(primaryFirst.body.model, 'contract-model')
+      assert.equal(primaryFirst.body.reasoning.effort, 'low')
     }
     if (restricted) {
       const commandItems = capture.notifications.filter(frame => frame.method === 'item/completed' && frame.params?.item?.type === 'commandExecution').map(frame => frame.params.item)

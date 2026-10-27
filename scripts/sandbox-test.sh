@@ -140,6 +140,7 @@ else
   if [ "${RUNTIME_SUITE}" -eq 1 ]; then
     case "${CMD}" in
       'node test/integration/providers/codex-cli-contract.mjs --scenario all' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario model-effort-usage' | \
       'node test/integration/providers/codex-cli-contract.mjs --scenario text-history --missing-policy-client-probe' | \
       'node test/integration/providers/codex-cli-contract.mjs --scenario mcp-form-url' | \
       'node test/integration/providers/codex-cli-contract.mjs --scenario parent-child-read --child-approval' | \

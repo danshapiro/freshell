@@ -42,21 +42,10 @@ describe('fresh-agent-models freshopencode static menu', () => {
 })
 
 describe('fresh-agent-models freshcodex static menu', () => {
-  it('tracks the current Codex model availability list', () => {
-    expect(FRESHCODEX_DEFAULT_MODEL).toBe('gpt-6-astra')
-    expect(FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE.freshcodex.map((option) => option.value)).toEqual([
-      'gpt-6-astra',
-      'gpt-5.6-sol',
-      'gpt-5.6-terra',
-      'gpt-5.6-luna',
-      'gpt-5.3-codex-spark',
-    ])
-  })
-
-  it('falls back retired or unknown freshcodex models to the current default', () => {
-    expect(normalizeFreshAgentModel('freshcodex', 'codex', 'gpt-5.4')).toBe('gpt-6-astra')
-    expect(normalizeFreshAgentModel('freshcodex', 'codex', 'gpt-5.4-mini')).toBe('gpt-6-astra')
-    expect(normalizeFreshAgentModel('freshcodex', 'codex', 'unknown-model')).toBe('gpt-6-astra')
+  it('preserves retired or custom model IDs for native validation', () => {
+    expect(normalizeFreshAgentModel('freshcodex', 'codex', 'gpt-5.4')).toBe('gpt-5.4')
+    expect(normalizeFreshAgentModel('freshcodex', 'codex', 'gpt-5.4-mini')).toBe('gpt-5.4-mini')
+    expect(normalizeFreshAgentModel('freshcodex', 'codex', 'unknown-model')).toBe('unknown-model')
   })
 })
 

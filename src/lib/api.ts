@@ -20,6 +20,7 @@ import type { RecoveryInventory } from '@/lib/recovery/types'
 import type { Machine } from '@/lib/machine-identity'
 import {
   type FreshAgentModelCapabilitiesResponse,
+  type FreshAgentCodexCatalogContext,
 } from '@shared/fresh-agent-model-capabilities'
 import {
   ManagedRuntimeIncidentSummarySchema,
@@ -612,10 +613,19 @@ export async function auditManagedRuntimeRepair(
 
 export async function getFreshAgentModelCapabilities(
   sessionType: string,
-  options: ApiRequestOptions & { cwd?: string } = {},
+  options: ApiRequestOptions & { cwd?: string; codexContext?: FreshAgentCodexCatalogContext } = {},
 ): Promise<FreshAgentModelCapabilitiesResponse> {
-  const { cwd, ...requestOptions } = options
-  const query = cwd ? `?${new URLSearchParams({ cwd }).toString()}` : ''
+  const { cwd, codexContext, ...requestOptions } = options
+  const params = new URLSearchParams()
+  if (codexContext) {
+    params.set('sessionId',codexContext.sessionId)
+    if (codexContext.sessionRef) params.set('sessionRef',JSON.stringify(codexContext.sessionRef))
+    if (codexContext.observedEpoch !== undefined) params.set('observedEpoch',String(codexContext.observedEpoch))
+    if (codexContext.observedGeneration !== undefined) params.set('observedGeneration',String(codexContext.observedGeneration))
+  }
+  const catalogCwd = codexContext?.cwd ?? cwd
+  if (catalogCwd) params.set('cwd',catalogCwd)
+  const query = params.size ? `?${params.toString()}` : ''
   try {
     return parseFreshAgentModelCapabilitiesResponse(
       await api.get(`/api/fresh-agent/model-capabilities/${encodeURIComponent(sessionType)}${query}`, requestOptions),
@@ -668,10 +678,19 @@ export async function getFreshAgentCheckpointOutcomePage(
 
 export async function refreshFreshAgentModelCapabilities(
   sessionType: string,
-  options: ApiRequestOptions & { cwd?: string } = {},
+  options: ApiRequestOptions & { cwd?: string; codexContext?: FreshAgentCodexCatalogContext } = {},
 ): Promise<FreshAgentModelCapabilitiesResponse> {
-  const { cwd, ...requestOptions } = options
-  const query = cwd ? `?${new URLSearchParams({ cwd }).toString()}` : ''
+  const { cwd, codexContext, ...requestOptions } = options
+  const params = new URLSearchParams()
+  if (codexContext) {
+    params.set('sessionId',codexContext.sessionId)
+    if (codexContext.sessionRef) params.set('sessionRef',JSON.stringify(codexContext.sessionRef))
+    if (codexContext.observedEpoch !== undefined) params.set('observedEpoch',String(codexContext.observedEpoch))
+    if (codexContext.observedGeneration !== undefined) params.set('observedGeneration',String(codexContext.observedGeneration))
+  }
+  const catalogCwd = codexContext?.cwd ?? cwd
+  if (catalogCwd) params.set('cwd',catalogCwd)
+  const query = params.size ? `?${params.toString()}` : ''
   try {
     return parseFreshAgentModelCapabilitiesResponse(
       await api.post(`/api/fresh-agent/model-capabilities/${encodeURIComponent(sessionType)}/refresh${query}`, {}, requestOptions),

@@ -313,7 +313,7 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
     }
   })
 
-  test('codex: create-shaped resume after restart carries the recorded model', async () => {
+  test('codex: configured xhigh and recorded model survive restart and the next send', async () => {
     test.setTimeout(180_000)
     const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'fa-settings-codex-'))
     const opLogPath = path.join(sharedRoot, 'codex-ops.jsonl')
@@ -325,7 +325,7 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
         CODEX_CMD: `${process.execPath} ${CODEX_FIXTURE}`,
         // STATIC per server boot (V4/A6): resume succeeds by default.
         FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
-          appendThreadOperationLogPath: opLogPath,
+          appendRequestLogPath: opLogPath,
         }),
       },
     })
@@ -353,6 +353,9 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
       )
       const threadId = created.sessionId as string
       expect(threadId).toBeTruthy()
+
+      ws.send({type:'freshAgent.configure',requestId:'codex-settings-xhigh',provider:'codex',sessionType:'freshcodex',sessionId:threadId,settings:{effort:'xhigh'}})
+      await ws.waitFor(f=>f.type==='freshAgent.event' && f.event?.type==='freshAgent.session.metadata' && f.event.effort==='xhigh',30_000,'exact xhigh metadata after configure')
 
       // One turn. `freshAgent.send.accepted` is broadcast after `turn/start`
       // resolves (codex.rs handle_send), and the fake answers turn/start with a
@@ -398,6 +401,12 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
       expect(resume, 'restart must resume the durable thread').toBeTruthy()
       expect(resume.params.model, 'resume must carry the recorded model, not null').toBe('gpt-5.3-codex-spark')
       expect(resume.params.sandbox, 'resume must carry the recorded sandbox').toBe('workspace-write')
+      ws.send({type:'freshAgent.send',requestId:'codex-settings-after-restart',provider:'codex',sessionType:'freshcodex',sessionId:threadId,text:'settings-resume second turn'})
+      await ws.waitFor(f=>f.type==='freshAgent.send.accepted' && f.requestId==='codex-settings-after-restart',30_000,'post-restart accepted send')
+      const turns=readJsonl(opLogPath).filter(op=>op.method==='turn/start')
+      expect(turns).toHaveLength(2)
+      expect(turns.map(turn=>turn.params.model)).toEqual(['gpt-5.3-codex-spark','gpt-5.3-codex-spark'])
+      expect(turns.map(turn=>turn.params.effort)).toEqual(['xhigh','xhigh'])
     } finally {
       ws?.close()
       await server.stop().catch(() => {})

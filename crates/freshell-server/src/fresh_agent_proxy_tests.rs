@@ -23,7 +23,11 @@ async fn codex_model_catalog_routes_only_to_current_root_and_discards_changed_so
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let envelope: Envelope<serde_json::Value> = read_frame(&mut stream).await.unwrap();
                 let result = match envelope.body["method"].as_str().unwrap() {
-                    "health" => serde_json::to_value(AdminResult::Health { control_epoch:7, installation_id:InstallationId::new() }).unwrap(),
+                    "health" => serde_json::to_value(AdminResult::Health {
+                        control_epoch: 7,
+                        installation_id: InstallationId::new(),
+                    })
+                    .unwrap(),
                     "inventory" => {
                         inventories += 1;
                         let changed = inventories >= 2;
@@ -46,31 +50,51 @@ async fn codex_model_catalog_routes_only_to_current_root_and_discards_changed_so
                     }
                     other => panic!("catalog attempted unrelated operation: {other}"),
                 };
-                write_frame(&mut stream,&serde_json::json!({"requestId":envelope.request_id,"result":{"Ok":result}})).await.unwrap();
+                write_frame(
+                    &mut stream,
+                    &serde_json::json!({"requestId":envelope.request_id,"result":{"Ok":result}}),
+                )
+                .await
+                .unwrap();
             }
         });
         let (broadcast, _) = broadcast::channel(16);
-        let owner = freshell_freshagent::FreshAgentState::new(Arc::new("tok".into()),Arc::new(broadcast));
-        owner.set_hosted_rest_gateway(snapshot_outage_proxy(&socket)).unwrap();
+        let owner =
+            freshell_freshagent::FreshAgentState::new(Arc::new("tok".into()), Arc::new(broadcast));
+        owner
+            .set_hosted_rest_gateway(snapshot_outage_proxy(&socket))
+            .unwrap();
         let app = freshell_freshagent::model_capabilities::router(owner);
         let response = app.oneshot(axum::http::Request::builder().uri("/api/fresh-agent/model-capabilities/freshcodex?sessionId=public-conversation&cwd=/managed/project&soulId=stale-frontend-soul").header("x-auth-token","tok").body(axum::body::Body::empty()).unwrap()).await.unwrap();
         let status = response.status();
-        let body:serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(),1024*1024).await.unwrap()).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         server.abort();
         assert!(server.await.unwrap_err().is_cancelled());
-        if scenario=="same" {
-            assert_eq!(status,axum::http::StatusCode::OK,"{body}");
-            assert_eq!(body["models"][0]["id"],"managed-current");
-            assert_eq!(body["models"][0]["supportedEffortLevels"],serde_json::json!(["ultra"]));
+        if scenario == "same" {
+            assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+            assert_eq!(body["models"][0]["id"], "managed-current");
+            assert_eq!(
+                body["models"][0]["supportedEffortLevels"],
+                serde_json::json!(["ultra"])
+            );
         } else {
-            assert_eq!(status,axum::http::StatusCode::SERVICE_UNAVAILABLE,"{scenario}: {body}");
-            assert_eq!(body["models"],serde_json::json!([]));
+            assert_eq!(
+                status,
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "{scenario}: {body}"
+            );
+            assert_eq!(body["models"], serde_json::json!([]));
         }
         let calls = calls.lock().await;
-        assert_eq!(calls.len(),1,"only the current host is queried");
-        assert_eq!(calls[0]["soulId"],"current-root-soul");
-        assert_eq!(calls[0]["cwd"],"/managed/project");
-        assert_eq!(calls[0]["expectedControlEpoch"],7);
+        assert_eq!(calls.len(), 1, "only the current host is queried");
+        assert_eq!(calls[0]["soulId"], "current-root-soul");
+        assert_eq!(calls[0]["cwd"], "/managed/project");
+        assert_eq!(calls[0]["expectedControlEpoch"], 7);
     }
 }
 

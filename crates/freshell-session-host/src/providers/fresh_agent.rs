@@ -1098,6 +1098,29 @@ impl FreshAgentTransport for HostedTransport {
         Ok(snapshot)
     }
 
+    async fn model_catalog(&self, cwd: Option<&str>) -> Result<Value, String> {
+        let before = self.current_native_id().await?;
+        let ProviderState::Codex(state) = &self.state else {
+            return Err("model catalog requires a bound Codex runtime".into());
+        };
+        let value = state
+            .model_catalog(
+                freshell_freshagent::model_capabilities::CodexCatalogContext {
+                    session_id: before.clone(),
+                    session_ref: None,
+                    cwd: cwd.map(str::to_string),
+                    observed_epoch: None,
+                    observed_generation: None,
+                },
+            )
+            .await
+            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+        if self.current_native_id().await? != before {
+            return Err("model catalog source changed".into());
+        }
+        Ok(value)
+    }
+
     async fn read_child(&self, child_thread_id: &str) -> Result<Value, String> {
         #[cfg(test)]
         if let Some(delegate) = self.test_delegate.as_ref() {
@@ -1940,6 +1963,79 @@ mod tests {
             _environment,
             _lock,
         }
+    }
+
+    #[tokio::test]
+    async fn model_catalog_uses_the_same_initialized_native_actor_process_without_a_turn() {
+        let logs = tempfile::tempdir().unwrap();
+        let log = logs.path().join("requests.jsonl");
+        let fixture=native_codex_fixture(json!({"appendRequestLogPath":log,"modelCatalogPages":[
+            {"data":[{"id":"catalog-record","model":"gpt-6.1-sol","displayName":"Native Sol","supportedReasoningEfforts":[{"reasoningEffort":"xhigh"}],"defaultReasoningEffort":"xhigh","inputModalities":["text","image"]}],"nextCursor":"1"},
+            {"data":[{"id":"record-current","model":"provider-current","displayName":"Provider Current","supportedReasoningEfforts":[{"reasoningEffort":"ultra"}],"defaultReasoningEffort":"ultra","inputModalities":["text"]}],"nextCursor":null},
+        ]})).await;
+        let actor = FreshAgentHostActor::open(
+            fixture.dir.path().join("catalog-actor"),
+            fixture.profile.clone(),
+            fixture.transport.clone(),
+        )
+        .await
+        .unwrap();
+        let before = actor.profile().await;
+        // Ordinary creation queues its created + idle snapshot frames. Join
+        // that existing startup boundary before testing a read-only operation.
+        tokio::time::timeout(Duration::from_secs(10),async {
+            loop {
+                if actor.read_events(0,256).await.events.iter().any(|entry|matches!(&entry.event,
+                    AgentEvent::Provider {payload} if payload["event"]["type"]=="freshAgent.session.snapshot"
+                    && payload["event"]["status"]=="idle" && payload["sessionId"].as_str()==before.native_session_id.as_deref())) {break;}
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("ordinary native creation reaches its idle snapshot");
+        let head = actor.read_events(0, 256).await.head;
+        let value = actor.model_catalog(Some(&before.cwd)).await.unwrap();
+        let after = actor.profile().await;
+        let after_events = actor.read_events(head, 256).await;
+        let after_head = after_events.head;
+        actor.stop().await.unwrap();
+        let requests = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(value[0]["id"], "gpt-6.1-sol");
+        assert_eq!(value[1]["id"], "provider-current");
+        assert_eq!(value[1]["defaultEffort"], "ultra");
+        assert_eq!(before.native_session_id, after.native_session_id);
+        assert_eq!(before.model, after.model);
+        assert_eq!(
+            head, after_head,
+            "events during catalog read: {:?}",
+            after_events.events
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r["method"] == "initialize")
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r["method"] == "thread/start")
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r["method"] == "model/list")
+                .count(),
+            2
+        );
+        assert!(!requests.iter().any(|r| r["method"] == "turn/start"
+            || r["method"] == "thread/resume"
+            || r["method"] == "thread/fork"));
     }
 
     #[tokio::test]

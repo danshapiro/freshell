@@ -2525,7 +2525,7 @@ describe('FreshAgentView', () => {
       sessionType: 'freshcodex',
       provider: 'codex',
       model: 'gpt-6-astra',
-      effort: 'max',
+      effort: undefined,
     }))
 
     const onMessage = wsMock.onMessage.mock.calls[0]?.[0]
@@ -3501,7 +3501,6 @@ describe('FreshAgentView', () => {
         settings: {
           cwd: '/repo',
           model: 'gpt-5.3-codex-spark',
-          effort: 'max',
         },
       }))
     })
@@ -6924,6 +6923,11 @@ describe('FreshAgentView', () => {
   })
 
   it('lets Freshcodex settings choose model and thinking level from the gear popover’s Change… dialog', async () => {
+    apiMock.getFreshAgentModelCapabilities.mockResolvedValue({
+      ok: true, sessionType: 'freshcodex', runtimeProvider: 'codex', status: 'fresh', fetchedAt: 1_234,
+      models: [{ id: 'gpt-5.6-luna', displayName: 'GPT-5.6 Luna', provider: 'codex', supportsEffort: true,
+        supportedEffortLevels: ['none', 'low', 'medium', 'high', 'xhigh', 'max'], supportsAdaptiveThinking: false }],
+    })
     const store = createStore()
     store.dispatch(initLayout({
       tabId: 'tab-1',
@@ -6955,11 +6959,11 @@ describe('FreshAgentView', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /Change/ }))
     await screen.findByRole('dialog', { name: 'Model and thinking level' })
-    fireEvent.click(screen.getByRole('option', { name: /GPT-5\.6 Luna/ }))
+    fireEvent.click(await screen.findByRole('option', { name: /GPT-5\.6 Luna/ }))
 
     // GPT-5.6 Luna declares the current GPT-5.6 reasoning levels in
     // canonical order.
-    const levelsList = screen.getByRole('listbox', { name: 'Thinking levels for GPT-5.6 Luna' })
+    const levelsList = await screen.findByRole('listbox', { name: 'Thinking levels for GPT-5.6 Luna' })
     const levelTexts = Array.from(levelsList.querySelectorAll('[role="option"]')).map((el) => el.textContent)
     expect(levelTexts.map((text) => text?.replace(/last used|highest|current|●/g, '').trim())).toEqual(
       ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
@@ -6986,6 +6990,11 @@ describe('FreshAgentView', () => {
   })
 
   it('persists Freshcodex thinking and permission settings as fresh-agent provider defaults', async () => {
+    apiMock.getFreshAgentModelCapabilities.mockResolvedValue({
+      ok: true, sessionType: 'freshcodex', runtimeProvider: 'codex', status: 'fresh', fetchedAt: 1_234,
+      models: [{ id: 'gpt-5.6-luna', displayName: 'GPT-5.6 Luna', provider: 'codex', supportsEffort: true,
+        supportedEffortLevels: ['none', 'low', 'medium', 'high', 'xhigh', 'max'], supportsAdaptiveThinking: false }],
+    })
     const store = createStore()
     store.dispatch(initLayout({
       tabId: 'tab-1',
@@ -7011,9 +7020,9 @@ describe('FreshAgentView', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
     // Thinking now persists through the Change… dialog, not a retired dropdown.
-    fireEvent.click(screen.getByRole('button', { name: /GPT-5\.6 Luna · medium.*Change/ }))
+    fireEvent.click(screen.getByRole('button', { name: /gpt-5\.6-luna · medium.*Change/ }))
     await screen.findByRole('dialog', { name: 'Model and thinking level' })
-    const levelsList = screen.getByRole('listbox', { name: 'Thinking levels for GPT-5.6 Luna' })
+    const levelsList = await screen.findByRole('listbox', { name: 'Thinking levels for GPT-5.6 Luna' })
     const highOption = Array.from(levelsList.querySelectorAll('[role="option"]')).find((el) => el.textContent?.includes('high'))
     expect(highOption).toBeDefined()
     fireEvent.click(highOption!)
@@ -8203,7 +8212,7 @@ describe('FreshAgentView', () => {
     expect(screen.queryByRole('radio', { name: 'custom-codex-model' })).not.toBeInTheDocument()
   })
 
-  it('normalizes stale Freshcodex thinking effort before create and send', async () => {
+  it('preserves explicit Freshcodex xhigh effort before create and send', async () => {
     const store = createStore()
     store.dispatch(initLayout({
       tabId: 'tab-1',
@@ -8227,7 +8236,7 @@ describe('FreshAgentView', () => {
     expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'freshAgent.create',
       requestId: 'req-stale-effort',
-      effort: 'max',
+      effort: 'xhigh',
     }))
 
     const onMessage = wsMock.onMessage.mock.calls[0]?.[0]
@@ -8253,7 +8262,7 @@ describe('FreshAgentView', () => {
 
     expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'freshAgent.send',
-      settings: expect.objectContaining({ effort: 'max' }),
+      settings: expect.objectContaining({ effort: 'xhigh' }),
     }))
   })
 
@@ -11673,7 +11682,7 @@ describe('FreshAgentView /model slash command', () => {
     expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
   })
 
-  it('opens the shared model dialog for freshcodex without any catalog probe', async () => {
+  it('opens the shared model dialog for freshcodex using the bound native catalog context', async () => {
     const store = createStore()
     store.dispatch(initLayout({
       tabId: 'tab-1',
@@ -11699,7 +11708,9 @@ describe('FreshAgentView /model slash command', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
 
     expect(await screen.findByRole('dialog', { name: 'Model and thinking level' })).toBeInTheDocument()
-    expect(apiMock.getFreshAgentModelCapabilities).not.toHaveBeenCalled()
+    expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenCalledWith('freshcodex', expect.objectContaining({
+      codexContext: expect.objectContaining({ sessionId: 'ses_model_cmd', sessionRef: { provider: 'codex', sessionId: 'ses_model_cmd' } }),
+    }))
   })
 
   it('shows the shared catalog-unavailable notice instead of an empty dialog when the freshopencode probe fails', async () => {

@@ -33,6 +33,39 @@ async fn drive_handshake(peer: &freshell_codex::ChannelPeer) {
 }
 
 #[tokio::test]
+async fn model_catalog_reads_all_visible_pages_on_the_initialized_client() {
+    let (transport, peer) = new_channel_transport();
+    let (client, _notifs) = CodexAppServerClient::connect(transport);
+    let driver = tokio::spawn(async move { freshell_codex::catalog::read_models(&client).await });
+    drive_handshake(&peer).await;
+    for (cursor, next, model, effort) in [
+        (None, Some("opaque-next"), "gpt-6.1-sol", "xhigh"),
+        (Some("opaque-next"), None, "provider-current", "ultra"),
+    ] {
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "model/list");
+        assert_eq!(params["includeHidden"], false);
+        assert_eq!(
+            params.get("cursor").and_then(serde_json::Value::as_str),
+            cursor
+        );
+        peer.respond(&id,json!({"data":[{"id":"metadata-record","model":model,"displayName":format!("Native {model}"),"supportedReasoningEfforts":[{"reasoningEffort":effort}],"defaultReasoningEffort":effort,"inputModalities":["text","image"]}],"nextCursor":next}));
+    }
+    let rows = driver.await.unwrap().unwrap();
+    drop(peer);
+    assert_eq!(
+        rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+        vec!["gpt-6.1-sol", "provider-current"]
+    );
+    assert_eq!(rows[1].supported_effort_levels, vec!["ultra"]);
+    assert_eq!(rows[1].default_effort.as_deref(), Some("ultra"));
+    assert_eq!(
+        rows[0].input_modalities,
+        Some(vec!["text".into(), "image".into()])
+    );
+}
+
+#[tokio::test]
 async fn full_drive_completed_turn_emits_the_positive_edge_with_verbatim_effort() {
     let (transport, peer) = new_channel_transport();
     let (client, mut notifs) = CodexAppServerClient::connect(transport);

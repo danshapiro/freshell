@@ -72,6 +72,8 @@ impl ModelCatalogProbe for RecordingProbe {
 
 fn cap(id: &str, display: &str, source_id: Option<&str>) -> ModelCapability {
     ModelCapability {
+        default_effort: None,
+        input_modalities: None,
         id: id.to_string(),
         display_name: display.to_string(),
         provider: "opencode",
@@ -331,70 +333,6 @@ async fn blank_cwd_maps_to_default_cache_key() {
         .get(SessionType::FreshOpencode, Some("   ".into()))
         .await;
     assert_eq!(probe.calls().await, vec![None]);
-}
-
-/// Codex keeps its built-in catalog without starting a Claude or OpenCode probe.
-#[tokio::test]
-async fn codex_serves_static_catalog() {
-    let probe = Arc::new(RecordingProbe::new());
-    let (registry, _now) = registry_with(probe.clone());
-
-    let (status, codex) = registry.get(SessionType::FreshCodex, None).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        codex,
-        json!({
-            "ok": true,
-            "sessionType": "freshcodex",
-            "runtimeProvider": "codex",
-            "status": "fresh",
-            "fetchedAt": 1_000,
-            "models": [
-                {
-                    "id": "gpt-6-astra",
-                    "displayName": "GPT-6 Astra",
-                    "provider": "codex",
-                    "supportsEffort": true,
-                    "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"],
-                    "supportsAdaptiveThinking": true,
-                },
-                {
-                    "id": "gpt-5.6-sol",
-                    "displayName": "GPT-5.6 Sol",
-                    "provider": "codex",
-                    "supportsEffort": true,
-                    "supportedEffortLevels": ["none", "low", "medium", "high", "xhigh", "max"],
-                    "supportsAdaptiveThinking": true,
-                },
-                {
-                    "id": "gpt-5.6-terra",
-                    "displayName": "GPT-5.6 Terra",
-                    "provider": "codex",
-                    "supportsEffort": true,
-                    "supportedEffortLevels": ["none", "low", "medium", "high", "xhigh", "max"],
-                    "supportsAdaptiveThinking": true,
-                },
-                {
-                    "id": "gpt-5.6-luna",
-                    "displayName": "GPT-5.6 Luna",
-                    "provider": "codex",
-                    "supportsEffort": true,
-                    "supportedEffortLevels": ["none", "low", "medium", "high", "xhigh", "max"],
-                    "supportsAdaptiveThinking": true,
-                },
-                {
-                    "id": "gpt-5.3-codex-spark",
-                    "displayName": "GPT-5.3 Codex Spark",
-                    "provider": "codex",
-                    "supportsEffort": true,
-                    "supportedEffortLevels": ["none", "minimal", "low", "medium", "high", "max"],
-                    "supportsAdaptiveThinking": true,
-                },
-            ],
-        })
-    );
-
-    assert_eq!(probe.call_count().await, 0, "static paths never probe");
 }
 
 #[test]
@@ -725,10 +663,86 @@ async fn post(app: Router, uri: &str, auth: bool) -> (StatusCode, Value) {
 const CAP: &str = "/api/fresh-agent/model-capabilities";
 
 #[tokio::test]
+async fn codex_unbound_registry_is_pending_and_never_probes_another_provider() {
+    let probe = Arc::new(RecordingProbe::new());
+    let (registry, _) = registry_with(probe.clone());
+    for (status, body) in [
+        registry.get(SessionType::FreshCodex, None).await,
+        registry.refresh(SessionType::FreshCodex, None).await,
+    ] {
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["code"], "RUNTIME_PENDING");
+        assert_eq!(body["models"], json!([]));
+    }
+    assert_eq!(
+        registry
+            .models(SessionType::FreshCodex, None)
+            .await
+            .unwrap_err()
+            .code,
+        "RUNTIME_PENDING"
+    );
+    assert_eq!(probe.call_count().await, 0);
+}
+
+#[tokio::test]
+async fn codex_model_catalog_cache_is_source_scoped_and_failed_refresh_preserves_same_source() {
+    let gateway = Arc::new(RecordingProbe::new());
+    let local = Arc::new(RecordingProbe::new());
+    let managed = Arc::new(RecordingProbe::new());
+    let (registry, _) = registry_with(gateway.clone());
+    local
+        .push_ok(vec![cap("local-current", "Local Current", None)])
+        .await;
+    managed
+        .push_ok(vec![cap("managed-current", "Managed Current", None)])
+        .await;
+    let local_source = CodexCatalogSource {
+        key: "native-client-a:epoch1:generation1".into(),
+        probe: local.clone(),
+    };
+    let managed_source = CodexCatalogSource {
+        key: "host-boot-b:incarnation2:generation3:volume-owned".into(),
+        probe: managed.clone(),
+    };
+    let (_, first) = registry
+        .codex(local_source.clone(), Some("/same-cwd".into()), false)
+        .await;
+    let (_, other) = registry
+        .codex(managed_source, Some("/same-cwd".into()), false)
+        .await;
+    assert_eq!(first["models"][0]["id"], "local-current");
+    assert_eq!(other["models"][0]["id"], "managed-current");
+    local
+        .push_err(CapabilityError {
+            code: "CAPABILITY_PROBE_TIMEOUT".into(),
+            message: "deadline".into(),
+            retryable: true,
+        })
+        .await;
+    let (status, failed) = registry
+        .codex(local_source.clone(), Some("/same-cwd".into()), true)
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(failed["error"]["code"], "CAPABILITY_PROBE_TIMEOUT");
+    let (_, cached) = registry
+        .codex(local_source, Some("/same-cwd".into()), false)
+        .await;
+    assert_eq!(cached["status"], "cached");
+    assert_eq!(cached["models"][0]["id"], "local-current");
+    assert_eq!(local.call_count().await, 2);
+    assert_eq!(managed.call_count().await, 1);
+    assert_eq!(gateway.call_count().await, 0);
+}
+
+#[tokio::test]
 async fn codex_model_catalog_without_bound_runtime_is_pending_and_does_not_probe_gateway() {
     let probe = Arc::new(RecordingProbe::new());
     let app = app_with_probe(probe.clone());
-    for uri in [format!("{CAP}/freshcodex"), format!("{CAP}/freshcodex?sessionId=not-created&cwd=/other-home")] {
+    for uri in [
+        format!("{CAP}/freshcodex"),
+        format!("{CAP}/freshcodex?sessionId=not-created&cwd=/other-home"),
+    ] {
         let (status, body) = get(app.clone(), &uri, true).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"]["code"], "RUNTIME_PENDING");
@@ -831,20 +845,6 @@ async fn probe_failure_maps_to_503_unavailable_envelope() {
             },
         })
     );
-}
-
-/// Static providers work over HTTP too and never probe.
-#[tokio::test]
-async fn get_freshcodex_serves_static_catalog_over_http() {
-    let probe = Arc::new(RecordingProbe::new());
-    let app = app_with_probe(probe.clone());
-
-    let (status, body) = get(app, &format!("{CAP}/freshcodex?cwd=/ignored"), true).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["runtimeProvider"], json!("codex"));
-    assert_eq!(body["models"].as_array().unwrap().len(), 5);
-    assert_eq!(body["models"][0]["id"], json!("gpt-6-astra"));
-    assert_eq!(probe.call_count().await, 0);
 }
 
 /// POST refresh re-probes even within the TTL window.
