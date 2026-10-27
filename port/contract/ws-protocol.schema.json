@@ -2,7 +2,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `pnpm run contract:generate`. Each entry in `schemas` is a self-contained JSON Schema for one exported Zod schema. The wire contract is frozen for the Rust port — changing it is out of scope.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "schemaCount": 88,
+  "schemaCount": 89,
   "schemas": {
     "AmplifierActivityListResponseSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -452,6 +452,10 @@
                     "minLength": 1,
                     "type": "string"
                   },
+                  "namingHandle": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
                   "paneKey": {
                     "minLength": 1,
                     "type": "string"
@@ -522,6 +526,10 @@
             "capabilities": {
               "additionalProperties": false,
               "properties": {
+                "freshAgentAttentionReplayV1": {
+                  "const": true,
+                  "type": "boolean"
+                },
                 "managedRuntimeV1": {
                   "const": true,
                   "type": "boolean"
@@ -2223,6 +2231,9 @@
               ],
               "type": "string"
             },
+            "requestId": {
+              "type": "string"
+            },
             "sessionId": {
               "minLength": 1,
               "type": "string"
@@ -2505,6 +2516,102 @@
             "provider",
             "requestId",
             "answers"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "enum": [
+                "accept",
+                "decline",
+                "cancel"
+              ],
+              "type": "string"
+            },
+            "content": {
+              "anyOf": [
+                {
+                  "additionalProperties": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "boolean"
+                      },
+                      {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      }
+                    ]
+                  },
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "cwd": {
+              "type": "string"
+            },
+            "provider": {
+              "enum": [
+                "claude",
+                "codex",
+                "opencode"
+              ],
+              "type": "string"
+            },
+            "requestId": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": -9007199254740991,
+                  "type": "integer"
+                }
+              ]
+            },
+            "sessionId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionType": {
+              "enum": [
+                "freshclaude",
+                "freshcodex",
+                "kilroy",
+                "freshopencode"
+              ],
+              "type": "string"
+            },
+            "type": {
+              "const": "freshAgent.elicitation.respond",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "sessionId",
+            "sessionType",
+            "provider",
+            "requestId",
+            "action",
+            "content"
           ],
           "type": "object"
         },
@@ -3826,6 +3933,9 @@
               ],
               "type": "string"
             },
+            "requestId": {
+              "type": "string"
+            },
             "sessionId": {
               "minLength": 1,
               "type": "string"
@@ -4108,6 +4218,102 @@
             "provider",
             "requestId",
             "answers"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "enum": [
+                "accept",
+                "decline",
+                "cancel"
+              ],
+              "type": "string"
+            },
+            "content": {
+              "anyOf": [
+                {
+                  "additionalProperties": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "boolean"
+                      },
+                      {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      }
+                    ]
+                  },
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "cwd": {
+              "type": "string"
+            },
+            "provider": {
+              "enum": [
+                "claude",
+                "codex",
+                "opencode"
+              ],
+              "type": "string"
+            },
+            "requestId": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": -9007199254740991,
+                  "type": "integer"
+                }
+              ]
+            },
+            "sessionId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionType": {
+              "enum": [
+                "freshclaude",
+                "freshcodex",
+                "kilroy",
+                "freshopencode"
+              ],
+              "type": "string"
+            },
+            "type": {
+              "const": "freshAgent.elicitation.respond",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "sessionId",
+            "sessionType",
+            "provider",
+            "requestId",
+            "action",
+            "content"
           ],
           "type": "object"
         },
@@ -4643,6 +4849,103 @@
       ],
       "type": "object"
     },
+    "FreshAgentElicitationRespondSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "accept",
+            "decline",
+            "cancel"
+          ],
+          "type": "string"
+        },
+        "content": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                ]
+              },
+              "propertyNames": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "provider": {
+          "enum": [
+            "claude",
+            "codex",
+            "opencode"
+          ],
+          "type": "string"
+        },
+        "requestId": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "maximum": 9007199254740991,
+              "minimum": -9007199254740991,
+              "type": "integer"
+            }
+          ]
+        },
+        "sessionId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sessionType": {
+          "enum": [
+            "freshclaude",
+            "freshcodex",
+            "kilroy",
+            "freshopencode"
+          ],
+          "type": "string"
+        },
+        "type": {
+          "const": "freshAgent.elicitation.respond",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "sessionId",
+        "sessionType",
+        "provider",
+        "requestId",
+        "action",
+        "content"
+      ],
+      "type": "object"
+    },
     "FreshAgentForkSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -4722,6 +5025,9 @@
             "codex",
             "opencode"
           ],
+          "type": "string"
+        },
+        "requestId": {
           "type": "string"
         },
         "sessionId": {
@@ -4881,7 +5187,12 @@
           "type": "integer"
         },
         "provider": {
-          "const": "codex",
+          "enum": [
+            "claude",
+            "codex",
+            "opencode",
+            "amplifier"
+          ],
           "type": "string"
         },
         "requestId": {
@@ -4893,7 +5204,12 @@
           "type": "string"
         },
         "sessionType": {
-          "const": "freshcodex",
+          "enum": [
+            "freshclaude",
+            "freshcodex",
+            "kilroy",
+            "freshopencode"
+          ],
           "type": "string"
         },
         "type": {
@@ -4921,7 +5237,12 @@
           "type": "string"
         },
         "provider": {
-          "const": "codex",
+          "enum": [
+            "claude",
+            "codex",
+            "opencode",
+            "amplifier"
+          ],
           "type": "string"
         },
         "requestId": {
@@ -4933,7 +5254,12 @@
           "type": "string"
         },
         "sessionType": {
-          "const": "freshcodex",
+          "enum": [
+            "freshclaude",
+            "freshcodex",
+            "kilroy",
+            "freshopencode"
+          ],
           "type": "string"
         },
         "success": {
@@ -5241,6 +5567,10 @@
         "capabilities": {
           "additionalProperties": false,
           "properties": {
+            "freshAgentAttentionReplayV1": {
+              "const": true,
+              "type": "boolean"
+            },
             "managedRuntimeV1": {
               "const": true,
               "type": "boolean"
@@ -7958,6 +8288,10 @@
                 "minLength": 1,
                 "type": "string"
               },
+              "namingHandle": {
+                "minLength": 1,
+                "type": "string"
+              },
               "paneKey": {
                 "minLength": 1,
                 "type": "string"
@@ -8234,6 +8568,10 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
+        "freshAgentAttentionReplayV1": {
+          "const": true,
+          "type": "boolean"
+        },
         "managedRuntimeV1": {
           "const": true,
           "type": "boolean"
@@ -8277,6 +8615,10 @@
           "type": "string"
         },
         "mode": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "namingHandle": {
           "minLength": 1,
           "type": "string"
         },

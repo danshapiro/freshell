@@ -41,6 +41,7 @@ import { migrateLegacyFreshAgentContent, migrateLegacyFreshAgentDurableState, pr
 import { normalizeFreshAgentStyleOverride } from '@shared/settings'
 import { isDurableProviderSessionId } from '@shared/session-flavor'
 import { parsePaneNamingIdentityInput } from '@/lib/tab-name-source'
+import { adoptAuthoritativeConversationNameRef, releaseSupersededConversationNaming } from '@/lib/terminal-naming-rebind'
 import { ManagedRuntimeProjectionFieldsSchema, type ManagedRuntimeProjectionFields } from '@shared/managed-runtime'
 
 
@@ -52,6 +53,7 @@ type FreshAgentSessionMaterializedPayload = {
   sessionType: FreshAgentPaneContent['sessionType']
   provider: FreshAgentPaneContent['provider']
   sessionRef?: SessionLocator
+  nameRef?: unknown
 }
 
 function normalizeManagedRuntimeProjection(
@@ -581,8 +583,8 @@ function normalizePaneTree(node: PaneNode, previous?: PaneNode): PaneNode | null
     const previousLeaf = previousValid ? findLeaf(previousValid, node.id) : null
     const normalizedLeaf: Extract<PaneNode, { type: 'leaf' }> = {
       ...node,
-      // Hydrate-scoped: normalizePaneTree is reachable ONLY from hydratePanes,
-      // so this is the one place a key-less incoming pane may inherit the
+      // Only hydratePanes supplies a previous tree. This is the one place a
+      // key-less incoming pane may inherit the
       // previous (local) same-kind pane's createRequestId instead of minting.
       // updatePaneContent et al. pass no options and keep minting — the
       // resume/repair rotation contract (tabsSlice.ts repairExistingTabLayout,
@@ -769,8 +771,11 @@ function buildMaterializedFreshAgentContent(
     provider: materialized.provider,
     sessionId: materialized.sessionId,
   }
+  const namingIdentity = { nameRef: content.nameRef, namingHandle: content.namingHandle }
+  adoptAuthoritativeConversationNameRef(namingIdentity, sessionRef, materialized.nameRef)
   return normalizePaneContent({
     ...content,
+    ...namingIdentity,
     sessionId: materialized.sessionId,
     resumeSessionId: materialized.sessionId,
     sessionRef,
@@ -1236,6 +1241,25 @@ export const panesSlice = createSlice({
       }
       state.activePane[tabId] = paneId
       state.paneTitles[tabId] = { [paneId]: derivePaneTitle(normalized) }
+      reconcileRefreshRequestsForTab(state, tabId)
+      delete state.restoreFallbackAttemptsByPane?.[tabId]
+    },
+
+    /** Install a complete copy without exposing partially constructed
+     * naming-source relationships. Unlike restoreLayout, the already
+     * sanitized content retains same-server live terminal handles. */
+    initCopiedLayout: (
+      state,
+      action: PayloadAction<{ tabId: string; layout: PaneNode; activePaneId?: string }>,
+    ) => {
+      const { tabId, layout, activePaneId } = action.payload
+      if (refuseMutationWhileClosing(state, tabId, 'initCopiedLayout') || state.layouts[tabId]) return
+      const normalized = normalizePaneTree(layout)
+      if (!normalized) return
+      const leaves = collectLeaves(normalized)
+      state.layouts[tabId] = normalized
+      state.activePane[tabId] = leaves.find((leaf) => leaf.id === activePaneId)?.id ?? leaves[0].id
+      state.paneTitles[tabId] = Object.fromEntries(leaves.map((leaf) => [leaf.id, derivePaneTitle(leaf.content)]))
       reconcileRefreshRequestsForTab(state, tabId)
       delete state.restoreFallbackAttemptsByPane?.[tabId]
     },
@@ -2369,7 +2393,13 @@ export const panesSlice = createSlice({
 
     reconcileTerminalSessionRefByTerminalId: (
       state,
-      action: PayloadAction<{ terminalId: string; sessionRef: unknown }>
+      action: PayloadAction<{
+        terminalId: string
+        sessionRef: unknown
+        previousSessionId?: string
+        spentNamingHandles?: string[]
+        nameRef?: unknown
+      }>
     ) => {
       const terminalId = action.payload.terminalId
       const sessionRef = sanitizeSessionRef(action.payload.sessionRef)
@@ -2386,7 +2416,16 @@ export const panesSlice = createSlice({
             return
           }
 
+          const adoptedNameRef = adoptAuthoritativeConversationNameRef(content, canonicalSessionRef, action.payload.nameRef)
           if (!sessionRefsEqual(content.sessionRef, canonicalSessionRef)) {
+            if (!adoptedNameRef) {
+              releaseSupersededConversationNaming(
+                content,
+                canonicalSessionRef,
+                action.payload.previousSessionId,
+                action.payload.spentNamingHandles,
+              )
+            }
             content.sessionRef = canonicalSessionRef
           }
           content.resumeSessionId = undefined
@@ -2983,6 +3022,7 @@ export const panesSlice = createSlice({
 
 export const {
   initLayout,
+  initCopiedLayout,
   restoreLayout,
   resetLayout,
   clearPanesForMachine,

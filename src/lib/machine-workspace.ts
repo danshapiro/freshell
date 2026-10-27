@@ -1,6 +1,5 @@
 import { getRecoveryInventory } from '@/lib/api'
 import { createLogger } from '@/lib/client-logger'
-import { captureLegacyNameEvidence } from '@/lib/session-name-migration'
 import {
   getMachineWorkspaceOriginId,
   persistMachineWorkspaceOriginId,
@@ -8,11 +7,12 @@ import {
 import { bootCapturedAtMs } from '@/lib/recovery/boot-state'
 import { buildRecoveryPlan } from '@/lib/recovery/build-recovery-plan'
 import type { RecoveryInventory } from '@/lib/recovery/types'
-import { addTerminalRestoreRequestId, armRecoveredLiveTerminalTarget } from '@/lib/terminal-restore'
+import { addTerminalRestoreRequestId } from '@/lib/terminal-restore'
+import { applyRecoveryTabPlan } from '@/lib/recovery/apply-recovery-plan'
 import { getCurrentTabRegistryClientInstanceId } from '@/store/tabRegistrySync'
 import { clearTabRegistryLocalClosed } from '@/store/tabRegistrySlice'
-import { clearTabsForMachine, addTab, setActiveTab } from '@/store/tabsSlice'
-import { clearPanesForMachine, restoreLayout, setPaneCrashTrace } from '@/store/panesSlice'
+import { clearTabsForMachine, setActiveTab } from '@/store/tabsSlice'
+import { clearPanesForMachine, setPaneCrashTrace } from '@/store/panesSlice'
 import type { CrashTrace, PaneNode } from '@/store/paneTypes'
 import type { RootState } from '@/store/store'
 
@@ -143,15 +143,6 @@ export async function restoreMachineWorkspace(
     reason: options.reason,
     machineId,
   })
-  // Unified agent names (Task 7): the belt beneath the module-import capture
-  // — preserve every raw legacy layout/backup envelope BEFORE this
-  // bootstrap clears the local cache below. Idempotent (the capture
-  // dedupes by storageKey+raw) and read-only w.r.t. the sources.
-  try {
-    captureLegacyNameEvidence(localStorage)
-  } catch (error) {
-    log.error('legacy-name evidence capture failed before the rebuild; retrying next boot', { error })
-  }
   // The recovery endpoint treats clientInstanceId as an opaque exclusion key.
   // The general recovery offer passes the real id so it cannot offer the page
   // its own already-loaded state. Machine bootstrap is different: a rebuild
@@ -196,26 +187,9 @@ export async function restoreMachineWorkspace(
   store.dispatch(clearTabRegistryLocalClosed())
 
   for (const plan of plans) {
-    store.dispatch(addTab({
-      id: plan.tabId,
-      title: plan.title,
-      // Unified agent names (Task 6): the recovered tab keeps its stable
-      // naming-source relationship (the plan remapped it through the
-      // old→new pane-id map; machine bootstrap preserves ids verbatim).
-      ...(plan.nameSource ? { nameSource: plan.nameSource } : {}),
-    }))
-    store.dispatch(restoreLayout({
-      tabId: plan.tabId,
-      layout: plan.layout,
-      paneTitles: plan.paneTitles,
-      // The inventory is scoped to this selected machine and the plan already
-      // chose only valid snapshot IDs. Preserve that durable pane identity;
-      // ordinary and cross-device restore callers intentionally omit this.
-      preserveCreateRequestIds: true,
-    }))
-    for (const target of plan.liveTerminalReattach ?? []) {
-      armRecoveredLiveTerminalTarget(plan.tabId, target.paneId, target.terminalId)
-    }
+    // The inventory is scoped to this selected machine and the plan already
+    // chose only valid snapshot IDs: preserve that durable pane identity.
+    applyRecoveryTabPlan(store.dispatch, plan, { preserveCreateRequestIds: true })
   }
   // A local trace follows only the exact same terminal identity on this
   // machine. In particular, a new create request or a different terminal mode
@@ -229,5 +203,13 @@ export async function restoreMachineWorkspace(
   // workspace successfully. This marker is local metadata, never server
   // snapshot state and never a cross-device recovery channel.
   persistMachineWorkspaceOriginId(machineId)
+  log.info('machine workspace rebuilt from server inventory', {
+    reason: options.reason,
+    machineId,
+    restoredTabs: plans.length,
+    restoredPaneTitles: plans.reduce((n, plan) => n + Object.keys(plan.paneTitles).length, 0),
+    restoredPaneUserFlags: plans.reduce((n, plan) => n + Object.keys(plan.paneTitleSetByUser).length, 0),
+    restoredTabUserFlags: plans.filter((plan) => plan.titleSetByUser).length,
+  })
   return { restoredTabs: plans.length }
 }

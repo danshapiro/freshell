@@ -965,6 +965,26 @@ impl FreshClaudeState {
             }
         };
 
+        // Preserve the name before any identity announcement can re-key a
+        // resumed pane. The source stays independent, including its manual
+        // provenance. A failed name commit leaves the original live.
+        if self
+            .preserve_rollback_name(&durable_id, &replacement, session_type)
+            .await
+            .is_err()
+        {
+            self.unwind_replacement(&replacement, &durable_id, lease_held)
+                .await;
+            self.compensate_rollback_record(&durable_id, existing.clone())
+                .await;
+            reply_sink(rollback_error_frame(
+                &op,
+                "NAME_PERSISTENCE_FAILED",
+                "The conversation's saved name could not be retained. Try again.",
+            ));
+            return;
+        }
+
         // ONE awaited ledger batch: the replacement's binding (its genesis,
         // the original's settings, `supersedes` = the original, which retires
         // the original's row and links it to the replacement) with the

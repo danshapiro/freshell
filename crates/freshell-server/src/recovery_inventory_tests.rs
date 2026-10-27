@@ -6284,3 +6284,110 @@ fn the_inventory_forwards_the_tab_name_source_additively() {
         out2["device"]["tabs"][0]
     );
 }
+
+/// Name reliability (Task 9, D7): a new window rebuilds its workspace from
+/// this inventory, so the pane titles and the "user renamed" flags (pane and
+/// tab) forward with each tab. Only well-typed values forward: a title is a
+/// string and a flag is a boolean; anything else is left out.
+#[test]
+fn inventory_forwards_pane_titles_and_user_flags() {
+    let mut d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc_with_tab_key(
+            "dev1",
+            1000,
+            "dev1:t1",
+            json!([
+                { "paneId": "p-renamed", "kind": "terminal", "title": "KeepMePane",
+                  "titleSetByUser": true,
+                  "payload": { "mode": "shell", "shell": "system", "createRequestId": "req-r" } },
+                { "paneId": "p-osc", "kind": "terminal", "title": "user@host: ~",
+                  "payload": { "mode": "shell", "shell": "system", "createRequestId": "req-o" } },
+                { "paneId": "p-untitled", "kind": "editor",
+                  "payload": { "filePath": "/tmp/notes.md" } },
+                { "paneId": "p-malformed", "kind": "browser", "title": 42,
+                  "titleSetByUser": "yes",
+                  "payload": { "url": "https://example.com" } }
+            ]),
+        ),
+    };
+    d.union_doc["records"][0]["titleSetByUser"] = json!(true);
+
+    let out = build_inventory(vec![d], vec![], no_live(), &no_evidence(), &no_closes());
+    let tab = &out["device"]["tabs"][0];
+    assert_eq!(
+        tab["titleSetByUser"],
+        json!(true),
+        "the tab flag forwards: {tab}"
+    );
+    let panes = tab["panes"].as_array().expect("panes");
+    assert_eq!(panes[0]["title"], json!("KeepMePane"), "{}", panes[0]);
+    assert_eq!(panes[0]["titleSetByUser"], json!(true), "{}", panes[0]);
+    assert_eq!(panes[1]["title"], json!("user@host: ~"), "{}", panes[1]);
+    assert!(panes[1].get("titleSetByUser").is_none(), "{}", panes[1]);
+    assert!(panes[2].get("title").is_none(), "{}", panes[2]);
+    assert!(panes[2].get("titleSetByUser").is_none(), "{}", panes[2]);
+    assert!(panes[3].get("title").is_none(), "{}", panes[3]);
+    assert!(panes[3].get("titleSetByUser").is_none(), "{}", panes[3]);
+
+    // A record whose tab nobody renamed forwards its false flag as recorded.
+    let mut d2 = DeviceUnion {
+        device_id: "dev2".into(),
+        union_doc: union_doc(
+            "dev2",
+            1000,
+            json!([{ "paneId": "p1", "kind": "terminal",
+                     "payload": { "mode": "shell", "shell": "system", "createRequestId": "r" } }]),
+        ),
+    };
+    d2.union_doc["records"][0]["titleSetByUser"] = json!(false);
+    let out2 = build_inventory(vec![d2], vec![], no_live(), &no_evidence(), &no_closes());
+    assert_eq!(out2["device"]["tabs"][0]["titleSetByUser"], json!(false));
+}
+
+/// Name reliability (Task 9) pinning test: names are not offer substance.
+/// Renaming a tab or a pane (or setting its user flag) must not change the
+/// dismissal id, or a declined offer would come back after every rename.
+#[test]
+fn inventory_digest_ignores_titles() {
+    let build = |tab_name: &str, tab_flag: bool, pane_title: Option<&str>, pane_flag: bool| {
+        let mut pane = json!({ "paneId": "p1", "kind": "terminal",
+                               "payload": { "mode": "shell", "shell": "system", "createRequestId": "r" } });
+        if let Some(title) = pane_title {
+            pane["title"] = json!(title);
+        }
+        if pane_flag {
+            pane["titleSetByUser"] = json!(true);
+        }
+        let mut d = DeviceUnion {
+            device_id: "dev".into(),
+            union_doc: union_doc("dev", 1000, json!([pane])),
+        };
+        d.union_doc["records"][0]["tabName"] = json!(tab_name);
+        d.union_doc["records"][0]["titleSetByUser"] = json!(tab_flag);
+        build_inventory(vec![d], vec![], no_live(), &no_evidence(), &no_closes())
+    };
+    let before = build("work", false, None, false);
+    let after = build("MyShellTab", true, Some("KeepMePane"), true);
+    assert_eq!(
+        before["contentId"], after["contentId"],
+        "a rename must not re-key the dismissal id"
+    );
+    // Control: a material change (another pane) does re-key it.
+    let mut d = DeviceUnion {
+        device_id: "dev".into(),
+        union_doc: union_doc(
+            "dev",
+            1000,
+            json!([
+                { "paneId": "p1", "kind": "terminal",
+                  "payload": { "mode": "shell", "shell": "system", "createRequestId": "r" } },
+                { "paneId": "p2", "kind": "terminal",
+                  "payload": { "mode": "shell", "shell": "system", "createRequestId": "r2" } }
+            ]),
+        ),
+    };
+    d.union_doc["records"][0]["titleSetByUser"] = json!(false);
+    let material = build_inventory(vec![d], vec![], no_live(), &no_evidence(), &no_closes());
+    assert_ne!(before["contentId"], material["contentId"]);
+}

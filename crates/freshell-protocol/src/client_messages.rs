@@ -782,6 +782,13 @@ pub struct ReconcilePane {
     /// Informational only — never trusted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// Name reliability: the pane's persisted pre-durable naming handle
+    /// (`terminal.create.namingHandle`). Additive optional. Read only when
+    /// the managed pre-pass reconstructs a supervisor-owned row after a web
+    /// restart: a zero-turn soul's name still lives under this handle, so
+    /// the adopted row rejoins it. The verdict ladder ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub naming_handle: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

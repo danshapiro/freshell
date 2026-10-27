@@ -429,6 +429,7 @@ async fn scoped_claude_resume_create_frames_carry_the_durable_naming_projection(
         name: "Preexisting Name".into(),
         intent: NameIntent::User,
         if_revision: None,
+        cwd: None,
     })
     .await
     .expect("seed rename");

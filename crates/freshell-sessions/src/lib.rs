@@ -24,8 +24,11 @@ pub mod codex_history;
 pub mod codex_locator;
 pub mod codex_segments;
 pub mod directory_index;
+mod first_message_rules;
 pub mod meta;
+pub mod name_evidence;
 pub mod opencode_locator;
+mod opencode_row_title;
 pub mod parse;
 pub mod provider_layout;
 pub mod resume_input;
@@ -46,6 +49,9 @@ pub mod watch_plan;
 pub(crate) static HOME_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub use meta::{CodexTaskEventSnapshot, ParsedSessionMeta, TokenSummary};
+pub use name_evidence::{
+    is_default_or_derived_name, is_provider_placeholder_title, NameEvidenceContext,
+};
 pub use parse::{
     parse_codex_session_content, parse_session_content, ClaudeUsageAccumulator, ParseSessionOptions,
 };

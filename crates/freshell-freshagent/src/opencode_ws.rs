@@ -10147,6 +10147,103 @@ mod tests {
         );
     }
 
+    /// Name-reliability Task 4: the SSE bridge folds `session.updated` titles
+    /// without ever stalling its relay. OpenCode's placeholder title never
+    /// reaches the naming store; the real title's inline fold fails on a
+    /// locked store, yet the following non-title event is relayed at once,
+    /// and the background retry lands the real title afterwards.
+    #[tokio::test]
+    async fn bridge_title_observations_skip_placeholders_and_never_stall_the_relay() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager.clone()).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        let sink = crate::naming::test_support::RecordingSink::new();
+        sink.seed_record(freshell_protocol::session_names::SessionNameRecord {
+            name_ref: freshell_protocol::session_names::SessionNameRef::Session {
+                provider: freshell_protocol::session_names::NamedProvider::Opencode,
+                session_id: "ses_title".to_string(),
+            },
+            name: "proj".into(),
+            source: freshell_protocol::session_names::NameSource::Directory,
+            revision: 1,
+            manual_revision: None,
+            renamed_at: None,
+            legacy_origin: None,
+        });
+        // The store is locked for the real title's inline attempt.
+        sink.fail_next_observations(1);
+        st.set_session_naming(sink.clone());
+        let _bridge = st.spawn_serve_bridge(
+            manager.clone(),
+            "ses_title".to_string(),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let title_event = |title: &str| freshell_opencode::ParsedServeEvent {
+            kind: "session.updated".to_string(),
+            session_id: Some("ses_title".to_string()),
+            properties: {
+                let mut properties = serde_json::Map::new();
+                properties.insert(
+                    "info".to_string(),
+                    json!({ "id": "ses_title", "title": title }),
+                );
+                properties
+            },
+            raw: serde_json::Map::new(),
+        };
+        manager.dispatch_event(title_event("New session - 2026-10-20T00:09:25.350Z"));
+        manager.dispatch_event(title_event("Publishing blocked by token error"));
+        let relay_started = std::time::Instant::now();
+        manager.dispatch_event(freshell_opencode::ParsedServeEvent {
+            kind: "message.updated".to_string(),
+            session_id: Some("ses_title".to_string()),
+            properties: serde_json::Map::new(),
+            raw: serde_json::Map::new(),
+        });
+
+        // The non-title event is relayed promptly, before any retry delay.
+        let relayed = tokio::time::timeout(Duration::from_millis(150), async {
+            loop {
+                let raw = rx.recv().await.expect("bridge frame");
+                let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                if frame["event"]["type"] == "freshAgent.session.changed" {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("the following frame is relayed while the store is locked");
+        assert_eq!(relayed["sessionId"], "ses_title");
+        assert!(relay_started.elapsed() < Duration::from_millis(150));
+
+        // The retry lands the real title; the placeholder never reached the store.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if !sink.observed_titles().is_empty() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the background retry folded the real title");
+        assert_eq!(
+            sink.observed_titles(),
+            vec!["Publishing blocked by token error".to_string()]
+        );
+        assert!(
+            !sink
+                .attempted_titles()
+                .iter()
+                .any(|title| title.starts_with("New session - ")),
+            "the placeholder never reached the store: {:?}",
+            sink.attempted_titles()
+        );
+    }
+
     /// The concurrent variant: two GENUINELY CONCURRENT creates sharing a `requestId`
     /// must still construct exactly ONE session object (never two, racing to overwrite
     /// each other in the `sessions` map).

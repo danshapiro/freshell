@@ -16,6 +16,7 @@ import { ReadyMessageSchema } from '@/lib/ready-message-schema'
 import { cancelCreate, _resetCancelledCreates } from '@/lib/create-cancellation'
 import type { SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
+import { resolvePaneNameRef } from '@/store/selectors/sessionNameSelectors'
 
 function createFreshAgentStore() {
   return configureStore({
@@ -114,6 +115,83 @@ describe('fresh-agent-ws', () => {
   })
   beforeEach(() => {
     _resetCancelledCreates()
+  })
+
+  it('a continuation follows its authoritative child name instead of the original spent handle', () => {
+    const store = createFreshAgentPaneStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent', provider: 'claude', sessionType: 'freshclaude',
+        sessionId: 'original', sessionRef: { provider: 'claude', sessionId: 'original' },
+        namingHandle: 'spent-original-handle', nameRef: { kind: 'pending', id: 'spent-original-handle' },
+        createRequestId: 'req-1', status: 'running',
+      },
+    }))
+
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.session.materialized',
+      previousSessionId: 'original', sessionId: 'replacement',
+      provider: 'claude', sessionType: 'freshclaude',
+      sessionRef: { provider: 'claude', sessionId: 'replacement' },
+      nameRef: { kind: 'session', provider: 'claude', sessionId: 'replacement' },
+    })
+
+    const layout = store.getState().panes.layouts['tab-1']
+    if (layout.type !== 'leaf') throw new Error('expected a pane')
+    expect(resolvePaneNameRef(layout.content)).toEqual({
+      kind: 'session', provider: 'claude', sessionId: 'replacement',
+    })
+    expect(layout.content).not.toHaveProperty('namingHandle', 'spent-original-handle')
+  })
+
+  it('adopts the Codex name without changing settings, child selection, retained source or writer', () => {
+    const store = configureStore({ reducer: {
+      freshAgent: freshAgentReducer, freshAgentLive: freshAgentLiveReducer, panes: panesReducer,
+    } })
+    const sessionId = savedCodexNativeHistory.threadId
+    const locator = { provider: 'codex', sessionType: 'freshcodex', sessionId } as const
+    store.dispatch(initLayout({ tabId: 'tab', paneId: 'pane', content: {
+      kind: 'fresh-agent', ...locator, createRequestId: 'stable-create', status: 'running',
+      sessionRef: { provider: 'codex', sessionId },
+      namingHandle: 'spent-handle', nameRef: { kind: 'pending', id: 'spent-handle' },
+      model: 'native-custom', effort: 'xhigh', sandbox: 'workspace-write',
+      initialCwd: '/workspace', observedChildThreadId: 'observed-child',
+    } }))
+    const ws = { send: vi.fn() }
+    const source = { projectionId: 'combined-source', ownerEpoch: 2, ownerGeneration: 3,
+      soulId: 'soul', incarnationId: 'incarnation', hostBootId: 'host' }
+    handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator, event: {
+      type: 'freshAgent.host.backpressure', retainedState: {
+        source, snapshot: { ...savedCodexNativeHistory, turns: [{
+          id: 'turn', turnId: 'turn', role: 'assistant', summary: '',
+          items: [{ id: 'answer', kind: 'text', text: 'Retained native answer' }],
+        }], extensions: { codex: { projection: {
+          id: source.projectionId, historyGeneration: 0, eventRevision: 1,
+          eventOwnedTurnIds: ['turn'], nativePreviewTurnIds: [], nativeFinalTurnIds: [],
+          turnRows: { turn: ['turn'] }, turnOutputStates: { turn: { provenance: 'retained', refreshPending: false } },
+          settledTurnIds: ['turn'],
+        } } } }, pendingControls: [], attentionMarks: [],
+      },
+    } }, ws)
+    const key = `freshcodex:codex:${sessionId}`
+    const retained = store.getState().freshAgentLive.bySession[key]
+    expect(retained.projection?.turns[0].items[0]).toMatchObject({ text: 'Retained native answer' })
+    const nameRef = { kind: 'session', provider: 'codex', sessionId } as const
+    handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.session.materialized', ...locator,
+      previousSessionId: sessionId, sessionRef: { provider: 'codex', sessionId }, nameRef,
+    }, ws)
+    const layout = store.getState().panes.layouts.tab
+    if (layout.type !== 'leaf') throw new Error('expected a pane')
+    expect(resolvePaneNameRef(layout.content)).toEqual(nameRef)
+    expect(layout.content).toMatchObject({ ...locator, createRequestId: 'stable-create',
+      model: 'native-custom', effort: 'xhigh', sandbox: 'workspace-write',
+      initialCwd: '/workspace', observedChildThreadId: 'observed-child',
+    })
+    expect(layout.content).not.toHaveProperty('namingHandle')
+    expect(store.getState().freshAgentLive.bySession[key]).toEqual(retained)
+    expect(ws.send).not.toHaveBeenCalled()
   })
 
   it('registers resumed creates with history hydration and handles freshAgent.created', () => {

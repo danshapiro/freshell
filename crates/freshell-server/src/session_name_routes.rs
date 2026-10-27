@@ -41,6 +41,9 @@ use crate::session_names::{
     is_boot_import_id, SessionNames, NAME_MIGRATION_IMPORT_CANDIDATE_LIMIT,
 };
 
+#[path = "session_name_route_admission.rs"]
+mod admission;
+
 /// Client batch reads are chunked to this many references per request (plan
 /// rule 9 / the route contract).
 pub(crate) const READ_CHUNK_LIMIT: usize = 100;
@@ -56,6 +59,9 @@ pub struct SessionNamesState {
     /// (live and retired entries) before the store sees them; unresolved
     /// ones stay recovery-only.
     pub identity: TerminalIdentityRegistry,
+    /// Name-reliability Task 4: the session index, the best-known folder of
+    /// a session-key rename target. `None` when no provider home resolves.
+    pub index: Option<Arc<freshell_sessions::directory_index::SessionIndex>>,
 }
 
 /// The session-names sub-router (`POST /api/session-names/read` +
@@ -96,24 +102,19 @@ pub(crate) fn name_error_response(error: &NameError, target: &SessionNameRef) ->
 /// The shared scoped-rename drive every convenience route funnels into —
 /// the ONE `rename` call with the intent default (`automatic`: an agent
 /// suggestion never acquires a user rename's permanence) and the optional
-/// `ifRevision` compare-and-set. Returns the accepted update, or the mapped
-/// error response (with the structured error log already emitted).
+/// `ifRevision` compare-and-set. `cwd` is the target's best-known folder
+/// (name-reliability Task 4: an automation rename to it is refused as a
+/// derived label). Returns the accepted update — carrying the rename's
+/// `outcome` — or the mapped error response (with the structured error log
+/// already emitted).
 pub(crate) async fn rename_through_authority(
     sink: &dyn SessionNaming,
-    target: SessionNameRef,
-    name: String,
-    intent: NameIntent,
-    if_revision: Option<u64>,
+    input: RenameNameInput,
+    identity: &TerminalIdentityRegistry,
+    index: Option<&freshell_sessions::directory_index::SessionIndex>,
 ) -> Result<freshell_protocol::session_names::SessionNameUpdate, Response> {
-    match sink
-        .rename(RenameNameInput {
-            target: target.clone(),
-            name,
-            intent,
-            if_revision,
-        })
-        .await
-    {
+    let target = input.target.clone();
+    match admission::rename(sink, input, identity, index).await {
         Ok(update) => Ok(update),
         Err(error) => {
             // Structured failure log under this server's own target
@@ -129,6 +130,65 @@ pub(crate) async fn rename_through_authority(
             Err(name_error_response(&error, &target))
         }
     }
+}
+
+/// Name-reliability Task 4 (LB-B8): the best-known folder of a rename
+/// target. A session target reads its session index row (the published
+/// snapshot only — a rename never waits on an index sweep); otherwise, or
+/// when the index has no row, a terminal row bound to the target (the
+/// identity table keeps the cwd of live and exited terminals). `None` when
+/// nothing knows the folder: the rename then recognizes folder-free labels
+/// only.
+pub(crate) fn rename_target_cwd(
+    target: &SessionNameRef,
+    identity: &TerminalIdentityRegistry,
+    index: Option<&freshell_sessions::directory_index::SessionIndex>,
+) -> Option<String> {
+    if let SessionNameRef::Session {
+        provider,
+        session_id,
+    } = target
+    {
+        let indexed = index
+            .and_then(|index| index.peek())
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|row| row.provider == provider.as_str() && &row.session_id == session_id)
+                    .and_then(|row| row.cwd.clone())
+            })
+            .filter(|cwd| !cwd.trim().is_empty());
+        if indexed.is_some() {
+            return indexed;
+        }
+        if let Some(cwd) = identity
+            .find_all_by_session(provider.as_str(), session_id, None)
+            .into_iter()
+            .find_map(|row| row.cwd.filter(|cwd| !cwd.trim().is_empty()))
+        {
+            return Some(cwd);
+        }
+    }
+    identity
+        .list()
+        .into_iter()
+        .filter(|row| row.name_ref.as_ref() == Some(target))
+        .find_map(|row| row.cwd.filter(|cwd| !cwd.trim().is_empty()))
+}
+
+/// Name-reliability Task 4 (LB-B8): a terminal's best-known folder — the
+/// live registry row, else the identity row (which survives the terminal's
+/// exit).
+pub(crate) fn terminal_row_cwd(
+    registry: &freshell_terminal::TerminalRegistry,
+    identity: &TerminalIdentityRegistry,
+    terminal_id: &str,
+) -> Option<String> {
+    registry
+        .probe(terminal_id)
+        .and_then(|row| row.cwd)
+        .or_else(|| identity.get(terminal_id).and_then(|row| row.cwd))
+        .filter(|cwd| !cwd.trim().is_empty())
 }
 
 /// Parse the rename-intent fields a convenience route may carry alongside
@@ -186,9 +246,11 @@ pub(crate) fn parse_rename_intents(body: &Value) -> Result<(NameIntent, Option<u
 }
 
 /// `POST /api/session-names/read {refs}` → `{names: [SessionNameUpdate]}`.
-/// Adopts the current document first (the common full-document refresh path
-/// before name-dependent reads), then resolves the requested refs — unknown
-/// refs are omitted (plan rule 7). A body naming more than
+/// Resolves the requested refs from the store's adopted view — unknown refs
+/// are omitted (plan rule 7). The store's read peeks the document's stamp
+/// and adopts a same-home participant's commit first, so a CLI/MCP read
+/// reflects current state without the document lock or a full-document
+/// rebuild (name-reliability Task 11). A body naming more than
 /// [`READ_CHUNK_LIMIT`] refs is a 400 (the client chunks).
 async fn read_session_names(
     State(state): State<SessionNamesState>,
@@ -230,21 +292,6 @@ async fn read_session_names(
                     .into_response();
             }
         }
-    }
-    // The common full-document adoption path before the name-dependent read:
-    // a same-home cooperating process's commits (the 2s tick's own refresh)
-    // are adopted here too, so a CLI/MCP read reflects current state without
-    // polling. Adoption failures degrade to the last established snapshot
-    // (the read still answers from it), loudly logged.
-    if let Err(error) = state.names.refresh_current().await {
-        tracing::warn!(
-            target: "freshell_server::session_names",
-            op = "refresh_current",
-            name_ref = "-",
-            revision = 0,
-            class = %error.code(),
-            "session_names.operation_failed: {error}"
-        );
     }
     match state.names.get(targets).await {
         Ok(updates) => Json(json!({ "names": updates })).into_response(),
@@ -307,7 +354,21 @@ async fn rename_session_name(
     }
     let target = request.target.clone();
     let intent = request.name_intent.unwrap_or(NameIntent::Automatic);
-    match rename_through_authority(&*state.names, target, name, intent, request.if_revision).await {
+    let cwd = rename_target_cwd(&target, &state.identity, state.index.as_deref());
+    match rename_through_authority(
+        &*state.names,
+        RenameNameInput {
+            target,
+            name,
+            intent,
+            if_revision: request.if_revision,
+            cwd,
+        },
+        &state.identity,
+        state.index.as_deref(),
+    )
+    .await
+    {
         Ok(update) => Json(serde_json::to_value(&update).unwrap_or(Value::Null)).into_response(),
         Err(response) => response,
     }

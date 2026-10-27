@@ -50,6 +50,12 @@ function makeSession() {
   const boundary = deferred<void>()
   const didClose = deferred<void>()
   const originalClose = capture.session.close.bind(capture.session)
+  const originalWaitForResultsAndIdle = capture.session.waitForResultsAndIdle
+  capture.session.waitForResultsAndIdle = function (...args: Parameters<typeof originalWaitForResultsAndIdle>) {
+    const waiting = originalWaitForResultsAndIdle.apply(this, args)
+    boundary.resolve()
+    return waiting
+  }
   const observed = {
     ...capture,
     boundary,

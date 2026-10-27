@@ -1,11 +1,34 @@
-import { test } from '../helpers/fixtures.js'
+import { expect, test } from '../helpers/fixtures.js'
+import { withholdSavedNames } from '../helpers/withhold-saved-names.js'
+import type { SessionNameRef } from '../../../shared/session-names.js'
+import {
+  createNamedAgent,
+  refreshHandle,
+  renameThroughPaneHeader,
+  sendFirstMessage,
+} from '../helpers/unified-agent-names.js'
 import {
   activityGeneratesOneSharedShortName,
+  bootJourney,
+  connect,
   everyApplicableRenameEntryConverges,
   manualNameSurvivesLateGenerationAndSwitch,
   pendingNameSurvivesMaterializeAndReopen,
+  readRecord,
+  resolveSessionId,
   twoBrowsersAndAnloadedHistoryConverge,
+  type Journey,
 } from '../helpers/unified-agent-names-modes.js'
+
+/** The server's `/api/terminals` row for one terminal (null when absent). */
+async function terminalRow(journey: Journey, terminalId: string): Promise<Record<string, any> | null> {
+  const response = await fetch(`${journey.server.info.baseUrl}/api/terminals`, {
+    headers: { 'x-auth-token': journey.server.info.token },
+  })
+  if (!response.ok) return null
+  const rows = await response.json() as Array<Record<string, any>>
+  return rows.find((row) => row.terminalId === terminalId) ?? null
+}
 
 // UNIFIED AGENT NAMES (plan Task 8) — the [claude] slice of the six-mode
 // acceptance, split per coordinator ruling (task-008-decisions.md,
@@ -54,5 +77,82 @@ test.describe('[claude] unified agent names', () => {
 
   test('manual name survives late generation and conversation switch', async ({ browser }) => {
     await manualNameSurvivesLateGenerationAndSwitch('claude', browser)
+  })
+
+  // Name reliability (Task 10, G45): an IN-PANE conversation switch (the
+  // CLI's `/clear`) moves the terminal row to the new session and shows that
+  // session's name; the old session keeps its own.
+  test('a conversation switch shows the new conversation name', async ({ browser }) => {
+    const journey = await bootJourney('claude')
+    try {
+      const { page, harness, context } = await connect(journey, browser)
+      const created = await createNamedAgent(harness, 'claude', { entry: 'ui', page, server: journey.server })
+      let handle = await refreshHandle(harness, created, 'claude')
+      expect(handle.terminalId, 'the claude pane has a terminal').toBeTruthy()
+      const terminalId = handle.terminalId!
+      await sendFirstMessage(page, harness, handle, 'claude', 'Explore the cache layer')
+      const sessionA = await resolveSessionId(journey, handle)
+      const refA: SessionNameRef = { kind: 'session', provider: 'claude', sessionId: sessionA }
+      // The pane's pending name binds onto session A once its transcript
+      // exists (the claude naming lane): the row is then on A's own record.
+      await expect.poll(async () => (await terminalRow(journey, terminalId))?.nameRef, {
+        timeout: 45_000, intervals: [500, 1_000, 2_000],
+      }).toEqual(refA)
+      await renameThroughPaneHeader(page, 'LotL')
+      await expect(async () => {
+        expect((await readRecord(journey, refA)).name).toBe('LotL')
+      }).toPass({ timeout: 30_000 })
+      await expect.poll(async () => (await terminalRow(journey, terminalId))?.sessionName?.name, {
+        timeout: 30_000,
+      }).toBe('LotL')
+
+      // A restored window has the mirrored title and its original pending
+      // handle, but may switch before the redirect/name cache loads. The
+      // authoritative association binding must release that spent handle.
+      const withholding = await withholdSavedNames(page)
+      await page.reload()
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+      handle = await refreshHandle(harness, handle, 'claude')
+      await expect(page.locator(`[data-context="tab"][data-tab-id="${handle.tabId}"]`))
+        .toContainText('LotL', { timeout: 30_000 })
+      expect(Object.keys((await harness.getState() as { sessionNames: { records: Record<string, unknown> } })
+        .sessionNames.records)).toEqual([])
+
+      // The switch: the CLI starts a new conversation inside the same pane.
+      await sendFirstMessage(page, harness, handle, 'claude', '/clear')
+      let sessionB = ''
+      await expect.poll(async () => {
+        const nameRef = (await terminalRow(journey, terminalId))?.nameRef
+        sessionB = nameRef?.kind === 'session' && nameRef.sessionId !== sessionA ? nameRef.sessionId : ''
+        return sessionB
+      }, { timeout: 45_000, intervals: [500, 1_000, 2_000] }).toBeTruthy()
+      const paneHeader = page.locator('[data-context="pane-header"]:visible').first()
+      const tab = page.locator(`[data-context="tab"][data-tab-id="${handle.tabId}"]`)
+      await expect(paneHeader, 'the pane leaves the old conversation\'s name').not.toContainText('LotL', {
+        timeout: 30_000,
+      })
+      await expect(tab, 'the tab leaves the old conversation\'s name').not.toContainText('LotL', { timeout: 30_000 })
+      await expect.poll(async () => {
+        const state = await harness.getState() as { tabs: { tabs: Array<{ id: string; title: string }> } }
+        return state.tabs.tabs.find((candidate) => candidate.id === handle.tabId)?.title
+      }, { timeout: 30_000 }).toMatch(/^Tab \d+$/)
+      expect((await terminalRow(journey, terminalId))?.sessionName?.name).not.toBe('LotL')
+
+      // The new conversation's first message names it.
+      withholding.release()
+      handle = await refreshHandle(harness, handle, 'claude')
+      await sendFirstMessage(page, harness, handle, 'claude', 'Billing bug in invoices')
+      await expect(paneHeader).toContainText('Billing bug in invoices', { timeout: 90_000 })
+      await expect(tab).toContainText('Billing bug in invoices', { timeout: 30_000 })
+      await expect.poll(async () => (await terminalRow(journey, terminalId))?.sessionName?.name, {
+        timeout: 30_000,
+      }).toBe('Billing bug in invoices')
+      // The old session keeps its own name.
+      expect((await readRecord(journey, refA)).name).toBe('LotL')
+      await context.close()
+    } finally {
+      await journey.cleanup()
+    }
   })
 })

@@ -20,7 +20,7 @@ import {
 test.setTimeout(360_000)
 
 test.describe('[freshcodex] unified agent names', () => {
-  test('activity uses the OneCLI route before the direct fallback key', async ({ browser }) => {
+  test('activity uses the inherited OneCLI route when no key is configured', async ({ browser }) => {
     await activityGeneratesOneSharedShortNameViaOneCliProxy('freshcodex', browser)
   })
 

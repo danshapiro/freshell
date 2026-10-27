@@ -282,6 +282,14 @@ export class Session {
     return this.waitFor(() => this.results().length >= count, ms, `${count} results`)
   }
 
+  waitForResultsAndIdle(count, ms = 20_000) {
+    return this.waitFor((message) => {
+      if (!isStateIdle(message)) return false
+      const result = this.results()[count - 1]
+      return result !== undefined && this.frames.indexOf(message) > this.frames.indexOf(result)
+    }, ms, `${count} results followed by idle`)
+  }
+
   /** Resolve once `count` messages matching `predicate` have arrived. */
   waitForCount(predicate, count, ms = 20_000, what = 'messages') {
     return this.waitFor(() => this.messages(predicate).length >= count, ms, `${count} ${what}`)
@@ -789,7 +797,7 @@ export const SCENARIOS = {
       env: { FRESHELL: '1', FRESHELL_URL: 'http://127.0.0.1:9/probe', FRESHELL_TOKEN: 'probe-token', FRESHELL_TAB_ID: 'tab-s', FRESHELL_PANE_ID: 'pane-s' },
     })
     s.push('MCP:call=mcp__freshell__context', 'u1')
-    await s.waitForResults(1, 30_000)
+    await s.waitForResultsAndIdle(1, 30_000)
     ctx.observe('connected', mcpTurnShape(s))
     const seen = JSON.parse(await fs.readFile(report, 'utf8'))
     delete seen.pid
@@ -798,7 +806,7 @@ export const SCENARIOS = {
 
     const m = ctx.open('M')
     m.push('MCP:call=mcp__freshell__freshell', 'u2')
-    await m.waitForResults(1, 30_000)
+    await m.waitForResultsAndIdle(1, 30_000)
     ctx.observe('missing', mcpTurnShape(m))
     await m.close()
   },

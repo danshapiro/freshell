@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { nanoid } from 'nanoid'
 import { api } from '@/lib/api'
-import { useAppDispatch, useAppSelector } from '@/store/hooks'
+import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { addTab, setActiveTab, updateTab } from '@/store/tabsSlice'
 import { initLayout, updatePaneTitleByTerminalId } from '@/store/panesSlice'
 import { receiveSessionNames } from '@/store/sessionNamesSlice'
@@ -11,6 +11,7 @@ import type { SessionNameRecord, SessionNameRef } from '@shared/session-names'
 import type { AppDispatch } from '@/store/store'
 import { getWsClient } from '@/lib/ws-client'
 import { collectTerminalIds } from '@/lib/pane-utils'
+import { canWriteLegacyTabTitle } from '@/lib/tab-title-ownership'
 import { cn } from '@/lib/utils'
 import { RefreshCw, Circle, Play, Pencil, Trash2, Sparkles, ExternalLink } from 'lucide-react'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
@@ -102,6 +103,7 @@ function formatDuration(ms: number): string {
 
 export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) {
   const dispatch = useAppDispatch()
+  const store = useAppStore()
   const tabs = useAppSelector((s) => s.tabs.tabs)
   const paneLayouts = useAppSelector((s) => s.panes.layouts)
 
@@ -246,7 +248,7 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
                         })
                         if (!scoped) {
                           const existing = findTabByTerminalId(t.terminalId)
-                          if (existing && title) {
+                          if (existing && title && canWriteLegacyTabTitle(store.getState(), existing.id)) {
                             dispatch(updateTab({ id: existing.id, updates: { title } }))
                           }
                         }

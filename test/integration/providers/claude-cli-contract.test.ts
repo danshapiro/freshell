@@ -143,6 +143,10 @@ describe(`pinned Claude CLI ${PINNED_CLI_VERSION} contract (real CLI, loopback p
     expect(appeared.msAfterResult).not.toBeNull()
     const shape = appeared.shape as Array<{ type: string, uuid: string }>
     expect(shape.some((line) => line.type === 'user' && line.uuid === 'u1')).toBe(true)
+    const firstResult = messages.findIndex(isResult)
+    const assistant = messages.slice(0, firstResult).filter((m) => m.type === 'assistant' && !m.parent_tool_use_id).at(-1)
+    expect(assistant).toBeDefined()
+    expect(shape).toContainEqual(expect.objectContaining({ type: 'assistant', uuid: assistant.uuid }))
   }, SCENARIO_TIMEOUT)
 
   it('T4: a fresh boot with an id whose transcript exists is refused: "Session ID X is already in use." and exit code 1', async () => {
@@ -488,6 +492,14 @@ describe(`pinned Claude CLI ${PINNED_CLI_VERSION} contract (real CLI, loopback p
 
   it('G19: a stdio MCP server starts with the CLI\'s environment and its tools are listed and called; an MCP tool no server offers is an error result', async () => {
     const r = await real('mcp')
+    for (const session of ['S', 'M']) {
+      const events = eventsOf(r, session)
+      const result = at(events, isMsg(isResult))
+      const idle = at(events, isMsg(isState('idle')))
+      const close = at(events, (event) => event.k === 'close')
+      expect(idle, `${session}: the turn becomes idle after its result`).toBeGreaterThan(result)
+      expect(close, `${session}: the session closes after the turn becomes idle`).toBeGreaterThan(idle)
+    }
     const environment = {
       FRESHELL: '1',
       FRESHELL_URL: 'http://127.0.0.1:9/probe',

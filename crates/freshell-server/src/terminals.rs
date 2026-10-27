@@ -1172,12 +1172,20 @@ async fn scoped_terminal_rename(
                 .into_response()
         }
     };
+    // Name-reliability Task 4 (LB-B8): the terminal row's folder.
+    let cwd =
+        crate::session_name_routes::terminal_row_cwd(&state.registry, &state.identity, terminal_id);
     let update = match crate::session_name_routes::rename_through_authority(
         sink.as_ref(),
-        target,
-        name.to_string(),
-        intent,
-        if_revision,
+        freshell_freshagent::naming::RenameNameInput {
+            target,
+            name: name.to_string(),
+            intent,
+            if_revision,
+            cwd,
+        },
+        &state.identity,
+        None,
     )
     .await
     {

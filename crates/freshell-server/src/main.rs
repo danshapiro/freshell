@@ -32,6 +32,7 @@ mod files;
 mod fresh_agent_extras;
 #[cfg(feature = "managed-runtime-v1")]
 mod fresh_agent_proxy;
+mod gemini_failure;
 mod host_stats;
 mod identity_sink;
 mod instance_id;
@@ -54,6 +55,8 @@ mod managed_provider_sdk_tests;
 mod managed_runtime;
 #[cfg(feature = "managed-runtime-v1")]
 mod managed_runtime_api;
+#[cfg(feature = "managed-runtime-v1")]
+mod managed_view_intent;
 mod migrations;
 mod net_bind;
 mod network;
@@ -70,10 +73,12 @@ mod screenshots;
 mod serve_client;
 mod session_directory;
 mod session_metadata;
+mod session_name_capability;
 mod session_name_generation;
 mod session_name_migration;
 mod session_name_native;
 mod session_name_routes;
+mod session_name_tick;
 mod session_names;
 mod sessions;
 mod settings;
@@ -829,9 +834,14 @@ async fn main() -> ExitCode {
     // here (e.g. an unwritable log dir) must never prevent boot -- the
     // pre-existing stderr "listening on" line below still gets the
     // operator to a running server either way.
+    // Name-reliability Task 6: secret values learned later (the configured
+    // Gemini key below, keys saved in Settings) are redacted from the first
+    // line that could carry them.
+    let log_secrets = freshell_runtime_observability::LiveSecrets::default();
     let logging_config = logging::resolve_config(
         home.as_deref(),
         auth_token.as_str().to_string(),
+        log_secrets.clone(),
         app_version.as_str().to_string(),
     );
     if let Err(err) = logging::init(logging_config) {
@@ -965,6 +975,12 @@ async fn main() -> ExitCode {
             .filter(|v| !v.is_empty()),
         settings.ai.gemini_api_key.clone(),
     );
+    for key in [ai_key.get(), settings.ai.gemini_api_key.clone()]
+        .into_iter()
+        .flatten()
+    {
+        log_secrets.insert(&key);
+    }
     // `FRESHELL_GEMINI_BASE_URL` is a Rust-only test seam for the e2e
     // fake-Gemini server (Task 21) — Node has NO env base-URL override (its
     // default is hardcoded), a deliberate documented superset (validator-A1).
@@ -978,28 +994,31 @@ async fn main() -> ExitCode {
             ai_key.clone(),
             gemini_base_url.clone(),
         ));
-    // Session naming alone uses the OneCLI proxy credential route when the
-    // effective reqwest proxy is marked as OneCLI. The generic transport above
-    // remains direct-key-only for summaries and other AI features.
+    // Session naming's own credential route (name-reliability Task 6): a
+    // configured key always wins (sent direct past a OneCLI ambient proxy,
+    // through any other ambient proxy); with no key, the inherited OneCLI
+    // proxy. The generic transport above stays direct-key-only for
+    // summaries and other AI features.
     let session_name_auth =
         ai_title::GeminiSessionNameAuth::from_environment(ai_key.clone(), &gemini_base_url);
+    let session_name_http = std::sync::Arc::new(ai_title::GeminiSessionNameHttp::new(
+        reqwest::Client::builder(),
+        session_name_auth.clone(),
+        gemini_base_url,
+    ));
     let session_name_gemini: std::sync::Arc<dyn ai_title::GeminiTransport> =
-        std::sync::Arc::new(ai_title::GeminiSessionNameHttp::new(
-            reqwest::Client::new(),
-            session_name_auth.clone(),
-            gemini_base_url,
-        ));
+        session_name_http.clone();
     // Unified agent names (Task 4): the generation participant of the ONE
     // shared serial naming worker — execution only, never another loop.
-    // Capability (the naming toggle + the OneCLI/direct credential route) is
-    // checked before selection, so disabled naming pauses without consuming
-    // anything.
+    // Capability (the naming toggle, the credential route and the naming
+    // pause) is checked before selection, so paused naming consumes nothing.
     let session_name_generator =
         std::sync::Arc::new(session_name_generation::SessionNameGenerator::new(
             settings_store.clone(),
             session_name_auth.clone(),
-            session_name_gemini.clone(),
+            session_name_http,
         ));
+    session_name_generator.log_boot_route();
 
     // The shared server→client broadcast bus (pre-serialized frames). REST handlers
     // (fresh-agent create/send) push here; every `/ws` connection fans it out to its
@@ -1375,54 +1394,16 @@ async fn main() -> ExitCode {
         fresh_codex_state.set_session_naming(names.clone());
         fresh_opencode_state.set_session_naming(names.clone());
 
-        // The 2s adoption/reconcile tick: (1) adopt a same-home cooperating
-        // process's committed generation (CLI/MCP writes) — the strict
-        // full-document re-read under the lock, never an mtime shortcut;
-        // (2) bind still-pending handles whose durability has since become
-        // verifiable. Claude: the transcript locator (the signal-first and
-        // zero-turn create lanes bind as soon as the transcript exists).
-        // Codex/opencode: their runtime edges (the rollout walk / the DB
-        // row) own the verified binds — the tick never fabricates one.
-        {
-            let names = names.clone();
-            let identity = terminal_identity.clone();
-            let registry = registry.clone();
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    tick.tick().await;
-                    if let Err(error) = names.refresh_current().await {
-                        tracing::warn!(
-                            target: "freshell_server::session_names",
-                            op = "refresh_current",
-                            name_ref = "-",
-                            revision = 0,
-                            class = %error.code(),
-                            "session_names.operation_failed: {error}"
-                        );
-                    }
-                    for (terminal_id, provider, session_id, _handle) in
-                        identity.pending_naming_binds()
-                    {
-                        if provider != "claude" {
-                            continue;
-                        }
-                        // One bounded locate + bind per still-pending claude
-                        // row; a miss or failure keeps the row pending for
-                        // the next tick's visible retry (the helper logs its
-                        // own failure classes).
-                        let _ = freshell_ws::identity::bind_pending_claude_transcript(
-                            &identity,
-                            &registry,
-                            &terminal_id,
-                            &session_id,
-                        )
-                        .await;
-                    }
-                }
-            });
-        }
+        // The 2s adoption/reconcile tick (`session_name_tick`): adopt a
+        // same-home cooperating process's committed generation through the
+        // cheap stamp peek, then bind still-pending claude handles whose
+        // transcripts now exist.
+        tokio::spawn(session_name_tick::run_naming_tick(
+            names.clone(),
+            terminal_identity.clone(),
+            registry.clone(),
+            session_name_tick::NAMING_TICK_PERIOD,
+        ));
 
         // The naming publisher: every committed update (this process's own
         // writes and adopted external ones) reaches WS clients as the
@@ -1808,8 +1789,6 @@ async fn main() -> ExitCode {
         .with_terminal_created_hook({
             let terminal_meta = terminal_meta.clone();
             let broadcast_tx = Arc::clone(&broadcast_tx);
-            let terminal_identity = terminal_identity.clone();
-            let registry = registry.clone();
             Arc::new(move |event: freshell_freshagent::TerminalCreatedEvent| {
                 freshell_ws::terminal_meta::seed_from_terminal(
                     &terminal_meta,
@@ -1819,27 +1798,16 @@ async fn main() -> ExitCode {
                     event.resume_session_id.as_deref(),
                     event.cwd.as_deref(),
                 );
-                // Unified agent names (Task 2): write the REST create-lane
-                // naming binding onto the SHARED identity registry (the CLI
-                // locator bind lanes and every rename resolver read it) and
-                // the terminal registry row (the display cache the
-                // `/api/terminals` projection carries). The WS create path
-                // performs its own admission — this hook only fires for
-                // REST-pipeline creates, so no row is double-bound.
-                if event.naming_handle.is_some() || event.name_ref.is_some() {
-                    terminal_identity.set_name_binding(
-                        &event.terminal_id,
-                        event.name_ref.clone(),
-                        event.naming_handle.clone(),
-                    );
-                    registry.set_naming(
-                        &event.terminal_id,
-                        event.name_ref.clone(),
-                        event.naming_handle.clone(),
-                    );
-                }
             })
-        });
+        })
+        // Name reliability (Task 10): the REST door's terminal naming bind
+        // writes the SAME shared identity registry the WS door binds (the
+        // CLI locator bind lanes and every rename resolver read it), through
+        // the one shared helper — replacing this hook's former binding
+        // write, so the registry row's cache and title are filled too.
+        .with_terminal_name_binder(Arc::new(
+            freshell_ws::terminal_naming::IdentityNameBinder::new(terminal_identity.clone()),
+        ));
     // Batch B: `session_directory` no longer re-walks + re-parses every
     // transcript on every request -- it reads a cached, TTL-refreshed
     // `SessionIndex`. Batch C adds `CodexSource` (file-based, same shape as
@@ -1981,37 +1949,15 @@ async fn main() -> ExitCode {
     // the durable opencode session's record, else the terminal's own
     // (pending) naming ref. A detached fold never disturbs the activity
     // lane; no wired store (degraded boot) drops the observation.
-    let opencode_native_title_observer: freshell_ws::opencode_lane::NativeTitleObserver = {
-        let identity = terminal_identity.clone();
-        let names = session_names.clone();
-        std::sync::Arc::new(move |terminal_id: &str, session_id: &str, title: &str| {
-            let Some(names) = names.clone() else {
-                return;
-            };
-            let identity = identity.clone();
-            let terminal_id = terminal_id.to_string();
-            let session_id = session_id.to_string();
-            let title = title.to_string();
-            tokio::spawn(async move {
-                let sink: Option<std::sync::Arc<dyn freshell_freshagent::naming::SessionNaming>> =
-                    Some(names);
-                let target = identity
-                    .named_session_ref_of("opencode", &session_id)
-                    .or_else(|| identity.name_ref_for(&terminal_id));
-                let Some(target) = target else {
-                    return;
-                };
-                let _ = freshell_freshagent::naming::observe_native_live(
-                    &sink,
-                    target,
-                    &title,
-                    freshell_freshagent::naming::NativeNameOrigin::Snapshot,
-                    None,
-                )
-                .await;
-            });
-        })
-    };
+    // Name-reliability Task 4: built in `freshell_ws::opencode_title_naming`
+    // (stream-ordered, placeholder-free, never stalls the lane).
+    let opencode_native_title_observer: freshell_ws::opencode_lane::NativeTitleObserver =
+        freshell_ws::opencode_title_naming::naming_title_observer(
+            terminal_identity.clone(),
+            session_names.clone().map(|names| {
+                names as std::sync::Arc<dyn freshell_freshagent::naming::SessionNaming>
+            }),
+        );
     activity_hub.set_opencode_lane_deps(std::sync::Arc::new(
         freshell_ws::opencode_lane::OpencodeLaneDeps {
             http: std::sync::Arc::new(freshell_ws::opencode_lane::ReqwestLaneHttp::new()),
@@ -2714,6 +2660,8 @@ async fn main() -> ExitCode {
                 // first-message lookup for already-named sessions.
                 index: Some(Arc::clone(index)),
                 index_hydrated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                // Name-reliability Task 5 (C5): remembered across passes.
+                first_message_lookups: Default::default(),
             },
             Arc::clone(index),
             SESSIONS_SWEEP_INTERVAL,
@@ -2786,6 +2734,12 @@ async fn main() -> ExitCode {
         ws_state.clone(),
         codex_proxy_events_rx,
     );
+    // Name reliability (Task 10): the 2s terminal-naming reconcile — rows
+    // whose identity ref moved (a conversation switch no caller reported),
+    // scoped rows with no naming binding, and bound rows with an empty name
+    // cache. Runs beside the naming tick above (which owns store adoption and
+    // the pending binds); one batched read per pass.
+    freshell_ws::terminal_naming::spawn_terminal_naming_reconcile(ws_state.clone());
     // P4 (stale-resume-identity): claude SessionStart signal sweep — drains
     // the signal files Task 11's launch hook writes
     // (`$HOME/.freshell/session-signals/claude/<terminal_id>__<nonce>.json`)
@@ -2819,6 +2773,8 @@ async fn main() -> ExitCode {
     // Task 6: the sessions router's provider-generated short-circuit reads
     // the SAME session index (another clone before the move below).
     let sessions_state_index = session_index.clone();
+    // Name-reliability Task 4: the canonical rename route's folder lookup.
+    let session_name_routes_index = session_index.clone();
     // The session-metadata store was created above (before the sweeps) —
     // both the `POST /api/session-metadata` write route below and Task
     // 20's session-directory read-join share that instance.
@@ -3173,6 +3129,10 @@ async fn main() -> ExitCode {
                 // Task 2: the SAME process-local AI key cell constructed at
                 // boot, so every settings save force-re-applies the key.
                 ai_key: ai_key.clone(),
+                // Name-reliability Task 6: a saved key becomes a live log
+                // secret, and a changed key resets the naming pause.
+                log_secrets: log_secrets.clone(),
+                naming_generation: Some(session_name_generator.clone()),
             },
         ))
         .merge(boot::router(boot_state))
@@ -3262,6 +3222,9 @@ async fn main() -> ExitCode {
                         // terminal import targets (the same registry every
                         // rename surface reads).
                         identity: terminal_identity.clone(),
+                        // Name-reliability Task 4: the best-known folder of a
+                        // session-key rename target.
+                        index: session_name_routes_index.clone(),
                     })
                 })
                 .unwrap_or_default(),

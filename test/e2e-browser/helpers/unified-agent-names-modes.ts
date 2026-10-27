@@ -1,7 +1,8 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { expect, type Browser } from './fixtures.js'
-import type { SessionNameRef } from '../../shared/session-names.js'
+import { expect } from './fixtures.js'
+import type { Browser } from '@playwright/test'
+import type { SessionNameRef } from '../../../shared/session-names.js'
 import {
   type UnifiedAgentMode,
   bootUnifiedNamesServer,
@@ -70,18 +71,22 @@ export interface Journey {
 export async function bootJourney(mode: UnifiedAgentMode, opts: {
   gemini?: FakeGemini | null
   oneCliGeminiProxy?: FakeOneCliGeminiProxy | null
-  directFallbackKey?: string
+  /** An env Gemini key for a OneCLI journey. Unset (the default) leaves the
+   * server with NO key, so it uses the inherited OneCLI route: a configured
+   * key always wins and goes direct past a OneCLI proxy (name-reliability
+   * Task 6). */
+  key?: string
   env?: Record<string, string>
   setupHome?: (homeDir: string) => Promise<void>
 } = {}): Promise<Journey> {
-  const oneCliEnv = opts.oneCliGeminiProxy
+  const oneCliEnv: Record<string, string> = opts.oneCliGeminiProxy
     ? {
         FRESHELL_GEMINI_BASE_URL: 'http://generativelanguage.googleapis.com/v1beta',
         HTTP_PROXY: opts.oneCliGeminiProxy.proxyUrl,
         http_proxy: opts.oneCliGeminiProxy.proxyUrl,
         NO_PROXY: '',
         no_proxy: '',
-        GOOGLE_GENERATIVE_AI_API_KEY: opts.directFallbackKey ?? 'unified-names-direct-fallback-sentinel',
+        GOOGLE_GENERATIVE_AI_API_KEY: opts.key ?? '',
       }
     : {}
   const server = await bootUnifiedNamesServer({
@@ -205,7 +210,7 @@ export function resolveSessionIdOf(state: unknown, ref: SessionNameRef): string 
   // (the swap was silently refused, pre-M-4), and exposed the moment the
   // pinned swap made the contents genuinely exchange.
   const redirects = (state as { sessionNames?: { redirects?: Record<string, { toKey?: string }> } })?.sessionNames?.redirects
-  const entry = redirects?.[JSON.stringify(ref.kind === 'pending' ? ['pending', ref.id] : ['session', ref.provider, ref.sessionId])]
+  const entry = redirects?.[JSON.stringify(['pending', ref.id])]
   const toKey = entry?.toKey
   if (typeof toKey !== 'string') return null
   try {
@@ -246,7 +251,7 @@ export async function activityGeneratesOneSharedShortName(mode: UnifiedAgentMode
         await expectSharedName(harness, handle.nameRef!, AI_NAME, {
           page, server: journey.server, tabId: handle.tabId, sessionId: handle.sessionId,
         })
-        const record = await readRecord(journey, handle.nameRef)
+        const record = await readRecord(journey, handle.nameRef!)
         expect(record.source).toBe('freshell_ai')
         expect(record.name.length).toBeLessThanOrEqual(60)
         await context.close()
@@ -262,10 +267,9 @@ export async function activityGeneratesOneSharedShortNameViaOneCliProxy(
 ): Promise<void> {
   const expectedFirstMessage = 'Repair the sardine factory line'
   const proxy = await startFakeOneCliGeminiProxy(AI_NAME, expectedFirstMessage)
-  const journey = await bootJourney(mode, {
-    oneCliGeminiProxy: proxy,
-    directFallbackKey: 'synthetic-direct-fallback-key',
-  })
+  // No key configured: the server borrows the inherited OneCLI identity and
+  // sends the request through the proxy without a key.
+  const journey = await bootJourney(mode, { oneCliGeminiProxy: proxy })
   try {
     const { page, harness, context } = await connect(journey, browser)
     let handle = await createNamedAgent(harness, mode, { entry: 'ui', page, server: journey.server })
@@ -669,6 +673,18 @@ export async function manualNameSurvivesLateGenerationAndSwitch(mode: UnifiedAge
           await expect(
             page.locator('[data-context="pane-header"]:visible').first(),
           ).not.toContainText(manualName, { timeout: 30_000 })
+          await expect(
+            page.locator(`[data-context="tab"][data-tab-id="${handle.tabId}"]`),
+          ).not.toContainText(manualName, { timeout: 30_000 })
+          await expect.poll(async () => {
+            const state = await harness.getState() as { tabs: { tabs: Array<{ id: string; title: string }> } }
+            return state.tabs.tabs.find((candidate) => candidate.id === handle.tabId)?.title
+          }, { timeout: 30_000 }).not.toBe(manualName)
+          const nextHandle = await refreshHandle(harness, handle, mode)
+          await sendFirstMessage(page, harness, nextHandle, mode, 'Billing bug in invoices')
+          await expect(
+            page.locator(`[data-context="tab"][data-tab-id="${handle.tabId}"]`),
+          ).toContainText(AI_NAME, { timeout: 90_000 })
         } else {
           const second = await createNamedAgent(harness, mode, { entry: 'ui', page, server: journey.server })
           await sendFirstMessage(page, harness, second, mode, 'A second conversation')

@@ -476,6 +476,50 @@ describe('executeAction -- tab actions', () => {
     expect(result).toEqual(acceptedResponse)
   })
 
+  it('rename-tab surfaces a refused automation rename in the tool result', async () => {
+    mockClient.get.mockResolvedValue({ tabs: [{ id: 't1', title: 'Tab 1' }], activeTabId: 't1' })
+    const refusedResponse = {
+      status: 'ok',
+      data: {
+        tabId: 't1',
+        sessionName: {
+          record: { ref: { kind: 'session', provider: 'claude', sessionId: 's1' }, name: 'LotL', source: 'manual', revision: 3 },
+          documentGeneration: 9,
+          redirects: [],
+          changed: false,
+          outcome: { applied: false, reason: 'protected_name' },
+        },
+      },
+    }
+    mockClient.patch.mockResolvedValue(refusedResponse)
+    const result = await executeAction('rename-tab', { target: 't1', name: 'Bot name' })
+    expect(result).toEqual({ ...refusedResponse, warning: 'name not applied: protected_name' })
+  })
+
+  it('rename-pane surfaces a refused default label in the tool result', async () => {
+    mockClient.get.mockImplementation(async (path: string) => {
+      if (path === '/api/tabs') return { tabs: [{ id: 't1', title: 'Tab 1', activePaneId: 'p1' }], activeTabId: 't1' }
+      return { panes: [{ id: 'p1', index: 0, kind: 'terminal' }] }
+    })
+    const refusedResponse = {
+      status: 'ok',
+      data: {
+        paneId: 'p1',
+        sessionName: {
+          record: { ref: { kind: 'session', provider: 'claude', sessionId: 's1' }, name: 'Real name', source: 'provider_ai', revision: 3 },
+          documentGeneration: 9,
+          redirects: [],
+          changed: false,
+          outcome: { applied: false, reason: 'default_label' },
+        },
+      },
+    }
+    mockClient.patch.mockResolvedValue(refusedResponse)
+    const result = await executeAction('rename-pane', { target: 'p1', name: 'Tab 3' })
+    expect(result).toMatchObject({ warning: 'name not applied: default_label' })
+    expect(result.data).toEqual(refusedResponse.data)
+  })
+
   it('has-tab calls GET /api/tabs/has?target=...', async () => {
     mockClient.get.mockResolvedValue({ exists: true })
     await executeAction('has-tab', { target: 'Work' })

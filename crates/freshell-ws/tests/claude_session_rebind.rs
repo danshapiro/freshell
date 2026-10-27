@@ -802,6 +802,7 @@ async fn session_start_signal_rebinds_and_restores_the_new_id() {
         name: "Pre Identity Name".into(),
         intent: NameIntent::User,
         if_revision: None,
+        cwd: None,
     })
     .await
     .expect("pre-identity rename lands on the pending record");
@@ -822,6 +823,8 @@ async fn session_start_signal_rebinds_and_restores_the_new_id() {
     tokio::task::yield_now().await;
 
     let rebound8 = next_associated_frame(&mut ws, &tid8, "phase8/first-bind").await;
+    assert_eq!(rebound8["nameRef"], serde_json::to_value(claude_session_ref(b2)).unwrap(),
+        "the association carries the verified naming binding even before the client reads redirects");
     assert_eq!(
         rebound8["sessionRef"],
         json!({ "provider": "claude", "sessionId": b2 }),
@@ -894,6 +897,7 @@ async fn session_start_signal_rebinds_and_restores_the_new_id() {
         name: "C Own Name".into(),
         intent: NameIntent::User,
         if_revision: None,
+        cwd: None,
     })
     .await
     .expect("name C2");
@@ -911,6 +915,11 @@ async fn session_start_signal_rebinds_and_restores_the_new_id() {
     tokio::task::yield_now().await;
 
     let rebound9 = next_associated_frame(&mut ws, &tid8, "phase9/switch").await;
+    assert_eq!(
+        rebound9["nameRef"],
+        serde_json::to_value(state.identity.name_ref_for(&tid8)).unwrap(),
+        "the switch carries its own authoritative naming binding"
+    );
     assert_eq!(
         rebound9["sessionRef"],
         json!({ "provider": "claude", "sessionId": c2 }),
@@ -942,6 +951,7 @@ async fn session_start_signal_rebinds_and_restores_the_new_id() {
         name: "Renamed After Switch".into(),
         intent: NameIntent::User,
         if_revision: None,
+        cwd: None,
     })
     .await
     .expect("rename through the pane's current binding");

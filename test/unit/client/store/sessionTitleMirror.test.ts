@@ -1,7 +1,7 @@
 import { configureStore } from '@reduxjs/toolkit'
 import { describe, expect, it } from 'vitest'
 import tabsReducer, { addTab } from '@/store/tabsSlice'
-import { panesSlice, initLayout, updatePaneTitle } from '@/store/panesSlice'
+import { panesSlice, initCopiedLayout, initLayout, updatePaneTitle } from '@/store/panesSlice'
 import { applySessionRenameCascade } from '@/store/titleSync'
 import sessionsReducer, { commitSessionWindowVisibleRefresh } from '@/store/sessionsSlice'
 import { sessionTitleMirrorMiddleware } from '@/store/sessionTitleMirror'
@@ -139,6 +139,22 @@ describe('sessionTitleMirrorMiddleware', () => {
     seedFreshAgentPane(store, DURABLE_CLAUDE)
     expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('ZZ probe summarize')
     expect(store.getState().panes.paneTitleSetByUser['tab-z']?.['pane-z']).toBeFalsy()
+  })
+
+  it('titles a copied legacy pane when its directory row was loaded before the atomic copy', () => {
+    const store = buildStore()
+    landSessionRow(store, { surface: 'sidebar', sessionId: DURABLE_CLAUDE, provider: 'claude', title: 'Copied conversation' })
+    store.dispatch(addTab({ id: 'tab-z', title: 'ZZ probe' }))
+
+    store.dispatch(initCopiedLayout({
+      tabId: 'tab-z',
+      layout: { type: 'leaf', id: 'pane-z', content: {
+        kind: 'fresh-agent', provider: 'claude', sessionType: 'kilroy',
+        sessionId: DURABLE_CLAUDE, sessionRef: { provider: 'claude', sessionId: DURABLE_CLAUDE },
+      } as never },
+    }))
+
+    expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Copied conversation')
   })
 
   it('a splitPane that binds a new pane to an already-landed session row mirrors the split pane (REST/MCP split binding path)', () => {

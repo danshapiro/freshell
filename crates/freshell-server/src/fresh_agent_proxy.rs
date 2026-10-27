@@ -19,8 +19,7 @@ use freshell_runtime_client::RuntimeClient;
 use freshell_runtime_protocol::{
     AgentEvent, DesiredState, FreshAgentFixtureTransport, FreshAgentLaunchSpec,
     FreshAgentRollbackDirection, FreshAgentRollbackMode, FreshProvider, LaunchRequest, RequestId,
-    RuntimeErrorCode, RuntimeLimits, RuntimeProfile, SoulId, StopOutcome, ViewIntentKind,
-    ViewIntentRequest, ViewVisibilityIntent,
+    RuntimeErrorCode, RuntimeLimits, RuntimeProfile, SoulId, StopOutcome,
 };
 use freshell_ws::hosted_fresh_agent::{HostedFreshAgentCommand, HostedFreshAgentGateway};
 use sha2::{Digest, Sha256};
@@ -82,6 +81,17 @@ impl HostedFreshAgentProxy {
             format!("{OPT_IN_ENV}=1 requires an available managed runtime controller")
         })?;
         let fixture_modes = configured_fixture_modes()?;
+        // Name reliability (Task 10, Residual 4): hosted fresh agents admit a
+        // pending name at create and read a resumed session's name, but no
+        // lane reports their first message or transfers the pending name onto
+        // the native session, so they never get a first-message or AI name.
+        // Said once at boot so enabling the flag cannot hide the gap.
+        tracing::warn!(
+            target: "freshell_server::session_names",
+            flag = OPT_IN_ENV,
+            "session_names.hosted_fresh_agent_naming_incomplete: hosted fresh-agent \
+             sessions keep their create-time name only (no first-message or AI naming)"
+        );
         Ok(Some(Arc::new(Self {
             client,
             broadcast,
@@ -784,16 +794,11 @@ impl HostedFreshAgentProxy {
             fixture: None,
             terminal: None,
             fresh_agent: Some(launch),
-            view_intent: Some(ViewIntentRequest {
-                owner_id: String::new(),
-                workspace_id: project_key,
-                kind: ViewIntentKind::AutomaticPrimary,
-                preferred_tab_id: message.tab_id.clone(),
-                preferred_pane_id: None,
-                title: Some(format!("{} agent", provider.as_str())),
-                placement_group: None,
-                visibility: ViewVisibilityIntent::Visible,
-            }),
+            view_intent: Some(crate::managed_view_intent::automatic_primary_view_request(
+                project_key,
+                message.tab_id.clone(),
+                None,
+            )),
             expected_control_epoch: None,
         };
         let launched = if provider == FreshProvider::Opencode {

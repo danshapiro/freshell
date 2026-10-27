@@ -179,6 +179,32 @@ pub struct NativeSyncProjection {
     pub reason: Option<String>,
 }
 
+/// Why a rename did not change the saved name (name-reliability Task 4).
+/// `ProtectedName`: an automation rename never replaces a name a person
+/// chose (manual), a migration-protected label, or an accepted Freshell AI
+/// name. `DefaultLabel`: an automation rename never saves a default or
+/// derived label ("Tab 3", a provider label, the target's own folder name).
+/// `Unchanged`: the saved name already is the requested text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RenameOutcomeReason {
+    ProtectedName,
+    DefaultLabel,
+    Unchanged,
+}
+
+/// Whether a rename applied (name-reliability Task 4). Additive and
+/// optional: only rename RESPONSES carry it — broadcasts never do. `applied`
+/// is true when the saved name now is the requested text (including the
+/// `unchanged` case); false means the record kept its name for `reason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameOutcome {
+    pub applied: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<RenameOutcomeReason>,
+}
+
 /// The common response/broadcast shape for every naming operation. `changed`
 /// is true only when the accepted record (text/source/revision) changed vs
 /// the store's previously established state — losing automatic offers and
@@ -186,6 +212,7 @@ pub struct NativeSyncProjection {
 /// `native_sync` (Task 3) is the additive writeback status projection;
 /// status-only updates (an unchanged record whose nativeSync moved) publish
 /// with `changed: false` and fold on the client by `documentGeneration`.
+/// `outcome` (name-reliability Task 4) rides rename responses only.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionNameUpdate {
@@ -195,6 +222,8 @@ pub struct SessionNameUpdate {
     pub changed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_sync: Option<NativeSyncProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<RenameOutcome>,
 }
 
 /// Rename request body (HTTP `PATCH /api/session-names` and the MCP-bridged

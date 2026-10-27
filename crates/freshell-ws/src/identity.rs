@@ -646,11 +646,13 @@ pub(crate) async fn bind_pending_naming(
         .await
     {
         Ok(update) => {
-            if update.record.name_ref == target {
-                identity.set_name_binding(terminal_id, Some(target.clone()), None);
-                registry.set_naming(terminal_id, Some(target), None);
-            }
-            registry.update_session_name(terminal_id, &update.record);
+            freshell_freshagent::terminal_name_binding::apply_transferred_record(
+                registry,
+                &crate::terminal_naming::IdentityNameBinder::new(identity.clone()),
+                terminal_id,
+                &target,
+                &update.record,
+            );
             true
         }
         Err(error) => {
@@ -985,6 +987,7 @@ mod tests {
                         document_generation: 1,
                         changed: false,
                         native_sync: None,
+                        outcome: None,
                     },
                 )
                 .collect();
@@ -1030,6 +1033,7 @@ mod tests {
                     document_generation: 1,
                     changed: true,
                     native_sync: None,
+                    outcome: None,
                 })
             })
         }

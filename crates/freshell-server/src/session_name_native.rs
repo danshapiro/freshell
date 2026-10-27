@@ -515,7 +515,9 @@ async fn run(
                 }
             }
             tokio::select! {
-                _ = tokio::time::sleep(WORKER_POLL_INTERVAL) => {}
+                // Name-reliability Task 6: a paused generation series is
+                // re-probed when its window ends, not up to a poll later.
+                _ = tokio::time::sleep(generator.idle_poll(WORKER_POLL_INTERVAL)) => {}
                 // A settings/key capability change wakes the poll
                 // immediately; the next pass re-evaluates capability.
                 _ = generator.wake_notify().notified() => {}

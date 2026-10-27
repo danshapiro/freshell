@@ -162,6 +162,7 @@ impl FreshAgentState {
                             name: name.to_string(),
                             intent,
                             if_revision: None,
+                            cwd: request.cwd.clone(),
                         })
                         .await
                     {

@@ -26,7 +26,9 @@ use freshell_protocol::session_names::{
 use serde_json::Value;
 
 use super::{GenerationOutcome, IndexedNameInput, SessionNameGenerator};
-use crate::ai_title::{AiKeyCell, BoxFuture, GeminiHttp, GeminiSessionNameHttp, GeminiTransport};
+use crate::ai_title::{AiKeyCell, BoxFuture, GeminiSessionNameAuth, GeminiSessionNameHttp};
+use crate::gemini_failure::{classify_gemini_failure, GeminiFailure};
+use crate::session_name_capability::SessionNameTransport;
 use crate::session_name_native::{
     NativeCallResult, NativeFuture, NativeNameAttempt, NativeNameBackend, NativeNameReadback,
     NativeNameTarget, NativeProbeFuture, SessionNameWorker,
@@ -40,15 +42,15 @@ use crate::session_names::{
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn temp_data_dir() -> tempfile::TempDir {
+pub(super) fn temp_data_dir() -> tempfile::TempDir {
     tempfile::tempdir().expect("tempdir")
 }
 
-fn open_store(dir: &Path) -> Arc<SessionNames> {
+pub(super) fn open_store(dir: &Path) -> Arc<SessionNames> {
     SessionNames::open(dir.to_path_buf()).expect("open store")
 }
 
-fn pending(id: &str) -> SessionNameRef {
+pub(super) fn pending(id: &str) -> SessionNameRef {
     SessionNameRef::Pending { id: id.to_string() }
 }
 
@@ -77,7 +79,7 @@ fn verified_acquisition(location: NativeLocation) -> NativeAcquisition {
     }
 }
 
-async fn ensure_pending(
+pub(super) async fn ensure_pending(
     store: &Arc<SessionNames>,
     handle: &str,
     provider: NamedProvider,
@@ -103,6 +105,7 @@ async fn rename_user(
             name: name.to_string(),
             intent: NameIntent::User,
             if_revision: None,
+            cwd: None,
         })
         .await
 }
@@ -143,13 +146,16 @@ async fn observe_provider_title(
         .await
 }
 
-async fn get_one(store: &Arc<SessionNames>, target: SessionNameRef) -> Option<SessionNameUpdate> {
+pub(super) async fn get_one(
+    store: &Arc<SessionNames>,
+    target: SessionNameRef,
+) -> Option<SessionNameUpdate> {
     let updates = store.get(vec![target]).await.expect("get succeeds");
     updates.into_iter().next()
 }
 
 /// Arm one record's generation series through the accepted-input path.
-async fn arm_with_message(
+pub(super) async fn arm_with_message(
     store: &Arc<SessionNames>,
     target: SessionNameRef,
     mode: &str,
@@ -169,23 +175,23 @@ async fn arm_with_message(
 
 /// The persisted document JSON (black-box: the series/retry state lives in
 /// the internal sections; the file is the contract).
-fn document_json(dir: &Path) -> Value {
+pub(super) fn document_json(dir: &Path) -> Value {
     let bytes = std::fs::read(dir.join("session-names.json")).expect("document exists");
     serde_json::from_slice(&bytes).expect("document parses")
 }
 
 /// The generation series entry for one target (black-box).
-fn generation_entry<'a>(doc: &'a Value, target: &SessionNameRef) -> Option<&'a Value> {
+pub(super) fn generation_entry<'a>(doc: &'a Value, target: &SessionNameRef) -> Option<&'a Value> {
     doc["generation"].as_object()?.get(&name_ref_key(target))
 }
 
-fn generation_status(doc: &Value, target: &SessionNameRef) -> Option<String> {
+pub(super) fn generation_status(doc: &Value, target: &SessionNameRef) -> Option<String> {
     generation_entry(doc, target)?["status"]
         .as_str()
         .map(str::to_string)
 }
 
-fn generation_consumed(doc: &Value, target: &SessionNameRef) -> u64 {
+pub(super) fn generation_consumed(doc: &Value, target: &SessionNameRef) -> u64 {
     generation_entry(doc, target)
         .and_then(|entry| entry["consumed"].as_u64())
         .unwrap_or(0)
@@ -223,8 +229,12 @@ impl CountingTransport {
     }
 }
 
-impl GeminiTransport for CountingTransport {
-    fn generate_content(&self, _prompt: String, _max: u32) -> BoxFuture<Result<String, String>> {
+impl SessionNameTransport for CountingTransport {
+    fn generate_content(
+        &self,
+        _prompt: String,
+        _max: u32,
+    ) -> BoxFuture<Result<String, GeminiFailure>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let answer = self.answer.lock().unwrap().clone();
         Box::pin(async move { Ok(answer) })
@@ -241,8 +251,12 @@ struct FileGatedTransport {
     held_sentinel: PathBuf,
 }
 
-impl GeminiTransport for FileGatedTransport {
-    fn generate_content(&self, _prompt: String, _max: u32) -> BoxFuture<Result<String, String>> {
+impl SessionNameTransport for FileGatedTransport {
+    fn generate_content(
+        &self,
+        _prompt: String,
+        _max: u32,
+    ) -> BoxFuture<Result<String, GeminiFailure>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let answer = self.answer.clone();
         let gate = self.gate_path.clone();
@@ -262,7 +276,8 @@ impl GeminiTransport for FileGatedTransport {
     }
 }
 
-/// A transport that always fails (the bounded-retry driver).
+/// A transport that always fails with a consuming failure (the bounded-retry
+/// driver).
 struct FailingTransport {
     calls: AtomicU32,
 }
@@ -275,15 +290,20 @@ impl FailingTransport {
     }
 }
 
-impl GeminiTransport for FailingTransport {
-    fn generate_content(&self, _prompt: String, _max: u32) -> BoxFuture<Result<String, String>> {
+impl SessionNameTransport for FailingTransport {
+    fn generate_content(
+        &self,
+        _prompt: String,
+        _max: u32,
+    ) -> BoxFuture<Result<String, GeminiFailure>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async move { Err("scripted provider failure".to_string()) })
+        // A consuming failure (a provider 500), never a capability pause.
+        Box::pin(async move { Err(classify_gemini_failure(500, b"scripted provider failure")) })
     }
 }
 
 /// A native backend that never has a route: native work stays paused.
-struct NoRouteNative;
+pub(super) struct NoRouteNative;
 
 impl NativeNameBackend for NoRouteNative {
     fn read(&self, _target: NativeNameTarget) -> NativeFuture<NativeNameReadback> {
@@ -303,14 +323,14 @@ impl NativeNameBackend for NoRouteNative {
     }
 }
 
-fn settings_for(dir: &Path) -> crate::settings_store::SettingsStore {
+pub(super) fn settings_for(dir: &Path) -> crate::settings_store::SettingsStore {
     crate::settings_store::SettingsStore::load(Some(dir), vec![])
 }
 
 fn generator_with(
     dir: &Path,
     key: Option<&str>,
-    transport: Arc<dyn GeminiTransport>,
+    transport: Arc<dyn SessionNameTransport>,
 ) -> Arc<SessionNameGenerator> {
     Arc::new(SessionNameGenerator::new(
         settings_for(dir),
@@ -323,7 +343,7 @@ fn generator_with(
 }
 
 /// A local HTTP Gemini fixture whose responses are HELD until released —
-/// the real `GeminiHttp` transport rides it, so the request bound, the wire
+/// the real session-name HTTP transport rides it, so the request bound, the wire
 /// contract, and the gated release are all real.
 struct GatedHttpGemini {
     base_url: String,
@@ -372,69 +392,16 @@ async fn start_gated_http_gemini(reply: &str) -> GatedHttpGemini {
 }
 
 impl GatedHttpGemini {
-    fn transport(&self, key: &str) -> Arc<GeminiHttp> {
-        Arc::new(GeminiHttp::new(
-            reqwest::Client::new(),
-            AiKeyCell::init(Some(key.to_string()), None),
+    fn transport(&self, key: &str) -> Arc<GeminiSessionNameHttp> {
+        Arc::new(GeminiSessionNameHttp::new(
+            reqwest::Client::builder().no_proxy(),
+            GeminiSessionNameAuth::direct_for_test(AiKeyCell::init(Some(key.to_string()), None)),
             self.base_url.clone(),
         ))
     }
 
     fn release(&self) {
         let _ = self.open.send(true);
-    }
-}
-
-struct OneCliFallbackGemini {
-    base_url: String,
-    observed_fallback_headers: Arc<Mutex<Vec<bool>>>,
-}
-
-async fn start_onecli_fallback_gemini() -> OneCliFallbackGemini {
-    use axum::body::Body;
-    use axum::routing::post;
-    use axum::{http::Response, Router};
-
-    let observed_fallback_headers = Arc::new(Mutex::new(Vec::new()));
-    let observed = Arc::clone(&observed_fallback_headers);
-    let requests = Arc::new(AtomicU32::new(0));
-    let request_count = Arc::clone(&requests);
-    let app = Router::new().route(
-        "/v1beta/models/gemini-3.5-flash-lite:generateContent",
-        post(move |headers: axum::http::HeaderMap| {
-            let observed = Arc::clone(&observed);
-            let request_count = Arc::clone(&request_count);
-            async move {
-                observed.lock().unwrap().push(
-                    headers
-                        .get("x-goog-api-key")
-                        .and_then(|value| value.to_str().ok())
-                        == Some("worker-fallback-sentinel"),
-                );
-                let response_number = request_count.fetch_add(1, Ordering::SeqCst);
-                let (status, body) = if response_number == 0 {
-                    (
-                        axum::http::StatusCode::UNAUTHORIZED,
-                        r#"{"error":"credential_not_found"}"#,
-                    )
-                } else {
-                    (
-                        axum::http::StatusCode::OK,
-                        r#"{"candidates":[{"content":{"parts":[{"text":"Sardine crash investigation"}]}}]}"#,
-                    )
-                };
-                let mut response = Response::new(Body::from(body));
-                *response.status_mut() = status;
-                response
-            }
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    OneCliFallbackGemini {
-        base_url: format!("http://{addr}/v1beta"),
-        observed_fallback_headers,
     }
 }
 
@@ -711,35 +678,35 @@ async fn releasing_the_gated_http_fixture_saves_a_short_ai_name() {
     assert_eq!(sync.desired_revision, interim.record.revision + 1);
 }
 
-/// The real worker uses the session-name transport's explicit OneCLI
-/// missing-credential fallback and persists the generated title through the
-/// normal durable name-store path.
+/// Name-reliability Task 6 (rewrites the removed OneCLI-then-key retry pin,
+/// G43): with a configured key and a OneCLI-marked ambient proxy, the real
+/// worker sends ONE keyed request straight to Gemini (never through the
+/// proxy) and persists the answer through the normal durable path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn onecli_missing_credential_worker_fallback_saves_ai_name() {
+async fn configured_key_worker_goes_direct_past_a_onecli_proxy() {
+    use crate::session_name_capability::tests::{
+        session_name_http, start_fake_gemini, start_fake_proxy, ProxyMode,
+    };
     let dir = temp_data_dir();
     let store = open_store(dir.path());
-    let fixture = start_onecli_fallback_gemini().await;
-    let auth = crate::ai_title::GeminiSessionNameAuth::onecli_for_test(AiKeyCell::init(
-        Some("worker-fallback-sentinel".to_string()),
-        None,
-    ));
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    let transport = Arc::new(GeminiSessionNameHttp::new(
-        client,
-        auth.clone(),
-        fixture.base_url.clone(),
-    ));
+    let gemini = start_fake_gemini("Sardine crash investigation", Some("worker-key-value")).await;
+    let proxy = start_fake_proxy("Proxy answer", ProxyMode::Ok).await;
+    let (auth, transport) = session_name_http(
+        AiKeyCell::init(Some("worker-key-value".to_string()), None),
+        &gemini.base_url,
+        Some(&proxy.onecli_url()),
+    );
     let generator = Arc::new(SessionNameGenerator::new(
         settings_for(dir.path()),
         auth,
         transport,
     ));
-    let target = pending("h-onecli-fallback");
+    let target = pending("h-key-direct");
     ensure_pending(
         &store,
-        "h-onecli-fallback",
+        "h-key-direct",
         NamedProvider::Claude,
-        Some("/w/onecli-fallback"),
+        Some("/w/key-direct"),
     )
     .await
     .expect("ensure");
@@ -766,16 +733,20 @@ async fn onecli_missing_credential_worker_fallback_saves_ai_name() {
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the worker must save the fallback answer"
+            "the worker must save the keyed answer"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     worker.abort();
 
     assert_eq!(
-        *fixture.observed_fallback_headers.lock().unwrap(),
-        vec![false, true],
-        "the worker makes one keyless OneCLI request and one direct-key fallback"
+        *gemini.keys.lock().unwrap(),
+        vec![Some("worker-key-value".to_string())],
+        "the worker makes one keyed request, direct"
+    );
+    assert!(
+        proxy.recorded().is_empty(),
+        "the OneCLI proxy is never used"
     );
 }
 
@@ -1119,8 +1090,12 @@ async fn the_retry_schedule_is_immediate_then_thirty_seconds_then_five_minutes()
 #[tokio::test(start_paused = true)]
 async fn the_twenty_second_request_bound_charges_the_attempt_once() {
     struct NeverTransport;
-    impl GeminiTransport for NeverTransport {
-        fn generate_content(&self, _p: String, _m: u32) -> BoxFuture<Result<String, String>> {
+    impl SessionNameTransport for NeverTransport {
+        fn generate_content(
+            &self,
+            _p: String,
+            _m: u32,
+        ) -> BoxFuture<Result<String, GeminiFailure>> {
             Box::pin(std::future::pending())
         }
     }
@@ -1129,7 +1104,7 @@ async fn the_twenty_second_request_bound_charges_the_attempt_once() {
     let generator = generator_with(
         dir.path(),
         Some("gen-key"),
-        Arc::new(NeverTransport) as Arc<dyn GeminiTransport>,
+        Arc::new(NeverTransport) as Arc<dyn SessionNameTransport>,
     );
     let target = pending("h-bound");
     ensure_pending(&store, "h-bound", NamedProvider::Claude, Some("/w/bound"))
@@ -1700,14 +1675,18 @@ async fn a_rearmed_series_rejects_answers_from_older_input() {
         .expect("claim runs")
         .expect("claimable");
 
-    // A genuinely new message re-arms the series (new fingerprint).
-    arm_with_message(
+    // The index re-derived the actual first message (new fingerprint).
+    // A later accepted send must never replace the first naming input.
+    activity(
         &store,
         target.clone(),
         "freshclaude",
-        "Second conversation message",
+        "corrected-first-message",
+        NameActivityReason::IndexUserMessage,
+        Some("Corrected first conversation message"),
     )
-    .await;
+    .await
+    .expect("the index corrects naming input");
 
     // The OLD input's late answer is rejected.
     store
@@ -1746,7 +1725,8 @@ async fn a_rearmed_series_rejects_answers_from_older_input() {
 /// Hydration installs the free fallbacks (provider title > first message >
 /// directory basename) and NEVER schedules paid titles across history: the
 /// absorbed series rests Idle, out of the selector, and stays that way
-/// across repeated hydration; a genuinely new message arms it.
+/// across repeated hydration and a re-derived message; a genuinely newly
+/// observed message on a session without an absorbed series arms.
 #[tokio::test]
 async fn hydration_installs_free_fallbacks_and_never_schedules_paid_titles() {
     let dir = temp_data_dir();
@@ -1826,14 +1806,39 @@ async fn hydration_installs_free_fallbacks_and_never_schedules_paid_titles() {
         "an existing record is returned unchanged"
     );
 
-    // A genuinely newly observed message (a later pass) arms generation.
+    // Name-reliability Task 5 (V2 decision B, re-absorb at rest): a changed
+    // message the index feeds to the absorbed series is only ever a
+    // RE-DERIVED first message (a real first message never changes; the
+    // extraction rules did), so it refreshes the input at rest and is still
+    // never scheduled in the background — an explicit open arms it.
     activity(
         &store,
         titled.clone(),
         "opencode",
+        "e-rederived-message",
+        NameActivityReason::IndexUserMessage,
+        Some("The re-derived first message"),
+    )
+    .await
+    .expect("the re-derived message rests");
+    assert!(
+        store.generation_work_snapshot().is_empty(),
+        "a re-derived message never arms an absorbed series in the background"
+    );
+    assert_eq!(
+        generation_status(&document_json(dir.path()), &titled).as_deref(),
+        Some("idle")
+    );
+
+    // A genuinely newly observed message (a later pass) on a session with
+    // no absorbed series arms generation.
+    activity(
+        &store,
+        plain.clone(),
+        "claude",
         "e-new-message",
         NameActivityReason::IndexUserMessage,
-        Some("A brand new second turn message"),
+        Some("A brand new first message"),
     )
     .await
     .expect("the new message arms");
@@ -1841,7 +1846,7 @@ async fn hydration_installs_free_fallbacks_and_never_schedules_paid_titles() {
         store
             .generation_work_snapshot()
             .iter()
-            .any(|item| item.target == titled),
+            .any(|item| item.target == plain),
         "a newly observed message makes the session eligible"
     );
 }
@@ -2186,14 +2191,19 @@ async fn the_targeted_opencode_lookup_serves_eligibility_and_is_bounded() {
         Duration::from_millis(1_000),
         None,
     );
-    let first = index.opencode_first_user_message("ses_named");
+    let first = index
+        .opencode_first_user_message("ses_named")
+        .expect("the targeted read succeeds");
     assert_eq!(
         first.as_deref(),
         Some("The hidden first message"),
         "an already-named opencode session's first message is served on demand"
     );
     assert!(
-        index.opencode_first_user_message("ses_missing").is_none(),
+        index
+            .opencode_first_user_message("ses_missing")
+            .expect("a missing session is an answer, not a failed read")
+            .is_none(),
         "a missing session answers None"
     );
 
@@ -2446,8 +2456,12 @@ async fn the_worker_alternates_native_and_generation_under_sustained_native_requ
     struct LoggingGeneration {
         order: Arc<Mutex<Vec<&'static str>>>,
     }
-    impl GeminiTransport for LoggingGeneration {
-        fn generate_content(&self, _p: String, _m: u32) -> BoxFuture<Result<String, String>> {
+    impl SessionNameTransport for LoggingGeneration {
+        fn generate_content(
+            &self,
+            _p: String,
+            _m: u32,
+        ) -> BoxFuture<Result<String, GeminiFailure>> {
             self.order.lock().unwrap().push("generation");
             Box::pin(async move { Ok("Alternating AI".to_string()) })
         }
@@ -2575,23 +2589,24 @@ async fn run_worker_child_role(role: &str, dir: &Path) {
     }
     let cell = AiKeyCell::init(Some("child-key".to_string()), None);
     let settings = settings_for(dir);
-    let (transport, native): (Arc<dyn GeminiTransport>, Arc<dyn NativeNameBackend>) = match role {
-        "worker" => (
-            CountingTransport::new("Child AI name"),
-            Arc::new(NoRouteNative),
-        ),
-        "gated_worker" => (
-            Arc::new(FileGatedTransport {
-                calls: AtomicU32::new(0),
-                answer: "Gated AI name".to_string(),
-                gate_path: dir.join("gemini-release"),
-                held_sentinel: dir.join("request-held"),
-            }),
-            Arc::new(NoRouteNative),
-        ),
-        "failing_worker" => (FailingTransport::new(), Arc::new(NoRouteNative)),
-        other => panic!("unknown child role {other}"),
-    };
+    let (transport, native): (Arc<dyn SessionNameTransport>, Arc<dyn NativeNameBackend>) =
+        match role {
+            "worker" => (
+                CountingTransport::new("Child AI name"),
+                Arc::new(NoRouteNative),
+            ),
+            "gated_worker" => (
+                Arc::new(FileGatedTransport {
+                    calls: AtomicU32::new(0),
+                    answer: "Gated AI name".to_string(),
+                    gate_path: dir.join("gemini-release"),
+                    held_sentinel: dir.join("request-held"),
+                }),
+                Arc::new(NoRouteNative),
+            ),
+            "failing_worker" => (FailingTransport::new(), Arc::new(NoRouteNative)),
+            other => panic!("unknown child role {other}"),
+        };
     let generator = Arc::new(SessionNameGenerator::new(
         settings,
         crate::ai_title::GeminiSessionNameAuth::direct_for_test(cell),

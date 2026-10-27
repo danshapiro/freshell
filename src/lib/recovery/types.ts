@@ -16,6 +16,13 @@ export interface RecoveryPane {
   mode: string | null
   shell: string | null
   cwd: string | null
+  /**
+   * Name reliability (Task 9): the pane's title as its registry snapshot
+   * recorded it, and whether a person set it. Display data only (never part
+   * of the dismissal digest). Absent from older servers and untitled panes.
+   */
+  title?: string
+  titleSetByUser?: boolean
   payload: Record<string, unknown>
   /** Effective (ledger-corrected) session ref — the D4 authority chain is applied server-side. */
   sessionRef: RecoverySessionRef | null
@@ -35,6 +42,12 @@ export interface RecoveryPane {
 export interface RecoveryTab {
   tabKey: string
   tabName: string
+  /**
+   * Name reliability (Task 9): whether a person renamed this tab (the
+   * registry record's flag). The recovery builder restores it only on tabs
+   * that are not session-owned. Absent from older servers.
+   */
+  titleSetByUser?: boolean
   /**
    * Unified agent names (Task 6): the tab's stable naming-source
    * relationship as recorded in the durable registry snapshot (additive;

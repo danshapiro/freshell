@@ -2,10 +2,12 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import { handleUiCommand } from '../../../src/lib/ui-commands'
 import { captureUiScreenshot } from '../../../src/lib/ui-screenshot'
-import tabsReducer from '../../../src/store/tabsSlice'
-import panesReducer from '../../../src/store/panesSlice'
+import tabsReducer, { addTab } from '../../../src/store/tabsSlice'
+import panesReducer, { initLayout } from '../../../src/store/panesSlice'
 import sessionNamesReducer from '../../../src/store/sessionNamesSlice'
 import { receiveSessionNames } from '../../../src/store/sessionNamesSlice'
+import { sessionNameLifecycleMiddleware } from '../../../src/store/sessionNameLifecycleMiddleware'
+import { savedNameTabTitleMirrorMiddleware } from '../../../src/store/savedNameTabTitleMirror'
 
 vi.mock('../../../src/lib/ui-screenshot', () => ({
   captureUiScreenshot: vi.fn(),
@@ -497,5 +499,118 @@ describe('ui.command focus neutrality through a real Redux store', () => {
       const key = JSON.stringify(['session', 'claude', 'sess-ui-2'])
       expect(store.getState().sessionNames.records[key]?.name).toBe('Refetched canonical name')
     })
+  })
+})
+
+// Name reliability (plan Task 7): a ui.command never freezes or retitles a
+// session-owned tab. Its stored title is the saved-name mirror, so a
+// caller-provided create name is only a provisional display until the
+// session's saved record arrives.
+describe('ui.command titles of session-owned tabs', () => {
+  function makeNamingStore(opts: { mirror: boolean }) {
+    return configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer, sessionNames: sessionNamesReducer },
+      middleware: (getDefault) => getDefault({ serializableCheck: false }).concat(
+        ...(opts.mirror ? [savedNameTabTitleMirrorMiddleware] : []),
+        sessionNameLifecycleMiddleware,
+      ),
+    })
+  }
+
+  function nameUpdate(sessionId: string, name: string, revision: number) {
+    return {
+      record: { ref: { kind: 'session' as const, provider: 'claude' as const, sessionId }, name, source: 'manual' as const, revision },
+      documentGeneration: revision,
+      redirects: [],
+      changed: true,
+    }
+  }
+
+  it('tab.create with a caller name on a Claude pane does not freeze the title', () => {
+    const store = makeNamingStore({ mirror: true })
+    const runtime = { dispatch: store.dispatch, getState: () => store.getState() as never }
+
+    handleUiCommand({
+      type: 'ui.command',
+      command: 'tab.create',
+      payload: {
+        id: 't-agent',
+        title: 'work',
+        mode: 'claude',
+        paneId: 'p-agent',
+        paneContent: {
+          kind: 'terminal',
+          mode: 'claude',
+          status: 'creating',
+          createRequestId: 'c-agent',
+          sessionRef: { provider: 'claude', sessionId: 'sess-create' },
+        },
+      },
+    }, runtime)
+    // A terminal-id create of a Codex agent (no explicit pane content).
+    handleUiCommand({
+      type: 'ui.command',
+      command: 'tab.create',
+      payload: { id: 't-codex', title: 'codex work', mode: 'codex', terminalId: 'term-codex', status: 'running' },
+    }, runtime)
+    // Out of scope: a named browser create keeps its user-set title.
+    handleUiCommand({
+      type: 'ui.command',
+      command: 'tab.create',
+      payload: { id: 't-browser', title: 'docs', paneId: 'p-browser', paneContent: { kind: 'browser', url: 'https://example.com', devToolsOpen: false } },
+    }, runtime)
+
+    const tabs = Object.fromEntries(store.getState().tabs.tabs.map((tab) => [tab.id, tab]))
+    expect(tabs['t-agent'].title).toBe('work')
+    expect(tabs['t-agent'].titleSetByUser).toBeUndefined()
+    expect(tabs['t-codex'].titleSetByUser).toBeUndefined()
+    expect(tabs['t-browser'].titleSetByUser).toBe(true)
+
+    // When the session's saved record arrives the tab follows it.
+    store.dispatch(receiveSessionNames([nameUpdate('sess-create', 'LotL', 1)]))
+    const agentTab = store.getState().tabs.tabs.find((tab) => tab.id === 't-agent')
+    expect(agentTab?.title).toBe('LotL')
+    expect(agentTab?.titleSetByUser).toBeUndefined()
+  })
+
+  it('tab.rename for a session-owned tab is consumed as a scoped rename', () => {
+    const store = makeNamingStore({ mirror: false })
+    store.dispatch(addTab({ id: 't-owned', title: 'LotL', mode: 'claude' }))
+    store.dispatch(initLayout({
+      tabId: 't-owned',
+      paneId: 'p-owned',
+      content: {
+        kind: 'terminal',
+        mode: 'claude',
+        status: 'running',
+        createRequestId: 'c-owned',
+        sessionRef: { provider: 'claude', sessionId: 'sess-owned' },
+      },
+    }))
+    expect(store.getState().tabs.tabs[0].nameSource).toEqual({ kind: 'session', paneId: 'p-owned' })
+    const dispatched: any[] = []
+    const runtime = {
+      dispatch: (action: any) => {
+        dispatched.push(action)
+        return store.dispatch(action)
+      },
+      getState: () => store.getState() as never,
+    }
+
+    handleUiCommand({
+      type: 'ui.command',
+      command: 'tab.rename',
+      payload: { id: 't-owned', title: 'Agent-applied name', sessionName: nameUpdate('sess-owned', 'Agent-applied name', 2) },
+    }, runtime)
+
+    // Consumed through the canonical cache: no legacy tab rename (which
+    // would store the title AND freeze it with titleSetByUser).
+    expect(dispatched.some((action) => typeof action === 'function')).toBe(false)
+    expect(dispatched.some((action) => action?.type === 'tabs/updateTab')).toBe(false)
+    const tab = store.getState().tabs.tabs[0]
+    expect(tab.titleSetByUser).toBeUndefined()
+    expect(tab.title).toBe('LotL')
+    const key = JSON.stringify(['session', 'claude', 'sess-owned'])
+    expect(store.getState().sessionNames.records[key]?.name).toBe('Agent-applied name')
   })
 })

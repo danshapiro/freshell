@@ -57,6 +57,7 @@ pub mod invariants;
 pub mod opencode_association;
 pub mod opencode_lane;
 pub mod opencode_signal;
+pub mod opencode_title_naming;
 pub mod origin;
 pub(crate) mod paced_replay;
 pub mod pane_identity_binder;
@@ -74,6 +75,7 @@ pub(crate) mod tabs_store_migrate;
 pub mod tabs_store_model;
 pub mod terminal;
 pub mod terminal_meta;
+pub mod terminal_naming;
 
 pub use codex_identity::codex_sessions_root;
 pub use codex_reconcile::locate_codex_rollout;

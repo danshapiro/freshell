@@ -1,6 +1,14 @@
 import { describe, it, expect } from 'vitest'
+import { configureStore } from '@reduxjs/toolkit'
+import tabsReducer, { addTab } from '@/store/tabsSlice'
+import panesReducer, { initLayout, updatePaneTitle } from '@/store/panesSlice'
+import sessionNamesReducer from '@/store/sessionNamesSlice'
+import connectionReducer from '@/store/connectionSlice'
+import tabRegistryReducer from '@/store/tabRegistrySlice'
+import extensionsReducer from '@/store/extensionsSlice'
 import {
   deriveRemoteSessionActivity,
+  selectLiveLocalTabRecords,
   selectMergedClosedRecords,
   selectRemoteSessionActivity,
   selectSameDeviceSessionKeys,
@@ -284,5 +292,34 @@ describe('registry name-refresh overlay', () => {
     } as unknown as RootState
 
     expect(selectMergedClosedRecords(state)[0].tabName).toBe('Durable current name')
+  })
+})
+
+// Name reliability (Task 9): a local live record carries the same pane user
+// flags the tabs.sync push sends, so the registry describes the renamed pane.
+describe('live local registry records', () => {
+  it('carry the pane user flag of a renamed pane', () => {
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        sessionNames: sessionNamesReducer,
+        connection: connectionReducer,
+        tabRegistry: tabRegistryReducer,
+        extensions: extensionsReducer,
+      },
+    })
+    store.dispatch(addTab({ id: 'tab-shell', title: 'MyShellTab', titleSetByUser: true }))
+    store.dispatch(initLayout({
+      tabId: 'tab-shell',
+      paneId: 'pane-shell',
+      content: { kind: 'terminal', mode: 'shell' },
+    }))
+    store.dispatch(updatePaneTitle({ tabId: 'tab-shell', paneId: 'pane-shell', title: 'KeepMePane', setByUser: true }))
+
+    const record = selectLiveLocalTabRecords(store.getState() as unknown as RootState)
+      .find((candidate) => candidate.tabId === 'tab-shell')
+    expect(record?.titleSetByUser).toBe(true)
+    expect(record?.panes[0]).toMatchObject({ paneId: 'pane-shell', title: 'KeepMePane', titleSetByUser: true })
   })
 })

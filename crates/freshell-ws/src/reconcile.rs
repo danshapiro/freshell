@@ -674,6 +674,7 @@ mod tests {
             session_ref: None,
             resume_session_id: None,
             status: None,
+            naming_handle: None,
         }
     }
 
@@ -784,8 +785,8 @@ mod tests {
     #[test]
     fn managed_ownership_dominates_a_stale_disk_index_absence_verdict() {
         let f = Fixture::new();
-        f.registry
-            .register_managed(freshell_terminal::registry::ManagedTerminalDescriptor {
+        f.registry.register_managed(
+            freshell_terminal::registry::ManagedTerminalDescriptor {
                 soul_id: "soul-managed-1".to_string(),
                 incarnation_id: "incarnation-managed-1".to_string(),
                 terminal_id: "T-managed".to_string(),
@@ -794,7 +795,9 @@ mod tests {
                 cwd: "/workspace".to_string(),
                 resume_session_id: Some("ses-managed".to_string()),
                 create_request_id: Some("cr-managed-original".to_string()),
-            });
+            },
+            "OpenCode".to_string(),
+        );
         // The host-local index has seen this id before and no longer finds it:
         // the exact shape that produces `session_not_on_disk`.
         f.probe.mark_observed("opencode", "ses-managed");

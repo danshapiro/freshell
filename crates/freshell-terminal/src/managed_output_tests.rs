@@ -79,16 +79,19 @@ impl ManagedTerminalController for Controller {
 
 fn fixture() -> (TerminalRegistry, Arc<Controller>) {
     let registry = TerminalRegistry::new();
-    registry.register_managed(ManagedTerminalDescriptor {
-        soul_id: "soul-stable".into(),
-        incarnation_id: "incarnation-old".into(),
-        terminal_id: "terminal-stable".into(),
-        stream_id: "epoch-old".into(),
-        mode: "opencode".into(),
-        cwd: "/workspace".into(),
-        resume_session_id: Some("native-original".into()),
-        create_request_id: Some("create-once".into()),
-    });
+    registry.register_managed(
+        ManagedTerminalDescriptor {
+            soul_id: "soul-stable".into(),
+            incarnation_id: "incarnation-old".into(),
+            terminal_id: "terminal-stable".into(),
+            stream_id: "epoch-old".into(),
+            mode: "opencode".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: Some("native-original".into()),
+            create_request_id: Some("create-once".into()),
+        },
+        "OpenCode".to_string(),
+    );
     registry.ingest_managed_output("terminal-stable", 206, 206, "old conversation tail".into());
     let controller = Arc::new(Controller {
         hold: AtomicBool::new(false),

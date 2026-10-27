@@ -7,7 +7,7 @@ import {
   terminalInventoryTitleReplayMiddleware,
 } from '@/lib/terminal-inventory-titles'
 import tabsReducer, { addTab } from '@/store/tabsSlice'
-import panesReducer, { initLayout, updatePaneTitle, updatePaneTitleByTerminalId } from '@/store/panesSlice'
+import panesReducer, { initCopiedLayout, initLayout, updatePaneTitle, updatePaneTitleByTerminalId } from '@/store/panesSlice'
 import { applyPaneRename } from '@/store/titleSync'
 
 function seedTerminalPane(store: ReturnType<typeof buildStore>, tabId: string, paneId: string, terminalId: string) {
@@ -202,6 +202,14 @@ describe('terminal inventory title cache + replay', () => {
           paneTitleSetByUser: {},
         },
       }),
+    },
+    {
+      name: 'panes/initCopiedLayout',
+      seed: (store) => store.dispatch(addTab({ id: 'tab-1', title: 'tab-1' })),
+      dispatch: (store) => store.dispatch(initCopiedLayout({
+        tabId: 'tab-1',
+        layout: { type: 'leaf', id: 'pane-1', content: SHELL_CONTENT('t-9', 'cr-copy') as never },
+      })),
     },
     {
       name: 'panes/splitPane',

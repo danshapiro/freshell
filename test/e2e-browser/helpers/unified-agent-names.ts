@@ -59,9 +59,19 @@ export interface FakeGemini {
   release: () => void
 }
 
+/** How the fake OneCLI gateway answers a request that carries NO key:
+ * `ok` answers as the gateway's own credential would (the AI reply);
+ * `access_restricted` is the real gateway's refusal when the agent has no
+ * access (403 + its JSON body). Mutable while the proxy runs. */
+export type FakeOneCliProxyMode = 'ok' | 'access_restricted'
+
 export interface FakeOneCliGeminiProxy {
   /** Ephemeral fixture setting used only to configure the owned test server. */
   proxyUrl: string
+  /** The loopback port (so a spec can check logs never name it). */
+  port: number
+  mode: FakeOneCliProxyMode
+  /** Every request it received, keyed or not. */
   requests: Array<{
     destinationHostname: string
     path: string
@@ -71,10 +81,25 @@ export interface FakeOneCliGeminiProxy {
   close: () => Promise<void>
 }
 
+/** The real gateway's refusal body (name-reliability V1), URLs removed. */
+const ONECLI_ACCESS_RESTRICTED_BODY = JSON.stringify({
+  error: 'access_restricted',
+  message: 'credentials exist in OneCLI but this agent does not have access',
+  manage_url: 'http://onecli.invalid/manage',
+  provider: 'generativelanguage.googleapis.com',
+})
+
 /** A local fake Gemini answering the Rust-only FRESHELL_GEMINI_BASE_URL seam
  * (auto-title-rust.spec.ts's pattern): deterministic short names, an
- * optional hold for the late-generation races. */
-export async function startFakeGemini(replyText: string, opts?: { hold?: boolean }): Promise<FakeGemini> {
+ * optional hold for the late-generation races. With `validKey` it checks
+ * the key as Google does: no key → 403 `PERMISSION_DENIED`, any other key →
+ * 400 `API_KEY_INVALID`. `status`/`body` make every other generate call
+ * answer that HTTP status and JSON body instead (for example a 403, so AI
+ * naming never succeeds and only first-message/folder names remain). */
+export async function startFakeGemini(
+  replyText: string,
+  opts?: { hold?: boolean; validKey?: string; status?: number; body?: unknown },
+): Promise<FakeGemini> {
   const requests: FakeGemini['requests'] = []
   let held = opts?.hold === true
   const server = http.createServer((req, res) => {
@@ -85,10 +110,31 @@ export async function startFakeGemini(replyText: string, opts?: { hold?: boolean
         apiKey: typeof req.headers['x-goog-api-key'] === 'string' ? req.headers['x-goog-api-key'] : undefined,
         body,
       })
+      const apiKey = typeof req.headers['x-goog-api-key'] === 'string' ? req.headers['x-goog-api-key'] : undefined
+      if (req.method === 'POST' && req.url === GEMINI_GENERATE_PATH && opts?.validKey !== undefined && apiKey !== opts.validKey) {
+        if (apiKey === undefined) {
+          res.writeHead(403, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ error: { code: 403, message: 'unregistered caller', status: 'PERMISSION_DENIED' } }))
+        } else {
+          res.writeHead(400, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({
+            error: {
+              code: 400,
+              message: 'API key not valid. Please pass a valid API key.',
+              status: 'INVALID_ARGUMENT',
+              details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: 'API_KEY_INVALID' }],
+            },
+          }))
+        }
+        return
+      }
       if (req.method === 'POST' && req.url === GEMINI_GENERATE_PATH) {
         const answer = () => {
-          res.writeHead(200, { 'content-type': 'application/json' })
-          res.end(JSON.stringify({ candidates: [{ content: { parts: [{ text: replyText }] } }] }))
+          const status = opts?.status ?? 200
+          res.writeHead(status, { 'content-type': 'application/json' })
+          res.end(JSON.stringify(opts?.body !== undefined
+            ? opts.body
+            : { candidates: [{ content: { parts: [{ text: replyText }] } }] }))
         }
         if (held) {
           const timer = setInterval(() => {
@@ -117,14 +163,20 @@ export async function startFakeGemini(replyText: string, opts?: { hold?: boolean
   }
 }
 
-/** Local HTTP proxy with a synthetic OneCLI authorization marker. It records
- * only safe request observations; request bodies and authorization values are
- * discarded after checking the expected prompt. */
+/** Local HTTP proxy with a synthetic OneCLI authorization marker, behaving
+ * like the real gateway (name-reliability V1): a request with NO key is
+ * answered per `mode` (see {@link FakeOneCliProxyMode}); a request WITH a
+ * key is forwarded-equivalent when the key is `validKey` (the AI reply) and
+ * refused with 400 + the gateway body otherwise. It records every request
+ * (keyed or not) as safe observations only; request bodies and
+ * authorization values are discarded after checking the expected prompt. */
 export async function startFakeOneCliGeminiProxy(
   replyText: string,
   expectedFirstMessage: string,
+  opts?: { mode?: FakeOneCliProxyMode; validKey?: string },
 ): Promise<FakeOneCliGeminiProxy> {
   const requests: FakeOneCliGeminiProxy['requests'] = []
+  const state = { mode: opts?.mode ?? 'ok' as FakeOneCliProxyMode }
   const server = http.createServer((req, res) => {
     let body = ''
     req.on('data', (chunk: Buffer) => { body += chunk.toString() })
@@ -156,6 +208,14 @@ export async function startFakeOneCliGeminiProxy(
       })
 
       if (req.method === 'POST' && destination?.pathname === GEMINI_GENERATE_PATH) {
+        const apiKey = req.headers['x-goog-api-key']
+        const keyed = typeof apiKey === 'string'
+        const refused = keyed ? apiKey !== opts?.validKey : state.mode === 'access_restricted'
+        if (refused) {
+          res.writeHead(keyed ? 400 : 403, { 'content-type': 'application/json' })
+          res.end(ONECLI_ACCESS_RESTRICTED_BODY)
+          return
+        }
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ candidates: [{ content: { parts: [{ text: replyText }] } }] }))
       } else {
@@ -168,6 +228,9 @@ export async function startFakeOneCliGeminiProxy(
   const port = (server.address() as AddressInfo).port
   return {
     proxyUrl: `http://%61oc_test_marker@127.0.0.1:${port}`,
+    port,
+    get mode() { return state.mode },
+    set mode(next: FakeOneCliProxyMode) { state.mode = next },
     requests,
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   }
@@ -644,7 +707,7 @@ export async function sendFirstMessage(
   await page.keyboard.press('Enter')
 }
 
-async function createThroughUi(options: CreateNamedAgentOptions, fixture: ModeFixture): Promise<NamedAgentHandle> {
+async function createThroughUi(options: CreateNamedAgentOptions & { harness: TestHarness }, fixture: ModeFixture): Promise<NamedAgentHandle> {
   const { page, harness, server } = options
   const cwd = options.cwd ?? server.projectDir
   if (!options.tabId) {
@@ -742,7 +805,7 @@ async function createThroughUi(options: CreateNamedAgentOptions, fixture: ModeFi
     await page.waitForTimeout(150)
   }
   if (!leaf) {
-    throw new Error(`the ${mode} pane never appeared in tab ${tabId}`)
+    throw new Error(`the ${fixture.provider} pane never appeared in tab ${tabId}`)
   }
   content = leaf.content
   if (!nameRef) {
@@ -1158,9 +1221,18 @@ async function commitPaneRenameEditor(page: Page, name: string): Promise<void> {
   // set aria-invalid), letting the in-flight window elapse first.
   for (const backoff of RENAME_RESUBMIT_BACKOFFS) {
     await page.waitForTimeout(backoff)
-    if (!(await input.isVisible().catch(() => false))) break
-    const errored = await input.getAttribute('aria-invalid').catch(() => null)
-    if (errored !== 'true') continue
+    // Read visibility and error together without waiting for an editor that
+    // a successful commit may already have removed.
+    const editor = await input.evaluateAll((elements) => {
+      const element = elements[0]
+      if (!element) return { visible: false, errored: false }
+      return {
+        visible: window.getComputedStyle(element).visibility === 'visible' && element.getClientRects().length > 0,
+        errored: element.getAttribute('aria-invalid') === 'true',
+      }
+    })
+    if (!editor.visible) break
+    if (!editor.errored) continue
     try {
       await input.fill(name, { timeout: RENAME_ACTION_TIMEOUT })
       await input.press('Enter', { timeout: RENAME_ACTION_TIMEOUT })
@@ -1247,6 +1319,10 @@ export async function renameThroughTabEdit(page: Page, tabId: string, name: stri
       await input.fill(name, { timeout: RENAME_ACTION_TIMEOUT })
       await input.press('Enter', { timeout: RENAME_ACTION_TIMEOUT })
     } catch (error) {
+      // The editor closed between the error check and the resubmit: the
+      // earlier submit committed (the editor closing is the product's
+      // success signal; the label assertion below is the commit gate).
+      if (!(await input.isVisible().catch(() => false))) break
       console.error(`[unified-agent-names] tab rename resubmit failed: ${String(error).slice(0, 200)}`)
     }
   }

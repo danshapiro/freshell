@@ -1786,6 +1786,11 @@ pub struct TerminalReplaced {
 pub struct TerminalSessionAssociated {
     pub session_ref: SessionLocator,
     pub terminal_id: String,
+    /// The authoritative naming binding after association. A prospective
+    /// zero-turn session can retain its pending handle; a conversation
+    /// switch names the new durable session even before it has a record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_ref: Option<SessionNameRef>,
     /// Present only on a server-authoritative mid-session rebind; names the
     /// session id this association supersedes. Optional+additive on the wire
     /// (WS_PROTOCOL_VERSION deliberately not bumped -- see plan
