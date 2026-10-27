@@ -116,13 +116,29 @@ export function FreshAgentModelDialog({
     const canonical = resolveCanonicalPaneSession(state,paneContent)
     return canonical ? selectSessionRuntimeOwner(state,canonical.provider,canonical.sessionId) : undefined
   })
-  const codexContext = useMemo<FreshAgentCodexCatalogContext | undefined>(() => sessionType === 'freshcodex' && paneContent.sessionId ? {
-    sessionId:paneContent.sessionId,
-    ...(paneContent.sessionRef ? {sessionRef:paneContent.sessionRef} : {}),
-    cwd:paneContent.initialCwd,
-    ...(runtimeOwner ? {observedEpoch:runtimeOwner.epoch,observedGeneration:runtimeOwner.generation} : {}),
-  } : undefined,[sessionType,paneContent.sessionId,paneContent.sessionRef,paneContent.initialCwd,runtimeOwner])
-  const probeKey = JSON.stringify([sessionType,cwdKey,codexContext,paneContent.serverInstanceId])
+  const referenceProvider = paneContent.sessionRef?.provider
+  const referenceSessionId = paneContent.sessionRef?.sessionId
+  const observedEpoch = runtimeOwner?.epoch
+  const observedGeneration = runtimeOwner?.generation
+  const codexContext = useMemo<FreshAgentCodexCatalogContext | undefined>(() => {
+    if (sessionType !== 'freshcodex' || !paneContent.sessionId) return undefined
+    return {
+      sessionId: paneContent.sessionId,
+      ...(referenceProvider !== undefined && referenceSessionId !== undefined
+        ? { sessionRef: { provider: referenceProvider, sessionId: referenceSessionId } }
+        : {}),
+      cwd: paneContent.initialCwd,
+      ...(observedEpoch !== undefined && observedGeneration !== undefined
+        ? { observedEpoch, observedGeneration }
+        : {}),
+    }
+  }, [sessionType, paneContent.sessionId, paneContent.initialCwd, referenceProvider, referenceSessionId, observedEpoch, observedGeneration])
+  // Source values invalidate a request; repeated observations of those values
+  // do not. The observation timestamp is not a change of owner or runtime.
+  const ownerSourceKey = sessionType === 'freshcodex' && runtimeOwner
+    ? JSON.stringify({ ...runtimeOwner, updatedAt: undefined })
+    : undefined
+  const probeKey = JSON.stringify([sessionType, cwdKey, codexContext, paneContent.serverInstanceId, ownerSourceKey])
   const [probeResult, setProbeResult] = useState<{
     key: string
     response: FreshAgentModelCapabilitiesResponse

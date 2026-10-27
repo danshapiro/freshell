@@ -1,5 +1,5 @@
 import { configureStore } from '@reduxjs/toolkit'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -7,6 +7,7 @@ import { FreshAgentModelDialog } from '@/components/fresh-agent/FreshAgentModelD
 import { useAppSelector } from '@/store/hooks'
 import panesReducer, { initLayout, mergePaneContent } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
+import freshAgentReducer, { applyRuntimeOwner } from '@/store/freshAgentSlice'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import type { FreshAgentSettingScopes } from '@shared/fresh-agent-contract'
 
@@ -115,6 +116,7 @@ function createStore() {
     reducer: {
       panes: panesReducer,
       settings: settingsReducer,
+      freshAgent: freshAgentReducer,
     },
   })
 }
@@ -631,6 +633,43 @@ describe('FreshAgentModelDialog (freshcodex)', () => {
     expect(wsSendSpy).toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.configure', settings: { model: 'provider-current', effort: 'ultra' } }))
   })
 
+  it('keeps the bound catalog stable when the same session reference is rematerialized', async () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_000)
+    try {
+      const store = createStore()
+      const owner = { type: 'session.runtimeOwner' as const, provider: 'codex', sessionId: 'thread-dialog',
+        epoch: 7, generation: 3, ownerKind: 'fresh-agent' as const, operationId: 'catalog-owner',
+        transition: 'handoff-committed' as const }
+      store.dispatch(applyRuntimeOwner(owner))
+      seedFreshcodexPane(store, { sessionRef: { provider: 'codex', sessionId: 'thread-dialog' } })
+      getFreshAgentModelCapabilitiesSpy.mockResolvedValue(nativeCatalog)
+      renderDialog(store, { open: true })
+      fireEvent.click(await screen.findByRole('option', { name: 'Provider Current' }))
+      fireEvent.change(screen.getByRole('searchbox'), { target: { value: 'provider' } })
+      fireEvent.click(screen.getByRole('option', { name: 'none', exact: true }))
+      expect(getFreshAgentModelCapabilitiesSpy).toHaveBeenCalledTimes(1)
+      await act(async () => {
+        store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: {
+          sessionRef: { provider: 'codex', sessionId: 'thread-dialog' },
+        } }))
+      })
+      expect(getFreshAgentModelCapabilitiesSpy).toHaveBeenCalledTimes(1)
+      now.mockReturnValue(1_001)
+      await act(async () => { store.dispatch(applyRuntimeOwner(owner)) })
+      expect(getFreshAgentModelCapabilitiesSpy, JSON.stringify(getFreshAgentModelCapabilitiesSpy.mock.calls)).toHaveBeenCalledTimes(1)
+      // A real owner transition at the same fence remains a new source.
+      await act(async () => { store.dispatch(applyRuntimeOwner({ ...owner, transition: 'handoff-started' })) })
+      expect(getFreshAgentModelCapabilitiesSpy).toHaveBeenCalledTimes(2)
+      expect(getFreshAgentModelCapabilitiesSpy).toHaveBeenLastCalledWith('freshcodex', expect.objectContaining({
+        codexContext: expect.objectContaining({ observedEpoch: 7, observedGeneration: 3 }),
+      }))
+      expect(screen.getByRole('searchbox')).toHaveValue('provider')
+      expect(screen.getByRole('button', { name: 'Use Provider Current · none' })).toBeEnabled()
+    } finally {
+      now.mockRestore()
+    }
+  })
+
   it('keeps the exact current model and xhigh visible when catalog fails or omits it', async () => {
     const store = createStore()
     seedFreshcodexPane(store, { model: 'saved-custom', effort: 'xhigh' })
@@ -727,9 +766,12 @@ describe('FreshAgentModelDialog (freshcodex)', () => {
       codexContext:expect.objectContaining({sessionId:'thread-dialog',cwd:'/repo/project-a'}),
     }))
     expect(screen.getAllByRole('option',{name:/GPT-6 Astra.*current/}).length).toBeGreaterThanOrEqual(1)
-    const levels = screen.getByRole('listbox',{name:'Thinking levels for GPT-6 Astra'})
-    const names = Array.from(levels.querySelectorAll('[role="option"]')).map((el)=>el.textContent?.replace(/last used|highest|current|●/g,'').trim())
-    expect(names).toEqual(['low','medium','high','xhigh','max'])
+    await waitFor(() => {
+      const levels = screen.getByRole('listbox', { name: 'Thinking levels for GPT-6 Astra' })
+      const names = Array.from(levels.querySelectorAll('[role="option"]'))
+        .map(el => el.textContent?.replace(/last used|highest|current|●/g, '').trim())
+      expect(names).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
+    })
     fireEvent.click(screen.getByRole('button',{name:'Use GPT-6 Astra · max'}))
     expect(paneContent(store)).toMatchObject({model:'gpt-6-astra',effort:'max'})
   })
