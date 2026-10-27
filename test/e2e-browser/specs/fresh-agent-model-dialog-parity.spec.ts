@@ -2,6 +2,89 @@ import type { Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
 import { FRESHCODEX_DEFAULT_MODEL } from '@shared/fresh-agent-models.js'
 
+const codexCatalog = {
+  ok: true, sessionType: 'freshcodex', runtimeProvider: 'codex', status: 'fresh', fetchedAt: 1234,
+  models: [{ id: 'provider-current', displayName: 'Provider Current', provider: 'codex',
+    supportsEffort: true, supportedEffortLevels: ['none', 'ultra'], defaultEffort: 'ultra',
+    inputModalities: ['text', 'image'], supportsAdaptiveThinking: false }],
+}
+
+test('Codex discovers only the bound runtime and preserves search and exact settings across rebind', async ({ freshellPage, page, terminal }) => {
+  await terminal.waitForTerminal()
+  let releaseOld!: () => void
+  const oldHeld = new Promise<void>((resolve) => { releaseOld = resolve })
+  const contexts: URLSearchParams[] = []
+  await page.route('**/api/fresh-agent/model-capabilities/freshcodex**', async (route) => {
+    const query = new URL(route.request().url()).searchParams
+    contexts.push(query)
+    if (contexts.length === 1) {
+      await oldHeld
+      await route.fulfill({ json: { ...codexCatalog, models: [{ ...codexCatalog.models[0], id: 'stale-model', displayName: 'Stale Provider' }] } })
+    } else await route.fulfill({ json: codexCatalog })
+  })
+  await installPane(page, 'codex')
+  await page.getByRole('button', { name: /^Model:.*change model$/ }).click()
+  const dialog = page.getByRole('dialog', { name: 'Model and thinking level' })
+  await expect.poll(() => contexts.length).toBe(1)
+  await dialog.getByRole('searchbox').fill('provider')
+  await page.evaluate(() => {
+    const harness = window.__FRESHELL_TEST_HARNESS__!
+    const state = harness.getState()
+    const tabId = state.tabs.activeTabId!
+    const paneId = state.panes.activePane[tabId]
+    harness.dispatch({ type: 'panes/mergePaneContent', payload: { tabId, paneId,
+      updates: { sessionId: 'replacement-native', sessionRef: { provider: 'codex', sessionId: 'replacement-native' } } } })
+  })
+  await dialog.getByRole('option', { name: 'Provider Current', exact: true }).click()
+  releaseOld()
+  await expect(dialog.getByRole('searchbox')).toHaveValue('provider')
+  await expect(dialog.getByRole('option', { name: 'Stale Provider' })).toHaveCount(0)
+  await expect.poll(() => contexts.length).toBe(2)
+  expect(contexts[0].get('sessionId')).toBe('d4430000-0000-4444-8444-000000000001')
+  expect(contexts[1].get('sessionId')).toBe('replacement-native')
+  await dialog.getByRole('button', { name: 'Use Provider Current · ultra' }).click()
+  await expect.poll(() => page.evaluate(() => {
+    const state = window.__FRESHELL_TEST_HARNESS__!.getState()
+    const layout = state.panes.layouts[state.tabs.activeTabId!]
+    return layout?.type === 'leaf' ? { model: layout.content.model, effort: layout.content.effort } : null
+  })).toEqual({ model: 'provider-current', effort: 'ultra' })
+})
+
+test('Codex picker waits for ordinary create and shows honest failure with exact saved input', async ({ freshellPage, page, terminal }) => {
+  await terminal.waitForTerminal()
+  let probes = 0
+  await page.route('**/api/fresh-agent/model-capabilities/freshcodex**', async (route) => {
+    probes++
+    await route.fulfill({ json: codexCatalog })
+  })
+  await installPane(page, 'codex')
+  const setStatus = async (status: string, sessionId?: string) => page.evaluate(({ status, sessionId }) => {
+    const harness = window.__FRESHELL_TEST_HARNESS__!
+    const state = harness.getState()
+    const tabId = state.tabs.activeTabId!
+    const paneId = state.panes.activePane[tabId]
+    harness.dispatch({ type: 'panes/mergePaneContent', payload: { tabId, paneId, updates: {
+      status, sessionId, sessionRef: undefined, resumeSessionId: undefined,
+      model: 'saved-custom', modelSelection: { kind: 'exact', modelId: 'saved-custom' }, effort: 'xhigh',
+    } } })
+  }, { status, sessionId })
+  await setStatus('creating')
+  await page.getByRole('button', { name: /^Model:.*change model$/ }).click()
+  const dialog = page.getByRole('dialog', { name: 'Model and thinking level' })
+  await expect(dialog.getByRole('status')).toContainText(/waiting.*runtime/i)
+  await dialog.getByRole('searchbox').fill('provider')
+  expect(probes).toBe(0)
+  await setStatus('idle', 'acknowledged-native')
+  await expect(dialog.getByRole('option', { name: 'Provider Current' })).toBeVisible()
+  await expect(dialog.getByRole('searchbox')).toHaveValue('provider')
+  expect(probes).toBe(1)
+  await setStatus('error')
+  await expect(dialog.getByRole('status')).toContainText(/catalog unavailable/i)
+  await dialog.getByRole('searchbox').fill('')
+  await expect(dialog.getByRole('button', { name: /Use saved-custom.*xhigh/ })).toBeEnabled()
+  expect(probes).toBe(1)
+})
+
 async function installPane(page: Page, provider: 'claude' | 'codex') {
   const sessionType = provider === 'claude' ? 'freshclaude' : 'freshcodex'
   const sessionId = 'd4430000-0000-4444-8444-000000000001'

@@ -29158,6 +29158,76 @@ pub(crate) mod tests {
 
     // ── freshAgent.configure: live model convergence ─────────────────────────
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_catalog_only_maps_legacy_max_when_selected_model_advertises_xhigh_without_max() {
+        let _guard = ENV_LOCK.lock().await;
+        for (levels, expected) in [(vec!["xhigh"], "xhigh"), (vec!["xhigh", "max"], "max"), (vec!["ultra"], "max")] {
+            let temp = tempfile::tempdir().unwrap();
+            let log = temp.path().join("native-requests.jsonl");
+            configure_fake_codex_cmd(&json!({"appendRequestLogPath": log,"modelCatalogPages":[{"data":[{
+                "id":"model-record","model":"gpt-6-astra","displayName":"Installed Astra",
+                "supportedReasoningEfforts":levels.iter().map(|effort|json!({"reasoningEffort":effort})).collect::<Vec<_>>(),
+                "defaultReasoningEffort":levels[0],"inputModalities":["text"]
+            }],"nextCursor":null}]}).to_string());
+            let (st, mut rx) = state_with_bus();
+            let mut create = create_msg("legacy-effort-create");
+            create.model = Some("gpt-6-astra".into());
+            create.effort = Some("max".into());
+            st.handle_create(create, None).await;
+            let created = collect_frames_until(&mut rx, Duration::from_secs(10), |f| f["type"] == "freshAgent.created").await;
+            let id = created.frames.iter().find(|f| f["type"] == "freshAgent.created").unwrap()["sessionId"].as_str().unwrap();
+            st.handle_send(send_msg(id, "legacy max selection")).await;
+            let _ = collect_frames_until(&mut rx, Duration::from_secs(5), |f| f["type"] == "freshAgent.send.accepted").await;
+            st.shutdown().await;
+            let requests: Vec<Value> = std::fs::read_to_string(log).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect();
+            let turn = requests.iter().find(|r|r["method"]=="turn/start").unwrap();
+            assert_eq!(turn["params"]["effort"], expected, "installed levels: {levels:?}");
+        }
+        std::env::remove_var("CODEX_CMD");
+        std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_model_choices_reach_create_send_configure_resume_and_fork_requests() {
+        let _guard = ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("native-requests.jsonl");
+        configure_fake_codex_cmd(&json!({"appendRequestLogPath": log, "recordTurns": true}).to_string());
+        let (st, mut rx) = state_with_bus();
+        let mut create = create_msg("native-model-create");
+        create.model_selection = Some(Some(freshell_protocol::ModelSelection { kind: "exact".into(), model_id: "provider-current".into() }));
+        create.effort = Some("ultra".into());
+        st.handle_create(create, None).await;
+        let created = collect_frames_until(&mut rx, Duration::from_secs(10), |f| f["type"] == "freshAgent.created").await;
+        let session_id = created.frames.iter().find(|f| f["type"] == "freshAgent.created").unwrap()["sessionId"].as_str().unwrap().to_string();
+        st.handle_send(send_msg(&session_id, "first native choice")).await;
+        let _ = collect_frames_until(&mut rx, Duration::from_secs(5), |f| f["event"]["type"] == "freshAgent.turn.complete").await;
+        st.handle_configure(configure_msg(&session_id, Some("provider-current"), Some("ultra"))).await;
+        st.handle_send(send_msg(&session_id, "configured native choice")).await;
+        let _ = collect_frames_until(&mut rx, Duration::from_secs(5), |f| f["event"]["type"] == "freshAgent.turn.complete").await;
+        let (sink, fork_frames) = capturing_sink();
+        st.handle_fork(fork_msg(&session_id, "native-model-fork", None), None, sink).await;
+        let forked = captured_frames(&fork_frames);
+        let child = forked.iter().find(|f|f["type"]=="freshAgent.forked").unwrap()["sessionId"].as_str().unwrap().to_string();
+        st.handle_send(send_msg(&child, "forked native choice")).await;
+        let _ = collect_frames_until(&mut rx, Duration::from_secs(5), |f| f["event"]["type"] == "freshAgent.turn.complete").await;
+        simulate_unrequested_crash(&st, &session_id).await;
+        st.handle_send(send_msg(&session_id, "resumed native choice")).await;
+        let _ = collect_frames_until(&mut rx, Duration::from_secs(10), |f| f["type"] == "freshAgent.send.accepted").await;
+        st.shutdown().await;
+        std::env::remove_var("CODEX_CMD");
+        std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
+        let requests: Vec<Value> = std::fs::read_to_string(log).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        for method in ["thread/start", "thread/resume", "thread/fork", "turn/start"] {
+            let rows: Vec<_> = requests.iter().filter(|row| row["method"] == method).collect();
+            assert!(!rows.is_empty(), "native method not exercised: {method}: {requests:?}");
+            for row in rows {
+                assert_eq!(row["params"]["model"], "provider-current", "{method}");
+                if method == "turn/start" { assert_eq!(row["params"]["effort"], "ultra"); }
+            }
+        }
+    }
+
     fn configure_msg(
         session_id: &str,
         model: Option<&str>,

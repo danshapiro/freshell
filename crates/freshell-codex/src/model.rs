@@ -182,6 +182,15 @@ pub fn to_codex_reasoning_effort(value: Option<&str>) -> Result<Option<String>, 
 mod tests {
     use super::*;
 
+    #[test]
+    fn explicit_native_model_choices_are_never_replaced_by_static_defaults() {
+        assert_eq!(normalize_freshcodex_model(Some("provider-current")), "provider-current");
+        for effort in ["ultra", "none", "xhigh", "max"] {
+            assert_eq!(normalize_freshcodex_effort(Some("provider-current"), Some(effort)).as_deref(), Some(effort));
+            assert_eq!(to_codex_reasoning_effort(Some(effort)).unwrap().as_deref(), Some(effort));
+        }
+    }
+
     // ── DEV-0003: none/minimal are forwarded VERBATIM (no clamp) ───────────────────────
 
     #[test]

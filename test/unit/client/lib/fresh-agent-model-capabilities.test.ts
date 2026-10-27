@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import { api, getFreshAgentModelCapabilities } from '@/lib/api'
 
 import type { FreshAgentModelCapabilities } from '@shared/fresh-agent-model-capabilities'
 import {
@@ -16,10 +17,35 @@ import {
   mergeClaudeModelCapabilities,
   mergeClaudeSelectorOptions,
   parseFreshAgentSettingsModelValue,
+  parseFreshAgentModelCapabilitiesResponse,
   requiresFreshAgentModelCapabilityValidation,
   resolveFreshAgentModelSelection,
   resolveFreshOpencodeCapabilityById,
 } from '@/lib/fresh-agent-model-capabilities'
+
+it('encodes the bound Codex conversation reference and owner fence on the existing HTTP request', async () => {
+  const get = vi.spyOn(api, 'get').mockResolvedValueOnce({ ok:false, sessionType:'freshcodex',runtimeProvider:'codex',status:'unavailable',models:[],error:{code:'RUNTIME_PENDING',message:'pending'} })
+  try {
+    await getFreshAgentModelCapabilities('freshcodex', { codexContext: {
+      sessionId: 'pane alias', sessionRef: { provider: 'codex', sessionId: 'native/current' }, cwd: '/project A', observedEpoch: 7, observedGeneration: 3,
+    } } as Parameters<typeof getFreshAgentModelCapabilities>[1])
+    const url = new URL(get.mock.calls[0][0], 'http://fixture')
+    expect(url.searchParams.get('sessionId')).toBe('pane alias')
+    expect(JSON.parse(url.searchParams.get('sessionRef')!)).toEqual({ provider:'codex',sessionId:'native/current' })
+    expect(url.searchParams.get('cwd')).toBe('/project A')
+    expect(url.searchParams.get('observedEpoch')).toBe('7')
+    expect(url.searchParams.get('observedGeneration')).toBe('3')
+  } finally { get.mockRestore() }
+})
+
+it('accepts native Codex defaults and input modalities without changing opaque effort values', () => {
+  const response = parseFreshAgentModelCapabilitiesResponse({
+    ok: true, sessionType: 'freshcodex', runtimeProvider: 'codex', status: 'fresh', fetchedAt: 1,
+    models: [{ id: 'provider-current', displayName: 'Provider Current', provider: 'codex',
+      supportsEffort: true, supportedEffortLevels: ['ultra'], defaultEffort: 'ultra', inputModalities: ['text', 'image'], supportsAdaptiveThinking: false }],
+  })
+  expect(response.models[0]).toMatchObject({ defaultEffort: 'ultra', inputModalities: ['text', 'image'] })
+})
 
 const capabilities = {
   sessionType: 'freshclaude',

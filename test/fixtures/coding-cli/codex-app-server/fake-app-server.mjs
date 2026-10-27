@@ -331,6 +331,14 @@ function successResult(method, params) {
     }
   }
   if (method === 'configRequirements/read') return { requirements: behavior.configRequirements ?? null }
+  if (method === 'model/list') {
+    const pages = behavior.modelCatalogPages ?? [{ data: [
+      { id: 'native-record', model: 'provider-current', displayName: 'Provider Current',
+        supportedReasoningEfforts: [{ reasoningEffort: 'none' }, { reasoningEffort: 'ultra' }],
+        defaultReasoningEffort: 'ultra', inputModalities: ['text', 'image'] },
+    ], nextCursor: null }]
+    return pages[params?.cursor ? Number(params.cursor) : 0]
+  }
   if (method === 'thread/start') {
     const threadId = behavior.threadStartThreadId
       || (behavior.uniqueThreadIds === true
@@ -806,6 +814,9 @@ wss.on('connection', (socket) => {
       return
     }
     const method = message.method
+    if (behavior.appendRequestLogPath) {
+      fs.appendFileSync(behavior.appendRequestLogPath, JSON.stringify({ method, params: message.params, codexHome: getCodexHome() }) + '\n')
+    }
 
     if (
       behavior.requireInitializeBeforeOtherMethods

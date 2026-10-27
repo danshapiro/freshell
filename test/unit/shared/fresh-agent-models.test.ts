@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { FreshAgentSettingsSchema } from '@shared/fresh-agent-contract'
 
 import {
   FRESHCODEX_DEFAULT_MODEL,
@@ -9,6 +10,16 @@ import {
   normalizeFreshAgentModel,
   resolveFreshAgentModelOption,
 } from '@shared/fresh-agent-models'
+
+describe('Codex exact native model choices', () => {
+  it('keeps custom and saved models and every explicit native effort for native validation', () => {
+    expect(normalizeFreshAgentModel('freshcodex', 'codex', 'provider-current')).toBe('provider-current')
+    for (const effort of ['ultra', 'none', 'xhigh', 'max']) {
+      expect(normalizeFreshAgentEffort('freshcodex', 'codex', 'provider-current', effort)).toBe(effort)
+      expect(FreshAgentSettingsSchema.parse({ model: 'provider-current', effort }).effort).toBe(effort)
+    }
+  })
+})
 
 describe('fresh-agent-models freshopencode static menu', () => {
   it('has no static fallback entries for freshopencode (models come from the live catalog)', () => {

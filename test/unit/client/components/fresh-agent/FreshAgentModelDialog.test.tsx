@@ -582,6 +582,86 @@ describe('FreshAgentModelDialog (freshopencode)', () => {
 })
 
 describe('FreshAgentModelDialog (freshcodex)', () => {
+  const nativeCatalog = {
+    ok: true as const, sessionType: 'freshcodex' as const, runtimeProvider: 'codex' as const,
+    status: 'fresh' as const, fetchedAt: 1234,
+    models: [{ id: 'provider-current', displayName: 'Provider Current', provider: 'codex' as const,
+      supportsEffort: true, supportedEffortLevels: ['none', 'ultra'], defaultEffort: 'ultra',
+      inputModalities: ['text', 'image'], supportsAdaptiveThinking: false }],
+  }
+
+  it('keeps a custom model and effort staged before create acknowledgement when the later catalog omits them', async () => {
+    const store = createStore()
+    seedFreshcodexPane(store, { sessionId: undefined, status: 'creating' })
+    getFreshAgentModelCapabilitiesSpy.mockResolvedValue({ ...nativeCatalog, models: [] })
+    renderDialog(store, { open: true })
+    fireEvent.change(screen.getByRole('textbox', { name: 'Exact model ID' }), { target: { value: 'unlisted-custom' } })
+    fireEvent.change(screen.getByRole('textbox', { name: 'Reasoning effort' }), { target: { value: 'ultra' } })
+    expect(paneContent(store).model).toBe('gpt-6-astra')
+    store.dispatch(mergePaneContent({ tabId:'tab-1',paneId:'pane-1',updates:{sessionId:'ack-custom',status:'idle'} }))
+    await waitFor(() => expect(getFreshAgentModelCapabilitiesSpy).toHaveBeenCalled())
+    fireEvent.click(screen.getByRole('button', { name:'Use unlisted-custom · ultra' }))
+    expect(paneContent(store)).toMatchObject({model:'unlisted-custom',effort:'ultra'})
+  })
+
+  it('automatically probes the acknowledged runtime without erasing pre-create search or the saved exact choice', async () => {
+    const store = createStore()
+    seedFreshcodexPane(store, { sessionId: undefined, status: 'creating', model: 'saved-custom', effort: 'xhigh' })
+    getFreshAgentModelCapabilitiesSpy.mockResolvedValue(nativeCatalog)
+    renderDialog(store, { open: true })
+    expect(getFreshAgentModelCapabilitiesSpy).not.toHaveBeenCalled()
+    expect(screen.getByRole('status')).toHaveTextContent(/waiting.*runtime/i)
+    const search = screen.getByRole('searchbox')
+    fireEvent.change(search, { target: { value: 'provider' } })
+    store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: { sessionId: 'bound-native', status: 'idle' } }))
+    await waitFor(() => expect(getFreshAgentModelCapabilitiesSpy).toHaveBeenCalledWith('freshcodex', expect.objectContaining({
+      codexContext: expect.objectContaining({ sessionId: 'bound-native', cwd: '/repo/project-a' }),
+    })))
+    fireEvent.click(await screen.findByRole('option', { name: 'Provider Current' }))
+    expect(search).toHaveValue('provider')
+    fireEvent.click(screen.getByRole('button', { name: 'Use Provider Current · ultra' }))
+    expect(paneContent(store)).toMatchObject({ model: 'provider-current', effort: 'ultra' })
+    expect(wsSendSpy).toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.configure', settings: { model: 'provider-current', effort: 'ultra' } }))
+  })
+
+  it('keeps the exact current model and xhigh visible when catalog fails or omits it', async () => {
+    const store = createStore()
+    seedFreshcodexPane(store, { model: 'saved-custom', effort: 'xhigh' })
+    getFreshAgentModelCapabilitiesSpy.mockResolvedValue({ ...nativeCatalog, ok: false, status: 'unavailable', models: [], error: { code: 'CAPABILITY_PROBE_FAILED', message: 'offline' } })
+    renderDialog(store, { open: true })
+    await waitFor(() => expect(getFreshAgentModelCapabilitiesSpy).toHaveBeenCalled())
+    expect(screen.getByRole('button', { name: /Use saved-custom.*xhigh/ })).toBeEnabled()
+    expect(screen.queryByRole('option', { name: /GPT-6 Astra/ })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /Use saved-custom.*xhigh/ }))
+    expect(paneContent(store)).toMatchObject({ model: 'saved-custom', effort: 'xhigh' })
+  })
+
+  it('rejects a delayed old-context catalog after rebind while preserving search and staged selection', async () => {
+    const store = createStore()
+    seedFreshcodexPane(store, { model: 'saved-custom', effort: 'xhigh' })
+    let release!: (v: typeof nativeCatalog) => void
+    getFreshAgentModelCapabilitiesSpy.mockReturnValueOnce(new Promise((r) => { release = r })).mockResolvedValue(nativeCatalog)
+    renderDialog(store, { open: true })
+    await waitFor(() => expect(getFreshAgentModelCapabilitiesSpy).toHaveBeenCalledTimes(1))
+    fireEvent.change(screen.getByRole('searchbox'), { target: { value: 'provider' } })
+    store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: { sessionId: 'replacement-native' } }))
+    fireEvent.click(await screen.findByRole('option', { name: 'Provider Current' }))
+    release({ ...nativeCatalog, models: [{ ...nativeCatalog.models[0], id: 'stale-model', displayName: 'Stale Provider' }] })
+    await waitFor(() => expect(getFreshAgentModelCapabilitiesSpy).toHaveBeenCalledTimes(2))
+    expect(screen.getByRole('searchbox')).toHaveValue('provider')
+    expect(screen.queryByRole('option', { name: 'Stale Provider' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Use Provider Current · ultra' })).toBeEnabled()
+  })
+
+  it('shows unavailable after failed ordinary creation without creating a catalog runtime', () => {
+    const store = createStore()
+    seedFreshcodexPane(store, { sessionId: undefined, status: 'error', model: 'saved-custom', effort: 'ultra' })
+    renderDialog(store, { open: true })
+    expect(screen.getByRole('status')).toHaveTextContent(/catalog unavailable/i)
+    expect(getFreshAgentModelCapabilitiesSpy).not.toHaveBeenCalled()
+    expect(wsSendSpy).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: /Use saved-custom.*ultra/ })).toBeEnabled()
+  })
   it('preserves the current thinking level when confirming an unchanged model', () => {
     const store = createStore()
     seedFreshcodexPane(store, { effort: 'low' })

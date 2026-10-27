@@ -724,6 +724,19 @@ async fn post(app: Router, uri: &str, auth: bool) -> (StatusCode, Value) {
 
 const CAP: &str = "/api/fresh-agent/model-capabilities";
 
+#[tokio::test]
+async fn codex_model_catalog_without_bound_runtime_is_pending_and_does_not_probe_gateway() {
+    let probe = Arc::new(RecordingProbe::new());
+    let app = app_with_probe(probe.clone());
+    for uri in [format!("{CAP}/freshcodex"), format!("{CAP}/freshcodex?sessionId=not-created&cwd=/other-home")] {
+        let (status, body) = get(app.clone(), &uri, true).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["code"], "RUNTIME_PENDING");
+        assert_eq!(body["models"], json!([]));
+    }
+    assert_eq!(probe.call_count().await, 0);
+}
+
 /// `model-capabilities-router.ts:34-37 + :50-53`.
 #[tokio::test]
 async fn invalid_session_type_is_400_for_get_and_refresh() {
