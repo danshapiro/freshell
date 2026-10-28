@@ -694,6 +694,7 @@ function candidateHelperBody(input: ClaudeCandidateAuthorization, role: 'mountpo
   body.Cmd = [role === 'reader' ? 'project-claude-candidate-private' : 'prepare-provider-mountpoints']
   body.HostConfig.CapAdd = ['CHOWN', 'SETGID', 'SETUID']
   body.HostConfig.Memory = body.HostConfig.MemorySwap = (role === 'reader' ? 256 : 128) * 1024 * 1024
+  body.HostConfig.NanoCpus = role === 'reader' ? 2_000_000_000 : 500_000_000
   body.HostConfig.Mounts = [
     { Type: 'bind', Source: input.hostBinaryPath, Target: '/runtime/freshell-session-host', ReadOnly: true },
     { Type: 'volume', Source: volume, Target: '/home/freshell/provider', ReadOnly: false, VolumeOptions: { NoCopy: true } },
@@ -851,7 +852,7 @@ describe('fixed initial Claude candidate broker', () => {
           instance.authorizeInitialProviderVolume(sourceAuthorization()); instance.authorizeClaudeCandidate(input)
           expect((await request('POST', '/v1.47/volumes/create', { Name: volume, Driver: 'local', DriverOpts: {}, Labels: candidateLabels(input) })).status).toBe(201)
           const body = candidateHelperBody(input, role), before = forwarded.length
-          for (const mutation of ['uid','command','credential','caps','network','memory','logs','reservation','generation','request','mount','readonly','volume']) {
+          for (const mutation of ['uid','command','credential','caps','network','memory','cpu','logs','reservation','generation','request','mount','readonly','volume']) {
             const changed = structuredClone(body)
             if (mutation === 'uid') changed.User = '65534:0'
             if (mutation === 'command') changed.Cmd.push('PRIVATE_CANDIDATE_SENTINEL')
@@ -859,6 +860,7 @@ describe('fixed initial Claude candidate broker', () => {
             if (mutation === 'caps') changed.HostConfig.CapAdd.push('DAC_OVERRIDE')
             if (mutation === 'network') changed.HostConfig.NetworkMode = 'bridge'
             if (mutation === 'memory') changed.HostConfig.Memory *= 2
+            if (mutation === 'cpu') changed.HostConfig.NanoCpus *= 2
             if (mutation === 'logs') changed.HostConfig.LogConfig.Type = 'json-file'
             if (mutation === 'reservation') changed.Labels['com.freshell.source-reservation-id'] = '33333333-3333-4333-8333-333333333333'
             if (mutation === 'generation') changed.Labels['com.freshell.input-generation'] = 'grant-33333333-3333-4333-8333-333333333333'

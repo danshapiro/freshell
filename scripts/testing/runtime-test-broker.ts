@@ -1104,7 +1104,8 @@ export class RestrictedDockerBroker {
       || host.NetworkMode !== 'none' || host.ReadonlyRootfs !== true
       || JSON.stringify(host.CapDrop) !== JSON.stringify(['ALL']) || JSON.stringify(host.CapAdd) !== JSON.stringify(['CHOWN','SETGID','SETUID'])
       || JSON.stringify(host.SecurityOpt) !== JSON.stringify(['no-new-privileges'])
-      || host.Memory !== (reader ? 256 : 128) * 1024 * 1024 || host.MemorySwap !== host.Memory || host.NanoCpus !== 500_000_000 || host.PidsLimit !== 32
+      || host.Memory !== (reader ? 256 : 128) * 1024 * 1024 || host.MemorySwap !== host.Memory
+      || host.NanoCpus !== (reader ? 2_000_000_000 : 500_000_000) || host.PidsLimit !== 32
       || !equalRecord(host.LogConfig, { Type: 'none', Config: host.LogConfig?.Config }) || Object.keys(host.LogConfig?.Config ?? {}).length
       || (reader ? !equalRecord(host.Tmpfs, {}) : host.Tmpfs !== undefined)) return false
     const mounts = host.Mounts
