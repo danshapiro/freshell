@@ -66,8 +66,18 @@ impl FreshAgentState {
                 .map(str::to_string),
             effort: body
                 .get("effort")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+                .map(|value| {
+                    serde_json::from_value(value.clone())
+                        .map_err(|_| invalid("effort must be a string or null".into()))
+                })
+                .transpose()?,
+            collaboration_mode: body
+                .get("collaborationMode")
+                .map(|value| {
+                    serde_json::from_value(value.clone())
+                        .map_err(|_| invalid("collaborationMode must be a string".into()))
+                })
+                .transpose()?,
             native_session_id,
             plugins: inputs.plugins,
             model_selection: inputs.model_selection,
@@ -77,29 +87,33 @@ impl FreshAgentState {
             observed_generation,
             ..Default::default()
         };
-        if provider == "claude" {
+        if matches!(provider, "claude" | "codex") {
             let settings = if let Some(reader) = self.rest_create_settings.get() {
                 reader().await
             } else {
-                SettingsFreshAgent {
+                rest_lane::RestCreateSettings::from(SettingsFreshAgent {
                     default_plugins: vec![],
                     enabled: false,
                     providers: json!({}),
                     initial_setup_done: None,
-                }
+                })
             };
-            let resolved = crate::claude_create_defaults::resolve_claude_rest_create(
-                session_type,
-                body,
-                &settings,
-            )
-            .map_err(invalid)?;
-            request.model = Some(resolved.model);
-            request.model_selection = Some(resolved.model_selection);
-            request.model_effort_levels = resolved.model_effort_levels;
-            request.effort = resolved.effort;
-            request.permission_mode = Some(resolved.permission_mode);
-            request.plugins = Some(resolved.plugins);
+            if provider == "codex" {
+                resolve_codex_rest_create(&mut request, &settings)?;
+            } else {
+                let resolved = crate::claude_create_defaults::resolve_claude_rest_create(
+                    session_type,
+                    body,
+                    &settings.fresh_agent,
+                )
+                .map_err(invalid)?;
+                request.model = Some(resolved.model);
+                request.model_selection = Some(resolved.model_selection);
+                request.model_effort_levels = resolved.model_effort_levels;
+                request.effort = resolved.effort.map(Some);
+                request.permission_mode = Some(resolved.permission_mode);
+                request.plugins = Some(resolved.plugins);
+            }
         }
         if naming::is_unified_agent_mode(None, Some(session_type)) {
             request.naming_handle = Some(
@@ -194,12 +208,20 @@ pub(crate) fn pane_content(request: &RestLaneCreate, created: &RestLaneCreated) 
     for (key, value) in [
         ("initialCwd", request.cwd.as_ref()),
         ("model", request.model.as_ref()),
-        ("effort", request.effort.as_ref()),
+        ("effort", request.effort.as_ref().and_then(Option::as_ref)),
         ("permissionMode", request.permission_mode.as_ref()),
         ("namingHandle", request.naming_handle.as_ref()),
     ] {
         if let Some(value) = value {
             content[key] = json!(value);
+        }
+    }
+    if request.provider == "codex" {
+        if request.effort.is_some() {
+            content["effortIsNativeDefault"] = json!(request.effort == Some(None));
+        }
+        if let Some(mode) = &request.collaboration_mode {
+            content["collaborationMode"] = json!(mode);
         }
     }
     if let Some(value) = &request.plugins {
@@ -217,5 +239,160 @@ pub(crate) fn pane_content(request: &RestLaneCreate, created: &RestLaneCreated) 
     if let Some(value) = &created.session_ref {
         content["sessionRef"] = json!(value);
     }
+    if let Some(settings) = &created.effective_settings {
+        for (from, to) in [
+            ("model", "model"),
+            ("cwd", "initialCwd"),
+            ("sandbox", "sandbox"),
+            ("permissionMode", "permissionMode"),
+            ("collaborationMode", "collaborationMode"),
+        ] {
+            if let Some(value) = settings.get(from) {
+                if value.is_null() {
+                    content.as_object_mut().expect("pane object").remove(to);
+                } else {
+                    content[to] = value.clone();
+                }
+            }
+        }
+        if let Some(effort) = settings.get("effort") {
+            if effort.is_null() {
+                content
+                    .as_object_mut()
+                    .expect("pane object")
+                    .remove("effort");
+            } else {
+                content["effort"] = effort.clone();
+            }
+            if request.provider == "codex" {
+                content["effortIsNativeDefault"] = json!(effort.is_null());
+            }
+        }
+    }
     content
+}
+
+fn resolve_codex_rest_create(
+    request: &mut RestLaneCreate,
+    settings: &rest_lane::RestCreateSettings,
+) -> Result<(), RestLaneError> {
+    use crate::codex::settings::CodexEffectiveSettings;
+    if request
+        .effort
+        .as_ref()
+        .and_then(Option::as_deref)
+        .is_some_and(|effort| effort.trim().is_empty())
+    {
+        return Err(RestLaneError::new(
+            RestLaneErrorKind::BadRequest,
+            "INVALID_EFFORT",
+            "effort must be a nonempty string or null for native Default",
+        ));
+    }
+    let saved = &settings.fresh_agent.providers["freshcodex"];
+    let cli = settings
+        .coding_cli
+        .as_ref()
+        .and_then(|settings| settings.providers.get("codex"));
+    // A canonical resume inherits its conversation's saved choices in the runtime.
+    // Provider defaults apply only when creating a new conversation.
+    if request.native_session_id.is_none() {
+        let selected_model = match &request.model_selection {
+            Some(selection) => selection
+                .as_ref()
+                .map(|selection| selection.model_id.clone()),
+            None => saved
+                .pointer("/modelSelection/modelId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        };
+        request.model = request
+            .model
+            .take()
+            .or(selected_model)
+            .or_else(|| cli.and_then(|settings| settings.model.clone()));
+        request.effort = request.effort.take().or_else(|| {
+            Some(
+                saved
+                    .get("effort")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            )
+        });
+        request.cwd = request
+            .cwd
+            .take()
+            .or_else(|| saved.get("cwd").and_then(Value::as_str).map(str::to_owned));
+        request.permission_mode = request
+            .permission_mode
+            .take()
+            .or_else(|| {
+                saved
+                    .get("defaultPermissionMode")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .or_else(|| cli.and_then(|settings| settings.permission_mode.clone()))
+            .or_else(|| Some("on-request".into()));
+        request.collaboration_mode = request
+            .collaboration_mode
+            .take()
+            .or_else(|| {
+                saved
+                    .get("collaborationMode")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .or_else(|| Some("default".into()));
+        if request.sandbox.is_none() {
+            let sandbox = saved
+                .get("sandbox")
+                .and_then(Value::as_str)
+                .or_else(|| cli.and_then(|settings| settings.sandbox.as_deref()));
+            request.sandbox = sandbox
+                .map(|value| serde_json::from_value(json!(value)))
+                .transpose()
+                .map_err(|_| {
+                    RestLaneError::new(
+                        RestLaneErrorKind::BadRequest,
+                        "INVALID_SANDBOX",
+                        "saved Codex file access is invalid",
+                    )
+                })?;
+        }
+    }
+    let effective = CodexEffectiveSettings::resolve(
+        &CodexEffectiveSettings {
+            model: request.model.clone().unwrap_or_default(),
+            effort: request.effort.clone().flatten(),
+            cwd: request.cwd.clone(),
+            sandbox: None,
+            permission_mode: None,
+            collaboration_mode: None,
+        },
+        &freshell_protocol::FreshAgentSendSettings {
+            sandbox: request.sandbox,
+            permission_mode: request.permission_mode.clone(),
+            collaboration_mode: request.collaboration_mode.clone(),
+            ..Default::default()
+        },
+    )
+    .map_err(|error| {
+        RestLaneError::new(RestLaneErrorKind::BadRequest, error.code, error.message)
+    })?;
+    // Keep resume omissions absent; otherwise full defaults would override saved intent.
+    if request.native_session_id.is_none() || request.model.is_some() {
+        request.model = Some(effective.model);
+    }
+    if request.effort.is_some() {
+        request.effort = Some(effective.effort);
+    }
+    request.permission_mode = effective.permission_mode;
+    request.sandbox = effective
+        .sandbox
+        .map(|sandbox| serde_json::from_value(json!(sandbox)).expect("validated Codex sandbox"));
+    request.collaboration_mode = effective
+        .collaboration_mode
+        .map(|mode| mode.as_str().into());
+    Ok(())
 }

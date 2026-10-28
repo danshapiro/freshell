@@ -24,6 +24,10 @@ impl FreshAgentRestLane for RefusingLane {
                 owner_generation: 7,
                 owner_epoch: 3,
             }),
+            session_id: None,
+            request_id: None,
+            incarnation_id: None,
+            submitted_turn_id: None,
         })
     }
 
@@ -177,7 +181,7 @@ async fn claude_defaults_are_read_once_and_used_for_the_runtime_and_pane() {
                 "freshclaude": { "modelSelection": { "kind": "exact", "modelId": "catalog-a" }, "modelEffortLevels": { "modelId": "catalog-a", "levels": [] }, "effort": "high", "defaultPermissionMode": "plan" },
                 "kilroy": { "modelSelection": { "kind": "exact", "modelId": "catalog-b" }, "effort": "low", "defaultPermissionMode": "bypassPermissions" },
             }),
-        } })
+        }.into() })
     })).unwrap();
     let router = app(state.clone());
     for (agent, model, mode, effort) in [
@@ -196,7 +200,7 @@ async fn claude_defaults_are_read_once_and_used_for_the_runtime_and_pane() {
             .unwrap();
         assert_eq!(request.model.as_deref(), Some(model));
         assert_eq!(request.permission_mode.as_deref(), Some(mode));
-        assert_eq!(request.effort.as_deref(), effort);
+        assert_eq!(request.effort.as_ref().and_then(Option::as_deref), effort);
         assert_eq!(request.plugins, Some(vec!["/saved-plugin".into()]));
         assert_eq!(pane["model"], model);
         assert_eq!(pane["permissionMode"], mode);
@@ -238,6 +242,7 @@ async fn an_explicit_model_override_clears_a_different_saved_exact_selection() {
             "modelEffortLevels": { "modelId": "saved-model", "levels": [] },
         } }),
                 }
+                .into()
             })
         }))
         .unwrap();
@@ -319,12 +324,206 @@ async fn hosted_gateway_takes_precedence_over_the_local_claude_lane() {
     assert!(local.creates.lock().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn hosted_gateway_takes_precedence_over_the_local_codex_lane() {
+    let state = state_with_registry();
+    let local = Arc::new(ContextLane {
+        layout: state.layout.clone(),
+        creates: Default::default(),
+    });
+    let hosted = Arc::new(ContextLane {
+        layout: state.layout.clone(),
+        creates: Default::default(),
+    });
+    state.set_codex_rest_lane(local.clone()).unwrap();
+    state.set_hosted_rest_gateway(hosted.clone()).unwrap();
+    let (status, body) = post(app(state), "/api/tabs", json!({"agent":"codex"}), true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(hosted.creates.lock().unwrap().len(), 1);
+    assert!(local.creates.lock().unwrap().is_empty());
+}
+
 #[derive(Default)]
 struct ControlLane {
     sends: std::sync::Mutex<Vec<RestLaneSend>>,
     captures: std::sync::Mutex<Vec<RestLaneCapture>>,
     materialized_session_id: Option<String>,
     concurrent_replacement: Option<(crate::layout_store::LayoutStore, String, String, Value)>,
+}
+
+#[tokio::test]
+async fn codex_rest_lane_wait_for_reads_the_current_fresh_pane_capture() {
+    let state = state_with_registry();
+    let (tab, pane) = state.layout.create_tab(None);
+    state.layout.attach_pane_content(
+        &tab,
+        &pane,
+        json!({
+            "kind":"fresh-agent", "provider":"codex", "sessionType":"freshcodex",
+            "sessionRef":{"provider":"codex","sessionId":"durable-codex"},
+        }),
+    );
+    let lane = Arc::new(ControlLane::default());
+    state.set_hosted_rest_gateway(lane.clone()).unwrap();
+    let router = app(state);
+    let matched = get(
+        router.clone(),
+        &format!("/api/panes/{pane}/wait-for?pattern=saved%20conversation&T=0"),
+        true,
+    )
+    .await;
+    let absent = get(
+        router,
+        &format!("/api/panes/{pane}/wait-for?pattern=absent&T=0"),
+        true,
+    )
+    .await;
+    assert_eq!(
+        (matched.0, absent.0),
+        (StatusCode::OK, StatusCode::OK),
+        "{matched:?} {absent:?}"
+    );
+    assert_eq!(matched.1["data"]["matched"], true);
+    assert_eq!(absent.1["status"], "approx");
+    assert_eq!(absent.1["data"]["matched"], false);
+    assert!(lane
+        .captures
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|request| request.session_id == "durable-codex"));
+}
+
+#[tokio::test]
+async fn codex_rest_lane_create_resolves_saved_defaults_and_explicit_native_default_once() {
+    let state = state_with_registry();
+    let lane = Arc::new(ContextLane {
+        layout: state.layout.clone(),
+        creates: Default::default(),
+    });
+    state.set_hosted_rest_gateway(lane.clone()).unwrap();
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = reads.clone();
+    state
+        .set_rest_create_settings_reader(Arc::new(move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                freshell_protocol::SettingsFreshAgent {
+                    default_plugins: vec![],
+                    enabled: true,
+                    initial_setup_done: None,
+                    providers: json!({"freshcodex":{
+                        "modelSelection":{"kind":"exact","modelId":"provider-current"},
+                        "effort":"ultra", "cwd":"/work", "sandbox":"workspace-write",
+                        "defaultPermissionMode":"on-request", "collaborationMode":"plan"
+                    }}),
+                }
+                .into()
+            })
+        }))
+        .unwrap();
+    let (status, body) = post(
+        app(state.clone()),
+        "/api/tabs",
+        json!({"agent":"codex", "effort":null}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let pane = state
+        .layout
+        .get_pane_snapshot(body["data"]["paneId"].as_str().unwrap())
+        .unwrap()
+        .pane_content
+        .unwrap();
+    assert_eq!(
+        json!({
+            "model":pane["model"], "effortIsNativeDefault":pane["effortIsNativeDefault"],
+            "cwd":pane["initialCwd"], "sandbox":pane["sandbox"],
+            "permissionMode":pane["permissionMode"], "collaborationMode":pane["collaborationMode"],
+        }),
+        json!({"model":"provider-current","effortIsNativeDefault":true,"cwd":"/work","sandbox":"workspace-write","permissionMode":"on-request","collaborationMode":"plan"})
+    );
+    assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn codex_rest_lane_explicit_model_selection_clear_uses_the_cli_default() {
+    let state = state_with_registry();
+    let lane = Arc::new(ContextLane {
+        layout: state.layout.clone(),
+        creates: Default::default(),
+    });
+    state.set_codex_rest_lane(lane.clone()).unwrap();
+    state.set_rest_create_settings_reader(Arc::new(|| Box::pin(async {
+        RestCreateSettings {
+            fresh_agent: freshell_protocol::SettingsFreshAgent {
+                default_plugins: vec![], enabled:true, initial_setup_done:None,
+                providers:json!({"freshcodex":{"modelSelection":{"kind":"exact","modelId":"saved-picker-model"}}}),
+            },
+            coding_cli:Some(serde_json::from_value(json!({
+                "enabledProviders":["codex"], "mcpServer":false,
+                "providers":{"codex":{"model":"cli-default-model"}},
+            })).unwrap()),
+        }
+    }))).unwrap();
+    let (status, body) = post(
+        app(state.clone()),
+        "/api/tabs",
+        json!({"agent":"codex","modelSelection":null}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let request = lane.creates.lock().unwrap().last().unwrap().clone();
+    assert_eq!(
+        request.model.as_deref(),
+        Some("cli-default-model"),
+        "explicit null must not restore a saved picker selection"
+    );
+    assert_eq!(request.model_selection, Some(None));
+    let content = state
+        .layout
+        .get_pane_snapshot(body["data"]["paneId"].as_str().unwrap())
+        .unwrap()
+        .pane_content
+        .unwrap();
+    assert_eq!(content["model"], "cli-default-model");
+    assert_eq!(content["modelSelection"], Value::Null);
+}
+
+#[tokio::test]
+async fn codex_rest_lane_blank_effort_is_not_an_explicit_native_default() {
+    let state = state_with_registry();
+    let lane = Arc::new(ContextLane {
+        layout: state.layout.clone(),
+        creates: Default::default(),
+    });
+    state.set_codex_rest_lane(lane.clone()).unwrap();
+    let router = app(state);
+    let mut outcomes = vec![];
+    for effort in ["", "  "] {
+        outcomes.push(
+            post(
+                router.clone(),
+                "/api/tabs",
+                json!({"agent":"codex","effort":effort}),
+                true,
+            )
+            .await,
+        );
+    }
+    assert!(
+        outcomes
+            .iter()
+            .all(|(status, body)| *status == StatusCode::BAD_REQUEST
+                && body["code"] == "INVALID_EFFORT"),
+        "{outcomes:?}"
+    );
+    assert!(
+        lane.creates.lock().unwrap().is_empty(),
+        "a blank string must not clear a choice or create a runtime"
+    );
 }
 
 #[async_trait::async_trait]

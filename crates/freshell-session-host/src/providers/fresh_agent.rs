@@ -479,7 +479,9 @@ impl FreshAgentTransport for HostedTransport {
             ProviderState::Claude(state) => {
                 state.handle_create(create, None).await;
             }
-            ProviderState::Codex(state) => state.handle_create(create, None).await,
+            ProviderState::Codex(state) => {
+                state.handle_create(create, None).await;
+            }
             ProviderState::Opencode { runtime, .. } => runtime.handle_create(create, None).await,
         }
         let session_id = self.wait_created().await?;
@@ -603,7 +605,9 @@ impl FreshAgentTransport for HostedTransport {
             ProviderState::Claude(state) => {
                 state.handle_send(send).await;
             }
-            ProviderState::Codex(state) => state.handle_send(send).await,
+            ProviderState::Codex(state) => {
+                state.handle_send(send).await;
+            }
             ProviderState::Opencode { runtime, .. } => runtime.handle_send(send).await,
         }
         match tokio::time::timeout(SEND_ACK_TIMEOUT, async {

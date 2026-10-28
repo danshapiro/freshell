@@ -1,6 +1,7 @@
 //! Session-local dispatch ownership. RPC replies describe delivery; only native
 //! terminal evidence (or confirmed owned exit) describes the end of work.
 
+use super::{CodexSettlementSource, CodexTurnEvent};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -58,12 +59,32 @@ pub(crate) struct CodexTurnState {
     stop: Option<StopOperation>,
     user_stop: Option<String>,
     owned_exit: bool,
+    settlement_stream: Option<SettlementStream>,
     pub changed: Arc<Notify>,
     #[cfg(test)]
     pub waiting_for_stop: Arc<Notify>,
 }
 
+#[derive(Debug)]
+struct SettlementStream {
+    session_id: String,
+    incarnation_id: String,
+    sender: tokio::sync::broadcast::Sender<CodexTurnEvent>,
+}
+
 impl CodexTurnState {
+    pub fn bind_settlement_stream(
+        &mut self,
+        session_id: String,
+        incarnation_id: String,
+        sender: tokio::sync::broadcast::Sender<CodexTurnEvent>,
+    ) {
+        self.settlement_stream = Some(SettlementStream {
+            session_id,
+            incarnation_id,
+            sender,
+        });
+    }
     pub fn begin_dispatch(&mut self, request_id: &str) -> DispatchToken {
         self.next_dispatch = self
             .next_dispatch
@@ -220,7 +241,29 @@ impl CodexTurnState {
     }
 
     pub fn settle_native(&mut self, turn_id: &str, evidence: NativeSettlement) -> bool {
+        self.settle(
+            turn_id,
+            evidence,
+            if evidence == NativeSettlement::OwnedExit {
+                CodexSettlementSource::ConfirmedOwnedExit
+            } else {
+                CodexSettlementSource::NativeNotification
+            },
+        )
+    }
+
+    pub fn settle_native_read(&mut self, turn_id: &str, evidence: NativeSettlement) -> bool {
+        self.settle(turn_id, evidence, CodexSettlementSource::NativeThreadRead)
+    }
+
+    fn settle(
+        &mut self,
+        turn_id: &str,
+        evidence: NativeSettlement,
+        source: CodexSettlementSource,
+    ) -> bool {
         let mut settled = false;
+        let mut receipts = std::collections::BTreeMap::<Option<String>, Vec<String>>::new();
         for fact in &mut self.facts {
             if fact.settlement.is_none()
                 && fact.delivery != Delivery::Refused
@@ -228,6 +271,10 @@ impl CodexTurnState {
                     || fact.turn_id.as_deref() == Some(turn_id))
             {
                 fact.settlement = Some(evidence);
+                receipts
+                    .entry(fact.turn_id.clone())
+                    .or_default()
+                    .push(fact.request_id.clone());
                 settled = true;
             }
         }
@@ -241,6 +288,18 @@ impl CodexTurnState {
             self.stop = None;
             self.user_stop = None;
             self.changed.notify_waiters();
+        }
+        if let Some(stream) = &self.settlement_stream {
+            for (turn_id, request_ids) in receipts {
+                let _ = stream.sender.send(CodexTurnEvent::Settled {
+                    session_id: stream.session_id.clone(),
+                    incarnation_id: stream.incarnation_id.clone(),
+                    turn_id,
+                    request_ids,
+                    outcome: evidence,
+                    source,
+                });
+            }
         }
         settled
     }

@@ -79,7 +79,6 @@ describe('Rust capability rejection wall', () => {
     ['run', { command: 'echo blocked' }],
     ['fresh-send', { sessionId: 's', sessionType: 't', provider: 'codex', text: 'blocked' }],
     ['attach', { target: 'p', terminalId: 't' }],
-    ['new-tab', { agent: 'codex' }],
     ['split-pane', { agent: 'opencode' }],
     ['split-pane', { model: 'model' }],
     ['split-pane', { effort: 'high' }],
@@ -127,17 +126,41 @@ describe('focus neutrality (MCP wrapper)', () => {
 })
 
 describe('executeAction -- tab actions', () => {
-  it.each(['claude', 'kilroy'])('new-tab supports agent %s and maps resume sugar to Claude identity', async (agent) => {
+  it('preserves uncertain native delivery identity and never replays the rejected HTTP operation', async () => {
+    mockClient.get.mockImplementation((url: string) => Promise.resolve(url === '/api/tabs'
+      ? { data: { tabs: [{ id: 'tab-a', activePaneId: 'pmain' }], activeTabId: 'tab-a' } }
+      : { data: { panes: [{ id: 'pmain', tabId: 'tab-a', index: 0 }] } }))
+    const receipt = { code: 'CODEX_DELIVERY_AMBIGUOUS', requestId: 'uncertain-request', sessionId: 'native-session', incarnationId: 'owned-incarnation', retryable: false, answer: 'do-not-return-this-answer' }
+    mockClient.post.mockRejectedValue(Object.assign(new Error('delivery is uncertain'), { status: 409, details: receipt }))
+    const result = await executeAction('send-keys', { target: 'pmain', keys: 'recoverable prompt', literal: true })
+    expect(result).toMatchObject({ code: receipt.code, requestId: receipt.requestId, sessionId: receipt.sessionId, incarnationId: receipt.incarnationId, retryable: false })
+    expect(mockClient.post).toHaveBeenCalledTimes(1)
+    expect(JSON.stringify(result)).not.toContain('do-not-return-this-answer')
+  })
+  it.each(['new-tab', 'split-pane'])('%s creates fresh Codex with canonical identity and exact settings', async (action) => {
+    mockClient.get.mockImplementation((url: string) => Promise.resolve(url === '/api/tabs'
+      ? { data: { tabs: [{ id: 'tab-a', activePaneId: 'pmain' }], activeTabId: 'tab-a' } }
+      : { data: { panes: [{ id: 'pmain', tabId: 'tab-a', index: 0 }] } }))
+    mockClient.post.mockResolvedValue({ status: 'ok', data: { tabId: 't1', paneId: 'p1' } })
+    const sessionRef = { provider: 'codex', sessionId: '550e8400-e29b-41d4-a716-446655440000' }
+    const result = await executeAction(action, { ...(action === 'split-pane' ? { target: 'pmain' } : {}), agent: 'codex', model: 'provider-current', effort: 'xhigh', cwd: '/work', sessionRef })
+    expect(result).not.toHaveProperty('error')
+    expect(mockClient.post).toHaveBeenCalledWith(action === 'new-tab' ? '/api/tabs' : '/api/panes/pmain/split', expect.objectContaining({
+      agent: 'codex', model: 'provider-current', effort: 'xhigh', cwd: '/work', sessionRef,
+    }))
+  })
+
+  it.each(['claude', 'kilroy', 'codex'])('new-tab supports agent %s and maps resume sugar to canonical identity', async (agent) => {
     mockClient.post.mockResolvedValue({ data: { tabId: 'tab-new', paneId: 'pane-new' } })
     const result = await executeAction('new-tab', { agent, model: 'catalog-model', effort: 'max', resume: '550e8400-e29b-41d4-a716-446655440000' })
     expect(result).not.toHaveProperty('error')
     expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({
       agent, model: 'catalog-model', effort: 'max',
-      sessionRef: { provider: 'claude', sessionId: '550e8400-e29b-41d4-a716-446655440000' },
+      sessionRef: { provider: agent === 'codex' ? 'codex' : 'claude', sessionId: '550e8400-e29b-41d4-a716-446655440000' },
     }))
   })
 
-  it.each(['claude', 'kilroy'])('split-pane supports agent %s and maps resume sugar to Claude identity', async (agent) => {
+  it.each(['claude', 'kilroy', 'codex'])('split-pane supports agent %s and maps resume sugar to canonical identity', async (agent) => {
     mockClient.get.mockImplementation((url: string) => Promise.resolve(url === '/api/tabs'
       ? { data: { tabs: [{ id: 'tab-a', activePaneId: 'pmain' }], activeTabId: 'tab-a' } }
       : { data: { panes: [{ id: 'pmain', tabId: 'tab-a', index: 0 }] } }))
@@ -146,7 +169,7 @@ describe('executeAction -- tab actions', () => {
     expect(result).not.toHaveProperty('error')
     expect(mockClient.post).toHaveBeenCalledWith('/api/panes/pmain/split', expect.objectContaining({
       agent, model: 'catalog-model', effort: 'max',
-      sessionRef: { provider: 'claude', sessionId: '550e8400-e29b-41d4-a716-446655440000' },
+      sessionRef: { provider: agent === 'codex' ? 'codex' : 'claude', sessionId: '550e8400-e29b-41d4-a716-446655440000' },
     }))
   })
 
@@ -381,19 +404,7 @@ describe('executeAction -- tab actions', () => {
     }))
   })
 
-  it('new-tab with agent: codex is locally rejected by the Rust capability contract', async () => {
-    mockClient.post.mockResolvedValue({ id: 't1' })
-
-    const result = await executeAction('new-tab', {
-      agent: 'codex',
-      resume: 'thread-pre-durable',
-    })
-
-    expect(result).toEqual(expect.objectContaining({ error: 'This fresh-agent provider is unavailable with the Rust Freshell server.' }))
-    expect(mockClient.post).not.toHaveBeenCalled()
-  })
-
-  it.each(['claude', 'kilroy'])('new-tab with agent %s accepts the resumeSessionId alias', async (agent) => {
+  it.each(['claude', 'kilroy', 'codex'])('new-tab with agent %s accepts the resumeSessionId alias', async (agent) => {
     mockClient.post.mockResolvedValue({ id: 't1' })
 
     await executeAction('new-tab', {
@@ -403,7 +414,7 @@ describe('executeAction -- tab actions', () => {
 
     expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({
       agent,
-      sessionRef: { provider: 'claude', sessionId: '550e8400-e29b-41d4-a716-446655440000' },
+      sessionRef: { provider: agent === 'codex' ? 'codex' : 'claude', sessionId: '550e8400-e29b-41d4-a716-446655440000' },
     }))
     expect(mockClient.post.mock.calls[0][1]).not.toHaveProperty('resumeSessionId')
   })

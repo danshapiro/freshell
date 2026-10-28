@@ -3937,32 +3937,10 @@ pub(crate) async fn wait_for(
         );
     };
 
-    let raw_pattern = params.get("pattern").or_else(|| params.get("p"));
-    let pattern = match raw_pattern {
-        Some(p) => match fancy_regex::Regex::new(p) {
-            Ok(re) => Some(re),
-            Err(_) => return fail_json(StatusCode::BAD_REQUEST, "invalid pattern".to_string()),
-        },
-        None => None,
+    let (pattern, deadline) = match wait_pattern(&params) {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
     };
-    if pattern.is_none() {
-        // Slice 1 scope: `stable`/`exit`/`prompt` fallback modes are deferred.
-        return fail_json(
-            StatusCode::BAD_REQUEST,
-            "wait-for requires `pattern` in this Rust port slice (stable/exit/prompt \
-             are deferred -- see docs/plans/2026-07-18-agent-api-mcp-parity-spec.md §8)"
-                .to_string(),
-        );
-    }
-    let pattern = pattern.expect("checked above");
-
-    let timeout_secs = params
-        .get("T")
-        .or_else(|| params.get("timeout"))
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v >= 0.0)
-        .unwrap_or(30.0);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout_secs);
 
     loop {
         let text = registry
@@ -3982,6 +3960,45 @@ pub(crate) async fn wait_for(
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) fn wait_pattern(
+    params: &std::collections::HashMap<String, String>,
+) -> Result<(fancy_regex::Regex, std::time::Instant), Response> {
+    let raw_pattern = params.get("pattern").or_else(|| params.get("p"));
+    let pattern = match raw_pattern {
+        Some(p) => match fancy_regex::Regex::new(p) {
+            Ok(re) => Some(re),
+            Err(_) => {
+                return Err(fail_json(
+                    StatusCode::BAD_REQUEST,
+                    "invalid pattern".to_string(),
+                ))
+            }
+        },
+        None => None,
+    };
+    if pattern.is_none() {
+        // Slice 1 scope: `stable`/`exit`/`prompt` fallback modes are deferred.
+        return Err(fail_json(
+            StatusCode::BAD_REQUEST,
+            "wait-for requires `pattern` in this Rust port slice (stable/exit/prompt \
+             are deferred -- see docs/plans/2026-07-18-agent-api-mcp-parity-spec.md §8)"
+                .to_string(),
+        ));
+    }
+    let pattern = pattern.expect("checked above");
+
+    let timeout_secs = params
+        .get("T")
+        .or_else(|| params.get("timeout"))
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(30.0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout_secs);
+
+    Ok((pattern, deadline))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

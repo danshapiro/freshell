@@ -241,7 +241,7 @@ pub(crate) async fn split_pane(
                             session_type: session_type.into(),
                             cwd: request.cwd.clone(),
                             model: request.model.clone(),
-                            effort: request.effort.clone(),
+                            effort: request.effort.clone().flatten(),
                             durable_id: Some(
                                 created
                                     .session_ref

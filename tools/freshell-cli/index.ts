@@ -10,6 +10,7 @@ import { partitionSendKeysArgs } from './send-keys-args.js'
 import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../node-client-runtime/codex-restore-contract.js'
 import { freshAgentResumeProvider, renderCliHelp, resolveCanonicalAction, unsupportedInvocationResult } from '../node-client-runtime/action-capabilities.js'
 import { renameNotAppliedMessage } from '../node-client-runtime/rename-outcome.js'
+import { automationErrorReceipt } from '../node-client-runtime/automation-errors.js'
 
 type Flags = Record<string, string | boolean>
 
@@ -160,8 +161,8 @@ function resolveSessionRefFlag(mode: unknown, raw: unknown): { rejected: boolean
 // `--resume <sid>` is promoted to the canonical `sessionRef {provider: mode,
 // sessionId}` before it hits the wire — exactly like the MCP freshell tool
 // (the MCP freshell tool's new-tab action) — so the CLI never sends the legacy
-// `resumeSessionId` field. An explicit `--session-ref` wins; codex is
-// rejected earlier by rejectRawCodexResume. Without a mode there is no
+// `resumeSessionId` field. An explicit `--session-ref` wins. Raw Codex terminal
+// resume is rejected earlier by rejectRawCodexResume. Without a mode or agent there is no
 // provider to promote with, so the flag combination is refused loudly rather
 // than silently dropping the resume identity.
 function promoteResumeFlag(
@@ -463,7 +464,7 @@ async function main() {
       const resumeProvider = mode ?? freshAgentResumeProvider(agent)
       const sessionRefResult = resolveSessionRefFlag(resumeProvider, getFlag(flags, 'session-ref'))
       const prompt = getFlag(flags, 'prompt') as string | undefined
-      if (rejectRawCodexResume(resumeProvider, resumeSessionId)) return
+      if (rejectRawCodexResume(mode, resumeSessionId)) return
       if (sessionRefResult.rejected) return
       const promoted = promoteResumeFlag(resumeProvider, resumeSessionId, sessionRefResult.sessionRef)
       if (promoted.rejected) return
@@ -585,7 +586,7 @@ async function main() {
       const resumeSessionId = getFlag(flags, 'resume') as string | undefined
       const resumeProvider = mode ?? freshAgentResumeProvider(agent)
       const sessionRefResult = resolveSessionRefFlag(resumeProvider, getFlag(flags, 'session-ref'))
-      if (rejectRawCodexResume(resumeProvider, resumeSessionId)) return
+      if (rejectRawCodexResume(mode, resumeSessionId)) return
       if (sessionRefResult.rejected) return
       const promoted = promoteResumeFlag(resumeProvider, resumeSessionId, sessionRefResult.sessionRef)
       if (promoted.rejected) return
@@ -991,7 +992,7 @@ async function main() {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((err) => {
-    writeError(err)
+    writeError(err, automationErrorReceipt(err))
     process.exitCode = 1
   })
 }

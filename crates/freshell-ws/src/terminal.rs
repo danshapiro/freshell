@@ -1998,7 +1998,9 @@ async fn handle_client_text(
                     let forward: futures::future::BoxFuture<'static, ()> = match send.provider {
                         freshell_protocol::AgentProvider::Codex => {
                             let fresh_codex = state.fresh_codex.clone();
-                            Box::pin(async move { fresh_codex.handle_send(send).await })
+                            Box::pin(async move {
+                                fresh_codex.handle_send(send).await;
+                            })
                         }
                         freshell_protocol::AgentProvider::Claude => {
                             let fresh_claude = state.fresh_claude.clone();

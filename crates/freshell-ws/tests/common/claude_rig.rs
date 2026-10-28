@@ -1168,7 +1168,7 @@ async fn spawn_rig_server(
         fresh_agent_state
             .set_rest_create_settings_reader(Arc::new(move || {
                 let defaults = defaults.clone();
-                Box::pin(async move { defaults.read().await.fresh_agent.clone() })
+                Box::pin(async move { defaults.read().await.fresh_agent.clone().into() })
             }))
             .expect("install the rig's REST defaults reader");
         router = router.merge(freshell_freshagent::router(fresh_agent_state.clone()));

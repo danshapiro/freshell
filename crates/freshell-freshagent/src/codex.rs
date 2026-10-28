@@ -93,6 +93,62 @@ pub(crate) mod turn_state;
 use turn_state::{CodexTurnState, DispatchToken, NativeSettlement, StopDisposition};
 type SharedCodexTurnState = Arc<StdMutex<CodexTurnState>>;
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum CodexCreateOutcome {
+    Created {
+        session_id: String,
+        session_ref: Option<SessionLocator>,
+        cleanup_ownership_id: Option<String>,
+    },
+    Failed {
+        code: String,
+        message: String,
+        retryable: Option<bool>,
+        owner: Option<crate::ownership_lane::TerminalOwnerFields>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CodexSendOutcome {
+    Accepted {
+        session_id: String,
+        submitted_turn_id: String,
+        incarnation_id: String,
+    },
+    Refused {
+        code: String,
+        message: String,
+        retryable: Option<bool>,
+        owner: Option<crate::ownership_lane::TerminalOwnerFields>,
+    },
+    Ambiguous {
+        session_id: String,
+        request_id: String,
+        incarnation_id: String,
+        code: String,
+        message: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CodexSettlementSource {
+    NativeNotification,
+    NativeThreadRead,
+    ConfirmedOwnedExit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CodexTurnEvent {
+    Settled {
+        session_id: String,
+        turn_id: Option<String>,
+        incarnation_id: String,
+        request_ids: Vec<String>,
+        outcome: NativeSettlement,
+        source: CodexSettlementSource,
+    },
+}
+
 /// Unified agent names (Task 2): the ambient `CODEX_HOME` fallback for the
 /// durability-driven pending bind when the app-server's own initialize
 /// result is unavailable (pre-initialize edge). Mirrors
@@ -365,6 +421,7 @@ pub struct FreshCodexState {
     /// `freshell-ws` connection. `freshAgent.created` / `freshAgent.send.accepted` /
     /// `freshAgent.event` are pushed here so the oracle's capture socket records them.
     broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+    turn_events: tokio::sync::broadcast::Sender<CodexTurnEvent>,
     /// threadId → live codex session (client + settings + owned sidecar).
     sessions: Arc<TokioMutex<HashMap<String, CodexSession>>>,
     child_reads: Arc<TokioMutex<HashMap<(String, String, String), u8>>>,
@@ -839,6 +896,7 @@ impl FreshCodexState {
         Self {
             sidecar_launch_context: CodexSidecarLaunchContext::default(),
             broadcast_tx,
+            turn_events: tokio::sync::broadcast::channel(256).0,
             sessions: Arc::new(TokioMutex::new(HashMap::new())),
             child_reads: Arc::new(TokioMutex::new(HashMap::new())),
             retained_changed: Arc::new(tokio::sync::watch::channel(0).0),
@@ -2167,7 +2225,7 @@ impl FreshCodexState {
         &self,
         msg: FreshAgentCreate,
         provenance: Option<crate::BindProvenance>,
-    ) {
+    ) -> CodexCreateOutcome {
         let request_id = msg.request_id.clone();
         // Unified agent names (Task 2): the pane's pre-durable naming handle
         // (threaded to both create lanes; `None` = an unnamed pane).
@@ -2194,12 +2252,19 @@ impl FreshCodexState {
                     session_type: SESSION_TYPE.to_string(),
                     session_ref: Some(SessionLocator {
                         provider: PROVIDER.to_string(),
-                        session_id: cached.session_id,
+                        session_id: cached.session_id.clone(),
                     }),
                     name_ref,
                     session_name,
                 }));
-                return;
+                return CodexCreateOutcome::Created {
+                    session_id: cached.session_id.clone(),
+                    session_ref: Some(SessionLocator {
+                        provider: PROVIDER.into(),
+                        session_id: cached.session_id,
+                    }),
+                    cleanup_ownership_id: None,
+                };
             }
             FreshAgentCreateOutcome::Proceed(guard) => guard,
         };
@@ -2282,8 +2347,7 @@ impl FreshCodexState {
         let effective = match CodexEffectiveSettings::resolve(&base, &patch) {
             Ok(settings) => settings,
             Err(error) => {
-                self.fail_create(&request_id, error.code, &error.message);
-                return;
+                return self.fail_create(&request_id, error.code, &error.message);
             }
         };
         let CodexEffectiveSettings {
@@ -2313,8 +2377,7 @@ impl FreshCodexState {
                 tracing::warn!(target: "freshell_freshagent::codex",
                     session_id = %resume_session_id, request_id = %request_id,
                     "fresh_agent_create_refused: a live terminal PTY owns this session (Task 13b cross-kind live-guard)");
-                self.fail_create_session_reserved(&request_id);
-                return;
+                return self.fail_create_session_reserved(&request_id);
             }
             // Task 12 (D8 for fresh agents): claim the per-sessionRef lease BEFORE any
             // spawn -- exactly one in-flight resume (and one live rollout writer) per
@@ -2347,8 +2410,7 @@ impl FreshCodexState {
                         session_id = %resume_session_id, request_id = %request_id,
                         code = err.code(),
                         "fresh_agent_create_refused: the observed fence is half-sent (invalid)");
-                    self.fail_create(&request_id, err.code(), err.message());
-                    return;
+                    return self.fail_create(&request_id, err.code(), err.message());
                 }
             };
             let own_ticket = match self.begin_lane_claim_at(
@@ -2419,21 +2481,20 @@ impl FreshCodexState {
                                      moved on while the live-runtime adopt committed — the \
                                      create is refused (never a live writer left unowned)"
                                 );
-                                self.fail_create(
+                                return self.fail_create(
                                     &request_id,
                                     "STALE_CLAIM",
                                     "ownership moved on while adopting the live session; refresh and retry",
                                 );
-                                return;
                             }
                         }
                         // D8 (focused-ep1-r4 Finding 1): the adopt re-parks/re-stamps
                         // the CURRENT connection's provenance — recovery plans mint
                         // NEW tabIds, so the incumbent must not keep the old tab's
                         // attribution.
-                        self.adopt_live_create(&request_id, &resume_session_id, provenance.clone())
+                        return self
+                            .adopt_live_create(&request_id, &resume_session_id, provenance.clone())
                             .await;
-                        return;
                     }
                     Some(ticket)
                 }
@@ -2442,9 +2503,9 @@ impl FreshCodexState {
                     // session adopts, spawn nothing. With no coordinator
                     // there is no fence to consult.
                     if self.has_live_session(&resume_session_id).await {
-                        self.adopt_live_create(&request_id, &resume_session_id, provenance.clone())
+                        return self
+                            .adopt_live_create(&request_id, &resume_session_id, provenance.clone())
                             .await;
-                        return;
                     }
                     None
                 }
@@ -2452,9 +2513,9 @@ impl FreshCodexState {
                     // A same-kind live runtime the coordinator names —
                     // adopt it, spawn nothing (the COORDINATED map-hit:
                     // the claim already verified the key's state).
-                    self.adopt_live_create(&request_id, &resume_session_id, provenance.clone())
+                    return self
+                        .adopt_live_create(&request_id, &resume_session_id, provenance.clone())
                         .await;
-                    return;
                 }
                 crate::ownership_lane::LaneClaim::Refused(outcome) => {
                     tracing::warn!(target: "freshell_freshagent::codex",
@@ -2463,8 +2524,15 @@ impl FreshCodexState {
                         "fresh_agent_create_refused: the ownership coordinator refused the \
                          claim (kata b8ke cross-kind authority)"
                     );
-                    self.fail_create_session_reserved(&request_id);
-                    return;
+                    return self.fail_create_with_owner(
+                        &request_id,
+                        "SESSION_RESERVED",
+                        "Another resume for this session is in flight",
+                        crate::ownership_lane::fresh_agent_owner_fields_from_outcome(
+                            &self.ownership,
+                            &outcome,
+                        ),
+                    );
                 }
             };
             let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
@@ -2488,13 +2556,12 @@ impl FreshCodexState {
                         // Under-lock ADOPT (the V5 TOCTOU window). D8
                         // (focused-ep1-r4 Finding 1): re-parks/re-stamps the
                         // CURRENT connection's provenance on the incumbent.
-                        self.adopt_live_create(&request_id, &resume_session_id, provenance.clone())
+                        return self
+                            .adopt_live_create(&request_id, &resume_session_id, provenance.clone())
                             .await;
-                        return;
                     }
                     crate::session_lease::FreshSessionClaim::Held { .. } => {
-                        self.fail_create_session_reserved(&request_id);
-                        return;
+                        return self.fail_create_session_reserved(&request_id);
                     }
                     crate::session_lease::FreshSessionClaim::ExpiredNeedsKill {
                         pid,
@@ -2514,27 +2581,26 @@ impl FreshCodexState {
                         }
                         tracing::error!(target: "invariant", pid, session_id = %resume_session_id,
                             "fresh_agent_lease_expired_kill_unconfirmed: holding closed");
-                        self.fail_create_session_reserved(&request_id);
-                        return;
+                        return self.fail_create_session_reserved(&request_id);
                     }
                 }
             }
-            self.handle_create_resume(
-                request_id,
-                resume_session_id,
-                cwd,
-                model,
-                effort,
-                sandbox,
-                permission_mode,
-                collaboration_mode,
-                lease_guard,
-                own_ticket,
-                provenance,
-                naming_handle,
-            )
-            .await;
-            return;
+            return self
+                .handle_create_resume(
+                    request_id,
+                    resume_session_id,
+                    cwd,
+                    model,
+                    effort,
+                    sandbox,
+                    permission_mode,
+                    collaboration_mode,
+                    lease_guard,
+                    own_ticket,
+                    provenance,
+                    naming_handle,
+                )
+                .await;
         }
 
         // b8ke ext r22 F1: the fresh create is coordinator-owned from BEFORE
@@ -2580,9 +2646,9 @@ impl FreshCodexState {
                 // an earlier create for this pane completed (the key is
                 // Aliased{to: canonical}); the idempotent re-drive ADOPTS
                 // the live session, never a second spawn.
-                self.adopt_live_create(&request_id, &claim_key, provenance.clone())
+                return self
+                    .adopt_live_create(&request_id, &claim_key, provenance.clone())
                     .await;
-                return;
             }
             crate::ownership_lane::LaneClaim::Refused(outcome) => {
                 tracing::warn!(target: "freshell_freshagent::codex",
@@ -2591,8 +2657,15 @@ impl FreshCodexState {
                     "fresh_agent_create_refused: the ownership coordinator refused the \
                      fresh create's provisional claim (kata b8ke ext r22 F1)"
                 );
-                self.fail_create_session_reserved(&request_id);
-                return;
+                return self.fail_create_with_owner(
+                    &request_id,
+                    "SESSION_RESERVED",
+                    "Another resume for this session is in flight",
+                    crate::ownership_lane::fresh_agent_owner_fields_from_outcome(
+                        &self.ownership,
+                        &outcome,
+                    ),
+                );
             }
         }
 
@@ -2600,8 +2673,7 @@ impl FreshCodexState {
         let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd.as_deref()).await {
             Ok(parts) => parts,
             Err(err) => {
-                self.fail_create(&request_id, "CODEX_APP_SERVER_START_FAILED", &err);
-                return;
+                return self.fail_create(&request_id, "CODEX_APP_SERVER_START_FAILED", &err);
             }
         };
 
@@ -2641,8 +2713,11 @@ impl FreshCodexState {
                 let _ = child.start_kill();
                 reap_owned_codex_sidecars(&ownership_id);
                 crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
-                self.fail_create(&request_id, "CODEX_THREAD_START_FAILED", &err.to_string());
-                return;
+                return self.fail_create(
+                    &request_id,
+                    "CODEX_THREAD_START_FAILED",
+                    &err.to_string(),
+                );
             }
         };
 
@@ -2711,12 +2786,11 @@ impl FreshCodexState {
                     let _ = child.start_kill();
                     reap_owned_codex_sidecars(&ownership_id);
                     crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
-                    self.fail_create(
+                    return self.fail_create(
                         &request_id,
                         "FRESH_AGENT_CREATE_FAILED",
                         "the minted thread id was claimed by another owner during the create; torn down",
                     );
-                    return;
                 }
             }
         }
@@ -2744,7 +2818,7 @@ impl FreshCodexState {
             None,
             naming_handle,
         )
-        .await;
+        .await
     }
 
     /// The resume branch of `handle_create` (FINDING 1 -- CODEX-FIRST triage): spawn a
@@ -2790,7 +2864,7 @@ impl FreshCodexState {
         provenance: Option<crate::BindProvenance>,
         // Unified agent names (Task 2): the pane's pre-durable naming handle.
         naming_handle: Option<String>,
-    ) {
+    ) -> CodexCreateOutcome {
         let _ = &mut own_ticket; // moved to finish_create below on the success path
                                  // b8ke focused episode-2 round-2 F4: the claim exists — register the
                                  // watchdog machinery NOW, before the spawn + thread/resume awaits (up
@@ -2820,12 +2894,11 @@ impl FreshCodexState {
             if let Some(mut g) = lease_guard.take() {
                 g.fail();
             }
-            self.fail_create(
+            return self.fail_create(
                 &request_id,
                 "FRESH_AGENT_CREATE_FAILED",
                 &format!("codex thread {resume_session_id} not found"),
             );
-            return;
         }
 
         // Round 4 (focused-ep5-r3 Finding 1): the claim's dead-state
@@ -2867,8 +2940,7 @@ impl FreshCodexState {
                 if let Some(mut g) = lease_guard.take() {
                     g.fail();
                 }
-                self.fail_create(&request_id, "CODEX_APP_SERVER_START_FAILED", &err);
-                return;
+                return self.fail_create(&request_id, "CODEX_APP_SERVER_START_FAILED", &err);
             }
         };
         // Task 12: arm the TTL tree-kill path now that the child + its tag exist.
@@ -2907,8 +2979,11 @@ impl FreshCodexState {
                 if is_codex_thread_not_found(&err) {
                     self.mark_thread_dead(&resume_session_id).await;
                 }
-                self.fail_create(&request_id, "FRESH_AGENT_CREATE_FAILED", &err.to_string());
-                return;
+                return self.fail_create(
+                    &request_id,
+                    "FRESH_AGENT_CREATE_FAILED",
+                    &err.to_string(),
+                );
             }
         };
         // TERM-25: never silently proceed against the wrong thread. `thread/resume`
@@ -2929,7 +3004,7 @@ impl FreshCodexState {
                 returned = %started.thread_id,
                 "freshagent.codex.wrong_thread_resume_rejected"
             );
-            self.fail_create(
+            return self.fail_create(
                 &request_id,
                 "FRESH_AGENT_CREATE_FAILED",
                 &format!(
@@ -2938,7 +3013,6 @@ impl FreshCodexState {
                     started.thread_id, resume_session_id
                 ),
             );
-            return;
         }
         let thread_id = resume_session_id;
         let mut effective = CodexEffectiveSettings {
@@ -2989,14 +3063,13 @@ impl FreshCodexState {
             if let Some(mut g) = lease_guard.take() {
                 g.fail();
             }
-            self.fail_create(
+            return self.fail_create(
                 &request_id,
                 "FRESH_AGENT_CREATE_FAILED",
                 &format!(
                     "codex thread {thread_id} closed while the resume was in flight; torn down"
                 ),
             );
-            return;
         }
 
         // Kata 1wxv Task 2 (r3): the durable rollout meta is the ONE source of
@@ -3041,7 +3114,7 @@ impl FreshCodexState {
             Some((thread_id.as_str(), claim_dead_state)),
             naming_handle,
         )
-        .await;
+        .await
     }
 
     /// Shared tail of `handle_create` and `handle_create_resume`: register the session
@@ -3092,7 +3165,7 @@ impl FreshCodexState {
         // (None = an unnamed pane; the frame then carries the durable
         // session's own projection when a record exists).
         naming_handle: Option<String>,
-    ) {
+    ) -> CodexCreateOutcome {
         let _ = &mut own_ticket; // consumed at the commit below on the success path
                                  // D8 (focused-ep1-r5 Finding 2): a HOLLOW `Some` (a partially
                                  // initialized client's hello — all fields absent) behaves like `None`
@@ -3102,6 +3175,7 @@ impl FreshCodexState {
         // kata b8ke Task 3: the sidecar pid for the commit's owner identity
         // (captured before `child` moves into the exit watcher).
         let sidecar_pid = child.id();
+        let cleanup_ownership_id = Some(ownership_id.clone());
 
         // Unified agent names (Task 2): capture the app-server's initialized
         // `codexHome` BEFORE `client` moves into the session registration
@@ -3136,9 +3210,9 @@ impl FreshCodexState {
             // re-parks/re-stamps the CURRENT connection's provenance on the
             // incumbent (this arm returns immediately, so moving `provenance`
             // in is safe).
-            self.adopt_live_create(&request_id, &thread_id, provenance)
+            return self
+                .adopt_live_create(&request_id, &thread_id, provenance)
                 .await;
-            return;
         }
 
         // Legacy `activeTurnByThread` mirror for THIS session (adapter.ts:295) -- set on
@@ -3295,14 +3369,13 @@ impl FreshCodexState {
                 if let Some(mut g) = lease_guard.take() {
                     g.fail();
                 }
-                self.fail_create(
+                return self.fail_create(
                     &request_id,
                     "FRESH_AGENT_CREATE_FAILED",
                     &format!(
                         "codex thread {thread_id} closed while the resume was in flight; torn down"
                     ),
                 );
-                return;
             }
         }
 
@@ -3326,12 +3399,11 @@ impl FreshCodexState {
                 if let Some((claim_id, _)) = claim {
                     self.rollback_session_claim(claim_id).await;
                 }
-                self.fail_create(
+                return self.fail_create(
                     &request_id,
                     "FRESH_AGENT_CREATE_FAILED",
                     "session lease revoked during create; torn down",
                 );
-                return;
             }
         }
 
@@ -3407,12 +3479,11 @@ impl FreshCodexState {
             if let Some(mut g) = lease_guard.take() {
                 g.fail();
             }
-            self.fail_create(
+            return self.fail_create(
                 &request_id,
                 "FRESH_AGENT_CREATE_FAILED",
                 "the session's resume record could not be persisted; torn down",
             );
-            return;
         }
         if let Err(outcome) =
             self.commit_lane_claim_at(&mut own_ticket, &thread_id, &thread_id, sidecar_pid)
@@ -3431,12 +3502,11 @@ impl FreshCodexState {
             if let Some(mut g) = lease_guard.take() {
                 g.fail();
             }
-            self.fail_create(
+            return self.fail_create(
                 &request_id,
                 "FRESH_AGENT_CREATE_FAILED",
                 "session ownership changed during create; torn down",
             );
-            return;
         }
 
         // DIAG-01: fresh-agent session lifecycle -- provider/session_id/cwd,
@@ -3544,6 +3614,14 @@ impl FreshCodexState {
             },
             None,
         );
+        CodexCreateOutcome::Created {
+            session_id: thread_id.clone(),
+            session_ref: Some(SessionLocator {
+                provider: PROVIDER.into(),
+                session_id: thread_id,
+            }),
+            cleanup_ownership_id,
+        }
     }
 
     /// REVIEW FIX (item 3): legacy's `freshAgent.create.failed` sends `retryable: true` on
@@ -3557,28 +3635,53 @@ impl FreshCodexState {
     /// so this was a real, user-visible gap: every Rust `fail_create` call previously sent
     /// no `retryable` field at all (serde omits `None`), silently hiding the retry button
     /// legacy always offers.
-    fn fail_create(&self, request_id: &str, code: &str, message: &str) {
-        self.broadcast(&ServerMessage::FreshAgentCreateFailed(
-            FreshAgentCreateFailed {
-                owner_kind: None,
-                owner_generation: None,
-                owner_epoch: None,
-                code: code.to_string(),
-                message: message.to_string(),
-                request_id: request_id.to_string(),
-                retryable: Some(true),
-            },
-        ));
+    fn fail_create(&self, request_id: &str, code: &str, message: &str) -> CodexCreateOutcome {
+        self.fail_create_with_owner(request_id, code, message, None)
+    }
+
+    fn fail_create_with_owner(
+        &self,
+        request_id: &str,
+        code: &str,
+        message: &str,
+        owner: Option<crate::ownership_lane::TerminalOwnerFields>,
+    ) -> CodexCreateOutcome {
+        let outcome = CodexCreateOutcome::Failed {
+            code: code.into(),
+            message: message.into(),
+            retryable: Some(true),
+            owner,
+        };
+        if let CodexCreateOutcome::Failed {
+            code,
+            message,
+            retryable,
+            owner,
+        } = &outcome
+        {
+            self.broadcast(&ServerMessage::FreshAgentCreateFailed(
+                FreshAgentCreateFailed {
+                    owner_kind: owner.as_ref().map(|owner| owner.owner_kind.into()),
+                    owner_generation: owner.as_ref().map(|owner| owner.owner_generation),
+                    owner_epoch: owner.as_ref().map(|owner| owner.owner_epoch),
+                    code: code.clone(),
+                    message: message.clone(),
+                    request_id: request_id.into(),
+                    retryable: *retryable,
+                },
+            ));
+        }
+        outcome
     }
 
     /// The D8 loser answer (Task 12): reuses the existing create-failed frame with the
     /// fixed reservation code — NO new protocol fields.
-    fn fail_create_session_reserved(&self, request_id: &str) {
+    fn fail_create_session_reserved(&self, request_id: &str) -> CodexCreateOutcome {
         self.fail_create(
             request_id,
             "SESSION_RESERVED",
             "Another resume for this session is in flight",
-        );
+        )
     }
 
     /// The HAS-LIVE→ADOPT arm (Task 12, V1): answer a loser's create-with-resume with a
@@ -3603,7 +3706,7 @@ impl FreshCodexState {
         request_id: &str,
         thread_id: &str,
         provenance: Option<crate::BindProvenance>,
-    ) {
+    ) -> CodexCreateOutcome {
         if let Some(p) = provenance.filter(|p| p.is_meaningful()) {
             // Re-park + snapshot the incumbent's settings in one lock scope
             // (the refresh write below asserts the parked identity together
@@ -3686,6 +3789,14 @@ impl FreshCodexState {
             name_ref,
             session_name,
         }));
+        CodexCreateOutcome::Created {
+            session_id: thread_id.into(),
+            session_ref: Some(SessionLocator {
+                provider: PROVIDER.into(),
+                session_id: thread_id.into(),
+            }),
+            cleanup_ownership_id: None,
+        }
     }
 
     // ── freshAgent.send (WS) ─────────────────────────────────────────────────
@@ -3698,7 +3809,11 @@ impl FreshCodexState {
     /// `ensureRuntime` lazy-restart invariant, adapter.ts:935-946) -- the ONLY visible effect
     /// is added latency on this one send; there is no user-facing error frame for a
     /// self-healed crash.
-    pub async fn handle_send(&self, msg: FreshAgentSend) {
+    pub(crate) fn subscribe_turn_events(&self) -> tokio::sync::broadcast::Receiver<CodexTurnEvent> {
+        self.turn_events.subscribe()
+    }
+
+    pub async fn handle_send(&self, msg: FreshAgentSend) -> CodexSendOutcome {
         let request_id = msg.request_id.clone();
         let checkpoint_identity_request = msg.checkpoint_intent.as_ref().and_then(|intent| {
             request_id
@@ -3719,8 +3834,7 @@ impl FreshCodexState {
                     tracing::warn!(target: "freshell_freshagent::codex",
                         session_id = %msg.session_id, code = err.code(),
                         "fresh_agent_send_refused: the observed fence is half-sent (invalid)");
-                    self.send_error(&request_id, err.code(), err.message());
-                    return;
+                    return self.refuse_send(&request_id, err.code(), err.message());
                 }
             };
 
@@ -3733,17 +3847,19 @@ impl FreshCodexState {
                 session_id = new_session_id;
             }
             Err(EnsureAliveError::NotFound) => {
-                self.send_error(&request_id, "SESSION_NOT_FOUND", "codex session not found");
-                return;
+                return self.refuse_send(
+                    &request_id,
+                    "SESSION_NOT_FOUND",
+                    "codex session not found",
+                );
             }
             Err(EnsureAliveError::RespawnFailed(err)) => {
-                self.send_error(&request_id, "CODEX_RESPAWN_FAILED", &err);
-                return;
+                return self.refuse_send(&request_id, "CODEX_RESPAWN_FAILED", &err);
             }
             Err(EnsureAliveError::Reserved) => {
                 // Task 13 (D8): another create/attach holds this sessionRef -- the
                 // retryable non-lost error channel; the client re-drive converges.
-                self.send_error(
+                let outcome = self.refuse_send(
                     &request_id,
                     "SESSION_RESERVED",
                     "Another resume for this session is in flight",
@@ -3753,7 +3869,7 @@ impl FreshCodexState {
                     "SESSION_RESERVED",
                     "Another resume for this session is in flight",
                 );
-                return;
+                return outcome;
             }
         }
 
@@ -3804,6 +3920,7 @@ impl FreshCodexState {
                     s.quiet_deadman.clone(),
                     s.exited.clone(),
                     s.checkpoint_probe_cancelled.clone(),
+                    s.sidecar_ownership_id.clone(),
                 )
             })
         };
@@ -3818,10 +3935,10 @@ impl FreshCodexState {
             quiet_deadman,
             exited,
             checkpoint_probe_cancelled,
+            incarnation_id,
         )) = looked_up
         else {
-            self.send_error(&request_id, "SESSION_NOT_FOUND", "codex session not found");
-            return;
+            return self.refuse_send(&request_id, "SESSION_NOT_FOUND", "codex session not found");
         };
 
         // Kata 1wxv Task 2 (r2 serialization discipline): take the session's
@@ -3845,8 +3962,7 @@ impl FreshCodexState {
             .get(&session_id)
             .map(CodexSession::effective_settings);
         let Some(stored) = stored else {
-            self.send_error(&request_id, "SESSION_NOT_FOUND", "codex session not found");
-            return;
+            return self.refuse_send(&request_id, "SESSION_NOT_FOUND", "codex session not found");
         };
         let mut patch = msg.settings.clone().unwrap_or_default();
         if patch.cwd.is_none() && stored.cwd.is_none() {
@@ -3855,8 +3971,7 @@ impl FreshCodexState {
         let effective = match CodexEffectiveSettings::resolve(&stored, &patch) {
             Ok(settings) => settings,
             Err(error) => {
-                self.send_error(&request_id, error.code, &error.message);
-                return;
+                return self.refuse_send(&request_id, error.code, &error.message);
             }
         };
         let model = effective.model.clone();
@@ -3880,8 +3995,7 @@ impl FreshCodexState {
         let wire_effort = match to_codex_reasoning_effort(wire_choice.as_deref()) {
             Ok(value) => value,
             Err(error) => {
-                self.send_error(&request_id, "INVALID_EFFORT", &error.to_string());
-                return;
+                return self.refuse_send(&request_id, "INVALID_EFFORT", &error.to_string());
             }
         };
         let native_settings = CodexEffectiveSettings {
@@ -3917,13 +4031,11 @@ impl FreshCodexState {
                     None
                 } else {
                     if turns.has_owned_exit() {
-                        self.send_error(&request_id, "SESSION_RESERVED", "The owned Codex runtime exited while this input waited; refresh before sending again");
-                        return;
+                        return self.refuse_send(&request_id, "SESSION_RESERVED", "The owned Codex runtime exited while this input waited; refresh before sending again");
                     }
                     let expected = turns.active_turn_id().map(str::to_owned);
                     if expected.is_none() && turns.has_unknown_delivery() {
-                        self.send_error(&request_id, "CODEX_DELIVERY_AMBIGUOUS", "Earlier input has unresolved native delivery; recover or inspect the conversation before sending again");
-                        return;
+                        return self.refuse_send(&request_id, "CODEX_DELIVERY_AMBIGUOUS", "Earlier input has unresolved native delivery; recover or inspect the conversation before sending again");
                     }
                     Some((
                         expected,
@@ -3963,8 +4075,7 @@ impl FreshCodexState {
                         .lock()
                         .expect("codex turn state")
                         .reject(dispatch);
-                    self.send_error(&request_id, "SESSION_RESERVED", &message);
-                    return;
+                    return self.refuse_send(&request_id, "SESSION_RESERVED", &message);
                 }
             }
         } else {
@@ -4007,36 +4118,50 @@ impl FreshCodexState {
                 (started.turn_id, latched_stop)
             }
             Err(err) => {
-                let mut refused = err.is_not_submitted();
-                let owed = {
+                let (refused, fact, owed) = {
                     let mut turns = turn_state.lock().expect("codex turn state");
-                    if refused {
-                        refused = turns.reject(dispatch);
-                    } else {
+                    let refused = err.is_not_submitted() && turns.reject(dispatch);
+                    if !refused {
                         turns.mark_ambiguous(dispatch);
                     }
-                    turns.has_owed_work()
+                    (
+                        refused,
+                        turns
+                            .facts()
+                            .iter()
+                            .find(|fact| fact.token == dispatch)
+                            .cloned(),
+                        turns.has_owed_work(),
+                    )
                 };
-                // An owned-exit watcher retains crash-attention authority.
                 if !exited.load(Ordering::SeqCst) {
                     turn_in_flight.store(owed, Ordering::SeqCst);
                     note_codex_activity(self, &session_id, &turn_in_flight, &quiet_deadman);
                 }
-                let code = if refused {
-                    "CODEX_TURN_START_FAILED"
+                tracing::warn!(provider=PROVIDER, session_id=%session_id, request_id=?request_id, incarnation_id=%incarnation_id, dispatch=?dispatch, expected_turn_id=?expected_turn_id, refused, error=%err, "freshagent.codex.send_failed");
+                if let Some(turn_id) = fact
+                    .as_ref()
+                    .filter(|fact| fact.delivery == turn_state::Delivery::Accepted)
+                    .and_then(|fact| fact.turn_id.clone())
+                {
+                    // Observed native admission outweighs a contradictory RPC reply.
+                    (turn_id, StopDisposition::None)
+                } else if refused {
+                    return self.refuse_send(
+                        &request_id,
+                        "CODEX_TURN_START_FAILED",
+                        &err.to_string(),
+                    );
                 } else {
-                    "CODEX_DELIVERY_AMBIGUOUS"
-                };
-                let receipt = turn_state
-                    .lock()
-                    .expect("codex turn state")
-                    .facts()
-                    .iter()
-                    .find(|fact| fact.token == dispatch)
-                    .map(|fact| fact.request_id.clone());
-                tracing::warn!(provider=PROVIDER, session_id=%session_id, request_id=?receipt, dispatch=?dispatch, expected_turn_id=?expected_turn_id, refused, error=%err, "freshagent.codex.send_failed");
-                self.send_error(&request_id, code, &err.to_string());
-                return;
+                    self.send_error(&request_id, "CODEX_DELIVERY_AMBIGUOUS", &err.to_string());
+                    return CodexSendOutcome::Ambiguous {
+                        session_id,
+                        request_id: request_id.unwrap_or_default(),
+                        incarnation_id,
+                        code: "CODEX_DELIVERY_AMBIGUOUS".into(),
+                        message: err.to_string(),
+                    };
+                }
             }
         };
         self.acknowledge_contextual_answers(&session_id, contextual_answers)
@@ -4187,6 +4312,11 @@ impl FreshCodexState {
                 &self.broadcast_tx,
             );
         }
+        let outcome = CodexSendOutcome::Accepted {
+            session_id: session_id.clone(),
+            submitted_turn_id: submitted_turn_id.clone(),
+            incarnation_id,
+        };
         // Release both serialization locks before Stop RPC work. The consumer
         // must remain free to observe terminal evidence while Stop is pending.
         drop(_event_emission);
@@ -4215,6 +4345,7 @@ impl FreshCodexState {
                 }),
             );
         }
+        outcome
     }
 
     fn spawn_checkpoint_identity_probe(
@@ -4333,6 +4464,21 @@ impl FreshCodexState {
                 );
             }
         })
+    }
+
+    fn refuse_send(
+        &self,
+        request_id: &Option<String>,
+        code: &str,
+        message: &str,
+    ) -> CodexSendOutcome {
+        self.send_error(request_id, code, message);
+        CodexSendOutcome::Refused {
+            code: code.into(),
+            message: message.into(),
+            retryable: None,
+            owner: None,
+        }
     }
 
     fn send_error(&self, request_id: &Option<String>, code: &str, message: &str) {
@@ -5847,7 +5993,39 @@ impl FreshCodexState {
     /// unconditional `return true`, adapter.ts:1211-1215) — `ws-handler.ts:3607-3626` always
     /// sends `success:true`. Never touches a process this session did not itself spawn.
     pub async fn handle_kill(&self, msg: FreshAgentKill) {
-        self.handle_stop(msg, CodexStopMode::Close).await;
+        let _ = self.handle_stop(msg, CodexStopMode::Close, None).await;
+    }
+
+    pub(crate) async fn abandon_created_runtime(
+        &self,
+        session_id: &str,
+        ownership_id: &str,
+    ) -> Result<(), crate::rest_lane::RestLaneError> {
+        let result = self
+            .handle_stop(
+                FreshAgentKill {
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    session_id: session_id.into(),
+                    cwd: None,
+                    observed_epoch: None,
+                    observed_generation: None,
+                },
+                CodexStopMode::Close,
+                Some(ownership_id),
+            )
+            .await;
+        match &result {
+            Ok(()) => tracing::info!(
+                event = "freshagent.codex.rest_lane.create_abandoned",
+                session_id,
+                ownership_id
+            ),
+            Err(error) => {
+                tracing::warn!(event="freshagent.codex.rest_lane.create_abandon_failed", session_id, ownership_id, code=%error.code)
+            }
+        }
+        result
     }
 
     /// Stop only the owned writer so the persisted Codex thread can be resumed.
@@ -5871,18 +6049,20 @@ impl FreshCodexState {
         let mode = CodexStopMode::Recovery {
             request_id: msg.request_id,
         };
-        self.handle_stop(
-            FreshAgentKill {
-                provider: msg.provider,
-                session_id: msg.session_id,
-                session_type: msg.session_type,
-                cwd: None,
-                observed_epoch: msg.observed_epoch,
-                observed_generation: msg.observed_generation,
-            },
-            mode,
-        )
-        .await;
+        let _ = self
+            .handle_stop(
+                FreshAgentKill {
+                    provider: msg.provider,
+                    session_id: msg.session_id,
+                    session_type: msg.session_type,
+                    cwd: None,
+                    observed_epoch: msg.observed_epoch,
+                    observed_generation: msg.observed_generation,
+                },
+                mode,
+                None,
+            )
+            .await;
     }
 
     fn broadcast_stop_result(&self, mode: &CodexStopMode, frame: &ServerMessage) {
@@ -5916,8 +6096,41 @@ impl FreshCodexState {
         }
     }
 
-    async fn handle_stop(&self, msg: FreshAgentKill, mode: CodexStopMode) {
+    async fn handle_stop(
+        &self,
+        msg: FreshAgentKill,
+        mode: CodexStopMode,
+        expected_owner: Option<&str>,
+    ) -> Result<(), crate::rest_lane::RestLaneError> {
         let session_id = msg.session_id.clone();
+
+        // A create receipt identifies only the incarnation it established. Capture
+        // its retained authority before any stop claim or awaited durable work.
+        let expected_stamp = if let Some(expected) = expected_owner {
+            let sessions = self.sessions.lock().await;
+            let Some(session) = sessions
+                .get(&session_id)
+                .filter(|session| session.sidecar_ownership_id == expected)
+            else {
+                return Ok(());
+            };
+            if self.ownership.is_some() {
+                let stamp =
+                    crate::ownership_lane::peek_retained_stamp(&self.ownership_stamps, &session_id)
+                        .filter(|stamp| {
+                            stamp.owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                                && stamp.owner.live_session_key.as_deref()
+                                    == Some(session_id.as_str())
+                                && stamp.owner.pid == session.sidecar_pid
+                        })
+                        .ok_or_else(codex_cleanup_error)?;
+                Some(stamp)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // b8ke delta review F7: a half-sent observed pair (exactly one of
         // epoch/generation) is the typed invalid-fence refusal — BEFORE the
@@ -5941,7 +6154,7 @@ impl FreshCodexState {
                             message: Some(err.message().to_string()),
                         }),
                     );
-                    return;
+                    return Err(codex_cleanup_error());
                 }
             };
 
@@ -5966,9 +6179,12 @@ impl FreshCodexState {
         // b8ke e3r3 F7: the granted stop's settlement guard.
         let mut _stop_settlement: Option<crate::ownership_lane::StopSettlementGuard> = None;
         if let Some(registry) = self.ownership.as_ref() {
-            if let Some(stamp) =
+            let stamp = if expected_owner.is_some() {
+                expected_stamp
+            } else {
                 crate::ownership_lane::peek_retained_stamp(&self.ownership_stamps, &session_id)
-            {
+            };
+            if let Some(stamp) = stamp {
                 let claim = crate::ownership_lane::stop_claim_from_stamp(&stamp, stop_fence);
                 let kill_op_id = format!("kill-{}", uuid::Uuid::new_v4());
                 let stop_outcome = crate::ownership_lane::begin_fresh_agent_stop(
@@ -6058,7 +6274,7 @@ impl FreshCodexState {
                             message: Some(refusal_message),
                         }),
                     );
-                    return;
+                    return Err(codex_cleanup_error());
                 }
             } else {
                 // b8ke delta round-3 F1: NO retained stamp — the kill STILL
@@ -6098,7 +6314,7 @@ impl FreshCodexState {
                                     ),
                                 }),
                             );
-                            return;
+                            return Err(codex_cleanup_error());
                         }
                         let claim = freshell_ownership::StopClaim {
                             expected_kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
@@ -6198,7 +6414,7 @@ impl FreshCodexState {
                                         message: Some(refusal_message),
                                     }),
                                 );
-                                return;
+                                return Err(codex_cleanup_error());
                             }
                         }
                     }
@@ -6223,7 +6439,7 @@ impl FreshCodexState {
                                     .to_string(),
                             ),
                         }));
-                        return;
+                        return Err(codex_cleanup_error());
                     }
                     freshell_ownership::OwnershipState::Starting { .. }
                     | freshell_ownership::OwnershipState::Stopping { .. } => {
@@ -6246,7 +6462,7 @@ impl FreshCodexState {
                                 ),
                             }),
                         );
-                        return;
+                        return Err(codex_cleanup_error());
                     }
                     freshell_ownership::OwnershipState::Fenced { .. } => {
                         tracing::warn!(target: "freshell_freshagent::codex",
@@ -6269,7 +6485,7 @@ impl FreshCodexState {
                                 ),
                             }),
                         );
-                        return;
+                        return Err(codex_cleanup_error());
                     }
                     _ => {
                         // Genuinely Vacant (or residue): lane-local cleanup
@@ -6282,16 +6498,46 @@ impl FreshCodexState {
         // Record the sidecar identity before the first teardown await. If the
         // bounded watcher window cannot prove the complete writer tree dead,
         // the deferred confirmation keeps this exact identity fenced.
-        let condemned_ownership_id = self.record_condemned_prior(&session_id).await;
+        let cleanup_removed = if let Some(expected) = expected_owner {
+            let mut sessions = self.sessions.lock().await;
+            if !sessions
+                .get(&session_id)
+                .is_some_and(|session| session.sidecar_ownership_id == expected)
+            {
+                return Err(codex_cleanup_error());
+            }
+            sessions.remove(&session_id)
+        } else {
+            None
+        };
+        let condemned_ownership_id = if let Some(session) = &cleanup_removed {
+            if let Some(pid) = session.sidecar_pid {
+                let recorded = crate::session_lease::record_condemned_runtime_identity(
+                    pid,
+                    CODEX_SIDECAR_OWNERSHIP_ENV,
+                    &session.sidecar_ownership_id,
+                );
+                self.condemned_priors
+                    .lock()
+                    .expect("condemned priors lock")
+                    .insert(session_id.clone(), recorded);
+                Some(session.sidecar_ownership_id.clone())
+            } else {
+                None
+            }
+        } else {
+            self.record_condemned_prior(&session_id).await
+        };
 
         // Ordinary close retires the pane-ledger row before teardown. Recovery
         // keeps that durable binding so a new writer can resume this thread.
         // A failed ordinary close stops before touching the live process.
-        let close_answer = if matches!(mode, CodexStopMode::Recovery { .. }) {
-            crate::identity_sink::CloseAnswer::Recorded
-        } else {
-            self.retire_closed_row(&session_id).await
-        };
+        let close_answer =
+            if expected_owner.is_some() || matches!(mode, CodexStopMode::Recovery { .. }) {
+                crate::identity_sink::CloseAnswer::Recorded
+            } else {
+                self.retire_closed_row(&session_id).await
+            };
         if close_answer == crate::identity_sink::CloseAnswer::Failed {
             // b8ke e3r2 F4 + e3r3 F2/F8: THE LIVENESS VERDICT COMES FIRST —
             // exactly ONE mutation path follows from it (pre-e3r3 the
@@ -6370,13 +6616,22 @@ impl FreshCodexState {
                     ),
                 }),
             );
-            return;
+            return Err(codex_cleanup_error());
         }
         let close_reported_failure = close_answer == crate::identity_sink::CloseAnswer::Persisted;
 
-        self.clear_controls(&session_id).await;
+        if let Some(session) = &cleanup_removed {
+            self.clear_source_controls(&session_id, &session.projection)
+                .await;
+        } else {
+            self.clear_controls(&session_id).await;
+        }
 
-        let removed = self.sessions.lock().await.remove(&session_id);
+        let removed = if expected_owner.is_some() {
+            cleanup_removed
+        } else {
+            self.sessions.lock().await.remove(&session_id)
+        };
         if let Some(session) = removed.as_ref() {
             // Requested teardown ends the probe's wait even when the provider never
             // emits turn/completed. Signal before closing the client so an in-flight
@@ -6538,6 +6793,27 @@ impl FreshCodexState {
                     ));
                 }
             }
+        } else if expected_owner.is_some() {
+            match teardown {
+                crate::session_handoff::StopResult::Reaped
+                | crate::session_handoff::StopResult::AlreadyGone => {}
+                crate::session_handoff::StopResult::NotConfirmed { confirmation } => {
+                    tokio::spawn(async move {
+                        let _ = confirmation.await;
+                    });
+                    kill_failure = Some((
+                        "TEARDOWN_NOT_CONFIRMED",
+                        "the owned Codex process tree is not yet confirmed stopped".into(),
+                    ));
+                }
+                crate::session_handoff::StopResult::PlatformLimited => {
+                    kill_failure = Some((
+                        "TEARDOWN_PLATFORM_LIMITED",
+                        "the complete owned Codex process tree could not be verified stopped"
+                            .into(),
+                    ));
+                }
+            }
         }
 
         // Explicit kill evicts this session's requestId dedup cache entries (mirrors
@@ -6550,6 +6826,7 @@ impl FreshCodexState {
             .clear_for_session(|record| record.session_id == session_id)
             .await;
 
+        let success = !close_reported_failure && kill_failure.is_none();
         self.broadcast_stop_result(
             &mode,
             &ServerMessage::FreshAgentKilled(FreshAgentKilled {
@@ -6559,11 +6836,16 @@ impl FreshCodexState {
                 // A persisted-despite-error close ends the session (consistent
                 // with the durable close) but the kill visibly fails
                 // (delta-r6-r4, focused-episode-6 round 3 Finding 3).
-                success: !close_reported_failure && kill_failure.is_none(),
+                success,
                 code: kill_failure.as_ref().map(|(code, _)| code.to_string()),
                 message: kill_failure.map(|(_, message)| message),
             }),
         );
+        if success {
+            Ok(())
+        } else {
+            Err(codex_cleanup_error())
+        }
     }
 
     /// The kill-side lane of `retire_closed` (delta-review round 5):
@@ -6605,6 +6887,29 @@ impl FreshCodexState {
         guard
             .get(session_id)
             .is_some_and(|s| !s.exited.load(Ordering::SeqCst))
+    }
+
+    pub(crate) async fn created_rest_settings(
+        &self,
+        session_id: &str,
+        expected_owner: Option<&str>,
+    ) -> Option<Value> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(session_id)?;
+        if session.exited.load(Ordering::SeqCst)
+            || expected_owner.is_some_and(|owner| owner != session.sidecar_ownership_id)
+        {
+            return None;
+        }
+        crate::ownership_lane::current_local_snapshot_owner(
+            &self.ownership,
+            &self.ownership_stamps,
+            PROVIDER,
+            session_id,
+            session_id,
+            session.sidecar_pid,
+        )?;
+        Some(session.effective_settings().as_json())
     }
 
     pub(crate) async fn local_snapshot_owner(
@@ -8757,7 +9062,7 @@ impl FreshCodexState {
                     _ => None,
                 };
                 if let Some(terminal) = terminal {
-                    turns.settle_native(id, terminal);
+                    turns.settle_native_read(id, terminal);
                 }
             }
         }
@@ -10833,6 +11138,16 @@ fn checkpoint_codex_turn_identity(
     Some((native_turn_id.to_string(), display_turn_id.to_string()))
 }
 
+fn codex_cleanup_error() -> crate::rest_lane::RestLaneError {
+    let mut error = crate::rest_lane::RestLaneError::new(
+        crate::rest_lane::RestLaneErrorKind::Unavailable,
+        "CODEX_CREATE_CLEANUP_UNCONFIRMED",
+        "the exact created Codex runtime could not be confirmed stopped",
+    );
+    error.retryable = Some(true);
+    error
+}
+
 /// Watch an owned sidecar child to completion. Two ways out:
 ///
 /// - The child exits ON ITS OWN (crash / unexpected disconnect, never requested): self-heal
@@ -11098,6 +11413,16 @@ fn spawn_exit_watcher_tracking_turns(
     turn_state: Option<SharedCodexTurnState>,
     retained_state: Option<FreshCodexState>,
 ) -> tokio::task::JoinHandle<crate::session_handoff::StopResult> {
+    if let (Some(turns), Some(state)) = (&turn_state, &retained_state) {
+        turns
+            .lock()
+            .expect("codex turn state")
+            .bind_settlement_stream(
+                thread_id.clone(),
+                ownership_id.clone(),
+                state.turn_events.clone(),
+            );
+    }
     // wfah: the thread id is fixed by the time the watcher is constructed at
     // every successful spawn site; enrich the durable record once, here.
     crate::codex_sidecar_tracking::enrich_record_session_id(&ownership_id, &thread_id);
@@ -12682,6 +13007,10 @@ impl crate::model_capabilities::ModelCatalogProbe for LocalCodexCatalogProbe {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "codex_rest_lane_tests.rs"]
+mod rest_lane_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {

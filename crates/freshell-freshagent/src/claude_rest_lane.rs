@@ -46,7 +46,7 @@ impl ClaudeRestLane {
                     model: request.model,
                     model_selection: request.model_selection,
                     permission_mode: request.permission_mode,
-                    effort: request.effort.map(Some),
+                    effort: request.effort,
                     plugins: request.plugins,
                     session_ref,
                     sandbox: request.sandbox,
@@ -70,6 +70,7 @@ impl ClaudeRestLane {
                 session_id,
                 session_ref,
                 cleanup_token: cleanup_ownership_id,
+                effective_settings: None,
             }),
             ClaudeCreateOutcome::Failed {
                 code,

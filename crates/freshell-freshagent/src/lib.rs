@@ -59,6 +59,7 @@ pub mod claude_spawn;
 pub(crate) mod claude_test_holds;
 pub(crate) mod claude_turns;
 pub mod codex;
+pub mod codex_rest_lane;
 pub(crate) mod codex_sidecar_tracking;
 pub(crate) mod delegation;
 pub mod identity_sink;
@@ -2095,6 +2096,7 @@ pub struct FreshAgentState {
     /// requests never touch this web process's legacy provider manager.
     hosted_rest: Arc<std::sync::OnceLock<rest_lane::SharedFreshAgentRestLane>>,
     local_claude_rest: Arc<std::sync::OnceLock<rest_lane::SharedFreshAgentRestLane>>,
+    local_codex_rest: Arc<std::sync::OnceLock<rest_lane::SharedFreshAgentRestLane>>,
     rest_create_settings: Arc<std::sync::OnceLock<rest_lane::RestCreateSettingsReader>>,
     /// Monotonic `sessions.changed` revision.
     sessions_revision: Arc<AtomicI64>,
@@ -2442,6 +2444,7 @@ impl FreshAgentState {
             opencode: Arc::new(tokio::sync::Mutex::new(None)),
             hosted_rest: Arc::new(std::sync::OnceLock::new()),
             local_claude_rest: Arc::new(std::sync::OnceLock::new()),
+            local_codex_rest: Arc::new(std::sync::OnceLock::new()),
             rest_create_settings: Arc::new(std::sync::OnceLock::new()),
             sessions_revision: Arc::new(AtomicI64::new(0)),
             terminal_registry: None,
@@ -2591,13 +2594,20 @@ impl FreshAgentState {
     }
 
     fn rest_lane_for(&self, provider: &str) -> Option<rest_lane::SharedFreshAgentRestLane> {
-        self.hosted_rest_gateway().or_else(|| {
-            if provider == "claude" {
-                self.local_claude_rest.get().cloned()
-            } else {
-                None
-            }
+        self.hosted_rest_gateway().or_else(|| match provider {
+            "claude" => self.local_claude_rest.get().cloned(),
+            "codex" => self.local_codex_rest.get().cloned(),
+            _ => None,
         })
+    }
+
+    pub fn set_codex_rest_lane(
+        &self,
+        lane: rest_lane::SharedFreshAgentRestLane,
+    ) -> Result<(), &'static str> {
+        self.local_codex_rest
+            .set(lane)
+            .map_err(|_| "local Codex REST lane is already installed")
     }
 
     /// Install a scripted model-catalog probe (tests) — the registry's
@@ -4732,7 +4742,7 @@ pub fn router(state: FreshAgentState) -> Router {
         .route("/api/panes/{id}", patch(rename_pane))
         .route("/api/panes/{id}/send-keys", post(send_keys))
         .route("/api/panes/{id}/capture", get(capture))
-        .route("/api/panes/{id}/wait-for", get(terminal_tabs::wait_for))
+        .route("/api/panes/{id}/wait-for", get(wait_for))
         .with_state(state.clone())
         .merge(model_capabilities::router(state.clone()))
         .merge(pane_ops::router(state))
@@ -4799,6 +4809,16 @@ fn rest_lane_failure(error: rest_lane::RestLaneError) -> Response {
         RestLaneErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
     };
     let mut body = json!({ "status": "error", "code": error.code, "message": error.message });
+    for (key, value) in [
+        ("sessionId", error.session_id),
+        ("requestId", error.request_id),
+        ("incarnationId", error.incarnation_id),
+        ("submittedTurnId", error.submitted_turn_id),
+    ] {
+        if let Some(value) = value {
+            body[key] = json!(value);
+        }
+    }
     if let Some(retryable) = error.retryable {
         body["retryable"] = json!(retryable);
     }
@@ -5137,7 +5157,7 @@ async fn create_lane_agent_tab(
                         session_type: request.session_type.clone(),
                         cwd: request.cwd.clone(),
                         model: request.model.clone(),
-                        effort: request.effort.clone(),
+                        effort: request.effort.clone().flatten(),
                         durable_id: Some(
                             created
                                 .session_ref
@@ -7201,6 +7221,59 @@ fn text_plain(body: String) -> Response {
         body,
     )
         .into_response()
+}
+
+async fn wait_for(
+    State(state): State<FreshAgentState>,
+    Path(pane_id): Path<String>,
+    headers: HeaderMap,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if !authorized(&headers, &state.auth_token) {
+        return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".into());
+    }
+    if pane_entry_for_request(&state, &pane_id).is_none() {
+        return terminal_tabs::wait_for(State(state), Path(pane_id), headers, Query(params)).await;
+    }
+    let (pattern, deadline) = match terminal_tabs::wait_pattern(&params) {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
+    };
+    loop {
+        let response = capture(
+            State(state.clone()),
+            Path(pane_id.clone()),
+            headers.clone(),
+            Query(Default::default()),
+        )
+        .await;
+        if response.status() != StatusCode::OK {
+            return response;
+        }
+        let bytes = match axum::body::to_bytes(response.into_body(), usize::MAX).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(event="agent_api.wait_for.capture_failed", pane_id, error=%error);
+                return fail_json(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "fresh-agent transcript is temporarily unavailable".into(),
+                );
+            }
+        };
+        if pattern
+            .is_match(&String::from_utf8_lossy(&bytes))
+            .unwrap_or(false)
+        {
+            return ok_json(
+                json!({"matched":true,"reason":"pattern"}),
+                "pattern matched",
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            return approx_json(json!({"matched":false}), "timeout");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Render an opencode message page to plain text: collect every `{type:'text', text}`
