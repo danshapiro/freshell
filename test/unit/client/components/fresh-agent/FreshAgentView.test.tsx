@@ -3533,6 +3533,7 @@ describe('FreshAgentView', () => {
         settings: {
           cwd: '/repo',
           model: 'gpt-5.3-codex-spark',
+          collaborationMode: 'default',
         },
       }))
     })
@@ -6998,7 +6999,7 @@ describe('FreshAgentView', () => {
     const levelsList = await screen.findByRole('listbox', { name: 'Thinking levels for GPT-5.6 Luna' })
     const levelTexts = Array.from(levelsList.querySelectorAll('[role="option"]')).map((el) => el.textContent)
     expect(levelTexts.map((text) => text?.replace(/last used|highest|current|●/g, '').trim())).toEqual(
-      ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
+      ['Default', 'none', 'low', 'medium', 'high', 'xhigh', 'max'],
     )
 
     fireEvent.click(screen.getByRole('button', { name: 'Use GPT-5.6 Luna · max' }))

@@ -4124,14 +4124,20 @@ export function FreshAgentView({
   const codexPaneSelectedModel = paneContent.modelSelection?.kind === 'exact' ? paneContent.modelSelection.modelId : undefined
   const codexSettingsConvergenceRef = useRef<CodexSettingsConvergence | undefined>(undefined)
   useEffect(() => {
-    if (paneContent.provider !== 'codex' || !liveSessionKey) {
+    if (paneContent.provider !== 'codex') {
       codexSettingsConvergenceRef.current = undefined
       return
     }
+    // Track edits from the original create intent, before a native identity
+    // exists. Its acknowledgement must not reset those newer local choices.
+    const pendingIdentity = `creating:${paneContent.createRequestId}`
+    const identity = liveSessionKey ?? pendingIdentity
+    const previous = codexSettingsConvergenceRef.current
+    if (liveSessionKey && previous?.identity === pendingIdentity) previous.identity = liveSessionKey
     const root = appStore.getState().panes.layouts[tabId]
     const current = (root ? findPaneContent(root, paneId) : null) ?? paneContentRef.current
     if (current.kind !== 'fresh-agent' || current.provider !== 'codex') return
-    const { cursor, updates } = convergeCodexSettings(codexSettingsConvergenceRef.current, liveSessionKey, {
+    const { cursor, updates } = convergeCodexSettings(previous, identity, {
       model: current.model ?? (current.modelSelection?.kind === 'exact' ? current.modelSelection.modelId : undefined),
       effort: current.effort,
       initialCwd: current.initialCwd,
@@ -4139,14 +4145,14 @@ export function FreshAgentView({
       permissionMode: current.permissionMode,
       collaborationMode: current.collaborationMode,
       effortIsNativeDefault: current.effortIsNativeDefault,
-    }, {
+    }, liveSessionKey ? {
       model: codexStatedModel,
       effort: codexStatedEffort,
       initialCwd: codexStatedCwd,
       sandbox: codexStatedSandbox,
       permissionMode: codexStatedPermission,
       collaborationMode: codexStatedMode,
-    })
+    } : {})
     codexSettingsConvergenceRef.current = cursor
     if (Object.keys(updates).length === 0) return
     dispatch(mergePaneContent({ tabId, paneId, updates: {
@@ -4154,7 +4160,7 @@ export function FreshAgentView({
       ...(updates.model ? { modelSelection: { kind: 'exact', modelId: updates.model } } : {}),
     } }))
   }, [
-    appStore, dispatch, paneId, tabId, liveSessionKey, paneContent.provider,
+    appStore, dispatch, paneId, tabId, liveSessionKey, paneContent.provider, paneContent.createRequestId,
     paneContent.model, codexPaneSelectedModel, paneContent.effort, paneContent.initialCwd,
     paneContent.sandbox, paneContent.permissionMode, paneContent.collaborationMode, paneContent.effortIsNativeDefault,
     codexStatedModel, codexStatedEffort, codexStatedCwd, codexStatedSandbox, codexStatedPermission, codexStatedMode,

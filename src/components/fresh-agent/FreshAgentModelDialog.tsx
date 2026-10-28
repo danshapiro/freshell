@@ -566,13 +566,17 @@ export function FreshAgentModelDialog({
             setExactModelInput(event.target.value)
             if (!id) return
             const row: FreshAgentModelCapability = {id,displayName:id,provider:'codex',supportsEffort:Boolean(effectiveEffort),supportedEffortLevels:effectiveEffort ? [effectiveEffort] : [],supportsAdaptiveThinking:false,source:{id:'exact-selection',displayName:'Exact selection'}}
-            setStagedModel(row); setHighlightedRowKey(`catalog:${id}`); setHighlightedLevelIndex(0)
+            setStagedModel(row); setHighlightedRowKey(`catalog:${id}`)
+            setHighlightedLevelIndex(preselectLevelIndex(levelRowsForModel(row, true), id))
           }} /></label>
           <label>Reasoning effort<input aria-label="Reasoning effort" value={highlightedLevelRow?.kind === 'level' ? highlightedLevelRow.id : ''} className="w-full rounded border bg-background px-2 py-1" onChange={(event) => {
             if (!highlightedModel) return
             const effort = event.target.value.trim()
-            setStagedModel({...highlightedModel,supportsEffort:Boolean(effort),supportedEffortLevels:effort ? [effort] : []})
-            setHighlightedRowKey(`catalog:${highlightedModel.id}`); setHighlightedLevelIndex(0)
+            const model = {...highlightedModel,supportsEffort:Boolean(effort),supportedEffortLevels:effort ? [effort] : []}
+            setStagedModel(model)
+            setHighlightedRowKey(`catalog:${model.id}`)
+            setHighlightedLevelIndex(levelRowsForModel(model, true).findIndex((row) => effort
+              ? row.kind === 'level' && row.id === effort : row.kind === 'default'))
           }} /></label>
         </div> : null}
         {!capabilities ? (
