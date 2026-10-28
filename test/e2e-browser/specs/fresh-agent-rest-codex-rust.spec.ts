@@ -25,9 +25,14 @@ test('REST creates and splits Freshcodex through the browser owning native runti
   const requests = path.join(root, 'requests.jsonl')
   await fs.writeFile(wrapper, `#!/usr/bin/env node
 import { randomUUID } from 'node:crypto'
+import path from 'node:path'
+const threadId = randomUUID()
+const now = new Date()
+const rollout = path.join(process.env.CODEX_HOME, 'sessions', String(now.getUTCFullYear()), String(now.getUTCMonth() + 1).padStart(2, '0'), String(now.getUTCDate()).padStart(2, '0'), \`rollout-\${threadId}.jsonl\`)
 process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR = JSON.stringify({
   ...JSON.parse(process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR || '{}'),
-  threadStartThreadId: randomUUID(),
+  threadStartThreadId: threadId,
+  writeRolloutOnMethods: { 'turn/start': { path: rollout, record: { type: 'session_meta', payload: { id: threadId, cwd: process.cwd() } } } },
 })
 await import(${JSON.stringify(source)})
 `)
@@ -142,6 +147,22 @@ await import(${JSON.stringify(source)})
     expect((await nativeRequests()).filter((row) => row.method === 'turn/start')).toHaveLength(turnsBeforeNoop)
 
     const savedName = 'Task009 saved Codex'
+    const namingContent = findLeaf(await harness.getPaneLayout(createdTab), createdPane)?.content
+    const sessionsRoot = path.join(info.homeDir, '.codex', 'sessions')
+    const nativeFile = (await fs.readdir(sessionsRoot, { recursive: true }))
+      .find((name) => name.endsWith(`rollout-${createdRef.sessionId}.jsonl`))
+    const nativeMeta = nativeFile ? JSON.parse((await fs.readFile(path.join(sessionsRoot, nativeFile), 'utf8')).split('\n')[0]) : undefined
+    const nameDocument = JSON.parse(await fs.readFile(path.join(info.homeDir, '.freshell', 'session-names.json'), 'utf8'))
+    console.log('TASK009_NAME_BINDING_CONTEXT', JSON.stringify({
+      sessionId: createdRef.sessionId,
+      pane: { sessionId: namingContent?.sessionId, sessionRef: namingContent?.sessionRef, nameRef: namingContent?.nameRef, namingHandle: namingContent?.namingHandle },
+      nativeMeta: { type: nativeMeta?.type, id: nativeMeta?.payload?.id, cwd: nativeMeta?.payload?.cwd },
+      records: Object.values(nameDocument.records).map((record: any) => ({ ref: record.ref, name: record.name, source: record.source })),
+      redirects: Object.values(nameDocument.redirects),
+    }))
+    expect(nativeMeta?.type).toBe('session_meta')
+    expect(nativeMeta?.payload?.id).toBe(createdRef.sessionId)
+    expect(namingContent?.sessionRef).toEqual(createdRef)
     const renamed = await mcp.callFreshellAction('rename-pane', { target: createdPane, name: savedName, nameIntent: 'user' })
     expect(renamed.status, JSON.stringify(renamed)).toBe('ok')
     const readName = async () => {
@@ -152,7 +173,7 @@ await import(${JSON.stringify(source)})
     console.log('TASK009_NAME_EVIDENCE', JSON.stringify({
       sessionId: createdRef.sessionId, renameStatus: renamed.status,
       renameNameRef: renamed.data?.nameRef,
-      readNameRef: observedName?.nameRef, name: observedName?.name, source: observedName?.source,
+      readNameRef: observedName?.ref, name: observedName?.name, source: observedName?.source,
     }))
     await expect.poll(readName, { timeout: 30_000 }).toMatchObject({ name: savedName, source: 'manual' })
     await expect.poll(async () => findLeaf(await harness.getPaneLayout(createdTab), createdPane)?.content?.sessionRef).toEqual(createdRef)
