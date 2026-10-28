@@ -1849,12 +1849,26 @@
         {
           "additionalProperties": false,
           "properties": {
+            "collaborationMode": {
+              "enum": [
+                "default",
+                "plan"
+              ],
+              "type": "string"
+            },
             "cwd": {
               "type": "string"
             },
             "effort": {
-              "minLength": 1,
-              "type": "string"
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "legacyRestoreContext": {
               "additionalProperties": false,
@@ -2172,13 +2186,27 @@
             "settings": {
               "additionalProperties": false,
               "properties": {
+                "collaborationMode": {
+                  "enum": [
+                    "default",
+                    "plan"
+                  ],
+                  "type": "string"
+                },
                 "cwd": {
                   "minLength": 1,
                   "type": "string"
                 },
                 "effort": {
-                  "minLength": 1,
-                  "type": "string"
+                  "anyOf": [
+                    {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 },
                 "model": {
                   "minLength": 1,
@@ -2294,13 +2322,27 @@
             "settings": {
               "additionalProperties": false,
               "properties": {
+                "collaborationMode": {
+                  "enum": [
+                    "default",
+                    "plan"
+                  ],
+                  "type": "string"
+                },
                 "cwd": {
                   "minLength": 1,
                   "type": "string"
                 },
                 "effort": {
-                  "minLength": 1,
-                  "type": "string"
+                  "anyOf": [
+                    {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 },
                 "model": {
                   "minLength": 1,
@@ -3551,12 +3593,26 @@
         {
           "additionalProperties": false,
           "properties": {
+            "collaborationMode": {
+              "enum": [
+                "default",
+                "plan"
+              ],
+              "type": "string"
+            },
             "cwd": {
               "type": "string"
             },
             "effort": {
-              "minLength": 1,
-              "type": "string"
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "legacyRestoreContext": {
               "additionalProperties": false,
@@ -3874,13 +3930,27 @@
             "settings": {
               "additionalProperties": false,
               "properties": {
+                "collaborationMode": {
+                  "enum": [
+                    "default",
+                    "plan"
+                  ],
+                  "type": "string"
+                },
                 "cwd": {
                   "minLength": 1,
                   "type": "string"
                 },
                 "effort": {
-                  "minLength": 1,
-                  "type": "string"
+                  "anyOf": [
+                    {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 },
                 "model": {
                   "minLength": 1,
@@ -3996,13 +4066,27 @@
             "settings": {
               "additionalProperties": false,
               "properties": {
+                "collaborationMode": {
+                  "enum": [
+                    "default",
+                    "plan"
+                  ],
+                  "type": "string"
+                },
                 "cwd": {
                   "minLength": 1,
                   "type": "string"
                 },
                 "effort": {
-                  "minLength": 1,
-                  "type": "string"
+                  "anyOf": [
+                    {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 },
                 "model": {
                   "minLength": 1,
@@ -4660,13 +4744,27 @@
         "settings": {
           "additionalProperties": false,
           "properties": {
+            "collaborationMode": {
+              "enum": [
+                "default",
+                "plan"
+              ],
+              "type": "string"
+            },
             "cwd": {
               "minLength": 1,
               "type": "string"
             },
             "effort": {
-              "minLength": 1,
-              "type": "string"
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "model": {
               "minLength": 1,
@@ -4705,12 +4803,26 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
+        "collaborationMode": {
+          "enum": [
+            "default",
+            "plan"
+          ],
+          "type": "string"
+        },
         "cwd": {
           "type": "string"
         },
         "effort": {
-          "minLength": 1,
-          "type": "string"
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "legacyRestoreContext": {
           "additionalProperties": false,
@@ -5448,13 +5560,27 @@
         "settings": {
           "additionalProperties": false,
           "properties": {
+            "collaborationMode": {
+              "enum": [
+                "default",
+                "plan"
+              ],
+              "type": "string"
+            },
             "cwd": {
               "minLength": 1,
               "type": "string"
             },
             "effort": {
-              "minLength": 1,
-              "type": "string"
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "model": {
               "minLength": 1,

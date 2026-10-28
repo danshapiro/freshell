@@ -867,6 +867,8 @@ pub struct BindingRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collaboration_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
     /// G15: the claude pane's local plugin directories, which every launch of
     /// the session hands to the sidecar again. Serde-optional under
@@ -1333,6 +1335,7 @@ impl<'a> GenesisWrite<'a> {
 /// so writes replace rather than merge.
 #[derive(Debug, Clone, Copy)]
 pub struct FreshAgentBindingWrite<'a> {
+    pub collaboration_mode: Option<&'a str>,
     pub provider: &'a str,
     pub session_id: &'a str,
     pub mode: &'a str,
@@ -2271,6 +2274,7 @@ impl PaneLedger {
             .map(str::to_string)
             .or_else(|| existing.and_then(|r| r.origin_create_request_id.clone()));
         let row = BindingRow {
+            collaboration_mode: None,
             ledger_version: LEDGER_VERSION,
             provider: w.provider.to_string(),
             session_id: w.session_id.to_string(),
@@ -2827,6 +2831,7 @@ impl PaneLedger {
             model: w.model.map(str::to_string),
             sandbox: w.sandbox.map(str::to_string),
             permission_mode: w.permission_mode.map(str::to_string),
+            collaboration_mode: w.collaboration_mode.map(str::to_string),
             effort: w.effort.map(str::to_string),
             plugins: w.plugins.map(<[String]>::to_vec),
             // A rebind during recovery must not erase a shutdown marker
@@ -4721,6 +4726,7 @@ impl PaneLedger {
                     && (r.model.is_some()
                         || r.sandbox.is_some()
                         || r.permission_mode.is_some()
+                        || r.collaboration_mode.is_some()
                         || r.effort.is_some()
                         || r.cwd.is_some()
                         || r.plugins.is_some())

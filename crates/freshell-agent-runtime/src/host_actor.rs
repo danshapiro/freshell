@@ -50,6 +50,8 @@ mod double_optional {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collaboration_mode: Option<String>,
     pub provider: FreshProvider,
     pub runtime_variant: String,
     pub cwd: String,
@@ -95,6 +97,9 @@ impl FreshAgentProfile {
     /// Folds per-turn settings into the durable launch profile: every
     /// provided field replaces the stored one, absent fields keep it.
     pub fn apply_turn_settings(&mut self, settings: &FreshAgentTurnSettings) {
+        if let Some(value) = &settings.collaboration_mode {
+            self.collaboration_mode = Some(value.clone());
+        }
         if let Some(value) = &settings.cwd {
             self.cwd = value.clone();
         }
@@ -102,7 +107,7 @@ impl FreshAgentProfile {
             self.model = Some(value.clone());
         }
         if let Some(value) = &settings.effort {
-            self.effort = Some(value.clone());
+            self.effort = value.clone();
         }
         if let Some(value) = &settings.permission_mode {
             self.permission_mode = Some(value.clone());
@@ -128,6 +133,10 @@ impl FreshAgentProfile {
 
     pub fn validate(&self) -> Result<(), ActorError> {
         if self.runtime_variant.is_empty()
+            || self
+                .collaboration_mode
+                .as_deref()
+                .is_some_and(|mode| !matches!(mode, "default" | "plan"))
             || self.cwd.is_empty()
             || self.provider_store_id.is_empty()
             || self.native_session_id.as_deref().is_some_and(str::is_empty)
@@ -264,6 +273,20 @@ pub trait FreshAgentTransport: Send + Sync {
         _logical_attempt_id: Option<&str>,
     ) -> Result<DispatchAck, DispatchFailure> {
         self.dispatch(request_id, text, profile).await
+    }
+    /// Carries the caller's partial settings separately from durable launch
+    /// intent. Providers with native effective defaults must not restate an
+    /// unchanged launch profile as new overrides on every send.
+    async fn dispatch_with_turn_settings(
+        &self,
+        request_id: &RequestId,
+        text: &str,
+        profile: &FreshAgentProfile,
+        _settings: Option<&FreshAgentTurnSettings>,
+        logical_attempt_id: Option<&str>,
+    ) -> Result<DispatchAck, DispatchFailure> {
+        self.dispatch_with_checkpoint_identity(request_id, text, profile, logical_attempt_id)
+            .await
     }
     async fn resolve_permission(
         &self,
@@ -688,8 +711,8 @@ impl FreshAgentHostActor {
                     other => Ok(other),
                 };
             }
-            if let Some(settings) = settings {
-                state.profile.apply_turn_settings(&settings);
+            if let Some(settings) = settings.as_ref() {
+                state.profile.apply_turn_settings(settings);
                 state.profile.validate()?;
             }
             dispatch_profile = state.profile.clone();
@@ -714,10 +737,11 @@ impl FreshAgentHostActor {
 
         let result = self
             .transport
-            .dispatch_with_checkpoint_identity(
+            .dispatch_with_turn_settings(
                 &request_id,
                 &text,
                 &dispatch_profile,
+                settings.as_ref(),
                 logical_attempt_id.as_deref(),
             )
             .await;

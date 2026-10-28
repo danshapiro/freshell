@@ -476,6 +476,7 @@ impl ClaudeRig {
             .as_ref()
             .expect("seeding a binding row needs the rig's durable ledger")
             .record_fresh_agent_binding(&freshell_ws::pane_ledger::FreshAgentBindingWrite {
+                collaboration_mode: None,
                 provider: "claude",
                 session_id,
                 mode: "freshclaude",

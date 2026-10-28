@@ -780,6 +780,7 @@ mod tests {
         state
             .pane_ledger
             .record_fresh_agent_binding(&crate::pane_ledger::FreshAgentBindingWrite {
+                collaboration_mode: None,
                 genesis: crate::pane_ledger::GenesisWrite::Keep,
                 provider: "codex",
                 session_id: TID,

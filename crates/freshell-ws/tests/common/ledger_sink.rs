@@ -207,6 +207,7 @@ impl PaneIdentitySink for LedgerSink {
             };
             let stored_genesis = upsert.genesis.stored_value();
             ledger.record_fresh_agent_binding(&FreshAgentBindingWrite {
+                collaboration_mode: upsert.settings.collaboration_mode.as_deref(),
                 genesis: freshell_ws::pane_ledger::GenesisWrite::from_update(
                     stored_genesis.as_ref(),
                     upsert.genesis.is_clear(),
@@ -295,6 +296,7 @@ impl PaneIdentitySink for LedgerSink {
             return None;
         }
         let settings = FreshAgentSettings {
+            collaboration_mode: row.collaboration_mode,
             model: row.model,
             sandbox: row.sandbox,
             permission_mode: row.permission_mode,

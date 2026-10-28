@@ -556,6 +556,8 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         effort: event.effort as string | null | undefined,
         // Absent = no statement (as for model/effort); only a mode name states one.
         ...(typeof event.permissionMode === 'string' && event.permissionMode ? { permissionMode: event.permissionMode } : {}),
+        ...(['read-only', 'workspace-write', 'danger-full-access'].includes(event.sandbox as string) ? { sandbox: event.sandbox as 'read-only' | 'workspace-write' | 'danger-full-access' } : {}),
+        ...(event.collaborationMode === 'default' || event.collaborationMode === 'plan' ? { collaborationMode: event.collaborationMode } : {}),
         cwd: event.cwd as string | undefined,
         tools: event.tools as Array<{ name: string }> | undefined,
       }))

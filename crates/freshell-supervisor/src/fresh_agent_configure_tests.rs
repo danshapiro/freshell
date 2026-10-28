@@ -80,6 +80,7 @@ async fn running_fresh_provider(provider: FreshProvider) -> RunningFreshAgent {
             fixture: None,
             terminal: None,
             fresh_agent: Some(FreshAgentLaunchSpec {
+                collaboration_mode: None,
                 session_id: "fresh-session".into(),
                 provider: provider.clone(),
                 session_type: if provider == FreshProvider::Codex {
@@ -268,12 +269,77 @@ fn configure_envelope_with(
 
 fn opus_high() -> FreshAgentTurnSettings {
     FreshAgentTurnSettings {
+        collaboration_mode: None,
         cwd: None,
         model: Some("opus".into()),
-        effort: Some("high".into()),
+        effort: Some(Some("high".into())),
         permission_mode: None,
         sandbox: None,
     }
+}
+
+#[tokio::test]
+async fn task008_settings_admin_codex_absent_effort_preserves_and_null_clears_recovery_defaults() {
+    let fixture = running_fresh_provider(FreshProvider::Codex).await;
+    let (received, host) = fake_host(&fixture.runtime_dir);
+    let epoch = fixture.supervisor.registry.control_epoch();
+    let original = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap()
+        .fresh_agent
+        .unwrap();
+    for (request, patch, expected) in [
+        (
+            "codex-cwd-only",
+            serde_json::json!({"cwd":original.cwd,"collaborationMode":"plan","sandbox":"read-only"}),
+            Some("low"),
+        ),
+        (
+            "codex-native-default",
+            serde_json::json!({"effort":null}),
+            None,
+        ),
+    ] {
+        let reply = fixture
+            .supervisor
+            .dispatch(configure_envelope_with(
+                &fixture.soul,
+                &RequestId::parse(request).unwrap(),
+                Some(epoch),
+                serde_json::from_value(patch).unwrap(),
+            ))
+            .await;
+        assert!(reply.result.is_ok(), "{:?}", reply.result);
+        let recovered = fixture
+            .supervisor
+            .registry
+            .recovery_context(fixture.soul.clone())
+            .await
+            .unwrap()
+            .fresh_agent
+            .unwrap();
+        assert_eq!(recovered.effort.as_deref(), expected);
+        assert_eq!(recovered.collaboration_mode.as_deref(), Some("plan"));
+        assert_eq!(recovered.sandbox.as_deref(), Some("read-only"));
+        assert_eq!(recovered.model, original.model);
+    }
+    host.abort();
+    let _ = host.await;
+    let configures: Vec<_> = received
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|command| match command {
+            HostCommand::FreshAgentConfigure { settings, .. } => Some(settings.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(configures.len(), 2);
+    assert_eq!(configures[0].effort, None);
+    assert_eq!(configures[1].effort, Some(None));
 }
 
 #[tokio::test]

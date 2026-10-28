@@ -220,6 +220,41 @@ afterEach(() => {
 })
 
 describe('FreshAgentSettingsButton', () => {
+  it.each(['read-only', 'workspace-write', 'danger-full-access'])('stages Codex file access %s through the real store, configure and defaults', (sandbox) => {
+    const store = createStore()
+    seedPane(store, { sessionType: 'freshcodex', provider: 'codex', status: 'running', model: 'provider-current', effort: 'ultra', permissionMode: 'never' })
+    renderButton(store)
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+    const input = screen.getByRole('combobox', { name: 'File access', exact: true })
+    expect(input).toBeEnabled()
+    fireEvent.change(input, { target: { value: sandbox } })
+    expect(readPaneContent(store)).toMatchObject({ sandbox, model: 'provider-current', effort: 'ultra', permissionMode: 'never' })
+    expect(wsSendSpy).toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.configure', settings: { sandbox } }))
+    expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({ freshAgent: { providers: { freshcodex: { sandbox } } } })
+  })
+
+  it.each(['plan', 'default'])('stages Codex work mode %s independently of approval and file access', (collaborationMode) => {
+    const store = createStore()
+    seedPane(store, { sessionType: 'freshcodex', provider: 'codex', status: 'running', sandbox: 'read-only', permissionMode: 'never', model: 'provider-current', effort: 'ultra' })
+    renderButton(store)
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+    fireEvent.change(screen.getByRole('combobox', { name: 'Work mode', exact: true }), { target: { value: collaborationMode } })
+    expect(readPaneContent(store)).toMatchObject({ collaborationMode, sandbox: 'read-only', permissionMode: 'never', model: 'provider-current', effort: 'ultra' })
+    expect(wsSendSpy).toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.configure', settings: { collaborationMode } }))
+    expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({ freshAgent: { providers: { freshcodex: { collaborationMode } } } })
+  })
+
+  it.each(['create-only', 'unsupported'])('disables unavailable Codex work and file changes for scope %s', async (scope) => {
+    getFreshAgentThreadSnapshotSpy.mockResolvedValue({ ...THREAD_SNAPSHOT_WITHOUT_SCOPES, capabilities: { ...THREAD_SNAPSHOT_WITHOUT_SCOPES.capabilities, settingScopes: { sandbox: scope, collaborationMode: scope } } })
+    const store = createStore()
+    seedPane(store, { sessionType: 'freshcodex', provider: 'codex' })
+    renderButton(store)
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+    await waitFor(() => expect(screen.getByRole('combobox', { name: 'File access', exact: true })).toBeDisabled())
+    expect(screen.getByRole('combobox', { name: 'Work mode', exact: true })).toBeDisabled()
+    expect(wsSendSpy).not.toHaveBeenCalled()
+  })
+
   it('offers valid Codex approval policies without implying sandbox access', () => {
     const store = createStore()
     seedPane(store, { sessionType: 'freshcodex', provider: 'codex', permissionMode: 'on-request', sandbox: 'read-only' })

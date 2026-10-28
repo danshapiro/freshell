@@ -25,6 +25,7 @@ import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
 import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
 import { adoptAuthoritativeConversationNameRef } from '@/lib/terminal-naming-rebind'
 import { sendSuppressedAwareFreshAgentFrame } from '@/lib/fresh-agent-configure'
+import { convergeCodexSettings, type CodexSettingsConvergence } from '@/lib/fresh-agent-settings-convergence'
 import { KILL_ACK_TIMEOUT_MESSAGE, KILL_FAILED_MESSAGE, sendFreshAgentKillAndAwait, sendFreshAgentRecoveryStopAndAwait } from '@/lib/kill-ack'
 import { createLogger } from '@/lib/client-logger'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
@@ -52,6 +53,7 @@ import { getRebindQueue } from '@/lib/rebind-queue'
 import { getSnapshotScheduler, makeSnapshotKey, type SnapshotTrigger } from '@/lib/fresh-agent-snapshot-scheduler'
 import {
   getEffectiveFreshAgentEffort,
+  getFreshAgentRequestEffort,
   resolveEffectiveFreshAgentModel,
   resolveFreshAgentType,
 } from '@/lib/fresh-agent-registry'
@@ -1922,7 +1924,8 @@ export function FreshAgentView({
         ...(resolveEffectiveFreshAgentModel(current, providerDefaults) ? { model: resolveEffectiveFreshAgentModel(current, providerDefaults) } : {}),
         ...(getEffectiveFreshAgentPermissionMode(current) ? { permissionMode: getEffectiveFreshAgentPermissionMode(current) } : {}),
         ...(current.sandbox ? { sandbox: current.sandbox } : {}),
-        ...(getEffectiveFreshAgentEffort(current, providerDefaults) ? { effort: getEffectiveFreshAgentEffort(current, providerDefaults) } : {}),
+        ...(current.provider === 'codex' ? { collaborationMode: current.collaborationMode ?? 'default' } : {}),
+        ...(getFreshAgentRequestEffort(current, providerDefaults) !== undefined ? { effort: getFreshAgentRequestEffort(current, providerDefaults) } : {}),
       },
     })
   }, [appStore, providerDefaults, sendFreshAgentMessage])
@@ -2061,7 +2064,8 @@ export function FreshAgentView({
       model: resolveEffectiveFreshAgentModel(content, providerDefaults),
       ...(getEffectiveFreshAgentPermissionMode(content) ? { permissionMode: getEffectiveFreshAgentPermissionMode(content) } : {}),
       sandbox: content.sandbox,
-      effort: getEffectiveFreshAgentEffort(content, providerDefaults),
+      ...(content.provider === 'codex' ? { collaborationMode: content.collaborationMode ?? 'default' } : {}),
+      effort: getFreshAgentRequestEffort(content, providerDefaults),
       plugins: content.plugins,
       // D8 (restore-open-sessions-only): the server composes the ledger row's
       // tabKey as `deviceId:tabId` from the connection identity + this field.
@@ -4111,12 +4115,56 @@ export function FreshAgentView({
   // Only a change of the stated mode acts, so a mode the user just picked here
   // is never undone.
   const sessionPermissionMode = agentSession?.permissionMode
+  const codexStatedModel = typeof agentSession?.model === 'string' ? agentSession.model : snapshot?.settings?.model
+  const codexStatedEffort = agentSession?.effort !== undefined ? agentSession.effort : snapshot?.settings?.effort
+  const codexStatedCwd = agentSession?.cwd ?? snapshot?.settings?.cwd
+  const codexStatedSandbox = agentSession?.sandbox ?? snapshot?.settings?.sandbox
+  const codexStatedPermission = sessionPermissionMode ?? snapshot?.settings?.permissionMode
+  const codexStatedMode = agentSession?.collaborationMode ?? snapshot?.settings?.collaborationMode
+  const codexPaneSelectedModel = paneContent.modelSelection?.kind === 'exact' ? paneContent.modelSelection.modelId : undefined
+  const codexSettingsConvergenceRef = useRef<CodexSettingsConvergence | undefined>(undefined)
+  useEffect(() => {
+    if (paneContent.provider !== 'codex' || !liveSessionKey) {
+      codexSettingsConvergenceRef.current = undefined
+      return
+    }
+    const root = appStore.getState().panes.layouts[tabId]
+    const current = (root ? findPaneContent(root, paneId) : null) ?? paneContentRef.current
+    if (current.kind !== 'fresh-agent' || current.provider !== 'codex') return
+    const { cursor, updates } = convergeCodexSettings(codexSettingsConvergenceRef.current, liveSessionKey, {
+      model: current.model ?? (current.modelSelection?.kind === 'exact' ? current.modelSelection.modelId : undefined),
+      effort: current.effort,
+      initialCwd: current.initialCwd,
+      sandbox: current.sandbox,
+      permissionMode: current.permissionMode,
+      collaborationMode: current.collaborationMode,
+      effortIsNativeDefault: current.effortIsNativeDefault,
+    }, {
+      model: codexStatedModel,
+      effort: codexStatedEffort,
+      initialCwd: codexStatedCwd,
+      sandbox: codexStatedSandbox,
+      permissionMode: codexStatedPermission,
+      collaborationMode: codexStatedMode,
+    })
+    codexSettingsConvergenceRef.current = cursor
+    if (Object.keys(updates).length === 0) return
+    dispatch(mergePaneContent({ tabId, paneId, updates: {
+      ...updates,
+      ...(updates.model ? { modelSelection: { kind: 'exact', modelId: updates.model } } : {}),
+    } }))
+  }, [
+    appStore, dispatch, paneId, tabId, liveSessionKey, paneContent.provider,
+    paneContent.model, codexPaneSelectedModel, paneContent.effort, paneContent.initialCwd,
+    paneContent.sandbox, paneContent.permissionMode, paneContent.collaborationMode, paneContent.effortIsNativeDefault,
+    codexStatedModel, codexStatedEffort, codexStatedCwd, codexStatedSandbox, codexStatedPermission, codexStatedMode,
+  ])
   const adoptedPermissionModeRef = useRef<string | undefined>(undefined)
   useEffect(() => {
     if (!sessionPermissionMode || sessionPermissionMode === adoptedPermissionModeRef.current) return
     adoptedPermissionModeRef.current = sessionPermissionMode
     const current = paneContentRef.current
-    if (current.provider === 'opencode' || current.permissionMode === sessionPermissionMode) return
+    if (current.provider !== 'claude' || current.permissionMode === sessionPermissionMode) return
     if (!(CLAUDE_PERMISSION_MODE_VALUES as readonly string[]).includes(sessionPermissionMode)) {
       if (current.permissionMode === undefined) return
       log.info('the session is in a permission mode the pane cannot show; the pane stops stating its own', {

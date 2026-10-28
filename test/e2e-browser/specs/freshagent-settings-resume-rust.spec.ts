@@ -313,10 +313,11 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
     }
   })
 
-  test('codex: configured xhigh and recorded model survive restart and the next send', async () => {
+  test('codex: configured xhigh, file access, Plan and explicit Default survive actual server restarts', async () => {
     test.setTimeout(180_000)
     const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'fa-settings-codex-'))
     const opLogPath = path.join(sharedRoot, 'codex-ops.jsonl')
+    const notificationLogPath = path.join(sharedRoot, 'codex-notifications.jsonl')
     const projectDir = path.join(sharedRoot, 'proj')
     await fsp.mkdir(projectDir, { recursive: true })
     const server = new RustServer({
@@ -326,6 +327,9 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
         // STATIC per server boot (V4/A6): resume succeeds by default.
         FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
           appendRequestLogPath: opLogPath,
+          appendNativeNotificationLogPath: notificationLogPath,
+          echoRequestedModel: true,
+          recordTurns: true,
         }),
       },
     })
@@ -353,25 +357,23 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
       )
       const threadId = created.sessionId as string
       expect(threadId).toBeTruthy()
+      const sendAndConsumeTerminal = async (requestId: string, text: string) => {
+        const capture = ws!
+        const from = capture.frames.length
+        const notificationFrom = readJsonl(notificationLogPath).length
+        capture.send({type:'freshAgent.send',requestId,provider:'codex',sessionType:'freshcodex',sessionId:threadId,text})
+        const accepted = await capture.waitFor(f=>f.type==='freshAgent.send.accepted' && f.requestId===requestId,30_000,`accepted ${requestId}`)
+        expect(accepted.submittedTurnId).toBeTruthy()
+        await capture.waitFor(f=>capture.frames.indexOf(f)>=from && f.type==='freshAgent.event' && f.sessionId===threadId && f.event?.type==='freshAgent.turn.complete',30_000,`consumed terminal ${requestId}`)
+        expect(readJsonl(notificationLogPath).slice(notificationFrom).some(row=>row.method==='turn/completed' && row.threadId===threadId && row.turnId===accepted.submittedTurnId)).toBe(true)
+      }
 
       ws.send({type:'freshAgent.configure',requestId:'codex-settings-xhigh',provider:'codex',sessionType:'freshcodex',sessionId:threadId,settings:{effort:'xhigh'}})
       await ws.waitFor(f=>f.type==='freshAgent.event' && f.event?.type==='freshAgent.session.metadata' && f.event.effort==='xhigh',30_000,'exact xhigh metadata after configure')
 
-      // One turn. `freshAgent.send.accepted` is broadcast after `turn/start`
-      // resolves (codex.rs handle_send), and the fake answers turn/start with a
-      // completed turn -- so this IS the turn's completion edge on this fixture.
-      ws.send({
-        type: 'freshAgent.send',
-        provider: 'codex',
-        sessionId: threadId,
-        sessionType: 'freshcodex',
-        text: 'settings-resume first turn',
-      })
-      await ws.waitFor(
-        (f) => f.type === 'freshAgent.send.accepted' && f.sessionId === threadId,
-        30_000,
-        'freshAgent.send.accepted (codex first turn)',
-      )
+      // Join native acceptance to its matching terminal notification and the
+      // owning Rust consumer's completion edge before restarting the server.
+      await sendAndConsumeTerminal('codex-settings-before-restart','settings-resume first turn')
       ws.close()
       ws = null
 
@@ -401,12 +403,35 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
       expect(resume, 'restart must resume the durable thread').toBeTruthy()
       expect(resume.params.model, 'resume must carry the recorded model, not null').toBe('gpt-5.3-codex-spark')
       expect(resume.params.sandbox, 'resume must carry the recorded sandbox').toBe('workspace-write')
-      ws.send({type:'freshAgent.send',requestId:'codex-settings-after-restart',provider:'codex',sessionType:'freshcodex',sessionId:threadId,text:'settings-resume second turn'})
-      await ws.waitFor(f=>f.type==='freshAgent.send.accepted' && f.requestId==='codex-settings-after-restart',30_000,'post-restart accepted send')
+      await sendAndConsumeTerminal('codex-settings-after-restart','settings-resume second turn')
       const turns=readJsonl(opLogPath).filter(op=>op.method==='turn/start')
       expect(turns).toHaveLength(2)
       expect(turns.map(turn=>turn.params.model)).toEqual(['gpt-5.3-codex-spark','gpt-5.3-codex-spark'])
       expect(turns.map(turn=>turn.params.effort)).toEqual(['xhigh','xhigh'])
+      // Partial changes retain xhigh; explicit Default clears it before a
+      // second actual server restart. The resumed create states no settings.
+      const nestedCwd = path.join(projectDir, 'nested')
+      await fsp.mkdir(nestedCwd)
+      ws.send({type:'freshAgent.configure',requestId:'codex-settings-scoped',provider:'codex',sessionType:'freshcodex',sessionId:threadId,settings:{cwd:nestedCwd,sandbox:'read-only',permissionMode:'never',collaborationMode:'plan'}})
+      await ws.waitFor(f=>f.type==='freshAgent.event' && f.event?.type==='freshAgent.session.metadata' && f.event.requestId==='codex-settings-scoped' && f.event.effort==='xhigh' && f.event.cwd===nestedCwd && f.event.collaborationMode==='plan',30_000,'complete staged defaults retain untouched effort')
+      ws.send({type:'freshAgent.configure',requestId:'codex-settings-default',provider:'codex',sessionType:'freshcodex',sessionId:threadId,settings:{effort:null}})
+      await ws.waitFor(f=>f.type==='freshAgent.event' && f.event?.type==='freshAgent.session.metadata' && f.event.requestId==='codex-settings-default' && f.event.effort===null,30_000,'explicit native Default metadata')
+      ws.close()
+      ws = null
+      await server.restartAbrupt()
+      await enableFreshAgent(server.info.baseUrl, server.info.token)
+      ws = new WsCapture(server.info.baseUrl, server.info.token)
+      await ws.ready()
+      ws.send({type:'freshAgent.create',requestId:'codex-settings-default-resume',provider:'codex',sessionType:'freshcodex',sessionRef:{provider:'codex',sessionId:threadId}})
+      await ws.waitFor(f=>f.type==='freshAgent.created' && f.requestId==='codex-settings-default-resume',30_000,'settings-free create resumes cleared defaults from the ledger')
+      const response = await fetch(`${server.info.baseUrl}/api/fresh-agent/threads/freshcodex/codex/${encodeURIComponent(threadId)}`,{headers:{'x-auth-token':server.info.token}})
+      expect(response.ok).toBe(true)
+      expect((await response.json() as any).settings).toEqual({model:'gpt-5.3-codex-spark',effort:null,cwd:nestedCwd,sandbox:'read-only',permissionMode:'never',collaborationMode:'plan'})
+      await sendAndConsumeTerminal('codex-default-after-second-restart','native Default after actual restart')
+      const afterDefault = readJsonl(opLogPath).filter(op=>op.method==='turn/start')
+      expect(afterDefault).toHaveLength(3)
+      expect(afterDefault[2].params).not.toHaveProperty('effort')
+      expect(afterDefault[2].params).toMatchObject({cwd:nestedCwd,sandboxPolicy:{type:'readOnly'},approvalPolicy:'never',collaborationMode:{mode:'plan',settings:{model:'gpt-5.3-codex-spark',reasoning_effort:null,developer_instructions:null}}})
     } finally {
       ws?.close()
       await server.stop().catch(() => {})

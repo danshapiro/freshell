@@ -18,6 +18,8 @@ export const FreshAgentSettingScopesSchema = z.object({
   effort: FreshAgentSettingScopeSchema.optional(),
   sandbox: FreshAgentSettingScopeSchema.optional(),
   permissionMode: FreshAgentSettingScopeSchema.optional(),
+  cwd: FreshAgentSettingScopeSchema.optional(),
+  collaborationMode: FreshAgentSettingScopeSchema.optional(),
 }).strict()
 export type FreshAgentSettingScopes = z.infer<typeof FreshAgentSettingScopesSchema>
 
@@ -53,9 +55,12 @@ export const FreshAgentTokenUsageSchema = z.object({
 }).strict()
 
 export const FreshAgentSettingsSchema = z.object({
+  cwd: z.string().min(1).optional(),
+  sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
+  collaborationMode: z.enum(['default', 'plan']).optional(),
   model: z.string().min(1).optional(),
   permissionMode: z.string().min(1).optional(),
-  effort: z.string().trim().min(1).optional(),
+  effort: z.string().trim().min(1).nullable().optional(),
   plugins: z.array(z.string()).optional(),
 }).strict()
 

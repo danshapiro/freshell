@@ -1792,6 +1792,8 @@ impl FreshProvider {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentLaunchSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collaboration_mode: Option<String>,
     /// Stable presentation/session key used by the external Freshell wire.
     pub session_id: String,
     pub provider: FreshProvider,
@@ -1845,6 +1847,10 @@ impl FreshAgentLaunchSpec {
             FreshProvider::Opencode => "freshopencode",
         };
         if self.session_id.is_empty()
+            || self
+                .collaboration_mode
+                .as_deref()
+                .is_some_and(|mode| !matches!(mode, "default" | "plan"))
             || self.session_type != expected_type
             || self.runtime_variant.is_empty()
             || self.provider_store_id.is_empty()
@@ -2540,11 +2546,17 @@ pub struct TerminalInputRequest {
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentTurnSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collaboration_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effort: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "double_optional"
+    )]
+    pub effort: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2554,7 +2566,7 @@ pub struct FreshAgentTurnSettings {
 impl FreshAgentTurnSettings {
     /// The effort a provider's live `freshAgent.configure` ends on. A
     /// configure states only what changed, except that the model selector's
-    /// Default thinking row is sent as an absent effort. Claude and Kilroy
+    /// Default thinking row historically used an absent effort. Claude and Kilroy
     /// read that absence as Default when the model changes, OpenCode always
     /// does, and Codex keeps the session's effort. Every durable copy of a
     /// hosted profile (the host actor's and the supervisor's recovery record)
@@ -2567,7 +2579,7 @@ impl FreshAgentTurnSettings {
         current_effort: Option<&str>,
     ) -> Option<String> {
         if let Some(effort) = &self.effort {
-            return Some(effort.clone());
+            return effort.clone();
         }
         let absent_means_default = match provider {
             FreshProvider::Claude | FreshProvider::Kilroy => self
@@ -4431,6 +4443,7 @@ mod tests {
 
     fn fresh_agent_launch(provider: FreshProvider, session_type: &str) -> FreshAgentLaunchSpec {
         FreshAgentLaunchSpec {
+            collaboration_mode: None,
             session_id: "presentation-one".into(),
             provider,
             session_type: session_type.into(),

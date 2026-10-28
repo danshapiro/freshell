@@ -62,11 +62,10 @@ use freshell_codex::launch_lifecycle::{
 use freshell_codex::launch_plan::{codex_sidecar_spawn_spec, CodexSidecarLaunchContext};
 use freshell_codex::transport::{reap_owned_codex_sidecars, TungsteniteTransport};
 use freshell_codex::{
-    mint_ownership_id, normalize_codex_thread_status, normalize_freshcodex_effort,
-    normalize_freshcodex_model, read_rollout_history_mode, to_codex_reasoning_effort,
-    CodexAdapterEvent, CodexAppServerClient, CodexAppServerError, CodexNotification, CodexStatus,
-    CodexSubscription, HistoryMode, StartThreadParams, StartTurnParams, ThreadForkParams,
-    CODEX_SIDECAR_OWNERSHIP_ENV,
+    mint_ownership_id, normalize_codex_thread_status, read_rollout_history_mode,
+    to_codex_reasoning_effort, CodexAdapterEvent, CodexAppServerClient, CodexAppServerError,
+    CodexNotification, CodexStatus, CodexSubscription, HistoryMode, StartThreadParams,
+    StartTurnParams, ThreadForkParams, CODEX_SIDECAR_OWNERSHIP_ENV,
 };
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCompact, FreshAgentConfigure,
@@ -83,6 +82,8 @@ use crate::summary::{
 use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
 
 pub mod children;
+pub mod settings;
+use settings::{CodexEffectiveSettings, CodexWorkMode};
 mod controls;
 mod elicitation;
 mod metadata;
@@ -526,6 +527,9 @@ struct CodexCreateRecord {
 /// One live freshcodex session: the app-server client, its owned sidecar, and the
 /// normalized create-time settings a later `send` re-uses.
 struct CodexSession {
+    collaboration_mode: Option<CodexWorkMode>,
+    native_turn_settings: Option<CodexEffectiveSettings>,
+    native_thread_settings: Option<Value>,
     turn_state: SharedCodexTurnState,
     projection: Arc<StdMutex<projection::CodexProjection>>,
     client: Arc<CodexAppServerClient>,
@@ -683,6 +687,37 @@ struct CodexSession {
     /// site filters hollow `Some`s away (focused-ep1-r5 Finding 2): a
     /// partially initialized client's hello never lands here.
     provenance: Option<crate::BindProvenance>,
+}
+
+impl CodexSession {
+    fn effective_settings(&self) -> CodexEffectiveSettings {
+        let mut settings = CodexEffectiveSettings {
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+            cwd: self.cwd.clone(),
+            sandbox: self.sandbox.clone(),
+            permission_mode: self.permission_mode.clone(),
+            collaboration_mode: self.collaboration_mode,
+        };
+        // Historical lineage-only resumes have no recorded next-turn intent.
+        // Their native observations still supply working/display defaults;
+        // provenance-only refreshes keep the raw blank sentinel untouched.
+        if self.model.is_empty() {
+            if let Some(native) = &self.native_thread_settings {
+                settings.adopt_native(native);
+            }
+        }
+        settings
+    }
+
+    fn apply_settings(&mut self, settings: &CodexEffectiveSettings) {
+        self.model = settings.model.clone();
+        self.effort = settings.effort.clone();
+        self.cwd = settings.cwd.clone();
+        self.sandbox = settings.sandbox.clone();
+        self.permission_mode = settings.permission_mode.clone();
+        self.collaboration_mode = settings.collaboration_mode;
+    }
 }
 
 struct CodexCheckpointIdentityProbe {
@@ -1698,6 +1733,7 @@ impl FreshCodexState {
         permission_mode: Option<&str>,
         effort: Option<&str>,
         cwd: Option<&str>,
+        collaboration_mode: Option<CodexWorkMode>,
         supersedes: Option<&str>,
         // D8 provenance stamps — `Some` from connection-scoped creates and
         // from the fork lane (the RESOLVED fork provenance: forking
@@ -1726,6 +1762,7 @@ impl FreshCodexState {
             return Ok(());
         };
         let settings = crate::identity_sink::FreshAgentSettings {
+            collaboration_mode: collaboration_mode.map(|mode| mode.as_str().into()),
             model: if model.is_empty() {
                 None
             } else {
@@ -1950,6 +1987,8 @@ impl FreshCodexState {
             snapshot["status"] = json!("exited");
         }
         self.overlay_controls(session_id, &mut snapshot).await;
+        self.overlay_settings_snapshot(session_id, &mut snapshot)
+            .await;
         let pending = self.retained_control_events(session_id).await;
         let marks = self
             .attention_marks()
@@ -2218,33 +2257,43 @@ impl FreshCodexState {
                 .unwrap_or_default(),
             None => crate::identity_sink::FreshAgentSettings::default(),
         };
-        let cwd = msg.cwd.clone().or(rec.cwd);
         let raw_model = msg
             .model
             .clone()
             .or_else(|| {
                 msg.model_selection
                     .as_ref()
-                    .and_then(|s| s.as_ref())
-                    .map(|s| s.model_id.clone())
+                    .and_then(|selection| selection.as_ref())
+                    .map(|selection| selection.model_id.clone())
             })
             .or(rec.model);
-        let model = normalize_freshcodex_model(raw_model.as_deref());
-        let raw_effort = msg.effort.clone().or(rec.effort);
-        let effort = normalize_freshcodex_effort(Some(&model), raw_effort.as_deref());
-        let mut sandbox = msg.sandbox.map(sandbox_wire_value).or(rec.sandbox);
-        let mut permission_mode = msg.permission_mode.clone().or(rec.permission_mode);
-        if let Err(error) = normalize_codex_permission(&mut permission_mode, &mut sandbox) {
-            self.fail_create(&request_id, "FRESH_AGENT_CREATE_FAILED", error);
-            return;
-        }
-
-        // Keep nonempty native values for native validation; discovery is not
-        // exhaustive for custom providers.
-        if let Err(err) = to_codex_reasoning_effort(effort.as_deref()) {
-            self.fail_create(&request_id, "FRESH_AGENT_CREATE_FAILED", &err.to_string());
-            return;
-        }
+        let base = CodexEffectiveSettings {
+            model: raw_model.unwrap_or_default(),
+            effort: msg.effort.clone().unwrap_or(rec.effort),
+            cwd: msg.cwd.clone().or(rec.cwd),
+            sandbox: msg.sandbox.map(sandbox_wire_value).or(rec.sandbox),
+            permission_mode: msg.permission_mode.clone().or(rec.permission_mode),
+            collaboration_mode: None,
+        };
+        let patch = freshell_protocol::FreshAgentSendSettings {
+            collaboration_mode: msg.collaboration_mode.clone().or(rec.collaboration_mode),
+            ..Default::default()
+        };
+        let effective = match CodexEffectiveSettings::resolve(&base, &patch) {
+            Ok(settings) => settings,
+            Err(error) => {
+                self.fail_create(&request_id, error.code, &error.message);
+                return;
+            }
+        };
+        let CodexEffectiveSettings {
+            model,
+            effort,
+            cwd,
+            sandbox,
+            permission_mode,
+            collaboration_mode,
+        } = effective;
 
         // FIX (CODEX-FIRST triage Finding 1): a `freshAgent.create` carrying
         // `resumeSessionId` must RESUME the existing thread -- mirroring the reference's
@@ -2478,6 +2527,7 @@ impl FreshCodexState {
                 effort,
                 sandbox,
                 permission_mode,
+                collaboration_mode,
                 lease_guard,
                 own_ticket,
                 provenance,
@@ -2583,8 +2633,8 @@ impl FreshCodexState {
                 history_mode: Some(HistoryMode::Paginated),
             })
             .await;
-        let thread_id = match started {
-            Ok(started) => started.thread_id,
+        let started = match started {
+            Ok(started) => started,
             Err(err) => {
                 client.close().await;
                 let mut child = child;
@@ -2595,6 +2645,25 @@ impl FreshCodexState {
                 return;
             }
         };
+
+        let thread_id = started.thread_id.clone();
+        let mut effective = CodexEffectiveSettings {
+            model,
+            effort,
+            cwd,
+            sandbox,
+            permission_mode,
+            collaboration_mode,
+        };
+        effective.adopt_native(&started.effective_settings);
+        let CodexEffectiveSettings {
+            model,
+            effort,
+            cwd,
+            sandbox,
+            permission_mode,
+            collaboration_mode,
+        } = effective;
 
         // b8ke ext r22 F1: the MINT-TIME REKEY — the SAME ticket's
         // in-flight record moves from the pane-scoped provisional key to
@@ -2664,6 +2733,8 @@ impl FreshCodexState {
             cwd,
             sandbox,
             permission_mode,
+            collaboration_mode,
+            started.effective_settings.clone(),
             None,
             // Threads freshell starts are paginated (we SET the mode at start).
             Some(HistoryMode::Paginated),
@@ -2708,6 +2779,7 @@ impl FreshCodexState {
         effort: Option<String>,
         sandbox: Option<String>,
         permission_mode: Option<String>,
+        collaboration_mode: Option<CodexWorkMode>,
         mut lease_guard: Option<crate::FreshSessionLeaseGuard>,
         // kata b8ke Task 3: the coordinator claim ticket from
         // `handle_create`'s resume lane — every failure return below drops
@@ -2869,6 +2941,23 @@ impl FreshCodexState {
             return;
         }
         let thread_id = resume_session_id;
+        let mut effective = CodexEffectiveSettings {
+            model,
+            effort,
+            cwd,
+            sandbox,
+            permission_mode,
+            collaboration_mode,
+        };
+        effective.adopt_native(&started.effective_settings);
+        let CodexEffectiveSettings {
+            model,
+            effort,
+            cwd,
+            sandbox,
+            permission_mode,
+            collaboration_mode,
+        } = effective;
         self.clear_dead_thread(&thread_id).await;
 
         // Retire-on-kill round 2/3 (focused-ep5-r1 Finding 2, -r2 Finding
@@ -2939,6 +3028,8 @@ impl FreshCodexState {
             cwd,
             sandbox,
             permission_mode,
+            collaboration_mode,
+            started.effective_settings.clone(),
             lease_guard,
             history_mode,
             own_ticket,
@@ -2973,6 +3064,8 @@ impl FreshCodexState {
         cwd: Option<String>,
         sandbox: Option<String>,
         permission_mode: Option<String>,
+        collaboration_mode: Option<CodexWorkMode>,
+        native_thread_settings: Value,
         mut lease_guard: Option<crate::FreshSessionLeaseGuard>,
         // Kata 1wxv Task 2: the thread's durable history mode — `Some(Paginated)`
         // for threads freshell started, the rollout-meta parse for resumes.
@@ -3138,6 +3231,9 @@ impl FreshCodexState {
         self.sessions.lock().await.insert(
             thread_id.clone(),
             CodexSession {
+                collaboration_mode,
+                native_turn_settings: None,
+                native_thread_settings: Some(native_thread_settings),
                 turn_state: turn_state.clone(),
                 client,
                 model: model.clone(),
@@ -3279,6 +3375,7 @@ impl FreshCodexState {
                 permission_mode.as_deref(),
                 effort.as_deref(),
                 cwd.as_deref(),
+                collaboration_mode,
                 None,
                 provenance.as_ref(),
                 // Unified agent names (Task 4, T2-M5): the naming classification
@@ -3424,7 +3521,7 @@ impl FreshCodexState {
             session_type: SESSION_TYPE.to_string(),
             session_ref: Some(SessionLocator {
                 provider: PROVIDER.to_string(),
-                session_id: thread_id,
+                session_id: thread_id.clone(),
             }),
             name_ref,
             session_name,
@@ -3435,6 +3532,18 @@ impl FreshCodexState {
         // notification already buffered on `notifs` is only delivered to the consumer
         // (and thus only broadcast) from this point on.
         let _ = created_tx.send(());
+        self.publish_codex_settings(
+            &thread_id,
+            &CodexEffectiveSettings {
+                model,
+                effort,
+                cwd,
+                sandbox,
+                permission_mode,
+                collaboration_mode,
+            },
+            None,
+        );
     }
 
     /// REVIEW FIX (item 3): legacy's `freshAgent.create.failed` sends `retryable: true` on
@@ -3512,10 +3621,12 @@ impl FreshCodexState {
                         s.cwd.clone(),
                         s.sandbox.clone(),
                         s.permission_mode.clone(),
+                        s.collaboration_mode,
                     )
                 })
             };
-            if let Some((model, effort, cwd, sandbox, permission_mode)) = parked {
+            if let Some((model, effort, cwd, sandbox, permission_mode, collaboration_mode)) = parked
+            {
                 let _ = self
                     .record_codex_binding(
                         thread_id,
@@ -3525,6 +3636,7 @@ impl FreshCodexState {
                         permission_mode.as_deref(),
                         effort.as_deref(),
                         cwd.as_deref(),
+                        collaboration_mode,
                         None,
                         Some(&p),
                         // Unified agent names: a refresh carries no naming fact.
@@ -3726,67 +3838,59 @@ impl FreshCodexState {
 
         // Read defaults after acquiring the turn lock: a queued send inherits the
         // last accepted settings, while this message's explicit choices win.
-        let stored = {
-            let sessions = self.sessions.lock().await;
-            sessions.get(&session_id).map(|s| {
-                (
-                    s.model.clone(),
-                    s.effort.clone(),
-                    s.cwd.clone(),
-                    s.sandbox.clone(),
-                    s.permission_mode.clone(),
-                )
-            })
-        };
-        let Some((stored_model, stored_effort, stored_cwd, stored_sandbox, stored_permission)) =
-            stored
-        else {
+        let stored = self
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .map(CodexSession::effective_settings);
+        let Some(stored) = stored else {
             self.send_error(&request_id, "SESSION_NOT_FOUND", "codex session not found");
             return;
         };
-        let settings = msg.settings.as_ref();
-        let model = settings
-            .and_then(|s| s.model.clone())
-            .unwrap_or(stored_model);
-        let effort = settings.and_then(|s| s.effort.clone()).or(stored_effort);
-        let turn_cwd = settings.and_then(|s| s.cwd.clone()).or(stored_cwd).or(cwd);
-        let mut sandbox = settings
-            .and_then(|s| s.sandbox)
-            .map(sandbox_wire_value)
-            .or(stored_sandbox);
-        let mut permission_mode = settings
-            .and_then(|s| s.permission_mode.clone())
-            .or(stored_permission);
-        if let Err(error) = normalize_codex_permission(&mut permission_mode, &mut sandbox) {
-            self.send_error(&request_id, "INVALID_PERMISSION_MODE", error);
-            return;
+        let mut patch = msg.settings.clone().unwrap_or_default();
+        if patch.cwd.is_none() && stored.cwd.is_none() {
+            patch.cwd = cwd;
         }
-
-        // Re-normalize model/effort on send (adapter.ts:961-963) — idempotent for stored values.
-        let model = normalize_freshcodex_model(Some(&model));
-        let effort = normalize_freshcodex_effort(Some(&model), effort.as_deref());
-        let effort = if effort.as_deref() == Some("max") {
+        let effective = match CodexEffectiveSettings::resolve(&stored, &patch) {
+            Ok(settings) => settings,
+            Err(error) => {
+                self.send_error(&request_id, error.code, &error.message);
+                return;
+            }
+        };
+        let model = effective.model.clone();
+        let effort = effective.effort.clone();
+        let turn_cwd = effective.cwd.clone();
+        let sandbox = effective.sandbox.clone();
+        let permission_mode = effective.permission_mode.clone();
+        let wire_choice = if effort.as_deref() == Some("max") {
             match freshell_codex::catalog::read_models(&client).await {
                 Ok(catalog) => Some(freshell_codex::catalog::resolve_legacy_effort(
                     &model, "max", &catalog,
                 )),
                 Err(error) => {
                     tracing::warn!(provider=PROVIDER, session_id=%session_id, request_id=?request_id, cause=%error, "freshagent.codex.effort_catalog_unavailable");
-                    effort
+                    effort.clone()
                 }
             }
         } else {
-            effort
+            effort.clone()
         };
-        let wire_effort = match to_codex_reasoning_effort(effort.as_deref()) {
+        let wire_effort = match to_codex_reasoning_effort(wire_choice.as_deref()) {
             Ok(value) => value,
-            Err(err) => {
-                self.send_error(&request_id, "INVALID_EFFORT", &err.to_string());
+            Err(error) => {
+                self.send_error(&request_id, "INVALID_EFFORT", &error.to_string());
                 return;
             }
         };
+        let native_settings = CodexEffectiveSettings {
+            effort: wire_effort.clone(),
+            ..effective.clone()
+        };
 
         let params = StartTurnParams {
+            collaboration_mode: native_settings.native_collaboration_mode(),
             thread_id: session_id.clone(),
             input: codex_user_input(&msg.text, msg.images.as_deref()),
             cwd: turn_cwd.clone(),
@@ -3943,12 +4047,11 @@ impl FreshCodexState {
         // keep the previous working settings for resume and retry.
         let mut settings_changed = false;
         if let Some(session) = self.sessions.lock().await.get_mut(&session_id) {
-            settings_changed = session.model != model || session.effort != effort;
-            session.model = model.clone();
-            session.effort = effort.clone();
-            session.cwd = turn_cwd.clone();
-            session.sandbox = sandbox.clone();
-            session.permission_mode = permission_mode.clone();
+            settings_changed = session.effective_settings() != effective;
+            session.apply_settings(&effective);
+            if expected_turn_id.is_none() {
+                session.native_turn_settings = Some(native_settings);
+            }
         }
         // b8ke ext r29 F3: the post-send binding refresh carries the
         // operation's CLAIM pair (captured above, right after ensure-alive)
@@ -3974,6 +4077,7 @@ impl FreshCodexState {
                 permission_mode.as_deref(),
                 effort.as_deref(),
                 turn_cwd.as_deref(),
+                effective.collaboration_mode,
                 None,
                 // Send/settings mutation is not a new browser assertion — conn-less
                 // (merge keeps prior stamps, ep4 writer rules).
@@ -4005,14 +4109,7 @@ impl FreshCodexState {
         // a device that missed the configure still lands here). Keyed at the
         // client-addressed id, the same stamp the accepted frame below uses.
         if settings_changed {
-            self.broadcast(&crate::session_metadata::session_metadata_frame(
-                PROVIDER,
-                SESSION_TYPE,
-                &session_id,
-                Some(model.as_str()),
-                effort.as_deref(),
-                None,
-            ));
+            self.publish_codex_settings(&session_id, &effective, request_id.as_deref());
         }
 
         // Unified agent names (Task 4): the shared accepted-input callback —
@@ -4274,100 +4371,152 @@ impl FreshCodexState {
     /// unknown session surfaces on the pane's error banner.
     pub async fn handle_configure(&self, msg: FreshAgentConfigure) {
         let session_id = msg.session_id.clone();
-        let stored = {
-            let sessions = self.sessions.lock().await;
-            sessions.get(&session_id).map(|s| {
-                (
-                    s.model.clone(),
-                    s.effort.clone(),
-                    s.sandbox.clone(),
-                    s.permission_mode.clone(),
-                    s.cwd.clone(),
-                )
-            })
-        };
-        let Some((stored_model, stored_effort, stored_sandbox, stored_permission, stored_cwd)) =
-            stored
-        else {
-            self.emit_fresh_agent_error(
+        let target = self
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .map(|session| (session.turn_lock.clone(), session.client.clone()));
+        let Some((turn_lock, client)) = target else {
+            self.configure_error(
                 &session_id,
+                msg.request_id.as_deref(),
                 "INVALID_SESSION_ID",
                 "codex session not found",
             );
             return;
         };
-
-        let settings = &msg.settings;
-        let mut model = settings
-            .model
-            .clone()
-            .unwrap_or_else(|| stored_model.clone());
-        let effort = settings.effort.clone().or_else(|| stored_effort.clone());
-        let mut sandbox = settings
-            .sandbox
-            .map(sandbox_wire_value)
-            .or_else(|| stored_sandbox.clone());
-        let mut permission_mode = settings
-            .permission_mode
-            .clone()
-            .or_else(|| stored_permission.clone());
-        if let Err(error) = normalize_codex_permission(&mut permission_mode, &mut sandbox) {
-            self.emit_fresh_agent_error(&session_id, "INVALID_PERMISSION_MODE", error);
+        // Keep the operation's retained owner fence across both the turn wait
+        // and durable write. Never sample a replacement owner's generation.
+        let (epoch, generation) = self
+            .ownership_stamps
+            .lock()
+            .expect("ownership stamps lock")
+            .get(&session_id)
+            .map(|stamp| (Some(stamp.epoch), Some(stamp.generation)))
+            .unwrap_or((None, None));
+        let _turn = turn_lock.lock().await;
+        let stored = self
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .filter(|session| {
+                Arc::ptr_eq(&client, &session.client) && !session.exited.load(Ordering::SeqCst)
+            })
+            .map(CodexSession::effective_settings);
+        let Some(stored) = stored else {
+            self.configure_error(
+                &session_id,
+                msg.request_id.as_deref(),
+                "SESSION_RESERVED",
+                "The Codex runtime changed while settings waited; refresh before changing them.",
+            );
+            return;
+        };
+        let mut patch = msg.settings;
+        patch.cwd = patch.cwd.or(msg.cwd);
+        let effective = match CodexEffectiveSettings::resolve(&stored, &patch) {
+            Ok(settings) => settings,
+            Err(error) => {
+                self.configure_error(
+                    &session_id,
+                    msg.request_id.as_deref(),
+                    error.code,
+                    &error.message,
+                );
+                return;
+            }
+        };
+        if effective == stored {
             return;
         }
-        // Re-normalize on configure (the same idempotent pass send applies).
-        model = normalize_freshcodex_model(Some(&model));
-        let effort = normalize_freshcodex_effort(Some(&model), effort.as_deref());
-        if let Err(err) = to_codex_reasoning_effort(effort.as_deref()) {
-            self.emit_fresh_agent_error(&session_id, "INVALID_EFFORT", &err.to_string());
-            return;
-        }
-
-        let settings_changed = stored_model != model
-            || stored_effort != effort
-            || stored_sandbox != sandbox
-            || stored_permission != permission_mode;
-        if !settings_changed {
-            // Idempotent configure: nothing to converge.
-            return;
-        }
-        if let Some(session) = self.sessions.lock().await.get_mut(&session_id) {
-            session.model = model.clone();
-            session.effort = effort.clone();
-            session.sandbox = sandbox.clone();
-            session.permission_mode = permission_mode.clone();
-        }
-        let _ = self
+        if let Err(error) = self
             .record_codex_binding(
                 &session_id,
                 None,
-                &model,
-                sandbox.as_deref(),
-                permission_mode.as_deref(),
-                effort.as_deref(),
-                stored_cwd.as_deref(),
-                None,
-                // A settings record is not a new browser assertion — conn-less
-                // (the ledger merge keeps the row's prior stamps).
-                None,
-                // Unified agent names: a settings refresh carries no naming fact.
+                &effective.model,
+                effective.sandbox.as_deref(),
+                effective.permission_mode.as_deref(),
+                effective.effort.as_deref(),
+                effective.cwd.as_deref(),
+                effective.collaboration_mode,
                 None,
                 None,
                 None,
+                epoch,
+                generation,
                 false,
             )
-            .await;
+            .await
+        {
+            tracing::warn!(provider=PROVIDER, session_id=%session_id, request_id=?msg.request_id, error=%error, "freshagent.codex.configure_persist_failed");
+            self.configure_error(
+                &session_id,
+                msg.request_id.as_deref(),
+                "CODEX_SETTINGS_PERSIST_FAILED",
+                "Could not save Codex settings. The previous settings remain active; try again.",
+            );
+            return;
+        }
+        let applied = {
+            let mut sessions = self.sessions.lock().await;
+            match sessions
+                .get_mut(&session_id)
+                .filter(|session| Arc::ptr_eq(&client, &session.client))
+            {
+                Some(session) => {
+                    session.apply_settings(&effective);
+                    true
+                }
+                None => false,
+            }
+        };
+        if !applied {
+            self.configure_error(
+                &session_id,
+                msg.request_id.as_deref(),
+                "SESSION_RESERVED",
+                "The Codex runtime changed while saving settings; refresh before changing them.",
+            );
+            return;
+        }
+        self.publish_codex_settings(&session_id, &effective, msg.request_id.as_deref());
+    }
 
-        // Broadcast keyed at the CLIENT-ADDRESSED id: the client's fold
-        // resolves the sessions-map entry by it.
-        self.broadcast(&crate::session_metadata::session_metadata_frame(
-            PROVIDER,
-            SESSION_TYPE,
-            &session_id,
-            Some(model.as_str()),
-            effort.as_deref(),
-            None,
-        ));
+    fn configure_error(
+        &self,
+        session_id: &str,
+        request_id: Option<&str>,
+        code: &str,
+        message: &str,
+    ) {
+        self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            event: json!({"type":"freshAgent.error","sessionId":session_id,"requestId":request_id,"code":code,"message":message}),
+            provider: PROVIDER.into(), session_type: SESSION_TYPE.into(), session_id: session_id.into(),
+        }));
+    }
+
+    fn publish_codex_settings(
+        &self,
+        session_id: &str,
+        settings: &CodexEffectiveSettings,
+        request_id: Option<&str>,
+    ) {
+        let mut event = settings.as_json();
+        event["type"] = json!("freshAgent.session.metadata");
+        event["sessionId"] = json!(session_id);
+        event["effort"] = json!(settings.effort);
+        event["settingsScope"] = json!("next-turn");
+        if let Some(request_id) = request_id {
+            event["requestId"] = json!(request_id);
+        }
+        self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            event,
+            provider: PROVIDER.into(),
+            session_type: SESSION_TYPE.into(),
+            session_id: session_id.into(),
+        }));
     }
 
     // ── freshAgent.interrupt (WS) ────────────────────────────────────────────
@@ -5240,6 +5389,7 @@ impl FreshCodexState {
                     s.cwd.clone(),
                     s.sandbox.clone(),
                     s.permission_mode.clone(),
+                    s.collaboration_mode,
                     // Fork precedence source (2) (focused-ep1-r3/r5): the
                     // parent's PARKED provenance (the child pane continues
                     // the parent's lineage in the same client context).
@@ -5254,6 +5404,7 @@ impl FreshCodexState {
             parent_cwd,
             parent_sandbox,
             parent_permission_mode,
+            parent_collaboration_mode,
             parent_provenance,
         )) = looked_up
         else {
@@ -5544,6 +5695,24 @@ impl FreshCodexState {
             return;
         }
 
+        let mut effective = CodexEffectiveSettings {
+            model: eff_model,
+            effort: parent_effort,
+            cwd: eff_cwd,
+            sandbox: parent_sandbox,
+            permission_mode: parent_permission_mode,
+            collaboration_mode: parent_collaboration_mode,
+        };
+        effective.adopt_native(&resumed.effective_settings);
+        let CodexEffectiveSettings {
+            model: eff_model,
+            effort: parent_effort,
+            cwd: eff_cwd,
+            sandbox: parent_sandbox,
+            permission_mode: parent_permission_mode,
+            collaboration_mode: parent_collaboration_mode,
+        } = effective;
+
         // Register the child on its OWN sidecar (the shared registration tail, the
         // ensure_session_resumable shape), inheriting the parent's settings. The
         // child rollout's durable session_meta is the history-mode SoT (kata 1wxv
@@ -5561,6 +5730,8 @@ impl FreshCodexState {
             eff_cwd.clone(),
             parent_sandbox.clone(),
             parent_permission_mode.clone(),
+            parent_collaboration_mode,
+            resumed.effective_settings.clone(),
             read_rollout_history_mode(&child_id),
             fork_provenance.clone(),
         )
@@ -5582,6 +5753,7 @@ impl FreshCodexState {
                 parent_permission_mode.as_deref(),
                 parent_effort.as_deref(),
                 eff_cwd.as_deref(),
+                parent_collaboration_mode,
                 None,
                 fork_provenance.as_ref(),
                 // Unified agent names (Task 4): the fork's naming classification
@@ -6756,10 +6928,9 @@ impl FreshCodexState {
     /// the OLD mint-new path silently discarded the model's memory of the conversation).
     ///
     /// If the app-server rejects the resume WITH those settings for any reason other than a
-    /// genuine "thread not found" (a stale/invalid model or sandbox value, say), one retry is
-    /// made with NO settings at all -- `handle_send`'s own "re-normalize on send" already
-    /// re-applies the real settings on the next turn, so a resume succeeding with defaults is
-    /// strictly better than failing over a value we can't currently validate.
+    /// genuine "thread not found", one retry may omit a stale model. File access
+    /// and approval remain exact on that retry. Untrusted policy refusal returns
+    /// directly, preserving its prepared-source diagnostic before any work.
     ///
     /// Only a genuine `threadNotFound` on resume ([`is_codex_thread_not_found`]) falls back to
     /// the ORIGINAL mint-new-thread behavior ([`Self::respawn_as_new_thread_after_crash`]):
@@ -6813,6 +6984,7 @@ impl FreshCodexState {
             session_effort,
             session_sandbox,
             session_permission_mode,
+            session_collaboration_mode,
             session_provenance,
         ) = {
             let guard = self.sessions.lock().await;
@@ -6826,6 +6998,7 @@ impl FreshCodexState {
                 session.effort.clone(),
                 session.sandbox.clone(),
                 session.permission_mode.clone(),
+                session.collaboration_mode,
                 // D8 (focused-ep1-r3): the parked provenance rides ACROSS the
                 // recovery rebuild below (and into the mint-new fallback) — the
                 // same logical session continues; nothing new is invented (the
@@ -6838,25 +7011,30 @@ impl FreshCodexState {
         // P1.13 (Task 5, R2): a blank stored model means this registration came from a
         // settings-less resume (a record miss at R3 time) -- fall back to the ledger
         // record so crash recovery doesn't silently respawn onto defaults.
-        let (model, sandbox, permission_mode, effort) = if session_model.is_empty() {
-            let rec = self
-                .identity_sink()
-                .and_then(|s| s.load_settings("codex", session_id))
-                .unwrap_or_default();
-            (
-                rec.model.unwrap_or_default(),
-                rec.sandbox,
-                rec.permission_mode,
-                rec.effort,
-            )
-        } else {
-            (
-                session_model,
-                session_sandbox,
-                session_permission_mode,
-                session_effort,
-            )
-        };
+        let (model, sandbox, permission_mode, effort, collaboration_mode) =
+            if session_model.is_empty() {
+                let rec = self
+                    .identity_sink()
+                    .and_then(|s| s.load_settings("codex", session_id))
+                    .unwrap_or_default();
+                (
+                    rec.model.unwrap_or_default(),
+                    rec.sandbox,
+                    rec.permission_mode,
+                    rec.effort,
+                    rec.collaboration_mode
+                        .as_deref()
+                        .and_then(CodexWorkMode::parse),
+                )
+            } else {
+                (
+                    session_model,
+                    session_sandbox,
+                    session_permission_mode,
+                    session_effort,
+                    session_collaboration_mode,
+                )
+            };
 
         // Single-flight: acquire (and possibly create) this session id's per-thread lock,
         // shared with `ensure_session_resumable`'s map so a concurrent historical-thread
@@ -7025,6 +7203,7 @@ impl FreshCodexState {
                     effort,
                     sandbox,
                     permission_mode,
+                    collaboration_mode,
                     lease_guard,
                     session_provenance,
                 )
@@ -7098,18 +7277,22 @@ impl FreshCodexState {
         let resume_result = match first_attempt {
             Ok(started) => Ok(started),
             Err(err) if is_codex_thread_not_found(&err) => Err(err),
-            // Not a "thread not found" -- retry once with no settings at all in case the
-            // app-server rejected one of them; `handle_send` re-applies the real settings
-            // on the next turn regardless.
-            Err(_) => {
+            // A retry without settings would drop prepared/explicit untrusted
+            // intent. Preserve the original typed refusal before any work.
+            Err(error) if permission_mode.as_deref() == Some("untrusted") => Err(error),
+            // A stale model may be unavailable after a provider update. Keep
+            // file access and approval intent on this retry: native defaults
+            // must never turn a settings refusal into broader access.
+            Err(error) => {
+                tracing::warn!(provider=PROVIDER, session_id=%session_id, cause=%error, "freshagent.codex.resume_retry_without_model");
                 client
                     .resume_thread(
                         session_id,
                         StartThreadParams {
                             cwd: cwd.clone(),
                             model: None,
-                            sandbox: None,
-                            approval_policy: None,
+                            sandbox: sandbox.clone(),
+                            approval_policy: permission_mode.clone(),
                             history_mode: None, // resume carries no mode param
                         },
                     )
@@ -7144,6 +7327,7 @@ impl FreshCodexState {
                         effort,
                         sandbox,
                         permission_mode,
+                        collaboration_mode,
                         lease_guard,
                         session_provenance,
                     )
@@ -7186,6 +7370,24 @@ impl FreshCodexState {
                 started.thread_id
             )));
         }
+
+        let mut effective = CodexEffectiveSettings {
+            model,
+            effort,
+            cwd,
+            sandbox,
+            permission_mode,
+            collaboration_mode,
+        };
+        effective.adopt_native(&started.effective_settings);
+        let CodexEffectiveSettings {
+            model,
+            effort,
+            cwd,
+            sandbox,
+            permission_mode,
+            collaboration_mode,
+        } = effective;
 
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let user_interrupt_pending: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
@@ -7273,6 +7475,9 @@ impl FreshCodexState {
             guard.insert(
                 session_id.to_string(),
                 CodexSession {
+                    collaboration_mode,
+                    native_turn_settings: None,
+                    native_thread_settings: Some(started.effective_settings.clone()),
                     turn_state: turn_state.clone(),
                     client,
                     model: model.clone(),
@@ -7326,6 +7531,7 @@ impl FreshCodexState {
                 permission_mode.as_deref(),
                 effort.as_deref(),
                 cwd.as_deref(),
+                collaboration_mode,
                 None,
                 None,
                 // Unified agent names: a refresh carries no naming fact.
@@ -7400,6 +7606,7 @@ impl FreshCodexState {
         effort: Option<String>,
         sandbox: Option<String>,
         permission_mode: Option<String>,
+        collaboration_mode: Option<CodexWorkMode>,
         mut lease_guard: Option<crate::FreshSessionLeaseGuard>,
         // D8 (focused-ep1-r3): the crashed session's parked provenance, CARRIED
         // onto the mint-new record below (the identity moved; the same logical
@@ -7435,8 +7642,8 @@ impl FreshCodexState {
                 history_mode: Some(HistoryMode::Paginated),
             })
             .await;
-        let new_thread_id = match started {
-            Ok(started) => started.thread_id,
+        let started = match started {
+            Ok(started) => started,
             Err(err) => {
                 client.close().await;
                 let mut child = child;
@@ -7450,6 +7657,25 @@ impl FreshCodexState {
                 return Err(EnsureAliveError::RespawnFailed(err.to_string()));
             }
         };
+
+        let new_thread_id = started.thread_id.clone();
+        let mut effective = CodexEffectiveSettings {
+            model,
+            effort,
+            cwd,
+            sandbox,
+            permission_mode,
+            collaboration_mode,
+        };
+        effective.adopt_native(&started.effective_settings);
+        let CodexEffectiveSettings {
+            model,
+            effort,
+            cwd,
+            sandbox,
+            permission_mode,
+            collaboration_mode,
+        } = effective;
 
         // kata b8ke Task 3: the mint-new fallback MINTS the canonical thread
         // id — claim it under the NEW key (no fence: a minted id was never
@@ -7589,6 +7815,9 @@ impl FreshCodexState {
             guard.insert(
                 new_thread_id.clone(),
                 CodexSession {
+                    collaboration_mode,
+                    native_turn_settings: None,
+                    native_thread_settings: Some(started.effective_settings.clone()),
                     turn_state: turn_state.clone(),
                     client,
                     model: model.clone(),
@@ -7669,6 +7898,7 @@ impl FreshCodexState {
                 permission_mode.as_deref(),
                 effort.as_deref(),
                 cwd.as_deref(),
+                collaboration_mode,
                 Some(old_session_id),
                 // D8: conn-less crash-respawn — provenance `None`; the ledger
                 // inherits the superseded parent's stamps (fork-chain rule).
@@ -8629,20 +8859,19 @@ impl FreshCodexState {
             snapshot["capabilities"]["interrupt"] = json!(true);
         }
         self.overlay_controls(thread_id, &mut snapshot).await;
-        if let Some(session) = self.sessions.lock().await.get(thread_id) {
-            let mut settings = Map::new();
-            if !session.model.is_empty() {
-                settings.insert("model".into(), json!(session.model));
-            }
-            if let Some(effort) = &session.effort {
-                settings.insert("effort".into(), json!(effort));
-            }
-            if let Some(permission) = &session.permission_mode {
-                settings.insert("permissionMode".into(), json!(permission));
-            }
-            snapshot["settings"] = Value::Object(settings);
-        }
+        self.overlay_settings_snapshot(thread_id, &mut snapshot)
+            .await;
         Ok(snapshot)
+    }
+
+    async fn overlay_settings_snapshot(&self, thread_id: &str, snapshot: &mut Value) {
+        if let Some(session) = self.sessions.lock().await.get(thread_id) {
+            snapshot["settings"] = session.effective_settings().as_json();
+            snapshot["extensions"]["codex"]["settings"] = json!({
+                "scope":"next-turn", "currentTurn":session.native_turn_settings.as_ref().map(CodexEffectiveSettings::as_json),
+                "lastThreadResponse":session.native_thread_settings.as_ref(),
+            });
+        }
     }
 
     /// Resolve the live client + active-turn bit for `thread_id` — FULLY
@@ -9150,7 +9379,7 @@ impl FreshCodexState {
                  running with default model and permissions. Reconfirm your settings.",
             );
         }
-        let rec = recovered.clone().unwrap_or_default();
+        let mut rec = recovered.clone().unwrap_or_default();
 
         // D8 (focused-ep1-r4 Finding 2 — the parking invariant's durable
         // half): this construction lane is CONN-LESS (attach / snapshot reads
@@ -9226,6 +9455,26 @@ impl FreshCodexState {
             )));
         }
 
+        if recovered.is_some() {
+            let mut effective = CodexEffectiveSettings {
+                model: rec.model.clone().unwrap_or_default(),
+                effort: rec.effort.clone(),
+                cwd: cwd.map(str::to_owned).or_else(|| rec.cwd.clone()),
+                sandbox: rec.sandbox.clone(),
+                permission_mode: rec.permission_mode.clone(),
+                collaboration_mode: rec
+                    .collaboration_mode
+                    .as_deref()
+                    .and_then(CodexWorkMode::parse),
+            };
+            effective.adopt_native(&started.effective_settings);
+            rec.model = (!effective.model.is_empty()).then_some(effective.model);
+            rec.effort = effective.effort;
+            rec.cwd = effective.cwd;
+            rec.sandbox = effective.sandbox;
+            rec.permission_mode = effective.permission_mode;
+        }
+
         // FIX (CODEX-FIRST triage Finding 2): the app-server just proved this id alive --
         // clear any stale "recently gone" marking so it doesn't linger.
         self.clear_dead_thread(thread_id).await;
@@ -9273,9 +9522,13 @@ impl FreshCodexState {
                 child,
                 rec.model.clone().unwrap_or_default(),
                 rec.effort.clone(),
-                cwd.map(str::to_string).or_else(|| rec.cwd.clone()),
+                rec.cwd.clone().or_else(|| cwd.map(str::to_string)),
                 rec.sandbox.clone(),
                 rec.permission_mode.clone(),
+                rec.collaboration_mode
+                    .as_deref()
+                    .and_then(CodexWorkMode::parse),
+                started.effective_settings.clone(),
                 // Kata 1wxv Task 2 (r3): the durable rollout meta carries the
                 // mode across resume (only a missing/unparseable meta ⇒ legacy).
                 read_rollout_history_mode(thread_id),
@@ -9382,7 +9635,10 @@ impl FreshCodexState {
                     rec.sandbox.as_deref(),
                     rec.permission_mode.as_deref(),
                     rec.effort.as_deref(),
-                    cwd.or(rec.cwd.as_deref()),
+                    rec.cwd.as_deref().or(cwd),
+                    rec.collaboration_mode
+                        .as_deref()
+                        .and_then(CodexWorkMode::parse),
                     None,
                     // D8: conn-less attach-resume refresh — provenance `None`
                     // keeps the row's existing stamps.
@@ -9502,6 +9758,8 @@ impl FreshCodexState {
         cwd: Option<String>,
         sandbox: Option<String>,
         permission_mode: Option<String>,
+        collaboration_mode: Option<CodexWorkMode>,
+        native_thread_settings: Value,
         // Kata 1wxv Task 2: the thread's durable history mode (the rollout-meta
         // parse the resume/fork callers perform post-RPC).
         history_mode: Option<HistoryMode>,
@@ -9569,6 +9827,9 @@ impl FreshCodexState {
         self.sessions.lock().await.insert(
             thread_id.to_string(),
             CodexSession {
+                collaboration_mode,
+                native_turn_settings: None,
+                native_thread_settings: Some(native_thread_settings),
                 turn_state: turn_state.clone(),
                 client,
                 model,
@@ -9667,6 +9928,9 @@ impl FreshCodexState {
         self.sessions.lock().await.insert(
             thread_id.to_string(),
             CodexSession {
+                collaboration_mode: None,
+                native_turn_settings: None,
+                native_thread_settings: None,
                 turn_state: turn_state.clone(),
                 client,
                 model: "gpt-5.3-codex-spark".to_string(),
@@ -10351,6 +10615,8 @@ fn build_codex_snapshot_json(
                 "effort": "per-send",
                 "sandbox": "per-send",
                 "permissionMode": "per-send",
+                "cwd": "per-send",
+                "collaborationMode": "per-send",
             },
         },
         "tokenUsage": {
@@ -12969,6 +13235,9 @@ pub(crate) mod tests {
         state.sessions.lock().await.insert(
             thread_id.to_string(),
             CodexSession {
+                collaboration_mode: None,
+                native_turn_settings: None,
+                native_thread_settings: None,
                 turn_state: turn_state.clone(),
                 client,
                 model: "gpt-5.3-codex-spark".to_string(),
@@ -13092,6 +13361,9 @@ pub(crate) mod tests {
         state.sessions.lock().await.insert(
             thread_id.to_string(),
             CodexSession {
+                collaboration_mode: None,
+                native_turn_settings: None,
+                native_thread_settings: None,
                 turn_state: turn_state.clone(),
                 client,
                 model: "gpt-5.3-codex-spark".to_string(),
@@ -13477,6 +13749,7 @@ pub(crate) mod tests {
         let sink = crate::naming::test_support::RecordingSink::new();
         st.set_session_naming(sink.clone());
         let create = FreshAgentCreate {
+            collaboration_mode: None,
             pane_id: None,
             observed_epoch: None,
             observed_generation: None,
@@ -14261,6 +14534,600 @@ pub(crate) mod tests {
             params["input"][1],
             json!({"type":"image","url":"data:image/png;base64,aGVsbG8="})
         );
+    }
+
+    async fn task008_settings_fixture() -> (
+        FreshCodexState,
+        freshell_codex::ChannelPeer,
+        tokio::sync::broadcast::Receiver<String>,
+        Arc<crate::identity_sink::FakeIdentitySink>,
+    ) {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifications) = CodexAppServerClient::connect(transport);
+        let (st, _) = state_with_bus();
+        let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(sink.clone());
+        let wire = insert_fake_session_with_real_consumer(
+            &st,
+            "thread-settings",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            notifications,
+            spawn_sleeper(),
+            &format!("task008-settings-{}", uuid::Uuid::new_v4()),
+        )
+        .await;
+        (st, peer, wire, sink)
+    }
+
+    async fn task008_settings_send(
+        st: &FreshCodexState,
+        peer: &freshell_codex::ChannelPeer,
+        settings: Value,
+    ) -> Value {
+        task008_settings_send_named(st, peer, settings, "turn-settings").await
+    }
+
+    async fn task008_settings_send_named(
+        st: &FreshCodexState,
+        peer: &freshell_codex::ChannelPeer,
+        settings: Value,
+        turn_id: &str,
+    ) -> Value {
+        let task = tokio::spawn({
+            let st = st.clone();
+            async move {
+                st.handle_send(serde_json::from_value(json!({
+                "provider":"codex", "sessionType":"freshcodex", "sessionId":"thread-settings",
+                "requestId":"settings-send", "text":"settings probe", "settings":settings,
+            })).unwrap()).await;
+            }
+        });
+        let (mut id, mut method, mut params) = peer.expect_request().await;
+        if method == "initialize" {
+            peer.respond(&id, json!({}));
+            peer.expect_notification().await;
+            (id, method, params) = peer.expect_request().await;
+        }
+        assert_eq!(method, "turn/start");
+        peer.respond(&id, json!({"turn":{"id":turn_id}}));
+        task.await.unwrap();
+        params
+    }
+
+    async fn task008_settings_snapshot(
+        st: &FreshCodexState,
+        peer: &freshell_codex::ChannelPeer,
+    ) -> Value {
+        let task = tokio::spawn({
+            let st = st.clone();
+            async move { st.get_snapshot("thread-settings", None).await.unwrap() }
+        });
+        let (id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "thread/read");
+        peer.respond(
+            &id,
+            json!({"thread":{"id":"thread-settings","status":{"type":"idle"},"turns":[]}}),
+        );
+        task.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn task008_settings_configure_cwd_reaches_the_next_native_start() {
+        let (st, peer, _, sink) = task008_settings_fixture().await;
+        st.handle_configure(serde_json::from_value(json!({"provider":"codex","sessionType":"freshcodex","sessionId":"thread-settings","settings":{"cwd":"/next","sandbox":"read-only","permissionMode":"never","model":"provider-current","effort":"ultra"}})).unwrap()).await;
+        let params = task008_settings_send(&st, &peer, Value::Null).await;
+        let saved = sink.load_settings("codex", "thread-settings");
+        peer.disconnect();
+        st.shutdown().await;
+        assert_eq!(params["cwd"], "/next");
+        assert_eq!(params["sandboxPolicy"]["type"], "readOnly");
+        assert_eq!(params["approvalPolicy"], "never");
+        assert_eq!(saved.unwrap().cwd.as_deref(), Some("/next"));
+    }
+
+    #[tokio::test]
+    async fn task008_settings_snapshot_exposes_complete_next_turn_defaults() {
+        let (st, peer, _, _) = task008_settings_fixture().await;
+        task008_settings_send(&st, &peer, json!({"cwd":"/next","sandbox":"read-only","permissionMode":"never","model":"provider-current","effort":"ultra"})).await;
+        let snapshot = task008_settings_snapshot(&st, &peer).await;
+        peer.disconnect();
+        st.shutdown().await;
+        assert_eq!(
+            snapshot["settings"],
+            json!({"cwd":"/next","sandbox":"read-only","permissionMode":"never","model":"provider-current","effort":"ultra","collaborationMode":"default"})
+        );
+        assert_eq!(snapshot["capabilities"]["settingScopes"]["cwd"], "per-send");
+    }
+
+    #[tokio::test]
+    async fn task008_settings_plan_and_explicit_build_use_native_collaboration_mode() {
+        let mut observed = Vec::new();
+        for mode in ["plan", "default"] {
+            let (st, peer, _, _) = task008_settings_fixture().await;
+            let params = task008_settings_send(&st, &peer, json!({"model":"provider-current","effort":"ultra","cwd":"/next","sandbox":"read-only","permissionMode":"never","collaborationMode":mode})).await;
+            peer.disconnect();
+            st.shutdown().await;
+            assert_eq!(params["sandboxPolicy"]["type"], "readOnly");
+            assert_eq!(params["approvalPolicy"], "never");
+            observed.push(params["collaborationMode"].clone());
+        }
+        assert_eq!(observed, ["plan", "default"].map(|mode| json!({"mode":mode,"settings":{"model":"provider-current","reasoning_effort":"ultra","developer_instructions":null}})));
+    }
+
+    #[tokio::test]
+    async fn task008_settings_newer_configure_survives_a_held_older_send_response() {
+        let (st, peer, mut wire, sink) = task008_settings_fixture().await;
+        let send = tokio::spawn({
+            let st = st.clone();
+            async move {
+                st.handle_send(serde_json::from_value(json!({"provider":"codex","sessionType":"freshcodex","sessionId":"thread-settings","text":"old settings","settings":{"model":"old-model","effort":"low","cwd":"/old","sandbox":"read-only","permissionMode":"on-request"}})).unwrap()).await;
+            }
+        });
+        let (id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "initialize");
+        peer.respond(&id, json!({}));
+        peer.expect_notification().await;
+        let (id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        let configure = st.handle_configure(serde_json::from_value(json!({"provider":"codex","sessionType":"freshcodex","sessionId":"thread-settings","requestId":"new-settings","settings":{"model":"new-model","effort":"ultra","cwd":"/new","sandbox":"workspace-write","permissionMode":"never","collaborationMode":"plan"}})).unwrap());
+        tokio::pin!(configure);
+        // Give the public configure an actual admission opportunity. It may
+        // finish now or serialize behind the held send; either ordering is valid.
+        let admitted = futures_util::poll!(&mut configure).is_ready();
+        peer.respond(&id, json!({"turn":{"id":"turn-old"}}));
+        send.await.unwrap();
+        if !admitted {
+            configure.await;
+        }
+        drain_wire(&mut wire);
+        peer.emit_notification(
+            "turn/completed",
+            json!({"threadId":"thread-settings","turn":{"id":"turn-old","status":"completed"}}),
+        );
+        await_next_idle_snapshot(&mut wire, "thread-settings").await;
+        let params = task008_settings_send(&st, &peer, Value::Null).await;
+        let saved = sink.load_settings("codex", "thread-settings").unwrap();
+        peer.disconnect();
+        st.shutdown().await;
+        assert_eq!(params["model"], "new-model");
+        assert_eq!(params["effort"], "ultra");
+        assert_eq!(params["cwd"], "/new");
+        assert_eq!(params["sandboxPolicy"]["type"], "workspaceWrite");
+        assert_eq!(params["approvalPolicy"], "never");
+        assert_eq!(saved.model.as_deref(), Some("new-model"));
+        assert_eq!(saved.cwd.as_deref(), Some("/new"));
+    }
+
+    #[tokio::test]
+    async fn task008_settings_durable_configure_failure_refuses_without_false_success() {
+        let (events, _capture) = tracing_capture::capture();
+        let (st, peer, mut wire, sink) = task008_settings_fixture().await;
+        task008_settings_send(&st, &peer, json!({"model":"saved-model","effort":"low"})).await;
+        drain_wire(&mut wire);
+        sink.set_fail_writes(true);
+        st.handle_configure(serde_json::from_value(json!({"provider":"codex","sessionType":"freshcodex","sessionId":"thread-settings","requestId":"refused-settings","settings":{"model":"unsaved-model","effort":"ultra"}})).unwrap()).await;
+        let frames = drain(&mut wire).await;
+        let snapshot = task008_settings_snapshot(&st, &peer).await;
+        let saved = sink.load_settings("codex", "thread-settings").unwrap();
+        peer.disconnect();
+        st.shutdown().await;
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame["event"]["type"] == "freshAgent.error"
+                    && frame["event"]["code"] == "CODEX_SETTINGS_PERSIST_FAILED"
+                    && frame["event"]["requestId"] == "refused-settings"),
+            "typed correlated refusal missing: {frames:?}"
+        );
+        assert!(!frames
+            .iter()
+            .any(|frame| frame["event"]["type"] == "freshAgent.session.metadata"));
+        assert_eq!(snapshot["settings"]["model"], "saved-model");
+        assert_eq!(saved.model.as_deref(), Some("saved-model"));
+        assert!(events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.message.contains("configure_persist_failed")));
+    }
+
+    #[tokio::test]
+    async fn task008_settings_configure_carries_its_retained_owner_fence() {
+        let (mut st, peer, _, sink) = task008_settings_fixture().await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        let mut ticket =
+            match st.begin_lane_claim_at("thread-settings", "settings-owner", None, "test") {
+                crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+                _ => panic!("settings ownership claim must grant"),
+            };
+        let expected = (
+            Some(registry.boot_epoch()),
+            Some(ticket.as_ref().unwrap().generation()),
+        );
+        assert!(st
+            .commit_lane_claim_at(&mut ticket, "thread-settings", "thread-settings", None)
+            .is_ok());
+        st.handle_configure(configure_msg(
+            "thread-settings",
+            Some("provider-current"),
+            Some("ultra"),
+        ))
+        .await;
+        let observed = sink
+            .binding_pairs
+            .lock()
+            .unwrap()
+            .get(&("codex".into(), "thread-settings".into()))
+            .cloned();
+        peer.disconnect();
+        st.shutdown().await;
+        assert_eq!(observed, Some(expected));
+    }
+
+    #[tokio::test]
+    async fn task008_settings_refinement_retained_snapshot_keeps_complete_staged_defaults() {
+        let (st, peer, _, _) = task008_settings_fixture().await;
+        task008_settings_send(&st, &peer, json!({"model":"provider-current","effort":"ultra","cwd":"/first","sandbox":"read-only","permissionMode":"never"})).await;
+        task008_settings_snapshot(&st, &peer).await;
+        st.handle_configure(serde_json::from_value(json!({"provider":"codex","sessionType":"freshcodex","sessionId":"thread-settings","settings":{"cwd":"/next","collaborationMode":"plan"}})).unwrap()).await;
+        let retained = st.retained_state("thread-settings").await.unwrap();
+        peer.disconnect();
+        st.shutdown().await;
+        assert_eq!(
+            retained["snapshot"]["settings"],
+            json!({"model":"provider-current","effort":"ultra","cwd":"/next","sandbox":"read-only","permissionMode":"never","collaborationMode":"plan"})
+        );
+        assert_eq!(
+            retained["snapshot"]["extensions"]["codex"]["settings"]["currentTurn"]["cwd"],
+            "/first"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn task008_settings_recovery_refusal_keeps_file_access_and_approval_on_retry() {
+        let _guard = ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("restricted-recovery.jsonl");
+        configure_fake_codex_cmd(&json!({"appendRequestLogPath":log}).to_string());
+        let (st, mut wire) = state_with_bus();
+        let mut create = create_msg("restricted-settings-recovery");
+        create.cwd = Some(temp.path().to_string_lossy().into());
+        create.sandbox = Some(freshell_protocol::Sandbox::ReadOnly);
+        create.permission_mode = Some("on-request".into());
+        st.handle_create(create, None).await;
+        let created = collect_frames_until(&mut wire, Duration::from_secs(10), |frame| {
+            frame["type"] == "freshAgent.created"
+        })
+        .await;
+        assert!(created
+            .frames
+            .iter()
+            .any(|frame| frame["type"] == "freshAgent.created"));
+        simulate_unrequested_crash(&st, "thread-new-1").await;
+        configure_fake_codex_cmd(
+            &json!({"appendRequestLogPath":log,"rejectResumeOverrides":true}).to_string(),
+        );
+        drain_wire(&mut wire);
+        st.handle_send(send_msg(
+            "thread-new-1",
+            "restricted recovery must not run with native full access",
+        ))
+        .await;
+        let frames = drain(&mut wire).await;
+        st.shutdown().await;
+        let requests: Vec<Value> = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let observed = json!({
+            "resumes":requests.iter().filter(|row| row["method"] == "thread/resume").map(|row| json!({"sandbox":row["params"]["sandbox"],"approval":row["params"]["approvalPolicy"]})).collect::<Vec<_>>(),
+            "work":requests.iter().filter(|row| row["method"] == "turn/start").map(|row| json!({"sandbox":row["params"]["sandboxPolicy"]["type"],"approval":row["params"]["approvalPolicy"]})).collect::<Vec<_>>(),
+            "refused":frames.iter().any(|frame| frame["type"] == "error" && frame["message"].as_str().is_some_and(|message| message.starts_with("CODEX_RESPAWN_FAILED:") && message.contains("resume sandbox or approval")))
+        });
+        assert_eq!(
+            observed,
+            json!({"resumes":[{"sandbox":"read-only","approval":"on-request"},{"sandbox":"read-only","approval":"on-request"}],"work":[],"refused":true}),
+            "native refusal cannot become a no-policy full-access recovery"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn task008_settings_refinement_untrusted_recovery_refuses_without_dropping_policy() {
+        let _guard = ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("untrusted-recovery.jsonl");
+        configure_fake_codex_cmd(&json!({"appendRequestLogPath":log}).to_string());
+        let (st, mut wire) = state_with_bus();
+        let mut create = create_msg("untrusted-settings-recovery");
+        create.model = Some("provider-current".into());
+        create.effort = Some(Some("ultra".into()));
+        create.cwd = Some(temp.path().to_string_lossy().into());
+        create.permission_mode = Some("untrusted".into());
+        create.collaboration_mode = Some("plan".into());
+        st.handle_create(create, None).await;
+        let created = collect_frames_until(&mut wire, Duration::from_secs(10), |frame| {
+            frame["type"] == "freshAgent.created"
+        })
+        .await;
+        assert!(
+            created
+                .frames
+                .iter()
+                .any(|frame| frame["type"] == "freshAgent.created"),
+            "native untrusted creation is ready"
+        );
+        simulate_unrequested_crash(&st, "thread-new-1").await;
+        configure_fake_codex_cmd(&json!({"appendRequestLogPath":log,"configRequirements":{"allowedApprovalPolicies":["never"]}}).to_string());
+        drain_wire(&mut wire);
+        st.handle_send(send_msg("thread-new-1", "must be refused before work"))
+            .await;
+        let frames = drain(&mut wire).await;
+        st.shutdown().await;
+        let requests: Vec<Value> = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            !requests
+                .iter()
+                .any(|row| row["method"] == "thread/resume" || row["method"] == "turn/start"),
+            "requirements refusal must not retry without untrusted approval: {requests:?}"
+        );
+        assert!(frames.iter().any(|frame| frame["type"] == "error"
+            && frame["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("approval_policy untrusted"))));
+        assert!(!frames
+            .iter()
+            .any(|frame| frame["type"] == "freshAgent.send.accepted"));
+    }
+
+    #[tokio::test]
+    async fn task008_settings_active_steer_keeps_the_native_turn_and_stages_the_next_start() {
+        let (st, peer, mut wire, sink) = task008_settings_fixture().await;
+        let first = task008_settings_send(&st, &peer, json!({"model":"first-model","effort":"low","cwd":"/first","sandbox":"read-only","permissionMode":"on-request"})).await;
+        st.handle_configure(serde_json::from_value(json!({"provider":"codex","sessionType":"freshcodex","sessionId":"thread-settings","settings":{"model":"next-model","effort":"ultra","cwd":"/next","sandbox":"workspace-write","permissionMode":"never","collaborationMode":"plan"}})).unwrap()).await;
+        let steer = tokio::spawn({
+            let st = st.clone();
+            async move {
+                st.handle_send(send_msg("thread-settings", "add context"))
+                    .await;
+            }
+        });
+        let (id, method, params) = peer.expect_request().await;
+        peer.respond(&id, json!({"turnId":"turn-settings"}));
+        steer.await.unwrap();
+        let snapshot = task008_settings_snapshot(&st, &peer).await;
+        drain_wire(&mut wire);
+        peer.emit_notification("turn/completed", json!({"threadId":"thread-settings","turn":{"id":"turn-settings","status":"completed"}}));
+        await_next_idle_snapshot(&mut wire, "thread-settings").await;
+        let next = task008_settings_send_named(&st, &peer, Value::Null, "turn-next").await;
+        let saved = sink.load_settings("codex", "thread-settings").unwrap();
+        peer.disconnect();
+        st.shutdown().await;
+        // Existing steering is an honest baseline: these assertions precede
+        // the newly missing staged/current-settings assertions.
+        assert_eq!(method, "turn/steer");
+        assert_eq!(
+            params,
+            json!({"threadId":"thread-settings","expectedTurnId":"turn-settings","input":[{"type":"text","text":"add context","text_elements":[]}]})
+        );
+        assert_eq!(first["model"], "first-model");
+        assert_eq!(first["effort"], "low");
+        assert_eq!(next["cwd"], "/next");
+        assert_eq!(next["model"], "next-model");
+        assert_eq!(next["effort"], "ultra");
+        assert_eq!(next["approvalPolicy"], "never");
+        assert_eq!(next["sandboxPolicy"]["type"], "workspaceWrite");
+        assert_eq!(next["collaborationMode"]["mode"], "plan");
+        assert_eq!(
+            snapshot["extensions"]["codex"]["settings"]["scope"],
+            "next-turn"
+        );
+        assert_eq!(
+            snapshot["extensions"]["codex"]["settings"]["currentTurn"]["model"],
+            "first-model"
+        );
+        assert_eq!(snapshot["settings"]["model"], "next-model");
+        assert_eq!(saved.model.as_deref(), Some("next-model"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn task008_settings_refinement_thread_effort_echo_preserves_next_turn_selection_and_native_default(
+    ) {
+        let _guard = ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("effort-scopes.jsonl");
+        configure_fake_codex_cmd(&json!({"appendRequestLogPath":log,"effectiveThreadSettings":{"reasoningEffort":"low","collaborationMode":{"mode":"default","settings":{"model":"provider-current","reasoning_effort":"low","developer_instructions":null}}}}).to_string());
+        for (index, effort) in [None, Some("ultra"), Some("max"), Some("future-effort")]
+            .into_iter()
+            .enumerate()
+        {
+            let (st, _) = state_with_bus();
+            let mut create = create_msg(&format!("effort-scope-{index}"));
+            create.model = Some("provider-current".into());
+            create.effort = effort.map(str::to_owned).map(Some);
+            create.collaboration_mode = Some("plan".into());
+            st.handle_create(create, None).await;
+            st.handle_send(send_msg("thread-new-1", "selected next-turn effort"))
+                .await;
+            st.shutdown().await;
+        }
+        let requests: Vec<Value> = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let turns: Vec<_> = requests
+            .iter()
+            .filter(|row| row["method"] == "turn/start")
+            .collect();
+        let actual: Vec<_> = turns.iter().map(|row| json!({"effort":row["params"]["effort"],"mode":row["params"]["collaborationMode"]["mode"],"modeEffort":row["params"]["collaborationMode"]["settings"]["reasoning_effort"]})).collect();
+        let expected: Vec<_> = [
+            Value::Null,
+            json!("ultra"),
+            json!("max"),
+            json!("future-effort"),
+        ]
+        .into_iter()
+        .map(|effort| json!({"effort":effort,"mode":"plan","modeEffort":effort}))
+        .collect();
+        assert_eq!(actual, expected, "thread/start has no effort override input; its current/default echo cannot replace next-turn intent");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn task008_settings_clear_effort_configure_preserves_cwd_only_changes_and_survives_resume(
+    ) {
+        let _guard = ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let next_cwd = temp.path().join("next");
+        std::fs::create_dir(&next_cwd).unwrap();
+        let log = temp.path().join("clear-effort.jsonl");
+        configure_fake_codex_cmd(&json!({"appendRequestLogPath":log,"recordTurns":true,"effectiveThreadSettings":{"reasoningEffort":"low"}}).to_string());
+        let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        let (st, mut wire) = state_with_bus();
+        st.set_identity_sink(sink.clone());
+        let mut create = create_msg("clear-effort-create");
+        create.cwd = Some(temp.path().to_string_lossy().into());
+        create.model = Some("provider-current".into());
+        create.effort = Some(Some("ultra".into()));
+        create.sandbox = Some(freshell_protocol::Sandbox::ReadOnly);
+        create.permission_mode = Some("never".into());
+        create.collaboration_mode = Some("plan".into());
+        st.handle_create(create, None).await;
+        for (index, patch) in [
+            None,
+            Some(json!({"cwd":next_cwd})),
+            Some(json!({"effort":null})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if let Some(settings) = patch {
+                st.handle_configure(serde_json::from_value(json!({"provider":"codex","sessionType":"freshcodex","sessionId":"thread-new-1","requestId":format!("clear-settings-{index}"),"settings":settings})).unwrap()).await;
+            }
+            drain_wire(&mut wire);
+            st.handle_send(send_msg("thread-new-1", &format!("effort stage {index}")))
+                .await;
+            collect_frames_until(&mut wire, Duration::from_secs(10), |frame| {
+                frame["event"]["type"] == "freshAgent.turn.complete"
+            })
+            .await;
+        }
+        let saved = sink.load_settings("codex", "thread-new-1").unwrap();
+        st.shutdown().await;
+        let (resumed, _) = state_with_bus();
+        resumed.set_identity_sink(sink);
+        resumed.handle_create(serde_json::from_value(json!({"requestId":"clear-effort-resume","provider":"codex","sessionType":"freshcodex","sessionRef":{"provider":"codex","sessionId":"thread-new-1"}})).unwrap(), None).await;
+        resumed
+            .handle_send(send_msg("thread-new-1", "after clearing and resume"))
+            .await;
+        resumed.shutdown().await;
+        let requests: Vec<Value> = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let turns: Vec<_> = requests
+            .iter()
+            .filter(|row| row["method"] == "turn/start")
+            .collect();
+        assert_eq!(
+            turns
+                .iter()
+                .map(|row| row["params"]["effort"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!("ultra"), json!("ultra"), Value::Null, Value::Null]
+        );
+        assert!(saved.effort.is_none());
+        for row in &turns[1..] {
+            assert_eq!(row["params"]["cwd"], json!(next_cwd));
+            assert_eq!(row["params"]["collaborationMode"]["mode"], "plan");
+            assert_eq!(row["params"]["sandboxPolicy"]["type"], "readOnly");
+            assert_eq!(row["params"]["approvalPolicy"], "never");
+        }
+        assert_eq!(
+            turns[2]["params"]["collaborationMode"]["settings"]["reasoning_effort"],
+            Value::Null
+        );
+        assert_eq!(
+            turns[3]["params"]["collaborationMode"]["settings"]["reasoning_effort"],
+            Value::Null
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn task008_settings_native_effective_values_win_on_create_resume_and_fork() {
+        let _environment_lock = ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("effective");
+        std::fs::create_dir(&cwd).unwrap();
+        let log = temp.path().join("settings-native-echo.jsonl");
+        configure_fake_codex_cmd(&json!({"appendRequestLogPath":log,"recordTurns":true,"effectiveThreadSettings":{"model":"native-effective","reasoningEffort":"ultra","cwd":cwd,"sandbox":"read-only","approvalPolicy":"on-request"}}).to_string());
+        let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        let (st, mut rx) = state_with_bus();
+        st.set_identity_sink(sink.clone());
+        st.handle_create(serde_json::from_value(json!({"requestId":"settings-echo-create","provider":"codex","sessionType":"freshcodex","model":"stale-create","effort":"low","cwd":temp.path(),"sandbox":"danger-full-access","permissionMode":"never","collaborationMode":"plan"})).unwrap(), None).await;
+        st.handle_send(send_msg("thread-new-1", "after effective create"))
+            .await;
+        collect_frames_until(&mut rx, Duration::from_secs(10), |frame| {
+            frame["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        let (reply, frames) = capturing_sink();
+        st.handle_fork(
+            fork_msg(
+                "thread-new-1",
+                "settings-echo-fork",
+                Some(json!({"model":"stale-fork","cwd":temp.path()})),
+            ),
+            None,
+            reply,
+        )
+        .await;
+        let child = captured_frames(&frames)
+            .iter()
+            .find(|frame| frame["type"] == "freshAgent.forked")
+            .expect("native fork completes")["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        st.handle_send(send_msg(&child, "after effective fork"))
+            .await;
+        collect_frames_until(&mut rx, Duration::from_secs(10), |frame| {
+            frame["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        st.shutdown().await;
+        let (resumed, _) = state_with_bus();
+        resumed.set_identity_sink(sink.clone());
+        resumed.handle_create(serde_json::from_value(json!({"requestId":"settings-echo-resume","provider":"codex","sessionType":"freshcodex","sessionRef":{"provider":"codex","sessionId":"thread-new-1"},"model":"stale-resume","effort":"low","cwd":temp.path(),"sandbox":"danger-full-access","permissionMode":"never"})).unwrap(), None).await;
+        resumed
+            .handle_send(send_msg("thread-new-1", "after effective resume"))
+            .await;
+        let snapshot = resumed.get_snapshot("thread-new-1", None).await.unwrap();
+        resumed.shutdown().await;
+        std::env::remove_var("CODEX_CMD");
+        std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
+        let requests: Vec<Value> = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let starts: Vec<_> = requests.iter().filter(|row| row["method"] == "turn/start").map(|row| json!({"model":row["params"]["model"],"effort":row["params"]["effort"],"cwd":row["params"]["cwd"],"sandbox":row["params"]["sandboxPolicy"],"approval":row["params"]["approvalPolicy"],"mode":row["params"]["collaborationMode"]})).collect();
+        let expected = json!({"model":"native-effective","effort":"low","cwd":cwd,"sandbox":{"type":"readOnly"},"approval":"on-request","mode":{"mode":"plan","settings":{"model":"native-effective","reasoning_effort":"low","developer_instructions":null}}});
+        assert_eq!(starts, vec![expected; 3]);
+        assert_eq!(snapshot["settings"]["effort"], "low");
+        assert_eq!(
+            snapshot["extensions"]["codex"]["settings"]["lastThreadResponse"]["reasoningEffort"],
+            "ultra"
+        );
+        let saved = sink.load_settings("codex", "thread-new-1").unwrap();
+        assert_eq!(saved.model.as_deref(), Some("native-effective"));
     }
 
     /// b8ke ext r29 F3 + focused ep5 r1 F2: the post-send binding refresh
@@ -15111,6 +15978,9 @@ pub(crate) mod tests {
         st.sessions.lock().await.insert(
             "thread-stall".to_string(),
             CodexSession {
+                collaboration_mode: None,
+                native_turn_settings: None,
+                native_thread_settings: None,
                 turn_state: turn_state.clone(),
                 client,
                 sidecar_pid: None,
@@ -15467,6 +16337,7 @@ pub(crate) mod tests {
         let create = tokio::spawn(async move {
             st2.handle_create(
                 FreshAgentCreate {
+                    collaboration_mode: None,
                     pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
@@ -15643,6 +16514,7 @@ pub(crate) mod tests {
         configure_fake_codex_cmd("{}");
         st.handle_create(
             FreshAgentCreate {
+                collaboration_mode: None,
                 pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
@@ -15804,6 +16676,7 @@ pub(crate) mod tests {
         let create_task = tokio::spawn(async move {
             st2.handle_create(
                 FreshAgentCreate {
+                    collaboration_mode: None,
                     pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
@@ -19053,6 +19926,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            None, // no work-mode override in this lease fixture
             // kata b8ke Task 3: no coordinator claim in this direct-drive
             // test path (the lease-claim skip mirrors handle_create's
             // pre-claim fast paths).
@@ -19532,6 +20406,12 @@ pub(crate) mod tests {
         // Conn-less attach reconstructs the session (all-blank settings),
         // seeding the OLD row's stamps (focused-ep1-r4 Finding 2).
         st.handle_attach(attach_msg("thread-lineage-adopt")).await;
+        let observed = st.get_snapshot("thread-lineage-adopt", None).await.unwrap();
+        assert_eq!(observed["settings"]["model"], "fixture-model");
+        assert_eq!(
+            observed["extensions"]["codex"]["settings"]["lastThreadResponse"]["model"],
+            "fixture-model"
+        );
 
         // A NEW connection's recovery-create adopts the live incumbent.
         let mut resume = create_msg("req-adopt-lineage");
@@ -19573,6 +20453,28 @@ pub(crate) mod tests {
             crate::identity_sink::FreshAgentSettings::default(),
             "the settings payload is untouched by the provenance refresh (stays lineage-only)"
         );
+        drop(bindings);
+        // Accepted work materializes the observed defaults as durable intent;
+        // it must use that exact native model, not a fabricated fallback.
+        st.handle_send(send_msg(
+            "thread-lineage-adopt",
+            "first accepted lineage work",
+        ))
+        .await;
+        let accepted = collect_frames_until(&mut rx, Duration::from_secs(10), |frame| {
+            frame["type"] == "freshAgent.send.accepted"
+                && frame["sessionId"] == "thread-lineage-adopt"
+        })
+        .await;
+        assert!(accepted.matched, "{:?}", accepted.frames);
+        assert_eq!(
+            fake.load_settings("codex", "thread-lineage-adopt")
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("fixture-model")
+        );
+        st.shutdown().await;
     }
 
     /// Focused-ep1-r4 Finding 2 (codex): the CONN-LESS cold attach
@@ -19617,6 +20519,7 @@ pub(crate) mod tests {
 
             authoritative: false,
             settings: crate::identity_sink::FreshAgentSettings {
+                collaboration_mode: None,
                 model: Some("gpt-5.3-codex-spark".into()),
                 sandbox: None,
                 permission_mode: None,
@@ -19722,6 +20625,7 @@ pub(crate) mod tests {
 
             authoritative: false,
             settings: crate::identity_sink::FreshAgentSettings {
+                collaboration_mode: None,
                 model: Some("gpt-5.3-codex-spark".into()),
                 sandbox: None,
                 permission_mode: None,
@@ -23685,6 +24589,7 @@ pub(crate) mod tests {
             let (st, mut rx) = state_with_bus();
             st.handle_create(
                 FreshAgentCreate {
+                    collaboration_mode: None,
                     pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
@@ -24237,6 +25142,7 @@ pub(crate) mod tests {
             "codex",
             "thread-9",
             crate::identity_sink::FreshAgentSettings {
+                collaboration_mode: None,
                 model: Some("gpt-5.3-codex-spark".into()),
                 sandbox: Some("workspace-write".into()),
                 permission_mode: Some("on-request".into()),
@@ -24381,6 +25287,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                collaboration_mode: None,
                 pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
@@ -24435,6 +25342,7 @@ pub(crate) mod tests {
     /// `request_id`.
     fn create_msg(request_id: &str) -> FreshAgentCreate {
         FreshAgentCreate {
+            collaboration_mode: None,
             pane_id: None,
             naming_handle: None,
             observed_epoch: None,
@@ -24781,6 +25689,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                collaboration_mode: None,
                 pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
@@ -24852,6 +25761,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                collaboration_mode: None,
                 pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
@@ -24934,6 +25844,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                collaboration_mode: None,
                 pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
@@ -25004,6 +25915,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                collaboration_mode: None,
                 pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
@@ -25669,7 +26581,16 @@ pub(crate) mod tests {
     /// to depending on a host-installed `codex` binary.
     pub(crate) fn configure_fake_codex_cmd(behavior_json: &str) {
         std::env::set_var("CODEX_CMD", format!("node {}", fake_codex_app_server_cmd()));
-        std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR", behavior_json);
+        let behavior = match serde_json::from_str::<Value>(behavior_json) {
+            Ok(Value::Object(mut behavior)) => {
+                behavior.entry("echoRequestedModel").or_insert(json!(true));
+                Value::Object(behavior).to_string()
+            }
+            // Existing fault cases deliberately pass malformed/non-object
+            // input. Let the native fake consume and refuse it as before.
+            _ => behavior_json.to_owned(),
+        };
+        std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR", behavior);
     }
 
     /// Create a session whose sidecar is a REAL fake-app-server-driven codex process (not
@@ -25692,6 +26613,7 @@ pub(crate) mod tests {
     ) -> String {
         st.handle_create(
             FreshAgentCreate {
+                collaboration_mode: None,
                 pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
@@ -25744,6 +26666,7 @@ pub(crate) mod tests {
     ) -> String {
         st.handle_create(
             FreshAgentCreate {
+                collaboration_mode: None,
                 pane_id: None,
                 observed_epoch: None,
                 observed_generation: None,
@@ -25941,6 +26864,7 @@ pub(crate) mod tests {
         state
             .handle_create(
                 FreshAgentCreate {
+                    collaboration_mode: None,
                     pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
@@ -25956,7 +26880,7 @@ pub(crate) mod tests {
                     model_selection: None,
                     permission_mode: Some("on-request".to_string()),
                     sandbox: Some(freshell_protocol::Sandbox::WorkspaceWrite),
-                    effort: Some("high".to_string()),
+                    effort: Some(Some("high".to_string())),
                     plugins: None,
                     tab_id: None,
                 },
@@ -26011,6 +26935,7 @@ pub(crate) mod tests {
         state
             .handle_create(
                 FreshAgentCreate {
+                    collaboration_mode: None,
                     pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
@@ -26094,6 +27019,7 @@ pub(crate) mod tests {
         state
             .handle_create(
                 FreshAgentCreate {
+                    collaboration_mode: None,
                     pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
@@ -26447,7 +27373,7 @@ pub(crate) mod tests {
         simulate_unrequested_crash(&st, &thread_id).await;
 
         // A transient failure (NOT a "not found"-shaped message) on EVERY `thread/resume`
-        // attempt -- the first (with settings) AND the retry (with settings dropped).
+        // attempt -- the first and the retry that omits only the model.
         configure_fake_codex_cmd(
             &json!({
                 "overrides": {
@@ -26621,6 +27547,7 @@ pub(crate) mod tests {
         let create_task = tokio::spawn(async move {
             st2.handle_create(
                 FreshAgentCreate {
+                    collaboration_mode: None,
                     pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
@@ -28015,7 +28942,7 @@ pub(crate) mod tests {
         assert_eq!(projection["nativeFinalTurnIds"], json!(["turn-1"]));
         assert_eq!(projection["turnRows"]["turn-1"], json!(["turn-1"]));
 
-        // kata z7j7: codex honors all four settings knobs per send (merged over
+        // Codex honors these settings per send (merged over
         // the session baseline before turn/start).
         assert_eq!(
             snapshot["capabilities"]["settingScopes"],
@@ -28024,6 +28951,8 @@ pub(crate) mod tests {
                 "effort": "per-send",
                 "sandbox": "per-send",
                 "permissionMode": "per-send",
+                "cwd": "per-send",
+                "collaborationMode": "per-send",
             })
         );
 
@@ -29307,7 +30236,7 @@ pub(crate) mod tests {
             let (st, mut rx) = state_with_bus();
             let mut create = create_msg("legacy-effort-create");
             create.model = Some("gpt-6-astra".into());
-            create.effort = Some("max".into());
+            create.effort = Some(Some("max".into()));
             st.handle_create(create, None).await;
             let created = collect_frames_until(&mut rx, Duration::from_secs(10), |f| {
                 f["type"] == "freshAgent.created"
@@ -29354,7 +30283,7 @@ pub(crate) mod tests {
         let (st, mut rx) = state_with_bus();
         let mut create = create_msg("native-model-refusal-create");
         create.model = Some("provider-current".into());
-        create.effort = Some("ultra".into());
+        create.effort = Some(Some("ultra".into()));
         st.handle_create(create, None).await;
         let created = collect_frames_until(&mut rx, Duration::from_secs(10), |frame| {
             frame["type"] == "freshAgent.created"
@@ -29442,7 +30371,7 @@ pub(crate) mod tests {
             kind: "exact".into(),
             model_id: "provider-current".into(),
         }));
-        create.effort = Some("ultra".into());
+        create.effort = Some(Some("ultra".into()));
         st.handle_create(create, None).await;
         let created = collect_frames_until(&mut rx, Duration::from_secs(10), |f| {
             f["type"] == "freshAgent.created"
@@ -29536,11 +30465,12 @@ pub(crate) mod tests {
             cwd: None,
             request_id: Some("req-configure".to_string()),
             settings: freshell_protocol::FreshAgentSendSettings {
+                collaboration_mode: None,
                 cwd: None,
                 model: model.map(|m| m.to_string()),
                 permission_mode: None,
                 sandbox: None,
-                effort: effort.map(|e| e.to_string()),
+                effort: effort.map(|e| e.to_string()).map(Some),
             },
         }
     }
@@ -29722,11 +30652,12 @@ pub(crate) mod tests {
             images: None,
             request_id: None,
             settings: Some(freshell_protocol::FreshAgentSendSettings {
+                collaboration_mode: None,
                 cwd: None,
                 model: Some(model.to_string()),
                 permission_mode: None,
                 sandbox: None,
-                effort: Some(effort.to_string()),
+                effort: Some(Some(effort.to_string())),
             }),
             observed_epoch: None,
             observed_generation: None,
@@ -30744,6 +31675,7 @@ pub(crate) mod tests {
             task_st
                 .handle_create(
                     FreshAgentCreate {
+                        collaboration_mode: None,
                         pane_id: None,
                         naming_handle: None,
                         observed_epoch: None,
@@ -30855,6 +31787,7 @@ pub(crate) mod tests {
             task_st
                 .handle_create(
                     FreshAgentCreate {
+                        collaboration_mode: None,
                         pane_id: None,
                         naming_handle: None,
                         observed_epoch: None,
@@ -30971,6 +31904,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                collaboration_mode: None,
                 pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
@@ -31385,6 +32319,7 @@ pub(crate) mod tests {
         // adopted without consulting the coordinator.
         st.handle_create(
             FreshAgentCreate {
+                collaboration_mode: None,
                 pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
@@ -31476,6 +32411,7 @@ pub(crate) mod tests {
         // observed generation — the fence discipline refuses typed.
         st.handle_create(
             FreshAgentCreate {
+                collaboration_mode: None,
                 pane_id: None,
                 naming_handle: None,
                 observed_epoch: Some(registry.boot_epoch()),

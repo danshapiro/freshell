@@ -644,6 +644,7 @@ mod tests {
     #[test]
     fn fixture_native_identity_is_store_and_provider_specific() {
         let profile = FreshAgentProfile {
+            collaboration_mode: None,
             provider: FreshProvider::Codex,
             runtime_variant: "codex-app-server".into(),
             cwd: "/workspace".into(),
@@ -678,6 +679,7 @@ mod tests {
     async fn provider_native_completion_crosses_the_durable_actor_once() {
         let root = tempfile::tempdir().unwrap();
         let profile = FreshAgentProfile {
+            collaboration_mode: None,
             provider: FreshProvider::Opencode,
             runtime_variant: "opencode-per-soul-http".into(),
             cwd: "/workspace".into(),

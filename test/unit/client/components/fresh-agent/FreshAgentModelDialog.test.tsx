@@ -599,6 +599,22 @@ describe('FreshAgentModelDialog (freshcodex)', () => {
       inputModalities: ['text', 'image'], supportsAdaptiveThinking: false }],
   }
 
+  it('offers Codex Default as an explicit effort clear through the real pane, configure and saved defaults', async () => {
+    const store = createStore()
+    seedFreshcodexPane(store, { model: 'provider-current', effort: 'ultra' })
+    getFreshAgentModelCapabilitiesSpy.mockResolvedValue(nativeCatalog)
+    renderDialog(store, { open: true })
+    await screen.findByRole('listbox', { name: 'Thinking levels for Provider Current' })
+    await screen.findByRole('option', { name: /^ultra\b/ })
+    fireEvent.click(screen.getByRole('option', { name: 'Default', exact: true }))
+    fireEvent.click(screen.getByRole('button', { name: 'Use Provider Current · Default' }))
+    expect(paneContent(store).effort).toBeUndefined()
+    expect(paneContent(store).effortIsNativeDefault).toBe(true)
+    expect(wsSendSpy).toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.configure', settings: { model: 'provider-current', effort: null } }))
+    // The established settings thunk encodes an own undefined as JSON null.
+    expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({ freshAgent: { providers: { freshcodex: { modelSelection: { kind: 'exact', modelId: 'provider-current' }, effort: undefined } } } })
+  })
+
   it('keeps a custom model and effort staged before create acknowledgement when the later catalog omits them', async () => {
     const store = createStore()
     seedFreshcodexPane(store, { sessionId: undefined, status: 'creating' })
@@ -770,7 +786,7 @@ describe('FreshAgentModelDialog (freshcodex)', () => {
       const levels = screen.getByRole('listbox', { name: 'Thinking levels for GPT-6 Astra' })
       const names = Array.from(levels.querySelectorAll('[role="option"]'))
         .map(el => el.textContent?.replace(/last used|highest|current|●/g, '').trim())
-      expect(names).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
+      expect(names).toEqual(['Default', 'low', 'medium', 'high', 'xhigh', 'max'])
     })
     fireEvent.click(screen.getByRole('button',{name:'Use GPT-6 Astra · max'}))
     expect(paneContent(store)).toMatchObject({model:'gpt-6-astra',effort:'max'})

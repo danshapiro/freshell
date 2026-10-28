@@ -689,9 +689,10 @@ async fn hosted_configure_calls_the_runtime_with_the_mapped_settings() {
         assert_eq!(
             configure.settings,
             freshell_runtime_protocol::FreshAgentTurnSettings {
+                collaboration_mode: None,
                 cwd: Some("/workspace".into()),
                 model: Some("opus".into()),
-                effort: Some("high".into()),
+                effort: Some(Some("high".into())),
                 permission_mode: Some("acceptEdits".into()),
                 sandbox: Some("workspace-write".into()),
             }
@@ -2278,7 +2279,7 @@ async fn hosted_configure_reaches_the_owning_host_through_the_real_supervisor() 
     assert_eq!(incarnation_id, &prepared.incarnation_id);
     assert_eq!(request_id.as_str(), "configure-through-supervisor");
     assert_eq!(settings.model.as_deref(), Some("opus"));
-    assert_eq!(settings.effort.as_deref(), Some("high"));
+    assert_eq!(settings.effort, Some(Some("high".into())));
     let recovered = registry
         .recovery_context(soul)
         .await

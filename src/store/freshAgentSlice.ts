@@ -231,6 +231,8 @@ const freshAgentSlice = createSlice({
       model?: string | null
       effort?: string | null
       permissionMode?: string
+      sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'
+      collaborationMode?: 'default' | 'plan'
       cwd?: string
       tools?: Array<{ name: string }>
     }>) {
@@ -255,6 +257,8 @@ const freshAgentSlice = createSlice({
       if (action.payload.model !== undefined) session.model = action.payload.model
       if (action.payload.effort !== undefined) session.effort = action.payload.effort
       if (action.payload.permissionMode !== undefined) session.permissionMode = action.payload.permissionMode
+      if (action.payload.sandbox !== undefined) session.sandbox = action.payload.sandbox
+      if (action.payload.collaborationMode !== undefined) session.collaborationMode = action.payload.collaborationMode
       session.cwd = action.payload.cwd ?? session.cwd
       session.tools = action.payload.tools ?? session.tools
       if (metadataCliSessionId && !wouldDowngradeSnapshotIdentity) {

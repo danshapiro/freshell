@@ -351,6 +351,15 @@ function normalizeTerminalContent(content: Record<string, unknown>): Record<stri
 }
 
 function normalizeFreshAgentContent(content: Record<string, unknown>): Record<string, unknown> {
+  if ('collaborationMode' in content && content.collaborationMode !== 'default' && content.collaborationMode !== 'plan') {
+    const { collaborationMode: _invalidMode, ...rest } = content
+    content = rest
+  }
+  if ('effortIsNativeDefault' in content && typeof content.effortIsNativeDefault !== 'boolean') {
+    const { effortIsNativeDefault: _invalidEffortIntent, ...rest } = content
+    content = rest
+  }
+
   // Only the native child selection is durable. Bodies and ownership fences
   // are read again through the parent's current provider after reload.
   if ('observedChildThreadId' in content && (content.provider !== 'codex' || typeof content.observedChildThreadId !== 'string' || !content.observedChildThreadId.trim())) {

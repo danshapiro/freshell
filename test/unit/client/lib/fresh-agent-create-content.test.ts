@@ -1,10 +1,25 @@
 import { describe, expect, it } from 'vitest'
 import fixtures from '../../../fixtures/fresh-agent/claude-create-defaults.json'
-import { createDefaultServerSettings, type ServerSettings } from '@shared/settings'
+import { createDefaultServerSettings, mergeServerSettings, type ServerSettings } from '@shared/settings'
 import { buildFreshAgentPaneContent } from '@/lib/fresh-agent-create-content'
-import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
+import { getEffectiveFreshAgentEffort, resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 
 describe('fresh-agent create defaults shared with REST', () => {
+  it('keeps a stated native-default effort distinct from fallback provider defaults and explicit next-turn choices', () => {
+    const content = { sessionType: 'freshcodex' as const, provider: 'codex' as const, model: 'provider-current', effortIsNativeDefault: true }
+    const inherited = { ...content, effortIsNativeDefault: false }
+    expect(getEffectiveFreshAgentEffort(inherited, { effort: 'ultra' })).toBe('ultra')
+    expect(getEffectiveFreshAgentEffort({ ...content, effort: 'max' }, { effort: 'ultra' })).toBe('max')
+    expect(getEffectiveFreshAgentEffort(content, { effort: 'ultra' })).toBeUndefined()
+  })
+  it('retains Codex work mode, file access and cwd through the saved-default settings path', () => {
+    const settings = mergeServerSettings(createDefaultServerSettings(), JSON.parse(JSON.stringify({ freshAgent: { providers: { freshcodex: {
+      modelSelection: { kind: 'exact', modelId: 'provider-current' }, effort: 'ultra',
+      defaultPermissionMode: 'never', sandbox: 'read-only', cwd: '/work', collaborationMode: 'plan',
+    } } } })))
+    const content = buildFreshAgentPaneContent({ entry: resolveFreshAgentType('freshcodex')!, createRequestId: 'complete-defaults', freshAgentSettings: settings.freshAgent, codingCliSettings: settings.codingCli })
+    expect(content).toMatchObject({ model: 'provider-current', effort: 'ultra', permissionMode: 'never', sandbox: 'read-only', initialCwd: '/work', collaborationMode: 'plan' })
+  })
   it('leaves an omitted Codex effort to the installed model instead of fabricating max for a custom model', () => {
     const defaults = createDefaultServerSettings()
     const content = buildFreshAgentPaneContent({

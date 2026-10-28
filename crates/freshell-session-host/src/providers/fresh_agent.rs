@@ -109,6 +109,7 @@ pub(crate) async fn open_hosted_fresh_agent(
 
 fn profile_from_launch(launch: &FreshAgentLaunchSpec) -> FreshAgentProfile {
     FreshAgentProfile {
+        collaboration_mode: launch.collaboration_mode.clone(),
         provider: launch.provider.clone(),
         runtime_variant: launch.runtime_variant.clone(),
         cwd: launch.cwd.clone(),
@@ -524,6 +525,32 @@ impl FreshAgentTransport for HostedTransport {
         profile: &FreshAgentProfile,
         logical_attempt_id: Option<&str>,
     ) -> Result<DispatchAck, DispatchFailure> {
+        let settings = freshell_runtime_protocol::FreshAgentTurnSettings {
+            collaboration_mode: profile.collaboration_mode.clone(),
+            cwd: Some(profile.cwd.clone()),
+            model: profile.model.clone(),
+            effort: Some(profile.effort.clone()),
+            permission_mode: profile.effective_permission_mode().map(str::to_owned),
+            sandbox: profile.sandbox.clone(),
+        };
+        self.dispatch_with_turn_settings(
+            request_id,
+            text,
+            profile,
+            Some(&settings),
+            logical_attempt_id,
+        )
+        .await
+    }
+
+    async fn dispatch_with_turn_settings(
+        &self,
+        request_id: &RequestId,
+        text: &str,
+        profile: &FreshAgentProfile,
+        requested: Option<&freshell_runtime_protocol::FreshAgentTurnSettings>,
+        logical_attempt_id: Option<&str>,
+    ) -> Result<DispatchAck, DispatchFailure> {
         #[cfg(test)]
         if let Some(delegate) = self.test_delegate.as_ref() {
             return delegate.dispatch(request_id, text, profile).await;
@@ -540,6 +567,18 @@ impl FreshAgentTransport for HostedTransport {
         *self.profile.lock().expect("profile lock") = Some(profile.clone());
         let permission_mode = profile.effective_permission_mode().map(str::to_owned);
         let profile = profile.clone();
+        let settings = if self.provider == FreshProvider::Codex {
+            requested.map(provider_send_settings)
+        } else {
+            Some(FreshAgentSendSettings {
+                collaboration_mode: profile.collaboration_mode,
+                cwd: Some(profile.cwd),
+                effort: profile.effort.map(Some),
+                model: profile.model,
+                permission_mode,
+                sandbox: profile.sandbox.as_deref().and_then(parse_sandbox),
+            })
+        };
         let mut outcomes = self.send_outcomes.subscribe();
         let send = FreshAgentSend {
             observed_epoch: None,
@@ -548,16 +587,10 @@ impl FreshAgentTransport for HostedTransport {
             session_id,
             session_type: self.session_type(),
             text: text.to_string(),
-            cwd: Some(profile.cwd.clone()),
+            cwd: settings.as_ref().and_then(|settings| settings.cwd.clone()),
             images: None,
             request_id: Some(request_id.as_str().to_string()),
-            settings: Some(FreshAgentSendSettings {
-                cwd: Some(profile.cwd),
-                effort: profile.effort,
-                model: profile.model,
-                permission_mode,
-                sandbox: profile.sandbox.as_deref().and_then(parse_sandbox),
-            }),
+            settings,
             checkpoint_intent: logical_attempt_id.map(|logical_attempt_id| {
                 FreshAgentCheckpointIntent {
                     logical_attempt_id: logical_attempt_id.to_string(),
@@ -939,13 +972,7 @@ impl FreshAgentTransport for HostedTransport {
                     session_type: self.session_type(),
                     cwd: settings.cwd.clone(),
                     request_id: Some(request_id.as_str().to_string()),
-                    settings: FreshAgentSendSettings {
-                        cwd: settings.cwd.clone(),
-                        effort: settings.effort.clone(),
-                        model: settings.model.clone(),
-                        permission_mode: settings.permission_mode.clone(),
-                        sandbox: settings.sandbox.as_deref().and_then(parse_sandbox),
-                    },
+                    settings: provider_send_settings(settings),
                 };
                 match &self.state {
                     ProviderState::Claude(state) => state.handle_configure(message).await,
@@ -1198,6 +1225,19 @@ impl FreshAgentTransport for HostedTransport {
     }
 }
 
+fn provider_send_settings(
+    settings: &freshell_runtime_protocol::FreshAgentTurnSettings,
+) -> FreshAgentSendSettings {
+    FreshAgentSendSettings {
+        collaboration_mode: settings.collaboration_mode.clone(),
+        cwd: settings.cwd.clone(),
+        model: settings.model.clone(),
+        effort: settings.effort.clone(),
+        permission_mode: settings.permission_mode.clone(),
+        sandbox: settings.sandbox.as_deref().and_then(parse_sandbox),
+    }
+}
+
 fn create_request_for_profile(profile: &FreshAgentProfile) -> FreshAgentCreate {
     let (provider, session_type, provider_name) = match profile.provider {
         FreshProvider::Claude => (AgentProvider::Claude, SessionType::Freshclaude, "claude"),
@@ -1210,6 +1250,7 @@ fn create_request_for_profile(profile: &FreshAgentProfile) -> FreshAgentCreate {
         ),
     };
     FreshAgentCreate {
+        collaboration_mode: profile.collaboration_mode.clone(),
         pane_id: None,
         request_id: format!("host-create-{}", uuid::Uuid::new_v4()),
         observed_epoch: None,
@@ -1217,7 +1258,11 @@ fn create_request_for_profile(profile: &FreshAgentProfile) -> FreshAgentCreate {
         naming_handle: None,
         session_type,
         cwd: Some(profile.cwd.clone()),
-        effort: profile.effort.clone(),
+        effort: if profile.provider == FreshProvider::Codex {
+            Some(profile.effort.clone())
+        } else {
+            profile.effort.clone().map(Some)
+        },
         legacy_restore_context: None,
         model: profile.model.clone(),
         model_selection: profile.model_selection.as_ref().map(|selection| {
@@ -1899,7 +1944,12 @@ mod tests {
         _lock: tokio::sync::MutexGuard<'static, ()>,
     }
 
-    async fn native_codex_fixture(behavior: Value) -> NativeCodexFixture {
+    async fn native_codex_fixture(mut behavior: Value) -> NativeCodexFixture {
+        behavior
+            .as_object_mut()
+            .unwrap()
+            .entry("echoRequestedModel")
+            .or_insert(json!(true));
         let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1963,6 +2013,201 @@ mod tests {
             _environment,
             _lock,
         }
+    }
+
+    #[tokio::test]
+    async fn task008_settings_native_echo_survives_managed_next_send_and_reopen() {
+        let logs = tempfile::tempdir().unwrap();
+        let log = logs.path().join("native-effective.jsonl");
+        let native_cwd = logs.path().join("native-cwd");
+        std::fs::create_dir(&native_cwd).unwrap();
+        let mut fixture = native_codex_fixture(json!({
+            "appendRequestLogPath":log, "recordTurns":true,
+            "effectiveThreadSettings":{"model":"provider-current","reasoningEffort":"low",
+                "cwd":native_cwd,"sandbox":{"type":"readOnly"},"approvalPolicy":"on-request"}
+        }))
+        .await;
+        fixture.profile.effort = Some("ultra".into());
+        fixture.profile.collaboration_mode = Some("plan".into());
+        let state_dir = fixture.dir.path().join("native-effective-actor");
+        let actor = FreshAgentHostActor::open(
+            &state_dir,
+            fixture.profile.clone(),
+            fixture.transport.clone(),
+        )
+        .await
+        .unwrap();
+        let startup = actor.snapshot().await.unwrap();
+        actor
+            .dispatch(
+                RequestId::parse("native-effective-first").unwrap(),
+                "native effective first send".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while actor.snapshot().await.unwrap()["status"] != "idle" {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let profile = actor.profile().await;
+        actor.stop().await.unwrap();
+        let resumed = FreshAgentHostActor::open(
+            &state_dir,
+            profile,
+            HostedTransport::new(FreshProvider::Codex).await,
+        )
+        .await
+        .unwrap();
+        resumed
+            .dispatch(
+                RequestId::parse("native-effective-resumed").unwrap(),
+                "native effective resumed send".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while resumed.snapshot().await.unwrap()["status"] != "idle" {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // An explicit per-send choice still wins even when it equals the old
+        // launch intent: equality of profiles is not absence of a request.
+        resumed.dispatch(RequestId::parse("native-effective-explicit").unwrap(), "explicit old selection".into(), Some(serde_json::from_value(json!({
+            "model":fixture.profile.model,"cwd":fixture.profile.cwd,"sandbox":"workspace-write","permissionMode":"never"
+        })).unwrap())).await.unwrap();
+        resumed.stop().await.unwrap();
+        let requests: Vec<Value> = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let starts: Vec<_> = requests
+            .iter()
+            .filter(|row| row["method"] == "turn/start")
+            .map(|row| &row["params"])
+            .collect();
+        assert_eq!(
+            startup["settings"]["model"], "provider-current",
+            "the owning provider already exposes its native-effective settings"
+        );
+        assert_eq!(starts.len(), 3);
+        assert_eq!(starts[2]["model"], fixture.profile.model.unwrap());
+        assert_eq!(starts[2]["cwd"], fixture.profile.cwd);
+        assert_eq!(starts[2]["sandboxPolicy"]["type"], "workspaceWrite");
+        assert_eq!(starts[2]["approvalPolicy"], "never");
+        assert_eq!(starts[..2].iter().map(|params| json!({"model":params["model"],"cwd":params["cwd"],"sandbox":params["sandboxPolicy"]["type"],"approval":params["approvalPolicy"],"effort":params["effort"],"mode":params["collaborationMode"]["mode"]})).collect::<Vec<_>>(), vec![json!({"model":"provider-current","cwd":native_cwd,"sandbox":"readOnly","approval":"on-request","effort":"ultra","mode":"plan"});2], "unchanged host intent must not put stale requested settings back over native echoes");
+    }
+
+    #[tokio::test]
+    async fn task008_settings_managed_actor_forwards_and_recovers_native_plan_defaults() {
+        let logs = tempfile::tempdir().unwrap();
+        let log = logs.path().join("settings-requests.jsonl");
+        let fixture =
+            native_codex_fixture(json!({"appendRequestLogPath":log,"recordTurns":true})).await;
+        let state_dir = fixture.dir.path().join("settings-actor");
+        let actor = FreshAgentHostActor::open(
+            &state_dir,
+            fixture.profile.clone(),
+            fixture.transport.clone(),
+        )
+        .await
+        .unwrap();
+        let cwd = fixture.dir.path().join("next");
+        std::fs::create_dir(&cwd).unwrap();
+        actor.configure(RequestId::parse("managed-settings").unwrap(), serde_json::from_value(json!({"model":"provider-current","effort":"ultra","cwd":cwd,"sandbox":"read-only","permissionMode":"on-request","collaborationMode":"plan"})).unwrap()).await.unwrap();
+        actor
+            .dispatch(
+                RequestId::parse("managed-plan").unwrap(),
+                "managed plan".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if actor.snapshot().await.unwrap()["status"] == "idle" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        actor
+            .configure(
+                RequestId::parse("managed-native-default").unwrap(),
+                serde_json::from_value(json!({"effort":null})).unwrap(),
+            )
+            .await
+            .unwrap();
+        actor
+            .dispatch(
+                RequestId::parse("managed-native-default-send").unwrap(),
+                "native default effort".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while actor.snapshot().await.unwrap()["status"] != "idle" {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let profile = actor.profile().await;
+        actor.stop().await.unwrap();
+        let resumed = FreshAgentHostActor::open(
+            &state_dir,
+            profile,
+            HostedTransport::new(FreshProvider::Codex).await,
+        )
+        .await
+        .unwrap();
+        resumed
+            .dispatch(
+                RequestId::parse("managed-plan-reload").unwrap(),
+                "managed plan after reload".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        let recovered = serde_json::to_value(resumed.profile().await).unwrap();
+        resumed.stop().await.unwrap();
+        let requests: Vec<Value> = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let starts: Vec<_> = requests
+            .iter()
+            .filter(|row| row["method"] == "turn/start")
+            .collect();
+        assert_eq!(starts.len(), 3);
+        assert_eq!(
+            starts
+                .iter()
+                .map(|row| row["params"]["effort"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!("ultra"), Value::Null, Value::Null]
+        );
+        for (index, row) in starts.into_iter().enumerate() {
+            assert_eq!(
+                row["params"]["collaborationMode"],
+                json!({"mode":"plan","settings":{"model":"provider-current","reasoning_effort":if index == 0 {json!("ultra")} else {Value::Null},"developer_instructions":null}})
+            );
+            assert_eq!(row["params"]["cwd"], json!(cwd));
+            assert_eq!(row["params"]["sandboxPolicy"]["type"], "readOnly");
+            assert_eq!(row["params"]["approvalPolicy"], "on-request");
+        }
+        assert_eq!(recovered["collaborationMode"], "plan");
     }
 
     #[tokio::test]
@@ -2923,6 +3168,7 @@ mod tests {
 
         fn profile(&self, resume: Option<&str>) -> FreshAgentProfile {
             FreshAgentProfile {
+                collaboration_mode: None,
                 provider: FreshProvider::Claude,
                 runtime_variant: "freshclaude".into(),
                 cwd: self.root.path().join("workspace").to_string_lossy().into(),
@@ -3282,6 +3528,7 @@ mod tests {
         .await;
         let transport = claude.transport.clone();
         let profile = FreshAgentProfile {
+            collaboration_mode: None,
             provider: FreshProvider::Claude,
             runtime_variant: "freshclaude".into(),
             cwd: claude
@@ -3354,7 +3601,7 @@ mod tests {
         let run = hosted_claude_configure(
             freshell_runtime_protocol::FreshAgentTurnSettings {
                 model: Some("opus".into()),
-                effort: Some("high".into()),
+                effort: Some(Some("high".into())),
                 ..Default::default()
             },
             false,
@@ -3430,7 +3677,7 @@ mod tests {
         let run = hosted_claude_configure(
             freshell_runtime_protocol::FreshAgentTurnSettings {
                 model: Some("opus".into()),
-                effort: Some("high".into()),
+                effort: Some(Some("high".into())),
                 ..Default::default()
             },
             true,
@@ -3537,6 +3784,7 @@ mod tests {
         std::env::set_var("FAKE_OPENCODE_AUDIT_LOG", &audit);
         let transport = HostedTransport::new_with_context(FreshProvider::Opencode, None).await;
         let profile = FreshAgentProfile {
+            collaboration_mode: None,
             provider: FreshProvider::Opencode,
             runtime_variant: "freshopencode".into(),
             cwd: dir.path().to_string_lossy().into(),
@@ -3739,6 +3987,7 @@ mod tests {
         // including the product RED and setup-error paths.
         let observed: Result<Value, String> = async {
             let profile = FreshAgentProfile {
+                collaboration_mode: None,
                 provider: FreshProvider::Opencode, runtime_variant: "freshopencode".into(),
                 cwd: dir.path().to_string_lossy().into(), model: None, effort: None,
                 permission_mode: None, sandbox: None, provider_store_id: "owned-store".into(),
@@ -3897,6 +4146,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let transport = HostedTransport::new_with_context(FreshProvider::Opencode, None).await;
         let profile = FreshAgentProfile {
+            collaboration_mode: None,
             provider: FreshProvider::Opencode,
             runtime_variant: "freshopencode".into(),
             cwd: dir.path().to_string_lossy().into(),
@@ -4336,6 +4586,7 @@ mod tests {
             FreshProvider::Kilroy => unreachable!(),
         };
         FreshAgentProfile {
+            collaboration_mode: None,
             provider: provider.clone(),
             runtime_variant: provider.as_str().into(),
             cwd: "/workspace".into(),
@@ -4404,9 +4655,10 @@ mod tests {
             },
             FreshAgentOperation::Configure {
                 settings: freshell_runtime_protocol::FreshAgentTurnSettings {
+                    collaboration_mode: None,
                     cwd: None,
                     model: Some("fixture-configured-model".into()),
-                    effort: Some("high".into()),
+                    effort: Some(Some("high".into())),
                     permission_mode: Some("acceptEdits".into()),
                     sandbox: None,
                 },
@@ -4464,7 +4716,7 @@ mod tests {
         let mut profile = provider_context.clone();
         profile.cwd = message.cwd.clone().unwrap();
         profile.model = message.model.clone();
-        profile.effort = message.effort.clone();
+        profile.effort = message.effort.clone().flatten();
         profile.permission_mode = message.permission_mode.clone();
         profile.sandbox = message
             .sandbox
@@ -4950,6 +5202,7 @@ mod tests {
                 FreshProvider::Kilroy => unreachable!(),
             };
             let profile = FreshAgentProfile {
+                collaboration_mode: None,
                 provider: provider.clone(),
                 runtime_variant: provider.as_str().into(),
                 cwd: "/workspace".into(),

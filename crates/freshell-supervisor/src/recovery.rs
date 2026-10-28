@@ -2011,9 +2011,14 @@ fn fresh_agent_replay_settings(
     agent: &freshell_runtime_protocol::FreshAgentLaunchSpec,
 ) -> freshell_runtime_protocol::FreshAgentTurnSettings {
     freshell_runtime_protocol::FreshAgentTurnSettings {
+        collaboration_mode: agent.collaboration_mode.clone(),
         cwd: Some(agent.cwd.clone()),
         model: agent.model.clone(),
-        effort: agent.effort.clone(),
+        effort: if agent.provider == freshell_runtime_protocol::FreshProvider::Codex {
+            Some(agent.effort.clone())
+        } else {
+            agent.effort.clone().map(Some)
+        },
         permission_mode: agent.permission_mode.clone(),
         sandbox: agent.sandbox.clone(),
     }
@@ -2419,6 +2424,7 @@ mod tests {
     #[test]
     fn queued_fresh_prompt_replays_with_the_exact_persisted_turn_profile() {
         let agent = FreshAgentLaunchSpec {
+            collaboration_mode: None,
             session_id: "presentation".into(),
             provider: FreshProvider::Codex,
             session_type: "freshcodex".into(),
@@ -2446,7 +2452,7 @@ mod tests {
         let settings = fresh_agent_replay_settings(&agent);
         assert_eq!(settings.cwd.as_deref(), Some("/workspace/nested"));
         assert_eq!(settings.model.as_deref(), Some("model-exact"));
-        assert_eq!(settings.effort.as_deref(), Some("high"));
+        assert_eq!(settings.effort, Some(Some("high".into())));
         assert_eq!(settings.permission_mode.as_deref(), Some("ask"));
         assert_eq!(settings.sandbox.as_deref(), Some("workspace-write"));
     }

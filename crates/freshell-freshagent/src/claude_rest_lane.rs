@@ -38,6 +38,7 @@ impl ClaudeRestLane {
             .state
             .handle_create(
                 FreshAgentCreate {
+                    collaboration_mode: None,
                     request_id: request.request_id,
                     provider: Some(AgentProvider::Claude),
                     session_type,
@@ -45,7 +46,7 @@ impl ClaudeRestLane {
                     model: request.model,
                     model_selection: request.model_selection,
                     permission_mode: request.permission_mode,
-                    effort: request.effort,
+                    effort: request.effort.map(Some),
                     plugins: request.plugins,
                     session_ref,
                     sandbox: request.sandbox,

@@ -632,6 +632,7 @@ impl FreshAgentTransport for FakeTransport {
 
 fn profile(provider: FreshProvider, store: &str, native: Option<&str>) -> FreshAgentProfile {
     FreshAgentProfile {
+        collaboration_mode: None,
         runtime_variant: provider.as_str().into(),
         provider,
         cwd: "/workspace".into(),
@@ -1113,9 +1114,10 @@ async fn exact_native_identity_and_profile_are_reused_on_host_actor_recovery() {
             RequestId::parse("settings-update").unwrap(),
             "continue".into(),
             Some(FreshAgentTurnSettings {
+                collaboration_mode: None,
                 cwd: None,
                 model: Some("updated-model".into()),
-                effort: Some("high".into()),
+                effort: Some(Some("high".into())),
                 permission_mode: None,
                 sandbox: None,
             }),
@@ -1776,9 +1778,10 @@ impl FreshAgentTransport for ConfigureTransport {
 
 fn opus_high() -> FreshAgentTurnSettings {
     FreshAgentTurnSettings {
+        collaboration_mode: None,
         cwd: None,
         model: Some("opus".into()),
-        effort: Some("high".into()),
+        effort: Some(Some("high".into())),
         permission_mode: None,
         sandbox: None,
     }

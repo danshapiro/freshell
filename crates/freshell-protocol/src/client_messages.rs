@@ -869,12 +869,19 @@ pub struct ModelSelection {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentCreate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collaboration_mode: Option<String>,
     pub request_id: String,
     pub session_type: SessionType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub effort: Option<String>,
+    /// Absent preserves saved effort; null selects the provider's default.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "double_option"
+    )]
+    pub effort: Option<Option<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub legacy_restore_context: Option<LegacyRestoreContext>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -975,13 +982,20 @@ pub struct FreshAgentImage {
     pub media_type: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentSendSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
+    pub collaboration_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub effort: Option<String>,
+    pub cwd: Option<String>,
+    /// Absent leaves the selection alone; null clears the Freshell override.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "double_option"
+    )]
+    pub effort: Option<Option<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Free string.

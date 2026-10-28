@@ -3495,6 +3495,7 @@ async fn an_ordinary_codex_cold_resume_with_recovered_settings_lands_end_to_end(
     );
     pane_ledger
         .record_fresh_agent_binding(&freshell_ws::pane_ledger::FreshAgentBindingWrite {
+            collaboration_mode: None,
             genesis: freshell_ws::pane_ledger::GenesisWrite::Keep,
             provider: "codex",
             session_id: &sid,

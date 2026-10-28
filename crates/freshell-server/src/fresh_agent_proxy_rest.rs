@@ -268,11 +268,12 @@ impl FreshAgentRestLane for HostedFreshAgentProxy {
             rest_agent_identity(&request.provider, &request.session_type)?;
         let runtime_provider = fresh_provider(&Some(provider), session_type).ok_or(())?;
         let message = freshell_protocol::FreshAgentCreate {
+            collaboration_mode: None,
             pane_id: request.pane_id,
             request_id: request.request_id,
             session_type,
             cwd: request.cwd,
-            effort: request.effort,
+            effort: request.effort.map(Some),
             legacy_restore_context: None,
             model: request.model,
             model_selection: request.model_selection,

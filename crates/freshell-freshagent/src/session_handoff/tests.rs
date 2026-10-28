@@ -701,6 +701,7 @@ async fn unsupported_atomic_handoff_refuses_before_mutation_and_clear_bypasses_p
 
 fn create_msg(sid: &str) -> FreshAgentCreate {
     FreshAgentCreate {
+        collaboration_mode: None,
         pane_id: None,
         naming_handle: None,
         request_id: format!("handoff-create-{}", uuid::Uuid::new_v4()),
@@ -6240,6 +6241,7 @@ async fn the_claude_handoff_target_binding_carries_the_handoff_generation() {
         "claude",
         &sid,
         crate::identity_sink::FreshAgentSettings {
+            collaboration_mode: None,
             model: Some("opus-x".into()),
             sandbox: None,
             permission_mode: Some("plan".into()),
@@ -6918,6 +6920,7 @@ async fn an_abort_cleanup_broadcasts_the_restored_prior_owner() {
 
 fn fresh_create_msg(session_type: SessionType) -> FreshAgentCreate {
     FreshAgentCreate {
+        collaboration_mode: None,
         pane_id: None,
         naming_handle: None,
         request_id: format!("handoff-create-fresh-{}", uuid::Uuid::new_v4()),

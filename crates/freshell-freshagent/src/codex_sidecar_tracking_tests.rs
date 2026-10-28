@@ -95,6 +95,7 @@ async fn create_tracked_session_with_resume(
 ) -> String {
     st.handle_create(
         FreshAgentCreate {
+            collaboration_mode: None,
             pane_id: None,
             naming_handle: None,
             observed_epoch: None,
@@ -227,6 +228,7 @@ async fn failed_spawn_leaves_no_record() {
 
     st.handle_create(
         FreshAgentCreate {
+            collaboration_mode: None,
             pane_id: None,
             naming_handle: None,
             observed_epoch: None,
@@ -629,6 +631,7 @@ async fn create_bail_after_spawn_leaves_no_record() {
 
     st.handle_create(
         FreshAgentCreate {
+            collaboration_mode: None,
             pane_id: None,
             naming_handle: None,
             observed_epoch: None,

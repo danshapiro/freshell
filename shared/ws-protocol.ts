@@ -861,9 +861,10 @@ export const FreshAgentCreateSchema = z.object({
   model: z.string().optional(),
   permissionMode: z.string().optional(),
   sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
+  collaborationMode: z.enum(['default', 'plan']).optional(),
   sessionRef: z.object({ provider: z.string().min(1), sessionId: z.string().min(1) }).optional(),
   modelSelection: z.object({ kind: z.string().min(1), modelId: z.string().min(1) }).optional().or(z.null()),
-  effort: z.string().trim().min(1).optional(),
+  effort: z.string().trim().min(1).nullable().optional(),
   plugins: z.array(z.string()).optional(),
   /** D8: the creating tab's client-side id; the server composes the ledger row's
    * `tabKey` as `deviceId:tabId`. Non-strict schema — tolerated by older servers. */
@@ -930,7 +931,8 @@ export const FreshAgentSendSchema = z.object({
     model: z.string().min(1).optional(),
     permissionMode: z.string().min(1).optional(),
     sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
-    effort: z.string().trim().min(1).optional(),
+  collaborationMode: z.enum(['default', 'plan']).optional(),
+    effort: z.string().trim().min(1).nullable().optional(),
   }).optional(),
   images: z.array(z.object({
     mediaType: z.string(),
@@ -978,7 +980,8 @@ export const FreshAgentConfigureSchema = z.object({
     model: z.string().min(1).optional(),
     permissionMode: z.string().min(1).optional(),
     sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
-    effort: z.string().trim().min(1).optional(),
+  collaborationMode: z.enum(['default', 'plan']).optional(),
+    effort: z.string().trim().min(1).nullable().optional(),
   }),
 })
 

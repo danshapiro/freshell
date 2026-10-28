@@ -65,6 +65,7 @@ async fn interrupt_turn_rpc_then_interrupted_completion_snapshots_without_chime(
                 .expect("thread/start");
             let turn = client
                 .start_turn(StartTurnParams {
+                    collaboration_mode: None,
                     thread_id: THREAD_ID.to_string(),
                     input: vec![json!({ "type": "text", "text": "hi" })],
                     cwd: None,

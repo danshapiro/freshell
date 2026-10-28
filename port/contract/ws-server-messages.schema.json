@@ -3929,6 +3929,16 @@
                   "additionalProperties": {
                     "additionalProperties": false,
                     "properties": {
+                      "collaborationMode": {
+                        "enum": [
+                          "default",
+                          "plan"
+                        ],
+                        "type": "string"
+                      },
+                      "cwd": {
+                        "type": "string"
+                      },
                       "defaultPermissionMode": {
                         "type": "string"
                       },
@@ -3991,6 +4001,14 @@
                             "type": "object"
                           }
                         ]
+                      },
+                      "sandbox": {
+                        "enum": [
+                          "read-only",
+                          "workspace-write",
+                          "danger-full-access"
+                        ],
+                        "type": "string"
                       },
                       "style": {
                         "enum": [

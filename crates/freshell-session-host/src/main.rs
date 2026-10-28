@@ -10367,6 +10367,7 @@ mod tests {
         let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
             state.state_dir.join("rpc-configure-agent"),
             FreshAgentProfile {
+                collaboration_mode: None,
                 provider: FreshProvider::Claude,
                 runtime_variant: "fixture-sdk".into(),
                 cwd: "/workspace".into(),
@@ -10394,9 +10395,10 @@ mod tests {
                     incarnation_id: state.incarnation_id.clone(),
                     request_id: RequestId::parse("rpc-configure-one").unwrap(),
                     settings: freshell_runtime_protocol::FreshAgentTurnSettings {
+                        collaboration_mode: None,
                         cwd: None,
                         model: Some("opus".into()),
-                        effort: Some("high".into()),
+                        effort: Some(Some("high".into())),
                         permission_mode: None,
                         sandbox: None,
                     },
@@ -10526,6 +10528,7 @@ mod tests {
         let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
             state.state_dir.join("child-observer"),
             FreshAgentProfile {
+                collaboration_mode: None,
                 provider: FreshProvider::Codex,
                 runtime_variant: "freshcodex".into(),
                 cwd: "/workspace".into(),
@@ -10603,6 +10606,7 @@ mod tests {
         let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
             state.state_dir.join("catalog-observer"),
             FreshAgentProfile {
+                collaboration_mode: None,
                 provider: FreshProvider::Codex,
                 runtime_variant: "freshcodex".into(),
                 cwd: "/workspace".into(),
@@ -10674,6 +10678,7 @@ mod tests {
         let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
             state.state_dir.join("rpc-fixture-agent"),
             FreshAgentProfile {
+                collaboration_mode: None,
                 provider: FreshProvider::Claude,
                 runtime_variant: "fixture-sdk".into(),
                 cwd: "/workspace".into(),

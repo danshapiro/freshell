@@ -353,12 +353,13 @@ function successResult(method, params) {
     return {
       thread,
       cwd: params?.cwd ?? process.cwd(),
-      model: 'fixture-model',
+      model: behavior.echoRequestedModel === true ? params?.model ?? 'fixture-model' : 'fixture-model',
       modelProvider: 'openai',
       instructionSources: [],
       approvalPolicy: behavior.effectiveApprovalPolicy ?? params?.approvalPolicy ?? 'never',
       approvalsReviewer: 'user',
       sandbox: params?.sandbox ?? 'danger-full-access',
+      ...behavior.effectiveThreadSettings,
     }
   }
   if (method === 'thread/resume') {
@@ -372,12 +373,13 @@ function successResult(method, params) {
     return {
       thread,
       cwd: params?.cwd ?? process.cwd(),
-      model: 'fixture-model',
+      model: behavior.echoRequestedModel === true ? params?.model ?? 'fixture-model' : 'fixture-model',
       modelProvider: 'openai',
       instructionSources: [],
       approvalPolicy: behavior.effectiveApprovalPolicy ?? params?.approvalPolicy ?? 'never',
       approvalsReviewer: 'user',
       sandbox: params?.sandbox ?? 'danger-full-access',
+      ...behavior.effectiveThreadSettings,
     }
   }
   if (method === 'turn/steer') {
@@ -921,6 +923,13 @@ wss.on('connection', (socket) => {
       return
     }
 
+    // Opt-in native requirements refusal. Unrelated fixture consumers retain
+    // their normal resume behavior and effective defaults.
+    if (behavior.rejectResumeOverrides === true && method === 'thread/resume'
+      && (message.params?.sandbox != null || message.params?.approvalPolicy != null)) {
+      socket.send(JSON.stringify({ id: message.id, error: { code: -32600, message: 'Native test requirements refuse requested resume sandbox or approval overrides' } }))
+      return
+    }
     const override = behavior.overrides?.[method]
     const delayMs = Number(behavior.delayMethodsMs?.[method] || 0)
     const floodStdoutBytes = Number(behavior.floodStdoutBeforeMethodsBytes?.[method] || 0)

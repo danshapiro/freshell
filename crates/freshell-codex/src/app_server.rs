@@ -178,6 +178,9 @@ pub struct StartThreadParams {
 pub struct StartedThread {
     pub thread_id: String,
     pub reasoning_effort: Option<String>,
+    /// Effective settings stated by native start/resume. Absent fields are
+    /// deliberately distinguishable from an explicit null native default.
+    pub effective_settings: Value,
 }
 
 /// `thread/fork` params (the 0.147.0 `ThreadForkParams` generated type): `{threadId,
@@ -211,6 +214,7 @@ pub struct StartTurnParams {
     pub effort: Option<String>,
     pub sandbox_policy: Option<Value>,
     pub approval_policy: Option<Value>,
+    pub collaboration_mode: Option<Value>,
 }
 
 /// The `turn/start` result (`CodexTurnStartResult`, `protocol.ts:318-320`): the provider turn id.
@@ -463,6 +467,7 @@ impl CodexAppServerClient {
         Ok(StartedThread {
             thread_id,
             reasoning_effort,
+            effective_settings: effective_thread_settings(&result),
         })
     }
 
@@ -518,6 +523,7 @@ impl CodexAppServerClient {
         Ok(StartedThread {
             thread_id: resumed_thread_id,
             reasoning_effort,
+            effective_settings: effective_thread_settings(&result),
         })
     }
 
@@ -606,6 +612,9 @@ impl CodexAppServerClient {
         insert_opt_str(&mut wire, "model", params.model);
         // DEV-0003: the reasoning effort crosses the wire EXACTLY as given (no clamp/remap).
         insert_opt_str(&mut wire, "effort", params.effort);
+        if let Some(mode) = params.collaboration_mode {
+            wire.insert("collaborationMode".to_string(), mode);
+        }
 
         let result = self.request("turn/start", Value::Object(wire)).await?;
         let turn_id = result
@@ -931,6 +940,23 @@ fn fail_all_pending(pending: &PendingMap, _reason: &str) {
         // Dropping the sender (via a closed Err) resolves the waiter's `Ok(Err(_))` → Closed.
         drop(tx);
     }
+}
+
+fn effective_thread_settings(response: &Value) -> Value {
+    let mut settings = Map::new();
+    for key in [
+        "model",
+        "reasoningEffort",
+        "cwd",
+        "sandbox",
+        "approvalPolicy",
+        "collaborationMode",
+    ] {
+        if let Some(value) = response.get(key) {
+            settings.insert(key.into(), value.clone());
+        }
+    }
+    Value::Object(settings)
 }
 
 fn insert_opt_str(map: &mut Map<String, Value>, key: &str, value: Option<String>) {
@@ -1397,6 +1423,7 @@ mod tests {
             let turn_effort = effort.to_string();
             let task = tokio::spawn(async move {
                 c.start_turn(StartTurnParams {
+                    collaboration_mode: None,
                     thread_id: "thread-1".to_string(),
                     input: vec![json!({ "type": "text", "text": "hi" })],
                     cwd: None,

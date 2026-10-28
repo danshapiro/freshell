@@ -167,7 +167,10 @@ export function FreshAgentSettingsButton({
   const permissionModeValue = paneContent.permissionMode
     ?? descriptor?.defaultPermissionMode
     ?? ''
-  const settingsDisabled = paneContent.status === 'running' || paneContent.status === 'compacting'
+  const settingsDisabled = paneContent.provider !== 'codex' && (paneContent.status === 'running' || paneContent.status === 'compacting')
+  const scopedSettingDisabled = (knob: 'sandbox' | 'collaborationMode') => settingsDisabled
+    || settingScopes?.[knob] === 'unsupported'
+    || Boolean(paneContent.sessionId && settingScopes?.[knob] === 'create-only')
   const styleValue = normalizeFreshAgentStyle(
     paneContent.style ?? providerDefaults?.style ?? DEFAULT_FRESH_AGENT_STYLE,
   )
@@ -184,6 +187,8 @@ export function FreshAgentSettingsButton({
   const closeModelDialog = useCallback(() => setModelDialogOpen(false), [])
   const close = useCallback(() => setOpen(false), [])
   const persistProviderDefaults = useCallback((defaults: {
+    sandbox?: FreshAgentPaneContent['sandbox']
+    collaborationMode?: FreshAgentPaneContent['collaborationMode']
     modelSelection?: { kind: 'exact'; modelId: string }
     defaultPermissionMode?: string
     effort?: string
@@ -198,6 +203,12 @@ export function FreshAgentSettingsButton({
       },
     }))
   }, [dispatch, paneContent.sessionType])
+
+  const commitCodexSettings = (settings: { sandbox?: FreshAgentPaneContent['sandbox']; collaborationMode?: FreshAgentPaneContent['collaborationMode'] }) => {
+    dispatch(mergePaneContent({ tabId, paneId, updates: settings }))
+    sendFreshAgentConfigure(paneId, paneContent, settings)
+    persistProviderDefaults(settings)
+  }
 
   // freshopencode + claude providers (freshclaude/kilroy): fetch the live
   // catalog when the popover opens. freshopencode renders display names and
@@ -480,6 +491,42 @@ export function FreshAgentSettingsButton({
                   </button>
                 </div>
               )
+            ) : null}
+
+            {descriptor?.settingsVisibility.sandbox ? (
+              <label className="block space-y-1">
+                <span className="font-medium">File access</span>
+                <select
+                  aria-label="File access"
+                  className="min-h-[2.5rem] w-full rounded border border-border/70 bg-background px-2 py-1 text-base sm:min-h-0 sm:text-xs"
+                  value={paneContent.sandbox ?? providerDefaults?.sandbox ?? ''}
+                  disabled={scopedSettingDisabled('sandbox')}
+                  onChange={(event) => commitCodexSettings({ sandbox: event.target.value as FreshAgentPaneContent['sandbox'] })}
+                >
+                  <option value="" disabled>Codex default</option>
+                  <option value="read-only">Read only</option>
+                  <option value="workspace-write">Workspace write</option>
+                  <option value="danger-full-access">Full access</option>
+                </select>
+                <span className="block text-[11px] text-muted-foreground">{settingScopeHint(settingScopes, 'sandbox')}</span>
+              </label>
+            ) : null}
+
+            {descriptor?.settingsVisibility.collaborationMode ? (
+              <label className="block space-y-1">
+                <span className="font-medium">Work mode</span>
+                <select
+                  aria-label="Work mode"
+                  className="min-h-[2.5rem] w-full rounded border border-border/70 bg-background px-2 py-1 text-base sm:min-h-0 sm:text-xs"
+                  value={paneContent.collaborationMode ?? providerDefaults?.collaborationMode ?? 'default'}
+                  disabled={scopedSettingDisabled('collaborationMode')}
+                  onChange={(event) => commitCodexSettings({ collaborationMode: event.target.value as 'default' | 'plan' })}
+                >
+                  <option value="default">Build</option>
+                  <option value="plan">Plan</option>
+                </select>
+                <span className="block text-[11px] text-muted-foreground">{settingScopeHint(settingScopes, 'collaborationMode')}</span>
+              </label>
             ) : null}
 
             {permissionModes.length > 0 ? (

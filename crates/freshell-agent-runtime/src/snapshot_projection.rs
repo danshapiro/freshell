@@ -147,7 +147,7 @@ fn valid_scopes(value: &Value) -> bool {
     scopes.iter().all(|(name, value)| {
         matches!(
             name.as_str(),
-            "model" | "effort" | "sandbox" | "permissionMode"
+            "model" | "effort" | "sandbox" | "permissionMode" | "cwd" | "collaborationMode"
         ) && matches!(
             value.as_str(),
             Some("per-send" | "create-only" | "unsupported")

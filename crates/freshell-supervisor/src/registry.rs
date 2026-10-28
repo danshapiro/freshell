@@ -1081,7 +1081,7 @@ impl Registry {
             let mut spec: FreshAgentLaunchSpec = serde_json::from_str(&encoded)
                 .map_err(|_| RegistryError::Integrity("invalid fresh-agent launch spec".into()))?;
             let effort = match fold {
-                SettingsFold::Turn => settings.effort.clone().or_else(|| spec.effort.clone()),
+                SettingsFold::Turn => settings.effort.clone().unwrap_or_else(|| spec.effort.clone()),
                 SettingsFold::Configure => settings.effort_after_configure(
                     &spec.provider,
                     spec.model.as_deref(),
@@ -1111,6 +1111,9 @@ impl Registry {
             }
             if let Some(value) = settings.sandbox {
                 spec.sandbox = Some(value);
+            }
+            if let Some(value) = settings.collaboration_mode {
+                spec.collaboration_mode = Some(value);
             }
             spec.validate().map_err(|error| {
                 RegistryError::InvalidState(error.message)
@@ -3796,6 +3799,7 @@ mod tests {
         launch.provider = "claude".into();
         launch.provider_store_id = "fresh-store".into();
         launch.fresh_agent = Some(FreshAgentLaunchSpec {
+            collaboration_mode: None,
             session_id: "fresh-session".into(),
             provider: freshell_runtime_protocol::FreshProvider::Claude,
             session_type: "freshclaude".into(),
@@ -4552,9 +4556,10 @@ mod tests {
                 soul.clone(),
                 prepared.incarnation_id,
                 FreshAgentTurnSettings {
+                    collaboration_mode: None,
                     cwd: Some(nested.to_string_lossy().into_owned()),
                     model: Some("recovery-model".into()),
-                    effort: Some("high".into()),
+                    effort: Some(Some("high".into())),
                     permission_mode: Some("accept-edits".into()),
                     sandbox: Some("danger-full-access".into()),
                 },

@@ -93,6 +93,7 @@ async fn full_drive_completed_turn_emits_the_positive_edge_with_verbatim_effort(
                 .unwrap();
             let turn = client
                 .start_turn(StartTurnParams {
+                    collaboration_mode: None,
                     thread_id: THREAD_ID.to_string(),
                     input: vec![json!({ "type": "text", "text": "freshell-t2-ok" })],
                     cwd: Some("/work".to_string()),
@@ -173,6 +174,7 @@ async fn full_drive_user_armed_interrupted_turn_does_not_chime() {
                 .unwrap();
             client
                 .start_turn(StartTurnParams {
+                    collaboration_mode: None,
                     thread_id: THREAD_ID.to_string(),
                     input: vec![json!({ "type": "text", "text": "hi" })],
                     cwd: None,
@@ -245,6 +247,7 @@ async fn rpc_error_on_turn_start_surfaces_to_the_caller() {
                 .expect("thread/start");
             client
                 .start_turn(StartTurnParams {
+                    collaboration_mode: None,
                     thread_id: THREAD_ID.to_string(),
                     input: vec![json!({ "type": "text", "text": "hi" })],
                     cwd: None,

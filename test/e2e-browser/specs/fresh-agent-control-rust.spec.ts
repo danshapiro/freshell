@@ -1310,6 +1310,7 @@ async function bootCodexLane(
           recordTurns: true,
           appendClientResponseLogPath: responseLogPath,
           appendRequestLogPath: requestLogPath,
+          echoRequestedModel: true,
           ...behavior,
         }),
         ...extraEnv,
@@ -1434,12 +1435,13 @@ async function sendCodexTurnAndWaitRows(
   harness: TestHarness,
   expectedRowCount: number,
   text: string,
+  threadId = 'thread-new-1',
 ): Promise<void> {
   const sentBefore = await harness.getSentWsMessages()
   const matchingSendsBefore = (sentBefore as any[]).filter(
     (message) => message?.type === 'freshAgent.send'
       && message?.provider === 'codex'
-      && message?.sessionId === 'thread-new-1'
+      && message?.sessionId === threadId
       && message?.text === text,
   ).length
   await sendComposerText(page, text)
@@ -1448,7 +1450,7 @@ async function sendCodexTurnAndWaitRows(
       async () => (await harness.getSentWsMessages() as any[]).filter(
         (message) => message?.type === 'freshAgent.send'
           && message?.provider === 'codex'
-          && message?.sessionId === 'thread-new-1'
+          && message?.sessionId === threadId
           && message?.text === text,
       ).length,
       {
@@ -1469,7 +1471,7 @@ async function sendCodexTurnAndWaitRows(
   await expect
     .poll(
       async () => {
-        const snapshot = await fetchSnapshot(info, 'freshcodex', 'codex', 'thread-new-1')
+        const snapshot = await fetchSnapshot(info, 'freshcodex', 'codex', threadId)
         return {
           rows: snapshot?.turns?.length ?? 0,
           status: snapshot?.status ?? null,
@@ -1486,7 +1488,7 @@ async function sendCodexTurnAndWaitRows(
   // provider snapshot alone.
   await expect
     .poll(
-      () => readFreshAgentSessionStatus(harness, 'thread-new-1'),
+      () => readFreshAgentSessionStatus(harness, threadId),
       {
         timeout: 30_000,
         message: `the browser did not settle its Codex session after "${text}"`,
@@ -1523,6 +1525,58 @@ async function readRollout(homeDir: string, threadId: string): Promise<string | 
 
 test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
   test.setTimeout(240_000)
+
+  test('Freshcodex explicitly clears effort with Default and keeps native settings after reload', async ({ page }) => {
+    const lane = await bootCodexLane(page, { uniqueThreadIds: true })
+    try {
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      const threadId = (await paneLeaf(lane.harness, lane.tabId)).content.sessionId as string
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 2, 'Default readiness control', threadId)
+      const starts = () => readJsonl(lane.requestLogPath).filter((row) => row.method === 'turn/start')
+      const settings = page.getByRole('dialog', { name: 'Agent settings' })
+      const modelDialog = page.getByRole('dialog', { name: 'Model and thinking level' })
+      await page.getByRole('button', { name: 'Agent settings' }).click()
+      await settings.getByRole('button', { name: /Change/ }).click()
+      await modelDialog.getByRole('option', { name: 'Provider Current', exact: true }).click()
+      await modelDialog.getByRole('listbox', { name: 'Thinking levels for Provider Current' }).getByRole('option', { name: /^ultra\b/ }).click()
+      await modelDialog.getByRole('button', { name: 'Use Provider Current · ultra' }).click()
+      await settings.getByRole('combobox', { name: 'File access', exact: true }).selectOption('read-only')
+      await settings.getByRole('combobox', { name: 'Work mode', exact: true }).selectOption('plan')
+      await page.keyboard.press('Escape')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 4, 'Explicit effort before Default', threadId)
+      expect(starts()[1].params).toMatchObject({ model: 'provider-current', effort: 'ultra', sandboxPolicy: { type: 'readOnly' }, collaborationMode: { mode: 'plan', settings: { reasoning_effort: 'ultra' } } })
+      const providerDefaults = async () => {
+        const response = await page.request.get(`${lane.info.baseUrl}/api/settings`, { headers: { 'x-auth-token': lane.info.token } })
+        expect(response.ok()).toBe(true)
+        return (await response.json()).freshAgent?.providers?.freshcodex
+      }
+      await expect.poll(async () => (await providerDefaults())?.effort).toBe('ultra')
+      console.log('TASK008_DEFAULT_NATIVE_READY', JSON.stringify({ threadId, completedControl: true, explicitEffort: 'ultra', savedEffort: 'ultra' }))
+      await page.getByRole('button', { name: 'Agent settings' }).click()
+      await settings.getByRole('button', { name: /Change/ }).click()
+      const levels = modelDialog.getByRole('listbox', { name: 'Thinking levels for Provider Current' })
+      await expect(levels.getByRole('option', { name: /^ultra\b/ })).toBeVisible()
+      await expect(levels.getByRole('option', { name: 'Default', exact: true })).toBeVisible({ timeout: 10_000 })
+      await levels.getByRole('option', { name: 'Default', exact: true }).click()
+      await modelDialog.getByRole('button', { name: 'Use Provider Current · Default' }).click()
+      await page.keyboard.press('Escape')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 6, 'Native Default next send', threadId)
+      expect(starts()[2].params).not.toHaveProperty('effort')
+      expect(starts()[2].params).toMatchObject({ cwd: lane.projectDir, sandboxPolicy: { type: 'readOnly' }, approvalPolicy: 'on-request', collaborationMode: { mode: 'plan', settings: { model: 'provider-current', reasoning_effort: null, developer_instructions: null } } })
+      expect((await lane.harness.getSentWsMessages() as any[]).some((frame) => frame.type === 'freshAgent.configure' && frame.settings?.effort === null)).toBe(true)
+      await expect.poll(async () => (await providerDefaults())?.effort ?? null).toBe(null)
+      await page.reload()
+      await lane.harness.waitForHarness()
+      await lane.harness.waitForConnection()
+      await expect.poll(async () => (await paneLeaf(lane.harness, lane.tabId))?.content?.effortIsNativeDefault).toBe(true)
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 8, 'Native Default after reload', threadId)
+      expect(starts()[3].params).not.toHaveProperty('effort')
+      expect(starts()[3].params).toMatchObject({ model: 'provider-current', sandboxPolicy: { type: 'readOnly' }, collaborationMode: { mode: 'plan', settings: { reasoning_effort: null } } })
+    } finally {
+      await lane.server.stop()
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true })
+    }
+  })
 
   test('Freshcodex file access and Plan settings reach native turns and survive reload', async ({ page }) => {
     const lane = await bootCodexLane(page, { serverRequestsByPrompt: {

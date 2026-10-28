@@ -2016,10 +2016,11 @@ impl FreshClaudeState {
         // `sdk.session.init` (claude has no sandbox concept: always `None`), and
         // the launch is built from the same values (G15: the plugins too).
         let settings = crate::identity_sink::FreshAgentSettings {
+            collaboration_mode: None,
             model: msg.model.clone(),
             sandbox: None,
             permission_mode: msg.permission_mode.clone(),
-            effort: msg.effort.clone(),
+            effort: msg.effort.clone().flatten(),
             cwd: msg.cwd.clone(),
             plugins: None,
         }
@@ -8092,6 +8093,7 @@ pub(crate) mod tests {
 
         let mut send = send_msg(&session_id, "carries an unsupported knob");
         send.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            collaboration_mode: None,
             cwd: None,
             model: None,
             effort: None,
@@ -8264,15 +8266,16 @@ pub(crate) mod tests {
         state.set_identity_sink(fake.clone());
         let mut create = dedup_create_msg("settings-send");
         create.model = Some("opus".into());
-        create.effort = Some("high".into());
+        create.effort = Some(Some("high".into()));
         state.handle_create(create, None).await;
         let created = await_claude_created(&mut rx, "settings-send").await;
         let session_id = created["sessionId"].as_str().unwrap();
         let mut send = send_msg(session_id, "Review this image");
         send.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            collaboration_mode: None,
             cwd: None,
             model: Some("sonnet".into()),
-            effort: Some("max".into()),
+            effort: Some(Some("max".into())),
             permission_mode: Some("plan".into()),
             sandbox: None,
         });
@@ -8335,14 +8338,15 @@ pub(crate) mod tests {
         state.set_identity_sink(fake.clone());
         let mut create = dedup_create_msg("partial-settings");
         create.model = Some("opus".into());
-        create.effort = Some("high".into());
+        create.effort = Some(Some("high".into()));
         state.handle_create(create, None).await;
         let created = await_claude_created(&mut rx, "partial-settings").await;
         let session_id = created["sessionId"].as_str().unwrap();
         let mut send = send_msg(session_id, "Keep this unsent");
         send.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            collaboration_mode: None,
             model: Some("sonnet".into()),
-            effort: Some("invalid".into()),
+            effort: Some(Some("invalid".into())),
             cwd: None,
             permission_mode: None,
             sandbox: None,
@@ -8390,6 +8394,7 @@ pub(crate) mod tests {
         let mut send = send_msg(session_id, "Do not lose this prompt");
         send.request_id = Some("retained-prompt".into());
         send.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            collaboration_mode: None,
             cwd: None,
             model: Some("unavailable".into()),
             effort: None,
@@ -8438,6 +8443,7 @@ pub(crate) mod tests {
 
     fn dedup_create_msg(request_id: &str) -> FreshAgentCreate {
         FreshAgentCreate {
+            collaboration_mode: None,
             pane_id: None,
             naming_handle: None,
             observed_epoch: None,
@@ -14981,7 +14987,7 @@ pub(crate) mod tests {
         msg.session_type = SessionType::Kilroy;
         msg.model = Some("opus-x".to_string());
         msg.permission_mode = Some("plan".to_string());
-        msg.effort = Some("high".to_string());
+        msg.effort = Some(Some("high".to_string()));
         msg.cwd = Some(env.dir.to_string_lossy().to_string());
         state.handle_create(msg, None).await;
         // Create publishes only after the native binding is durable.
@@ -15164,6 +15170,7 @@ pub(crate) mod tests {
             "claude",
             DURABLE,
             crate::identity_sink::FreshAgentSettings {
+                collaboration_mode: None,
                 model: Some("opus-x".into()),
                 sandbox: None,
                 permission_mode: Some("plan".into()),
@@ -17135,11 +17142,12 @@ rl.on('line', (line) => {
             cwd: None,
             request_id: Some("req-configure".to_string()),
             settings: freshell_protocol::FreshAgentSendSettings {
+                collaboration_mode: None,
                 cwd: None,
                 model: model.map(|m| m.to_string()),
                 permission_mode: None,
                 sandbox: None,
-                effort: effort.map(|e| e.to_string()),
+                effort: effort.map(|e| e.to_string()).map(Some),
             },
         }
     }
@@ -17307,9 +17315,10 @@ rl.on('line', (line) => {
 
         let mut send = send_msg(&session_id, "carries a new model");
         send.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            collaboration_mode: None,
             cwd: None,
             model: Some("opus[1m]".to_string()),
-            effort: Some("high".to_string()),
+            effort: Some(Some("high".to_string())),
             permission_mode: None,
             sandbox: None,
         });
@@ -17351,9 +17360,10 @@ rl.on('line', (line) => {
         // exactly one metadata frame converges.
         let mut send = send_msg(&session_id, "carries a new model");
         send.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            collaboration_mode: None,
             cwd: None,
             model: Some("opus[1m]".to_string()),
-            effort: Some("high".to_string()),
+            effort: Some(Some("high".to_string())),
             permission_mode: None,
             sandbox: None,
         });
@@ -17377,9 +17387,10 @@ rl.on('line', (line) => {
         // no second configure), and the unchanged pair converges nothing.
         let mut resend = send_msg(&session_id, "same pair again");
         resend.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            collaboration_mode: None,
             cwd: None,
             model: Some("opus[1m]".to_string()),
-            effort: Some("high".to_string()),
+            effort: Some(Some("high".to_string())),
             permission_mode: None,
             sandbox: None,
         });

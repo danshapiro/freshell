@@ -45,7 +45,7 @@ import { highestThinkingLevelId, orderThinkingLevelIds } from '@shared/fresh-age
 const MAX_RENDERED_MODEL_ROWS = 250
 
 /** A right-column row: a real thinking level declared by the highlighted
- * model, or the single Default row (no variant) for models without levels. */
+ * model, plus Codex's native Default or a Default for models without levels. */
 type LevelRow = { kind: 'level'; id: string } | { kind: 'default' }
 
 type ModelRow = {
@@ -53,11 +53,12 @@ type ModelRow = {
   model: FreshAgentModelCapability
 }
 
-function levelRowsForModel(model: FreshAgentModelCapability): LevelRow[] {
+function levelRowsForModel(model: FreshAgentModelCapability, nativeDefault: boolean): LevelRow[] {
   // Levels arrive pre-ordered from the server; order defensively client-side.
   const ordered = orderThinkingLevelIds(model.supportedEffortLevels)
   if (ordered.length === 0) return [{ kind: 'default' }]
-  return ordered.map((id) => ({ kind: 'level', id }))
+  const levels: LevelRow[] = ordered.map((id) => ({ kind: 'level', id }))
+  return nativeDefault ? [{ kind: 'default' }, ...levels] : levels
 }
 
 function getFocusable(container: HTMLElement): HTMLElement[] {
@@ -236,6 +237,9 @@ export function FreshAgentModelDialog({
   // use the last chosen level, then their highest available level.
   const preselectLevelIndex = useCallback((rows: LevelRow[], modelId: string): number => {
     if (modelId === effectiveModelId) {
+      if (sessionType === 'freshcodex' && paneContent.effortIsNativeDefault && !effectiveEffort) {
+        return Math.max(rows.findIndex((row) => row.kind === 'default'), 0)
+      }
       const currentIndex = rows.findIndex((row) => row.kind === 'level' && row.id === effectiveEffort)
       if (currentIndex >= 0) return currentIndex
     }
@@ -247,7 +251,7 @@ export function FreshAgentModelDialog({
     const defaultEffort = capabilities?.models.find((model) => model.id === modelId)?.defaultEffort
     const defaultIndex = rows.findIndex((row) => row.kind === 'level' && row.id === defaultEffort)
     return defaultIndex >= 0 ? defaultIndex : rows.length - 1
-  }, [effectiveEffort, effectiveModelId, lastUsedLevelFor, capabilities])
+  }, [effectiveEffort, effectiveModelId, lastUsedLevelFor, capabilities, sessionType, paneContent.effortIsNativeDefault])
 
   // Reset only when opening or changing panes, never when an asynchronous
   // catalog arrives while the user is typing or choosing a level.
@@ -356,7 +360,7 @@ export function FreshAgentModelDialog({
     ?? (sessionType === 'freshcodex' && stagedModel ? {key:`catalog:${stagedModel.id}`,model:stagedModel} : undefined)
     ?? flatModelRows[0], [flatModelRows, highlightedRowKey, effectiveModelId, sessionType, stagedModel])
   const highlightedModel = highlightedRow?.model
-  const levelRows: LevelRow[] = highlightedModel ? levelRowsForModel(highlightedModel) : []
+  const levelRows: LevelRow[] = highlightedModel ? levelRowsForModel(highlightedModel, sessionType === 'freshcodex') : []
   // The level highlight is user-set only when the highlighted model row is
   // user-set (selectModelRow stages both together); the derived initial
   // highlight uses the preselection rule directly.
@@ -379,7 +383,7 @@ export function FreshAgentModelDialog({
   const selectModelRow = useCallback((row: ModelRow) => {
     if (sessionType === 'freshcodex') setStagedModel(row.model)
     setHighlightedRowKey(row.key)
-    setHighlightedLevelIndex(preselectLevelIndex(levelRowsForModel(row.model), row.model.id))
+    setHighlightedLevelIndex(preselectLevelIndex(levelRowsForModel(row.model, sessionType === 'freshcodex'), row.model.id))
     setActiveColumn('models')
   }, [preselectLevelIndex,sessionType])
 
@@ -431,6 +435,7 @@ export function FreshAgentModelDialog({
           ? { modelLabel: { modelId: model.id, label: model.displayName } }
           : {}),
         effort: level,
+        ...(sessionType === 'freshcodex' ? { effortIsNativeDefault: level === undefined } : {}),
         ...(modelEffortLevels ? { modelEffortLevels } : {}),
       },
     }))
@@ -438,12 +443,11 @@ export function FreshAgentModelDialog({
     // answers with the freshAgent.session.metadata broadcast that converges
     // the lower-left chip — and every other device's surfaces — immediately,
     // instead of the next message's send-time settings carrying it. Pre-create
-    // panes (no sessionId) stage only, exactly as before. An ABSENT effort key
-    // is the explicit Default row (opencode clears the variant; the per-send
-    // providers keep the session's current effort).
+    // panes (no sessionId) stage only. Codex uses null for explicit Default;
+    // an omitted partial-request field keeps its previous selection.
     sendFreshAgentConfigure(paneId, paneContent, {
       model: model.id,
-      ...(level ? { effort: level } : {}),
+      ...(level ? { effort: level } : sessionType === 'freshcodex' ? { effort: null } : {}),
     })
     void dispatch(saveServerSettingsPatch({
       freshAgent: {

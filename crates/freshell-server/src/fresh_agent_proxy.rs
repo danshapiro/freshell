@@ -734,6 +734,7 @@ impl HostedFreshAgentProxy {
         };
         provider_launch_context = context_for_fresh_provider(provider_launch_context);
         let launch = FreshAgentLaunchSpec {
+            collaboration_mode: message.collaboration_mode.clone(),
             session_id: public_session_id.clone(),
             provider: provider.clone(),
             session_type: session_type.clone(),
@@ -746,7 +747,7 @@ impl HostedFreshAgentProxy {
             run_as_uid: PROVIDER_UID,
             run_as_gid: PROVIDER_GID,
             model: message.model.clone(),
-            effort: message.effort.clone(),
+            effort: message.effort.clone().flatten(),
             permission_mode: message.permission_mode.clone(),
             sandbox: message
                 .sandbox
@@ -1503,6 +1504,7 @@ fn turn_settings(
 ) -> Option<freshell_runtime_protocol::FreshAgentTurnSettings> {
     let mut settings = settings.map(
         |settings| freshell_runtime_protocol::FreshAgentTurnSettings {
+            collaboration_mode: settings.collaboration_mode,
             cwd: settings.cwd,
             model: settings.model,
             effort: settings.effort,

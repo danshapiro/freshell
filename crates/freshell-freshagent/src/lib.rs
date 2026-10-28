@@ -5703,6 +5703,7 @@ async fn resume_session_ref_tab(
                 // carries no handoff continuation context).
                 authoritative: false,
                 settings: identity_sink::FreshAgentSettings {
+                    collaboration_mode: None,
                     model: model.clone(),
                     sandbox: None,
                     permission_mode: None,
@@ -6752,6 +6753,7 @@ async fn send_keys(
                     // b8ke focused ep5 r2 F1: a REST-lane write.
                     authoritative: false,
                     settings: identity_sink::FreshAgentSettings {
+                        collaboration_mode: None,
                         model: pane.model.clone(),
                         sandbox: None,
                         permission_mode: None,

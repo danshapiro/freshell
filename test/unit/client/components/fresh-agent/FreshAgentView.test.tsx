@@ -20,6 +20,7 @@ import { FreshAgentView, IDLE_INCOMPLETE_MAX_RETRIES, locatorMatchesPane } from 
 import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSettingsButton'
 import {
   initLayout,
+  mergePaneContent,
   splitPane,
   applyFreshAgentReconcileAttach,
   requestPaneRefresh,
@@ -1281,6 +1282,37 @@ describe('new conversation close acceptance', () => {
 })
 
 describe('FreshAgentView', () => {
+  it('converges Codex native settings into the next send while preserving newer staged choices and absent metadata', async () => {
+    const store = createStore()
+    const locator = { sessionId: 'settings-convergence', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ status: 'idle', capabilities: { send: true, interrupt: true }, turns: [] })
+    store.dispatch(sessionInit(locator))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      kind: 'fresh-agent', ...locator, createRequestId: 'settings-convergence-create', status: 'idle',
+      model: 'stale-model', effort: 'low', initialCwd: '/stale', sandbox: 'danger-full-access', permissionMode: 'never', collaborationMode: 'default',
+    } }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeEnabled())
+    const metadata = (settings: Record<string, unknown>) => act(() => {
+      handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.session.metadata', sessionId: locator.sessionId, ...settings } })
+    })
+    const native = { model: 'native-model', effort: 'ultra', cwd: '/native', sandbox: 'read-only', permissionMode: 'on-request', collaborationMode: 'plan' }
+    metadata(native)
+    const { cwd: nativeCwd, ...nativePaneSettings } = native
+    await waitFor(() => expect(getFreshAgentPaneContent(store)).toMatchObject({ ...nativePaneSettings, initialCwd: nativeCwd }))
+    const staged = { model: 'staged-model', effort: 'future-effort', initialCwd: '/staged', sandbox: 'workspace-write' as const, permissionMode: 'never', collaborationMode: 'default' as const }
+    act(() => store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: staged })))
+    metadata({ model: native.model, effort: native.effort })
+    expect(getFreshAgentPaneContent(store)).toMatchObject(staged)
+    metadata({ ...staged, cwd: staged.initialCwd })
+    metadata({ model: 'other-device-model', effort: null, cwd: '/other', sandbox: 'read-only', permissionMode: 'untrusted', collaborationMode: 'plan' })
+    await waitFor(() => expect(getFreshAgentPaneContent(store)).toMatchObject({ model: 'other-device-model', initialCwd: '/other', sandbox: 'read-only', permissionMode: 'untrusted', collaborationMode: 'plan' }))
+    expect(getFreshAgentPaneContent(store).effort).toBeUndefined()
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), { target: { value: 'use the native settings' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1))
+    expect(sentFreshAgentMessages('freshAgent.send')[0].settings).toEqual({ model: 'other-device-model', effort: null, cwd: '/other', sandbox: 'read-only', permissionMode: 'untrusted', collaborationMode: 'plan' })
+  })
   it('renders and dismisses a failed close while keeping the stopped managed conversation', async () => {
     const store = createStore()
     const handlers = new Set<(message: unknown) => void>()

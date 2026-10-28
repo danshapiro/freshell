@@ -513,6 +513,9 @@ export type FreshAgentPaneContent = {
   model?: string
   permissionMode?: string
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'
+  collaborationMode?: 'default' | 'plan'
+  /** A stated native default differs from an older pane inheriting provider defaults. */
+  effortIsNativeDefault?: boolean
   effort?: string
   /** Effort levels for the current model as known at selection time (static
    * or probed catalog), stamped by the settings selector's model switch. An
