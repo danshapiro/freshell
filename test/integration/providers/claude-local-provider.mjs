@@ -128,6 +128,7 @@ export async function createClaudeFixture({ parent = os.tmpdir(), prefix = 'fres
   const tmp = path.join(root, 'tmp')
   for (const directory of [home, cwd, tmp]) await fs.mkdir(directory, { recursive: true, mode: 0o700 })
   const claudeConfigDir = path.join(home, '.claude')
+  const ownedProcessLifetimes = new Map()
   return {
     root,
     home,
@@ -186,10 +187,80 @@ export async function createClaudeFixture({ parent = os.tmpdir(), prefix = 'fres
       const complete = text.slice(0, text.lastIndexOf('\n') + 1)
       return complete.split('\n').filter(Boolean).map((line) => JSON.parse(line))
     },
+    /** Register immediately after spawn so even an early close is retained. */
+    ownProcess(child) {
+      const closed = new Promise(resolve => child.once('close', resolve))
+      ownedProcessLifetimes.set(child.pid, () => waitForFixtureProcess(closed, child.pid))
+      return child
+    },
+    /** The sidecar's created frame identifies its separately owned native CLI. */
+    async ownProcessId(pid) {
+      if (!Number.isInteger(pid) || pid <= 0) throw new Error('fixture process PID must be a positive integer')
+      if (ownedProcessLifetimes.has(pid)) return
+      const identity = await liveFixtureProcessIdentity(pid)
+      if (identity) ownedProcessLifetimes.set(pid, () => waitForFixturePid(pid, identity))
+    },
     async cleanup() {
+      // A sidecar exit/query.close() initiates CLI shutdown; it does not join
+      // the native writer. Never remove HOME until all registered owners have
+      // settled. A missing exit retains the fixture and fails diagnostically.
+      const outcomes = await Promise.allSettled([...ownedProcessLifetimes.values()].map(wait => wait()))
+      const failures = outcomes.filter(result => result.status === 'rejected').map(result => result.reason)
+      if (failures.length) throw new AggregateError(failures, `Claude fixture process cleanup incomplete; retained ${root}`)
       await fs.rm(root, { recursive: true, force: true })
     },
   }
+}
+
+const FIXTURE_PROCESS_EXIT_BUDGET_MS = 5_000
+
+async function liveFixtureProcessIdentity(pid) {
+  let stat
+  try { stat = await fs.readFile(`/proc/${pid}/stat`, 'utf8') }
+  catch (error) { if (error.code === 'ENOENT' || error.code === 'ESRCH') return null; throw error }
+  const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ')
+  if (!/^\d+$/.test(fields[19] ?? '')) throw new Error(`cannot establish fixture process identity for PID ${pid}`)
+  // Zombies cannot write; start time distinguishes the captured process from
+  // a later process reusing its PID. No signal is sent by fixture cleanup.
+  return fields[0] === 'Z' || fields[0] === 'X' ? null : fields[19]
+}
+
+function processExitError(pid) {
+  return new Error(`fixture-owned process ${pid} did not settle within ${FIXTURE_PROCESS_EXIT_BUDGET_MS}ms`)
+}
+
+async function waitForFixtureProcess(closed, pid) {
+  let timer
+  try {
+    await Promise.race([closed, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(processExitError(pid)), FIXTURE_PROCESS_EXIT_BUDGET_MS)
+    })])
+  } finally { clearTimeout(timer) }
+}
+
+function waitForFixturePid(pid, identity) {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    let reading = false
+    const finish = error => {
+      if (settled) return
+      settled = true
+      clearInterval(poll)
+      clearTimeout(deadline)
+      if (error) reject(error)
+      else resolve()
+    }
+    const check = async () => {
+      if (reading || settled) return
+      reading = true
+      try { if (await liveFixtureProcessIdentity(pid) !== identity) finish() }
+      catch (error) { finish(error) }
+      finally { reading = false }
+    }
+    const poll = setInterval(check, 10)
+    const deadline = setTimeout(() => finish(processExitError(pid)), FIXTURE_PROCESS_EXIT_BUDGET_MS)
+    void check()
+  })
 }
 
 function textOfContent(content) {
