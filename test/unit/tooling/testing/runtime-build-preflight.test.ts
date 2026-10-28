@@ -5,13 +5,23 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { setupRuntimeBuildPreflight } from '../../../setup/runtime-build-preflight.js'
-import { RUNTIME_BUILD_MANIFEST_ENV, preparedRuntimeBinary } from '../../../../scripts/testing/runtime-build-preflight.js'
+import { RUNTIME_BUILD_MANIFEST_ENV, prepareRuntimeBuilds, preparedRuntimeBinary } from '../../../../scripts/testing/runtime-build-preflight.js'
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { ManagedRuntimeBrowserRig } from '../../../e2e-browser/helpers/managed-runtime.js'
+
+const childFixture = vi.hoisted(() => ({ execute: undefined as undefined | ((program: string, args: string[], options?: any) => any) }))
+vi.mock('node:child_process', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:child_process')>()
+  const execute = ((program: string, args: string[], options?: any) => childFixture.execute
+    ? childFixture.execute(program, args, options) : actual.execFileSync(program, args, options)) as typeof actual.execFileSync
+  return { ...actual, execFileSync: execute, default: { ...actual, execFileSync: execute } }
+})
 
 const owned: string[] = []
 afterEach(() => {
   vi.unstubAllEnvs()
+  vi.restoreAllMocks()
+  childFixture.execute = undefined
   for (const directory of owned.splice(0)) fs.rmSync(directory, { recursive: true, force: true })
 })
 
@@ -130,6 +140,121 @@ describe('managed runtime build preparation before suite startup', () => {
     expect(f.rows()).toHaveLength(4)
     await teardown?.()
     expect(fs.readFileSync(server, 'utf8')).toContain('release:managed-provider-qualification')
+  })
+
+  it('freezes and reuses the ordinary managed browser server without a second compiler selection', () => {
+    const f = fixture()
+    const prepared = prepareRuntimeBuilds(f.root, ['managed-server'], { env: f.project.config.env, command: f.command })
+    vi.stubEnv(RUNTIME_BUILD_MANIFEST_ENV, prepared.manifestPath)
+    try {
+      const rig = new ManagedRuntimeBrowserRig(f.root)
+      fs.mkdirSync(rig.runtime.buildDir, { recursive: true })
+      const server = (rig as unknown as { buildManagedServer(): string }).buildManagedServer()
+      expect(fs.readFileSync(server, 'utf8')).toContain('release:managed-runtime-v1')
+      expect(f.rows()).toHaveLength(1)
+      fs.rmSync(rig.runtime.buildDir, { recursive: true, force: true })
+    } finally { prepared.cleanup() }
+  })
+
+  it('attributes runtime build receipts to the prepared command instead of the host mise compiler', async () => {
+    const f = fixture()
+    const teardown = await setupRuntimeBuildPreflight(f.project, { command: f.command })
+    vi.stubEnv(RUNTIME_BUILD_MANIFEST_ENV, f.project.config.env[RUNTIME_BUILD_MANIFEST_ENV])
+    try {
+      const runtime = new RuntimeHarness(f.root, undefined, 2)
+      const { execFileSync: execute } = await vi.importActual<typeof import('node:child_process')>('node:child_process')
+      childFixture.execute = (program, args, options) => {
+        if (program === 'docker') return 'fixture client/server'
+        if (program === 'git') return execute(program, args, options)
+        throw new Error(`prepared receipt unexpectedly executes ${program}`)
+      }
+      const methods = runtime as unknown as { buildBinaries(): void; collectBuildInfo(): Record<string, unknown> }
+      methods.buildBinaries()
+      const receipt = methods.collectBuildInfo()
+      expect(receipt).not.toHaveProperty('rustc')
+      expect(receipt.build).toEqual({ source: 'prepared', manifestPath: f.project.config.env[RUNTIME_BUILD_MANIFEST_ENV], command: f.command })
+      expect(receipt).not.toHaveProperty('hostMiseRustc')
+      fs.rmSync(runtime.buildDir, { recursive: true, force: true })
+    } finally { await teardown?.() }
+  })
+
+  it('builds default runtime artifacts with the exact reported mise command and labels the host version', async () => {
+    const f = fixture()
+    const runtime = new RuntimeHarness(f.root, undefined, 2)
+    const builds: string[][] = []
+    childFixture.execute = (program, args) => {
+      if (program === 'docker') return 'fixture client/server'
+      if (!program.endsWith('/mise')) throw new Error('unexpected builder')
+      if (args.includes('rustc')) return 'rustc fixture-host-version\n'
+      // This builder refuses a different compiler selection, before producing artifacts.
+      if (args[1] !== 'rust@1.96.0' || !args.includes('--locked')) throw new Error('wrong compiler or unlocked build')
+      builds.push(args)
+      const target = path.join(f.root, 'target', args.includes('--release') ? 'release' : 'debug')
+      fs.mkdirSync(target, { recursive: true })
+      for (const binary of ['freshell-supervisor', 'freshell-session-host']) {
+        fs.writeFileSync(path.join(target, binary), `#!/bin/sh\n# ${args.includes('--release') ? 'release' : 'test'}\n`, { mode: 0o755 })
+      }
+      return ''
+    }
+    const methods = runtime as unknown as { buildBinaries(): void; collectBuildInfo(): any }
+    methods.buildBinaries()
+    const receipt = methods.collectBuildInfo()
+    expect(receipt.build.source).toBe('mise')
+    expect(receipt.build.hostMiseRustc).toBe('rustc fixture-host-version')
+    expect(receipt).not.toHaveProperty('rustc')
+    expect(builds).toHaveLength(2)
+    for (const args of builds) expect(args.slice(0, 4)).toEqual(receipt.build.command.args)
+    expect(fs.readFileSync(runtime.testHostBinary, 'utf8')).toContain('# test')
+    expect(fs.readFileSync(runtime.releaseHostBinary, 'utf8')).toContain('# release')
+    fs.rmSync(runtime.buildDir, { recursive: true, force: true })
+  })
+
+  it.each([
+    { enabledProviders: ['opencode'], feature: 'managed-runtime-v1' },
+    { enabledProviders: ['codex'], feature: 'managed-provider-qualification' },
+    { enabledProviders: ['codex'], fixtureFreshAgentModes: ['freshcodex'], feature: 'managed-fresh-agent-fixtures' },
+  ])('builds the selected browser server with the exact locked compiler: $feature', selection => {
+    const f = fixture()
+    const rig = new ManagedRuntimeBrowserRig(f.root, 2, {}, {}, 'test', selection)
+    fs.mkdirSync(rig.runtime.buildDir, { recursive: true })
+    const builds: string[][] = []
+    childFixture.execute = (program, args) => {
+      if (!program.endsWith('/mise') || args[1] !== 'rust@1.96.0' || !args.includes('--locked')) {
+        throw new Error('browser selected a different compiler or unlocked build')
+      }
+      builds.push(args)
+      const target = path.join(f.root, 'target/release')
+      fs.mkdirSync(target, { recursive: true })
+      fs.writeFileSync(path.join(target, 'freshell-server'), `#!/bin/sh\n# ${args[args.indexOf('--features') + 1]}\n`, { mode: 0o755 })
+      return ''
+    }
+    const server = (rig as unknown as { buildManagedServer(): string }).buildManagedServer()
+    expect(fs.readFileSync(server, 'utf8')).toContain(`# ${selection.feature}`)
+    expect(builds).toHaveLength(1)
+    fs.rmSync(rig.runtime.buildDir, { recursive: true, force: true })
+  })
+
+  it('keeps compiler provenance unknown for an older prepared manifest', async () => {
+    const f = fixture()
+    const teardown = await setupRuntimeBuildPreflight(f.project, { command: f.command })
+    const manifestPath = f.project.config.env[RUNTIME_BUILD_MANIFEST_ENV]!
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+    delete manifest.command
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest))
+    vi.stubEnv(RUNTIME_BUILD_MANIFEST_ENV, manifestPath)
+    try {
+      const runtime = new RuntimeHarness(f.root, undefined, 2)
+      const { execFileSync: execute } = await vi.importActual<typeof import('node:child_process')>('node:child_process')
+      childFixture.execute = (program, args, options) => {
+        if (program === 'docker') return 'fixture client/server'
+        if (program === 'git') return execute(program, args, options)
+        throw new Error('older provenance must not be inferred from an installed compiler')
+      }
+      const methods = runtime as unknown as { buildBinaries(): void; collectBuildInfo(): any }
+      methods.buildBinaries()
+      expect(methods.collectBuildInfo().build).toEqual({ source: 'prepared', manifestPath, command: null })
+      fs.rmSync(runtime.buildDir, { recursive: true, force: true })
+    } finally { await teardown?.() }
   })
 
   it('runs preflight before a real Vitest startup hook, selects only requested files, and never starts after a build failure', () => {

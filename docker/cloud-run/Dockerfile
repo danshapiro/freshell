@@ -15,7 +15,7 @@ ARG FRESHELL_BUILD_COMMIT
 # ---------------------------------------------------------------------------
 # Stage 1: build the Rust server.
 # ---------------------------------------------------------------------------
-FROM rust:1-bookworm AS rust-builder
+FROM rust:1.96.0-bookworm AS rust-builder
 
 ARG FRESHELL_BUILD_COMMIT
 
@@ -39,7 +39,8 @@ COPY crates/ ./crates/
 COPY extensions/ ./extensions/
 COPY docker/runtime/provider-versions.json ./docker/runtime/provider-versions.json
 COPY docker/runtime/codex-native-sandbox.json ./docker/runtime/codex-native-sandbox.json
-RUN FRESHELL_BUILD_COMMIT="$FRESHELL_BUILD_COMMIT" cargo build --release -p freshell-server --locked
+RUN rustc --version && cargo --version \
+    && FRESHELL_BUILD_COMMIT="$FRESHELL_BUILD_COMMIT" cargo build --release -p freshell-server --locked
 # Compile the real-client requirement guard before entering native test lanes.
 RUN set -eu; cargo test --release -p freshell-codex --features native-policy-qualification --lib --no-run --locked \
     ; set -- target/release/deps/freshell_codex-* \
