@@ -1551,7 +1551,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       await fs.unlink(releasePath)
       await page.getByRole('button', { name: 'New shell tab', exact: true }).click()
       await selectShellIfPickerShowing(page)
-      await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+      await expect(page.locator('.xterm:visible').first()).toBeVisible({ timeout: 30_000 })
       const tabId = (await lane.harness.getActiveTabId())!
       await createFreshAgentPane(page, /^Freshcodex$/, 'Freshcodex', lane.projectDir)
       await expect.poll(() => readJsonl(lane.requestLogPath).filter((row) => row.method === 'thread/start').length).toBe(2)
@@ -1575,6 +1575,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
 
       await page.getByRole('button', { name: 'Agent settings' }).click()
       await settings.getByRole('button', { name: /Change/ }).click()
+      await expect(modelDialog.getByRole('listbox', { name: 'Thinking levels for Provider Current' })).toBeVisible()
       await modelDialog.getByRole('textbox', { name: 'Reasoning effort', exact: true }).fill('future-effort')
       const commitButton = modelDialog.getByRole('button', { name: /^Use / })
       const typedLabel = await commitButton.textContent()
