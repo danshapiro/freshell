@@ -422,7 +422,7 @@ async function sendComposerText(page: Page, text: string): Promise<void> {
   const paneRoot = page.locator('[data-context="fresh-agent"]').last()
   const composer = paneRoot.getByRole('textbox', { name: 'Chat message input' })
   await composer.fill(text)
-  await paneRoot.getByRole('button', { name: 'Send' }).click()
+  await paneRoot.getByRole('button', { name: 'Send', exact: true }).click()
 }
 
 /** Capture the pane's durable sessionRef id once it exists. */
@@ -1675,7 +1675,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       await expect.poll(() => starts().length).toBe(2)
       const plan = starts()[1].params
       expect(plan).toMatchObject({ cwd: lane.projectDir, sandboxPolicy: { type: 'readOnly' }, approvalPolicy: 'on-request', collaborationMode: {
-        mode: 'plan', settings: { model: plan.model, reasoning_effort: plan.effort, developer_instructions: null },
+        mode: 'plan', settings: { model: plan.model, reasoning_effort: plan.effort ?? null, developer_instructions: null },
       } })
       await question.getByRole('button', { name: 'Small change', exact: true }).click()
       await expect.poll(() => readJsonl(lane.responseLogPath)).toContainEqual({ id: 'plan-question', result: { answers: { approach: { answers: ['Small change'] } } } })
@@ -1687,7 +1687,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       await page.keyboard.press('Escape')
       await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 6, 'Build the change')
       expect(starts()[2].params).toMatchObject({ cwd: lane.projectDir, sandboxPolicy: { type: 'readOnly' }, approvalPolicy: 'on-request', collaborationMode: {
-        mode: 'default', settings: { model: plan.model, reasoning_effort: plan.effort, developer_instructions: null },
+        mode: 'default', settings: { model: plan.model, reasoning_effort: plan.effort ?? null, developer_instructions: null },
       } })
 
       await page.reload()
@@ -2370,10 +2370,24 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
   })
 
   test('per-send settings alter the turn payload against the Rust server (freshcodex)', async ({ page }) => {
-    const lane = await bootCodexLane(page)
+    const lane = await bootCodexLane(page, { modelCatalogPages: [{ data: [
+      { id: 'astra-record', model: 'gpt-6-astra', displayName: 'GPT-6 Astra',
+        supportedReasoningEfforts: [{ reasoningEffort: 'high' }, { reasoningEffort: 'xhigh' }], defaultReasoningEffort: 'xhigh' },
+      { id: 'sol-record', model: 'gpt-5.6-sol', displayName: 'GPT-5.6 Sol',
+        supportedReasoningEfforts: [{ reasoningEffort: 'low' }, { reasoningEffort: 'high' }], defaultReasoningEffort: 'high' },
+    ], nextCursor: null }] })
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
-      // Turn 1 rides the pane's untouched defaults.
+      // Omission is native no-override. Deliberately select legacy max so the
+      // original first-turn xhigh assertion exercises the advertised alias.
+      await page.getByRole('button', { name: 'Agent settings' }).click()
+      await page.getByRole('dialog', { name: 'Agent settings' }).getByRole('button', { name: /Change/ }).click()
+      const initialDialog = page.getByRole('dialog', { name: 'Model and thinking level' })
+      await expect(initialDialog.getByRole('listbox', { name: 'Thinking levels for GPT-6 Astra' })).toBeVisible()
+      await initialDialog.getByRole('textbox', { name: 'Reasoning effort', exact: true }).fill('max')
+      await initialDialog.getByRole('button', { name: 'Use GPT-6 Astra · max' }).click()
+      await page.keyboard.press('Escape')
+      expect((await paneLeaf(lane.harness, lane.tabId))?.content?.effort).toBe('max')
       await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 2, 'codex turn one')
       const threadId = (await paneLeaf(lane.harness, lane.tabId))?.content?.sessionId as string
       expect(threadId, 'the durable codex thread id must be known before turn two').toBeTruthy()
@@ -2410,9 +2424,8 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       // Ground truth: the fake's recorded-turns file under the lane's isolated
       // CODEX_HOME (<home>/.codex/fake-turns/<threadId>.json). Each recorded
       // turn carries its captured turn/start params additively under `start` —
-      // turn 2 carries the per-send selection while turn 1 kept the defaults
-      // (gpt-6-astra / the default 'max' effort, wire-mapped 'xhigh' by
-      // to_codex_reasoning_effort).
+      // Turn 1 keeps the explicit max intent, wire-mapped to xhigh only because
+      // this selected native model advertises xhigh and no distinct max.
       const turnsPath = path.join(lane.info.homeDir, '.codex', 'fake-turns', `${threadId}.json`)
       await expect(async () => {
         const turns = JSON.parse(await fs.readFile(turnsPath, 'utf8')) as any[]
