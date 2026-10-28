@@ -1289,6 +1289,7 @@ async function bootCodexLane(
   projectDir: string
   opLogPath: string
   responseLogPath: string
+  requestLogPath: string
   tabId: string
 }> {
   const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-agentctl-codex-'))
@@ -1297,6 +1298,7 @@ async function bootCodexLane(
     await fs.mkdir(projectDir, { recursive: true })
     const opLogPath = path.join(sharedRoot, 'codex-ops.jsonl')
     const responseLogPath = path.join(sharedRoot, 'codex-responses.jsonl')
+    const requestLogPath = path.join(sharedRoot, 'codex-requests.jsonl')
     const { server, info, harness } = await bootWall(page, {
       env: {
         // Whitespace-split by spawn_sidecar (codex.rs): interpreter + script.
@@ -1307,6 +1309,7 @@ async function bootCodexLane(
           // answers the recorded history, so forks provably diverge at the pin.
           recordTurns: true,
           appendClientResponseLogPath: responseLogPath,
+          appendRequestLogPath: requestLogPath,
           ...behavior,
         }),
         ...extraEnv,
@@ -1319,7 +1322,7 @@ async function bootCodexLane(
     const tabId = (await harness.getActiveTabId())!
     expect(tabId).toBeTruthy()
     await createFreshAgentPane(page, /^Freshcodex$/, 'Freshcodex', projectDir)
-    return { server, info, harness, sharedRoot, projectDir, opLogPath, responseLogPath, tabId }
+    return { server, info, harness, sharedRoot, projectDir, opLogPath, responseLogPath, requestLogPath, tabId }
   } catch (error) {
     await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
     throw error
@@ -1520,6 +1523,60 @@ async function readRollout(homeDir: string, threadId: string): Promise<string | 
 
 test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
   test.setTimeout(240_000)
+
+  test('Freshcodex file access and Plan settings reach native turns and survive reload', async ({ page }) => {
+    const lane = await bootCodexLane(page, { serverRequestsByPrompt: {
+      'Plan the change': { id: 'plan-question', method: 'item/tool/requestUserInput', params: {
+        isBlocking: true, questions: [{ id: 'approach', header: 'Approach', question: 'Choose an approach', options: [{ label: 'Small change', description: 'Keep the change focused' }] }],
+      } },
+    } })
+    try {
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 2, 'Settings readiness control')
+      expect(readJsonl(lane.requestLogPath).filter((row) => row.method === 'turn/start')).toHaveLength(1)
+      console.log('TASK008_SETTINGS_NATIVE_READY', JSON.stringify({ threadId: 'thread-new-1', status: 'idle', completedControl: true }))
+
+      await page.getByRole('button', { name: 'Agent settings' }).click()
+      const settings = page.getByRole('dialog', { name: 'Agent settings' })
+      await settings.getByRole('combobox', { name: 'File access', exact: true }).selectOption('read-only')
+      await settings.getByRole('combobox', { name: 'Work mode', exact: true }).selectOption('plan')
+      await page.keyboard.press('Escape')
+      await sendComposerText(page, 'Plan the change')
+      const question = page.getByRole('region', { name: 'Question from Codex' })
+      await expect(question).toBeVisible()
+      const starts = () => readJsonl(lane.requestLogPath).filter((row) => row.method === 'turn/start')
+      await expect.poll(() => starts().length).toBe(2)
+      const plan = starts()[1].params
+      expect(plan).toMatchObject({ cwd: lane.projectDir, sandboxPolicy: { type: 'readOnly' }, approvalPolicy: 'on-request', collaborationMode: {
+        mode: 'plan', settings: { model: plan.model, reasoning_effort: plan.effort, developer_instructions: null },
+      } })
+      await question.getByRole('button', { name: 'Small change', exact: true }).click()
+      await expect.poll(() => readJsonl(lane.responseLogPath)).toContainEqual({ id: 'plan-question', result: { answers: { approach: { answers: ['Small change'] } } } })
+      await expect.poll(async () => (await fetchSnapshot(lane.info, 'freshcodex', 'codex', 'thread-new-1'))?.status).toBe('idle')
+      await expect.poll(() => readFreshAgentSessionStatus(lane.harness, 'thread-new-1')).toBe('idle')
+
+      await page.getByRole('button', { name: 'Agent settings' }).click()
+      await settings.getByRole('combobox', { name: 'Work mode', exact: true }).selectOption('default')
+      await page.keyboard.press('Escape')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 6, 'Build the change')
+      expect(starts()[2].params).toMatchObject({ cwd: lane.projectDir, sandboxPolicy: { type: 'readOnly' }, approvalPolicy: 'on-request', collaborationMode: {
+        mode: 'default', settings: { model: plan.model, reasoning_effort: plan.effort, developer_instructions: null },
+      } })
+
+      await page.reload()
+      await lane.harness.waitForHarness()
+      await lane.harness.waitForConnection()
+      await page.getByRole('button', { name: 'Agent settings' }).click()
+      await expect(settings.getByRole('combobox', { name: 'File access', exact: true })).toHaveValue('read-only')
+      await expect(settings.getByRole('combobox', { name: 'Work mode', exact: true })).toHaveValue('default')
+      await page.keyboard.press('Escape')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 8, 'After settings reload')
+      expect(starts()[3].params).toMatchObject({ cwd: lane.projectDir, sandboxPolicy: { type: 'readOnly' }, collaborationMode: { mode: 'default' } })
+    } finally {
+      await lane.server.stop()
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true })
+    }
+  })
 
   test('Codex approvals and questions survive reload and send user decisions to the provider', async ({ page }) => {
     const lane = await bootCodexLane(page, { serverRequestsByPrompt: {
