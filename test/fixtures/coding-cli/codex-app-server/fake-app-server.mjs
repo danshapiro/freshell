@@ -945,6 +945,15 @@ wss.on('connection', (socket) => {
     }
 
     setTimeout(async () => {
+      // Opt-in creation interleaving: the real browser may stage settings
+      // after its native thread/start request but before its acknowledgement.
+      if (method === 'thread/start' && behavior.waitForThreadStartReleasePath) {
+        const deadline = Date.now() + 120_000
+        while (!fs.existsSync(behavior.waitForThreadStartReleasePath)) {
+          if (Date.now() > deadline) throw new Error('Timed out waiting for test thread/start release')
+          await new Promise((resolve) => setTimeout(resolve, 25))
+        }
+      }
       await writeBytes(process.stdout, floodStdoutBytes)
       await writeBytes(process.stderr, floodStderrBytes)
       const result = method === 'thread/read' && behavior.threadReadResults?.[message.params?.threadId]

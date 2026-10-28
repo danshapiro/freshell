@@ -8244,6 +8244,35 @@ describe('FreshAgentView', () => {
     expect(screen.queryByRole('radio', { name: 'custom-codex-model' })).not.toBeInTheDocument()
   })
 
+  it.each([
+    { name: 'opaque effort', effort: 'future-effort', effortIsNativeDefault: false, wire: 'future-effort' },
+    { name: 'native Default', effort: undefined, effortIsNativeDefault: true, wire: null },
+  ])('preserves a newer $name choice across create acknowledgement and stale initial settings', async ({ effort, effortIsNativeDefault, wire }) => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle', capabilities: { send: true, interrupt: true }, turns: [],
+      settings: { model: 'provider-current', effort: 'ultra' },
+    })
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex',
+      createRequestId: 'pre-ack-settings', status: 'creating', model: 'provider-current', effort: 'ultra',
+    } }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    expect(sentFreshAgentMessages('freshAgent.create')[0]).toMatchObject({ requestId: 'pre-ack-settings', effort: 'ultra' })
+    act(() => store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: { effort, effortIsNativeDefault } })))
+    const onMessage = wsMock.onMessage.mock.calls[0]?.[0]
+    expect(onMessage).toBeTypeOf('function')
+    act(() => onMessage({ type: 'freshAgent.created', requestId: 'pre-ack-settings',
+      sessionId: 'pre-ack-native', sessionType: 'freshcodex', provider: 'codex', runtimeProvider: 'codex' }))
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeEnabled())
+    expect(getFreshAgentPaneContent(store)).toMatchObject({ effort, effortIsNativeDefault })
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), { target: { value: 'use newer settings' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1))
+    expect(sentFreshAgentMessages('freshAgent.send')[0].settings).toMatchObject({ model: 'provider-current', effort: wire })
+  })
+
   it('preserves explicit Freshcodex xhigh effort before create and send', async () => {
     const store = createStore()
     store.dispatch(initLayout({

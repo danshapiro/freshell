@@ -1526,6 +1526,78 @@ async function readRollout(homeDir: string, threadId: string): Promise<string | 
 test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
   test.setTimeout(240_000)
 
+  test('Freshcodex preserves pre-ack Default and typed exact effort through native sends', async ({ page }) => {
+    const gateRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-create-gate-'))
+    const releasePath = path.join(gateRoot, 'release')
+    await fs.writeFile(releasePath, '')
+    const lane = await bootCodexLane(page, { uniqueThreadIds: true, waitForThreadStartReleasePath: releasePath })
+    try {
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      const controlId = (await paneLeaf(lane.harness, lane.tabId)).content.sessionId as string
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 2, 'Pre-ack readiness control', controlId)
+      const settings = page.getByRole('dialog', { name: 'Agent settings' })
+      const modelDialog = page.getByRole('dialog', { name: 'Model and thinking level' })
+      await page.getByRole('button', { name: 'Agent settings' }).click()
+      await settings.getByRole('button', { name: /Change/ }).click()
+      await modelDialog.getByRole('option', { name: 'Provider Current', exact: true }).click()
+      await modelDialog.getByRole('listbox', { name: 'Thinking levels for Provider Current' }).getByRole('option', { name: /^ultra\b/ }).click()
+      await modelDialog.getByRole('button', { name: 'Use Provider Current · ultra' }).click()
+      await page.keyboard.press('Escape')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 4, 'Pre-ack explicit ultra control', controlId)
+      const starts = () => readJsonl(lane.requestLogPath).filter((row) => row.method === 'turn/start')
+      expect(starts()[1].params).toMatchObject({ model: 'provider-current', effort: 'ultra' })
+      console.log('TASK008_PREACK_NATIVE_READY', JSON.stringify({ controlId, completedControl: true, explicitEffort: 'ultra' }))
+
+      await fs.unlink(releasePath)
+      await page.getByRole('button', { name: 'New shell tab', exact: true }).click()
+      await selectShellIfPickerShowing(page)
+      await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+      const tabId = (await lane.harness.getActiveTabId())!
+      await createFreshAgentPane(page, /^Freshcodex$/, 'Freshcodex', lane.projectDir)
+      await expect.poll(() => readJsonl(lane.requestLogPath).filter((row) => row.method === 'thread/start').length).toBe(2)
+      const create = (await lane.harness.getSentWsMessages() as any[]).filter((row) => row.type === 'freshAgent.create').at(-1)
+      expect(create.effort).toBe('ultra')
+      expect((await paneLeaf(lane.harness, tabId)).content.sessionId).toBeUndefined()
+      await page.getByRole('button', { name: 'Agent settings' }).click()
+      await settings.getByRole('button', { name: /Change/ }).click()
+      await modelDialog.getByRole('option', { name: 'Default', exact: true }).click()
+      await modelDialog.getByRole('button', { name: /^Use .* · Default$/ }).click()
+      expect((await paneLeaf(lane.harness, tabId)).content).toMatchObject({ effortIsNativeDefault: true })
+      expect((await paneLeaf(lane.harness, tabId)).content.effort).toBeUndefined()
+      await page.keyboard.press('Escape')
+      await fs.writeFile(releasePath, '')
+      await expect.poll(async () => (await paneLeaf(lane.harness, tabId))?.content?.sessionId ?? null).not.toBe(null)
+      const threadId = (await paneLeaf(lane.harness, tabId)).content.sessionId as string
+      await expect.poll(async () => (await fetchSnapshot(lane.info, 'freshcodex', 'codex', threadId))?.settings?.effort).toBe('ultra')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 2, 'Pre-ack Default next send', threadId)
+      const afterAck = (await paneLeaf(lane.harness, tabId)).content
+      const defaultStart = starts().at(-1).params
+
+      await page.getByRole('button', { name: 'Agent settings' }).click()
+      await settings.getByRole('button', { name: /Change/ }).click()
+      await modelDialog.getByRole('textbox', { name: 'Reasoning effort', exact: true }).fill('future-effort')
+      const commitButton = modelDialog.getByRole('button', { name: /^Use / })
+      const typedLabel = await commitButton.textContent()
+      await commitButton.click()
+      await page.keyboard.press('Escape')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 4, 'Typed exact effort next send', threadId)
+      expect({
+        afterAck: { effort: afterAck.effort ?? null, nativeDefault: afterAck.effortIsNativeDefault },
+        defaultNative: defaultStart.effort ?? null,
+        defaultCollaboration: defaultStart.collaborationMode.settings.reasoning_effort,
+        typedLabel, typedNative: starts().at(-1).params.effort ?? null,
+      }).toEqual({
+        afterAck: { effort: null, nativeDefault: true }, defaultNative: null, defaultCollaboration: null,
+        typedLabel: 'Use Provider Current · future-effort', typedNative: 'future-effort',
+      })
+    } finally {
+      await fs.writeFile(releasePath, '')
+      await lane.server.stop()
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true })
+      await fs.rm(gateRoot, { recursive: true, force: true })
+    }
+  })
+
   test('Freshcodex explicitly clears effort with Default and keeps native settings after reload', async ({ page }) => {
     const lane = await bootCodexLane(page, { uniqueThreadIds: true })
     try {
