@@ -1947,12 +1947,16 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
   })
 
   test('compact: thread/compact/start, never a turn; pane returns usable', async ({ page }) => {
-    const lane = await bootCodexLane(page)
+    const compactRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-compact-'))
+    const notificationLogPath = path.join(compactRoot, 'native-notifications.jsonl')
+    const lane = await bootCodexLane(page, { appendNativeNotificationLogPath: notificationLogPath })
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
       await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 2, 'codex turn one')
 
       // Typed slash gesture → freshAgent.compact → thread/compact/start.
+      const notificationFrom = readJsonl(notificationLogPath).length
+      const receivedFrom = (await lane.harness.getReceivedWsMessages()).length
       const paneRoot = page.locator('[data-context="fresh-agent"]').last()
       await paneRoot.getByRole('textbox', { name: 'Chat message input' }).fill('/compact')
       await paneRoot.getByRole('textbox', { name: 'Chat message input' }).press('Enter')
@@ -1963,8 +1967,28 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
         'thread/compact/start op',
       )
       expect(compactOp.params.threadId).toBe('thread-new-1')
-      // Busy→idle ride the probed notification sequence; the pane settles.
+      // A prior idle snapshot can still be visible when the compact RPC lands.
+      // Join this native compaction turn's terminal and its owning Rust
+      // consumption before the next send is allowed to be an idle start.
+      let compactTurnId: string | undefined
+      await expect.poll(() => {
+        compactTurnId = readJsonl(notificationLogPath).slice(notificationFrom)
+          .find((row) => row.method === 'turn/started' && row.threadId === 'thread-new-1')?.turnId
+        return compactTurnId
+      }).toBeTruthy()
+      await expect.poll(async () => {
+        const nativeCompleted = readJsonl(notificationLogPath).slice(notificationFrom).some((row) =>
+          row.method === 'turn/completed' && row.threadId === 'thread-new-1' && row.turnId === compactTurnId)
+        const frames = (await lane.harness.getReceivedWsMessages() as any[]).slice(receivedFrom)
+        const settled = frames.findIndex((frame) => frame.type === 'freshAgent.event' && frame.sessionId === 'thread-new-1'
+          && frame.event?.type === 'freshAgent.transcript.patch'
+          && frame.event.ops?.some((op: any) => op.op === 'settleTurn' && op.nativeTurnId === compactTurnId))
+        const consumed = settled >= 0 && frames.slice(settled + 1).some((frame) =>
+          frame.type === 'freshAgent.event' && frame.sessionId === 'thread-new-1' && frame.event?.type === 'freshAgent.turn.complete')
+        return nativeCompleted && consumed
+      }).toBe(true)
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      expect(readJsonl(lane.requestLogPath).filter((row) => row.method === 'turn/start')).toHaveLength(1)
 
       // AGENT-04's crucial shape pin: compact minted NO turn. The fixture's
       // recorded-turns store is the ground truth — after the compact the
@@ -1977,12 +2001,15 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       // Usable after compact: a follow-up prompt mints exactly the next turn
       // (two recorded turns -> four display rows).
       await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 4, 'codex post-compact turn')
+      expect(readJsonl(lane.requestLogPath).filter((row) => row.method === 'turn/start')).toHaveLength(2)
+      expect(readJsonl(lane.requestLogPath).filter((row) => row.method === 'turn/steer')).toHaveLength(0)
     } catch (error) {
       await captureCodexLaneDiagnostics(page, lane).catch((diagnosticError) => console.log('TASK006_CODEX_DIAGNOSTIC_FAILED', String(diagnosticError)))
       throw error
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+      await fs.rm(compactRoot, { recursive: true, force: true }).catch(() => {})
     }
   })
 
