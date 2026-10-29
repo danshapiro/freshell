@@ -251,7 +251,7 @@ mod tests {
         )]);
         check_final_exec(
             "/bin/sh",
-            &[layout.npm_wrapper.clone()],
+            std::slice::from_ref(&layout.npm_wrapper),
             &environment,
             &[],
             profile,
@@ -268,8 +268,7 @@ mod tests {
             .env_clear()
             .env("PATH", expanded)
             .spawn()
-            .err()
-            .expect("actual Linux kernel must reject the final oversized PATH");
+            .expect_err("actual Linux kernel must reject the final oversized PATH");
         assert_eq!(error.raw_os_error(), Some(libc::E2BIG));
         assert!(!marker.exists());
         let small = BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]);
