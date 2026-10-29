@@ -1100,28 +1100,29 @@ async fn admin_model_catalog_uses_authenticated_current_host_and_preserves_recov
                 RuntimeErrorCode::OwnershipMismatch
             ),
         }
-        let commands = received.lock().unwrap();
-        if scenario == "stale-epoch" || scenario == "wrong-provider" {
-            assert!(commands.is_empty());
-        } else {
-            assert_eq!(
-                commands
-                    .iter()
-                    .filter(|c| matches!(c, HostCommand::FreshAgentModelCatalog { .. }))
-                    .count(),
-                1
-            );
-            assert!(commands.iter().all(|c| matches!(
-                c,
-                HostCommand::Hello { .. } | HostCommand::FreshAgentModelCatalog { .. }
-            )));
-            for command in commands.iter() {
-                if let HostCommand::FreshAgentModelCatalog { incarnation_id, .. } = command {
-                    assert_eq!(incarnation_id, &fixture.incarnation);
+        {
+            let commands = received.lock().unwrap();
+            if scenario == "stale-epoch" || scenario == "wrong-provider" {
+                assert!(commands.is_empty());
+            } else {
+                assert_eq!(
+                    commands
+                        .iter()
+                        .filter(|c| matches!(c, HostCommand::FreshAgentModelCatalog { .. }))
+                        .count(),
+                    1
+                );
+                assert!(commands.iter().all(|c| matches!(
+                    c,
+                    HostCommand::Hello { .. } | HostCommand::FreshAgentModelCatalog { .. }
+                )));
+                for command in commands.iter() {
+                    if let HostCommand::FreshAgentModelCatalog { incarnation_id, .. } = command {
+                        assert_eq!(incarnation_id, &fixture.incarnation);
+                    }
                 }
             }
         }
-        drop(commands);
         let after = fixture
             .supervisor
             .registry
