@@ -116,7 +116,7 @@ Convergence means correct native saved history plus richer output actually still
 - Produces: claim-specific native receipts for F1/F2/F3/F4/F6/F7, selected actual feature/configuration flags/tool schemas and observed behavior used by later fixture expectations. No new universal protocol SDK, packaging framework, native lifecycle controller or production installation.
 - Produces: preserved effective `untrusted` policy in existing managed launch/profile settings and typed native create/resume/fork/next-turn requests, with declaring-source identity. Only owned prepared public config/layers omit the rejected declaration. If that cannot preserve effective source precedence/requirements/unrelated settings, return an early typed configuration incompatibility naming the setting/source and preserve the prompt/settings. Task 8 consumes this compatibility path; no public `-c` substitute or real-home rewrite.
 
-- [ ] **Step 1: Add the failing behavioral contract and minimal executable harness**
+- [x] **Step 1: Add the failing behavioral contract and minimal executable harness**
 
 Use the existing Claude contract style as a fixture pattern, but implement Codex Responses/MCP exchanges from exact native evidence. Preserve raw request/response/native-ID ordering. A representative actual native contract assertion is:
 
@@ -134,7 +134,7 @@ it('retains the actual final answer through exact history and resume', async () 
 
 `finalAssistantText`/`resumedAssistantText` are derived from captured native thread/read bodies by native turn and ordered role/content; canonical item IDs are used only in history modes preserving them. Minimal fixture code and staging helper belong in this step so missing imports/prerequisites are fixed before the intended red run. Before changing the managed pin, run its actual binary receipt: the current runtime supplies 0.147.0, so the required 0.164.0 native-version assertion fails for the intended reason. No static version-string test substitutes for executing that runtime binary.
 
-- [ ] **Step 2: Stage before offline entry and establish intended red evidence**
+- [x] **Step 2: Stage before offline entry and establish intended red evidence**
 
 Known Linux x64 artifact metadata is exact: URL `https://registry.npmjs.org/@openai/codex/-/codex-0.164.0-linux-x64.tgz`, integrity `sha512-XLAoaWsGOT2khzl+P4FYDPTkzAr9W0VFXFaVkqlFdkM0soa1gH/4S0wSD57Ek3HHwkirAEGz2/Mwehseh+l5Mg==`, installed executable `vendor/x86_64-unknown-linux-musl/bin/codex`, unpacked package 444,349,626 bytes. Pin these in the test artifact JSON, verify archive bytes/manifest/layout and publish an atomic completed directory containing the full verified vendor/resource tree and bundled helpers. The installed mode 0700 is not evidence of archive permissions. Normalize permissions only inside the owned completed subtree; verify readable files, executable helpers and search access through **every ancestor** as final cloud `node`, sandbox and provider identities. Unavailable ancestors fail the gate, without broad chmod/chown outside owned paths. Keep archive/unpacked bytes out of the 512 MiB `/tmp` and 256 MiB `.cache` tmpfs.
 
@@ -146,7 +146,7 @@ Run: `node test/integration/providers/codex-cli-contract.mjs --managed-runtime -
 
 Expected: staging succeeds, with actual byte/integrity/layout receipt; managed required-version assertion FAILS on current 0.147.0. If staging/harness setup fails first, repair it and rerun so the red result is behavioral. These are future implementation actions after formal validation and independent plan review; no native execution occurred during plan publication.
 
-- [ ] **Step 3: Prove the isolated native flows, then align the managed pin**
+- [x] **Step 3: Prove the isolated native flows, then align the managed pin**
 
 In `docker/cloud-run/Dockerfile`, after connected node-builder source copy, run the preparer with `--output /opt/freshell-test-providers/codex/0.164.0-linux-x64`; explicitly copy the completed tree into the final image and set the contract-root ENV in that final stage. Keep `.runtime-build` source-upload exclusions unchanged. Verify final copied resources and ancestor traversal/read/execute as final `node`, including `/opt` paths outside `/app` ownership adjustment. Missing/corrupt artifacts or stale offline prerequisites fail loudly without package bootstrap. Compare ambient `codex` resolution as a present-or-absent value before/after preparation. Root deps/lock/workspaces/.bin and host production CLI stay unchanged. Required cloud/offline receipts separately record actual Linux x64 architecture, verified bytes/layout/path, final UID/GID and permissions, warmed prerequisites, writable roots, native version/scenario traffic and unchanged ambient resolution. Six-platform metadata is not execution proof; the managed npm-wrapper proof is separate.
 
@@ -173,17 +173,17 @@ Expected: actual pinned-native captures PASS in both required environments. Shar
 
 Only after the staged native gate, set Codex version to `0.164.0` in `docker/runtime/provider-versions.json` and `ARG CODEX_VERSION=0.164.0` in `docker/runtime/Dockerfile`. Preserve install/version verification and all other provider pins; derive runtime-sandbox receipts from the manifest. Build the existing run-owned managed image and prove all essential scenarios, prepared approval projection and actual restricted commands through its intended npm wrapper/native resources as the real provider identity. Record digest, wrapper/native resolution, UID/GID, sanitized owning context, permissions/limits, allowed effects and denied effects. `--version`, text-only, staged-artifact or full-access success cannot satisfy this separate F4 gate. Do not proceed to dependent tasks if it fails; no image deployment, production qualification or service restart is authorized.
 
-- [ ] **Step 4: Confirm green native/runtime evidence**
+- [x] **Step 4: Confirm green native/runtime evidence**
 
 Run: `node test/integration/providers/codex-cli-contract.mjs --managed-runtime --receipt-dir .runtime-build/codex-contract/managed-green`.
 
 Run the exact sandbox and configured cloud native commands from Step 3. Expected: PASS; test artifact and managed runtime both actually execute Codex 0.164.0 with the essential captured contract. Reuse content-identical capture receipts instead of repeating expensive scenarios when nothing changed; changed pin/image must have its own actual binary receipt.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Consolidate only the Codex fixture's owned process/deadline/cleanup and sanitized trace helpers. Keep artifact preparation outside offline execution and use one pinned metadata source. Do not move the wrapper into root dependencies or create a cross-platform package manager. Use real captured shapes to refine the existing fake fixture in each later feature task.
 
-- [ ] **Step 6: Verify impacts**
+- [x] **Step 6: Verify impacts**
 
 Run: `pnpm run typecheck`.
 
@@ -195,7 +195,7 @@ Run: `python3 /home/dan/code/freshell/.worktrees/.the-usual-logs/freshcodex-comp
 
 Expected: PASS with nonzero native scenarios and owned runtime-image receipts. Record image digest, executing architecture and exact provider versions. Final full-suite/hosted/browser evidence remains in Task 10; fixture parity alone does not prove the upgraded managed binary.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add scripts/testing/prepare-codex-contract.mjs test/fixtures/coding-cli/codex-native-artifact.json test/integration/providers/codex-local-provider.mjs test/integration/providers/codex-cli-contract.mjs test/integration/providers/codex-cli-contract.test.ts docker/cloud-run/Dockerfile docker/runtime/provider-versions.json docker/runtime/Dockerfile scripts/testing/runtime-sandbox.ts
@@ -217,7 +217,7 @@ git commit -m "feat(codex): establish verified 0.164 native runtime contract"
 - Produces: `CodexProjection::new(projection_id:String, thread_id:String)`, `apply(&mut self, method:&str, params:&Value) -> Result<Vec<Value>, ProjectionError>`, `begin_history_read(&self) -> SnapshotReadFence`, `accept_native_history(&mut self, raw:&Value, read_fence:&SnapshotReadFence) -> Result<ProjectionSnapshot,SnapshotStale>`; normalized patch contract above. `SnapshotReadFence` carries projectionId, existing owner epoch/generation and historyGeneration. `ProjectionSnapshot` carries chosen raw bodies, eventRevision, event-owned/native-preview/native-final memberships and `turnOutputStates` provenance/finite diagnostics. Native read errors preserve usable retained state and expose typed unavailable/retryable status rather than a blank successful snapshot. `SnapshotStale` requests bounded reread; `ProjectionError` includes method/IDs, never secret-bearing payload.
 - Produces: `FreshAgentTranscriptPatchSchema`; `applyFreshAgentTranscriptPatch(state,patch)` and `mergeFreshAgentTranscriptProjection(snapshot,live)` using existing `FreshAgentTurn`/item types. Live payload remains outside the general session slice.
 
-- [ ] **Step 1: Write failing behavioral tests**
+- [x] **Step 1: Write failing behavioral tests**
 
 In the new Rust module's tests, use native frames, not already normalized output. This representative test defines the projection seam; `snapshot_rows()` is the helper returning `build_codex_turn_json` over the projection's raw turn, implemented in that module so it exercises the real mapper:
 
@@ -253,7 +253,7 @@ Also drive native frames through `insert_fake_session_with_real_consumer`, not o
 
 Drive reducer/merge through independent-reader schedules: event `Hel`, native read ahead `Hello`, later `lo` yields `Hello` once without using read text as an append baseline; a behind read cannot erase `Hel`. Complete-item replacement fences a queued higher-revision append, including after eight later turns. A nonappendable recovery preview receives a normal complete replacement or freezes visibly interrupted when no completed item exists. Warm interruption retains fragments; cold native-only recovery has a finite saved-only interrupted view. Summary/NotLoaded turn completion cannot erase content or pretend full replacement. Missing persistence stops bounded refresh with explicit unsaved output; captured command/MCP results over 64 KiB preserve actual native truncation plus richer retained output without endless equality retries. Legacy tests vary only evidenced synthetic IDs and keep exact ordered duplicate bodies/multi-role turns; unexplained assistant differences stay diagnosed. Hold reads across undo/compaction/source change and reject stale generations. Frozen extras cannot revive removed membership or accept old-incarnation deltas. Repeat item completion/read order, row splits, hidden/reveal, disconnect/refetch and host loss; render all provenance/finite states through `FreshAgentTranscript`.
 
-- [ ] **Step 2: Run and confirm intended failures**
+- [x] **Step 2: Run and confirm intended failures**
 
 Run: `python3 /home/dan/code/freshell/.worktrees/.the-usual-logs/freshcodex-complete/run-focused-rust.py -p freshell-freshagent codex::projection`.
 
@@ -261,7 +261,7 @@ Run: `pnpm run test:vitest run test/unit/client/lib/fresh-agent-transcript-proje
 
 Expected: missing projection/event behavior, followed by explicit assertion failures when the minimal types exist; do not count an unresolved import as the final red receipt.
 
-- [ ] **Step 3: Implement the projection and existing transport integration**
+- [x] **Step 3: Implement the projection and existing transport integration**
 
 Add the module and session-owned state at all create/resume/recovery construction sites. `apply` validates thread/turn/item identity, updates only its owned raw records, and emits the incremental operations above. The core append operation is:
 
@@ -282,15 +282,15 @@ For usage, preserve raw native `last/total` and context window in `extensions.co
 
 The consumer applies projection before broadcast within existing ordering, flushing patch ops before lifecycle/control. Capture/recheck source/history read fences around RPC, choose event-owned versus whole native bodies and stamp only captured event revision/memberships. Never initialize an append baseline from an independent read. Implement whole-native-turn Legacy comparison and finite saved/retained states in the projection/merge helpers: only demonstrated synthetic ID changes are normalized; roles, order, duplicates and outcomes stay exact. Render one group with concise saved/retained/interrupted/unsaved/truncated provenance and a retained-output disclosure only where useful. Preserve actual native truncation markers; a shorter assistant body is not automatically truncation. Freeze terminal retained bodies, release incremental logs, bound refresh using existing scheduling, and preserve content on unavailable reads. Reuse shared transcript/live state, request authority and hidden dirty handling; no universal journal or scattered revision rules.
 
-- [ ] **Step 4: Run the focused tests**
+- [x] **Step 4: Run the focused tests**
 
 Run the same two commands from Step 2. Expected: PASS with pre-completion content, exact normal whole-turn replacement, finite interrupted/unsaved/truncated views and linear emitted bytes.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Centralize native ID checks, indexed reasoning append, and final-item replacement inside `projection.rs`. Keep existing mapper/role segmentation as the single normalized representation. Coalesce patches in one session-owned batcher; remove temporary duplicate mapper/usage branches introduced during green development. Re-run the focused tests.
 
-- [ ] **Step 6: Run impacted verification**
+- [x] **Step 6: Run impacted verification**
 
 Run: `python3 /home/dan/code/freshell/.worktrees/.the-usual-logs/freshcodex-complete/run-focused-rust.py -p freshell-codex -p freshell-freshagent`.
 
@@ -298,7 +298,7 @@ Run: `pnpm run test:vitest run test/unit/shared/fresh-agent-contract.test.ts tes
 
 Expected: PASS. This shared live-state boundary affects all provider live rendering, so include the whole existing Freshagent client lib/store/component set, especially Claude stream landing, OpenCode projection and hidden-rebind/view tests. Retain the real browser pre-completion journey for Task 10.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/freshell-freshagent/src/codex.rs crates/freshell-freshagent/src/codex/projection.rs shared/fresh-agent-contract.ts src/store/freshAgentLiveTypes.ts src/store/freshAgentLiveSlice.ts src/lib/fresh-agent-ws.ts src/lib/fresh-agent-transcript-projection.ts src/lib/fresh-agent-context-usage.ts src/components/fresh-agent/FreshAgentView.tsx src/components/fresh-agent/FreshAgentSidebar.tsx src/components/fresh-agent/FreshAgentDiffPanel.tsx test/unit/shared/fresh-agent-contract.test.ts test/unit/client/lib/fresh-agent-transcript-projection.test.ts test/unit/client/lib/fresh-agent-context-usage.test.ts test/unit/client/lib/fresh-agent-ws.test.ts test/unit/client/store/freshAgentLiveSlice.test.ts test/unit/client/components/fresh-agent/FreshAgentSidebar.test.tsx test/unit/client/components/fresh-agent/FreshAgentDiffPanel.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.reconcile.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.stream-render.test.tsx
@@ -321,7 +321,7 @@ git commit -m "feat(codex): project native live transcript and usage"
 - Produces: minimal managed `FreshAgentReadChildRequest {soul_id,child_thread_id,expected_control_epoch}` / `HostCommand::FreshAgentReadChild {incarnation_id,child_thread_id}` and corresponding `FreshAgentChildSnapshot(Value)` result through current typed client/supervisor/session-host dispatch. Gateway resolves the parent alias to its root soul, never resolves the child as a registered root. Recheck the existing same_snapshot_source tuple after read.
 - Produces: `FreshAgentChildObserver({parent,childThreadId,onClose})` using `FreshAgentTranscript` in a read-only dialog/section. Parent includes its current provider/session/owner fence. Persist only `observedChildThreadId?:string` in parent pane content so reload can restore observation; no independent child pane/session lifecycle.
 
-- [ ] **Step 1: Write failing behavioral tests**
+- [x] **Step 1: Write failing behavioral tests**
 
 Add to the existing item card suite:
 
@@ -341,7 +341,7 @@ Pair command/file-change running/completed/failed/declined cases through the rea
 
 Observer tests cover durable active/final/saved reads with exact parent/child identity, pending pre-materialization then materialization, bounded refresh exhaustion, and terminal ephemeral unavailable with absent snapshot and specific reason. Preserve a selected child's already available content when source temporarily fails/rebinds, clearly labeling stale availability; do not erase it or switch HOME. Ordinary saved starts preserve demonstrated durable defaults; explicitly ephemeral/resumed contexts stay ephemeral. Count zero observer create/resume/send/stop/configure operations across local/managed reads, reload and all failure states. Native truncation/interruption follows Task 2 semantics rather than promising every token from read-only history.
 
-- [ ] **Step 2: Confirm red**
+- [x] **Step 2: Confirm red**
 
 Run: `pnpm run test:vitest run test/unit/client/components/fresh-agent/FreshAgentItemCard.test.tsx test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx --config config/vitest/vitest.config.ts`.
 
@@ -349,7 +349,7 @@ Run: `python3 /home/dan/code/freshell/.worktrees/.the-usual-logs/freshcodex-comp
 
 Expected: declined currently appears complete, new variants are dropped, child callback cannot select Codex.
 
-- [ ] **Step 3: Implement faithful mappings and rendering**
+- [x] **Step 3: Implement faithful mappings and rendering**
 
 Extend current mapper and role classifier; map native subagent activity to a task/delegation activity with child native identity and direct status mapping. Preserve function-call output plain text and content-item text/image references; unknown content items keep a readable type/result representation, not blank output. Map sleep to a visible tool activity with actual duration. Preserve optional agent-message phase/async choice metadata as optional item extensions used for a readable choice list; never infer completion merely from absent phase.
 
@@ -363,15 +363,15 @@ For local reads resolve the parent's current registered client, verify exact chi
 
 Managed reads add the minimal parent-root typed request described above, run in its provider volume, and return the child under an explicit observer response. The existing root snapshot route is not an arbitrary-child reader and must retain its root identity checks. The observer response stamps child capabilities nonmutating. Route tests use deliberately different gateway/provider child histories, verify the right result, reject an unrelated child and a replaced owner during a paused read, and count zero child-start/resume RPCs. Component/browser tests restore the observer after reload while parent identity/transcript/actions remain intact.
 
-- [ ] **Step 4: Confirm green**
+- [x] **Step 4: Confirm green**
 
 Run both Step 2 commands. Expected: PASS; variants render, declined/failed never become success, durable child observation returns exact available native history, and pending/unavailable cases are finite and honest without a child writer.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Consolidate child-status/result formatting in one focused helper shared by collab/activity/sidebar. Reuse existing generic tool/delegation blocks and remove dead duplicated branches only if the task actively changed/read them. Preserve OpenCode callback behavior.
 
-- [ ] **Step 6: Verify impacts**
+- [x] **Step 6: Verify impacts**
 
 Run: `pnpm run test:vitest run test/unit/shared/fresh-agent-contract.test.ts test/unit/client/components/fresh-agent/ --config config/vitest/vitest.config.ts`.
 
@@ -381,7 +381,7 @@ Run: `python3 /home/dan/code/freshell/.worktrees/.the-usual-logs/freshcodex-comp
 
 Expected: PASS with nonzero parent/child route, serializer and source-fence tests, including existing OpenCode delegation and Claude tool rows. Task 10 supplies denied-tool/child/reload browser receipts.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/freshell-freshagent/src/codex.rs crates/freshell-freshagent/src/codex/metadata.rs shared/fresh-agent-contract.ts src/components/fresh-agent/FreshAgentItemCard.tsx src/components/fresh-agent/FreshAgentSidebar.tsx src/components/fresh-agent/FreshAgentView.tsx test/unit/shared/fresh-agent-contract.test.ts test/unit/client/components/fresh-agent/FreshAgentItemCard.test.tsx test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx test/unit/client/components/fresh-agent/FreshAgentSidebar.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.test.tsx
@@ -401,13 +401,13 @@ git commit -m "feat(codex): preserve native tool and child activity"
 - Produces: `CodexTurnState` with `begin_dispatch(request_id:&str)->DispatchToken`, `accept(token,turn_id:&str)->StopDisposition`, `reject(token)->bool`, `mark_ambiguous(token:DispatchToken)`, `request_stop()->StopDisposition`, `interrupt_ack(token:DispatchToken,turn_id:&str)`, `settle_native(turn_id:&str,evidence:NativeSettlement)->bool`, and `has_owed_work()->bool`. `NativeSettlement` is completed/interrupted/failed native terminal evidence or confirmed owned runtime exit, never interrupt acknowledgement/quiet-deadman attention. `DispatchToken` is monotonically session-local and equality-owned; `StopDisposition` is `None | Latched | Interrupt { dispatch:DispatchToken, turn_id:String }`. Keep compatibility latches mirrored from this one transition source until consumers can use it directly.
 - Produces: identity-owned turn facts usable by Task 9 without the broadcast bus, plus a per-session issuance gate using existing dispatch/ownership serialization: a later native start waits until an earlier Stop operation is definitively resolved. Terminal work settlement and release of this issuance gate are separate facts; timeout does not retract an ambiguous native interrupt. Ordinary browser busy sends retain the client queue; deliberate active server/API input uses `turn/steer {expectedTurnId}`, idle input uses `turn/start`. Steer has no setting overrides, so staged settings apply on the next turn. No new provider-wide queue or paid retry.
 
-- [ ] **Step 1: Add failing race tests**
+- [x] **Step 1: Add failing race tests**
 
 Replace the invalid draft schedule that accepted a new start while old Stop remained unresolved with behavioral tests through actual turn-state and ChannelTransport dispatch. Accept old work, reject its expected-ID steer and preserve the owed turn; request Stop, hold its RPC, then submit later idle input and assert no native `turn/start` is issued. Deliver natural completion/terminal evidence while Stop is held: the consumer must progress and settle only old work, but later start still waits for definitive Stop resolution. Release Stop, admit the new start, then deliver old duplicate ACK/terminal frames and verify the new turn remains busy/targetable. Separately inject adversarial stale replies after a supported resolved rollover; do not call this native normal ACK ordering.
 
 Test latched Stop before start acceptance, one interrupt of the returned ID, events preceding acceptance, same-ID accepted steer with two dispatch facts but one terminal settlement, explicit no-active/mismatch refusal, rejected initial dispatch, and ambiguous start/steer/interrupt without replay. A held successful ACK without terminal evidence cannot settle REST/busy; matching terminal evidence does. Startup empty-ID Stop has no promised terminal notification: require actual startup result or confirmed owned exit, not fabricated completion or WebSocket-loss death. An ambiguous Stop timeout keeps the new-start gate closed until definitive native/owned recovery evidence. Exercise that event consumption never awaits a dispatch-held lock needed to release the gate. Inject ownership refusal during recovery and assert both pane-scoped SESSION_RESERVED and request-correlated send error; restore refused/ambiguous prompt and delivery receipt without overwriting newer typed text. Preserve accepted-before-immediate-completion and lifecycle-loss dedup tests.
 
-- [ ] **Step 2: Confirm red**
+- [x] **Step 2: Confirm red**
 
 Run: `python3 /home/dan/code/freshell/.worktrees/.the-usual-logs/freshcodex-complete/run-focused-rust.py -p freshell-freshagent codex::`.
 
@@ -415,7 +415,7 @@ Run the existing FreshAgentView send/queue/refusal test files through `pnpm run 
 
 Expected: old interruption clears new turn; rejected steer clears previous latch; pre-accept Stop fails; interrupt acknowledgement incorrectly retires work; refused Codex prompt is not restored.
 
-- [ ] **Step 3: Implement identity-owned transitions**
+- [x] **Step 3: Implement identity-owned transitions**
 
 Replace unconditional shared-latch retirement with matching dispatch/native-turn transitions. Capture interrupt ownership before awaiting; successful response records ACK only, never outcome/REST settlement. Matching native terminal/confirmed owned exit retires that work; an old response cannot alter newer work. Native checks the requested interrupt ID then submits an unqualified core interrupt, so serialize the adapter's Stop/new-start issuance per session until the old Stop is definitively resolved. Natural completion may win. An ambiguous failed/timed-out Stop keeps its unresolved operation/gate; only proven pre-submission refusal can disarm its marker immediately. Do not hold a state/emission/turn lock across RPC if the notification consumer needs it to progress. Latch Stop on pending initial dispatch, interrupt once its ID arrives, and keep startup empty-ID ACK distinct from actual startup outcome/owned exit. Retain compact's guarded identity and existing owned-process recovery; no production restart.
 
@@ -423,15 +423,15 @@ Task 1 F2 is a hard prerequisite. Use idle `turn/start` and explicit active `tur
 
 At main's SESSION_RESERVED recovery refusal, call existing `send_error(&request_id,...)` before pane error, retaining request and holder diagnostics. Expand the existing prompt-restoration branch to Codex request-correlated refusals and restore only when it will not destroy newer user input; keep the refused text recoverable through the existing notice/composer mechanism. No blanket retry.
 
-- [ ] **Step 4: Confirm green**
+- [x] **Step 4: Confirm green**
 
 Run Step 2 commands. Expected: PASS with deterministic barriers, no sleeps as race proof.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Make all send/started/completed/interrupt/death/close paths call the same transition methods. Remove temporary duplicate owned-turn booleans only after all existing tests are green. Keep lock order rollback registry → turn lock → short state guard; never await while holding a standard mutex or take the turn lock from the consumer behind the existing emission gate.
 
-- [ ] **Step 6: Verify impacts**
+- [x] **Step 6: Verify impacts**
 
 Run: `python3 /home/dan/code/freshell/.worktrees/.the-usual-logs/freshcodex-complete/run-focused-rust.py --build-server -p freshell-codex -p freshell-freshagent -p freshell-ws`.
 
@@ -439,7 +439,7 @@ Run: `pnpm run test:vitest run test/unit/client/components/fresh-agent/ test/uni
 
 Expected: PASS, including crash, compact, fork, rollback and stale-send fences. Process-fault tests remain in Docker.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/freshell-freshagent/src/codex.rs crates/freshell-freshagent/src/codex/turn_state.rs src/components/fresh-agent/FreshAgentView.tsx test/unit/client/components/fresh-agent/FreshAgentView.test.tsx
@@ -462,7 +462,7 @@ git commit -m "fix(codex): preserve turn ownership across send and stop races"
 - Produces: session-owned atomic `awaited_control_count`, synchronized from actual unresolved reply-bearing native approvals/questions/elicitations and used for deadman arm/fire validity. Native question `isBlocking:false` still counts when native awaits the response. True async AgentMessage question content has no pending server RPC and never increments this count.
 - Produces: Task 3 preserved async delivery/question metadata rendered as transcript questions/choices. A contextual answer enters the existing composer/send path: preserve native item/question identity as context and exact chosen/free-entry text, use normal idle start or existing active queue/expected-ID steer, and retain refusal/ambiguity/draft state. An answer-accepted indication means only ordinary input acceptance, never native control resolution or turn completion. No fabricated RequestId, `UserInputAnswer` RPC, durable permission record or automatic resend on reload.
 
-- [ ] **Step 1: Write failing request→UI→response and deadman tests**
+- [x] **Step 1: Write failing request→UI→response and deadman tests**
 
 Extend existing controls `runtime()/event()/snapshot()` fixture. This representative assertion exercises a real native request:
 
@@ -498,7 +498,7 @@ Use the short quiet-window seam: unanswered approvals, MCP and both true/false-f
 
 Render/reload/hidden-pane tests keep async questions in saved/retained transcript, synchronous controls in retained pending state, exact response IDs and native choice/secret behavior. Server-authoritative attention distinguishes awaited waiting from nonblocking actionable async content, deduplicates existing timestamps, seeds reload silently and never steals focus. An ordinary accepted async answer clears only its local action indication, independently of native work/terminal status.
 
-- [ ] **Step 2: Confirm red**
+- [x] **Step 2: Confirm red**
 
 Run: `python3 /home/dan/code/freshell/.worktrees/.the-usual-logs/freshcodex-complete/run-focused-rust.py -p freshell-freshagent codex::`.
 
@@ -506,7 +506,7 @@ Run: `pnpm run test:vitest run test/unit/shared/fresh-agent-contract.test.ts tes
 
 Expected: native flags/choices lost, secret input unmasked, MCP rejected, awaited false-flag request trips deadman, or true async reply is incorrectly routed as a control/pauses work.
 
-- [ ] **Step 3: Extend the existing control path and bounded elicitation UI**
+- [x] **Step 3: Extend the existing control path and bounded elicitation UI**
 
 Normalize native fields into the existing public control records and live events identically. Keep RequestId string/integer identity through all serialization; request keys remain stable on reload. Managed `decision_id` is an opaque routing key using the existing unambiguous JSON/native-ID mapping; keep original native ID type in retained request data. Test integer 41 versus string "41" concurrently so hosted conversion cannot collapse them, and respond with the original native RequestId. Store original native params privately for exact validation/response and turn cancellation. Never restore secret entered values after reload, store them in pane persistence, or log them.
 
@@ -520,15 +520,15 @@ After the early native gate has established actual elicitation setup/lifetimes, 
 
 Publish `awaited_control_count` from actual reply-bearing pending insert/remove/drain transitions before deadman changes. Watch only when work remains owed and that count is zero, rechecking the same facts and timer generation at firing. Both synchronous question flags count; a true async transcript item does not. Draining the final awaited request feeds activity/rearms a full window. Preserve independent progress, server-authoritative awaited waiting/nonblocking question attention, and turn completion. The earlier flag-based draft condition is superseded by this behavioral requirement; implementation/tests must use Task 1's executed lifetimes.
 
-- [ ] **Step 4: Confirm green**
+- [x] **Step 4: Confirm green**
 
 Run Step 2 commands. Expected: PASS; exact native control responses/retained metadata, no false deadman for awaited false-flag questions, and genuine async contextual answers through ordinary input without pausing ongoing work.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Centralize pending insert/remove/drain transitions so every route updates count, cancellation event and waiting state once. Keep typed bounded form validation in `elicitation.rs`; do not embed JSON-schema interpretation in the main view. Keep provider-specific decision translation in Codex controls.
 
-- [ ] **Step 6: Verify impacts**
+- [x] **Step 6: Verify impacts**
 
 Run: `python3 /home/dan/code/freshell/.worktrees/.the-usual-logs/freshcodex-complete/run-focused-rust.py --build-server -p freshell-codex -p freshell-freshagent -p freshell-ws -p freshell-session-host`.
 
@@ -536,7 +536,7 @@ Run: `pnpm run test:vitest run test/unit/shared/ test/unit/client/components/fre
 
 Expected: PASS. The new typed response goes through ordinary and managed WS ingress, and old Claude/OpenCode approval/question flows remain intact.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/freshell-freshagent/src/codex.rs crates/freshell-freshagent/src/codex/controls.rs crates/freshell-freshagent/src/codex/controls/tests.rs crates/freshell-freshagent/src/codex/elicitation.rs crates/freshell-protocol/src/client_messages.rs crates/freshell-ws/src/terminal.rs crates/freshell-ws/src/hosted_fresh_agent.rs crates/freshell-server/src/fresh_agent_proxy.rs crates/freshell-session-host/src/providers/fresh_agent.rs shared/fresh-agent-contract.ts shared/ws-protocol.ts src/store/freshAgentTypes.ts src/store/freshAgentSlice.ts src/lib/fresh-agent-ws.ts src/components/fresh-agent/FreshAgentQuestionBanner.tsx src/components/fresh-agent/FreshAgentApprovalBanner.tsx src/components/fresh-agent/FreshAgentApprovalCard.tsx src/components/fresh-agent/FreshAgentElicitationBanner.tsx src/components/fresh-agent/FreshAgentView.tsx test/unit/shared/fresh-agent-contract.test.ts test/unit/client/components/fresh-agent/FreshAgentQuestionBanner.test.tsx test/unit/client/components/fresh-agent/FreshAgentApprovalBanner.test.tsx test/unit/client/components/fresh-agent/FreshAgentApprovalCard.test.tsx test/unit/client/components/fresh-agent/FreshAgentElicitationBanner.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.approvals.test.tsx test/unit/client/lib/fresh-agent-ws.test.ts
@@ -557,7 +557,7 @@ git commit -m "feat(codex): honor native controls and MCP elicitation"
 - Produces: `FreshCodexState::retained_state(session_id:&str) -> Result<Value,RetainedStateError>` with existing source identity, projection/memberships/finite `turnOutputStates`, attention marks and actual pending public controls; true async questions remain transcript content plus actionable nonblocking metadata, never durable permission requests. `subscribe_retained_state(session_id:&str) -> watch::Receiver<u64>` coalesces wakeups, not a new history clock/journal. Native facts update retained state before best-effort broadcast. Expose through existing provider transport/snapshot; default-unsupported trait behavior preserves other providers.
 - Produces: one owned bridge recovery worker that reacts to the coalesced wakeup/loss, awaits downstream channel capacity without holding provider locks, and drains the latest retained source. It sends current marks/projection resync in a properly routed `FreshAgentEvent` envelope using the existing `freshAgent.host.backpressure` recovery event with retained/source data, plus every retained pending control through its durable `PermissionRequested` conversion. The retained snapshot includes last exact native history plus event-owned active state and does not wait for another native RPC merely to recover a dropped frame. Gateway/client apply this fenced retained state immediately and request native history refresh separately through the bounded scheduler. It runs even when the dropped frame was the last frame; no later provider token is required. Gateway ready/reset reconciliation reads this retained source under the existing host/incarnation fence, rather than treating its lossy journal as complete history.
 
-- [ ] **Step 1: Write red replay tests**
+- [x] **Step 1: Write red replay tests**
 
 Mirror the real WS harness and drive native facts through the consumer. After disconnect: complete/fail, reconnect, compare retained timestamp/session type; awaited question with either flag or approval recovers waiting once; last awaited response clears waiting independently of completion. True async question recovers transcript/action attention while ongoing work remains active, without a pending decision or false waiting/completion. Normal accepted contextual answer clears its action indication only; refusal/ambiguity preserves it. Unrequested death retains completion/clears dead controls, close forgets aliases, materialization aliases, unnegotiated ready has no replay. Prove silent reload seed and reconnect/duplicate dedup. Saturate upstream/downstream channels, drop the final completion/waiting/control/async-content frame and emit **no more provider frames**. Drain capacity and recover exact finite transcript/attention; only real pending question/elicitation becomes a durable answerable decision. Repeat journal reset/source replacement; reject old incarnation, preserve available interrupted/unsaved/truncated retained evidence without reopening appends. No cross-pane focus/attention leak.
 
@@ -575,27 +575,27 @@ assert_eq!(marks[0].last_waiting_at, None);
 
 This pure assertion supplements, rather than replaces, the consumer→WS ready tests.
 
-- [ ] **Step 2: Confirm red**
+- [x] **Step 2: Confirm red**
 
 Run: `python3 /home/dan/code/freshell/.worktrees/.the-usual-logs/freshcodex-complete/run-focused-rust.py --build-server -p freshell-ws --test freshagent_codex_attention_replay`.
 
 Expected: real Codex marks are absent from ready replay and the current bridge loses a final edge/control before journal without an independent drain. Add the compiling test harness first so the red receipt is behavioral.
 
-- [ ] **Step 3: Integrate the existing ledger**
+- [x] **Step 3: Integrate the existing ledger**
 
 Add clone-shared `Arc<AttentionLedger>` and observe sessions at admission. Completion and synthesized death/deadman edges record timestamp **before** broadcast under existing semantics. Waiting comes from actual awaited controls, including synchronous false-flag questions; final awaited drain clears it. Async transcript question visibility uses existing nonblocking actionable attention/timestamp dedup, without claiming native waiting, idle or completion; accepted ordinary answer clears only that action. Close forgets, materialization aliases, unrequested death retains completion. Reuse clocks/dedup, combine Claude/Codex marks in negotiated ready and preserve existing managed extension forwarding. Repair `spawn_broadcast_bridge` lag/drop before journal through retain-before-broadcast and the coalesced capacity-awaiting worker, even for the final lost frame. Patches stay best effort with one fenced resync on loss; no unbounded journal. Only real pending elicitation/approval/question requests enter durable actor conversion, including missed requests; async content stays in projection/history recovery.
 
 At the gateway, retain authoritative host marks for ready replay and refetch the provider-retained source on journal reset/backpressure; recheck current source tuple before applying it. Client `fresh-agent-ws`/View marks a patch gap, host backpressure or host journal reset dirty and schedules one coalesced snapshot; visible rows stay until authoritative replacement. Do not wait for a later provider frame to trigger recovery. A gateway-only ledger cannot reconstruct an edge lost before the journal, so it is not the sole source.
 
-- [ ] **Step 4: Confirm green**
+- [x] **Step 4: Confirm green**
 
 Run Step 2 command. Expected: PASS with exact timestamps and capability gating.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Route all Codex attention edges through focused retain-and-broadcast helpers; consolidate only the touched bridge recovery paths and reuse existing durable pending-decision recording, without a new generic event journal; keep the generic ledger and Claude observer contract intact. Remove any duplicate controls waiting clock only if the same monotonic timeline is fully preserved and tests prove it.
 
-- [ ] **Step 6: Verify impacts**
+- [x] **Step 6: Verify impacts**
 
 Run: `python3 /home/dan/code/freshell/.worktrees/.the-usual-logs/freshcodex-complete/run-focused-rust.py --build-server -p freshell-freshagent -p freshell-ws -p freshell-session-host -p freshell-agent-runtime -p freshell-server`.
 
@@ -603,7 +603,7 @@ Run existing client attention/ready tests through `pnpm run test:vitest run test
 
 Expected: PASS, including Claude/Kilroy silent seed and alias eviction behavior. Task 10 adds browser offline/hidden/two-pane proof.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/freshell-freshagent/src/codex.rs crates/freshell-freshagent/src/codex/controls.rs crates/freshell-ws/src/lib.rs crates/freshell-ws/tests/freshagent_codex_attention_replay.rs crates/freshell-server/src/fresh_agent_proxy.rs
@@ -626,7 +626,7 @@ git commit -m "fix(codex): recover retained state after hosted event loss"
 - Produces: catalog cache key `{provider,currentSource,cwd}` where currentSource derives from existing native identity/owner epoch+generation or managed same_snapshot_source fields (host boot/incarnation/execution generation/provider volume). Rebind/restart/materialization invalidates the old key and in-flight client request; stale replies cannot overwrite a newer context or staged selection. Use the existing TTL/singleflight registry. Native model-list absence never rejects an explicit model/effort; exact values remain eligible for native validation.
 - Produces: capability-aware selection validation shared by create/send/configure/fork; nonempty native effort strings preserved across wire/TS validation. No new fixed effort enum. `max` legacy alias maps to `xhigh` only where the installed selected model supports xhigh and does not advertise distinct max.
 
-- [ ] **Step 1: Write red model/effort behavior tests**
+- [x] **Step 1: Write red model/effort behavior tests**
 
 Use the existing app-server ChannelPeer handshake helper to test list pagination; native result page 1 contains `gpt-6.1-sol` with `xhigh`, page 2 contains `provider-current` with effort `ultra` and no static menu entry. Assert exact request cursor and final mapped choice list. Probe failure/deadline returns typed unavailable and leaves previous same-source cache intact; it creates/closes no extra provider process. Distinct provider contexts and gateway HOME must yield distinct records and exact source routing.
 
@@ -643,7 +643,7 @@ fn explicit_native_choices_are_never_replaced_by_static_defaults() {
 
 The provider-drive test is necessary: a normalizer test alone cannot prove runtime acceptance. Current-model omitted from refresh stays visibly selected/unavailable, failed catalog does not switch to Astra, delayed refresh does not erase search or staged selection, committed xhigh survives configure→send→reload→send. Any native rejection of an explicit choice is a useful typed failure; catalog omission alone is never a rejection. Absent choice uses native/default chosen by existing defaults. Preserve a nonempty explicit model/effort for native validation whether catalog succeeds, is incomplete, or is unavailable. Open the picker before create acknowledgement, stage a new exact choice, acknowledge creation, and assert the auto-probe uses the newly bound context without erasing the choice or search. Fail creation and prove honest unavailable with no hidden runtime. Rebind during a held catalog response and prove the old source reply cannot commit.
 
-- [ ] **Step 2: Confirm red**
+- [x] **Step 2: Confirm red**
 
 Run: `python3 /home/dan/code/freshell/.worktrees/.the-usual-logs/freshcodex-complete/run-focused-rust.py -p freshell-codex -p freshell-freshagent model`.
 
@@ -651,7 +651,7 @@ Run: `pnpm run test:vitest run test/unit/shared/fresh-agent-models.test.ts test/
 
 Expected: static clamp substitutes Astra/max and Codex dialog never probes native.
 
-- [ ] **Step 3: Implement native catalog and faithful selection**
+- [x] **Step 3: Implement native catalog and faithful selection**
 
 `list_models` uses the existing bound client's initialized request path; request visible models, follow cursor to exhaustion and reject malformed/looping cursors with typed probe error. Preserve advertised fields and native defaults. The normal automatic pane create establishes the runtime with exact saved/default settings; a catalog request never creates a synthetic conversation or probes another HOME. While create is pending keep exact selection, show pending, and preserve any labeled defaults. After bind, fetch automatically using the current-context request above.
 
@@ -659,15 +659,15 @@ Replace FreshCodex's static fast path only for a bound context. Server resolves 
 
 Keep every nonempty explicit Codex model/effort through create/send/configure/resume/fork. The catalog populates menus and advertised choices; it is not proved exhaustive for custom providers, so successful list absence never rejects exact intent. Let native validate and return typed failure rather than silently substitute a model/effort. `FreshAgentSettingsSchema.effort` accepts nonempty native strings. Preserve xhigh exactly; migrate legacy max→xhigh only at the intended compatibility boundary where the selected native model advertises xhigh and no distinct max. Saved/custom values omitted by refresh stay visible as exact current selections. No new fixed effort enum or session-preparation/auth framework.
 
-- [ ] **Step 4: Confirm green**
+- [x] **Step 4: Confirm green**
 
 Run Step 2 commands plus `python3 /home/dan/code/freshell/.worktrees/.the-usual-logs/freshcodex-complete/run-focused-rust.py -p freshell-codex catalog`. Expected: PASS, exact current values reach native calls.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Unify selection application across all Codex lifecycle paths, leaving shared provider-specific behavior intact. Delete obsolete Codex fixed-menu clamps and misleading 0.129 effort comments, retain deliberate fallback constants only for genuinely omitted choices. Keep native catalog mapping in `catalog.rs`, process lifecycle in the existing transport/launch seam, registry caching in the existing registry.
 
-- [ ] **Step 6: Verify impacts**
+- [x] **Step 6: Verify impacts**
 
 Run: `python3 /home/dan/code/freshell/.worktrees/.the-usual-logs/freshcodex-complete/run-focused-rust.py --build-server -p freshell-codex -p freshell-freshagent -p freshell-session-host -p freshell-runtime-protocol -p freshell-runtime-client -p freshell-supervisor`.
 
@@ -675,7 +675,7 @@ Run: `pnpm run test:vitest run test/unit/shared/ test/unit/client/lib/ test/unit
 
 Expected: PASS; all providers' model choices and saved Codex defaults remain usable. Task 10 runs the Codex live-convergence browser leg absent today.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/freshell-codex/src/app_server.rs crates/freshell-codex/src/model.rs crates/freshell-codex/src/catalog.rs crates/freshell-codex/src/lib.rs crates/freshell-codex/tests/app_server_drive.rs crates/freshell-opencode/src/catalog.rs crates/freshell-freshagent/src/codex.rs crates/freshell-freshagent/src/model_capabilities.rs crates/freshell-freshagent/src/model_capabilities_tests.rs crates/freshell-runtime-protocol/src/lib.rs crates/freshell-runtime-client/src/lib.rs crates/freshell-supervisor/src/service.rs crates/freshell-session-host/src/main.rs crates/freshell-session-host/src/providers/fresh_agent.rs crates/freshell-agent-runtime/src/host_actor.rs crates/freshell-server/src/fresh_agent_proxy.rs shared/fresh-agent-models.ts shared/fresh-agent-model-capabilities.ts shared/fresh-agent-contract.ts src/lib/fresh-agent-model-capabilities.ts src/lib/fresh-agent-registry.ts src/components/fresh-agent/FreshAgentModelDialog.tsx test/unit/shared/fresh-agent-models.test.ts test/unit/client/lib/fresh-agent-model-capabilities.test.ts test/unit/client/lib/fresh-agent-create-content.test.ts test/unit/client/components/fresh-agent/FreshAgentModelDialog.test.tsx
@@ -694,7 +694,7 @@ git commit -m "feat(codex): use native model and reasoning capabilities"
 - Produces: `CodexEffectiveSettings { model:String, effort:Option<String>, cwd:Option<String>, sandbox:Option<String>, permission_mode:Option<String>, collaboration_mode:Option<CodexWorkMode> }`, with `CodexWorkMode::{Default,Plan}`. A pure `resolve(base,patch)` validates and merges; apply under existing serialization boundary; emit/persist complete effective settings. Wire create/send/configure/pane/default types add optional `collaborationMode:'default'|'plan'`; shared scopes add cwd/collaborationMode optional keys.
 - Produces: `StartTurnParams.collaboration_mode:Option<Value>` serialized as native `collaborationMode` with selected model, reasoning_effort and developer_instructions:null. All existing Rust struct-literal callers add `None` or use `..Default::default()` deliberately; update native client drive tests accordingly.
 
-- [ ] **Step 1: Write failing settings/order/Plan behavior tests**
+- [x] **Step 1: Write failing settings/order/Plan behavior tests**
 
 Test native wire encoding independently:
 
@@ -722,7 +722,7 @@ Active expected-ID steer carries no setting overrides: change model/effort/cwd/a
 
 Component tests use real store/settings callback: select File access Read only/Workspace write/Full access and Work mode Plan/Build, observe pane patch and configure payload. Read-only and approval Never ask remain distinct; create-only/unsupported scope shows honest hint/disabled action. Plan→native question→answer→Build is later proven in browser, not just by static label assertions.
 
-- [ ] **Step 2: Confirm red**
+- [x] **Step 2: Confirm red**
 
 Run: `python3 /home/dan/code/freshell/.worktrees/.the-usual-logs/freshcodex-complete/run-focused-rust.py -p freshell-codex -p freshell-freshagent settings`.
 
@@ -730,21 +730,21 @@ Run: `pnpm run test:vitest run test/unit/client/lib/fresh-agent-create-content.t
 
 Expected: configure ignores cwd; snapshot omits sandbox/cwd; send overwrites newer configure; no native mode or file-access control.
 
-- [ ] **Step 3: Implement one effective-settings path**
+- [x] **Step 3: Implement one effective-settings path**
 
 Use existing configure/send/rollback serialization without preventing native consumer progress or violating Task 4 Stop gate. A later configure cannot be overwritten by an older response. Resolve/validate all fields once; persist accepted next-turn defaults with captured owner fence and explicit write errors, distinguishing staged defaults from current native-turn effective settings. Active expected-ID steer has no overrides; apply staged settings only to the next idle `turn/start`, never route through convenience start to pretend reconfiguration. Broadcast/snapshot exact fields and staged scope. Carry work mode through `FreshAgentTurnSettings`, durable host profiles/recovery and native `StartTurnParams`; allow cwd/collaborationMode in hosted `snapshot_projection::valid_scopes`. Older absent metadata cannot clear valid fields. Reuse Task 1 compatibility projection and typed native policy on every create/resume/fork/next-turn path: preserve effective untrusted intent, prepared-layer/source precedence and native requirements, with precise early refusal when faithful preparation is impossible. Never edit user HOME/config or broaden policy for startup.
 
 Build native collaborationMode using resolved model and **wire-normalized** effort. Selecting Build explicitly switches native `mode:'default'`, not omission that might preserve Plan. Start/resume effective values, when native echoes them, are authoritative. Plan setting is capability/scoped and separate from approval policy. Extend the existing settings popover with plain-language File access and Work mode rows, persist defaults via current provider settings patch, and stage/commit through the same helper as model/permission. Snapshot capability `settingScopes` truthfully advertises per-send cwd/sandbox/model/effort/approval/work mode supported by installed Codex; no invented live-only reconfiguration.
 
-- [ ] **Step 4: Confirm green**
+- [x] **Step 4: Confirm green**
 
 Run Step 2 commands. Expected: PASS and exact Plan/default native fields with same model/effort and correct sandbox/cwd after reload.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Replace four separate settings-normalization blocks with the focused helper and shared persistence/projection functions. Do not move identity/lease/fork machinery into settings. Keep mode/approval/sandbox distinct in names and UI copy.
 
-- [ ] **Step 6: Verify impacts**
+- [x] **Step 6: Verify impacts**
 
 Run: `python3 /home/dan/code/freshell/.worktrees/.the-usual-logs/freshcodex-complete/run-focused-rust.py -p freshell-codex -p freshell-freshagent -p freshell-protocol -p freshell-session-host`.
 
@@ -752,7 +752,7 @@ Run: `pnpm run test:vitest run test/unit/shared/ test/unit/client/lib/ test/unit
 
 Expected: PASS including old saved panes, create defaults, hosted settings forwarding and cross-provider settings scope behavior.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/freshell-codex/src/app_server.rs crates/freshell-codex/tests/app_server_drive.rs crates/freshell-protocol/src/client_messages.rs crates/freshell-freshagent/src/codex.rs crates/freshell-freshagent/src/codex/settings.rs crates/freshell-runtime-protocol/src/lib.rs crates/freshell-agent-runtime/src/host_actor.rs crates/freshell-agent-runtime/src/snapshot_projection.rs crates/freshell-session-host/src/providers/fresh_agent.rs crates/freshell-server/src/fresh_agent_proxy.rs shared/fresh-agent-contract.ts shared/settings.ts shared/ws-protocol.ts src/store/paneTypes.ts src/store/persistedState.ts src/lib/fresh-agent-create-content.ts src/lib/fresh-agent-registry.ts src/lib/fresh-agent-setting-scopes.ts src/components/fresh-agent/FreshAgentSettingsButton.tsx src/components/fresh-agent/FreshAgentView.tsx test/unit/client/lib/fresh-agent-create-content.test.ts test/unit/client/components/fresh-agent/FreshAgentSettingsButton.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.test.tsx
@@ -770,7 +770,7 @@ git commit -m "feat(codex): expose faithful settings and native plan mode"
 - Consumes: `FreshAgentRestLane::{create_agent,abandon_create,send_agent,capture,snapshot}`, exact `RestLaneCreate/Send/Capture` types, Task 4 identity-owned turn facts, current naming/ownership/fence/create cleanup contract.
 - Produces: `CodexRestLane::new(state:FreshCodexState, enabled:Arc<dyn Fn()->bool+Send+Sync>)`; `FreshAgentState::set_codex_rest_lane(SharedFreshAgentRestLane)`; local provider selection `codex` after hosted gateway precedence. `CodexCreateOutcome` is `Created { session_id:String, session_ref:Option<SessionLocator>, cleanup_ownership_id:Option<String> } | Failed { code:String,message:String,retryable:Option<bool>,owner:Option<TerminalOwnerFields> }`. `CodexSendOutcome` is `Accepted { session_id:String, submitted_turn_id:String, incarnation_id:String } | Refused { code:String,message:String,retryable:Option<bool>,owner:Option<TerminalOwnerFields> } | Ambiguous { session_id:String,request_id:String,incarnation_id:String,code:String,message:String }`. Accepted means native acceptance only; it is not completed. Exact field responsibilities match the existing Claude typed outcomes. `CodexTurnEvent::Settled` carries native session/turn/incarnation, terminal outcome and actual evidence source; interrupt acknowledgement, quiet-deadman attention, arbitrary status snapshots and acceptance are not settlement events. Subscribe before dispatch and settle only matching native identity. Same-ID steering shares the existing native turn; ambiguous delivery remains incomplete/uncertain with no automatic replay.
 
-- [ ] **Step 1: Add failing real dispatcher and HTTP/runtime tests**
+- [x] **Step 1: Add failing real dispatcher and HTTP/runtime tests**
 
 Extend the existing actual CLI HTTP-recording parameterized test from Claude/Kilroy to Codex with provider-specific sessionRef. This complete representative MCP case exercises its real dispatcher:
 
@@ -792,7 +792,7 @@ Add the split equivalent with target lookup. The CLI test invokes the real `tool
 
 Rust HTTP tests construct default state with real Codex lane/ChannelTransport: headless new/split honors all settings, initial acceptance, canonical resume reuses writer, Enter-only no-op, and send waits for actual matching terminal evidence, including same-ID expected-ID steer and ACK before observed terminal. Later idle start remains unissued while old Stop is unresolved; event/terminal consumption progresses without lock deadlock. Capture returns finite saved/retained transcript with byte-limit truncation separate from native persistence truncation; wait-for observes actual output, rename uses shared authority. Failed create leaves no blank pane/only cleans owned runtime; adoption never grants cleanup ownership. Proven refusal preserves prompt; arbitrary internal error/timeout is ambiguous, never auto-replayed or reported complete. Startup Stop requires actual result/owned exit, not invented terminal.
 
-- [ ] **Step 2: Confirm red**
+- [x] **Step 2: Confirm red**
 
 Run: `python3 /home/dan/code/freshell/.worktrees/.the-usual-logs/freshcodex-complete/run-focused-rust.py -p freshell-freshagent rest_lane`.
 
@@ -800,7 +800,7 @@ Run: `pnpm run test:vitest run test/unit/cli/action-capabilities.test.ts test/un
 
 Expected: default local Codex create/split is unavailable and standalone clients refuse before HTTP.
 
-- [ ] **Step 3: Adapt the existing runtime rather than duplicate it**
+- [x] **Step 3: Adapt the existing runtime rather than duplicate it**
 
 Refactor create/send to typed outcomes while retaining broadcasts; publish the private typed settlement subscription from the authoritative reducer and subscribe **before** dispatch. Correlate session/native turn/incarnation/ownership/request, use idle start or active expected-ID steer, and wait for the same owed native turn without an extra completion. Task 4's unresolved Stop gates later start issuance without blocking events; settings remain next-turn defaults on steer. Cancellation/death/close requires actual terminal evidence or confirmed owned termination, not ACK/WebSocket loss. Only proven pre-admission rejection is Refused; timeout/lost reply/arbitrary internal error stays Ambiguous with recoverable prompt/receipt and no replay. Finite saved-only interrupted or unsaved/truncated transcript state does not invent a terminal outcome.
 
@@ -808,15 +808,15 @@ Implement CodexRestLane by translating existing RestLane request into `FreshAgen
 
 Register local Codex lane at server construction beside local Claude; `rest_lane_for` retains hosted-gateway precedence and selects Codex locally when unmanaged. Existing split/new layout transaction continues to own rollback. Only once runtime behavior is green, extend the client capability guard and fresh-agent resume parser to Codex and update MCP parameter description. Remove the specific obsolete negative Codex refusal cases; retain all unrelated refusal cases and action counts. Do not add a new fresh-send command.
 
-- [ ] **Step 4: Confirm green**
+- [x] **Step 4: Confirm green**
 
 Run Step 2 commands. Expected: PASS with actual HTTP body and real lane behavior, no change to terminal-mode constraints.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Reuse existing text capture, typed REST error and wait-deadline helpers; keep provider-specific outcome extraction in Codex. Avoid refactoring all providers into a new runtime trait. Remove temporary broadcast-message parsing used during green implementation.
 
-- [ ] **Step 6: Verify impacts**
+- [x] **Step 6: Verify impacts**
 
 Run: `python3 /home/dan/code/freshell/.worktrees/.the-usual-logs/freshcodex-complete/run-focused-rust.py --build-server -p freshell-freshagent -p freshell-server`.
 
@@ -824,7 +824,7 @@ Run: `pnpm run test:vitest run test/unit/cli/ test/unit/mcp/ --config config/vit
 
 Expected: PASS, including Claude automation, naming, focus contracts, split rollback and terminal command validation. Task 10 proves the real Rust/fake-native browser journey and hosted arrangement.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/freshell-freshagent/src/codex_rest_lane.rs crates/freshell-freshagent/src/codex.rs crates/freshell-freshagent/src/lib.rs crates/freshell-freshagent/src/rest_lane.rs crates/freshell-freshagent/src/rest_lane_http_tests.rs crates/freshell-freshagent/src/pane_ops.rs crates/freshell-server/src/main.rs tools/node-client-runtime/action-capabilities.ts tools/freshell-cli/index.ts tools/freshell-mcp/freshell-tool.ts test/unit/cli/action-capabilities.test.ts test/unit/cli/commands.test.ts test/unit/mcp/freshell-tool.test.ts
@@ -876,17 +876,17 @@ Required journeys and exact evidence:
 6. **Preserved lifecycle:** ordinary durable parent-scoped child observer shows exact available active/final/saved native history, restores selection after reload, bounds unmaterialized pending and retains available content on temporary source loss. Ephemeral child returns specific unavailable/absent snapshot without changing ephemerality, empty success or spinning; zero observer child create/resume/send/stop/configure RPCs or inferred release. Preserve /new, native compact (no turn/start text), specific-row/native-boundary fork, conversation undo without file effects, honest redo refusal, native image input/output and meaningful image/text attachment history after reload, checkpoint/rewind and `!command` cwd, saved-name precedence, same-thread recovery and handoff without duplicate writer. Stop during start/expected-ID steer/ambiguous delivery and later-start gating respect actual terminal/owned-exit evidence; late old replies cannot retire new work. Fault/kill/restart variants remain inside disposable Docker, never production/host destructive runs.
 7. **Managed hosted:** extend existing `fresh-agent-parity.test.ts` rig for native catalog/model/effort/settings/Plan, finite transcript+usage, awaited controls/async contextual answers, REST capture/send and authoritative reconnect attention. Assert actual provider-volume log and gateway-visible state; required isolated session-host crash/restart retains ref/settings/name and rejects stale incarnation without losing available frozen output. Add actual-native leg with freshcodex omitted from fixtureFreshAgentModes, aligned image and Task 1 release-supported loopback Responses/MCP fixture in the owning provider namespace. `codex-local-provider.mjs` exposes `startInManagedContext(rig,source) -> Promise<{baseUrl,stop,traffic}>` through owned RuntimeSandbox/broker. Real gateway→session-host→Codex proves wrapper/native version/UID/context, streamed/saved/retained semantics, native Plan/control/async responses, all faithful settings including prepared untrusted create/resume/fork/send/child/requirements behavior, actual permitted restricted commands and absent denied effects, and durable/ephemeral observation through production routing. Keep deterministic fake transport for forced races; it cannot replace this native leg. Docker local companion must discover/execute it, preserving unchanged isolation and no live-host operations.
 
-- [ ] **Step 2: Run affected cloud specs and confirm intended red evidence**
+- [x] **Step 2: Run affected cloud specs and confirm intended red evidence**
 
 During each earlier implementation slice, select its new affected spec with `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium test/e2e-browser/specs/freshcodex-live-transcript-rust.spec.ts test/e2e-browser/specs/fresh-agent-rest-codex-rust.spec.ts` before/after production work; record nonzero discovered test count and failure reason. The concrete final selectors are in Step 4. Expected initial failures correspond to the missing user behavior, not fixture boot/setup failures. If fixture setup fails, fix setup and rerun before claiming red.
 
-- [ ] **Step 3: Complete minimal integrated implementation and documentation**
+- [x] **Step 3: Complete minimal integrated implementation and documentation**
 
 Repair only production gaps revealed by the accepted journeys, within the earlier task intents. For schema fixture inventory update, represent 0.164 supported/unsupported classifications honestly and preserve unknown-type tolerance; do not add test assertions that merely require version/comment text. Keep native fake configured via existing behavior JSON, exact ID replacement, durable turn recording, and response/operation logs. Add opt-in prompt scripts and release barriers there, not production test seams.
 
 Update README usage for installed model selection, Plan/Build, file access versus approval, awaited versus async questions/MCP prompts, truthful saved/retained/interrupted output and unavailable ephemeral child history, CLI/MCP create/split and undo/no-redo. Describe precise incompatible-config diagnostics without exposing implementation internals. Keep it concise/user-facing; update `docs/index.html` major affordances with existing patterns. No additional end-user Markdown guide.
 
-- [ ] **Step 4: Run exact focused browser/hosted verification**
+- [x] **Step 4: Run exact focused browser/hosted verification**
 
 Run:
 
@@ -900,7 +900,7 @@ Expected: actual pinned-native contract and discovered/executed Codex browser ca
 
 Managed parity remains in the real Docker-backed `test/integration/server` local companion. Use the broad supported run below, which automatically includes that excluded-from-cloud tree. Do not run a focused cloud selector and claim it executed the hosted rig. If a focused supported local companion invocation is needed, use its repository-owned selector documented by the harness, not an ad hoc local backend override; otherwise wait for the full check.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Remove duplicate temporary fake scripts/helpers introduced by this work; keep per-spec ownership conventions. Consolidate repeated production projection/settings/control transitions only where the earlier tasks already own them. Check logging has diagnosable IDs/severity and no secret answers; verify instructions/copy describe actual behavior. Re-run only affected cases when this cleanup changes behavior.
 
@@ -924,6 +924,14 @@ git commit -m "test(codex): prove complete Freshagent workflows"
 ```
 
 Commit any later review fixes separately. The file lists above are the exact intended task ownership; leave unchanged tracked entries unstaged, and if implementing a listed behavior necessarily modifies another already-read caller/constructor, record that exact path in the task receipt and stage it explicitly as well. Never stage unrelated work. Verify clean feature worktree, focused history and no unrelated files; push the feature branch using the existing hooks. Report what changed, native/local/hosted/browser evidence, commit/branch, and any real remaining finding disposition. Ask the user for the repository-required explicit approval to open/land a PR only after the result is concrete and reviewable. Do not create a PR in advance, merge, clean up the worktree, deploy, or restart production.
+
+## Execution progress — 2026-10-29
+
+Tasks 001–009 are independently reviewed and adopted; their 63 completed step markers are reconciled here. The original instructions, decisions, command examples and publication-time self-review below remain historical text. Actual command/backend/compiler/sandbox adaptations and task receipts are indexed in `/home/dan/code/freshell/.worktrees/.the-usual-logs/freshcodex-complete/reports/task010-plan-checkbox-preparation.md` and the task reports under `.git/worktrees/freshcodex-complete/usual-sdd/`.
+
+Task 010 Steps 2–5 have executed focused evidence at production checkpoint `4b099e397089d3167e1e6d7d191b234b48b86753`: configured-cloud browser 69/69 across 11 affected specs, actual checkpoint compiler caller plus cloud 5/5, configured-cloud native contract 25/25, direct installed native 24 plus separate network case, and the Root-adopted actual managed recovery journey024. The last two native roles retain their recorded earlier source scopes; no unchanged native matrix was rerun for documentation or UI-only work. Exact commands, red/green/refactor chronology, source boundaries and receipts are in `task-010-report.md` in that task-report directory. The public managed ephemeral-parent method remains unreachable/unexecuted through the existing create interface, with the explicit Root evidence-method adaptation retained for independent assessment; it is not labeled a pass, residual or waiver.
+
+Task 010 Step 1 remains unchecked pending fresh independent assessment of the completed, newly dated source-preserving producer TDD recovery. The original production-before-qualified-host-RED deviation remains substantiated-unresolved until that assessment; the confounded31856 and gateway25529 are not relabeled as a healthy host-producer RED. Genuine later browser/component/public-server REDs remain separately recorded. Steps 6–7 remain pending the coordinator's pinned fmt/Clippy, one exact-tree full check, Task010 and whole-branch reviews, and verified handoff. Root alone owns authorized PR landing; no production deployment or restart is part of this implementation.
 
 ## Mandatory self-review of this implementation plan
 
