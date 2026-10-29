@@ -541,6 +541,7 @@ pub struct FreshCodexState {
     naming: crate::naming::NamingSink,
     hosted_naming_events: bool,
     naming_rollout_probe: Arc<std::sync::OnceLock<CodexNamingRolloutProbe>>,
+    sidecar_cleanup_probe: Arc<std::sync::OnceLock<CodexSidecarCleanupProbe>>,
     /// Unified agent names: thread id → the pre-durable naming handle
     /// admitted at create. A `thread/start` id/path is PROSPECTIVE (the
     /// rollout hasn't materialized), so the handle stays pending and the
@@ -582,6 +583,16 @@ pub type CodexNamingRolloutProbe = Arc<
             String,
         )
             -> futures_util::future::BoxFuture<'static, Result<Option<std::path::PathBuf>, String>>
+        + Send
+        + Sync,
+>;
+
+/// Hosted cleanup runs under the same identity as the exact owned sidecar.
+/// A positive answer must confirm the recorded incarnation and whole tree gone.
+pub type CodexSidecarCleanupProbe = Arc<
+    dyn Fn(
+            crate::session_lease::CondemnedRuntimeIdentity,
+        ) -> futures_util::future::BoxFuture<'static, Result<bool, String>>
         + Send
         + Sync,
 >;
@@ -936,6 +947,7 @@ impl FreshCodexState {
             naming: crate::naming::NamingSink::default(),
             hosted_naming_events: false,
             naming_rollout_probe: Arc::new(std::sync::OnceLock::new()),
+            sidecar_cleanup_probe: Arc::new(std::sync::OnceLock::new()),
             naming_handles: Arc::new(TokioMutex::new(HashMap::new())),
             snapshot_pause: Arc::new(StdMutex::new(None)),
             snapshot_pause_after_capture: Arc::new(StdMutex::new(None)),
@@ -955,6 +967,10 @@ impl FreshCodexState {
 
     pub fn set_naming_rollout_probe(&self, probe: CodexNamingRolloutProbe) {
         let _ = self.naming_rollout_probe.set(probe);
+    }
+
+    pub fn set_sidecar_cleanup_probe(&self, probe: CodexSidecarCleanupProbe) {
+        let _ = self.sidecar_cleanup_probe.set(probe);
     }
 
     async fn report_hosted_naming_fact(
@@ -1237,11 +1253,9 @@ impl FreshCodexState {
             .get(session_id)
             .cloned();
         if let Some(condemned) = condemned {
-            let confirmed = crate::session_lease::kill_and_confirm_recorded_tree_dead(
-                &condemned,
-                CODEX_SIDECAR_OWNERSHIP_ENV,
-            )
-            .await;
+            let confirmed =
+                confirm_codex_tree_dead(&condemned, self.sidecar_cleanup_probe.get().cloned())
+                    .await;
             if confirmed {
                 let ownership = self
                     .ownership_watch()
@@ -7766,8 +7780,53 @@ impl FreshCodexState {
                 // and fall back to the ORIGINAL mint-new-thread recovery on a fresh sidecar.
                 client.close().await;
                 let mut dead_child = child;
-                let _ = dead_child.start_kill();
-                reap_owned_codex_sidecars(&ownership_id);
+                let recorded = crate::session_lease::record_condemned_runtime_identity(
+                    dead_child.id().unwrap_or(0),
+                    CODEX_SIDECAR_OWNERSHIP_ENV,
+                    &ownership_id,
+                );
+                if !confirm_codex_tree_dead(&recorded, self.sidecar_cleanup_probe.get().cloned())
+                    .await
+                {
+                    // No user input was dispatched. Retain exact cleanup
+                    // evidence and claims until the owned tree is confirmed.
+                    self.condemned_priors
+                        .lock()
+                        .expect("condemned priors lock")
+                        .insert(session_id.to_string(), recorded.clone());
+                    let confirmation = codex_tree_death_escalation(
+                        recorded,
+                        ownership_id.clone(),
+                        session_id.to_string(),
+                        self.sidecar_cleanup_probe.get().cloned(),
+                    );
+                    let state = self.clone();
+                    let key = session_id.to_string();
+                    tokio::spawn(async move {
+                        if confirmation.await {
+                            let _ = dead_child.wait().await;
+                            crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
+                            state.clear_condemned_prior_if_matching(&key, &ownership_id);
+                            if let Some(mut guard) = lease_guard {
+                                guard.fail();
+                            }
+                            drop(own_ticket);
+                        } else {
+                            std::future::pending::<()>().await;
+                            drop((dead_child, lease_guard, own_ticket));
+                        }
+                    });
+                    tracing::warn!(
+                        provider = PROVIDER,
+                        session_id,
+                        "freshagent.codex.failed_resume_cleanup_unconfirmed"
+                    );
+                    return Err(EnsureAliveError::RespawnFailed(
+                        "the failed Codex resume's owned process tree is not yet confirmed stopped"
+                            .into(),
+                    ));
+                }
+                let _ = dead_child.wait().await;
                 crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                 // FIX (CODEX-FIRST triage Finding 2): remember this id as genuinely gone so
                 // a later attach/create against it fails fast instead of repeating this same
@@ -11346,17 +11405,43 @@ fn with_codex_turn_exit_confirmation(
     })
 }
 
-/// Continue an incomplete Codex tree reap after the bounded watcher window. The first
-/// watcher pass has already stopped the direct child; this continuation keeps probing the
-/// recorded incarnation and tagged descendants until the complete writer tree is confirmed
-/// gone. An incomplete identity capture cannot be repaired safely, so it stays fail-closed.
+/// Keep the same recorded process identity when a hosted provider needs its
+/// own uid to inspect and terminate the tree. Local lanes use the same primitive.
+async fn confirm_codex_tree_dead(
+    recorded: &crate::session_lease::CondemnedRuntimeIdentity,
+    probe: Option<CodexSidecarCleanupProbe>,
+) -> bool {
+    match probe {
+        Some(probe) => match probe(recorded.clone()).await {
+            Ok(confirmed) => confirmed,
+            Err(error) => {
+                tracing::warn!(provider=PROVIDER, pid=recorded.pid, ownership_id=%recorded.ownership_id, %error,
+                    "freshagent.codex.owned_cleanup_unavailable");
+                false
+            }
+        },
+        None => {
+            crate::session_lease::kill_and_confirm_recorded_tree_dead(
+                recorded,
+                CODEX_SIDECAR_OWNERSHIP_ENV,
+            )
+            .await
+        }
+    }
+}
+
+/// Continue the existing exact-owned teardown until confirmed. A hosted
+/// identity helper may complete a capture its unprivileged host could not read.
 fn codex_tree_death_escalation(
     recorded: crate::session_lease::CondemnedRuntimeIdentity,
     ownership_id: String,
     thread_id: String,
+    cleanup_probe: Option<CodexSidecarCleanupProbe>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'static>> {
     Box::pin(async move {
-        if !recorded.capture_complete {
+        if (!recorded.capture_complete && cleanup_probe.is_none())
+            || (recorded.start_time.is_none() && cleanup_probe.is_some())
+        {
             tracing::error!(target: "freshell_freshagent::codex",
                 session_id = %thread_id,
                 ownership_id = %ownership_id,
@@ -11364,12 +11449,7 @@ fn codex_tree_death_escalation(
             return false;
         }
         loop {
-            if crate::session_lease::kill_and_confirm_recorded_tree_dead(
-                &recorded,
-                CODEX_SIDECAR_OWNERSHIP_ENV,
-            )
-            .await
-            {
+            if confirm_codex_tree_dead(&recorded, cleanup_probe.clone()).await {
                 return true;
             }
             tracing::warn!(target: "freshell_freshagent::codex",
@@ -11599,6 +11679,9 @@ fn spawn_exit_watcher_tracking_turns(
         )
     });
     let ownership = ownership.map(|watch| watch.for_runtime(&thread_id, child.id()));
+    let cleanup_probe = retained_state
+        .as_ref()
+        .and_then(|state| state.sidecar_cleanup_probe.get().cloned());
     tokio::spawn(async move {
         // `biased` + the REQUESTED-kill arm listed FIRST: a `freshAgent.kill` signals
         // `kill_tx` right before `start_kill()`s the child, so `child.wait()` can become
@@ -11627,21 +11710,29 @@ fn spawn_exit_watcher_tracking_turns(
                 // Arcs at its rebuild, and a teardown void would reopen
                 // the gate for a buffered late completion of the
                 // already-rang turn.
-                let _ = child.start_kill();
-                let wait_result = child.wait().await;
-                let confirmed = if cfg!(target_os = "linux") {
-                    match recorded.as_ref() {
-                        Some(recorded) => {
-                            crate::session_lease::kill_and_confirm_recorded_tree_dead(
-                                recorded,
-                                CODEX_SIDECAR_OWNERSHIP_ENV,
-                            )
-                            .await
-                        }
+                let (wait_result, confirmed) = if cleanup_probe.is_some() {
+                    let confirmed = match recorded.as_ref() {
+                        Some(recorded) => confirm_codex_tree_dead(recorded, cleanup_probe.clone()).await,
                         None => false,
-                    }
+                    };
+                    let waited = if confirmed {
+                        child.wait().await
+                    } else {
+                        Err(std::io::Error::other("owned provider exit remains unconfirmed"))
+                    };
+                    (waited, confirmed)
                 } else {
-                    false
+                    let _ = child.start_kill();
+                    let waited = child.wait().await;
+                    let confirmed = if cfg!(target_os = "linux") {
+                        match recorded.as_ref() {
+                            Some(recorded) => confirm_codex_tree_dead(recorded, None).await,
+                            None => false,
+                        }
+                    } else {
+                        false
+                    };
+                    (waited, confirmed)
                 };
                 if confirmed {
                     if let Some(turns) = &turn_state { turns.lock().expect("codex turn state").settle_native("", NativeSettlement::OwnedExit); }
@@ -11689,6 +11780,7 @@ fn spawn_exit_watcher_tracking_turns(
                                 recorded,
                                 ownership_id.clone(),
                                 thread_id.clone(),
+                                cleanup_probe.clone(),
                             )
                         })
                         .unwrap_or_else(|| Box::pin(async { false }));
@@ -11714,11 +11806,7 @@ fn spawn_exit_watcher_tracking_turns(
                 let confirmed = if cfg!(target_os = "linux") {
                     match recorded.as_ref() {
                         Some(recorded) => {
-                            crate::session_lease::kill_and_confirm_recorded_tree_dead(
-                                recorded,
-                                CODEX_SIDECAR_OWNERSHIP_ENV,
-                            )
-                            .await
+                            confirm_codex_tree_dead(recorded, cleanup_probe.clone()).await
                         }
                         None => false,
                     }
@@ -11775,6 +11863,7 @@ fn spawn_exit_watcher_tracking_turns(
                                 recorded,
                                 ownership_id.clone(),
                                 thread_id.clone(),
+                                cleanup_probe.clone(),
                             )
                         })
                         .unwrap_or_else(|| Box::pin(async { false }));

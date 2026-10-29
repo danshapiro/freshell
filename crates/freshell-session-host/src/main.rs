@@ -179,6 +179,7 @@ async fn run() -> Result<(), String> {
         Some("opencode-identity-worker") => pty::run_opencode_identity_worker(&args[2..]),
         Some("provider-probe-worker") => providers::run_probe_worker(&args[2..]),
         Some("codex-naming-proof") => providers::run_naming_proof(&args[2..]),
+        Some("codex-owned-cleanup") => providers::run_owned_cleanup(&args[2..]).await,
         Some("refresh-provider-config") => refresh_provider_config_worker(&args[2..]),
         Some("prepare-provider-features") => providers::run_provider_features_worker(&args[2..]),
         Some("prepare-amplifier-state") => providers::run_amplifier_state_worker(&args[2..]),

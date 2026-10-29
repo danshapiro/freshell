@@ -100,6 +100,9 @@ pub(crate) async fn open_hosted_fresh_agent(
                 state.set_naming_rollout_probe(Arc::new(move |home, thread| {
                     Box::pin(super::codex::naming_rollout(home, thread, uid, gid))
                 }));
+                state.set_sidecar_cleanup_probe(Arc::new(move |recorded| {
+                    Box::pin(super::codex::cleanup_sidecar(recorded, uid, gid))
+                }));
             }
             transport
         }
@@ -2154,6 +2157,255 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task010_failed_resume_confirms_its_owned_tree_before_minting_again() {
+        let logs = tempfile::tempdir().unwrap();
+        let marker = logs.path().join("original-native-exit");
+        let fixture = native_codex_fixture(json!({"recordTurns":true,
+            "exitProcessAfterMethodsOnce":["turn/start"],"exitProcessAfterMethodsOnceMarkerPath":marker,
+            "overrides":{"thread/resume":{"error":{"code":-32600,"message":"no rollout found for thread id old-owned-native"}}}
+        })).await;
+        let actor = FreshAgentHostActor::open(
+            fixture.dir.path().join("owned-tree-actor"),
+            fixture.profile.clone(),
+            fixture.transport.clone(),
+        )
+        .await
+        .unwrap();
+        actor
+            .dispatch(
+                RequestId::parse("first-before-exit").unwrap(),
+                "first native input".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fixture.transport.is_live().await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the original owned executable must exit");
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs")
+            .canonicalize()
+            .unwrap();
+        let ready = logs.path().join("failed-resume-descendant.ready");
+        let wrapper = fixture._exec_dir.path().join("failed-resume-tree.mjs");
+        let parameters = json!({"source":source,"marker":logs.path().join("resume-sidecar-seen"),
+            "ready":ready,"output":logs.path().join("failed-resume-descendant.log"),"port":logs.path().join("failed-resume-descendant.port"),"replacement":uuid::Uuid::new_v4().to_string()});
+        let script = r#"#!/usr/bin/env node
+import fs from 'node:fs'
+import {spawn} from 'node:child_process'
+const parameters=PARAMETERS
+if(!fs.existsSync(parameters.marker)){
+  fs.writeFileSync(parameters.marker,'first resume attempt')
+  const child=spawn(process.execPath,[parameters.source,'fake-durable-writer',parameters.output,parameters.ready,parameters.port],{
+    env:{...process.env,FAKE_CODEX_WRITER_IGNORE_SIGTERM:'1'},stdio:'ignore'})
+  child.unref()
+  const deadline=Date.now()+5000
+  while(!fs.existsSync(parameters.ready)){
+    if(child.exitCode!==null||Date.now()>deadline)throw Error('Owned failed-resume descendant did not become ready')
+    await new Promise(resolve=>setTimeout(resolve,10))
+  }
+}
+const behavior=JSON.parse(process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR)
+behavior.threadStartThreadId=parameters.replacement
+process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR=JSON.stringify(behavior)
+await import(parameters.source)
+"#.replace("PARAMETERS", &parameters.to_string());
+        std::fs::write(&wrapper, script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("CODEX_CMD", wrapper);
+        let recovery = tokio::time::timeout(
+            Duration::from_secs(10),
+            actor.dispatch(
+                RequestId::parse("recover-after-missing-rollout").unwrap(),
+                "recovery native input".into(),
+                None,
+            ),
+        )
+        .await;
+        let pid = std::fs::read_to_string(&ready)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        let surviving_start = freshell_codex::sidecar_store::proc_starttime(pid);
+        actor.stop().await.unwrap();
+        // This test's marked persistent descendant has no natural exit. Clean
+        // only its exact captured incarnation before asserting the result.
+        if let Some(start) = surviving_start {
+            if freshell_codex::sidecar_store::proc_starttime(pid) == Some(start) {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+        recovery
+            .expect("owned recovery must settle")
+            .expect("native recovery input must be accepted");
+        assert!(surviving_start.is_none(), "the failed resume's owned descendant must be confirmed terminal before mint-new acceptance");
+    }
+
+    #[tokio::test]
+    async fn task010_unknown_owned_cleanup_retains_claim_and_never_replays_input() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let logs = tempfile::tempdir().unwrap();
+        let requests = logs.path().join("native-requests.jsonl");
+        let mut behavior = json!({"recordTurns":true,"appendRequestLogPath":requests,
+            "exitProcessAfterMethodsOnce":["turn/start"],"exitProcessAfterMethodsOnceMarkerPath":logs.path().join("original-exit"),
+            "overrides":{"thread/resume":{"error":{"code":-32600,"message":"no rollout found for thread id thread-new-1"}}}
+        });
+        let fixture = native_codex_fixture(behavior.clone()).await;
+        let actor = FreshAgentHostActor::open(
+            fixture.dir.path().join("unknown-cleanup-actor"),
+            fixture.profile.clone(),
+            fixture.transport.clone(),
+        )
+        .await
+        .unwrap();
+        // The original watcher already owns its local confirmation primitive.
+        // Only the subsequently spawned failed-resume tree sees this outage.
+        let ProviderState::Codex(state) = &fixture.transport.state else {
+            unreachable!()
+        };
+        let available = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        state.set_sidecar_cleanup_probe(Arc::new({
+            let available = available.clone();
+            let attempts = attempts.clone();
+            move |recorded| {
+                let available = available.clone();
+                let attempts = attempts.clone();
+                Box::pin(async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    if !available.load(Ordering::SeqCst) {
+                        return Err("owned cleanup temporarily unavailable".into());
+                    }
+                    Ok(
+                        freshell_freshagent::session_lease::kill_and_confirm_recorded_tree_dead(
+                            &recorded,
+                            freshell_codex::durability::CODEX_SIDECAR_OWNERSHIP_ENV,
+                        )
+                        .await,
+                    )
+                })
+            }
+        }));
+        actor
+            .dispatch(
+                RequestId::parse("original-input").unwrap(),
+                "original accepted input".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fixture.transport.is_live().await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        behavior["threadStartThreadId"] = json!(uuid::Uuid::new_v4().to_string());
+        std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR", behavior.to_string());
+        let refused = tokio::time::timeout(
+            Duration::from_secs(5),
+            actor.dispatch(
+                RequestId::parse("cleanup-refused-input").unwrap(),
+                "must never be replayed".into(),
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            refused.is_err(),
+            "unconfirmed cleanup must refuse recovery: {refused:?}"
+        );
+        assert!(attempts.load(Ordering::SeqCst) > 0);
+        assert!(
+            state
+                .leases()
+                .peek_kill_handle("codex", "thread-new-1")
+                .is_some(),
+            "the failed resume must retain its exact owned claim"
+        );
+        let read_requests = || {
+            std::fs::read_to_string(&requests)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let before = read_requests();
+        assert_eq!(
+            before
+                .iter()
+                .filter(|row| row["method"] == "thread/start")
+                .count(),
+            1,
+            "unknown cleanup must not mint a replacement"
+        );
+        assert_eq!(
+            before
+                .iter()
+                .filter(|row| row["method"] == "turn/start")
+                .count(),
+            1,
+            "refused input must never reach native work"
+        );
+        available.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state
+                .leases()
+                .peek_kill_handle("codex", "thread-new-1")
+                .is_some()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("only positive exact-owned confirmation may release the claim");
+        actor
+            .dispatch(
+                RequestId::parse("new-explicit-recovery-input").unwrap(),
+                "new explicit input after confirmation".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        actor.stop().await.unwrap();
+        let after = read_requests();
+        assert_eq!(
+            after
+                .iter()
+                .filter(|row| row["method"] == "thread/start")
+                .count(),
+            2
+        );
+        let turns = after
+            .iter()
+            .filter(|row| row["method"] == "turn/start")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            turns.len(),
+            2,
+            "only original and new explicit inputs may be dispatched"
+        );
+        assert!(!turns
+            .iter()
+            .any(|row| row.to_string().contains("must never be replayed")));
+        assert!(turns[1]
+            .to_string()
+            .contains("new explicit input after confirmation"));
+    }
+
+    #[tokio::test]
     async fn task010_native_mint_ack_updates_actor_before_snapshot_and_second_send() {
         for pending in [false, true] {
             assert_native_mint_ack(pending).await;
@@ -2279,8 +2531,15 @@ mod tests {
             }
         })
         .await;
+        let naming_snapshot = match naming_snapshot {
+            Ok(snapshot) => snapshot,
+            Err(_) => actor.snapshot().await.unwrap(),
+        };
         actor.stop().await.unwrap();
-        let naming_snapshot = naming_snapshot.expect("recovered native turn must settle");
+        assert_eq!(
+            naming_snapshot["status"], "idle",
+            "recovered native turn must actually settle"
+        );
         let fact = naming_snapshot["extensions"]["codex"]["hostedNamingFacts"]
             .as_array()
             .and_then(|facts| {

@@ -1,6 +1,6 @@
 //! Provider-specific recovery probes executed inside the soul enclosure.
 //!
-//! The trusted host delegates store reads to a short-lived helper running as
+//! The trusted host delegates store reads and exact owned sidecar cleanup to helpers running as
 //! the same unprivileged uid/gid as the provider. This avoids granting the host
 //! DAC override while keeping all provider-state inspection inside the runtime.
 
@@ -19,6 +19,7 @@ pub(crate) use deterministic_fresh_agent::run_worker as run_fresh_agent_fixture_
 pub(crate) use fresh_agent::open_hosted_fresh_agent;
 
 pub(crate) use codex::run_naming_proof;
+pub(crate) use codex::run_owned_cleanup;
 pub(crate) use codex::PreparedCodexLaunch;
 
 use freshell_agent_runtime::ProviderStoreProbe;
