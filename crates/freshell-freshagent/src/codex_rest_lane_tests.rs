@@ -312,7 +312,7 @@ async fn task009_rest_lane_typed_create_and_adoption_distinguish_cleanup_authori
     state.shutdown().await;
     assert_eq!(writers, 1);
     assert!(
-        matches!(created, CodexCreateOutcome::Created { session_id, session_ref: Some(reference), cleanup_ownership_id: Some(owner) } if session_id == "task009-created" && reference.session_id == session_id && !owner.is_empty())
+        matches!(created, CodexCreateOutcome::Created { session_id, session_ref: Some(reference), cleanup_ownership_id: Some(owner), .. } if session_id == "task009-created" && reference.session_id == session_id && !owner.is_empty())
     );
     assert!(
         matches!(adopted, CodexCreateOutcome::Created { session_id, cleanup_ownership_id: None, .. } if session_id == "task009-created")

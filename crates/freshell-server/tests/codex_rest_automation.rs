@@ -46,20 +46,33 @@ fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
 
 #[tokio::test]
 async fn task009_codex_rest_saved_name_binds_to_the_actual_persisted_native_thread() {
-    assert_saved_name(false, false).await;
+    assert_saved_name(SavedNameScenario::Persisted).await;
 }
 
 #[tokio::test]
 async fn task009_codex_rest_name_survives_a_connected_ws_control_runtime() {
-    assert_saved_name(true, false).await;
+    assert_saved_name(SavedNameScenario::ConnectedControl).await;
 }
 
 #[tokio::test]
 async fn task009_codex_rest_name_survives_native_hydration_during_dispatch() {
-    assert_saved_name(false, true).await;
+    assert_saved_name(SavedNameScenario::HydrationDuringDispatch).await;
 }
 
-async fn assert_saved_name(with_ws: bool, poll_during_send: bool) {
+#[tokio::test]
+async fn task010_codex_rest_adopted_pane_reads_the_established_conversation_name() {
+    assert_saved_name(SavedNameScenario::AdoptEstablished).await;
+}
+
+#[derive(Clone, Copy)]
+enum SavedNameScenario {
+    Persisted,
+    ConnectedControl,
+    HydrationDuringDispatch,
+    AdoptEstablished,
+}
+
+async fn assert_saved_name(scenario: SavedNameScenario) {
     let home = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     let project = workspace.path();
@@ -144,7 +157,7 @@ await import({})
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
     let mut control_socket = None;
-    if with_ws {
+    if matches!(scenario, SavedNameScenario::ConnectedControl) {
         let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
             .await
             .unwrap();
@@ -224,7 +237,7 @@ await import({})
             .json(&json!({"data":"persist native naming metadata\r","requestId":"task009-name-send","timeout":3}))
             .send().await.unwrap().error_for_status().unwrap().json::<Value>().await.unwrap()
     });
-    if poll_during_send {
+    if matches!(scenario, SavedNameScenario::HydrationDuringDispatch) {
         let end = Instant::now() + Duration::from_secs(5);
         loop {
             let snapshot: Value = http
@@ -376,6 +389,69 @@ await import({})
             .map(|path| std::fs::read_to_string(path).unwrap());
         assert!(Instant::now()<end,"valid UUID/native metadata and idle owning snapshot established; rename={renamed}; reads={names}; persisted name document={saved_names:?}");
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if matches!(scenario, SavedNameScenario::AdoptEstablished) {
+        let adopted: Value = http
+            .post(format!("{base}/api/tabs"))
+            .header("x-auth-token", TOKEN)
+            .json(&json!({"agent":"codex","cwd":project,
+                "sessionRef":{"provider":"codex","sessionId":thread},
+                "namingHandle":"nh-established-adoption"}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let tab = adopted["data"]["tabId"].as_str().unwrap();
+        let layout: Value = http
+            .get(format!("{base}/api/layout/snapshot"))
+            .header("x-auth-token", TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let content = &layout["data"]["layouts"][tab]["content"];
+        assert_eq!(
+            content["sessionRef"],
+            json!({"provider":"codex","sessionId":thread}),
+            "{layout}"
+        );
+        // Follow the published pane's naming identity, just as a fresh browser
+        // does; an unrelated newly admitted pending handle cannot hide Resume's
+        // established durable record.
+        let name_ref = content.get("nameRef").cloned().unwrap_or_else(|| {
+            content
+                .get("namingHandle")
+                .map(|handle| json!({"kind":"pending","id":handle}))
+                .unwrap_or_else(|| json!({"kind":"session","provider":"codex","sessionId":thread}))
+        });
+        let names: Value = http
+            .post(format!("{base}/api/session-names/read"))
+            .header("x-auth-token", TOKEN)
+            .json(&json!({"refs":[name_ref]}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(names["names"][0]["record"]["name"], "Task009 saved Codex",
+            "the REST-published adopted pane must resolve the established manual name; pane={content}; names={names}");
+        assert_eq!(
+            names["names"][0]["record"]["ref"],
+            json!({"kind":"session","provider":"codex","sessionId":thread}),
+            "{names}"
+        );
+        assert_eq!(names["names"][0]["record"]["source"], "manual", "{names}");
     }
     if let Some(mut socket) = control_socket {
         let _ = socket.close(None).await;

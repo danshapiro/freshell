@@ -166,6 +166,9 @@ pub struct RestLaneCreated {
     /// table. It is not substituted for the provider's native identity.
     pub session_id: String,
     pub session_ref: Option<freshell_protocol::SessionLocator>,
+    /// Naming identity acknowledged by the owning create/resume operation.
+    /// A resumed conversation can already have a durable canonical record.
+    pub name_ref: Option<freshell_protocol::session_names::SessionNameRef>,
     /// Provider-owned identity of a runtime newly started by this create.
     /// An adopted existing writer has no cleanup token.
     pub cleanup_token: Option<String>,

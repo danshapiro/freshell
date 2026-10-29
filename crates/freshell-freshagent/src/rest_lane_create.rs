@@ -239,6 +239,9 @@ pub(crate) fn pane_content(request: &RestLaneCreate, created: &RestLaneCreated) 
     if let Some(value) = &created.session_ref {
         content["sessionRef"] = json!(value);
     }
+    if let Some(value) = &created.name_ref {
+        content["nameRef"] = json!(value);
+    }
     if let Some(settings) = &created.effective_settings {
         for (from, to) in [
             ("model", "model"),

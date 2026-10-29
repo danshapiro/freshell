@@ -162,6 +162,7 @@ impl FreshAgentRestLane for CodexRestLane {
                 session_id,
                 session_ref,
                 cleanup_ownership_id,
+                name_ref,
             } => {
                 let effective_settings = self
                     .state
@@ -186,6 +187,7 @@ impl FreshAgentRestLane for CodexRestLane {
                     session_ref,
                     cleanup_token: cleanup_ownership_id,
                     effective_settings,
+                    name_ref,
                 })
             }
             CodexCreateOutcome::Failed {

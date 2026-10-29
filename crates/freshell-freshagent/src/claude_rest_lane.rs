@@ -71,6 +71,7 @@ impl ClaudeRestLane {
                 session_ref,
                 cleanup_token: cleanup_ownership_id,
                 effective_settings: None,
+                name_ref: None,
             }),
             ClaudeCreateOutcome::Failed {
                 code,

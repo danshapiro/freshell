@@ -99,6 +99,7 @@ pub enum CodexCreateOutcome {
         session_id: String,
         session_ref: Option<SessionLocator>,
         cleanup_ownership_id: Option<String>,
+        name_ref: Option<freshell_protocol::session_names::SessionNameRef>,
     },
     Failed {
         code: String,
@@ -2409,7 +2410,7 @@ impl FreshCodexState {
                         provider: PROVIDER.to_string(),
                         session_id: cached.session_id.clone(),
                     }),
-                    name_ref,
+                    name_ref: name_ref.clone(),
                     session_name,
                 }));
                 return CodexCreateOutcome::Created {
@@ -2419,6 +2420,7 @@ impl FreshCodexState {
                         session_id: cached.session_id,
                     }),
                     cleanup_ownership_id: None,
+                    name_ref,
                 };
             }
             FreshAgentCreateOutcome::Proceed(guard) => guard,
@@ -3748,7 +3750,7 @@ impl FreshCodexState {
                 provider: PROVIDER.to_string(),
                 session_id: thread_id.clone(),
             }),
-            name_ref,
+            name_ref: name_ref.clone(),
             session_name,
         }));
 
@@ -3776,6 +3778,7 @@ impl FreshCodexState {
                 session_id: thread_id,
             }),
             cleanup_ownership_id,
+            name_ref,
         }
     }
 
@@ -3941,7 +3944,7 @@ impl FreshCodexState {
                 provider: PROVIDER.to_string(),
                 session_id: thread_id.to_string(),
             }),
-            name_ref,
+            name_ref: name_ref.clone(),
             session_name,
         }));
         CodexCreateOutcome::Created {
@@ -3951,6 +3954,7 @@ impl FreshCodexState {
                 session_id: thread_id.into(),
             }),
             cleanup_ownership_id: None,
+            name_ref,
         }
     }
 
