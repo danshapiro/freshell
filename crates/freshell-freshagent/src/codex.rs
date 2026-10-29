@@ -10470,6 +10470,16 @@ fn is_codex_include_turns_unavailable(err: &CodexAppServerError) -> bool {
 /// app-server's own error text says so, so a garbage/expired thread id (as opposed to a
 /// real spawn/RPC failure) doesn't masquerade as a server error.
 fn is_codex_thread_not_found(err: &CodexAppServerError) -> bool {
+    // The qualified native resume rejection uses "no rollout found", which
+    // does not contain "not found". The same fork text can mean an empty
+    // parent; only the actual resume RPC and its native error code qualify.
+    if matches!(err, CodexAppServerError::Rpc { method, error }
+        if method == "thread/resume" && error.code == -32600
+            && (error.message == "no rollout found for thread id"
+                || error.message.starts_with("no rollout found for thread id ")))
+    {
+        return true;
+    }
     let message = err.to_string().to_lowercase();
     message.contains("not found")
         || message.contains("no such thread")
@@ -27620,6 +27630,56 @@ pub(crate) mod tests {
     /// brand-new id, conversation memory for the old thread genuinely lost.
     #[tokio::test(flavor = "multi_thread")]
     async fn send_after_crash_falls_back_to_mint_new_thread_when_resume_reports_not_found() {
+        assert_crash_mints_new_thread(json!({"code":-32001,"message":"Thread not found"})).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_after_crash_falls_back_for_native_missing_rollout_rpc() {
+        assert_crash_mints_new_thread(
+            json!({"code":-32600,"message":"no rollout found for thread id thread-original"}),
+        )
+        .await;
+    }
+
+    #[test]
+    fn native_missing_rollout_requires_the_resume_rpc_and_known_error_code() {
+        for (method, code, expected) in [
+            ("thread/resume", -32600, true),
+            ("thread/fork", -32600, false),
+            ("thread/read", -32600, false),
+            ("thread/resume", -32000, false),
+        ] {
+            let error = CodexAppServerError::Rpc {
+                method: method.into(),
+                error: freshell_codex::protocol::RpcError {
+                    code,
+                    message: "no rollout found for thread id thread-original".into(),
+                    data: None,
+                },
+            };
+            assert_eq!(
+                is_codex_thread_not_found(&error),
+                expected,
+                "{method}/{code}"
+            );
+        }
+        assert!(!is_codex_thread_not_found(
+            &CodexAppServerError::Transport {
+                method: "thread/resume".into(),
+                message: "no rollout found for thread id thread-original".into()
+            }
+        ));
+        assert!(!is_codex_thread_not_found(&CodexAppServerError::Rpc {
+            method: "thread/resume".into(),
+            error: freshell_codex::protocol::RpcError {
+                code: -32600,
+                message: "approval_policy untrusted is not supported".into(),
+                data: None
+            }
+        }));
+    }
+
+    async fn assert_crash_mints_new_thread(resume_error: Value) {
         let _guard = ENV_LOCK.lock().await;
         let (st, mut rx) = state_with_bus();
 
@@ -27637,7 +27697,7 @@ pub(crate) mod tests {
                 "threadStartThreadId": "thread-respawned",
                 "overrides": {
                     "thread/resume": {
-                        "error": { "code": -32001, "message": "Thread not found" }
+                        "error": resume_error
                     }
                 }
             })
