@@ -59,7 +59,7 @@ async fn boot(home: &Path, behavior: Value) -> (OwnedServer, String, Socket) {
     std::fs::create_dir_all(home.join(".freshell")).unwrap();
     std::fs::write(home.join(".freshell/config.json"), json!({"settings":{"freshAgent":{"enabled":true},"network":{"configured":true,"host":"127.0.0.1"}}}).to_string()).unwrap();
     let bin = std::env::var_os("FRESHELL_SERVER_BIN")
-        .expect("run with run-focused-rust.py --build-server");
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_freshell-server").into());
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs");
     let server = OwnedServer(

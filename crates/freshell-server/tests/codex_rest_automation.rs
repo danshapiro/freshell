@@ -108,31 +108,30 @@ await import({})
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
     let log = std::fs::File::create(home.path().join("server.log")).unwrap();
+    let bin = std::env::var_os("FRESHELL_SERVER_BIN")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_freshell-server").into());
     let mut server = OwnedServer(
-        Command::new(
-            std::env::var_os("FRESHELL_SERVER_BIN")
-                .expect("use the strict run-focused-rust.py --build-server route"),
-        )
-        .current_dir(home.path())
-        .env("PORT", port.to_string())
-        .env("AUTH_TOKEN", TOKEN)
-        .env("FRESHELL_BIND_HOST", "127.0.0.1")
-        .env("HOME", home.path())
-        .env("FRESHELL_HOME", home.path())
-        .env("CODEX_HOME", home.path().join(".codex"))
-        .env("CODEX_CMD", &wrapper)
-        .env("FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES", "1")
-        .env(
-            "FAKE_CODEX_APP_SERVER_BEHAVIOR",
-            json!({"recordTurns":true,"echoRequestedModel":true}).to_string(),
-        )
-        .env_remove("FRESHELL_MANAGED_RUNTIME_V1")
-        .env_remove("FRESHELL_MANAGED_FRESH_AGENT_V1")
-        .stdin(Stdio::null())
-        .stdout(log.try_clone().unwrap())
-        .stderr(log)
-        .spawn()
-        .unwrap(),
+        Command::new(bin)
+            .current_dir(home.path())
+            .env("PORT", port.to_string())
+            .env("AUTH_TOKEN", TOKEN)
+            .env("FRESHELL_BIND_HOST", "127.0.0.1")
+            .env("HOME", home.path())
+            .env("FRESHELL_HOME", home.path())
+            .env("CODEX_HOME", home.path().join(".codex"))
+            .env("CODEX_CMD", &wrapper)
+            .env("FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES", "1")
+            .env(
+                "FAKE_CODEX_APP_SERVER_BEHAVIOR",
+                json!({"recordTurns":true,"echoRequestedModel":true}).to_string(),
+            )
+            .env_remove("FRESHELL_MANAGED_RUNTIME_V1")
+            .env_remove("FRESHELL_MANAGED_FRESH_AGENT_V1")
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap(),
     );
     let base = format!("http://127.0.0.1:{port}");
     let http = reqwest::Client::builder()
