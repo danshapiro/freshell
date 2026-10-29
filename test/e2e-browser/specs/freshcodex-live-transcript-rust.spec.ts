@@ -309,9 +309,18 @@ if(ordinal>1)behavior={...behavior,modelCatalogPagesByCwd:{[process.cwd()]:[{dat
     await otherComposer.fill('/model')
     await otherComposer.press('Enter')
     const otherDialog = b.page.getByRole('dialog', { name: 'Model and thinking level' })
-    await expect(otherDialog.getByRole('textbox', { name: 'Exact model ID' })).toHaveValue('catalog-only-model')
+    await expect(otherDialog.getByRole('option', { name: /^Owning runtime model(?: current)?$/ })).toBeVisible({ timeout: 30_000 })
+    const peerSnapshotResponse = await page.request.get(`${info.baseUrl}/api/fresh-agent/threads/freshcodex/codex/${nativeId}`,
+      { headers: { 'x-auth-token': info.token } })
+    const peerSnapshot = peerSnapshotResponse.ok() ? await peerSnapshotResponse.json() : undefined
+    console.info(JSON.stringify({ event: 'task010.catalog.peer_selection', nativeId, status: peerSnapshotResponse.status(),
+      settings: peerSnapshot?.settings, options: await otherDialog.getByRole('option').allTextContents() }))
+    // Exact model ID is a cleared manual-entry draft. The current catalog
+    // row and selected pair express the second browser's effective choice.
+    await expect(otherDialog.getByRole('option', { name: 'Owning runtime model current', exact: true }))
+      .toHaveAttribute('aria-selected', 'true')
     await expect(otherDialog.getByRole('textbox', { name: 'Reasoning effort' })).toHaveValue('ultra')
-    await expect(otherDialog.getByRole('option', { name: 'Owning runtime model', exact: true })).toBeVisible({ timeout: 30_000 })
+    await expect(otherDialog.getByRole('button', { name: 'Use Owning runtime model · ultra', exact: true })).toBeEnabled()
     await otherDialog.getByRole('button', { name: 'Cancel', exact: true }).click()
     const otherModel = b.page.getByRole('button', { name: 'Model: Owning runtime model — change model', exact: true })
     await expect(otherModel).toBeVisible({ timeout: 30_000 })
