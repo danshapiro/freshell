@@ -12503,6 +12503,94 @@ describe('/undo + /redo dispatch (kata 1wxv)', () => {
 })
 
 describe('FreshAgentView session status strip', () => {
+  describe('bound Codex catalog strip', () => {
+    const model = 'catalog-only-model'
+    const catalog = (label: string) => ({ ok: true, sessionType: 'freshcodex', runtimeProvider: 'codex',
+      status: 'fresh', fetchedAt: 1_000, models: [{ id: model, displayName: label, provider: 'codex',
+        supportsEffort: true, supportedEffortLevels: ['ultra'], supportsAdaptiveThinking: false }] })
+    const nativeId = savedCodexNativeHistory.threadId
+    const content = { kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+      createRequestId: 'bound-strip-create', initialCwd: '/repo/bound-catalog', model,
+      modelSelection: { kind: 'exact' as const, modelId: model }, effort: 'ultra' }
+    const owner = { type: 'session.runtimeOwner' as const, provider: 'codex' as const, sessionId: nativeId,
+      epoch: 7, generation: 3, ownerKind: 'fresh-agent' as const, operationId: 'bound-strip-owner',
+      transition: 'handoff-committed' as const }
+    const bound = { ...content, sessionId: nativeId, sessionRef: { provider: 'codex' as const, sessionId: nativeId },
+      status: 'connected' as const }
+
+    it('waits for ordinary binding then resolves the model name through its exact owned Codex context', async () => {
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(new Promise(() => {}))
+      apiMock.getFreshAgentModelCapabilities.mockResolvedValue(catalog('Owning runtime model'))
+      const store = createStore()
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: { ...content, status: 'creating' } }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      expect(apiMock.getFreshAgentModelCapabilities).not.toHaveBeenCalled()
+      expect(screen.queryByRole('button', { name: /^Model: / })).toBeNull()
+      const createsBefore = sentFreshAgentMessages('freshAgent.create')
+      act(() => {
+        store.dispatch(applyRuntimeOwner(owner))
+        store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: bound }))
+        store.dispatch(sessionInit({ sessionType: 'freshcodex', provider: 'codex', sessionId: nativeId, model, effort: 'ultra' }))
+      })
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Model: Owning runtime model — change model' })).toBeInTheDocument())
+      expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenCalledExactlyOnceWith('freshcodex', {
+        cwd: content.initialCwd, codexContext: { sessionId: nativeId, sessionRef: bound.sessionRef,
+          cwd: content.initialCwd, observedEpoch: 7, observedGeneration: 3 },
+      })
+      expect(screen.getByRole('button', { name: 'Model: Owning runtime model — change model' }))
+        .toHaveAttribute('title', 'catalog-only-model · effort ultra')
+      expect(screen.queryByRole('button', { name: `Model: ${model} — change model` })).toBeNull()
+      expect(sentFreshAgentMessages('freshAgent.create')).toEqual(createsBefore)
+    })
+
+    it.each(['raw-id', 'unavailable', 'wrong-provider'] as const)('keeps an unstamped custom Codex model intact and unlabeled after a %s reply', async (reply) => {
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(new Promise(() => {}))
+      const pending = createDeferred<unknown>()
+      apiMock.getFreshAgentModelCapabilities.mockReturnValue(pending.promise)
+      const store = createStore()
+      store.dispatch(applyRuntimeOwner(owner))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: bound }))
+      store.dispatch(sessionInit({ sessionType: 'freshcodex', provider: 'codex', sessionId: nativeId, model, effort: 'ultra' }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      await waitFor(() => expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenCalledTimes(1))
+      const response = reply === 'raw-id' ? catalog(model)
+        : reply === 'unavailable' ? { ...catalog('Unused label'), ok: false, status: 'unavailable', models: [] }
+          : { ...catalog('Other provider label'), sessionType: 'freshopencode', runtimeProvider: 'opencode' }
+      await act(async () => { pending.resolve(response) })
+      expect(screen.queryByRole('button', { name: /^Model: / })).toBeNull()
+      expect(getFreshAgentPaneContent(store)).toMatchObject({ model, effort: 'ultra', modelSelection: { kind: 'exact', modelId: model } })
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+    })
+
+    it('ignores a stale same-model Codex source reply without reprobing identical owner observations', async () => {
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(new Promise(() => {}))
+      const old = createDeferred<unknown>(), current = createDeferred<unknown>()
+      apiMock.getFreshAgentModelCapabilities.mockReturnValueOnce(old.promise).mockReturnValueOnce(current.promise)
+      const now = vi.spyOn(Date, 'now').mockReturnValue(1_000)
+      try {
+        const store = createStore()
+        store.dispatch(applyRuntimeOwner(owner))
+        store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: bound }))
+        store.dispatch(sessionInit({ sessionType: 'freshcodex', provider: 'codex', sessionId: nativeId, model, effort: 'ultra' }))
+        render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+        await waitFor(() => expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenCalledTimes(1))
+        now.mockReturnValue(1_001)
+        act(() => store.dispatch(applyRuntimeOwner(owner)))
+        expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenCalledTimes(1)
+        act(() => store.dispatch(applyRuntimeOwner({ ...owner, generation: 4, operationId: 'next-strip-owner' })))
+        await waitFor(() => expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenCalledTimes(2))
+        expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenLastCalledWith('freshcodex', expect.objectContaining({
+          codexContext: expect.objectContaining({ sessionId: nativeId, observedEpoch: 7, observedGeneration: 4 }),
+        }))
+        await act(async () => { current.resolve(catalog('Current source model')) })
+        expect(screen.getByRole('button', { name: 'Model: Current source model — change model' })).toBeInTheDocument()
+        await act(async () => { old.resolve(catalog('Stale source model')) })
+        expect(screen.queryByRole('button', { name: 'Model: Stale source model — change model' })).toBeNull()
+        expect(screen.getByRole('button', { name: 'Model: Current source model — change model' })).toBeInTheDocument()
+      } finally { now.mockRestore() }
+    })
+  })
+
   it('renders the chip with the effective model display name when the pane has no explicit model', () => {
     const store = createStore()
     // Provider defaults live in server settings (mirrors the "saved provider

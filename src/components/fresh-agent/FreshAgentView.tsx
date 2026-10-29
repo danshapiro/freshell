@@ -43,6 +43,7 @@ import { isManagedRuntimeRecoveryDecision, ManagedRuntimeRecoveryCard } from '@/
 import { isManagedRuntimeRecoveryPending } from '@/lib/managed-runtime-recovery-message'
 import { confirmManagedRuntimeStopped } from '@/lib/managed-runtime-stop'
 import { FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE } from '@/lib/fresh-agent-model-capabilities'
+import type { FreshAgentCodexCatalogContext } from '@shared/fresh-agent-model-capabilities'
 import { applyRefusalFence, clearPendingCreateFailure, clearRestoreFailure, clearSessionError, clearSessionLost, sessionError, setSessionStatus } from '@/store/freshAgentSlice'
 import { openSessionTab } from '@/store/tabsSlice'
 import { buildReconcileRequestForPanes, foldVerdicts, isFreshAgentReconcileActive } from '@/lib/pane-reconcile'
@@ -1399,48 +1400,78 @@ export function FreshAgentView({
   // Paired with the model id the probe resolved: a live-model switch leaves
   // the previous model's probed label in state until the effect re-runs; only
   // the id-paired label may render (no stale-label frame, no raw id).
-  const [stripProbedModelPair, setStripProbedModelPair] = useState<{ modelId: string; label: string } | null>(null)
-  // Catalog display-name upgrade: freshopencode's static table is empty
-  // ("live catalog only"), and freshclaude/kilroy users can now pick
-  // catalog-only models in the shared dialog — without this probe both would
-  // permanently render raw ids on the chip ("raw id is tooltip-only" is the
-  // contract). Same endpoint the settings popover calls (5-min server cache +
-  // in-flight dedupe). Re-probes when the active model changes; the raw id
-  // renders immediately and survives a catalog failure — never blank, never
-  // "Loading". Cancelled-flag guard matches the sibling probe effects
-  // (FreshAgentModelDialog/FreshAgentSettingsButton).
+  const [stripProbedModelPair, setStripProbedModelPair] = useState<{ modelId: string; label: string; sourceKey?: string } | null>(null)
+  // Catalog-only models resolve their real display name through the
+  // provider's existing discovery path. Unknown or unavailable names keep
+  // the raw ID tooltip-only; a pick-time label remains immediately usable.
   // Id-paired pick-time stamp from the dialog/popover: authoritative for
   // catalog-only ids — the chip shows the picked label immediately, with no
   // probe window and no raw-id flash, and survives probe failure.
   const stripStampedModelLabel = paneContent.modelLabel != null && paneContent.modelLabel.modelId === stripModelId
     ? paneContent.modelLabel.label
     : undefined
+  const stripReferenceProvider = paneContent.sessionRef?.provider
+  const stripReferenceSessionId = paneContent.sessionRef?.sessionId
+  const stripObservedEpoch = runtimeOwner?.epoch
+  const stripObservedGeneration = runtimeOwner?.generation
+  const stripCodexContext = useMemo<FreshAgentCodexCatalogContext | undefined>(() => {
+    if (paneContent.sessionType !== 'freshcodex' || !paneContent.sessionId) return undefined
+    return {
+      sessionId: paneContent.sessionId,
+      ...(stripReferenceProvider !== undefined && stripReferenceSessionId !== undefined
+        ? { sessionRef: { provider: stripReferenceProvider, sessionId: stripReferenceSessionId } }
+        : {}),
+      cwd: paneContent.initialCwd,
+      ...(stripObservedEpoch !== undefined && stripObservedGeneration !== undefined
+        ? { observedEpoch: stripObservedEpoch, observedGeneration: stripObservedGeneration }
+        : {}),
+    }
+  }, [paneContent.sessionType, paneContent.sessionId, paneContent.initialCwd,
+    stripReferenceProvider, stripReferenceSessionId, stripObservedEpoch, stripObservedGeneration])
+  // Match the dialog's source boundary: timestamps alone are observations,
+  // while a new owner/server invalidates even the same model's old label.
+  const stripProbeSourceKey = paneContent.sessionType === 'freshcodex'
+    ? JSON.stringify([stripCodexContext, paneContent.serverInstanceId,
+      runtimeOwner ? { ...runtimeOwner, updatedAt: undefined } : undefined])
+    : undefined
   const stripProbeSessionType = paneContent.sessionType === 'freshopencode'
     || paneContent.sessionType === 'freshclaude'
     || paneContent.sessionType === 'kilroy'
+    || paneContent.sessionType === 'freshcodex'
     ? paneContent.sessionType
     : null
   useEffect(() => {
     setStripProbedModelPair(null)
     if (!stripProbeSessionType || !stripModelId || stripStaticModelLabel || stripStampedModelLabel) return
+    // Discovery observes the ordinary bound runtime; it never creates one.
+    if (stripProbeSessionType === 'freshcodex' && !stripCodexContext) return
     let cancelled = false
-    void getFreshAgentModelCapabilities(stripProbeSessionType, { cwd: paneContent.initialCwd })
+    void getFreshAgentModelCapabilities(stripProbeSessionType, {
+      cwd: paneContent.initialCwd,
+      ...(stripCodexContext ? { codexContext: stripCodexContext } : {}),
+    })
       .then((result) => {
         if (cancelled) return
-        const probed = result.ok
+        const matchesProvider = stripProbeSessionType !== 'freshcodex'
+          || (result.sessionType === 'freshcodex' && result.runtimeProvider === 'codex')
+        const probed = result.ok && matchesProvider
           ? result.models.find((model) => model.id === stripModelId)?.displayName ?? null
           : null
         // A displayName echoing the raw id is not a display name (e.g.
         // opencode's no-name fallback) — the chip would render a raw id,
         // which is tooltip-only by contract.
-        setStripProbedModelPair(probed && probed !== stripModelId ? { modelId: stripModelId, label: probed } : null)
+        setStripProbedModelPair(probed && probed !== stripModelId
+          ? { modelId: stripModelId, label: probed, sourceKey: stripProbeSourceKey }
+          : null)
       })
       .catch(() => {
         if (!cancelled) setStripProbedModelPair(null)
       })
     return () => { cancelled = true }
-  }, [stripProbeSessionType, paneContent.initialCwd, stripModelId, stripStaticModelLabel, stripStampedModelLabel])
+  }, [stripProbeSessionType, paneContent.initialCwd, stripModelId, stripStaticModelLabel, stripStampedModelLabel,
+    stripCodexContext, stripProbeSourceKey])
   const stripProbedModelLabel = stripProbedModelPair && stripProbedModelPair.modelId === stripModelId
+    && stripProbedModelPair.sourceKey === stripProbeSourceKey
     ? stripProbedModelPair.label
     : undefined
   // The chip NEVER renders a raw model id (user directive, review-loop round
