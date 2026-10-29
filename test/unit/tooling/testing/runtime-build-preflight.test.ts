@@ -58,6 +58,13 @@ for (let i=0; i<args.length; i++) if (args[i] === '-p') {
   return { root, project, command, rows }
 }
 
+function snapshotExecutables(files: string[]) {
+  return files.map(file => {
+    expect(fs.statSync(file).mode & 0o111).not.toBe(0)
+    return { file, bytes: fs.readFileSync(file) }
+  })
+}
+
 describe('managed runtime build preparation before suite startup', () => {
   it('does no builds or artifact work for an unrelated selected unit file', async () => {
     const f = fixture()
@@ -77,16 +84,26 @@ describe('managed runtime build preparation before suite startup', () => {
       path.join(f.root, 'test/integration/server/provider-parity-contract.test.ts'),
     ]
     const teardown = await setupRuntimeBuildPreflight(f.project, { command: f.command })
-    expect(f.rows()).toHaveLength(5)
+    expect(f.rows()).toHaveLength(6)
     const terminal = preparedRuntimeBinary(f.root, 'server-managed-provider-qualification', f.project.config.env)!
     const fresh = preparedRuntimeBinary(f.root, 'server-managed-fresh-agent-fixtures', f.project.config.env)!
+    const managed = preparedRuntimeBinary(f.root, 'server-managed-runtime-v1', f.project.config.env)!
+    const supervisor = preparedRuntimeBinary(f.root, 'supervisor-test', f.project.config.env)!
     expect(fs.readFileSync(terminal, 'utf8')).toContain('release:managed-provider-qualification')
     expect(fs.readFileSync(fresh, 'utf8')).toContain('release:managed-fresh-agent-fixtures')
-    expect(fs.readFileSync(preparedRuntimeBinary(f.root, 'supervisor-test', f.project.config.env)!, 'utf8')).toContain('debug:freshell-supervisor/runtime-test-faults')
-    expect(fs.statSync(terminal).mode & 0o111).not.toBe(0)
+    expect(fs.readFileSync(managed, 'utf8')).toContain('release:managed-runtime-v1')
+    expect(fs.readFileSync(supervisor, 'utf8')).toContain('debug:freshell-supervisor/runtime-test-faults')
+    const artifacts = snapshotExecutables([terminal, fresh, managed, supervisor])
+    // A later server build overwrites Cargo's shared output, including the newest managed variant.
+    execFileSync(f.command.program, [
+      ...f.command.args, 'build', '--locked', '--release', '-p', 'freshell-server', '--features', 'managed-provider-qualification',
+    ], { cwd: f.root, env: f.project.config.env })
+    expect(f.rows()).toHaveLength(7)
+    const cargoServer = path.join(f.project.config.env.CARGO_TARGET_DIR, 'release', `freshell-server${process.platform === 'win32' ? '.exe' : ''}`)
+    expect(fs.readFileSync(cargoServer, 'utf8')).toContain('release:managed-provider-qualification')
+    for (const { file, bytes } of artifacts) expect(fs.readFileSync(file)).toEqual(bytes)
     await teardown?.()
-    expect(fs.existsSync(terminal)).toBe(false)
-    expect(fs.existsSync(fresh)).toBe(false)
+    for (const { file } of artifacts) expect(fs.existsSync(file)).toBe(false)
   })
 
   it('reuses the parent invocation artifacts for nested parity runners without compiling or owning their cleanup', async () => {
@@ -94,13 +111,23 @@ describe('managed runtime build preparation before suite startup', () => {
     f.project.vitest.state.getPaths = () => [path.join(f.root, 'test/integration/server/provider-parity-contract.test.ts')]
     const teardown = await setupRuntimeBuildPreflight(f.project, { command: f.command })
     const binary = preparedRuntimeBinary(f.root, 'server-managed-provider-qualification', f.project.config.env)!
+    const managed = preparedRuntimeBinary(f.root, 'server-managed-runtime-v1', f.project.config.env)!
+    expect(fs.readFileSync(binary, 'utf8')).toContain('release:managed-provider-qualification')
+    expect(fs.readFileSync(managed, 'utf8')).toContain('release:managed-runtime-v1')
+    const artifacts = snapshotExecutables([binary, managed])
+    const parentBuilds = f.rows()
+    expect(parentBuilds).toHaveLength(6)
     const nested = { ...f.project, config: { ...f.project.config, env: { ...f.project.config.env } } }
     const childTeardown = await setupRuntimeBuildPreflight(nested, { command: f.command })
-    expect(f.rows()).toHaveLength(5)
+    expect(f.rows()).toEqual(parentBuilds)
+    expect(preparedRuntimeBinary(f.root, 'server-managed-provider-qualification', nested.config.env)).toBe(binary)
+    expect(preparedRuntimeBinary(f.root, 'server-managed-runtime-v1', nested.config.env)).toBe(managed)
+    expect(childTeardown).toBeUndefined()
     await childTeardown?.()
-    expect(fs.existsSync(binary)).toBe(true)
+    for (const { file, bytes } of artifacts) expect(fs.readFileSync(file)).toEqual(bytes)
+    expect(f.rows()).toEqual(parentBuilds)
     await teardown?.()
-    expect(fs.existsSync(binary)).toBe(false)
+    for (const { file } of artifacts) expect(fs.existsSync(file)).toBe(false)
   })
 
   it('fails preparation before publishing a partial bundle when a prerequisite build fails', async () => {
