@@ -296,7 +296,11 @@ if(ordinal>1)behavior={...behavior,modelCatalogPagesByCwd:{[process.cwd()]:[{dat
     await dialog.getByRole('option', { name: 'Owning runtime model', exact: true }).click()
     await dialog.getByRole('listbox', { name: 'Thinking levels for Owning runtime model', exact: true }).getByRole('option', { name: /^ultra(?:\s|$)/ }).click()
     await dialog.getByRole('button', { name: 'Use Owning runtime model · ultra' }).click()
-    await pane.getByRole('button', { name: 'Agent settings', exact: true }).click()
+    // Settings belongs to the pane header, alongside the content view.
+    const settingsButton = page.locator(`[data-context="pane-header"][data-pane-id="${paneId}"]`)
+      .getByRole('button', { name: 'Agent settings', exact: true })
+    await expect(settingsButton).toBeVisible()
+    await settingsButton.click()
     await page.getByRole('combobox', { name: 'File access' }).selectOption('read-only')
     await page.getByRole('combobox', { name: 'Work mode' }).selectOption('plan')
     await page.getByRole('combobox', { name: 'Permission mode' }).selectOption('never')
