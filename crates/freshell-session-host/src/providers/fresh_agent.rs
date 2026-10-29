@@ -2163,12 +2163,30 @@ mod tests {
     async fn assert_native_mint_ack(pending: bool) {
         let logs = tempfile::tempdir().unwrap();
         let log = logs.path().join("recovery-requests.jsonl");
-        let fixture = native_codex_fixture(json!({
-            "uniqueThreadIds":true,"recordTurns":true,"appendRequestLogPath":log,
+        let original_id = uuid::Uuid::new_v4().to_string();
+        let replacement_id = uuid::Uuid::new_v4().to_string();
+        let behavior = json!({
+            "threadStartThreadId":original_id,"recordTurns":true,"echoRequestedModel":true,"appendRequestLogPath":log,
             "exitProcessAfterMethodsOnce":[if pending {"thread/start"} else {"turn/start"}],
             "exitProcessAfterMethodsOnceMarkerPath":logs.path().join("first-native-exit"),
             "overrides":{"thread/resume":{"error":{"code":-32600,"message":"no rollout found for thread id original-native"}}}
-        })).await;
+        });
+        let fixture = native_codex_fixture(behavior.clone()).await;
+        let qualified_behavior = |id: &str| {
+            let mut behavior = behavior.clone();
+            behavior["threadStartThreadId"] = json!(id);
+            behavior["writeRolloutOnMethods"] = json!({"turn/start": {
+                "path": fixture.dir.path().join("codex-home/sessions").join(format!("rollout-{id}.jsonl")),
+                "record": {"type":"session_meta","payload":{"id":id,"cwd":fixture.profile.cwd}}
+            }});
+            behavior
+        };
+        // Qualified 0.164 writes the exact initial header before completion.
+        // Use the existing owned opt-in; shared fake defaults stay unchanged.
+        std::env::set_var(
+            "FAKE_CODEX_APP_SERVER_BEHAVIOR",
+            qualified_behavior(&original_id).to_string(),
+        );
         let mut profile = fixture.profile.clone();
         profile.naming_handle = pending.then(|| "pending-initial-recovery".into());
         profile.effort = Some("xhigh".into());
@@ -2182,6 +2200,7 @@ mod tests {
         .await
         .unwrap();
         let original = actor.profile().await.native_session_id.unwrap();
+        assert_eq!(original, original_id);
         if !pending {
             actor
                 .dispatch(
@@ -2199,6 +2218,10 @@ mod tests {
         })
         .await
         .expect("the owned native executable must actually exit");
+        std::env::set_var(
+            "FAKE_CODEX_APP_SERVER_BEHAVIOR",
+            qualified_behavior(&replacement_id).to_string(),
+        );
         actor
             .dispatch(
                 RequestId::parse("recover-native").unwrap(),
@@ -2239,7 +2262,49 @@ mod tests {
             Some(native.as_str())
         );
         assert_eq!(actor.snapshot().await.unwrap()["threadId"], native);
+        let naming_snapshot = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = actor.snapshot().await.unwrap();
+                let has_proof = snapshot["extensions"]["codex"]["hostedNamingFacts"]
+                    .as_array()
+                    .is_some_and(|facts| {
+                        facts.iter().any(|fact| {
+                            fact["kind"] == if pending { "transition" } else { "acquisition" }
+                        })
+                    });
+                if snapshot["status"] == "idle" && has_proof {
+                    break snapshot;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
         actor.stop().await.unwrap();
+        let naming_snapshot = naming_snapshot.expect("recovered native turn must settle");
+        let fact = naming_snapshot["extensions"]["codex"]["hostedNamingFacts"]
+            .as_array()
+            .and_then(|facts| {
+                facts
+                    .iter()
+                    .find(|fact| fact["kind"] == if pending { "transition" } else { "acquisition" })
+            })
+            .expect("the verified recovered native source must retain its naming acquisition");
+        assert_eq!(fact["data"]["target"]["sessionId"], native);
+        let acquisition = if pending {
+            assert_eq!(
+                fact["data"]["transition"]["reason"],
+                "InitialMaterialization"
+            );
+            assert_eq!(
+                fact["data"]["transition"]["pending"],
+                "pending-initial-recovery"
+            );
+            &fact["data"]["transition"]["acquisition"]
+        } else {
+            &fact["data"]["acquisition"]
+        };
+        assert_eq!(acquisition["persistence"], "verified");
+        assert_eq!(acquisition["location"]["nativeThreadId"], native);
         let rows = std::fs::read_to_string(log)
             .unwrap()
             .lines()

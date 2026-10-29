@@ -354,6 +354,13 @@ pub const HOSTED_CODEX_NAMING_EVENT: &str = "freshAgent.host.naming";
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum HostedCodexNamingFact {
     Activity(NameActivity),
+    /// Exact persisted metadata for a current session without a pending
+    /// handle. This admits that session's own name; it never transfers one.
+    Acquisition {
+        target: SessionNameRef,
+        acquisition: NativeAcquisition,
+        cwd: Option<String>,
+    },
     Transition {
         target: SessionNameRef,
         transition: NameTransition,

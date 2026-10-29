@@ -7,6 +7,184 @@ use freshell_runtime_protocol::{
 use tokio::net::UnixListener;
 
 #[tokio::test]
+async fn task010_hosted_new_conversation_admits_only_its_verified_current_name() {
+    use freshell_freshagent::naming::{
+        HostedCodexNamingFact, NameActivity, NameActivityReason, RenameNameInput,
+    };
+    use freshell_protocol::native_location::{
+        NativeAcquisition, NativeEvidenceKind, NativeLocation, NativePersistence,
+    };
+    use freshell_protocol::session_names::{NameIntent, SessionNameRef};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("new-name.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let switch_after = Arc::new(AtomicUsize::new(0));
+    let switch = switch_after.clone();
+    let server = tokio::spawn(async move {
+        let changed = AtomicBool::new(false);
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            let result = match request.body {
+                AdminCommand::Health => AdminResult::Health {
+                    control_epoch: 7,
+                    installation_id: InstallationId::new(),
+                },
+                AdminCommand::Inventory => {
+                    if switch.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    }) == Ok(1)
+                    {
+                        changed.store(true, Ordering::SeqCst);
+                    }
+                    AdminResult::Inventory(vec![serde_json::from_value(serde_json::json!({
+                    "soulId":"name-soul","incarnationId":"name-incarnation","hostBootId":if changed.load(Ordering::SeqCst) {"new-boot"} else {"name-boot"},
+                    "launchState":"running","cleanupState":"none","intentRevision":3,"executionGeneration":2,
+                    "desiredState":"running","recoveryState":"live","durabilityState":"unknown","allocationState":"allocated",
+                    "evidenceRevision":0,"successfulRecoveriesInWindow":0,"provider":"codex",
+                    "nativeSessionId":"new-native","freshAgentSessionId":"same-opaque-ref","freshAgentSessionType":"freshcodex"
+                })).unwrap()])
+                }
+                other => panic!("name admission must perform no provider work: {other:?}"),
+            };
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: request.request_id,
+                    result: Ok(result),
+                },
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let proxy = snapshot_outage_proxy(&socket);
+    let names = crate::session_names::SessionNames::open(dir.path().join("names")).unwrap();
+    proxy.set_session_naming(names.clone());
+    let target = |id: &str| SessionNameRef::Session {
+        provider: NamedProvider::Codex,
+        session_id: id.into(),
+    };
+    let old = target("old-native");
+    let new = target("new-native");
+    names.ensure_session(old.clone(), None).await.unwrap();
+    let old_record = names
+        .rename(RenameNameInput {
+            target: old.clone(),
+            name: "Protected old manual name".into(),
+            intent: NameIntent::User,
+            if_revision: None,
+            cwd: None,
+        })
+        .await
+        .unwrap()
+        .record;
+    let acquisition = |id: &str, persistence| HostedCodexNamingFact::Acquisition {
+        target: target(id),
+        cwd: Some("/work/recovery".into()),
+        acquisition: NativeAcquisition {
+            location: NativeLocation::Codex {
+                codex_home: "/owning/codex".into(),
+                native_thread_id: Some(id.into()),
+                rollout_path: Some(format!("/owning/codex/sessions/rollout-{id}.jsonl")),
+                persistence_evidence: Some("verified header".into()),
+            },
+            evidence: NativeEvidenceKind::PersistedMetadata,
+            persistence,
+        },
+    };
+    for (id, persistence) in [
+        ("old-native", NativePersistence::Verified),
+        ("new-native", NativePersistence::Prospective),
+    ] {
+        proxy
+            .fold_hosted_codex_naming(
+                "same-opaque-ref",
+                id,
+                serde_json::to_value(acquisition(id, persistence)).unwrap(),
+            )
+            .await;
+    }
+    assert!(
+        names.get(vec![new.clone()]).await.unwrap().is_empty(),
+        "stale or prospective facts cannot admit a name"
+    );
+    let fact =
+        serde_json::to_value(acquisition("new-native", NativePersistence::Verified)).unwrap();
+    proxy
+        .fold_hosted_codex_naming("same-opaque-ref", "new-native", fact.clone())
+        .await;
+    let admitted = names.get(vec![new.clone()]).await.unwrap();
+    assert_eq!(
+        admitted.len(),
+        1,
+        "a verified new conversation must have its own saved name"
+    );
+    assert_eq!(admitted[0].record.name_ref, new);
+    assert_ne!(admitted[0].record.name, old_record.name);
+    assert!(names.current_location_revision(&new).await.unwrap() > 0);
+    assert_eq!(names.get(vec![old]).await.unwrap()[0].record, old_record);
+    // The accepted input can now upgrade this record without transferring
+    // the old conversation's protected name or redirecting either native ref.
+    names
+        .activity(NameActivity {
+            target: new.clone(),
+            mode: "freshcodex".into(),
+            event_id: "recovery-input".into(),
+            reason: NameActivityReason::AcceptedUserMessage,
+            first_user_message: Some("New recovery subject".into()),
+            cwd: Some("/work/recovery".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        names.get(vec![new]).await.unwrap()[0].record.name,
+        "New recovery subject"
+    );
+    let manual = names
+        .rename(RenameNameInput {
+            target: target("new-native"),
+            name: "New protected manual name".into(),
+            intent: NameIntent::User,
+            if_revision: None,
+            cwd: None,
+        })
+        .await
+        .unwrap();
+    proxy
+        .fold_hosted_codex_naming("same-opaque-ref", "new-native", fact)
+        .await;
+    assert_eq!(
+        names.get(vec![target("new-native")]).await.unwrap()[0].record,
+        manual.record,
+        "replayed acquisition must preserve the new conversation's own manual name"
+    );
+    let location_revision = names
+        .current_location_revision(&target("new-native"))
+        .await
+        .unwrap();
+    let mut stale_location =
+        serde_json::to_value(acquisition("new-native", NativePersistence::Verified)).unwrap();
+    stale_location["data"]["acquisition"]["location"]["rolloutPath"] =
+        serde_json::json!("/changed-during-admission.jsonl");
+    switch_after.store(2, Ordering::SeqCst);
+    proxy
+        .fold_hosted_codex_naming("same-opaque-ref", "new-native", stale_location)
+        .await;
+    assert_eq!(
+        names
+            .current_location_revision(&target("new-native"))
+            .await
+            .unwrap(),
+        location_revision,
+        "a host source change across admission cannot authorize a new native location"
+    );
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
 async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_failures() {
     use crate::session_name_native::{NativeCallResult, NativeNameTarget};
     use freshell_runtime_protocol::{
@@ -2329,6 +2507,7 @@ async fn hosted_configure_reaches_the_owning_host_through_the_real_supervisor() 
                     effective_limits: limits,
                 },
                 HostCommand::FreshAgentConfigure { .. } => HostResult::FreshAgentCommand {
+                    native_identity: None,
                     state: freshell_runtime_protocol::CommandState::ProviderAcked,
                     native_session_id: None,
                 },
@@ -2669,12 +2848,27 @@ async fn task6_gateway_recovery_receipts(
             let (mut stream, _) = listener.accept().await.unwrap();
             let envelope: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
             let result = match envelope.body {
-                AdminCommand::Health => AdminResult::Health {control_epoch:7,installation_id:InstallationId::new()},
-                AdminCommand::Inventory => AdminResult::Inventory(vec![serde_json::from_value(serde_json::json!({
+                AdminCommand::Health => AdminResult::Health {
+                    control_epoch: 7,
+                    installation_id: InstallationId::new(),
+                },
+                AdminCommand::Inventory => {
+                    let current: freshell_runtime_protocol::RuntimeView = serde_json::from_value(serde_json::json!({
                     "soulId":"retained-soul","incarnationId":if replace_on_continuation && !replace_native && server_pages.load(std::sync::atomic::Ordering::SeqCst)>=2 {"replacement-incarnation"} else {"original-incarnation"},"hostBootId":"original-boot","launchState":"running","cleanupState":"none","intentRevision":1,"executionGeneration":1,"desiredState":"running","recoveryState":"live","durabilityState":"unknown","allocationState":"allocated","evidenceRevision":0,"successfulRecoveriesInWindow":0,"provider":"codex","nativeSessionId":if replace_on_continuation && replace_native && server_pages.load(std::sync::atomic::Ordering::SeqCst)>=2 {"replacement-native"} else {"native-owned"},"freshAgentSessionId":"public-owned","freshAgentSessionType":"freshcodex"
-                })).unwrap()]),
+                    })).unwrap();
+                    // Real inventory retains stopped historical incarnations
+                    // before the current running row for the same soul.
+                    let mut retired = current.clone();
+                    retired.launch_state = freshell_runtime_protocol::LaunchState::Stopped;
+                    retired.incarnation_id =
+                        freshell_runtime_protocol::IncarnationId::parse("retired-incarnation")
+                            .unwrap();
+                    retired.host_boot_id =
+                        Some(freshell_runtime_protocol::HostBootId::parse("retired-boot").unwrap());
+                    AdminResult::Inventory(vec![retired, current])
+                }
                 AdminCommand::FreshAgentReadEvents(request) => {
-                    server_pages.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+                    server_pages.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     AdminResult::FreshAgentEvents(freshell_runtime_protocol::AgentEventBatch {
                     retained_state:(request.after_sequence==0).then(||serde_json::json!({
                         "source":{"soulId":"retained-soul","incarnationId":"original-incarnation","hostBootId":"original-boot","projectionId":"source-projection","ownerEpoch":0,"ownerGeneration":0},

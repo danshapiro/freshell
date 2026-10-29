@@ -81,15 +81,14 @@ impl HostedFreshAgentProxy {
             format!("{OPT_IN_ENV}=1 requires an available managed runtime controller")
         })?;
         let fixture_modes = configured_fixture_modes()?;
-        // Name reliability (Task 10, Residual 4): hosted fresh agents admit a
-        // pending name at create and read a resumed session's name, but no
-        // lane reports their first message or transfers the pending name onto
-        // the native session, so they never get a first-message or AI name.
-        // Said once at boot so enabling the flag cannot hide the gap.
+        // Codex reports authenticated accepted-input and verified acquisition
+        // facts to the shared authority. The other hosted provider lanes
+        // still have no first-message/materialization naming feed.
         tracing::warn!(
             target: "freshell_server::session_names",
             flag = OPT_IN_ENV,
-            "session_names.hosted_fresh_agent_naming_incomplete: hosted fresh-agent \
+            providers = "claude,opencode",
+            "session_names.hosted_fresh_agent_naming_incomplete: hosted Claude and OpenCode \
              sessions keep their create-time name only (no first-message or AI naming)"
         );
         Ok(Some(Arc::new(Self {
@@ -1159,7 +1158,12 @@ impl HostedFreshAgentProxy {
             .await
             .ok()?
             .into_iter()
-            .find(|view| &view.soul_id == soul && view.desired_state == DesiredState::Running)
+            .rev()
+            .find(|view| {
+                &view.soul_id == soul
+                    && view.desired_state == DesiredState::Running
+                    && view.launch_state == freshell_runtime_protocol::LaunchState::Running
+            })
     }
 
     async fn forward_retained(
@@ -1179,7 +1183,14 @@ impl HostedFreshAgentProxy {
                 .as_object_mut()
                 .and_then(|extension| extension.remove("hostedNamingFacts"))
             {
-                for fact in facts.as_array().into_iter().flatten() {
+                let facts = facts.as_array().into_iter().flatten();
+                // A retained accepted input may precede its admission fact.
+                // Bind/admit first, then fold that same idempotent input.
+                for fact in facts
+                    .clone()
+                    .filter(|fact| fact["kind"] != "activity")
+                    .chain(facts.filter(|fact| fact["kind"] == "activity"))
+                {
                     self.fold_hosted_codex_naming(presentation, &native, fact.clone())
                         .await;
                 }
@@ -1352,7 +1363,9 @@ impl HostedFreshAgentProxy {
         value: serde_json::Value,
     ) {
         use freshell_freshagent::naming::{HostedCodexNamingFact, NameTransitionReason};
-        use freshell_protocol::native_location::{NativeLocation, NativePersistence};
+        use freshell_protocol::native_location::{
+            NativeEvidenceKind, NativeLocation, NativePersistence,
+        };
         use freshell_protocol::session_names::{NamedProvider, SessionNameRef};
         if native_id.is_empty() {
             return;
@@ -1386,6 +1399,75 @@ impl HostedFreshAgentProxy {
         };
         let sink = self.naming.get().cloned();
         match fact {
+            HostedCodexNamingFact::Acquisition {
+                target,
+                acquisition,
+                cwd,
+            } => {
+                let expected = SessionNameRef::Session {
+                    provider: NamedProvider::Codex,
+                    session_id: native_id.into(),
+                };
+                let location_matches = matches!(&acquisition.location,
+                    NativeLocation::Codex { codex_home, native_thread_id: Some(id), rollout_path: Some(path), .. }
+                    if !codex_home.is_empty() && id == native_id && !path.is_empty());
+                if target != expected
+                    || !location_matches
+                    || acquisition.persistence != NativePersistence::Verified
+                    || acquisition.evidence != NativeEvidenceKind::PersistedMetadata
+                {
+                    tracing::warn!(
+                        provider = "codex",
+                        native_session_id = native_id,
+                        "freshagent.gateway.naming_source_mismatch"
+                    );
+                    return;
+                }
+                if let Some(sink) = sink {
+                    if let Err(error) = sink.ensure_session(target.clone(), cwd).await {
+                        freshell_freshagent::naming::log_name_error(
+                            "ensure_session",
+                            &target,
+                            &error,
+                        );
+                        return;
+                    }
+                    let after_admission = self.current_source(&soul).await;
+                    if !current
+                        .as_ref()
+                        .zip(after_admission.as_ref())
+                        .is_some_and(|(before, after)| rest::same_snapshot_source(before, after))
+                    {
+                        tracing::warn!(
+                            provider = "codex",
+                            session_id = presentation,
+                            native_session_id = native_id,
+                            "freshagent.gateway.naming_source_changed"
+                        );
+                        return;
+                    }
+                    if let Err(error) = sink.record_acquisition(target.clone(), acquisition).await {
+                        freshell_freshagent::naming::log_name_error(
+                            "record_acquisition",
+                            &target,
+                            &error,
+                        );
+                    }
+                    let after_acquisition = self.current_source(&soul).await;
+                    if !current
+                        .as_ref()
+                        .zip(after_acquisition.as_ref())
+                        .is_some_and(|(before, after)| rest::same_snapshot_source(before, after))
+                    {
+                        tracing::warn!(
+                            provider = "codex",
+                            session_id = presentation,
+                            native_session_id = native_id,
+                            "freshagent.gateway.naming_source_changed"
+                        );
+                    }
+                }
+            }
             HostedCodexNamingFact::Activity(input) => {
                 let valid_target = match &input.target {
                     SessionNameRef::Pending { id } => !id.is_empty(),

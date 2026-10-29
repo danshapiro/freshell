@@ -1668,7 +1668,8 @@ impl FreshCodexState {
         None
     }
 
-    /// Unified agent names (Task 2): the durability-driven pending bind. A
+    /// Durability-driven naming: bind a pending handle, or admit a hosted
+    /// session's own name when it has no handle. A
     /// freshcodex thread is verified ONLY once its rollout exists under the
     /// initialized `codexHome` sessions tree (the first line a
     /// `session_meta` naming the thread — the same proof
@@ -1679,12 +1680,28 @@ impl FreshCodexState {
     /// store answers the already-bound handle with a Read, and the stash is
     /// consumed on success). `codex_home` comes from the app-server's own
     /// initialize result when known.
-    pub(crate) async fn try_bind_pending_naming(
+    pub(crate) async fn try_materialize_naming(
         &self,
         thread_id: &str,
         codex_home: Option<&str>,
     ) -> Option<crate::naming::NameTransition> {
-        let handle = self.naming_handles.lock().await.get(thread_id).cloned()?;
+        let handle = self.naming_handles.lock().await.get(thread_id).cloned();
+        if handle.is_none() && !self.hosted_naming_events {
+            return None;
+        }
+        let (source_projection, cwd) = {
+            let sessions = self.sessions.lock().await;
+            let session = sessions.get(thread_id)?;
+            (session.projection.clone(), session.cwd.clone())
+        };
+        if handle.is_none()
+            && source_projection
+                .lock()
+                .expect("codex projection lock")
+                .has_hosted_naming_proof()
+        {
+            return None;
+        }
         let home = codex_home
             .map(str::to_string)
             .or_else(codex_home_from_env)?;
@@ -1716,6 +1733,40 @@ impl FreshCodexState {
             },
             evidence: freshell_protocol::native_location::NativeEvidenceKind::PersistedMetadata,
             persistence: freshell_protocol::native_location::NativePersistence::Verified,
+        };
+        if !self
+            .sessions
+            .lock()
+            .await
+            .get(thread_id)
+            .is_some_and(|session| Arc::ptr_eq(&session.projection, &source_projection))
+        {
+            return None;
+        }
+        let Some(handle) = handle else {
+            // Established mint-new recovery has no pending name to transfer.
+            // The same verified-header boundary admits its own durable name,
+            // and also repairs an unnamed restored session without relabeling
+            // the identity transition or starting another provider.
+            self.report_hosted_naming_fact(
+                thread_id,
+                crate::naming::HostedCodexNamingFact::Acquisition {
+                    target,
+                    acquisition,
+                    cwd,
+                },
+            )
+            .await;
+            let activity = source_projection
+                .lock()
+                .expect("codex projection lock")
+                .hosted_naming_activity();
+            if let Some(activity) = activity {
+                if let Ok(activity) = serde_json::from_value(activity) {
+                    self.report_hosted_naming_fact(thread_id, activity).await;
+                }
+            }
+            return None;
         };
         // Unified agent names (Task 4, T2-M5): the rollout-verified
         // pending→durable transition is an InitialMaterialization — the
@@ -3658,7 +3709,7 @@ impl FreshCodexState {
         // bind, so the classification is not yet verified at upsert time).
         if claim.is_some() {
             if let Some(transition) = self
-                .try_bind_pending_naming(&thread_id, codex_home.as_deref())
+                .try_materialize_naming(&thread_id, codex_home.as_deref())
                 .await
             {
                 tracing::debug!(
@@ -8885,7 +8936,7 @@ impl FreshCodexState {
                             None => None,
                         };
                         if let Some(transition) = state
-                            .try_bind_pending_naming(session_id, codex_home.as_deref())
+                            .try_materialize_naming(session_id, codex_home.as_deref())
                             .await
                         {
                             tracing::debug!(

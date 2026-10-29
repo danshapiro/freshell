@@ -1099,6 +1099,19 @@ impl CodexProjection {
         true
     }
 
+    pub(super) fn has_hosted_naming_proof(&self) -> bool {
+        self.hosted_naming_facts
+            .iter()
+            .any(|fact| matches!(fact["kind"].as_str(), Some("transition" | "acquisition")))
+    }
+
+    pub(super) fn hosted_naming_activity(&self) -> Option<Value> {
+        self.hosted_naming_facts
+            .iter()
+            .find(|fact| fact["kind"] == "activity")
+            .cloned()
+    }
+
     #[cfg(test)]
     fn snapshot_rows(&self, turn_id: &str) -> Option<Vec<Value>> {
         super::build_codex_turn_json(&self.turns.iter().find(|t| t.raw["id"] == turn_id)?.raw, 0)
