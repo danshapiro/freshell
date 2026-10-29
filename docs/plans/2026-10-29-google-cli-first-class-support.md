@@ -1,166 +1,912 @@
-# First-class Google coding CLI support in Freshell
+# First-class Google coding CLI support in Freshell — Implementation Plan
 
-Date: 2026-10-29. Status: proposed implementation plan; no product code changed.
-Repository inspected: `origin/main` at `31cb9ad69f5b` (refresh the base before implementation).
+Date: 2026-10-29. Status: executable implementation plan (restructured from the committed first draft; research findings folded into Global Constraints and the Provider Contract Record below).
+Worktree: `.worktrees/google-cli-plan`, branch `docs/google-cli-first-class-plan`, base_ref `4da47fd9aed84d3f8f6c71bed1eb0ab6419ebd17`.
 
-## 1. Product decision and scope
+> **For agentic workers:** Execute this plan task by task with a fresh
+> implementer and a specification-plus-quality review after every task. Track
+> progress with the checkbox steps below.
 
-Google's current consumer successor to **Gemini CLI** is **Antigravity CLI**, invoked as `agy`. Google announced the transition on May 19, 2026, with consumer Gemini CLI access ending June 18; it continues to support Gemini CLI for Standard/Enterprise customers and paid API-key usage. These are distinct products with different launch, authentication, configuration, and conversation contracts. [Google's transition announcement](https://developers.googleblog.com/en/an-important-update-transitioning-gemini-cli-to-antigravity-cli/)
+## User Request
 
-Recommended interpretation of this request: make **Antigravity CLI** a first-class terminal agent, while preserving Freshell's existing **Gemini CLI** entry. Use provider ID `antigravity`, label `Antigravity CLI`, command `agy`, and override `ANTIGRAVITY_CMD`. Keep `gemini` and `GEMINI_CMD` intact. Never silently send a saved Gemini session to `agy`, alias their IDs, or run Google's configuration migration on the user's behalf.
+### Requested result
+- First-class Google coding CLI support in Freshell, implemented in the existing `.worktrees/google-cli-plan` worktree: make Antigravity CLI (`agy`, provider ID `antigravity`) a first-class terminal agent across launch, native history/search, exact identity/resume, naming/activity/attention, and qualified managed recovery, while preserving the existing Gemini CLI (`gemini`) entry.
 
-If the product requirement specifically means the maintained `gemini` executable, use the same Freshell integration stages below with its separate contract described in section 4. Do not build two full provider integrations as an implicit expansion of this request.
+### Explicit constraints
+- Use the committed plan document `docs/plans/2026-10-29-google-cli-first-class-support.md` as the first draft plan and start from there.
+- Run the full the-usual workflow in that worktree: plan, load-bearing validation, independent plan review, task-by-task TDD execution with per-task review, independent delta review, recap.
+- Follow repo rules: red/green/refactor TDD, unit + e2e coverage, pnpm 10.34.5, coordinator gate for broad runs with `GCLOUD_ROBOT_REQUIRE=1`, destructive tests in the disposable sandbox, focused commits; no PR creation without explicit approval; never restart the live self-hosted server on port 3001 without the user's explicit "APPROVED".
+- Never silently send a saved Gemini session to `agy`, alias their IDs, or run Google's configuration migration on the user's behalf.
 
-“First class” means the following observable behavior:
+### Accepted tradeoffs and residuals
+- The plan's Stage-1 provider-contract probes require a real pinned `agy` binary; neither `agy` nor `gemini` was on PATH during planning. Unproven contract details stay named blockers with honest recorded limitations; a launch-only milestone may ship with accurate limitations. Paid real-provider probes are opt-in and bounded and were not executed during planning.
 
-1. The installed CLI appears in the pane picker and settings, launches in the selected directory, accepts the supported model and permission controls, and can be launched through Freshell's CLI and MCP client.
-2. Each pane has an exact provider conversation identity. Concurrent panes in the same directory stay separate, and in-CLI conversation switches update that identity.
-3. Sidebar/history/search show native conversations with the correct directory, title, timestamps, messages, and available usage information. Clicking an entry focuses its live pane or resumes that exact conversation.
-4. Pane, tab, sidebar, and history names agree; manual names retain precedence. Working, waiting, completed, interrupted, and failed states reflect provider evidence.
-5. Browser refresh and transport reconnect retain the same terminal. Managed execution and recovery become available only after their existing qualification requirements pass.
-6. Missing executables, expired authentication, unavailable history, and unsupported versions produce useful errors without quietly creating a replacement conversation.
+**Goal:** A user with Antigravity CLI installed sees "Antigravity CLI" in the pane picker and settings, launches it in a chosen directory with model/effort passthrough, gets exact per-pane conversation identity with concurrent same-directory panes staying separate, finds native conversations in sidebar/history/search, resumes the exact conversation after exit/restart with continued content, gets unified names and busy/turn-completion attention, and never has a Gemini session silently handed to `agy` — with every unproven native-contract claim recorded as a named limitation instead of assumed.
 
-This plan covers the terminal CLI experience. A new FreshAgent chat interface, Google IDE/app integration, provider configuration migration, and changes to Freshell's Gemini-powered title/summary service are outside this implementation. Existing checkpoint and provider-environment mechanisms should be extended where necessary; no new general provider framework is proposed.
+**Architecture:** Register `antigravity` as a seventh bundled CLI extension (manifest-expressible launch + resume templates, no resolver code changes), add a native session source in `freshell-sessions` (codex-style JSONL parser + amplifier-style own-file source over the documented `~/.gemini/antigravity-cli/brain/<conversationId>/.system_generated/logs/transcript.jsonl` store), bind live identity with a codex-style disk locator (no provider hooks are installed — no shared-file writes, inactive in external shells by construction), drive busy/turn-completion attention from an amplifier-style read-only transcript tailer with a conservative pure tracker, join the unified-naming provider lists with honest `unsupported` native rename, and add the managed-runtime capability row in the fully blocked/disabled state until real-binary qualification evidence exists. Gemini's existing entry, settings, and saved panes remain valid and untouched.
 
-## 2. Current Freshell support and concrete gaps
+**Tech Stack:** Rust workspace (`freshell-extensions`, `freshell-platform`, `freshell-sessions`, `freshell-ws`, `freshell-activity`, `freshell-protocol`, `freshell-freshagent`, `freshell-server`, `freshell-agent-runtime`), React/Redux/Zod client, Vitest + Cargo tests, Playwright browser specs with contract-faithful fake CLIs, pnpm 10.34.5.
 
-| Area | Existing behavior | Required work |
-| --- | --- | --- |
-| Provider registration | `extensions/gemini/freshell.json` launches `gemini`, honors `GEMINI_CMD`, and puts it in the agents group. | Add a distinct Antigravity extension. Leave existing Gemini settings and saved panes valid. |
-| Picker and appearance | CLI choices derive from the extension registry; Gemini already has an icon and settings entry. | Register Antigravity's label/icon and availability through the same paths; preserve user enable/disable choices. |
-| Launch | `crates/freshell-platform/src/cli_launch.rs` already builds argv from manifest templates. | Express model, exact resume, and other proven options as templates; add special code only for behavior the schema cannot express. |
-| History | `freshell-sessions` has Claude, Codex, OpenCode, and Amplifier sources/layouts; no Google CLI source. | Add a provider-specific reader, discovery/watch layout, metadata, history, and search. |
-| Identity | Generic `SessionRef` and identity registry accept arbitrary provider strings. Gemini is excluded from live identity marker resolution. | Capture exact native identity and verify store evidence before advertising resume. |
-| Naming | Unified naming still has explicit provider lists in TypeScript and Rust. | Add the new provider through those lists and name consumers after identity exists. |
-| Activity | No Gemini activity adapter; completion handling treats it as shell. | Add native lifecycle tracking and turn completion, including client attention handling. |
-| Managed runtime | Gemini is explicitly `legacy-extension`, with identity/state unimplemented and managed/durable recovery disabled. Antigravity has no capability row or image install. | Add typed preparation, version inventory, probes, and qualification before enabling managed promises. |
-| Automation/tests | CLI/MCP mode and session-reference flows are mostly generic. `fake-gemini.mjs` is only a generic terminal fixture. | Exercise real server behavior and introduce fixtures that model the selected CLI's actual contracts. |
+## Global Constraints
 
-Important implementation seams:
+1. **Product identity:** provider ID `antigravity`, label `Antigravity CLI`, command `agy`, env override `ANTIGRAVITY_CMD`. `gemini`/`GEMINI_CMD` stay intact and valid.
+2. **Never do:** send a saved Gemini session to `agy`; alias Gemini/Antigravity IDs; run Google's configuration migration on the user's behalf; use `--continue` or the `~/.gemini/antigravity-cli/cache/last_conversations.json` cache for exact-session resume or identity evidence; edit provider transcripts to rename; overwrite any shared user/project configuration (`.agents/hooks.json`, `~/.gemini/config/hooks.json` included); claim recovery from a display-only transcript; copy live credential stores into fixtures.
+3. **No silent replacement:** missing native state, authentication failure, and transient store errors remain distinct outcomes; a failed resume surfaces an error, never a fresh substitute conversation. Resume of a stale user-chosen id follows the resume-gate policy (validated providers: `Absent` → SpawnFresh + visible notice; managed recovery: fail closed).
+4. **Candidate-contract honesty:** every native-contract fact not validated against a real pinned binary is a NAMED BLOCKER (see Provider Contract Record). Code built on candidate contracts must work end-to-end against the checked-in fixtures and carry a `// Stage-1 candidate contract:` comment at the seam, and the limitation must be recorded in the Provider Contract Record and README. No capability flag, qualification entry, or recovery claim may be enabled on candidate evidence.
+5. **Hooks:** install NO antigravity hooks and write NO antigravity config anywhere until a launch-scoped, user-preserving mechanism is proven against a real binary (named blocker). Freshell's integration is read-only over the provider's own store. Identity/activity therefore use the codex locator and amplifier tailer precedents (both hook-free).
+6. **Repo rules:** red/green/refactor TDD for every behavior change (tests must execute readers, launches, routes, or user interactions — never assert that source/docs/config contain strings); pnpm 10.34.5 with `--frozen-lockfile`; narrowed Cargo selectors are delegated lanes; broad gates only through the coordinator with `GCLOUD_ROBOT_REQUIRE=1`, `FRESHELL_RUST_TEST_SANDBOX=1`, and a `FRESHELL_TEST_SUMMARY`; process-kill/restart-storm suites only in the disposable sandbox; browser specs must pass on the configured `FRESHELL_E2E_BACKEND` (cloud) and not sit in `CLOUD_SKIP_SPECS`; TypeScript relative imports need `.js` extensions; no PR creation without explicit user approval; never restart the live port 3001 server without "APPROVED"; commit `.kata.toml` if modified.
+7. **Structured logging:** emit JSONL severity-tagged events (launch outcomes, identity bind/rebind/refusals, discovery/parse failures, resume decisions, activity transitions) correlating provider, terminal id, and native conversation id; omit prompt/transcript contents and credentials; rate-limit repeated failures per repo conventions.
+8. **Documentation:** `README.md` is the only end-user doc (env var row, provider row, limitations); `docs/index.html` mock updated only for the new visible provider experience; agent-facing notes link from `AGENTS.md`.
+9. **Preserve frozen provenance:** never edit `crates/freshell-extensions/fixtures/manifest-oracle.json` or `port/**`; the bundled-manifests test covers the real new file.
+10. **A11y:** new UI rows follow the repo's semantic-HTML/aria rules (`pnpm run lint` clean).
 
-1. Registration/UI: `extensions/`, `shared/extension-types.ts`, `src/lib/coding-cli-utils.ts`, `src/components/panes/PanePicker.tsx`, `src/components/settings/CodingAgentsSettings.tsx`, `src/components/icons/provider-icons.tsx`, and `src/deck/provider-icon-svg.ts`.
-2. Native sessions: `crates/freshell-sessions/src/{provider_layout,directory_index,meta,search,resume_input,resume_resolve}.rs`, `src/parse/`, and server `main.rs`, `session_directory.rs`, `resolve.rs`, and `existence.rs`.
-3. Terminal identity/activity: `crates/freshell-ws/src/{terminal,identity,resume_validation,activity}.rs`, existing `claude_signal.rs` and OpenCode association/signal patterns, and `crates/freshell-activity/src/`.
-4. Names and notifications: `shared/session-names.ts`, `shared/resume-input-parser.ts`, `shared/turn-complete-signal.ts`, `crates/freshell-protocol/src/session_names.rs`, `crates/freshell-freshagent/src/naming.rs`, `src/lib/session-names.ts`, and `src/lib/turn-complete-signal.ts`. The FreshAgent naming file is shared infrastructure; changing its terminal provider mapping does not add a FreshAgent UI.
-5. Managed execution: `crates/freshell-agent-runtime/src/{lib,provider_inventory}.rs`, server `managed_provider_bootstrap.rs` and `managed_provider_references.rs`, `crates/freshell-session-host/src/providers/`, `crates/freshell-platform/src/provider_environment_grants.rs`, `crates/freshell-runtime-protocol/src/`, and `docker/runtime/{provider-versions.json,Dockerfile}`.
+## Requirements → Tasks map
 
-## 3. Antigravity contracts: established facts and proof still needed
+| # | User-visible requirement (from the first draft §1) | Tasks |
+|---|---|---|
+| 1 | Picker/settings entry, launches in selected directory, model/effort controls, CLI/MCP launch | 2, 3, 11 |
+| 2 | Exact per-pane conversation identity; concurrent same-dir panes separate; in-CLI switches update identity | 6, 12, 13 |
+| 3 | Sidebar/history/search show native conversations; click focuses live pane or resumes exact conversation | 5, 12 |
+| 4 | Names agree across surfaces; states reflect provider evidence | 8, 9, 13 |
+| 5 | Refresh/reconnect retain the terminal; managed execution only after qualification | 7, 12, 14 |
+| 6 | Missing executable/auth/history produce useful errors without replacement conversations | 3, 7, 11, 12 |
 
-The current CLI reference documents `--model`, `--effort`, `--mode`, `-i`/`--prompt-interactive`, and exact resume with `--conversation <id>`. Use the interactive prompt option for a seeded terminal pane; `-p` selects headless operation. Offer only controls supported by the tested release and account. [CLI reference](https://antigravity.google/docs/cli/reference/), [headless interface](https://antigravity.google/docs/cli/headless/)
+## Provider Contract Record (documented facts, validation status, named blockers)
 
-The last-conversation cache is `~/.gemini/antigravity-cli/cache/last_conversations.json`. It maps workspaces to their latest IDs; `--continue` can start fresh if its target is missing. Consequently, this cache is neither a complete history index nor sufficient identity evidence, and Freshell must never use `--continue` for an exact-session resume. [Resume documentation](https://www.antigravity.google/docs/cli/commands/resume/)
+Every row's status is one of: `documented` (source: Google docs), `fixture-validated` (proven against our checked-in fake), or `blocked` (needs a real pinned binary; candidate contract in use). Task 1 updates this record; later tasks must not flip a `blocked` row without real-binary evidence.
 
-The documented hook inputs include `conversationId`, `workspacePaths`, and `transcriptPath`. For CLI sessions, transcript storage is described as `~/.gemini/antigravity-cli/brain/<conversationId>/.system_generated/logs/transcript.jsonl`. Hooks load from `.agents/hooks.json`, `~/.gemini/config/hooks.json`, or plugins, rather than CLI `settings.json`. Relevant events include `SessionStart`, `PreInvocation`, `PostInvocation`, and `Stop`; `Stop` includes `fullyIdle`, an error, and a termination reason. These provide candidate integration surfaces, subject to the release probe below. [Hook contracts](https://antigravity.google/docs/hooks/)
+| Contract fact | Status | Evidence / blocker |
+|---|---|---|
+| Google's consumer successor to Gemini CLI is Antigravity CLI, invoked `agy`; Gemini CLI continues for Standard/Enterprise/API-key | documented | https://developers.googleblog.com/en/an-important-update-transitioning-gemini-cli-to-antigravity-cli/ |
+| CLI flags: `--model`, `--effort`, `--mode`, `-i`/`--prompt-interactive`, `-p` (headless), exact resume `--conversation <id>` | documented | https://antigravity.google/docs/cli/reference/ ; blocked: validate against a pinned binary (Task 1) |
+| Interactive panes launch with `-i`; `-p` is never used for panes | documented | first draft §3; fixture-validated in Task 10 fake |
+| Transcript at `~/.gemini/antigravity-cli/brain/<conversationId>/.system_generated/logs/transcript.jsonl` | documented (path), blocked (record schema) | https://antigravity.google/docs/hooks/ ; candidate record schema below is fixture-validated only |
+| Hook inputs `conversationId`, `workspacePaths`, `transcriptPath`; events `SessionStart`, `PreInvocation`, `PostInvocation`, `Stop` (`Stop` carries `fullyIdle`, an error, a termination reason) | documented, blocked | We install no hooks (Global Constraint 5); semantics encoded only in the fake for spec assertions |
+| Hook config sources: `.agents/hooks.json`, `~/.gemini/config/hooks.json`, plugins — all SHARED files; no launch-scoped overlay is known | documented | BLOCKER: no hook producer until a real binary proves a launch-scoped mechanism that preserves user hooks |
+| `cache/last_conversations.json` maps workspaces → latest ids; `--continue` may start fresh if target missing | documented | Never used for resume/identity (Global Constraint 2) |
+| API-key auth needs `modelProvider: "gemini"` in settings AND `GEMINI_API_KEY`; OS keyring for local sign-in; CLI does not load `.env` | documented, blocked | https://antigravity.google/docs/install/?tab=cli ; managed-auth projection unproven |
+| Native titles, complete conversation enumeration, retention/deletion, transcript recovery authority, independent-process/backend ownership | blocked | Task 1 records any obtainable evidence; everything else stays a named blocker |
+| Candidate transcript record schema (fixtures + parser + fake agree on this) | fixture-validated | Defined in Task 4; NOT real-binary evidence |
 
-Migration changes MCP configuration and skills paths, and first launch can offer to import old assets. Treat onboarding as provider-owned interaction, not a background Freshell operation. [Migration documentation](https://antigravity.google/docs/cli/gcli-migration/)
+**Candidate transcript record schema** (used by Task 4 fixtures, Task 5 parser, Task 8 tailer, Task 10 fake — first line is the ownership record, codex `session_meta` style):
 
-Antigravity's authentication documentation says API-key operation requires both `modelProvider: "gemini"` in its settings and `GEMINI_API_KEY`; the variable alone is insufficient, and the CLI does not load `.env` files. Local sign-in uses the OS keyring. Verify the manual remote-login flow from a browser-hosted Freshell pane, which may lack the SSH environment variables used to select that flow. [Antigravity authentication](https://antigravity.google/docs/install/?tab=cli)
+```jsonl
+{"type":"session_start","conversationId":"<uuid>","workspacePaths":["/abs/cwd"],"model":"<model>","startedAt":"<RFC3339>"}
+{"type":"user_message","conversationId":"<uuid>","text":"<prompt>","at":"<RFC3339>"}
+{"type":"assistant_message","conversationId":"<uuid>","text":"<reply>","at":"<RFC3339>","usage":{"inputTokens":10,"outputTokens":20,"cachedTokens":0,"totalTokens":30}}
+{"type":"turn_settled","conversationId":"<uuid>","at":"<RFC3339>","outcome":"completed"|"errored","fullyIdle":true|false}
+```
 
-Neither `agy` nor `gemini` was on this planning shell's PATH. Documentation research establishes candidate contracts, not a tested binary version or successful authentication. Before writing the provider adapter, prove:
+Multi-workspace conversations: `workspacePaths` may carry several paths; the parser keeps them all and uses the first recorded one as the evidenced primary cwd (never the current terminal's cwd). Unknown record types are ignored; malformed lines are skipped; a truncated final line is skipped.
 
-1. A pinned stable `agy` release and its Linux, macOS, and native Windows distribution/install mechanisms. Antigravity is not the `@google/gemini-cli` npm package. Record artifact checksums and actual version/help output; identify the minimum supported release.
-2. Actual transcript record schema, complete conversation enumeration, workspace association, retention/deletion behavior, native titles, and whether the transcript is sufficient for native recovery or only an exported display log. Check unobserved sessions created outside Freshell; hook-only indexing cannot claim complete history parity.
-3. Hook behavior on fresh start, exact resume, `/resume`, `/clear`, forks, cancellation, approvals, subagents, and asynchronous work. A model invocation ending is not necessarily a user turn ending; hook inputs alone do not prove the final outcome after all user hooks run.
-4. A launch-scoped way to install the Freshell hook/MCP configuration while preserving ordinary user hooks, plugins, skills, rules, credential access, and project configuration. Prefer a supported overlay or plugin selected for the child. If the release requires changing shared files, stop that design and specify a reversible, narrowly owned integration before implementation; do not overwrite the user's shared configuration.
-5. Authentication under host and managed execution, including whether login relies on an OS keyring, local daemon, or backend state that cannot be projected into a container. Prove the documented headless/Cloud-project path where applicable. Obtain secret values through the existing OneCLI integration; do not copy live credential stores into fixtures or commit them.
-6. Independent CLI-process lifecycle and session resume across process/server restart. Determine whether any shared backend process owns durable state, and keep cleanup limited to processes created by the test.
+---
 
-**Exit condition:** checked-in sanitized native fixtures and a short contract record in this plan identify the tested version, source/overlay mechanism, identity/rebind semantics, and native recovery store. Missing evidence stays a named blocker for that capability. A launch-only milestone may ship with accurate limitations; it is not completion of first-class support.
+### Task 1: Probe the real provider contract (acquire a pinned `agy` or record the blocker)
 
-## 4. Maintained Gemini CLI compatibility
+**Files:**
+- Modify: `docs/plans/2026-10-29-google-cli-first-class-support.md` (Provider Contract Record rows only)
+- Create: `/home/dan/code/freshell/.worktrees/.the-usual-logs/google-cli-plan/reports/contract-probe.md` (evidence log, outside the tracked tree)
 
-Preserve the existing `gemini` provider even when Antigravity becomes the recommended Google CLI. Do not infer that a working Gemini CLI installation is obsolete for every account.
+**Interfaces:**
+- Consumes: the documented URLs in the Provider Contract Record.
+- Produces: updated Contract Record statuses (Task 2/3 flags decisions cite this); possibly sanitized launch evidence (version/help output). No product code.
 
-If `gemini` itself is selected for full integration, use these separate inputs:
+- [ ] **Step 1: Research the distribution mechanism (read-only)**
 
-1. Executable `gemini`, package `@google/gemini-cli`; the registry reported stable version `0.66.0` during research. Use `gemini --resume <full-uuid>` and verify interactive/model flags against the pinned executable. [Package metadata](https://registry.npmjs.org/@google/gemini-cli/latest), [Gemini session documentation](https://geminicli.com/docs/cli/session-management/)
-2. The session documentation still describes project-hash chat directories. The pinned `v0.66.0` source already handles JSONL recording, legacy JSON migration, patch/metadata/rewind records, a project registry, and project-root markers. Base the reader on the pinned format and migration fixtures; do not implement only the old JSON-snapshot schema or attempt to reverse a directory hash into a cwd. [Recording types](https://github.com/google-gemini/gemini-cli/blob/v0.66.0/packages/core/src/services/chatRecordingTypes.ts), [recording service](https://github.com/google-gemini/gemini-cli/blob/v0.66.0/packages/core/src/services/chatRecordingService.ts), [storage](https://github.com/google-gemini/gemini-cli/blob/v0.66.0/packages/core/src/config/storage.ts), [project registry](https://github.com/google-gemini/gemini-cli/blob/v0.66.0/packages/core/src/config/projectRegistry.ts)
-3. Gemini hooks use their own event vocabulary and snake-case fields such as `session_id`, `transcript_path`, and `cwd`; Antigravity hooks use a different contract. Implement separate boundary adapters while reusing existing Freshell identity/activity types. [Gemini hooks](https://geminicli.com/docs/hooks/reference/)
-4. Google sign-in, API-key authentication, and Vertex AI are separate supported Gemini authentication paths. Keep CLI authentication separate from Freshell's Gemini API setting for generated names and summaries. [Gemini authentication](https://geminicli.com/docs/get-started/authentication/)
+Web-fetch https://antigravity.google/docs/cli/reference/ , https://antigravity.google/docs/install/?tab=cli , and https://antigravity.google/docs/cli/headless/ . Record: the exact install mechanism for Linux, the latest stable version string, and whether a non-interactive artifact (downloadable tarball/package with checksum) exists. Write findings to the evidence log.
 
-No full second adapter is required merely to preserve existing launch/settings compatibility.
+- [ ] **Step 2: Attempt an isolated acquisition (bounded, disposable)**
 
-## 5. Implementation sequence
+If — and only if — a non-interactive artifact is publicly available: download it into a disposable prefix (e.g. `/tmp/opencode/agy-probe/`; NEVER a global install, NEVER `~/.local`/npm-global, NEVER touching `~/.gemini` or any user config), verify its checksum if published, and run `<prefix>/agy --version` and `<prefix>/agy --help` with `HOME=/tmp/opencode/agy-probe-home` (disposable home). Record exact output. If no non-interactive artifact exists (e.g. install requires an interactive browser flow), record that and stop this step — the blocker stands.
 
-Each code stage follows red/green/refactor: first run a behavioral test that fails for the missing behavior, implement the smallest complete path, then remove duplication and rerun affected checks. Commit each completed stage. Tests must execute readers, launches, server routes, or user interactions; do not assert that source, documentation, prompts, or configuration contain particular strings.
+- [ ] **Step 3: Validate the launch contract against the binary (only if Step 2 succeeded)**
 
-Across these stages, emit structured JSONL/tracing events with severity for launch outcomes, identity binding/rebinding, discovery/parse failures, resume decisions, rejected or stale hook events, activity transitions, and managed qualification/recovery. Correlate provider, terminal, launch generation, and native session ID where available; omit prompt/transcript contents and credentials. Validate representative failure and rebind events by exercising those production paths and checking their emitted fields. Keep routine events concise and rate-limit repeated failures through existing logging conventions.
+From `--help`/`--version` output, confirm or correct each documented flag: `--model`, `--effort`, `--mode`, `-i`/`--prompt-interactive`, `-p`, `--conversation`. Record the exact spelling of each. Do NOT attempt login, model calls, or any authenticated operation (paid/interactive probes stay opt-in per the Accepted tradeoffs).
 
-### Stage 1 — Prove the provider contract
+- [ ] **Step 4: Update the Provider Contract Record**
 
-Run the section 3 probes in disposable homes/workspaces and record sanitized fixtures for fresh, resumed, switched, tool-using, cancelled, failed, and zero-turn sessions. Capture the actual hook configuration and payloads. Include two simultaneous sessions in one directory. Keep paid real-provider probes opt-in and bounded; this planning document does not execute them.
+Flip statuses only for facts now validated against the real binary (e.g. flags row: `blocked` → `documented+validated (<version>, <date>, <help excerpt>)`). If acquisition failed, append one line to each affected row: "blocked: no non-interactive artifact available as of <date>". Self-review the record for honesty: no status may claim more than the evidence shows.
 
-Deliverable: versioned fixture corpus and executable contract smoke. Resolve the configuration/keyring/backend questions before selecting a managed launch design. Do not install global software or migrate the user's configuration as part of the probe.
+- [ ] **Step 5: Commit the record update**
 
-### Stage 2 — Register the CLI and launch it correctly
+```bash
+git add docs/plans/2026-10-29-google-cli-first-class-support.md
+git commit -m "docs(plan): record antigravity contract-probe evidence"
+```
 
-Create `extensions/antigravity/freshell.json` and register the label/icon through the existing UI paths. Add command override, exact-resume template, and proven option templates. Derive availability from the selected executable on the server host; distinguish installed from authenticated. Reuse provider discovery/settings merging so a new provider appears without resetting existing choices.
+**Note:** This is an investigation task; there is no Red step (nothing is executed by product code). The deliverable is the honest record. If flags were corrected in Step 3, Task 3's manifest templates follow the corrected spellings; if the binary was unobtainable, Tasks 2–14 proceed on the documented candidate contract with the blocker recorded (exactly what the Accepted tradeoffs authorize).
 
-Use argv arrays through the current platform launch builder. Handle spaces, Unicode, Windows `.cmd`/executable resolution, and custom wrappers. Preserve provider-native interactive authentication/approvals; default launch must not add broad approval-bypass flags. Model and effort controls should use supported discovery/default behavior rather than a copied list of today's model names. Add controls only where actual flag/value mapping exists.
+---
 
-Tests: execute a contract-faithful fake executable through the real launch builder and create route; check observed argv, cwd, selected model, interactive prompt, and override resolution. Exercise absent executable and rejected option errors. Verify picker/settings behavior and CLI/MCP creation against the server.
+### Task 2: Register the `antigravity` extension end to end
 
-Deliverable: complete launch/settings behavior, explicitly without native-history or durable-recovery claims until later stages pass.
+**Files:**
+- Create: `extensions/antigravity/freshell.json`
+- Modify: `crates/freshell-server/src/extensions.rs:588-601` (bundled-names test), `src/components/icons/provider-icons.tsx` (icon + map), `src/components/settings/CodingAgentsSettings.tsx:25-34` (AGENT_ROWS), `crates/freshell-terminal/src/registry.rs:2161-2165` (`is_agent_mode`) and its test list at `registry.rs:13032`, `README.md:209` (env-var table)
+- Test: `crates/freshell-server/src/extensions.rs` (in-file), `test/unit/client/components/icons/provider-icons.test.tsx`, `test/unit/client/components/SettingsView.agent-chat.test.tsx`, `test/unit/client/components/panes/PanePicker.test.tsx`
 
-### Stage 3 — Read native history and search it
+**Interfaces:**
+- Consumes: `ExtensionRegistry::scan` (extensions.rs:89), `detect_available_clis` env-var override (extensions.rs:324), `AGENT_ROWS` shape, `PROVIDER_ICONS` map.
+- Produces: registered provider `antigravity` with label `Antigravity CLI`, command `agy`, override `ANTIGRAVITY_CMD`; `availableClis.antigravity` derived by the existing PATH probe; settings auto-discovery (no `coding-cli-defaults.ts` change).
 
-Add proposed `AntigravityLayout`, `AntigravitySource`, and `parse/antigravity.rs` using the stage 1 schema. Register them in `all_layouts()`, server source construction, and provider-home watcher mapping. Reuse the current index's dirty marking, cache, checked discovery, and scan-failure reporting.
+- [ ] **Step 1: Write the failing tests**
 
-Extract exact native ID, recorded workspace paths, native title where available, first authored user prompt, start/update time, message/tool history, and available usage. Keep missing usage unknown. For multi-folder conversations, retain all known paths and use an evidenced primary directory for the existing single-directory UI; do not guess from an unrelated current terminal.
+1. In `crates/freshell-server/src/extensions.rs`, update `all_bundled_manifests_validate_and_register_through_scan` (line 588) — add a red assertion first: the expected list becomes `["amplifier","antigravity","claude","codex","gemini","kimi","opencode"]` (sorted). Run and watch it fail with the missing name.
+2. Add to `test/unit/client/components/icons/provider-icons.test.tsx`: assert `PROVIDER_ICONS.antigravity` is defined and renders a distinct testid (`provider-icon-antigravity`), model: `provider-icons.test.tsx:14-40`.
+3. Add to `test/unit/client/components/SettingsView.agent-chat.test.tsx`: with `availableClis: { antigravity: true }`, an `Antigravity CLI` switch row renders and toggling writes `codingCli.enabledProviders` (model: lines 92-158).
+4. Add to `test/unit/client/components/panes/PanePicker.test.tsx`: with an antigravity registry entry + `availableClis.antigravity: true` + enabled, a picker tile labelled `Antigravity CLI` renders and is keyboard-activatable (model: lines 277-366).
 
-Search the normalized native conversation rather than grepping raw JSON. Handle append/replace/rename, partial writes, unknown records, truncation/rewind, missing/late roots, deletion, and configured home paths. Recover from a temporarily incomplete tail without erasing the last valid indexed result. Bound reads and avoid repeatedly parsing entire histories on every filesystem event. Leave provider files read-only.
+- [ ] **Step 2: Run the tests and verify the intended failure**
 
-Tests: parser fixtures and real temporary-directory watcher/index tests, then session-directory/history/search HTTP tests. Include sessions created outside Freshell, duplicate-ID ambiguity across providers, malformed records, Unicode/Windows paths, and deleted history. If complete native enumeration is not supported, document the remaining gap instead of presenting observed-only history as full coverage.
+Run: `cargo test -p freshell-server --lib extensions && pnpm run test:vitest run test/unit/client/components/icons/provider-icons.test.tsx test/unit/client/components/SettingsView.agent-chat.test.tsx test/unit/client/components/panes/PanePicker.test.tsx --config config/vitest/vitest.config.ts`
 
-### Stage 4 — Bind exact live identity and resume it
+Expected: FAIL — bundled list missing `antigravity`; icon undefined; no settings row; no picker tile.
 
-Add a small provider hook adapter using the established terminal signal path. Bind events to the terminal and its launch generation, carry the exact conversation ID and authoritative transcript/store locator, and acknowledge quickly without changing provider behavior. Observer hooks return neutral `{}` output and do not alter permissions, inject messages, or force the agent loop to continue. Keep hooks inactive in ordinary external shells. Reuse the generic identity registry and `SessionRef { provider, sessionId }` rather than inventing another identity type.
+- [ ] **Step 3: Add the minimal production implementation**
 
-Only enable this provider in marker/association resolution once its adapter works. Rebind on proven in-CLI conversation changes; reject late events from retired generations. Do not associate a pane with the newest transcript, a cwd match, a process title, or the last-conversation cache. Retain identity after process exit and keep zero-turn session identity distinct from proof of a durable conversation.
+Create `extensions/antigravity/freshell.json` (strict schema — no unknown keys, no nulls):
 
-Extend server existence checks, resolve hints and exact-ID routing, `resume_validation`, and client resume templates. A live matching session is focused/reattached. A stopped session resumes with the exact native ID and workspace. Missing native state, authentication failure, and transient store errors remain different outcomes; none silently becomes a fresh chat. Never copy Antigravity's “continue latest” fallback into Freshell's resume path.
+```json
+{
+  "name": "antigravity",
+  "version": "1.0.0",
+  "label": "Antigravity CLI",
+  "description": "Google's Antigravity CLI agent",
+  "category": "cli",
+  "cli": {
+    "command": "agy",
+    "envVar": "ANTIGRAVITY_CMD"
+  },
+  "picker": {
+    "group": "agents"
+  }
+}
+```
 
-Tests: two same-directory panes, live focus, stopped resume, explicit ambiguous IDs, `/resume`/`/clear`/fork rebinding, delayed old-generation events, browser reload, disconnect/reconnect, exited processes, and native history loss. Assert continued conversation content after a second turn, not just matching displayed IDs.
+In `src/components/icons/provider-icons.tsx`: add a mono-color `AntigravityIcon` (pattern: `GeminiIcon` at lines 61-73) — a four-pointed star distinct from Gemini's, e.g. `<path d="M12 2c.9 4.06 3.04 7.2 6.9 8.6-3.86 1.4-6 4.54-6.9 8.6-.9-4.06-3.04-7.2-6.9-8.6C8.96 9.2 11.1 6.06 12 2Z"/><path d="M18.5 14.5c.45 2.03 1.52 3.6 3.45 4.3-1.93.7-3 2.27-3.45 4.3-.45-2.03-1.52-3.6-3.45-4.3 1.93-.7 3-2.27 3.45-4.3Z"/>` with `viewBox="0 0 24 24"`, `fill="currentColor"`, `data-testid="provider-icon-antigravity"`; add `antigravity: AntigravityIcon` to `PROVIDER_ICONS` (line 236). In `CodingAgentsSettings.tsx` add `{ kind: 'cli', id: 'antigravity', label: 'Antigravity CLI', icon: AntigravityIcon }` to `AGENT_ROWS` (import the icon). In `crates/freshell-terminal/src/registry.rs` add `"antigravity"` to the `is_agent_mode` closed list (line 2162) and to the test list at line 13032 — antigravity turns must not be idle-reaped. In `README.md` env-var table add `| ANTIGRAVITY_CMD | No | Antigravity CLI command override |`.
 
-### Stage 5 — Names, activity, completion, and attention
+Deliberately NOT done here (each gated on its own task): `resumeArgs`/`modelArgs` (Task 3), any naming/identity/activity list (Tasks 6–9), MCP injection (no arm — unknown modes already get no injection), `is_session_provider_mode` (Task 7 decides), managed rows (Task 14).
 
-Extend unified naming's explicit TypeScript/Rust provider lists and terminal mappings. Use native names when supported, existing first-message fallback otherwise, and the current manual-name precedence. Keep pane/tab/sidebar/history names aligned after reload and rebind. Native rename writes require a supported provider operation; do not edit provider transcripts to rename a session.
+- [ ] **Step 4: Run the focused tests**
 
-Add a `freshell-activity` adapter and wire it through WebSocket state and client completion handling. Normalize observed events into existing activity types. For Antigravity, distinguish individual invocation completion from full turn completion and outstanding asynchronous work. Treat `Stop` plus `fullyIdle` and outcome as evidence to validate against real traces, not an unconditional success bell. Only expose approval/question distinctions if the release supplies reliable evidence; otherwise show an accurate broader state.
+Run: same command as Step 2. Expected: PASS.
 
-Tests: tool loops, multiple invocations, subagents/background work, approval waits, cancellation, errors, stale/duplicate hooks, process exit, and completion/attention exactly once. Verify name consistency and manual precedence across multiple clients.
+- [ ] **Step 5: Refactor while green**
 
-### Stage 6 — Managed execution and durable recovery
+Check for duplication only (icon pattern is already shared); none expected. Explicitly verify the picker shortcut behavior: antigravity sets no `picker.shortcut`, so its tile defaults to `'A'` colliding with amplifier — cosmetic (first-match-wins); leave as-is and record in the task report.
 
-Add the selected provider to the version inventory and runtime image with a pinned, verified artifact. Extend existing typed provider preparation/bootstrap/reference profiles, host provider dispatch, and native-history probes. Carry ordinary instructions, skills, plugins/dependencies, MCP definitions, proxy settings, and configuration references through the established bounded environment mechanism. Source private credential values through OneCLI and existing grants; preserve native auth requirements identified in stage 1.
+- [ ] **Step 6: Run impacted-test verification**
 
-Reuse existing recovery policy: verified live reattach, exact native resume, checkpoint restore where genuinely supported, and pristine-seed recovery only when never dispatched. A transcript display export alone does not establish native resume/checkpoint capability. Confirm which state/backend must survive host/container replacement; never claim recovery by copying an insufficient log.
+Impacted set: extension scan/settings auto-discovery (`cargo test -p freshell-server --lib settings_store`), icon consumers (`test/unit/client/components/icons/PaneIcon.test.tsx`, `test/unit/client/deck/provider-icon-svg.test.ts`, `test/unit/client/deck/tile-renderer.test.ts`), settings hydration (`test/unit/shared/settings.test.ts`), launch goldens referencing bundled manifests (`cargo test -p freshell-platform --lib cli_launch`).
 
-Add an Antigravity capability row in `freshell-agent-runtime` and its documentation mirror. Advance certification states only through the existing qualification process. Preserve the Gemini row's disabled guarantees unless its own implementation is being completed. Keep unsupported recovery paths explicit rather than inventing positive evidence or a parallel recovery engine.
+Run: `cargo test -p freshell-server --lib extensions settings_store && cargo test -p freshell-platform --lib cli_launch && pnpm run test:vitest run test/unit/client/components/icons/ test/unit/client/deck/provider-icon-svg.test.ts test/unit/client/deck/tile-renderer.test.ts test/unit/shared/settings.test.ts --config config/vitest/vitest.config.ts`
 
-Tests: real controller → session host → provider preparation, executable configured resources and MCP access, exact identity, native resume after process replacement, host/controller restart, checkpoint restore where claimed, retained replay, missing-store evidence, zero-turn recovery, and blocked recovery without replacement. Run destructive cases in the repo's disposable sandbox. Exercise auth/config failure paths without touching production or other agents' processes.
+Expected: PASS (the new manifest must not break any golden — it has no templates yet).
 
-### Stage 7 — End-to-end proof and documentation
+- [ ] **Step 7: Commit the task**
 
-Add proposed browser specs `google-cli-launch-rust.spec.ts`, `google-cli-history-resume-rust.spec.ts`, `google-cli-identity-activity-rust.spec.ts`, and `runtime-google-provider-qualification-rust.spec.ts`. Build the fake CLI from the stage 1 fixtures and actual hook/native-store semantics; the existing generic `fake-gemini.mjs` launcher is insufficient proof.
+```bash
+git add extensions/antigravity/freshell.json crates/freshell-server/src/extensions.rs src/components/icons/provider-icons.tsx src/components/settings/CodingAgentsSettings.tsx crates/freshell-terminal/src/registry.rs README.md test/unit/client/components/icons/provider-icons.test.tsx test/unit/client/components/SettingsView.agent-chat.test.tsx test/unit/client/components/panes/PanePicker.test.tsx
+git commit -m "feat(antigravity): register Antigravity CLI extension"
+```
 
-The browser tests must create a pane, send a prompt, observe work and completion, find its history, refresh/reconnect, focus the live session, stop the owned fixture process, resume the exact native conversation, and continue with preserved content. Cover two concurrent same-directory sessions and at least one failure that preserves the conversation instead of replacing it.
+---
 
-Keep the real-provider contract smoke separate from routine hermetic CI. Run it against the pinned binary with isolated state and an approved low-cost model, proving one turn, a tool operation, exact resume, and continued context. A fake passing is necessary for regression coverage and insufficient for provider qualification.
+### Task 3: Launch correctly — manifest templates + argv proof
 
-Update `README.md` with the actual product name, installation/login location, command override, supported settings, history/resume behavior, and specific supported-version limitations. Update `docs/index.html` for the new visible provider experience. Link agent implementation notes from `AGENTS.md`; do not add a separate end-user Markdown guide.
+**Files:**
+- Modify: `extensions/antigravity/freshell.json` (add templates), `crates/freshell-platform/src/cli_launch_goldens.rs` (new goldens), `crates/freshell-ws/tests/` (new integration test file `antigravity_launch_e2e.rs`)
+- Test: `crates/freshell-platform/src/cli_launch_goldens.rs`, `crates/freshell-ws/tests/antigravity_launch_e2e.rs`
 
-## 6. Verification and completion gates
+**Interfaces:**
+- Consumes: `CliCommandSpec` templates (`resumeArgs` first-occurrence `{{sessionId}}`, `modelArgs`/`effortArgs` replace-all, `cli.args` static — cli_launch.rs:34-61, 366-381); `resolve_coding_cli_command` generic provider branch (cli_launch.rs:414-432, 491-505); WS fake-executable harness (`tests/common/mod.rs` `sleeper_cli_spec`, `auto_resume_e2e.rs` `write_executable`).
+- Produces: manifest `resumeArgs: ["--conversation","{{sessionId}}"]`, `modelArgs: ["--model","{{model}}"]`, `effortArgs: ["--effort","{{effort}}"]`, `args: ["-i"]`, `supportsModel: true`, `supportsEffort: true`. (If Task 1 corrected flag spellings, use those.)
 
-1. Before implementation, fetch/fast-forward clean local `main`, verify a green intended base through `scripts/base-gate.sh`, and create a fresh `.worktrees/` feature branch from `origin/main`.
-2. Use repo-owned focused Vitest commands for affected client/tooling tests, e.g. `pnpm run test:vitest run test/unit/client/lib/coding-cli-utils.test.ts --config config/vitest/vitest.config.ts`. Use narrowed Rust selectors during development and the sandbox wrapper for destructive or direct server/integration workloads. New tests must execute a nonzero count.
-3. Run the affected browser specs on the configured `FRESHELL_E2E_BACKEND`; verify they are not in `CLOUD_SKIP_SPECS` and did not filter to zero cases. Managed tests must exercise an actual managed candidate on that backend, not a legacy-terminal substitute. Follow the existing external-target managed test topology when needed.
-4. Run `pnpm run check` with `GCLOUD_ROBOT_REQUIRE=1`, `FRESHELL_RUST_TEST_SANDBOX=1`, and a useful `FRESHELL_TEST_SUMMARY` from the implementation worktree. Preserve the configured cloud backend and coordinator gate; no silent local fallback. Broad passing results supplement the specific acceptance coverage above.
-5. Require the real-provider qualification receipt before enabling managed/durable flags. Record the tested binary, target platform, image, recovery paths, and limitations. Verify Linux/WSL terminal behavior and native Windows executable/argv behavior; the Windows desktop path uses the native Windows app.
-6. Commit focused changes and push the clean branch. Obtain explicit approval before creating the PR; merge only after required checks and approval constraints are satisfied. Follow existing launch/rollout runbooks for any later deployment. The live self-hosted server on port 3001 must not be restarted without the user's explicit `APPROVED`.
+- [ ] **Step 1: Write the failing tests**
 
-Completion is assessed against all six user-visible requirements in section 1. A picker entry, passing generic fixture, working headless prompt, or optimistic capability flag alone is not first-class integration.
+Goldens (in `cli_launch_goldens.rs`, model: `gemini_env_injection_passes_through_command_env` at 1052 and amplifier goldens at 1128-1243):
 
-## 7. Recommended first action
+```rust
+#[test]
+fn antigravity_fresh_launch_uses_interactive_prompt_flag() {
+    let launch = resolve_for_manifest_spec("antigravity", inputs("antigravity", None, LaunchIntent::Start))
+        .expect("registered");
+    assert_eq!(launch.command, "agy");
+    assert!(launch.args.contains(&"-i".to_string()));
+    assert!(!launch.args.iter().any(|a| a == "-p"));
+}
 
-Run Stage 1 for **Antigravity CLI (`agy`)**, then implement launch → native history → exact identity/resume → naming/activity → qualified managed recovery in that order. Preserve `gemini` compatibility throughout. The highest-risk unknowns are launch-scoped hooks/configuration, native state needed for recovery, and managed authentication/backend ownership; resolving those first prevents building the rest on an assumed contract.
+#[test]
+fn antigravity_resume_uses_conversation_flag_adjacent_pair() {
+    let launch = resolve_for_manifest_spec("antigravity",
+        inputs("antigravity", Some("conv-1234"), LaunchIntent::Resume)).expect("registered");
+    let i = launch.args.iter().position(|a| a == "--conversation").expect("resume flag");
+    assert_eq!(launch.args[i + 1], "conv-1234");
+    assert!(!launch.args.iter().any(|a| a == "--continue"));
+}
+
+#[test]
+fn antigravity_model_and_effort_templates_apply() { /* fresh launch + settings model "m"/effort "e" ⇒ argv contains --model m and --effort e, in the settings segment */ }
+
+#[test]
+fn antigravity_env_var_command_override_wins() { /* env ANTIGRAVITY_CMD=/custom/agy ⇒ command == /custom/agy */ }
+```
+
+(Adapt helper names to the file's existing spec/inputs helpers; the golden file's `specs()` mirrors shipped manifests, so the new manifest fields flow automatically once the manifest is edited — write the assertions against a manifest-loaded spec the way amplifier's `amplifier_manifest_matches_legacy_cli_block` reads the real file.)
+
+WS integration (new `crates/freshell-ws/tests/antigravity_launch_e2e.rs`, model: `auto_resume_e2e.rs` `counting_crashing_claude_spec` + `resume_validation_gate.rs` argv capture): spawn the real server with an `antigravity` spec whose executable is an `#!/bin/sh` script appending its argv to a capture file; create a terminal with `mode: "antigravity"` over raw WS; then create with `session_ref {provider:"antigravity", session_id:"conv-9"}`; assert both argv rows: fresh row contains `-i` and no `--conversation`; resume row contains the adjacent pair `--conversation` `conv-9`; and an unknown-mode create (`mode: "antigravityy"`) answers `Invalid terminal mode` with `antigravity` in the valid list.
+
+- [ ] **Step 2: Run the tests and verify the intended failure**
+
+Run: `cargo test -p freshell-platform --lib cli_launch && cargo test -p freshell-ws --test antigravity_launch_e2e`
+
+Expected: FAIL — no `--conversation`/`-i`/`--model` in argv (manifest has no templates yet); the WS resume row lacks `--conversation`.
+
+- [ ] **Step 3: Add the minimal production implementation**
+
+Edit `extensions/antigravity/freshell.json` (Task 1 spellings; documented spellings if Task 1 was blocked):
+
+```json
+{
+  "name": "antigravity",
+  "version": "1.0.0",
+  "label": "Antigravity CLI",
+  "description": "Google's Antigravity CLI agent",
+  "category": "cli",
+  "cli": {
+    "command": "agy",
+    "args": ["-i"],
+    "envVar": "ANTIGRAVITY_CMD",
+    "resumeArgs": ["--conversation", "{{sessionId}}"],
+    "modelArgs": ["--model", "{{model}}"],
+    "effortArgs": ["--effort", "{{effort}}"],
+    "supportsModel": true,
+    "supportsEffort": true
+  },
+  "picker": { "group": "agents" }
+}
+```
+
+No resolver changes: the generic branch already applies templates in segment order `[remote, provider, base, settings, resume]`; `cli.args` rides `base`. Missing executable surfaces through the existing ENOENT wrapper (`wrap_terminal_spawn_error`, terminal.rs:8814) whose message names `ANTIGRAVITY_CMD` — add one golden assertion for that message in the WS test if not already covered generically.
+
+- [ ] **Step 4: Run the focused tests**
+
+Run: same as Step 2. Expected: PASS.
+
+- [ ] **Step 5: Refactor while green**
+
+None expected — manifest-only. Confirm `client_entry` now reports `supportsResume: true` and `resumeCommandTemplate: ["agy","--conversation","{{sessionId}}"]` to the client (derived, extensions.rs:296-301) — assert via the extensions scan test from Task 2 if not already.
+
+- [ ] **Step 6: Run impacted-test verification**
+
+Impacted: all launch goldens (`cargo test -p freshell-platform --lib`), extension scan (`cargo test -p freshell-server --lib extensions`), client resume-command rendering (`test/unit/client/lib/coding-cli-utils.test.ts` — add a case: antigravity registry entry renders `agy --conversation <id>`; registry entry wins, no builtin fallback).
+
+Run: `cargo test -p freshell-platform --lib && cargo test -p freshell-server --lib extensions && pnpm run test:vitest run test/unit/client/lib/coding-cli-utils.test.ts --config config/vitest/vitest.config.ts`
+
+Expected: PASS.
+
+- [ ] **Step 7: Commit the task**
+
+```bash
+git add extensions/antigravity/freshell.json crates/freshell-platform/src/cli_launch_goldens.rs crates/freshell-ws/tests/antigravity_launch_e2e.rs test/unit/client/lib/coding-cli-utils.test.ts
+git commit -m "feat(antigravity): launch templates with exact --conversation resume"
+```
+
+---
+
+### Task 4: Native history part 1 — home, layout, parser, candidate fixtures
+
+**Files:**
+- Create: `crates/freshell-sessions/src/parse/antigravity.rs`, `crates/freshell-sessions/tests/antigravity_fixture_parity.rs`, `test/fixtures/coding-cli/antigravity/fresh.sanitized.jsonl`, `test/fixtures/coding-cli/antigravity/resumed.sanitized.jsonl`, `test/fixtures/coding-cli/antigravity/tool-use.sanitized.jsonl`, `test/fixtures/coding-cli/antigravity/errored.sanitized.jsonl`, `test/fixtures/coding-cli/antigravity/zero-turn.sanitized.jsonl`, `test/fixtures/coding-cli/antigravity/two-same-dir.sanitized.jsonl`, `test/fixtures/coding-cli/antigravity/malformed-tail.sanitized.jsonl`
+- Modify: `crates/freshell-sessions/src/parse/mod.rs` (module + re-export), `crates/freshell-sessions/src/lib.rs` (re-export), `crates/freshell-sessions/src/provider_layout.rs` (AntigravityLayout + tests)
+- Test: the new parity test + in-file parser/layout tests
+
+**Interfaces:**
+- Consumes: `ParsedSessionMeta` (meta.rs:51 — `session_id`, `cwd`, `created_at`, `last_activity_at`, `first_user_message`, `token_usage: Option<TokenSummary>`, `message_count`), codex parser structure (parse/codex.rs:273-533), `ProviderLayout` trait (provider_layout.rs:34).
+- Produces: `pub fn parse_antigravity_session_content(content: &str) -> Option<ParsedSessionMeta>` (`None` when no ownership record yields an id — the R10b-style exclusion); `pub struct AntigravityLayout;` impl `ProviderLayout` with `name() = "antigravity"`, `session_root(home) = antigravity_home(home).join("brain")`, `watch_bases = [antigravity_home(home)]` with `watch_mode_for_base` = NonRecursive for the home + Recursive for `brain` (codex split model, provider_layout.rs:159-165), `qualifies(path)` = file named `transcript.jsonl` with an ancestor chain `brain/<conversationId>/.system_generated/logs/`; `pub fn antigravity_home(home: &Path) -> PathBuf` (env `FRESHELL_ANTIGRAVITY_HOME` used as-is — amplifier precedent amplifier.rs:57 — else `home.join(".gemini").join("antigravity-cli"`; NEVER bare `~/.gemini`).
+
+- [ ] **Step 1: Write the failing tests**
+
+Create the fixture corpus first (each file exercises the candidate schema; `fresh.sanitized.jsonl` in full):
+
+```jsonl
+{"type":"session_start","conversationId":"11111111-2222-3333-4444-555555555555","workspacePaths":["/home/u/proj"],"model":"gemini-3-pro","startedAt":"2026-10-29T20:00:00.000Z"}
+{"type":"user_message","conversationId":"11111111-2222-3333-4444-555555555555","text":"Fix the flaky test","at":"2026-10-29T20:00:01.000Z"}
+{"type":"assistant_message","conversationId":"11111111-2222-3333-4444-555555555555","text":"Fixed the test.","at":"2026-10-29T20:00:05.000Z","usage":{"inputTokens":10,"outputTokens":20,"cachedTokens":0,"totalTokens":30}}
+{"type":"turn_settled","conversationId":"11111111-2222-3333-4444-555555555555","at":"2026-10-29T20:00:05.500Z","outcome":"completed","fullyIdle":true}
+```
+
+Variants: `resumed` (same conversationId, an extra `session_start` with `"source":"resume"` — parser keeps first id, no double-count), `tool-use` (extra unknown-typed records `{"type":"tool_call",...}` between user and assistant — ignored, message_count still counts non-empty lines), `errored` (`turn_settled` `outcome:"errored"`), `zero-turn` (ownership record only — id + cwd known, empty first_user_message), `two-same-dir` (two conversation ids, same workspacePaths), `malformed-tail` (one garbage line, one truncated final line — both skipped; valid prefix parsed).
+
+Then `antigravity_fixture_parity.rs` (model: `codex_fixture_parity.rs`), asserting per fixture: session_id, cwd, created_at/last_activity_at folds (min/max over semantic records only: session_start/user_message/assistant_message/turn_settled), first_user_message, title derivation from the first user message (via `extract_title_from_message`, 200 chars), `token_usage` mapping with missing-usage ⇒ `None` (zero-turn), and `message_count` = non-empty line count. Plus in-file parser unit tests: malformed-line tolerance, unknown-record tolerance, multi-workspace `workspacePaths` (primary = first recorded), and `None` for content with no extractable conversationId. Plus layout tests in `provider_layout.rs`'s `mod tests` (model: codex set at 290-534): `name`, `session_root`, `qualifies` accept/reject shapes (`brain/<id>/.system_generated/logs/transcript.jsonl` yes; `brain/<id>/notes.md` no; `cache/last_conversations.json` no), watch-mode split, and `antigravity_home` env override (use the `HOME_ENV_TEST_TEST_LOCK` pattern, lib.rs:42-49).
+
+- [ ] **Step 2: Run the tests and verify the intended failure**
+
+Run: `cargo test -p freshell-sessions antigravity`
+
+Expected: FAIL — no `antigravity` module (compile error is the red here: the missing behavior is the absent parser/layout). If preferred, stub empty files first and watch the assertions fail instead of the build.
+
+- [ ] **Step 3: Add the minimal production implementation**
+
+`parse/antigravity.rs` (core; follow codex's per-line `serde_json::from_str` + `continue`, unknown records ignored, `// Stage-1 candidate contract:` header comment):
+
+```rust
+pub fn parse_antigravity_session_content(content: &str) -> Option<ParsedSessionMeta> {
+    let mut meta = ParsedSessionMeta::default();
+    let mut have_id = false;
+    let mut have_cwd = false;
+    let mut first_user: Option<String> = None;
+    let mut summary: Option<String> = None;
+    let mut count = 0i64;
+    for line in content.split('\n') {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() { continue; }
+        count += 1;
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else { continue }; // malformed ⇒ skip
+        let conv = obj.get("conversationId").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+        match obj.get("type").and_then(|v| v.as_str()) {
+            Some("session_start") => {
+                if !have_id { if let Some(id) = conv { meta.session_id = Some(id.to_string()); have_id = true; } }
+                if !have_cwd {
+                    if let Some(paths) = obj.get("workspacePaths").and_then(|v| v.as_array()) {
+                        if let Some(primary) = paths.iter().find_map(|p| p.as_str()) {
+                            if looks_like_path(primary) { meta.cwd = Some(primary.to_string()); have_cwd = true; }
+                        }
+                    }
+                }
+                fold_ts(&mut meta, obj.get("startedAt"));
+            }
+            Some("user_message") => {
+                let text = obj.get("text").and_then(|v| v.as_str());
+                if first_user.is_none() { if let Some(t) = text { first_user = Some(crate::text::normalize_first_user_message(t)); } }
+                fold_ts(&mut meta, obj.get("at"));
+            }
+            Some("assistant_message") => {
+                if summary.is_none() { summary = obj.get("text").and_then(|v| v.as_str()).map(|s| s.chars().take(240).collect()); }
+                fold_ts(&mut meta, obj.get("at"));
+                if let Some(u) = obj.get("usage") { meta.token_usage = parse_antigravity_token_envelope(u).or(meta.token_usage.take()); }
+            }
+            Some("turn_settled") => { fold_ts(&mut meta, obj.get("at")); }
+            _ => {} // unknown record types are ignored
+        }
+    }
+    if !have_id { return None; } // no ownership evidence ⇒ excluded row (R10b-style)
+    meta.message_count = count;
+    meta.first_user_message = first_user;
+    if let Some(f) = &meta.first_user_message {
+        meta.title = Some(crate::text::extract_title_from_message(f, 200)); // helper names follow parse/codex.rs:401-427
+        meta.title_provider_generated = false;
+    }
+    meta.summary = summary;
+    Some(meta)
+}
+```
+
+`parse_antigravity_token_envelope` maps `inputTokens/outputTokens/cachedTokens/totalTokens` into `TokenSummary` with plausibility coercion (model: `parse_codex_token_envelope`, parse/codex.rs:184); missing usage stays `None`. `fold_ts` folds `created_at` = min, `last_activity_at` = max over the four semantic record types only (model: parse/codex.rs:303-308). Add `pub mod antigravity;` + re-export in `parse/mod.rs` and `lib.rs:55`. Add `AntigravityLayout` + `antigravity_home` to `provider_layout.rs`.
+
+- [ ] **Step 4: Run the focused tests**
+
+Run: `cargo test -p freshell-sessions antigravity && cargo test -p freshell-sessions --test antigravity_fixture_parity`
+
+Expected: PASS.
+
+- [ ] **Step 5: Refactor while green**
+
+Extract the timestamp-fold and title helpers into shared use of `crate::text` if codex's helpers are reusable as-is; otherwise keep local and note the duplication for a later sweep. Rerun the focused tests.
+
+- [ ] **Step 6: Run impacted-test verification**
+
+Impacted: the whole `freshell-sessions` crate (parse/mod provider additions are additive but the crate compiles as one unit) and the pre-push-relevant fixture path (`test/fixtures/**` changes route the pre-push gate to broad cargo — noted, not run here).
+
+Run: `cargo test -p freshell-sessions`
+
+Expected: PASS.
+
+- [ ] **Step 7: Commit the task**
+
+```bash
+git add crates/freshell-sessions/src/parse/antigravity.rs crates/freshell-sessions/src/parse/mod.rs crates/freshell-sessions/src/lib.rs crates/freshell-sessions/src/provider_layout.rs crates/freshell-sessions/tests/antigravity_fixture_parity.rs test/fixtures/coding-cli/antigravity/
+git commit -m "feat(antigravity): native transcript parser, layout, and candidate fixtures"
+```
+
+---
+
+### Task 5: Native history part 2 — source, index wiring, search, server routes
+
+**Files:**
+- Create: `crates/freshell-sessions/src/antigravity.rs` (source module, amplifier pattern)
+- Modify: `crates/freshell-sessions/src/lib.rs` (`pub mod antigravity;`), `crates/freshell-sessions/src/search.rs:177` (`extract_message` arm + `extract_antigravity_message`), `crates/freshell-server/src/main.rs:164-186` (`build_session_sources`), `crates/freshell-server/src/main.rs:1856-1874` (watcher list), `crates/freshell-server/src/main.rs:2069-2084` (`provider_roots`), `crates/freshell-server/src/existence.rs:42` (`KNOWN_PROVIDERS`), `crates/freshell-server/src/resolve.rs:238` (`KNOWN_RESUME_PROVIDERS`), `crates/freshell-server/src/session_directory.rs:2286` (file-search provider gate)
+- Test: in-file source tests, `session_watcher_tests.rs`-style temp-dir tests, `session_directory.rs`/`resolve.rs`/`existence.rs` in-file route tests
+
+**Interfaces:**
+- Consumes: `SessionSource` trait (directory_index.rs:223-332: `discover`, `discover_checked`, `parse`, `provider_name`, default `stat_scoped`), `open_root_dir` (directory_index.rs:355), `item_from_meta` (directory_index.rs:554), `AntigravityLayout` + `parse_antigravity_session_content` + `antigravity_home` (Task 4).
+- Produces: `pub struct AntigravitySource { antigravity_home: PathBuf }` with `new(home)`; indexed rows with `source_file: Some(transcript path)` (searchable); `KNOWN_PROVIDERS`/`KNOWN_RESUME_PROVIDERS` gain `"antigravity"` (5 entries); watcher + existence roots registered; file-tier search extracts user/assistant text.
+
+- [ ] **Step 1: Write the failing tests**
+
+1. Source/index (in `antigravity.rs` `mod tests`, model: amplifier.rs in-file tests + `session_watcher_tests.rs:105/161/215`): temp home seeded with two `brain/<id>/.system_generated/logs/transcript.jsonl` files (fixture content) → discover finds both; `parse` maps id/cwd/title/first message/usage and `source_file: Some`; a rename/delete event prunes; a mid-write truncated tail keeps the last valid row (re-parse of the truncated file must not erase the previous indexed result — index preserve-on-error rules); `discover_checked` returns `Ok(None)` for a missing root and `Err` for an unlistable one (scan failure recorded, cache preserved).
+2. Search: `search_session_file(path, "antigravity", "flaky", UserMessages)` hits the `user_message` record; `FullText` hits assistant text; extract snippets are case-insensitive.
+3. Routes (`session_directory.rs` in-file tests, model: codex route tests at 3962-4233 and `same_raw_session_id_from_different_providers_is_legal` at 5678): with a seeded index, `GET /api/session-directory` lists antigravity rows (title/cwd/first message); `tier=userMessages` search finds the fixture text (proving the provider gate at session_directory.rs:2286 now admits `"antigravity"`); a claude session with the SAME raw id stays distinct (`antigravity:<id>` vs `claude:<id>` keys); resolve route: exact-id input resolves the antigravity row and reports the provider; `unsearchedProviders` honesty when disabled in settings.
+4. Existence (`existence.rs` in-file tests, model: 568-1244): warm index → `Present`; absent id → `Absent`; cold index + missing antigravity root → `ProviderUnavailable`; unknown provider still `Absent` (never `Unknown`).
+
+- [ ] **Step 2: Run the tests and verify the intended failure**
+
+Run: `cargo test -p freshell-sessions antigravity && cargo test -p freshell-server session_directory resolve existence`
+
+Expected: FAIL — source unwired (no rows, no search arm, provider gate skips antigravity, existence unknown-provider).
+
+- [ ] **Step 3: Add the minimal production implementation**
+
+`crates/freshell-sessions/src/antigravity.rs` (amplifier own-file pattern; `// Stage-1 candidate contract:` header):
+
+```rust
+pub struct AntigravitySource { antigravity_home: PathBuf }
+impl AntigravitySource {
+    pub fn new(antigravity_home: PathBuf) -> Self { Self { antigravity_home } }
+}
+impl SessionSource for AntigravitySource {
+    fn discover(&self) -> Vec<FileStat> { self.discover_checked().unwrap_or_default() }
+    fn discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error> {
+        let root = self.antigravity_home.join("brain");
+        match crate::directory_index::open_root_dir(&root)? {
+            None => Ok(Vec::new()),
+            Some(_) => Ok(crate::directory_index::walk_jsonl_recursive(&root)), // codex recursion model, depth-bounded as in directory_index.rs:678-722
+        }
+    }
+    fn parse(&self, path: &Path) -> Option<IndexedSession> {
+        let content = std::fs::read(path).ok().map(|b| String::from_utf8_lossy(&b).into_owned())?;
+        let meta = crate::parse::parse_antigravity_session_content(&content)?;
+        let mut item = crate::directory_index::item_from_meta("antigravity", &meta, path); // cwd gate inside: meta.cwd required
+        item.source_file = Some(path.to_path_buf());
+        Some(item)
+    }
+    fn provider_name(&self) -> Option<&'static str> { Some("antigravity") }
+}
+```
+
+(Adapt to the real signatures — `item_from_meta`'s actual parameters and `walk_jsonl_recursive` visibility are crate-internal and reusable exactly as codex/amplifier do; keep `source_file: Some`.) Wire `search.rs`: `extract_antigravity_message(obj)` returns user text for `type=="user_message"` (`text` field) and assistant text for `type=="assistant_message"` (model: `extract_codex_message`, search.rs:214-229) + the `"antigravity" =>` arm. Extend the session_directory.rs:2286 gate to `matches!(item.provider.as_str(), "claude" | "codex" | "antigravity")`. Server wiring in `main.rs`: `build_session_sources` adds `Arc::new(AntigravitySource::new(antigravity_home(&home)))`; watcher list adds `WatchedProvider { layout: Box::new(AntigravityLayout), home: antigravity_home(&home) }`; `provider_roots` adds `("antigravity".to_string(), antigravity_home(&h))`. `existence.rs` and `resolve.rs` lists gain `"antigravity"`.
+
+- [ ] **Step 4: Run the focused tests**
+
+Run: same as Step 2. Expected: PASS.
+
+- [ ] **Step 5: Refactor while green**
+
+Check `discover`/`discover_checked` duplication against codex's pair (directory_index.rs:678-728); if a shared recursive-walk helper already exists, use it directly instead of re-wrapping. Rerun.
+
+- [ ] **Step 6: Run impacted-test verification**
+
+Impacted: whole `freshell-sessions`, `freshell-server` route suites touched, watcher behavior, and the settings auto-discovery interplay (`cargo test -p freshell-server --lib settings_store`).
+
+Run: `cargo test -p freshell-sessions && cargo test -p freshell-server --lib session_directory resolve existence settings_store`
+
+Expected: PASS.
+
+- [ ] **Step 7: Commit the task**
+
+```bash
+git add crates/freshell-sessions/src/antigravity.rs crates/freshell-sessions/src/lib.rs crates/freshell-sessions/src/search.rs crates/freshell-server/src/main.rs crates/freshell-server/src/existence.rs crates/freshell-server/src/resolve.rs crates/freshell-server/src/session_directory.rs
+git commit -m "feat(antigravity): native session source, search, and server wiring"
+```
+
+---
+
+### Task 6: Exact live identity — disk locator, association, MARKER_MODES
+
+**Files:**
+- Create: `crates/freshell-sessions/src/antigravity_locator.rs` (codex_locator model), `crates/freshell-ws/src/antigravity_association.rs` (codex_association model)
+- Modify: `crates/freshell-sessions/src/lib.rs` (module), `crates/freshell-ws/src/lib.rs` (module + state field), `crates/freshell-ws/src/terminal.rs:209` (`MARKER_MODES`), `crates/freshell-ws/src/activity.rs` (association hub wiring point for the sweep, mirroring the codex association sweep), `crates/freshell-server/src/main.rs:2746-2759` (boot sweep registration beside claude/opencode)
+- Test: `crates/freshell-ws/tests/antigravity_session_rebind.rs` (model: `claude_session_rebind.rs` + `codex_fork_rebind.rs`), in-file locator/association tests
+
+**Interfaces:**
+- Consumes: `MARKER_MODES` pending-marker branch (terminal.rs:7250-7300 → `ledger.record_pending`), the codex locator pattern (`codex_locator.rs`: `arm` :231, `note_submit` :279, `tick` :322 refuse-on-ambiguity, `watch_fork` :470), codex association guards (`codex_association.rs:118-178`: unknown/not-Running/wrong-mode/already-bound rejected, fork watch BEFORE adoption tail), the shared adoption/rebind tail (`codex_identity.rs::adopt_codex_identity` :60-131 / `rebind_codex_identity` :138-238 with A13 live-owner and A8 ledger guards), `AntigravityActivityTracker` (Task 8 — this task wires the association only; the tracker wiring lands in Task 8; if the tail requires the hub bind call, gate it behind the Task 8 seam with a neutral no-op that Task 8 fills).
+- Produces: `AntigravityLocator { arm(terminal_id, cwd), note_possible_submit(terminal_id), tick() -> Vec<(terminal_id, conversation_id, transcript_path)> }` enumerating `brain/<id>/` transcripts whose `workspacePaths` contain the pane's cwd, excluding ids already bound to any live/retired-inclusive terminal (A13/A8 via the shared tail), refusing on ambiguity (multiple new candidates for one pane ⇒ adopt nothing, log `antigravity_association_refused {reason:"ambiguous"}`); `MARKER_MODES: [&str; 4] = ["codex","opencode","amplifier","antigravity"]`.
+
+**Design decision (recorded per the identity report's honest finding):** there is no per-launch generation token on any existing terminal-CLI signal path; antigravity follows the claude/codex residual-risk profile (liveness + provider-match + A13 live-owner + A8 ledger + retired-pane guards) rather than inventing new generation machinery. A respawned pane re-seeds identity at create; late events from a dead launch evaluate against the new row and are rejected by those guards. This matches every shipped provider; the residual risk is recorded here and in the task report.
+
+- [ ] **Step 1: Write the failing tests**
+
+New `crates/freshell-ws/tests/antigravity_session_rebind.rs` (one multi-phase tokio test, model: `claude_session_rebind.rs` / `codex_fork_rebind.rs`; fake agy = `#!/bin/sh` script writing the fixture-format transcript for a fixed id then sleeping):
+1. create antigravity pane with cwd A → Enter (submit) → fake writes `brain/<id1>/` transcript with workspacePaths [A] → sweep adopts: pane leaf gains `sessionRef {provider:"antigravity", sessionId:id1}` (frames `terminal.session.associated`).
+2. second pane, SAME cwd A → its own submit writes `brain/<id2>/` → each pane bound to its own id; no cross-bind (the refuse-on-ambiguity path is exercised when both transcripts appear between two submits of one pane: assert no wrong adoption).
+3. in-CLI switch: fake mints `brain/<id3>/` on a scripted `/switch` line → rebind: sessionRef becomes id3, supersede recorded, naming follows (`follow_identity_switch`), the OLD id stays bound-elsewhere-safe (a third pane targeting id1 gets a live-owner refusal).
+4. restart: `server.restart()` (same home) → the restored pane resumes with the adjacent `--conversation <id>` argv (fake echoes resumed marker) and identity persists.
+5. zero-turn pane (created, no submit): no sessionRef, no association frame.
+6. late event: kill the pane process, respawn via reload; a transcript write for the dead launch's candidate id does NOT bind to the new row (wrong-generation liveness rejection via the guards above).
+
+- [ ] **Step 2: Run the tests and verify the intended failure**
+
+Run: `cargo test -p freshell-ws --test antigravity_session_rebind`
+
+Expected: FAIL — `antigravity` not in MARKER_MODES, no locator/association modules (no adoption happens; the sessionRef assertions fail).
+
+- [ ] **Step 3: Add the minimal production implementation**
+
+Add `"antigravity"` to `MARKER_MODES` (terminal.rs:209, `[&str; 4]`, doc comment updated: antigravity resolves via the disk locator). Create `antigravity_locator.rs` in freshell-sessions (codex_locator shape, `// Stage-1 candidate contract:` header; discovery via `AntigravityLayout` root + parse of the ownership record only — bounded: read first line, extract conversationId + workspacePaths). Create `antigravity_association.rs` in freshell-ws (codex_association shape): arm at create (antigravity mode, non-managed), `note_possible_submit` on Enter (re-snapshot before the byte, like codex_association.rs:66-96), `drain_and_associate` rejecting unknown terminal / mode mismatch / already-bound-different, then the shared adoption tail — provider-parameterized reuse of the codex tail's guard ladder (A13 `registry.live_session_owner`, A8 `find_by_session_including_retired`, ledger-first `ledger_resolve_identity`, `identity.upsert`, naming bind via `bind_pending_naming`, `registry.set_meta`, broadcast `terminal.session.associated`). Register the boot sweep beside main.rs:2746-2759 (channel-deferred like the amplifier association, activity.rs:654). JSONL log events: `antigravity_identity_bound`, `antigravity_identity_rebound`, `antigravity_association_refused {reason}`.
+
+- [ ] **Step 4: Run the focused tests**
+
+Run: same as Step 2 plus in-file units: `cargo test -p freshell-ws --lib antigravity && cargo test -p freshell-sessions antigravity_locator`. Expected: PASS.
+
+- [ ] **Step 5: Refactor while green**
+
+If the shared adoption tail cannot be provider-parameterized without touching codex paths, keep a thin antigravity-specific tail that CALLS the same helpers (naming bind, ledger resolve) — do not fork duplicated guard logic beyond the minimum; note any residual duplication in the report.
+
+- [ ] **Step 6: Run impacted-test verification**
+
+Impacted: identity module units (`cargo test -p freshell-ws --lib identity`), the codex/opencode association suites (shared helpers touched: `cargo test -p freshell-ws --lib codex_association opencode_signal`), the session-rebind siblings (`cargo test -p freshell-ws --test codex_fork_rebind claude_session_rebind` — narrowed selectors), and `resume_validation` (marker list changed: `cargo test -p freshell-ws --test resume_validation_gate`).
+
+Run: `cargo test -p freshell-ws --lib identity codex_association opencode_signal antigravity && cargo test -p freshell-ws --test codex_fork_rebind -- --include-ignored && cargo test -p freshell-ws --test resume_validation_gate`
+
+Expected: PASS.
+
+- [ ] **Step 7: Commit the task**
+
+```bash
+git add crates/freshell-sessions/src/antigravity_locator.rs crates/freshell-sessions/src/lib.rs crates/freshell-ws/src/antigravity_association.rs crates/freshell-ws/src/lib.rs crates/freshell-ws/src/terminal.rs crates/freshell-ws/src/activity.rs crates/freshell-server/src/main.rs crates/freshell-ws/tests/antigravity_session_rebind.rs
+git commit -m "feat(antigravity): disk-locator identity binding with rebind guards"
+```
+
+---
+
+### Task 7: Exact resume — validation gate, by-id existence, no silent replacement
+
+**Files:**
+- Create: `crates/freshell-server/src/antigravity_existence_by_id.rs` (or extend `existence_by_id.rs` — follow the file's existing layout)
+- Modify: `crates/freshell-platform/src/resume_gate.rs:19` (`VALIDATED_PROVIDERS`, 4→5), `crates/freshell-ws/src/resume_validation.rs` (SpawnFresh arm policy), `crates/freshell-freshagent/src/terminal_tabs.rs:155-160` (`is_session_provider_mode` — add antigravity), `crates/freshell-server/src/main.rs` (wire the by-id locator into the existence probe, model: codex at main.rs:2125-2127), `crates/freshell-sessions/src/resume_input.rs` + `shared/resume-input-parser.ts` (advisory COMMAND_HINTS rows) + `test/fixtures/resume-input/parser-cases.json` (fixture rows FIRST — both twins consume it)
+- Test: `resume_gate.rs` in-file tests, `resume_validation.rs` in-file tests (:160-380, :308 list pin), `crates/freshell-ws/tests/resume_validation_gate.rs` extension
+
+**Interfaces:**
+- Consumes: `evaluate_resume_gate_for_intent` (resume_gate.rs:85-97: user-create `Absent` → `SpawnFresh` + stale notice; managed → `BlockedRecovery`), `validate_wire_resume` per-provider SpawnFresh shapes (resume_validation.rs:132-146 — codex/opencode drop the resume id entirely), `IndexExistenceProbe` by-id locator pattern (existence_by_id.rs:144 `codex_rollout_existence_locator`), `accepted_session_ref_for_mode` (terminal_tabs.rs:110-115, provider-generic).
+- Produces: antigravity joins `VALIDATED_PROVIDERS`; a by-id locator walking the deterministic `brain/<id>/` tree answering Present/Absent tri-state (a no-match tree walk is `Blocked{AmbiguousIdentity}`-style unknown for loss decisions, but a warm-index Absent confirmed by the by-id walk is a user-create `SpawnFresh`); `is_session_provider_mode` includes `"antigravity"` so REST/MCP `resume`/`resumeSessionId` map to `sessionRef {provider:"antigravity"}`; SpawnFresh shape = drop-resume-id (codex style — never substitutes an id, never `--continue`).
+
+- [ ] **Step 1: Write the failing tests**
+
+1. `resume_gate.rs`: `antigravity_resume_absent_user_create_spawns_fresh_with_notice`, `antigravity_managed_recovery_absent_blocks` (fail-closed), `antigravity_present_proceeds`.
+2. `resume_validation.rs`: update the unvalidated-passthrough list pin at :308 (antigravity now VALIDATED — remove it from the passthrough assertion set if listed) and add `antigravity_spawn_fresh_drops_resume_id` (SpawnFresh never fabricates a replacement id).
+3. `resume_validation_gate.rs` (real WS + fake): create with a sessionRef for an id whose `brain/<id>/` exists → argv contains `--conversation <id>`; create with an id absent from index AND disk (by-id walk confirms) → SpawnFresh: fresh argv WITHOUT `--conversation`, visible `stale_resume_notice` recorded, and `assert_never_captured` proves no second spawn; ambiguous/locked store (unreadable dir) → proceed, never fresh-substitute.
+4. `terminal_tabs.rs` in-file test: `resumeSessionId: "conv-1"` with `mode:"antigravity"` maps to sessionRef provider antigravity; a gemini id does NOT cross (provider-matched only).
+
+- [ ] **Step 2: Run the tests and verify the intended failure**
+
+Run: `cargo test -p freshell-platform resume_gate && cargo test -p freshell-ws --lib resume_validation && cargo test -p freshell-ws --test resume_validation_gate && cargo test -p freshell-freshagent terminal_tabs`
+
+Expected: FAIL — antigravity not in VALIDATED_PROVIDERS (gate tests fail on the new provider rows), no by-id locator, passthrough pin mismatch.
+
+- [ ] **Step 3: Add the minimal production implementation**
+
+Add `"antigravity"` to `VALIDATED_PROVIDERS` (5 entries) and the SpawnFresh drop-resume arm mirroring codex (resume_validation.rs:140-146 region). Add the by-id locator: walk `antigravity_home/brain/<id>/.system_generated/logs/transcript.jsonl` — exists+readable ⇒ `Present`; missing dir ⇒ `Absent` (confirmed by both index and walk); unreadable ⇒ unknown/`Proceed`. Wire it into the existence probe's by-id path in main.rs. Add `"antigravity"` to `is_session_provider_mode` (terminal_tabs.rs:156). Update the resume-input hint tables ONLY as advisory additions if `--conversation` ids have a recognizable shape (conversation ids are UUIDs — the generic UUID hint already catches them; add a `agy`/`antigravity` COMMAND_HINTS entry + parity fixture rows in `test/fixtures/resume-input/parser-cases.json` BEFORE the Rust/TS twins per the file's header contract — advisory only, no launch effect).
+
+- [ ] **Step 4: Run the focused tests**
+
+Run: same as Step 2. Expected: PASS.
+
+- [ ] **Step 5: Refactor while green**
+
+Check the by-id locator against the amplifier/codex locators for a shareable "deterministic path probe" helper; keep the antigravity one thin. Rerun.
+
+- [ ] **Step 6: Run impacted-test verification**
+
+Impacted: `resume_input` parity (fixture moved first), `existence` route tests, the REST create-path suites (`cargo test -p freshell-freshagent --lib terminal_tabs`), and the launch e2e from Task 3 (`cargo test -p freshell-ws --test antigravity_launch_e2e`).
+
+Run: `cargo test -p freshell-sessions resume_input && cargo test -p freshell-server --lib existence resolve && cargo test -p freshell-freshagent --lib terminal_tabs && cargo test -p freshell-ws --test antigravity_launch_e2e && pnpm run test:vitest run test/unit/shared/resume-input-parser.test.ts --config config/vitest/vitest.config.ts`
+
+Expected: PASS.
+
+- [ ] **Step 7: Commit the task**
+
+```bash
+git add crates/freshell-platform/src/resume_gate.rs crates/freshell-ws/src/resume_validation.rs crates/freshell-server/src/antigravity_existence_by_id.rs crates/freshell-server/src/main.rs crates/freshell-freshagent/src/terminal_tabs.rs test/fixtures/resume-input/parser-cases.json crates/freshell-sessions/src/resume_input.rs shared/resume-input-parser.ts crates/freshell-ws/tests/resume_validation_gate.rs
+git commit -m "feat(antigravity): validated exact resume with no silent replacement"
+```
+
+---
+
+### Task 8: Activity, turn completion, and attention
+
+**Files:**
+- Create: `crates/freshell-activity/src/antigravity.rs` (pure tracker + record classification), the transcript-tail read helper in the same module (amplifier `tailer` pattern)
+- Modify: `crates/freshell-activity/src/lib.rs` (module + `TrackerEffect` reuse), `crates/freshell-ws/src/activity.rs` (Created/Input/Output/Exit dispatch arms :1106/:1247/:1341/:1436, inotify lane ownership modeled on the amplifier lane :16/:122-129, `*_frames` mapper, `next_deadline` aggregation, `attach_antigravity_association` seam from Task 6), `crates/freshell-ws/src/lib.rs`/state wiring, `shared/ws-protocol.ts` + `crates/freshell-protocol` (new `antigravity.activity.updated` record, model: the amplifier record), `src/store/antigravityActivitySlice.ts` (model: an existing activity slice), `src/lib/pane-activity.ts:209` (`TRULY_IDLE_CLI_MODES` + `resolvePaneActivity` branch :150-184), `src/App.tsx` (frame ingestion, model: the amplifier activity record fold)
+- Test: in-file tracker tests (`crates/freshell-activity`), hub tests (`crates/freshell-ws --lib activity`), client vitest (`pane-activity.test.ts`, `turnCompletionSlice.test.ts`), and the Task 6 rebind suite's activity phases
+
+**Interfaces:**
+- Consumes: `TrackerEffect` enum (lib.rs:41-57: `Changed`/`TurnComplete`/`ForceRead`/`AttentionBoundary`), `TurnCompletionLedger` (completion_seq), `IdleGate` (`IDLE_GRACE_MS = 2_000`, `terminal.idle` reason enum `grace|queue-empty` — closed, do not extend), the amplifier lane wiring (inotify watcher + offset lanes + `attach_amplifier_association`, activity.rs:114-129/:408-425), `terminal.turn.complete` frame minting (activity.rs:2271), death-bell semantics (activity.rs:1389-1420).
+- Produces: `AntigravityActivityTracker` — `note_record(record)` from the tailer lane: `user_message` ⇒ Busy (a new submit); `turn_settled{fullyIdle:true}` ⇒ exactly one `TurnComplete` (deduped per settle); `turn_settled{fullyIdle:false}` ⇒ stay Busy (outstanding async work — invocation completion is NOT turn completion); `turn_settled{outcome:"errored"}` ⇒ `TurnComplete` (attention is outcome-uniform); deadman `ANTIGRAVITY_BUSY_DEADMAN_MS = 120_000` ⇒ `ForceRead` (re-read latest transcript records; a found settle completes, else stays busy). The tailer reads ONLY the pane's bound transcript (from Task 6's bound path — never the last-conversations cache). `supports_turn_signal` stays claude|codex only (antigravity is NOT a BEL mode; no `turn-complete-signal` change, no `normalizeTurnCompleteSignalMode` change). Client: busy/blue resolves from the new activity record; `terminal.idle` drives attention via the existing mode-agnostic `recordTerminalIdle` path once the server mints it.
+
+- [ ] **Step 1: Write the failing tests**
+
+1. Tracker units (in `antigravity.rs`): submit-then-settle ⇒ Busy then exactly one TurnComplete with monotonic completion_seq; `fullyIdle:false` settle ⇒ no TurnComplete, still Busy; errored settle ⇒ TurnComplete; deadman fires ForceRead after 120 s quiet while busy; untracked terminal ⇒ no effects; exit while busy ⇒ hub death-bell path emits one `terminal.idle` (hub test).
+2. Hub tests (`cargo test -p freshell-ws --lib activity`): antigravity Created arms the tracker (add `antigravity_and_gemini_kimi_split` asserting antigravity is tracked while gemini/kimi stay inert — extend `gemini_and_kimi_are_status_inert` :2996); Input submit arms; a scripted settle drives `terminal.turn.complete` then exactly one `terminal.idle{reason:"grace"}` (model: `claude_submit_bel_turn_complete_and_terminal_idle_flow` :2404 but record-fed, not BEL-fed).
+3. Client vitest: `pane-activity.test.ts` — antigravity pane resolves BUSY when the activity record exists and IDLE otherwise; `TRULY_IDLE_CLI_MODES` contains antigravity; `turnCompletionSlice.test.ts` unchanged semantics (terminal.idle path is mode-agnostic — add an antigravity record ingestion case).
+
+- [ ] **Step 2: Run the tests and verify the intended failure**
+
+Run: `cargo test -p freshell-activity antigravity && cargo test -p freshell-ws --lib activity && pnpm run test:vitest run test/unit/client/lib/pane-activity.test.ts test/unit/client/store/turnCompletionSlice.test.ts --config config/vitest/vitest.config.ts`
+
+Expected: FAIL — no tracker module; hub `_ => {}` arm leaves antigravity inert; client has no branch.
+
+- [ ] **Step 3: Add the minimal production implementation**
+
+Implement the pure tracker + record classifier in `crates/freshell-activity/src/antigravity.rs` (`// Stage-1 candidate contract:` header — classification is conservative: only `turn_settled` records mint completions). Add the tail-read helper (amplifier `tailer` pattern: attach-at offset, bounded reads, degrade reasons). In the hub: add the four dispatch arms, the per-terminal transcript lane (attach on association — Task 6's `attach_antigravity_association` now binds the lane), the `*_frames` mapper emitting `antigravity.activity.updated`, and `expire_due`/death-bell reuse. Protocol: new `AntigravityActivityUpdated` record in `freshell-protocol` + zod twin in `shared/ws-protocol.ts` (additive). Client: new slice, `resolvePaneActivity` branch, `TRULY_IDLE_CLI_MODES` gains `'antigravity'`, `App.tsx` fold (model: the amplifier record's ingestion path).
+
+- [ ] **Step 4: Run the focused tests**
+
+Run: same as Step 2. Expected: PASS.
+
+- [ ] **Step 5: Refactor while green**
+
+Confirm no BEL code path gained antigravity (`supports_turn_signal` unchanged — add one assertion in `test/unit/shared/turn-complete-signal.test.ts` that antigravity is NOT signal-supported, mirroring the gemini pin at :16-17). Rerun.
+
+- [ ] **Step 6: Run impacted-test verification**
+
+Impacted: all activity suites (`cargo test -p freshell-activity`), the full hub lib suite (`cargo test -p freshell-ws --lib activity`), the rebind suite from Task 6 (association now also binds lanes), the full attention vitest set (`turn-complete-signal`, `turnCompletion*`).
+
+Run: `cargo test -p freshell-activity && cargo test -p freshell-ws --lib activity && cargo test -p freshell-ws --test antigravity_session_rebind && pnpm run test:vitest run test/unit/shared/turn-complete-signal.test.ts test/unit/client/lib/pane-activity.test.ts test/unit/client/store/turnCompletionSlice.test.ts test/unit/client/store/turnCompletionAttention.test.ts --config config/vitest/vitest.config.ts`
+
+Expected: PASS.
+
+- [ ] **Step 7: Commit the task**
+
+```bash
+git add crates/freshell-activity/src/antigravity.rs crates/freshell-activity/src/lib.rs crates/freshell-ws/src/activity.rs crates/freshell-ws/src/lib.rs crates/freshell-protocol/src/ shared/ws-protocol.ts src/store/antigravityActivitySlice.ts src/lib/pane-activity.ts src/App.tsx test/unit/shared/turn-complete-signal.test.ts test/unit/client/lib/pane-activity.test.ts
+git commit -m "feat(antigravity): transcript-tail activity with turn-completion attention"
+```
+
+---
+
+### Task 9: Unified naming across every surface
+
+**Files:**
+- Modify: `shared/session-names.ts:20,24-31,221-222,232-240` (`NamedProviderSchema`, `UnifiedAgentModeSchema`, `TERMINAL_UNIFIED_MODES`, `isUnifiedAgentMode`), `src/store/selectors/sessionNameSelectors.ts:64-66` (`isNamedProvider`), `crates/freshell-protocol/src/session_names.rs:23-50` (`NamedProvider` enum + wire string + `display_label`), `crates/freshell-freshagent/src/naming.rs:264-306` (`TERMINAL_UNIFIED_MODES`, `named_provider_for`), `crates/freshell-freshagent/src/layout_store_content.rs:63-67` (mode label map), `shared/name-evidence.ts:77-96` + `crates/freshell-sessions/src/name_evidence.rs:46-60` (label rows) + `test/fixtures/name-evidence/cases.json` (fixture rows FIRST, both twins consume it), `src/lib/coding-cli-utils.ts` (no change — verify only)
+- Test: `test/unit/shared/session-names.test.ts`, `crates/freshell-freshagent` naming in-file tests (:1091-1137), `test/unit/shared/name-evidence.test.ts` + `crates/freshell-sessions/tests/name_evidence.rs`, naming store/selector tests
+
+**Interfaces:**
+- Consumes: the pending-handle → durable-bind chain (`admit_pending_projection`/`ensure_pending` naming.rs:588-611; `bind_pending_naming` via Task 6's adoption tail), `NamedProvider` wire enum, name-evidence label fixtures.
+- Produces: antigravity joins the unified ONE-durable-name regime (pane header, tab, sidebar row, history row, terminal presentation, API projections); `NamedProvider::Antigravity` wire string `"antigravity"`, `display_label` `"Antigravity CLI"` (directory-basename fallback); native rename writeback stays honest-`unsupported` (no `NativeLocation` variant — no proven provider rename operation; `NativeNameDispatch` answers `Unsupported`, which the wire contract already models).
+
+- [ ] **Step 1: Write the failing tests**
+
+1. `test/unit/shared/session-names.test.ts`: `isUnifiedAgentMode('antigravity') === true`; `NamedProviderSchema` accepts `'antigravity'`; the scope test at :65 gains antigravity true (and keeps gemini/kimi/amplifier false).
+2. `cargo test -p freshell-freshagent naming`: update `unified_agent_scope_matches_exactly_the_six_modes` (:1091 — now seven modes) and `named_provider_answers_the_scoped_provider_only` (:1120 — antigravity maps to `NamedProvider::Antigravity`; gemini still does not).
+3. Name-evidence: add fixture rows to `test/fixtures/name-evidence/cases.json` proving an `Antigravity CLI` title is a default label (never name evidence), then run both twins.
+4. `src/store/selectors/sessionNameSelectors` tests: pane header/history row resolve the antigravity saved name (`selectSessionRowRecord` no longer drops provider `antigravity`).
+5. Store tests: a rename via `PATCH /api/session-names` for `{provider:'antigravity', sessionId}` persists and propagates to tab title mirror (model: `sessionNames.test.ts`, `savedNameTabTitleMirror.test.ts`).
+
+- [ ] **Step 2: Run the tests and verify the intended failure**
+
+Run: `pnpm run test:vitest run test/unit/shared/session-names.test.ts test/unit/shared/name-evidence.test.ts test/unit/client/store/sessionNames.test.ts --config config/vitest/vitest.config.ts && cargo test -p freshell-freshagent naming && cargo test -p freshell-sessions --test name_evidence`
+
+Expected: FAIL — antigravity out of every list/schema/enum.
+
+- [ ] **Step 3: Add the minimal production implementation**
+
+Widen every list (exact edits): `NamedProviderSchema = z.enum(['claude','codex','opencode','antigravity'])`; `UnifiedAgentModeSchema` + `TERMINAL_UNIFIED_MODES` gain `'antigravity'`; `isNamedProvider` gains the check; `NamedProvider::Antigravity` with `as_str() == "antigravity"`, `display_label() == "Antigravity CLI"`; naming.rs `TERMINAL_UNIFIED_MODES` (`[&str; 4]`) + `"antigravity" => NamedProvider::Antigravity` arm; layout_store_content label `"antigravity" => "Antigravity CLI"`; name-evidence label rows `antigravity`/`antigravity cli` in BOTH twins (fixture file first). No NativeLocation variant; no native adapter (unsupported is the honest modeled state — the plan forbids transcript edits).
+
+- [ ] **Step 4: Run the focused tests**
+
+Run: same as Step 2. Expected: PASS.
+
+- [ ] **Step 5: Refactor while green**
+
+None expected — list extension. Verify `src/lib/session-names.ts` needs no edit (inherits the shared schema — the wholesale-400 guard now accepts antigravity refs).
+
+- [ ] **Step 6: Run impacted-test verification**
+
+Impacted: all naming suites (shared + Rust twins + store/selector tests + the batched-read 400 guard) and the cross-mode gemini preservation pins.
+
+Run: `pnpm run test:vitest run test/unit/shared/session-names.test.ts test/unit/shared/name-evidence.test.ts test/unit/shared/session-flavor.test.ts test/unit/client/lib/session-names.test.ts test/unit/client/store/sessionNames.test.ts test/unit/client/store/sessionNameLifecycle.test.ts test/unit/client/store/savedNameTabTitleMirror.test.ts test/unit/client/store/storedTabTitleHeal.test.ts test/unit/client/components/UnifiedAgentRename.test.tsx --config config/vitest/vitest.config.ts && cargo test -p freshell-freshagent naming && cargo test -p freshell-server --lib session_name`
+
+Expected: PASS (gemini's legacy pins must stay green — gemini is NOT added to any unified list).
+
+- [ ] **Step 7: Commit the task**
+
+```bash
+git add shared/session-names.ts src/store/selectors/sessionNameSelectors.ts crates/freshell-protocol/src/session_names.rs crates/freshell-freshagent/src/naming.rs crates/freshell-freshagent/src/layout_store_content.rs shared/name-evidence.ts crates/freshell-sessions/src/name_evidence.rs test/fixtures/name-evidence/cases.json test/unit/shared/session-names.test.ts
+git commit -m "feat(antigravity): unified durable naming with unsupported native sync"
+```
+
+---
+
+### Task 10: Contract-faithful fake `agy` fixtures
+
+**Files:**
+- Create: `test/e2e-browser/fixtures/providers/fake-agy.mjs` (thin adapter), `test/e2e-browser/fixtures/fake-agy-terminal.mjs` (contract-faithful store-writing fake)
+- Modify: `test/e2e-browser/specs/harness-03-provider-fixtures.spec.ts` (provider loop row + resume argv shape)
+- Test: the harness-03 spec rows; helper unit tests colocated if any helper is added
+
+**Interfaces:**
+- Consumes: HARNESS-03 engine (`fixture-core.mjs`, `terminal-cli.mjs` with `detectLaunch` override seam), the fake-codex-terminal contract shape (`fake-codex-terminal.mjs`: argv log, Enter-anchored store write, resume verification, race gate).
+- Produces: a fake `agy` that (a) records argv to `FAKE_AGY_TERMINAL_ARGV_LOG` JSONL; (b) on first Enter mints `conversationId = crypto.randomUUID()` and writes `$HOME/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl` in the candidate schema (first line the ownership record), plus `cache/last_conversations.json` (so specs can prove Freshell NEVER resumes from it); (c) per stdin line: busy marker → append user+assistant records → bare BEL + `turn done.` → appends `turn_settled{fullyIdle:true}`; a line matching `/^async:/` appends `turn_settled{fullyIdle:false}` (no completion); `/^switch:/` mints a NEW conversation dir (rebind path); `/^explode:/` exits mid-turn; `/^approval:/` renders a greppable approval prompt; a nonce after `remember:` is echoed on later turns (resume-content proof); (d) `--conversation <id>` resume: missing `brain/<id>/` ⇒ non-zero exit with greppable error, else `agy: resumed conversation <id>` and transcript continues; (e) optional `FAKE_AGY_STORE_GATE_PATH` race gate (copy fake-codex:195-208).
+
+- [ ] **Step 1: Write the failing test**
+
+Add the antigravity rows to `harness-03-provider-fixtures.spec.ts` (provider list + resume argv `--conversation <id>` shape, model: lines 64, 102-111). Run: `pnpm run test:e2e --local --project=chromium test/e2e-browser/specs/harness-03-provider-fixtures.spec.ts` — Expected: FAIL (no fake-agy adapter).
+
+- [ ] **Step 2: Implement the fixtures**
+
+`fake-agy.mjs` (adapter, model: fake-gemini.mjs but with `detectLaunch` handling `--conversation`/`--session-id`); `fake-agy-terminal.mjs` (model: fake-codex-terminal.mjs line-for-line with the store layout above). Wire the harness-03 rows.
+
+- [ ] **Step 3: Run the focused test**
+
+Run: same as Step 1. Expected: PASS.
+
+- [ ] **Step 4: Refactor while green**
+
+Share nothing new with codex's fake beyond the existing engine; keep the fake hermetic (env allowlist discipline from fixture-core so credentials can never leak).
+
+- [ ] **Step 5: Run impacted-test verification**
+
+Impacted: the harness-03/06 fixture specs (full files) and the e2e helper unit lane.
+
+Run: `pnpm run test:e2e --local --project=chromium test/e2e-browser/specs/harness-03-provider-fixtures.spec.ts test/e2e-browser/specs/harness-06-misc-fixtures.spec.ts && pnpm run test:e2e:helpers`
+
+Expected: PASS.
+
+- [ ] **Step 6: Commit the task**
+
+```bash
+git add test/e2e-browser/fixtures/providers/fake-agy.mjs test/e2e-browser/fixtures/fake-agy-terminal.mjs test/e2e-browser/specs/harness-03-provider-fixtures.spec.ts
+git commit -m "test(antigravity): contract-faithful fake agy fixtures"
+```
+
+---
+
+### Task 11: Browser spec — launch (picker, REST, CLI/MCP, errors, gemini preserved)
+
+**Files:**
+- Create: `test/e2e-browser/specs/google-cli-launch-rust.spec.ts`
+- Test: the spec itself (cloud-legal: deterministic fakes, no wall-clock-sensitive waits)
+
+**Interfaces:**
+- Consumes: `RustServer` fixture (per-test server, `env: { ANTIGRAVITY_CMD: <fake>, GEMINI_CMD: <fake-gemini.mjs> }`, `setupHome` seeding `codingCli.enabledProviders: ['antigravity','gemini']` — model: `codex-terminal-restore-rust.spec.ts:59-198`), `openPanePicker`, `harness.getTerminalBuffer`, `harness.getPaneLayout`, `postJsonRetry429`, `installFakeCli` copy-then-chmod pattern, `fake-agy-terminal.mjs` argv log.
+- Produces: proof of requirement 1 + the launch half of requirement 6.
+
+- [ ] **Step 1: Write the spec (red)**
+
+Scenarios (all in one spec, per-test servers): picker shows and launches `Antigravity CLI` (tile → directory combobox → leaf `content.mode === 'antigravity'`, buffer shows `agy> `); REST `POST /api/tabs {mode:'antigravity', cwd}` creates a pane; argv log asserts `-i` present, `-p` absent, `--model m` only when a model setting was configured; `ANTIGRAVITY_CMD=/nonexistent/agy` create answers a visible error mentioning `ANTIGRAVITY_CMD` with NO pane and no silent shell fallback; CLI client `new-tab --mode antigravity` (mirror `test/unit/cli/commands.test.ts` POST shape — assert the request body in the CLI unit test if the e2e lane is local-only); gemini preservation: a gemini pane still launches via `GEMINI_CMD` fake and its legacy behavior is unchanged.
+
+Run: `pnpm run test:e2e --local --project=chromium test/e2e-browser/specs/google-cli-launch-rust.spec.ts` — Expected: FAIL at the first antigravity assertion before Task 2-3 land (with them landed it should pass; write it after Task 3 in sequence so red comes from the spec's own gaps: e.g. run it red against a server booted WITHOUT the extension seeded to see honest failure, then green with it).
+
+- [ ] **Step 2: Make it green**
+
+No product changes expected (Tasks 2-10 already landed); fix spec bugs only. Expected: PASS locally.
+
+- [ ] **Step 3: Verify cloud legality**
+
+Confirm the spec is NOT in `CLOUD_SKIP_SPECS` (it should not need to be — deterministic fakes, generous polls) and run it on the configured backend: `pnpm run test:e2e --cloud --project=chromium test/e2e-browser/specs/google-cli-launch-rust.spec.ts` (sharded run covers it; verify nonzero execution in the report). Expected: PASS on cloud.
+
+- [ ] **Step 4: Impacted-test verification**
+
+New-spec parse gate: create `test/e2e-browser/tsconfig.google-cli-spec-parse-check.json` per the `tsconfig.<slug>-spec-parse-check.json` convention, including `specs/google-cli-launch-rust.spec.ts` (Tasks 12/13 append their specs to this include list), then `pnpm exec tsc -p test/e2e-browser/tsconfig.google-cli-spec-parse-check.json`. Expected: zero error lines attributed to the included specs.
+
+- [ ] **Step 5: Commit the task**
+
+```bash
+git add test/e2e-browser/specs/google-cli-launch-rust.spec.ts test/e2e-browser/tsconfig.google-cli-spec-parse-check.json
+git commit -m "test(antigravity): browser launch spec incl. gemini preservation"
+```
+
+---
+
+### Task 12: Browser spec — history, search, exact resume across restart
+
+**Files:**
+- Create: `test/e2e-browser/specs/google-cli-history-resume-rust.spec.ts`
+
+**Interfaces:**
+- Consumes: Task 10 fake (store writes, nonce recall, missing-store error), `server.restart()` (same home/port/token), session-directory HTTP routes, sidebar/history selectors, `WsCapture` where frames matter.
+
+- [ ] **Step 1: Write the spec (red)**
+
+Scenarios: two concurrent panes in the SAME cwd submit distinct nonces → each leaf gains its own `sessionRef {provider:'antigravity'}` with distinct ids; `/api/session-directory` lists both (right cwd/title/first message); a `userMessages`-tier search hits the normalized conversation (not raw JSON grep); stop the owned fixture process → pane `exited`, identity retained; `server.restart()` → the restored pane respawns with the ADJACENT argv pair `--conversation <sessionId>` and the fake echoes the remembered nonce on a second turn (continued content, not just id match); `--continue` NEVER appears in any captured argv; zero-turn pane restores FRESH (no sessionRef, no resume argv); delete `brain/<id>/` under the isolated HOME → resume attempt surfaces the fake's missing-store error distinctly (no replacement conversation).
+
+- [ ] **Step 2: Run and verify**
+
+Run: `pnpm run test:e2e --local --project=chromium test/e2e-browser/specs/google-cli-history-resume-rust.spec.ts` — Expected: PASS after Tasks 4-7 (red first for any gap they left). Then cloud: `pnpm run test:e2e --cloud --project=chromium test/e2e-browser/specs/google-cli-history-resume-rust.spec.ts` — Expected: PASS, nonzero cases. Append the spec to `test/e2e-browser/tsconfig.google-cli-spec-parse-check.json` and rerun `pnpm exec tsc -p test/e2e-browser/tsconfig.google-cli-spec-parse-check.json` — Expected: zero errors.
+
+- [ ] **Step 3: Commit the task**
+
+```bash
+git add test/e2e-browser/specs/google-cli-history-resume-rust.spec.ts test/e2e-browser/tsconfig.google-cli-spec-parse-check.json
+git commit -m "test(antigravity): browser history and exact-resume spec"
+```
+
+---
+
+### Task 13: Browser spec — identity, activity, attention, naming agreement
+
+**Files:**
+- Create: `test/e2e-browser/specs/google-cli-identity-activity-rust.spec.ts`
+
+**Interfaces:**
+- Consumes: `WsCapture` (frames `terminal.session.associated`, `terminal.turn.complete`, `terminal.idle`), the Task 10 fake's async/switch/explode/approval commands, naming helpers (`expectSharedName` from `helpers/unified-agent-names.ts`), Task 8's activity record, Task 9's naming surfaces.
+
+- [ ] **Step 1: Write the spec (red)**
+
+Scenarios: association frame after the store write binds identity; busy while a turn runs; exactly one `terminal.turn.complete` + one `terminal.idle{reason:'grace'}` per settled turn; `/async:` turn (settle without fullyIdle) → NO completion, busy persists, follow-up settle completes once; scripted approval prompt → waiting treatment (if the waiting edge is not implemented for terminal antigravity panes, assert the honest broader state and record it — do not fake evidence); `/switch:` rebind updates sessionRef to the new id and stale old-launch writes are rejected (no second association for the old id); duplicate settle records replayed by the fake → no double completion, one bell; `/explode:` mid-turn crash → the unified attention edge rings once; naming: pane header, tab title, sidebar row, and history row agree after reload, and manual Rename wins (antigravity is in the unified store — explicitly NOT the gemini legacy pin).
+
+- [ ] **Step 2: Run and verify**
+
+Run: `pnpm run test:e2e --local --project=chromium test/e2e-browser/specs/google-cli-identity-activity-rust.spec.ts` — Expected: PASS after Tasks 6/8/9. Cloud: `pnpm run test:e2e --cloud --project=chromium test/e2e-browser/specs/google-cli-identity-activity-rust.spec.ts` — Expected: PASS, nonzero cases. Append the spec to `test/e2e-browser/tsconfig.google-cli-spec-parse-check.json` and rerun `pnpm exec tsc -p test/e2e-browser/tsconfig.google-cli-spec-parse-check.json` — Expected: zero errors.
+
+- [ ] **Step 3: Commit the task**
+
+```bash
+git add test/e2e-browser/specs/google-cli-identity-activity-rust.spec.ts test/e2e-browser/tsconfig.google-cli-spec-parse-check.json
+git commit -m "test(antigravity): browser identity/activity/naming spec"
+```
+
+---
+
+### Task 14: Managed-runtime row (honest blocked state), real-provider smoke, docs
+
+**Files:**
+- Modify: `crates/freshell-agent-runtime/src/lib.rs:107-254` (`PROVIDER_CAPABILITIES` antigravity row) and its fail-closed tests (2420/2466-2478 — antigravity NOT added to deferred/certified lists), `crates/freshell-ws/src/terminal.rs:3768-3784` (manifest parity test), `docs/development/runtime-provider-capabilities.json` (mirror row + NOT in `deferredProviders`), `README.md` (provider row + limitations), `docs/index.html` (picker mock gains an Antigravity tile if the mock shows provider tiles), `AGENTS.md` (one-line link note already present — verify)
+- Create: `test/integration/real/antigravity-launch-smoke.test.ts`
+- Test: `cargo test -p freshell-agent-runtime --locked`, the smoke (environment-optional), runtime gate classification
+
+**Interfaces:**
+- Consumes: the `ProviderCapability` schema (lib.rs:75-102), the gemini row as the disabled template (lib.rs:218-235), the amplifier smoke's three-tier gating (`amplifier-launch-smoke.test.ts:24-64`), `scripts/testing/provider-certification.ts` classification (not_applicable rows outside managed scope).
+- Produces: an `antigravity` capability row in the fully disabled state — `certification_state: NotApplicable` (today), `qualification_ready: false`, `managed_enabled: false`, `durable_recovery_enabled: false`, `recovery_paths: &[]`, `managed_modes: &["antigravity"]`, `execution_boundary: "legacy-extension"`, `identity_capture: "terminal locator (candidate contract; managed identity unimplemented)"`, `state_store: "$HOME/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl (candidate)"`, `resume_command: None` (no managed claim), `zero_turn_policy: "no-continuity-claim"`, `checkpoint_policy: "none"`, `bootstrap: "extension-owned"`, `live_gate: "not-enabled"`, `blocked_reason: Some("BLOCKED_RECOVERY_IMPLEMENTATION")`. The qualification spec, `QUALIFIABLE_TERMINAL_PROVIDERS`, Docker image pin, `ProviderPreparation`/secret/bootstrap arms, and any managed doorway are explicitly NOT added — they are the named blocker chain gated on Task 1's real-binary evidence + a live qualification receipt (per the first draft's gate 5). The smoke: version probe always-runs when `agy` (or `ANTIGRAVITY_CMD`) is on PATH, skip-never-fail otherwise; the headless tier is double-gated (`FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1` + antigravity key) and never runs in default CI.
+
+- [ ] **Step 1: Write the failing tests**
+
+1. `cargo test -p freshell-agent-runtime --locked`: add a red test `antigravity_row_is_fully_blocked_and_not_applicable` asserting the row's fields exactly as above AND that `deferred`/`certified_durable` lists are UNCHANGED (`["claude","codex","amplifier"]` / `["opencode"]`) and `qualification_policy` rejects `"antigravity"` (model: the gemini rejection test at qualification_policy.rs:95-111).
+2. `crates/freshell-ws/src/terminal.rs` manifest parity test: `managed_runtime_mode("antigravity") == false` follows the mirror row.
+3. Docs mirror parity test (`checked_in_manifest_publishes_the_same_certification_states`) — add the mirror row to the fixture the test reads (`docs/development/runtime-provider-capabilities.json`) with `certificationState: "not_applicable"`.
+4. Smoke skeleton red: `test/integration/real/antigravity-launch-smoke.test.ts` with a version-probe assertion against a stub binary via `ANTIGRAVITY_CMD` (proves the probe logic without the real CLI).
+
+- [ ] **Step 2: Run and verify the intended failure**
+
+Run: `cargo test -p freshell-agent-runtime --locked && cargo test -p freshell-ws --lib managed_modes_follow`
+
+Expected: FAIL — no row.
+
+- [ ] **Step 3: Add the minimal production implementation**
+
+Add the row (fields above) to `PROVIDER_CAPABILITIES`; add the docs-mirror row; update `README.md` with the provider row, `ANTIGRAVITY_CMD` (already added in Task 2 — verify), and a limitations paragraph (candidate contracts, no managed execution, no hook installation, native rename unsupported, real-binary validation pending); `docs/index.html` picker mock gains the Antigravity tile only if provider tiles are mocked there. Implement the smoke per the amplifier three-tier pattern with `ANTIGRAVITY_CMD` resolution.
+
+- [ ] **Step 4: Run the focused tests**
+
+Run: `cargo test -p freshell-agent-runtime --locked && cargo test -p freshell-ws --lib managed_modes_follow && FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 pnpm run test:vitest run test/integration/real/antigravity-launch-smoke.test.ts --config config/vitest/vitest.config.ts`
+
+Expected: PASS (smoke skips with a clear reason when no binary).
+
+- [ ] **Step 5: Refactor while green**
+
+None — static row + docs. Verify the runtime gate classifier treats the row as outside managed scope: `pnpm run test:vitest run test/runtime/gates/provider-certification.test.ts --config config/vitest/vitest.config.ts` (PC gates must not demand a receipt for a not_applicable row).
+
+- [ ] **Step 6: Run impacted-test verification**
+
+Impacted: the supervisor qualification-scope test (`crates/freshell-supervisor/src/service.rs:4212` — antigravity must NOT be in scope), provider inventory (`cargo test -p freshell-agent-runtime provider_inventory` — the inventory list stays 4), and the docs sweep.
+
+Run: `cargo test -p freshell-supervisor --lib service && cargo test -p freshell-agent-runtime`
+
+Expected: PASS.
+
+- [ ] **Step 7: Commit the task**
+
+```bash
+git add crates/freshell-agent-runtime/src/lib.rs crates/freshell-ws/src/terminal.rs docs/development/runtime-provider-capabilities.json README.md docs/index.html test/integration/real/antigravity-launch-smoke.test.ts
+git commit -m "feat(antigravity): blocked managed row, real-provider smoke, docs"
+```
+
+---
+
+## Verification and completion gates
+
+1. Per task: the focused commands above, red first, green after, impacted set rerun.
+2. End of execution: run the broad gate from the implementation worktree:
+   `GCLOUD_ROBOT_REQUIRE=1 FRESHELL_RUST_TEST_SANDBOX=1 FRESHELL_VITEST_BACKEND=cloud FRESHELL_E2E_BACKEND=cloud FRESHELL_TEST_SUMMARY='the-usual google-cli plan full-suite gate' pnpm run check`
+   Pass criterion: green excluding ledger-recorded pre-existing failures (baseline ledger: the `freshell-supervisor` `provider_claude_nested_source_reply_requires_live_scope_after_private_ipc` flake with its reproduction receipt).
+3. The three new browser specs must pass on the configured cloud backend with nonzero case counts and must not be added to `CLOUD_SKIP_SPECS`. The runtime qualification spec for antigravity is deliberately NOT created (managed adapter blocked) — this deviation from the first draft's Stage-7 file list is required by the honesty discipline (Global Constraints 4/5) and recorded in the Provider Contract Record.
+4. `pnpm run lint` clean (a11y rules for the new settings row).
+5. Commit focused changes per task; push the branch only when the user asks; PR creation requires explicit user approval. The live 3001 server is never restarted by this work (no deploy steps exist in this plan).
+
+## Known limitations this plan deliberately ships (recorded, not hidden)
+
+1. All native-contract behavior (transcript schema, store authority, flags) is candidate-contract until Task 1 or a later real-binary probe validates it; every seam carries a `Stage-1 candidate contract` comment and the README says so.
+2. No antigravity hooks are installed anywhere; identity/activity are read-only disk integrations (the hook producer stays a named blocker).
+3. Managed execution, durable recovery, qualification, and the runtime image pin for antigravity are NOT built; the capability row fails closed and says why.
+4. Native rename writeback is `unsupported` (no proven provider rename operation; transcript edits forbidden).
+5. Approval/question distinction is only surfaced to the extent the transcript tailer can prove it; otherwise the broader busy/idle state is shown.
