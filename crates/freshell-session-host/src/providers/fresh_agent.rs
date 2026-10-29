@@ -2108,11 +2108,11 @@ mod tests {
                 .map(|key| (*key, std::env::var_os(key)))
                 .collect(),
         );
-        let exec_dir = tempfile::tempdir_in(
-            std::env::var_os("FRESHELL_TEST_EXECUTABLE_TMP_DIR")
-                .expect("owned executable fixture root"),
-        )
-        .unwrap();
+        let exec_dir = match std::env::var_os("FRESHELL_TEST_EXECUTABLE_TMP_DIR") {
+            Some(directory) => tempfile::tempdir_in(directory),
+            None => tempfile::tempdir(),
+        }
+        .expect("owned executable fixture directory");
         let wrapper = exec_dir.path().join("codex.mjs");
         std::fs::write(
             &wrapper,
