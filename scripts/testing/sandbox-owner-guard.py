@@ -14,7 +14,7 @@ def identity(pid):
     try:
         fields = Path(f"/proc/{pid}/stat").read_text().rpartition(") ")[2].split()
         return None if fields[0] == "Z" else fields[19]
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return None
 
 

@@ -185,6 +185,37 @@ with (root / 'receipt.jsonl').open('a') as log:
 }
 
 describe('sandbox wrapper owned launch settlement', () => {
+  it('joins a completed guard when procfs reports ESRCH during its exit', () => {
+    const f = fixture('published-success')
+    try {
+      const result = spawnSync('python3', ['-c', String.raw`
+import errno, json, runpy, sys
+from pathlib import Path
+from unittest.mock import patch
+guard = runpy.run_path(sys.argv[1])
+control = Path(sys.argv[2])
+(control / 'owner-guard.json').write_text(json.dumps({'pid': 194708, 'identity': 'owned-birth'}))
+original_read = Path.read_text
+def read_during_exit(self, *args, **kwargs):
+    if str(self) == '/proc/194708/stat':
+        raise ProcessLookupError(errno.ESRCH, 'Process exited during procfs read')
+    return original_read(self, *args, **kwargs)
+results = []
+with patch.object(Path, 'read_text', read_during_exit):
+    for code in [0, 1]:
+        (control / 'owner-guard.done').write_text(json.dumps({'code': code}))
+        results.append(guard['join'](control))
+    (control / 'owner-guard.done').unlink()
+    results.append(guard['join'](control))
+print(json.dumps(results))
+`, path.resolve('scripts/testing/sandbox-owner-guard.py'), path.join(f.root, 'control')], {
+        encoding: 'utf8', timeout: 10_000,
+      })
+      expect(result.status, result.stderr).toBe(0)
+      expect(JSON.parse(result.stdout)).toEqual([0, 1, 1])
+    } finally { f.cleanup() }
+  })
+
   it.each(['published', 'published-success'])('fails when the independent guard reports an error before %s completion', mode => {
     const f = fixture(mode)
     try {
