@@ -30,6 +30,15 @@ describe('Codex 0.164.0 release contract through an isolated Responses provider'
       const capture = await captureNativeScenario(scenario, { timeoutMs: 120_000 })
       expect(capture.passed).toBe(true)
       expect(capture.fixtureTraffic.length).toBeGreaterThan(0)
+      if (scenario === 'model-effort-usage') {
+        const [explicit, nativeDefault] = capture.observations.sameThreadNativeDefault
+        expect(explicit.traffic[0].body.reasoning.effort).toBe('xhigh')
+        expect(nativeDefault.params).not.toHaveProperty('effort')
+        expect(nativeDefault.params.collaborationMode.settings.reasoning_effort).toBeNull()
+        expect(nativeDefault.completed.params.turn.status).toBe('completed')
+        expect(nativeDefault.traffic.length).toBeGreaterThan(0)
+        expect(nativeDefault.current.thread.id).toBe(explicit.current.thread.id)
+      }
     }, 180_000,
   )
   it.each(['read-only', 'workspace-write'])('executes restricted never policy with actual %s effects', async sandboxMode => {

@@ -2,6 +2,7 @@
 
 import { WebSocketServer } from 'ws'
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import net from 'node:net'
 import os from 'node:os'
@@ -546,6 +547,22 @@ function maybeWriteRolloutForMethod(method, params) {
   }
 }
 
+function recordInputFileReads(method, params) {
+  if (method !== 'turn/start' || !behavior.appendInputFileReadLogPath) return
+  const text = (params?.input ?? []).filter(part => part.type === 'text').map(part => part.text).join('\n')
+  for (const match of text.matchAll(/^- (.+)$/gm)) {
+    const file = match[1]
+    if (!path.isAbsolute(file)) continue
+    const size = fs.statSync(file).size
+    if (size > 10 * 1024 * 1024) throw new Error(`Native fixture attachment exceeds its bounded read: ${file}`)
+    const bytes = fs.readFileSync(file)
+    fs.appendFileSync(behavior.appendInputFileReadLogPath, JSON.stringify({
+      threadId: params.threadId, pid: process.pid, uid: process.getuid?.(), gid: process.getgid?.(),
+      path: file, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex'),
+    }) + '\n')
+  }
+}
+
 const listenUrl = parseListenUrl(process.argv.slice(2))
 const behavior = loadBehavior()
 if (process.env.FAKE_CODEX_APP_SERVER_ARG_LOG) {
@@ -817,7 +834,7 @@ wss.on('connection', (socket) => {
     }
     const method = message.method
     if (behavior.appendRequestLogPath) {
-      fs.appendFileSync(behavior.appendRequestLogPath, JSON.stringify({ method, params: message.params, codexHome: getCodexHome(), cwd: process.cwd() }) + '\n')
+      fs.appendFileSync(behavior.appendRequestLogPath, JSON.stringify({ method, params: message.params, codexHome: getCodexHome(), cwd: process.cwd(), ...(behavior.requestLogContext ? { context: behavior.requestLogContext } : {}) }) + '\n')
     }
 
     if (
@@ -968,6 +985,7 @@ wss.on('connection', (socket) => {
       // response implies the witness entry is already on disk.
       appendThreadOperation(method, message.params, result)
       maybeWriteRolloutForMethod(method, message.params)
+      recordInputFileReads(method, message.params)
       socket.send(JSON.stringify({
         id: message.id,
         result,
@@ -1003,7 +1021,8 @@ wss.on('connection', (socket) => {
           threadId: message.params?.threadId,
           turn: { id: result.turn.id, status: 'inProgress' },
         })
-        if (behavior.liveTranscript) {
+        const prompt = (message.params?.input ?? []).filter((part) => part.type === 'text').map((part) => part.text).join('\n')
+        if (behavior.liveTranscript && (!behavior.liveTranscriptPrompts || behavior.liveTranscriptPrompts.some(marker => prompt.includes(marker)))) {
           const threadId = message.params.threadId
           const turnId = result.turn.id
           const user = result.turn.items[0]
@@ -1042,7 +1061,6 @@ wss.on('connection', (socket) => {
           turn.status = 'completed'
           persistRecordedTurns(threadId, turns)
         }
-        const prompt = (message.params?.input ?? []).filter((part) => part.type === 'text').map((part) => part.text).join('\n')
         const userRequest = behavior.serverRequestsByPrompt?.[prompt]
         let interrupted = false
         if (userRequest) {
@@ -1064,7 +1082,9 @@ wss.on('connection', (socket) => {
         })
         broadcastNotification('turn/completed', {
           threadId: message.params?.threadId,
-          turn: { id: result.turn.id, status: interrupted ? 'interrupted' : 'completed' },
+          turn: behavior.terminalItemsView
+            ? projectTurnItemsView({ ...loadRecordedTurns(message.params.threadId).find(turn => turn.id === result.turn.id), status: interrupted ? 'interrupted' : 'completed' }, behavior.terminalItemsView)
+            : { id: result.turn.id, status: interrupted ? 'interrupted' : 'completed' },
         })
       }
       if (method === 'initialize') {

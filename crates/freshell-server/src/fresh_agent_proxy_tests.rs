@@ -412,7 +412,8 @@ async fn codex_model_catalog_routes_only_to_current_root_and_discards_changed_so
 }
 
 #[tokio::test]
-async fn child_route_reads_only_the_parent_provider_volume_and_fences_replaced_sources() {
+async fn child_route_reads_only_the_parent_provider_volume_and_fences_replaced_sources_and_ephemeral_history(
+) {
     use tower::ServiceExt;
     let mut env = crate::test_env_lock::TestEnv::lock().await;
     let dir = tempfile::tempdir().unwrap();
@@ -426,6 +427,7 @@ async fn child_route_reads_only_the_parent_provider_volume_and_fences_replaced_s
     for scenario in [
         "saved",
         "live",
+        "ephemeral",
         "replaced-owner",
         "wrong-child",
         "unrelated",
@@ -466,7 +468,11 @@ async fn child_route_reads_only_the_parent_provider_volume_and_fences_replaced_s
                             ))
                         } else {
                             Ok(AdminResult::FreshAgentChildSnapshot(
-                                serde_json::json!({"parentThreadId":"parent-native","childThreadId":if scenario == "wrong-child" {"foreign-child"} else {"child-native"},"status":if scenario == "live" {"live"} else {"saved"},"snapshot":{"threadId":"child-native","provider":"codex","sessionType":"freshcodex","turns":[{"text":"Provider volume child"}],"capabilities":{"send":true,"interrupt":true,"fork":true,"undo":true},"pendingApprovals":[],"pendingQuestions":[],"extensions":{}}}),
+                                if scenario == "ephemeral" {
+                                    serde_json::json!({"parentThreadId":"parent-native","childThreadId":"child-native","status":"unavailable","reason":"ephemeral_history_unavailable","retryable":false})
+                                } else {
+                                    serde_json::json!({"parentThreadId":"parent-native","childThreadId":if scenario == "wrong-child" {"foreign-child"} else {"child-native"},"status":if scenario == "live" {"live"} else {"saved"},"snapshot":{"threadId":"child-native","provider":"codex","sessionType":"freshcodex","turns":[{"text":"Provider volume child"}],"capabilities":{"send":true,"interrupt":true,"fork":true,"undo":true},"pendingApprovals":[],"pendingQuestions":[],"extensions":{}}})
+                                },
                             ))
                         }
                     }
@@ -527,6 +533,13 @@ async fn child_route_reads_only_the_parent_provider_volume_and_fences_replaced_s
             assert_eq!(body["status"], scenario);
             assert_eq!(body["snapshot"]["capabilities"]["send"], false);
             assert_eq!(body["snapshot"]["capabilities"]["fork"], false);
+        } else if scenario == "ephemeral" {
+            assert_eq!(body["parentThreadId"], "parent-native");
+            assert_eq!(body["childThreadId"], "child-native");
+            assert_eq!(body["status"], "unavailable");
+            assert_eq!(body["reason"], "ephemeral_history_unavailable");
+            assert_eq!(body["retryable"], false);
+            assert!(body.get("snapshot").is_none());
         } else {
             assert_eq!(body["reason"], "source_unavailable");
             assert!(body.get("snapshot").is_none());
@@ -2879,7 +2892,8 @@ async fn task6_gateway_recovery_receipts(
                     // The controller's own bound can be smaller than the requested
                     // page. Receipts deliberately lie beyond the first page.
                     events:payloads.iter().enumerate().filter(|(index,_)|(*index as u64)+1>request.after_sequence).take(request.max_events.min(2) as usize).map(|(index,event)|freshell_runtime_protocol::AgentJournalEvent {sequence:index as u64+1,event:event.clone()}).collect(),
-                })},
+                })
+                }
                 other => panic!("recovery must only read events and source identity: {other:?}"),
             };
             write_frame(

@@ -1165,6 +1165,28 @@ export async function captureNativeScenario(name, options = {}) {
       const primaryFirst=fixture.traffic[capture.observations.productionCatalogClient.fixtureRequestCount]
       assert.equal(primaryFirst.body.model, 'contract-model')
       assert.equal(primaryFirst.body.reasoning.effort, 'low')
+      // Default clears Freshell's override. Record Codex's actual later
+      // behavior instead of assuming omission resets its native effort.
+      const observations = []
+      for (const [label, selection] of [
+        ['explicit', { effort: 'xhigh' }],
+        ['native-default', { collaborationMode: { mode: 'default', settings: { model: 'contract-model', reasoning_effort: null, developer_instructions: null } } }],
+      ]) {
+        const before = fixture.traffic.length
+        const params = { threadId: capture.threadId, input: [{ type: 'text', text: `Observe the ${label} effort.` }], ...selection }
+        const submitted = await client.request('turn/start', params)
+        const completed = await client.wait(frame => frame.method === 'turn/completed' && frame.params?.turn?.id === submitted.turn.id)
+        assert.equal(completed.params.turn.status, 'completed')
+        const current = await client.request('thread/read', { threadId: capture.threadId, includeTurns: true })
+        assert.equal(assistantText(current, submitted.turn.id), 'First fragment and final fragment')
+        const traffic = fixture.traffic.slice(before)
+        assert(traffic.length > 0, `${label} must reach the actual native model wire`)
+        observations.push({ label, params, turnId: submitted.turn.id, completed, traffic, current })
+      }
+      assert.equal(observations[0].traffic[0].body.reasoning.effort, 'xhigh')
+      assert.equal(Object.hasOwn(observations[1].params, 'effort'), false)
+      assert.equal(observations[1].params.collaborationMode.settings.reasoning_effort, null)
+      capture.observations.sameThreadNativeDefault = observations
     }
     if (restricted) {
       const commandItems = capture.notifications.filter(frame => frame.method === 'item/completed' && frame.params?.item?.type === 'commandExecution').map(frame => frame.params.item)
