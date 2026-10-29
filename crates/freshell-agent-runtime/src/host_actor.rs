@@ -1374,11 +1374,69 @@ impl FreshAgentHostActor {
         Ok(sequence)
     }
 
+    async fn record_retained_permission(&self, decision_id: &str) -> Result<(), ActorError> {
+        // A reconnect/snapshot can expose a native control before the
+        // asynchronous event pump journals it. Reconcile only on the user
+        // command, from the existing live source; reads stay side-effect free.
+        let before = self.profile().await;
+        if before.provider != FreshProvider::Codex || !self.transport.is_live().await {
+            return Ok(());
+        }
+        let Some(retained) = self
+            .transport
+            .retained_state()
+            .await
+            .map_err(ActorError::Transport)?
+        else {
+            return Ok(());
+        };
+        let after = self.profile().await;
+        if before.native_session_id.is_none()
+            || before.native_session_id != after.native_session_id
+            || before.provider_store_id != after.provider_store_id
+            || before.provider != after.provider
+            || !self.transport.is_live().await
+            || retained["snapshot"]["threadId"].as_str() != before.native_session_id.as_deref()
+            || retained["snapshot"]["provider"] != "codex"
+            || retained["snapshot"]["sessionType"] != "freshcodex"
+        {
+            return Ok(());
+        }
+        let Some(payload) = retained["pendingControls"].as_array().and_then(|pending| {
+            pending.iter().find(|payload| {
+                payload["requestId"].as_str() == Some(decision_id)
+                    && payload["sessionId"].as_str() == before.native_session_id.as_deref()
+                    && matches!(
+                        payload["type"].as_str(),
+                        Some(
+                            "freshAgent.permission.request"
+                                | "freshAgent.question.request"
+                                | "freshAgent.elicitation.request"
+                        )
+                    )
+            })
+        }) else {
+            return Ok(());
+        };
+        self.record_permission(decision_id.to_owned(), payload.clone())
+            .await?;
+        tracing::info!(
+            provider = "codex",
+            request_id = decision_id,
+            native_session_id = before.native_session_id.as_deref(),
+            "freshagent.host.control_admitted_from_retained"
+        );
+        Ok(())
+    }
+
     pub async fn resolve_permission(
         &self,
         decision_id: &str,
         decision: Value,
     ) -> Result<(), ActorError> {
+        if !self.state.lock().await.decisions.contains_key(decision_id) {
+            self.record_retained_permission(decision_id).await?;
+        }
         let response_digest = digest(&serde_json::to_vec(&decision).map_err(persist)?);
         {
             let mut state = self.state.lock().await;
