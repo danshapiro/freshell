@@ -415,6 +415,8 @@ fn codex_quiet_window_ms_from_env() -> u64 {
     )
 }
 
+type ChildReadAttempts = HashMap<(String, String, String), u8>;
+
 /// Shared, cheaply-cloneable freshcodex WS state (mergeable into the server app + WsState).
 #[derive(Clone)]
 pub struct FreshCodexState {
@@ -426,7 +428,7 @@ pub struct FreshCodexState {
     turn_events: tokio::sync::broadcast::Sender<CodexTurnEvent>,
     /// threadId → live codex session (client + settings + owned sidecar).
     sessions: Arc<TokioMutex<HashMap<String, CodexSession>>>,
-    child_reads: Arc<TokioMutex<HashMap<(String, String, String), u8>>>,
+    child_reads: Arc<TokioMutex<ChildReadAttempts>>,
     retained_changed: Arc<tokio::sync::watch::Sender<u64>>,
     attention: Arc<crate::attention_ledger::AttentionLedger>,
     /// The `settings.freshAgent.enabled` gate the WS `freshAgent.create` requires
@@ -6671,9 +6673,9 @@ impl FreshCodexState {
         // the deferred confirmation keeps this exact identity fenced.
         let cleanup_removed = if let Some(expected) = expected_owner {
             let mut sessions = self.sessions.lock().await;
-            if !sessions
+            if sessions
                 .get(&session_id)
-                .is_some_and(|session| session.sidecar_ownership_id == expected)
+                .is_none_or(|session| session.sidecar_ownership_id != expected)
             {
                 return Err(codex_cleanup_error());
             }

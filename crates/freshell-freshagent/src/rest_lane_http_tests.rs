@@ -24,10 +24,7 @@ impl FreshAgentRestLane for RefusingLane {
                 owner_generation: 7,
                 owner_epoch: 3,
             }),
-            session_id: None,
-            request_id: None,
-            incarnation_id: None,
-            submitted_turn_id: None,
+            correlation: None,
         })
     }
 

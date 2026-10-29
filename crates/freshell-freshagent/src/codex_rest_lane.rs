@@ -279,10 +279,12 @@ impl FreshAgentRestLane for CodexRestLane {
                         };
                         let mut error = failure(code.into(), message.into(), Some(false), None);
                         error.kind = RestLaneErrorKind::Conflict;
-                        error.session_id = Some(session_id);
-                        error.request_id = Some(request.request_id);
-                        error.incarnation_id = Some(incarnation_id);
-                        error.submitted_turn_id = Some(submitted_turn_id);
+                        error.correlation = Some(Box::new(RestLaneErrorCorrelation {
+                            session_id: Some(session_id),
+                            request_id: Some(request.request_id),
+                            incarnation_id: Some(incarnation_id),
+                            submitted_turn_id: Some(submitted_turn_id),
+                        }));
                         return Err(error);
                     }
                     Ok(Err(error)) => return Err(error),
@@ -309,9 +311,12 @@ impl FreshAgentRestLane for CodexRestLane {
                 message,
             } => {
                 let mut error = failure(code, message, Some(false), None);
-                error.session_id = Some(session_id);
-                error.request_id = Some(request_id);
-                error.incarnation_id = Some(incarnation_id);
+                error.correlation = Some(Box::new(RestLaneErrorCorrelation {
+                    session_id: Some(session_id),
+                    request_id: Some(request_id),
+                    incarnation_id: Some(incarnation_id),
+                    ..Default::default()
+                }));
                 Err(error)
             }
         }

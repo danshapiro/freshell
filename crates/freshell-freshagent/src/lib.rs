@@ -4809,14 +4809,16 @@ fn rest_lane_failure(error: rest_lane::RestLaneError) -> Response {
         RestLaneErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
     };
     let mut body = json!({ "status": "error", "code": error.code, "message": error.message });
-    for (key, value) in [
-        ("sessionId", error.session_id),
-        ("requestId", error.request_id),
-        ("incarnationId", error.incarnation_id),
-        ("submittedTurnId", error.submitted_turn_id),
-    ] {
-        if let Some(value) = value {
-            body[key] = json!(value);
+    if let Some(correlation) = error.correlation {
+        for (key, value) in [
+            ("sessionId", correlation.session_id),
+            ("requestId", correlation.request_id),
+            ("incarnationId", correlation.incarnation_id),
+            ("submittedTurnId", correlation.submitted_turn_id),
+        ] {
+            if let Some(value) = value {
+                body[key] = json!(value);
+            }
         }
     }
     if let Some(retryable) = error.retryable {

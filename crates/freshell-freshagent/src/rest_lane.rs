@@ -41,6 +41,11 @@ pub struct RestLaneError {
     pub retryable: Option<bool>,
     pub retry_after_ms: Option<u64>,
     pub owner: Option<crate::ownership_lane::TerminalOwnerFields>,
+    pub correlation: Option<Box<RestLaneErrorCorrelation>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RestLaneErrorCorrelation {
     pub session_id: Option<String>,
     pub request_id: Option<String>,
     pub incarnation_id: Option<String>,
@@ -60,10 +65,7 @@ impl RestLaneError {
             retryable: None,
             retry_after_ms: None,
             owner: None,
-            session_id: None,
-            request_id: None,
-            incarnation_id: None,
-            submitted_turn_id: None,
+            correlation: None,
         }
     }
 }

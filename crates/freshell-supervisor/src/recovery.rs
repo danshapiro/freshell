@@ -194,7 +194,7 @@ impl Supervisor {
         // A restarted host cannot certify a surviving
         // worker from initialization alone. It can still
         // inspect its exact owned store as the provider UID.
-        let candidate = match resume_catalog::exact_resume_candidate(&context, None) {
+        let candidate = match resume_catalog::exact_resume_candidate(context, None) {
             Ok(Some(candidate)) => candidate,
             Ok(None) => {
                 return Ok(blocked(
@@ -207,7 +207,7 @@ impl Supervisor {
             Err(probe) => return Ok(probe),
         };
         let probe = self
-            .probe_host_store(&context, &host, Some(candidate))
+            .probe_host_store(context, host, Some(candidate))
             .await?;
         crate::service::append_event(
             &self.config.lifecycle_log,
@@ -217,9 +217,9 @@ impl Supervisor {
                 "nativeSessionId":context.native_session_id, "probe":probe
             }),
         );
-        return match probe {
+        match probe {
             ready @ RecoveryProbe::ResumeReady { .. } => {
-                self.persist_resume_probe(&context, ready).await
+                self.persist_resume_probe(context, ready).await
             }
             other @ RecoveryProbe::Blocked { .. } => Ok(other),
             _ => Ok(blocked(
@@ -228,7 +228,7 @@ impl Supervisor {
                 "unconfirmed worker requires a positive exact-session store proof",
                 Some(2_000),
             )),
-        };
+        }
     }
 
     async fn persist_resume_probe(
