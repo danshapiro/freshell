@@ -309,7 +309,8 @@ if(ordinal>1)behavior={...behavior,modelCatalogPagesByCwd:{[process.cwd()]:[{dat
     await otherComposer.fill('/model')
     await otherComposer.press('Enter')
     const otherDialog = b.page.getByRole('dialog', { name: 'Model and thinking level' })
-    await expect(otherDialog.getByRole('option', { name: /^Owning runtime model(?: current)?$/ })).toBeVisible({ timeout: 30_000 })
+    const peerCurrentRows = otherDialog.getByRole('option', { name: 'Owning runtime model current', exact: true })
+    await expect(peerCurrentRows.and(otherDialog.locator('[data-group="catalog"]'))).toBeVisible({ timeout: 30_000 })
     const peerSnapshotResponse = await page.request.get(`${info.baseUrl}/api/fresh-agent/threads/freshcodex/codex/${nativeId}`,
       { headers: { 'x-auth-token': info.token } })
     const peerSnapshot = peerSnapshotResponse.ok() ? await peerSnapshotResponse.json() : undefined
@@ -317,8 +318,9 @@ if(ordinal>1)behavior={...behavior,modelCatalogPagesByCwd:{[process.cwd()]:[{dat
       settings: peerSnapshot?.settings, options: await otherDialog.getByRole('option').allTextContents() }))
     // Exact model ID is a cleared manual-entry draft. The current catalog
     // row and selected pair express the second browser's effective choice.
-    await expect(otherDialog.getByRole('option', { name: 'Owning runtime model current', exact: true }))
-      .toHaveAttribute('aria-selected', 'true')
+    // Recent and catalog can both contain the current model. Exactly one
+    // row is highlighted, while the native catalog row stays available.
+    await expect(peerCurrentRows.and(otherDialog.locator('[aria-selected="true"]'))).toHaveCount(1)
     await expect(otherDialog.getByRole('textbox', { name: 'Reasoning effort' })).toHaveValue('ultra')
     await expect(otherDialog.getByRole('button', { name: 'Use Owning runtime model · ultra', exact: true })).toBeEnabled()
     await otherDialog.getByRole('button', { name: 'Cancel', exact: true }).click()
@@ -383,8 +385,9 @@ if(ordinal>1)behavior={...behavior,modelCatalogPagesByCwd:{[process.cwd()]:[{dat
     await b.page.keyboard.press('Escape')
     await composer.fill('/model')
     await composer.press('Enter')
-    await expect(dialog.getByRole('option', { name: 'Owning runtime model', exact: true })).toBeVisible()
-    await expect(dialog.getByRole('option', { name: 'Second runtime model', exact: true })).toHaveCount(0)
+    const returnedCatalog = dialog.locator('[data-group="catalog"]')
+    await expect(dialog.getByRole('option', { name: 'Owning runtime model current', exact: true }).and(returnedCatalog)).toBeVisible()
+    await expect(dialog.getByRole('option', { name: /^Second runtime model(?: current)?$/ }).and(returnedCatalog)).toHaveCount(0)
     await page.keyboard.press('Escape')
     expect((await readNative()).filter(row => row.method === 'thread/start')).toHaveLength(2)
     expect((await readNative()).filter(row => row.method === 'turn/start')).toHaveLength(3)
