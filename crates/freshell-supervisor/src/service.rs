@@ -587,6 +587,14 @@ impl Supervisor {
                         .await?,
                 ))
             }
+            AdminCommand::FreshAgentNativeName(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::FreshAgentNativeName(
+                    self.fresh_agent_native_name(request).await?,
+                ))
+            }
             AdminCommand::FreshAgentReadSnapshot(request) => {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
@@ -1975,6 +1983,84 @@ impl Supervisor {
                 "unexpected fresh-agent capture reply",
             )),
         }
+    }
+
+    async fn fresh_agent_native_name(
+        &self,
+        request: freshell_runtime_protocol::FreshAgentNativeNameRequest,
+    ) -> Result<freshell_runtime_protocol::FreshAgentNativeNameReply, RuntimeError> {
+        use freshell_runtime_protocol::{FreshAgentNativeNameError, FreshAgentNativeNameReply};
+        let unavailable = || {
+            FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Unavailable {
+                message: "native naming source is no longer current".into(),
+            })
+        };
+        let lifecycle_lock = self.lifecycle_lock(&request.soul_id).await;
+        // Metadata discovery must not queue behind lifecycle work and then
+        // dispatch after the name worker's existing request budget expired.
+        let Ok(_guard) = lifecycle_lock.try_lock() else {
+            return Ok(unavailable());
+        };
+        let handle = self
+            .registry
+            .active_handle_for_soul(request.soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let before = find_view(&self.registry, handle.incarnation_id()).await?;
+        let matches_source = |view: &RuntimeView| {
+            view.incarnation_id == request.source.incarnation_id
+                && view.host_boot_id.as_ref() == Some(&request.source.host_boot_id)
+                && view.execution_generation == request.source.execution_generation
+                && view.intent_revision == request.source.intent_revision
+                && view.native_session_id.as_deref()
+                    == Some(request.source.native_session_id.as_str())
+                && view.launch_state == LaunchState::Running
+                && view.recovery_state == freshell_runtime_protocol::RecoveryState::Live
+                && view.desired_state == freshell_runtime_protocol::DesiredState::Running
+        };
+        if !matches_source(&before)
+            || !handle.fresh_agent().is_some_and(|agent| {
+                agent.provider == freshell_runtime_protocol::FreshProvider::Codex
+            })
+            || request.codex_home.is_empty()
+        {
+            return Ok(unavailable());
+        }
+        let host = self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await?;
+        if host.host_boot_id != request.source.host_boot_id {
+            return Ok(unavailable());
+        }
+        let reply = self
+            .send_authenticated_host_command(
+                handle.incarnation_id().clone(),
+                handle.runtime_dir(),
+                &host,
+                HostCommand::FreshAgentNativeName {
+                    incarnation_id: handle.incarnation_id().clone(),
+                    native_session_id: request.source.native_session_id.clone(),
+                    codex_home: request.codex_home.clone(),
+                    operation: request.operation.clone(),
+                },
+            )
+            .await?;
+        let HostResult::FreshAgentNativeName(value) = reply else {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::HostAuthenticationFailed,
+                "unexpected native naming reply",
+            ));
+        };
+        let after = find_view(&self.registry, handle.incarnation_id()).await?;
+        let after_host = self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await?;
+        if !matches_source(&after) || after_host.host_boot_id != host.host_boot_id {
+            return Ok(FreshAgentNativeNameReply::Failed(
+                FreshAgentNativeNameError::Closed,
+            ));
+        }
+        Ok(value)
     }
 
     async fn fresh_agent_model_catalog(
@@ -3779,6 +3865,7 @@ pub(crate) fn uses_fresh_agent_command_budget(command: &HostCommand) -> bool {
     matches!(
         command,
         HostCommand::FreshAgentSend { .. }
+            | HostCommand::FreshAgentNativeName { .. }
             | HostCommand::FreshAgentCompact { .. }
             | HostCommand::FreshAgentConfigure { .. }
             | HostCommand::FreshAgentRollback { .. }

@@ -538,6 +538,8 @@ pub struct FreshCodexState {
     /// set-once/shared model as [`Self::identity_sink`]. Wired by
     /// `freshell-server::main`; unwired = scoped naming fails unavailable.
     naming: crate::naming::NamingSink,
+    hosted_naming_events: bool,
+    naming_rollout_probe: Arc<std::sync::OnceLock<CodexNamingRolloutProbe>>,
     /// Unified agent names: thread id → the pre-durable naming handle
     /// admitted at create. A `thread/start` id/path is PROSPECTIVE (the
     /// rollout hasn't materialized), so the handle stays pending and the
@@ -570,6 +572,18 @@ pub struct FreshCodexState {
 /// in the `TerminalLivenessProbe` injection idiom, never env vars.
 pub type SnapshotPauseHook =
     std::sync::Arc<dyn Fn(&str) -> futures_util::future::BoxFuture<'static, ()> + Send + Sync>;
+
+/// A hosted runtime reads private native metadata as the provider identity.
+/// The initialized root and exact thread ID remain the proof inputs.
+pub type CodexNamingRolloutProbe = Arc<
+    dyn Fn(
+            String,
+            String,
+        )
+            -> futures_util::future::BoxFuture<'static, Result<Option<std::path::PathBuf>, String>>
+        + Send
+        + Sync,
+>;
 
 /// The cached result of a completed codex `freshAgent.create`, keyed by `requestId` in
 /// [`FreshCodexState::create_dedup`]. Only `session_id` is needed: every other field of
@@ -919,6 +933,8 @@ impl FreshCodexState {
             codex_quiet_window_ms: Arc::new(AtomicU64::new(codex_quiet_window_ms_from_env())),
             rollback_in_flight: crate::InFlightRegistry::new(),
             naming: crate::naming::NamingSink::default(),
+            hosted_naming_events: false,
+            naming_rollout_probe: Arc::new(std::sync::OnceLock::new()),
             naming_handles: Arc::new(TokioMutex::new(HashMap::new())),
             snapshot_pause: Arc::new(StdMutex::new(None)),
             snapshot_pause_after_capture: Arc::new(StdMutex::new(None)),
@@ -929,6 +945,48 @@ impl FreshCodexState {
     pub fn with_sidecar_launch_context(mut self, context: CodexSidecarLaunchContext) -> Self {
         self.sidecar_launch_context = context;
         self
+    }
+
+    pub fn with_hosted_naming_events(mut self) -> Self {
+        self.hosted_naming_events = true;
+        self
+    }
+
+    pub fn set_naming_rollout_probe(&self, probe: CodexNamingRolloutProbe) {
+        let _ = self.naming_rollout_probe.set(probe);
+    }
+
+    async fn report_hosted_naming_fact(
+        &self,
+        thread_id: &str,
+        fact: crate::naming::HostedCodexNamingFact,
+    ) {
+        if !self.hosted_naming_events {
+            return;
+        }
+        let Ok(fact) = serde_json::to_value(fact) else {
+            return;
+        };
+        let projection = self
+            .sessions
+            .lock()
+            .await
+            .get(thread_id)
+            .map(|session| Arc::clone(&session.projection));
+        let Some(projection) = projection else {
+            return;
+        };
+        if !projection
+            .lock()
+            .expect("codex projection lock")
+            .retain_hosted_naming_fact(fact.clone())
+        {
+            return;
+        }
+        self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            provider: PROVIDER.into(), session_type: SESSION_TYPE.into(), session_id: thread_id.into(),
+            event: json!({"type":crate::naming::HOSTED_CODEX_NAMING_EVENT,"sessionId":thread_id,"fact":fact}),
+        }));
     }
 
     /// Wire the server-owned durable checkpoint-event path before this state is
@@ -1520,6 +1578,12 @@ impl FreshCodexState {
             return None;
         }
         let handle = handle.to_string();
+        if self.hosted_naming_events {
+            self.naming_handles
+                .lock()
+                .await
+                .insert(thread_id.into(), handle.clone());
+        }
         let sink = self.naming();
         let projection = crate::naming::admit_pending_projection(
             &sink,
@@ -1623,8 +1687,19 @@ impl FreshCodexState {
         let home = codex_home
             .map(str::to_string)
             .or_else(codex_home_from_env)?;
-        let sessions_root = std::path::Path::new(&home).join("sessions");
-        let Some(rollout) = locate_thread_rollout(&sessions_root, thread_id) else {
+        let rollout = if let Some(probe) = self.naming_rollout_probe.get() {
+            match probe(home.clone(), thread_id.to_string()).await {
+                Ok(path) => path,
+                Err(error) => {
+                    tracing::warn!(provider = "codex", session_id = thread_id, %error,
+                        "freshagent.codex.naming_proof_unavailable");
+                    None
+                }
+            }
+        } else {
+            locate_thread_rollout(&std::path::Path::new(&home).join("sessions"), thread_id)
+        };
+        let Some(rollout) = rollout else {
             return None; // still prospective: the next turn-completed edge retries
         };
         let target = freshell_protocol::session_names::SessionNameRef::Session {
@@ -1650,6 +1725,20 @@ impl FreshCodexState {
             acquisition,
             pending: Some(handle),
         };
+        if self.hosted_naming_events {
+            self.report_hosted_naming_fact(
+                thread_id,
+                crate::naming::HostedCodexNamingFact::Transition {
+                    target: target.clone(),
+                    transition: transition.clone(),
+                },
+            )
+            .await;
+            // This is the provider's verified materialization fact. Canonical
+            // acceptance remains in the gateway; the retained source keeps
+            // this fact available even if its final notification was dropped.
+            self.naming_handles.lock().await.remove(thread_id);
+        }
         match crate::naming::fold_identity_transition(&self.naming(), &transition, target.clone())
             .await
         {
@@ -4255,6 +4344,20 @@ impl FreshCodexState {
                     session_id: session_id.clone(),
                 },
             );
+        if !msg.text.trim().is_empty() {
+            self.report_hosted_naming_fact(
+                &session_id,
+                crate::naming::HostedCodexNamingFact::Activity(crate::naming::NameActivity {
+                    target: naming_target.clone(),
+                    mode: SESSION_TYPE.into(),
+                    event_id: submitted_turn_id.to_string(),
+                    reason: crate::naming::NameActivityReason::AcceptedUserMessage,
+                    first_user_message: Some(msg.text.trim().to_string()),
+                    cwd: turn_cwd.clone(),
+                }),
+            )
+            .await;
+        }
         crate::naming::report_accepted_input(
             &self.naming(),
             &naming_target,

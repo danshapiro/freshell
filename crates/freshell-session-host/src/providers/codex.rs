@@ -12,6 +12,54 @@ use freshell_runtime_protocol::{ResumeSpec, TerminalLaunchSpec};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+/// Inspect the native recorder under its owner, without starting or resuming
+/// Codex and without giving the host access to the private provider HOME.
+pub async fn naming_rollout(
+    home: String,
+    thread_id: String,
+    uid: u32,
+    gid: u32,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let output = cli::provider_command(std::path::Path::new("/usr/bin/timeout"), uid, gid)
+        .args(["--kill-after=1s", "5s"])
+        .arg(executable)
+        .args([
+            "codex-naming-proof",
+            "--codex-home",
+            &home,
+            "--thread-id",
+            &thread_id,
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(|error| format!("run Codex naming proof: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Codex naming proof exited {:?}",
+            output.status.code()
+        ));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("decode Codex naming proof: {error}"))
+}
+
+pub fn run_naming_proof(args: &[String]) -> Result<(), String> {
+    let argument = |key: &str| {
+        args.windows(2)
+            .find(|pair| pair[0] == key)
+            .map(|pair| pair[1].as_str())
+            .ok_or_else(|| format!("missing {key}"))
+    };
+    let rollout = freshell_codex::durability::locate_thread_rollout_in_home(
+        std::path::Path::new(argument("--codex-home")?),
+        argument("--thread-id")?,
+    );
+    serde_json::to_writer(std::io::stdout(), &rollout)
+        .map_err(|error| format!("encode Codex naming proof: {error}"))
+}
+
 pub struct PreparedCodexLaunch {
     pub sidecar: Arc<CodexLaunchSidecar>,
     pub events: mpsc::UnboundedReceiver<RemoteProxyEvent>,

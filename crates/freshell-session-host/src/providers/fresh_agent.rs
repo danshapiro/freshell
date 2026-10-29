@@ -22,6 +22,7 @@ use freshell_protocol::{
 };
 use freshell_runtime_protocol::{
     AgentEvent, FreshAgentCapture, FreshAgentFixtureTransport, FreshAgentLaunchSpec,
+    FreshAgentNativeNameError, FreshAgentNativeNameOperation, FreshAgentNativeNameReply,
     FreshAgentRollbackDirection, FreshAgentRollbackMode, FreshProvider, ProviderLaunchContext,
     ProviderPreparation, RequestId,
 };
@@ -89,11 +90,18 @@ pub(crate) async fn open_hosted_fresh_agent(
     let profile = profile_from_launch(&launch);
     let transport: Arc<dyn FreshAgentTransport> = match launch.fixture_transport {
         None => {
-            HostedTransport::new_with_context(
+            let transport = HostedTransport::new_with_context(
                 launch.provider,
                 profile.provider_launch_context.as_ref(),
             )
-            .await
+            .await;
+            if let ProviderState::Codex(state) = &transport.state {
+                let (uid, gid) = (launch.run_as_uid, launch.run_as_gid);
+                state.set_naming_rollout_probe(Arc::new(move |home, thread| {
+                    Box::pin(super::codex::naming_rollout(home, thread, uid, gid))
+                }));
+            }
+            transport
         }
         Some(FreshAgentFixtureTransport::Deterministic) => {
             deterministic_transport(&profile, launch.run_as_uid, launch.run_as_gid).await?
@@ -109,6 +117,7 @@ pub(crate) async fn open_hosted_fresh_agent(
 
 fn profile_from_launch(launch: &FreshAgentLaunchSpec) -> FreshAgentProfile {
     FreshAgentProfile {
+        naming_handle: launch.naming_handle.clone(),
         collaboration_mode: launch.collaboration_mode.clone(),
         provider: launch.provider.clone(),
         runtime_variant: launch.runtime_variant.clone(),
@@ -213,7 +222,8 @@ impl HostedTransport {
                         provider_exec_profile: true,
                         config_args: sidecar_args,
                         env: Default::default(),
-                    }),
+                    })
+                    .with_hosted_naming_events(),
                 )
             }
             FreshProvider::Opencode => {
@@ -1152,6 +1162,87 @@ impl FreshAgentTransport for HostedTransport {
         Ok(value)
     }
 
+    async fn native_name(
+        &self,
+        native_session_id: &str,
+        codex_home: &str,
+        operation: &FreshAgentNativeNameOperation,
+    ) -> FreshAgentNativeNameReply {
+        let unavailable = || {
+            FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Unavailable {
+                message: "no current root-matched native naming connection".into(),
+            })
+        };
+        if self.current_native_id().await.as_deref() != Ok(native_session_id) {
+            return unavailable();
+        }
+        let ProviderState::Codex(state) = &self.state else {
+            return unavailable();
+        };
+        let Some(client) = state.management_client_for_root(codex_home).await else {
+            return unavailable();
+        };
+        // The probe inspects existing authority only; it sends no native RPC.
+        let result = match operation {
+            FreshAgentNativeNameOperation::Probe => return FreshAgentNativeNameReply::Available,
+            FreshAgentNativeNameOperation::Read => client
+                .read_thread_metadata(native_session_id)
+                .await
+                .and_then(|value| {
+                    if value["thread"]["id"].as_str() != Some(native_session_id) {
+                        return Err(
+                            freshell_codex::app_server::CodexAppServerError::InvalidResponse {
+                                method: "thread/read".into(),
+                                detail: "native metadata names another thread".into(),
+                            },
+                        );
+                    }
+                    Ok(FreshAgentNativeNameReply::Title(
+                        freshell_codex::protocol::thread_name_from_result(&value),
+                    ))
+                }),
+            FreshAgentNativeNameOperation::Write { title } => client
+                .set_thread_name(native_session_id, title)
+                .await
+                .map(|()| FreshAgentNativeNameReply::Renamed),
+        };
+        if self.current_native_id().await.as_deref() != Ok(native_session_id) {
+            return FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Closed);
+        }
+        result.unwrap_or_else(|error| {
+            use freshell_codex::app_server::CodexAppServerError as Error;
+            let failure_kind = match &error {
+                Error::Rpc { .. } => "rpc",
+                Error::Timeout { .. } => "timeout",
+                Error::Closed { .. } => "closed",
+                Error::Transport { .. } => "transport",
+                Error::InvalidResponse { .. } => "invalid_response",
+            };
+            tracing::warn!(
+                provider = "codex",
+                native_session_id,
+                failure_kind,
+                "freshagent.codex.native_name_failed"
+            );
+            FreshAgentNativeNameReply::Failed(match error {
+                Error::Rpc { error, .. } => FreshAgentNativeNameError::Rpc {
+                    code: error.code,
+                    message: error.message,
+                },
+                Error::Timeout { timeout_ms, .. } => {
+                    FreshAgentNativeNameError::Timeout { timeout_ms }
+                }
+                Error::Closed { .. } => FreshAgentNativeNameError::Closed,
+                Error::Transport { message, .. } => {
+                    FreshAgentNativeNameError::Transport { message }
+                }
+                Error::InvalidResponse { detail, .. } => {
+                    FreshAgentNativeNameError::InvalidResponse { detail }
+                }
+            })
+        })
+    }
+
     async fn read_child(&self, child_thread_id: &str) -> Result<Value, String> {
         #[cfg(test)]
         if let Some(delegate) = self.test_delegate.as_ref() {
@@ -1259,7 +1350,7 @@ fn create_request_for_profile(profile: &FreshAgentProfile) -> FreshAgentCreate {
         request_id: format!("host-create-{}", uuid::Uuid::new_v4()),
         observed_epoch: None,
         observed_generation: None,
-        naming_handle: None,
+        naming_handle: profile.naming_handle.clone(),
         session_type,
         cwd: Some(profile.cwd.clone()),
         effort: if profile.provider == FreshProvider::Codex {
@@ -2017,6 +2108,184 @@ mod tests {
             _environment,
             _lock,
         }
+    }
+
+    #[tokio::test]
+    async fn task010_codex_native_name_uses_only_current_root_matched_metadata_methods() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let fixture = native_codex_fixture(json!({"recordTurns":true,"appendRequestLogPath":log.path(),
+            "overrides":{"thread/read":{"result":{"thread":{"id":"thread-new-1","name":"Native saved title"}}},"thread/name/set":{"result":{}}}})).await;
+        let actor = FreshAgentHostActor::open(
+            fixture.dir.path().join("name-actor"),
+            fixture.profile.clone(),
+            fixture.transport.clone(),
+        )
+        .await
+        .unwrap();
+        let home = fixture
+            .dir
+            .path()
+            .join("codex-home")
+            .to_string_lossy()
+            .into_owned();
+        let requests = || {
+            std::fs::read_to_string(log.path())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let before = requests().len();
+        for (native, root) in [
+            ("foreign-thread", home.as_str()),
+            ("thread-new-1", "/wrong/root"),
+        ] {
+            assert!(matches!(
+                actor
+                    .native_name(
+                        native,
+                        root,
+                        &FreshAgentNativeNameOperation::Write {
+                            title: "Must not apply".into()
+                        }
+                    )
+                    .await,
+                FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Unavailable { .. })
+            ));
+        }
+        assert_eq!(
+            requests().len(),
+            before,
+            "stale targets perform no native work"
+        );
+        assert_eq!(
+            actor
+                .native_name("thread-new-1", &home, &FreshAgentNativeNameOperation::Probe)
+                .await,
+            FreshAgentNativeNameReply::Available
+        );
+        assert_eq!(
+            requests().len(),
+            before,
+            "capability probing is read-only and sends no native RPC"
+        );
+        assert_eq!(
+            actor
+                .native_name("thread-new-1", &home, &FreshAgentNativeNameOperation::Read)
+                .await,
+            FreshAgentNativeNameReply::Title(Some("Native saved title".into()))
+        );
+        assert_eq!(
+            actor
+                .native_name(
+                    "thread-new-1",
+                    &home,
+                    &FreshAgentNativeNameOperation::Write {
+                        title: "Manual title".into()
+                    }
+                )
+                .await,
+            FreshAgentNativeNameReply::Renamed
+        );
+        let after = requests();
+        assert_eq!(
+            after[before..]
+                .iter()
+                .map(|row| row["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["thread/read", "thread/name/set"]
+        );
+        assert_eq!(
+            after[before]["params"],
+            json!({"threadId":"thread-new-1","includeTurns":false})
+        );
+        assert_eq!(
+            after[before + 1]["params"],
+            json!({"threadId":"thread-new-1","name":"Manual title"})
+        );
+        actor.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn task010_codex_verified_naming_survives_event_replay_in_retained_source() {
+        let mut fixture = native_codex_fixture(json!({"recordTurns":true})).await;
+        let native_id = uuid::Uuid::new_v4().to_string();
+        let rollout = fixture
+            .dir
+            .path()
+            .join("codex-home/sessions")
+            .join(format!("rollout-{native_id}.jsonl"));
+        std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR", json!({"recordTurns":true,"echoRequestedModel":true,
+            "threadStartThreadId":native_id,"writeRolloutOnMethods":{"turn/start":{"path":rollout,
+                "record":{"type":"session_meta","payload":{"id":native_id,"cwd":fixture.profile.cwd}}}}
+        }).to_string());
+        fixture.profile.naming_handle = Some("managed-native-name".into());
+        let actor = FreshAgentHostActor::open(
+            fixture.dir.path().join("naming-actor"),
+            fixture.profile.clone(),
+            fixture.transport.clone(),
+        )
+        .await
+        .unwrap();
+        let observed = tokio::time::timeout(Duration::from_secs(10), async {
+            actor
+                .dispatch(
+                    RequestId::parse("managed-naming-first").unwrap(),
+                    "Name the managed conversation".into(),
+                    None,
+                )
+                .await
+                .unwrap();
+            loop {
+                let snapshot = actor.snapshot().await.unwrap();
+                let facts = &snapshot["extensions"]["codex"]["hostedNamingFacts"];
+                if snapshot["status"] == "idle"
+                    && facts
+                        .as_array()
+                        .is_some_and(|facts| facts.iter().any(|fact| fact["kind"] == "transition"))
+                {
+                    break (snapshot, actor.read_events(0, 256).await);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        actor.stop().await.unwrap();
+        let (snapshot, events) =
+            observed.expect("verified naming must remain available without another provider token");
+        let facts = snapshot["extensions"]["codex"]["hostedNamingFacts"]
+            .as_array()
+            .unwrap();
+        assert_eq!(facts.len(), 2);
+        let activity = facts
+            .iter()
+            .find(|fact| fact["kind"] == "activity")
+            .unwrap();
+        assert_eq!(
+            activity["data"]["target"],
+            json!({"kind":"pending","id":"managed-native-name"})
+        );
+        assert_eq!(
+            activity["data"]["first_user_message"],
+            "Name the managed conversation"
+        );
+        let transition = facts
+            .iter()
+            .find(|fact| fact["kind"] == "transition")
+            .unwrap();
+        assert_eq!(
+            transition["data"]["target"],
+            json!({"kind":"session","provider":"codex","sessionId":native_id})
+        );
+        assert_eq!(
+            transition["data"]["transition"]["acquisition"]["persistence"],
+            "verified"
+        );
+        assert_eq!(
+            transition["data"]["transition"]["pending"],
+            "managed-native-name"
+        );
+        assert!(events.events.iter().any(|entry| matches!(&entry.event,AgentEvent::Provider {payload} if payload["event"]["type"] == freshell_freshagent::naming::HOSTED_CODEX_NAMING_EVENT)));
     }
 
     #[tokio::test]
@@ -3172,6 +3441,7 @@ mod tests {
 
         fn profile(&self, resume: Option<&str>) -> FreshAgentProfile {
             FreshAgentProfile {
+                naming_handle: None,
                 collaboration_mode: None,
                 provider: FreshProvider::Claude,
                 runtime_variant: "freshclaude".into(),
@@ -3532,6 +3802,7 @@ mod tests {
         .await;
         let transport = claude.transport.clone();
         let profile = FreshAgentProfile {
+            naming_handle: None,
             collaboration_mode: None,
             provider: FreshProvider::Claude,
             runtime_variant: "freshclaude".into(),
@@ -3788,6 +4059,7 @@ mod tests {
         std::env::set_var("FAKE_OPENCODE_AUDIT_LOG", &audit);
         let transport = HostedTransport::new_with_context(FreshProvider::Opencode, None).await;
         let profile = FreshAgentProfile {
+            naming_handle: None,
             collaboration_mode: None,
             provider: FreshProvider::Opencode,
             runtime_variant: "freshopencode".into(),
@@ -3991,6 +4263,7 @@ mod tests {
         // including the product RED and setup-error paths.
         let observed: Result<Value, String> = async {
             let profile = FreshAgentProfile {
+                naming_handle: None,
                 collaboration_mode: None,
                 provider: FreshProvider::Opencode, runtime_variant: "freshopencode".into(),
                 cwd: dir.path().to_string_lossy().into(), model: None, effort: None,
@@ -4150,6 +4423,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let transport = HostedTransport::new_with_context(FreshProvider::Opencode, None).await;
         let profile = FreshAgentProfile {
+            naming_handle: None,
             collaboration_mode: None,
             provider: FreshProvider::Opencode,
             runtime_variant: "freshopencode".into(),
@@ -4590,6 +4864,7 @@ mod tests {
             FreshProvider::Kilroy => unreachable!(),
         };
         FreshAgentProfile {
+            naming_handle: None,
             collaboration_mode: None,
             provider: provider.clone(),
             runtime_variant: provider.as_str().into(),
@@ -5206,6 +5481,7 @@ mod tests {
                 FreshProvider::Kilroy => unreachable!(),
             };
             let profile = FreshAgentProfile {
+                naming_handle: None,
                 collaboration_mode: None,
                 provider: provider.clone(),
                 runtime_variant: provider.as_str().into(),

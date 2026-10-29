@@ -1402,6 +1402,7 @@ impl Registry {
             if let Some(spec) = fresh_spec.as_mut() {
                 spec.session_id = child_session_id.clone();
                 spec.native_session_id = Some(child_session_id.clone());
+                spec.naming_handle = None;
                 if let Some(reference) = spec.session_ref.as_mut() {
                     reference.session_id = child_session_id.clone();
                 }
@@ -3799,6 +3800,7 @@ mod tests {
         launch.provider = "claude".into();
         launch.provider_store_id = "fresh-store".into();
         launch.fresh_agent = Some(FreshAgentLaunchSpec {
+            naming_handle: None,
             collaboration_mode: None,
             session_id: "fresh-session".into(),
             provider: freshell_runtime_protocol::FreshProvider::Claude,
@@ -4351,6 +4353,23 @@ mod tests {
         // soul and enclosure stay live.
         {
             let conn = open_connection(&registry.inner.db_path).unwrap();
+            let encoded: String = conn
+                .query_row(
+                    "SELECT fresh_agent_spec FROM incarnations WHERE incarnation_id=?1",
+                    params![prepared.incarnation_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let mut spec: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+            spec["namingHandle"] = serde_json::json!("parent-only-pending-name");
+            conn.execute(
+                "UPDATE incarnations SET fresh_agent_spec=?1 WHERE incarnation_id=?2",
+                params![
+                    serde_json::to_string(&spec).unwrap(),
+                    prepared.incarnation_id.as_str()
+                ],
+            )
+            .unwrap();
             conn.execute(
                 "UPDATE souls SET durability_state='checkpoint_captured', allocation_state='verified_durable', checkpoint_revision=9, resume_spec='{}' WHERE soul_id=?1",
                 params![soul.as_str()],
@@ -4367,6 +4386,17 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(
+            registry
+                .active_handle_for_soul(soul.clone())
+                .await
+                .unwrap()
+                .fresh_agent()
+                .unwrap()
+                .naming_handle
+                .is_none(),
+            "the child launch must not reuse the parent's pending name"
+        );
         // A retry after the transition is idempotent, but an unrelated expected parent is not.
         registry
             .transition_native_session(

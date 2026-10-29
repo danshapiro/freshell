@@ -5,6 +5,7 @@ import { createInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import assert from 'node:assert/strict'
+import { randomUUID } from 'node:crypto'
 
 export const MCP_LARGE_TEXT = 'F1_MCP_HEAD\n' + 'm'.repeat(128 * 1024) + '\nF1_MCP_TAIL'
 export const MCP_FORM_CONTENT = { name: 'fixture', count: 2.5, enabled: true, color: 'blue' }
@@ -65,7 +66,7 @@ function serveMcpFixture(tracePath, url, holdStartup = false) {
   })
 }
 
-export async function createCodexLocalProvider(handler) {
+export async function createCodexLocalProvider(handler, { port = 0 } = {}) {
   const traffic = []
   let sequence = 0
   const sockets = new Set()
@@ -121,10 +122,66 @@ export async function createCodexLocalProvider(handler) {
     }
   })
   server.on('connection', socket => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)) })
-  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', resolve) })
   return {
     baseUrl: `http://127.0.0.1:${server.address().port}/v1`, traffic,
     async close() { for (const socket of sockets) socket.destroy(); await new Promise(resolve => server.close(resolve)) },
+  }
+}
+
+/** Run the model-wire fixture beside the actual managed provider, never on host localhost. */
+export async function startInManagedContext(rig, source) {
+  const { containerId, handlerSource, port = 51991 } = source
+  assert.match(containerId, /^[a-f0-9]{64}$/)
+  assert.equal(typeof handlerSource, 'string')
+  assert(Number.isSafeInteger(port) && port > 1024 && port < 65536)
+  const directory = `/home/freshell/provider/.freshell-fixture/codex-wire-${randomUUID()}`
+  const trafficPath = `${directory}/traffic.jsonl`
+  const readyPath = `${directory}/ready.json`
+  // Import the original ESM bytes: Vitest's transformed function.toString()
+  // references its host-only module loader and cannot run inside the provider.
+  const moduleUrl = `data:text/javascript;base64,${fs.readFileSync(fileURLToPath(import.meta.url)).toString('base64')}`
+  const code = `import fs from 'node:fs';
+    const {createCodexLocalProvider} = await import(${JSON.stringify(moduleUrl)});
+    const handle = (${handlerSource});
+    const fixture = await createCodexLocalProvider(async (record, context) => {
+      fs.appendFileSync(${JSON.stringify(trafficPath)}, JSON.stringify(record) + '\\n');
+      return handle(record, context);
+    }, {port:${port}});
+    fs.writeFileSync(${JSON.stringify(readyPath)}, JSON.stringify({baseUrl:fixture.baseUrl,uid:process.getuid(),gid:process.getgid(),pid:process.pid,node:process.version}));
+    process.once('SIGTERM', async () => { await fixture.close(); fs.writeFileSync(${JSON.stringify(`${directory}/closed`)},'closed');process.exit(0); });`
+  rig.ownedProviderExec(containerId, ['node', '-e', `
+    const fs=require('node:fs'),{spawn}=require('node:child_process');
+    fs.mkdirSync(${JSON.stringify(directory)}, {recursive:true,mode:0o700});
+    const log=fs.openSync(${JSON.stringify(`${directory}/stderr`)},'a',0o600);
+    const child=spawn(process.execPath,['--input-type=module','-e',${JSON.stringify(code)}],{detached:true,stdio:['ignore','ignore',log]});
+    fs.writeFileSync(${JSON.stringify(`${directory}/pid`)},String(child.pid));child.unref();`])
+  let ready
+  const deadline = Date.now() + 30_000
+  while (!ready && Date.now() < deadline) {
+    ready = JSON.parse(rig.ownedProviderExec(containerId, ['node', '-e', `const fs=require('node:fs');process.stdout.write(fs.existsSync(${JSON.stringify(readyPath)})?fs.readFileSync(${JSON.stringify(readyPath)},'utf8'):'null')`]))
+    if (!ready) await new Promise(resolve => setTimeout(resolve, 50))
+  }
+  assert(ready, `managed Codex loopback fixture did not start: ${rig.ownedProviderExec(containerId, ['cat', `${directory}/stderr`])}`)
+  assert.equal(ready.uid, 65534)
+  assert.equal(ready.gid, 0)
+  return {
+    baseUrl: ready.baseUrl,
+    context: ready,
+    get traffic() {
+      return JSON.parse(rig.ownedProviderExec(containerId, ['node', '-e', `const fs=require('node:fs');const p=${JSON.stringify(trafficPath)};process.stdout.write(JSON.stringify(fs.existsSync(p)?fs.readFileSync(p,'utf8').trim().split('\\n').filter(Boolean).map(JSON.parse):[]))`]))
+    },
+    async stop() {
+      if (!rig.runtime.isContainerRunning(containerId)) return
+      // This PID was created and recorded by this invocation in the owned namespace.
+      rig.ownedProviderExec(containerId, ['node', '-e', `const fs=require('node:fs');const p=Number(fs.readFileSync(${JSON.stringify(`${directory}/pid`)},'utf8'));if(p!==${ready.pid})throw Error('fixture PID changed');try{process.kill(p,'SIGTERM')}catch(e){if(e.code!=='ESRCH')throw e}`])
+      const deadline = Date.now() + 10_000
+      while (Date.now() < deadline) {
+        if (rig.ownedProviderExec(containerId, ['node', '-e', `process.stdout.write(String(require('node:fs').existsSync(${JSON.stringify(`${directory}/closed`)})))`]) === 'true') return
+        await new Promise(resolve => setTimeout(resolve, 50))
+      }
+      throw new Error(`managed Codex loopback fixture did not close: ${containerId}/${ready.pid}`)
+    },
   }
 }
 

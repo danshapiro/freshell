@@ -355,6 +355,7 @@ mod tests {
         context.provider = "codex".into();
         context.provider_store_id = "codex-store-42".into();
         context.fresh_agent = Some(FreshAgentLaunchSpec {
+            naming_handle: None,
             collaboration_mode: None,
             session_id: "presentation-42".into(),
             provider: FreshProvider::Codex,
@@ -401,6 +402,7 @@ mod tests {
         context.provider = "codex".into();
         context.provider_store_id = "fixture-store-42".into();
         context.fresh_agent = Some(FreshAgentLaunchSpec {
+            naming_handle: None,
             collaboration_mode: None,
             session_id: "presentation-fixture-42".into(),
             provider: FreshProvider::Codex,

@@ -8,7 +8,8 @@ pub use freshell_runtime_protocol::{
     AgentEvent, AgentEventBatch as EventBatch, AgentJournalEvent as JournalEvent, FreshProvider,
 };
 use freshell_runtime_protocol::{
-    CommandState, FreshAgentCapture, FreshAgentRollbackDirection, FreshAgentRollbackMode,
+    CommandState, FreshAgentCapture, FreshAgentNativeNameError, FreshAgentNativeNameOperation,
+    FreshAgentNativeNameReply, FreshAgentRollbackDirection, FreshAgentRollbackMode,
     FreshAgentTurnSettings, ProviderLaunchContext, ProviderModelSelection, ProviderSecretReference,
     ProviderSessionReference, RequestId,
 };
@@ -50,6 +51,8 @@ mod double_optional {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub naming_handle: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collaboration_mode: Option<String>,
     pub provider: FreshProvider,
@@ -333,6 +336,17 @@ pub trait FreshAgentTransport: Send + Sync {
     }
     async fn model_catalog(&self, _cwd: Option<&str>) -> Result<Value, String> {
         Err("provider does not expose a model catalog".into())
+    }
+
+    async fn native_name(
+        &self,
+        _native_session_id: &str,
+        _codex_home: &str,
+        _operation: &FreshAgentNativeNameOperation,
+    ) -> FreshAgentNativeNameReply {
+        FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Unavailable {
+            message: "provider has no live native naming authority".into(),
+        })
     }
 
     async fn read_child(&self, _child_thread_id: &str) -> Result<Value, String> {
@@ -871,6 +885,7 @@ impl FreshAgentHostActor {
                     return Err(ActorError::AmbiguousDispatch);
                 }
                 state.profile.native_session_id = Some(transition.child_session_id.clone());
+                state.profile.naming_handle = None;
                 if let Some(reference) = state.profile.session_ref.as_mut() {
                     reference.session_id = transition.child_session_id.clone();
                 }
@@ -1069,6 +1084,7 @@ impl FreshAgentHostActor {
         if let Some(native_session_id) = native_session_id {
             if state.profile.native_session_id.as_deref() != Some(&native_session_id) {
                 state.profile.native_session_id = Some(native_session_id.clone());
+                state.profile.naming_handle = None;
                 if let Some(reference) = state.profile.session_ref.as_mut() {
                     reference.session_id = native_session_id.clone();
                 }
@@ -1196,6 +1212,44 @@ impl FreshAgentHostActor {
             ));
         }
         Ok(value)
+    }
+
+    pub async fn native_name(
+        &self,
+        native_session_id: &str,
+        codex_home: &str,
+        operation: &FreshAgentNativeNameOperation,
+    ) -> FreshAgentNativeNameReply {
+        let before = self.profile().await;
+        if before.provider != FreshProvider::Codex
+            || before.native_session_id.as_deref() != Some(native_session_id)
+            || codex_home.is_empty()
+            || !self.transport.is_live().await
+        {
+            return FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Unavailable {
+                message: "native naming target is no longer current".into(),
+            });
+        }
+        let reply = self
+            .transport
+            .native_name(native_session_id, codex_home, operation)
+            .await;
+        let after = self.profile().await;
+        if before.native_session_id != after.native_session_id
+            || before.provider_store_id != after.provider_store_id
+            || !self.transport.is_live().await
+        {
+            // A write may already have applied to the captured source.
+            return FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Closed);
+        }
+        if serde_json::to_vec(&reply).map_or(true, |bytes| {
+            bytes.len() > freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES - 4096
+        }) {
+            return FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::InvalidResponse {
+                detail: "native naming reply exceeds control frame limit".into(),
+            });
+        }
+        reply
     }
 
     pub async fn read_child(&self, child_thread_id: &str) -> Result<Value, ActorError> {

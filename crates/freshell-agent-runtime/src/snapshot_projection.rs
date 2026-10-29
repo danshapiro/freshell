@@ -73,6 +73,13 @@ fn visit(value: &mut Value, provider: &str, session_type: &str, known_pair: bool
 }
 
 fn project_capabilities(snapshot: &mut Map<String, Value>, provider: &str, known_pair: bool) {
+    if let Some(extension) = snapshot
+        .get_mut("extensions")
+        .and_then(|value| value.get_mut("codex"))
+        .and_then(Value::as_object_mut)
+    {
+        extension.remove("hostedNamingFacts");
+    }
     let native = snapshot.get("capabilities").and_then(Value::as_object);
     let required_valid = native.is_some_and(|capabilities| {
         ["send", "interrupt", "approvals", "questions", "fork"]

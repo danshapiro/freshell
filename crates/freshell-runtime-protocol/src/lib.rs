@@ -1793,6 +1793,8 @@ impl FreshProvider {
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentLaunchSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub naming_handle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collaboration_mode: Option<String>,
     /// Stable presentation/session key used by the external Freshell wire.
     pub session_id: String,
@@ -2993,6 +2995,7 @@ pub enum AdminCommand {
     FreshAgentReadHistory(FreshAgentReadHistoryRequest),
     FreshAgentReadSnapshot(FreshAgentReadSnapshotRequest),
     FreshAgentModelCatalog(FreshAgentModelCatalogRequest),
+    FreshAgentNativeName(FreshAgentNativeNameRequest),
     FreshAgentReadChild(FreshAgentReadChildRequest),
     RuntimeMetrics(RuntimeMetricsRequest),
     ProbeRecovery(RecoveryProbeRequest),
@@ -3509,6 +3512,7 @@ pub enum AdminResult {
     FreshAgentHistory(serde_json::Value),
     FreshAgentSnapshot(serde_json::Value),
     FreshAgentModelCatalog(serde_json::Value),
+    FreshAgentNativeName(FreshAgentNativeNameReply),
     FreshAgentChildSnapshot(serde_json::Value),
     RuntimeMetrics(RuntimeMetrics),
     RecoveryProbe(RecoveryProbe),
@@ -3632,6 +3636,12 @@ pub enum HostCommand {
         incarnation_id: IncarnationId,
         cwd: Option<String>,
     },
+    FreshAgentNativeName {
+        incarnation_id: IncarnationId,
+        native_session_id: String,
+        codex_home: String,
+        operation: FreshAgentNativeNameOperation,
+    },
     FreshAgentReadChild {
         incarnation_id: IncarnationId,
         child_thread_id: String,
@@ -3701,6 +3711,7 @@ pub enum HostResult {
     RuntimeMetrics(RuntimeMetrics),
     FreshAgentSnapshot(serde_json::Value),
     FreshAgentModelCatalog(serde_json::Value),
+    FreshAgentNativeName(FreshAgentNativeNameReply),
     FreshAgentChildSnapshot(serde_json::Value),
     Status {
         host_boot_id: HostBootId,
@@ -4443,6 +4454,7 @@ mod tests {
 
     fn fresh_agent_launch(provider: FreshProvider, session_type: &str) -> FreshAgentLaunchSpec {
         FreshAgentLaunchSpec {
+            naming_handle: None,
             collaboration_mode: None,
             session_id: "presentation-one".into(),
             provider,

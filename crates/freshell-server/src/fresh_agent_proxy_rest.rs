@@ -493,7 +493,7 @@ impl freshell_freshagent::model_capabilities::ModelCatalogProbe for HostedCodexC
     }
 }
 
-fn same_snapshot_source(
+pub(super) fn same_snapshot_source(
     before: &freshell_runtime_protocol::RuntimeView,
     after: &freshell_runtime_protocol::RuntimeView,
 ) -> bool {

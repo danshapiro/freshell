@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
+import http from 'node:http'
 import { randomUUID } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { pathToFileURL } from 'node:url'
@@ -13,6 +14,8 @@ import { authorizeFreshAgentParityRequest, captureProviderParityVolumes, cleanup
 import { makeProviderParityResourcesReadable, prepareProviderParityUserRoots, supervisorRegistrySecretScan } from '../../helpers/provider-parity-environment.js'
 import { exposeGrantsToHarness, fakeOnecliGrants, withMissingGrant } from '../../helpers/provider-parity-onecli.js'
 import type { InitialProviderVolumeAuthorization } from '../../../scripts/testing/runtime-test-broker.js'
+// @ts-expect-error The native model-wire fixture is also used by the offline Node runner.
+import { startInManagedContext } from '../providers/codex-local-provider.mjs'
 
 const root = path.resolve(import.meta.dirname, '../../..')
 const providers = [
@@ -32,7 +35,7 @@ async function waitFor<T>(label: string, probe: () => T | undefined | Promise<T 
 }
 
 class FreshWire {
-  private readonly frames: any[] = []
+  readonly frames: any[] = []
 
   private constructor(private readonly socket: WebSocket) {
     socket.on('message', data => {
@@ -350,5 +353,263 @@ describe('hosted fresh-agent provider inputs', () => {
         },
       }))
     }
+  }, 240_000)
+})
+
+describe('installed Codex through the managed gateway and durable actor', () => {
+  let rig: ManagedRuntimeBrowserRig
+  let home: string
+  let workspace: string
+  let grants: ReturnType<typeof fakeOnecliGrants>
+  let restoreGrants: (() => void) | undefined
+  let source: ProviderParitySource
+  let wire: FreshWire
+  let model: Awaited<ReturnType<typeof startInManagedContext>> | undefined
+  let naming: http.Server
+  const namingRequests: string[] = []
+  const owners: InitialProviderVolumeAuthorization[] = []
+
+  beforeAll(async () => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'freshcodex-managed-native-'))
+    workspace = path.join(home, 'workspace')
+    fs.mkdirSync(workspace)
+    execFileSync('git', ['init', '--quiet', workspace])
+    const xdg = path.join(home, 'xdg')
+    prepareProviderParityUserRoots(home, xdg)
+    grants = fakeOnecliGrants(['codex'])
+    restoreGrants = exposeGrantsToHarness(grants.serverEnv)
+    naming = http.createServer(async (request, response) => {
+      const chunks: Buffer[] = []
+      for await (const chunk of request) chunks.push(Buffer.from(chunk))
+      namingRequests.push(Buffer.concat(chunks).toString('utf8'))
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'Managed native suggested name' }] } }] }))
+    })
+    await new Promise<void>(resolve => naming.listen(0, '127.0.0.1', resolve))
+    const namingAddress = naming.address()
+    if (!namingAddress || typeof namingAddress === 'string') throw new Error('Owned naming fixture has no TCP port')
+    rig = new ManagedRuntimeBrowserRig(root, 2,
+      { XDG_CONFIG_HOME: xdg, ...grants.serverEnv, GOOGLE_GENERATIVE_AI_API_KEY: 'managed-naming-fixture',
+        FRESHELL_GEMINI_BASE_URL: `http://127.0.0.1:${namingAddress.port}` }, { XDG_CONFIG_HOME: xdg }, 'test',
+      { enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: [] }, home,
+      { workspaceRoots: [workspace], providerInputRoots: [], bootstrapFiles: Object.values(grants.grants), defaultCwd: workspace })
+    await rig.start()
+    const health = await rig.runtime.adminOk(rig.supervisor, { method: 'health' })
+    source = await readProviderParitySource(rig.runtime, health.data.installation_id)
+    const catalog = path.join(home, '.codex', 'models.json')
+    fs.writeFileSync(catalog, JSON.stringify({ models: [{ slug: 'contract-model', display_name: 'Managed native model',
+      description: 'Owned native managed contract', default_reasoning_level: 'low',
+      supported_reasoning_levels: [{ effort: 'low', description: 'Low' }, { effort: 'xhigh', description: 'Extra high' }],
+      shell_type: 'unified_exec', visibility: 'list', supported_in_api: true, priority: 0, support_verbosity: false,
+      truncation_policy: { mode: 'tokens', limit: 10000 }, context_window: 128000,
+      experimental_supported_tools: ['request_user_input_async'], supports_search_tool: false,
+      tool_mode: 'direct', use_responses_lite: false, model_messages: { instructions_template: 'Use the available tools to follow the user request.' } }] }))
+    fs.writeFileSync(path.join(home, '.codex/config.toml'), `model = "contract-model"
+model_provider = "contract-loopback"
+approval_policy = "untrusted"
+model_catalog_json = ${JSON.stringify(catalog)}
+web_search = "disabled"
+[features]
+apps = false
+default_mode_request_user_input = true
+unified_exec = true
+[tools.experimental_request_user_input]
+enabled = true
+[model_providers.contract-loopback]
+name = "Managed owned loopback"
+base_url = "http://127.0.0.1:51991/v1"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+request_max_retries = 0
+stream_max_retries = 0
+`)
+    makeProviderParityResourcesReadable(home)
+    wire = await FreshWire.connect(rig.info)
+  }, 900_000)
+
+  afterAll(async () => {
+    try {
+      await wire?.close()
+      await model?.stop()
+      if (rig) {
+        const volumes = captureProviderParityVolumes(owners)
+        const cleanup = await rig.stop()
+        expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
+        cleanupProviderParityVolumes(volumes)
+      }
+    } finally {
+      if (naming) {
+        naming.closeAllConnections()
+        await new Promise<void>(resolve => naming.close(() => resolve()))
+      }
+      restoreGrants?.()
+      if (grants) fs.rmSync(grants.directory, { recursive: true, force: true })
+      if (home) fs.rmSync(home, { recursive: true, force: true })
+    }
+  }, 180_000)
+
+  it('uses the installed wrapper for catalog, settings, saved output and exact native controls', async () => {
+    const requestId = `native-managed-${randomUUID()}`
+    owners.push(authorizeFreshAgentParityRequest(rig.runtime.broker, source, 'codex', requestId))
+    wire.send({ type: 'freshAgent.create', requestId, provider: 'codex', sessionType: 'freshcodex',
+      cwd: workspace, model: 'contract-model', effort: 'xhigh', sandbox: 'workspace-write', permissionMode: 'untrusted',
+      namingHandle: `name-${requestId}`, tabId: `tab-${requestId}` })
+    const created = await wire.wait(frame => frame.requestId === requestId
+      && ['freshAgent.created', 'freshAgent.create.failed'].includes(frame.type))
+    expect(created.type, JSON.stringify(created)).toBe('freshAgent.created')
+    const view = await waitFor('native managed provider', async () => {
+      const row = await rig.runningViewForFreshSession(created.sessionId)
+      return row?.containerId && row.nativeSessionId ? row : undefined
+    })
+    expect(rig.ownedProviderExec(view.containerId!, ['/opt/freshell-codex/launch', '--version'])).toContain('0.164.0')
+    const nativeContext = JSON.parse(rig.ownedProviderExec(view.containerId!, ['node', '-e', `
+      const fs=require('node:fs');const layout=JSON.parse(fs.readFileSync('/opt/freshell-codex/layout.json','utf8'));
+      const found=fs.readdirSync('/proc').filter(p=>Number.isInteger(Number(p))).flatMap(pid=>{try{
+        if(fs.readlinkSync('/proc/'+pid+'/exe')!==layout.nativeExecutable)return[];
+        if(!fs.readFileSync('/proc/'+pid+'/cmdline','utf8').split(String.fromCharCode(0)).includes('app-server'))return[];
+        const status=fs.readFileSync('/proc/'+pid+'/status','utf8');const field=k=>status.split(String.fromCharCode(10)).find(line=>line.startsWith(k+':'))?.slice(k.length+1).trim();
+        return[{pid:Number(pid),uid:Number(field('Uid')?.split(String.fromCharCode(9))[0]),gid:Number(field('Gid')?.split(String.fromCharCode(9))[0]),
+          executable:layout.nativeExecutable,cwd:fs.readlinkSync('/proc/'+pid+'/cwd'),noNewPrivs:field('NoNewPrivs'),capEff:field('CapEff')}];
+      }catch{return[]}});if(found.length!==1)throw Error('Expected one actual installed native Codex app-server');process.stdout.write(JSON.stringify(found[0]));`]))
+    expect(nativeContext).toMatchObject({ uid: 65534, gid: 0, cwd: workspace, noNewPrivs: '1', capEff: '0000000000000000' })
+    model = await startInManagedContext(rig, { containerId: view.containerId!, handlerSource: `async record => {
+      const input=record.body.input;
+      const user=input.filter(item=>item.role==='user').at(-1);
+      const prompt=JSON.stringify(user);
+      const call=(name,args,id)=>{
+        let namespace;let tool=record.body.tools.find(tool=>tool.type==='function'&&tool.name===name);
+        if(!tool){const group=record.body.tools.find(tool=>tool.type==='namespace'&&tool.tools?.some(member=>member.name===name));tool=group?.tools.find(member=>member.name===name);namespace=group?.name;}
+        if(!tool)throw Error('Native model did not advertise '+name);
+        return {items:[{id:'fc_'+id,type:'function_call',call_id:'call_'+id,...(namespace?{namespace}:{}),name,arguments:JSON.stringify(args),status:'completed'}]};
+      };
+      if(prompt.includes('AWAITED_PLAN')&&!input.some(item=>item.call_id==='call_awaited'))return call('request_user_input',{questions:[{id:'managed_choice',header:'Choice',question:'Which managed result?',options:[{label:'Alpha',description:'First result'},{label:'Beta',description:'Second result'}]}]},'awaited');
+      if(prompt.includes('ASYNC_QUESTION')&&!input.some(item=>item.call_id==='call_async'))return call('request_user_input_async',{questions:[{title:'Which managed environment?',options:['Staging','Production']}]},'async');
+      return {text:prompt.includes('ASYNC_QUESTION')?'Managed work continued before the answer.':prompt.includes('AWAITED_PLAN')?'Managed awaited answer completed.':'Managed native final answer.'};
+    }` })
+    expect(model.context).toMatchObject({ uid: 65534, gid: 0 })
+    const headers = { 'x-auth-token': rig.info.token }
+    const snapshot = async () => {
+      const response = await fetch(`${rig.info.baseUrl}/api/fresh-agent/threads/freshcodex/codex/${created.sessionId}`, { headers })
+      expect(response.ok, await response.clone().text()).toBe(true)
+      return response.json()
+    }
+    const catalogResponse = await fetch(`${rig.info.baseUrl}/api/fresh-agent/model-capabilities/freshcodex?${new URLSearchParams({ sessionId: created.sessionId, sessionRef: JSON.stringify(created.sessionRef), cwd: workspace })}`, { headers })
+    expect(catalogResponse.ok, await catalogResponse.clone().text()).toBe(true)
+    expect((await catalogResponse.json()).models).toEqual(expect.arrayContaining([expect.objectContaining({ id: 'contract-model', supportedEffortLevels: ['low', 'xhigh'] })]))
+    const send = async (text: string, settings?: unknown) => {
+      const id = `send-${randomUUID()}`
+      wire.send({ type: 'freshAgent.send', sessionType: 'freshcodex', provider: 'codex', sessionId: created.sessionId, requestId: id, text, ...(settings ? { settings } : {}) })
+      const accepted = await wire.wait(frame => frame.requestId === id && ['freshAgent.send.accepted', 'error'].includes(frame.type))
+      expect(accepted.type, JSON.stringify(accepted)).toBe('freshAgent.send.accepted')
+      return accepted
+    }
+    await send('MANAGED_NATIVE_FIRST')
+    const saved = await waitFor('managed native saved first answer', async () => {
+      const value = await snapshot()
+      return value.status === 'idle' && JSON.stringify(value.turns).includes('Managed native final answer.') ? value : undefined
+    })
+    expect(saved.settings).toMatchObject({ model: 'contract-model', effort: 'xhigh', sandbox: 'workspace-write', permissionMode: 'untrusted', cwd: workspace })
+    expect(model.traffic[0].body.reasoning.effort).toBe('xhigh')
+    await send('AWAITED_PLAN', { collaborationMode: 'plan' })
+    const pending = await waitFor('managed native awaited Plan control', async () => {
+      const value = await snapshot()
+      return value.pendingQuestions?.length ? value.pendingQuestions[0] : undefined
+    })
+    expect(pending.questions[0].id).toBe('managed_choice')
+    wire.send({ type: 'freshAgent.question.respond', sessionType: 'freshcodex', provider: 'codex', sessionId: created.sessionId,
+      requestId: pending.requestId, answers: { managed_choice: 'Alpha' } })
+    await waitFor('managed native awaited decision drained', async () => {
+      const value = await snapshot()
+      return value.status === 'idle' && !value.pendingQuestions.length && JSON.stringify(value.turns).includes('Managed awaited answer completed.') ? true : undefined
+    })
+    await send('ASYNC_QUESTION', { collaborationMode: 'default' })
+    const asyncSnapshot = await waitFor('managed native async continuation without answer', async () => {
+      const value = await snapshot()
+      return value.status === 'idle' && JSON.stringify(value.turns).includes('Managed work continued before the answer.') ? value : undefined
+    })
+    expect(asyncSnapshot.pendingQuestions).toHaveLength(0)
+    expect(JSON.stringify(asyncSnapshot.turns)).toContain('Which managed environment?')
+    await send('Question: Which managed environment? Answer: Staging.', { effort: null })
+    await waitFor('managed contextual answer at loopback model', () => model!.traffic.some((row: any) => JSON.stringify(row.body.input).includes('Answer: Staging.')) ? true : undefined)
+    await waitFor('managed contextual answer completion', async () => (await snapshot()).status === 'idle' ? true : undefined)
+    const resumedResponse = await fetch(`${rig.info.baseUrl}/api/tabs`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ agent: 'codex', cwd: workspace, sessionRef: { provider: 'codex', sessionId: view.nativeSessionId } }) })
+    expect(resumedResponse.ok, await resumedResponse.clone().text()).toBe(true)
+    const resumed = await resumedResponse.json()
+    const paneId = resumed.data?.paneId ?? resumed.paneId
+    expect(paneId).toBeTruthy()
+    const captureResponse = await fetch(`${rig.info.baseUrl}/api/panes/${paneId}/capture`, { headers })
+    expect(captureResponse.ok, await captureResponse.clone().text()).toBe(true)
+    expect(await captureResponse.text()).toContain('Managed native final answer.')
+    const durableNameRef = { kind: 'session', provider: 'codex', sessionId: view.nativeSessionId }
+    const readName = async () => {
+      const response = await fetch(`${rig.info.baseUrl}/api/session-names/read`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+        body: JSON.stringify({ refs: [durableNameRef] }) })
+      expect(response.ok).toBe(true)
+      return (await response.json()).names[0]?.record
+    }
+    const nativeMetadata = JSON.parse(rig.ownedProviderExec(view.containerId!, ['node', '-e', `
+      const fs=require('node:fs'),path=require('node:path');
+      const env=Object.fromEntries(fs.readFileSync('/proc/${nativeContext.pid}/environ','utf8').split(String.fromCharCode(0)).flatMap(entry=>{
+        const at=entry.indexOf('=');const key=entry.slice(0,at);return ['HOME','CODEX_HOME'].includes(key)?[[key,entry.slice(at+1)]]:[];
+      }));
+      const errors=[],headers=[],directories=[];let visited=0;
+      const stat=p=>{const s=fs.statSync(p);return{uid:s.uid,gid:s.gid,mode:(s.mode&511).toString(8)}};
+      const roots=[...new Set([env.CODEX_HOME,env.HOME&&path.join(env.HOME,'.codex')].filter(Boolean))];
+      const walk=(dir,depth)=>{if(depth>8||visited++>1024)return;try{
+        directories.push({path:dir,...stat(dir)});
+        for(const entry of fs.readdirSync(dir,{withFileTypes:true})){
+          const file=path.join(dir,entry.name);if(entry.isDirectory())walk(file,depth+1);
+          else if(entry.isFile()&&entry.name.endsWith('.jsonl')){
+            const fd=fs.openSync(file,'r');let first;try{const b=Buffer.alloc(65536);first=b.toString('utf8',0,fs.readSync(fd,b,0,b.length,0)).split(String.fromCharCode(10))[0]}finally{fs.closeSync(fd)}
+            let meta;try{meta=JSON.parse(first)}catch{}
+            headers.push({path:file,...stat(file),type:meta?.type,id:meta?.payload?.id??meta?.payload?.session_id});
+          }
+        }
+      }catch(error){errors.push({path:dir,code:error.code})}};
+      for(const root of roots)walk(path.join(root,'sessions'),0);
+      const hostStatus=fs.readFileSync('/proc/1/status','utf8').split(String.fromCharCode(10)).filter(line=>/^(Uid|Gid|CapEff|NoNewPrivs):/.test(line));
+      process.stdout.write(JSON.stringify({env,roots,directories,headers,errors,hostStatus}));`]))
+    const hostMetadataAccess = JSON.parse(rig.ownedContainerExec(view.containerId!, ['node', '-e', `
+      const fs=require('node:fs');const root='/home/freshell/provider';const s=fs.statSync(root);
+      let readError;try{fs.readdirSync(root+'/.codex/sessions')}catch(error){readError=error.code}
+      process.stdout.write(JSON.stringify({uid:process.getuid(),root:{uid:s.uid,gid:s.gid,mode:(s.mode&511).toString(8)},readError}));`]))
+    expect(hostMetadataAccess).toMatchObject({ uid: 0, root: { uid: 65534, mode: '700' }, readError: 'EACCES' })
+    expect(nativeMetadata.headers).toEqual(expect.arrayContaining([expect.objectContaining({ type: 'session_meta', id: view.nativeSessionId })]))
+    rig.runtime.writeIncident('freshcodex-managed-native-before-naming', { created, view, nativeContext, nativeMetadata, fixtureContext: model.context, saved, asyncSnapshot,
+      hostMetadataAccess, traffic: model.traffic, final: await snapshot() })
+    const durableName = await waitFor('managed native durable shared name', async () => {
+      const record = await readName()
+      return record?.ref?.sessionId === view.nativeSessionId ? record : undefined
+    }, 15_000)
+    expect(durableName.ref).toEqual(durableNameRef)
+    await waitFor('managed first-message naming request', () => namingRequests.some(body => body.includes('MANAGED_NATIVE_FIRST')) ? true : undefined)
+    const renamed = await fetch(`${rig.info.baseUrl}/api/session-names`, { method: 'PATCH', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ target: durableNameRef, name: 'Managed native saved name', nameIntent: 'user' }) })
+    expect(renamed.ok, await renamed.clone().text()).toBe(true)
+    const canonicalName = await readName()
+    expect(canonicalName).toMatchObject({ ref: durableNameRef, name: 'Managed native saved name', source: 'manual' })
+    const readNativeName = () => JSON.parse(rig.ownedProviderExec(view.containerId!, ['node', '-e', `
+      const fs=require('node:fs');const argv=fs.readFileSync('/proc/${nativeContext.pid}/cmdline','utf8').split(String.fromCharCode(0));
+      const endpoint=argv[argv.indexOf('--listen')+1];const target=new URL(endpoint);
+      if(target.protocol!=='ws:'||target.hostname!=='127.0.0.1'||!target.port)throw Error('Expected the existing native loopback endpoint');
+      const socket=new WebSocket(endpoint);let settled=false;
+      const finish=(error,value)=>{if(settled)return;settled=true;clearTimeout(timer);socket.close();
+        if(error){process.stderr.write(String(error));process.exit(1)}process.stdout.write(JSON.stringify(value),()=>process.exit(0));};
+      const timer=setTimeout(()=>finish('Existing native metadata observer timed out'),8000);
+      socket.addEventListener('error',()=>finish('Existing native metadata connection failed'));
+      socket.addEventListener('open',()=>socket.send(JSON.stringify({id:1,method:'initialize',params:{clientInfo:{name:'freshell_name_read_probe',version:'1'}}})));
+      socket.addEventListener('message',event=>{const frame=JSON.parse(String(event.data));if(frame.error)return finish(frame.error.message);
+        if(frame.id===1){socket.send(JSON.stringify({method:'initialized'}));socket.send(JSON.stringify({id:2,method:'thread/read',params:{threadId:${JSON.stringify(view.nativeSessionId)},includeTurns:false}}));}
+        if(frame.id===2)finish(null,{id:frame.result.thread.id,title:frame.result.thread.name??null});});`]))
+    const nativeNameBeforeWait = readNativeName()
+    rig.runtime.writeIncident('freshcodex-managed-native-name-writeback', { canonicalName, nativeNameBeforeWait, view, nativeContext })
+    await waitFor('managed native name writeback', () => {
+      const observation = readNativeName()
+      return observation.id === view.nativeSessionId && observation.title === canonicalName.name ? observation : undefined
+    }, 15_000)
+    rig.runtime.writeIncident('freshcodex-managed-native-journey', { created, view, nativeContext, context: model.context,
+      traffic: model.traffic, saved, asyncSnapshot, canonicalName, nativeName: readNativeName(), final: await snapshot() })
   }, 240_000)
 })

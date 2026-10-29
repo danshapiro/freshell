@@ -7,6 +7,141 @@ use freshell_runtime_protocol::{
 use tokio::net::UnixListener;
 
 #[tokio::test]
+async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_failures() {
+    use crate::session_name_native::{NativeCallResult, NativeNameTarget};
+    use freshell_runtime_protocol::{
+        FreshAgentNativeNameError as Error, FreshAgentNativeNameReply as Reply,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    for scenario in [
+        "ok",
+        "missing",
+        "source-changes",
+        "unavailable",
+        "unsupported",
+        "refused",
+        "timeout",
+        "closed",
+        "transport",
+        "invalid-response",
+    ] {
+        let socket = dir.path().join(format!("native-name-{scenario}.sock"));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        let server = tokio::spawn(async move {
+            let mut inventories = 0;
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let envelope: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+                let result = match envelope.body {
+                    AdminCommand::Health => AdminResult::Health {
+                        control_epoch: 7,
+                        installation_id: InstallationId::new(),
+                    },
+                    AdminCommand::Inventory => {
+                        inventories += 1;
+                        AdminResult::Inventory(vec![serde_json::from_value(serde_json::json!({
+                            "soulId":"name-soul","incarnationId":"name-incarnation","hostBootId":if scenario=="source-changes"&&inventories>1 {"replaced-boot"}else{"name-boot"},
+                            "launchState":"running","cleanupState":"none","intentRevision":3,"executionGeneration":2,
+                            "desiredState":"running","recoveryState":"live","durabilityState":"unknown","allocationState":"allocated",
+                            "evidenceRevision":0,"successfulRecoveriesInWindow":0,"provider":"codex",
+                            "nativeSessionId":if scenario=="missing" {"foreign-native"}else{"name-native"},"freshAgentSessionId":"public-name-session","freshAgentSessionType":"freshcodex"
+                        })).unwrap()])
+                    }
+                    AdminCommand::FreshAgentNativeName(request) => {
+                        assert_eq!(request.soul_id.as_str(), "name-soul");
+                        assert_eq!(request.codex_home, "/owning/codex");
+                        assert_eq!(request.source.native_session_id, "name-native");
+                        assert_eq!(request.source.incarnation_id.as_str(), "name-incarnation");
+                        assert_eq!(request.source.host_boot_id.as_str(), "name-boot");
+                        assert_eq!(
+                            (
+                                request.source.execution_generation,
+                                request.source.intent_revision
+                            ),
+                            (2, 3)
+                        );
+                        assert_eq!(request.expected_control_epoch, Some(7));
+                        assert_eq!(
+                            request.operation,
+                            freshell_runtime_protocol::FreshAgentNativeNameOperation::Read
+                        );
+                        seen.lock().await.push(request);
+                        AdminResult::FreshAgentNativeName(match scenario {
+                            "ok" | "source-changes" => Reply::Title(Some("Native title".into())),
+                            "unavailable" => Reply::Failed(Error::Unavailable {
+                                message: "current connection absent".into(),
+                            }),
+                            "unsupported" => Reply::Failed(Error::Rpc {
+                                code: -32601,
+                                message: "method unavailable".into(),
+                            }),
+                            "refused" => Reply::Failed(Error::Rpc {
+                                code: -32602,
+                                message: "invalid name input".into(),
+                            }),
+                            "timeout" => Reply::Failed(Error::Timeout { timeout_ms: 20_000 }),
+                            "closed" => Reply::Failed(Error::Closed),
+                            "transport" => Reply::Failed(Error::Transport {
+                                message: "send refused".into(),
+                            }),
+                            "invalid-response" => Reply::Failed(Error::InvalidResponse {
+                                detail: "malformed metadata".into(),
+                            }),
+                            _ => unreachable!(),
+                        })
+                    }
+                    other => panic!("native naming attempted unrelated operation: {other:?}"),
+                };
+                write_frame(
+                    &mut stream,
+                    &AdminReply {
+                        request_id: envelope.request_id,
+                        result: Ok(result),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let backend = snapshot_outage_proxy(&socket).native_name_backend();
+        let reply = backend
+            .read(NativeNameTarget {
+                name_ref: freshell_protocol::session_names::SessionNameRef::Session {
+                    provider: NamedProvider::Codex,
+                    session_id: "name-native".into(),
+                },
+                location: freshell_protocol::native_location::NativeLocation::Codex {
+                    codex_home: "/owning/codex".into(),
+                    native_thread_id: Some("name-native".into()),
+                    rollout_path: None,
+                    persistence_evidence: None,
+                },
+                location_revision: 1,
+            })
+            .await;
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        match scenario {
+            "ok" => assert!(
+                matches!(reply,NativeCallResult::Confirmed(value) if value.title.as_deref()==Some("Native title"))
+            ),
+            "missing" | "unavailable" | "refused" | "transport" => assert!(
+                matches!(reply, NativeCallResult::Undelivered(_)),
+                "{scenario}: {reply:?}"
+            ),
+            "unsupported" => assert!(matches!(reply, NativeCallResult::Unsupported(_))),
+            _ => assert!(
+                matches!(reply, NativeCallResult::Ambiguous(_)),
+                "{scenario}: {reply:?}"
+            ),
+        }
+        assert_eq!(calls.lock().await.len(), usize::from(scenario != "missing"));
+    }
+}
+
+#[tokio::test]
 async fn codex_model_catalog_routes_only_to_current_root_and_discards_changed_sources() {
     use tower::ServiceExt;
     let mut env = crate::test_env_lock::TestEnv::lock().await;
@@ -277,8 +412,8 @@ fn managed_provider_fresh_codex_retains_terminal_and_native_sidecar_arguments() 
     );
 }
 
-#[test]
-fn hosted_created_frame_uses_the_public_request_identity() {
+#[tokio::test]
+async fn hosted_created_frame_uses_the_public_request_identity() {
     let (broadcast, mut receiver) = broadcast::channel(8);
     let proxy = HostedFreshAgentProxy {
         client: RuntimeClient::new("/tmp/unopened-fresh-agent-proxy.sock", "fixture"),
@@ -291,16 +426,18 @@ fn hosted_created_frame_uses_the_public_request_identity() {
         checkpoint_barrier: OnceLock::new(),
         ownership: OnceLock::new(),
     };
-    proxy.forward_host_event(
-        AgentEvent::Provider {
-            payload: serde_json::json!({
-                "type":"freshAgent.created", "requestId":"host-internal", "sessionId":"native"
-            }),
-        },
-        "claude",
-        "public",
-        "freshclaude",
-    );
+    proxy
+        .forward_host_event(
+            AgentEvent::Provider {
+                payload: serde_json::json!({
+                    "type":"freshAgent.created", "requestId":"host-internal", "sessionId":"native"
+                }),
+            },
+            "claude",
+            "public",
+            "freshclaude",
+        )
+        .await;
     assert!(
         receiver.try_recv().is_err(),
         "internal create ID must not reach the client"
@@ -440,7 +577,7 @@ async fn hosted_codex_preparation_refusal_case(rest: bool, operational: bool) {
                 session_type: "freshcodex".into(),
                 cwd: Some(workspace.to_str().unwrap().into()),
                 model: Some("original-model".into()),
-                effort: Some("high".into()),
+                effort: Some(Some("high".into())),
                 permission_mode: Some("untrusted".into()),
                 ..Default::default()
             })

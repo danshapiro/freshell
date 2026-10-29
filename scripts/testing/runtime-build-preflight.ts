@@ -57,7 +57,7 @@ export function runtimeBuildRecipesForFiles(repoRoot: string, files: string[], e
   return [
     'test-hosts', 'release-hosts',
     ...(terminal ? ['qualification-supervisor', 'qualification-server'] as const : []),
-    ...(fresh ? ['fresh-fixture-server'] as const : []),
+    ...(fresh ? ['fresh-fixture-server', 'managed-server'] as const : []),
   ]
 }
 

@@ -1908,6 +1908,7 @@ mod tests {
         let binary = root.path().join("freshell-session-host");
         std::fs::write(&binary, b"host").unwrap();
         let agent = FreshAgentLaunchSpec {
+            naming_handle: None,
             collaboration_mode: None,
             session_id: "session-one".into(),
             provider: FreshProvider::Codex,
@@ -2257,6 +2258,7 @@ mod tests {
     #[test]
     fn fresh_agent_config_digest_survives_native_identity_and_turn_settings() {
         let agent = FreshAgentLaunchSpec {
+            naming_handle: None,
             collaboration_mode: None,
             session_id: "presentation-one".into(),
             provider: FreshProvider::Codex,
@@ -2399,6 +2401,7 @@ mod tests {
 
     fn fresh_agent_spec_fixture() -> FreshAgentLaunchSpec {
         FreshAgentLaunchSpec {
+            naming_handle: None,
             collaboration_mode: None,
             session_id: "session-fixture".into(),
             provider: FreshProvider::Codex,

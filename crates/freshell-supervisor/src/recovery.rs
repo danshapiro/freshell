@@ -2424,6 +2424,7 @@ mod tests {
     #[test]
     fn queued_fresh_prompt_replays_with_the_exact_persisted_turn_profile() {
         let agent = FreshAgentLaunchSpec {
+            naming_handle: None,
             collaboration_mode: None,
             session_id: "presentation".into(),
             provider: FreshProvider::Codex,

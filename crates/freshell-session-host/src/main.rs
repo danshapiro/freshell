@@ -178,6 +178,7 @@ async fn run() -> Result<(), String> {
         Some("fresh-agent-fixture-state-worker") => providers::run_fresh_agent_fixture_state_worker(&args[2..]),
         Some("opencode-identity-worker") => pty::run_opencode_identity_worker(&args[2..]),
         Some("provider-probe-worker") => providers::run_probe_worker(&args[2..]),
+        Some("codex-naming-proof") => providers::run_naming_proof(&args[2..]),
         Some("refresh-provider-config") => refresh_provider_config_worker(&args[2..]),
         Some("prepare-provider-features") => providers::run_provider_features_worker(&args[2..]),
         Some("prepare-amplifier-state") => providers::run_amplifier_state_worker(&args[2..]),
@@ -742,6 +743,25 @@ async fn dispatch(
                             .model_catalog(cwd.as_deref())
                             .await
                             .map_err(map_actor_error)?,
+                    ))
+                }
+                HostCommand::FreshAgentNativeName {
+                    incarnation_id,
+                    native_session_id,
+                    codex_home,
+                    operation,
+                } => {
+                    ensure_incarnation(&incarnation_id, state)?;
+                    let actor = state
+                        .fresh_agent
+                        .lock()
+                        .await
+                        .clone()
+                        .ok_or_else(unsupported_fresh_agent)?;
+                    Ok(HostResult::FreshAgentNativeName(
+                        actor
+                            .native_name(&native_session_id, &codex_home, &operation)
+                            .await,
                     ))
                 }
                 HostCommand::FreshAgentReadSnapshot { incarnation_id } => {
@@ -10367,6 +10387,7 @@ mod tests {
         let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
             state.state_dir.join("rpc-configure-agent"),
             FreshAgentProfile {
+                naming_handle: None,
                 collaboration_mode: None,
                 provider: FreshProvider::Claude,
                 runtime_variant: "fixture-sdk".into(),
@@ -10528,6 +10549,7 @@ mod tests {
         let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
             state.state_dir.join("child-observer"),
             FreshAgentProfile {
+                naming_handle: None,
                 collaboration_mode: None,
                 provider: FreshProvider::Codex,
                 runtime_variant: "freshcodex".into(),
@@ -10606,6 +10628,7 @@ mod tests {
         let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
             state.state_dir.join("catalog-observer"),
             FreshAgentProfile {
+                naming_handle: None,
                 collaboration_mode: None,
                 provider: FreshProvider::Codex,
                 runtime_variant: "freshcodex".into(),
@@ -10678,6 +10701,7 @@ mod tests {
         let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
             state.state_dir.join("rpc-fixture-agent"),
             FreshAgentProfile {
+                naming_handle: None,
                 collaboration_mode: None,
                 provider: FreshProvider::Claude,
                 runtime_variant: "fixture-sdk".into(),

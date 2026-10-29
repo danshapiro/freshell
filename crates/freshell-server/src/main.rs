@@ -1469,6 +1469,12 @@ async fn main() -> ExitCode {
                         >
                 },
             ));
+            #[cfg(feature = "managed-runtime-v1")]
+            let codex_adapter = codex_adapter.with_hosted_backend(
+                hosted_fresh_gateway
+                    .as_ref()
+                    .map(|gateway| gateway.native_name_backend()),
+            );
             let opencode_adapter = Some(session_name_native::OpencodeNativeNameAdapter::new(
                 agent_state.opencode_shared_handle(),
             ));

@@ -80,6 +80,7 @@ async fn running_fresh_provider(provider: FreshProvider) -> RunningFreshAgent {
             fixture: None,
             terminal: None,
             fresh_agent: Some(FreshAgentLaunchSpec {
+                naming_handle: None,
                 collaboration_mode: None,
                 session_id: "fresh-session".into(),
                 provider: provider.clone(),
@@ -182,10 +183,16 @@ fn fake_host_with_boot_change(
     runtime_dir: &std::path::Path,
     change_boot: bool,
 ) -> (Arc<StdMutex<Vec<HostCommand>>>, tokio::task::JoinHandle<()>) {
+    fake_host_with_boot(runtime_dir, change_boot, HostBootId::new())
+}
+fn fake_host_with_boot(
+    runtime_dir: &std::path::Path,
+    change_boot: bool,
+    boot: HostBootId,
+) -> (Arc<StdMutex<Vec<HostCommand>>>, tokio::task::JoinHandle<()>) {
     let secret = b"synthetic-host-secret";
     std::fs::write(runtime_dir.join("secret"), secret).unwrap();
     let listener = UnixListener::bind(runtime_dir.join("host.sock")).unwrap();
-    let boot = HostBootId::new();
     let received = Arc::new(StdMutex::new(Vec::new()));
     let log = Arc::clone(&received);
     let task = tokio::spawn(async move {
@@ -219,6 +226,27 @@ fn fake_host_with_boot_change(
                     HostResult::FreshAgentModelCatalog(
                         serde_json::json!([{"id":"provider-current","displayName":"Provider Current","supportedEffortLevels":["ultra"],"defaultEffort":"ultra"}]),
                     )
+                }
+                HostCommand::FreshAgentNativeName {
+                    native_session_id,
+                    codex_home,
+                    operation,
+                    ..
+                } => {
+                    assert_eq!(native_session_id, "name-native");
+                    assert_eq!(codex_home, "/owning/codex");
+                    HostResult::FreshAgentNativeName(match operation {
+                        FreshAgentNativeNameOperation::Probe => {
+                            FreshAgentNativeNameReply::Available
+                        }
+                        FreshAgentNativeNameOperation::Read => {
+                            FreshAgentNativeNameReply::Title(Some("Native title".into()))
+                        }
+                        FreshAgentNativeNameOperation::Write { title } => {
+                            assert_eq!(title, "Manual title");
+                            FreshAgentNativeNameReply::Renamed
+                        }
+                    })
                 }
                 HostCommand::FreshAgentConfigure { .. } => HostResult::FreshAgentCommand {
                     state: CommandState::ProviderAcked,
@@ -536,6 +564,169 @@ fn host_configure_gets_the_fresh_agent_command_budget() {
     assert!(!uses_fresh_agent_command_budget(&HostCommand::Status {
         incarnation_id: IncarnationId::new(),
     }));
+}
+
+#[tokio::test]
+async fn admin_native_name_rejects_stale_authority_before_host_work_and_preserves_recovery() {
+    for scenario in [
+        "read",
+        "write",
+        "probe",
+        "busy",
+        "stale-native",
+        "stale-boot",
+        "stale-incarnation",
+        "stale-generation",
+        "stale-intent",
+        "stale-epoch",
+        "wrong-provider",
+        "boot-changes",
+    ] {
+        let fixture = running_fresh_provider(if scenario == "wrong-provider" {
+            FreshProvider::Claude
+        } else {
+            FreshProvider::Codex
+        })
+        .await;
+        fixture
+            .supervisor
+            .registry
+            .record_native_session(
+                fixture.soul.clone(),
+                fixture.incarnation.clone(),
+                "name-native".into(),
+            )
+            .await
+            .unwrap();
+        let view = fixture
+            .supervisor
+            .registry
+            .inventory()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|view| view.soul_id == fixture.soul)
+            .unwrap();
+        let before = fixture
+            .supervisor
+            .registry
+            .recovery_context(fixture.soul.clone())
+            .await
+            .unwrap()
+            .fresh_agent;
+        let mut source = FreshAgentNativeNameSource {
+            incarnation_id: view.incarnation_id.clone(),
+            host_boot_id: view.host_boot_id.clone().unwrap(),
+            execution_generation: view.execution_generation,
+            intent_revision: view.intent_revision,
+            native_session_id: "name-native".into(),
+        };
+        let (received, host) = fake_host_with_boot(
+            &fixture.runtime_dir,
+            scenario == "boot-changes",
+            source.host_boot_id.clone(),
+        );
+        match scenario {
+            "stale-native" => source.native_session_id = "foreign-native".into(),
+            "stale-boot" => source.host_boot_id = HostBootId::new(),
+            "stale-incarnation" => source.incarnation_id = IncarnationId::new(),
+            "stale-generation" => source.execution_generation += 1,
+            "stale-intent" => source.intent_revision += 1,
+            _ => {}
+        }
+        let epoch = fixture.supervisor.registry.control_epoch();
+        let mut request = Envelope::new(
+            RequestId::new(),
+            ControlRole::Web,
+            AdminCommand::FreshAgentNativeName(FreshAgentNativeNameRequest {
+                soul_id: fixture.soul.clone(),
+                source,
+                codex_home: "/owning/codex".into(),
+                operation: match scenario {
+                    "write" => FreshAgentNativeNameOperation::Write {
+                        title: "Manual title".into(),
+                    },
+                    "probe" => FreshAgentNativeNameOperation::Probe,
+                    _ => FreshAgentNativeNameOperation::Read,
+                },
+                expected_control_epoch: Some(if scenario == "stale-epoch" {
+                    epoch + 1
+                } else {
+                    epoch
+                }),
+            }),
+        );
+        request.auth = Some(SECRET.into());
+        let lifecycle = fixture.supervisor.lifecycle_lock(&fixture.soul).await;
+        let _busy_guard = if scenario == "busy" {
+            Some(lifecycle.lock().await)
+        } else {
+            None
+        };
+        let reply = fixture.supervisor.dispatch(request).await;
+        host.abort();
+        let _ = host.await;
+        if scenario == "stale-epoch" {
+            assert_eq!(
+                reply.result.unwrap_err().code,
+                RuntimeErrorCode::StaleControlEpoch
+            );
+        } else {
+            let AdminResult::FreshAgentNativeName(reply) = reply.result.unwrap() else {
+                panic!("wrong reply")
+            };
+            match scenario {
+                "read" => assert_eq!(
+                    reply,
+                    FreshAgentNativeNameReply::Title(Some("Native title".into()))
+                ),
+                "write" => assert_eq!(reply, FreshAgentNativeNameReply::Renamed),
+                "probe" => assert_eq!(reply, FreshAgentNativeNameReply::Available),
+                "boot-changes" => assert_eq!(
+                    reply,
+                    FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Closed)
+                ),
+                _ => assert!(matches!(
+                    reply,
+                    FreshAgentNativeNameReply::Failed(
+                        FreshAgentNativeNameError::Unavailable { .. }
+                    )
+                )),
+            }
+        }
+        {
+            let calls = received.lock().unwrap();
+            if scenario.starts_with("stale-") || scenario == "wrong-provider" || scenario == "busy"
+            {
+                assert!(
+                    calls.is_empty(),
+                    "{scenario}: no host/native work for stale authority"
+                );
+            } else {
+                assert_eq!(
+                    calls
+                        .iter()
+                        .filter(|command| matches!(
+                            command,
+                            HostCommand::FreshAgentNativeName { .. }
+                        ))
+                        .count(),
+                    1
+                );
+            }
+        }
+        assert_eq!(
+            fixture
+                .supervisor
+                .registry
+                .recovery_context(fixture.soul.clone())
+                .await
+                .unwrap()
+                .fresh_agent,
+            before,
+            "metadata does not change launch/recovery settings"
+        );
+    }
 }
 
 #[tokio::test]

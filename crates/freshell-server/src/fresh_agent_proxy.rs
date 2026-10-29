@@ -734,6 +734,9 @@ impl HostedFreshAgentProxy {
         };
         provider_launch_context = context_for_fresh_provider(provider_launch_context);
         let launch = FreshAgentLaunchSpec {
+            naming_handle: (provider == FreshProvider::Codex)
+                .then(|| message.naming_handle.clone())
+                .flatten(),
             collaboration_mode: message.collaboration_mode.clone(),
             session_id: public_session_id.clone(),
             provider: provider.clone(),
@@ -1067,17 +1070,19 @@ impl HostedFreshAgentProxy {
                                 .get(&soul)
                                 .cloned()
                                 .unwrap_or_else(|| presentation_session_id.clone());
-                            proxy.forward_retained(
-                                retained,
-                                &provider,
-                                &presentation,
-                                &session_type,
-                                if batch.reset_required {
-                                    "freshAgent.host.journal.reset"
-                                } else {
-                                    "freshAgent.host.backpressure"
-                                },
-                            );
+                            proxy
+                                .forward_retained(
+                                    retained,
+                                    &provider,
+                                    &presentation,
+                                    &session_type,
+                                    if batch.reset_required {
+                                        "freshAgent.host.journal.reset"
+                                    } else {
+                                        "freshAgent.host.backpressure"
+                                    },
+                                )
+                                .await;
                             // Projection and controls are covered, but request receipts
                             // still have to drain through every bounded journal page.
                             retained_through = retained_through.max(batch.head);
@@ -1113,12 +1118,14 @@ impl HostedFreshAgentProxy {
                                 .get(&soul)
                                 .cloned()
                                 .unwrap_or_else(|| presentation_session_id.clone());
-                            proxy.forward_host_event(
-                                event.event,
-                                &provider,
-                                &current_presentation,
-                                &session_type,
-                            );
+                            proxy
+                                .forward_host_event(
+                                    event.event,
+                                    &provider,
+                                    &current_presentation,
+                                    &session_type,
+                                )
+                                .await;
                         }
                     }
                     Err(_) => {
@@ -1155,7 +1162,7 @@ impl HostedFreshAgentProxy {
             .find(|view| &view.soul_id == soul && view.desired_state == DesiredState::Running)
     }
 
-    fn forward_retained(
+    async fn forward_retained(
         &self,
         mut retained: serde_json::Value,
         provider: &str,
@@ -1163,6 +1170,21 @@ impl HostedFreshAgentProxy {
         session_type: &str,
         event_type: &str,
     ) {
+        let native = retained["snapshot"]["threadId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if provider == "codex" {
+            if let Some(facts) = retained["snapshot"]["extensions"]["codex"]
+                .as_object_mut()
+                .and_then(|extension| extension.remove("hostedNamingFacts"))
+            {
+                for fact in facts.as_array().into_iter().flatten() {
+                    self.fold_hosted_codex_naming(presentation, &native, fact.clone())
+                        .await;
+                }
+            }
+        }
         retained["source"]["nativeSessionId"] = retained["snapshot"]["threadId"].clone();
         if let Some(ownership) = self.ownership.get() {
             let canonical = ownership.resolve_canonical(provider, presentation);
@@ -1197,7 +1219,8 @@ impl HostedFreshAgentProxy {
                 provider,
                 presentation,
                 session_type,
-            );
+            )
+            .await;
         }
     }
 
@@ -1244,7 +1267,8 @@ impl HostedFreshAgentProxy {
                     presentation_session_id,
                     session_type,
                     "freshAgent.host.backpressure",
-                );
+                )
+                .await;
                 retained_through = retained_through.max(batch.head);
             }
             if batch.events.is_empty() {
@@ -1261,7 +1285,8 @@ impl HostedFreshAgentProxy {
                         provider,
                         presentation_session_id,
                         session_type,
-                    );
+                    )
+                    .await;
                 }
             }
             if cursor >= replay_through {
@@ -1270,7 +1295,7 @@ impl HostedFreshAgentProxy {
         }
     }
 
-    fn forward_host_event(
+    async fn forward_host_event(
         &self,
         event: AgentEvent,
         provider: &str,
@@ -1279,6 +1304,20 @@ impl HostedFreshAgentProxy {
     ) {
         match event {
             AgentEvent::Provider { mut payload } => {
+                if payload["event"]["type"]
+                    == freshell_freshagent::naming::HOSTED_CODEX_NAMING_EVENT
+                {
+                    if provider == "codex" {
+                        let native = payload["sessionId"].as_str().unwrap_or_default();
+                        self.fold_hosted_codex_naming(
+                            presentation_session_id,
+                            native,
+                            payload["event"]["fact"].clone(),
+                        )
+                        .await;
+                    }
+                    return;
+                }
                 if payload.get("type").and_then(serde_json::Value::as_str)
                     == Some("freshAgent.created")
                 {
@@ -1303,6 +1342,91 @@ impl HostedFreshAgentProxy {
                 }));
             }
             _ => {}
+        }
+    }
+
+    async fn fold_hosted_codex_naming(
+        &self,
+        presentation: &str,
+        native_id: &str,
+        value: serde_json::Value,
+    ) {
+        use freshell_freshagent::naming::{HostedCodexNamingFact, NameTransitionReason};
+        use freshell_protocol::native_location::{NativeLocation, NativePersistence};
+        use freshell_protocol::session_names::{NamedProvider, SessionNameRef};
+        if native_id.is_empty() {
+            return;
+        }
+        let Some(soul) = self
+            .resolve_soul(&AgentProvider::Codex, SessionType::Freshcodex, presentation)
+            .await
+        else {
+            return;
+        };
+        let current = self.current_source(&soul).await;
+        if current
+            .as_ref()
+            .and_then(|view| view.native_session_id.as_deref())
+            != Some(native_id)
+        {
+            tracing::warn!(
+                provider = "codex",
+                session_id = presentation,
+                native_session_id = native_id,
+                "freshagent.gateway.naming_source_changed"
+            );
+            return;
+        }
+        let fact = match serde_json::from_value::<HostedCodexNamingFact>(value) {
+            Ok(fact) => fact,
+            Err(error) => {
+                tracing::warn!(provider="codex", native_session_id=native_id, %error, "freshagent.gateway.invalid_naming_fact");
+                return;
+            }
+        };
+        let sink = self.naming.get().cloned();
+        match fact {
+            HostedCodexNamingFact::Activity(input) => {
+                let valid_target = match &input.target {
+                    SessionNameRef::Pending { id } => !id.is_empty(),
+                    SessionNameRef::Session {
+                        provider,
+                        session_id,
+                    } => *provider == NamedProvider::Codex && session_id == native_id,
+                };
+                if valid_target && input.mode == "freshcodex" {
+                    if let Some(sink) = sink {
+                        if let Err(error) = sink.activity(input.clone()).await {
+                            freshell_freshagent::naming::log_name_error(
+                                "activity",
+                                &input.target,
+                                &error,
+                            );
+                        }
+                    }
+                }
+            }
+            HostedCodexNamingFact::Transition { target, transition } => {
+                let expected = SessionNameRef::Session {
+                    provider: NamedProvider::Codex,
+                    session_id: native_id.into(),
+                };
+                let location_matches = matches!(&transition.acquisition.location, NativeLocation::Codex { native_thread_id:Some(id), .. } if id == native_id);
+                if target != expected
+                    || !location_matches
+                    || transition.reason != NameTransitionReason::InitialMaterialization
+                    || transition.acquisition.persistence != NativePersistence::Verified
+                {
+                    tracing::warn!(
+                        provider = "codex",
+                        native_session_id = native_id,
+                        "freshagent.gateway.naming_source_mismatch"
+                    );
+                    return;
+                }
+                freshell_freshagent::naming::fold_identity_transition(&sink, &transition, target)
+                    .await;
+            }
         }
     }
 
@@ -1438,6 +1562,8 @@ impl HostedFreshAgentGateway for HostedFreshAgentProxy {
     }
 }
 
+#[path = "fresh_agent_proxy_naming.rs"]
+mod native_naming;
 #[path = "fresh_agent_proxy_rest.rs"]
 mod rest;
 #[cfg(test)]

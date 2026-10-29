@@ -154,6 +154,7 @@ pub(super) struct CodexProjection {
     pub usage: Option<Value>,
     pub plan: Option<Value>,
     pub diff: Option<Value>,
+    hosted_naming_facts: Vec<Value>,
     pending_ops: Vec<Value>,
     pending_after_revision: Option<u64>,
 }
@@ -180,6 +181,7 @@ impl CodexProjection {
             usage: None,
             plan: None,
             diff: None,
+            hosted_naming_facts: vec![],
             pending_ops: vec![],
             pending_after_revision: None,
         }
@@ -1053,6 +1055,9 @@ impl CodexProjection {
     }
 
     pub(super) fn overlay(&self, snapshot: &mut Value, metadata: Value) {
+        if !self.hosted_naming_facts.is_empty() {
+            snapshot["extensions"]["codex"]["hostedNamingFacts"] = json!(self.hosted_naming_facts);
+        }
         snapshot["extensions"]["codex"]["projection"] = metadata;
         snapshot["tokenUsage"]["observed"] = json!(self.usage.is_some());
         if let Some(usage) = &self.usage {
@@ -1072,6 +1077,26 @@ impl CodexProjection {
             }
             snapshot["capabilities"]["diffs"] = json!(true);
         }
+    }
+
+    /// Retain the first accepted naming input and latest verified transition
+    /// with this source, so a dropped final event can reconcile without a token.
+    pub(super) fn retain_hosted_naming_fact(&mut self, fact: Value) -> bool {
+        if self.retired {
+            return false;
+        }
+        if let Some(existing) = self
+            .hosted_naming_facts
+            .iter_mut()
+            .find(|old| old["kind"] == fact["kind"])
+        {
+            if fact["kind"] != "activity" {
+                *existing = fact;
+            }
+        } else {
+            self.hosted_naming_facts.push(fact);
+        }
+        true
     }
 
     #[cfg(test)]

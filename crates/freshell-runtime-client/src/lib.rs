@@ -854,6 +854,39 @@ impl RuntimeClient {
         }
     }
 
+    pub async fn fresh_agent_native_name(
+        &self,
+        mut request: freshell_runtime_protocol::FreshAgentNativeNameRequest,
+    ) -> Result<freshell_runtime_protocol::FreshAgentNativeNameReply, ClientError> {
+        request.expected_control_epoch = Some(self.current_epoch().await?);
+        // A stale epoch is a settled refusal before host/native dispatch. Keep
+        // the captured target unchanged if refreshing only that control stamp.
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::FreshAgentNativeName(request.clone()),
+            )
+            .await
+        {
+            Ok(AdminResult::FreshAgentNativeName(reply)) => Ok(reply),
+            Err(error) if error.runtime_code() == Some(RuntimeErrorCode::StaleControlEpoch) => {
+                request.expected_control_epoch = Some(self.health().await?.0);
+                match self
+                    .request(
+                        RequestId::new(),
+                        AdminCommand::FreshAgentNativeName(request),
+                    )
+                    .await?
+                {
+                    AdminResult::FreshAgentNativeName(reply) => Ok(reply),
+                    _ => Err(ClientError::UnexpectedResult),
+                }
+            }
+            Ok(_) => Err(ClientError::UnexpectedResult),
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn fresh_agent_model_catalog(
         &self,
         soul_id: SoulId,
