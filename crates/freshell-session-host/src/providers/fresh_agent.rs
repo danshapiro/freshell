@@ -3541,8 +3541,10 @@ await import(parameters.source)
                     }
                     _ => {}
                 }
-                if recovery.is_some() && (blocking.is_none() || !decisions.is_empty()) {
-                    break (recovery.unwrap(), decisions);
+                if let Some(recovery) =
+                    recovery.take_if(|_| blocking.is_none() || !decisions.is_empty())
+                {
+                    break (recovery, decisions);
                 }
             }
         })

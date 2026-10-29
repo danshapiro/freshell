@@ -21019,28 +21019,29 @@ pub(crate) mod tests {
             "the adopt answers created: {created}"
         );
 
-        let bindings = fake.bindings.lock().expect("bindings mutex");
-        let b = bindings
-            .iter()
-            .rev()
-            .find(|b| b.session_id == "thread-lineage-adopt")
-            .expect("the adopt's refresh write must NOT be eaten by the no-laundering guard");
-        assert_eq!(
-            b.asserted_stamps().client_instance_id.as_deref(),
-            Some("client-new"),
-            "the provenance refresh must not be gated on settings presence"
-        );
-        assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-new"));
-        assert_eq!(
-            b.asserted_stamps().tab_key.as_deref(),
-            Some("device-new:tab-new")
-        );
-        assert_eq!(
-            b.settings,
-            crate::identity_sink::FreshAgentSettings::default(),
-            "the settings payload is untouched by the provenance refresh (stays lineage-only)"
-        );
-        drop(bindings);
+        {
+            let bindings = fake.bindings.lock().expect("bindings mutex");
+            let b = bindings
+                .iter()
+                .rev()
+                .find(|b| b.session_id == "thread-lineage-adopt")
+                .expect("the adopt's refresh write must NOT be eaten by the no-laundering guard");
+            assert_eq!(
+                b.asserted_stamps().client_instance_id.as_deref(),
+                Some("client-new"),
+                "the provenance refresh must not be gated on settings presence"
+            );
+            assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-new"));
+            assert_eq!(
+                b.asserted_stamps().tab_key.as_deref(),
+                Some("device-new:tab-new")
+            );
+            assert_eq!(
+                b.settings,
+                crate::identity_sink::FreshAgentSettings::default(),
+                "the settings payload is untouched by the provenance refresh (stays lineage-only)"
+            );
+        }
         // Accepted work materializes the observed defaults as durable intent;
         // it must use that exact native model, not a fabricated fallback.
         st.handle_send(send_msg(
