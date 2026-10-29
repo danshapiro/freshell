@@ -240,6 +240,7 @@ impl FreshAgentRestLane for CodexRestLane {
                 session_id,
                 submitted_turn_id,
                 incarnation_id,
+                ..
             } => {
                 let settled = tokio::time::timeout_at(deadline, async {
                     loop {

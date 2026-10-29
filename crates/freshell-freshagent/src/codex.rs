@@ -114,6 +114,7 @@ pub enum CodexSendOutcome {
         session_id: String,
         submitted_turn_id: String,
         incarnation_id: String,
+        pending_naming_handle: Option<String>,
     },
     Refused {
         code: String,
@@ -4331,12 +4332,9 @@ impl FreshCodexState {
         // target is the stashed pre-durable handle (it redirects once the
         // rollout bind lands), else the durable thread itself. A failed feed
         // never blocks the turn.
-        let naming_target = self
-            .naming_handles
-            .lock()
-            .await
-            .get(&session_id)
-            .cloned()
+        let pending_naming_handle = self.naming_handles.lock().await.get(&session_id).cloned();
+        let naming_target = pending_naming_handle
+            .clone()
             .map(|handle| freshell_protocol::session_names::SessionNameRef::Pending { id: handle })
             .unwrap_or_else(
                 || freshell_protocol::session_names::SessionNameRef::Session {
@@ -4419,6 +4417,7 @@ impl FreshCodexState {
             session_id: session_id.clone(),
             submitted_turn_id: submitted_turn_id.clone(),
             incarnation_id,
+            pending_naming_handle,
         };
         // Release both serialization locks before Stop RPC work. The consumer
         // must remain free to observe terminal evidence while Stop is pending.

@@ -2,9 +2,10 @@ use crate::admission::{AdmissionPolicy, ReservationTotals};
 use freshell_runtime_protocol::{
     AllocationState, CleanupState, DesiredState, DockerDaemonId, DurabilityState, FixtureKind,
     FreshAgentLaunchSpec, FreshAgentTurnSettings, GrantId, HostBootId, IncarnationId, IncidentId,
-    InstallationId, LaunchNonce, LaunchState, NoticeId, RecoveryAttemptId, RecoveryBlockReason,
-    RecoveryPath, RecoveryState, RecoveryTrigger, RequestId, ResumeSpec, RuntimeLimits,
-    RuntimeProfile, RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec, ViewIntentRequest,
+    InstallationId, LaunchNonce, LaunchState, NativeDispatchIdentity, NoticeId, RecoveryAttemptId,
+    RecoveryBlockReason, RecoveryPath, RecoveryState, RecoveryTrigger, RequestId, ResumeSpec,
+    RuntimeLimits, RuntimeProfile, RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec,
+    ViewIntentRequest,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -351,6 +352,13 @@ pub struct ReplacementPreparation {
 enum SettingsFold {
     Turn,
     Configure,
+}
+
+enum NativeIdentityChange {
+    FollowNative,
+    AcceptedDispatch {
+        pending_naming_handle: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1320,11 +1328,54 @@ impl Registry {
         expected_parent: &str,
         child_session_id: &str,
     ) -> Result<(), RegistryError> {
+        self.transition_native_session_inner(
+            soul_id,
+            incarnation_id,
+            expected_parent,
+            child_session_id,
+            NativeIdentityChange::FollowNative,
+        )
+        .await
+    }
+
+    pub async fn record_fresh_agent_dispatch_identity(
+        &self,
+        soul_id: SoulId,
+        incarnation_id: IncarnationId,
+        identity: NativeDispatchIdentity,
+    ) -> Result<(), RegistryError> {
+        self.transition_native_session_inner(
+            soul_id,
+            incarnation_id,
+            &identity.previous_native_session_id,
+            &identity.native_session_id,
+            NativeIdentityChange::AcceptedDispatch {
+                pending_naming_handle: identity.pending_naming_handle,
+            },
+        )
+        .await
+    }
+
+    async fn transition_native_session_inner(
+        &self,
+        soul_id: SoulId,
+        incarnation_id: IncarnationId,
+        expected_parent: &str,
+        child_session_id: &str,
+        change: NativeIdentityChange,
+    ) -> Result<(), RegistryError> {
+        let pending_naming_handle = match change {
+            NativeIdentityChange::FollowNative => None,
+            NativeIdentityChange::AcceptedDispatch {
+                pending_naming_handle,
+            } => Some(pending_naming_handle),
+        };
+        let preserve_presentation = pending_naming_handle.is_some();
         let expected_parent = expected_parent.to_string();
         let child_session_id = child_session_id.to_string();
         if expected_parent.is_empty()
             || child_session_id.is_empty()
-            || expected_parent == child_session_id
+            || (!preserve_presentation && expected_parent == child_session_id)
             || expected_parent.chars().any(char::is_control)
             || child_session_id.chars().any(char::is_control)
         {
@@ -1347,9 +1398,18 @@ impl Registry {
             if owner != soul_id.as_str() {
                 return Err(RegistryError::NativeIdentityConflict);
             }
+            if preserve_presentation {
+                let current: bool=tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id JOIN writer_claims w ON w.soul_id=s.soul_id AND w.incarnation_id=i.incarnation_id WHERE s.soul_id=?1 AND i.incarnation_id=?2 AND i.launch_state='running' AND s.desired_state='running' AND w.provider=s.provider AND w.provider_store_id=s.provider_store_id AND w.native_session_id=?3 AND w.intent_revision=s.intent_revision)",
+                    params![soul_id.as_str(),incarnation_id.as_str(),expected_parent],|row|row.get(0)
+                )?;
+                if provider!="codex" || existing.as_deref()!=Some(expected_parent.as_str()) || !current {
+                    return Err(RegistryError::NativeIdentityConflict);
+                }
+            }
             // The response to a successful provider fork can be lost. Retrying
             // the same transition after durable commit is idempotent.
-            if existing.as_deref() == Some(child_session_id.as_str()) {
+            if !preserve_presentation && existing.as_deref() == Some(child_session_id.as_str()) {
                 let claim: Option<String> = tx.query_row(
                     "SELECT incarnation_id FROM writer_claims WHERE provider=?1 AND provider_store_id=?2 AND native_session_id=?3",
                     params![provider, store, child_session_id], |row| row.get(0),
@@ -1376,6 +1436,20 @@ impl Registry {
                 (None, Some(spec)) if provider == "opencode" && spec.mode == "opencode" => {},
                 _ => return Err(RegistryError::NativeIdentityConflict),
             }
+            if let Some(pending)=&pending_naming_handle {
+                let spec=fresh_spec.as_mut().ok_or(RegistryError::NativeIdentityConflict)?;
+                if pending.as_ref().is_some_and(|handle|spec.naming_handle.as_ref()!=Some(handle)) {
+                    return Err(RegistryError::NativeIdentityConflict);
+                }
+                if expected_parent==child_session_id {
+                    if spec.naming_handle!=*pending {
+                        spec.naming_handle=pending.clone();
+                        tx.execute("UPDATE incarnations SET fresh_agent_spec=?1,updated_at=?2 WHERE incarnation_id=?3",params![serde_json::to_string(spec)?,now_millis(),incarnation_id.as_str()])?;
+                    }
+                    tx.commit()?;
+                    return Ok(());
+                }
+            }
             let conflicting: Option<String> = tx.query_row(
                 "SELECT incarnation_id FROM writer_claims WHERE provider=?1 AND provider_store_id=?2 AND native_session_id=?3",
                 params![provider, store, child_session_id], |row| row.get(0),
@@ -1394,15 +1468,16 @@ impl Registry {
                 "INSERT INTO writer_claims (provider,provider_store_id,native_session_id,soul_id,incarnation_id,intent_revision) VALUES (?1,?2,?3,?4,?5,?6)",
                 params![provider, store, child_session_id, soul_id.as_str(), incarnation_id.as_str(), intent],
             )?;
-            // An in-soul reroot changes both the provider-native writer key
-            // and the externally resumable presentation key. Persist them
-            // together so a web-server restart cannot rediscover the retired
-            // parent through inventory fallback.
+            // Fork/reroot follows the new native presentation key. A direct
+            // accepted recovery keeps the exact existing presentation key.
+            // Both persist the source and writer claim in this transaction.
             let now = now_millis();
             if let Some(spec) = fresh_spec.as_mut() {
-                spec.session_id = child_session_id.clone();
+                if !preserve_presentation {
+                    spec.session_id = child_session_id.clone();
+                }
                 spec.native_session_id = Some(child_session_id.clone());
-                spec.naming_handle = None;
+                spec.naming_handle = pending_naming_handle.clone().flatten();
                 if let Some(reference) = spec.session_ref.as_mut() {
                     reference.session_id = child_session_id.clone();
                 }

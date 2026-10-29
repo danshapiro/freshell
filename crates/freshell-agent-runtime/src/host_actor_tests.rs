@@ -543,6 +543,8 @@ struct FakeTransport {
     checkpoint_attempts: std::sync::Mutex<Vec<Option<String>>>,
     decisions: AtomicUsize,
     retained: std::sync::Mutex<Option<Value>>,
+    dispatch_identity: std::sync::Mutex<Option<NativeDispatchIdentity>>,
+    dispatch_gate: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     stops: AtomicUsize,
     ambiguous_dispatch: bool,
     live: std::sync::atomic::AtomicBool,
@@ -575,6 +577,7 @@ impl FreshAgentTransport for SerialTransport {
         tokio::time::sleep(std::time::Duration::from_millis(15)).await;
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
         Ok(DispatchAck {
+            native_identity: None,
             provider_ack_id: None,
         })
     }
@@ -644,6 +647,8 @@ impl FakeTransport {
             checkpoint_attempts: std::sync::Mutex::new(Vec::new()),
             decisions: AtomicUsize::new(0),
             retained: std::sync::Mutex::new(None),
+            dispatch_identity: std::sync::Mutex::new(None),
+            dispatch_gate: std::sync::Mutex::new(None),
             stops: AtomicUsize::new(0),
             ambiguous_dispatch: false,
             live: std::sync::atomic::AtomicBool::new(true),
@@ -660,6 +665,8 @@ impl FakeTransport {
                 checkpoint_attempts: std::sync::Mutex::new(Vec::new()),
                 decisions: AtomicUsize::new(0),
                 retained: std::sync::Mutex::new(None),
+                dispatch_identity: std::sync::Mutex::new(None),
+                dispatch_gate: std::sync::Mutex::new(None),
                 stops: AtomicUsize::new(0),
                 ambiguous_dispatch: false,
                 live: std::sync::atomic::AtomicBool::new(true),
@@ -684,6 +691,11 @@ impl FreshAgentTransport for FakeTransport {
         _profile: &FreshAgentProfile,
     ) -> Result<DispatchAck, DispatchFailure> {
         self.dispatches.fetch_add(1, Ordering::SeqCst);
+        let gate = self.dispatch_gate.lock().unwrap().clone();
+        if let Some((entered, release)) = gate {
+            entered.notify_one();
+            release.notified().await;
+        }
         if self.ambiguous_dispatch {
             Err(DispatchFailure {
                 message: "reply lost".into(),
@@ -691,6 +703,7 @@ impl FreshAgentTransport for FakeTransport {
             })
         } else {
             Ok(DispatchAck {
+                native_identity: self.dispatch_identity.lock().unwrap().clone(),
                 provider_ack_id: Some("ack-1".into()),
             })
         }
@@ -1041,6 +1054,123 @@ async fn transport_liveness_is_observed_without_transferring_ownership() {
     transport.live.store(false, Ordering::SeqCst);
     assert!(!actor.is_live().await);
     assert_eq!(transport.stops.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn accepted_dispatch_native_identity_requires_current_source_and_existing_pending_authority()
+{
+    for scenario in [
+        "wrong-pending",
+        "initial-recovery",
+        "new-conversation",
+        "wrong-parent",
+        "empty-native",
+        "control-native",
+        "stale-native",
+        "stale-store",
+        "stale-provider",
+        "ambiguous",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = if scenario == "ambiguous" {
+            FakeTransport::ambiguous("native-old")
+        } else {
+            FakeTransport::new("native-old")
+        };
+        let mut launch = profile(FreshProvider::Codex, "native-store", None);
+        launch.naming_handle = Some("pending-original".into());
+        *transport.dispatch_identity.lock().unwrap() = Some(NativeDispatchIdentity {
+            previous_native_session_id: if scenario == "wrong-parent" {
+                "foreign-native"
+            } else {
+                "native-old"
+            }
+            .into(),
+            native_session_id: match scenario {
+                "empty-native" => "",
+                "control-native" => "native\nnew",
+                _ => "native-new",
+            }
+            .into(),
+            pending_naming_handle: match scenario {
+                "wrong-pending" => Some("foreign-pending".into()),
+                "initial-recovery" => launch.naming_handle.clone(),
+                _ => None,
+            },
+        });
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        if scenario.starts_with("stale-") {
+            *transport.dispatch_gate.lock().unwrap() = Some((entered.clone(), release.clone()));
+        }
+        let actor = FreshAgentHostActor::open(dir.path(), launch, transport.clone())
+            .await
+            .unwrap();
+        let request = RequestId::parse("native-identity-request").unwrap();
+        let work = tokio::spawn({
+            let actor = actor.clone();
+            let request = request.clone();
+            async move {
+                actor
+                    .dispatch(request, "controlled native input".into(), None)
+                    .await
+            }
+        });
+        if scenario.starts_with("stale-") {
+            tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified())
+                .await
+                .unwrap();
+            let mut state = actor.state.lock().await;
+            match scenario {
+                "stale-native" => {
+                    state.profile.native_session_id = Some("replacement-native".into())
+                }
+                "stale-store" => state.profile.provider_store_id = "replacement-store".into(),
+                "stale-provider" => state.profile.provider = FreshProvider::Claude,
+                _ => unreachable!(),
+            }
+            drop(state);
+            release.notify_one();
+        }
+        let result = work.await.unwrap();
+        let current = actor.profile().await;
+        if matches!(scenario, "initial-recovery" | "new-conversation") {
+            assert_eq!(result, Ok(CommandState::ProviderAcked), "{scenario}");
+            assert_eq!(current.native_session_id.as_deref(), Some("native-new"));
+            assert_eq!(
+                current.naming_handle,
+                if scenario == "initial-recovery" {
+                    Some("pending-original".into())
+                } else {
+                    None
+                }
+            );
+        } else {
+            assert!(
+                matches!(result, Err(ActorError::AmbiguousDispatch)),
+                "{scenario}: {result:?}"
+            );
+            assert_ne!(
+                current.native_session_id.as_deref(),
+                Some("native-new"),
+                "{scenario}"
+            );
+            assert_eq!(
+                current.naming_handle.as_deref(),
+                Some("pending-original"),
+                "{scenario}"
+            );
+            assert_eq!(
+                actor
+                    .dispatch(request, "controlled native input".into(), None)
+                    .await,
+                Err(ActorError::AmbiguousDispatch),
+                "an uncertain native result cannot be replayed: {scenario}"
+            );
+            assert_eq!(transport.dispatches.load(Ordering::SeqCst), 1, "{scenario}");
+        }
+        actor.stop().await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -1969,6 +2099,7 @@ impl FreshAgentTransport for ConfigureTransport {
     ) -> Result<DispatchAck, DispatchFailure> {
         self.sent_profiles.lock().unwrap().push(profile.clone());
         Ok(DispatchAck {
+            native_identity: None,
             provider_ack_id: Some(request_id.as_str().into()),
         })
     }

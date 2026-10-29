@@ -61,6 +61,13 @@ async fn running_fresh_claude() -> RunningFreshAgent {
     running_fresh_provider(FreshProvider::Claude).await
 }
 async fn running_fresh_provider(provider: FreshProvider) -> RunningFreshAgent {
+    running_fresh_provider_with_name(provider, None).await
+}
+
+async fn running_fresh_provider_with_name(
+    provider: FreshProvider,
+    naming_handle: Option<String>,
+) -> RunningFreshAgent {
     let root = tempfile::tempdir().unwrap();
     let workspace = std::fs::canonicalize(root.path()).unwrap();
     let registry = Registry::open(root.path().join("registry"), None).unwrap();
@@ -80,7 +87,7 @@ async fn running_fresh_provider(provider: FreshProvider) -> RunningFreshAgent {
             fixture: None,
             terminal: None,
             fresh_agent: Some(FreshAgentLaunchSpec {
-                naming_handle: None,
+                naming_handle,
                 collaboration_mode: None,
                 session_id: "fresh-session".into(),
                 provider: provider.clone(),
@@ -173,6 +180,316 @@ async fn running_fresh_provider(provider: FreshProvider) -> RunningFreshAgent {
     }
 }
 
+fn native_send_reply(previous: &str, native: &str, pending: Option<String>) -> HostResult {
+    HostResult::FreshAgentCommand {
+        state: CommandState::ProviderAcked,
+        native_session_id: Some(native.into()),
+        native_identity: Some(NativeDispatchIdentity {
+            previous_native_session_id: previous.into(),
+            native_session_id: native.into(),
+            pending_naming_handle: pending,
+        }),
+    }
+}
+
+fn native_send_host(
+    fixture: &RunningFreshAgent,
+    replies: Vec<HostResult>,
+    gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<usize>,
+) {
+    let secret = b"synthetic-host-secret";
+    std::fs::write(fixture.runtime_dir.join("secret"), secret).unwrap();
+    let listener = UnixListener::bind(fixture.runtime_dir.join("host.sock")).unwrap();
+    let boot = HostBootId::new();
+    let incarnation = fixture.incarnation.clone();
+    let (shutdown, mut stop) = tokio::sync::oneshot::channel();
+    let host = tokio::spawn(async move {
+        let mut replies = replies.into_iter();
+        let mut sends = 0;
+        loop {
+            let mut socket =
+                tokio::select! {_=&mut stop=>break,result=listener.accept()=>result.unwrap().0};
+            let envelope: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
+            let result = match envelope.body {
+                HostCommand::Hello {incarnation_id,challenge} => HostResult::Hello {
+                    host_boot_id:boot.clone(),proof:host_proof(secret,&challenge,&boot,&incarnation_id),capabilities:vec![],effective_limits:crate::checkpoints::tests::limits()
+                },
+                HostCommand::FreshAgentSend {incarnation_id,..} => {
+                    assert_eq!(incarnation_id,incarnation);
+                    assert_eq!(envelope.auth,Some(host_proof(secret,"command-auth",&boot,&incarnation)));
+                    sends+=1;
+                    if let Some((entered,release))=&gate {entered.notify_one();release.notified().await;}
+                    replies.next().expect("no input may be automatically resent")
+                },
+                other=>panic!("native acknowledgement must not create/start/configure/probe a provider: {other:?}")
+            };
+            write_frame(
+                &mut socket,
+                &HostReply {
+                    request_id: envelope.request_id,
+                    result: Ok(result),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        sends
+    });
+    (shutdown, host)
+}
+
+#[tokio::test]
+async fn accepted_native_recovery_preserves_presentation_and_pending_name_policy() {
+    for pending in [false, true] {
+        let fixture =
+            running_fresh_provider_with_name(FreshProvider::Codex, Some("pending-original".into()))
+                .await;
+        fixture
+            .supervisor
+            .registry
+            .record_native_session(
+                fixture.soul.clone(),
+                fixture.incarnation.clone(),
+                "native-original".into(),
+            )
+            .await
+            .unwrap();
+        let before = fixture
+            .supervisor
+            .registry
+            .recovery_context(fixture.soul.clone())
+            .await
+            .unwrap();
+        let before_spec = before.fresh_agent.unwrap();
+        let handle = pending.then(|| "pending-original".to_string());
+        let mut replies = Vec::new();
+        if !pending {
+            replies.push(native_send_reply(
+                "native-original",
+                "native-original",
+                None,
+            ));
+        }
+        replies.push(native_send_reply(
+            "native-original",
+            "native-recovered",
+            handle.clone(),
+        ));
+        replies.push(native_send_reply(
+            "native-recovered",
+            "native-recovered",
+            handle.clone(),
+        ));
+        let expected_sends = replies.len();
+        let (shutdown, host) = native_send_host(&fixture, replies, None);
+        let mut results = Vec::new();
+        let mut same_native = None;
+        for index in 0..expected_sends {
+            let result = fixture
+                .supervisor
+                .fresh_agent_send(
+                    RequestId::new(),
+                    fixture.soul.clone(),
+                    format!("controlled native input {index}"),
+                    None,
+                    None,
+                )
+                .await;
+            let failed = result.is_err();
+            results.push(result);
+            if !pending && index == 0 {
+                same_native = Some(
+                    fixture
+                        .supervisor
+                        .registry
+                        .recovery_context(fixture.soul.clone())
+                        .await
+                        .unwrap(),
+                );
+            }
+            if failed {
+                break;
+            }
+        }
+        shutdown.send(()).unwrap();
+        let sends = host.await.unwrap();
+        for result in results {
+            result.expect(
+                "native acceptance must atomically persist current source and pending-name state",
+            );
+        }
+        assert_eq!(sends, expected_sends);
+        if let Some(same) = same_native {
+            assert_eq!(same.native_session_id.as_deref(), Some("native-original"));
+            assert!(same.fresh_agent.unwrap().naming_handle.is_none(),"consumed pending authority must clear on ordinary same-native accepts, keeping the actor/recovery spec consistent");
+        }
+        let after = fixture
+            .supervisor
+            .registry
+            .recovery_context(fixture.soul.clone())
+            .await
+            .unwrap();
+        let spec = after.fresh_agent.unwrap();
+        assert_eq!(after.native_session_id.as_deref(), Some("native-recovered"));
+        assert_eq!(
+            spec.session_id, before_spec.session_id,
+            "presentation reference must remain byte-identical"
+        );
+        assert_eq!(spec.native_session_id.as_deref(), Some("native-recovered"));
+        assert_eq!(spec.naming_handle, handle);
+        assert_eq!(spec.model, before_spec.model);
+        assert_eq!(spec.effort, before_spec.effort);
+        assert_eq!(spec.cwd, before_spec.cwd);
+        assert_eq!(spec.permission_mode, before_spec.permission_mode);
+        assert_eq!(spec.sandbox, before_spec.sandbox);
+        let connection =
+            rusqlite::Connection::open(fixture.supervisor.registry.database_path()).unwrap();
+        let claims: Vec<String> = connection
+            .prepare("SELECT native_session_id FROM writer_claims WHERE soul_id=?1")
+            .unwrap()
+            .query_map([fixture.soul.as_str()], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(claims, vec!["native-recovered".to_string()]);
+    }
+}
+
+#[tokio::test]
+async fn native_dispatch_rejects_stale_invalid_and_nonaccepted_identity_authority() {
+    for scenario in [
+        "untagged",
+        "wrong-parent",
+        "wrong-reply",
+        "missing-reply",
+        "invalid-native",
+        "foreign-pending",
+        "wrong-provider",
+        "ambiguous",
+        "refused",
+        "stop-intent",
+    ] {
+        let fixture = running_fresh_provider_with_name(
+            if scenario == "wrong-provider" {
+                FreshProvider::Claude
+            } else {
+                FreshProvider::Codex
+            },
+            Some("pending-original".into()),
+        )
+        .await;
+        fixture
+            .supervisor
+            .registry
+            .record_native_session(
+                fixture.soul.clone(),
+                fixture.incarnation.clone(),
+                "native-original".into(),
+            )
+            .await
+            .unwrap();
+        let before = fixture
+            .supervisor
+            .registry
+            .recovery_context(fixture.soul.clone())
+            .await
+            .unwrap()
+            .fresh_agent;
+        let native = if scenario == "invalid-native" {
+            "native\ninvalid"
+        } else {
+            "native-recovered"
+        };
+        let mut reply = native_send_reply(
+            if scenario == "wrong-parent" {
+                "stale-native"
+            } else {
+                "native-original"
+            },
+            native,
+            if scenario == "foreign-pending" {
+                Some("unrelated-pending".into())
+            } else {
+                None
+            },
+        );
+        if let HostResult::FreshAgentCommand {
+            state,
+            native_session_id,
+            native_identity,
+        } = &mut reply
+        {
+            match scenario {
+                "untagged" => *native_identity = None,
+                "wrong-reply" => *native_session_id = Some("different-reply".into()),
+                "missing-reply" => *native_session_id = None,
+                "ambiguous" => *state = CommandState::Ambiguous,
+                "refused" => *state = CommandState::Cancelled,
+                _ => {}
+            }
+        }
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (shutdown, host) = native_send_host(
+            &fixture,
+            vec![reply],
+            (scenario == "stop-intent").then(|| (entered.clone(), release.clone())),
+        );
+        let work = tokio::spawn({
+            let supervisor = fixture.supervisor.clone();
+            let soul = fixture.soul.clone();
+            async move {
+                supervisor
+                    .fresh_agent_send(
+                        RequestId::new(),
+                        soul,
+                        "controlled refused identity".into(),
+                        None,
+                        None,
+                    )
+                    .await
+            }
+        });
+        if scenario == "stop-intent" {
+            tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified())
+                .await
+                .unwrap();
+            fixture
+                .supervisor
+                .registry
+                .begin_stop(fixture.soul.clone())
+                .await
+                .unwrap();
+            release.notify_one();
+        }
+        let result = work.await.unwrap();
+        shutdown.send(()).unwrap();
+        assert_eq!(host.await.unwrap(), 1);
+        assert!(
+            !matches!(
+                result,
+                Ok(CommandState::ProviderAcked | CommandState::Completed)
+            ),
+            "{scenario}: {result:?}"
+        );
+        let after = fixture
+            .supervisor
+            .registry
+            .recovery_context(fixture.soul.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            after.native_session_id.as_deref(),
+            Some("native-original"),
+            "{scenario}"
+        );
+        assert_eq!(after.fresh_agent, before, "{scenario}");
+    }
+}
+
 /// An authenticated session host that records every command it is sent.
 fn fake_host(
     runtime_dir: &std::path::Path,
@@ -249,6 +566,7 @@ fn fake_host_with_boot(
                     })
                 }
                 HostCommand::FreshAgentConfigure { .. } => HostResult::FreshAgentCommand {
+                    native_identity: None,
                     state: CommandState::ProviderAcked,
                     native_session_id: Some("native-claude".into()),
                 },

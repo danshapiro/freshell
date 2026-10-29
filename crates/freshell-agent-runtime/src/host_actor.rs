@@ -6,6 +6,7 @@
 use async_trait::async_trait;
 pub use freshell_runtime_protocol::{
     AgentEvent, AgentEventBatch as EventBatch, AgentJournalEvent as JournalEvent, FreshProvider,
+    NativeDispatchIdentity,
 };
 use freshell_runtime_protocol::{
     CommandState, FreshAgentCapture, FreshAgentNativeNameError, FreshAgentNativeNameOperation,
@@ -196,6 +197,9 @@ pub struct TransportStart {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchAck {
     pub provider_ack_id: Option<String>,
+    /// Direct correlated provider acceptance, never an asynchronous Started
+    /// frame. The previous identity fences a recovery result to its caller.
+    pub native_identity: Option<NativeDispatchIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -760,6 +764,58 @@ impl FreshAgentHostActor {
             )
             .await;
         let mut state = self.state.lock().await;
+        if let Ok(ack) = &result {
+            if let Some(identity) = &ack.native_identity {
+                if identity.native_session_id.is_empty()
+                    || identity.native_session_id.chars().any(char::is_control)
+                    || dispatch_profile.native_session_id.as_deref()
+                        != Some(identity.previous_native_session_id.as_str())
+                    || state.profile.native_session_id != dispatch_profile.native_session_id
+                    || state.profile.provider_store_id != dispatch_profile.provider_store_id
+                    || state.profile.provider != dispatch_profile.provider
+                    || identity
+                        .pending_naming_handle
+                        .as_ref()
+                        .is_some_and(|handle| {
+                            dispatch_profile.naming_handle.as_ref() != Some(handle)
+                        })
+                {
+                    state
+                        .commands
+                        .get_mut(request_id.as_str())
+                        .expect("durable command")
+                        .state = CommandState::Ambiguous;
+                    push_event_bounded(
+                        &mut state,
+                        AgentEvent::CommandOutcome {
+                            request_id,
+                            state: CommandState::Ambiguous,
+                        },
+                        self.event_byte_cap,
+                        self.event_count_cap,
+                    )?;
+                    write_state(&self.state_dir, &state)?;
+                    return Err(ActorError::AmbiguousDispatch);
+                }
+                let changed = state.profile.native_session_id.as_deref()
+                    != Some(identity.native_session_id.as_str());
+                state.profile.native_session_id = Some(identity.native_session_id.clone());
+                state.profile.naming_handle = identity.pending_naming_handle.clone();
+                if changed {
+                    if let Some(reference) = state.profile.session_ref.as_mut() {
+                        reference.session_id = identity.native_session_id.clone();
+                    }
+                    push_event_bounded(
+                        &mut state,
+                        AgentEvent::Started {
+                            native_session_id: identity.native_session_id.clone(),
+                        },
+                        self.event_byte_cap,
+                        self.event_count_cap,
+                    )?;
+                }
+            }
+        }
         let command = state
             .commands
             .get_mut(request_id.as_str())
@@ -1511,6 +1567,8 @@ impl FreshAgentHostActor {
                     .events
                     .iter()
                     .filter(|event| event.sequence > after)
+                    .filter(|event| !matches!(&event.event, AgentEvent::Started {native_session_id}
+                        if state.profile.native_session_id.as_deref() != Some(native_session_id.as_str())))
                     .take(max_events)
                     .cloned()
                     .collect(),

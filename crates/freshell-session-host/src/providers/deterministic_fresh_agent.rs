@@ -244,6 +244,7 @@ impl FreshAgentTransport for DeterministicFreshAgentTransport {
                     .await
                     .map_err(|_| non_ambiguous("deterministic event receiver closed"))?;
                 return Ok(DispatchAck {
+                    native_identity: None,
                     provider_ack_id: Some(request_id.as_str().into()),
                 });
             }
@@ -255,6 +256,7 @@ impl FreshAgentTransport for DeterministicFreshAgentTransport {
             self.emit_completion(request_id).await?;
         }
         Ok(DispatchAck {
+            native_identity: None,
             provider_ack_id: Some(request_id.as_str().into()),
         })
     }

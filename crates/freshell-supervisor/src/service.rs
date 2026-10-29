@@ -1631,8 +1631,36 @@ impl Supervisor {
             Ok(HostResult::FreshAgentCommand {
                 state: CommandState::ProviderAcked | CommandState::Completed,
                 native_session_id,
+                native_identity,
             }) => {
-                if let Some(native_session_id) = native_session_id {
+                if let Some(identity) = native_identity {
+                    let prior_native = active
+                        .fresh_agent()
+                        .and_then(|spec| spec.native_session_id.as_deref());
+                    if active.fresh_agent().is_none_or(|spec| {
+                        spec.provider != freshell_runtime_protocol::FreshProvider::Codex
+                    }) || prior_native != Some(identity.previous_native_session_id.as_str())
+                        || native_session_id.as_deref() != Some(identity.native_session_id.as_str())
+                    {
+                        return Err(RuntimeError::new(
+                            RuntimeErrorCode::OwnershipMismatch,
+                            "accepted native identity does not match its captured command source",
+                        ));
+                    }
+                    let update = classify_fresh_agent_operation_identity(
+                        prior_native,
+                        native_session_id.as_deref(),
+                    )?;
+                    self.registry
+                        .record_fresh_agent_dispatch_identity(
+                            soul_id.clone(),
+                            handle.incarnation_id().clone(),
+                            identity,
+                        )
+                        .await
+                        .map_err(map_registry)?;
+                    tracing::info!(soul_id=%soul_id,incarnation_id=%handle.incarnation_id(),previous_native_session_id=prior_native,native_session_id=native_session_id.as_deref(),native_identity_update=?update,"freshagent.native_dispatch_identity_committed");
+                } else if let Some(native_session_id) = native_session_id {
                     self.registry
                         .record_native_session(
                             soul_id.clone(),
@@ -1893,6 +1921,7 @@ impl Supervisor {
             HostResult::FreshAgentCommand {
                 state,
                 native_session_id,
+                ..
             } => {
                 let identity_update = classify_fresh_agent_operation_identity(
                     prior_native.as_deref(),

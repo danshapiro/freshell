@@ -2544,6 +2544,18 @@ pub struct TerminalInputRequest {
     pub expected_control_epoch: Option<u64>,
 }
 
+/// Correlated native acceptance inside the authenticated owning host.
+/// This never grants identity authority to asynchronous provider events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeDispatchIdentity {
+    pub previous_native_session_id: String,
+    pub native_session_id: String,
+    /// Existing provider pending-name intent: retained for initial recovery,
+    /// absent for an established new conversation.
+    pub pending_naming_handle: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentTurnSettings {
@@ -3703,6 +3715,8 @@ pub enum HostResult {
         /// at the same acceptance boundary as this acknowledgement.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         native_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_identity: Option<NativeDispatchIdentity>,
     },
     FreshAgentFork(FreshAgentForkResult),
     FreshAgentInterrupted,

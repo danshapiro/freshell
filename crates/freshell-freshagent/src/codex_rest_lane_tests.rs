@@ -148,6 +148,7 @@ async fn typed_send_receipt(response: &str) {
                 session_id,
                 submitted_turn_id,
                 incarnation_id,
+                ..
             },
         ) => {
             assert_eq!(

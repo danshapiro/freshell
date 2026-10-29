@@ -587,6 +587,7 @@ async fn dispatch(
                         .await
                         .clone()
                         .ok_or_else(unsupported_fresh_agent)?;
+                    let before = actor.profile().await;
                     let command_state = actor
                         .dispatch_with_checkpoint_identity(
                             request_id,
@@ -596,8 +597,24 @@ async fn dispatch(
                         )
                         .await
                         .map_err(map_actor_error)?;
-                    let native_session_id = actor.profile().await.native_session_id;
+                    let after = actor.profile().await;
+                    let native_session_id = after.native_session_id.clone();
+                    let native_identity =
+                        if after.provider == freshell_runtime_protocol::FreshProvider::Codex {
+                            before.native_session_id.zip(after.native_session_id).map(
+                                |(previous_native_session_id, native_session_id)| {
+                                    freshell_runtime_protocol::NativeDispatchIdentity {
+                                        previous_native_session_id,
+                                        native_session_id,
+                                        pending_naming_handle: after.naming_handle,
+                                    }
+                                },
+                            )
+                        } else {
+                            None
+                        };
                     Ok(HostResult::FreshAgentCommand {
+                        native_identity,
                         state: command_state,
                         native_session_id,
                     })
@@ -651,6 +668,7 @@ async fn dispatch(
                         .await
                         .map_err(map_actor_error)?;
                     Ok(HostResult::FreshAgentCommand {
+                        native_identity: None,
                         state: command_state,
                         native_session_id: actor.profile().await.native_session_id,
                     })
@@ -673,6 +691,7 @@ async fn dispatch(
                         .map_err(map_actor_error);
                     emit_environment_event(configure_outcome_event(&request_id, &outcome));
                     Ok(HostResult::FreshAgentCommand {
+                        native_identity: None,
                         state: outcome?,
                         native_session_id: actor.profile().await.native_session_id,
                     })
@@ -705,6 +724,7 @@ async fn dispatch(
                         .await
                         .map_err(map_actor_error)?;
                     Ok(HostResult::FreshAgentCommand {
+                        native_identity: None,
                         state: command_state,
                         native_session_id: actor.profile().await.native_session_id,
                     })
@@ -812,6 +832,7 @@ async fn dispatch(
                         .map_err(map_actor_error)?;
                     let native_session_id = actor.profile().await.native_session_id;
                     Ok(HostResult::FreshAgentCommand {
+                        native_identity: None,
                         state: freshell_runtime_protocol::CommandState::Completed,
                         native_session_id,
                     })
@@ -10247,6 +10268,7 @@ mod tests {
         ) -> Result<DispatchAck, DispatchFailure> {
             self.dispatches.fetch_add(1, Ordering::SeqCst);
             Ok(DispatchAck {
+                native_identity: None,
                 provider_ack_id: Some(request_id.to_string()),
             })
         }
@@ -10264,6 +10286,7 @@ mod tests {
                 .unwrap()
                 .push(logical_attempt_id.map(str::to_owned));
             Ok(DispatchAck {
+                native_identity: None,
                 provider_ack_id: Some(request_id.to_string()),
             })
         }
@@ -10434,6 +10457,7 @@ mod tests {
                 HostResult::FreshAgentCommand {
                     state: freshell_runtime_protocol::CommandState::ProviderAcked,
                     native_session_id: Some(ref native),
+                    ..
                 } if native == "fixture-native-thread"
             ));
         }
@@ -10749,6 +10773,7 @@ mod tests {
             HostResult::FreshAgentCommand {
                 state: freshell_runtime_protocol::CommandState::ProviderAcked,
                 native_session_id: Some(ref native),
+                    ..
             }
             if native == "fixture-native-thread"
         ));

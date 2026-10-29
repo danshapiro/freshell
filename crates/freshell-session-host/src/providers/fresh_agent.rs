@@ -7,8 +7,8 @@
 use async_trait::async_trait;
 use freshell_agent_runtime::host_actor::{
     DispatchAck, DispatchFailure, ForkTransition, FreshAgentHostActor, FreshAgentOperation,
-    FreshAgentProfile, FreshAgentTransport, OperationAck, OperationFailure, OperationFailureKind,
-    TransportStart,
+    FreshAgentProfile, FreshAgentTransport, NativeDispatchIdentity, OperationAck, OperationFailure,
+    OperationFailureKind, TransportStart,
 };
 use freshell_agent_runtime::snapshot_text::render_snapshot_text;
 use freshell_codex::launch_plan::CodexSidecarLaunchContext;
@@ -596,7 +596,7 @@ impl FreshAgentTransport for HostedTransport {
             observed_epoch: None,
             observed_generation: None,
             provider: self.provider_wire(),
-            session_id,
+            session_id: session_id.clone(),
             session_type: self.session_type(),
             text: text.to_string(),
             cwd: settings.as_ref().and_then(|settings| settings.cwd.clone()),
@@ -611,12 +611,54 @@ impl FreshAgentTransport for HostedTransport {
             }),
         };
         match &self.state {
-            // The acceptance is read from the bus below, as for every provider.
+            // Legacy providers expose acceptance through their existing bus.
             ProviderState::Claude(state) => {
                 state.handle_send(send).await;
             }
             ProviderState::Codex(state) => {
-                state.handle_send(send).await;
+                use freshell_freshagent::codex::CodexSendOutcome;
+                return match state.handle_send(send).await {
+                    CodexSendOutcome::Accepted {
+                        session_id: native,
+                        submitted_turn_id,
+                        incarnation_id,
+                        pending_naming_handle,
+                    } => {
+                        let mut current = self.session_id.lock().await;
+                        if current.as_deref() != Some(session_id.as_str()) {
+                            return Err(DispatchFailure {
+                                message: "native send source changed after acceptance".into(),
+                                acceptance_ambiguous: true,
+                            });
+                        }
+                        *current = Some(native.clone());
+                        if let Some(profile) = self.profile.lock().expect("profile lock").as_mut() {
+                            profile.native_session_id = Some(native.clone());
+                            profile.naming_handle = pending_naming_handle.clone();
+                            if let Some(reference) = profile.session_ref.as_mut() {
+                                reference.session_id = native.clone();
+                            }
+                        }
+                        self.native_tx.send_replace(Some(native.clone()));
+                        tracing::info!(request_id=%request_id,native_session_id=%native,native_incarnation_id=%incarnation_id,"freshagent.host.native_dispatch_accepted");
+                        Ok(DispatchAck {
+                            provider_ack_id: Some(submitted_turn_id),
+                            native_identity: Some(NativeDispatchIdentity {
+                                previous_native_session_id: session_id,
+                                native_session_id: native,
+                                pending_naming_handle,
+                            }),
+                        })
+                    }
+                    CodexSendOutcome::Refused { code, message, .. } => Err(DispatchFailure {
+                        message: format!("{code}: {message}"),
+                        acceptance_ambiguous: false,
+                    }),
+                    CodexSendOutcome::Ambiguous { code, message, .. } => Err(DispatchFailure {
+                        message: format!("{code}: {message}"),
+                        acceptance_ambiguous: true,
+                    }),
+                };
             }
             ProviderState::Opencode { runtime, .. } => runtime.handle_send(send).await,
         }
@@ -636,6 +678,7 @@ impl FreshAgentTransport for HostedTransport {
         .await
         {
             Ok(Ok(true)) => Ok(DispatchAck {
+                native_identity: None,
                 provider_ack_id: Some(request_id.as_str().to_string()),
             }),
             Ok(Ok(false)) => Err(DispatchFailure {
@@ -2108,6 +2151,200 @@ mod tests {
             _environment,
             _lock,
         }
+    }
+
+    #[tokio::test]
+    async fn task010_native_mint_ack_updates_actor_before_snapshot_and_second_send() {
+        for pending in [false, true] {
+            assert_native_mint_ack(pending).await;
+        }
+    }
+
+    async fn assert_native_mint_ack(pending: bool) {
+        let logs = tempfile::tempdir().unwrap();
+        let log = logs.path().join("recovery-requests.jsonl");
+        let fixture = native_codex_fixture(json!({
+            "uniqueThreadIds":true,"recordTurns":true,"appendRequestLogPath":log,
+            "exitProcessAfterMethodsOnce":[if pending {"thread/start"} else {"turn/start"}],
+            "exitProcessAfterMethodsOnceMarkerPath":logs.path().join("first-native-exit"),
+            "overrides":{"thread/resume":{"error":{"code":-32600,"message":"no rollout found for thread id original-native"}}}
+        })).await;
+        let mut profile = fixture.profile.clone();
+        profile.naming_handle = pending.then(|| "pending-initial-recovery".into());
+        profile.effort = Some("xhigh".into());
+        profile.collaboration_mode = Some("plan".into());
+        profile.sandbox = Some("read-only".into());
+        let actor = FreshAgentHostActor::open(
+            fixture.dir.path().join("recovery-actor"),
+            profile.clone(),
+            fixture.transport.clone(),
+        )
+        .await
+        .unwrap();
+        let original = actor.profile().await.native_session_id.unwrap();
+        if !pending {
+            actor
+                .dispatch(
+                    RequestId::parse("before-native-exit").unwrap(),
+                    "first native input".into(),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fixture.transport.is_live().await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the owned native executable must actually exit");
+        actor
+            .dispatch(
+                RequestId::parse("recover-native").unwrap(),
+                "recover native input".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        let recovered = actor.profile().await;
+        let native = recovered.native_session_id.clone().unwrap();
+        assert_ne!(native, original,"the typed successful mint-new result must update durable actor identity before dispatch returns");
+        assert_eq!(recovered.naming_handle, profile.naming_handle);
+        assert_eq!(recovered.model, profile.model);
+        assert_eq!(recovered.effort, profile.effort);
+        assert_eq!(recovered.collaboration_mode, profile.collaboration_mode);
+        assert_eq!(recovered.sandbox, profile.sandbox);
+        assert!(actor
+            .observe_native_identity("arbitrary-started".into())
+            .await
+            .is_err());
+        assert!(actor
+            .observe_native_identity(original.clone())
+            .await
+            .is_err());
+        assert!(actor.read_events(0, 256).await.events.iter().all(|entry| !matches!(&entry.event,AgentEvent::Started{native_session_id} if native_session_id != &native)),"historical Started must not re-key durable inventory after a trusted command transition");
+        let snapshot = actor.snapshot().await.unwrap();
+        assert_eq!(snapshot["threadId"], native);
+        actor
+            .dispatch(
+                RequestId::parse("second-current-native").unwrap(),
+                "second current native input".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            actor.profile().await.native_session_id.as_deref(),
+            Some(native.as_str())
+        );
+        assert_eq!(actor.snapshot().await.unwrap()["threadId"], native);
+        actor.stop().await.unwrap();
+        let rows = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["method"] == "thread/start")
+                .count(),
+            2,
+            "only the initial thread and explicit native missing-history fallback may create"
+        );
+        let starts = rows
+            .iter()
+            .filter(|row| row["method"] == "turn/start")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            starts.len(),
+            if pending { 2 } else { 3 },
+            "no accepted input may be replayed"
+        );
+        if !pending {
+            assert_eq!(starts[0]["params"]["threadId"], original);
+        }
+        for row in &starts[usize::from(!pending)..] {
+            assert_eq!(row["params"]["threadId"], native);
+            assert_eq!(row["params"]["effort"], "xhigh");
+            assert_eq!(row["params"]["collaborationMode"]["mode"], "plan");
+            assert_eq!(row["params"]["sandboxPolicy"]["type"], "readOnly");
+        }
+    }
+
+    /// Observer-boundary qualification, separate from public creation: the
+    /// release CLI's explicitly ephemeral parent/child contract is receipt16.
+    /// No application start parameter or native ephemerality is rewritten here.
+    #[tokio::test]
+    async fn task010_hosted_ephemeral_child_is_finite_and_never_becomes_a_writer() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let parent = json!({"id":"thread-new-1","ephemeral":true,"status":{"type":"active"},"turns":[{"id":"registered-child-turn","status":"inProgress","items":[{"id":"spawn","type":"collabAgentToolCall","tool":"spawnAgent","status":"completed","senderThreadId":"thread-new-1","receiverThreadIds":["ephemeral-child"],"agentsStates":{}}]}]});
+        let child = json!({"id":"ephemeral-child","parentThreadId":"thread-new-1","ephemeral":true,"status":{"type":"active"},"turns":[]});
+        let fixture = native_codex_fixture(json!({"appendRequestLogPath":log.path(),"threadReadResults":{"thread-new-1":parent,"ephemeral-child":child}})).await;
+        let actor = FreshAgentHostActor::open(
+            fixture.dir.path().join("ephemeral-observer-actor"),
+            fixture.profile.clone(),
+            fixture.transport.clone(),
+        )
+        .await
+        .unwrap();
+        let profile = actor.profile().await;
+        let before = std::fs::read_to_string(log.path()).unwrap();
+        assert!(actor.read_child("unregistered-child").await.is_err());
+        for _ in 0..2 {
+            let value = actor.read_child("ephemeral-child").await.unwrap();
+            assert_eq!(
+                value,
+                json!({"parentThreadId":"thread-new-1","childThreadId":"ephemeral-child","status":"unavailable","reason":"ephemeral_history_unavailable","retryable":false})
+            );
+        }
+        assert_eq!(actor.profile().await, profile);
+        let after = std::fs::read_to_string(log.path()).unwrap();
+        let rows: Vec<Value> = after
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let baseline: Vec<Value> = before
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["method"] == "thread/start")
+                .count(),
+            baseline
+                .iter()
+                .filter(|row| row["method"] == "thread/start")
+                .count()
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["params"]["threadId"] == "ephemeral-child")
+                .count(),
+            2
+        );
+        assert!(rows
+            .iter()
+            .filter(|row| row["params"]["threadId"] == "ephemeral-child")
+            .all(|row| row["method"] == "thread/read" && row["params"]["includeTurns"] == true));
+        assert!(!rows
+            .iter()
+            .any(|row| row["params"]["threadId"] == "unregistered-child"));
+        // A final native read still reports true; observation did not persist,
+        // resume, configure, send to, stop or relabel the child.
+        let ProviderState::Codex(state) = &fixture.transport.state else {
+            panic!("Codex fixture")
+        };
+        let native = state
+            .management_client_for_root(&fixture.dir.path().join("codex-home").to_string_lossy())
+            .await
+            .unwrap()
+            .read_thread_metadata("ephemeral-child")
+            .await
+            .unwrap();
+        assert_eq!(native["thread"]["ephemeral"], true);
+        assert_eq!(native["thread"]["parentThreadId"], "thread-new-1");
+        actor.stop().await.unwrap();
     }
 
     #[tokio::test]
@@ -4657,6 +4894,7 @@ mod tests {
                 format!("accepted:{}", request_id.as_str()),
             );
             Ok(DispatchAck {
+                native_identity: None,
                 provider_ack_id: Some(request_id.as_str().into()),
             })
         }
