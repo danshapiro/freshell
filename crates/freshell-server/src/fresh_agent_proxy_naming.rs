@@ -129,11 +129,11 @@ fn classify_name_error(error: NameError, method: &str) -> NativeClassified {
         NameError::Unavailable { message } => return NativeClassified::Undelivered(message),
         NameError::Rpc { code, message } => Error::Rpc {
             method,
-            error: freshell_codex::protocol::RpcError {
+            error: Box::new(freshell_codex::protocol::RpcError {
                 code,
                 message,
                 data: None,
-            },
+            }),
         },
         NameError::Timeout { timeout_ms } => Error::Timeout { method, timeout_ms },
         NameError::Closed => Error::Closed { method },
