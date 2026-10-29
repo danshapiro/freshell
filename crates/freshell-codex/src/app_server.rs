@@ -83,7 +83,10 @@ pub trait WsTransport: Send + Sync {
 #[derive(Clone, Debug, PartialEq)]
 pub enum CodexAppServerError {
     /// A JSON-RPC error envelope for the request (`CodexAppServerRpcError`, `client.ts:68-78`).
-    Rpc { method: String, error: RpcError },
+    Rpc {
+        method: String,
+        error: Box<RpcError>,
+    },
     /// The request timed out (`client.ts:784-787`).
     Timeout { method: String, timeout_ms: u64 },
     /// The connection closed before the request completed (`client.ts:449,726`).
@@ -875,7 +878,7 @@ impl CodexAppServerClient {
             Ok(Ok(Ok(result))) => Ok(result),
             Ok(Ok(Err(error))) => Err(CodexAppServerError::Rpc {
                 method: method.to_string(),
-                error,
+                error: Box::new(error),
             }),
             // The sender was dropped without a value → the connection closed.
             Ok(Err(_)) => Err(CodexAppServerError::Closed {
@@ -1105,22 +1108,22 @@ mod tests {
         ] {
             assert!(CodexAppServerError::Rpc {
                 method: "turn/steer".into(),
-                error: RpcError {
+                error: Box::new(RpcError {
                     code: -32600,
                     message: message.into(),
                     data: None
-                }
+                })
             }
             .is_not_submitted());
         }
         for error in [
             CodexAppServerError::Rpc {
                 method: "turn/start".into(),
-                error: RpcError {
+                error: Box::new(RpcError {
                     code: -32603,
                     message: "internal failure".into(),
                     data: None,
-                },
+                }),
             },
             CodexAppServerError::Timeout {
                 method: "turn/start".into(),

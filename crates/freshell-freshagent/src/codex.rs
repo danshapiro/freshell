@@ -27794,11 +27794,11 @@ pub(crate) mod tests {
         ] {
             let error = CodexAppServerError::Rpc {
                 method: method.into(),
-                error: freshell_codex::protocol::RpcError {
+                error: Box::new(freshell_codex::protocol::RpcError {
                     code,
                     message: "no rollout found for thread id thread-original".into(),
                     data: None,
-                },
+                }),
             };
             assert_eq!(
                 is_codex_thread_not_found(&error),
@@ -27814,11 +27814,11 @@ pub(crate) mod tests {
         ));
         assert!(!is_codex_thread_not_found(&CodexAppServerError::Rpc {
             method: "thread/resume".into(),
-            error: freshell_codex::protocol::RpcError {
+            error: Box::new(freshell_codex::protocol::RpcError {
                 code: -32600,
                 message: "approval_policy untrusted is not supported".into(),
                 data: None
-            }
+            })
         }));
     }
 
