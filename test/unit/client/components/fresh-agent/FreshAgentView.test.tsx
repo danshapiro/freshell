@@ -4156,7 +4156,9 @@ describe('FreshAgentView', () => {
   // newest unbound modern user row shows the honest "still saving" state only
   // while this pane's agent turn runs; older unbound rows (historical
   // MCP/CLI-driven turns) keep the honest unavailable verdict even mid-turn,
-  // and a bound capture is never downgraded by the busy fallback.
+  // a pending local echo (the send's row before it lands in the snapshot)
+  // holds the newest user row during the echo window, and a bound capture is
+  // never downgraded by the busy fallback.
   describe('fresh-agent rewind availability honesty', () => {
     const unboundModernUserTurn = (id: string, text: string) => ({
       id,
@@ -4241,6 +4243,67 @@ describe('FreshAgentView', () => {
       expect(olderButton).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
     })
 
+    it('keeps the older snapshot user row honestly unavailable while a pending local echo holds the newest user row', async () => {
+      const sessionId = 'thread-rewind-echo-window'
+      const store = createStore()
+      let onMessage: ((message: Record<string, unknown>) => void) | undefined
+      wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+        onMessage = handler
+        return () => {}
+      })
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+        status: 'idle',
+        summary: 'one older unbound modern user turn',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [unboundModernUserTurn('msg_older', 'Older MCP-driven prompt')],
+      })
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-rewind-echo-window',
+          sessionId,
+          status: 'idle',
+        },
+      }))
+
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+
+      expect(await screen.findAllByRole('article', { name: 'You transcript turn' })).toHaveLength(1)
+      await waitFor(() => {
+        expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+      })
+      // A UI send whose turn has NOT landed in the snapshot: the optimistic
+      // echo row is displayed as the newest user turn for as long as the
+      // snapshot does not hold the send's own row (the echo window).
+      fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+        target: { value: 'Follow-up sent from this pane' },
+      })
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      expect(await screen.findAllByRole('article', { name: 'You transcript turn' })).toHaveLength(2)
+      expect(onMessage).toBeTypeOf('function')
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'running')
+
+      const [snapshotRow, echoRow] = screen.getAllByRole('article', { name: 'You transcript turn' })
+      // The echo row itself keeps its request-keyed pending verdict while
+      // the pane is busy.
+      const echoButton = await within(echoRow!).findByRole('button', { name: 'Saving code rewind checkpoint' })
+      expect(echoButton).toBeDisabled()
+      // The older snapshot row (an MCP/CLI-shaped turn) stays honestly
+      // unavailable for the whole echo window — never a momentary
+      // "still saving" on a row nothing is being saved for.
+      const snapshotButton = within(snapshotRow!).getByRole('button', { name: 'Rewind unavailable for this message' })
+      expect(snapshotButton).toBeDisabled()
+      expect(snapshotButton).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
+    })
+
     it('keeps a settled unbound modern turn unavailable when the agent is idle', async () => {
       const sessionId = 'thread-rewind-idle-settled'
       const store = createStore()
@@ -4279,6 +4342,10 @@ describe('FreshAgentView', () => {
       // The busy→idle edge must leave no wedged "saving" state behind: the
       // pending fallback is computed, never stored.
       emitSessionSnapshotStatus(store, onMessage, sessionId, 'running')
+      // Pin that the busy drive actually engaged: while busy the pane shows
+      // its stop affordance (the composer's Stop button is aria-hidden when
+      // the pane is not busy).
+      expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
       emitSessionSnapshotStatus(store, onMessage, sessionId, 'idle')
 
       const [userRow] = screen.getAllByRole('article', { name: 'You transcript turn' })
@@ -4354,6 +4421,9 @@ describe('FreshAgentView', () => {
         })
       })
       emitSessionSnapshotStatus(store, onMessage, sessionId, 'running')
+      // Pin that the busy drive actually engaged: the bound-available verdict
+      // below is only meaningful while the pane is truly busy.
+      expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
 
       const [userRow] = await screen.findAllByRole('article', { name: 'You transcript turn' })
       const rewindButton = await within(userRow!).findByRole('button', { name: 'Rewind code to here' })

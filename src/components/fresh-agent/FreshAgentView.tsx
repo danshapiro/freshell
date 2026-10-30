@@ -142,9 +142,10 @@ import {
 
 const EARLY_STATES = new Set(['creating', 'starting'])
 const BUSY_STATES = FRESH_AGENT_BUSY_STATUSES
-// Stable empty list for the transcript-turn source (snapshot turns) so the
-// newest-user-row memo's dependency identity never churns on a missing snapshot.
-const EMPTY_TRANSCRIPT_TURNS: readonly FreshAgentTurn[] = []
+// Stable empty list for the transcript-turn source (snapshot turns) — the
+// ONE derivation feeds both the newest-user-row memo and the transcript's
+// turns prop, and its identity never churns on a missing snapshot.
+const EMPTY_TRANSCRIPT_TURNS: FreshAgentTurn[] = []
 // Copy for the stuck-notice card (role="alert") shown while the store carries
 // the deadman's 'stuck' status; recovery actions live on the card itself.
 const FRESH_AGENT_STUCK_NOTICE_TEXT = 'Agent appears stuck — no events from the agent process for a while.'
@@ -3986,11 +3987,26 @@ export function FreshAgentView({
     : (agentSession?.status ?? paneContent.status)
   const isBusy = BUSY_STATES.has(effectiveStatus)
   const sessionEnded = effectiveStatus === 'exited' || effectiveStatus === 'create-failed'
+  // The user's just-sent message as an optimistic echo row, displayed after
+  // the turns until the send's turn lands in the snapshot (the transcript
+  // appends it as the newest turn). While it is displayed it holds the
+  // newest user row for the rewind fallback: no snapshot row can claim the
+  // busy-pending state during the echo window, so older rows keep the
+  // honest unavailable verdict until the send's own row lands.
+  const localEchoTurn = useMemo<FreshAgentTurn | undefined>(() => (localEcho ? {
+    id: `__local-echo:${localEcho.requestId}`,
+    turnId: localEcho.submittedTurnId ?? `__local-echo:${localEcho.requestId}`,
+    requestId: localEcho.requestId,
+    role: 'user',
+    summary: localEcho.text,
+    items: [{ id: `__local-echo-item:${localEcho.requestId}`, kind: 'text', text: localEcho.text }],
+  } as FreshAgentTurn : undefined), [localEcho])
   const transcriptTurns = snapshot?.turns ?? EMPTY_TRANSCRIPT_TURNS
   const newestUserTurnKey = useMemo(() => {
+    if (localEchoTurn) return getFreshAgentDisplayTurnKey(localEchoTurn)
     const userTurns = transcriptTurns.filter((turn) => turn.role === 'user')
     return userTurns.length > 0 ? getFreshAgentDisplayTurnKey(userTurns[userTurns.length - 1]) : undefined
-  }, [transcriptTurns])
+  }, [localEchoTurn, transcriptTurns])
   const getRewindAvailability = useCallback((turn: FreshAgentTurn): FreshAgentTurnRewindAvailability | undefined => {
     const availability = getCheckpointAvailability(turn)
     if (!availability) {
@@ -4021,14 +4037,6 @@ export function FreshAgentView({
       ? liveTailShowsContent(state.freshAgentLive?.bySession[liveSessionKey], landedTranscript, 'ended')
       : false
   ))
-  const localEchoTurn = useMemo<FreshAgentTurn | undefined>(() => (localEcho ? {
-    id: `__local-echo:${localEcho.requestId}`,
-    turnId: localEcho.submittedTurnId ?? `__local-echo:${localEcho.requestId}`,
-    requestId: localEcho.requestId,
-    role: 'user',
-    summary: localEcho.text,
-    items: [{ id: `__local-echo-item:${localEcho.requestId}`, kind: 'text', text: localEcho.text }],
-  } as FreshAgentTurn : undefined), [localEcho])
   const splitLiveTailAtEcho = Boolean(localEchoTurn && endedLiveTailShows)
   // Provider notices (rate limits, a failed compaction, CLI banners) show in
   // the pane's notice banner; they never end the turn (transcript-live P4).
@@ -4452,7 +4460,7 @@ export function FreshAgentView({
   const content = useMemo(() => {
     const retainedHistory = snapshot?.extensions?.[snapshot.provider]?.nativeHistoryRetention
     const partialHistory = isRecord(retainedHistory) && retainedHistory.partial === true
-    const turns = snapshot?.turns ?? []
+    const turns = transcriptTurns
     const pendingApprovals = snapshot?.pendingApprovals ?? []
     const pendingQuestions = snapshot?.pendingQuestions ?? []
     const worktrees = snapshot?.worktrees ?? []
@@ -5081,6 +5089,7 @@ export function FreshAgentView({
     snapshot,
     snapshotRevealError,
     snapshotDirty,
+    transcriptTurns,
     slashCommands,
     dispatch,
     appStore,
