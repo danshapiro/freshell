@@ -24,7 +24,7 @@ Fix Freshell so a successful OpenCode conversation snapshot refresh makes the pa
 - Continue in the existing dedicated worktree and branch based on the captured clean `origin/main` commit. Do not modify unrelated files.
 - Use the pinned pnpm 10.34.5 and the repo-owned test commands below. Do not use npm installs, raw Vitest, or `npx`.
 - The Vitest and browser e2e backends are already configured as cloud in this workspace; run the focused commands through that configuration. `freshopencode-transcript-scroll.spec.ts` and `freshopencode-snapshot-409-recovery.spec.ts` are not in the cloud skip list.
-- Preserve current stale-response fences and the rule that lower OpenCode revisions remain blocked. Equal-revision clearance applies only to a successful, current OpenCode reveal when hidden reconnect is the sole cause of the dirty period. Transcript invalidations and accepted sends must latch that period to the existing stricter revision rule; a reconnect cannot loosen it, including while a reveal fetch is pending. Preserve current absent or nonnumeric revision fallback behavior and other-provider comparisons.
+- Preserve current stale-response fences and the rule that lower OpenCode revisions remain blocked. Equal-revision clearance applies only to a successful, current OpenCode reveal when hidden reconnect is the sole cause of the dirty period. Transcript invalidations and accepted sends must latch that period to the existing stricter revision rule; a later hidden reconnect cannot loosen it, and invalidations received while a reveal fetch is pending must supersede that fetch. Preserve current absent or nonnumeric revision fallback behavior and other-provider comparisons. Keep the exception specific to OpenCode, the provider in this request; no shared freshness contract for other providers has been established.
 - Do not change API or WebSocket schemas, persisted state, dependencies, settings, or the Rust snapshot producer. No migration or rollback action is needed because the changed state is client memory and reverting the source change restores the old behavior.
 - Keep the existing structured snapshot request and display audit events. This change creates no new request outcome that needs a new event.
 - This is a focused visibility bug fix, not a new usage flow or significant UI redesign, so it requires no README or `docs/index.html` update. Do not restart or deploy the self-hosted server.
@@ -112,7 +112,7 @@ it('reveals an OpenCode pane after reconnect when the refreshed revision is unch
     await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
     expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
     expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[1][3]).toMatchObject({ trigger: 'reveal' })
-    expect(screen.getByText('same-revision transcript')).toBeVisible()
+    expect(screen.getByText('same-revision transcript')).toBeInTheDocument()
     expect(screen.queryByTestId('fresh-agent-stale-transcript')).not.toBeInTheDocument()
     expect(screen.queryByRole('status', { name: 'Refreshing conversation' })).not.toBeInTheDocument()
 
@@ -194,12 +194,17 @@ it.each(['event-before-reconnect', 'event-after-reconnect'] as const)(
         sessionId,
         event: { type: 'freshAgent.session.changed', sessionId },
       }))
-      const reconnect = () => act(() => reconnectHandler?.())
+      const reconnect = async () => {
+        await act(async () => {
+          reconnectHandler?.()
+          await Promise.resolve()
+        })
+      }
       if (order === 'event-before-reconnect') {
         invalidateTranscript()
-        reconnect()
+        await reconnect()
       } else {
-        reconnect()
+        await reconnect()
         invalidateTranscript()
       }
       await act(async () => { await vi.advanceTimersByTimeAsync(0) })
@@ -218,7 +223,7 @@ it.each(['event-before-reconnect', 'event-after-reconnect'] as const)(
 
       await act(async () => { await vi.advanceTimersByTimeAsync(1_000) })
       expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(3)
-      expect(screen.getByText('updated transcript')).toBeVisible()
+      expect(screen.getByText('updated transcript')).toBeInTheDocument()
       expect(screen.queryByRole('status', { name: 'Refreshing conversation' })).not.toBeInTheDocument()
     } finally {
       cleanup()
@@ -231,7 +236,9 @@ it.each(['event-before-reconnect', 'event-after-reconnect'] as const)(
 
 Add a lower-revision assertion to the reconnect-only test: make the first reveal response revision `4` and keep the overlay up, then resolve the retry at revision `5` and expect it to clear. The existing equal-revision case above separately proves that revision `5` can clear immediately when reconnect is the sole dirty cause.
 
-Add an owned-send overlap case. Start a hidden reconnect reveal, keep its response pending, reveal the pane, and deliver `freshAgent.send.accepted` for a send from that pane. Assert that the dirty period becomes strict and a new `trigger: 'reveal'` request supersedes the pending read. An equal-revision result must remain concealed; a later revision `6` response must clear the state. Reuse the existing send UI and `wsMock.onMessage` patterns. This covers acceptance both during hidden reconnect dirtiness and after a reveal has started, without testing a private ref name.
+Add a hidden accepted-send guard: deliver an owned `freshAgent.send.accepted` frame while a pane is hidden, then reveal it; an equal-revision response must stay concealed and a newer response must clear it. This preserves the existing hidden-send behavior.
+
+Add an owned-send overlap case for a send accepted after reveal starts. Hold the hidden-reconnect reveal response, reveal the pane, send through the existing composer, and deliver `freshAgent.send.accepted` for the captured request ID. Assert that the new request has `trigger: 'reveal'`. Resolve the old pending response at revision `5` and verify it cannot clear dirty state because it is superseded. Then resolve the current replacement reveal request at revision `5` and verify the overlay remains because send acceptance made the dirty period strict. The subsequent current retry at revision `6` must clear it. Reuse the existing send UI and `wsMock.onMessage` patterns; do not count a stale response as evidence of strict-cause handling.
 
 In `freshopencode-transcript-scroll.spec.ts`, add this browser test to the existing `Freshopencode transcript scrolling` describe block. It hides the target tab, forces a page-local WebSocket disconnect, waits for a different completed ready handshake, then reveals the original tab. Do not inject `freshAgent.session.changed` or call `snapshot.replaceTurns`; the routed snapshot must retain the same revision and transcript.
 
@@ -279,7 +286,7 @@ test('reveals the OpenCode transcript after a real reconnect with an unchanged r
 
 Run: `pnpm run test:vitest run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx --config config/vitest/vitest.config.ts`
 
-Expected: FAIL because the reconnect-only reveal at revision `5` remains behind the refresh state. The strict-cause tests must also demonstrate that their event/send setup is accepted by the existing handler and fail on the intended equal-revision visibility assertion, not on test setup.
+Expected: The reconnect-only equal-revision test fails on unchanged code because the successful current revision-`5` response remains behind the refresh state. The strict-cause preservation test is expected to PASS before and after the change; it guards existing behavior and is not part of the Red failure. The owned-send overlap test fails before the change at the missing replacement `trigger: 'reveal'` request, after the pending read is superseded by the existing `send-accepted` request path. Do not change preservation assertions to force them to fail.
 
 Run: `pnpm run test:e2e --project=chromium test/e2e-browser/specs/freshopencode-transcript-scroll.spec.ts`
 
@@ -319,9 +326,19 @@ Run: `pnpm run typecheck:client`
 
 Expected: PASS.
 
+Run: `pnpm run lint`
+
+Expected: PASS, including the required jsx-a11y rules.
+
 Run: `pnpm run test:e2e --project=chromium test/e2e-browser/specs/freshopencode-transcript-scroll.spec.ts test/e2e-browser/specs/freshopencode-snapshot-409-recovery.spec.ts`
 
 Expected: PASS on the configured cloud backend; the browser observes the real reconnect/new-handshake path and the adjacent 409 recovery continues to render its recovered snapshot.
+
+After the final independent delta review, the usual workflow runs one full coordinated check on the final `HEAD`:
+
+Run: `GCLOUD_ROBOT_REQUIRE=1 FRESHELL_RUST_TEST_SANDBOX=1 pnpm run check`
+
+Expected: PASS on the configured backend; the final branch passes typecheck and the coordinated full suite. This is the final workflow gate, not a duplicate per-task run.
 
 - [ ] **Step 7: Commit the task**
 
