@@ -750,14 +750,18 @@ mod tests {
     fn antigravity_home_env_override_wins_and_default_is_antigravity_cli_subtree() {
         // Mutates process env: serialize on the crate-wide
         // HOME_ENV_TEST_LOCK (the `parse::opencode` home_dir tests and the
-        // directory_index persist-path test share it) and restore on drop.
+        // directory_index persist-path test share it). The save/restore
+        // runs through a DROP GUARD (the `parse::opencode`
+        // `home_dir_tests::EnvVarGuard` model): a mid-test panic can never
+        // leak `FRESHELL_ANTIGRAVITY_HOME` into the rest of the test
+        // binary, where it would cross-contaminate every later test that
+        // resolves an antigravity home (the Task-5 source tests included).
         let _lock = crate::HOME_ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let saved = std::env::var_os("FRESHELL_ANTIGRAVITY_HOME");
+        let _guard = EnvVarGuard::set("FRESHELL_ANTIGRAVITY_HOME", "/custom/antigravity-home");
 
         // Env override is used AS-IS (the `amplifier_home` precedent).
-        std::env::set_var("FRESHELL_ANTIGRAVITY_HOME", "/custom/antigravity-home");
         assert_eq!(
             antigravity_home(Path::new("/home/user")),
             Path::new("/custom/antigravity-home")
@@ -770,10 +774,33 @@ mod tests {
             antigravity_home(Path::new("/home/user")),
             Path::new("/home/user/.gemini/antigravity-cli")
         );
+        // `_guard`'s Drop restores the saved value on scope exit, panic
+        // included.
+    }
 
-        match saved {
-            Some(v) => std::env::set_var("FRESHELL_ANTIGRAVITY_HOME", v),
-            None => std::env::remove_var("FRESHELL_ANTIGRAVITY_HOME"),
+    /// Save-and-restore guard for one env var; restores on drop, panic
+    /// included (same shape as `parse::opencode`'s `home_dir_tests::EnvVarGuard`
+    /// — kept local to this module's tests rather than hoisted, matching
+    /// the crate's existing per-module test-guard precedent).
+    struct EnvVarGuard {
+        name: &'static str,
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let saved = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, saved }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(v) => std::env::set_var(self.name, v),
+                None => std::env::remove_var(self.name),
+            }
         }
     }
 }

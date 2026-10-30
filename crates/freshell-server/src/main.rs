@@ -182,6 +182,17 @@ pub(crate) fn build_session_sources(
         Arc::new(freshell_sessions::amplifier::AmplifierSource::new(
             freshell_sessions::amplifier::amplifier_home(home),
         )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
+        // Fifth source: the Antigravity CLI (`agy`) native store —
+        // `AntigravitySource` over the resolved antigravity home (the
+        // `antigravity-cli` subtree of `~/.gemini`, `FRESHELL_ANTIGRAVITY_HOME`
+        // override honored; see
+        // `freshell_sessions::provider_layout::antigravity_home`). The home
+        // is resolved HERE (the wiring seam), never inside the layout or
+        // the source, so the watcher/source/existence roots share one
+        // resolution.
+        Arc::new(freshell_sessions::antigravity::AntigravitySource::new(
+            freshell_sessions::provider_layout::antigravity_home(home),
+        )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
     ]
 }
 
@@ -1871,6 +1882,14 @@ async fn main() -> ExitCode {
                     layout: Box::new(freshell_sessions::provider_layout::AmplifierLayout),
                     home: freshell_sessions::amplifier::amplifier_home(&home),
                 },
+                // Fifth provider: AntigravityLayout — the two-base watch
+                // spec (the home NonRecursive, `brain` Recursive), the
+                // same resolved home the source and the existence roots
+                // use.
+                freshell_sessions::session_watcher::WatchedProvider {
+                    layout: Box::new(freshell_sessions::provider_layout::AntigravityLayout),
+                    home: freshell_sessions::provider_layout::antigravity_home(&home),
+                },
             ];
             let mut watcher = freshell_sessions::session_watcher::SessionWatcher::new(
                 Arc::clone(index),
@@ -2078,6 +2097,10 @@ async fn main() -> ExitCode {
                             (
                                 "amplifier".to_string(),
                                 freshell_sessions::amplifier::amplifier_home(&h),
+                            ),
+                            (
+                                "antigravity".to_string(),
+                                freshell_sessions::provider_layout::antigravity_home(&h),
                             ),
                         ])
                     })

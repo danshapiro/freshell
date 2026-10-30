@@ -2283,7 +2283,7 @@ fn apply_file_search(
         if results.len() > limit {
             break;
         }
-        if !matches!(item.provider.as_str(), "claude" | "codex") {
+        if !matches!(item.provider.as_str(), "claude" | "codex" | "antigravity") {
             continue;
         }
         let source_count = item
@@ -3956,6 +3956,169 @@ mod tests {
             legacy_name_migration_completed: false,
         });
         (app, index)
+    }
+
+    // ── Antigravity: native rows, file-tier search, cross-provider keys ──
+
+    fn antigravity_fixtures_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/coding-cli/antigravity")
+    }
+
+    /// Write the canonical
+    /// `<home>/.gemini/antigravity-cli/brain/<conv>/.system_generated/logs/transcript.jsonl`
+    /// from a committed fixture and return the transcript path.
+    fn write_antigravity_transcript(home: &Path, conv_id: &str, fixture: &str) -> PathBuf {
+        let dir = home
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("brain")
+            .join(conv_id)
+            .join(".system_generated")
+            .join("logs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let content = std::fs::read_to_string(antigravity_fixtures_dir().join(fixture)).unwrap();
+        let path = dir.join("transcript.jsonl");
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// The session-directory app over a REAL `AntigravitySource` rooted at
+    /// `<home>/.gemini/antigravity-cli` (the plan's wiring shape), plus any
+    /// extra sibling sources for cross-provider tests.
+    fn antigravity_session_directory_app(
+        home: &Path,
+        extra_sources: Vec<Arc<dyn freshell_sessions::directory_index::SessionSource>>,
+    ) -> (Router, Arc<SessionIndex>) {
+        let mut sources: Vec<Arc<dyn freshell_sessions::directory_index::SessionSource>> =
+            vec![Arc::new(
+                freshell_sessions::antigravity::AntigravitySource::new(
+                    home.join(".gemini").join("antigravity-cli"),
+                ),
+            )];
+        sources.extend(extra_sources);
+        let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
+            sources,
+            Duration::from_secs(3600),
+            None,
+        ));
+        let app = router(SessionDirectoryState {
+            auth_token: Arc::new("tok".to_string()),
+            settings: crate::settings_store::SettingsStore::load(
+                Some(home),
+                vec!["antigravity".into()],
+            ),
+            session_index: Some(Arc::clone(&index)),
+            identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+            metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: Arc::new("srv-antigravity-test".to_string()),
+            collision_signatures: Default::default(),
+            legacy_name_migration_completed: false,
+        });
+        (app, index)
+    }
+
+    #[tokio::test]
+    async fn antigravity_rows_list_and_search_through_file_tiers() {
+        const FRESH_CONV: &str = "11111111-2222-3333-4444-555555555555";
+        const RESUMED_CONV: &str = "22222222-3333-4444-5555-666666666666";
+        let home = unique_temp_dir();
+        write_antigravity_transcript(&home, FRESH_CONV, "fresh.sanitized.jsonl");
+        write_antigravity_transcript(&home, RESUMED_CONV, "resumed.sanitized.jsonl");
+        let (app, _index) = antigravity_session_directory_app(&home, Vec::new());
+
+        let base = "/api/session-directory?priority=visible";
+        let page = get_directory_page(&app, base).await;
+        let rows = page["items"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "both antigravity conversations list: {page}");
+        let fresh = rows
+            .iter()
+            .find(|r| r["sessionId"] == json!(FRESH_CONV))
+            .expect("the fresh fixture's row");
+        assert_eq!(fresh["provider"], json!("antigravity"));
+        assert_eq!(fresh["cwd"], json!("/home/u/proj"));
+        assert_eq!(fresh["projectPath"], json!("/home/u/proj"));
+        assert_eq!(fresh["title"], json!("Fix the flaky test"));
+        assert_eq!(fresh["firstUserMessage"], json!("Fix the flaky test"));
+        assert_eq!(fresh["summary"], json!("Fixed the test."));
+        assert_eq!(fresh["createdAt"], json!(1_793_304_000_000i64));
+        assert_eq!(fresh["lastActivityAt"], json!(1_793_304_005_500i64));
+
+        // The file-search provider gate must admit "antigravity": the
+        // userMessages tier finds the fixture's user text and the fullText
+        // tier the assistant text (before the gate, both are silently
+        // skipped with no error).
+        for (needle, tier, matched_in) in [
+            ("Fix the flaky test", "userMessages", "userMessage"),
+            ("Fixed the test", "fullText", "assistantMessage"),
+        ] {
+            let query = format!("{base}&query={}&tier={tier}", needle.replace(' ', "%20"));
+            let result = get_directory_page(&app, &query).await;
+            let matches = result["items"].as_array().unwrap();
+            assert_eq!(
+                matches.len(),
+                1,
+                "antigravity needle {needle:?} at {tier}: {result}"
+            );
+            assert_eq!(matches[0]["sessionId"], json!(FRESH_CONV));
+            assert_eq!(matches[0]["matchedIn"], json!(matched_in));
+            assert!(matches[0]["snippet"].as_str().unwrap().contains(needle));
+        }
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test]
+    async fn same_raw_session_id_from_antigravity_and_claude_stays_distinct() {
+        // Identity is the compound `provider:sessionId` key: a claude
+        // transcript and an antigravity conversation may share the SAME raw
+        // id (here: claude's filename identity equals antigravity's
+        // conversationId) and must surface as two distinct rows.
+        const SHARED_ID: &str = "11111111-2222-3333-4444-555555555555";
+        let home = unique_temp_dir();
+        let claude_project = home.join(".claude").join("projects").join("-home-u-proj");
+        std::fs::create_dir_all(&claude_project).unwrap();
+        std::fs::write(
+            claude_project.join(format!("{SHARED_ID}.jsonl")),
+            concat!(
+                r#"{"type":"user","message":{"role":"user","content":"hello from claude"},"uuid":"m1","cwd":"/home/u/proj","timestamp":"2026-10-29T19:00:00.000Z"}"#,
+                "\n",
+                r#"{"type":"user","message":{"role":"user","content":"second claude turn"},"uuid":"m2","timestamp":"2026-10-29T19:05:00.000Z"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        write_antigravity_transcript(&home, SHARED_ID, "fresh.sanitized.jsonl");
+
+        let (app, _index) = antigravity_session_directory_app(
+            &home,
+            vec![Arc::new(
+                freshell_sessions::directory_index::ClaudeSource::new(home.join(".claude")),
+            )],
+        );
+
+        let page = get_directory_page(&app, "/api/session-directory?priority=visible").await;
+        let keys: std::collections::BTreeSet<String> = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                format!(
+                    "{}:{}",
+                    item["provider"].as_str().unwrap(),
+                    item["sessionId"].as_str().unwrap()
+                )
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "antigravity:11111111-2222-3333-4444-555555555555".to_string(),
+                "claude:11111111-2222-3333-4444-555555555555".to_string(),
+            ])
+        );
+        assert!(page.get("integrityError").is_none());
+
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[tokio::test]
