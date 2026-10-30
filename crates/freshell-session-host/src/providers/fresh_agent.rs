@@ -1908,6 +1908,7 @@ fn parse_send_outcome(value: &Value) -> Option<(String, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use freshell_freshagent::session_lease::CondemnedRuntimeIdentity;
 
     static OPENCODE_SNAPSHOT_ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -2405,6 +2406,123 @@ await import(parameters.source)
             .contains("new explicit input after confirmation"));
     }
 
+    struct NativeCodexCleanupReadiness {
+        available: Arc<std::sync::atomic::AtomicBool>,
+        original: Arc<std::sync::Mutex<Option<CondemnedRuntimeIdentity>>>,
+        ready: watch::Receiver<Option<CondemnedRuntimeIdentity>>,
+    }
+
+    fn native_cleanup_evidence(recorded: &CondemnedRuntimeIdentity) -> Value {
+        json!({"pid":recorded.pid,"startTime":recorded.start_time,
+            "ownershipId":recorded.ownership_id,"tree":recorded.tree,
+            "captureComplete":recorded.capture_complete})
+    }
+
+    impl NativeCodexCleanupReadiness {
+        fn withheld(fixture: &NativeCodexFixture, pending: bool) -> Self {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let ProviderState::Codex(state) = &fixture.transport.state else {
+                unreachable!()
+            };
+            let available = Arc::new(AtomicBool::new(false));
+            let original = Arc::new(std::sync::Mutex::new(None::<CondemnedRuntimeIdentity>));
+            let (ready_tx, ready) = watch::channel(None);
+            state.set_sidecar_cleanup_probe(Arc::new({
+                let available = available.clone();
+                let original = original.clone();
+                move |recorded| {
+                    let available = available.clone();
+                    let original = original.clone();
+                    let ready_tx = ready_tx.clone();
+                    Box::pin(async move {
+                        let is_original = {
+                            let mut first = original.lock().expect("original owned identity");
+                            let first = first.get_or_insert_with(|| recorded.clone());
+                            first.pid == recorded.pid
+                                && first.start_time == recorded.start_time
+                                && first.ownership_id == recorded.ownership_id
+                        };
+                        let withheld = !available.load(Ordering::SeqCst);
+                        let confirmed = if withheld {
+                            false
+                        } else {
+                            freshell_freshagent::session_lease::kill_and_confirm_recorded_tree_dead(
+                                &recorded,
+                                freshell_codex::durability::CODEX_SIDECAR_OWNERSHIP_ENV,
+                            )
+                            .await
+                        };
+                        eprintln!(
+                            "{}",
+                            json!({"event":"freshcodex.test.owned_cleanup_probe",
+                            "severity":if confirmed {"info"} else {"warn"}, "pending":pending,
+                            "identity":native_cleanup_evidence(&recorded),
+                            "isOriginal":is_original,"withheld":withheld,"confirmed":confirmed})
+                        );
+                        if confirmed && is_original {
+                            ready_tx.send_replace(Some(recorded));
+                        }
+                        if withheld {
+                            Err("controlled original teardown proof unavailable".into())
+                        } else {
+                            Ok(confirmed)
+                        }
+                    })
+                }
+            }));
+            Self {
+                available,
+                original,
+                ready,
+            }
+        }
+
+        fn evidence(&self) -> Value {
+            let original = self.original.lock().expect("original owned identity");
+            json!({"original":original.as_ref().map(native_cleanup_evidence),
+                "confirmed":self.ready.borrow().as_ref().map(native_cleanup_evidence)})
+        }
+
+        async fn allow_and_wait(
+            &mut self,
+            state: &FreshCodexState,
+            session_id: &str,
+            pending: bool,
+            deadline: tokio::time::Instant,
+        ) {
+            self.available
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            // This existing lifecycle operation clears ownership only after
+            // actual confirmation. It never starts native work or replays input.
+            let readiness = tokio::time::timeout_at(deadline, async {
+                let confirmed = state.confirm_fenced_prior_dead(session_id).await;
+                eprintln!(
+                    "{}",
+                    json!({"event":"freshcodex.test.cleanup_readiness",
+                    "severity":"info","pending":pending,"confirmReturned":confirmed,
+                    "evidence":self.evidence()})
+                );
+                // A detached confirmer may have already completed the same
+                // record, so the exact original proof is the readiness oracle.
+                loop {
+                    if self.ready.borrow().is_some() {
+                        return;
+                    }
+                    self.ready
+                        .changed()
+                        .await
+                        .expect("owned cleanup proof stream");
+                }
+            })
+            .await;
+            assert!(
+                readiness.is_ok(),
+                "positive exact-owned readiness required; pending={pending}; evidence={}",
+                self.evidence()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn task010_native_mint_ack_updates_actor_before_snapshot_and_second_send() {
         for pending in [false, true] {
@@ -2413,6 +2531,11 @@ await import(parameters.source)
     }
 
     async fn assert_native_mint_ack(pending: bool) {
+        eprintln!(
+            "{}",
+            json!({"event":"freshcodex.test.native_mint_ack_case",
+            "severity":"info","pending":pending,"phase":"start"})
+        );
         let logs = tempfile::tempdir().unwrap();
         let log = logs.path().join("recovery-requests.jsonl");
         let original_id = uuid::Uuid::new_v4().to_string();
@@ -2424,6 +2547,7 @@ await import(parameters.source)
             "overrides":{"thread/resume":{"error":{"code":-32600,"message":"no rollout found for thread id original-native"}}}
         });
         let fixture = native_codex_fixture(behavior.clone()).await;
+        let mut cleanup = NativeCodexCleanupReadiness::withheld(&fixture, pending);
         let qualified_behavior = |id: &str| {
             let mut behavior = behavior.clone();
             behavior["threadStartThreadId"] = json!(id);
@@ -2463,25 +2587,99 @@ await import(parameters.source)
                 .await
                 .unwrap();
         }
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // Keep the original five-second lifecycle budget for both exit
+        // and readiness; no accepted recovery dispatch is retried.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let exited = tokio::time::timeout_at(deadline, async {
             while fixture.transport.is_live().await {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .expect("the owned native executable must actually exit");
+        .await;
+        eprintln!(
+            "{}",
+            json!({"event":"freshcodex.test.native_exit",
+            "severity":"info","pending":pending,"exited":exited.is_ok(),
+            "evidence":cleanup.evidence()})
+        );
+        assert!(
+            exited.is_ok(),
+            "the owned native executable must actually exit; pending={pending}"
+        );
+
+        let refused = tokio::time::timeout_at(
+            deadline,
+            actor.dispatch(
+                RequestId::parse("before-cleanup-proof").unwrap(),
+                "unconfirmed cleanup must not reach native work".into(),
+                None,
+            ),
+        )
+        .await;
+        eprintln!(
+            "{}",
+            json!({"event":"freshcodex.test.recovery_before_proof",
+            "severity":"info","pending":pending,"result":format!("{refused:?}"),
+            "evidence":cleanup.evidence()})
+        );
+        assert!(
+            matches!(refused,
+            Ok(Err(freshell_agent_runtime::host_actor::ActorError::Transport(ref message)))
+                if message.starts_with("SESSION_RESERVED:")),
+            "unconfirmed teardown must refuse; pending={pending}; result={refused:?}"
+        );
+        let before_proof = std::fs::read_to_string(&log).unwrap();
+        let rows = before_proof
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["method"] == "thread/start")
+                .count(),
+            1,
+            "no replacement writer before proof; pending={pending}"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["method"] == "turn/start")
+                .count(),
+            usize::from(!pending),
+            "refused input must not reach native work; pending={pending}"
+        );
+        assert!(!before_proof.contains("unconfirmed cleanup must not reach native work"));
+        let ProviderState::Codex(state) = &fixture.transport.state else {
+            unreachable!()
+        };
+        eprintln!(
+            "{}",
+            json!({"event":"freshcodex.test.pre_proof_guards_passed",
+            "severity":"info","pending":pending,"noReplacementWriter":true,"noReplay":true,
+            "nativeRequests":rows.iter().map(|row|json!({"method":row["method"],
+                "threadId":row["params"]["threadId"]})).collect::<Vec<_>>(),
+            "evidence":cleanup.evidence()})
+        );
+        cleanup
+            .allow_and_wait(state, &original, pending, deadline)
+            .await;
         std::env::set_var(
             "FAKE_CODEX_APP_SERVER_BEHAVIOR",
             qualified_behavior(&replacement_id).to_string(),
         );
-        actor
+        let recovery = actor
             .dispatch(
                 RequestId::parse("recover-native").unwrap(),
                 "recover native input".into(),
                 None,
             )
-            .await
-            .unwrap();
+            .await;
+        eprintln!(
+            "{}",
+            json!({"event":"freshcodex.test.recovery_after_proof",
+            "severity":"info","pending":pending,"result":format!("{recovery:?}"),
+            "evidence":cleanup.evidence()})
+        );
+        recovery.unwrap();
         let recovered = actor.profile().await;
         let native = recovered.native_session_id.clone().unwrap();
         assert_ne!(native, original,"the typed successful mint-new result must update durable actor identity before dispatch returns");
@@ -2584,6 +2782,12 @@ await import(parameters.source)
             starts.len(),
             if pending { 2 } else { 3 },
             "no accepted input may be replayed"
+        );
+        assert!(
+            !starts.iter().any(|row| row
+                .to_string()
+                .contains("unconfirmed cleanup must not reach native work")),
+            "refused input must never be replayed after proof; pending={pending}"
         );
         if !pending {
             assert_eq!(starts[0]["params"]["threadId"], original);
