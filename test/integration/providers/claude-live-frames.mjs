@@ -28,7 +28,7 @@ import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { randomUUID } from 'node:crypto'
 import { createClaudeFixture, FAKE_MODEL, resolvePinnedClaude, startLocalProvider } from './claude-local-provider.mjs'
-import { stopFixtureProcess } from '../../support/stop-fixture-process.mjs'
+import { stopFixtureProcess, waitForFixtureProcessExit } from '../../support/stop-fixture-process.mjs'
 import { SUBAGENT_MARKER } from '../../fixtures/claude-cli-sim/prompt-markers.mjs'
 
 const repoRoot = process.argv[2]
@@ -142,7 +142,7 @@ try {
     stdio: ['pipe', 'pipe', 'pipe'],
   })
   sidecar.stdin.on('error', () => {})
-  const exited = new Promise((resolve) => sidecar.once('exit', (code, signal) => { sidecarExit = { code, signal }; resolve() }))
+  sidecar.once('exit', (code, signal) => { sidecarExit = { code, signal } })
   createInterface({ input: sidecar.stderr }).on('line', (line) => stderrLines.push(line))
   const waiters = []
   createInterface({ input: sidecar.stdout }).on('line', (line) => {
@@ -215,7 +215,7 @@ try {
   await poller
   write({ type: 'shutdown' })
   sidecar.stdin.end()
-  await Promise.race([exited, sleep(10_000)])
+  await waitForFixtureProcessExit(sidecar, 10_000)
 } catch (error) {
   failure = String(error?.message ?? error).slice(0, 1000)
   log('error', 'run.failed', { error: failure })

@@ -1,4 +1,7 @@
-import { stopFixtureProcess as stopFixtureProcessRuntime } from './stop-fixture-process.mjs'
+import {
+  stopFixtureProcess as stopFixtureProcessRuntime,
+  waitForFixtureProcessExit as waitForFixtureProcessExitRuntime,
+} from './stop-fixture-process.mjs'
 
 /** The minimal child-process surface owned by a test fixture. */
 export interface FixtureProcess {
@@ -20,3 +23,8 @@ export const stopFixtureProcess: (
   child: FixtureProcess | undefined,
   options?: StopFixtureProcessOptions,
 ) => Promise<void> = stopFixtureProcessRuntime
+
+export const waitForFixtureProcessExit: (
+  child: FixtureProcess,
+  timeoutMs: number,
+) => Promise<void> = waitForFixtureProcessExitRuntime

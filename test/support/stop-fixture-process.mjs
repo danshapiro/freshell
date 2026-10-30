@@ -46,6 +46,19 @@ function sendExactSignal(child, signal) {
 }
 
 /**
+ * Require a protocol-requested exit before fallback cleanup sends a signal.
+ * A cleanup SIGTERM can exit with code zero; it cannot prove that the earlier
+ * shutdown request worked, so a missed deadline must remain a test failure.
+ * @param {import('./stop-fixture-process.js').FixtureProcess} child
+ * @param {number} timeoutMs
+ */
+export async function waitForFixtureProcessExit(child, timeoutMs) {
+  if (!await waitForExit(child, timeoutMs)) {
+    throw new Error(`captured fixture process did not exit within ${timeoutMs}ms after protocol shutdown`)
+  }
+}
+
+/**
  * Contain a fixture process before its scratch directory is removed. SIGTERM
  * gets one bounded grace period; a surviving exact child receives SIGKILL and
  * must then prove exit before this resolves. A survivor is a teardown error,

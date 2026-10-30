@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { stopFixtureProcess, type FixtureProcess } from '../../support/stop-fixture-process.js'
+import { stopFixtureProcess, waitForFixtureProcessExit, type FixtureProcess } from '../../support/stop-fixture-process.js'
 
 class FakeFixtureProcess extends EventEmitter implements FixtureProcess {
   exitCode: number | null = null
@@ -16,14 +16,49 @@ class FakeFixtureProcess extends EventEmitter implements FixtureProcess {
     return true
   }
 
-  exit(signal: NodeJS.Signals): void {
+  exit(signal: NodeJS.Signals | null): void {
     this.signalCode = signal
-    this.emit('exit', null, signal)
+    this.exitCode = signal === null ? 0 : null
+    this.emit('exit', this.exitCode, signal)
   }
 }
 
 afterEach(() => {
   vi.useRealTimers()
+})
+
+describe('waitForFixtureProcessExit', () => {
+  it('accepts a protocol exit and releases its deadline without sending a signal', async () => {
+    vi.useFakeTimers()
+    const child = new FakeFixtureProcess()
+    const waiting = waitForFixtureProcessExit(child, 50)
+
+    child.exit(null)
+    await waiting
+
+    expect(child.signals).toEqual([])
+    expect(child.listenerCount('exit')).toBe(0)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('keeps a protocol shutdown timeout failed when fallback SIGTERM produces a clean exit', async () => {
+    vi.useFakeTimers()
+    const child = new FakeFixtureProcess()
+    child.onTerm = () => setTimeout(() => child.exit(null), 10)
+    const shutdown = waitForFixtureProcessExit(child, 50).finally(() => stopFixtureProcess(child))
+    const outcome = shutdown.then(() => null, (error: Error) => error)
+
+    await vi.advanceTimersByTimeAsync(49)
+    expect(child.signals).toEqual([])
+    await vi.advanceTimersByTimeAsync(11)
+
+    expect(await outcome).toBeInstanceOf(Error)
+    expect((await outcome)?.message).toMatch(/did not exit within 50ms/i)
+    expect(child.exitCode).toBe(0)
+    expect(child.signals).toEqual(['SIGTERM'])
+    expect(child.listenerCount('exit')).toBe(0)
+    expect(vi.getTimerCount()).toBe(0)
+  })
 })
 
 describe('stopFixtureProcess', () => {
