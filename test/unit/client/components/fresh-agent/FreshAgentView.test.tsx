@@ -3703,6 +3703,219 @@ describe('FreshAgentView', () => {
     expect(apiMock.get).not.toHaveBeenCalledWith(expect.stringContaining('/api/fresh-agent/checkpoints?'))
   })
 
+  it("binds a freshopencode first message's checkpoint live when the enriched outcome arrives addressed to the materialized session", async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    // OpenCode persists the first user row under the native message id the
+    // server derives deterministically from the send's logicalAttemptId
+    // (uuid v5, NAMESPACE_OID — pinned in crates/freshell-freshagent's
+    // opencode_ws.rs for the known attempt 'V1StGXR8_Z5jdHi6B-myT'); the
+    // durable history row and the identity-enriched outcome frame carry it.
+    const nativeTurnId = 'msg_55c25d96e4445f67b35ea116686e169c'
+    const checkpointId = 'cccccccccccccccccccccccccccccccc'
+    const firstMessageText = 'First message in this conversation'
+    apiMock.getFreshAgentThreadSnapshot
+      .mockResolvedValueOnce({
+        status: 'idle',
+        summary: 'empty',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [],
+      })
+      .mockResolvedValue({
+        status: 'idle',
+        summary: 'first turn settled',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [
+          {
+            id: nativeTurnId,
+            turnId: nativeTurnId,
+            role: 'user',
+            source: 'durable',
+            summary: firstMessageText,
+            items: [{ id: 'first-user-text', kind: 'text', text: firstMessageText }],
+          },
+          {
+            id: 'msg_assistant_first',
+            turnId: 'msg_assistant_first',
+            role: 'assistant',
+            summary: 'Done.',
+            items: [{ id: 'first-assistant-text', kind: 'text', text: 'Done.' }],
+          },
+        ],
+      })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req1',
+        status: 'creating',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    // An un-materialized freshopencode create holds the placeholder id
+    // `freshopencode-<createRequestId>` until the first send materializes it.
+    expect(sentFreshAgentMessages('freshAgent.create').at(-1)).toMatchObject({
+      type: 'freshAgent.create',
+      requestId: 'req1',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+    })
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.created',
+        requestId: 'req1',
+        sessionId: 'freshopencode-req1',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        runtimeProvider: 'opencode',
+        sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req1' },
+      })
+    })
+    await waitFor(() => {
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    })
+    wsMock.send.mockClear()
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: firstMessageText },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    const sendFrame = sentFreshAgentMessages('freshAgent.send')[0]
+    expect(sendFrame).toMatchObject({
+      type: 'freshAgent.send',
+      sessionId: 'freshopencode-req1',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      text: firstMessageText,
+      checkpointIntent: {
+        logicalAttemptId: expect.any(String),
+      },
+    })
+    const requestId = String(sendFrame?.requestId)
+    const logicalAttemptId = String((sendFrame?.checkpointIntent as Record<string, unknown>)?.logicalAttemptId)
+    expect(requestId).not.toBe('undefined')
+    expect(logicalAttemptId).not.toBe('undefined')
+    expect(requestId).not.toBe(logicalAttemptId)
+    expect(apiMock.post.mock.calls.some(([url]) => String(url).startsWith('/api/fresh-agent/checkpoints'))).toBe(false)
+    // The in-flight send's echo row shows the still-saving hover state before
+    // the server owns the capture outcome.
+    const savingButton = screen.getByRole('button', { name: 'Saving code rewind checkpoint' })
+    expect(savingButton).toBeDisabled()
+    expect(savingButton).toHaveAttribute('title', 'Saving the code state from before this message')
+    expect(onMessage).toBeTypeOf('function')
+
+    // Server order, frame 1: the capture outcome fires before the send is
+    // accepted and carries no native row identity yet (the user row has not
+    // been persisted), addressed to the placeholder the pane still holds.
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.checkpoint.outcome',
+        requestId,
+        logicalAttemptId,
+        sessionId: 'freshopencode-req1',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        status: 'available',
+        checkpointId,
+      })
+    })
+    // The bound capture is honestly available even while the turn is in
+    // flight: the echo row's hover button flips to enabled with no reload.
+    expect(await screen.findByRole('button', { name: 'Rewind code to here' })).toBeEnabled()
+
+    // Frame 2: OpenCode accepts the send without a submittedTurnId.
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.send.accepted',
+        requestId,
+      })
+    })
+
+    // Frame 3: the first send materializes the durable session and re-keys
+    // the pane off the placeholder.
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.session.materialized',
+        previousSessionId: 'freshopencode-req1',
+        sessionId: 'ses_durable',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_durable' },
+      })
+    })
+    await waitFor(() => {
+      expect(getFreshAgentPaneContent(store).sessionId).toBe('ses_durable')
+    })
+    // Frame 4: the refreshed history lands the first user row under its
+    // deterministic native id (the assistant row is the landing marker —
+    // only the refreshed snapshot carries it, so it pins the application).
+    await waitFor(() => {
+      expect(screen.getByText('Done.')).toBeInTheDocument()
+    })
+    const userRows = screen.getAllByRole('article', { name: 'You transcript turn' })
+    expect(userRows).toHaveLength(1)
+    const userRow = userRows[0]!
+    expect(userRow).toHaveTextContent(firstMessageText)
+    // Before the enriched frame, the landed row is honestly unavailable: its
+    // only bound outcome is still request-keyed with no row identity.
+    const unavailableButton = within(userRow).getByRole('button', { name: 'Rewind unavailable for this message' })
+    expect(unavailableButton).toBeDisabled()
+    expect(unavailableButton).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
+
+    // Frame 5: the identity-enriched outcome is re-broadcast addressed to the
+    // DURABLE id. The pane already holds that id, so the frame binds live —
+    // no reload, no remount, and no outcome-page refetch carries the
+    // binding (the page stub stays at the beforeEach's empty outcomes).
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.checkpoint.outcome',
+        requestId,
+        logicalAttemptId,
+        sessionId: 'ses_durable',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        status: 'available',
+        checkpointId,
+        nativeTurnId,
+        displayTurnId: nativeTurnId,
+      })
+    })
+
+    const rewindButton = await within(userRow).findByRole('button', { name: 'Rewind code to here' })
+    expect(rewindButton).toBeEnabled()
+    // The pinned row element is still the same connected DOM node — the bind
+    // happened in the live mounted view, not a remount.
+    expect(userRow.isConnected).toBe(true)
+
+    expect(apiMock.get).not.toHaveBeenCalledWith(expect.stringContaining('/api/fresh-agent/checkpoints?'))
+
+    const persistedOutcomes = getFreshAgentPaneContent(store).checkpointOutcomes ?? []
+    expect(persistedOutcomes).toHaveLength(1)
+    expect(persistedOutcomes).toEqual(expect.arrayContaining([expect.objectContaining({
+      requestId,
+      conversationRequestId: 'req1',
+      conversationSessionKey: JSON.stringify(['opencode', 'freshopencode', 'ses_durable']),
+      status: 'available',
+      checkpointId,
+      nativeTurnId,
+      displayTurnId: nativeTurnId,
+    })]))
+  })
+
   it('accepts a late checkpoint outcome event when it carries an exact provider row identity', async () => {
     const checkpointId = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
     const workspace = { path: '/repo/selected', provenance: 'directory-picker' as const }
