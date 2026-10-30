@@ -290,4 +290,24 @@ describe('native Claude fixture process ownership', () => {
       await fixture.cleanup()
     }
   })
+
+  if (process.platform === 'darwin') {
+    it('uses the native process table after a refused signal-zero probe', async () => {
+      const fixture = await createClaudeFixture()
+      const child = fixture.spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+      const originalKill = process.kill
+      const denied = vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+        if (pid === -child.pid! && signal === 0) throw Object.assign(new Error('probe refused'), { code: 'EPERM' })
+        return originalKill(pid, signal)
+      })
+      try {
+        await fixture.cleanup()
+        expect(await live(child.pid!)).toBe(false)
+        await expect(fs.stat(fixture.root)).rejects.toMatchObject({ code: 'ENOENT' })
+      } finally {
+        denied.mockRestore()
+        await fixture.cleanup()
+      }
+    })
+  }
 })

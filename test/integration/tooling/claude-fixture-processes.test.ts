@@ -144,6 +144,24 @@ describe('Claude fixture native process ownership', () => {
     }
   })
 
+  it('inspects group membership when a signal-zero permission probe is refused', async () => {
+    const fixture = await createClaudeFixture()
+    const child = fixture.spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+    const originalKill = process.kill
+    const kill = vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+      if (pid === -child.pid! && signal === 0) throw Object.assign(new Error('permission probe refused'), { code: 'EPERM' })
+      return originalKill(pid, signal)
+    })
+    try {
+      await expect(fixture.cleanup()).resolves.toBeUndefined()
+      expect(await live(child.pid!)).toBe(false)
+      await expect(fs.stat(fixture.root)).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      kill.mockRestore()
+      await fixture.cleanup()
+    }
+  })
+
   it('stops only its owned group and refuses new launches once cleanup starts', async () => {
     const fixture = await createClaudeFixture()
     const otherFixture = await createClaudeFixture()

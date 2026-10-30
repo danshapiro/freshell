@@ -14,7 +14,9 @@ const log = (severity, event, fields) => {
 async function liveGroupMembers(groupId, platform) {
   try { process.kill(-groupId, 0) } catch (error) {
     if (error.code === 'ESRCH') return []
-    throw error
+    // A signal-zero refusal is not proof of a live writer. Inspect members
+    // (and exclude exited zombies); real TERM/KILL refusals still propagate.
+    if (error.code !== 'EPERM') throw error
   }
   if (platform !== 'linux') {
     // Darwin's session field is not the numeric Linux SID. The PGID of our
