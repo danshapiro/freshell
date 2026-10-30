@@ -6,7 +6,13 @@
   "category": "cli",
   "cli": {
     "command": "agy",
-    "envVar": "ANTIGRAVITY_CMD"
+    "args": ["-i"],
+    "envVar": "ANTIGRAVITY_CMD",
+    "resumeArgs": ["--conversation", "{{sessionId}}"],
+    "modelArgs": ["--model", "{{model}}"],
+    "effortArgs": ["--effort", "{{effort}}"],
+    "supportsModel": true,
+    "supportsEffort": true
   },
   "picker": {
     "group": "agents"

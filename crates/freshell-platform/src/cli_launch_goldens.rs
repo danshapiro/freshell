@@ -1276,3 +1276,220 @@ fn amplifier_manifest_matches_legacy_cli_block() {
         serde_json::json!({ "PROMPT_TOOLKIT_NO_CPR": "1" })
     );
 }
+
+// ===========================================================================
+// Batch G-AN — Antigravity terminal mode. `extensions/antigravity/
+// freshell.json` is the single source of truth for its launch behavior (the
+// amplifier precedent): every golden below runs the resolver against a spec
+// COMPILED FROM THE REAL MANIFEST FILE — the field mapping of
+// `ExtensionRegistry::cli_command_specs()` (`crates/freshell-server/src/
+// extensions.rs:197-223`) — so the argv assertions stay red until the
+// manifest carries the launch templates and then pin it against silent
+// drift. Antigravity rides the resolver's GENERIC branch (like
+// gemini/kimi/amplifier): no provider_args special-case, MCP injection
+// default (the `_` arm of `mcp_inject.rs::generate_mcp_injection` yields no
+// injection), settings templates applied when set, resume template on a
+// provider-matched sessionRef.
+//
+// Contract facts pinned here (Provider Contract Record, plan doc
+// docs/plans/2026-10-29-google-cli-first-class-support.md): fresh launch =
+// `agy -i` (`-i`/`--prompt-interactive` interactive; `-p`/`--print`/
+// `--prompt` is the HEADLESS spelling and must never appear), resume =
+// `--conversation <id>` (adjacent pair, never the weaker `--continue`
+// cache mechanism — Global Constraint 2), and model/effort pass through
+// `--model`/`--effort` verbatim (the effort enum is model-dependent; the
+// manifest template NEVER hardcodes an enum).
+
+fn antigravity_manifest_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../extensions/antigravity/freshell.json")
+}
+
+fn manifest_str_array(value: &serde_json::Value) -> Option<Vec<String>> {
+    value.as_array().map(|items| {
+        items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .expect("manifest argv templates hold strings")
+                    .to_string()
+            })
+            .collect()
+    })
+}
+
+/// Compile the real `extensions/antigravity/freshell.json` `cli` block into a
+/// [`CliCommandSpec`] — field-for-field the way `ExtensionRegistry::
+/// cli_command_specs()` (`crates/freshell-server/src/extensions.rs:197-223`)
+/// compiles every bundled CLI manifest: name/label from the manifest, `envVar`
+/// emptiness-filtered to `None`, `command` as the default command, `args` as
+/// base args, `env` as base env, and the resume/create/model/effort/
+/// sandbox/permissionMode templates verbatim.
+fn antigravity_manifest_spec() -> CliCommandSpec {
+    let raw = std::fs::read_to_string(antigravity_manifest_path())
+        .unwrap_or_else(|e| panic!("missing antigravity manifest: {e}"));
+    let json: serde_json::Value = serde_json::from_str(&raw).expect("manifest must be valid JSON");
+    let cli = &json["cli"];
+    CliCommandSpec {
+        name: json["name"].as_str().expect("manifest name").to_string(),
+        label: json["label"].as_str().expect("manifest label").to_string(),
+        env_var: cli["envVar"]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .map(str::to_string),
+        default_cmd: cli["command"]
+            .as_str()
+            .expect("manifest command")
+            .to_string(),
+        base_args: manifest_str_array(&cli["args"]).unwrap_or_default(),
+        base_env: cli["env"]
+            .as_object()
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            v.as_str()
+                                .expect("manifest env values are strings")
+                                .to_string(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        resume_args: manifest_str_array(&cli["resumeArgs"]),
+        create_session_args: manifest_str_array(&cli["createSessionArgs"]),
+        model_args: manifest_str_array(&cli["modelArgs"]),
+        effort_args: manifest_str_array(&cli["effortArgs"]),
+        sandbox_args: manifest_str_array(&cli["sandboxArgs"]),
+        permission_mode_args: manifest_str_array(&cli["permissionModeArgs"]),
+    }
+}
+
+fn antigravity_inputs<'a>(
+    resume_session_id: Option<&'a str>,
+    launch_intent: LaunchIntent,
+) -> CliLaunchInputs<'a> {
+    CliLaunchInputs {
+        mode: "antigravity",
+        target: ProviderTarget::Unix,
+        resume_session_id,
+        launch_intent,
+        permission_mode: None,
+        model: None,
+        effort: None,
+        sandbox: None,
+        codex_remote_ws_url: None,
+        opencode_server: None,
+        mcp_injection: McpInjection::default(),
+        opencode_rebind_tui_config: None,
+    }
+}
+
+/// Run the resolver for `inputs` against the shipped specs plus the
+/// manifest-compiled antigravity spec (the `resolve_amplifier_golden_with_
+/// intent` shape; flattens the mode-match `Option` since the antigravity
+/// spec is always pushed).
+fn resolve_antigravity(
+    inputs: &CliLaunchInputs<'_>,
+    env: &MapEnv,
+) -> Result<CliLaunch, CliLaunchError> {
+    let mut all_specs = specs();
+    all_specs.push(antigravity_manifest_spec());
+    resolve_coding_cli_command(&all_specs, inputs, env)
+        .map(|launch| launch.expect("antigravity spec is present"))
+}
+
+/// G-AN1 — antigravity fresh launch: the manifest's static `args` seed the
+/// interactive prompt flag (`-i`), and the headless print flags (`-p` /
+/// `--print` / `--prompt`) must never appear on an interactive pane.
+#[test]
+fn antigravity_fresh_launch_uses_interactive_prompt_flag() {
+    let launch = resolve_antigravity(&antigravity_inputs(None, LaunchIntent::Start), &env_of(&[]))
+        .expect("registered");
+    assert_eq!(launch.command, "agy");
+    assert!(launch.args.contains(&"-i".to_string()));
+    assert!(!launch.args.iter().any(|a| a == "-p"));
+}
+
+/// G-AN2 — antigravity resume: the manifest's `resumeArgs` template yields
+/// the ADJACENT pair `--conversation <id>` (first-occurrence substitution,
+/// rev 2.1 pin), and the weaker `--continue` cache mechanism must never be
+/// used (Global Constraint 2 — no silent replacement of the conversation).
+#[test]
+fn antigravity_resume_uses_conversation_flag_adjacent_pair() {
+    let launch = resolve_antigravity(
+        &antigravity_inputs(Some("conv-1234"), LaunchIntent::Resume),
+        &env_of(&[]),
+    )
+    .expect("registered");
+    let i = launch
+        .args
+        .iter()
+        .position(|a| a == "--conversation")
+        .expect("resume flag");
+    assert_eq!(launch.args[i + 1], "conv-1234");
+    assert!(!launch.args.iter().any(|a| a == "--continue"));
+}
+
+/// G-AN3 — the manifest's `modelArgs`/`effortArgs` templates apply in the
+/// settings segment as `--model m` / `--effort e` (pass-through: the effort
+/// enum is model-dependent per the contract record, so the template only
+/// substitutes `{{effort}}` and never hardcodes an enum).
+#[test]
+fn antigravity_model_and_effort_templates_apply() {
+    let mut inputs = antigravity_inputs(None, LaunchIntent::Start);
+    inputs.model = Some("m");
+    inputs.effort = Some("e");
+    let launch = resolve_antigravity(&inputs, &env_of(&[])).expect("registered");
+    assert!(launch.args.windows(2).any(|pair| pair == ["--model", "m"]));
+    assert!(launch.args.windows(2).any(|pair| pair == ["--effort", "e"]));
+}
+
+/// G-AN4 — `ANTIGRAVITY_CMD` env override wins over the manifest's default
+/// command (`command = env[spec.envVar] || spec.defaultCommand`), exercised
+/// through the real manifest spec.
+#[test]
+fn antigravity_env_var_command_override_wins() {
+    let launch = resolve_antigravity(
+        &antigravity_inputs(None, LaunchIntent::Start),
+        &env_of(&[("ANTIGRAVITY_CMD", "/custom/agy")]),
+    )
+    .expect("registered");
+    assert_eq!(launch.command, "/custom/agy");
+}
+
+/// The antigravity extension manifest is the single source of truth for its
+/// launch behavior (the `amplifier_manifest_matches_legacy_cli_block`
+/// precedent). The resolver goldens above compile this exact file; this pin
+/// additionally holds the fields a [`CliCommandSpec`] cannot carry — the
+/// `supportsModel`/`supportsEffort` flags `client_entry` re-emits to the
+/// client (`extensions.rs:284-295`) — plus the exact template bytes
+/// `supportsResume`/`resumeCommandTemplate` derive from
+/// (`extensions.rs:296-301`).
+#[test]
+fn antigravity_manifest_matches_launch_templates() {
+    let raw = std::fs::read_to_string(antigravity_manifest_path())
+        .unwrap_or_else(|e| panic!("missing antigravity manifest: {e}"));
+    let json: serde_json::Value = serde_json::from_str(&raw).expect("manifest must be valid JSON");
+    assert_eq!(json["name"], "antigravity");
+    assert_eq!(json["category"], "cli");
+    let cli = &json["cli"];
+    assert_eq!(cli["command"], "agy");
+    assert_eq!(cli["envVar"], "ANTIGRAVITY_CMD");
+    assert_eq!(cli["args"], serde_json::json!(["-i"]));
+    assert_eq!(
+        cli["resumeArgs"],
+        serde_json::json!(["--conversation", "{{sessionId}}"])
+    );
+    assert_eq!(
+        cli["modelArgs"],
+        serde_json::json!(["--model", "{{model}}"])
+    );
+    assert_eq!(
+        cli["effortArgs"],
+        serde_json::json!(["--effort", "{{effort}}"])
+    );
+    assert_eq!(cli["supportsModel"], serde_json::json!(true));
+    assert_eq!(cli["supportsEffort"], serde_json::json!(true));
+}
