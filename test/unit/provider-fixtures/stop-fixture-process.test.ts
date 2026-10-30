@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { stopFixtureProcess, type FixtureProcess } from '../../support/stop-fixture-process.js'
+import { stopFixtureProcess, stopFixtureProcessThen, type FixtureProcess } from '../../support/stop-fixture-process.js'
 
 class FakeFixtureProcess extends EventEmitter implements FixtureProcess {
   exitCode: number | null = null
@@ -66,6 +66,24 @@ describe('stopFixtureProcess', () => {
 
     await rejected
     expect(child.signals).toEqual(['SIGTERM', 'SIGKILL'])
+    expect(child.listenerCount('exit')).toBe(0)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('does not run fixture cleanup when the captured child never confirms exit', async () => {
+    vi.useFakeTimers()
+    const child = new FakeFixtureProcess()
+    const cleanup = vi.fn(async () => {})
+    const stopping = stopFixtureProcessThen(child, cleanup, {
+      gracefulTimeoutMs: 50,
+      forceTimeoutMs: 50,
+    })
+    const rejected = expect(stopping).rejects.toThrow(/did not exit/i)
+    await vi.advanceTimersByTimeAsync(50)
+    await vi.advanceTimersByTimeAsync(50)
+    await rejected
+    expect(child.signals).toEqual(['SIGTERM', 'SIGKILL'])
+    expect(cleanup).not.toHaveBeenCalled()
     expect(child.listenerCount('exit')).toBe(0)
     expect(vi.getTimerCount()).toBe(0)
   })
