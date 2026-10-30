@@ -3228,12 +3228,14 @@ mod tests {
                 );
                 let query_module = owned.path().join("query.mjs");
                 let input_receipt = owned.path().join("input-received");
+                let query_receipt = owned.path().join("queries.jsonl");
+                let unavailable = owned.path().join("query-unavailable");
                 std::fs::write(&query_module, format!(
-                    "import {{ appendFile }} from 'node:fs/promises';\nimport {{ query as controlledQuery }} from {};\nexport function query(args) {{ const options = {{...args.options, sessionId:args.options.sessionId ?? args.options.resume}}; const prompt = (async function* () {{ for await (const message of args.prompt) {{ await appendFile({}, options.sessionId + '\\n'); yield message; }} }})(); return controlledQuery({{...args, prompt, options}}) }}\n",
-                    json!(repo.join("test/unit/claude-sidecar/fixtures/native-startup-query.mjs")), json!(input_receipt))).unwrap();
+                    "import {{ appendFile }} from 'node:fs/promises';\nimport {{ appendFileSync, existsSync }} from 'node:fs';\nimport {{ query as controlledQuery }} from {};\nexport function query(args) {{ const options = {{...args.options, sessionId:args.options.sessionId ?? args.options.resume}}; appendFileSync({}, JSON.stringify({{nativeSessionId:options.sessionId,pid:process.pid}}) + '\\n'); if (existsSync({})) throw new Error('owned replacement query unavailable'); const prompt = (async function* () {{ for await (const message of args.prompt) {{ await appendFile({}, options.sessionId + '\\n'); yield message; }} }})(); return controlledQuery({{...args, prompt, options}}) }}\n",
+                    json!(repo.join("test/unit/claude-sidecar/fixtures/native-startup-query.mjs")), json!(query_receipt), json!(unavailable), json!(input_receipt))).unwrap();
                 std::env::set_var("FRESHELL_CLAUDE_SDK_QUERY_MODULE", &query_module);
                 std::env::set_var("FRESHELL_NATIVE_IDENTITY_LAUNCH", json!(launch).to_string());
-                if followup != "undo" {
+                if followup == "input" {
                     std::env::remove_var("FRESHELL_SIDECAR_TEST_CHECKPOINT");
                     std::env::remove_var("FRESHELL_SIDECAR_TEST_NATIVE_EXIT_DELAY");
                 } else {
@@ -3319,16 +3321,6 @@ mod tests {
                         let undo = actor.semantic_operation(RequestId::parse("valid-undo-after-refusal").unwrap(),
                             FreshAgentOperation::Rollback { direction:FreshAgentRollbackDirection::Undo,
                                 mode:FreshAgentRollbackMode::Step, turn_id:None, cwd:None }).await;
-                        if followup == "retired" {
-                            if !matches!(undo, Err(freshell_agent_runtime::host_actor::ActorError::AmbiguousDispatch))
-                                || transport.provider_session_is_live(PARENT).await
-                                || crate::fresh_native_observation(&launch, &actor).await.is_some()
-                                || actor.capture(4096).await.is_ok()
-                                || actor.dispatch(RequestId::parse("retired-parent-input").unwrap(), "must not run".into(), None).await.is_ok() {
-                                return Err("post-retirement failure revived the old parent".into());
-                            }
-                            return Ok(());
-                        }
                         if let Err(error) = undo {
                             tokio::time::timeout(Duration::from_secs(1), async {
                                 loop {
@@ -3351,6 +3343,53 @@ mod tests {
                                 tokio::time::sleep(Duration::from_millis(10)).await;
                             }
                         }).await.map_err(|_| "subsequent child proof missing")?;
+                        if followup == "retired" {
+                            let queries: Vec<Value> = std::fs::read_to_string(&query_receipt)
+                                .map_err(|error| error.to_string())?.lines()
+                                .map(|line| serde_json::from_str(line).unwrap()).collect();
+                            let child_pid = queries.iter().rev()
+                                .find(|query| query["nativeSessionId"] == child)
+                                .and_then(|query| query["pid"].as_i64())
+                                .ok_or("owned child process was not recorded")? as i32;
+                            let parent_pid = queries.iter()
+                                .find(|query| query["nativeSessionId"] == PARENT)
+                                .and_then(|query| query["pid"].as_i64())
+                                .ok_or("owned parent process was not recorded")? as i32;
+                            // The pane's former id deliberately aliases its
+                            // replacement. Actual writer retirement is the old
+                            // recorded process being reaped, not that alias
+                            // ceasing to resolve the live child.
+                            if child_pid == parent_pid || unsafe { libc::kill(parent_pid, 0) } == 0 {
+                                return Err("successful Undo must reap its original writer".into());
+                            }
+                            // The child is proven current and the parent is
+                            // already retired. Fail only that owned runtime,
+                            // then make any attempted exact recovery refuse
+                            // before it can consume a new input.
+                            std::fs::write(&unavailable, "").map_err(|error| error.to_string())?;
+                            if unsafe { libc::kill(child_pid, libc::SIGKILL) } != 0 {
+                                return Err("could not fail the exact owned child".into());
+                            }
+                            tokio::time::timeout(Duration::from_secs(3), async {
+                                while transport.provider_session_is_live(&child).await {
+                                    tokio::time::sleep(Duration::from_millis(10)).await;
+                                }
+                            }).await.map_err(|_| "owned child failure was not observed")?;
+                            let old_parent_live = transport.provider_session_is_live(PARENT).await;
+                            let current_proof = crate::fresh_native_observation(&child_launch, &actor).await.is_some();
+                            let captured_root = actor.capture(4096).await.ok().map(|capture| capture.native_session_id);
+                            let accepted_input = actor.dispatch(RequestId::parse("retired-parent-input").unwrap(), "must not run".into(), None).await.is_ok();
+                            if old_parent_live || current_proof
+                                || captured_root.as_deref().is_some_and(|root| root != child)
+                                || accepted_input || transport.provider_session_is_live(PARENT).await {
+                                return Err(format!("post-retirement failure revived the old parent: parent_live={old_parent_live}, proof={current_proof}, capture_root={captured_root:?}, input_accepted={accepted_input}"));
+                            }
+                            if !std::fs::read_to_string(&input_receipt).unwrap_or_default().is_empty()
+                                || std::fs::read_to_string(&source).map_err(|error| error.to_string())? != content {
+                                return Err("post-retirement failure replayed input or changed native history".into());
+                            }
+                            return Ok(());
+                        }
                         if actor.capture(4096).await.map_err(|error| error.to_string())?.native_session_id != child {
                             return Err("subsequent legitimate child capture broke".into());
                         }
@@ -4293,8 +4332,16 @@ export function query({ prompt, options }) {
         .await
         .is_ok();
         let crashed_status = status().await.unwrap();
-        let bridge_still_live =
-            unsafe { libc::kill(before[0]["bridgePid"].as_i64().unwrap() as i32, 0) } == 0;
+        // A v2 SDK stream end deliberately exits its sidecar after flushing
+        // sdk.stream.ended. Observe its complete reap rather than requiring a
+        // bridge with no native session to remain running.
+        let bridge_reaped = tokio::time::timeout(Duration::from_secs(3), async {
+            while unsafe { libc::kill(before[0]["bridgePid"].as_i64().unwrap() as i32, 0) } == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
         let after = launches();
         let input_count = std::fs::read_to_string(root.path().join("native-inputs.jsonl"))
             .unwrap()
@@ -4311,11 +4358,11 @@ export function query({ prompt, options }) {
         drop(actor);
         assert!(
             detected,
-            "native SDK worker death must reach host liveness while its bridge stdout remains open"
+            "native SDK worker death must reach host liveness without another send"
         );
         assert!(
-            bridge_still_live,
-            "native death detection must not kill the healthy Node bridge"
+            bridge_reaped,
+            "an ended SDK stream must reap its now-sessionless Node bridge"
         );
         assert!(
             matches!(
@@ -4888,22 +4935,30 @@ export function query({ prompt, options }) {
                 .dispatch(RequestId::new(), "owned checkpoint operation".into(), None)
                 .await
                 .unwrap();
-            let detected = tokio::time::timeout(Duration::from_secs(8), async {
-                while actor.is_live().await {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .is_ok();
-            // Native liveness and the actor event journal have separate
-            // consumers. Wait for the journal's own terminal edge as well.
-            let failed_turn = tokio::time::timeout(Duration::from_secs(2), async {
+            // Loading a replacement briefly makes native readiness false.
+            // Wait for actual terminal publication, not that intermediate
+            // state, within the original native-close failure budget.
+            let failed_turn = tokio::time::timeout(Duration::from_secs(8), async {
                 loop {
-                    if actor.read_events(0, 128).await.events.iter().any(|row| {
+                    let events = actor.read_events(0, 128).await.events;
+                    let completed = events.iter().any(|row| {
                         matches!(&row.event, AgentEvent::Provider { payload }
-                            if payload["event"]["type"] == "freshAgent.turn.complete"
-                                && payload["event"]["outcome"] == "failed")
-                    }) {
+                            if payload["event"]["type"] == "freshAgent.turn.complete")
+                    });
+                    let exited = events.iter().any(|row| {
+                        matches!(&row.event, AgentEvent::Provider { payload }
+                            if payload["event"]["type"] == "freshAgent.status"
+                                && payload["event"]["status"] == "exited")
+                    });
+                    let failed = events.iter().any(|row| {
+                        matches!(&row.event, AgentEvent::Provider { payload }
+                            if payload["event"]["type"] == "freshAgent.error"
+                                && payload["event"]["code"] == "SIDECAR_EXITED")
+                    });
+                    // Claude's v2 attention edge carries no result verdict.
+                    // An owed turn ending without a result is reported by its
+                    // edge together with the exited state and failure banner.
+                    if completed && exited && failed && !actor.is_live().await {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4911,6 +4966,7 @@ export function query({ prompt, options }) {
             })
             .await
             .is_ok();
+            let detected = !actor.is_live().await;
             let events = actor.read_events(0, 128).await.events;
             if let ProviderState::Claude(state) = &transport.state {
                 state.shutdown().await;
@@ -4921,7 +4977,16 @@ export function query({ prompt, options }) {
             );
             assert!(
                 failed_turn,
-                "{scenario}: accepted turn must settle as failed"
+                "{scenario}: accepted turn must settle as failed; frames={:?}",
+                events
+                    .iter()
+                    .filter_map(|row| match &row.event {
+                        AgentEvent::Provider { payload } => Some(json!({
+                        "type":payload["event"]["type"], "status":payload["event"]["status"],
+                        "code":payload["event"]["code"]})),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
             );
             assert!(
                 events
@@ -5049,8 +5114,12 @@ export function query({ prompt, options }) {
     /// CLAUDE_CONFIG_DIR holds a transcript for each id in `conversations`.
     struct SimulatedClaude {
         root: tempfile::TempDir,
+        project: std::path::PathBuf,
         ledger: std::path::PathBuf,
         transport: Arc<HostedTransport>,
+        // Callers hold OPENCODE_SNAPSHOT_ENV_LOCK for this fixture's lifetime.
+        // Restore the reader's roots after the other fixture fields drop.
+        _store_environment: SnapshotProviderEnv,
     }
 
     impl SimulatedClaude {
@@ -5068,14 +5137,43 @@ export function query({ prompt, options }) {
             let home = root.path().join("home");
             let workspace = root.path().join("workspace");
             let config = home.join(".claude");
-            let project = config.join("projects").join("-workspace");
+            let project_slug: String = workspace
+                .to_string_lossy()
+                .chars()
+                .map(|value| {
+                    if value.is_ascii_alphanumeric() {
+                        value
+                    } else {
+                        '-'
+                    }
+                })
+                .collect();
+            let project = config.join("projects").join(project_slug);
             std::fs::create_dir_all(&workspace).unwrap();
             std::fs::create_dir_all(&project).unwrap();
             for id in conversations {
-                let line = json!({ "type": "user", "uuid": format!("u-{id}"), "parentUuid": null,
+                let line = json!({ "type": "user", "uuid": uuid::Uuid::new_v4().to_string(), "parentUuid": null,
                     "sessionId": id, "cwd": workspace, "message": { "role": "user", "content": "hello" } });
                 std::fs::write(project.join(format!("{id}.jsonl")), format!("{line}\n")).unwrap();
             }
+            let store_environment = SnapshotProviderEnv(
+                ["HOME", "CLAUDE_HOME", "CLAUDE_CONFIG_DIR"]
+                    .into_iter()
+                    .map(|key| (key, std::env::var_os(key)))
+                    .collect(),
+            );
+            // Production's Rust history reader and SDK child share one HOME.
+            // The sidecar-only environment seam does not change Rust's roots.
+            std::env::set_var("HOME", &home);
+            std::env::set_var("CLAUDE_HOME", &config);
+            std::env::set_var("CLAUDE_CONFIG_DIR", &config);
+            let launch: freshell_runtime_protocol::NativeIdentityLaunch =
+                serde_json::from_value(json!({
+                    "incarnationId":"owned-simulated-claude", "launchNonce":uuid::Uuid::new_v4().to_string(),
+                    "evidenceRevision":1, "executionGeneration":1,
+                    "requestedNativeSessionId":conversations.first(),
+                }))
+                .unwrap();
             let ledger = root.path().join("sim-ledger.jsonl");
             let text = |path: &std::path::Path| path.to_string_lossy().into_owned();
             let tmp = root.path().join("tmp");
@@ -5099,6 +5197,10 @@ export function query({ prompt, options }) {
                 ("LANG".to_string(), "C.UTF-8".to_string()),
                 ("CLAUDE_CONFIG_DIR".to_string(), text(&config)),
                 (
+                    "FRESHELL_NATIVE_IDENTITY_LAUNCH".to_string(),
+                    json!(launch).to_string(),
+                ),
+                (
                     "FRESHELL_CLAUDE_SDK_QUERY_MODULE".to_string(),
                     freshell_platform::opencode_plugin::plugin_file_spec(
                         &repo.join("test/integration/providers/claude-sdk-for-rust-runtime.mjs"),
@@ -5113,10 +5215,19 @@ export function query({ prompt, options }) {
                 context,
             )
             .await;
+            {
+                // Mirror the managed host's private launch binding; the real
+                // SessionStart hook still supplies all native identity proof.
+                let mut identity = transport.native_identity.lock().unwrap();
+                identity.launch = Some(launch.clone());
+                identity.producer_launch = Some(launch);
+            }
             Self {
                 root,
+                project,
                 ledger,
                 transport,
+                _store_environment: store_environment,
             }
         }
 
@@ -5147,6 +5258,15 @@ export function query({ prompt, options }) {
                 .filter_map(|line| serde_json::from_str::<Value>(line).ok())
                 .filter(|row| row["kind"] == kind)
                 .collect()
+        }
+
+        fn assert_resume_parent(&self, options: &Value, native: &str) {
+            let selector = options["resume"].as_str().expect("a resume selector");
+            let transcript = self.project.join(format!("{native}.jsonl"));
+            assert!(
+                selector == native || std::path::Path::new(selector) == transcript,
+                "the SDK must resume the exact owned parent: {options}"
+            );
         }
     }
 
@@ -5350,7 +5470,7 @@ export function query({ prompt, options }) {
             .find(|options| options["sessionId"] == child.as_str())
             .expect("the CLI booted the child");
         assert_eq!(boot["forkSession"], true, "{boot}");
-        assert_eq!(boot["resume"], conversation, "{boot}");
+        claude.assert_resume_parent(&boot, conversation);
         assert!(
             claude.ledger_rows("prompt").is_empty(),
             "no prompt was needed"
@@ -5385,7 +5505,7 @@ export function query({ prompt, options }) {
             .map(|row| row["options"].clone())
             .find(|options| options["sessionId"] == grandchild.as_str())
             .expect("the CLI booted the second child");
-        assert_eq!(boot["resume"], conversation, "{boot}");
+        claude.assert_resume_parent(&boot, conversation);
         let child = grandchild;
 
         let mut child_profile = profile.clone();
@@ -5721,6 +5841,8 @@ export function query({ prompt, options }) {
             "CLAUDE_CONFIG_DIR",
             "FRESHELL_CLAUDE_SIDECAR",
             "FRESHELL_CLAUDE_SDK_QUERY_MODULE",
+            "FRESHELL_NATIVE_IDENTITY_LAUNCH",
+            "FRESHELL_SIDECAR_TEST_TRANSCRIPT",
         ];
         let _restore = SnapshotProviderEnv(
             keys.iter()
@@ -5738,9 +5860,23 @@ export function query({ prompt, options }) {
         );
         std::env::set_var(
             "FRESHELL_CLAUDE_SDK_QUERY_MODULE",
-            repo.join("test/unit/claude-sidecar/fixtures/settings-query-module.mjs")
+            repo.join("test/unit/claude-sidecar/fixtures/native-startup-query.mjs")
                 .canonicalize()
                 .unwrap(),
+        );
+        let native = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let transcript = root.path().join("native.jsonl");
+        std::fs::write(
+            &transcript,
+            format!("{{\"type\":\"system\",\"sessionId\":\"{native}\"}}\n"),
+        )
+        .unwrap();
+        std::env::set_var("FRESHELL_SIDECAR_TEST_TRANSCRIPT", &transcript);
+        std::env::set_var(
+            "FRESHELL_NATIVE_IDENTITY_LAUNCH",
+            json!({"incarnationId":"normalized-init","launchNonce":"normalized-init-nonce",
+                "evidenceRevision":0,"executionGeneration":1,"requestedNativeSessionId":native})
+            .to_string(),
         );
         for provider in [FreshProvider::Claude, FreshProvider::Kilroy] {
             let transport = HostedTransport::new(provider.clone()).await;
@@ -5780,10 +5916,10 @@ export function query({ prompt, options }) {
                 "the observed native session must remain a live host transport after startup"
             );
             assert!(observed_evidence.is_some());
-            assert_ne!(
+            assert_eq!(
                 created,
                 profile.native_session_id.clone().unwrap(),
-                "local key is separate"
+                "the v2 runtime registers under the exact native conversation UUID"
             );
             assert_eq!(native,profile.native_session_id,
                 "production sidecar sdk.session.init must pass the actual upstream normalizer and reach the host");
@@ -5929,6 +6065,7 @@ export function query({ prompt, options }) {
             "FRESHELL_NATIVE_IDENTITY_LAUNCH",
             "FRESHELL_SIDECAR_TEST_CHECKPOINT",
             "FRESHELL_SIDECAR_TEST_NATIVE_REQUEST_ID",
+            "FRESHELL_SIDECAR_TEST_NATIVE_PROJECT",
         ];
         let _restore = SnapshotProviderEnv(
             keys.iter()
@@ -5937,12 +6074,9 @@ export function query({ prompt, options }) {
         );
         for provider in [FreshProvider::Claude, FreshProvider::Kilroy] {
             let owned = tempfile::tempdir().unwrap();
-            let native = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-            std::fs::write(
-                owned.path().join("native.jsonl"),
-                format!("{{\"type\":\"system\",\"sessionId\":\"{native}\"}}\n"),
-            )
-            .unwrap();
+            // Both fresh and exact-resume queries use the allocated UUID's
+            // actual transcript, including the zero-message continuation.
+            std::env::set_var("FRESHELL_SIDECAR_TEST_NATIVE_PROJECT", owned.path());
             std::env::set_var("HOME", owned.path());
             std::env::set_var("CLAUDE_HOME", owned.path().join(".claude"));
             std::env::set_var("CLAUDE_CONFIG_DIR", owned.path().join(".claude"));
@@ -5958,7 +6092,7 @@ export function query({ prompt, options }) {
             std::env::set_var(
                 "FRESHELL_NATIVE_IDENTITY_LAUNCH",
                 json!({"incarnationId":"current","launchNonce":"current-nonce",
-                "evidenceRevision":0,"executionGeneration":1,"requestedNativeSessionId":native})
+                "evidenceRevision":0,"executionGeneration":1,"requestedNativeSessionId":null})
                 .to_string(),
             );
             let mut profile = parity_profile(FreshProvider::Claude);
@@ -5988,6 +6122,12 @@ export function query({ prompt, options }) {
             let actor = FreshAgentHostActor::open(&actor_dir, profile.clone(), original.clone())
                 .await
                 .unwrap();
+            let native = actor.profile().await.native_session_id.unwrap();
+            assert!(
+                uuid::Uuid::parse_str(&native).is_ok(),
+                "fresh creation allocates the actual native UUID"
+            );
+            let transcript = owned.path().join(format!("{native}.jsonl"));
             actor
                 .dispatch(
                     RequestId::parse("original-operation").unwrap(),
@@ -6031,12 +6171,18 @@ export function query({ prompt, options }) {
             assert!(actor.is_live().await,
                 "the ended query preceding native checkpoint continuation must not close its current replacement");
             profile = actor.profile().await;
-            assert_eq!(profile.native_session_id.as_deref(), Some(native));
+            assert_eq!(profile.native_session_id.as_deref(), Some(native.as_str()));
             if let ProviderState::Claude(state) = &original.state {
                 state.shutdown().await;
             }
             drop(actor);
             tokio::task::yield_now().await;
+            std::env::set_var(
+                "FRESHELL_NATIVE_IDENTITY_LAUNCH",
+                json!({"incarnationId":"current","launchNonce":"current-nonce",
+                "evidenceRevision":0,"executionGeneration":1,"requestedNativeSessionId":native})
+                .to_string(),
+            );
             std::env::set_var("FRESHELL_SIDECAR_TEST_NATIVE_REQUEST_ID", "native-new");
             let current = HostedTransport::new(provider).await;
             {
@@ -6064,7 +6210,7 @@ export function query({ prompt, options }) {
                     .is_empty(),
                 "actual saved actor must register its native checkpoint before startup"
             );
-            let before = std::fs::read(owned.path().join("native.jsonl")).unwrap();
+            let before = std::fs::read(&transcript).unwrap();
             let receipt = actor.resume_pending_native_permissions().await;
             let recovered = tokio::time::timeout(Duration::from_secs(3), async {
                 loop {
@@ -6114,11 +6260,11 @@ export function query({ prompt, options }) {
                 duplicate.is_ok(),
                 "settled actor release must succeed without a second native continuation: {duplicate:?}"
             );
-            assert_eq!(identity_before_repeat.0.as_deref(), Some(native));
+            assert_eq!(identity_before_repeat.0.as_deref(), Some(native.as_str()));
             assert!(identity_before_repeat.1.is_some());
             assert_eq!(identity_after_repeat, identity_before_repeat);
             assert_eq!(
-                std::fs::read(owned.path().join("native.jsonl")).unwrap(),
+                std::fs::read(&transcript).unwrap(),
                 before,
                 "parked native ask must not execute or rewrite history"
             );

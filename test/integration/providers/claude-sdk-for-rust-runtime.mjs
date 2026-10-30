@@ -3,7 +3,9 @@
 // never emits a sidecar protocol frame. Faults stay at SDK method boundaries.
 import fs from 'node:fs'
 import path from 'node:path'
+import { exec } from 'node:child_process'
 import { query as simulateQuery } from '../../fixtures/claude-cli-sim/query.mjs'
+import { claudeConfigDir, findTranscript, projectSlug } from '../../fixtures/claude-cli-sim/transcript.mjs'
 
 function append(file, row) {
   if (file) fs.appendFileSync(file, `${JSON.stringify(row)}\n`)
@@ -59,6 +61,24 @@ function closeWhenGuardEnds(runtime) {
   }
 }
 
+async function observeNativeStart(options, initialized) {
+  const command = options.settings?.hooks?.SessionStart?.[0]?.hooks?.[0]?.command
+  if (!command) return
+  const boot = fs.readFileSync(process.env.FRESHELL_CLAUDE_SIM_LEDGER, 'utf8')
+    .trim().split('\n').map(line => JSON.parse(line))
+    .find(row => row.kind === 'boot' && row.cliPid === initialized.pid)
+  if (!boot) throw new Error('The initialized simulator CLI has no native boot record')
+  const config = claudeConfigDir(options.env ?? process.env)
+  const transcript = findTranscript(config, boot.sessionId)
+    ?? path.join(config, 'projects', projectSlug(options.cwd), `${boot.sessionId}.jsonl`)
+  await new Promise((resolve, reject) => {
+    const child = exec(command, { env: options.env }, error => error ? reject(error) : resolve())
+    child.stdin.end(JSON.stringify({ hook_event_name: 'SessionStart', session_id: boot.sessionId,
+      source: options.forkSession ? 'fork' : options.resume ? 'resume' : 'startup',
+      cwd: options.cwd, transcript_path: transcript }))
+  })
+}
+
 export function query(params) {
   // Keep credentials and callbacks out of fixture diagnostics.
   const { env, ...options } = params.options
@@ -89,11 +109,15 @@ export function query(params) {
   }
   closeWhenGuardEnds(runtime)
   const initialize = runtime.initializationResult.bind(runtime)
+  let nativeStarted
   runtime.initializationResult = async () => {
     const delay = Number(process.env.FRESHELL_TEST_CLAUDE_DEFER_CREATE_MS ?? 0)
     if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay))
     if (process.env.FRESHELL_TEST_CLAUDE_FAIL_CREATE === '1') throw new Error('Injected SDK initialization failure')
-    return initialize()
+    const initialized = await initialize()
+    nativeStarted ??= observeNativeStart(params.options, initialized)
+    await nativeStarted
+    return initialized
   }
   for (const [method, key] of [
     ['setModel', 'FRESHELL_TEST_CLAUDE_REJECT_MODEL'],
