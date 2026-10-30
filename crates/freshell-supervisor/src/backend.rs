@@ -7,12 +7,14 @@ mod native_auth;
 mod native_history;
 mod prepared_inputs;
 mod provider_mountpoints;
+pub use native_history::StoppedRepairFailure;
 
 use crate::registry::OwnedRuntimeHandle;
 use async_trait::async_trait;
 use freshell_runtime_protocol::{
     DockerDaemonId, FreshAgentFixtureTransport, FreshAgentLaunchSpec, FreshProvider, IncarnationId,
-    InstallationId, ProviderBootstrapFile, RuntimeLimits, SoulId, TerminalLaunchSpec,
+    InstallationId, OpenCodeTransferDescriptor, ProviderBootstrapFile, RuntimeLimits, SoulId,
+    TerminalLaunchSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -20,6 +22,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -27,15 +30,21 @@ use tokio::{
 };
 
 const DOCKER_API: &str = "/v1.47";
+const DOCKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const PROVIDER_HOST_CAPABILITIES: [&str; 4] = ["CHOWN", "KILL", "SETGID", "SETUID"];
 
 const OPERATOR_HOME_MOUNT_LABEL: &str = "com.freshell.operator-home-mount";
 
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
+    #[error("stopped OpenCode repair failed: {0}")]
+    StoppedRepair(Box<StoppedRepairFailure>),
     #[error("docker backend unavailable: {0}")]
     Unavailable(String),
     #[error("runtime ownership proof no longer matches the backend object: {0}")]
     OwnershipMismatch(String),
+    #[error("owned runtime launch policy is incompatible: {0}")]
+    PolicyMismatch(String),
     #[error("docker request failed with HTTP {status}: {body}")]
     DockerHttp { status: u16, body: String },
     #[error("docker response was malformed: {0}")]
@@ -58,7 +67,84 @@ pub struct CreateRuntimeSpec {
     pub test_run_id: String,
     pub terminal: Option<TerminalLaunchSpec>,
     pub fresh_agent: Option<FreshAgentLaunchSpec>,
+    /// Supervisor-verified ready bundle directory, mounted read-only only for
+    /// the session-host importer.
+    pub opencode_transfer_dir: Option<PathBuf>,
     pub provider_volume_name: String,
+}
+
+/// Exact read-only bind mount used to expose one verified OpenCode transfer
+/// bundle to the session host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenCodeTransferMountPlan {
+    pub source: PathBuf,
+}
+
+impl OpenCodeTransferMountPlan {
+    pub const DESTINATION: &'static str = "/run/freshell-opencode-transfer";
+
+    pub fn docker_bind(&self) -> String {
+        format!("{}:{}:ro", self.source.display(), Self::DESTINATION)
+    }
+}
+
+/// Resolve and validate the transfer mount that `create_stopped` will pass to
+/// Docker. Keeping this derivation in one place also lets synthetic launch
+/// tests use the exact production mount plan without opening a Docker socket.
+pub fn opencode_transfer_mount_plan(
+    spec: &CreateRuntimeSpec,
+) -> Result<Option<OpenCodeTransferMountPlan>, BackendError> {
+    let runtime_dir = canonical_dir(&spec.runtime_dir)?;
+    opencode_transfer_mount_plan_for_runtime_dir(spec, &runtime_dir)
+}
+
+fn opencode_transfer_mount_plan_for_runtime_dir(
+    spec: &CreateRuntimeSpec,
+    runtime_dir: &Path,
+) -> Result<Option<OpenCodeTransferMountPlan>, BackendError> {
+    let expected = expected_opencode_transfer_dir(runtime_dir, spec.terminal.as_ref())?;
+    match (&spec.opencode_transfer_dir, expected) {
+        (Some(path), Some(expected)) if path == &expected => Ok(Some(OpenCodeTransferMountPlan {
+            source: canonical_dir(path)?,
+        })),
+        (None, None) => Ok(None),
+        _ => Err(BackendError::InvalidConfig(
+            "OpenCode transfer mount does not match the terminal descriptor".into(),
+        )),
+    }
+}
+
+/// Check Docker's inspected mount projection against the same plan used to
+/// create the container. The target must occur exactly once and remain
+/// read-only.
+pub fn verify_opencode_transfer_mount_inspection(
+    mounts: &[Value],
+    expected: Option<&OpenCodeTransferMountPlan>,
+) -> Result<(), BackendError> {
+    let transfer_mounts = mounts
+        .iter()
+        .filter(|mount| {
+            mount.get("Destination").and_then(Value::as_str)
+                == Some(OpenCodeTransferMountPlan::DESTINATION)
+        })
+        .collect::<Vec<_>>();
+    match expected {
+        Some(expected)
+            if transfer_mounts.len() == 1
+                && transfer_mounts[0].get("Source").and_then(Value::as_str)
+                    == Some(expected.source.to_string_lossy().as_ref())
+                && transfer_mounts[0].get("RW").and_then(Value::as_bool) == Some(false) =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(BackendError::OwnershipMismatch(
+            "OpenCode transfer mount is missing, writable, or points to another bundle".into(),
+        )),
+        None if transfer_mounts.is_empty() => Ok(()),
+        None => Err(BackendError::OwnershipMismatch(
+            "runtime gained an unexpected OpenCode transfer mount".into(),
+        )),
+    }
 }
 
 const HOST_ACTOR_STATE_MOUNT: &str = "/run/freshell-host-actor";
@@ -102,6 +188,26 @@ fn verified_host_actor_state_dir(
     Ok(canonical)
 }
 
+fn expected_opencode_transfer_dir(
+    runtime_dir: &Path,
+    terminal: Option<&TerminalLaunchSpec>,
+) -> Result<Option<PathBuf>, BackendError> {
+    let Some(descriptor) = terminal.and_then(|terminal| terminal.opencode_transfer.as_ref()) else {
+        return Ok(None);
+    };
+    descriptor
+        .validate()
+        .map_err(|error| BackendError::InvalidConfig(error.message))?;
+    let runtime_root = runtime_dir
+        .parent()
+        .ok_or_else(|| BackendError::InvalidConfig("runtime directory has no parent".into()))?;
+    Ok(Some(
+        runtime_root
+            .join("opencode-transfers")
+            .join(format!("{}.ready", descriptor.transfer_id)),
+    ))
+}
+
 #[derive(Debug, Clone)]
 pub struct BackendCreated {
     pub daemon_id: DockerDaemonId,
@@ -138,6 +244,12 @@ pub enum ClaudeSourceOwner {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct StoppedOpenCodeRepairReceipts {
+    pub imported: freshell_agent_runtime::opencode_transfer::ImportReceipt,
+    pub readable: freshell_agent_runtime::opencode_transfer::InstalledStoreReadable,
+}
+
 #[async_trait]
 pub trait RuntimeBackend: Send + Sync {
     /// Observe Claude sources through the fixed reader. The read, its owned
@@ -161,14 +273,14 @@ pub trait RuntimeBackend: Send + Sync {
             "initial auth source observation unavailable".into(),
         ))
     }
-    /// Remove only the generation of a positively rejected, stopped initial
-    /// host. The owning supervisor must prove the grant was never consumed.
-    async fn discard_rejected_provider_inputs(
+    /// Remove disposable input mounts only after the exact workload is stopped.
+    /// Durable provider HOME and controller-staged source data remain available.
+    async fn discard_stopped_provider_inputs(
         &self,
         _handle: &OwnedRuntimeHandle,
     ) -> Result<(), BackendError> {
         Err(BackendError::Unavailable(
-            "rejected provider input cleanup unavailable".into(),
+            "stopped provider input cleanup unavailable".into(),
         ))
     }
     async fn commit_prepared_inputs(
@@ -194,6 +306,41 @@ pub trait RuntimeBackend: Send + Sync {
     ) -> Result<BTreeMap<String, String>, BackendError> {
         Err(BackendError::Unavailable(
             "native auth reader unavailable".into(),
+        ))
+    }
+    /// Read the exact retained provider volume without a provider process or grant.
+    async fn read_native_census(
+        &self,
+        _handle: &OwnedRuntimeHandle,
+        _spec: &freshell_runtime_protocol::ResumeSpec,
+        _reader_binary: &Path,
+        _image_ref: &str,
+    ) -> Result<freshell_agent_runtime::ProviderStoreProbe, BackendError> {
+        Err(BackendError::Unavailable(
+            "native census reader unavailable".into(),
+        ))
+    }
+    /// Import and independently read one exact OpenCode generation from a
+    /// stopped soul's provider volume. Implementations must not start the
+    /// provider, create a PTY, or consume a launch grant.
+    async fn repair_stopped_opencode(
+        &self,
+        _handle: &OwnedRuntimeHandle,
+        _descriptor: &OpenCodeTransferDescriptor,
+        _verified_stage_dir: &Path,
+    ) -> Result<StoppedOpenCodeRepairReceipts, BackendError> {
+        Err(BackendError::Unavailable(
+            "stopped OpenCode repair helper is unavailable".into(),
+        ))
+    }
+    async fn qualify_retained_opencode(
+        &self,
+        _handle: &OwnedRuntimeHandle,
+        _request: &freshell_runtime_protocol::RetainedStoreCompatibilityRequest,
+        _reader_binary: &Path,
+    ) -> Result<freshell_runtime_protocol::RetainedStoreCompatibilityReceipt, BackendError> {
+        Err(BackendError::Unavailable(
+            "current-image retained-store qualification is unavailable".into(),
         ))
     }
     async fn read_native_history(
@@ -339,12 +486,7 @@ impl DockerEngineBackend {
             ));
         }
 
-        let expected_digest = immutable_digest_from_handle(handle)?;
-        if expected_digest != handle.immutable_config_digest() {
-            return Err(BackendError::OwnershipMismatch(
-                "registry immutable-config digest does not match its own fields".into(),
-            ));
-        }
+        verify_saved_immutable_digest(handle)?;
         verify_inspect_config(handle, &value)?;
         let mounts = match (handle.terminal(), handle.fresh_agent()) {
             (Some(terminal), None) => Some(docker::terminal_mounts_for_adoption(terminal)),
@@ -388,15 +530,80 @@ impl DockerEngineBackend {
         Ok(Some(value))
     }
 
+    /// Disable restart on the exact owned container before Stop can settle an
+    /// empty observation. Return the post-update inspection so callers act on
+    /// its current state, including a restart that raced the update.
+    async fn suppress_restart_policy(
+        &self,
+        handle: &OwnedRuntimeHandle,
+    ) -> Result<Option<Value>, BackendError> {
+        let Some(value) = self.verify_handle_value(handle).await? else {
+            return Ok(None);
+        };
+        if restart_policy_is_disabled(&value)? {
+            return Ok(Some(value));
+        }
+
+        let body = json!({"RestartPolicy":{"Name":"no","MaximumRetryCount":0}});
+        let response = self
+            .request(
+                "POST",
+                &format!("{DOCKER_API}/containers/{}/update", handle.container_id()),
+                Some(&body),
+            )
+            .await?;
+        if response.status != 200 {
+            return Err(response.as_error());
+        }
+
+        let Some(updated) = self.verify_handle_value(handle).await? else {
+            return Err(BackendError::OwnershipMismatch(
+                "owned container disappeared while disabling restart".into(),
+            ));
+        };
+        if !matches!(
+            updated
+                .pointer("/HostConfig/RestartPolicy/Name")
+                .and_then(Value::as_str),
+            Some("no")
+        ) {
+            return Err(BackendError::PolicyMismatch(
+                "Docker did not confirm the disabled restart policy".into(),
+            ));
+        }
+        Ok(Some(updated))
+    }
+
     async fn request(
         &self,
         method: &str,
         path: &str,
         body: Option<&Value>,
     ) -> Result<DockerResponse, BackendError> {
-        self.request_bounded(method, path, body, u64::MAX).await
+        // Cancel only the dependency exchange. Recovery still owns its future
+        // and receives a typed transient error to settle its retry reservation.
+        tokio::time::timeout(
+            DOCKER_REQUEST_TIMEOUT,
+            self.request_bounded(method, path, body, u64::MAX),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            tracing::warn!(
+                event = "supervisor.docker.request_timeout",
+                method,
+                path,
+                timeout_ms = DOCKER_REQUEST_TIMEOUT.as_millis() as u64,
+                "Docker request timed out"
+            );
+            Err(BackendError::Unavailable(format!(
+                "Docker {method} {path} timed out after {}ms",
+                DOCKER_REQUEST_TIMEOUT.as_millis()
+            )))
+        })
     }
 
+    // Size-bounded helper requests run inside their operation's existing
+    // elapsed-time budget, including longer native history/repair waits.
     async fn request_bounded(
         &self,
         method: &str,
@@ -457,7 +664,9 @@ fn docker_create_body(
     memory_swap: u64,
 ) -> Value {
     let cap_add: Vec<&str> = if spec.terminal.is_some() || spec.fresh_agent.is_some() {
-        vec!["CHOWN", "SETGID", "SETUID"]
+        // The host stays UID0 while its provider runs as another UID. KILL is
+        // required to terminate that child and finish the PTY waiter/reader.
+        PROVIDER_HOST_CAPABILITIES.to_vec()
     } else {
         Vec::new()
     };
@@ -726,14 +935,13 @@ impl RuntimeBackend for DockerEngineBackend {
         test_run_id: &str,
         until: tokio::time::Instant,
     ) -> Result<freshell_platform::claude_inputs::observation::ObservationReply, BackendError> {
-        self.observe_claude_sources_with(
-            &helper_lifecycle::CLAUDE_SOURCE_READER_RETRY,
-            owner,
-            request,
-            test_run_id,
-            until,
-        )
-        .await
+        let mut policy = helper_lifecycle::CLAUDE_SOURCE_READER_RETRY;
+        policy.attempt = freshell_platform::provider_startup::claude_source_observation_budget(
+            request.candidate.is_some(),
+            matches!(owner, ClaudeSourceOwner::Retained { .. }),
+        );
+        self.observe_claude_sources_with(&policy, owner, request, test_run_id, until)
+            .await
     }
     async fn observe_initial_auth_volume(
         &self,
@@ -768,7 +976,7 @@ impl RuntimeBackend for DockerEngineBackend {
         }
         Ok(())
     }
-    async fn discard_rejected_provider_inputs(
+    async fn discard_stopped_provider_inputs(
         &self,
         handle: &OwnedRuntimeHandle,
     ) -> Result<(), BackendError> {
@@ -795,6 +1003,40 @@ impl RuntimeBackend for DockerEngineBackend {
             std::time::Duration::from_secs(20),
         )
         .await
+    }
+    async fn read_native_census(
+        &self,
+        handle: &OwnedRuntimeHandle,
+        spec: &freshell_runtime_protocol::ResumeSpec,
+        reader_binary: &Path,
+        image_ref: &str,
+    ) -> Result<freshell_agent_runtime::ProviderStoreProbe, BackendError> {
+        self.read_census_helper(handle, spec, reader_binary, image_ref)
+            .await
+    }
+    async fn repair_stopped_opencode(
+        &self,
+        handle: &OwnedRuntimeHandle,
+        descriptor: &OpenCodeTransferDescriptor,
+        verified_stage_dir: &Path,
+    ) -> Result<StoppedOpenCodeRepairReceipts, BackendError> {
+        self.repair_stopped_opencode_helper(
+            handle,
+            descriptor,
+            verified_stage_dir,
+            std::time::Duration::from_secs(120),
+        )
+        .await
+    }
+
+    async fn qualify_retained_opencode(
+        &self,
+        handle: &OwnedRuntimeHandle,
+        request: &freshell_runtime_protocol::RetainedStoreCompatibilityRequest,
+        reader_binary: &Path,
+    ) -> Result<freshell_runtime_protocol::RetainedStoreCompatibilityReceipt, BackendError> {
+        self.retained_store_helper(handle, request, reader_binary)
+            .await
     }
     async fn read_native_history(
         &self,
@@ -883,6 +1125,7 @@ impl RuntimeBackend for DockerEngineBackend {
         let operator_home = terminal_mounts
             .as_ref()
             .and_then(|mounts| mounts.operator_home.as_ref());
+        let transfer_mount = opencode_transfer_mount_plan_for_runtime_dir(spec, &runtime_dir)?;
         let expected = ExpectedConfig::new(spec, &binary, &runtime_dir);
         let immutable_config_digest = digest_expected(&expected)?;
         let (daemon_id, rootless) = self.daemon_info().await?;
@@ -899,7 +1142,7 @@ impl RuntimeBackend for DockerEngineBackend {
             .ok_or_else(|| BackendError::InvalidConfig("memory+swap overflow".into()))?;
         let requested_limits = serde_json::to_string(&spec.limits)
             .map_err(|e| BackendError::Malformed(e.to_string()))?;
-        let (binds, operator_home_tmpfs) = assemble_workload_binds(
+        let (mut binds, operator_home_tmpfs) = assemble_workload_binds(
             &binary,
             &runtime_dir,
             &spec.provider_volume_name,
@@ -912,6 +1155,9 @@ impl RuntimeBackend for DockerEngineBackend {
             spec.fresh_agent.as_ref(),
             operator_home.map(|mount| mount.home.as_path()),
         )?;
+        if let Some(transfer_mount) = &transfer_mount {
+            binds.push(transfer_mount.docker_bind());
+        }
         let runtime_mode = spec
             .terminal
             .as_ref()
@@ -1065,38 +1311,8 @@ impl RuntimeBackend for DockerEngineBackend {
                 configured_limits: handle.requested_limits(),
             });
         };
-        let state_value = value.get("State").cloned().unwrap_or(Value::Null);
-        let running = state_value
-            .get("Running")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let paused = state_value
-            .get("Paused")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let restarting = state_value
-            .get("Restarting")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let status = state_value
-            .get("Status")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let state = if paused {
-            BackendRuntimeState::Paused
-        } else if restarting {
-            BackendRuntimeState::Restarting
-        } else if running {
-            BackendRuntimeState::Running
-        } else {
-            match status {
-                "created" => BackendRuntimeState::Created,
-                "dead" => BackendRuntimeState::Dead,
-                _ => BackendRuntimeState::Exited,
-            }
-        };
         Ok(BackendInspection {
-            state,
+            state: runtime_state_from_inspect(&value),
             configured_limits: configured_limits_from_inspect(&value, handle.requested_limits()),
         })
     }
@@ -1106,8 +1322,10 @@ impl RuntimeBackend for DockerEngineBackend {
         handle: &OwnedRuntimeHandle,
         grace_seconds: u64,
     ) -> Result<(), BackendError> {
-        let inspected = self.inspect(handle).await?;
-        match inspected.state {
+        let Some(value) = self.suppress_restart_policy(handle).await? else {
+            return Ok(());
+        };
+        match runtime_state_from_inspect(&value) {
             BackendRuntimeState::Missing
             | BackendRuntimeState::Exited
             | BackendRuntimeState::Dead => return Ok(()),
@@ -1144,14 +1362,17 @@ impl RuntimeBackend for DockerEngineBackend {
     }
 
     async fn force_stop(&self, handle: &OwnedRuntimeHandle) -> Result<(), BackendError> {
-        let inspected = self.inspect(handle).await?;
+        let Some(value) = self.suppress_restart_policy(handle).await? else {
+            return Ok(());
+        };
+        let state = runtime_state_from_inspect(&value);
         if matches!(
-            inspected.state,
+            state,
             BackendRuntimeState::Missing | BackendRuntimeState::Exited | BackendRuntimeState::Dead
         ) {
             return Ok(());
         }
-        if inspected.state == BackendRuntimeState::Paused {
+        if state == BackendRuntimeState::Paused {
             let response = self
                 .request(
                     "POST",
@@ -1181,10 +1402,17 @@ impl RuntimeBackend for DockerEngineBackend {
     }
 
     async fn verify_empty(&self, handle: &OwnedRuntimeHandle) -> Result<bool, BackendError> {
-        Ok(matches!(
-            self.inspect(handle).await?.state,
-            BackendRuntimeState::Missing | BackendRuntimeState::Exited | BackendRuntimeState::Dead
-        ))
+        // inspect first proves the daemon, full id and immutable ownership.
+        // A positively inspected Created enclosure has never run a workload;
+        // Docker stop/kill are no-ops and need not turn it into Exited.
+        let Some(value) = self.verify_handle_value(handle).await? else {
+            return Ok(true);
+        };
+        let empty = matches!(
+            runtime_state_from_inspect(&value),
+            BackendRuntimeState::Created | BackendRuntimeState::Exited | BackendRuntimeState::Dead
+        );
+        Ok(empty && restart_policy_is_disabled(&value)?)
     }
 
     async fn list_known(
@@ -1256,8 +1484,11 @@ struct ExpectedConfig {
     runtime_dir: String,
     limits: RuntimeLimits,
     terminal: Option<TerminalLaunchSpec>,
+    opencode_transfer_dir: Option<String>,
     fresh_agent: Option<ImmutableFreshAgentConfig>,
     provider_volume_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launch_policy: Option<freshell_runtime_protocol::RuntimeLaunchPolicy>,
 }
 
 /// The registry updates session identity and turn settings while a container
@@ -1309,10 +1540,29 @@ impl ExpectedConfig {
             runtime_dir: runtime_dir.to_string_lossy().into_owned(),
             limits: spec.limits,
             terminal: spec.terminal.clone(),
+            opencode_transfer_dir: spec
+                .opencode_transfer_dir
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
             fresh_agent: spec.fresh_agent.as_ref().map(Into::into),
             provider_volume_name: spec.provider_volume_name.clone(),
+            launch_policy: Some(freshell_runtime_protocol::RuntimeLaunchPolicy::ProviderVolumeV1),
         }
     }
+}
+
+// The private historical fixture uses the current physical enclosure profile,
+// while schema 7 represents no launch policy. Bind exactly those saved fields;
+// this is not a production digest override or an authentic old-binary receipt.
+#[cfg(test)]
+pub(super) fn task007_schema_seven_digest(
+    spec: &CreateRuntimeSpec,
+) -> Result<String, BackendError> {
+    let binary = canonical_regular_file(&spec.host_binary_path)?;
+    let runtime_dir = canonical_dir(&spec.runtime_dir)?;
+    let mut expected = ExpectedConfig::new(spec, &binary, &runtime_dir);
+    expected.launch_policy = None;
+    digest_expected(&expected)
 }
 
 fn immutable_digest_from_handle(handle: &OwnedRuntimeHandle) -> Result<String, BackendError> {
@@ -1325,9 +1575,77 @@ fn immutable_digest_from_handle(handle: &OwnedRuntimeHandle) -> Result<String, B
         runtime_dir: handle.runtime_dir().to_string_lossy().into_owned(),
         limits: handle.requested_limits(),
         terminal: handle.terminal().cloned(),
+        opencode_transfer_dir: expected_opencode_transfer_dir(
+            handle.runtime_dir(),
+            handle.terminal(),
+        )?
+        .map(|path| path.to_string_lossy().into_owned()),
         fresh_agent: handle.fresh_agent().map(Into::into),
         provider_volume_name: handle.provider_volume_name().to_owned(),
+        launch_policy: handle.launch_policy(),
     })
+}
+
+#[derive(Serialize)]
+struct LegacyExpectedTerminalConfig<'a> {
+    image_ref: &'a str,
+    installation_id: &'a str,
+    soul_id: &'a str,
+    incarnation_id: &'a str,
+    host_binary_path: std::borrow::Cow<'a, str>,
+    runtime_dir: std::borrow::Cow<'a, str>,
+    limits: RuntimeLimits,
+    terminal: Option<&'a TerminalLaunchSpec>,
+    fresh_agent: Option<()>,
+    provider_volume_name: &'a str,
+}
+
+fn known_legacy_opencode_profile(
+    handle: &OwnedRuntimeHandle,
+    tmpfs: &BTreeMap<String, String>,
+) -> bool {
+    let mut legacy = runtime_tmpfs(Some("opencode"));
+    legacy.remove("/run/freshell-private");
+    known_legacy_opencode_identity(handle) && tmpfs == &legacy
+}
+fn known_legacy_opencode_identity(handle: &OwnedRuntimeHandle) -> bool {
+    handle.launch_policy().is_none()
+        && handle.fresh_agent().is_none()
+        && handle.terminal().is_some_and(|terminal| {
+            terminal.mode == "opencode"
+                && terminal.provider_launch_context.is_none()
+                && terminal.opencode_transfer.is_none()
+                && terminal.opencode_adoption.is_none()
+        })
+}
+fn verify_saved_immutable_digest(handle: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+    if immutable_digest_from_handle(handle)? == handle.immutable_config_digest() {
+        return Ok(());
+    }
+    if known_legacy_opencode_identity(handle) {
+        // Exact serializer/order from7dbc7ef6, terminal-only/no transfer;
+        // retain its saved bytes and never infer a newer profile over it.
+        let legacy = LegacyExpectedTerminalConfig {
+            image_ref: handle.image_ref(),
+            installation_id: handle.installation_id().as_str(),
+            soul_id: handle.soul_id().as_str(),
+            incarnation_id: handle.incarnation_id().as_str(),
+            host_binary_path: handle.host_binary_path().to_string_lossy(),
+            runtime_dir: handle.runtime_dir().to_string_lossy(),
+            limits: handle.requested_limits(),
+            terminal: handle.terminal(),
+            fresh_agent: None,
+            provider_volume_name: handle.provider_volume_name(),
+        };
+        let bytes = serde_json::to_vec(&legacy)
+            .map_err(|error| BackendError::Malformed(error.to_string()))?;
+        if format!("sha256:{:x}", Sha256::digest(bytes)) == handle.immutable_config_digest() {
+            return Ok(());
+        }
+    }
+    Err(BackendError::OwnershipMismatch(
+        "registry immutable-config digest does not match its own fields".into(),
+    ))
 }
 
 fn digest_expected(expected: &ExpectedConfig) -> Result<String, BackendError> {
@@ -1519,15 +1837,22 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
                 .collect::<std::collections::BTreeSet<_>>()
         })
         .unwrap_or_default();
-    let expected_cap_add = if handle.terminal().is_some() || handle.fresh_agent().is_some() {
-        ["CHOWN", "SETGID", "SETUID"]
+    let provider_workload = handle.terminal().is_some() || handle.fresh_agent().is_some();
+    let expected_cap_add = if provider_workload {
+        PROVIDER_HOST_CAPABILITIES
             .into_iter()
             .map(str::to_string)
             .collect::<std::collections::BTreeSet<_>>()
     } else {
         std::collections::BTreeSet::new()
     };
-    if actual_cap_add != expected_cap_add {
+    // Existing owned enclosures predate host signal authority. Keep custody
+    // so their pending Stop can still use the exact Docker fallback.
+    let mut legacy_cap_add = expected_cap_add.clone();
+    legacy_cap_add.remove("KILL");
+    if actual_cap_add != expected_cap_add
+        && !(provider_workload && actual_cap_add == legacy_cap_add)
+    {
         return Err(BackendError::OwnershipMismatch(format!(
             "runtime capability set changed: {actual_cap_add:?}"
         )));
@@ -1556,11 +1881,12 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
                 .collect::<std::collections::BTreeMap<_, _>>()
         })
         .unwrap_or_default();
-    if actual_tmpfs != expected_tmpfs {
-        return Err(BackendError::OwnershipMismatch(format!(
-            "runtime tmpfs topology changed: {actual_tmpfs:?}"
-        )));
-    }
+    let tmpfs_well_formed = host_config
+        .get("Tmpfs")
+        .and_then(Value::as_object)
+        .is_some_and(|object| object.len() == actual_tmpfs.len());
+    let exact_legacy = tmpfs_well_formed && known_legacy_opencode_profile(handle, &actual_tmpfs);
+    let policy_mismatch = !tmpfs_well_formed || (actual_tmpfs != expected_tmpfs && !exact_legacy);
 
     let mounts = value
         .get("Mounts")
@@ -1571,11 +1897,13 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
             == Some(handle.host_binary_path().to_string_lossy().as_ref())
             && m.get("Destination").and_then(Value::as_str)
                 == Some("/runtime/freshell-session-host")
+            && m.get("RW").and_then(Value::as_bool) == Some(false)
     });
     let has_runtime = mounts.iter().any(|m| {
         m.get("Source").and_then(Value::as_str)
             == Some(handle.runtime_dir().to_string_lossy().as_ref())
             && m.get("Destination").and_then(Value::as_str) == Some("/run/freshell")
+            && m.get("RW").and_then(Value::as_bool) == Some(true)
     });
     if !has_binary || !has_runtime {
         return Err(BackendError::OwnershipMismatch(
@@ -1585,12 +1913,17 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
     let has_provider = mounts.iter().any(|mount| {
         mount.get("Name").and_then(Value::as_str) == Some(handle.provider_volume_name())
             && mount.get("Destination").and_then(Value::as_str) == Some("/home/freshell/provider")
+            && mount.get("RW").and_then(Value::as_bool) == Some(true)
     });
     if !has_provider {
         return Err(BackendError::OwnershipMismatch(
             "provider home volume changed".into(),
         ));
     }
+    let expected_transfer_mount =
+        expected_opencode_transfer_dir(handle.runtime_dir(), handle.terminal())?
+            .map(|source| OpenCodeTransferMountPlan { source });
+    verify_opencode_transfer_mount_inspection(mounts, expected_transfer_mount.as_ref())?;
     let actor_mounts = mounts
         .iter()
         .filter(|mount| {
@@ -1633,15 +1966,80 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
             ));
         }
     }
-    if let Some(terminal) = handle.terminal() {
-        let expected = docker::terminal_mounts_for_adoption(terminal)
-            .map_err(BackendError::OwnershipMismatch)?;
-        verify_workload_mounts(mounts, &expected)?;
+    // Existing-object checks share the accepted mount plan. Current input
+    // availability is a creation precondition, not existing-container identity.
+    let workload = handle
+        .terminal()
+        .map(docker::terminal_mounts_for_adoption)
+        .or_else(|| {
+            handle
+                .fresh_agent()
+                .map(docker::fresh_agent_mounts_for_adoption)
+        })
+        .transpose()
+        .map_err(BackendError::OwnershipMismatch)?;
+    if let Some(expected) = &workload {
+        verify_workload_mounts(mounts, expected)?;
     }
-    if let Some(agent) = handle.fresh_agent() {
-        let expected = docker::fresh_agent_mounts_for_adoption(agent)
-            .map_err(BackendError::OwnershipMismatch)?;
-        verify_workload_mounts(mounts, &expected)?;
+    // Each declared destination occurs once. Required source/access checks
+    // above still determine ownership; this rejects extra/duplicate enclosures.
+    let mut destinations = std::collections::BTreeSet::from([
+        "/runtime/freshell-session-host".to_owned(),
+        "/run/freshell".to_owned(),
+        "/home/freshell/provider".to_owned(),
+    ]);
+    if let Some(mount) = &operator_home {
+        destinations.insert(mount.home.to_string_lossy().into_owned());
+    }
+    if expected_transfer_mount.is_some() {
+        destinations.insert(OpenCodeTransferMountPlan::DESTINATION.into());
+    }
+    if handle.fresh_agent().is_some() {
+        destinations.insert(HOST_ACTOR_STATE_MOUNT.into());
+    }
+    if let Some(workload) = workload {
+        for descriptor in
+            prepared_inputs::mount_descriptors(&workload, handle.provider_volume_name())?
+        {
+            let destination = descriptor["Target"].as_str().ok_or_else(|| {
+                BackendError::OwnershipMismatch("prepared mount destination is invalid".into())
+            })?;
+            destinations.insert(destination.to_owned());
+        }
+        destinations.insert(workload.workspace.to_string_lossy().into_owned());
+        if let Some(git) = workload
+            .git_common_dir
+            .filter(|git| !git.starts_with(&workload.workspace))
+        {
+            destinations.insert(git.to_string_lossy().into_owned());
+        }
+        for (index, _) in workload.provider_secret_files.iter().enumerate() {
+            destinations.insert(format!("/run/freshell-secrets/provider-{index}"));
+        }
+        for (index, _) in workload.provider_bootstrap_files.iter().enumerate() {
+            destinations.insert(format!("/run/freshell-bootstrap/provider-{index}"));
+        }
+        if workload.provider_user_root.is_some() {
+            destinations.insert("/run/freshell-private/user-provider".into());
+        }
+        if workload.mcp_capability_file.is_some() {
+            destinations.insert("/run/freshell/mcp-capability.json".into());
+        }
+    }
+    let actual = mounts
+        .iter()
+        .filter_map(|mount| mount["Destination"].as_str())
+        .map(str::to_owned)
+        .collect::<std::collections::BTreeSet<_>>();
+    if actual != destinations || mounts.len() != actual.len() {
+        return Err(BackendError::OwnershipMismatch(
+            "runtime gained extra, duplicate, or missing mounts".into(),
+        ));
+    }
+    if policy_mismatch {
+        return Err(BackendError::PolicyMismatch(
+            "owned_launch_policy_mismatch".into(),
+        ));
     }
     Ok(())
 }
@@ -1736,6 +2134,49 @@ fn verify_workload_mounts(
         }
     }
     Ok(())
+}
+
+fn runtime_state_from_inspect(value: &Value) -> BackendRuntimeState {
+    let state = value.get("State").cloned().unwrap_or(Value::Null);
+    let running = state
+        .get("Running")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let paused = state
+        .get("Paused")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let restarting = state
+        .get("Restarting")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let status = state
+        .get("Status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if paused {
+        BackendRuntimeState::Paused
+    } else if restarting {
+        BackendRuntimeState::Restarting
+    } else if running {
+        BackendRuntimeState::Running
+    } else {
+        match status {
+            "created" => BackendRuntimeState::Created,
+            "dead" => BackendRuntimeState::Dead,
+            _ => BackendRuntimeState::Exited,
+        }
+    }
+}
+
+fn restart_policy_is_disabled(value: &Value) -> Result<bool, BackendError> {
+    let name = value
+        .pointer("/HostConfig/RestartPolicy/Name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            BackendError::PolicyMismatch("container restart policy is missing or malformed".into())
+        })?;
+    Ok(name.is_empty() || name == "no")
 }
 
 fn configured_limits_from_inspect(value: &Value, fallback: RuntimeLimits) -> RuntimeLimits {
@@ -1856,11 +2297,406 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::docker::{OperatorHomeMount, TerminalMounts};
     use super::*;
     use freshell_runtime_protocol::{FreshProvider, LaunchNonce};
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    /// A Docker HTTP peer, not a RuntimeBackend double: all ownership, state
+    /// interpretation and Stop requests still execute DockerEngineBackend.
+    pub(crate) struct StopDockerFixture {
+        pub(crate) backend: DockerEngineBackend,
+        pub(crate) digest: String,
+        pub(crate) state: std::sync::Arc<std::sync::Mutex<StopDockerState>>,
+        shutdown: tokio::sync::oneshot::Sender<()>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    pub(crate) struct StopDockerState {
+        pub(crate) inspection: Value,
+        pub(crate) daemon_id: String,
+        pub(crate) requests: Vec<String>,
+        pub(crate) restart_updates: Vec<(String, Value)>,
+        pub(crate) apply_restart_update: bool,
+        pub(crate) silence: Option<&'static str>,
+        pub(crate) stop_response_overhead: Option<Duration>,
+        pub(crate) completed_stops: usize,
+        pub(crate) disconnected: usize,
+        pub(crate) first_inspection_at: Option<std::time::Instant>,
+        pub(crate) first_silent_eof_at: Option<std::time::Instant>,
+    }
+
+    impl StopDockerFixture {
+        pub(crate) async fn new(root: &Path, handle: &OwnedRuntimeHandle) -> Self {
+            let agent = handle.fresh_agent().unwrap();
+            let workspace = &agent.workspace_path;
+            let actor = host_actor_state_dir(
+                handle.runtime_dir().parent().unwrap(),
+                handle.installation_id(),
+                handle.soul_id(),
+            );
+            std::fs::create_dir_all(&actor).unwrap();
+            std::fs::set_permissions(&actor, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut inspection = json!({
+                    "Id":handle.container_id(), "Image":handle.image_ref(),
+                    "State":{"Status":"created", "Running":false,"Paused":false,"Restarting":false},
+                    "Config":{"Labels":{
+                        "com.freshell.managed":"true",
+                        "com.freshell.installation-id":handle.installation_id(),
+                        "com.freshell.soul-id":handle.soul_id(),
+                        "com.freshell.incarnation-id":handle.incarnation_id()
+                    },"Env":runtime_host_environment(
+                None,
+                Some(agent),
+                None,
+            ).unwrap()},
+                    "HostConfig":{"NetworkMode":"bridge","PidMode":"","Privileged":false,
+                        "RestartPolicy":{"Name":"no","MaximumRetryCount":0},
+                        "CapAdd":["CHOWN","SETUID","SETGID"],"Tmpfs":runtime_tmpfs(Some(agent.provider.as_str()))},
+                    "Mounts":[
+                        {"Source":handle.host_binary_path(),"Destination":"/runtime/freshell-session-host","RW":false},
+                        {"Source":handle.runtime_dir(),"Destination":"/run/freshell","RW":true},
+                        {"Name":handle.provider_volume_name(),"Destination":"/home/freshell/provider","RW":true},
+                        {"Source":workspace,"Destination":workspace,"RW":true},
+                        {"Source":actor,"Destination":HOST_ACTOR_STATE_MOUNT,"RW":true}
+                    ]
+                });
+            let mounts = docker::fresh_agent_mounts(agent).unwrap();
+            for (source, destination) in [
+                (
+                    mounts.mcp_capability_file,
+                    "/run/freshell/mcp-capability.json",
+                ),
+                (
+                    mounts.provider_user_root,
+                    "/run/freshell-private/user-provider",
+                ),
+            ] {
+                if let Some(source) = source {
+                    inspection["Mounts"].as_array_mut().unwrap().push(json!({
+                        "Source":source,"Destination":destination,"RW":false
+                    }));
+                }
+            }
+            let state = std::sync::Arc::new(std::sync::Mutex::new(StopDockerState {
+                inspection,
+                daemon_id: handle.daemon_id().to_string(),
+                requests: vec![],
+                restart_updates: vec![],
+                apply_restart_update: true,
+                silence: None,
+                stop_response_overhead: None,
+                completed_stops: 0,
+                disconnected: 0,
+                first_inspection_at: None,
+                first_silent_eof_at: None,
+            }));
+            let socket = root.join("docker-stop.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
+            let server_state = state.clone();
+            let container_id = handle.container_id().to_owned();
+            let task = tokio::spawn(async move {
+                let mut connections = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        _ = &mut shutdown_rx => break,
+                        completed = connections.join_next(), if !connections.is_empty() => {
+                            completed.unwrap().unwrap();
+                        }
+                        accepted = listener.accept() => {
+                            let (mut stream, _) = accepted.unwrap();
+                            let state = server_state.clone();
+                            let container = container_id.clone();
+                            connections.spawn(async move {
+                                let mut header = Vec::new();
+                                while !header.ends_with(b"\r\n\r\n") {
+                                    header.push(stream.read_u8().await.unwrap());
+                                }
+                                let header = String::from_utf8(header).unwrap();
+                                let request = header.lines().next().unwrap().to_owned();
+                                let content_length = header
+                                    .lines()
+                                    .find_map(|line| {
+                                        line.split_once(':').and_then(|(name, value)| {
+                                            name.eq_ignore_ascii_case("content-length")
+                                                .then_some(value.trim())
+                                        })
+                                    })
+                                    .unwrap_or("0")
+                                    .parse::<usize>()
+                                    .unwrap();
+                                let mut body_bytes = vec![0; content_length];
+                                stream.read_exact(&mut body_bytes).await.unwrap();
+                                let body = if body_bytes.is_empty() {
+                                    None
+                                } else {
+                                    Some(serde_json::from_slice::<Value>(&body_bytes).unwrap())
+                                };
+                                let (silent, status, response, stop_delay) = {
+                                    let mut state = state.lock().unwrap();
+                                    let inspect = request == format!("GET {DOCKER_API}/containers/{container}/json HTTP/1.1");
+                                    if inspect {
+                                        state.first_inspection_at.get_or_insert_with(std::time::Instant::now);
+                                    }
+                                    let stop = request == format!("POST {DOCKER_API}/containers/{container}/stop?t=2 HTTP/1.1");
+                                    let force = request == format!("POST {DOCKER_API}/containers/{container}/kill?signal=KILL HTTP/1.1");
+                                    let update = request == format!("POST {DOCKER_API}/containers/{container}/update HTTP/1.1");
+                                    let after_stop = state.requests.iter().any(|r| r.contains("/stop?"));
+                                    let after_force = state.requests.iter().any(|r| r.contains("/kill?"));
+                                    let observations = state.requests.iter().filter(|r| r.contains("/json ")).count();
+                                    let silent = match state.silence {
+                                        Some("initial_inspect") => inspect,
+                                        Some("graceful_request") => stop,
+                                        // Consume part of the polling budget before going silent.
+                                        Some("graceful_observation") => inspect && after_stop && observations >= 14,
+                                        Some("force_request") => force,
+                                        Some("force_observation") => inspect && after_force,
+                                        Some("error_observation") => inspect && after_stop,
+                                        _ => false,
+                                    };
+                                    state.requests.push(request.clone());
+                                    let (status, response) = if request == format!("GET {DOCKER_API}/info HTTP/1.1") {
+                                        (200, json!({"ID":state.daemon_id,"SecurityOptions":["name=rootless"]}))
+                                    } else if inspect {
+                                        (200, state.inspection.clone())
+                                    } else if update {
+                                        let body = body.clone().expect("Docker update requires a JSON body");
+                                        state.restart_updates.push((request.clone(), body.clone()));
+                                        if state.apply_restart_update {
+                                            state.inspection["HostConfig"]["RestartPolicy"] =
+                                                body["RestartPolicy"].clone();
+                                        }
+                                        (200, json!({}))
+                                    } else if stop || force {
+                                        // Docker never starts or changes a Created container for
+                                        // these no-op requests. Running fixtures survive signals.
+                                        let status = if state.silence == Some("error_observation") && stop {
+                                            500
+                                        } else if state.inspection["State"]["Status"] == "created" {
+                                            if force { 409 } else { 304 }
+                                        } else { 204 };
+                                        (status, json!({"message":"fixture response"}))
+                                    } else {
+                                        panic!("unexpected Docker Stop request: {request}");
+                                    };
+                                    let stop_delay = if stop {
+                                        state.stop_response_overhead.map(|overhead| {
+                                            let grace = request.split("/stop?t=").nth(1).unwrap()
+                                                .split_whitespace().next().unwrap().parse::<u64>().unwrap();
+                                            Duration::from_secs(grace) + overhead
+                                        })
+                                    } else { None };
+                                    (silent, status, response, stop_delay)
+                                };
+                                if silent {
+                                    // Accepted request, no response. Observe cancellation closing
+                                    // the real transport instead of completing a fake future.
+                                    let mut bytes = Vec::new();
+                                    stream.read_to_end(&mut bytes).await.unwrap();
+                                    let mut state = state.lock().unwrap();
+                                    state.disconnected += 1;
+                                    state.first_silent_eof_at.get_or_insert_with(std::time::Instant::now);
+                                } else {
+                                    if let Some(delay) = stop_delay {
+                                        tokio::time::sleep(delay).await;
+                                        state.lock().unwrap().inspection["State"] = json!({
+                                            "Status":"exited","Running":false,"Paused":false,"Restarting":false
+                                        });
+                                    }
+                                    let body = serde_json::to_vec(&response).unwrap();
+                                    stream.write_all(format!("HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).as_bytes()).await.unwrap();
+                                    stream.write_all(&body).await.unwrap();
+                                    stream.shutdown().await.unwrap();
+                                    if stop_delay.is_some() {
+                                        state.lock().unwrap().completed_stops += 1;
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+                connections.shutdown().await;
+            });
+            Self {
+                backend: DockerEngineBackend::new(socket),
+                digest: immutable_digest_from_handle(handle).unwrap(),
+                state,
+                shutdown,
+                task,
+            }
+        }
+
+        pub(crate) async fn close(self) {
+            let _ = self.shutdown.send(());
+            self.task.await.unwrap();
+        }
+    }
+
+    fn retained_opencode_fixture() -> (tempfile::TempDir, OwnedRuntimeHandle, Value) {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_dir = root.path().join("runtime");
+        let workspace = root.path().join("workspace");
+        let binary = root.path().join("host");
+        std::fs::create_dir(&runtime_dir).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(&binary, "owned fixture").unwrap();
+        let terminal:TerminalLaunchSpec=serde_json::from_value(json!({"terminalId":"terminal-retained","streamId":"stream-retained","mode":"opencode","program":"opencode","args":[],"cwd":workspace,"runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"project-retained","workspacePath":workspace,"resumeSessionId":"ses_retained"})).unwrap();
+        let handle = OwnedRuntimeHandle::from_registry(
+            InstallationId::new(),
+            SoulId::new(),
+            "retained-store".into(),
+            IncarnationId::new(),
+            LaunchNonce::new(),
+            DockerDaemonId::new(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            "sha256:retained-image".into(),
+            runtime_dir.clone(),
+            binary.clone(),
+            "saved-digest".into(),
+            RuntimeLimits {
+                cpu_milli: 500,
+                memory_bytes: 128 * 1024 * 1024,
+                swap_bytes: 0,
+                pids_max: 64,
+            },
+            None,
+            Some(terminal),
+            None,
+            "freshell-provider-retained".into(),
+        );
+        let mut tmpfs = runtime_tmpfs(Some("opencode"));
+        tmpfs.remove("/run/freshell-private");
+        let inspection = json!({"Id":handle.container_id(),"Image":handle.image_ref(),"Config":{"Labels":{"com.freshell.managed":"true","com.freshell.installation-id":handle.installation_id(),"com.freshell.soul-id":handle.soul_id(),"com.freshell.incarnation-id":handle.incarnation_id()},"Env":runtime_host_environment(
+            handle.terminal(),
+            None,
+            None,
+        ).unwrap()},"HostConfig":{"NetworkMode":"bridge","PidMode":"","Privileged":false,"CapAdd":["CHOWN","SETUID","SETGID"],"Tmpfs":tmpfs},"Mounts":[{"Source":binary,"Destination":"/runtime/freshell-session-host","RW":false},{"Source":runtime_dir,"Destination":"/run/freshell","RW":true},{"Name":handle.provider_volume_name(),"Destination":"/home/freshell/provider","RW":true},{"Source":workspace,"Destination":workspace,"RW":true}]});
+        (root, handle, inspection)
+    }
+
+    #[test]
+    fn historical_legacy_serializer_remains_owned_without_rewriting_saved_digest() {
+        let (_root, original, inspection) = retained_opencode_fixture();
+        // Exact production serializer field/order from immutable7dbc7ef6;
+        // the physical fixture also uses its independently compiled creator.
+        let encoded=format!("{{\"image_ref\":{},\"installation_id\":{},\"soul_id\":{},\"incarnation_id\":{},\"host_binary_path\":{},\"runtime_dir\":{},\"limits\":{},\"terminal\":{},\"fresh_agent\":null,\"provider_volume_name\":{}}}",serde_json::to_string(original.image_ref()).unwrap(),serde_json::to_string(&original.installation_id()).unwrap(),serde_json::to_string(&original.soul_id()).unwrap(),serde_json::to_string(&original.incarnation_id()).unwrap(),serde_json::to_string(&original.host_binary_path()).unwrap(),serde_json::to_string(&original.runtime_dir()).unwrap(),serde_json::to_string(&original.requested_limits()).unwrap(),serde_json::to_string(&original.terminal()).unwrap(),serde_json::to_string(original.provider_volume_name()).unwrap());
+        let saved = format!("sha256:{:x}", Sha256::digest(encoded));
+        let handle = OwnedRuntimeHandle::from_registry(
+            original.installation_id().clone(),
+            original.soul_id().clone(),
+            original.provider_store_id().into(),
+            original.incarnation_id().clone(),
+            original.launch_nonce().clone(),
+            original.daemon_id().clone(),
+            original.container_id().into(),
+            original.image_ref().into(),
+            original.runtime_dir().into(),
+            original.host_binary_path().into(),
+            saved.clone(),
+            original.requested_limits(),
+            None,
+            original.terminal().cloned(),
+            None,
+            original.provider_volume_name().into(),
+        );
+        assert!(
+            verify_saved_immutable_digest(&handle).is_ok(),
+            "the exact known historical serializer must qualify without hash mutation"
+        );
+        assert_eq!(handle.immutable_config_digest(), saved);
+        let modern = handle.clone().with_launch_policy(Some(
+            freshell_runtime_protocol::RuntimeLaunchPolicy::ProviderVolumeV1,
+        ));
+        assert!(verify_saved_immutable_digest(&modern).is_err());
+        let mut unknown = inspection.clone();
+        unknown["HostConfig"]["Tmpfs"]["/foreign"] = json!("rw");
+        assert!(verify_saved_immutable_digest(&handle).is_ok(),"the exact saved legacy codec remains valid independently of current actual mount policy");
+        assert!(
+            matches!(
+                verify_inspect_config(&handle, &unknown),
+                Err(BackendError::PolicyMismatch(_))
+            ),
+            "an owned historical enclosure with altered policy remains precisely blocked"
+        );
+        assert_eq!(handle.immutable_config_digest(), saved);
+    }
+
+    #[test]
+    fn retained_legacy_opencode_requires_exact_known_profile_and_protected_mounts() {
+        let (_root, handle, inspection) = retained_opencode_fixture();
+        assert!(
+            verify_inspect_config(&handle, &inspection).is_ok(),
+            "exact known legacy mount profile remains owned across supervisor upgrades"
+        );
+        assert_eq!(handle.immutable_config_digest(), "saved-digest");
+        assert!(matches!(
+            verify_inspect_config(
+                &handle.clone().with_launch_policy(Some(
+                    freshell_runtime_protocol::RuntimeLaunchPolicy::ProviderVolumeV1
+                )),
+                &inspection
+            ),
+            Err(BackendError::PolicyMismatch(_))
+        ));
+        for changed in [
+            {
+                let mut value = inspection.clone();
+                value["Mounts"][0]["RW"] = json!(true);
+                value
+            },
+            {
+                let mut value = inspection.clone();
+                value["Mounts"][1]["RW"] = json!(false);
+                value
+            },
+            {
+                let mut value = inspection.clone();
+                value["Mounts"][2]["RW"] = json!(false);
+                value
+            },
+            {
+                let mut value = inspection.clone();
+                value["HostConfig"]["Tmpfs"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("/tmp");
+                value
+            },
+            {
+                let mut value = inspection.clone();
+                value["HostConfig"]["Tmpfs"]["/extra"] = json!("rw");
+                value
+            },
+            {
+                let mut value = inspection.clone();
+                value["Mounts"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"Source":"/foreign","Destination":"/foreign","RW":true}));
+                value
+            },
+            {
+                let mut value = inspection.clone();
+                value["Mounts"][0]["Source"] = json!("/foreign/host");
+                value
+            },
+            {
+                let mut value = inspection.clone();
+                value["Config"]["Labels"]["com.freshell.soul-id"] = json!("foreign-soul");
+                value
+            },
+            {
+                let mut value = inspection.clone();
+                value["Image"] = json!("sha256:foreign");
+                value
+            },
+        ] {
+            assert!(verify_inspect_config(&handle, &changed).is_err());
+        }
+    }
 
     #[test]
     fn provider_private_parent_mount_adoption_checks_topology_and_actor_ownership() {
@@ -1909,6 +2745,7 @@ mod tests {
         let handle = OwnedRuntimeHandle::from_registry(
             installation_id.clone(),
             soul_id.clone(),
+            soul_id.to_string(),
             incarnation_id.clone(),
             LaunchNonce::new(),
             DockerDaemonId::new(),
@@ -1963,7 +2800,7 @@ mod tests {
             inspected["HostConfig"]["Tmpfs"]["/run/freshell-private"] = serde_json::json!(option);
             assert!(matches!(
                 verify_inspect_config(&handle, &inspected),
-                Err(BackendError::OwnershipMismatch(_))
+                Err(BackendError::PolicyMismatch(message)) if message == "owned_launch_policy_mismatch"
             ));
         }
         inspected["HostConfig"]["Tmpfs"] = serde_json::json!(runtime_tmpfs(Some("codex")));
@@ -1991,12 +2828,211 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn kilroy_creation_and_ownership_use_the_native_familys_private_mount() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("docker.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let daemon = tokio::spawn(async move {
+            let mut created = Vec::new();
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                loop {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).await.unwrap();
+                    raw.push(byte[0]);
+                    if raw.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let header = String::from_utf8(raw).unwrap();
+                let length: usize = header
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).await.unwrap();
+                let (status, response) = if header.starts_with("GET /v1.47/info ") {
+                    (
+                        200,
+                        json!({"ID":"owned-daemon", "SecurityOptions":["name=rootless"]}),
+                    )
+                } else {
+                    assert!(
+                        header.starts_with("POST /v1.47/containers/create?"),
+                        "unexpected owned Docker request"
+                    );
+                    created.push(serde_json::from_slice::<Value>(&body).unwrap());
+                    (201, json!({"Id":format!("{:064x}",created.len())}))
+                };
+                let response = serde_json::to_vec(&response).unwrap();
+                stream.write_all(format!("HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).as_bytes()).await.unwrap();
+                stream.write_all(&response).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+            created
+        });
+        let binary = root.path().join("host");
+        std::fs::write(&binary, b"owned-host").unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let backend = DockerEngineBackend::new(&socket);
+        let mut handles = Vec::new();
+        for (index, provider) in ["claude", "kilroy"].into_iter().enumerate() {
+            let incarnation_id =
+                IncarnationId::parse(format!("owned-incarnation-{index}")).unwrap();
+            let soul_id = SoulId::parse(format!("owned-soul-{index}")).unwrap();
+            let installation_id = InstallationId::parse("owned-installation").unwrap();
+            let runtime_dir = root.path().join(incarnation_id.as_str());
+            std::fs::create_dir(&runtime_dir).unwrap();
+            let actor_dir = host_actor_state_dir(root.path(), &installation_id, &soul_id);
+            std::fs::create_dir_all(&actor_dir).unwrap();
+            std::fs::set_permissions(&actor_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let agent: FreshAgentLaunchSpec = serde_json::from_value(json!({
+                "sessionId":format!("owned-session-{index}"),"provider":provider,
+                "sessionType":if provider=="kilroy" {"kilroy"} else {"freshclaude"},
+                "runtimeVariant":if provider=="kilroy" {"kilroy-claude-agent-sdk"} else {"claude-agent-sdk"},
+                "providerStoreId":format!("owned-store-{index}"),"cwd":workspace,"workspacePath":workspace,
+                "runAsUid":65534,"runAsGid":0
+            })).unwrap();
+            let spec = CreateRuntimeSpec {
+                initial_input_reservation: None,
+                prior_provider_owner: None,
+                installation_id: installation_id.clone(),
+                soul_id: soul_id.clone(),
+                incarnation_id: incarnation_id.clone(),
+                image_ref: format!("sha256:{}", "a".repeat(64)),
+                host_binary_path: binary.clone(),
+                runtime_dir: runtime_dir.clone(),
+                limits: RuntimeLimits {
+                    cpu_milli: 500,
+                    memory_bytes: 128 * 1024 * 1024,
+                    swap_bytes: 0,
+                    pids_max: 64,
+                },
+                test_run_id: "owned-kilroy-private-mount".into(),
+                terminal: None,
+                fresh_agent: Some(agent.clone()),
+                opencode_transfer_dir: None,
+                provider_volume_name: format!("freshell-provider-{index:024x}"),
+            };
+            let created = backend.create_stopped(&spec).await.unwrap();
+            handles.push(
+                OwnedRuntimeHandle::from_registry(
+                    installation_id,
+                    soul_id.clone(),
+                    soul_id.to_string(),
+                    incarnation_id,
+                    LaunchNonce::new(),
+                    created.daemon_id,
+                    created.container_id,
+                    spec.image_ref,
+                    runtime_dir,
+                    binary.clone(),
+                    created.immutable_config_digest,
+                    spec.limits,
+                    None,
+                    None,
+                    Some(agent),
+                    spec.provider_volume_name,
+                )
+                .with_launch_policy(Some(
+                    freshell_runtime_protocol::RuntimeLaunchPolicy::ProviderVolumeV1,
+                )),
+            );
+        }
+        let created = tokio::time::timeout(std::time::Duration::from_secs(5), daemon)
+            .await
+            .unwrap()
+            .unwrap();
+        let inspect = |body: &Value| {
+            let mounts = body["HostConfig"]["Binds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|bind| {
+                    let parts = bind.as_str().unwrap().split(':').collect::<Vec<_>>();
+                    let mut mount = json!({"Destination":parts[1],"RW":parts[2]=="rw"});
+                    mount[if parts[0].starts_with("freshell-provider-") {
+                        "Name"
+                    } else {
+                        "Source"
+                    }] = json!(parts[0]);
+                    mount
+                })
+                .collect::<Vec<_>>();
+            json!({"Image":body["Image"],"Config":{"Labels":body["Labels"],"Env":body["Env"]},"HostConfig":body["HostConfig"],"Mounts":mounts})
+        };
+        let mut kilroy = inspect(&created[1]);
+        // A physical enclosure with the native family's existing private mount
+        // must qualify while keeping its own logical Kilroy labels/environment.
+        kilroy["HostConfig"]["Tmpfs"] = created[0]["HostConfig"]["Tmpfs"].clone();
+        assert!(verify_inspect_config(&handles[1], &kilroy).is_ok());
+        assert!(verify_inspect_config(&handles[1], &inspect(&created[1])).is_ok());
+        assert!(verify_saved_immutable_digest(&handles[1]).is_ok());
+        kilroy["HostConfig"]["Tmpfs"]
+            .as_object_mut()
+            .unwrap()
+            .remove("/run/freshell-private");
+        assert!(matches!(
+            verify_inspect_config(&handles[1], &kilroy),
+            Err(BackendError::PolicyMismatch(_))
+        ));
+        let mut changed = inspect(&created[1]);
+        changed["HostConfig"]["Tmpfs"]["/run/freshell-private"] = json!("rw,exec,size=32m");
+        assert!(matches!(
+            verify_inspect_config(&handles[1], &changed),
+            Err(BackendError::PolicyMismatch(_))
+        ));
+    }
+
     #[test]
     fn parses_content_length_response() {
         let response =
             parse_http_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}").unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"{}");
+    }
+
+    #[tokio::test]
+    async fn bounded_helper_exchange_retains_its_enclosing_operation_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("docker-helper.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+            }
+            tokio::time::sleep(DOCKER_REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                .await
+                .unwrap();
+        });
+        // Native history/repair wait requests already belong to a separately
+        // bounded helper operation (20s/120s), which may legitimately take
+        // longer than an ordinary Docker metadata request.
+        let result = tokio::time::timeout(
+            DOCKER_REQUEST_TIMEOUT + Duration::from_secs(5),
+            DockerEngineBackend::new(socket).request_bounded("POST", "/helper/wait", None, 1_024),
+        )
+        .await
+        .unwrap();
+        if result.is_err() {
+            peer.abort();
+        }
+        assert_eq!(
+            result
+                .expect("the helper's caller owns its longer elapsed-time budget")
+                .body,
+            b"{}"
+        );
+        peer.await.unwrap();
     }
 
     #[test]
@@ -2073,6 +3109,9 @@ mod tests {
             provider_bootstrap_files: Vec::new(),
             provider_secret_references: Vec::new(),
             provider_launch_context: None,
+            opencode_transfer: None,
+            opencode_transfer_attempt_id: None,
+            opencode_adoption: None,
         };
         let env = runtime_host_environment(Some(&terminal), None, None).unwrap();
         assert!(env
@@ -2129,6 +3168,9 @@ mod tests {
                 profile: ProviderSecretProfile::AmplifierOnecliLunarouteGlm53,
             }],
             provider_launch_context: None,
+            opencode_transfer: None,
+            opencode_transfer_attempt_id: None,
+            opencode_adoption: None,
         };
         let mounts = docker::terminal_mounts(&terminal).unwrap();
         let binds: Vec<String> = mounts
@@ -2160,6 +3202,7 @@ mod tests {
             test_run_id: "reference-only".into(),
             terminal: Some(terminal),
             fresh_agent: None,
+            opencode_transfer_dir: None,
             provider_volume_name: "freshell-provider-test".into(),
         };
         let body = docker_create_body(
@@ -2262,8 +3305,10 @@ mod tests {
                     pids_max: 64,
                 },
                 terminal: None,
+                opencode_transfer_dir: None,
                 fresh_agent: Some((&agent).into()),
                 provider_volume_name: "freshell-provider-one".into(),
+                launch_policy: None,
             })
             .unwrap()
         };
@@ -2323,6 +3368,8 @@ mod tests {
         })).unwrap();
         for fresh_route in [false, true] {
             let mut expected = ExpectedConfig {
+                opencode_transfer_dir: None,
+                launch_policy: None,
                 image_ref: "sha256:image".into(),
                 installation_id: "installation-digest".into(),
                 soul_id: "soul-digest".into(),
@@ -2385,6 +3432,9 @@ mod tests {
 
     fn terminal_spec_fixture(workspace: &Path) -> TerminalLaunchSpec {
         TerminalLaunchSpec {
+            opencode_transfer: None,
+            opencode_transfer_attempt_id: None,
+            opencode_adoption: None,
             terminal_id: "terminal-fixture".into(),
             stream_id: "stream-fixture".into(),
             mode: "shell".into(),
@@ -2536,6 +3586,7 @@ mod tests {
         let handle = OwnedRuntimeHandle::from_registry(
             installation_id.clone(),
             soul_id.clone(),
+            "store".into(),
             incarnation_id.clone(),
             LaunchNonce::new(),
             DockerDaemonId::new(),
@@ -2599,6 +3650,226 @@ mod tests {
     }
 
     #[test]
+    fn verify_inspect_config_keeps_terminal_owned_after_selected_workspace_input_deletion() {
+        assert_owned_after_selected_workspace_input_deletion(
+            false,
+            "backend::tests::verify_inspect_config_keeps_terminal_owned_after_selected_workspace_input_deletion",
+        );
+    }
+
+    #[test]
+    fn verify_inspect_config_keeps_fresh_agent_owned_after_selected_workspace_input_deletion() {
+        assert_owned_after_selected_workspace_input_deletion(
+            true,
+            "backend::tests::verify_inspect_config_keeps_fresh_agent_owned_after_selected_workspace_input_deletion",
+        );
+    }
+
+    fn assert_owned_after_selected_workspace_input_deletion(fresh: bool, test_name: &str) {
+        use freshell_runtime_protocol::{
+            McpCapabilityReference, PreparedProviderInputs, ProviderInputManifestReference,
+            ProviderLaunchContext, ProviderPreparation, ProviderResourceKind,
+            ProviderResourceMount,
+        };
+
+        // Capability and HOME selection are process-wide. Isolate them from
+        // other ownership tests, as the mount adoption tests do.
+        const CHILD: &str = "FRESHELL_WORKSPACE_INPUT_INSPECTION_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new("/usr/bin/timeout")
+                .args(["--kill-after=1s", "20s"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated owned-input inspection failed");
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let (original, mut inspected) = terminal_runtime_fixture(root.path(), None);
+        let workspace = Path::new(&original.terminal().unwrap().workspace_path);
+        std::env::set_var("HOME", workspace);
+        std::env::remove_var("FRESHELL_SUPERVISOR_OPERATOR_HOME");
+        let selected = workspace.join(".opencode");
+        let capabilities = root.path().join("mcp-capabilities");
+        let stage = root.path().join("provider-roots/grant-owned-input");
+        std::fs::create_dir(&selected).unwrap();
+        std::fs::write(selected.join("provider-owned-state"), b"keep").unwrap();
+        std::fs::create_dir(&capabilities).unwrap();
+        std::fs::create_dir_all(stage.join(".freshell/resource-units/project")).unwrap();
+        let manifest = b"{\"sources\":[]}";
+        std::fs::write(stage.join(".freshell/input-manifest.json"), manifest).unwrap();
+        let grant = capabilities.join("grant-owned-input.json");
+        std::fs::write(&grant, b"{}").unwrap();
+        std::fs::set_permissions(&grant, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::env::set_var("FRESHELL_RUNTIME_CAPABILITY_DIR", capabilities);
+        let context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Opencode {
+                project_config: vec![],
+                tui_config: None,
+                tui_source: None,
+                inline_config: false,
+            },
+            config: vec![],
+            mcp_capability: Some(McpCapabilityReference {
+                grant_id: "grant-owned-input".into(),
+                endpoint: "http://host.docker.internal:4000".into(),
+                provider_relative_path: ".freshell/mcp-capability.json".into(),
+                host_gateway_address: None,
+            }),
+            prepared_inputs: Some(PreparedProviderInputs {
+                generation_id: "grant-owned-input".into(),
+                initial_auth_reservation: None,
+                manifest: ProviderInputManifestReference {
+                    relative_path: ".freshell/input-manifest.json".into(),
+                    sha256: format!("{:x}", Sha256::digest(manifest)),
+                    source_count: 0,
+                    alias_count: 0,
+                    recipe_count: 0,
+                },
+                config_binds: vec![],
+                resource_mounts: vec![ProviderResourceMount {
+                    stage_relative_path: ".freshell/resource-units/project".into(),
+                    provider_relative_path: ".freshell/provider-roots/project".into(),
+                    logical_destination: selected.to_string_lossy().into_owned(),
+                    effective_destination: selected.to_string_lossy().into_owned(),
+                    kind: ProviderResourceKind::Directory,
+                    writable: false,
+                    reference_aliases: vec![],
+                    retired_reference_aliases: vec![],
+                }],
+                indexed_files: None,
+            }),
+        };
+        let (terminal, agent, mounts) = if fresh {
+            let agent: FreshAgentLaunchSpec = serde_json::from_value(json!({
+                "sessionId":"owned-input", "provider":"opencode", "sessionType":"freshopencode",
+                "runtimeVariant":"opencode", "providerStoreId":"store",
+                "cwd":workspace,"workspacePath":workspace,"runAsUid":65534,"runAsGid":0,
+                "providerLaunchContext":context
+            }))
+            .unwrap();
+            let mounts = docker::fresh_agent_mounts(&agent).unwrap();
+            (None, Some(agent), mounts)
+        } else {
+            let mut terminal = original.terminal().unwrap().clone();
+            terminal.mode = "opencode".into();
+            terminal.program = "opencode".into();
+            terminal.provider_launch_context = Some(context);
+            let mounts = docker::terminal_mounts(&terminal).unwrap();
+            (Some(terminal), None, mounts)
+        };
+        let handle = OwnedRuntimeHandle::from_registry(
+            original.installation_id().clone(),
+            original.soul_id().clone(),
+            original.provider_store_id().into(),
+            original.incarnation_id().clone(),
+            original.launch_nonce().clone(),
+            original.daemon_id().clone(),
+            original.container_id().into(),
+            original.image_ref().into(),
+            original.runtime_dir().into(),
+            original.host_binary_path().into(),
+            original.immutable_config_digest().into(),
+            original.requested_limits(),
+            None,
+            terminal,
+            agent,
+            original.provider_volume_name().into(),
+        );
+        inspected["Config"]["Env"] =
+            json!(runtime_host_environment(handle.terminal(), handle.fresh_agent(), None).unwrap());
+        inspected["HostConfig"]["Tmpfs"] = json!(runtime_tmpfs(Some("opencode")));
+        let reported = inspected["Mounts"].as_array_mut().unwrap();
+        for (source, destination) in [
+            (
+                mounts.provider_user_root.as_ref().unwrap(),
+                "/run/freshell-private/user-provider",
+            ),
+            (
+                mounts.mcp_capability_file.as_ref().unwrap(),
+                "/run/freshell/mcp-capability.json",
+            ),
+        ] {
+            reported.push(json!({"Source":source,"Destination":destination,"RW":false}));
+        }
+        reported.push(json!({"Type":"volume","Name":handle.provider_volume_name(),
+            "Source":"/docker/owned-provider","Destination":selected,"RW":true}));
+        if fresh {
+            let actor =
+                host_actor_state_dir(root.path(), handle.installation_id(), handle.soul_id());
+            std::fs::create_dir_all(&actor).unwrap();
+            std::fs::set_permissions(&actor, std::fs::Permissions::from_mode(0o700)).unwrap();
+            reported.push(json!({"Source":actor,"Destination":HOST_ACTOR_STATE_MOUNT,"RW":true}));
+        }
+        inspected["HostConfig"]["Mounts"] =
+            json!(
+                prepared_inputs::mount_descriptors(&mounts, handle.provider_volume_name()).unwrap()
+            );
+        let volumes = BTreeMap::from([(
+            handle.provider_volume_name().to_owned(),
+            json!({"Name":handle.provider_volume_name(),"Driver":"local","Mountpoint":"/docker/owned-provider"}),
+        )]);
+        let verify = |value: &Value| {
+            verify_inspect_config(&handle, value)?;
+            prepared_inputs::verify(value, &mounts, handle.provider_volume_name(), &volumes)
+        };
+        verify(&inspected).expect("prepared owned mount configuration is valid before deletion");
+
+        std::fs::remove_dir_all(&selected).unwrap();
+        verify(&inspected)
+            .expect("original input deletion must not revoke existing mount ownership");
+        let create = handle
+            .terminal()
+            .map(docker::terminal_mounts)
+            .or_else(|| handle.fresh_agent().map(docker::fresh_agent_mounts))
+            .unwrap();
+        assert_eq!(
+            create.unwrap_err(),
+            "selected workspace input mountpoint is unavailable",
+            "a new runtime still requires current prepared input topology"
+        );
+
+        for changed in [
+            {
+                let mut value = inspected.clone();
+                value["Config"]["Labels"]["com.freshell.soul-id"] = json!("foreign");
+                value
+            },
+            {
+                let mut value = inspected.clone();
+                value["Mounts"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"Source":"/foreign","Destination":"/foreign","RW":true}));
+                value
+            },
+            {
+                let mut value = inspected.clone();
+                value["HostConfig"]["Mounts"][0]["VolumeOptions"]["Subpath"] = json!("foreign");
+                value
+            },
+            {
+                let mut value = inspected.clone();
+                value["Mounts"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|mount| mount["Destination"] == json!(selected))
+                    .unwrap()["Name"] = json!("foreign-volume");
+                value
+            },
+        ] {
+            assert!(
+                matches!(verify(&changed), Err(BackendError::OwnershipMismatch(_))),
+                "input deletion must not permit changed container ownership or mounted state"
+            );
+        }
+    }
+
+    #[test]
     fn verify_inspect_config_ignores_home_mounts_without_the_marker_env() {
         // Pre-upgrade running souls lack FRESHELL_OPERATOR_HOME_MOUNT entirely;
         // inspection must keep passing for them.
@@ -2632,7 +3903,7 @@ mod tests {
             .remove(&format!("{}/.freshell", home.display()));
         assert!(matches!(
             verify_inspect_config(&handle, &inspected),
-            Err(BackendError::OwnershipMismatch(_))
+            Err(BackendError::PolicyMismatch(message)) if message == "owned_launch_policy_mismatch"
         ));
     }
 

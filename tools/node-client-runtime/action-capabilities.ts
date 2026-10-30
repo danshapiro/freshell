@@ -14,17 +14,19 @@ export type ActionCapability = {
 const unavailable = 'This action is unavailable with the Rust Freshell server.'
 const noParams: ActionParameters = { required: [], optional: [] }
 const params = (required: readonly string[] = [], optional: readonly string[] = []): ActionParameters => ({ required, optional })
+const freshAgentParams = ['agent', 'model', 'effort', 'permissionMode'] as const
+const freshAgentFamilies = ['claude', 'kilroy', 'codex', 'opencode'] as const
 
 /** The closed Rust client contract: 33 canonical actions and 14 tmux aliases. */
 export const ACTION_CAPABILITIES: readonly ActionCapability[] = [
-  { action: 'new-tab', aliases: ['new-window', 'new-session'], supported: true, params: params([], ['name', 'nameIntent', 'mode', 'shell', 'cwd', 'browser', 'editor', 'hostStats', 'resume', 'resumeSessionId', 'sessionRef', 'prompt', 'agent', 'model', 'effort']) },
+  { action: 'new-tab', aliases: ['new-window', 'new-session'], supported: true, params: params([], ['name', 'nameIntent', 'mode', 'shell', 'cwd', 'browser', 'editor', 'hostStats', 'resume', 'resumeSessionId', 'sessionRef', 'prompt', ...freshAgentParams]) },
   { action: 'list-tabs', aliases: ['list-windows'], supported: true, params: noParams },
   { action: 'select-tab', aliases: ['select-window'], supported: true, params: params(['target']) },
   { action: 'kill-tab', aliases: ['kill-window'], supported: true, params: params(['target']) },
   { action: 'rename-tab', aliases: ['rename-window'], supported: true, params: params(['name'], ['target', 'nameIntent']) },
   { action: 'next-tab', aliases: ['next-window'], supported: true, params: noParams },
   { action: 'prev-tab', aliases: ['previous-window', 'prev-window'], supported: true, params: noParams },
-  { action: 'split-pane', aliases: ['split-window'], supported: true, params: params([], ['target', 'direction', 'mode', 'shell', 'cwd', 'browser', 'editor', 'hostStats', 'resume', 'sessionRef', 'agent', 'model', 'effort']) },
+  { action: 'split-pane', aliases: ['split-window'], supported: true, params: params([], ['target', 'direction', 'mode', 'shell', 'cwd', 'browser', 'editor', 'hostStats', 'resume', 'sessionRef', ...freshAgentParams]) },
   { action: 'display', aliases: ['display-message'], supported: true, params: params([], ['target', 'format']) },
   { action: 'screenshot', aliases: ['screenshot-pane', 'screenshot-tab', 'screenshot-view'], supported: true, params: params(['scope'], ['target', 'name']) },
   { action: 'has-tab', supported: true, params: params(['target']) },
@@ -132,12 +134,9 @@ export function unsupportedInvocationResult(
   const unsupported = unsupportedActionResult(action)
   if (unsupported) return unsupported
   const canonical = resolveCanonicalAction(action)
-  if (canonical === 'new-tab' && invocation?.agent !== undefined && !['claude', 'kilroy', 'opencode'].includes(String(invocation.agent))) {
-    return { error: 'This fresh-agent provider is unavailable with the Rust Freshell server.', hint: 'Use agent claude, kilroy, or opencode; use mode codex for a Codex terminal.' }
-  }
-  if (canonical === 'split-pane' && ['agent', 'model', 'effort'].some((key) => invocation?.[key] !== undefined)
-    && !['claude', 'kilroy'].includes(String(invocation?.agent))) {
-    return { error: 'Fresh-agent splits require agent claude or kilroy.', hint: 'Choose a supported fresh agent or use mode for a terminal pane.' }
+  if ((canonical === 'new-tab' || canonical === 'split-pane') && invocation?.agent !== undefined
+    && !freshAgentFamilies.some(agent => agent === invocation.agent)) {
+    return { error: 'Unsupported fresh-agent family with the Rust Freshell server.', hint: 'Use agent: claude, kilroy, codex, or opencode.' }
   }
   const waitPattern = canonical === 'wait-for' ? invocation?.pattern : undefined
   if (canonical === 'wait-for' && (

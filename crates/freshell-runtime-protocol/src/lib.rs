@@ -10,9 +10,15 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const CONTROL_PROTOCOL_VERSION: u32 = 1;
+// v2 adds mandatory per-attempt ownership tokens to OpenCode transfer actions.
+pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_NATIVE_HISTORY_FRAME_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_OPENCODE_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
+pub const MAX_OPENCODE_TRANSFER_BUNDLE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+pub const MAX_OPENCODE_TRANSFER_FILES: usize = 4096;
+pub const MAX_OPENCODE_TRANSFER_MANIFEST_BYTES: usize = 512 * 1024;
+pub const OPENCODE_TRANSFER_DESTINATION_DB: &str = ".local/share/opencode/opencode.db";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -28,6 +34,10 @@ pub use terminal_spool::{
 #[cfg(test)]
 #[path = "fresh_agent_ops_tests.rs"]
 mod fresh_agent_ops_tests;
+
+#[cfg(test)]
+#[path = "opencode_transfer_tests.rs"]
+mod opencode_transfer_tests;
 
 macro_rules! string_id {
     ($name:ident, $prefix:literal) => {
@@ -122,6 +132,7 @@ pub enum RecoveryState {
     Blocked,
     Lost,
     Stopped,
+    DataRepairComplete,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -260,6 +271,10 @@ pub struct CredentialReference {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResumeSpec {
+    /// Native UUID-preserving recovery of an acknowledged Claude fork before
+    /// its first input materializes a child transcript. Intent, not observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_fork: Option<ClaudeForkRecipe>,
     #[serde(default = "default_resume_spec_schema_version")]
     pub schema_version: u32,
     pub provider_session: ProviderSessionRef,
@@ -270,6 +285,11 @@ pub struct ResumeSpec {
     /// the resumed host never silently crosses into a paid provider adapter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixture_transport: Option<FreshAgentFixtureTransport>,
+    /// Passive evidence for the already installed OpenCode history baseline.
+    /// This never requests staging or import; it only permits a fresh
+    /// provider-reader check and incarnation-bound TUI adoption gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_adoption_baseline: Option<OpenCodeAdoptionBaseline>,
     pub program: String,
     #[serde(default)]
     pub resume_argv: Vec<String>,
@@ -309,6 +329,76 @@ pub struct ResumeSpec {
     /// True only when the durable command journal proves no provider input was
     /// ever dispatched. It is the sole authority for pristine-seed recovery.
     pub never_dispatched: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaudeForkRecipe {
+    /// Retains the missing-child blocker after a potentially accepted effect.
+    /// A disabled source can never recreate its older prefix.
+    #[serde(default)]
+    pub recovery_disabled: bool,
+    pub child_session_id: String,
+    pub parent_session_id: String,
+    pub parent_transcript: String,
+    pub child_transcript: String,
+    pub parent_sha256: String,
+    pub target: ClaudeForkTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum ClaudeForkTarget {
+    Prefix {
+        cutoff_uuid: String,
+        drop_turn_uuid: Option<String>,
+    },
+    Empty,
+}
+
+impl ClaudeForkRecipe {
+    pub fn validate(&self, child: &str) -> Result<(), String> {
+        let uuid = |value: &str| uuid::Uuid::parse_str(value).is_ok();
+        let path = |value: &str, root: &str| {
+            let path = std::path::Path::new(value);
+            value.len() <= 4096
+                && path.starts_with(".claude/projects")
+                && path
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+                && path.file_name().and_then(|name| name.to_str())
+                    == Some(format!("{root}.jsonl").as_str())
+        };
+        if self.child_session_id != child
+            || !uuid(child)
+            || !uuid(&self.parent_session_id)
+            || child == self.parent_session_id
+            || !path(&self.parent_transcript, &self.parent_session_id)
+            || !path(&self.child_transcript, child)
+            || self.parent_sha256.len() != 64
+            || !self
+                .parent_sha256
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err("invalid Claude parent-backed fork recipe".into());
+        }
+        if let ClaudeForkTarget::Prefix {
+            cutoff_uuid,
+            drop_turn_uuid,
+        } = &self.target
+        {
+            if !uuid(cutoff_uuid) || drop_turn_uuid.as_ref().is_some_and(|id| !uuid(id)) {
+                return Err("invalid Claude fork cutoff".into());
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -579,6 +669,313 @@ pub struct IncidentSummaryRequest {
     pub expected_control_epoch: Option<u64>,
 }
 
+/// One exact false-loss row selected for stopped restoration. Native paths,
+/// provider payloads, and session contents are intentionally absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LostSoulRepairTarget {
+    pub soul_id: SoulId,
+    pub incident_id: IncidentId,
+    pub expected_intent_revision: u64,
+}
+
+/// A user-selected canonical owner for an otherwise ambiguous native root.
+/// This is sent only after the server has returned its exact candidate soul
+/// IDs; it contains no provider paths or session content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CanonicalOwnerChoice {
+    pub root_session_id: String,
+    pub soul_id: SoulId,
+    pub expected_intent_revision: u64,
+}
+
+/// Exact source selection. Its members are independently resolved by the
+/// supervisor; callers cannot supply the expected set of lost souls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepairBatchSourceSelection {
+    pub source_store_id: String,
+    pub root_session_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepairBatchTarget {
+    pub target: LostSoulRepairTarget,
+    pub provider_store_id: String,
+    pub root_session_id: String,
+    pub incident_revision: u64,
+    pub identity_revision: u64,
+    pub native_import_revision: u64,
+    pub evidence_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepairBatchRoot {
+    pub root_session_id: String,
+    pub graph_digest: String,
+    pub eligible_owners: Vec<SoulId>,
+    pub canonical_soul_id: Option<SoulId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepairBatchScope {
+    pub scope_id: String,
+    pub source_store_id: String,
+    pub source_fingerprint: String,
+    pub targets: Vec<RepairBatchTarget>,
+    pub roots: Vec<RepairBatchRoot>,
+}
+
+impl RepairBatchScope {
+    pub fn source_descriptor_digest(&self) -> String {
+        let mut roots = self
+            .roots
+            .iter()
+            .map(|root| (&root.root_session_id, &root.graph_digest))
+            .collect::<Vec<_>>();
+        roots.sort();
+        hex::encode(Sha256::digest(
+            serde_json::to_vec(&(&self.source_store_id, roots))
+                .expect("source descriptor serializes"),
+        ))
+    }
+    pub fn source_selection(&self) -> RepairBatchSourceSelection {
+        RepairBatchSourceSelection {
+            source_store_id: self.source_store_id.clone(),
+            root_session_ids: self
+                .roots
+                .iter()
+                .map(|root| root.root_session_id.clone())
+                .collect(),
+        }
+    }
+
+    pub fn descriptor_digest(&self) -> String {
+        let mut descriptor = self.clone();
+        descriptor.scope_id.clear();
+        descriptor.targets.sort_by(|left, right| {
+            left.target
+                .soul_id
+                .as_str()
+                .cmp(right.target.soul_id.as_str())
+        });
+        descriptor
+            .roots
+            .sort_by(|left, right| left.root_session_id.cmp(&right.root_session_id));
+        for root in &mut descriptor.roots {
+            root.eligible_owners
+                .sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        }
+        hex::encode(Sha256::digest(
+            serde_json::to_vec(&descriptor).expect("scope descriptor serializes"),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PreflightLostSoulsRequest {
+    pub source: RepairBatchSourceSelection,
+    pub expected_control_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RestoreLostSoulsRequest {
+    pub scope_id: String,
+    pub source: RepairBatchSourceSelection,
+    pub targets: Vec<LostSoulRepairTarget>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub canonical_owners: Vec<CanonicalOwnerChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+impl RestoreLostSoulsRequest {
+    pub fn validate_payload(&self) -> Result<(), RuntimeError> {
+        let mut souls = std::collections::BTreeSet::new();
+        let mut incidents = std::collections::BTreeSet::new();
+        if self.targets.is_empty()
+            || !is_lower_hex_sha256(&self.scope_id)
+            || !is_lower_hex_sha256(&self.source.source_store_id)
+            || self.source.root_session_ids.is_empty()
+            || self
+                .source
+                .root_session_ids
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != self.source.root_session_ids.len()
+            || self.targets.iter().any(|target| {
+                target.expected_intent_revision == 0
+                    || !souls.insert(target.soul_id.as_str())
+                    || !incidents.insert(target.incident_id.as_str())
+            })
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "stopped restoration requires a qualified scope and distinct revisioned soul and incident targets",
+            ));
+        }
+        let mut roots = std::collections::BTreeSet::new();
+        if self.canonical_owners.iter().any(|choice| {
+            choice.root_session_id.trim().is_empty()
+                || choice.root_session_id.len() > 160
+                || choice
+                    .root_session_id
+                    .bytes()
+                    .any(|byte| byte.is_ascii_control())
+                || !roots.insert(choice.root_session_id.as_str())
+        }) {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "canonical owner choices require distinct, valid native root identifiers",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_exact_batch(&self, scope: &RepairBatchScope) -> Result<(), RuntimeError> {
+        self.validate_payload()?;
+        let refused = || {
+            RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "stopped restoration differs from the independently resolved exact scope",
+            )
+        };
+        let mut expected = scope
+            .targets
+            .iter()
+            .map(|member| member.target.clone())
+            .collect::<Vec<_>>();
+        let mut submitted = self.targets.clone();
+        expected.sort_by(|left, right| left.soul_id.as_str().cmp(right.soul_id.as_str()));
+        submitted.sort_by(|left, right| left.soul_id.as_str().cmp(right.soul_id.as_str()));
+        let mut selection = self.source.clone();
+        selection.root_session_ids.sort();
+        let mut expected_selection = scope.source_selection();
+        expected_selection.root_session_ids.sort();
+        if self.scope_id != scope.scope_id
+            || scope.scope_id != scope.descriptor_digest()
+            || scope.source_fingerprint != scope.source_descriptor_digest()
+            || expected != submitted
+            || selection != expected_selection
+            || scope
+                .roots
+                .iter()
+                .map(|root| root.root_session_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != scope.roots.len()
+            || scope.targets.iter().any(|member| {
+                !scope
+                    .roots
+                    .iter()
+                    .any(|root| root.root_session_id == member.root_session_id)
+            })
+            || scope
+                .targets
+                .iter()
+                .any(|member| member.provider_store_id.trim().is_empty())
+            || scope.roots.iter().any(|root| {
+                !is_lower_hex_sha256(&root.graph_digest)
+                    || root.eligible_owners.is_empty()
+                    || root
+                        .eligible_owners
+                        .iter()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                        != root.eligible_owners.len()
+                    || root
+                        .canonical_soul_id
+                        .as_ref()
+                        .is_some_and(|owner| !root.eligible_owners.contains(owner))
+            })
+        {
+            return Err(refused());
+        }
+        for choice in &self.canonical_owners {
+            let root = scope
+                .roots
+                .iter()
+                .find(|root| root.root_session_id == choice.root_session_id)
+                .ok_or_else(refused)?;
+            if !root.eligible_owners.contains(&choice.soul_id)
+                || root
+                    .canonical_soul_id
+                    .as_ref()
+                    .is_some_and(|owner| owner != &choice.soul_id)
+                || !scope.targets.iter().any(|member| {
+                    member.target.soul_id == choice.soul_id
+                        && member.root_session_id == choice.root_session_id
+                        && member.target.expected_intent_revision == choice.expected_intent_revision
+                })
+            {
+                return Err(refused());
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SoulRepairStatus {
+    Pending,
+    OwnerDecisionRequired,
+    Complete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootRepairImportStatus {
+    Pending,
+    OwnerDecisionRequired,
+    StructurallyVerified,
+    ProviderReadable,
+    Complete,
+}
+
+/// Body-free progress for one canonical native root in a stopped correction.
+/// It contains identity and revision codes only; source paths and transcript
+/// data never cross the request boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreLostSoulRootResult {
+    pub root_session_id: String,
+    pub canonical_soul_id: Option<SoulId>,
+    pub import_status: RootRepairImportStatus,
+    pub intent_revision: Option<u64>,
+    pub native_import_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_candidates: Vec<SoulId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreLostSoulsResult {
+    pub operation_id: RequestId,
+    pub scope_id: String,
+    pub status: SoulRepairStatus,
+    pub repaired_target_count: u32,
+    pub total_target_count: u32,
+    #[serde(default)]
+    pub roots: Vec<RestoreLostSoulRootResult>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeCounter {
@@ -666,6 +1063,38 @@ pub struct RepairAudit {
     pub mutation_performed: bool,
 }
 
+/// Immutable enclosure policy captured at creation; absent values identify
+/// historical rows, never permission to ignore current protected ownership facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeLaunchPolicy {
+    ProviderVolumeV1,
+}
+
+/// Read-only current-image qualification; never certifies a running provider identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetainedStoreCompatibilityRequest {
+    pub provider_store_id: String,
+    pub native_session_id: String,
+    pub image_ref: String,
+    pub provider_home: String,
+    pub workspace_path: String,
+    pub cwd: String,
+    pub provider_uid: u32,
+    pub provider_gid: u32,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetainedStoreCompatibilityReceipt {
+    pub request: RetainedStoreCompatibilityRequest,
+    pub provider_version: String,
+    pub source_schema_fingerprint: String,
+    pub migration_journal_fingerprint: String,
+    pub generation: String,
+    pub row_count: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LaunchState {
@@ -746,6 +1175,60 @@ pub enum RuntimeErrorCode {
     RecoveryRetryBudget,
     RecoveryInProgress,
     RecoveryStopUnconfirmed,
+}
+
+/// Stable, body-free context for diagnosing a host activation failure.
+/// This is optional so older supervisors and session hosts keep the existing
+/// wire shape and newer ones can still read replies from older peers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RuntimeDiagnosticCode {
+    HostSocketConnectFailed,
+    HostCommandFrameFailed,
+    HostCommandTimeout,
+    ProviderStatePrepareFailed,
+    ProviderSecretResolutionFailed,
+    ProviderFilesPrepareFailed,
+    ProviderLaunchPrepareFailed,
+    CodexConfigPlanningFailed,
+    CodexAppServerStartFailed,
+    CodexProxyStartFailed,
+    ProviderChildEnvironmentPrepareFailed,
+    ProviderChildEnvironmentInstallFailed,
+    ProviderProcessSpawnFailed,
+    FreshAgentOpenFailed,
+    FreshAgentProviderStartFailed,
+    OpencodeActivityReadyTimeout,
+    OpencodeActivityDisconnected,
+}
+
+/// A closed, body-free reason that a managed fresh-agent provider did not
+/// start. This crosses the runtime boundary only after provider error text
+/// has been reduced to one of these fixed categories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FreshAgentProviderStartDiagnostic {
+    Authentication,
+    Arguments,
+    Listener,
+    Configuration,
+    Network,
+    Unclassified,
+    NoDiagnostic,
+}
+
+impl FreshAgentProviderStartDiagnostic {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Authentication => "authentication",
+            Self::Arguments => "arguments",
+            Self::Listener => "listener",
+            Self::Configuration => "configuration",
+            Self::Network => "network",
+            Self::Unclassified => "unclassified",
+            Self::NoDiagnostic => "no-diagnostic",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -930,13 +1413,16 @@ pub enum ProviderSecretProfile {
     AmplifierConfigurationFile,
     ClaudeOnecliEnvironment,
     ClaudeOnecliAuthFile,
+    ClaudeOnecliCaFile,
     CodexOnecliEnvironment,
     CodexOnecliAuthFile,
+    CodexOnecliCaFile,
     OpencodeOnecliEnvironment,
     OpencodeOnecliAuthFile,
     OpencodeOnecliCaFile,
     AmplifierOnecliEnvironment,
     AmplifierOnecliKeysFile,
+    AmplifierOnecliCaFile,
     /// The approved OneCLI deployment: Amplifier's VLLM module talks to the
     /// LunaRoute-compatible upstream through the credentialed HTTPS proxy
     /// referenced by the user's private keys.env.
@@ -953,9 +1439,11 @@ impl ProviderSecretProfile {
         match self {
             Self::ClaudeOnecliEnvironment
             | Self::ClaudeOnecliAuthFile
+            | Self::ClaudeOnecliCaFile
             | Self::ClaudeConfigurationFile => "claude",
             Self::CodexOnecliEnvironment
             | Self::CodexOnecliAuthFile
+            | Self::CodexOnecliCaFile
             | Self::CodexConfigurationFile => "codex",
             Self::OpencodeOnecliEnvironment
             | Self::OpencodeOnecliAuthFile
@@ -964,6 +1452,7 @@ impl ProviderSecretProfile {
             Self::AmplifierOnecliEnvironment
             | Self::AmplifierConfigurationFile
             | Self::AmplifierOnecliKeysFile
+            | Self::AmplifierOnecliCaFile
             | Self::AmplifierOnecliLunarouteGlm53
             | Self::LegacyAmplifierOnecliAnthropicHaikuLow => "amplifier",
         }
@@ -993,7 +1482,10 @@ impl ProviderSecretProfile {
     /// such as the gateway CA certificate.
     pub fn provider_file_relative_path(self) -> Option<&'static str> {
         self.auth_relative_path().or(match self {
-            Self::OpencodeOnecliCaFile => Some(".config/onecli/gateway-ca.pem"),
+            Self::OpencodeOnecliCaFile
+            | Self::ClaudeOnecliCaFile
+            | Self::CodexOnecliCaFile
+            | Self::AmplifierOnecliCaFile => Some(".config/onecli/gateway-ca.pem"),
             _ => None,
         })
     }
@@ -1020,6 +1512,14 @@ pub struct ProviderLaunchContext {
     pub mcp_capability: Option<McpCapabilityReference>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub config: Vec<ProviderConfigReference>,
+}
+
+/// Exact current producer inputs for an already owned soul's replacement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderReplacementPreparation {
+    pub context: ProviderLaunchContext,
+    pub secret_references: Vec<ProviderSecretReference>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1286,6 +1786,67 @@ fn secret_component(value: &str) -> bool {
 mod provider_launch_context_tests {
     use super::*;
 
+    fn valid_adoption_baseline(root_session_id: &str) -> OpenCodeAdoptionBaseline {
+        let source_store_id = "c".repeat(64);
+        let source_generation = "d".repeat(64);
+        let source_schema_fingerprint = "e".repeat(64);
+        let migration_journal_fingerprint = "f".repeat(64);
+        let payload = b"x";
+        let payload_sha256 = sha256_hex(payload);
+        let manifest_json = serde_json::json!({
+            "version": 1,
+            "provider_schema": "opencode-1.18.21",
+            "root_session_id": root_session_id,
+            "source_store_id": source_store_id,
+            "source_schema_fingerprint": source_schema_fingerprint,
+            "migration_journal_fingerprint": migration_journal_fingerprint,
+            "sqlite_version": "test",
+            "row_count": 0,
+            "rows": [],
+            "assets": [],
+            "payload_bytes": payload.len(),
+            "payload_sha256": payload_sha256,
+            "generation": source_generation,
+        })
+        .to_string();
+        let files = vec![OpenCodeTransferFile {
+            index: 0,
+            relative_path: "payload.json".into(),
+            size_bytes: payload.len() as u64,
+            sha256: payload_sha256,
+        }];
+        let target_image_ref = format!("sha256:{}", "a".repeat(64));
+        let mut descriptor = OpenCodeTransferDescriptor {
+            transfer_id: "transfer-adoption-test".into(),
+            provider: "opencode".into(),
+            source_store_id,
+            root_session_id: root_session_id.into(),
+            source_generation,
+            provider_schema: "opencode-1.18.21".into(),
+            source_schema_fingerprint,
+            migration_journal_fingerprint,
+            destination_store_id: "store-adoption-test".into(),
+            destination_database_path: OPENCODE_TRANSFER_DESTINATION_DB.into(),
+            target_image_ref: target_image_ref.clone(),
+            target_build_receipt: opencode_target_build_receipt(
+                &target_image_ref,
+                "opencode-1.18.21",
+            ),
+            incarnation_id: "incarnation-import".into(),
+            manifest_json,
+            files,
+            total_bytes: payload.len() as u64,
+            bundle_sha256: String::new(),
+        };
+        descriptor.bundle_sha256 =
+            opencode_transfer_bundle_digest(&descriptor.manifest_json, &descriptor.files);
+        let manifest_sha256 = sha256_hex(descriptor.manifest_json.as_bytes());
+        OpenCodeAdoptionBaseline {
+            descriptor,
+            manifest_sha256,
+        }
+    }
+
     #[test]
     fn old_terminal_launch_row_deserializes_without_provider_context() {
         let row = serde_json::json!({
@@ -1296,6 +1857,70 @@ mod provider_launch_context_tests {
         });
         let launch: TerminalLaunchSpec = serde_json::from_value(row).unwrap();
         assert!(launch.provider_launch_context.is_none());
+        assert!(launch.opencode_adoption.is_none());
+    }
+
+    #[test]
+    fn old_host_status_row_defaults_to_no_opencode_adoption_gate() {
+        let result: HostResult = serde_json::from_value(serde_json::json!({
+            "kind": "status",
+            "data": {
+                "host_boot_id": "hostboot-legacy-status",
+                "worker_pid": 42,
+                "worker_launch_count": 1,
+                "max_control_epoch": 1,
+                "max_execution_generation": 1,
+                "fixture_evidence": {},
+                "exited": false
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            result,
+            HostResult::Status {
+                opencode_adoption: OpenCodeAdoptionStatus::NotRequired,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn adoption_expectation_and_observation_are_typed_and_body_free() {
+        let incarnation_id = IncarnationId::parse("incarnation-adoption-test").unwrap();
+        let expected = OpenCodeAdoptionExpectation {
+            baseline: valid_adoption_baseline("ses_exactroot"),
+            root_session_id: "ses_exactroot".into(),
+            root_tail: OpenCodeVerifiedRootTail::Message {
+                message_id: "msg_exact_tail".into(),
+            },
+            evidence_generation: "a".repeat(64),
+            incarnation_id: incarnation_id.clone(),
+            launch_nonce: "b".repeat(32),
+        };
+        expected.validate().unwrap();
+        let observation = OpenCodeAdoptionObservation {
+            terminal_id: "terminal-adoption-test".into(),
+            root_session_id: expected.root_session_id.clone(),
+            tail_message_id: Some("msg_exact_tail".into()),
+            evidence_generation: expected.evidence_generation.clone(),
+            incarnation_id,
+            launch_nonce: expected.launch_nonce.clone(),
+            hydrated: true,
+            messages_read: OpenCodeMessagesRead::Success,
+        };
+        let json = serde_json::to_value(&observation).unwrap();
+        assert_eq!(json["messagesRead"], "success");
+        assert!(json.get("message").is_none());
+        assert_eq!(
+            serde_json::from_value::<OpenCodeAdoptionObservation>(json).unwrap(),
+            observation
+        );
+
+        let empty: OpenCodeVerifiedRootTail = serde_json::from_value(serde_json::json!({
+            "state": "qualified_empty"
+        }))
+        .unwrap();
+        assert_eq!(empty, OpenCodeVerifiedRootTail::QualifiedEmpty);
     }
 
     #[test]
@@ -1425,6 +2050,76 @@ mod provider_launch_context_tests {
                 "gpt-5.6-luna"
             ]
         );
+    }
+
+    #[test]
+    fn managed_claude_fork_requires_one_exact_root_selector() {
+        let root = "112fa138-8ed5-4f98-8977-4444e8433207";
+        let args = vec!["--resume".into(), root.into(), "--fork-session".into()];
+        assert!(validate_managed_terminal_args("claude", &args).is_ok());
+        assert!(durable_managed_terminal_args("claude", args, None).is_ok());
+        assert!(validate_managed_terminal_args(
+            "claude",
+            &["--session-id".into(), root.into(), "--fork-session".into()]
+        )
+        .is_ok());
+        for invalid in [
+            vec!["--fork-session".into()],
+            vec![
+                "--session-id".into(),
+                root.into(),
+                "--resume".into(),
+                root.into(),
+                "--fork-session".into(),
+            ],
+            vec!["--model".into(), "--resume".into(), "--fork-session".into()],
+            vec![
+                "--resume".into(),
+                root.into(),
+                "--fork-session".into(),
+                "true".into(),
+            ],
+            vec![
+                "--resume".into(),
+                "bad\nroot".into(),
+                "--fork-session".into(),
+            ],
+        ] {
+            assert!(validate_managed_terminal_args("claude", &invalid).is_err());
+        }
+        assert!(validate_managed_terminal_args("codex", &["--fork-session".into()]).is_err());
+    }
+
+    #[test]
+    fn managed_codex_pinned_update_setting_survives_durable_resume_without_expanding_overrides() {
+        let args = vec![
+            "--model".into(),
+            "gpt-5.6-luna".into(),
+            "-c".into(),
+            "model_reasoning_effort=\"low\"".into(),
+            "-c".into(),
+            "check_for_update_on_startup=false".into(),
+            "resume".into(),
+            "thread-current".into(),
+        ];
+        validate_managed_terminal_args("codex", &args).unwrap();
+        let durable = durable_managed_terminal_args("codex", args, None).unwrap();
+        validate_managed_terminal_args("codex", &durable).unwrap();
+        for value in [
+            "check_for_update_on_startup=true",
+            "check_for_update_on_startup=false\napi_key=secret",
+            "check_for_update_on_startup=\"false\"",
+            "check_for_update_on_startup=false;token=secret",
+        ] {
+            assert!(validate_managed_terminal_args("codex", &["-c".into(), value.into()]).is_err());
+        }
+        for provider in ["claude", "opencode", "amplifier"] {
+            assert!(validate_managed_terminal_args(
+                provider,
+                &["-c".into(), "check_for_update_on_startup=false".into()]
+            )
+            .is_err());
+        }
     }
 
     #[test]
@@ -1617,6 +2312,7 @@ mod provider_launch_context_tests {
                 vec![
                     ProviderSecretProfile::ClaudeOnecliEnvironment,
                     ProviderSecretProfile::ClaudeOnecliAuthFile,
+                    ProviderSecretProfile::ClaudeOnecliCaFile,
                 ],
             ),
             (
@@ -1624,6 +2320,7 @@ mod provider_launch_context_tests {
                 vec![
                     ProviderSecretProfile::CodexOnecliEnvironment,
                     ProviderSecretProfile::CodexOnecliAuthFile,
+                    ProviderSecretProfile::CodexOnecliCaFile,
                 ],
             ),
             (
@@ -1639,6 +2336,7 @@ mod provider_launch_context_tests {
                 vec![
                     ProviderSecretProfile::AmplifierOnecliEnvironment,
                     ProviderSecretProfile::AmplifierOnecliKeysFile,
+                    ProviderSecretProfile::AmplifierOnecliCaFile,
                 ],
             ),
         ] {
@@ -1732,9 +2430,13 @@ mod double_optional {
 }
 
 impl FreshProvider {
+    pub fn native_provider(&self) -> &'static str {
+        self.native_family()
+    }
+
     /// Native input recipes are shared by the two existing Claude flavors.
     /// Runtime identities and reservation owners still use `as_str()`.
-    pub fn native_provider(&self) -> &'static str {
+    pub fn native_family(&self) -> &'static str {
         match self {
             Self::Kilroy => "claude",
             _ => self.as_str(),
@@ -2006,6 +2708,19 @@ pub struct TerminalLaunchSpec {
     pub provider_secret_references: Vec<ProviderSecretReference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_launch_context: Option<ProviderLaunchContext>,
+    /// Bounded metadata binding one exact native-history transfer to this
+    /// OpenCode terminal. The bundle bytes are never embedded here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_transfer: Option<OpenCodeTransferDescriptor>,
+    /// Attempt token for the finalized stage's pending ownership claim. The
+    /// supervisor consumes it atomically with durable launch preparation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_transfer_attempt_id: Option<String>,
+    /// A verified native root-history snapshot that the fresh OpenCode TUI
+    /// must observe before this terminal accepts input. Absent on legacy and
+    /// unmanaged OpenCode launches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_adoption: Option<OpenCodeAdoptionExpectation>,
 }
 
 impl TerminalLaunchSpec {
@@ -2025,6 +2740,37 @@ impl TerminalLaunchSpec {
                 RuntimeErrorCode::InvalidRequest,
                 "managed terminal launch has an empty/root-uid required field",
             ));
+        }
+        if let Some(transfer) = &self.opencode_transfer {
+            transfer.validate()?;
+            if self.mode != "opencode"
+                || self.resume_session_id.as_deref() != Some(transfer.root_session_id.as_str())
+                || !self
+                    .opencode_transfer_attempt_id
+                    .as_deref()
+                    .is_some_and(valid_opencode_transfer_attempt_id)
+            {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::RecoveryWrongIdentity,
+                    "OpenCode transfer must match the resumed native session and a valid staging attempt",
+                ));
+            }
+        } else if self.opencode_transfer_attempt_id.is_some() {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "OpenCode staging attempt has no transfer descriptor",
+            ));
+        }
+        if let Some(adoption) = &self.opencode_adoption {
+            adoption.validate()?;
+            if self.mode != "opencode"
+                || self.resume_session_id.as_deref() != Some(adoption.root_session_id.as_str())
+            {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::RecoveryWrongIdentity,
+                    "OpenCode adoption expectation does not match the resumed root session",
+                ));
+            }
         }
         if self.env.len() > 512 || self.args.len() > 512 || self.provider_bootstrap_files.len() > 16
         {
@@ -2159,9 +2905,16 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
         )
     };
     let mut index = 0;
+    let mut claude_fork = false;
+    let mut claude_root_selectors = 0;
     while index < args.len() {
         let flag = args[index].as_str();
         if mode == "claude" && flag == "--init-only" {
+            index += 1;
+            continue;
+        }
+        if mode == "claude" && flag == "--fork-session" {
+            claude_fork = true;
             index += 1;
             continue;
         }
@@ -2193,12 +2946,17 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
                 value == freshell_platform::claude_inputs::MANAGED_SETTINGS_ARGUMENT
                     || freshell_platform::cli_launch::is_owned_claude_settings(value)
                     || APPROVED_CLAUDE_SETTINGS_DIGESTS.contains(&digest.as_str())
+                    || [freshell_platform::cli_launch::ProviderTarget::Unix, freshell_platform::cli_launch::ProviderTarget::Windows].into_iter().any(|target| value == &freshell_platform::cli_launch::claude_settings_json(target))
+                    || value == &freshell_platform::cli_launch::claude_managed_settings_json()
             }
             ("claude", "--mcp-config") => matches!(
                 value.as_str(),
                 ".claude/freshell-mcp.json" | "/home/freshell/provider/.claude/freshell-mcp.json"
             ),
-            ("claude", "--session-id" | "--resume") => safe_selector(value),
+            ("claude", "--session-id" | "--resume") => {
+                claude_root_selectors += 1;
+                safe_selector(value)
+            }
             ("claude", "--model" | "--effort" | "--permission-mode") => safe_selector(value),
             ("claude", "--plugin-dir") => safe_selector(value),
             ("claude", "--setting-sources") => freshell_platform::claude_inputs::parse_setting_sources(value).is_ok(),
@@ -2206,6 +2964,7 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
                 matches!(
                     value.as_str(),
                     "tui.notification_method=bel"
+                        | "check_for_update_on_startup=false"
                         | "tui.notifications=['agent-turn-complete']"
                         | "features.apps=false"
                         | "mcp_servers.freshell.command=\"node\""
@@ -2231,6 +2990,9 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
             return Err(invalid());
         }
         index += 2;
+    }
+    if claude_fork && claude_root_selectors != 1 {
+        return Err(invalid());
     }
     Ok(())
 }
@@ -2453,6 +3215,13 @@ pub struct RuntimeOutputBatch {
     pub native_session_id: Option<String>,
     #[serde(default)]
     pub frames: Vec<RuntimeOutputFrame>,
+    /// Native activity metadata from the private OpenCode endpoint. Raw
+    /// provider events and HTTP bodies never cross this control boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_activity: Option<freshell_activity::opencode::OpencodeActivityBatch>,
+    /// Native Codex turn metadata from the host-owned app-server proxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_activity: Option<freshell_activity::codex::CodexActivityBatch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2558,6 +3327,8 @@ pub struct FreshAgentForkRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentForkResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_fork: Option<ClaudeForkRecipe>,
     pub parent_session_id: String,
     pub child_session_id: String,
     pub parent_retired_by_runtime: bool,
@@ -2644,6 +3415,10 @@ pub struct RuntimeMetricsRequest {
 pub struct RuntimeError {
     pub code: RuntimeErrorCode,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic_code: Option<RuntimeDiagnosticCode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_agent_provider_start_diagnostic: Option<FreshAgentProviderStartDiagnostic>,
 }
 
 impl RuntimeError {
@@ -2651,7 +3426,22 @@ impl RuntimeError {
         Self {
             code,
             message: message.into(),
+            diagnostic_code: None,
+            fresh_agent_provider_start_diagnostic: None,
         }
+    }
+
+    pub fn with_diagnostic_code(mut self, diagnostic_code: RuntimeDiagnosticCode) -> Self {
+        self.diagnostic_code = Some(diagnostic_code);
+        self
+    }
+
+    pub fn with_fresh_agent_provider_start_diagnostic(
+        mut self,
+        diagnostic: FreshAgentProviderStartDiagnostic,
+    ) -> Self {
+        self.fresh_agent_provider_start_diagnostic = Some(diagnostic);
+        self
     }
 }
 
@@ -2683,6 +3473,658 @@ impl<T> Envelope<T> {
             auth: None,
             body,
         }
+    }
+}
+
+/// Immutable source and destination binding for one OpenCode history import.
+/// It contains bounded metadata only; payload and asset bytes use the dedicated
+/// chunk commands below.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeTransferDescriptor {
+    pub transfer_id: String,
+    pub provider: String,
+    pub source_store_id: String,
+    pub root_session_id: String,
+    pub source_generation: String,
+    pub provider_schema: String,
+    pub source_schema_fingerprint: String,
+    pub migration_journal_fingerprint: String,
+    pub destination_store_id: String,
+    pub destination_database_path: String,
+    pub target_image_ref: String,
+    pub target_build_receipt: String,
+    pub incarnation_id: String,
+    /// Serialized Task 1 manifest. It contains per-row digests and asset
+    /// metadata, never message or prompt bodies.
+    pub manifest_json: String,
+    pub files: Vec<OpenCodeTransferFile>,
+    pub total_bytes: u64,
+    /// SHA-256 over the manifest and ordered file metadata. Per-file SHA-256
+    /// values bind every transmitted byte.
+    pub bundle_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeTransferFile {
+    pub index: u32,
+    pub relative_path: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeTransferChunk {
+    pub transfer_id: String,
+    /// Opaque fencing token for the Begin/resume attempt that owns this
+    /// partial stage. A later Begin for the stable transfer ID supersedes it.
+    pub attempt_id: String,
+    pub sequence: u64,
+    pub file_index: u32,
+    pub offset: u64,
+    #[serde(with = "base64_bytes")]
+    pub data: Vec<u8>,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", content = "data", rename_all = "snake_case")]
+pub enum OpenCodeTransferAction {
+    TargetInfo,
+    Begin {
+        descriptor: Box<OpenCodeTransferDescriptor>,
+        attempt_id: String,
+    },
+    WaitForCapacity {
+        transfer_id: String,
+        attempt_id: String,
+    },
+    Chunk(OpenCodeTransferChunk),
+    Finalize {
+        transfer_id: String,
+        attempt_id: String,
+    },
+    Abort {
+        transfer_id: String,
+        attempt_id: String,
+    },
+}
+
+/// Attempt tokens use UUID's simple 32-character lowercase hexadecimal form.
+/// Keeping the wire form opaque avoids making attempt identity part of the
+/// durable transfer descriptor or its readiness receipt.
+pub fn valid_opencode_transfer_attempt_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_opencode_session_id(value: &str) -> bool {
+    value
+        .strip_prefix("ses_")
+        .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "data", rename_all = "snake_case")]
+pub enum OpenCodeTransferResult {
+    TargetInfo {
+        image_ref: String,
+        provider_schema: String,
+        build_receipt: String,
+    },
+    Started {
+        next_sequence: u64,
+        file_offsets: Vec<OpenCodeTransferFileOffset>,
+    },
+    ChunkStored {
+        sequence: u64,
+    },
+    Queued {
+        transfer_id: String,
+    },
+    Ready {
+        transfer_id: String,
+    },
+    Aborted {
+        transfer_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeTransferFileOffset {
+    pub file_index: u32,
+    pub next_offset: u64,
+}
+
+/// Body-free acknowledgement that the session host revalidated the durable
+/// structural import and provider-identity reader receipts before consuming
+/// an execution grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeTransferReadinessReceipt {
+    pub transfer_id: String,
+    pub destination_store_id: String,
+    pub root_session_id: String,
+    pub source_generation: String,
+    pub provider_uid: u32,
+    pub provider_gid: u32,
+    pub structural_sha256: String,
+    pub reader_receipt_sha256: String,
+}
+
+/// Exact verified root-history state that a resumed managed OpenCode TUI must
+/// load before the session host will release user input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "data", rename_all = "snake_case")]
+pub enum OpenCodeVerifiedRootTail {
+    Message {
+        message_id: String,
+    },
+    /// This variant may be produced only after a successful native read has
+    /// confirmed the root session has no messages.
+    QualifiedEmpty,
+}
+
+/// Passive import metadata used to verify later store evolutions. It carries
+/// no bundle bytes and never authorizes running the importer on resume.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeAdoptionBaseline {
+    pub descriptor: OpenCodeTransferDescriptor,
+    pub manifest_sha256: String,
+}
+
+/// Identity selected by the current native provider loader, never by argv or
+/// an old transcript. The digest covers body-free producer evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeIdentitySource {
+    CodexAppServer,
+    OpencodeTui,
+    ClaudeNativeEvent,
+    /// The same CLI selected a new session through its native /clear command.
+    ClaudeNativeClear,
+    AmplifierNativeLoadedContext,
+    FreshProviderHandshake,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeIdentityObservation {
+    pub native_session_id: String,
+    pub incarnation_id: IncarnationId,
+    pub launch_nonce: String,
+    pub evidence_revision: u64,
+    pub source: NativeIdentitySource,
+    pub evidence_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeIdentityLaunch {
+    pub incarnation_id: IncarnationId,
+    pub launch_nonce: String,
+    pub evidence_revision: u64,
+    pub execution_generation: u64,
+    pub requested_native_session_id: Option<String>,
+}
+
+impl NativeIdentityObservation {
+    pub fn matches_provider(&self, provider: &str, fresh_agent: bool) -> bool {
+        if fresh_agent {
+            return matches!(provider, "claude" | "kilroy" | "codex" | "opencode")
+                && (self.source == NativeIdentitySource::FreshProviderHandshake
+                    || (matches!(provider, "claude" | "kilroy")
+                        && self.source == NativeIdentitySource::ClaudeNativeClear));
+        }
+        matches!(
+            (provider, &self.source),
+            ("claude", NativeIdentitySource::ClaudeNativeEvent)
+                | ("claude", NativeIdentitySource::ClaudeNativeClear)
+                | ("codex", NativeIdentitySource::CodexAppServer)
+                | ("opencode", NativeIdentitySource::OpencodeTui)
+                | (
+                    "amplifier",
+                    NativeIdentitySource::AmplifierNativeLoadedContext
+                )
+        )
+    }
+
+    pub fn matches_launch(&self, launch: &NativeIdentityLaunch) -> bool {
+        !self.native_session_id.is_empty()
+            && !self.native_session_id.chars().any(char::is_control)
+            && self.incarnation_id == launch.incarnation_id
+            && !self.launch_nonce.is_empty()
+            && self.launch_nonce == launch.launch_nonce
+            && self.evidence_revision == launch.evidence_revision
+            // A native clear replaces the root within this same launched CLI.
+            // Other loader observations must still acknowledge the requested root.
+            && (self.source == NativeIdentitySource::ClaudeNativeClear
+                || launch
+                    .requested_native_session_id
+                    .as_deref()
+                    .is_none_or(|root| root == self.native_session_id))
+            && self.evidence_digest.len() == 64
+            && self
+                .evidence_digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+}
+
+impl OpenCodeAdoptionBaseline {
+    pub fn from_descriptor(descriptor: OpenCodeTransferDescriptor) -> Result<Self, RuntimeError> {
+        let baseline = Self {
+            manifest_sha256: sha256_hex(descriptor.manifest_json.as_bytes()),
+            descriptor,
+        };
+        baseline.validate()?;
+        Ok(baseline)
+    }
+
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        self.descriptor.validate()?;
+        if !is_lower_hex_64(&self.manifest_sha256)
+            || sha256_hex(self.descriptor.manifest_json.as_bytes()) != self.manifest_sha256
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "OpenCode adoption baseline manifest digest is invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Per-launch evidence required to open a managed OpenCode terminal's input
+/// gate. `launch_nonce` makes observations from older launches inert even
+/// when terminal and native session ids are reused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeAdoptionExpectation {
+    pub baseline: OpenCodeAdoptionBaseline,
+    pub root_session_id: String,
+    pub root_tail: OpenCodeVerifiedRootTail,
+    pub evidence_generation: String,
+    pub incarnation_id: IncarnationId,
+    pub launch_nonce: String,
+}
+
+impl OpenCodeAdoptionExpectation {
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        self.baseline.validate()?;
+        let tail_is_valid = match &self.root_tail {
+            OpenCodeVerifiedRootTail::Message { message_id } => {
+                !message_id.is_empty() && message_id.len() <= 256
+            }
+            OpenCodeVerifiedRootTail::QualifiedEmpty => true,
+        };
+        if !valid_opencode_session_id(&self.root_session_id)
+            || self.baseline.descriptor.root_session_id != self.root_session_id
+            || !tail_is_valid
+            || !is_lower_hex_64(&self.evidence_generation)
+            || !valid_opencode_transfer_attempt_id(&self.launch_nonce)
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "OpenCode adoption expectation is invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Result of the plugin's fresh, hydrated TUI read of the active root
+/// session's native messages. A failed read and a successful empty read are
+/// distinct protocol states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenCodeMessagesRead {
+    Success,
+    EmptyConfirmed,
+    Failed,
+}
+
+/// Body-free observation written by the OpenCode TUI plugin for one exact
+/// terminal launch. It is not adoption evidence until the session host checks
+/// every field against its launch expectation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OpenCodeAdoptionObservation {
+    #[serde(alias = "terminal_id")]
+    pub terminal_id: String,
+    #[serde(alias = "root_session_id")]
+    pub root_session_id: String,
+    #[serde(alias = "tail_message_id")]
+    pub tail_message_id: Option<String>,
+    #[serde(alias = "evidence_generation")]
+    pub evidence_generation: String,
+    #[serde(alias = "incarnation_id")]
+    pub incarnation_id: IncarnationId,
+    #[serde(alias = "launch_nonce")]
+    pub launch_nonce: String,
+    pub hydrated: bool,
+    #[serde(alias = "messages_read")]
+    pub messages_read: OpenCodeMessagesRead,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "state", content = "data", rename_all = "snake_case")]
+pub enum OpenCodeAdoptionStatus {
+    #[default]
+    NotRequired,
+    AwaitingObservation,
+    Observed {
+        observation: OpenCodeAdoptionObservation,
+    },
+}
+
+impl OpenCodeTransferReadinessReceipt {
+    pub fn matches_descriptor(&self, descriptor: &OpenCodeTransferDescriptor) -> bool {
+        self.transfer_id == descriptor.transfer_id
+            && self.destination_store_id == descriptor.destination_store_id
+            && self.root_session_id == descriptor.root_session_id
+            && self.source_generation == descriptor.source_generation
+            && is_lower_hex_64(&self.structural_sha256)
+            && is_lower_hex_64(&self.reader_receipt_sha256)
+    }
+}
+
+impl OpenCodeTransferDescriptor {
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        let invalid = || {
+            RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "OpenCode transfer descriptor is invalid or exceeds its bounds",
+            )
+        };
+        if self.transfer_id.is_empty()
+            || self.transfer_id.len() > 128
+            || !self
+                .transfer_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            || self.provider != "opencode"
+            || !is_lower_hex_64(&self.source_store_id)
+            || self.root_session_id.is_empty()
+            || self.root_session_id.len() > 256
+            || self.source_generation.len() != 64
+            || self.provider_schema != "opencode-1.18.21"
+            || self.source_schema_fingerprint.len() != 64
+            || self.migration_journal_fingerprint.len() != 64
+            || self.destination_store_id.is_empty()
+            || self.destination_database_path != OPENCODE_TRANSFER_DESTINATION_DB
+            || !self.target_image_ref.starts_with("sha256:")
+            || self.target_image_ref.len() != "sha256:".len() + 64
+            || self.target_build_receipt.len() != 64
+            || self.incarnation_id.is_empty()
+            || self.manifest_json.len() > MAX_OPENCODE_TRANSFER_MANIFEST_BYTES
+            || self.files.is_empty()
+            || self.files.len() > MAX_OPENCODE_TRANSFER_FILES
+            || self.total_bytes == 0
+            || self.total_bytes > MAX_OPENCODE_TRANSFER_BUNDLE_BYTES
+            || !is_lower_hex_64(&self.source_generation)
+            || !is_lower_hex_64(&self.source_schema_fingerprint)
+            || !is_lower_hex_64(&self.migration_journal_fingerprint)
+            || !is_lower_hex_64(&self.target_build_receipt)
+            || !is_lower_hex_64(&self.bundle_sha256)
+            || !is_lower_hex_64(&self.target_image_ref["sha256:".len()..])
+            || self.target_build_receipt
+                != opencode_target_build_receipt(&self.target_image_ref, &self.provider_schema)
+        {
+            return Err(invalid());
+        }
+        IncarnationId::parse(self.incarnation_id.clone()).map_err(|_| invalid())?;
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&self.manifest_json).map_err(|_| invalid())?;
+        if manifest
+            .get("root_session_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(self.root_session_id.as_str())
+            || manifest
+                .get("source_store_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(self.source_store_id.as_str())
+            || manifest
+                .get("generation")
+                .and_then(serde_json::Value::as_str)
+                != Some(self.source_generation.as_str())
+            || manifest
+                .get("provider_schema")
+                .and_then(serde_json::Value::as_str)
+                != Some(self.provider_schema.as_str())
+            || manifest
+                .get("source_schema_fingerprint")
+                .and_then(serde_json::Value::as_str)
+                != Some(self.source_schema_fingerprint.as_str())
+            || manifest
+                .get("migration_journal_fingerprint")
+                .and_then(serde_json::Value::as_str)
+                != Some(self.migration_journal_fingerprint.as_str())
+            || !matches!(
+                manifest.get("version").and_then(serde_json::Value::as_u64),
+                Some(1 | 2)
+            )
+            || manifest
+                .get("payload_bytes")
+                .and_then(serde_json::Value::as_u64)
+                != self.files.first().map(|file| file.size_bytes)
+            || manifest
+                .get("payload_sha256")
+                .and_then(serde_json::Value::as_str)
+                != self.files.first().map(|file| file.sha256.as_str())
+        {
+            return Err(invalid());
+        }
+
+        // New transfers put variable row/asset/snapshot metadata in the
+        // existing checksummed bulk stream. Control messages stay bounded as
+        // a conversation grows. Legacy descriptors retain their old arrays.
+        let assets: &[serde_json::Value] = if manifest["version"] == 1 {
+            manifest
+                .get("assets")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(invalid)?
+        } else {
+            let summary = &manifest["saved_snapshot_summary"];
+            let valid_summary = match summary["status"].as_str() {
+                Some("legacy_unqualified") => true,
+                Some("qualified_references") => {
+                    summary["retained_closure_count"].as_u64().is_some()
+                        && summary["unavailable_reference_count"].as_u64().is_some()
+                }
+                _ => false,
+            };
+            if manifest["row_count"].as_u64().is_none()
+                || manifest["asset_count"].as_u64().is_none()
+                || !valid_summary
+                || self.files.len() != 1
+            {
+                return Err(invalid());
+            }
+            &[]
+        };
+        let mut seen_indices = std::collections::BTreeSet::new();
+        let mut seen_paths = std::collections::BTreeSet::new();
+        let mut asset_metadata = std::collections::BTreeSet::new();
+        let mut total = 0_u64;
+        for (position, file) in self.files.iter().enumerate() {
+            let path = std::path::Path::new(&file.relative_path);
+            if file.index as usize != position
+                || !seen_indices.insert(file.index)
+                || !seen_paths.insert(file.relative_path.as_str())
+                || file.relative_path.is_empty()
+                || path.is_absolute()
+                || path
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+                || file.size_bytes == 0
+                || !is_lower_hex_64(&file.sha256)
+            {
+                return Err(invalid());
+            }
+            total = total.checked_add(file.size_bytes).ok_or_else(invalid)?;
+        }
+        for asset in assets {
+            let kind = asset
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(invalid)?;
+            let path = asset
+                .get("target_relative_path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(invalid)?;
+            let size = asset
+                .get("size_bytes")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(invalid)?;
+            let sha256 = asset
+                .get("sha256")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(invalid)?;
+            let relative = std::path::Path::new(path);
+            let empty_workspace_reference =
+                kind == "workspace_path_reference" && sha256 == sha256_hex(&[]);
+            if kind.is_empty()
+                || path.is_empty()
+                || relative.is_absolute()
+                || relative
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+                || (size == 0 && !empty_workspace_reference)
+                || !is_lower_hex_64(sha256)
+                || !asset_metadata.insert((path.to_string(), size, sha256.to_string()))
+            {
+                return Err(invalid());
+            }
+        }
+        if self.files.iter().skip(1).any(|file| {
+            !asset_metadata.contains(&(
+                file.relative_path.clone(),
+                file.size_bytes,
+                file.sha256.clone(),
+            ))
+        }) {
+            return Err(invalid());
+        }
+        if self.files[0].index != 0
+            || self.files[0].relative_path != "payload.json"
+            || total != self.total_bytes
+            || self.bundle_sha256
+                != opencode_transfer_bundle_digest(&self.manifest_json, &self.files)
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
+    pub fn validate_launch_binding(
+        &self,
+        provider: &str,
+        root_session_id: &str,
+        destination_store_id: &str,
+        incarnation_id: &str,
+        image_ref: &str,
+    ) -> Result<(), RuntimeError> {
+        self.validate()?;
+        if provider != self.provider
+            || root_session_id != self.root_session_id
+            || destination_store_id != self.destination_store_id
+            || incarnation_id != self.incarnation_id
+            || image_ref != self.target_image_ref
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::RecoveryWrongIdentity,
+                "OpenCode transfer does not match the launch identity or target image",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl OpenCodeTransferChunk {
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        if self.transfer_id.is_empty()
+            || self.transfer_id.len() > 128
+            || !valid_opencode_transfer_attempt_id(&self.attempt_id)
+            || self.data.is_empty()
+            || self.data.len() > MAX_OPENCODE_TRANSFER_CHUNK_BYTES
+            || !is_lower_hex_64(&self.sha256)
+            || self.sha256 != sha256_hex(&self.data)
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "OpenCode transfer chunk is invalid or exceeds 256 KiB",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn opencode_transfer_bundle_digest(
+    manifest_json: &str,
+    files: &[OpenCodeTransferFile],
+) -> String {
+    let mut files = files.to_vec();
+    files.sort_by_key(|file| file.index);
+    let mut hasher = Sha256::new();
+    hasher.update(b"freshell-opencode-transfer-v1\0");
+    hasher.update(manifest_json.as_bytes());
+    hasher.update([0]);
+    for file in files {
+        hasher.update(file.index.to_be_bytes());
+        hasher.update(file.relative_path.as_bytes());
+        hasher.update([0]);
+        hasher.update(file.size_bytes.to_be_bytes());
+        hasher.update(file.sha256.as_bytes());
+        hasher.update([0]);
+    }
+    hex::encode(hasher.finalize())
+}
+
+pub fn opencode_target_build_receipt(image_ref: &str, provider_schema: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"freshell-opencode-import-build-v1\0");
+    hasher.update(image_ref.as_bytes());
+    hasher.update([0]);
+    hasher.update(provider_schema.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn is_lower_hex_64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+mod base64_bytes {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        STANDARD.decode(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -2720,7 +4162,33 @@ impl LaunchRequest {
     pub fn validate_workload(&self) -> Result<(), RuntimeError> {
         match (&self.fixture, &self.terminal, &self.fresh_agent) {
             (Some(_), None, None) => Ok(()),
-            (None, Some(terminal), None) => terminal.validate(),
+            (None, Some(terminal), None) => {
+                terminal.validate()?;
+                if let Some(transfer) = &terminal.opencode_transfer {
+                    if self.provider != "opencode"
+                        || self.provider_store_id != transfer.destination_store_id
+                        || self.native_session_id.as_deref()
+                            != Some(transfer.root_session_id.as_str())
+                    {
+                        return Err(RuntimeError::new(
+                            RuntimeErrorCode::RecoveryWrongIdentity,
+                            "OpenCode transfer does not match the launch provider store or native session",
+                        ));
+                    }
+                }
+                if let Some(adoption) = &terminal.opencode_adoption {
+                    if self.provider != "opencode"
+                        || self.native_session_id.as_deref()
+                            != Some(adoption.root_session_id.as_str())
+                    {
+                        return Err(RuntimeError::new(
+                            RuntimeErrorCode::RecoveryWrongIdentity,
+                            "OpenCode adoption expectation does not match the launch provider or native root",
+                        ));
+                    }
+                }
+                Ok(())
+            }
             (None, None, Some(agent)) => {
                 agent.validate()?;
                 if self.provider != agent.provider.as_str()
@@ -2874,6 +4342,10 @@ pub enum AdminCommand {
     ObserveClaudeSources(Box<ObserveClaudeSourcesRequest>),
     BindProviderPathInputs(BindProviderPathInputsRequest),
     Launch(Box<LaunchRequest>),
+    /// Dedicated authenticated, bounded OpenCode-history transfer channel.
+    /// These chunk commands are never embedded in launch or host-control
+    /// frames; launch carries only the immutable descriptor.
+    OpenCodeTransfer(OpenCodeTransferAction),
     Stop(StopRequest),
     Inventory,
     InventorySnapshot,
@@ -2886,6 +4358,8 @@ pub enum AdminCommand {
     PendingNotices(PendingNoticesRequest),
     NoticeReceipt(NoticeReceiptRequest),
     IncidentSummary(IncidentSummaryRequest),
+    PreflightLostSouls(PreflightLostSoulsRequest),
+    RestoreLostSouls(RestoreLostSoulsRequest),
     MetricsSnapshot,
     MigrationPlan(MigrationPlanRequest),
     RepairAudit(RepairRequest),
@@ -2899,6 +4373,7 @@ pub enum AdminCommand {
     FreshAgentRollback(FreshAgentRollbackRequest),
     FreshAgentCapture(FreshAgentCaptureRequest),
     FreshAgentResolve(FreshAgentResolveRequest),
+    FreshAgentPrepareNative(FreshAgentInterruptRequest),
     FreshAgentInterrupt(FreshAgentInterruptRequest),
     FreshAgentReadEvents(FreshAgentReadEventsRequest),
     FreshAgentReadHistory(FreshAgentReadHistoryRequest),
@@ -3266,6 +4741,8 @@ impl fmt::Debug for NativeAuthValues {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_identity_observation: Option<NativeIdentityObservation>,
     pub soul_id: SoulId,
     pub incarnation_id: IncarnationId,
     pub launch_state: LaunchState,
@@ -3386,6 +4863,7 @@ pub enum AdminResult {
         installation_id: InstallationId,
     },
     Launch(LaunchResult),
+    OpenCodeTransfer(OpenCodeTransferResult),
     Stop {
         outcome: StopOutcome,
         view: RuntimeView,
@@ -3400,6 +4878,8 @@ pub enum AdminResult {
     PendingNotices(Vec<RuntimeNotice>),
     NoticeReceiptRecorded,
     IncidentSummary(LossIncidentSummary),
+    PreflightLostSouls(RepairBatchScope),
+    RestoreLostSouls(RestoreLostSoulsResult),
     MetricsSnapshot(RuntimeMetricsSnapshot),
     MigrationPlan(MigrationPlan),
     RepairAudit(RepairAudit),
@@ -3460,6 +4940,8 @@ pub enum HostCommand {
         /// Absent means the host applies no bound of its own.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         dispatch_budget_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_identity_launch: Option<NativeIdentityLaunch>,
     },
     Stop {
         incarnation_id: IncarnationId,
@@ -3488,6 +4970,12 @@ pub enum HostCommand {
         max_bytes: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expected_stream_epoch: Option<String>,
+    },
+    FreshAgentPrepareNative {
+        incarnation_id: IncarnationId,
+    },
+    FreshAgentResumePending {
+        incarnation_id: IncarnationId,
     },
     FreshAgentSend {
         incarnation_id: IncarnationId,
@@ -3578,6 +5066,14 @@ pub enum HostResult {
         fixture_evidence: serde_json::Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         native_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_identity_observation: Option<NativeIdentityObservation>,
+        /// Present only when an OpenCode transfer's durable provider-reader
+        /// receipt was revalidated before this grant was consumed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        opencode_transfer_receipt: Option<OpenCodeTransferReadinessReceipt>,
+        #[serde(default)]
+        opencode_adoption: OpenCodeAdoptionStatus,
     },
     Stopped,
     SecurityProbe(serde_json::Value),
@@ -3588,6 +5084,8 @@ pub enum HostResult {
     TerminalOutput(RuntimeOutputBatch),
     FreshAgentCommand {
         state: CommandState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_fork: Option<ClaudeForkRecipe>,
         /// Provider identity observed and durably recorded by the host actor
         /// at the same acceptance boundary as this acknowledgement.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3611,6 +5109,15 @@ pub enum HostResult {
         exited: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         native_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_identity_observation: Option<NativeIdentityObservation>,
+        /// Persisted post-import and provider-reader receipt. Recovery uses it
+        /// to finish the supervisor's release marker after a crash between
+        /// grant acknowledgement and marker persistence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        opencode_transfer_receipt: Option<OpenCodeTransferReadinessReceipt>,
+        #[serde(default)]
+        opencode_adoption: OpenCodeAdoptionStatus,
     },
     RecoveryProbe(RecoveryProbe),
 }
@@ -3880,6 +5387,80 @@ mod tests {
     }
 
     #[test]
+    fn runtime_errors_keep_optional_body_free_diagnostic_codes_compatible() {
+        let error = RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            "private detail must remain outside lifecycle diagnostics",
+        )
+        .with_diagnostic_code(RuntimeDiagnosticCode::ProviderStatePrepareFailed);
+        let encoded = serde_json::to_value(&error).unwrap();
+        assert_eq!(encoded["diagnosticCode"], "PROVIDER_STATE_PREPARE_FAILED");
+
+        let provider_start = RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            "hosted fresh-agent provider failed to start (startup diagnostic: authentication)",
+        )
+        .with_diagnostic_code(RuntimeDiagnosticCode::FreshAgentProviderStartFailed)
+        .with_fresh_agent_provider_start_diagnostic(
+            FreshAgentProviderStartDiagnostic::Authentication,
+        );
+        let encoded_provider_start = serde_json::to_value(provider_start).unwrap();
+        assert_eq!(
+            encoded_provider_start["diagnosticCode"],
+            "FRESH_AGENT_PROVIDER_START_FAILED"
+        );
+        assert_eq!(
+            encoded_provider_start["freshAgentProviderStartDiagnostic"],
+            "authentication"
+        );
+
+        let old_payload = serde_json::json!({
+            "code": "HOST_UNREACHABLE",
+            "message": "legacy host error",
+        });
+        let decoded: RuntimeError = serde_json::from_value(old_payload).unwrap();
+        assert_eq!(decoded.diagnostic_code, None);
+        assert_eq!(decoded.fresh_agent_provider_start_diagnostic, None);
+
+        let undecorated = serde_json::to_value(RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            "legacy host error",
+        ))
+        .unwrap();
+        assert!(undecorated.get("diagnosticCode").is_none());
+        assert!(undecorated
+            .get("freshAgentProviderStartDiagnostic")
+            .is_none());
+    }
+
+    #[test]
+    fn codex_prepare_diagnostics_have_stable_body_free_wire_codes() {
+        let cases = [
+            (
+                RuntimeDiagnosticCode::CodexConfigPlanningFailed,
+                "CODEX_CONFIG_PLANNING_FAILED",
+            ),
+            (
+                RuntimeDiagnosticCode::CodexAppServerStartFailed,
+                "CODEX_APP_SERVER_START_FAILED",
+            ),
+            (
+                RuntimeDiagnosticCode::CodexProxyStartFailed,
+                "CODEX_PROXY_START_FAILED",
+            ),
+        ];
+
+        for (diagnostic_code, wire_code) in cases {
+            let encoded = serde_json::to_value(diagnostic_code).unwrap();
+            assert_eq!(encoded, wire_code);
+            assert_eq!(
+                serde_json::from_value::<RuntimeDiagnosticCode>(encoded).unwrap(),
+                diagnostic_code
+            );
+        }
+    }
+
+    #[test]
     fn durable_terminal_argument_recipe_preserves_provider_options_and_legacy_modes() {
         for (provider, args) in [
             (
@@ -4095,6 +5676,126 @@ mod tests {
     }
 
     #[test]
+    fn stopped_repair_exact_batch_nine() {
+        let members = (0..9)
+            .map(|index| RepairBatchTarget {
+                target: LostSoulRepairTarget {
+                    soul_id: SoulId::parse(format!("soul-fixture-{index}")).unwrap(),
+                    incident_id: IncidentId::parse(format!("incident-fixture-{index}")).unwrap(),
+                    expected_intent_revision: 2,
+                },
+                root_session_id: format!("ses_fixture_root_{}", index % 7),
+                provider_store_id: format!("store-fixture-{index}"),
+                incident_revision: 1,
+                identity_revision: 0,
+                native_import_revision: 0,
+                evidence_revision: 0,
+            })
+            .collect::<Vec<_>>();
+        let mut scope = RepairBatchScope {
+            scope_id: String::new(),
+            source_store_id: "a".repeat(64),
+            source_fingerprint: "b".repeat(64),
+            targets: members,
+            roots: (0..7)
+                .map(|index| RepairBatchRoot {
+                    root_session_id: format!("ses_fixture_root_{index}"),
+                    graph_digest: "c".repeat(64),
+                    eligible_owners: vec![SoulId::parse(format!("soul-fixture-{index}")).unwrap()],
+                    canonical_soul_id: None,
+                })
+                .collect(),
+        };
+        scope.source_fingerprint = scope.source_descriptor_digest();
+        scope.scope_id = scope.descriptor_digest();
+        let request = RestoreLostSoulsRequest {
+            scope_id: scope.scope_id.clone(),
+            source: scope.source_selection(),
+            targets: scope
+                .targets
+                .iter()
+                .map(|member| member.target.clone())
+                .collect(),
+            canonical_owners: Vec::new(),
+            expected_control_epoch: Some(1),
+        };
+        assert!(request.validate_exact_batch(&scope).is_ok());
+        let mut eight = request.clone();
+        eight.targets.pop();
+        assert!(eight.validate_exact_batch(&scope).is_err());
+        let mut ten = request.clone();
+        let mut tenth = scope.targets[0].clone();
+        tenth.target.soul_id = SoulId::parse("soul-fixture-tenth").unwrap();
+        tenth.target.incident_id = IncidentId::parse("incident-fixture-tenth").unwrap();
+        ten.targets.push(tenth.target.clone());
+        assert!(ten.validate_exact_batch(&scope).is_err());
+        let mut fresh_scope = scope.clone();
+        fresh_scope.targets.push(tenth);
+        fresh_scope.source_fingerprint = fresh_scope.source_descriptor_digest();
+        fresh_scope.scope_id = fresh_scope.descriptor_digest();
+        ten.scope_id = fresh_scope.scope_id.clone();
+        assert!(ten.validate_exact_batch(&fresh_scope).is_ok());
+        for mutate in [
+            |request: &mut RestoreLostSoulsRequest| {
+                request.targets[1].soul_id = request.targets[0].soul_id.clone();
+            },
+            |request: &mut RestoreLostSoulsRequest| {
+                request.targets[1].incident_id = request.targets[0].incident_id.clone();
+            },
+            |request: &mut RestoreLostSoulsRequest| {
+                request.targets[0].expected_intent_revision += 1;
+            },
+            |request: &mut RestoreLostSoulsRequest| {
+                request.source.root_session_ids.pop();
+            },
+            |request: &mut RestoreLostSoulsRequest| {
+                request.source.source_store_id = "d".repeat(64);
+            },
+            |request: &mut RestoreLostSoulsRequest| {
+                request.scope_id = "e".repeat(64);
+            },
+        ] {
+            let mut invalid = request.clone();
+            mutate(&mut invalid);
+            assert!(invalid.validate_exact_batch(&scope).is_err());
+        }
+    }
+
+    #[test]
+    fn stopped_repair_request_rejects_caller_supplied_paths_and_payloads() {
+        let valid = serde_json::json!({
+            "scopeId": "a".repeat(64),
+            "source": {
+                "sourceStoreId": "b".repeat(64),
+                "rootSessionIds": ["ses_fixture_root"]
+            },
+            "targets": (0..8).map(|_| serde_json::json!({
+                "soulId": SoulId::new(),
+                "incidentId": IncidentId::new(),
+                "expectedIntentRevision": 1
+            })).collect::<Vec<_>>(),
+            "expectedControlEpoch": 1
+        });
+        let request: RestoreLostSoulsRequest = serde_json::from_value(valid.clone())
+            .expect("a request without caller-supplied paths or payloads must deserialize");
+        request.validate_payload().unwrap();
+        for (field, supplied) in [
+            ("nativePath", serde_json::json!("/must/not/be/accepted")),
+            (
+                "nativePayload",
+                serde_json::json!({"messages": [{"role": "user", "content": "caller supplied"}]}),
+            ),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["targets"][0][field] = supplied;
+            assert!(
+                serde_json::from_value::<RestoreLostSoulsRequest>(invalid).is_err(),
+                "caller-supplied {field} must be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn hmac_proof_is_scoped_to_boot_and_incarnation() {
         let incarnation = IncarnationId::new();
         let boot = HostBootId::new();
@@ -4159,6 +5860,7 @@ mod tests {
     #[test]
     fn recovery_contract_serializes_references_not_credential_bytes() {
         let spec = ResumeSpec {
+            claude_fork: None,
             schema_version: RESUME_SPEC_SCHEMA_VERSION,
             provider_session: ProviderSessionRef {
                 provider: "claude".into(),
@@ -4168,6 +5870,7 @@ mod tests {
             mode: "claude".into(),
             runtime_variant: "managed_terminal_pty".into(),
             fixture_transport: None,
+            opencode_adoption_baseline: None,
             program: "claude".into(),
             resume_argv: vec!["--resume".into(), "session-one".into()],
             provider_home: "/home/freshell/provider".into(),
@@ -4307,6 +6010,9 @@ mod tests {
             provider_bootstrap_files: Vec::new(),
             provider_secret_references: Vec::new(),
             provider_launch_context: None,
+            opencode_transfer: None,
+            opencode_transfer_attempt_id: None,
+            opencode_adoption: None,
         };
         assert!(spec.validate().is_ok());
         spec.provider_model = Some("bad\0model".into());
@@ -4346,6 +6052,53 @@ mod tests {
             provider_secret_references: Vec::new(),
             provider_launch_context: None,
         }
+    }
+
+    #[test]
+    fn kilroy_accepts_only_its_native_claude_context_and_grants_without_changing_mode() {
+        let mut launch = fresh_agent_launch(FreshProvider::Kilroy, "kilroy");
+        launch.provider_launch_context = Some(ProviderLaunchContext {
+            prepared_inputs: None,
+            preparation: ProviderPreparation::Claude {
+                mcp_args: Vec::new(),
+            },
+            mcp_capability: None,
+            config: Vec::new(),
+        });
+        launch.provider_secret_references = vec![
+            ProviderSecretReference {
+                source_path: "/private/claude.env".into(),
+                profile: ProviderSecretProfile::ClaudeOnecliEnvironment,
+                provider_relative_path: None,
+            },
+            ProviderSecretReference {
+                source_path: "/private/claude-ca.pem".into(),
+                profile: ProviderSecretProfile::ClaudeOnecliCaFile,
+                provider_relative_path: None,
+            },
+        ];
+        assert!(launch.validate().is_ok());
+        assert_eq!(launch.provider.as_str(), "kilroy");
+        assert_eq!(launch.session_type, "kilroy");
+        let mut wrong = launch.clone();
+        wrong.provider_secret_references[0].profile = ProviderSecretProfile::CodexOnecliEnvironment;
+        assert!(wrong.validate().is_err());
+        wrong = launch.clone();
+        wrong.provider_launch_context.as_mut().unwrap().preparation = ProviderPreparation::Codex {
+            tui_args: Vec::new(),
+            sidecar_args: Vec::new(),
+        };
+        assert!(wrong.validate().is_err());
+        launch.provider_bootstrap_files.push(ProviderBootstrapFile {
+            source_path: "/private/legacy-auth".into(),
+            provider_relative_path: ".claude/.credentials.json".into(),
+        });
+        assert!(launch.validate().is_ok());
+        launch.provider = FreshProvider::Claude;
+        launch.session_type = "freshclaude".into();
+        assert!(launch.validate().is_err());
+        launch.provider_bootstrap_files.clear();
+        assert!(launch.validate().is_ok());
     }
 
     #[test]
@@ -4408,6 +6161,7 @@ mod tests {
         assert!(matches!(decoded, AdminCommand::FreshAgentFork(value) if value == request));
 
         let transition = FreshAgentForkResult {
+            claude_fork: None,
             parent_session_id: "native-parent".into(),
             child_session_id: "native-child".into(),
             parent_retired_by_runtime: true,

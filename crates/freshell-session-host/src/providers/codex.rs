@@ -1,16 +1,20 @@
 use super::cli;
 use freshell_agent_runtime::ProviderStoreProbe;
 use freshell_codex::{
-    launch_lifecycle::{CodexLaunchSidecar, CodexTerminalLaunchManager, LaunchClass},
+    launch_lifecycle::{
+        CodexLaunchError, CodexLaunchSidecar, CodexTerminalLaunchManager, LaunchClass,
+    },
     launch_plan::{
         codex_remote_args, CodexLaunchPlanInput, CodexSidecarLaunchContext,
         CODEX_INITIAL_LAUNCH_ATTEMPTS,
     },
     remote_proxy::RemoteProxyEvent,
 };
-use freshell_runtime_protocol::{ResumeSpec, TerminalLaunchSpec};
+use freshell_runtime_protocol::{ResumeSpec, RuntimeDiagnosticCode, TerminalLaunchSpec};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+
+use super::ProviderLaunchPreparationError;
 
 pub struct PreparedCodexLaunch {
     pub sidecar: Arc<CodexLaunchSidecar>,
@@ -21,7 +25,7 @@ pub struct PreparedCodexLaunch {
 pub async fn prepare(
     terminal: &TerminalLaunchSpec,
     child_secret_env: &std::collections::BTreeMap<String, String>,
-) -> Result<PreparedCodexLaunch, String> {
+) -> Result<PreparedCodexLaunch, ProviderLaunchPreparationError> {
     if terminal.mode != "codex" {
         return Err("Codex launch adapter received another provider".into());
     }
@@ -61,7 +65,7 @@ pub async fn prepare(
             LaunchClass::Interactive,
         )
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(provider_preparation_error)?;
     let remote_args = codex_remote_args(&launch.remote_ws_url)
         .map_err(|error| format!("invalid Codex proxy URL: {error:?}"))?;
     Ok(PreparedCodexLaunch {
@@ -69,6 +73,26 @@ pub async fn prepare(
         events: launch.events,
         remote_args,
     })
+}
+
+fn provider_preparation_error(error: CodexLaunchError) -> ProviderLaunchPreparationError {
+    let diagnostic_code = match &error {
+        CodexLaunchError::Config(_) => Some(RuntimeDiagnosticCode::CodexConfigPlanningFailed),
+        CodexLaunchError::AppServerStart(_) => {
+            Some(RuntimeDiagnosticCode::CodexAppServerStartFailed)
+        }
+        CodexLaunchError::ProxyStart(_) => Some(RuntimeDiagnosticCode::CodexProxyStartFailed),
+        CodexLaunchError::Failed(_) | CodexLaunchError::QueueFull | CodexLaunchError::Cancelled => {
+            None
+        }
+    };
+    let message = error.to_string();
+    match diagnostic_code {
+        Some(diagnostic_code) => {
+            ProviderLaunchPreparationError::with_diagnostic_code(message, diagnostic_code)
+        }
+        None => message.into(),
+    }
 }
 
 pub async fn probe(
@@ -80,4 +104,52 @@ pub async fn probe(
         return Err("Codex recovery adapter received another provider".into());
     }
     cli::probe_as_provider(spec, run_as_uid, run_as_gid).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use freshell_codex::launch_plan::CodexLaunchConfigError;
+
+    #[test]
+    fn codex_launch_stages_keep_body_free_diagnostics_and_other_errors_stay_generic() {
+        let cases = [
+            (
+                CodexLaunchError::Config(CodexLaunchConfigError {
+                    message: "invalid sandbox setting".into(),
+                }),
+                RuntimeDiagnosticCode::CodexConfigPlanningFailed,
+            ),
+            (
+                CodexLaunchError::AppServerStart("local readiness detail".into()),
+                RuntimeDiagnosticCode::CodexAppServerStartFailed,
+            ),
+            (
+                CodexLaunchError::ProxyStart("local proxy detail".into()),
+                RuntimeDiagnosticCode::CodexProxyStartFailed,
+            ),
+        ];
+
+        for (error, expected_code) in cases {
+            let preparation_error = provider_preparation_error(error);
+            assert_eq!(
+                preparation_error
+                    .diagnostic_code_or(RuntimeDiagnosticCode::ProviderLaunchPrepareFailed),
+                expected_code
+            );
+        }
+
+        for error in [
+            CodexLaunchError::Failed("unclassified local detail".into()),
+            CodexLaunchError::QueueFull,
+            CodexLaunchError::Cancelled,
+        ] {
+            let preparation_error = provider_preparation_error(error);
+            assert_eq!(
+                preparation_error
+                    .diagnostic_code_or(RuntimeDiagnosticCode::ProviderLaunchPrepareFailed),
+                RuntimeDiagnosticCode::ProviderLaunchPrepareFailed
+            );
+        }
+    }
 }

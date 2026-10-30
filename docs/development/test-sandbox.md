@@ -37,7 +37,13 @@ scripts/sandbox-test.sh --runtime-suite "cargo test -p freshell-codex <destructi
 
 `--runtime-suite` is intentionally incompatible with `--corpus`. It uses `--network none`, a
 read-only container root with only explicit tmpfs/bind/volume write locations and enables
-`no-new-privileges`. The root entrypoint may initialize cache-volume ownership, but it always drops
+`no-new-privileges` for the requested command. Before that container starts, a separate disposable
+container on the dedicated bridge prepares the fingerprinted Node dependencies and runs
+`cargo fetch --locked` when `Cargo.lock` exists. Only this fixed preparation has networking and
+a writable root; it never receives the requested command or mounts provider homes or admin
+sockets. Preparation failure stops the run before the requested command starts. The command's
+container reuses those volumes with Cargo in offline mode, so a cold cache needs no manual warm-up.
+The root entrypoint may initialize cache-volume ownership, but it always drops
 to the unprivileged `sandbox` UID before test code and the self-test verifies that test code has zero
 effective capabilities. The mode never mounts Docker/admin sockets or real provider homes. The runtime gate's separate trusted broker is the only component allowed to hold the real
 Docker socket; this wrapper never grants it to tests.
@@ -87,12 +93,31 @@ before returning. The coordinator's watchdog limits and kill behavior remain
 unchanged.
 Warm dependency caches through the documented ordinary sandbox preparation
 before a strict run if needed; strict mode keeps its read-only home and no network.
+The exact stopped-repair selector has a finite managed-runtime route:
+
+```bash
+scripts/sandbox-test.sh --runtime-suite "cargo test -p freshell-supervisor stopped_repair_crash_ -- --ignored"
+```
+
+For this literal command only, the owner compiles the current supervisor library test
+harness with pinned Cargo, selects and copies that executable, and prepares three fresh
+historical fixtures through a restricted run-owned broker. The selected harness and its
+aborting children execute inside a disposable rootless container with UID0 mapped to
+the unprivileged host owner, zero capabilities, no network, a read-only root and only
+the private run directory writable. Private build artifacts mount read-only at their
+canonical host paths. The actual importer/read helpers still use UID65534:GID0 and
+their production permissions. No administrative socket, operator home or provider
+grant is mounted. The three parents must reach their named abort boundary, reopen the
+same surviving Registry files, and pass all original import/retraction assertions;
+compilation or listing alone is insufficient. The owner preserves logs and verifies
+exact container/helper/provider-volume cleanup. Every other selector retains the
+ordinary sandbox route, and combining this command with `--corpus` remains refused.
 
 ## Safety guarantees
 
 | What | Guarantee |
 |---|---|
-| Network | Ordinary mode uses the dedicated `freshell-sandbox` bridge, never `--network=host`; `--runtime-suite` uses `--network none`. Binding a port inside either container namespace cannot collide with a host listener. |
+| Network | Ordinary mode and fixed dependency preparation use the dedicated `freshell-sandbox` bridge, never `--network=host`; `--runtime-suite` commands use `--network none`. Binding a port inside either container namespace cannot collide with a host listener. |
 | Host processes | Container has its own PID namespace. Killing/crashing anything inside (including something literally named `freshell-server`) cannot reach a host process. |
 | `~/.freshell`, `~/.claude`, `~/.codex`, `~/.local/share/opencode` | Not mounted by default. `--corpus` mounts only `~/.codex/sessions` and `~/.claude/projects`, and only **read-only**. |
 | Repo | Bind-mounted read-write at `/workspace` so test output/artifacts are inspectable from the host. |
@@ -137,6 +162,7 @@ Named Docker volumes persist across runs to avoid re-fetching dependencies every
 of each is slower — see below):
 
 - `freshell-sandbox-cargo-registry`, `freshell-sandbox-cargo-git` — cargo's package cache
+- `freshell-sandbox-pnpm-store` — pnpm's downloaded package store.
 - `freshell-sandbox-cargo-target` — **sandbox-owned**, not the host's `target/`. Sharing the host
   target directory would cause lock contention with concurrent host builds.
 - `freshell-sandbox-node-modules` — **sandbox-owned**, populated by the container's dependency
@@ -150,11 +176,16 @@ of each is slower — see below):
   branches these stay mounted but unused.
 - `freshell-sandbox-playwright-cache` — downloaded browser binaries.
 
+Set `FRESHELL_SANDBOX_CACHE_PREFIX` to a unique Docker volume name prefix to use an
+independent set of all eight caches, including when running `scripts/sandbox-selftest.sh`.
+The default prefix is `freshell-sandbox`; paths are rejected to prevent accidentally mounting
+host directories. The cold-start regression creates and removes its own volumes automatically.
+
 Reset everything (forces a clean re-warm on next run):
 
 ```bash
 docker volume rm freshell-sandbox-cargo-registry freshell-sandbox-cargo-git \
-  freshell-sandbox-cargo-target freshell-sandbox-node-modules \
+  freshell-sandbox-cargo-target freshell-sandbox-pnpm-store freshell-sandbox-node-modules \
   freshell-sandbox-sidecar-node-modules freshell-sandbox-mcp-node-modules \
   freshell-sandbox-playwright-cache
 ```

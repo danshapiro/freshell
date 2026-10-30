@@ -271,7 +271,7 @@ pub(crate) async fn split_pane(
                 .await;
         }
         return ok_json(
-            json!({ "paneId": new_pane_id, "terminalId": Value::Null }),
+            json!({ "paneId": new_pane_id, "terminalId": Value::Null, "sessionId": created.session_id }),
             "pane split (non-terminal)",
         );
     } else if body
@@ -339,6 +339,10 @@ pub(crate) async fn split_pane(
         .attach_pane_content(&tab_id, &new_pane_id, new_content.clone());
 
     let terminal_id = new_content.get("terminalId").cloned();
+    let mut data = json!({ "paneId": new_pane_id, "terminalId": terminal_id });
+    if new_content["kind"] == "fresh-agent" {
+        data["sessionId"] = new_content["sessionId"].clone();
+    }
 
     broadcast_pane_split(
         &state,
@@ -354,10 +358,7 @@ pub(crate) async fn split_pane(
     } else {
         "pane split (non-terminal)"
     };
-    ok_json(
-        json!({ "paneId": new_pane_id, "terminalId": terminal_id }),
-        message,
-    )
+    ok_json(data, message)
 }
 
 fn broadcast_pane_split(

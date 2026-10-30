@@ -912,7 +912,7 @@ pub struct FreshAgentCreate {
     pub tab_id: Option<String>,
     /// G19: the creating pane's id. With `tab_id` it is the pane context the
     /// agent's Freshell MCP acts for (`FRESHELL_TAB_ID`/`FRESHELL_PANE_ID`).
-    /// Additive optional.
+    /// It also binds managed view intent. Additive optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_id: Option<String>,
     /// Unified agent names (Task 1 wire / Task 2 Rust side): the pane's

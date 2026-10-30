@@ -442,6 +442,151 @@ async fn thread_start_response_is_relayed_unchanged_and_yields_a_candidate_event
     proxy.close().await;
 }
 
+async fn assert_resume_response_observation(history_bytes: usize) {
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, false))
+            .await
+            .unwrap();
+    let mut tui = connect_tui(proxy.ws_url()).await;
+    let request = json!({"id":"resume-current", "method":"thread/resume", "params":{"threadId":"requested-root"}}).to_string();
+    tui.send(Message::Text(request.clone())).await.unwrap();
+    let mut conn = upstream.accept().await;
+    assert_eq!(conn.recv_text().await, request);
+    // The actual returned identity differs from the request. Extraction must
+    // surface provider evidence; the host owns the subsequent exact-root gate.
+    let response = json!({"id":"resume-current", "result":{"thread":{"id":"actually-loaded-root", "path":"/tmp/owned-native-history.jsonl",
+        "ephemeral":false,"turns":[{"items":[{"text":huge_string(history_bytes)}]}]}}}).to_string();
+    conn.send_text(response.clone());
+    assert_eq!(recv_text(&mut tui).await, response);
+    let observed = recv_events(&mut events, 1).await;
+    match &observed[0] {
+        RemoteProxyEvent::Candidate(candidate) => {
+            assert_eq!(candidate.source, CandidateSource::ThreadResumeResponse);
+            assert_eq!(candidate.thread.id, "actually-loaded-root");
+            assert_eq!(
+                candidate.thread.path.as_deref(),
+                Some("/tmp/owned-native-history.jsonl")
+            );
+            assert!(!candidate.thread.ephemeral);
+        }
+        other => panic!("expected actual loaded native resume candidate, got {other:?}"),
+    }
+    assert!(
+        events.try_recv().is_err(),
+        "resume response does not fabricate a started notification"
+    );
+    proxy.close().await;
+}
+
+#[tokio::test]
+async fn thread_resume_response_without_started_notification_yields_actual_loaded_candidate() {
+    assert_resume_response_observation(8).await;
+}
+
+#[tokio::test]
+async fn large_thread_resume_response_preserves_bytes_and_bounded_loaded_candidate() {
+    assert_resume_response_observation(1024 * 1024 + 4096).await;
+}
+
+#[tokio::test]
+async fn thread_resume_error_unmatched_and_invalid_results_relay_without_identity_candidates() {
+    for fault in [
+        "error",
+        "unknown-id",
+        "unrelated",
+        "missing-thread",
+        "empty-id",
+        "malformed-id",
+        "error-and-result",
+        "large-error",
+        "large-empty",
+    ] {
+        let mut upstream = start_fake_upstream().await;
+        let (proxy, mut events) =
+            CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, false))
+                .await
+                .unwrap();
+        let mut tui = connect_tui(proxy.ws_url()).await;
+        let request = json!({"id":1,"method":if fault=="unrelated" {"thread/read"} else {"thread/resume"},"params":{"threadId":"requested-root"}}).to_string();
+        tui.send(Message::Text(request.clone())).await.unwrap();
+        let mut conn = upstream.accept().await;
+        assert_eq!(conn.recv_text().await, request);
+        let mut response =
+            json!({"id":1,"result":{"thread":{"id":"unqualified-root","ephemeral":false}}});
+        match fault {
+            "error" | "large-error" => {
+                response.as_object_mut().unwrap().remove("result");
+                response["error"] = json!({"code":-1,"message":if fault=="large-error" {huge_string(1024*1024+4096)} else {"native load failed".into()}});
+            }
+            "unknown-id" => response["id"] = json!(999),
+            "missing-thread" => response["result"] = json!({}),
+            "empty-id" | "large-empty" => {
+                response["result"]["thread"]["id"] = json!("");
+                if fault == "large-empty" {
+                    response["result"]["thread"]["turns"] =
+                        json!([{"text":huge_string(1024*1024+4096)}]);
+                }
+            }
+            "malformed-id" => response["result"]["thread"]["id"] = json!(42),
+            "error-and-result" => {
+                response["error"] = json!({"code":-1,"message":"ambiguous failed load"})
+            }
+            _ => {}
+        }
+        let response = response.to_string();
+        conn.send_text(response.clone());
+        assert_eq!(recv_text(&mut tui).await, response, "{fault}");
+        // A correlated valid response is an ordered event barrier: any prior
+        // invalid candidate would be observed first instead of this root.
+        let barrier = json!({"id":2,"method":"thread/resume","params":{"threadId":"loaded-root"}})
+            .to_string();
+        tui.send(Message::Text(barrier.clone())).await.unwrap();
+        assert_eq!(conn.recv_text().await, barrier);
+        let result =
+            json!({"id":2,"result":{"thread":{"id":"loaded-root","ephemeral":false}}}).to_string();
+        conn.send_text(result.clone());
+        assert_eq!(recv_text(&mut tui).await, result);
+        let observed = recv_events(&mut events, 1).await;
+        assert!(
+            matches!(&observed[0], RemoteProxyEvent::Candidate(candidate) if candidate.thread.id=="loaded-root" && candidate.source==CandidateSource::ThreadResumeResponse),
+            "{fault}: {observed:?}"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "{fault}: unexpected extra identity event"
+        );
+        proxy.close().await;
+    }
+}
+
+#[tokio::test]
+async fn thread_resume_keeps_ephemeral_native_evidence_explicit_for_the_host_refusal() {
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, false))
+            .await
+            .unwrap();
+    let mut tui = connect_tui(proxy.ws_url()).await;
+    tui.send(Message::Text(
+        json!({"id":1,"method":"thread/resume","params":{"threadId":"expected-root"}}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let mut conn = upstream.accept().await;
+    conn.recv_text().await;
+    let response =
+        json!({"id":1,"result":{"thread":{"id":"actual-ephemeral-root","ephemeral":true}}})
+            .to_string();
+    conn.send_text(response.clone());
+    assert_eq!(recv_text(&mut tui).await, response);
+    let observed = recv_events(&mut events, 1).await;
+    assert!(
+        matches!(&observed[0], RemoteProxyEvent::Candidate(candidate) if candidate.thread.id=="actual-ephemeral-root" && candidate.thread.ephemeral && candidate.source==CandidateSource::ThreadResumeResponse)
+    );
+    proxy.close().await;
+}
+
 // ── 4. thread/fork request rewrite + response normalization ────────────────────────
 
 #[tokio::test]
@@ -596,6 +741,94 @@ async fn turn_started_and_completed_notifications_carry_full_params_for_small_fr
             assert_eq!(p.thread_id, "t1");
             assert_eq!(p.params.get("status"), Some(&json!("completed")));
             assert_eq!(p.params.get("usage"), Some(&json!({"tokens": 42})));
+        }
+        other => panic!("expected TurnCompleted, got {other:?}"),
+    }
+
+    proxy.close().await;
+}
+
+#[tokio::test]
+async fn small_turn_notifications_extract_inline_turn_ids() {
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
+    let _tui = connect_tui(proxy.ws_url()).await;
+    let conn = upstream.accept().await;
+
+    conn.send_text(
+        json!({"method": "turn/started", "params": {"threadId": "t1", "turn": {"id": "inline-start"}}})
+            .to_string(),
+    );
+    let received_events = recv_events(&mut events, 1).await;
+    match &received_events[0] {
+        RemoteProxyEvent::TurnStarted(event) => {
+            assert_eq!(event.turn_id.as_deref(), Some("inline-start"));
+            assert_eq!(event.params["turn"]["id"], json!("inline-start"));
+        }
+        other => panic!("expected TurnStarted, got {other:?}"),
+    }
+
+    conn.send_text(
+        json!({"method": "turn/completed", "params": {"threadId": "t1", "turn": {"id": "inline-complete", "status": "completed"}}})
+            .to_string(),
+    );
+    let received_events = recv_events(&mut events, 1).await;
+    match &received_events[0] {
+        RemoteProxyEvent::TurnCompleted(event) => {
+            assert_eq!(event.turn_id.as_deref(), Some("inline-complete"));
+            assert_eq!(event.params["turn"]["status"], json!("completed"));
+        }
+        other => panic!("expected TurnCompleted, got {other:?}"),
+    }
+
+    proxy.close().await;
+}
+
+#[tokio::test]
+async fn oversized_turn_notifications_extract_inline_turn_ids() {
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
+    let _tui = connect_tui(proxy.ws_url()).await;
+    let conn = upstream.accept().await;
+    let padding = huge_string(2 * 1024 * 1024);
+
+    let started = json!({
+        "method": "turn/started",
+        "params": {"threadId": "t1", "turn": {"id": "inline-large-start"}, "padding": padding},
+    })
+    .to_string();
+    assert!(started.len() > 1024 * 1024);
+    conn.send_text(started);
+    let received_events = recv_events(&mut events, 1).await;
+    match &received_events[0] {
+        RemoteProxyEvent::TurnStarted(event) => {
+            assert_eq!(event.turn_id.as_deref(), Some("inline-large-start"));
+        }
+        other => panic!("expected TurnStarted, got {other:?}"),
+    }
+
+    let completed = json!({
+        "method": "turn/completed",
+        "params": {
+            "threadId": "t1",
+            "turn": {"id": "inline-large-complete", "status": "completed"},
+            "padding": padding,
+        },
+    })
+    .to_string();
+    assert!(completed.len() > 1024 * 1024);
+    conn.send_text(completed);
+    let received_events = recv_events(&mut events, 1).await;
+    match &received_events[0] {
+        RemoteProxyEvent::TurnCompleted(event) => {
+            assert_eq!(event.turn_id.as_deref(), Some("inline-large-complete"));
+            assert_eq!(event.params.get("status"), Some(&json!("completed")));
         }
         other => panic!("expected TurnCompleted, got {other:?}"),
     }

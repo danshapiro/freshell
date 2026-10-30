@@ -93,6 +93,15 @@ fn client_roundtrip(wire: &str, type_name: &str) -> ClientMessage {
     msg
 }
 
+#[test]
+fn fresh_agent_create_preserves_pane_id() {
+    let wire = r#"{"type":"freshAgent.create","requestId":"r1","sessionType":"freshclaude","provider":"claude","tabId":"tab1","paneId":"pane1"}"#;
+    assert!(matches!(
+        client_roundtrip(wire, "freshAgent.create"),
+        ClientMessage::FreshAgentCreate(_)
+    ));
+}
+
 // --------------------------------------------------------------------------
 // 1 + 2. The real handshake transcript.
 // --------------------------------------------------------------------------
@@ -356,6 +365,16 @@ fn rich_server_messages() {
     let wire = r#"{"type":"terminal.turn.complete","at":1,"completionSeq":5,"provider":"opencode","terminalId":"t1","sessionId":"ses_1"}"#;
     match server_roundtrip(wire, "terminal.turn.complete") {
         ServerMessage::TerminalTurnComplete(t) => assert_eq!(t.provider, AgentProvider::Opencode),
+        other => panic!("expected TerminalTurnComplete, got {other:?}"),
+    }
+
+    // terminal.turn.complete — preserve a provider-reported Codex outcome.
+    let wire = r#"{"type":"terminal.turn.complete","at":2,"completionSeq":6,"outcome":"failed","provider":"codex","terminalId":"t2"}"#;
+    match server_roundtrip(wire, "terminal.turn.complete") {
+        ServerMessage::TerminalTurnComplete(t) => {
+            assert_eq!(t.provider, AgentProvider::Codex);
+            assert_eq!(t.outcome, Some(TerminalTurnOutcome::Failed));
+        }
         other => panic!("expected TerminalTurnComplete, got {other:?}"),
     }
 

@@ -68,7 +68,7 @@ use freshell_protocol::{
     TerminalDetach, TerminalIdOnly, TerminalInputBlocked, TerminalInputBlockedReason, TerminalKill,
     TerminalResize, FRESH_AGENT_DISABLED_REFUSAL, LEGACY_RESUME_IDENTITY_REFUSAL,
 };
-use freshell_terminal::registry::ManagedTerminalLaunch;
+use freshell_terminal::registry::{ManagedTerminalInputError, ManagedTerminalLaunch};
 use freshell_terminal::{build_child_env_from_process, FrameSink};
 
 use crate::WsState;
@@ -84,6 +84,10 @@ mod terminal_launch_prep_tests;
 #[cfg(test)]
 #[path = "managed_fixture_denies_host_pty.rs"]
 mod managed_fixture_denies_host_pty;
+
+#[cfg(test)]
+#[path = "terminal_managed_input_tests.rs"]
+mod terminal_managed_input_tests;
 
 #[path = "connection_writer.rs"]
 mod connection_writer;
@@ -582,6 +586,7 @@ async fn run_loop(
                 for terminal_id in state.registry.managed_attached_to(conn_id) {
                     // The shared registry logs changed classified failures once.
                     let _ = refresh_managed_output_and_associate(state, &terminal_id, 64 * 1024).await;
+                    project_managed_geometry(state, &terminal_id);
                 }
             }
             inbound = ws_rx.next() => {
@@ -3625,7 +3630,7 @@ mod managed_runtime_id_tests {
     };
     use freshell_terminal::registry::{
         ManagedOutputRead, ManagedTerminalController, ManagedTerminalDescriptor,
-        ManagedTerminalFuture, ManagedTerminalLaunch,
+        ManagedTerminalFuture, ManagedTerminalInputError, ManagedTerminalLaunch,
     };
     use std::sync::Arc;
 
@@ -3667,6 +3672,193 @@ mod managed_runtime_id_tests {
         final_tail: bool,
     }
 
+    struct CaptureLaunchController(std::sync::Mutex<Option<ManagedTerminalLaunch>>);
+
+    impl ManagedTerminalController for CaptureLaunchController {
+        fn lookup_terminal<'a>(
+            &'a self,
+            _: &'a str,
+            _: Option<String>,
+        ) -> ManagedTerminalFuture<'a, Result<Option<ManagedTerminalDescriptor>, String>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn launch<'a>(
+            &'a self,
+            request: ManagedTerminalLaunch,
+        ) -> ManagedTerminalFuture<
+            'a,
+            Result<
+                ManagedTerminalDescriptor,
+                freshell_terminal::registry::ManagedTerminalLaunchError,
+            >,
+        > {
+            Box::pin(async move {
+                *self.0.lock().unwrap() = Some(request);
+                Err("captured managed launch without spawning".into())
+            })
+        }
+
+        fn input<'a>(
+            &'a self,
+            _: ManagedTerminalDescriptor,
+            _: String,
+        ) -> ManagedTerminalFuture<'a, Result<(), ManagedTerminalInputError>> {
+            Box::pin(async { panic!("capture must not receive terminal input") })
+        }
+
+        fn resize<'a>(
+            &'a self,
+            _: ManagedTerminalDescriptor,
+            _: u16,
+            _: u16,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { panic!("capture must not resize a terminal") })
+        }
+
+        fn stop<'a>(
+            &'a self,
+            _: ManagedTerminalDescriptor,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { panic!("capture must not stop a terminal") })
+        }
+
+        fn read_output<'a>(
+            &'a self,
+            _: ManagedTerminalDescriptor,
+            _: i64,
+            _: u64,
+        ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
+            Box::pin(async { panic!("capture must not read terminal output") })
+        }
+    }
+
+    struct PresentCodexSession;
+
+    impl crate::existence::SessionExistenceProbe for PresentCodexSession {
+        fn exists(&self, provider: &str, session_id: &str) -> crate::existence::SessionExistence {
+            assert_eq!(provider, "codex");
+            assert_eq!(session_id, "owned-native-root");
+            crate::existence::SessionExistence::Present
+        }
+
+        fn ever_observed(&self, _: &str, _: &str) -> bool {
+            true
+        }
+    }
+
+    async fn assert_managed_codex_model(model: Option<&str>, resume: bool) {
+        let mut state = super::pane_reconcile_gate_tests::state();
+        let mut settings = crate::test_settings();
+        settings.coding_cli.providers.insert(
+            "codex".into(),
+            serde_json::from_value(serde_json::json!({ "model": model, "effort": "low" })).unwrap(),
+        );
+        state.settings = Arc::new(settings);
+        state.cli_commands = Arc::new(vec![freshell_platform::CliCommandSpec {
+            name: "codex".into(),
+            label: "Codex CLI".into(),
+            default_cmd: "codex".into(),
+            model_args: Some(vec!["--model".into(), "{{model}}".into()]),
+            effort_args: Some(vec![
+                "-c".into(),
+                "model_reasoning_effort=\"{{effort}}\"".into(),
+            ]),
+            resume_args: Some(vec!["resume".into(), "{{sessionId}}".into()]),
+            ..Default::default()
+        }]);
+        let controller = Arc::new(CaptureLaunchController(std::sync::Mutex::new(None)));
+        state
+            .registry
+            .set_managed_controller(Some(controller.clone()));
+        state.registry.set_managed_runtime_connection(17, true);
+        state.session_existence = Arc::new(PresentCodexSession);
+        let sink: freshell_terminal::FrameSink = Arc::new(|_| {});
+        let mut output = crate::create_gate::CreateOutput::Channel(&sink);
+        let mut body = serde_json::json!({
+            "requestId": "managed-codex-model", "mode": "codex", "shell": "system",
+            "cwd": std::env::temp_dir(),
+        });
+        if resume {
+            body["sessionRef"] = serde_json::json!({
+                "provider": "codex", "sessionId": "owned-native-root"
+            });
+        }
+        let create = serde_json::from_value(body).unwrap();
+        let mut limiter = crate::create_limit::CreateRateLimiter::new(100, 1000);
+        assert!(
+            super::handle_create(
+                create,
+                None,
+                &mut output,
+                &state,
+                17,
+                true,
+                &mut limiter,
+                &super::ConnectionIdentity::default(),
+                super::now_ms(),
+            )
+            .await
+        );
+        let request = controller
+            .0
+            .lock()
+            .unwrap()
+            .take()
+            .expect("actual managed launch request");
+        assert_eq!(request.provider_model.as_deref(), model);
+        assert_eq!(request.provider_reasoning_effort.as_deref(), Some("low"));
+        let args = &request.spec.args;
+        let models: Vec<_> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--model")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(
+            models,
+            model.into_iter().collect::<Vec<_>>(),
+            "the native TUI must receive the configured model through the shipped template"
+        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-c", "model_reasoning_effort=\"low\""]));
+        assert_eq!(
+            request.resume_session_id.as_deref(),
+            resume.then_some("owned-native-root")
+        );
+        assert_eq!(args.iter().any(|arg| arg == "resume"), resume);
+        if resume {
+            assert!(args
+                .windows(2)
+                .any(|pair| pair == ["resume", "owned-native-root"]));
+        }
+        assert!(
+            state.registry.directory().is_empty(),
+            "capture spawns no provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_codex_model_reaches_native_launch() {
+        assert_managed_codex_model(Some("gpt-5.6-luna"), false).await;
+    }
+
+    #[tokio::test]
+    async fn managed_codex_model_honors_a_different_user_selection() {
+        assert_managed_codex_model(Some("gpt-5.2-codex"), false).await;
+    }
+
+    #[tokio::test]
+    async fn managed_codex_model_missing_does_not_fabricate_a_default() {
+        assert_managed_codex_model(None, false).await;
+    }
+
+    #[tokio::test]
+    async fn managed_codex_model_exact_resume_keeps_model_effort_and_native_root() {
+        assert_managed_codex_model(Some("gpt-5.6-luna"), true).await;
+        assert_managed_codex_model(Some("gpt-5.2-codex"), true).await;
+    }
+
     impl ManagedTerminalController for LookupOnlyController {
         fn lookup_terminal<'a>(
             &'a self,
@@ -3695,7 +3887,7 @@ mod managed_runtime_id_tests {
             &'a self,
             _terminal: ManagedTerminalDescriptor,
             _data: String,
-        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+        ) -> ManagedTerminalFuture<'a, Result<(), ManagedTerminalInputError>> {
             Box::pin(async move {
                 assert!(
                     !self.final_tail,
@@ -3732,6 +3924,8 @@ mod managed_runtime_id_tests {
                     return Err("not needed".into());
                 }
                 Ok(ManagedOutputRead {
+                    codex_activity: None,
+                    opencode_activity: None,
                     lifecycle: None,
                     completion: Some(freshell_terminal::registry::ManagedOutputCompletion {
                         stream_epoch: self.descriptor.stream_id.clone(),
@@ -4454,7 +4648,10 @@ mod managed_resume_gate_tests {
             &'a self,
             _: freshell_terminal::registry::ManagedTerminalDescriptor,
             _: String,
-        ) -> freshell_terminal::registry::ManagedTerminalFuture<'a, Result<(), String>> {
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<
+            'a,
+            Result<(), freshell_terminal::registry::ManagedTerminalInputError>,
+        > {
             panic!("a failed request has no input target")
         }
         fn resize<'a>(
@@ -6489,11 +6686,17 @@ pub(crate) async fn handle_create(
     } else {
         cli_provider_settings(state, &mode)
     };
-    // Codex model, sandbox, and approval belong to the app-server plan on
-    // both routes. The managed launch still carries them separately to the
-    // soul's sidecar; the TUI gets the ordinary CLI settings tuple.
+    // Preserve the legacy Codex CLI policy. A managed terminal's host adds
+    // --remote to this TUI; the configured model must also reach that TUI
+    // through the manifest, just as on the ordinary REST spawn path. The
+    // sidecar's typed launch plan alone does not apply a native model setting.
     let (cli_permission_mode, cli_model, cli_effort, cli_sandbox) =
         cli_provider_settings(state, &mode);
+    let cli_model = if use_managed_runtime && mode == "codex" {
+        model.as_deref()
+    } else {
+        cli_model.as_deref()
+    };
 
     // opencode: allocate the loopback control endpoint BEFORE building the launch
     // (`ws:2471-2473`; `local-port.ts:13-41`), via the freshell-opencode
@@ -6655,7 +6858,7 @@ pub(crate) async fn handle_create(
         resume_session_id: resume_session_id.as_deref(),
         launch_intent,
         permission_mode: cli_permission_mode.as_deref(),
-        model: cli_model.as_deref(),
+        model: cli_model,
         effort: cli_effort.as_deref(),
         sandbox: cli_sandbox.as_deref(),
         codex_remote_ws_url: codex_remote_ws_url.as_deref(),
@@ -8983,6 +9186,30 @@ async fn refresh_managed_output_and_associate(
         crate::opencode_association::associate_managed_session(state, terminal_id, session_id)
             .await;
     }
+    if let (Some(hub), Some(epoch), Some(native)) = (
+        state.activity.as_ref(),
+        read.stream_epoch.as_deref(),
+        read.codex_activity,
+    ) {
+        hub.note_managed_codex_activity(
+            terminal_id,
+            epoch,
+            read.native_session_id.as_deref(),
+            native,
+        );
+    }
+    if let (Some(hub), Some(epoch), Some(native)) = (
+        state.activity.as_ref(),
+        read.stream_epoch.as_deref(),
+        read.opencode_activity,
+    ) {
+        hub.note_managed_opencode_activity(
+            terminal_id,
+            epoch,
+            read.native_session_id.as_deref(),
+            native,
+        );
+    }
     let lifecycle_changed = state
         .registry
         .publish_managed_lifecycle(terminal_id, read.lifecycle);
@@ -9017,6 +9244,29 @@ async fn refresh_managed_output_and_associate(
         broadcast_terminals_changed(state);
     }
     Ok(())
+}
+
+fn project_managed_geometry(state: &WsState, terminal_id: &str) {
+    let Some(projection) = state.registry.managed_geometry_projection(terminal_id) else {
+        return;
+    };
+    let terminal_id = terminal_id.to_owned();
+    // The registry reserves at most one bounded host command for this facade.
+    // No timer/task loop is created; attach and the existing output ticker
+    // recheck dirty geometry after failure or a replacement/size transition.
+    tokio::spawn(
+        async move {
+            if projection.await.is_err() {
+                tracing::warn!(
+                    event = "managed_runtime.geometry_projection_failed",
+                    terminal_id = %terminal_id,
+                    cause = "host_resize_unavailable",
+                    "Managed output remains available while host geometry is pending"
+                );
+            }
+        }
+        .in_current_span(),
+    );
 }
 
 fn managed_output_gate(terminal_id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -9155,32 +9405,12 @@ async fn handle_attach(
             paced_options,
         )
     };
-    // The registry decides geometry and installs the subscriber under one
-    // terminal lock. Mirror only an accepted geometry to the external host;
-    // a secondary viewer or keepalive attach must not resize that PTY.
-    if outcome.found
-        && state.registry.is_managed(&attach.terminal_id)
-        && matches!(
-            outcome.geometry,
-            Some(
-                freshell_terminal::registry::AttachResizeStatus::Resized
-                    | freshell_terminal::registry::AttachResizeStatus::Unchanged
-            )
-        )
-    {
-        let cols = (attach.cols.clamp(0, u16::MAX as i64) as u16).max(2);
-        let rows = (attach.rows.clamp(0, u16::MAX as i64) as u16).max(2);
-        if let Err(error) = state
-            .registry
-            .managed_resize(&attach.terminal_id, cols, rows)
-            .await
-        {
-            state.registry.detach(&attach.terminal_id, conn_id);
-            return AttachReply::Error(Box::new(managed_runtime_error(
-                &attach.terminal_id,
-                &format!("attach resize failed: {error}"),
-            )));
-        }
+    // Read ownership and replay are already established. Project only the
+    // registry's accepted canonical dimensions; a secondary viewer cannot
+    // substitute its requested size. A refused or slow host command must not
+    // delay attachment, and the existing output ticker retries pending geometry.
+    if outcome.found && geometry_identity_ok {
+        project_managed_geometry(state, &attach.terminal_id);
     }
     if outcome.found {
         return match outcome.paced {
@@ -9436,19 +9666,17 @@ fn unknown_terminal_input_blocked(terminal_id: &str) -> ServerMessage {
     })
 }
 
-fn managed_input_blocked_reason(detail: &str) -> Option<TerminalInputBlockedReason> {
-    let normalized = detail.to_ascii_lowercase();
-    if normalized.contains("recovery is in progress")
-        || normalized.contains("input was not dispatched")
-    {
-        Some(TerminalInputBlockedReason::ManagedRecoveryPending)
-    } else if normalized.contains("recovery ended in blocked")
-        || normalized.contains("recovery is blocked")
-        || normalized.contains("blocked_retry_budget")
-    {
-        Some(TerminalInputBlockedReason::ManagedRecoveryBlocked)
-    } else {
-        None
+fn managed_input_blocked_reason(
+    error: &ManagedTerminalInputError,
+) -> Option<TerminalInputBlockedReason> {
+    match error {
+        ManagedTerminalInputError::RecoveryPending => {
+            Some(TerminalInputBlockedReason::ManagedRecoveryPending)
+        }
+        ManagedTerminalInputError::RecoveryBlocked => {
+            Some(TerminalInputBlockedReason::ManagedRecoveryBlocked)
+        }
+        ManagedTerminalInputError::Unavailable(_) => None,
     }
 }
 
@@ -12603,14 +12831,12 @@ mod terminal_dims_range_tests {
 
     #[test]
     fn managed_recovery_input_is_visibly_fenced() {
-        let pending = managed_input_blocked_reason(
-            "managed soul recovery is in progress; input was not dispatched",
-        )
-        .expect("pending recovery reason");
-        let blocked = managed_input_blocked_reason(
-            "managed soul recovery ended in Blocked: BLOCKED_RETRY_BUDGET",
-        )
-        .expect("blocked recovery reason");
+        let pending =
+            managed_input_blocked_reason(&super::ManagedTerminalInputError::RecoveryPending)
+                .expect("pending recovery reason");
+        let blocked =
+            managed_input_blocked_reason(&super::ManagedTerminalInputError::RecoveryBlocked)
+                .expect("blocked recovery reason");
         assert_eq!(pending, TerminalInputBlockedReason::ManagedRecoveryPending);
         assert_eq!(blocked, TerminalInputBlockedReason::ManagedRecoveryBlocked);
 
@@ -13308,6 +13534,716 @@ mod managed_output_order_tests {
         ManagedTerminalController, ManagedTerminalDescriptor, ManagedTerminalFuture,
     };
 
+    struct ManagedOutputFixture {
+        output: ManagedOutputRead,
+        resize_result: StdMutex<Result<(), String>>,
+        resizes: StdMutex<Vec<(String, u16, u16)>>,
+        resize_completed: Arc<std::sync::atomic::AtomicUsize>,
+        resize_gate: StdMutex<Option<Arc<tokio::sync::Semaphore>>>,
+        resize_reply_gate: StdMutex<Option<Arc<tokio::sync::Semaphore>>>,
+        host_geometry: Arc<StdMutex<(u16, u16)>>,
+    }
+
+    impl ManagedOutputFixture {
+        fn new(output: ManagedOutputRead) -> Self {
+            Self {
+                output,
+                resize_result: StdMutex::new(Err("unused resize".into())),
+                resizes: StdMutex::new(Vec::new()),
+                resize_completed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                resize_gate: StdMutex::new(None),
+                resize_reply_gate: StdMutex::new(None),
+                host_geometry: Arc::new(StdMutex::new((80, 24))),
+            }
+        }
+
+        async fn wait_for_resizes(&self, count: usize) {
+            tokio::time::timeout(std::time::Duration::from_millis(500), async {
+                while self
+                    .resize_completed
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    < count
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("bounded synthetic geometry command must complete");
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_attach_keeps_recovered_output_when_host_resize_is_unavailable() {
+        let state = super::pane_reconcile_gate_tests::state();
+        let terminal = "T-managed-attach-recovery";
+        state.registry.register_managed(
+            ManagedTerminalDescriptor {
+                soul_id: "soul-attach-recovery".into(),
+                incarnation_id: "incarnation-old".into(),
+                terminal_id: terminal.into(),
+                stream_id: "epoch-old".into(),
+                mode: "shell".into(),
+                cwd: "/workspace".into(),
+                resume_session_id: None,
+                create_request_id: None,
+            },
+            "Shell".into(),
+        );
+        let read = |epoch: &str, incarnation: &str, data: &str| ManagedOutputRead {
+            lifecycle: None,
+            completion: None,
+            stream_epoch: Some(epoch.into()),
+            incarnation_id: Some(incarnation.into()),
+            reset_required: false,
+            truncated: false,
+            retained_from_seq: 1,
+            head_seq: 1,
+            exit_code: None,
+            native_session_id: None,
+            chunks: vec![ManagedOutputChunk {
+                seq_start: 1,
+                seq_end: 1,
+                data: data.into(),
+            }],
+            opencode_activity: None,
+            codex_activity: None,
+        };
+        let before = Arc::new(ManagedOutputFixture::new(read(
+            "epoch-old",
+            "incarnation-old",
+            "old retained output\n",
+        )));
+        state.registry.set_managed_controller(Some(before.clone()));
+        let frames = Arc::new(StdMutex::new(Vec::new()));
+        let captured = Arc::clone(&frames);
+        let sink: FrameSink = Arc::new(move |frame| captured.lock().unwrap().push(frame));
+        let attach: TerminalAttach = serde_json::from_value(serde_json::json!({
+            "terminalId": terminal, "intent": "viewport_hydrate", "cols": 80, "rows": 24,
+            "sinceSeq": 0, "attachRequestId": "attach-before-recovery"
+        }))
+        .unwrap();
+        // The real attach path publishes ready before its host resize. This
+        // controller refuses mutation, as a recovering enclosure can do.
+        let reply = handle_attach(attach, &state, 7, &sink, false, false, None).await;
+        before.wait_for_resizes(1).await;
+        assert_eq!(
+            *before.resizes.lock().unwrap(),
+            [("incarnation-old".into(), 80, 24)]
+        );
+        assert!(frames.lock().unwrap().iter().any(|frame| matches!(
+            frame, ServerMessage::TerminalAttachReady(ready) if ready.terminal_id == terminal
+        )));
+        let after = Arc::new(ManagedOutputFixture::new(read(
+            "epoch-replacement",
+            "incarnation-replacement",
+            "replacement launch\n",
+        )));
+        *after.resize_result.lock().unwrap() = Ok(());
+        state.registry.set_managed_controller(Some(after.clone()));
+        // Match the actual socket ticker: only retained subscribers get reads.
+        for attached in state.registry.managed_attached_to(7) {
+            refresh_managed_output_and_associate(&state, &attached, 65_536)
+                .await
+                .unwrap();
+        }
+        assert!(
+            frames.lock().unwrap().iter().any(|frame| matches!(
+                frame, ServerMessage::TerminalOutput(output)
+                    if output.terminal_id == terminal && output.data.contains("replacement launch")
+            )),
+            "an acknowledged attach must remain subscribed to accepted replacement output"
+        );
+        assert!(matches!(reply, AttachReply::Legacy));
+        assert_eq!(state.registry.managed_attached_to(7), vec![terminal]);
+        let secondary: TerminalAttach = serde_json::from_value(serde_json::json!({
+            "terminalId": terminal, "intent": "viewport_hydrate", "cols": 200, "rows": 60,
+            "sinceSeq": 0, "attachRequestId": "secondary-viewer"
+        }))
+        .unwrap();
+        assert!(matches!(
+            handle_attach(secondary, &state, 8, &sink, false, false, None).await,
+            AttachReply::Legacy
+        ));
+        assert!(
+            after.resizes.lock().unwrap().is_empty(),
+            "secondary viewers must not resize the host"
+        );
+        let resize = |cols, rows| {
+            serde_json::from_value(serde_json::json!({
+                "terminalId": terminal, "cols": cols, "rows": rows
+            }))
+            .unwrap()
+        };
+        handle_resize(resize(100, 40), &state).await.unwrap();
+        assert_eq!(
+            *after.resizes.lock().unwrap(),
+            [("incarnation-replacement".into(), 100, 40)]
+        );
+        *after.resize_result.lock().unwrap() = Err("host unavailable".into());
+        assert!(
+            handle_resize(resize(120, 50), &state).await.is_err(),
+            "explicit host resize failures remain visible to their caller"
+        );
+        assert_eq!(state.registry.managed_attached_to(7), vec![terminal]);
+    }
+
+    fn geometry_output(
+        incarnation: &str,
+        stream: &str,
+        lifecycle: ManagedLifecycleState,
+    ) -> ManagedOutputRead {
+        ManagedOutputRead {
+            lifecycle: Some(ManagedLifecycle {
+                state: lifecycle,
+                recovery_summary: None,
+            }),
+            completion: None,
+            stream_epoch: Some(stream.into()),
+            incarnation_id: Some(incarnation.into()),
+            reset_required: false,
+            truncated: false,
+            retained_from_seq: 1,
+            head_seq: 1,
+            exit_code: None,
+            native_session_id: None,
+            chunks: vec![ManagedOutputChunk {
+                seq_start: 1,
+                seq_end: 1,
+                data: format!("{incarnation} output"),
+            }],
+            opencode_activity: None,
+            codex_activity: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_replacement_reattach_restores_canonical_geometry_without_user_resize() {
+        for paced in [false, true] {
+            let state = super::pane_reconcile_gate_tests::state();
+            let terminal = "T-managed-geometry-recovery";
+            state.registry.register_managed(
+                ManagedTerminalDescriptor {
+                    soul_id: "soul-geometry-recovery".into(),
+                    incarnation_id: "old".into(),
+                    terminal_id: terminal.into(),
+                    stream_id: "old-stream".into(),
+                    mode: "shell".into(),
+                    cwd: "/workspace".into(),
+                    resume_session_id: None,
+                    create_request_id: None,
+                },
+                "Shell".into(),
+            );
+            let before = Arc::new(ManagedOutputFixture::new(geometry_output(
+                "old",
+                "old-stream",
+                ManagedLifecycleState::Running,
+            )));
+            state.registry.set_managed_controller(Some(before.clone()));
+            let frames = Arc::new(StdMutex::new(Vec::new()));
+            let captured = frames.clone();
+            let sink: FrameSink = Arc::new(move |frame| captured.lock().unwrap().push(frame));
+            let attach = |request, cols, rows| {
+                serde_json::from_value(serde_json::json!({
+                "terminalId": terminal, "intent": "viewport_hydrate", "cols": cols, "rows": rows,
+                "sinceSeq": 0, "attachRequestId": request
+            })).unwrap()
+            };
+            // The launch defaults are 80x24, but the first accepted pane is 120x40.
+            handle_attach(
+                attach("initial", 120, 40),
+                &state,
+                7,
+                &sink,
+                false,
+                paced,
+                None,
+            )
+            .await;
+            before.wait_for_resizes(1).await;
+            assert_eq!(*before.resizes.lock().unwrap(), [("old".into(), 120, 40)]);
+            assert_eq!(*before.host_geometry.lock().unwrap(), (80, 24));
+            let after = Arc::new(ManagedOutputFixture::new(geometry_output(
+                "replacement",
+                "new-stream",
+                ManagedLifecycleState::Running,
+            )));
+            *after.resize_result.lock().unwrap() = Ok(());
+            state.registry.set_managed_controller(Some(after.clone()));
+            refresh_managed_output_and_associate(&state, terminal, 65_536)
+                .await
+                .unwrap();
+            assert!(frames.lock().unwrap().iter().any(|frame| matches!(
+                frame, ServerMessage::TerminalStreamChanged(change) if change.stream_id == "new-stream"
+            )));
+            // TerminalView responds to that event by reattaching on this same
+            // connection, without detach or an explicit terminal.resize.
+            handle_attach(
+                attach("replacement", 120, 40),
+                &state,
+                7,
+                &sink,
+                false,
+                paced,
+                None,
+            )
+            .await;
+            after.wait_for_resizes(1).await;
+            assert_eq!(*after.host_geometry.lock().unwrap(), (120, 40));
+            assert_eq!(
+                *after.resizes.lock().unwrap(),
+                [("replacement".into(), 120, 40)],
+                "the automatic replacement attach must project the accepted canonical dimensions"
+            );
+            handle_attach(
+                attach("secondary", 200, 60),
+                &state,
+                8,
+                &sink,
+                false,
+                paced,
+                None,
+            )
+            .await;
+            handle_attach(
+                attach("secondary-repeat", 210, 70),
+                &state,
+                8,
+                &sink,
+                false,
+                paced,
+                None,
+            )
+            .await;
+            assert_eq!(
+                *after.resizes.lock().unwrap(),
+                [("replacement".into(), 120, 40)]
+            );
+            let (cols, rows, _) = state.registry.geometry(terminal).unwrap();
+            assert_eq!(
+                (cols, rows),
+                (120, 40),
+                "secondary viewers must remain neutral"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_geometry_projection_does_not_block_replay_or_settle_a_changed_owner_or_size() {
+        for same_incarnation in [false, true] {
+            let state = super::pane_reconcile_gate_tests::state();
+            let terminal = "T-inflight-geometry";
+            state.registry.register_managed(
+                ManagedTerminalDescriptor {
+                    soul_id: "soul-inflight-geometry".into(),
+                    incarnation_id: "old".into(),
+                    terminal_id: terminal.into(),
+                    stream_id: "old-stream".into(),
+                    mode: "shell".into(),
+                    cwd: "/workspace".into(),
+                    resume_session_id: None,
+                    create_request_id: None,
+                },
+                "Shell".into(),
+            );
+            let before = Arc::new(ManagedOutputFixture::new(geometry_output(
+                "old",
+                "old-stream",
+                ManagedLifecycleState::Running,
+            )));
+            *before.resize_result.lock().unwrap() = Ok(());
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            *before.resize_gate.lock().unwrap() = Some(gate.clone());
+            state.registry.set_managed_controller(Some(before.clone()));
+            let frames = Arc::new(StdMutex::new(Vec::new()));
+            let captured = frames.clone();
+            let sink: FrameSink = Arc::new(move |frame| captured.lock().unwrap().push(frame));
+            let attach = |request| {
+                serde_json::from_value(serde_json::json!({
+                    "terminalId": terminal, "intent": "viewport_hydrate", "cols": 120, "rows": 40,
+                    "sinceSeq": 0, "attachRequestId": request
+                }))
+                .unwrap()
+            };
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                handle_attach(attach("initial"), &state, 7, &sink, false, false, None),
+            )
+            .await
+            .expect("attach must not await a blocked host resize");
+            tokio::task::yield_now().await;
+            assert_eq!(*before.resizes.lock().unwrap(), [("old".into(), 120, 40)]);
+            for _ in 0..3 {
+                project_managed_geometry(&state, terminal);
+            }
+            assert!(
+                state
+                    .registry
+                    .managed_geometry_projection(terminal)
+                    .is_none(),
+                "only one host projection may be in flight"
+            );
+            let incarnation = if same_incarnation {
+                "old"
+            } else {
+                "replacement"
+            };
+            let after = Arc::new(ManagedOutputFixture::new(geometry_output(
+                incarnation,
+                "new-stream",
+                ManagedLifecycleState::Running,
+            )));
+            *after.resize_result.lock().unwrap() = Ok(());
+            state.registry.set_managed_controller(Some(after.clone()));
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                refresh_managed_output_and_associate(&state, terminal, 65_536),
+            )
+            .await
+            .expect("replacement replay must not await the old host resize")
+            .unwrap();
+            assert!(frames.lock().unwrap().iter().any(|frame| matches!(
+                frame, ServerMessage::TerminalOutput(output) if output.stream_id == "new-stream"
+            )));
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                handle_attach(attach("replacement"), &state, 7, &sink, false, false, None),
+            )
+            .await
+            .expect("same-connection recovery reattach must remain prompt");
+            let resize = serde_json::from_value(serde_json::json!({
+                "terminalId": terminal, "cols": 150, "rows": 50
+            }))
+            .unwrap();
+            handle_resize(resize, &state).await.unwrap();
+            // The old command succeeds after both accepted stream and canonical
+            // dimensions changed. It must not settle this successor projection.
+            gate.add_permits(1);
+            before.wait_for_resizes(1).await;
+            project_managed_geometry(&state, terminal);
+            after.wait_for_resizes(2).await;
+            assert_eq!(
+                *after.resizes.lock().unwrap(),
+                [(incarnation.into(), 150, 50), (incarnation.into(), 150, 50)]
+            );
+            assert_eq!(*after.host_geometry.lock().unwrap(), (150, 50));
+            assert!(
+                state
+                    .registry
+                    .managed_geometry_projection(terminal)
+                    .is_none(),
+                "the exact accepted owner, stream and canonical size are now settled"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_geometry_waits_for_running_and_first_viewers_share_one_canonical_size() {
+        let state = super::pane_reconcile_gate_tests::state();
+        let terminal = "T-concurrent-geometry";
+        state.registry.register_managed(
+            ManagedTerminalDescriptor {
+                soul_id: "soul-concurrent-geometry".into(),
+                incarnation_id: "current".into(),
+                terminal_id: terminal.into(),
+                stream_id: "stream".into(),
+                mode: "shell".into(),
+                cwd: "/workspace".into(),
+                resume_session_id: None,
+                create_request_id: None,
+            },
+            "Shell".into(),
+        );
+        let recovering = Arc::new(ManagedOutputFixture::new(geometry_output(
+            "current",
+            "stream",
+            ManagedLifecycleState::Recovering,
+        )));
+        state
+            .registry
+            .set_managed_controller(Some(recovering.clone()));
+        let sink: FrameSink = Arc::new(|_| {});
+        let attach = |request, cols, rows| {
+            serde_json::from_value(serde_json::json!({
+                "terminalId": terminal, "intent": "viewport_hydrate", "cols": cols, "rows": rows,
+                "sinceSeq": 0, "attachRequestId": request
+            }))
+            .unwrap()
+        };
+        tokio::join!(
+            handle_attach(
+                attach("first", 120, 40),
+                &state,
+                7,
+                &sink,
+                false,
+                false,
+                None
+            ),
+            handle_attach(
+                attach("second", 200, 60),
+                &state,
+                8,
+                &sink,
+                false,
+                false,
+                None
+            )
+        );
+        assert!(recovering.resizes.lock().unwrap().is_empty());
+        assert!(state
+            .registry
+            .managed_geometry_projection(terminal)
+            .is_none());
+        let (cols, rows, _) = state.registry.geometry(terminal).unwrap();
+        assert!(matches!((cols, rows), (120, 40) | (200, 60)));
+        let running = Arc::new(ManagedOutputFixture::new(geometry_output(
+            "current",
+            "stream",
+            ManagedLifecycleState::Running,
+        )));
+        *running.resize_result.lock().unwrap() = Ok(());
+        state.registry.set_managed_controller(Some(running.clone()));
+        // This is the existing ticker path after recovery becomes live. No
+        // detach, user resize, extra timer, or new attach is required.
+        for attached in state.registry.managed_attached_to(7) {
+            refresh_managed_output_and_associate(&state, &attached, 65_536)
+                .await
+                .unwrap();
+            project_managed_geometry(&state, &attached);
+        }
+        running.wait_for_resizes(1).await;
+        assert_eq!(
+            *running.resizes.lock().unwrap(),
+            [("current".into(), cols, rows)]
+        );
+        assert_eq!(*running.host_geometry.lock().unwrap(), (cols, rows));
+        for lifecycle in [ManagedLifecycleState::Blocked, ManagedLifecycleState::Ended] {
+            state.registry.resize(terminal, cols + 1, rows + 1);
+            state.registry.publish_managed_lifecycle(
+                terminal,
+                Some(ManagedLifecycle {
+                    state: lifecycle,
+                    recovery_summary: None,
+                }),
+            );
+            assert!(
+                state
+                    .registry
+                    .managed_geometry_projection(terminal)
+                    .is_none(),
+                "unavailable or ended lifecycle must not issue host mutation"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_old_explicit_resize_cannot_leave_newer_geometry_cached() {
+        old_explicit_geometry_race(false).await;
+    }
+
+    #[tokio::test]
+    async fn managed_old_explicit_resize_completion_invalidates_a_delayed_projection_reply() {
+        old_explicit_geometry_race(true).await;
+    }
+
+    async fn old_explicit_geometry_race(delayed_projection_reply: bool) {
+        let state = Arc::new(super::pane_reconcile_gate_tests::state());
+        let terminal = "T-explicit-geometry-race";
+        state.registry.register_managed(
+            ManagedTerminalDescriptor {
+                soul_id: "soul-explicit-geometry-race".into(),
+                incarnation_id: "current".into(),
+                terminal_id: terminal.into(),
+                stream_id: "stream".into(),
+                mode: "shell".into(),
+                cwd: "/workspace".into(),
+                resume_session_id: None,
+                create_request_id: None,
+            },
+            "Shell".into(),
+        );
+        let initial = Arc::new(ManagedOutputFixture::new(geometry_output(
+            "current",
+            "stream",
+            ManagedLifecycleState::Running,
+        )));
+        *initial.resize_result.lock().unwrap() = Ok(());
+        state.registry.set_managed_controller(Some(initial.clone()));
+        let sink: FrameSink = Arc::new(|_| {});
+        let attach = serde_json::from_value(serde_json::json!({
+            "terminalId": terminal, "intent": "viewport_hydrate", "cols": 80, "rows": 24,
+            "sinceSeq": 0, "attachRequestId": "initial"
+        }))
+        .unwrap();
+        handle_attach(attach, &state, 7, &sink, false, false, None).await;
+        initial.wait_for_resizes(1).await;
+        let secondary = serde_json::from_value(serde_json::json!({
+            "terminalId": terminal, "intent": "viewport_hydrate", "cols": 200, "rows": 60,
+            "sinceSeq": 0, "attachRequestId": "secondary"
+        }))
+        .unwrap();
+        handle_attach(secondary, &state, 8, &sink, false, false, None).await;
+        assert_eq!(state.registry.managed_attached_to(8), vec![terminal]);
+        let fixture = || {
+            let mut fixture = ManagedOutputFixture::new(geometry_output(
+                "current",
+                "stream",
+                ManagedLifecycleState::Running,
+            ));
+            fixture.host_geometry = initial.host_geometry.clone();
+            *fixture.resize_result.lock().unwrap() = Ok(());
+            Arc::new(fixture)
+        };
+        let old = fixture();
+        let old_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *old.resize_gate.lock().unwrap() = Some(old_gate.clone());
+        state.registry.set_managed_controller(Some(old.clone()));
+        let resize = |cols, rows| {
+            serde_json::from_value(serde_json::json!({
+                "terminalId": terminal, "cols": cols, "rows": rows
+            }))
+            .unwrap()
+        };
+        let old_state = state.clone();
+        let old_request = resize(120, 40);
+        let old_task = tokio::spawn(async move { handle_resize(old_request, &old_state).await });
+        tokio::task::yield_now().await;
+        assert_eq!(*old.resizes.lock().unwrap(), [("current".into(), 120, 40)]);
+        // Another viewer's newer canonical size reaches this same actual host.
+        let newer = fixture();
+        state.registry.set_managed_controller(Some(newer.clone()));
+        handle_resize(resize(150, 50), &state).await.unwrap();
+        let projection = fixture();
+        let reply_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        if delayed_projection_reply {
+            *projection.resize_reply_gate.lock().unwrap() = Some(reply_gate.clone());
+        }
+        state
+            .registry
+            .set_managed_controller(Some(projection.clone()));
+        project_managed_geometry(&state, terminal);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            *projection.resizes.lock().unwrap(),
+            [("current".into(), 150, 50)]
+        );
+        assert_eq!(*initial.host_geometry.lock().unwrap(), (150, 50));
+        if !delayed_projection_reply {
+            projection.wait_for_resizes(1).await;
+        }
+        old_gate.add_permits(1);
+        old_task.await.unwrap().unwrap();
+        assert_eq!(*initial.host_geometry.lock().unwrap(), (120, 40));
+        if delayed_projection_reply {
+            reply_gate.add_permits(1);
+            projection.wait_for_resizes(1).await;
+            *projection.resize_reply_gate.lock().unwrap() = None;
+        }
+        // No further viewer action occurs. The existing output ticker must
+        // restore the current canonical size after either reply ordering.
+        tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            loop {
+                for attached in state.registry.managed_attached_to(7) {
+                    refresh_managed_output_and_associate(&state, &attached, 65_536).await.unwrap();
+                    project_managed_geometry(&state, &attached);
+                }
+                if *initial.host_geometry.lock().unwrap() == (150, 50) { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("an older explicit resize must not strand canonical geometry behind a falsely clean cache");
+        projection.wait_for_resizes(2).await;
+        assert_eq!(
+            state.registry.geometry(terminal).map(|(c, r, _)| (c, r)),
+            Some((150, 50))
+        );
+        assert_eq!(
+            *projection.resizes.lock().unwrap(),
+            [("current".into(), 150, 50), ("current".into(), 150, 50)]
+        );
+    }
+
+    impl ManagedTerminalController for ManagedOutputFixture {
+        fn lookup_terminal<'a>(
+            &'a self,
+            _: &'a str,
+            _: Option<String>,
+        ) -> ManagedTerminalFuture<'a, Result<Option<ManagedTerminalDescriptor>, String>> {
+            Box::pin(async { Err("unused lookup".into()) })
+        }
+
+        fn launch<'a>(
+            &'a self,
+            _: ManagedTerminalLaunch,
+        ) -> ManagedTerminalFuture<
+            'a,
+            Result<
+                ManagedTerminalDescriptor,
+                freshell_terminal::registry::ManagedTerminalLaunchError,
+            >,
+        > {
+            Box::pin(async { Err("unused launch".into()) })
+        }
+
+        fn input<'a>(
+            &'a self,
+            _: ManagedTerminalDescriptor,
+            _: String,
+        ) -> ManagedTerminalFuture<'a, Result<(), ManagedTerminalInputError>> {
+            Box::pin(async {
+                Err(ManagedTerminalInputError::Unavailable(
+                    "unused input".into(),
+                ))
+            })
+        }
+
+        fn resize<'a>(
+            &'a self,
+            terminal: ManagedTerminalDescriptor,
+            cols: u16,
+            rows: u16,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            self.resizes
+                .lock()
+                .unwrap()
+                .push((terminal.incarnation_id, cols, rows));
+            let result = self.resize_result.lock().unwrap().clone();
+            let gate = self.resize_gate.lock().unwrap().clone();
+            let reply_gate = self.resize_reply_gate.lock().unwrap().clone();
+            let completed = self.resize_completed.clone();
+            let geometry = self.host_geometry.clone();
+            Box::pin(async move {
+                if let Some(gate) = gate {
+                    gate.acquire_owned().await.unwrap().forget();
+                }
+                if result.is_ok() {
+                    *geometry.lock().unwrap() = (cols, rows);
+                }
+                if let Some(gate) = reply_gate {
+                    gate.acquire_owned().await.unwrap().forget();
+                }
+                completed.fetch_add(1, std::sync::atomic::Ordering::Release);
+                result
+            })
+        }
+
+        fn stop<'a>(
+            &'a self,
+            _: ManagedTerminalDescriptor,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { Err("unused stop".into()) })
+        }
+
+        fn read_output<'a>(
+            &'a self,
+            _: ManagedTerminalDescriptor,
+            _: i64,
+            _: u64,
+        ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
+            Box::pin(async { Ok(self.output.clone()) })
+        }
+    }
+
     struct ExitedOpenCodeRead {
         final_head: i64,
         lifecycle: Option<ManagedLifecycle>,
@@ -13351,8 +14287,12 @@ mod managed_output_order_tests {
             &'a self,
             _: ManagedTerminalDescriptor,
             _: String,
-        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
-            Box::pin(async { Err("unused input".into()) })
+        ) -> ManagedTerminalFuture<'a, Result<(), ManagedTerminalInputError>> {
+            Box::pin(async {
+                Err(ManagedTerminalInputError::Unavailable(
+                    "unused input".into(),
+                ))
+            })
         }
 
         fn resize<'a>(
@@ -13386,6 +14326,8 @@ mod managed_output_order_tests {
             }
             Box::pin(async move {
                 Ok(ManagedOutputRead {
+                    codex_activity: None,
+                    opencode_activity: None,
                     lifecycle: self.lifecycle.clone(),
                     completion: None,
                     stream_epoch: Some("S-managed-short-lived".into()),
@@ -13727,8 +14669,11 @@ mod managed_output_order_tests {
             &'a self,
             _: ManagedTerminalDescriptor,
             _: String,
-        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
-            Box::pin(async { Err("unused".into()) })
+        ) -> ManagedTerminalFuture<
+            'a,
+            Result<(), freshell_terminal::registry::ManagedTerminalInputError>,
+        > {
+            Box::pin(async { Err(ManagedTerminalInputError::Unavailable("unused".into())) })
         }
         fn resize<'a>(
             &'a self,
@@ -13755,6 +14700,8 @@ mod managed_output_order_tests {
                     return Err(error);
                 }
                 Ok(ManagedOutputRead {
+                    codex_activity: None,
+                    opencode_activity: None,
                     lifecycle: None,
                     completion: None,
                     stream_epoch: None,
@@ -13895,6 +14842,112 @@ mod managed_output_order_tests {
         }
         .with_subscriber(subscriber)
         .await;
+    }
+
+    #[tokio::test]
+    async fn managed_codex_native_turns_reach_browser_activity_and_complete_once() {
+        use freshell_activity::codex::{CodexActivityBatch, CodexActivityEvent};
+        let mut state = super::pane_reconcile_gate_tests::state();
+        let hub = crate::activity::ActivityHub::new(state.broadcast_tx.clone(), None);
+        state
+            .registry
+            .set_activity_observer(hub.registry_observer());
+        state.activity = Some(hub);
+        let mut frames = state.broadcast_tx.subscribe();
+        let terminal_id = "T-managed-codex";
+        state.registry.register_managed(
+            ManagedTerminalDescriptor {
+                soul_id: "soul-codex".into(),
+                incarnation_id: "incarnation-codex".into(),
+                terminal_id: terminal_id.into(),
+                stream_id: "codex-epoch".into(),
+                mode: "codex".into(),
+                cwd: "/workspace".into(),
+                resume_session_id: Some("thread-owned".into()),
+                create_request_id: Some("create-codex".into()),
+            },
+            "Codex".into(),
+        );
+        state
+            .registry
+            .set_managed_controller(Some(Arc::new(ManagedOutputFixture::new(
+                ManagedOutputRead {
+                    lifecycle: None,
+                    completion: None,
+                    stream_epoch: Some("codex-epoch".into()),
+                    incarnation_id: Some("incarnation-codex".into()),
+                    reset_required: false,
+                    truncated: false,
+                    retained_from_seq: 1,
+                    head_seq: 1,
+                    exit_code: None,
+                    native_session_id: Some("thread-owned".into()),
+                    chunks: vec![ManagedOutputChunk {
+                        seq_start: 1,
+                        seq_end: 1,
+                        data: "assistant answer without a bell".into(),
+                    }],
+                    opencode_activity: None,
+                    codex_activity: Some(CodexActivityBatch {
+                        retained_from_seq: 1,
+                        head_seq: 2,
+                        events: [false, true]
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, completed)| CodexActivityEvent {
+                                seq: index as u64 + 1,
+                                at: now_ms() + index as i64,
+                                thread_id: "thread-owned".into(),
+                                turn_id: Some("turn-owned".into()),
+                                status: completed.then(|| "completed".into()),
+                                completed,
+                            })
+                            .collect(),
+                    }),
+                },
+            ))));
+        refresh_managed_output_and_associate(&state, terminal_id, 1024)
+            .await
+            .unwrap();
+        let mut saw_busy = false;
+        let completion = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let frame: serde_json::Value =
+                    serde_json::from_str(&frames.recv().await.unwrap()).unwrap();
+                if frame["type"] == "codex.activity.updated"
+                    && frame["upsert"]
+                        .as_array()
+                        .is_some_and(|rows| rows.iter().any(|row| row["phase"] == "busy"))
+                {
+                    saw_busy = true;
+                }
+                if frame["type"] == "terminal.turn.complete" {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .expect("native Codex turn completion must reach the browser without a PTY bell");
+        assert!(saw_busy);
+        assert_eq!(completion["outcome"], "completed");
+        assert_eq!(completion["sessionId"], "thread-owned");
+        refresh_managed_output_and_associate(&state, terminal_id, 1024)
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), async {
+                loop {
+                    let frame: serde_json::Value =
+                        serde_json::from_str(&frames.recv().await.unwrap()).unwrap();
+                    if frame["type"] == "terminal.turn.complete" {
+                        break;
+                    }
+                }
+            })
+            .await
+            .is_err(),
+            "repeated host reads must not duplicate a completion"
+        );
     }
 }
 #[cfg(test)]
