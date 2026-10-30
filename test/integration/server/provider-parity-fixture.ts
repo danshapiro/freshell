@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -31,21 +32,52 @@ async function run(command: string, args: string[], cwd: string, evidenceDir: st
   // These Cargo tests also publish ordinary session-host executables. Share
   // the runtime builder's lock so they cannot replace a feature build between
   // its compilation and its run-private snapshot.
-  const executable = command === 'cargo' ? runtimeCargoCommand(cwd, command, args) : { command, args }
+  const sandboxed = command === 'cargo' && args[0] === 'test' && process.env.FRESHELL_RUST_TEST_SANDBOX === '1'
+  const executable = sandboxed
+    ? { command: path.join(cwd, 'scripts/sandbox-test.sh'), args: ['--runtime-suite', cargoSandboxCommand(cwd, args, evidenceDir)] }
+    : command === 'cargo' ? runtimeCargoCommand(cwd, command, args) : { command, args }
   const child = spawn(executable.command, executable.args, {
     cwd,
-    env: { ...process.env, FRESHELL_PROVIDER_PARITY_ROWS_DIR: evidenceDir },
+    env: { ...process.env, FRESHELL_PROVIDER_PARITY_ROWS_DIR: evidenceDir,
+      ...(sandboxed ? { FRESHELL_SANDBOX_OWNER_GUARD: '1' } : {}) },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   let output = ''
   const capture = (chunk: Buffer) => { output = `${output}${chunk}`.slice(-40_000) }
   child.stdout.on('data', capture)
   child.stderr.on('data', capture)
+  if (sandboxed) {
+    child.stdout.pipe(process.stdout, { end: false })
+    child.stderr.pipe(process.stderr, { end: false })
+  }
   const code = await new Promise<number>((resolve, reject) => {
     child.once('error', reject)
     child.once('close', value => resolve(value ?? 1))
   })
   if (code !== 0) throw new Error(`${command} ${args.join(' ')} failed (${code}):\n${output}`)
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`
+}
+
+function cargoSandboxCommand(repoRoot: string, args: string[], evidenceDir: string): string {
+  const relativeRows = path.relative(repoRoot, evidenceDir)
+  if (path.isAbsolute(relativeRows) || relativeRows === '..' || relativeRows.startsWith(`..${path.sep}`)) {
+    throw new Error('Sandbox parity rows must remain in the owned checkout directory')
+  }
+  const guestRows = path.posix.join('/workspace', ...relativeRows.split(path.sep))
+  const target = `/freshell-test-artifacts/targets/${createHash('sha256').update(repoRoot).digest('hex').slice(0, 12)}`
+  return `set -e
+test "$FRESHELL_SANDBOX_MODE" = runtime-suite
+owned_tmp="$(mktemp -d /freshell-test-artifacts/XXX)"
+trap 'rm -rf -- "$owned_tmp"' EXIT
+export TMPDIR="$owned_tmp" FRESHELL_TEST_EXECUTABLE_TMP_DIR="$owned_tmp"
+export CARGO_TARGET_DIR=${shellQuote(target)} CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=4 TOKIO_WORKER_THREADS=2 FRESHELL_RUST_TEST_SANDBOX=0
+export FRESHELL_PROVIDER_PARITY_ROWS_DIR=${shellQuote(guestRows)}
+printf '{"severity":"info","event":"provider_parity.rust_sandbox_started","mode":"runtime-suite"}\\n'
+${['cargo', 'test', '--locked', ...args.slice(1)].map(shellQuote).join(' ')}
+`
 }
 
 function terminalTrace(record: any, route: 'direct' | 'managed'): ProviderVisibleTrace {
@@ -114,8 +146,15 @@ function freshTrace(record: any, route: 'direct' | 'managed'): ProviderVisibleTr
 }
 
 export async function runProviderParityFixture(repoRoot: string, eventsTarget?: string): Promise<ProviderParityReceipt> {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-provider-parity-'))
+  // dist is ignored, traversable and unshadowed by the sandbox's cache mounts.
+  // Rootless Docker maps the guest UID separately; only this run's synthetic
+  // output directory needs cross-UID writes. Private input directories stay sealed.
+  const sandboxed = process.env.FRESHELL_RUST_TEST_SANDBOX === '1'
+  const base = sandboxed ? path.join(repoRoot, 'dist') : os.tmpdir()
+  fs.mkdirSync(base, { recursive: true })
+  const directory = fs.mkdtempSync(path.join(base, 'freshell-provider-parity-'))
   try {
+    if (sandboxed) fs.chmodSync(directory, 0o777)
     await run('cargo', ['test', '-p', 'freshell-session-host', 'direct_and_hosted_provider_transport_operations_have_matching_rows'], repoRoot, directory)
     await run('cargo', ['test', '-p', 'freshell-runtime-protocol', 'raw_secret_payload_and_unapproved_config_paths_are_rejected'], repoRoot, directory)
     await run('cargo', ['test', '-p', 'freshell-runtime-protocol', 'onecli_profiles_match_only_their_named_provider'], repoRoot, directory)
