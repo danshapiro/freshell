@@ -706,17 +706,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     createRequestId: string | undefined
     terminalId: string | undefined
   } | null>(null)
-  // Branch-5 / reconcile-verdict interaction (design invariant 7): a pane
-  // listed in the dead-session adjudication panel is owned by the user's
-  // explicit panel decision -- the INVALID_TERMINAL_ID auto-recovery must
-  // stand down for it (see the attach-error handler below).
-  const isDeadSessionAdjudicated = useAppSelector(
-    (s) => (s.panes.deadSessionAdjudication ?? []).some(
-      (entry) => entry.tabId === tabId && entry.paneId === paneId,
-    ),
-  )
-  const isDeadSessionAdjudicatedRef = useRef(isDeadSessionAdjudicated)
-  isDeadSessionAdjudicatedRef.current = isDeadSessionAdjudicated
   const verdictWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const connectionErrorCode = useAppSelector((s) => s.connection.lastErrorCode)
   const settings = useAppSelector((s) => s.settings.settings)
@@ -910,6 +899,19 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // Extract terminal-specific fields (safe because we check kind later)
   const isTerminal = paneContent.kind === 'terminal'
   const terminalContent = isTerminal ? paneContent : null
+  // Dead-session stand-down latch (design invariant 7, re-keyed to the
+  // durable restoreError latch): a pane whose saved session artifact is gone
+  // must not mint a recovery create on an INVALID_TERMINAL_ID round -- that
+  // would resume the dead session as an orphan PTY nothing adopts
+  // (duplicate `--resume <dead-session>` spawns after a restart). The
+  // persisted per-pane latch is strictly more accurate than the old
+  // adjudication list: per-pane and reload-surviving, and cleared exactly by
+  // the recovery folds (attach/reset), which re-arms auto-recovery the
+  // moment the pane legitimately moves on. Other restoreError reasons
+  // (dead_live_handle etc.) keep today's auto-recovery.
+  const deadSessionLatchRef = useRef(false)
+  deadSessionLatchRef.current =
+    terminalContent?.restoreError?.reason === 'durable_artifact_missing'
   const managedReplayAvailable = canReplayManagedTerminal(terminalContent)
 
   // kata b8ke (round-1 review: convergence is bidirectional): a TERMINAL
@@ -6687,18 +6689,25 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           // This prevents an infinite respawn loop when terminals fail immediately
           // (e.g., due to permission errors on cwd). User must explicitly restart.
           if (currentTerminalId && current?.status !== 'exited') {
-            // Branch-5 / reconcile-verdict interaction (design invariant 7):
-            // when the reconcile flow owns this pane's fate, stand down --
-            // - listed in the dead-session adjudication panel: the verdict
-            //   already declared the session dead; minting a recovery create
-            //   here would resume it as an orphan PTY the panel never adopts
-            //   (duplicate `--resume <dead-session>` spawns after a restart).
+            // Branch-5 / reconcile-verdict interaction (design invariant 7,
+            // re-keyed to the durable restoreError latch): when the
+            // reconcile flow owns this pane's fate, stand down --
+            // - the pane's persisted restoreError latch says the saved
+            //   session artifact is gone (durable_artifact_missing): the
+            //   verdict already declared the session dead; minting a
+            //   recovery create here would resume it as an orphan PTY
+            //   nothing adopts (duplicate `--resume <dead-session>` spawns
+            //   after a restart). The latch is cleared exactly by the
+            //   recovery folds (attach/reset), which re-arms auto-recovery
+            //   the moment the pane legitimately moves on. Other
+            //   restoreError reasons (dead_live_handle etc.) keep today's
+            //   auto-recovery.
             // - reconcile-pending within the bounded verdict window: the
             //   verdict fold (attach/respawn/dead_session) drives the next
             //   create/attach round. On timeout the pending flag clears and
             //   the next attach-error round takes the recovery below -- the
             //   ensure() re-fire re-attaches, so this can never wedge.
-            if (isDeadSessionAdjudicatedRef.current) return
+            if (deadSessionLatchRef.current) return
             if (
               reconcilePendingSinceRef.current !== undefined
               && Date.now() - reconcilePendingSinceRef.current < RECONCILE_VERDICT_WAIT_MS

@@ -41,6 +41,7 @@ import {
   createDefaultServerSettings,
   resolveLocalSettings,
 } from '@shared/settings'
+import { buildRestoreError } from '@shared/session-contract'
 
 const wsMocks = vi.hoisted(() => ({
   send: vi.fn(),
@@ -2310,7 +2311,10 @@ describe('TerminalView lifecycle updates', () => {
   // the very session a dead_session verdict just declared dead -- observed in
   // the Task 11 e2e wall as duplicate `claude --resume <deleted-session>`
   // PTYs that the adjudication panel never adopts.
-  function setupReconcileOwnedPane(panesExtra: Record<string, unknown>) {
+  function setupReconcileOwnedPane(
+    panesExtra: Record<string, unknown>,
+    contentExtra: Partial<TerminalPaneContent> = {},
+  ) {
     const tabId = 'tab-reconcile-owned'
     const paneId = 'pane-reconcile-owned'
     const terminalId = 'term-reconcile-owned'
@@ -2327,6 +2331,7 @@ describe('TerminalView lifecycle updates', () => {
         sessionId: '550e8400-e29b-41d4-a716-446655440042',
       },
       initialCwd: '/tmp',
+      ...contentExtra,
     }
 
     const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
@@ -2365,16 +2370,11 @@ describe('TerminalView lifecycle updates', () => {
     return { store, tabId, paneId, terminalId, paneContent }
   }
 
-  it('does not auto-recover from INVALID_TERMINAL_ID while the pane awaits dead-session adjudication', async () => {
-    const { store, tabId, paneId, terminalId, paneContent } = setupReconcileOwnedPane({
-      deadSessionAdjudication: [{
-        tabId: 'tab-reconcile-owned',
-        paneId: 'pane-reconcile-owned',
-        title: 'Claude',
-        mode: 'claude',
-        sessionRef: { provider: 'claude', sessionId: '550e8400-e29b-41d4-a716-446655440042' },
-      }],
-    })
+  it('does not auto-recover from INVALID_TERMINAL_ID while the pane carries the dead-session restoreError latch', async () => {
+    const { store, tabId, paneId, terminalId, paneContent } = setupReconcileOwnedPane(
+      {},
+      { restoreError: buildRestoreError('durable_artifact_missing') },
+    )
 
     render(
       <Provider store={store}>
@@ -2398,13 +2398,59 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     // The pane is untouched: no minted recovery createRequestId, no
-    // resume-create sent -- the adjudication panel owns the next step.
+    // resume-create sent -- the dead-session latch owns the stand-down
+    // until a recovery fold clears it.
     const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
     expect(layout.content.createRequestId).toBe('req-reconcile-owned')
     expect(layout.content.terminalId).toBe(terminalId)
     expect(layout.content.status).toBe('running')
     const createCalls = wsMocks.send.mock.calls.filter(([msg]) => msg?.type === 'terminal.create')
     expect(createCalls).toHaveLength(0)
+  })
+
+  it('still auto-recovers from INVALID_TERMINAL_ID for a non-dead restoreError reason (dead_live_handle)', async () => {
+    const { store, tabId, paneId, terminalId, paneContent } = setupReconcileOwnedPane(
+      {},
+      { restoreError: buildRestoreError('dead_live_handle') },
+    )
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    wsMocks.send.mockClear()
+    restoreMocks.addTerminalRestoreRequestId.mockClear()
+
+    act(() => {
+      messageHandler!({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        message: 'Unknown terminalId',
+        terminalId,
+      })
+    })
+
+    // The opposite of the latch stand-down: the recovery create IS minted
+    // (the resume-recovery path -- this pane has a durable sessionRef), the
+    // dead live handle is dropped, and the pane moves to 'creating'.
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
+      expect(layout.content.terminalId).toBeUndefined()
+    })
+    const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
+    expect(layout.content.createRequestId).not.toBe('req-reconcile-owned')
+    expect(layout.content.status).toBe('creating')
+    expect(restoreMocks.addTerminalRestoreRequestId).toHaveBeenCalledWith(
+      layout.content.createRequestId,
+    )
+    const tab = store.getState().tabs.tabs.find((t) => t.id === tabId)
+    expect(tab?.status).toBe('creating')
   })
 
   it('does not auto-recover from INVALID_TERMINAL_ID during the bounded pre-verdict reconcile window', async () => {
