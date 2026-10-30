@@ -23,7 +23,7 @@ Fix four fresh-agent "code rewind" defects:
 - The inline "Code rewind unavailable/available for this message" transcript note and its tests are deliberately removed as a user-approved behavior change; the hover action keeps enabled/disabled state plus the reason.
 - MCP/CLI-driven turns stay honestly rewind-unavailable until separate REST-lane capture work (out of scope).
 
-**Goal:** Every transcript turn shows rewind status only where it is real: agent turns show nothing, the in-flight user turn shows "still saving," settled user turns show enabled (or disabled-with-reason) rewind, and a freshopencode session's FIRST message binds its code checkpoint live — no reload needed.
+**Goal:** Every transcript turn shows rewind status only where it is real: agent turns show nothing, an in-flight user turn whose capture/identity is still unbound shows "still saving" (a bound capture honestly shows available even mid-turn), settled user turns show enabled (or disabled-with-reason) rewind, and a freshopencode session's FIRST message binds its code checkpoint live — no reload needed.
 
 **Architecture:** Three seams. (1) Client availability policy: `getRewindAvailability` gains the user-role gate and a busy-gated pending state, extracted as a pure decision helper; the transcript's inline status `<div>` is deleted, leaving the existing hover button / action-sheet surfaces (which already render enabled/disabled/reason/pending). (2) Server broadcast addressing: the identity-enriched outcome re-broadcast in `observe_turn_identity_with_match` fans out one frame per stored session alias (re-addressing `sessionId` like the REST replay path already does), so the pane holding the materialized durable id receives the frame the same moment it holds that id. (3) Contract pins: a client unit test drives the full first-message frame sequence end-to-end (placeholder send → materialize → durable-addressed enriched frame → hover enabled without reload), and a freshopencode e2e spec does the same against the fake-opencode harness.
 
@@ -33,7 +33,7 @@ Fix four fresh-agent "code rewind" defects:
 
 - Package manager: pnpm 10.34.5 exactly; never `npm ci`/`npm install` in this tree.
 - TypeScript NodeNext/ESM: relative imports need `.js` extensions.
-- Test lanes: focused Vitest via `pnpm run test:vitest run <paths> --config config/vitest/vitest.config.ts`; focused Rust via `cargo test -p freshell-server <filter>` (narrowed selectors are delegated — no coordinator gate); e2e runs per-spec on its legal lane (load-bearing finder LB4/LB5, reports/load-bearing-finder.md): cloud-legal specs via `FRESHELL_E2E_BACKEND=cloud pnpm run test:e2e <spec>`, `CLOUD_SKIP_SPECS` members (the whole freshopencode family) via `pnpm run test:e2e:local <spec>`, and the closed external-target spec (`code-checkpoint-workspace-external.spec.ts`) ONLY via `GCLOUD_ROBOT_REQUIRE=1 pnpm exec tsx scripts/testing/managed-provider-environment-target.ts --checkpoint`; broad gates only via `scripts/base-gate.sh` with `GCLOUD_ROBOT_REQUIRE=1`.
+- Test lanes: focused Vitest via `pnpm run test:vitest run <paths> --config config/vitest/vitest.config.ts`; focused Rust via `cargo test -p freshell-server <filter>` (narrowed selectors are delegated — no coordinator gate); e2e runs per-spec on its legal lane (load-bearing finder LB4/LB5, reports/load-bearing-finder.md): cloud-legal specs via `FRESHELL_E2E_BACKEND=cloud pnpm run test:e2e <spec>`, `CLOUD_SKIP_SPECS` members (the whole freshopencode family) via `pnpm run test:e2e:local <spec>`, and the closed external-target spec (`code-checkpoint-workspace-external.spec.ts`) ONLY via `GCLOUD_ROBOT_REQUIRE=1 GCLOUD_ROBOT_ACCOUNT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com pnpm exec tsx scripts/testing/managed-provider-environment-target.ts --checkpoint`, which additionally requires a committed clean worktree — run it after the owning task's commit step, never before; broad gates only via `scripts/base-gate.sh` with `GCLOUD_ROBOT_REQUIRE=1`.
 - The wire frame `freshAgent.checkpoint.outcome` schema (Zod `FreshAgentCheckpointOutcomeSchema` in `shared/ws-protocol.ts:1897-1916`, Rust mirror in `crates/freshell-protocol/src/server_messages.rs:292-317`) must NOT change: the fix re-uses the existing `sessionId` field per-alias. `test/unit/port/ws-contract-freeze.test.ts` pins the type inventory.
 - Identity contract (docs/development/managed-runtime.md:593-615): rewind availability binds only from persisted native row identities; the per-alias re-addressing changes WHERE the frame is addressed, not WHAT identity it claims. Do not pre-stamp predicted identities on capture-time frames.
 - Hover surfaces already exist and must not be redesigned: enabled button `aria-label="Rewind code to here"`, disabled pending `aria-label="Saving code rewind checkpoint"` + `title="Saving the code state from before this message"`, disabled unavailable `aria-label="Rewind unavailable for this message"` + `title="Rewind unavailable: <reason>"` (FreshAgentTurnActions.tsx:153-170), sheet/menu labels `Rewind code to here` / `Saving code rewind checkpoint…` / `Rewind unavailable: <reason>` (:42-74).
@@ -53,28 +53,26 @@ Fix four fresh-agent "code rewind" defects:
 **Interfaces:**
 - Consumes: `getCheckpointAvailability(turn): CheckpointTurnAvailability | undefined` (FreshAgentView.tsx:1311, unchanged), `isModernCheckpointTurn(turn)` (:381), `isBusy` (derived at :3973, `BUSY_STATES.has(effectiveStatus)`).
 - Produces: `export function unboundRewindAvailability(turn: FreshAgentTurn, agentBusy: boolean): FreshAgentTurnRewindAvailability | undefined` — the pure fallback policy: non-user turns → `undefined`; modern user turns while the agent is busy → `{ status: 'pending' }`; modern user turns while idle → `{ status: 'unavailable', reason: MODERN_TURN_CHECKPOINT_UNAVAILABLE }`; non-modern turns → `undefined`. `getRewindAvailability` becomes: role/bound lookup first (unchanged), then `unboundRewindAvailability(turn, isBusy)`, with `isBusy` added to its `useCallback` deps.
+- Semantics decision (round-2 review finding 1): a BOUND availability always wins over the busy fallback, and that is honest — the capture completes at the barrier BEFORE the turn runs, so a row that has bound an `available` capture outcome genuinely has a snapshot while the agent works (the existing e2e `fresh-agent-checkpoint-unavailable-rust.spec.ts:123` already asserts the mid-turn available state as a pinned journey, and the snapshot-refreshed `msg_`-id rows cannot bind the request-keyed capture frame — :1329-1331 requires `turn.requestId`, which schema rows do not carry — so THOSE unbound modern rows are exactly the mid-turn surface the pending state serves). The pending state therefore applies ONLY to unbound modern user rows; it must never override a bound `available`.
 
-- [ ] **Step 1: Write the failing behavioral tests**
+- [ ] **Step 1: Write the failing behavioral test (no new module imports)**
 
-In `FreshAgentView.test.tsx`, add one `describe('fresh-agent rewind availability honesty', ...)` with two tests, using the file's existing harness idioms (frame-driven `onMessage`, snapshot turns via the outcome/snapshot frames — see the test at :3492 for the accepted-turn flow and the `isBusyEvent` frame kinds `freshAgent.status` / `freshAgent.session.snapshot` at :3144 for driving busy):
+In `FreshAgentView.test.tsx`, add one `describe('fresh-agent rewind availability honesty', ...)` with the tests below, using the file's existing harness idioms (frame-driven `onMessage`, snapshot turns via the outcome/snapshot frames — see the test at :3492 for the accepted-turn flow and the `isBusyEvent` frame kinds `freshAgent.status` / `freshAgent.session.snapshot` at :3144 for driving busy). IMPORTANT (round-2 review finding 6): this first batch must NOT import `unboundRewindAvailability` — an import of a not-yet-existing export breaks the whole test file's module load and the red step never runs. The helper-import assertions are added AFTER implementation, in Step 4.
 
-Test A — `does not consider agent response turns for rewind status at all`:
-1. Build the turn objects as the harness does; assert via the pure helper (imported from the module): `unboundRewindAvailability(assistantTurn, false)` and `unboundRewindAvailability(assistantTurn, true)` are both `undefined` — the role gate holds even while busy (agent turns never become "saving"). This import is part of the red: no such export exists today.
-2. Render a fresh-agent pane (existing render helper) with an opencode-style snapshot: one assistant turn with `source: 'durable'` and a `nativeTurnId`, plus one user turn.
-3. Assert the assistant article's hover toolbar has no rewind button at all — not `Rewind code to here`, not `Rewind unavailable for this message` (pins that the hover role gate in canRewind is not regressed). Do NOT assert on the transcript note here; Task 2 removes it.
-
-Test B — `shows the honest still-saving state while the agent turn is running`:
+Test B (the red test) — `shows the honest still-saving state while the agent turn is running`:
 1. Render the pane with a modern user snapshot turn (turnId `msg_…`, `source: 'durable'`) that has NO bound checkpoint outcome, and drive the pane busy with a `freshAgent.session.snapshot` frame carrying a busy status (idiom per :3144).
 2. Hover the user turn's article; assert the rewind button is disabled with `aria-label="Saving code rewind checkpoint"` and `title="Saving the code state from before this message"`.
 3. RED today: the button instead says `aria-label="Rewind unavailable for this message"` with `title` containing `No exact code checkpoint is available for this message.`
 
-Also add Test C — `keeps a settled unbound modern turn unavailable when the agent is idle` asserting the idle case still shows the disabled `Rewind unavailable for this message` button (this is the existing pinned behavior at :4103; assert through the hover surface so it survives Task 2).
+Test C (green pin, keeps passing) — `keeps a settled unbound modern turn unavailable when the agent is idle`: the idle case still shows the disabled `Rewind unavailable for this message` button (existing pinned behavior at :4103; assert through the hover surface so it survives Task 2).
+
+Test D (green pin, keeps passing) — `a bound available capture keeps showing available while the agent is busy` (round-2 review finding 1): render a pane busy per Test B, with a user turn that HAS a bound `available` checkpoint outcome (bind it through the request-key frame path exactly as the :3492 test does); assert the hover button is ENABLED `Rewind code to here` — never downgraded to pending. This pin protects the bound-wins semantics against a future "fix" that turns mid-turn available into pending.
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
 Run: `pnpm run test:vitest run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx --config config/vitest/vitest.config.ts`
 
-Expected: FAIL — Test A fails to import the nonexistent helper (or fails its expectation), Test B fails with the button showing "Rewind unavailable for this message" instead of "Saving code rewind checkpoint".
+Expected: FAIL — the module loads (no new imports yet); Test B fails with the button showing "Rewind unavailable for this message" instead of "Saving code rewind checkpoint"; Tests C and D pass (they pin current behavior).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -115,11 +113,15 @@ The move is required, not cosmetic: `isBusy` is declared at :3973, and its first
 
 (Keep the `FreshAgentTurnRewindAvailability` import; the hover button, context-menu builder and action sheet consume the result unchanged.)
 
-- [ ] **Step 4: Run the focused test**
+- [ ] **Step 4: Add the helper-level role-gate pin and run the focused test**
+
+Now that the export exists, add Test A — `does not consider agent response turns for rewind status at all`:
+1. Import `unboundRewindAvailability` from the module; build the turn objects as the harness does and assert `unboundRewindAvailability(assistantTurn, false)` and `unboundRewindAvailability(assistantTurn, true)` are both `undefined` — the role gate holds even while busy (agent turns never become "saving").
+2. Render a fresh-agent pane with an opencode-style snapshot: one assistant turn with `source: 'durable'` and a `nativeTurnId`, plus one user turn; assert the assistant article's hover toolbar has no rewind button at all — not `Rewind code to here`, not `Rewind unavailable for this message` (pins that the hover role gate in canRewind is not regressed). Do NOT assert on the transcript note here; Task 2 removes it.
 
 Run: `pnpm run test:vitest run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx --config config/vitest/vitest.config.ts`
 
-Expected: PASS (the whole file — including the pre-existing tests at :3492, :3706, :4103, :4622, which pin hover/notice/persistence behavior that the role gate and busy-pending must not disturb; :4103's idle-unavailable expectation must keep passing because that test's pane is idle).
+Expected: PASS (the whole file — including the pre-existing tests at :3492, :3706, :4103, :4622, which pin hover/notice/persistence behavior that the role gate and busy-pending must not disturb; :4103's idle-unavailable expectation must keep passing because that test's pane is idle; and Test D keeps the mid-turn bound-available journey green).
 
 - [ ] **Step 5: Refactor while green**
 
@@ -157,7 +159,7 @@ git commit -m "fix(fresh-agent): role-gate rewind status and show still-saving w
 
 1. In `FreshAgentTranscript.test.tsx:2057` (`shows unavailable rewind state and disables the action on the affected turn`): delete the `getByRole('note', …)` assertion (:2071-2072); KEEP the disabled hover-button assertion (:2073) and the builder label `Rewind unavailable: <reason>` (:2075-2077); ADD `expect(screen.queryByRole('note')).toBeNull()` and `expect(screen.queryByRole('status', { name: /Code rewind available for this message/ })).toBeNull()` to pin absence.
 2. In `FreshAgentView.test.tsx`: in each listed block, replace every `getByRole('note'|'status', …)` assertion on the per-turn rewind text with either a pin of absence (`queryByRole(...)` null) or — where the block was asserting an available/pending/unavailable STATE — an assertion of the hover button's state: enabled `getByRole('button', { name: 'Rewind code to here' })` not disabled; pending `disabled` button with `aria-label` `Saving code rewind checkpoint`; unavailable `disabled` button with `aria-label` `Rewind unavailable for this message`. Keep every send-frame shape, outcome fold, persistence, restore-by-id and reload-rebind assertion untouched.
-3. In both e2e specs: replace the `getByRole('status'/'note', …)` transcript-text assertions with the corresponding hover assertions already used elsewhere in those specs (`.hover()` then `getByRole('button', { name: 'Rewind code to here' })` / `{ name: 'Rewind unavailable for this message' })` with disabled state; the reason remains visible via the button `title`).
+3. In both e2e specs: replace the `getByRole('status'/'note', …)` transcript-text assertions with the corresponding hover assertions already used elsewhere in those specs (`.hover()` then `getByRole('button', { name: 'Rewind code to here' })` / `{ name: 'Rewind unavailable for this message' })` with disabled state; the reason remains visible via the button `title`), AND add per-pane absence pins for the removed text (round-2 review finding 2 — hover assertions alone can pass while the note still renders): `await expect(paneRoot.getByRole('note')).toHaveCount(0)` and `await expect(paneRoot.getByRole('status', { name: /Code rewind (is available|unavailable) for this message|Saving code rewind checkpoint for this message/ })).toHaveCount(0)` at the same points the old note assertions ran, so the REMOVAL itself is e2e-protected, not just the hover state.
 
 - [ ] **Step 2: Run the unit tests and verify the intended failure**
 
@@ -182,19 +184,15 @@ Expected: PASS.
 
 Check for now-dead exports/strings: `rg -n "MODERN_TURN_CHECKPOINT_UNAVAILABLE|Saving the code state from before this message\." src/` — the constant stays (Task 1 uses it; the hover title at FreshAgentTurnActions.tsx:137 and the rewind-click notices in FreshAgentView still use their own strings). Remove only the note's unique strings if nothing else references them (expected: none unique to the note).
 
-- [ ] **Step 6: Run impacted-test verification (unit + e2e)**
+- [ ] **Step 6: Run impacted-test verification (unit + cloud e2e)**
 
 Run: `pnpm run test:vitest run test/unit/client/components/fresh-agent/ --config config/vitest/vitest.config.ts`
 
 Expected: PASS.
 
-E2e, split per lane (the two specs live on different lanes — `code-checkpoint-workspace-external.spec.ts` is a closed external-target spec that cannot be combined with other spec paths or run on the ordinary lane; load-bearing finding LB5, reports/load-bearing-finder.md):
+Run (cloud-legal spec, ordinary lane): `FRESHELL_E2E_BACKEND=cloud pnpm run test:e2e test/e2e-browser/specs/fresh-agent-checkpoint-unavailable-rust.spec.ts`
 
-Run: `FRESHELL_E2E_BACKEND=cloud pnpm run test:e2e test/e2e-browser/specs/fresh-agent-checkpoint-unavailable-rust.spec.ts`
-
-Run (closed driver, the only supported invocation): `GCLOUD_ROBOT_REQUIRE=1 pnpm exec tsx scripts/testing/managed-provider-environment-target.ts --checkpoint`
-
-Expected: PASS on both (including the unchanged restore journeys and the six note/status assertion conversions in the external spec).
+Expected: PASS (including the unchanged restore journeys and the new absence pins).
 
 - [ ] **Step 7: Commit the task**
 
@@ -202,6 +200,14 @@ Expected: PASS on both (including the unchanged restore journeys and the six not
 git add src/components/fresh-agent/FreshAgentTranscript.tsx test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx test/e2e-browser/specs/fresh-agent-checkpoint-unavailable-rust.spec.ts test/e2e-browser/specs/code-checkpoint-workspace-external.spec.ts
 git commit -m "fix(fresh-agent): remove the per-turn rewind status text; hover keeps state and reason"
 ```
+
+- [ ] **Step 8: Run the external-target driver verification (requires the Step 7 commit)**
+
+The closed driver builds from a COMMITTED acceptance SHA and asserts an empty `git status --porcelain`, so it can only run AFTER the task's commit (round-2 review finding 3). It also asserts the exact robot account (`managed-provider-environment-target.ts:1192-1193`):
+
+Run: `GCLOUD_ROBOT_REQUIRE=1 GCLOUD_ROBOT_ACCOUNT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com pnpm exec tsx scripts/testing/managed-provider-environment-target.ts --checkpoint`
+
+Expected: PASS (covers the six note/status assertion conversions in `code-checkpoint-workspace-external.spec.ts`). If it fails, fix and amend with a follow-up commit, then re-run.
 
 ---
 
@@ -283,7 +289,14 @@ async fn identity_re_broadcast_is_addressed_to_every_session_alias() {
     let home = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     let (broadcast_tx, mut broadcast_rx) = tokio::sync::broadcast::channel(1024);
-    let service = CheckpointService::new(home.path(), broadcast_tx.clone()).await.unwrap();
+    // Construction mirrors the existing tests' idiom (e.g. :6271):
+    // CheckpointService::new(Arc<PathBuf>, Arc<Sender<String>>) -> Self —
+    // it takes no async and returns no Result, so there is nothing to await
+    // or unwrap (round-2 review finding 4).
+    let service = Arc::new(CheckpointService::new(
+        Arc::new(home.path().to_path_buf()),
+        Arc::new(broadcast_tx),
+    ));
     // … build a `FreshAgentSend` for provider opencode / sessionType freshopencode
     // with session_id "freshopencode-req1", request_id "req1",
     // checkpoint_intent{ logical_attempt_id: "V1StGXR8_Z5jdHi6B-myT", workspace: <workspace as resolved-project> },
@@ -379,30 +392,42 @@ git commit -m "fix(checkpoints): broadcast identity-enriched outcomes to every s
 ### Task 5: E2E — a freshopencode first message offers rewind live, without reload (defect 3, end to end)
 
 **Files:**
-- Test: `test/e2e-browser/specs/freshopencode-first-send-reload-repro.spec.ts` (add one test reusing the file's fake-opencode harness pieces — `installFakeOpencode`, `createSetupHome`, `createServerOptions`, `TestHarness`, `RustServer` — but with a FRESH `createServerOptions` for the new test; see LB6 note in Step 1)
+- Test: `test/e2e-browser/specs/freshopencode-first-send-reload-repro.spec.ts` — add one test reusing the file's fake-opencode harness pieces (`installFakeOpencode`, `createSetupHome`, `TestHarness`, `RustServer`), and parameterize the spec-local `createServerOptions` helper (it currently HARD-CODES `FAKE_OPENCODE_HANG_SESSION_CREATE: '1'` at :50-63, so "call it freshly without the flag" is impossible — round-2 review finding 5; add an optional `hangSessionCreate?: boolean` input defaulting to `true` so the existing test's call sites are unchanged, and the new test passes `false`)
 
 **Interfaces:**
-- Consumes: the fake `opencode` fixture (`test/e2e-browser/fixtures/fake-opencode.cjs`) — it validates and persists the server-provided `messageID` prompt ids (`msg_[0-9a-f]{32}`, fixture :123-124, :174-200), so the deterministic identity observation succeeds end to end; Task 4's per-alias broadcast; Task 2's hover-only surfaces. This spec is in `CLOUD_SKIP_SPECS` (`playwright.cloud.config.ts:41`, provider-boot-timing class) and its new test inherits that membership — the cloud lane's `testIgnore` silently drops it, so this spec runs on the LOCAL lane only (load-bearing finding LB4, reports/load-bearing-finder.md).
-- Produces: one spec proving the first composer message's rewind button is enabled right after its turn completes, with no page reload.
+- Consumes: the fake `opencode` fixture (`test/e2e-browser/fixtures/fake-opencode.cjs`) — it validates and persists the server-supplied `messageID` prompt ids (`msg_[0-9a-f]{32}`, fixture :123-124, :174-200), so the deterministic identity observation succeeds end to end; Task 4's per-alias broadcast; Task 2's hover-only surfaces. This spec is in `CLOUD_SKIP_SPECS` (`playwright.cloud.config.ts:41`, provider-boot-timing class) and its new test inherits that membership — the cloud lane's `testIgnore` silently drops it, so this spec runs on the LOCAL lane only (load-bearing finding LB4, reports/load-bearing-finder.md).
+- Produces: one spec proving the first composer message's rewind button is enabled right after its turn completes, with no page reload — PLUS the e2e coverage for Task 1's behaviors that the unit tests alone cannot provide (round-2 review finding 2): the mid-turn busy-pending hover, the agent-turn role gate (no rewind control on assistant rows), and the transcript note absence.
 
 - [ ] **Step 1: Write the spec**
 
-Add to `freshopencode-first-send-reload-repro.spec.ts`:
+Add to `freshopencode-first-send-reload-repro.spec.ts` (first parameterize `createServerOptions` per the Files note):
 
 ```ts
 test('binds the first message\'s code checkpoint live, without a reload', async ({ page }) => {
-  // Boot the Rust server + fake opencode harness with the same pieces the
-  // existing test uses, BUT pass a fresh createServerOptions WITHOUT
-  // FAKE_OPENCODE_HANG_SESSION_CREATE: that flag pins session materialization
-  // in flight forever (fixture :1694-1702 never responds), so the durable
-  // ses_* id would never appear and this test could never pass (LB6,
+  // Boot the Rust server + fake opencode harness with createServerOptions({ …,
+  // hangSessionCreate: false }): the hard-coded flag pins session materialization
+  // in flight forever (fixture :1694-1702 never responds), so the durable ses_*
+  // id would never appear and this test could never pass (LB6,
   // reports/load-bearing-finder.md). Do not inherit the existing test's
   // flag-conditioned wait helpers either.
   // … open a fresh freshopencode pane (picker → opencode mode with a Git
   // workspace cwd so capture succeeds) …
   // … type the first composer message and submit …
-  // … wait for the assistant turn to settle and the snapshot to show the
-  // user + assistant rows …
+  // MID-TURN (Task 1 busy-pending e2e): after the snapshot's user row
+  // (msg_-id, source durable — the request-keyed capture frame cannot bind it,
+  // see Task 1's semantics note) is visible while the pane is still busy:
+  //   await userTurn.hover()
+  //   → assert the rewind button is DISABLED with aria-label
+  //     "Saving code rewind checkpoint" and title "Saving the code state from
+  //     before this message". If the fake's turn settles too fast to make this
+  //     window deterministic, hold it open with the fixture's existing
+  //     summarize gate (FAKE_OPENCODE_HOLD_SUMMARIZE_GATE_PATH, fixture
+  //     :667/:1632), assert, then release the gate.
+  // ROLE GATE + NOTE ABSENCE (Task 1/2 e2e): on the assistant row, assert NO
+  // rewind button at all (not enabled, not disabled); assert the pane has no
+  // role="note"/"status" rewind-status text (toHaveCount(0) pins the removal).
+  // … release the gate if held; wait for the assistant turn to settle and the
+  // enriched outcome to bind …
   const userTurn = page.getByRole('article').filter({ hasText: '<the sent text>' }).first()
   await userTurn.hover()
   const rewind = userTurn.getByRole('button', { name: 'Rewind code to here' })
@@ -418,9 +443,9 @@ Run: `pnpm run test:e2e:local test/e2e-browser/specs/freshopencode-first-send-re
 
 Expected: PASS for the new test (and the existing one, which keeps its hang-flag harness and reload journey). NOTE (LB6): no e2e anywhere has composed the freshopencode checkpoint journey before — every link is individually proven (fixture messageID persistence, provider-neutral capture, the LB1 client chain, the Task 4 Rust unit test), but the composition executes for the first time here. If the new test fails on first run, treat the HARNESS as suspect first (see Step 3).
 
-- [ ] **Step 3: No production implementation**
+- [ ] **Step 3: No production implementation (test-infra only)**
 
-None expected. If the spec fails, diagnose in this order: (1) harness-suspect-first — verify the server options really dropped `FAKE_OPENCODE_HANG_SESSION_CREATE`, the fake materialized a durable `ses_*` id, the snapshot shows both rows, and the server JSONL shows the capture + identity observation + per-alias broadcast frames; (2) only then consider a contract break between Task 4's fan-out and the client gates. Never relax the spec to make it pass.
+None in src/ or crates/. If the spec fails, diagnose in this order: (1) harness-suspect-first — verify the server options really dropped the hang flag (the parameterized helper default must still keep the EXISTING test green), the fake materialized a durable `ses_*` id, the snapshot shows both rows, and the server JSONL shows the capture + identity observation + per-alias broadcast frames; (2) only then consider a contract break between Task 4's fan-out and the client gates. Never relax the spec to make it pass.
 
 - [ ] **Step 4: Run the focused spec**
 
@@ -432,17 +457,13 @@ Expected: PASS.
 
 None.
 
-- [ ] **Step 6: Run impacted-test verification**
-
-The checkpoint suites touched by this branch, each on its legal lane (LB4/LB5, reports/load-bearing-finder.md):
+- [ ] **Step 6: Run impacted-test verification (local + cloud lanes)**
 
 Run: `pnpm run test:e2e:local test/e2e-browser/specs/freshopencode-first-send-reload-repro.spec.ts`
 
 Run: `FRESHELL_E2E_BACKEND=cloud pnpm run test:e2e test/e2e-browser/specs/fresh-agent-checkpoint-unavailable-rust.spec.ts`
 
-Run (closed external-target driver, the only supported invocation for this spec): `GCLOUD_ROBOT_REQUIRE=1 pnpm exec tsx scripts/testing/managed-provider-environment-target.ts --checkpoint`
-
-Expected: PASS on all three (the third includes the six note-assertion conversions Task 2 made in `code-checkpoint-workspace-external.spec.ts`).
+Expected: PASS on both.
 
 - [ ] **Step 7: Commit the task**
 
@@ -450,6 +471,14 @@ Expected: PASS on all three (the third includes the six note-assertion conversio
 git add test/e2e-browser/specs/freshopencode-first-send-reload-repro.spec.ts
 git commit -m "test(e2e): freshopencode first message binds rewind live without reload"
 ```
+
+- [ ] **Step 8: Run the external-target driver verification (requires the Step 7 commit)**
+
+The closed driver builds from a COMMITTED acceptance SHA, asserts an empty `git status --porcelain`, and asserts the exact robot account (`managed-provider-environment-target.ts:1192-1193`), so it runs AFTER the task's commit (round-2 review finding 3):
+
+Run: `GCLOUD_ROBOT_REQUIRE=1 GCLOUD_ROBOT_ACCOUNT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com pnpm exec tsx scripts/testing/managed-provider-environment-target.ts --checkpoint`
+
+Expected: PASS (covers the six note/status assertion conversions in `code-checkpoint-workspace-external.spec.ts`). If it fails, fix and amend with a follow-up commit, then re-run.
 
 ---
 
