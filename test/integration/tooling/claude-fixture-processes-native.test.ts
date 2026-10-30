@@ -98,6 +98,31 @@ const SIDECAR = `
 `
 
 describe('native Claude fixture process ownership', () => {
+  it('closes a root-only process stream while its Windows Job host remains alive', async () => {
+    const fixture = await createClaudeFixture()
+    const child = fixture.spawn(process.execPath, ['-e', 'process.stdout.write("root finished\\n", () => process.exit(0))'], { stdio: 'pipe' })
+    const hostPid = (child as ChildProcess & { fixtureHostPid?: number }).fixtureHostPid
+    child.stderr!.resume()
+    const output = observe(child)
+    let closed = false
+    void output.closed.then(() => { closed = true })
+    try {
+      await waitUntil(async () => closed)
+      expect(child.exitCode).toBe(0)
+      expect(output.stdout()).toBe('root finished\n')
+      if (process.platform === 'win32') {
+        expect(Number.isInteger(hostPid)).toBe(true)
+        expect(await live(hostPid!)).toBe(true)
+      }
+      await fixture.cleanup()
+      if (process.platform === 'win32') {
+        expect(await live(hostPid!)).toBe(false)
+      }
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
   for (const [mode, description] of [
     ['clean', 'a clean sidecar exit'],
     ['create-failed', 'creation fails without a created frame'],
