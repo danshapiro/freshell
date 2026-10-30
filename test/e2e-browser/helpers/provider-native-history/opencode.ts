@@ -1,6 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
+import { createRequire } from 'node:module'
 
 import {
   MAX_NATIVE_TURNS,
@@ -18,6 +18,8 @@ import { safeOpaqueId } from './safe-io.js'
 const MAX_MESSAGE_ROWS = 128
 const MAX_PART_ROWS = 256
 const MAX_SQLITE_JSON_BYTES = 256 * 1024
+type DatabaseSync = import('node:sqlite').DatabaseSync
+const { DatabaseSync }: typeof import('node:sqlite') = createRequire(import.meta.url)('node:sqlite')
 
 function requireRegularDatabase(filename: string): void {
   if (!path.isAbsolute(filename)) throw new Error('OpenCode database path must be absolute')
@@ -42,7 +44,16 @@ function requireColumns(db: DatabaseSync, table: string, columns: string[]): voi
 }
 
 /** OpenCode's SQLite reader uses a query-only read transaction for a consistent snapshot. */
+export type OpenCodeNativeInput = { messageId: string; text: string }
+
 export function readOpenCodeNativeHistory(filename: string, exactSessionId: string): NativeHistory {
+  const { history } = readOpenCodeNativeObservation(filename, exactSessionId)
+  if (history.turns.length === 0) throw new Error('OpenCode exact native session has no completed assistant response')
+  return history
+}
+
+/** Retains actual user IDs/text alongside the completed native parent links. */
+export function readOpenCodeNativeObservation(filename: string, exactSessionId: string): { history: NativeHistory; inputs: OpenCodeNativeInput[] } {
   const sessionId = safeOpaqueId(exactSessionId, 'OpenCode native session id')
   requireRegularDatabase(filename)
   const db = new DatabaseSync(filename, { readOnly: true })
@@ -61,6 +72,8 @@ export function readOpenCodeNativeHistory(filename: string, exactSessionId: stri
       'SELECT data FROM part WHERE session_id = ? AND message_id = ? ORDER BY time_created, id LIMIT ?',
     )
     const turns: NativeAssistantTurn[] = []
+    const inputs: OpenCodeNativeInput[] = []
+    const messageIds = new Set<string>()
     for (const row of rows) {
       if (Buffer.byteLength(row.data, 'utf8') > MAX_SQLITE_JSON_BYTES) {
         throw new Error('OpenCode message JSON exceeds the evidence bound')
@@ -69,8 +82,10 @@ export function readOpenCodeNativeHistory(filename: string, exactSessionId: stri
       try { message = object(JSON.parse(row.data), 'OpenCode message data') } catch (error) {
         throw new Error(`OpenCode message data is not valid JSON: ${String(error)}`)
       }
-      if (message.role !== 'assistant') continue
-      if (!Number.isSafeInteger(message.time?.completed) || message.time.completed <= 0) continue
+      if (messageIds.has(row.id)) throw new Error('OpenCode duplicate native message ID')
+      messageIds.add(row.id)
+      if (message.role !== 'assistant' && message.role !== 'user') continue
+      if (message.role === 'assistant' && (!Number.isSafeInteger(message.time?.completed) || message.time.completed <= 0)) continue
       const partRows = partsQuery.all(sessionId, row.id, MAX_PART_ROWS + 1) as { data: string }[]
       if (partRows.length > MAX_PART_ROWS) throw new Error('OpenCode part rows exceed the evidence bound')
       const parts = partRows.map((part) => {
@@ -85,6 +100,10 @@ export function readOpenCodeNativeHistory(filename: string, exactSessionId: stri
         .filter((part) => part.type === 'text')
         .map((part) => typeof part.text === 'string' ? part.text : '')
         .join(''), 'OpenCode native assistant response')
+      if (message.role === 'user') {
+        inputs.push({ messageId: requiredString(row.id, 'OpenCode native user ID'), text })
+        continue
+      }
       const toolCalls = boundedToolCalls(parts
         .filter((part) => part.type === 'tool')
         .map((part) => ({ type: 'tool', ...(optionalString(part.tool ?? part.name) ? { name: optionalString(part.tool ?? part.name)! } : {}) })),
@@ -97,20 +116,20 @@ export function readOpenCodeNativeHistory(filename: string, exactSessionId: stri
         messageId,
         parentMessageId,
         completedAt: message.time.completed,
+        outcome: message.error != null ? 'failed' : 'completed',
         text,
         toolCalls,
         resolvedProvider: requiredString(message.providerID, 'OpenCode assistant provider id'),
         resolvedModel: requiredString(message.modelID, 'OpenCode assistant model id'),
-        resolvedReasoningEffort: 'provider-default',
+        resolvedReasoningEffort: 'unknown',
         providerProvenance: 'opencode-message.providerID',
         modelProvenance: 'opencode-message.modelID',
-        reasoningEffortProvenance: 'opencode-message.provider-default',
+        reasoningEffortProvenance: 'unsupported-native-telemetry',
       })
       if (turns.length > MAX_NATIVE_TURNS) throw new Error('OpenCode native assistant turns exceed the evidence bound')
     }
-    if (turns.length === 0) throw new Error('OpenCode exact native session has no completed assistant response')
     db.exec('COMMIT;')
-    return { schemaVersion: NATIVE_HISTORY_SCHEMA_VERSION, provider: 'opencode', nativeSessionId: sessionId, turns }
+    return { history: { schemaVersion: NATIVE_HISTORY_SCHEMA_VERSION, provider: 'opencode', nativeSessionId: sessionId, turns }, inputs }
   } catch (error) {
     try { db.exec('ROLLBACK;') } catch {}
     throw error

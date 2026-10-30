@@ -221,10 +221,10 @@ async fn managed_runtime_recovery_transition_changes_cause_only_and_redacts_fail
         for _ in 0..40 {controller.hydrate(view.clone()).await;}
         let before_retry=bytes.lock().unwrap().len();
         let sequence=controller.begin_recovery(&soul,true).await.unwrap();
-        controller.publish_recovery(&soul,sequence,&Err(ClientError::Runtime(RuntimeErrorCode::HostUnreachable,"raw secret=synthetic-sensitive-error".into()))).await;
-        for _ in 0..40 {controller.publish_recovery(&soul,sequence,&Err(ClientError::Runtime(RuntimeErrorCode::HostUnreachable,"raw secret=synthetic-sensitive-error".into()))).await;}
+        controller.publish_recovery(&soul,sequence,&Err(ClientError::Runtime { code: RuntimeErrorCode::HostUnreachable, message: "raw secret=synthetic-sensitive-error".into(), diagnostic_code: None, fresh_agent_provider_start_diagnostic: None })).await;
+        for _ in 0..40 {controller.publish_recovery(&soul,sequence,&Err(ClientError::Runtime { code: RuntimeErrorCode::HostUnreachable, message: "raw secret=synthetic-sensitive-error".into(), diagnostic_code: None, fresh_agent_provider_start_diagnostic: None })).await;}
         let sequence=controller.begin_recovery(&soul,true).await.unwrap();
-        controller.publish_recovery(&soul,sequence,&Err(ClientError::Runtime(RuntimeErrorCode::InvalidRequest,"raw secret=synthetic-sensitive-error".into()))).await;
+        controller.publish_recovery(&soul,sequence,&Err(ClientError::Runtime { code: RuntimeErrorCode::InvalidRequest, message: "raw secret=synthetic-sensitive-error".into(), diagnostic_code: None, fresh_agent_provider_start_diagnostic: None })).await;
         let sequence=controller.begin_recovery(&soul,true).await.unwrap();
         view.recovery_state=RecoveryState::Live;view.recovery_reason=None;
         controller.publish_recovery(&soul,sequence,&Ok(RecoveryResult {outcome:RecoveryOutcome::AlreadyLive,view,probe:None,

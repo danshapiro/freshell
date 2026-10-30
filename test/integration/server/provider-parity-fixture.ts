@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { runtimeCargoCommand } from '../../../scripts/testing/runtime-cargo-artifacts.js'
 
 import {
   readProviderParityReceipt,
@@ -27,7 +28,11 @@ function writeFixtureRow(directory: string, row: ProviderParityRow): void {
 }
 
 async function run(command: string, args: string[], cwd: string, evidenceDir: string): Promise<void> {
-  const child = spawn(command, args, {
+  // These Cargo tests also publish ordinary session-host executables. Share
+  // the runtime builder's lock so they cannot replace a feature build between
+  // its compilation and its run-private snapshot.
+  const executable = command === 'cargo' ? runtimeCargoCommand(cwd, command, args) : { command, args }
+  const child = spawn(executable.command, executable.args, {
     cwd,
     env: { ...process.env, FRESHELL_PROVIDER_PARITY_ROWS_DIR: evidenceDir },
     stdio: ['ignore', 'pipe', 'pipe'],

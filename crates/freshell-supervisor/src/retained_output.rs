@@ -75,10 +75,10 @@ pub(crate) fn read(
         metadata(&source.runtime_dir.join(SPOOL_DESCRIPTOR_FILE))?;
     descriptor.validate()?;
     if descriptor.incarnation_id != source.incarnation_id
-        || descriptor.terminal_id != source.terminal.terminal_id
+        || descriptor.terminal_id != source.terminal_id
         || !descriptor
             .stream_epoch
-            .starts_with(&format!("{}-", source.terminal.stream_id))
+            .starts_with(&format!("{}-", source.stream_id))
     {
         return Err("retained output source association mismatch".into());
     }
@@ -503,7 +503,7 @@ mod tests {
     use super::*;
     use freshell_runtime_protocol::{
         terminal_spool::{write_spool_index_header, TerminalSpoolFrame, MAX_OUTPUT_FRAME_BYTES},
-        IncarnationId, TerminalLaunchSpec,
+        IncarnationId,
     };
 
     #[test]
@@ -594,13 +594,11 @@ mod tests {
         let make_source = || RetainedOutputSource {
             incarnation_id: descriptor.incarnation_id.clone(),
             runtime_dir: directory.path().to_path_buf(),
-            terminal: serde_json::from_value::<TerminalLaunchSpec>(serde_json::json!({
-                "terminalId":terminal_id,"streamId":"launch-prefix","mode":"shell",
-                "program":"/bin/sh","cwd":"/workspace","runAsUid":65534,
-                "runAsGid":0,"cols":120,"rows":30,"projectKey":"fixture",
-                "workspacePath":"/workspace"
-            }))
-            .unwrap(),
+            terminal_id: terminal_id.into(),
+            stream_id: "launch-prefix".into(),
+            read_fence: Default::default(),
+            stopped: false,
+            verified_empty: false,
             native_session_id: None,
         };
         let mut spool = File::create(directory.path().join(SPOOL_CURRENT_FILE)).unwrap();
@@ -666,13 +664,11 @@ mod tests {
         let source = RetainedOutputSource {
             incarnation_id: descriptor.incarnation_id.clone(),
             runtime_dir: directory.path().to_path_buf(),
-            terminal: serde_json::from_value::<TerminalLaunchSpec>(serde_json::json!({
-                "terminalId":terminal_id,"streamId":"launch-prefix","mode":"shell",
-                "program":"/bin/sh","cwd":"/workspace","runAsUid":65534,
-                "runAsGid":0,"cols":120,"rows":30,"projectKey":"fixture",
-                "workspacePath":"/workspace"
-            }))
-            .unwrap(),
+            terminal_id: terminal_id.into(),
+            stream_id: "launch-prefix".into(),
+            read_fence: Default::default(),
+            stopped: false,
+            verified_empty: false,
             native_session_id: None,
         };
         let frame = freshell_runtime_protocol::RuntimeOutputFrame {
@@ -736,13 +732,11 @@ mod tests {
         let make_source = || RetainedOutputSource {
             incarnation_id: descriptor.incarnation_id.clone(),
             runtime_dir: directory.path().to_path_buf(),
-            terminal: serde_json::from_value::<TerminalLaunchSpec>(serde_json::json!({
-                "terminalId":terminal_id,"streamId":"launch-prefix","mode":"shell",
-                "program":"/bin/sh","cwd":"/workspace","runAsUid":65534,
-                "runAsGid":0,"cols":120,"rows":30,"projectKey":"fixture",
-                "workspacePath":"/workspace"
-            }))
-            .unwrap(),
+            terminal_id: terminal_id.into(),
+            stream_id: "launch-prefix".into(),
+            read_fence: Default::default(),
+            stopped: false,
+            verified_empty: false,
             native_session_id: None,
         };
         std::fs::write(
@@ -798,13 +792,11 @@ mod tests {
         let source = RetainedOutputSource {
             incarnation_id: incarnation_id.clone(),
             runtime_dir: directory.path().to_path_buf(),
-            terminal: serde_json::from_value::<TerminalLaunchSpec>(serde_json::json!({
-                "terminalId":terminal_id,"streamId":"launch-prefix","mode":"shell",
-                "program":"/bin/sh","cwd":"/workspace","runAsUid":65534,
-                "runAsGid":0,"cols":120,"rows":30,"projectKey":"fixture",
-                "workspacePath":"/workspace"
-            }))
-            .unwrap(),
+            terminal_id: terminal_id.into(),
+            stream_id: "launch-prefix".into(),
+            read_fence: Default::default(),
+            stopped: false,
+            verified_empty: false,
             native_session_id: None,
         };
         let descriptor = TerminalSpoolDescriptor {

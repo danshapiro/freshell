@@ -1,12 +1,16 @@
 //! Fixed helper for descriptor-owned placeholders in the exact soul volume.
 use super::helper_lifecycle::{
     AttemptStep, Deferred, HelperContainer, HelperDeadlines, HelperFailure, HelperKind,
-    HelperObjects, HELPER_CLEANUP_BUDGET,
+    HelperObjects, HelperOwner, HELPER_CLEANUP_BUDGET,
 };
 use super::*;
 use freshell_platform::provider_mountpoints::Mountpoint;
 use std::time::Duration;
 use tokio::net::UnixListener;
+
+#[cfg(test)]
+#[path = "provider_mountpoints_lifecycle_tests.rs"]
+mod lifecycle_tests;
 
 fn fail(cause: &'static str) -> BackendError {
     BackendError::Unavailable(cause.into())
@@ -220,7 +224,7 @@ impl DockerEngineBackend {
         self.run_launch_mountpoint_helper(
             target,
             selected,
-            HelperDeadlines::after(Duration::from_secs(30), HELPER_CLEANUP_BUDGET),
+            HelperDeadlines::after(Duration::from_secs(90), HELPER_CLEANUP_BUDGET),
         )
         .await
     }
@@ -234,19 +238,19 @@ impl DockerEngineBackend {
         selected: Vec<Mountpoint>,
         deadlines: HelperDeadlines,
     ) -> Result<(), BackendError> {
-        let mut owned = None;
+        let mut owner = HelperOwner::new(self, "provider_mountpoints", None);
         let result = self
             .run_provider_mountpoint_helper(
                 target,
                 selected,
                 deadlines,
                 &AttemptStep::new(),
-                &mut owned,
+                owner.objects_mut(),
             )
             .await;
         // The run still owns a helper Docker has not created yet, or one whose
         // removal it could not confirm: either is still ours to remove.
-        if let Some(helper) = owned.take() {
+        if let Some(helper) = owner.into_objects() {
             let why = if helper.is_pending() {
                 Deferred::CreateUnanswered
             } else {
@@ -308,11 +312,14 @@ impl DockerEngineBackend {
         let operation = async {
             step.enter("mountpoints_create");
             let created = owned
-                .insert(HelperContainer::new(
-                    HelperKind::ProviderMountpoints,
-                    name.clone(),
-                    body.clone(),
-                ))
+                .insert(
+                    HelperContainer::new(
+                        HelperKind::ProviderMountpoints,
+                        name.clone(),
+                        body.clone(),
+                    )
+                    .with_exchange_directory(directory),
+                )
                 .create(self)
                 .await
                 .map_err(|_| {
@@ -334,112 +341,124 @@ impl DockerEngineBackend {
                 .as_str()
                 .filter(|id| id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
                 .ok_or_else(|| fail("provider mountpoint helper identity invalid"))?;
-            let inspected = self
-                .request_bounded(
-                    "GET",
-                    &format!("{DOCKER_API}/containers/{id}/json"),
-                    None,
-                    1024 * 1024,
-                )
-                .await?;
-            let actual: Value = serde_json::from_slice(&inspected.body)
-                .map_err(|_| fail("provider mountpoint helper inspection invalid"))?;
-            if inspected.status != 200
-                || actual["Id"] != id
-                || actual["State"]["Running"] != false
-                || !owned_mountpoint_helper(&actual, &body)
-            {
-                return Err(
-                    fail("provider mountpoint helper namespace changed before start").into(),
-                );
-            }
-            step.enter("mountpoints_start");
-            let started = self
-                .request("POST", &format!("{DOCKER_API}/containers/{id}/start"), None)
-                .await
-                .map_err(|_| {
-                    HelperFailure::unanswered(
-                        "mountpoints_start",
-                        fail("provider mountpoint helper start unanswered"),
-                    )
-                })?;
-            if started.status != 204 {
-                return Err(HelperFailure::answered(
-                    "mountpoints_start",
-                    started.status,
-                    fail("provider mountpoint helper start failed"),
-                ));
-            }
-            step.enter("mountpoints_read");
-            let exchange = async {
-                let (mut stream, _) = listener
-                    .accept()
-                    .await
-                    .map_err(|_| fail("provider mountpoint exchange failed"))?;
-                stream
-                    .write_all(&(request.len() as u32).to_be_bytes())
-                    .await
-                    .map_err(|_| fail("provider mountpoint request failed"))?;
-                stream
-                    .write_all(&request)
-                    .await
-                    .map_err(|_| fail("provider mountpoint request incomplete"))?;
-                let mut acknowledgement = [0; 2];
-                stream
-                    .read_exact(&mut acknowledgement)
-                    .await
-                    .map_err(|_| fail("provider mountpoint acknowledgement unavailable"))?;
-                step.enter("mountpoints_exit");
-                match &acknowledgement {
-                    b"ok" => Ok(()),
-                    b"er" => {
-                        let mut length = [0; 4];
-                        stream
-                            .read_exact(&mut length)
-                            .await
-                            .map_err(|_| fail("provider mountpoint failure reason unavailable"))?;
-                        let length = u32::from_be_bytes(length) as usize;
-                        if length == 0 || length > 4096 {
-                            return Err(fail("provider mountpoint failure reason exceeds limit"));
-                        }
-                        let mut reason = vec![0; length];
-                        stream
-                            .read_exact(&mut reason)
-                            .await
-                            .map_err(|_| fail("provider mountpoint failure reason incomplete"))?;
-                        let reason = std::str::from_utf8(&reason)
-                            .map_err(|_| fail("provider mountpoint failure reason invalid"))?;
-                        Err(BackendError::Unavailable(format!(
-                            "provider mountpoint preparation failed: {reason}"
-                        )))
-                    }
-                    _ => Err(fail("provider mountpoint acknowledgement invalid")),
-                }
-            };
-            let wait = async {
-                let response = self
+            let work = async {
+                let inspected = self
                     .request_bounded(
-                        "POST",
-                        &format!("{DOCKER_API}/containers/{id}/wait?condition=not-running"),
+                        "GET",
+                        &format!("{DOCKER_API}/containers/{id}/json"),
                         None,
-                        64 * 1024,
+                        1024 * 1024,
                     )
                     .await?;
-                let value: Value = serde_json::from_slice(&response.body)
-                    .map_err(|_| fail("provider mountpoint exit metadata invalid"))?;
-                if response.status != 200 || value["StatusCode"] != 0 {
-                    return Err(fail("provider mountpoint helper failed"));
+                let actual: Value = serde_json::from_slice(&inspected.body)
+                    .map_err(|_| fail("provider mountpoint helper inspection invalid"))?;
+                if inspected.status != 200
+                    || actual["Id"] != id
+                    || actual["State"]["Running"] != false
+                    || !owned_mountpoint_helper(&actual, &body)
+                {
+                    return Err(
+                        fail("provider mountpoint helper namespace changed before start").into(),
+                    );
+                }
+                step.enter("mountpoints_start");
+                let started = self
+                    .request("POST", &format!("{DOCKER_API}/containers/{id}/start"), None)
+                    .await
+                    .map_err(|_| {
+                        HelperFailure::unanswered(
+                            "mountpoints_start",
+                            fail("provider mountpoint helper start unanswered"),
+                        )
+                    })?;
+                if started.status != 204 {
+                    return Err(HelperFailure::answered(
+                        "mountpoints_start",
+                        started.status,
+                        fail("provider mountpoint helper start failed"),
+                    ));
+                }
+                step.enter("mountpoints_read");
+                let exchange = async {
+                    let (mut stream, _) = listener
+                        .accept()
+                        .await
+                        .map_err(|_| fail("provider mountpoint exchange failed"))?;
+                    stream
+                        .write_all(&(request.len() as u32).to_be_bytes())
+                        .await
+                        .map_err(|_| fail("provider mountpoint request failed"))?;
+                    stream
+                        .write_all(&request)
+                        .await
+                        .map_err(|_| fail("provider mountpoint request incomplete"))?;
+                    let mut acknowledgement = [0; 2];
+                    stream
+                        .read_exact(&mut acknowledgement)
+                        .await
+                        .map_err(|_| fail("provider mountpoint acknowledgement unavailable"))?;
+                    step.enter("mountpoints_exit");
+                    match &acknowledgement {
+                        b"ok" => Ok(()),
+                        b"er" => {
+                            let mut length = [0; 4];
+                            stream.read_exact(&mut length).await.map_err(|_| {
+                                fail("provider mountpoint failure reason unavailable")
+                            })?;
+                            let length = u32::from_be_bytes(length) as usize;
+                            if length == 0 || length > 4096 {
+                                return Err(fail(
+                                    "provider mountpoint failure reason exceeds limit",
+                                ));
+                            }
+                            let mut reason = vec![0; length];
+                            stream.read_exact(&mut reason).await.map_err(|_| {
+                                fail("provider mountpoint failure reason incomplete")
+                            })?;
+                            let reason = std::str::from_utf8(&reason)
+                                .map_err(|_| fail("provider mountpoint failure reason invalid"))?;
+                            Err(BackendError::Unavailable(format!(
+                                "provider mountpoint preparation failed: {reason}"
+                            )))
+                        }
+                        _ => Err(fail("provider mountpoint acknowledgement invalid")),
+                    }
+                };
+                let wait = async {
+                    let response = self
+                        .request_bounded(
+                            "POST",
+                            &format!("{DOCKER_API}/containers/{id}/wait?condition=not-running"),
+                            None,
+                            64 * 1024,
+                        )
+                        .await?;
+                    let value: Value = serde_json::from_slice(&response.body)
+                        .map_err(|_| fail("provider mountpoint exit metadata invalid"))?;
+                    if response.status != 200 || value["StatusCode"] != 0 {
+                        return Err(fail("provider mountpoint helper failed"));
+                    }
+                    Ok(())
+                };
+                let (exchange_result, wait_result) = tokio::join!(exchange, wait);
+                exchange_result?;
+                wait_result?;
+                step.enter("mountpoints_verify");
+                if self.daemon_id().await? != *target.daemon {
+                    return Err(
+                        fail("provider mountpoint daemon changed before main create").into(),
+                    );
                 }
                 Ok(())
             };
-            let (exchange_result, wait_result) = tokio::join!(exchange, wait);
-            exchange_result?;
-            wait_result?;
-            step.enter("mountpoints_verify");
-            if self.daemon_id().await? != *target.daemon {
-                return Err(fail("provider mountpoint daemon changed before main create").into());
-            }
-            Ok(())
+            tokio::time::timeout(Duration::from_secs(30), work)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(HelperFailure::timed_out(
+                        fail("provider mountpoint preparation timed out"),
+                        step,
+                    ))
+                })
         };
         let result = tokio::time::timeout_at(deadline, operation)
             .await

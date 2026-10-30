@@ -8,8 +8,13 @@ publish.workspace = true
 [features]
 default = []
 fresh-agent-fixtures = []
+opencode-docker-contract-tests = []
+managed-stop-contract-tests = []
+provider-startup-contract-tests = []
 
 [dependencies]
+freshell-opencode = { path = "../freshell-opencode", features = ["real-transport"] }
+freshell-activity = { path = "../freshell-activity" }
 freshell-agent-runtime = { path = "../freshell-agent-runtime" }
 freshell-freshagent = { path = "../freshell-freshagent" }
 freshell-codex = { path = "../freshell-codex", features = ["real-transport"] }
@@ -31,7 +36,19 @@ url = "2"
 tempfile = "3"
 
 [dev-dependencies]
+hex = "0.4"
 rusqlite = { version = "0.31", features = ["bundled"] }
 # The claude tests run the real sidecar over the CLI simulator through the
 # sidecar-environment seam (FreshClaudeState::with_sidecar_environment).
 freshell-freshagent = { path = "../freshell-freshagent", features = ["test-support"] }
+freshell-supervisor = { path = "../freshell-supervisor" }
+
+[[test]]
+name = "opencode_docker_contract"
+path = "tests/opencode_docker_contract.rs"
+required-features = ["opencode-docker-contract-tests"]
+
+[[test]]
+name = "provider_startup_retry"
+path = "tests/provider_startup_retry.rs"
+required-features = ["provider-startup-contract-tests"]

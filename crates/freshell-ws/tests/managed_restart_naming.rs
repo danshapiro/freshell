@@ -94,7 +94,8 @@ impl ManagedTerminalController for RestartedSupervisor {
         &'a self,
         _terminal: ManagedTerminalDescriptor,
         _data: String,
-    ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+    ) -> ManagedTerminalFuture<'a, Result<(), freshell_terminal::registry::ManagedTerminalInputError>>
+    {
         Box::pin(async { Ok(()) })
     }
 
@@ -132,6 +133,8 @@ impl ManagedTerminalController for RestartedSupervisor {
                 head_seq: 0,
                 exit_code: None,
                 native_session_id: None,
+                codex_activity: None,
+                opencode_activity: None,
                 chunks: Vec::new(),
             })
         })

@@ -85,6 +85,7 @@ async fn recovery_fixture(
         .commit_created(
             prepared.incarnation_id,
             BackendCreatedRecord {
+                launch_policy: Default::default(),
                 daemon_id: DockerDaemonId::new(),
                 container_id: "callback-budget-container".into(),
                 image_ref: image.clone(),
