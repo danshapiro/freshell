@@ -2,6 +2,12 @@ name: Electron Build
 
 on:
   workflow_dispatch:
+    inputs:
+      fixture_processes_only:
+        description: Run only native fixture process ownership checks
+        type: boolean
+        required: false
+        default: false
   push:
     tags: ['v*']
   pull_request:
@@ -20,8 +26,12 @@ on:
       - 'config/vite/**'
       - 'config/vitest/vitest.electron-runtime.config.ts'
       - 'config/vitest/vitest.electron.config.ts'
+      - 'config/vitest/vitest.fixture-processes-native.config.ts'
       - 'test/unit/electron/**'
       - 'test/integration/electron/**'
+      - 'test/integration/tooling/claude-fixture-processes-native.test.ts'
+      - 'test/integration/providers/claude-local-provider.mjs'
+      - 'test/support/**'
       - 'scripts/electron-dev-prerequisites.ts'
       - 'scripts/prepare-electron-runtime.ts'
       - 'scripts/ensure-claude-sidecar.ts'
@@ -40,7 +50,43 @@ permissions:
   contents: read
 
 jobs:
+  fixture-processes:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.fixture_processes_only }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Windows fixture Job Object host
+        if: runner.os == 'Windows'
+        run: cargo build -p freshell-platform --example fixture-job-host --locked
+
+      - name: Test native fixture process ownership
+        run: pnpm run test:vitest run test/integration/tooling/claude-fixture-processes-native.test.ts --config config/vitest/vitest.fixture-processes-native.config.ts
+
   build:
+    if: ${{ !inputs.fixture_processes_only }}
     strategy:
       fail-fast: false
       matrix:
@@ -89,6 +135,14 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Build Windows fixture Job Object host
+        if: matrix.os == 'windows-2022'
+        run: cargo build -p freshell-platform --example fixture-job-host --locked
+
+      - name: Test native fixture process ownership
+        if: matrix.os == 'windows-2022' || startsWith(matrix.os, 'macos')
+        run: pnpm run test:vitest run test/integration/tooling/claude-fixture-processes-native.test.ts --config config/vitest/vitest.fixture-processes-native.config.ts
 
       # Exercise the native Windows Claude profile lookup and the generated
       # terminal hook behavior. Keep this scoped to the two owning Rust crates.
