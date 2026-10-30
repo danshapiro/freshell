@@ -23,6 +23,7 @@ import panesReducer, {
 import type { PanesState } from '@/store/panesSlice'
 import type { TerminalPaneContent, PaneNode } from '@/store/paneTypes'
 import type { AppDispatch, RootState } from '@/store/store'
+import tabsReducer, { addTab } from '@/store/tabsSlice'
 import type { PaneVerdict, PaneReconcileRequest, PaneReconcileResultMessage } from '@shared/ws-protocol'
 import { ReconcilePaneSchema, ReadyCapabilitiesSchema } from '@shared/ws-protocol'
 import {
@@ -32,7 +33,12 @@ import {
   foldVerdicts,
   paneKeyFor,
 } from '@/lib/pane-reconcile'
-import type { UnknownAction } from '@reduxjs/toolkit'
+import { configureStore, type UnknownAction } from '@reduxjs/toolkit'
+import { ManagedRuntimeInventorySnapshotSchema } from '@shared/managed-runtime'
+import {
+  applyManagedRuntimeMergePlan,
+  buildManagedRuntimeMergePlan,
+} from '@/lib/recovery/managed-runtime-recovery'
 
 function emptyPanesState(): PanesState {
   return {
@@ -259,28 +265,82 @@ describe('buildReconcileRequest', () => {
     expect(pane.resumeSessionId).toBeUndefined()
   })
 
-  it("carries the pane's persisted namingHandle, so a restarted server's managed adoption rejoins a zero-turn name", () => {
+  it("serializes an unmanaged zero-turn pane's persisted namingHandle for server adoption", () => {
     let state = emptyPanesState()
-    // A zero-turn managed Claude pane renamed before its first message: its
-    // sessionRef is the preallocated (record-less) session, its name lives
-    // under the pending handle.
+    // Before managed adoption, a renamed zero-turn pane has only a
+    // preallocated session reference and a pending naming handle.
     state = addTerminalPane(state, 'tab1', 'zero-turn', {
       mode: 'claude',
       terminalId: 't-soul',
       status: 'running',
-      soulId: 'soul-1',
       sessionRef: { provider: 'claude', sessionId: 'prealloc-1' },
       namingHandle: 'nh-zero-turn',
     } as Partial<TerminalPaneContent>)
     state = addTerminalPane(state, 'tab2', 'no-handle', { mode: 'claude', terminalId: 't-2' })
 
     const req = buildReconcileRequest(asRootState(state))!
-    const zeroTurn = req.panes.find((p) => p.paneKey === paneKeyFor('tab1', 'zero-turn'))
-    expect(zeroTurn?.namingHandle).toBe('nh-zero-turn')
-    expect(zeroTurn?.sessionRef).toEqual({ provider: 'claude', sessionId: 'prealloc-1' })
+    const zeroTurn = ReconcilePaneSchema.parse(req.panes.find((p) => p.paneKey === paneKeyFor('tab1', 'zero-turn')))
+    expect(zeroTurn.namingHandle).toBe('nh-zero-turn')
+    expect(zeroTurn.sessionRef).toEqual({ provider: 'claude', sessionId: 'prealloc-1' })
     const noHandle = req.panes.find((p) => p.paneKey === paneKeyFor('tab2', 'no-handle'))
     expect(noHandle).toBeDefined()
     expect(noHandle).not.toHaveProperty('namingHandle')
+  })
+
+  it('keeps a managed zero-turn naming handle through inventory updates without legacy reconciliation', () => {
+    const store = configureStore({ reducer: { panes: panesReducer, tabs: tabsReducer } })
+    store.dispatch(addTab({ id: 'managed-tab', mode: 'claude' }))
+    store.dispatch(initLayout({
+      tabId: 'managed-tab', paneId: 'managed-pane',
+      content: {
+        kind: 'terminal', mode: 'claude', shell: 'system', status: 'running',
+        createRequestId: 'managed-create', terminalId: 'old-terminal',
+        soulId: 'managed-soul', viewIntentId: 'managed-view',
+        namingHandle: 'nh-managed-zero-turn',
+        sessionRef: { provider: 'claude', sessionId: 'prealloc-managed' },
+      },
+    }))
+    const inventory = ManagedRuntimeInventorySnapshotSchema.parse({
+      revision: 2,
+      readiness: {
+        inventoryRevision: 2, initialScanState: 'complete', blockedSubsystems: [],
+        startupRecoveryConcurrencyLimit: 4, startupRecoveryPeak: 1,
+      },
+      souls: [{
+        soulId: 'managed-soul', incarnationId: 'new-incarnation',
+        terminalId: 'new-terminal', terminalMode: 'claude',
+        launchState: 'running', cleanupState: 'none', intentRevision: 1, executionGeneration: 2,
+        desiredState: 'running', recoveryState: 'live', durabilityState: 'live_only',
+        allocationState: 'allocated', provider: 'claude', nativeSessionId: 'prealloc-managed',
+        evidenceRevision: 1, successfulRecoveriesInWindow: 0,
+      }],
+      viewIntents: [{
+        viewId: 'managed-view', soulId: 'managed-soul', ownerId: 'owner', workspaceId: 'workspace',
+        kind: 'automatic_primary', preferredTabId: 'managed-tab', preferredPaneId: 'managed-pane',
+        title: 'Claude', placementGroup: 'workspace', visibility: 'visible',
+        revision: 1, soulIntentRevision: 1, createdAt: 1, updatedAt: 1,
+      }],
+      pendingProjectionCount: 0,
+    })
+    const target = [{ tabId: 'managed-tab', paneId: 'managed-pane' }]
+    const assertNoLegacyRequest = () => {
+      const state = store.getState() as RootState
+      expect(buildReconcileRequest(state)).toBeNull()
+      expect(buildReconcileRequestForPanes(state, target)).toBeNull()
+    }
+    assertNoLegacyRequest()
+    const plan = buildManagedRuntimeMergePlan(inventory, store.getState())
+    expect(plan.creates).toEqual([])
+    expect(plan.updates).toHaveLength(1)
+    applyManagedRuntimeMergePlan({ dispatch: store.dispatch, getState: () => store.getState() as RootState }, plan)
+    expect(store.getState().panes.layouts['managed-tab']).toMatchObject({
+      type: 'leaf', id: 'managed-pane', content: {
+        namingHandle: 'nh-managed-zero-turn', soulId: 'managed-soul',
+        incarnationId: 'new-incarnation', terminalId: 'new-terminal',
+        sessionRef: { provider: 'claude', sessionId: 'prealloc-managed' },
+      },
+    })
+    assertNoLegacyRequest()
   })
 
   it('never promotes a shell-mode legacy resumeSessionId (a stateless shell has no durable identity)', () => {
