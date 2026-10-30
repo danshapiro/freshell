@@ -82,6 +82,10 @@ pub use crate::existence_by_id::{
     amplifier_dir_locator, codex_rollout_existence_locator, AmplifierSessionLocator, ByIdAnswer,
     CodexRolloutExistenceLocator,
 };
+// Antigravity by-id locator (plan Task 7): same focused-sibling convention.
+pub use crate::antigravity_existence_by_id::{
+    antigravity_transcript_locator, AntigravityTranscriptLocator,
+};
 
 pub struct IndexExistenceProbe {
     index: Arc<SessionIndex>,
@@ -131,6 +135,21 @@ pub struct IndexExistenceProbe {
     /// and the cold path never consult it (AD-4: cold codex stays
     /// `Unknown`). `None` keeps the pure index answer.
     codex_rollout_locator: Option<CodexRolloutExistenceLocator>,
+    /// Antigravity by-id fallback (plan Task 7): the index's
+    /// `AntigravitySource` drops transcripts whose ownership/workspace
+    /// parse yields no row, so a conversation dir on disk can be
+    /// index-invisible while the attach arm (`agy --conversation <id>`)
+    /// would still resume it — the two arms must agree. The check is CHEAP
+    /// (one `File::open` on the canonical
+    /// `brain/<id>/.system_generated/logs/transcript.jsonl` path), so it
+    /// lives on the sync warm-Absent adjudication path in `exists()` beside
+    /// the amplifier/opencode arms (NOT the codex gate-only treatment —
+    /// there is no ~1s walk to keep off the reconcile path) and improves
+    /// pane-reconcile dead-session answers today; `exists_for_gate`
+    /// inherits it through `exists()` for the deferred future gate
+    /// activation. `None` (tests, callers that never set it) keeps the
+    /// pure index answer.
+    antigravity_transcript_locator: Option<AntigravityTranscriptLocator>,
 }
 
 impl IndexExistenceProbe {
@@ -148,6 +167,7 @@ impl IndexExistenceProbe {
             opencode_session_locator: None,
             amplifier_session_locator: None,
             codex_rollout_locator: None,
+            antigravity_transcript_locator: None,
         }
     }
 
@@ -175,10 +195,21 @@ impl IndexExistenceProbe {
     }
 
     /// Builder-style: install the by-id rollout fallback for codex (see the
-    /// field doc). Chained at the single production construction site in
-    /// main.rs.
+    /// field doc). Chained at the single production construction site
+    /// in main.rs.
     pub fn with_codex_rollout_locator(mut self, locator: CodexRolloutExistenceLocator) -> Self {
         self.codex_rollout_locator = Some(locator);
+        self
+    }
+
+    /// Builder-style: install the by-id transcript fallback for
+    /// antigravity (see the field doc). Chained at the single production
+    /// construction site in main.rs.
+    pub fn with_antigravity_transcript_locator(
+        mut self,
+        locator: AntigravityTranscriptLocator,
+    ) -> Self {
+        self.antigravity_transcript_locator = Some(locator);
         self
     }
 
@@ -396,6 +427,40 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                         }
                     }
                 }
+                // Antigravity by-id fallback (plan Task 7): before
+                // finalizing Absent for antigravity, re-check the SAME
+                // canonical transcript path the attach arm
+                // (`agy --conversation <id>`) resolves — the index's
+                // AntigravitySource drops parse-failed transcripts (no
+                // ownership record, no usable workspace path), so a
+                // conversation dir on disk can be index-invisible yet
+                // resumable. CHEAP single-open check (the amplifier/opencode
+                // class, NOT codex's gate-only ~1s walk), so it stays on
+                // this sync reconcile-consulted path and improves
+                // pane-reconcile dead-session answers today;
+                // `exists_for_gate` inherits it through `exists()` for the
+                // deferred future gate activation. An unreadable store is
+                // honest Unknown (G28: bounded deferral), NEVER Absent.
+                if provider == "antigravity" {
+                    if let Some(locator) = &self.antigravity_transcript_locator {
+                        match locator(session_id) {
+                            ByIdAnswer::Present => {
+                                // A fallback hit is an on-disk observation:
+                                // feed the monotone observed-set (module-doc
+                                // invariant), same as the arms above.
+                                self.observed
+                                    .lock()
+                                    .expect("observed set lock")
+                                    .insert(format!("{provider}:{session_id}"));
+                                return SessionExistence::Present;
+                            }
+                            ByIdAnswer::Unreadable => return SessionExistence::Unknown,
+                            ByIdAnswer::Absent => {}
+                        }
+                    }
+                }
+                // After the antigravity arm, `Absent` for
+                // claude/opencode/amplifier/antigravity is POSITIVE absence.
                 SessionExistence::Absent
             }
         }

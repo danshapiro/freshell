@@ -145,17 +145,18 @@ fn requested_resume_session_id_for_mode(
 
 /// The terminal modes whose sessions live in a provider-durable store the
 /// session directory can resolve (`amplifier`/`opencode`/`claude`/`gemini`/
-/// `kimi`) -- the providers for which a bare `resumeSessionId` IS sufficient
-/// canonical identity to mint `sessionRef {provider: mode, sessionId}`.
-/// Deliberately NOT `codex`: a raw codex thread id alone is not restore
-/// identity (`INVALID_RAW_CODEX_RESUME_MESSAGE` / `restore-decision.ts`).
+/// `kimi`/`antigravity`) -- the providers for which a caller-supplied
+/// resume id IS sufficient canonical identity to mint
+/// `sessionRef {provider: mode, sessionId}`. Deliberately NOT `codex`: a raw
+/// codex thread id alone is not restore identity
+/// (`INVALID_RAW_CODEX_RESUME_MESSAGE` / `restore-decision.ts`).
 /// (kata ejh6: wire-level legacy `resumeSessionId` is rejected at the REST
 /// door-top before any of this runs — the plausibility/promotion machinery
 /// below now only sees resume ids derived from an accepted `sessionRef`.)
 fn is_session_provider_mode(mode: &str) -> bool {
     matches!(
         mode,
-        "amplifier" | "opencode" | "claude" | "gemini" | "kimi"
+        "amplifier" | "opencode" | "claude" | "gemini" | "kimi" | "antigravity"
     )
 }
 
@@ -167,10 +168,10 @@ fn is_session_provider_mode(mode: &str) -> bool {
 /// (the published shape contract: `shared/session-flavor.ts:65`
 /// `isDurableProviderSessionId` requires `/^ses_/` for opencode). The
 /// remaining session providers have no published id-shape contract (amplifier
-/// ids are directory names, gemini/kimi are opaque), so their gate is the
-/// honest minimum: non-empty with no whitespace -- an id that couldn't
-/// possibly name a stored session is left on the legacy `resumeSessionId`
-/// path instead of being promoted to canonical identity.
+/// ids are directory names, gemini/kimi/antigravity are opaque), so their
+/// gate is the honest minimum: non-empty with no whitespace -- an id that
+/// couldn't possibly name a stored session is left on the legacy
+/// `resumeSessionId` path instead of being promoted to canonical identity.
 fn plausible_resume_session_id(mode: &str, id: &str) -> bool {
     if mode == "claude" {
         return freshell_sessions::text::is_canonical_claude_session_id(id);
@@ -6625,6 +6626,253 @@ if (args.includes('app-server')) {{
         assert!(argv.contains("legacy-resume-id-xyz"), "resume argv: {argv}");
 
         registry.kill(&terminal_id);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    // ── Antigravity exact-resume routing (plan Task 7) ─────────────────────
+    //
+    // Wire facts (kata ejh6): a BARE wire-level `resumeSessionId` in
+    // `POST /api/tabs` is refused at the REST door-top on every mode;
+    // promotion into the launch resume path only ever sees ids derived from
+    // an accepted, provider-matched `sessionRef`.
+
+    /// `is_session_provider_mode` covers antigravity (opaque ids — the
+    /// gemini/kimi class: no published id-shape contract, so the plausibility
+    /// gate is the honest minimum of non-empty + no whitespace), and the
+    /// door-3 gate stays DEFERRED for it: `validate_rest_resume` passes a
+    /// stale antigravity id through untouched even against a
+    /// definitively-absent probe (the plan's load-bearing A2 — antigravity is
+    /// NOT in `resume_gate.rs VALIDATED_PROVIDERS` until real-binary
+    /// transcript-store evidence exists).
+    #[test]
+    fn antigravity_is_a_session_provider_mode_with_opaque_plausible_ids_and_ungated_resume() {
+        use freshell_platform::resume_gate::{ResumeExistence, ResumeIntent};
+        assert!(is_session_provider_mode("antigravity"));
+        // The opaque-id honest minimum (the gemini/kimi arm).
+        assert!(plausible_resume_session_id("antigravity", "conv-1"));
+        assert!(!plausible_resume_session_id("antigravity", ""));
+        assert!(!plausible_resume_session_id("antigravity", "conv 1"));
+        // Non-session modes stay out; raw codex ids never claim (never-alias).
+        assert!(!is_session_provider_mode("shell"));
+        assert!(!is_session_provider_mode("codex"));
+        // Door-3 deferral pin: a stale antigravity id passes through even
+        // against positive absence — never blocked, never substituted.
+        let probe = probe_answering(ResumeExistence::Absent, true);
+        let out = validate_rest_resume(
+            "antigravity",
+            Some("stale-agy".into()),
+            LaunchIntent::Resume,
+            Some(&probe),
+            ResumeIntent::UserCreate,
+        );
+        assert_eq!(out.resume_session_id.as_deref(), Some("stale-agy"));
+        assert!(out.stale_session_id.is_none());
+        assert!(!out.blocked_recovery);
+    }
+
+    /// A fresh (no identity) antigravity tab.create is a session-provider
+    /// create — with antigravity joining `is_session_provider_mode`, the
+    /// missing-identity invariant alarm fires for it exactly as for gemini
+    /// (the pane has no identity key until the disk-locator association
+    /// resolves).
+    #[tokio::test]
+    async fn create_fresh_antigravity_tab_without_identity_warns_invariant() {
+        let (events, _guard) = invariant_capture::capture();
+        let argv_file = unique_argv_file("antigravity-invariant");
+        let state =
+            state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
+                "antigravity",
+                &argv_file,
+            )]));
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            app(state.clone()),
+            "/api/tabs",
+            json!({ "mode": "antigravity", "cwd": tmp.to_string_lossy() }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+
+        let warnings = missing_identity_warnings(&events.lock().unwrap());
+        assert_eq!(
+            warnings.len(),
+            1,
+            "a fresh antigravity tab.create with no identity keys must warn once"
+        );
+        assert_eq!(
+            warnings[0].fields.get("mode").map(String::as_str),
+            Some("antigravity")
+        );
+
+        state.terminal_registry.clone().unwrap().kill(&terminal_id);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    /// A provider-matched `sessionRef {provider:"antigravity"}` is ACCEPTED
+    /// for an antigravity pane and promotes into the launch resume path:
+    /// the registry row, the spawned argv (the manifest's adjacent
+    /// `--conversation <id>` pair), and the broadcast `paneContent`/payload
+    /// all carry the exact id — never the legacy field.
+    #[tokio::test]
+    async fn create_antigravity_tab_accepts_provider_matched_session_ref_and_resumes_exact_conversation(
+    ) {
+        let argv_file = unique_argv_file("antigravity-accept");
+        let mut cli = recording_cli_spec("antigravity", &argv_file);
+        // The manifest's exact resume pair (extensions/antigravity/
+        // freshell.json `resumeArgs`): the ADJACENT `--conversation <id>`.
+        cli.resume_args = Some(vec![
+            "--conversation".to_string(),
+            "{{sessionId}}".to_string(),
+        ]);
+        let state = state_with_registry().with_cli_commands(std::sync::Arc::new(vec![cli]));
+        let mut rx = state.broadcast_tx.subscribe();
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            app(state.clone()),
+            "/api/tabs",
+            json!({
+                "mode": "antigravity",
+                "cwd": tmp.to_string_lossy(),
+                "sessionRef": { "provider": "antigravity", "sessionId": "conv-1" }
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+
+        // Launch resume path: the registry row carries the exact id.
+        let registry = state.terminal_registry.clone().unwrap();
+        let entry = registry
+            .directory()
+            .into_iter()
+            .find(|e| e.terminal_id == terminal_id)
+            .expect("directory entry");
+        assert_eq!(entry.mode, "antigravity");
+        assert_eq!(entry.resume_session_id.as_deref(), Some("conv-1"));
+
+        // Spawned argv: the adjacent pair, never a continue-style mechanism.
+        let argv = read_argv_file_eventually(&argv_file).await;
+        let rows: Vec<&str> = argv.lines().collect();
+        assert_eq!(
+            rows,
+            vec!["--conversation", "conv-1"],
+            "resume argv must be the exact adjacent --conversation pair: {argv}"
+        );
+
+        // `paneContent`/`ui.command` carry the canonical sessionRef, NOT the
+        // legacy `resumeSessionId` (mutually exclusive).
+        let frame = rx.recv().await.expect("ui.command frame broadcast");
+        let msg: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(msg["command"], json!("tab.create"));
+        assert_eq!(
+            msg["payload"]["sessionRef"],
+            json!({ "provider": "antigravity", "sessionId": "conv-1" })
+        );
+        assert!(msg["payload"].get("resumeSessionId").is_none());
+        assert_eq!(
+            msg["payload"]["paneContent"]["sessionRef"],
+            json!({ "provider": "antigravity", "sessionId": "conv-1" })
+        );
+        assert!(msg["payload"]["paneContent"]
+            .get("resumeSessionId")
+            .is_none());
+
+        registry.kill(&terminal_id);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    /// The never-alias rule at the door: a `sessionRef` minted for a
+    /// DIFFERENT provider (`gemini`) is NOT accepted for an antigravity
+    /// pane — the foreign id never reaches agy's argv and the pane launches
+    /// identity-less (never a wrong-conversation resume, never a silent
+    /// cross-provider substitution).
+    #[tokio::test]
+    async fn create_antigravity_tab_never_aliases_a_mismatched_provider_session_ref() {
+        let argv_file = unique_argv_file("antigravity-mismatch");
+        let mut cli = recording_cli_spec("antigravity", &argv_file);
+        cli.resume_args = Some(vec![
+            "--conversation".to_string(),
+            "{{sessionId}}".to_string(),
+        ]);
+        let state = state_with_registry().with_cli_commands(std::sync::Arc::new(vec![cli]));
+        let mut rx = state.broadcast_tx.subscribe();
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            app(state.clone()),
+            "/api/tabs",
+            json!({
+                "mode": "antigravity",
+                "cwd": tmp.to_string_lossy(),
+                "sessionRef": { "provider": "gemini", "sessionId": "gemini-conv-9" }
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the mismatched ref is not accepted, but the pane itself launches: {body}"
+        );
+        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+
+        // Identity-less fresh launch: no resume id in the registry row...
+        let registry = state.terminal_registry.clone().unwrap();
+        let entry = registry
+            .directory()
+            .into_iter()
+            .find(|e| e.terminal_id == terminal_id)
+            .expect("directory entry");
+        assert_eq!(
+            entry.resume_session_id, None,
+            "a gemini session id must never become an antigravity resume id"
+        );
+        // ...no --conversation in the spawned argv...
+        let argv = read_argv_file_eventually(&argv_file).await;
+        assert!(
+            !argv.contains("--conversation") && !argv.contains("gemini-conv-9"),
+            "the foreign id never reaches agy's argv: {argv}"
+        );
+        // ...and no sessionRef in the broadcast payload.
+        let frame = rx.recv().await.expect("ui.command frame broadcast");
+        let msg: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(msg["command"], json!("tab.create"));
+        assert!(
+            msg["payload"].get("sessionRef").is_none(),
+            "the unaccepted ref must not be aliased into the payload: {msg}"
+        );
+        assert!(msg["payload"].get("resumeSessionId").is_none());
+
+        registry.kill(&terminal_id);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    /// A BARE wire-level `resumeSessionId` is refused at the REST door for
+    /// antigravity too (kata ejh6: the any-carry guard is mode-generic) —
+    /// pinned so the plan never relies on the dead promotion path.
+    #[tokio::test]
+    async fn create_antigravity_tab_rejects_bare_resume_session_id_at_the_door() {
+        let argv_file = unique_argv_file("antigravity-legacy-reject");
+        let state =
+            state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
+                "antigravity",
+                &argv_file,
+            )]));
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({ "mode": "antigravity", "resumeSessionId": "conv-1" }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["message"],
+            json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."),
+            "frozen refusal text: {body}"
+        );
         let _ = std::fs::remove_file(&argv_file);
     }
 

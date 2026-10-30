@@ -18,6 +18,7 @@
 
 mod ai_router;
 mod ai_title;
+mod antigravity_existence_by_id;
 mod attachments;
 mod auto_title;
 mod auto_title_sweep;
@@ -2161,6 +2162,25 @@ async fn main() -> ExitCode {
             let probe = match freshell_ws::codex_sessions_root() {
                 Some(codex_sessions_root) => probe.with_codex_rollout_locator(
                     existence::codex_rollout_existence_locator(codex_sessions_root),
+                ),
+                None => probe,
+            };
+            // Antigravity by-id fallback (plan Task 7): the SAME canonical
+            // `brain/<id>/.system_generated/logs/transcript.jsonl` raw
+            // check the attach arm (`agy --conversation <id>`) resolves —
+            // the index's AntigravitySource drops parse-failed transcripts,
+            // so a conversation dir on disk can answer a false warm Absent
+            // while the CLI would still resume it. CHEAP single-open check,
+            // so it joins the sync warm-Absent adjudication path
+            // (amplifier/opencode class, NOT codex's gate-only walk). The
+            // home is resolved with the SAME helper the provider_roots
+            // entry above uses. No resolvable provider home => probe
+            // behaves as today for antigravity.
+            let probe = match session_directory::provider_home() {
+                Some(h) => probe.with_antigravity_transcript_locator(
+                    existence::antigravity_transcript_locator(
+                        freshell_sessions::provider_layout::antigravity_home(&h),
+                    ),
                 ),
                 None => probe,
             };
