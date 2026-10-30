@@ -3692,7 +3692,7 @@ fn read_packed_snapshot_response(
     }
     let mut newline = [0];
     output.read_exact(&mut newline)?;
-    if newline != [b'\n'] {
+    if newline != *b"\n" {
         return Err(TransferError::Blocked(
             "packed snapshot decoder returned an incomplete object".into(),
         ));
@@ -5488,7 +5488,7 @@ fn workspace_config_dependencies(
         ));
     }
     let mut complete = true;
-    for pair in fields[..fields.len() - 1].chunks_exact(2) {
+    for pair in fields[..fields.len() - 1].as_chunks::<2>().0 {
         let origin = std::str::from_utf8(pair[0])
             .map_err(|_| TransferError::Blocked("Git configuration origin is not UTF-8".into()))?;
         let origin = origin.strip_prefix("file:").ok_or_else(|| {
@@ -5909,7 +5909,7 @@ impl WorkspaceGitChild {
         } else {
             hex::encode(sha256.finalize())
         };
-        if newline != [b'\n']
+        if newline != *b"\n"
             || parser.phase != 0
             || parser.digits
             || !hash.eq_ignore_ascii_case(object)
