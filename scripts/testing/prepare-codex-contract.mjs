@@ -222,6 +222,20 @@ async function verifyPrepared() {
   return { manifest, artifact, fingerprint: manifest.fingerprint, uid: process.getuid(), gid: process.getgid() }
 }
 
+export function verifySandboxTargetCache() {
+  // Both native consumers must read the target that sandbox-test.sh prepared.
+  // Let Bash spell the path as the wrapper does, including on Windows hosts.
+  const worktreeSha256 = digest(run('bash', ['-c', 'pwd -P']).trim())
+  const targetVolume = `freshell-sandbox-rust-target-v1-${worktreeSha256.slice(0, 24)}`
+  const target = JSON.parse(run('docker', ['volume', 'inspect', targetVolume]))[0]
+  const expectedTargetLabels = {
+    'com.freshell.cache.owner': 'freshell', 'com.freshell.cache.purpose': 'rust-target',
+    'com.freshell.cache.schema': '1', 'com.freshell.cache.worktree-sha256': worktreeSha256,
+  }
+  if (target?.Name !== targetVolume || Object.entries(expectedTargetLabels).some(([key, value]) => target.Labels?.[key] !== value)) fail('sandbox target cache ownership labels do not match')
+  return { name: targetVolume, labels: expectedTargetLabels }
+}
+
 export async function verifySandbox() {
   const manifest = JSON.parse(await fsp.readFile(stageManifest, 'utf8'))
   const policy = nativeSandboxPolicy()
@@ -234,17 +248,7 @@ export async function verifySandbox() {
     const observed = JSON.parse(run('docker', ['image', 'inspect', image]))[0]
     if (observed.Id !== image || observed.Config?.Labels?.['org.freshell.codex-contract-owner'] !== manifest.subdir || manifest.contractImage.requirementsSha256 !== digest(CODEX_NETWORK_REQUIREMENTS)) fail('owned Codex test image or system prerequisites changed')
   }
-  // Match sandbox-test.sh's canonical worktree identity: the verifier must read
-  // precisely the target volume that connected preparation and native work use.
-  // Let Bash spell the path as the wrapper does, including on Windows hosts.
-  const worktreeSha256 = digest(run('bash', ['-c', 'pwd -P']).trim())
-  const targetVolume = `freshell-sandbox-rust-target-v1-${worktreeSha256.slice(0, 24)}`
-  const target = JSON.parse(run('docker', ['volume', 'inspect', targetVolume]))[0]
-  const expectedTargetLabels = {
-    'com.freshell.cache.owner': 'freshell', 'com.freshell.cache.purpose': 'rust-target',
-    'com.freshell.cache.schema': '1', 'com.freshell.cache.worktree-sha256': worktreeSha256,
-  }
-  if (!target || Object.entries(expectedTargetLabels).some(([key, value]) => target.Labels?.[key] !== value)) fail('sandbox target cache ownership labels do not match')
+  const { name: targetVolume } = verifySandboxTargetCache()
   for (const volume of ['freshell-sandbox-node-modules', 'freshell-sandbox-sidecar-node-modules', 'freshell-sandbox-mcp-node-modules']) run('docker', ['volume', 'inspect', volume])
   const name = `freshcodex-verifier-${randomUUID()}`
   const args = ['run', '--rm', '--name', name, '--label', `org.freshell.codex-contract=${name}`, '--read-only', '--network', 'none', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', `${manifest.uid}:${manifest.gid}`, '--entrypoint', 'node', '-v', `${repoRoot}:/workspace:ro`, '-v', `${targetVolume}:/freshell-test-artifacts:ro`, '-v', 'freshell-sandbox-node-modules:/workspace/node_modules:ro', image, '/workspace/scripts/testing/prepare-codex-contract.mjs', '--verify-prepared']

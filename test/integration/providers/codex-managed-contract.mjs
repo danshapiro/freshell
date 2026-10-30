@@ -4,7 +4,7 @@ import fsp from 'node:fs/promises'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { repoRoot, artifactMetadata, verifyArtifact, nativeSandboxPolicy, prepareContractImage } from '../../../scripts/testing/prepare-codex-contract.mjs'
+import { repoRoot, artifactMetadata, verifyArtifact, nativeSandboxPolicy, prepareContractImage, verifySandboxTargetCache } from '../../../scripts/testing/prepare-codex-contract.mjs'
 
 const hash = bytes => createHash('sha256').update(bytes).digest('hex')
 function docker(args, options = {}) {
@@ -58,16 +58,15 @@ export function verifyManagedPrerequisites(staged) {
   assert.equal(staged.complete, true, 'managed contract requires completed preparation')
   assert.match(staged.policyClientProbe?.path ?? '', /^\/freshell-test-artifacts\/freshcodex-contract-[a-f0-9-]+\/policy-client-probe$/)
   assert.match(staged.policyClientProbe?.sha256 ?? '', /^[a-f0-9]{64}$/)
-  // Docker would silently create this shared prerequisite volume if absent.
-  const volume = JSON.parse(docker(['volume', 'inspect', 'freshell-sandbox-cargo-target']))[0]
-  assert.equal(volume.Name, 'freshell-sandbox-cargo-target')
+  // Refuse absent/foreign preparation before Docker can create any resources.
+  return verifySandboxTargetCache()
 }
 
 export async function runManagedContract(harness, receiptDir, options = {}) {
   const owner = `managed-codex-${randomUUID()}`
   const artifact = await verifyArtifact(path.join(repoRoot, '.runtime-build/codex-contract/artifact'))
   const staged = JSON.parse(await fsp.readFile(path.join(repoRoot, '.runtime-build/codex-contract/staged.json'), 'utf8'))
-  verifyManagedPrerequisites(staged)
+  const targetCache = verifyManagedPrerequisites(staged)
   const policy = nativeSandboxPolicy()
   const policyFile = path.join(receiptDir, 'codex-policy.json')
   await fsp.writeFile(policyFile, policy.json, { mode: 0o644 })
@@ -80,7 +79,8 @@ export async function runManagedContract(harness, receiptDir, options = {}) {
     const ambient = path.join(receiptDir, `${owner}-ambient-helper`)
     await fsp.mkdir(ambient, { mode: 0o755 })
     await fsp.writeFile(path.join(ambient, 'bwrap'), '#!/bin/sh\ncase "$1" in --version) echo ambient-incompatible-bwrap;; --help) echo "--as-pid-1 --perms";; *) printf used > "$TMPDIR/ambient-bwrap-used"; exit 97;; esac\n', { mode: 0o755 })
-    const common = ['--label', `org.freshell.codex-contract=${owner}`, '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--security-opt', `seccomp=${policyFile}`, '--user', '65534:0', '--pids-limit', '512', '--memory', '1g', '--cpus', '2', '--tmpfs', '/tmp:rw,nosuid,nodev,size=128m,mode=1777', '--tmpfs', '/probe-state:rw,nosuid,nodev,size=512m,mode=700,uid=65534,gid=0', '--mount', `type=bind,source=${repoRoot},target=/contract,readonly`, '--mount', `type=bind,source=${artifact.path}/artifact-receipt.json,target=/native-reference.json,readonly`, '--mount', `type=bind,source=${ambient},target=/opt/freshell-codex-ambient,readonly`, '--mount', 'type=volume,source=freshell-sandbox-cargo-target,target=/freshell-test-artifacts,readonly', '--env', 'FRESHELL_CODEX_MANAGED_CONTRACT=1', '--env', `FRESHELL_CODEX_POLICY_CLIENT_PROBE=${staged.policyClientProbe.path}`, '--env', 'PATH=/opt/freshell-codex-ambient:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', '--entrypoint', '/usr/local/bin/node']
+    const targetMount = `type=volume,source=${targetCache.name},target=/freshell-test-artifacts,readonly,${Object.entries(targetCache.labels).map(([key, value]) => `volume-label=${key}=${value}`).join(',')}`
+    const common = ['--label', `org.freshell.codex-contract=${owner}`, '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--security-opt', `seccomp=${policyFile}`, '--user', '65534:0', '--pids-limit', '512', '--memory', '1g', '--cpus', '2', '--tmpfs', '/tmp:rw,nosuid,nodev,size=128m,mode=1777', '--tmpfs', '/probe-state:rw,nosuid,nodev,size=512m,mode=700,uid=65534,gid=0', '--mount', `type=bind,source=${repoRoot},target=/contract,readonly`, '--mount', `type=bind,source=${artifact.path}/artifact-receipt.json,target=/native-reference.json,readonly`, '--mount', `type=bind,source=${ambient},target=/opt/freshell-codex-ambient,readonly`, '--mount', targetMount, '--env', 'FRESHELL_CODEX_MANAGED_CONTRACT=1', '--env', `FRESHELL_CODEX_POLICY_CLIENT_PROBE=${staged.policyClientProbe.path}`, '--env', 'PATH=/opt/freshell-codex-ambient:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', '--entrypoint', '/usr/local/bin/node']
     const run = (label, args, extra = []) => runManagedContainer({ owner, image: image.image, receiptDir, common, label, args, extra })
     const missing = await run('missing-helper', [policy.native.launchWrapper, '--version'], ['--entrypoint', '/usr/local/bin/node', '--tmpfs', `${policy.native.helperDirectory}:ro,nosuid,nodev,size=1m,mode=755`])
     assert.notEqual(missing.status, 0, 'missing owned helper must refuse before native startup')
