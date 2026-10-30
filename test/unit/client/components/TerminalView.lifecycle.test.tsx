@@ -2313,7 +2313,7 @@ describe('TerminalView lifecycle updates', () => {
   // must stand down. Without this guard, a post-restart attach error resumes
   // the very session a dead_session verdict just declared dead -- observed in
   // the Task 11 e2e wall as duplicate `claude --resume <deleted-session>`
-  // PTYs that the adjudication panel never adopts.
+  // PTYs that no adjudication surface ever adopts.
   function setupReconcileOwnedPane(
     panesExtra: Record<string, unknown>,
     contentExtra: Partial<TerminalPaneContent> = {},
