@@ -362,7 +362,6 @@ describe('terminalDetachMiddleware — durable pane-close evidence (delta-r7-r2 
           zoomedPane: {},
           refreshRequestsByPane: {},
           restoreFallbackAttemptsByPane: {},
-          deadSessionAdjudication: [],
           reconcileWarming: null,
           reconcilePendingPanes: {},
         },

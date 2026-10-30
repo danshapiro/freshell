@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, cleanup, screen, waitFor, act } from '@testing-library/react'
+import { render, cleanup, waitFor, act } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import App from '@/App'
@@ -8,7 +8,7 @@ import tabsReducer from '@/store/tabsSlice'
 import connectionReducer, { setLiveTerminalIds } from '@/store/connectionSlice'
 import managedRuntimeReducer from '@/store/managedRuntimeSlice'
 import sessionsReducer from '@/store/sessionsSlice'
-import panesReducer, { applyReconcileAttach, clearDeadTerminals, setDeadSessionAdjudication } from '@/store/panesSlice'
+import panesReducer, { applyReconcileAttach, clearDeadTerminals } from '@/store/panesSlice'
 import { isFreshAgentReconcileActive, setFreshAgentReconcileActive } from '@/lib/pane-reconcile'
 import tabRegistryReducer from '@/store/tabRegistrySlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
@@ -543,10 +543,10 @@ describe('App pane.reconcile adoption', () => {
     expect(dispatched.types).toContain(clearDeadTerminals.type) // census ran from cached liveTerminalIds
   })
 
-  it('a later clean App-level fold clears stale warming banner and dead-session adjudication', async () => {
-    // Final-review finding 2: foldVerdicts only SETS the batched warming /
-    // dead state (counts > 0) — App's fold site must clear it when its
-    // all-pane round reports none, or a banner/dialog from an earlier
+  it('a later clean App-level fold clears the stale warming banner', async () => {
+    // Final-review finding 2: foldVerdicts only SETS the batched warming
+    // state (counts > 0) — App's fold site must clear it when its
+    // all-pane round reports none, or a banner from an earlier
     // round survives forever.
     seedPersistedTerminalPane({ createRequestId: 'cr-1' })
     const { sentFrames, store } = await bootAppWithReady({ capabilities: { paneReconcileV1: true } })
@@ -564,35 +564,12 @@ describe('App pane.reconcile adoption', () => {
       })),
     })
     expect(store.getState().panes.reconcileWarming).not.toBeNull()
-    // A dead-sessions dialog from an earlier round is also still up.
-    act(() => {
-      store.dispatch(setDeadSessionAdjudication([
-        { tabId: 'tab-1', paneId: 'pane-1', title: 'Terminal', mode: 'shell' },
-      ]))
-    })
     // WS reconnect: ready re-sends the App-level request (covers every pane).
     await simulateReconnectWithReady({ capabilities: { paneReconcileV1: true } })
     const req2 = sentFrames.filter((f) => f.type === 'pane.reconcile.request')[1]
     // Clean all-attach round: authoritative — stale batched UI state clears.
     await receiveServerFrame(attachResultFor(req2, 'term-new'))
     expect(store.getState().panes.reconcileWarming).toBeNull()
-    expect(store.getState().panes.deadSessionAdjudication ?? []).toHaveLength(0)
-  })
-
-  it('renders no dead-sessions dialog even when adjudication state is populated', async () => {
-    // No-modal contract: dead panes explain themselves in their own pane
-    // (restoreError latch + buffer notice); populating the adjudication
-    // state must NOT raise a blocking dialog. This suite mocks no
-    // dead-session panel, so a reintroduced modal mounted by App would
-    // surface here.
-    seedPersistedTerminalPane({ createRequestId: 'cr-1' })
-    const { store } = await bootAppWithReady({ capabilities: { paneReconcileV1: true } })
-    act(() => {
-      store.dispatch(setDeadSessionAdjudication([
-        { tabId: 'tab-1', paneId: 'pane-1', title: 'x', mode: 'claude' },
-      ]))
-    })
-    expect(screen.queryByRole('dialog', { name: 'Dead sessions' })).toBeNull()
   })
 
   it('re-sends the reconcile request on EVERY ready (reconnect covers loss windows)', async () => {

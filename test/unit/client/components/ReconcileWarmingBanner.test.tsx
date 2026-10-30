@@ -5,7 +5,7 @@ import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import type { Store } from '@reduxjs/toolkit'
 import panesReducer, { clearReconcileWarming } from '@/store/panesSlice'
-import type { DeadSessionEntry, PaneNode, ReconcileWarmingState } from '@/store/paneTypes'
+import type { PaneNode, ReconcileWarmingState } from '@/store/paneTypes'
 import { ReconcileWarmingBanner } from '@/components/ReconcileWarmingBanner'
 
 // --- ws-client mock: capture sent frames, support multiple onMessage subscribers ---
@@ -82,14 +82,12 @@ function dispatchedTypes(store: Store): string[] {
 }
 
 function renderWithStore(opts: {
-  deadSessionAdjudication?: DeadSessionEntry[]
   reconcileWarming?: ReconcileWarmingState | null
   paneIds?: string[]
 }) {
   const paneIds =
     opts.paneIds ??
     [...new Set([
-      ...(opts.deadSessionAdjudication ?? []).map((e) => e.paneId),
       ...(opts.reconcileWarming?.paneRefs ?? []).map((r) => r.paneId),
     ])]
   const captured: string[] = []
@@ -111,7 +109,6 @@ function renderWithStore(opts: {
         zoomedPane: {},
         refreshRequestsByPane: {},
         restoreFallbackAttemptsByPane: {},
-        deadSessionAdjudication: opts.deadSessionAdjudication ?? [],
         reconcileWarming: opts.reconcileWarming ?? null,
       } as any,
     },

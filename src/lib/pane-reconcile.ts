@@ -22,7 +22,6 @@ import type { FreshAgentRuntimeProvider } from '@shared/fresh-agent'
 import { buildRestoreError } from '@shared/session-contract'
 import type { AppDispatch, RootState } from '@/store/store'
 import type {
-  DeadSessionEntry,
   FreshAgentPaneContent,
   PaneNode,
   TerminalPaneContent,
@@ -32,7 +31,6 @@ import {
   applyReconcileAttach,
   resetFreshAgentPaneForReconcileCreate,
   resetPaneForReconcileCreate,
-  setDeadSessionAdjudication,
   setPaneReconcileNotice,
   setPaneRestoreError,
   setReconcileWarming,
@@ -40,7 +38,6 @@ import {
 import { retainedManagedPreparationFailure } from '@/store/paneTypes'
 import { clearSessionLost } from '@/store/freshAgentSlice'
 import type { PaneOwnerDivergence } from '@/store/selectors/runtimeOwner'
-import { derivePaneTitle } from '@/lib/derivePaneTitle'
 
 /** Protocol cap on request size (mirrors PaneReconcileRequestSchema). */
 const MAX_RECONCILE_PANES = 200
@@ -290,7 +287,6 @@ export interface FoldOutcome {
   attached: number
   respawned: number
   fresh: number
-  dead: number
   warming: number
   /**
    * Panes the server explicitly deferred to managed-runtime truth. They are
@@ -314,21 +310,6 @@ function paneRefFromOwnKey(paneKey: string): { tabId: string; paneId: string } {
   return { tabId: paneKey.slice(0, sep), paneId: paneKey.slice(sep + 1) }
 }
 
-function deadSessionTitle(pane: ReconcilePane): string {
-  if (pane.kind === 'fresh-agent') {
-    // The true sessionType is not derivable from the provider (kilroy and
-    // freshclaude both run provider 'claude'), so use a stable human label
-    // built from the provider instead of derivePaneTitle.
-    return `${pane.mode.charAt(0).toUpperCase()}${pane.mode.slice(1)} session`
-  }
-  return derivePaneTitle({
-    kind: 'terminal',
-    mode: pane.mode as TerminalPaneContent['mode'],
-    createRequestId: pane.createRequestId,
-    status: 'running',
-  })
-}
-
 /**
  * Fold one fresh-agent verdict. Routing mirrors the terminal arms:
  * attach → applyFreshAgentReconcileAttach (skipped without a sessionRef —
@@ -336,17 +317,17 @@ function deadSessionTitle(pane: ReconcilePane): string {
  * resetFreshAgentPaneForReconcileCreate (SKIPPED while the pane's canonical
  * session diverges — kata b8ke T1 rec A5: a terminal-owned session must not
  * re-arm a stale-kind freshAgent.create after reconnect; the pane keeps its
- * identity and renders the divergence state instead); dead_session →
- * batched entry + loud per-pane restoreError; invalid → restoreError +
- * notice; error → warming batch or restoreError. Returns true iff the
- * verdict was folded.
+ * identity and renders the divergence state instead); dead_session → loud
+ * per-pane restoreError (NO dead-copy notice mint — FreshAgentView renders
+ * reconcileNotice as a transient status); invalid → restoreError + notice;
+ * error → warming batch or restoreError. Returns true iff the verdict was
+ * folded.
  */
 function foldFreshAgentVerdict(
   dispatch: AppDispatch,
   pane: ReconcilePane,
   verdict: PaneReconcileResultMessage['verdicts'][number],
   result: PaneReconcileResultMessage,
-  deadEntries: DeadSessionEntry[],
   warmingRefs: Array<{ tabId: string; paneId: string }>,
   outcome: FoldOutcome,
   getOwnerDivergence?: (pane: ReconcilePane) => PaneOwnerDivergence | null,
@@ -407,21 +388,11 @@ function foldFreshAgentVerdict(
       return true
     }
     case 'dead_session': {
-      deadEntries.push({
-        tabId,
-        paneId,
-        title: deadSessionTitle(pane),
-        mode: pane.mode,
-        kind: 'fresh-agent',
-        sessionRef: verdict.sessionRef,
-        reason: verdict.reason,
-      })
       dispatch(setPaneRestoreError({
         tabId,
         paneId,
         restoreError: buildRestoreError('durable_artifact_missing'),
       }))
-      outcome.dead++
       return true
     }
     case 'invalid': {
@@ -471,8 +442,7 @@ const MANAGED_DEFERRED_REASONS = new Set([
 
 /**
  * Fold a pane.reconcile.result into the store, one dispatch per pane
- * verdict — EXCEPT dead_session adjudication and index_warming, which
- * are each batched into a single dispatch.
+ * verdict — EXCEPT index_warming, which is batched into a single dispatch.
  *
  * Cardinality invariant comes FIRST: verdicts must match the request's
  * panes 1:1 in order. On violation NOTHING is dispatched — the caller
@@ -504,7 +474,6 @@ export function foldVerdicts(
     attached: 0,
     respawned: 0,
     fresh: 0,
-    dead: 0,
     warming: 0,
     managedDeferred: 0,
     invalid: 0,
@@ -522,7 +491,6 @@ export function foldVerdicts(
     }
   }
 
-  const deadEntries: DeadSessionEntry[] = []
   const warmingRefs: Array<{ tabId: string; paneId: string }> = []
 
   for (let i = 0; i < request.panes.length; i++) {
@@ -530,7 +498,7 @@ export function foldVerdicts(
     const verdict = result.verdicts[i]
 
     if (pane.kind === 'fresh-agent') {
-      const folded = foldFreshAgentVerdict(dispatch, pane, verdict, result, deadEntries, warmingRefs, outcome, opts?.getOwnerDivergence)
+      const folded = foldFreshAgentVerdict(dispatch, pane, verdict, result, warmingRefs, outcome, opts?.getOwnerDivergence)
       if (folded) opts?.onVerdictFolded?.(pane.createRequestId)
       continue
     }
@@ -580,17 +548,9 @@ export function foldVerdicts(
         break
       }
       case 'dead_session': {
-        deadEntries.push({
-          tabId,
-          paneId,
-          title: deadSessionTitle(pane),
-          mode: pane.mode,
-          sessionRef: verdict.sessionRef,
-          reason: verdict.reason,
-        })
         // Loud, non-destructive per-pane breadcrumb: the saved session
         // artifact is gone. RestoreError reasons are a closed enum, so the
-        // verdict's machine reason travels on the DeadSessionEntry instead.
+        // verdict's machine reason travels on the dead-copy notice below.
         dispatch(setPaneRestoreError({
           tabId,
           paneId,
@@ -609,7 +569,6 @@ export function foldVerdicts(
           paneId,
           notice: deadSessionReconcileNoticeFor(verdict.reason),
         }))
-        outcome.dead++
         break
       }
       case 'invalid': {
@@ -656,10 +615,6 @@ export function foldVerdicts(
     if (folded) opts?.onVerdictFolded?.(pane.createRequestId)
   }
 
-  // Council rule 1: ONE batched adjudication list — never N dispatches.
-  if (deadEntries.length > 0) {
-    dispatch(setDeadSessionAdjudication(deadEntries))
-  }
   // Council rule 5: warming verdicts aggregate into ONE dispatch.
   if (warmingRefs.length > 0) {
     dispatch(setReconcileWarming({ count: warmingRefs.length, paneRefs: warmingRefs }))

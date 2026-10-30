@@ -9,7 +9,6 @@ import {
   normalizeFreshAgentPendingLocalEcho,
   normalizeHandoffError,
   normalizeLaunchFailure,
-  type DeadSessionEntry,
   type CrashTrace,
   type FreshAgentCheckpointWorkspace,
   type FreshAgentCheckpointOutcome,
@@ -487,7 +486,6 @@ function loadInitialPanesState(): PanesState {
     zoomedPane: {},
     refreshRequestsByPane: {},
     restoreFallbackAttemptsByPane: {},
-    deadSessionAdjudication: [],
     reconcileWarming: null,
     reconcilePendingPanes: {},
     closingTabs: {},
@@ -509,7 +507,6 @@ function loadInitialPanesState(): PanesState {
       zoomedPane: {},
       refreshRequestsByPane: {},
       restoreFallbackAttemptsByPane: {},
-      deadSessionAdjudication: [],
       reconcileWarming: null,
       reconcilePendingPanes: {},
       // The close guard is strictly in-flight state: a reload has no pending
@@ -1321,7 +1318,6 @@ export const panesSlice = createSlice({
       state.refreshRequestsByPane = {}
       state.focusEpochByPaneId = {}
       state.restoreFallbackAttemptsByPane = {}
-      state.deadSessionAdjudication = []
       state.reconcileWarming = null
       state.reconcilePendingPanes = {}
       state.closingTabs = {}
@@ -2236,7 +2232,6 @@ export const panesSlice = createSlice({
           if (!live.has(id)) delete state.focusEpochByPaneId[id]
         }
       }
-      state.deadSessionAdjudication = []
       state.reconcileWarming = null
       state.reconcilePendingPanes = {}
     },
@@ -2910,22 +2905,6 @@ export const panesSlice = createSlice({
       if (content && content.crashTrace) delete content.crashTrace
     },
 
-    /** Council rule 12: dead_session is a UI state, not a deletion — panes wait for the user. */
-    setDeadSessionAdjudication: (state, action: PayloadAction<DeadSessionEntry[]>) => {
-      state.deadSessionAdjudication = action.payload
-    },
-
-    resolveDeadSessionEntry: (state, action: PayloadAction<{ tabId: string; paneId: string }>) => {
-      const { tabId, paneId } = action.payload
-      state.deadSessionAdjudication = (state.deadSessionAdjudication ?? []).filter(
-        (entry) => !(entry.tabId === tabId && entry.paneId === paneId),
-      )
-    },
-
-    clearDeadSessionAdjudication: (state) => {
-      state.deadSessionAdjudication = []
-    },
-
     setReconcileWarming: (state, action: PayloadAction<ReconcileWarmingState>) => {
       state.reconcileWarming = action.payload
     },
@@ -3074,9 +3053,6 @@ export const {
   clearPaneCloseError,
   setPaneCrashTrace,
   clearPaneCrashTrace,
-  setDeadSessionAdjudication,
-  resolveDeadSessionEntry,
-  clearDeadSessionAdjudication,
   setReconcileWarming,
   clearReconcileWarming,
   setReconcilePendingPanes,

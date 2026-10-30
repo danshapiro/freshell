@@ -16,7 +16,6 @@ import panesReducer, {
   initLayout,
   applyReconcileAttach,
   resetPaneForReconcileCreate,
-  setDeadSessionAdjudication,
   setReconcileWarming,
   setPaneReconcileNotice,
   setPaneRestoreError,
@@ -31,6 +30,7 @@ import {
   buildReconcileRequestForPanes,
   collectTerminalPaneTargets,
   foldVerdicts,
+  isDeadSessionReconcileNotice,
   paneKeyFor,
   DEAD_SESSION_RECONCILE_NOTICES,
 } from '@/lib/pane-reconcile'
@@ -312,10 +312,9 @@ describe('foldVerdicts', () => {
       ['error', { reason: 'index_warming' }],
     ])
     const outcome = foldVerdicts(dispatch, req, resultFor(req, dispatched.verdicts))
-    expect(outcome).toMatchObject({ attached: 1, respawned: 1, fresh: 1, dead: 1, warming: 1, cardinalityViolation: false })
+    expect(outcome).toMatchObject({ attached: 1, respawned: 1, fresh: 1, warming: 1, cardinalityViolation: false })
     expect(dispatched.types).toContain(applyReconcileAttach.type)
     expect(dispatched.types).toContain(resetPaneForReconcileCreate.type)
-    expect(dispatched.types).toContain(setDeadSessionAdjudication.type)
     expect(dispatched.types).toContain(setReconcileWarming.type)
   })
 
@@ -366,12 +365,29 @@ describe('foldVerdicts', () => {
     })
   })
 
-  it('dead sessions are batched into ONE setDeadSessionAdjudication dispatch (never N)', () => {
+  it('dead sessions get exactly one per-pane restoreError latch, one dead-copy reconcileNotice, and no batched dispatch', () => {
+    // No-modal contract (Task 4): dead_session folds carry NO batched
+    // adjudication dispatch anymore — the per-pane restoreError latch is
+    // the single dead-session state, plus the one-shot dead-copy notice
+    // mint. RED while the batched adjudication dispatch still exists (it is
+    // the 7th dispatch for 3 dead panes); GREEN exactly when it is removed.
     const { req, dispatch, dispatched } = foldHarnessAllDead(3)
     const outcome = foldVerdicts(dispatch, req, deadResultFor(req))
-    expect(outcome.dead).toBe(3)
-    expect(dispatched.countOf(setDeadSessionAdjudication.type)).toBe(1)
-    expect(dispatched.lastPayloadOf(setDeadSessionAdjudication.type)).toHaveLength(3)
+    expect(outcome.cardinalityViolation).toBe(false)
+    expect(dispatched.actions).toHaveLength(6)
+    expect(new Set(dispatched.actions.map((a) => a.type))).toEqual(
+      new Set([setPaneRestoreError.type, setPaneReconcileNotice.type]),
+    )
+    const restoreErrors = dispatched.actions
+      .filter((a) => a.type === setPaneRestoreError.type)
+      .map((a) => (a as unknown as { payload: { restoreError: { code: string; reason: string } } }).payload.restoreError)
+    expect(restoreErrors).toHaveLength(3)
+    expect(restoreErrors.every((r) => r.code === 'RESTORE_UNAVAILABLE' && r.reason === 'durable_artifact_missing')).toBe(true)
+    const deadNotices = dispatched.actions
+      .filter((a) => a.type === setPaneReconcileNotice.type)
+      .map((a) => (a as unknown as { payload: { notice: string } }).payload.notice)
+    expect(deadNotices.every((notice) => isDeadSessionReconcileNotice(notice))).toBe(true)
+    expect(deadNotices).toHaveLength(3)
   })
 
   it('dead sessions ALSO get a loud per-pane restoreError breadcrumb', () => {
@@ -381,8 +397,14 @@ describe('foldVerdicts', () => {
     expect(dispatched.lastPayloadOf(setPaneRestoreError.type)).toMatchObject({
       tabId: 'tab1',
       paneId: 'p1',
-      restoreError: { code: 'RESTORE_UNAVAILABLE' },
+      restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'durable_artifact_missing' },
     })
+    // ...beside the one-shot dead-copy notice mint (consumed by
+    // TerminalView's buffer-notice machinery).
+    expect(dispatched.countOf(setPaneReconcileNotice.type)).toBe(1)
+    expect(isDeadSessionReconcileNotice(
+      (dispatched.lastPayloadOf(setPaneReconcileNotice.type) as { notice: string }).notice,
+    )).toBe(true)
   })
 
   it('dead terminal verdicts mint a reason-honest dead-copy reconcileNotice beside the latch', () => {
@@ -396,7 +418,7 @@ describe('foldVerdicts', () => {
       ['dead_session', { sessionRef: { provider: 'claude', sessionId: 'gone-unknown' } }],
     ])
     const outcome = foldVerdicts(dispatch, req, resultFor(req, dispatched.verdicts))
-    expect(outcome.dead).toBe(3)
+    expect(outcome.cardinalityViolation).toBe(false)
     const noticePayloads = dispatched.actions
       .filter((a) => a.type === setPaneReconcileNotice.type)
       .map((a) => (a as unknown as { payload: { tabId: string; paneId: string; notice: string } }).payload)

@@ -399,7 +399,6 @@ describe('TerminalView reconcile adoption: verdict-driven create + bounded re-dr
     await flushEffects()
 
     expect(paneContent(store).restoreError).toBeTruthy()
-    expect(store.getState().panes.deadSessionAdjudication).toHaveLength(1)
 
     // No-modal contract (Task 2): the dead verdict explains itself with
     // exactly ONE notice line written directly into the pane's own stale

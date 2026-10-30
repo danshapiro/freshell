@@ -40,7 +40,7 @@ const skipDetachActionTypes = new Set<string>([
  * hardened by delta-r7-round-2 Findings F1+F2):
  *
  * * `closePane` — the plain pane-X (via closePaneWithCleanup: PaneContainer,
- *   context menu, ui-commands, DeadSessionPanel).
+ *   context menu, ui-commands).
  * * `removeLayout` — a whole-tab close (via the closeTab thunk), covering
  *   every pane in the tab tree.
  * * `replacePane` — the context-menu "Replace pane": the pane's content is
