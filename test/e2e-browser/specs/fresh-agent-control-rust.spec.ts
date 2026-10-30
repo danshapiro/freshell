@@ -2033,6 +2033,12 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       await expect.poll(async () =>
         (await fetchSnapshot(lane.info, 'freshcodex', 'codex', threadId))?.turns?.length,
       { timeout: 15_000 }).toBe(turnsAfter.length + 2)
+      const recordedTurns = JSON.parse(await fs.readFile(
+        path.join(lane.info.homeDir, '.codex', 'fake-turns', `${threadId}.json`), 'utf8',
+      ))
+      expect(recordedTurns.map((turn: any) => turn.items[0].content[0].text)).toEqual([
+        'run a turn that will wedge', 'follow-up after sidecar restart',
+      ])
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
