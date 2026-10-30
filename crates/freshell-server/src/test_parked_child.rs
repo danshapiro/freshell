@@ -34,7 +34,7 @@ impl ParkedChild {
         // async-signal-safe, with no allocation and no locks.
         unsafe {
             command.pre_exec(move || {
-                let parked = [b'p'];
+                let parked = *b"p";
                 libc::write(child_fd, parked.as_ptr().cast(), 1);
                 let mut go = [0u8];
                 libc::read(child_fd, go.as_mut_ptr().cast(), 1);
