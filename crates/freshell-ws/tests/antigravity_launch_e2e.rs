@@ -180,6 +180,29 @@ async fn antigravity_launch_argv_is_manifest_template_driven() {
     // carries no resume args at all.
     let fresh_tid = create_terminal(&mut ws, "req-antigravity-fresh", "antigravity", None).await;
 
+    // Await and assert the fresh argv row BEFORE issuing the resume create,
+    // so no cross-create ordering assumption exists (the sibling
+    // auto_resume_e2e.rs bar: "no timing assumption anywhere" — a heavily
+    // loaded host can never invert the rows).
+    let fresh_rows = wait_capture_rows(&capture, 1).await;
+    assert_eq!(fresh_rows.len(), 1, "fresh argv row: {fresh_rows:?}");
+    let fresh_argv: Vec<&str> = fresh_rows[0].split_whitespace().collect();
+    assert!(
+        fresh_argv.contains(&"-i"),
+        "fresh row carries the manifest's interactive flag: {:?}",
+        fresh_rows[0]
+    );
+    assert!(
+        !fresh_argv.contains(&"-p"),
+        "fresh row never uses the headless print flag: {:?}",
+        fresh_rows[0]
+    );
+    assert!(
+        !fresh_argv.contains(&"--conversation"),
+        "fresh row never resumes: {:?}",
+        fresh_rows[0]
+    );
+
     // Resume create: provider-matched sessionRef (the frozen client's only
     // identity carrier for terminal-mode panes).
     let resume_tid = create_terminal(
@@ -189,6 +212,31 @@ async fn antigravity_launch_argv_is_manifest_template_driven() {
         Some(serde_json::json!({ "provider": "antigravity", "sessionId": "conv-9" })),
     )
     .await;
+
+    // The resume row is the NEW row: the fresh row was already asserted, so
+    // anything beyond it can only be the resume spawn's argv.
+    let resume_rows = wait_capture_rows(&capture, 2).await;
+    assert_eq!(
+        resume_rows.len(),
+        2,
+        "exactly one new argv row for the resume create: {resume_rows:?}"
+    );
+    let resume_argv: Vec<&str> = resume_rows[1].split_whitespace().collect();
+    let i = resume_argv
+        .iter()
+        .position(|a| *a == "--conversation")
+        .unwrap_or_else(|| panic!("resume row carries --conversation: {:?}", resume_rows[1]));
+    assert_eq!(
+        resume_argv[i + 1],
+        "conv-9",
+        "resume id is the ADJACENT argument: {:?}",
+        resume_rows[1]
+    );
+    assert!(
+        !resume_argv.contains(&"--continue"),
+        "resume row never uses the weaker continue mechanism: {:?}",
+        resume_rows[1]
+    );
 
     // Unknown-mode create: rejected with the valid list naming antigravity.
     ws.send(WsMessage::Text(
@@ -215,44 +263,13 @@ async fn antigravity_launch_argv_is_manifest_template_driven() {
         "exact unknown-mode wording with antigravity in the valid list"
     );
 
-    // Both argv rows landed — one space-joined line per create, in create
-    // order (the test serializes the creates and consumes each reply before
-    // sending the next).
-    let rows = wait_capture_rows(&capture, 2).await;
-    assert_eq!(rows.len(), 2, "one argv row per create: {rows:?}");
-
-    let fresh_argv: Vec<&str> = rows[0].split_whitespace().collect();
-    assert!(
-        fresh_argv.contains(&"-i"),
-        "fresh row carries the manifest's interactive flag: {:?}",
-        rows[0]
-    );
-    assert!(
-        !fresh_argv.contains(&"-p"),
-        "fresh row never uses the headless print flag: {:?}",
-        rows[0]
-    );
-    assert!(
-        !fresh_argv.contains(&"--conversation"),
-        "fresh row never resumes: {:?}",
-        rows[0]
-    );
-
-    let resume_argv: Vec<&str> = rows[1].split_whitespace().collect();
-    let i = resume_argv
-        .iter()
-        .position(|a| *a == "--conversation")
-        .unwrap_or_else(|| panic!("resume row carries --conversation: {:?}", rows[1]));
+    // The rejected create spawned NOTHING: the capture file still holds
+    // exactly the two asserted rows (assert_never_captured spirit).
+    let final_rows = wait_capture_rows(&capture, 2).await;
     assert_eq!(
-        resume_argv[i + 1],
-        "conv-9",
-        "resume id is the ADJACENT argument: {:?}",
-        rows[1]
-    );
-    assert!(
-        !resume_argv.contains(&"--continue"),
-        "resume row never uses the weaker continue mechanism: {:?}",
-        rows[1]
+        final_rows.len(),
+        2,
+        "the rejected unknown-mode create spawns no process: {final_rows:?}"
     );
 
     // Cleanup: only the terminals this test created (never a broad kill).
