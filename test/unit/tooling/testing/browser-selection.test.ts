@@ -184,7 +184,7 @@ describe('browser selection non-vacuity', () => {
 
   // Two full discovery scans import every browser spec. Their measured cloud
   // runtime exceeds the generic 30s unit-test budget; each child remains bounded
-  // at 40s, with 90s for both scans and their roster assertions.
+  // at 40s; the outer budget also allows discovery and assertion overhead.
   it('selects a non-vacuous Chromium lane and all CI application projects', () => {
     const chromium = listedProjects(cleanEnvironment())
     expect(chromium.labels).toEqual(['chromium'])
@@ -224,7 +224,12 @@ describe('browser selection non-vacuity', () => {
     expect(ci.labels).toEqual(['chromium', 'firefox', 'webkit'])
     const retiredProjectNames = [`legacy${'-chromium'}`, `rust${'-chromium'}`]
     expect(ci.output).not.toMatch(new RegExp(`${retiredProjectNames.join('|')}|Total:\\s*0 tests in`, 'i'))
-  }, 90_000)
+    // Two full-roster --list passes (base lane + the 3-project CI lane) ran
+    // ~25-30 s in cloud shards and one loaded shard (job
+    // freshell-vitest-5be2481fa684-quhpuc, 2026-10-30) pushed the heavier
+    // pass past the 30 s default and failed the suite — the same headroom
+    // reason the single-spec siblings above carry 90_000.
+  }, 180_000)
 
   it('creates Rust fixtures and selects the supported cloud projects', async () => {
     const server = await createE2eServerHandle({})
