@@ -14809,7 +14809,7 @@ pub(crate) mod tests {
             json!({"launch":{"incarnationId":"owned","launchNonce":"current"},"queryGeneration":1});
         let result = state
             .dispatch_native_control_checked(
-                &session_id,
+                session_id,
                 SessionType::Freshclaude,
                 "checkpoint",
                 "release-current".into(),
@@ -17357,6 +17357,32 @@ rl.on('line', (line) => {
         // Even failed compaction settles its own command before rollback reopens.
         await_frame_of_inner_type(&mut rx, "freshAgent.result").await;
         await_ledger_busy(&st, &session_id, false).await;
+        // The CLI result precedes its buffered transcript flush. The retry
+        // needs the compact command's actual persisted user record, rather
+        // than assuming the ledger's completion also flushed native history.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let persisted = crate::claude_snapshot::locate_transcript(&session_id)
+                    .and_then(|path| std::fs::read_to_string(path).ok())
+                    .is_some_and(|text| {
+                        text.lines()
+                            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                            .any(|row| {
+                                row["type"] == "user"
+                                    && row["sessionId"] == session_id
+                                    && row["isMeta"] != true
+                                    && row["message"]["role"] == "user"
+                                    && row["uuid"].as_str().is_some()
+                            })
+                    });
+                if persisted {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the completed compact command must reach its native transcript");
         let (sink2, captured2) = capturing_sink();
         st.handle_rollback(
             rollback_op(&session_id, "rb-compact-2", RollbackDirection::Undo),
