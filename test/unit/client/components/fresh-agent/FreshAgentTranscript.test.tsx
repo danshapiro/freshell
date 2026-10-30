@@ -2068,9 +2068,12 @@ describe('FreshAgentTranscript', () => {
       )
 
       const userArticle = screen.getByRole('article', { name: 'You transcript turn' })
-      expect(within(userArticle).getByRole('note', { name: 'Code rewind unavailable for this message' }))
-        .toHaveTextContent(`Code rewind unavailable for this message: ${reason}`)
       expect(within(userArticle).getByRole('button', { name: 'Rewind unavailable for this message' })).toBeDisabled()
+      // The per-turn rewind status note is removed: rewind state lives only on
+      // the hover button and the sheet/menu items. Pin the removal — no note
+      // and no rewind status text may render anywhere in the transcript.
+      expect(screen.queryByRole('note')).toBeNull()
+      expect(screen.queryByRole('status', { name: /Code rewind available for this message/ })).toBeNull()
 
       const build = getFreshAgentTurnItemsBuilder('pane-unavailable-rewind')
       const rewindItem = build!(0)!.find((item) => item.label.startsWith('Rewind unavailable:'))

@@ -918,7 +918,6 @@ export function FreshAgentTurnArticle({
   // coarse→fine pointer flip stops advertising/handling long-press even though
   // the instance persists for the article's lifetime.
   const longPress = !live && actions.onOpenActions ? longPressRef.current : null
-  const rewindAvailability = live ? undefined : actions.getRewindAvailability?.(actionTurn)
   if (live) {
     return (
       <article
@@ -997,28 +996,6 @@ export function FreshAgentTurnArticle({
         getRewindAvailability={actions.getRewindAvailability}
         onOpenActions={actions.onOpenActions}
       />
-      {rewindAvailability ? (
-        <div
-          role={rewindAvailability.status === 'unavailable' ? 'note' : 'status'}
-          aria-label={rewindAvailability.status === 'unavailable'
-            ? 'Code rewind unavailable for this message'
-            : rewindAvailability.status === 'pending'
-              ? 'Saving code rewind checkpoint for this message'
-              : 'Code rewind available for this message'}
-          className={cn(
-            'px-1 pb-1 text-xs',
-            rewindAvailability.status === 'unavailable'
-              ? 'text-amber-700 dark:text-amber-400'
-              : 'text-muted-foreground',
-          )}
-        >
-          {rewindAvailability.status === 'unavailable'
-            ? `Code rewind unavailable for this message: ${rewindAvailability.reason}`
-            : rewindAvailability.status === 'pending'
-              ? 'Saving the code state from before this message.'
-              : 'Code rewind is available for this message.'}
-        </div>
-      ) : null}
       {showHeader ? (
         <div className="fresh-agent-turn-header mb-1 flex items-center justify-between gap-2 text-xs text-muted-foreground">
           <span>{turnLabel}</span>

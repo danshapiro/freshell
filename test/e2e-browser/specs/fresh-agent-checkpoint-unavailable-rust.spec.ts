@@ -7,6 +7,7 @@ import { test, expect, createFreshE2ePage } from '../helpers/fixtures.js'
 import { RustServer } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { expectNoRewindStatusText } from '../helpers/fresh-agent-transcript.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -117,8 +118,13 @@ test.describe('fresh-agent checkpoint availability', () => {
 
       const userTurn = paneRoot.locator('[data-turn-role="user"]', { hasText: marker })
       await expect(userTurn).toBeVisible({ timeout: 20_000 })
-      await expect(userTurn.getByRole('status', { name: 'Code rewind available for this message' }))
-        .toContainText('Code rewind is available for this message.')
+      // Rewind state lives on the hover button (the transcript status note is
+      // removed): the bound capture shows the enabled rewind button even while
+      // the provider turn is still running, and no status text renders.
+      await userTurn.hover()
+      const rewindAvailable = userTurn.getByRole('button', { name: 'Rewind code to here' })
+      await expect(rewindAvailable).toBeEnabled()
+      await expectNoRewindStatusText(paneRoot)
       await expect(paneRoot.getByText('Fixture turn')).toBeVisible({ timeout: 30_000 })
 
       let content: any
@@ -144,8 +150,7 @@ test.describe('fresh-agent checkpoint availability', () => {
       await expect(reloadedPane).toBeVisible({ timeout: 20_000 })
       const reloadedTurn = reloadedPane.locator('[data-turn-role="user"]', { hasText: marker })
       await expect(reloadedTurn).toBeVisible({ timeout: 30_000 })
-      await expect(reloadedTurn.getByRole('status', { name: 'Code rewind available for this message' }))
-        .toContainText('Code rewind is available for this message.')
+      await expectNoRewindStatusText(reloadedPane)
       await reloadedTurn.hover()
       const rewind = reloadedTurn.getByRole('button', { name: 'Rewind code to here' })
       await expect(rewind).toBeEnabled()
@@ -247,10 +252,13 @@ test.describe('fresh-agent checkpoint availability', () => {
 
       const userTurn = paneRoot.locator('[data-turn-role="user"]', { hasText: marker })
       await expect(userTurn).toBeVisible({ timeout: 20_000 })
-      const unavailable = userTurn.getByRole('note', { name: 'Code rewind unavailable for this message' })
-      await expect(unavailable).toContainText('A selected project file could not be read')
+      // The unavailable verdict lives on the hover button: disabled with the
+      // exact reason in its title, and no status note renders.
       await userTurn.hover()
-      await expect(userTurn.getByRole('button', { name: 'Rewind unavailable for this message' })).toBeDisabled()
+      const unavailable = userTurn.getByRole('button', { name: 'Rewind unavailable for this message' })
+      await expect(unavailable).toBeDisabled()
+      await expect(unavailable).toHaveAttribute('title', /A selected project file could not be read/)
+      await expectNoRewindStatusText(paneRoot)
       await expect(paneRoot.getByText('Fixture turn')).toBeVisible({ timeout: 30_000 })
 
       let content: any
@@ -297,11 +305,11 @@ test.describe('fresh-agent checkpoint availability', () => {
       await expect(reloadedPane).toBeVisible({ timeout: 20_000 })
       const reloadedUserTurn = reloadedPane.locator('[data-turn-role="user"]', { hasText: marker })
       await expect(reloadedUserTurn).toBeVisible({ timeout: 30_000 })
-      await expect(reloadedUserTurn.getByRole('note', { name: 'Code rewind unavailable for this message' }))
-        .toContainText('A selected project file could not be read')
+      await expectNoRewindStatusText(reloadedPane)
       await reloadedUserTurn.hover()
-      await expect(reloadedUserTurn.getByRole('button', { name: 'Rewind unavailable for this message' }))
-        .toBeDisabled()
+      const reloadedUnavailable = reloadedUserTurn.getByRole('button', { name: 'Rewind unavailable for this message' })
+      await expect(reloadedUnavailable).toBeDisabled()
+      await expect(reloadedUnavailable).toHaveAttribute('title', /A selected project file could not be read/)
 
       // Provider ground truth: the send behind the unavailable checkpoint
       // really reached the provider as that checkpoint's turn. The fake

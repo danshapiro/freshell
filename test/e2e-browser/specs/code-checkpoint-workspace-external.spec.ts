@@ -4,6 +4,7 @@ import { resolvePairedExternalFixture } from '../../../scripts/testing/e2e-exter
 import { test, expect } from '../helpers/fixtures.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TestHarness } from '../helpers/test-harness.js'
+import { expectNoRewindStatusText } from '../helpers/fresh-agent-transcript.js'
 
 const paired = resolvePairedExternalFixture(process.env, true)
 if (paired?.kind !== 'code-checkpoint') throw new Error('Code checkpoint acceptance requires its paired owned target')
@@ -356,8 +357,7 @@ test('Git workspace sends retain per-turn success and failure, then restore the 
     path: fixture.syntheticWorkspacePath, provenance: 'directory-picker',
   } })
   expect(first.outcome.checkpointId).toMatch(/^[a-f0-9]{40}$/)
-  await expect(first.row.getByRole('status', { name: 'Code rewind available for this message' }))
-    .toContainText('Code rewind is available for this message.')
+  await expectNoRewindStatusText(paneRoot)
   await first.row.hover()
   await expect(first.row.getByRole('button', { name: 'Rewind code to here' })).toBeEnabled()
   await assertNativeUserIdentity(page, first.outcome, first.accepted.submittedTurnId, samePrompt)
@@ -375,11 +375,15 @@ test('Git workspace sends retain per-turn success and failure, then restore the 
     .toBe(2)
   const firstRow = paneRoot.locator('article[data-turn-role="user"]', { hasText: samePrompt }).nth(0)
   const secondRow = paneRoot.locator('article[data-turn-role="user"]', { hasText: samePrompt }).nth(1)
-  await expect(firstRow.getByRole('status', { name: 'Code rewind available for this message' })).toBeVisible()
-  await expect(secondRow.getByRole('note', { name: 'Code rewind unavailable for this message' }))
-    .toContainText('A selected project file could not be read')
+  await expectNoRewindStatusText(paneRoot)
+  await firstRow.hover()
+  await expect(firstRow.getByRole('button', { name: 'Rewind code to here' })).toBeEnabled()
+  // The unavailable verdict lives on the hover button: disabled with the
+  // exact reason in its title, and no status note renders.
   await secondRow.hover()
-  await expect(secondRow.getByRole('button', { name: 'Rewind unavailable for this message' })).toBeDisabled()
+  const secondUnavailable = secondRow.getByRole('button', { name: 'Rewind unavailable for this message' })
+  await expect(secondUnavailable).toBeDisabled()
+  await expect(secondUnavailable).toHaveAttribute('title', /A selected project file could not be read/)
   await assertNativeUserIdentity(page, second.outcome, second.accepted.submittedTurnId, samePrompt)
   await requestPrivateFileState(page, 'ignored')
 
@@ -404,8 +408,9 @@ test('Git workspace sends retain per-turn success and failure, then restore the 
   const restoredPane = page.locator('[data-context="fresh-agent"]').last()
   const duplicateRows = restoredPane.locator('article[data-turn-role="user"]', { hasText: samePrompt })
   await expect(duplicateRows).toHaveCount(2, { timeout: 60_000 })
-  await expect(duplicateRows.nth(0).getByRole('status', { name: 'Code rewind available for this message' })).toBeVisible()
-  await expect(duplicateRows.nth(1).getByRole('note', { name: 'Code rewind unavailable for this message' })).toBeVisible()
+  await expectNoRewindStatusText(restoredPane)
+  await duplicateRows.nth(1).hover()
+  await expect(duplicateRows.nth(1).getByRole('button', { name: 'Rewind unavailable for this message' })).toBeDisabled()
   await duplicateRows.nth(0).hover()
   const rewind = duplicateRows.nth(0).getByRole('button', { name: 'Rewind code to here' })
   await expect(rewind).toBeEnabled()
@@ -534,7 +539,7 @@ test('picker-confirmed non-Git workspace captures and restores all selected file
     path: fixture.nonGitWorkspacePath, provenance: 'directory-picker',
   } })
   expect(turn.outcome.checkpointId).toMatch(/^[a-f0-9]{40}$/)
-  await expect(turn.row.getByRole('status', { name: 'Code rewind available for this message' })).toBeVisible()
+  await expectNoRewindStatusText(paneRoot)
   await turn.row.hover()
   await expect(turn.row.getByRole('button', { name: 'Rewind code to here' })).toBeEnabled()
   await assertNativeUserIdentity(page, turn.outcome, turn.accepted.submittedTurnId, marker)
@@ -571,11 +576,14 @@ test('picker-confirmed HOME sets launch cwd without creating a checkpoint scope'
   const turn = await sendThroughComposer(page, paneRoot, marker, undefined)
   expect(turn.outcome).toMatchObject({ status: 'unavailable', code: 'workspace_unavailable' })
   expect(turn.outcome.reason).toContain('No eligible code workspace')
-  await expect(turn.row.getByRole('note', { name: 'Code rewind unavailable for this message' }))
-    .toContainText('rewind is unavailable')
+  // The unavailable verdict lives on the hover button: disabled with the
+  // reason (which carries "rewind is unavailable") in its title, and no
+  // status note renders.
+  await expectNoRewindStatusText(paneRoot)
   await turn.row.hover()
-  await expect(turn.row.getByRole('button', { name: 'Rewind unavailable for this message' }))
-    .toBeDisabled()
+  const homeUnavailable = turn.row.getByRole('button', { name: 'Rewind unavailable for this message' })
+  await expect(homeUnavailable).toBeDisabled()
+  await expect(homeUnavailable).toHaveAttribute('title', /rewind is unavailable/)
   await assertNativeUserIdentity(page, turn.outcome, turn.accepted.submittedTurnId, marker)
 
   await targetWrite(page, homeFile, 'home file changed after send\n')
@@ -590,10 +598,14 @@ test('picker-confirmed HOME sets launch cwd without creating a checkpoint scope'
       code: 'workspace_unavailable',
     }),
   ]))
-  const restoredRow = page.locator('[data-context="fresh-agent"]').last()
+  const restoredPaneRoot = page.locator('[data-context="fresh-agent"]').last()
+  const restoredRow = restoredPaneRoot
     .locator('article[data-turn-role="user"]', { hasText: marker })
-  await expect(restoredRow.getByRole('note', { name: 'Code rewind unavailable for this message' }))
-    .toContainText('rewind is unavailable')
+  await expectNoRewindStatusText(restoredPaneRoot)
+  await restoredRow.hover()
+  const restoredUnavailable = restoredRow.getByRole('button', { name: 'Rewind unavailable for this message' })
+  await expect(restoredUnavailable).toBeDisabled()
+  await expect(restoredUnavailable).toHaveAttribute('title', /rewind is unavailable/)
 
   const query = new URLSearchParams({ cwd: fixture.syntheticHomePath })
   const listUrl = `${paired!.targetUrl}/api/fresh-agent/checkpoints?${query}`

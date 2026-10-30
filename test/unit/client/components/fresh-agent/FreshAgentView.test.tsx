@@ -47,7 +47,7 @@ import {
   UNDO_REFILL_NOTICE,
   rollbackUnsupportedNotice,
 } from '@/lib/fresh-agent-rollback'
-import { getFreshAgentPaneActions } from '@/lib/pane-action-registry'
+import { getFreshAgentPaneActions, getFreshAgentTurnItemsBuilder } from '@/lib/pane-action-registry'
 import type { PaneNode } from '@/store/paneTypes'
 import { findPaneContent } from '@/lib/pane-utils'
 import { resetManagedRuntimeRefreshForTest } from '@/lib/recovery/managed-runtime-recovery'
@@ -3600,8 +3600,11 @@ describe('FreshAgentView', () => {
     expect(requestId).not.toBe(logicalAttemptId)
     expect(apiMock.post.mock.calls.some(([url]) => String(url).startsWith('/api/fresh-agent/checkpoints'))).toBe(false)
     expect(screen.getByText('Ship it')).toBeInTheDocument()
-    expect(screen.getByRole('status', { name: 'Saving code rewind checkpoint for this message' }))
-      .toHaveTextContent('Saving the code state from before this message.')
+    // Rewind state lives on the hover button (the transcript status note is
+    // removed): the in-flight send's row shows the still-saving button.
+    const savingButton = screen.getByRole('button', { name: 'Saving code rewind checkpoint' })
+    expect(savingButton).toBeDisabled()
+    expect(savingButton).toHaveAttribute('title', 'Saving the code state from before this message')
 
     act(() => {
       onMessage?.({
@@ -3616,8 +3619,7 @@ describe('FreshAgentView', () => {
         workspace: resolvedCheckpointWorkspace,
       })
     })
-    expect(await screen.findByRole('status', { name: 'Code rewind available for this message' }))
-      .toHaveTextContent('Code rewind is available for this message.')
+    expect(await screen.findByRole('button', { name: 'Rewind code to here' })).toBeEnabled()
     expect(onMessage).toBeTypeOf('function')
     act(() => {
       onMessage?.({
@@ -3661,8 +3663,7 @@ describe('FreshAgentView', () => {
     await waitFor(() => {
       expect(getFreshAgentPaneContent(store).sessionId).toBe('thread-materialized-send')
     })
-    expect(await screen.findByRole('status', { name: 'Code rewind available for this message' }))
-      .toHaveTextContent('Code rewind is available for this message.')
+    expect(await screen.findByRole('button', { name: 'Rewind code to here' })).toBeEnabled()
     await waitFor(() => {
       expect(screen.getByText('Done.')).toBeInTheDocument()
     })
@@ -3688,8 +3689,7 @@ describe('FreshAgentView', () => {
         <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
       </Provider>,
     )
-    expect(await screen.findByRole('status', { name: 'Code rewind available for this message' }))
-      .toHaveTextContent('Code rewind is available for this message.')
+    expect(await screen.findByRole('button', { name: 'Rewind code to here' })).toBeEnabled()
 
     vi.spyOn(window, 'confirm').mockReturnValue(true)
     fireEvent.click(screen.getByRole('button', { name: 'Rewind code to here' }))
@@ -3800,14 +3800,12 @@ describe('FreshAgentView', () => {
 
     const exactReplayUserRows = screen.getAllByRole('article', { name: 'You transcript turn' })
     expect(exactReplayUserRows).toHaveLength(2)
-    expect(await within(exactReplayUserRows[0]!).findByRole('status', { name: 'Code rewind available for this message' }))
-      .toHaveTextContent('Code rewind is available for this message.')
+    expect(await within(exactReplayUserRows[0]!).findByRole('button', { name: 'Rewind code to here' })).toBeEnabled()
     expect(within(exactReplayUserRows[1]!).queryByRole('status', { name: 'Code rewind available for this message' }))
       .not.toBeInTheDocument()
-    expect(within(exactReplayUserRows[1]!).getByRole('note', { name: 'Code rewind unavailable for this message' }))
-      .toHaveTextContent('No exact code checkpoint is available for this message.')
-    expect(within(exactReplayUserRows[1]!).getByRole('button', { name: 'Rewind unavailable for this message' }))
-      .toBeDisabled()
+    const replayUnavailableButton = within(exactReplayUserRows[1]!).getByRole('button', { name: 'Rewind unavailable for this message' })
+    expect(replayUnavailableButton).toBeDisabled()
+    expect(replayUnavailableButton).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
     expect(getFreshAgentPaneContent(store).checkpointOutcomes).toEqual(expect.arrayContaining([
       expect.objectContaining({
         requestId: 'request-replayed-turn',
@@ -3852,15 +3850,14 @@ describe('FreshAgentView', () => {
     )
     const remountedUserRows = await screen.findAllByRole('article', { name: 'You transcript turn' })
     expect(remountedUserRows).toHaveLength(2)
-    expect(await within(remountedUserRows[0]!).findByRole('status', { name: 'Code rewind available for this message' }))
-      .toHaveTextContent('Code rewind is available for this message.')
-    expect(within(remountedUserRows[0]!).getByRole('button', { name: 'Rewind code to here' })).toBeEnabled()
+    expect(within(remountedUserRows[0]!).queryByRole('status', { name: 'Code rewind available for this message' }))
+      .not.toBeInTheDocument()
+    expect(await within(remountedUserRows[0]!).findByRole('button', { name: 'Rewind code to here' })).toBeEnabled()
     expect(within(remountedUserRows[1]!).queryByRole('status', { name: 'Code rewind available for this message' }))
       .not.toBeInTheDocument()
-    expect(within(remountedUserRows[1]!).getByRole('note', { name: 'Code rewind unavailable for this message' }))
-      .toHaveTextContent('No exact code checkpoint is available for this message.')
-    expect(within(remountedUserRows[1]!).getByRole('button', { name: 'Rewind unavailable for this message' }))
-      .toBeDisabled()
+    const remountedUnavailableButton = within(remountedUserRows[1]!).getByRole('button', { name: 'Rewind unavailable for this message' })
+    expect(remountedUnavailableButton).toBeDisabled()
+    expect(remountedUnavailableButton).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
   })
 
   it('restores durable checkpoint outcomes from paged session history after reopening a pane', async () => {
@@ -4143,10 +4140,9 @@ describe('FreshAgentView', () => {
     )
 
     const [userRow] = await screen.findAllByRole('article', { name: 'You transcript turn' })
-    expect(within(userRow!).getByRole('note', { name: 'Code rewind unavailable for this message' }))
-      .toHaveTextContent('No exact code checkpoint is available for this message.')
     const rewindButton = within(userRow!).getByRole('button', { name: 'Rewind unavailable for this message' })
     expect(rewindButton).toBeDisabled()
+    expect(rewindButton).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
     fireEvent.click(rewindButton)
     expect(apiMock.get).not.toHaveBeenCalledWith(expect.stringContaining('/api/fresh-agent/checkpoints?'))
     expect(apiMock.post).not.toHaveBeenCalledWith('/api/fresh-agent/checkpoints/restore', expect.anything())
@@ -4429,6 +4425,62 @@ describe('FreshAgentView', () => {
       const rewindButton = await within(userRow!).findByRole('button', { name: 'Rewind code to here' })
       expect(rewindButton).toBeEnabled()
     })
+
+    it('labels an assistant row rewind item with the plain role-gated label under the real availability wiring', async () => {
+      const sessionId = 'thread-rewind-role-gate-builder'
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+        status: 'idle',
+        summary: 'one user prompt and one assistant answer',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [
+          unboundModernUserTurn('msg_role_gate', 'A prompt the agent answered'),
+          {
+            id: 'assistant-role-gate',
+            turnId: 'assistant-role-gate',
+            role: 'assistant' as const,
+            summary: 'The agent answer',
+            items: [{ id: 'assistant-role-gate-text', kind: 'text' as const, text: 'The agent answer' }],
+          },
+        ],
+      })
+      const store = createStore()
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-rewind-role-gate-builder',
+          sessionId,
+          status: 'idle',
+        },
+      }))
+
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+
+      expect(await screen.findAllByRole('article', { name: 'You transcript turn' })).toHaveLength(1)
+      expect(screen.getByRole('article', { name: 'Freshcodex transcript turn' })).toBeInTheDocument()
+
+      // Same pane, same REAL getRewindAvailability wiring: the unbound modern
+      // user row earns the honest unavailable verdict in the sheet/menu items,
+      // while the assistant row is never even considered for rewind status —
+      // its item keeps the plain label with the role-gated disabled state,
+      // never an "unavailable"/"saving" verdict.
+      const build = getFreshAgentTurnItemsBuilder('pane-1')
+      expect(build).toBeDefined()
+      const userItems = build!(0)!
+      expect(userItems.find((item) => item.label.startsWith('Rewind unavailable:')))
+        .toMatchObject({ label: 'Rewind unavailable: No exact code checkpoint is available for this message.', disabled: true })
+      const assistantItems = build!(1)!
+      expect(assistantItems.find((item) => item.label === 'Rewind code to here')).toMatchObject({ disabled: true })
+      expect(assistantItems.find((item) => item.label.startsWith('Rewind unavailable:'))).toBeUndefined()
+      expect(assistantItems.find((item) => item.label === 'Saving code rewind checkpoint…')).toBeUndefined()
+    })
   })
 
   it('restores saved rewind availability when the same durable session opens with a new pane request', async () => {
@@ -4482,8 +4534,7 @@ describe('FreshAgentView', () => {
     )
 
     const userRow = await screen.findByRole('article', { name: 'You transcript turn' })
-    expect(within(userRow).getByRole('status', { name: 'Code rewind available for this message' }))
-      .toHaveTextContent('Code rewind is available for this message.')
+    expect(within(userRow).queryByRole('status', { name: 'Code rewind available for this message' })).not.toBeInTheDocument()
     expect(within(userRow).getByRole('button', { name: 'Rewind code to here' })).toBeEnabled()
   })
 
@@ -4947,8 +4998,11 @@ describe('FreshAgentView', () => {
     const requestId = String(sendFrame?.requestId)
     const logicalAttemptId = String((sendFrame?.checkpointIntent as Record<string, unknown>)?.logicalAttemptId)
     expect(screen.getByText(submittedText)).toBeInTheDocument()
-    expect(await screen.findByRole('status', { name: 'Saving code rewind checkpoint for this message' }))
-      .toHaveTextContent('Saving the code state from before this message.')
+    // The in-flight send's row shows the still-saving hover button; the
+    // transcript status note is removed.
+    const savingButton = await screen.findByRole('button', { name: 'Saving code rewind checkpoint' })
+    expect(savingButton).toBeDisabled()
+    expect(savingButton).toHaveAttribute('title', 'Saving the code state from before this message')
 
     expect(onMessage).toBeTypeOf('function')
     act(() => {
@@ -4967,9 +5021,9 @@ describe('FreshAgentView', () => {
     expect(getFreshAgentPaneContent(store).checkpointOutcomes).toEqual(expect.arrayContaining([
       expect.objectContaining({ requestId, status: 'unavailable', reason: workspaceReason }),
     ]))
-    expect(await screen.findByRole('note', { name: 'Code rewind unavailable for this message' }))
-      .toHaveTextContent(`Code rewind unavailable for this message: ${workspaceReason}`)
-    expect(screen.getByRole('button', { name: 'Rewind unavailable for this message' })).toBeDisabled()
+    const unavailableButton = await screen.findByRole('button', { name: 'Rewind unavailable for this message' })
+    expect(unavailableButton).toBeDisabled()
+    expect(unavailableButton).toHaveAttribute('title', `Rewind unavailable: ${workspaceReason}`)
 
     act(() => {
       onMessage?.({
@@ -5020,9 +5074,9 @@ describe('FreshAgentView', () => {
         <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
       </Provider>,
     )
-    expect(await screen.findByRole('note', { name: 'Code rewind unavailable for this message' }))
-      .toHaveTextContent(workspaceReason)
-    expect(screen.getByRole('button', { name: 'Rewind unavailable for this message' })).toBeDisabled()
+    const reloadedUnavailableButton = await screen.findByRole('button', { name: 'Rewind unavailable for this message' })
+    expect(reloadedUnavailableButton).toBeDisabled()
+    expect(reloadedUnavailableButton).toHaveAttribute('title', `Rewind unavailable: ${workspaceReason}`)
   })
 
   it('persists a pending local echo so a remounted pane keeps the submitted prompt visible', async () => {
