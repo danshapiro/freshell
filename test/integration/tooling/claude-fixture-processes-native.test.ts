@@ -215,6 +215,106 @@ describe('native Claude fixture process ownership', () => {
   }
 
   if (process.platform === 'win32') {
+    it('reports abrupt Job host death and releases its controller without a polling leak', async () => {
+      const control = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-abrupt-job-'))
+      const fixtureModule = new URL('../providers/claude-local-provider.mjs', import.meta.url).href
+      const controller = spawn(process.execPath, ['--input-type=module', '-e', `
+        import fs from 'node:fs/promises'
+        import path from 'node:path'
+        import { setTimeout as delay } from 'node:timers/promises'
+        const [moduleUrl, control, sidecar, writer, mcp] = process.argv.slice(1)
+        const { createClaudeFixture } = await import(moduleUrl)
+        const fixture = await createClaudeFixture({ parent: control })
+        const child = fixture.spawn(process.execPath, ['-e', sidecar, fixture.root, control, 'hard-killed', writer, mcp], { stdio: 'pipe' })
+        const events = []
+        let failure
+        child.on('error', (error) => { failure = error.message; events.push('error') })
+        child.on('exit', () => events.push('exit'))
+        const closed = new Promise(resolve => child.once('close', () => { events.push('close'); resolve() }))
+        child.stdout.resume()
+        child.stderr.resume()
+        while (!await fs.stat(path.join(control, 'ready')).then(() => true, () => false)) await delay(20)
+        const pids = await Promise.all(['root.pid', 'writer.pid', 'mcp.pid'].map(async file => Number(await fs.readFile(path.join(control, file), 'utf8'))))
+        for (const pid of [child.fixtureHostPid, ...pids]) process.kill(pid, 0)
+        await fs.writeFile(path.join(control, 'controller-ready.json'), JSON.stringify({ pid: process.pid, root: fixture.root, hostPid: child.fixtureHostPid, rootPid: child.pid }))
+        process.kill(child.fixtureHostPid, 'SIGKILL')
+        await closed
+        await fs.writeFile(path.join(control, 'controller-done.json'), JSON.stringify({ events, failure, exitCode: child.exitCode, signalCode: child.signalCode }))
+        // Deliberately omit cleanup and process.exit. After terminal error,
+        // closed pipes and a stopped poller must let Node finish naturally.
+      `, fixtureModule, control, SIDECAR, WRITER, MCP], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+      const output = observe(controller)
+      let stderr = ''
+      controller.stderr!.on('data', (data: Buffer) => { stderr += data.toString() })
+      let ownedPids: number[] | undefined
+      try {
+        await waitUntil(async () => {
+          if (await fs.stat(path.join(control, 'controller-ready.json')).then(() => true, () => false)) return true
+          if (controller.exitCode !== null || controller.signalCode !== null) throw new Error(`abrupt-host controller exited before readiness: ${stderr}`)
+          return false
+        })
+        const metadata = JSON.parse(await fs.readFile(path.join(control, 'controller-ready.json'), 'utf8')) as { pid: number; root: string; hostPid: number; rootPid: number }
+        expect(controller.pid).toBe(metadata.pid)
+        ownedPids = [metadata.hostPid, ...await Promise.all(['root.pid', 'writer.pid', 'mcp.pid'].map(async (file) => Number(await fs.readFile(path.join(control, file), 'utf8'))))]
+        expect(metadata.rootPid).toBe(ownedPids[1])
+        expect(new Set(ownedPids).size).toBe(4)
+        await waitUntil(async () => fs.stat(path.join(control, 'controller-done.json')).then(() => true, () => false))
+        await waitUntil(async () => controller.exitCode !== null || controller.signalCode !== null)
+        await output.closed
+        expect(controller.exitCode, stderr).toBe(0)
+        expect(controller.signalCode).toBeNull()
+        const result = JSON.parse(await fs.readFile(path.join(control, 'controller-done.json'), 'utf8'))
+        expect(result).toMatchObject({ events: ['error', 'close'], exitCode: null, signalCode: null })
+        expect(result.failure).toContain('fixture Job host exited without confirming its process tree')
+        await waitUntil(async () => (await Promise.all(ownedPids!.map(live))).every((running) => !running))
+        await expect(fs.stat(metadata.root)).resolves.toBeDefined()
+        const directory = (await fs.readdir(metadata.root)).find((entry) => entry.startsWith('.process-job-'))!
+        const status = JSON.parse(await fs.readFile(path.join(metadata.root, directory, 'status.json'), 'utf8'))
+        expect(status).toMatchObject({ pid: metadata.rootPid, rootExited: false, settled: false })
+      } finally {
+        if (controller.exitCode === null && controller.signalCode === null) controller.kill('SIGKILL')
+        if (ownedPids !== undefined) {
+          for (const pid of ownedPids) if (await live(pid)) process.kill(pid, 'SIGKILL')
+          await waitUntil(async () => (await Promise.all(ownedPids!.map(live))).every((running) => !running))
+        }
+        await output.closed
+        if (ownedPids !== undefined) await fs.rm(control, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+      }
+    })
+
+    it('stops later launches after an earlier owned target refuses termination', async () => {
+      const fixture = await createClaudeFixture()
+      const other = await createClaudeFixture()
+      const spawnTarget = (owner: typeof fixture, name: string) => owner.spawn(process.execPath, ['-e', `require('node:fs').writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1000)`, path.join(owner.root, name)], { stdio: 'ignore' })
+      const first = spawnTarget(fixture, 'first.pid')
+      const second = spawnTarget(fixture, 'second.pid')
+      const unrelated = spawnTarget(other, 'unrelated.pid')
+      let denied: { mockRestore(): void } | undefined
+      try {
+        await waitUntil(async () => (await Promise.all([
+          path.join(fixture.root, 'first.pid'), path.join(fixture.root, 'second.pid'), path.join(other.root, 'unrelated.pid'),
+        ].map((file) => fs.stat(file).then(() => true, () => false)))).every(Boolean))
+        expect(await live(first.pid!)).toBe(true)
+        expect(await live(second.pid!)).toBe(true)
+        expect(await live(unrelated.pid!)).toBe(true)
+        denied = vi.spyOn(first, 'kill').mockImplementation(() => { throw Object.assign(new Error('first target refuses termination'), { code: 'EPERM' }) })
+
+        const failure = await fixture.cleanup().then(() => undefined, (error: unknown) => error)
+        const causes: Error[] = []
+        for (let cause = failure; cause instanceof Error; cause = cause.cause) causes.push(cause)
+        expect(causes).toContainEqual(expect.objectContaining({ code: 'EPERM' }))
+        expect(await live(first.pid!)).toBe(true)
+        expect(await live(second.pid!)).toBe(false)
+        expect(await live((second as ChildProcess & { fixtureHostPid: number }).fixtureHostPid)).toBe(false)
+        expect(await live(unrelated.pid!)).toBe(true)
+        await expect(fs.stat(fixture.root)).resolves.toBeDefined()
+      } finally {
+        denied?.mockRestore()
+        await fixture.cleanup()
+        await other.cleanup()
+      }
+    })
+
     it('closes after a terminal Job host failure with a target PID and retains unconfirmed fixture files', async () => {
       const fixture = await createClaudeFixture()
       const report = path.join(fixture.root, 'started.pid')

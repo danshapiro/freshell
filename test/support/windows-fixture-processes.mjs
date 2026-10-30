@@ -78,7 +78,7 @@ export class FixtureChild extends EventEmitter {
     this.completedEvent = true
   }
 
-  observe(status) {
+  observe(status, { deferClose = false } = {}) {
     this.pid ??= status.pid
     if (status.error && !this.failure) {
       this.fail(Object.assign(new Error(status.error), { code: status.errorCode ?? 'EIO' }))
@@ -91,7 +91,7 @@ export class FixtureChild extends EventEmitter {
       this.emit('exit', this.exitCode, this.signalCode)
       this.completedEvent = true
     }
-    this.maybeClose()
+    if (!deferClose) this.maybeClose()
   }
 
   kill(signal = 'SIGTERM') {
@@ -125,23 +125,57 @@ export function createWindowsFixtureSession(root) {
     child: undefined,
     status: undefined,
     timer: undefined,
+    controllerEnded: false,
     command(value) { publish(controlFile, { ...value, id: randomUUID() }) },
-    poll() {
+    stopPolling() {
       clearInterval(this.timer)
+      this.timer = undefined
+    },
+    failController(error) {
+      this.controllerFailure ??= error
+      this.stopPolling()
+      if (this.child && !this.child.closed) {
+        this.child.fail(this.controllerFailure)
+        this.child.maybeClose()
+      }
+    },
+    poll() {
+      this.stopPolling()
+      if (this.controllerEnded || this.controllerFailure) return
       this.timer = setInterval(() => {
         try { this.refresh() } catch (error) {
-          this.controllerFailure = error
-          clearInterval(this.timer)
+          this.failController(error)
         }
       }, POLL_MS)
     },
-    refresh() {
+    refresh(options) {
       const status = readStatus(statusFile)
       if (status) {
         this.status = status
-        this.child?.observe(status)
+        this.child?.observe(status, options)
       }
       return this.status
+    },
+    watchController() {
+      this.controller.once('error', (error) => {
+        this.controllerEnded = true
+        this.failController(error)
+      })
+      this.controller.once('exit', () => {
+        this.controllerEnded = true
+        this.stopPolling()
+        try {
+          // A final status can contain a real target exit. Deliver it before
+          // the terminal owner error, and close only after both observations.
+          this.refresh({ deferClose: true })
+          if (!this.status?.settled) {
+            this.failController(Object.assign(new Error('fixture Job host exited without confirming its process tree'), { code: 'EIO' }))
+          }
+          this.child.maybeClose()
+        } catch (error) {
+          this.failController(error)
+        }
+      })
     },
     start(command, args, options = {}) {
       if (options.shell || options.detached) throw new Error('fixture Job Objects require a direct, owned executable')
@@ -153,16 +187,7 @@ export function createWindowsFixtureSession(root) {
         cwd: options.cwd, env: options.env, stdio: options.stdio ?? ['pipe', 'pipe', 'pipe'], windowsHide: true,
       })
       this.child = new FixtureChild(this, this.controller, command, args)
-      this.controller.once('error', (error) => {
-        this.child.fail(error)
-        this.child.maybeClose()
-      })
-      this.controller.once('exit', () => {
-        this.refresh()
-        if (!this.status?.settled) {
-          this.controllerFailure = new Error('fixture Job host exited without confirming its process tree')
-        }
-      })
+      this.watchController()
       if (this.controller.pid === undefined) {
         this.child.exitCode = -1
         this.status = { settled: true }
@@ -219,7 +244,7 @@ export function createWindowsFixtureSession(root) {
           await delay(POLL_MS)
         }
       } finally {
-        clearInterval(this.timer)
+        this.stopPolling()
       }
     },
   }
