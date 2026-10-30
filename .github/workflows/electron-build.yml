@@ -82,6 +82,10 @@ jobs:
         if: runner.os == 'Windows'
         run: cargo build -p freshell-platform --example fixture-job-host --locked
 
+      - name: Test Windows fixture Job Object host
+        if: runner.os == 'Windows'
+        run: cargo test -p freshell-platform --example fixture-job-host --locked
+
       - name: Test native fixture process ownership
         run: pnpm run test:vitest run test/integration/tooling/claude-fixture-processes-native.test.ts --config config/vitest/vitest.fixture-processes-native.config.ts
 
@@ -139,6 +143,10 @@ jobs:
       - name: Build Windows fixture Job Object host
         if: matrix.os == 'windows-2022'
         run: cargo build -p freshell-platform --example fixture-job-host --locked
+
+      - name: Test Windows fixture Job Object host
+        if: matrix.os == 'windows-2022'
+        run: cargo test -p freshell-platform --example fixture-job-host --locked
 
       - name: Test native fixture process ownership
         if: matrix.os == 'windows-2022' || startsWith(matrix.os, 'macos')

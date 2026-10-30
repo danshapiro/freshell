@@ -1,4 +1,5 @@
 import type { TestProject } from 'vitest/node'
+import { prepareFixtureProcessOwner } from '../support/owned-fixture-processes.mjs'
 import {
   RUNTIME_BUILD_MANIFEST_ENV,
   hasPreparedRuntimeBuilds,
@@ -14,6 +15,10 @@ type Project = {
 }
 
 export async function setupRuntimeBuildPreflight(project: Project, options: { command?: RuntimeBuildCommand } = {}): Promise<(() => void) | undefined> {
+  if (process.platform === 'win32' && project.vitest.state.getPaths().some((file) => file.replaceAll('\\', '/').includes('/test/integration/providers/'))) {
+    // Compile the small native owner before suite-hook deadlines start.
+    await prepareFixtureProcessOwner()
+  }
   const env = { ...process.env, ...project.config.env }
   const selected = runtimeBuildRecipesForFiles(project.config.root, project.vitest.state.getPaths(), env)
   if (selected.length === 0 || hasPreparedRuntimeBuilds(project.config.root, selected, env)) return

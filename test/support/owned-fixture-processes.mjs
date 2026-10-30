@@ -1,10 +1,8 @@
 import { execFile, spawn } from 'node:child_process'
 import fs from 'node:fs/promises'
-import path from 'node:path'
-import { randomUUID } from 'node:crypto'
 import { setTimeout as delay } from 'node:timers/promises'
 import { promisify } from 'node:util'
-import { stopFixtureProcess } from './stop-fixture-process.mjs'
+import { createWindowsFixtureSession, prepareWindowsFixtureHost } from './windows-fixture-processes.mjs'
 
 const EXIT_TIMEOUT_MS = 3_000
 const POLL_MS = 25
@@ -75,50 +73,27 @@ async function stopGroup(groupId, platform) {
   }
 }
 
-function guardedNodeLaunch(args, options, root) {
-  if (!root) throw new Error('a Windows Node fixture requires its owned root')
-  const env = options.env ?? process.env
-  if (env.NODE_OPTIONS || args.some((arg) => /^(?:--(?:require|import)(?:=|$)|-r)/.test(arg))) {
-    throw new Error('fixture Node ownership requires its controlled entrypoint and environment')
-  }
-  const record = path.join(root, `.native-exit-${randomUUID()}.json`)
-  return {
-    record,
-    args: ['--import', new URL('./fixture-native-exit-guard.mjs', import.meta.url).href, ...args],
-    options: { ...options, env: { ...env, FRESHELL_FIXTURE_NATIVE_EXIT_RECORD: record } },
-  }
-}
-
-async function stopWindowsChild(child, record) {
-  await stopFixtureProcess(child)
-  if (!record || child.pid === undefined) return
-  let evidence
-  try { evidence = JSON.parse(await fs.readFile(record, 'utf8')) } catch (error) {
-    throw new Error(`unconfirmed native process exit for fixture child ${child.pid}`, { cause: error })
-  }
-  if (evidence.pid !== child.pid || evidence.state !== 'complete') {
-    throw new Error(`unconfirmed native process exit for fixture child ${child.pid}`)
-  }
+export async function prepareFixtureProcessOwner() {
+  if (process.platform === 'win32') await prepareWindowsFixtureHost()
 }
 
 /**
- * POSIX children own detached process groups. Windows keeps the original
- * ChildProcess/PID and, for Node sidecars, observes the SDK child's actual
- * exit before allowing the sidecar to exit. Unconfirmed exits retain files.
+ * POSIX children own detached process groups. Windows starts every target
+ * suspended in its own Job Object and keeps that job after the root exits.
+ * Cleanup requires every member's actual process handle to report exit.
  */
-export function createFixtureProcessOwner({ platform = process.platform, root } = {}) {
+export function createFixtureProcessOwner({ root } = {}) {
+  const platform = process.platform
   const groups = new Set()
-  const windowsChildren = new Map()
+  const windowsSessions = new Set()
   let closing = false
   return {
     spawn(command, args, options = {}) {
       if (closing) throw new Error('cannot spawn a fixture process after cleanup has started')
       if (platform === 'win32') {
-        const isNode = command === process.execPath || /(?:^|[\\/])node(?:\.exe)?$/i.test(command)
-        const launch = isNode ? guardedNodeLaunch(args, options, root) : { args, options }
-        const child = spawn(command, launch.args, { ...launch.options, detached: false })
-        windowsChildren.set(child, launch.record)
-        return child
+        const session = createWindowsFixtureSession(root)
+        windowsSessions.add(session)
+        return session.start(command, args, options)
       }
       // Node establishes pgid = sid = child.pid before spawn returns. Ownership
       // is captured before any created frame or native-CLI initialization, and
@@ -129,9 +104,9 @@ export function createFixtureProcessOwner({ platform = process.platform, root } 
     },
     async stop() {
       closing = true
-      for (const [child, record] of windowsChildren) {
-        await stopWindowsChild(child, record)
-        windowsChildren.delete(child)
+      for (const session of windowsSessions) {
+        await session.stop()
+        windowsSessions.delete(session)
       }
       for (const groupId of groups) {
         await stopGroup(groupId, platform)

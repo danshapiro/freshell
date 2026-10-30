@@ -35,7 +35,7 @@ import { promisify } from 'node:util'
 import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { parsePromptMarkers, SUBAGENT_MARKER, HANG_MCP_QUALIFIED_TOOL, PLAN_TEXT } from '../../fixtures/claude-cli-sim/prompt-markers.mjs'
-import { createFixtureProcessOwner } from '../../support/owned-fixture-processes.mjs'
+import { createFixtureProcessOwner, prepareFixtureProcessOwner } from '../../support/owned-fixture-processes.mjs'
 
 export const PINNED_SDK_VERSION = '0.3.237'
 export const PINNED_CLI_VERSION = '2.1.237'
@@ -122,6 +122,7 @@ export async function resolvePinnedClaude(repoRoot = DEFAULT_REPO_ROOT) {
  * leaks in except PATH's node directory.
  */
 export async function createClaudeFixture({ parent = os.tmpdir(), prefix = 'freshell-claude-contract-' } = {}) {
+  await prepareFixtureProcessOwner()
   const root = await fs.mkdtemp(path.join(parent, prefix))
   await fs.chmod(root, 0o700)
   const home = path.join(root, 'home')
