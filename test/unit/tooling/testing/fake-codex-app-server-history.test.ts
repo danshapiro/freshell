@@ -89,6 +89,87 @@ async function stop(child: ChildProcess | undefined): Promise<void> {
 }
 
 describe('fake Codex app-server history transcript', () => {
+  it('keeps recorded current turns and accepted native input available while completion is wedged and after resume', async () => {
+    const owned = await fs.mkdtemp(path.join(os.tmpdir(), 'fake-codex-wedged-history-'))
+    const workspace = path.join(owned, 'workspace')
+    const codexHome = path.join(owned, '.codex')
+    const portFile = path.join(owned, 'port')
+    const threadId = 'thread-wedged-history'
+    const prompts = ['original wedged input', 'one original input after resume']
+    await fs.mkdir(workspace)
+    let child: ChildProcess | undefined
+    let socket: WebSocket | undefined
+    const start = async () => {
+      await fs.rm(portFile, { force: true })
+      child = spawn(process.execPath, [fakeAppServer, '--listen', 'ws://127.0.0.1:0'], {
+        cwd: workspace,
+        env: {
+          ...process.env,
+          CODEX_HOME: codexHome,
+          FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES: '1',
+          FAKE_CODEX_APP_SERVER_PORT_FILE: portFile,
+          FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
+            threadStartThreadId: threadId,
+            recordTurns: true,
+            persistRolloutUserMessages: true,
+            turnCompleteDelayMs: 3_600_000,
+          }),
+        },
+        stdio: ['ignore', 'ignore', 'pipe'],
+      })
+      socket = await connectWebSocket(`ws://127.0.0.1:${await waitForPort(portFile, child)}`)
+      await rpc(socket, 'initialize', 'initialize', {})
+      socket.send(JSON.stringify({ jsonrpc: '2.0', method: 'initialized', params: {} }))
+      return socket
+    }
+    try {
+      let current = await start()
+      const started = await rpc(current, 'thread-start', 'thread/start', { cwd: workspace })
+      const rolloutPath = started.result?.thread?.path
+      for (const [index, prompt] of prompts.entries()) {
+        if (index > 0) {
+          current.close()
+          await stop(child)
+          current = await start()
+          const resumed = await rpc(current, 'thread-resume', 'thread/resume', { threadId })
+          expect(resumed.result?.thread?.id).toBe(threadId)
+        }
+        await rpc(current, `turn-start-${index}`, 'turn/start', {
+          threadId,
+          input: [{ type: 'text', text: prompt }],
+        })
+        const read = await rpc(current, `thread-read-${index}`, 'thread/read', { threadId, includeTurns: true })
+        const recent = await rpc(current, `recent-turn-${index}`, 'thread/turns/list', {
+          threadId, sortDirection: 'desc', itemsView: 'full', limit: 1,
+        })
+        expect(read.result?.thread?.turns).toHaveLength(index + 1)
+        expect(read.result.thread.turns.map((turn: any) => turn.items[0].content[0].text))
+          .toEqual(prompts.slice(0, index + 1))
+        expect(recent.result?.data).toEqual(read.result.thread.turns.slice(-1))
+        const oldest = await rpc(current, `oldest-turn-${index}`, 'thread/turns/list', {
+          threadId, sortDirection: 'asc', itemsView: 'full', limit: 1,
+        })
+        expect(oldest.result?.data).toEqual(read.result.thread.turns.slice(0, 1))
+        expect(oldest.result?.nextCursor).toBe(index > 0 ? '1' : null)
+        if (index > 0) {
+          const next = await rpc(current, 'next-turn', 'thread/turns/list', {
+            threadId, sortDirection: 'asc', itemsView: 'full', limit: 1, cursor: oldest.result.nextCursor,
+          })
+          expect(next.result?.data).toEqual(read.result.thread.turns.slice(1))
+          expect(next.result?.nextCursor).toBeNull()
+        }
+        const records = (await fs.readFile(rolloutPath, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+        expect(records[0]?.type).toBe('session_meta')
+        expect(records.filter(record => record.payload?.type === 'user_message')
+          .map(record => record.payload.message)).toEqual(prompts.slice(0, index + 1))
+      }
+    } finally {
+      socket?.close()
+      await stop(child)
+      await fs.rm(owned, { recursive: true, force: true })
+    }
+  }, 15_000)
+
   it('persists the submitted user message in the rollout so History can display the session', async () => {
     const owned = await fs.mkdtemp(path.join(os.tmpdir(), 'fake-codex-history-'))
     const workspace = path.join(owned, 'workspace')
