@@ -906,13 +906,27 @@ mod tests {
         let current_resource = stage.join(".freshell/resource-units/unit-1");
         std::fs::create_dir_all(&current_resource).unwrap();
         std::fs::write(current_resource.join("source"), b"current-resource").unwrap();
+        for (unit, content) in [
+            ("unit-2", "frozen-directory"),
+            ("unit-3", "current-directory"),
+        ] {
+            let directory = stage
+                .join(".freshell/resource-units")
+                .join(unit)
+                .join("commands");
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("command"), content).unwrap();
+        }
         let generation = format!("grant-{}", uuid::Uuid::new_v4());
         let prior: freshell_runtime_protocol::ProviderLaunchContext = serde_json::from_value(serde_json::json!({
             "preparation":{"claude":{"mcp_args":[]}},
             "config":[{"root":"user_provider","relativePath":".claude/old-settings.json","providerRelativePath":".claude/old-settings.json","format":"json"}],
             "mcpCapability":{"grantId":generation,"endpoint":"http://host.docker.internal:4000","providerRelativePath":".freshell/mcp-capability.json"},
             "preparedInputs":{"generationId":generation,"manifest":{"relativePath":".freshell/input-manifest.json","sha256":format!("{:x}",Sha256::digest(b"{}")),"sourceCount":0,"aliasCount":0,"recipeCount":0},
-                "resourceMounts":[{"stageRelativePath":".freshell/resource-units/unit-0/source","providerRelativePath":".freshell/provider-roots/unit-0/source","logicalDestination":workspace.join("selected-resource"),"effectiveDestination":workspace.join("selected-resource"),"kind":"file"}]}
+                "resourceMounts":[
+                    {"stageRelativePath":".freshell/resource-units/unit-0/source","providerRelativePath":".freshell/provider-roots/unit-0/source","logicalDestination":workspace.join("selected-resource"),"effectiveDestination":workspace.join("selected-resource"),"kind":"file"},
+                    {"stageRelativePath":".freshell/resource-units/unit-2","providerRelativePath":".freshell/provider-roots/unit-2","logicalDestination":workspace.join("selected-directory"),"effectiveDestination":workspace.join("selected-directory"),"kind":"directory"}
+                ]}
         })).unwrap();
         std::fs::write(
             stage.join(".freshell/prepared-context.json"),
@@ -966,19 +980,49 @@ mod tests {
             ".freshell/provider-roots/unit-1/source".into();
         current.prepared_inputs.as_mut().unwrap().resource_mounts[0].stage_relative_path =
             ".freshell/resource-units/unit-1/source".into();
+        current.prepared_inputs.as_mut().unwrap().resource_mounts[1].provider_relative_path =
+            ".freshell/provider-roots/unit-3".into();
+        current.prepared_inputs.as_mut().unwrap().resource_mounts[1].stage_relative_path =
+            ".freshell/resource-units/unit-3".into();
         prior.validate("claude").unwrap();
         current.validate("claude").unwrap();
         assert_eq!(unsafe { libc::seteuid(identity.0) }, 0);
+        let native_metadata = native.metadata().unwrap();
         // The prior runtime and replacement runtime mount distinct physical
         // resource roots, even when their logical destination is unchanged.
-        for (root, relative) in [
-            (&retained, ".freshell/provider-roots/unit-0/source"),
-            (&home, ".freshell/provider-roots/unit-1/source"),
-        ] {
-            let file = root.join(relative);
-            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-            std::fs::write(&file, b"").unwrap();
-            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let selected_mountpoints = |context: &freshell_runtime_protocol::ProviderLaunchContext| {
+            context
+                .prepared_inputs
+                .as_ref()
+                .unwrap()
+                .resource_mounts
+                .iter()
+                .map(
+                    |mount| freshell_platform::provider_mountpoints::Mountpoint {
+                        relative_path: mount.provider_relative_path.clone(),
+                        directory: mount.kind
+                            == freshell_runtime_protocol::ProviderResourceKind::Directory,
+                    },
+                )
+                .collect::<Vec<_>>()
+        };
+        for (root, context) in [(&retained, &prior), (&home, &current)] {
+            let selected = selected_mountpoints(context);
+            if restricted {
+                freshell_platform::provider_mountpoints::prepare(root, &selected).unwrap();
+            } else {
+                for mount in selected {
+                    let path = root.join(mount.relative_path);
+                    if mount.directory {
+                        std::fs::create_dir_all(path).unwrap();
+                    } else {
+                        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                        std::fs::write(&path, b"").unwrap();
+                        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                            .unwrap();
+                    }
+                }
+            }
         }
         let initialized = crate::refresh_provider_config_references(
             &prior, "claude", &workspace, &stage, &retained, identity.0, identity.1,
@@ -1031,6 +1075,7 @@ for root in (home,retained):
     assert (stat.st_uid,stat.st_gid,stat.st_mode & 0o777)==(uid,gid,0o700)
 with open(home+'/.claude/old-settings.json') as f: assert json.load(f)=={'ordinary':'frozen'}
 with open(home+'/.freshell/provider-roots/unit-0/source') as f: assert f.read()=='frozen-resource'
+with open(home+'/.freshell/provider-roots/unit-2/commands/command') as f: assert f.read()=='frozen-directory'
 assert not os.path.exists(home+'/.claude/projects/native.jsonl')
 assert os.stat(retained+'/.claude/projects/native.jsonl').st_atime_ns==1000000000
 print('provider-read-verified')
@@ -1084,6 +1129,82 @@ print('provider-read-verified')
         } else {
             None
         };
+        let replacement_mountpoints = if restricted {
+            assert_eq!(unsafe { libc::seteuid(identity.0) }, 0);
+            let prepared = (|| {
+                use std::os::fd::AsRawFd;
+                let selected = selected_mountpoints(&current);
+                for path in [
+                    retained.join(".freshell/provider-roots/unit-0/source"),
+                    retained.join(crate::PROVIDER_PROJECTION_MANIFEST),
+                ] {
+                    let file = std::fs::File::open(&path).map_err(|error| error.to_string())?;
+                    assert_eq!(unsafe { libc::seteuid(reader.0) }, 0);
+                    assert_eq!(
+                        unsafe { libc::fchown(file.as_raw_fd(), reader.0, identity.1) },
+                        0
+                    );
+                    assert_eq!(unsafe { libc::seteuid(identity.0) }, 0);
+                    let refused =
+                        freshell_platform::provider_mountpoints::prepare(&retained, &selected)
+                            .is_err();
+                    assert_eq!(unsafe { libc::seteuid(reader.0) }, 0);
+                    assert_eq!(
+                        unsafe { libc::fchown(file.as_raw_fd(), identity.0, identity.1) },
+                        0
+                    );
+                    assert_eq!(unsafe { libc::seteuid(identity.0) }, 0);
+                    if !refused {
+                        return Err("replacement accepted foreign-owned ordinary projection".into());
+                    }
+                }
+                freshell_platform::provider_mountpoints::prepare(&retained, &selected)
+                    .map_err(str::to_owned)?;
+                let resource = retained.join(&selected[0].relative_path);
+                let inode = std::fs::metadata(&resource)
+                    .map_err(|error| error.to_string())?
+                    .ino();
+                crate::refresh_provider_config_references(
+                    &current, "claude", &workspace, &stage, &retained, identity.0, identity.1,
+                )?;
+                if resource
+                    .metadata()
+                    .map_err(|error| error.to_string())?
+                    .ino()
+                    != inode
+                    || std::fs::read(&resource).map_err(|error| error.to_string())?
+                        != b"current-resource"
+                    || retained
+                        .join(".freshell/provider-roots/unit-0/source")
+                        .exists()
+                    || std::fs::read(
+                        retained.join(".freshell/provider-roots/unit-3/commands/command"),
+                    )
+                    .map_err(|error| error.to_string())?
+                        != b"current-directory"
+                    || retained.join(".freshell/provider-roots/unit-2").exists()
+                {
+                    return Err("replacement projection did not hand off its ordinary files".into());
+                }
+                let history = native.metadata().map_err(|error| error.to_string())?;
+                if history.ino() != native_metadata.ino()
+                    || (history.mtime(), history.mtime_nsec())
+                        != (native_metadata.mtime(), native_metadata.mtime_nsec())
+                    || history.len() != b"PRIVATE_NATIVE_HISTORY_SENTINEL".len() as u64
+                    || history.atime() != 1
+                    || (history.uid(), history.gid()) != identity
+                {
+                    return Err("replacement projection changed retained native history".into());
+                }
+                freshell_platform::provider_mountpoints::prepare(&retained, &selected)
+                    .map_err(str::to_owned)?;
+                Ok::<_, String>(())
+            })();
+            assert_eq!(unsafe { libc::seteuid(reader.0) }, 0);
+            Some(prepared)
+        } else {
+            None
+        };
         for root in [&retained, &home] {
             let chmod = provider_command("/usr/bin/find")
                 .arg(root)
@@ -1119,6 +1240,13 @@ print('provider-read-verified')
         );
         assert_eq!(observed.stdout, b"provider-read-verified\n");
         assert_eq!(current_guards, Some(Ok(())));
+        if let Some(prepared) = replacement_mountpoints {
+            assert_eq!(
+                prepared,
+                Ok(()),
+                "replacement launch mountpoint preparation"
+            );
+        }
     }
 
     #[test]
