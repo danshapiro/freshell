@@ -2796,6 +2796,14 @@ async fn main() -> ExitCode {
             .unwrap_or(false),
     };
 
+    #[cfg(feature = "managed-runtime-v1")]
+    let session_directory_router = session_directory::router_with_managed_client(
+        session_directory_state,
+        managed_runtime_client.clone(),
+    );
+    #[cfg(not(feature = "managed-runtime-v1"))]
+    let session_directory_router = session_directory::router(session_directory_state);
+
     let client_dir = Arc::new(resolve_client_dir());
 
     // The files REST surface the RETAINED SPA's DirectoryPicker fetches when a
@@ -3160,7 +3168,7 @@ async fn main() -> ExitCode {
             },
         ))
         .merge(network::router(network_state))
-        .merge(session_directory::router(session_directory_state))
+        .merge(session_directory_router)
         // Task 7: `POST /api/ai/terminals/:terminalId/summary` keeps the
         // generic direct-key Gemini transport, plus the shared terminal
         // registry for the scrollback snapshot.

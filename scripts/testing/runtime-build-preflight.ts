@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { runtimeCargoBuildAndCopy } from './runtime-cargo-artifacts.js'
 
 export const RUNTIME_BUILD_MANIFEST_ENV = 'FRESHELL_RUNTIME_TEST_BUILD_MANIFEST'
 export type RuntimeBinary = 'supervisor-test' | 'host-test' | 'supervisor-release' | 'host-release'
@@ -111,13 +112,14 @@ export function prepareRuntimeBuilds(
       const recipe = recipes[name]
       const started = Date.now()
       process.stderr.write(`${JSON.stringify({ severity: 'info', event: 'runtime_build.preflight.started', at: new Date().toISOString(), recipe: name })}\n`)
-      execFileSync(command.program, [...command.args, 'build', '--locked', ...recipe.args], {
-        cwd: root, env: { ...env, CARGO_BUILD_JOBS: String(jobs) }, stdio: 'inherit', timeout: 900_000,
-      })
-      for (const [binary, crate] of Object.entries(recipe.outputs)) {
+      const copies = Object.entries(recipe.outputs).map(([binary, crate]) => ({
+        source: path.join(target, recipe.profile, `${crate}${process.platform === 'win32' ? '.exe' : ''}`),
+        target: path.join(directory, `${binary}${process.platform === 'win32' ? '.exe' : ''}`),
+      }))
+      runtimeCargoBuildAndCopy(root, command.program, [...command.args, 'build', '--locked', ...recipe.args],
+        copies, { ...env, CARGO_BUILD_JOBS: String(jobs) }, 900_000)
+      for (const binary of Object.keys(recipe.outputs)) {
         const destination = path.join(directory, `${binary}${process.platform === 'win32' ? '.exe' : ''}`)
-        fs.copyFileSync(path.join(target, recipe.profile, `${crate}${process.platform === 'win32' ? '.exe' : ''}`), destination)
-        fs.chmodSync(destination, 0o755)
         manifest.binaries[binary as RuntimeBinary] = destination
       }
       process.stderr.write(`${JSON.stringify({ severity: 'info', event: 'runtime_build.preflight.completed', at: new Date().toISOString(), recipe: name, durationMs: Date.now() - started })}\n`)

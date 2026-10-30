@@ -5,6 +5,47 @@ use std::{
     path::Path,
 };
 
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+
+    #[test]
+    fn saved_history_activity_uses_native_time_or_source_modification() {
+        for timestamp in [Some("2026-10-11T10:00:01Z"), None] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("rollout.jsonl");
+            let mut row =
+                json!({"type":"session_meta","payload":{"id":"saved-root","cwd":"/workspace"}});
+            if let Some(timestamp) = timestamp {
+                row["timestamp"] = json!(timestamp);
+            }
+            std::fs::write(&path, format!("{row}\n")).unwrap();
+            let snapshot = read_rollout(&path, "saved-root").unwrap();
+            let activity = &snapshot["extensions"]["codex"]["nativeHistoryActivity"];
+            let expected = timestamp
+                .and_then(|value| freshell_sessions::time::parse_timestamp_ms(&json!(value)))
+                .unwrap_or_else(|| {
+                    std::fs::metadata(&path)
+                        .unwrap()
+                        .modified()
+                        .unwrap()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as i64
+                });
+            assert_eq!(activity["at"], expected);
+            assert_eq!(
+                activity["source"],
+                if timestamp.is_some() {
+                    "native_timestamp"
+                } else {
+                    "source_modification"
+                }
+            );
+        }
+    }
+}
+
 pub(crate) fn read(home: &Path, id: &str) -> Result<Value, String> {
     let path = super::locate_thread_rollout(&home.join(".codex/sessions"), id)
         .ok_or("saved native session not found")?;
@@ -16,7 +57,14 @@ const MESSAGE_DIGEST: &str = "nativeHistoryMessageDigest";
 pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
     let retention = crate::native_history::Retention::new();
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    let extent = file.metadata().map_err(|e| e.to_string())?.len();
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    let extent = metadata.len();
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64);
+    let mut native_activity = None;
     let source =
         crate::native_history::Records::new(std::io::BufReader::new(file.take(extent)), &retention);
     let mut omitted_turns = 0;
@@ -38,7 +86,18 @@ pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
         let Some((row, omitted)) = row.map_err(|e| e.to_string())? else {
             continue;
         };
+        if let Some(at) = freshell_sessions::time::parse_timestamp_ms(&row["timestamp"]) {
+            native_activity = Some(native_activity.map_or(at, |prior: i64| prior.max(at)));
+        }
         let payload = &row["payload"];
+        if row["type"] == "session_meta" {
+            let owner = payload["id"]
+                .as_str()
+                .or_else(|| payload["session_id"].as_str());
+            if owner != Some(id) {
+                return Err("selected Codex rollout names another native root".into());
+            }
+        }
         match row["type"].as_str() {
             Some("turn_context") => {
                 if let Some(next) = payload["turn_id"].as_str() {
@@ -271,6 +330,11 @@ pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
                 }
             }
         }
+    }
+    if let Some(at) = native_activity.or(modified) {
+        snapshot["extensions"]["codex"]["nativeHistoryActivity"] = json!({
+            "at":at,"source":if native_activity.is_some(){"native_timestamp"}else{"source_modification"},
+        });
     }
     crate::native_history::finish_retention(
         "codex",

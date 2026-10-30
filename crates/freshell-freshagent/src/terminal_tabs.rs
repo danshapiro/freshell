@@ -788,7 +788,9 @@ fn codex_launch_error_response(
     use freshell_codex::launch_lifecycle::CodexLaunchError;
     let status = match &error {
         CodexLaunchError::Config(_) => StatusCode::BAD_REQUEST,
-        CodexLaunchError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        CodexLaunchError::AppServerStart(_)
+        | CodexLaunchError::ProxyStart(_)
+        | CodexLaunchError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
         // Restore-class-only variants. The REST door is Interactive by
         // construction, so these are defensively mapped, mirroring
         // spawn_gate_error_response's QueueFull -> 429.
@@ -3999,6 +4001,10 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use axum::Router;
+    use freshell_terminal::registry::{
+        ManagedOutputRead, ManagedTerminalController, ManagedTerminalDescriptor,
+        ManagedTerminalFuture, ManagedTerminalInputError,
+    };
     use std::sync::Arc;
     use tower::util::ServiceExt;
 
@@ -4132,7 +4138,7 @@ mod tests {
     /// sandbox etc.) is an INPUT error → 400; any other launch failure (runtime/proxy
     /// IO, planner shutdown) → 500.
     #[test]
-    fn rest_codex_launch_error_maps_config_to_400_and_failed_to_500() {
+    fn rest_codex_launch_error_keeps_config_and_runtime_failures_on_their_existing_statuses() {
         use freshell_codex::launch_lifecycle::CodexLaunchError;
         use freshell_codex::launch_plan::CodexLaunchConfigError;
         let config =
@@ -4140,10 +4146,14 @@ mod tests {
                 message: "Invalid Codex sandbox setting \"x\".".to_string(),
             }));
         assert_eq!(config.status(), StatusCode::BAD_REQUEST);
-        let failed = codex_launch_error_response(CodexLaunchError::Failed(
-            "codex app-server WS never came up".to_string(),
-        ));
-        assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        for failure in [
+            CodexLaunchError::AppServerStart("local readiness failure".into()),
+            CodexLaunchError::ProxyStart("local proxy failure".into()),
+            CodexLaunchError::Failed("unclassified local failure".into()),
+        ] {
+            let response = codex_launch_error_response(failure);
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        }
     }
 
     /// `router.ts:177`: `resumeSessionId: opts.resumeSessionId ? (plan.sessionId ??
@@ -7074,6 +7084,138 @@ if (args.includes('app-server')) {{
 
     struct UnusedManagedController;
 
+    struct CapturingManagedController(std::sync::Mutex<Option<ManagedTerminalLaunch>>);
+
+    impl ManagedTerminalController for CapturingManagedController {
+        fn lookup_terminal<'a>(
+            &'a self,
+            _: &'a str,
+            _: Option<String>,
+        ) -> ManagedTerminalFuture<'a, Result<Option<ManagedTerminalDescriptor>, String>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn launch<'a>(
+            &'a self,
+            request: ManagedTerminalLaunch,
+        ) -> ManagedTerminalFuture<
+            'a,
+            Result<
+                ManagedTerminalDescriptor,
+                freshell_terminal::registry::ManagedTerminalLaunchError,
+            >,
+        > {
+            Box::pin(async move {
+                *self.0.lock().unwrap() = Some(request);
+                Err("captured managed launch without spawning".into())
+            })
+        }
+
+        fn input<'a>(
+            &'a self,
+            terminal: ManagedTerminalDescriptor,
+            data: String,
+        ) -> ManagedTerminalFuture<'a, Result<(), ManagedTerminalInputError>> {
+            UnusedManagedController.input(terminal, data)
+        }
+
+        fn resize<'a>(
+            &'a self,
+            terminal: ManagedTerminalDescriptor,
+            cols: u16,
+            rows: u16,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            UnusedManagedController.resize(terminal, cols, rows)
+        }
+
+        fn stop<'a>(
+            &'a self,
+            terminal: ManagedTerminalDescriptor,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            UnusedManagedController.stop(terminal)
+        }
+
+        fn read_output<'a>(
+            &'a self,
+            terminal: ManagedTerminalDescriptor,
+            after_seq: i64,
+            max_bytes: u64,
+        ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
+            UnusedManagedController.read_output(terminal, after_seq, max_bytes)
+        }
+    }
+
+    #[tokio::test]
+    async fn rest_managed_codex_model_preserves_explicit_selection_and_exact_resume() {
+        for (model, resume) in [
+            (Some("gpt-5.6-luna"), false),
+            (Some("gpt-5.2-codex"), false),
+            (None, false),
+            (Some("gpt-5.6-luna"), true),
+            (Some("gpt-5.2-codex"), true),
+        ] {
+            let mut spec = managed_codex_cli_spec();
+            spec.effort_args = Some(vec![
+                "-c".into(),
+                "model_reasoning_effort=\"{{effort}}\"".into(),
+            ]);
+            let state = state_with_registry()
+                .with_cli_commands(Arc::new(vec![spec]))
+                .with_resume_probe(probe_answering(
+                    freshell_platform::resume_gate::ResumeExistence::Present,
+                    true,
+                ));
+            let registry = state.terminal_registry.clone().unwrap();
+            let controller = Arc::new(CapturingManagedController(std::sync::Mutex::new(None)));
+            registry.set_managed_controller(Some(controller.clone()));
+            let mut body = json!({"mode":"codex", "cwd":std::env::temp_dir(), "effort":"low"});
+            if let Some(model) = model {
+                body["model"] = json!(model);
+            }
+            if resume {
+                body["sessionRef"] = json!({"provider":"codex", "sessionId":"owned-native-root"});
+            }
+            let (status, response) = post(app(state), "/api/tabs", body, true).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{}", response["message"]);
+            assert!(response["message"]
+                .as_str()
+                .unwrap()
+                .contains("captured managed launch"));
+            let request = controller
+                .0
+                .lock()
+                .unwrap()
+                .take()
+                .expect("actual REST managed launch request");
+            assert_eq!(request.provider_model.as_deref(), model);
+            assert_eq!(request.provider_reasoning_effort.as_deref(), Some("low"));
+            let args = &request.spec.args;
+            let models: Vec<_> = args
+                .windows(2)
+                .filter(|pair| pair[0] == "--model")
+                .map(|pair| pair[1].as_str())
+                .collect();
+            assert_eq!(models, model.into_iter().collect::<Vec<_>>());
+            assert!(args
+                .windows(2)
+                .any(|pair| pair == ["-c", "model_reasoning_effort=\"low\""]));
+            assert_eq!(
+                request.resume_session_id.as_deref(),
+                resume.then_some("owned-native-root")
+            );
+            assert_eq!(args.iter().any(|arg| arg == "resume"), resume);
+            if resume {
+                assert!(args
+                    .windows(2)
+                    .any(|pair| pair == ["resume", "owned-native-root"]));
+            }
+            assert!(
+                registry.directory().is_empty(),
+                "capture spawns no provider"
+            );
+        }
+    }
+
     impl freshell_terminal::registry::ManagedTerminalController for UnusedManagedController {
         fn lookup_terminal<'a>(
             &'a self,
@@ -7103,8 +7245,15 @@ if (args.includes('app-server')) {{
             &'a self,
             _: freshell_terminal::registry::ManagedTerminalDescriptor,
             _: String,
-        ) -> freshell_terminal::registry::ManagedTerminalFuture<'a, Result<(), String>> {
-            Box::pin(async { Err("unexpected managed input".into()) })
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<
+            'a,
+            Result<(), ManagedTerminalInputError>,
+        > {
+            Box::pin(async {
+                Err(ManagedTerminalInputError::Unavailable(
+                    "unexpected managed input".into(),
+                ))
+            })
         }
 
         fn resize<'a>(

@@ -27,19 +27,21 @@ export type FreshAgentConfigureSettings = {
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'
 }
 
-/** The suppression-aware fresh-agent frame send (mirrors the view's own
- * `sendFreshAgentMessage` seam — suppressed frames go to the harness spy,
- * never the wire). */
-export function sendSuppressedAwareFreshAgentFrame(
-  paneId: string,
-  message: Record<string, unknown>,
-): void {
-  const suppressed = typeof window !== 'undefined'
+/** Both the lifecycle decision and the sender honor the same harness hold. */
+export function isFreshAgentNetworkEffectsSuppressed(paneId: string): boolean {
+  return typeof window !== 'undefined'
     && (
       window.__FRESHELL_TEST_HARNESS__?.isAllFreshAgentNetworkEffectsSuppressed?.() === true
       || window.__FRESHELL_TEST_HARNESS__?.isFreshAgentNetworkEffectsSuppressed?.(paneId) === true
     )
-  if (suppressed) {
+}
+
+/** Suppressed frames go to the harness spy, never the wire. */
+export function sendSuppressedAwareFreshAgentFrame(
+  paneId: string,
+  message: Record<string, unknown>,
+): void {
+  if (isFreshAgentNetworkEffectsSuppressed(paneId)) {
     window.__FRESHELL_TEST_HARNESS__?.recordSentWsMessage?.(message)
     return
   }

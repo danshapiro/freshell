@@ -161,7 +161,8 @@ impl FreshAgentRestLane for HostedFreshAgentProxy {
         );
         let cleanup_token = self
             .create(message)
-            .await?
+            .await
+            .map_err(|_| ())?
             .map(|receipt| serde_json::to_string(&receipt).map_err(|_| ()))
             .transpose()?;
         Ok(RestLaneCreated {

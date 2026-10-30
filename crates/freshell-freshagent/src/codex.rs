@@ -56,9 +56,7 @@ use axum::{
 use serde_json::{json, Map, Value};
 use tokio::sync::{oneshot, Mutex as TokioMutex};
 
-use freshell_codex::launch_lifecycle::{
-    allocate_loopback_port, drain_child_io, SIDECAR_START_BUDGET,
-};
+use freshell_codex::launch_lifecycle::{allocate_loopback_port, SIDECAR_START_BUDGET};
 use freshell_codex::launch_plan::{codex_sidecar_spawn_spec, CodexSidecarLaunchContext};
 use freshell_codex::transport::{reap_owned_codex_sidecars, TungsteniteTransport};
 use freshell_codex::{
@@ -185,8 +183,227 @@ fn locate_thread_rollout(
     hit
 }
 
+pub(crate) fn read_large_native_display(
+    codex_home: &std::path::Path,
+    thread_id: &str,
+) -> Result<Option<Value>, String> {
+    let Some(path) = locate_thread_rollout(&codex_home.join("sessions"), thread_id) else {
+        return Err("selected Codex rollout is unavailable".into());
+    };
+    if std::fs::metadata(&path)
+        .map_err(|error| error.to_string())?
+        .len()
+        <= crate::native_history::RETAINED_TURN_BYTES as u64
+    {
+        return Ok(None);
+    }
+    native_history::read_rollout(&path, thread_id).map(Some)
+}
+
+fn join_retained_codex_display(snapshot: &mut Value, mut saved: Value) {
+    let live = snapshot["turns"]
+        .as_array_mut()
+        .map(std::mem::take)
+        .unwrap_or_default();
+    let live_roots = live
+        .iter()
+        .filter_map(|turn| turn["turnId"].as_str())
+        .map(|id| {
+            id.rsplit_once(":row-")
+                .filter(|(_, index)| index.parse::<usize>().is_ok())
+                .map_or(id, |(id, _)| id)
+                .to_owned()
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let mut turns = saved["turns"]
+        .as_array_mut()
+        .map(std::mem::take)
+        .unwrap_or_default();
+    let replacement_ordinal = turns
+        .iter()
+        .filter(|turn| {
+            let id = turn["turnId"].as_str().unwrap_or("");
+            live_roots.iter().any(|root| {
+                id == root
+                    || id
+                        .strip_prefix(root)
+                        .is_some_and(|suffix| suffix.starts_with(":row-"))
+            })
+        })
+        .filter_map(|turn| turn["ordinal"].as_u64())
+        .min();
+    turns.retain(|turn| {
+        let id = turn["turnId"].as_str().unwrap_or("");
+        !live_roots.iter().any(|root| {
+            id == root
+                || id
+                    .strip_prefix(root)
+                    .is_some_and(|suffix| suffix.starts_with(":row-"))
+        })
+    });
+    let ordinal = replacement_ordinal.unwrap_or_else(|| {
+        turns
+            .iter()
+            .filter_map(|turn| turn["ordinal"].as_u64())
+            .max()
+            .map_or(0, |value| value + 1)
+    });
+    turns.extend(live.into_iter().enumerate().map(|(index, mut turn)| {
+        turn["ordinal"] = json!(ordinal + index as u64);
+        turn
+    }));
+    let (diffs, children) = metadata::transcript_metadata(&turns);
+    snapshot["capabilities"]["diffs"] = json!(!diffs.is_empty());
+    snapshot["capabilities"]["childThreads"] = json!(!children.is_empty());
+    snapshot["diffs"] = json!(diffs);
+    snapshot["childThreads"] = json!(children);
+    snapshot["turns"] = json!(turns);
+    for key in ["nativeHistoryRetention", "nativeHistoryActivity"] {
+        if let Some(value) = saved["extensions"]["codex"].get(key) {
+            snapshot["extensions"]["codex"][key] = value.clone();
+        }
+    }
+    crate::native_history::retain_snapshot_display("codex", snapshot);
+}
+
 /// The codex fresh-agent `sessionType` (`AGENT_SESSION_TYPES.codex`).
 const SESSION_TYPE: &str = "freshcodex";
+
+const CODEX_STARTUP_STDERR_SAMPLE_MAX_BYTES: usize = 4096;
+
+struct CodexStartupStderr {
+    sample: Arc<StdMutex<Vec<u8>>>,
+    drained: oneshot::Receiver<()>,
+}
+
+impl CodexStartupStderr {
+    async fn safe_category_after_exit(self) -> &'static str {
+        let mut drained = self.drained;
+        // Process exit closes the pipe. Keep the failure path bounded if a
+        // wrapper accidentally leaves another writer open.
+        let _ = tokio::time::timeout(Duration::from_millis(100), &mut drained).await;
+        let sample = self
+            .sample
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        classify_codex_startup_stderr(&sample)
+    }
+}
+
+/// Drain Codex startup output while retaining only a short stderr tail for
+/// classification. Provider output is never logged or persisted; callers get
+/// one fixed diagnostic category suitable for a structured failure event.
+fn drain_codex_child_io_with_startup_diagnostics(
+    child: &mut tokio::process::Child,
+) -> CodexStartupStderr {
+    use tokio::io::AsyncReadExt;
+
+    if let Some(mut stdout) = child.stdout.take() {
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await;
+        });
+    }
+
+    let sample = Arc::new(StdMutex::new(Vec::with_capacity(
+        CODEX_STARTUP_STDERR_SAMPLE_MAX_BYTES,
+    )));
+    let (drained_tx, drained_rx) = oneshot::channel();
+    if let Some(mut stderr) = child.stderr.take() {
+        let sample_for_task = Arc::clone(&sample);
+        tokio::spawn(async move {
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let count = match stderr.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => count,
+                };
+                let mut tail = sample_for_task
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let overflow = tail
+                    .len()
+                    .saturating_add(count)
+                    .saturating_sub(CODEX_STARTUP_STDERR_SAMPLE_MAX_BYTES);
+                if overflow > 0 {
+                    let drain_len = overflow.min(tail.len());
+                    tail.drain(..drain_len);
+                }
+                tail.extend_from_slice(&chunk[..count]);
+            }
+            let _ = drained_tx.send(());
+        });
+    } else {
+        let _ = drained_tx.send(());
+    }
+    CodexStartupStderr {
+        sample,
+        drained: drained_rx,
+    }
+}
+
+fn classify_codex_startup_stderr(stderr: &[u8]) -> &'static str {
+    if stderr.is_empty() {
+        return "no-diagnostic";
+    }
+    let lower = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    if [
+        "not logged in",
+        "login required",
+        "codex login",
+        "authentication",
+        "credentials",
+        "unauthorized",
+        "token expired",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        "authentication"
+    } else if [
+        "unknown option",
+        "unrecognized option",
+        "unknown argument",
+        "unexpected argument",
+        "usage:",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        "arguments"
+    } else if [
+        "address already in use",
+        "failed to bind",
+        "bind failed",
+        "permission denied",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        "listener"
+    } else if [
+        "config.toml",
+        "invalid config",
+        "configuration error",
+        "failed to parse config",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        "configuration"
+    } else if [
+        "connection refused",
+        "could not resolve",
+        "dns",
+        "network error",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        "network"
+    } else {
+        "unclassified"
+    }
+}
 /// The runtime provider (`AGENT_SESSION_TYPES.codex.provider`).
 const PROVIDER: &str = "codex";
 /// Codex history is sometimes behind the turn-completion notification. Keep
@@ -6022,6 +6239,15 @@ impl FreshCodexState {
             .is_some_and(|s| !s.exited.load(Ordering::SeqCst))
     }
 
+    /// Read-only identity of this registered native process. A same-thread
+    /// crash recovery has a different token; this is not native session proof.
+    pub async fn live_session_incarnation(&self, session_id: &str) -> Option<String> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(session_id)?;
+        (!session.exited.load(Ordering::SeqCst) && !session.sidecar_ownership_id.is_empty())
+            .then(|| session.sidecar_ownership_id.clone())
+    }
+
     pub(crate) async fn local_snapshot_owner(
         &self,
         native_id: &str,
@@ -7433,8 +7659,10 @@ impl FreshCodexState {
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("codex app-server spawn failed ({codex_cmd}): {e}"))?;
-        // Drain child stdio so verbose app-server/MCP logs can never fill the pipe and stall it.
-        drain_child_io(&mut child);
+        // Drain child output so verbose app-server logs cannot back-pressure it.
+        // Retain only a bounded stderr tail in memory, classify it to a fixed
+        // category on startup failure, and never expose the provider's text.
+        let startup_stderr = drain_codex_child_io_with_startup_diagnostics(&mut child);
 
         // wfah: durable tracking BEFORE the handshake — the record must exist
         // even while this sidecar's 45s startup budget is still running, or an
@@ -7458,15 +7686,24 @@ impl FreshCodexState {
                 Err(err) => {
                     if let Ok(Some(status)) = child.try_wait() {
                         crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
-                        return Err(format!(
-                            "codex app-server exited before listening: {status}"
-                        ));
+                        let diagnostic = startup_stderr.safe_category_after_exit().await;
+                        tracing::warn!(target: "freshell_freshagent::codex",
+                            exit_status = %status,
+                            startup_diagnostic = diagnostic,
+                            "freshagent.codex.app_server_start_failed_before_listening"
+                        );
+                        return Err(format!("codex app-server exited before listening: {status} (startup diagnostic: {diagnostic})"));
                     }
                     if Instant::now() >= deadline {
                         let _ = child.start_kill();
                         reap_owned_codex_sidecars(&ownership_id);
                         crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
-                        return Err(format!("codex app-server WS never came up: {err}"));
+                        let diagnostic = startup_stderr.safe_category_after_exit().await;
+                        tracing::warn!(target: "freshell_freshagent::codex",
+                            startup_diagnostic = diagnostic,
+                            "freshagent.codex.app_server_listener_timeout"
+                        );
+                        return Err(format!("codex app-server WS never came up: {err} (startup diagnostic: {diagnostic})"));
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
@@ -7489,7 +7726,8 @@ impl FreshCodexState {
                         crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                         return Err(format!("codex app-server initialize failed: {err}"));
                     }
-                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    tokio::time::sleep(freshell_codex::launch_plan::SIDECAR_INITIALIZE_RETRY_DELAY)
+                        .await;
                 }
             }
         }
@@ -7866,13 +8104,58 @@ impl FreshCodexState {
         // this port previously had no fallback at all, so ANY such rejection became an
         // unconditional 500. Retry once with `includeTurns:false`, matching the reference
         // exactly (still a valid, if turn-less, snapshot).
-        let raw = match client.read_thread(thread_id, true).await {
-            Ok(raw) => raw,
-            Err(err) if is_codex_include_turns_unavailable(&err) => client
+        client
+            .initialize()
+            .await
+            .map_err(CodexSnapshotError::AppServer)?;
+        let codex_home = client.codex_home().await;
+        let (retained, mut older_history_unavailable) = if let Some(home) = codex_home {
+            match crate::native_history::large_codex_display(std::path::Path::new(&home), thread_id)
+                .await
+            {
+                Ok(retained) => (retained, false),
+                Err(error) => {
+                    tracing::warn!(provider = PROVIDER, session_id = %thread_id, %error,
+                        "freshagent.codex.older_display_unavailable");
+                    (None, true)
+                }
+            }
+        } else {
+            (None, false)
+        };
+        let raw = if retained.is_some() || older_history_unavailable {
+            let mut metadata = client
                 .read_thread(thread_id, false)
                 .await
-                .map_err(CodexSnapshotError::AppServer)?,
-            Err(err) => return Err(CodexSnapshotError::AppServer(err)),
+                .map_err(CodexSnapshotError::AppServer)?;
+            if metadata["thread"]["id"] != thread_id {
+                return Err(CodexSnapshotError::Protocol(
+                    "live native metadata names another Codex root".into(),
+                ));
+            }
+            let page = match client.read_recent_turn(thread_id).await {
+                Ok(page) => page,
+                Err(error) if is_codex_include_turns_unavailable(&error) => json!({"data":[]}),
+                Err(error) => return Err(CodexSnapshotError::AppServer(error)),
+            };
+            let turns = page["data"].as_array().ok_or_else(|| {
+                CodexSnapshotError::Protocol("native recent-turn page has no turn array".into())
+            })?;
+            // Native zero-turn state confirms no older conversation was omitted.
+            if turns.is_empty() {
+                older_history_unavailable = false;
+            }
+            metadata["thread"]["turns"] = json!(turns);
+            metadata
+        } else {
+            match client.read_thread(thread_id, true).await {
+                Ok(raw) => raw,
+                Err(err) if is_codex_include_turns_unavailable(&err) => client
+                    .read_thread(thread_id, false)
+                    .await
+                    .map_err(CodexSnapshotError::AppServer)?,
+                Err(err) => return Err(CodexSnapshotError::AppServer(err)),
+            }
         };
         // U-1 repair (wedged-sidecar deadman): a thread restored MID-TURN has no
         // adapter-observed `turn/started` (this process never saw one), so
@@ -7960,6 +8243,14 @@ impl FreshCodexState {
             stuck,
         )
         .map_err(CodexSnapshotError::Protocol)?;
+        if let Some(retained) = retained {
+            join_retained_codex_display(&mut snapshot, retained);
+        }
+        if older_history_unavailable {
+            snapshot["extensions"]["codex"]["nativeHistoryRetention"]["partial"] = json!(true);
+            snapshot["extensions"]["codex"]["nativeHistoryRetention"]["olderHistoryUnavailable"] =
+                json!(true);
+        }
         self.overlay_controls(thread_id, &mut snapshot).await;
         if let Some(session) = self.sessions.lock().await.get(thread_id) {
             let mut settings = Map::new();
@@ -9670,6 +9961,7 @@ fn build_codex_snapshot_json(
         );
         snapshot["revision"] = json!(floored);
     }
+    crate::native_history::retain_snapshot_display(PROVIDER, &mut snapshot);
     Ok(snapshot)
 }
 
@@ -11078,8 +11370,14 @@ fn adapter_event_to_frame(event: &CodexAdapterEvent, thread_id: &str) -> Option<
             }
             Value::Object(map)
         }
-        CodexAdapterEvent::TurnComplete { session_id, at } => {
-            crate::attention::turn_complete_event(session_id, *at)
+        CodexAdapterEvent::TurnComplete {
+            session_id,
+            at,
+            outcome,
+        } => {
+            let mut event = crate::attention::turn_complete_event(session_id, *at);
+            event["outcome"] = json!(outcome.as_str());
+            event
         }
         CodexAdapterEvent::Status { session_id, status } => json!({
             "type": "freshAgent.status",
@@ -11117,6 +11415,7 @@ fn mint_synthesized_attention_edge(
     let event = CodexAdapterEvent::TurnComplete {
         session_id: thread_id.to_string(),
         at,
+        outcome: freshell_codex::CodexTurnOutcome::Unknown,
     };
     if let Some(frame) = adapter_event_to_frame(&event, thread_id) {
         let _ = broadcast_tx.send(frame);
@@ -11477,6 +11776,46 @@ pub(crate) mod tests {
     use crate::summary::{SUMMARY_KIND_AUTHORED, SUMMARY_KIND_ECHO};
     use freshell_codex::{CodexStatus, CodexTurnEvent};
 
+    pub(crate) fn small_native_home(thread_id: &str) -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        std::fs::write(
+            sessions.join(format!("rollout-{thread_id}.jsonl")),
+            format!(
+                "{}\n",
+                json!({"type":"session_meta","payload":{"id":thread_id}})
+            ),
+        )
+        .unwrap();
+        home
+    }
+
+    #[test]
+    fn codex_startup_diagnostics_use_only_safe_categories() {
+        assert_eq!(
+            classify_codex_startup_stderr(b"Please run codex login to continue"),
+            "authentication"
+        );
+        assert_eq!(
+            classify_codex_startup_stderr(b"could not parse config.toml"),
+            "configuration"
+        );
+        assert_eq!(
+            classify_codex_startup_stderr(b"unknown option --listen"),
+            "arguments"
+        );
+        assert_eq!(
+            classify_codex_startup_stderr(b"address already in use"),
+            "listener"
+        );
+        assert_eq!(
+            classify_codex_startup_stderr(b"provider startup failed"),
+            "unclassified"
+        );
+        assert_eq!(classify_codex_startup_stderr(b""), "no-diagnostic");
+    }
+
     // ── DIAG-01 lifecycle tracing events (capturing test facility) ────────
     mod tracing_capture {
         use std::collections::BTreeMap;
@@ -11830,6 +12169,7 @@ pub(crate) mod tests {
             &CodexAdapterEvent::TurnComplete {
                 session_id: "t-1".into(),
                 at: 42,
+                outcome: freshell_codex::CodexTurnOutcome::Completed,
             },
             "t-1",
         )
@@ -11841,6 +12181,22 @@ pub(crate) mod tests {
         assert_eq!(wire["sessionId"], "t-1");
         assert_eq!(wire["event"]["type"], "freshAgent.turn.complete");
         assert_eq!(wire["event"]["at"], 42);
+        assert_eq!(wire["event"]["outcome"], "completed");
+    }
+
+    #[test]
+    fn failed_turn_complete_frames_keep_the_unsuccessful_outcome() {
+        let frame = adapter_event_to_frame(
+            &CodexAdapterEvent::TurnComplete {
+                session_id: "t-1".into(),
+                at: 43,
+                outcome: freshell_codex::CodexTurnOutcome::Failed,
+            },
+            "t-1",
+        )
+        .unwrap();
+        let wire: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(wire["event"]["outcome"], "failed");
     }
 
     #[test]
@@ -12171,6 +12527,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn get_snapshot_reports_sendable_after_a_turn_completes_via_the_real_notification_stream()
     {
+        let native_home = small_native_home("thread-1");
         let (transport, peer) = freshell_codex::new_channel_transport();
         let (client, notifs) = CodexAppServerClient::connect(transport);
         let client = Arc::new(client);
@@ -12217,7 +12574,7 @@ pub(crate) mod tests {
         assert_eq!(init_method, "initialize");
         peer.respond(
             &init_id,
-            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+            json!({ "userAgent": "x", "codexHome": native_home.path(), "platformFamily": "u", "platformOs": "l" }),
         );
         let _ = peer.expect_notification().await;
 
@@ -12677,6 +13034,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn quiet_deadman_fires_stuck_and_rings_the_unified_attention_edge() {
+        let native_home = small_native_home("thread-quiet-stuck");
         let (st, mut frame_rx) = state_with_bus();
         st.set_codex_quiet_window_ms_for_tests(150);
         let capture = tracing_capture::capture_by_session("thread-quiet-stuck");
@@ -12700,7 +13058,7 @@ pub(crate) mod tests {
             let st = st.clone();
             tokio::spawn(async move { st.handle_send(send_msg("thread-quiet-stuck", "run")).await })
         };
-        answer_initialize(&peer).await;
+        answer_initialize_in_home(&peer, native_home.path()).await;
         let (id, method, _params) = peer.expect_request().await;
         assert_eq!(method, "turn/start");
         peer.respond(&id, json!({ "turn": { "id": "turn-1" } }));
@@ -12794,6 +13152,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn quiet_deadman_resets_on_lane_events_and_resolves_on_turn_completion() {
+        let native_home = small_native_home("thread-quiet-reset");
         let (st, mut frame_rx) = state_with_bus();
         st.set_codex_quiet_window_ms_for_tests(300);
         let capture = tracing_capture::capture_by_session("thread-quiet-reset");
@@ -12815,7 +13174,7 @@ pub(crate) mod tests {
             let st = st.clone();
             tokio::spawn(async move { st.handle_send(send_msg("thread-quiet-reset", "run")).await })
         };
-        answer_initialize(&peer).await;
+        answer_initialize_in_home(&peer, native_home.path()).await;
         let (id, method, _params) = peer.expect_request().await;
         assert_eq!(method, "turn/start");
         peer.respond(&id, json!({ "turn": { "id": "turn-1" } }));
@@ -12984,6 +13343,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn quiet_deadman_arms_from_snapshot_observed_in_flight_turn() {
+        let native_home = small_native_home("thread-quiet-midrestore");
         // U-1 repair: a session registered WITHOUT any adapter-observed turn (a thread
         // restored mid-turn), then a live thread read sees an in-flight turn -> seed
         // `active_turn` (side-state only) and arm the window; the wedge still fires.
@@ -13017,7 +13377,7 @@ pub(crate) mod tests {
             let st = st.clone();
             tokio::spawn(async move { st.get_snapshot("thread-quiet-midrestore", None).await })
         };
-        answer_initialize(&peer).await;
+        answer_initialize_in_home(&peer, native_home.path()).await;
         let (id, method, _params) = peer.expect_request().await;
         assert_eq!(method, "thread/read");
         peer.respond(&id, snapshot_payload());
@@ -13134,6 +13494,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn quiet_deadman_rearms_after_terminal_status_clearance() {
+        let native_home = small_native_home("thread-quiet-rearm");
         // M1 regression: a terminal status (`turn/completed` here) must DISARM the
         // quiet deadman, not merely suppress its fire by clearing `active_turn`
         // (the waiter's `has_turn` re-check). A stale `Some(deadline)` left behind
@@ -13163,7 +13524,7 @@ pub(crate) mod tests {
             let st = st.clone();
             tokio::spawn(async move { st.handle_send(send_msg("thread-quiet-rearm", "run")).await })
         };
-        answer_initialize(&peer).await;
+        answer_initialize_in_home(&peer, native_home.path()).await;
         let (id, method, _params) = peer.expect_request().await;
         assert_eq!(method, "turn/start");
         peer.respond(&id, json!({ "turn": { "id": "turn-1" } }));
@@ -13549,6 +13910,119 @@ pub(crate) mod tests {
         assert!(
             refused,
             "the refused refresh is logged typed, never silently dropped: {events:?}"
+        );
+    }
+
+    #[test]
+    fn live_codex_snapshot_retains_recent_history_without_changing_running_controls() {
+        let text = "large ordinary tool output ".repeat(50_000);
+        let turns: Vec<_> = (0..32)
+            .map(|index| {
+                json!({"id":format!("turn-{index}"),
+            "items":[{"id":format!("answer-{index}"),"type":"agentMessage","text":text}]})
+            })
+            .collect();
+        let raw = json!({"thread":{"id":"live-root","status":{"type":"active"},"turns":turns}});
+        let snapshot = build_codex_snapshot_json(
+            "live-root",
+            &raw,
+            true,
+            Some(HistoryMode::Paginated),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(serde_json::to_vec(&raw).unwrap().len() > 32 * 1024 * 1024);
+        assert!(
+            serde_json::to_vec(&snapshot).unwrap().len()
+                < crate::native_history::MAX_HISTORY_BYTES as usize
+        );
+        assert_eq!(snapshot["threadId"], "live-root");
+        assert_eq!(snapshot["status"], "running");
+        assert_eq!(snapshot["capabilities"]["interrupt"], true);
+        assert_eq!(snapshot["capabilities"]["send"], false);
+        assert_eq!(snapshot["capabilities"]["undo"], true);
+        assert_eq!(
+            snapshot["turns"].as_array().unwrap().last().unwrap()["turnId"],
+            "turn-31"
+        );
+        assert_eq!(
+            snapshot["extensions"]["codex"]["nativeHistoryRetention"]["partial"],
+            true
+        );
+        assert_ne!(snapshot["extensions"]["codex"]["ownerKind"], "vacant");
+    }
+
+    #[test]
+    fn live_codex_snapshot_retains_short_items_within_one_large_native_turn() {
+        let text = "x".repeat(3000);
+        let items: Vec<_> = (0..12_000)
+            .map(|index| json!({"id":format!("answer-{index}"),"type":"agentMessage","text":text}))
+            .collect();
+        let raw = json!({"thread":{"id":"live-root","status":{"type":"active"},"turns":[{"id":"long-turn","items":items}]}});
+        assert!(serde_json::to_vec(&raw).unwrap().len() > 32 * 1024 * 1024);
+        let snapshot = build_codex_snapshot_json(
+            "live-root",
+            &raw,
+            true,
+            Some(HistoryMode::Paginated),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            serde_json::to_vec(&snapshot).unwrap().len()
+                < crate::native_history::MAX_HISTORY_BYTES as usize
+        );
+        assert_eq!(snapshot["status"], "running");
+        assert_eq!(snapshot["capabilities"]["interrupt"], true);
+        assert_eq!(snapshot["turns"][0]["turnId"], "long-turn");
+        assert_eq!(
+            snapshot["turns"][0]["items"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["id"],
+            "answer-11999"
+        );
+        assert!(
+            snapshot["extensions"]["codex"]["nativeHistoryRetention"]["omittedItems"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+    }
+
+    #[test]
+    fn live_codex_snapshot_retains_large_file_change_diff_and_raw_display_metadata() {
+        let diff = format!("-{}\n+{}", "old".repeat(4_000_000), "new".repeat(4_000_000));
+        let raw = json!({"thread":{"id":"live-root","status":{"type":"active"},"turns":[{"id":"edit-turn","items":[{
+            "id":"edit-1","type":"fileChange","status":"completed","changes":[{"path":"generated.txt","kind":{"type":"update"},"diff":diff}]
+        }]}]}});
+        let snapshot = build_codex_snapshot_json(
+            "live-root",
+            &raw,
+            true,
+            Some(HistoryMode::Paginated),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            serde_json::to_vec(&snapshot).unwrap().len()
+                < crate::native_history::MAX_HISTORY_BYTES as usize
+        );
+        assert_eq!(snapshot["status"], "running");
+        assert_eq!(snapshot["capabilities"]["interrupt"], true);
+        assert_eq!(snapshot["turns"][0]["turnId"], "edit-turn");
+        let item = &snapshot["turns"][0]["items"][0];
+        assert_eq!(item["id"], "edit-1");
+        assert_eq!(item["status"], "completed");
+        assert_eq!(item["changes"][0]["path"], "generated.txt");
+        assert_eq!(snapshot["diffs"][0]["path"], "generated.txt");
+        assert_eq!(
+            snapshot["extensions"]["codex"]["nativeHistoryRetention"]["partial"],
+            true
         );
     }
 
@@ -15059,11 +15533,15 @@ pub(crate) mod tests {
 
     /// Complete the initialize handshake a first RPC triggers (client.ts:777-778).
     async fn answer_initialize(peer: &freshell_codex::ChannelPeer) {
+        answer_initialize_in_home(peer, std::path::Path::new("/h")).await;
+    }
+
+    async fn answer_initialize_in_home(peer: &freshell_codex::ChannelPeer, home: &std::path::Path) {
         let (init_id, init_method, _p) = peer.expect_request().await;
         assert_eq!(init_method, "initialize");
         peer.respond(
             &init_id,
-            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+            json!({ "userAgent": "x", "codexHome": home, "platformFamily": "u", "platformOs": "l" }),
         );
         let _ = peer.expect_notification().await; // initialized
     }
@@ -26269,6 +26747,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn get_snapshot_returns_a_schema_shaped_snapshot_with_turn_text() {
+        let native_home = small_native_home("thread-1");
         let (transport, peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
         let client = Arc::new(client);
@@ -26295,7 +26774,7 @@ pub(crate) mod tests {
         assert_eq!(init_method, "initialize");
         peer.respond(
             &init_id,
-            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+            json!({ "userAgent": "x", "codexHome": native_home.path(), "platformFamily": "u", "platformOs": "l" }),
         );
         let _ = peer.expect_notification().await;
 
@@ -26363,6 +26842,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn get_snapshot_reports_running_capabilities_when_a_turn_is_tracked_active() {
+        let native_home = small_native_home("thread-1");
         let (transport, peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
         let client = Arc::new(client);
@@ -26386,7 +26866,7 @@ pub(crate) mod tests {
         let (init_id, _m, _p) = peer.expect_request().await;
         peer.respond(
             &init_id,
-            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+            json!({ "userAgent": "x", "codexHome": native_home.path(), "platformFamily": "u", "platformOs": "l" }),
         );
         let _ = peer.expect_notification().await;
 
@@ -26419,6 +26899,7 @@ pub(crate) mod tests {
     /// full stop -- matching the legacy adapter, which has no such fallback to begin with.
     #[tokio::test]
     async fn get_snapshot_is_sendable_once_thread_status_is_idle_even_if_active_turn_is_stale() {
+        let native_home = small_native_home("thread-1");
         let (transport, peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
         let client = Arc::new(client);
@@ -26445,7 +26926,7 @@ pub(crate) mod tests {
         let (init_id, _m, _p) = peer.expect_request().await;
         peer.respond(
             &init_id,
-            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+            json!({ "userAgent": "x", "codexHome": native_home.path(), "platformFamily": "u", "platformOs": "l" }),
         );
         let _ = peer.expect_notification().await;
 
@@ -26809,6 +27290,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn get_snapshot_renders_tool_reasoning_and_file_change_items_end_to_end() {
+        let native_home = small_native_home("thread-rich");
         let (transport, peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
         let client = Arc::new(client);
@@ -26832,7 +27314,7 @@ pub(crate) mod tests {
         let (init_id, _m, _p) = peer.expect_request().await;
         peer.respond(
             &init_id,
-            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+            json!({ "userAgent": "x", "codexHome": native_home.path(), "platformFamily": "u", "platformOs": "l" }),
         );
         let _ = peer.expect_notification().await;
 
@@ -27488,6 +27970,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn get_snapshot_surfaces_the_durable_rollback_record_and_floors_the_revision() {
+        let native_home = small_native_home("thread-1");
         let (transport, peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
         let client = Arc::new(client);
@@ -27513,7 +27996,7 @@ pub(crate) mod tests {
         let (init_id, _m, _p) = peer.expect_request().await;
         peer.respond(
             &init_id,
-            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+            json!({ "userAgent": "x", "codexHome": native_home.path(), "platformFamily": "u", "platformOs": "l" }),
         );
         let _ = peer.expect_notification().await;
         let (id, method, _params) = peer.expect_request().await;

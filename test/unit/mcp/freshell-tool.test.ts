@@ -79,10 +79,8 @@ describe('Rust capability rejection wall', () => {
     ['run', { command: 'echo blocked' }],
     ['fresh-send', { sessionId: 's', sessionType: 't', provider: 'codex', text: 'blocked' }],
     ['attach', { target: 'p', terminalId: 't' }],
-    ['new-tab', { agent: 'codex' }],
-    ['split-pane', { agent: 'opencode' }],
-    ['split-pane', { model: 'model' }],
-    ['split-pane', { effort: 'high' }],
+    ['new-tab', { agent: 'unknown' }],
+    ['split-pane', { agent: 'unknown' }],
     ['wait-for', {}],
     ['wait-for', { p: 'ready' }],
     ['wait-for', { pattern: 'ready', stable: 1 }],
@@ -381,7 +379,7 @@ describe('executeAction -- tab actions', () => {
     }))
   })
 
-  it('new-tab with agent: codex is locally rejected by the Rust capability contract', async () => {
+  it('new-tab with agent: codex rejects a raw resume id', async () => {
     mockClient.post.mockResolvedValue({ id: 't1' })
 
     const result = await executeAction('new-tab', {
@@ -389,7 +387,7 @@ describe('executeAction -- tab actions', () => {
       resume: 'thread-pre-durable',
     })
 
-    expect(result).toEqual(expect.objectContaining({ error: 'This fresh-agent provider is unavailable with the Rust Freshell server.' }))
+    expect(result).toEqual(expect.objectContaining({ error: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.' }))
     expect(mockClient.post).not.toHaveBeenCalled()
   })
 
@@ -406,6 +404,19 @@ describe('executeAction -- tab actions', () => {
       sessionRef: { provider: 'claude', sessionId: '550e8400-e29b-41d4-a716-446655440000' },
     }))
     expect(mockClient.post.mock.calls[0][1]).not.toHaveProperty('resumeSessionId')
+  })
+
+  it.each(['claude', 'kilroy'])('new-tab with agent: %s forwards its explicit canonical root', async (agent) => {
+    mockClient.post.mockResolvedValue({ id: 't1' })
+
+    await executeAction('new-tab', {
+      agent,
+      sessionRef: { provider: 'claude', sessionId: '550e8400-e29b-41d4-a716-446655440000' },
+    })
+
+    expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({
+      agent, sessionRef: { provider: 'claude', sessionId: '550e8400-e29b-41d4-a716-446655440000' },
+    }))
   })
 
   it('list-tabs calls GET /api/tabs', async () => {

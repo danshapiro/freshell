@@ -12,7 +12,7 @@ const SPEC = 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust
 export function selectedProviderFromArgs(args: readonly string[]): string {
   const values = args[0] === '--provider' ? args.slice(1) : args
   if (values.length !== 1) {
-    throw new Error('usage: npm run test:runtime:provider-qualification -- --provider claude|codex|opencode|amplifier')
+    throw new Error('usage: pnpm run test:runtime:provider-qualification --provider claude|codex|opencode|amplifier')
   }
   const selected = parseQualificationProviderSelection(values[0])
   if (selected.length !== 1) {
@@ -21,10 +21,11 @@ export function selectedProviderFromArgs(args: readonly string[]): string {
   return selected[0]
 }
 
-export function runSelectedProviderQualification(args = process.argv.slice(2)): void {
+export function runSelectedProviderQualification(args = process.argv.slice(2), execute: typeof execFileSync = execFileSync): void {
   const provider = selectedProviderFromArgs(args)
-  execFileSync('npm', [
-    'run', 'test:e2e:local', '--', '--project=chromium', SPEC,
+  execute('pnpm', [
+    'exec', 'tsx', 'scripts/testing/runtime-external-browser.ts',
+    '--spec', SPEC, '--provider', provider,
   ], {
     cwd: process.cwd(),
     env: {

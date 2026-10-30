@@ -20,7 +20,8 @@
   "providers": {
     "claude": {
       "package": "@anthropic-ai/claude-code",
-      "version": "2.1.263"
+      "version": "2.1.263",
+      "sdkNativeVersion": "2.1.237"
     },
     "codex": {
       "package": "@openai/codex",

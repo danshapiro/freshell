@@ -147,6 +147,7 @@ function applyFreshAgentAttentionEdge(
       paneId: location.paneId,
       terminalId: waiting ? waitingDedupeKey(payload.provider, payload.sessionId) : sessionKey,
       at: payload.at,
+      ...(!waiting && payload.outcome ? { outcome: payload.outcome } : {}),
     }))
     advanceAttentionAliases(dispatch, terminalIds, payload.at)
   }
@@ -224,6 +225,7 @@ export type ApplyFreshAgentCompletionPayload = {
   provider: string
   sessionId: string
   at: number
+  outcome?: 'completed' | 'failed'
 }
 
 /**
@@ -231,7 +233,8 @@ export type ApplyFreshAgentCompletionPayload = {
  * discrete turn-complete edge for ANY turn end except a user-initiated interrupt —
  * successes, errors, max-turns, crashes, deadman fires, and mid-turn stream
  * exceptions all ring the same unified attention signal — so the client never
- * derives green/sound from the busy level or the turn's outcome. We resolve the
+ * derives green/sound from the busy level or the turn's outcome. The fixed
+ * outcome category is retained as metadata only. We resolve the
  * owning tab/pane from the `provider:sessionId` session key and fold the event into
  * the GREEN/SOUND pipeline via the `at`-monotonic dedupe regime (no completionSeq).
  * A reconnect's ready marks replay only edges this page missed. First connect,

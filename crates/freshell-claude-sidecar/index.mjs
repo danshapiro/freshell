@@ -147,10 +147,15 @@
 
 import { createInterface } from 'node:readline'
 import { randomBytes } from 'node:crypto'
+import { isAbsolute, join } from 'node:path'
+import { nativeProfileDigest, nativeResourceDigest } from './native-profile-digest.mjs'
+import { createNativeSessionChannel, inspectNativeForkSource, nativeInputDigest } from './native-session-channel.mjs'
+import { createNativeCheckpointStore } from './native-checkpoint-state.mjs'
+import { spawnObservedNative } from './native-process.mjs'
 import { configureSession, userMessageContent } from './session-settings.mjs'
 import { createFrameState, frameLogRecord, framesForSdkMessage, resultFrames } from './sdk-message-frames.mjs'
 import { checkpointAttemptOf, isUuid, rememberCheckpointAttempt, takeCheckpointIdentity } from './checkpoint-identity.mjs'
-import { managedSdkSpawn } from './exec-profile.mjs'
+import { checkSdkExec, managedSdkSpawn } from './exec-profile.mjs'
 import { mcpServersFor, withFreshellContext } from './mcp-servers.mjs'
 import { cliStderrLogger, errorText, log } from './log.mjs'
 import { isHostedSidecar } from './hosted.mjs'
@@ -173,6 +178,8 @@ const sdkModule = await import(process.env.FRESHELL_CLAUDE_SDK_QUERY_MODULE || '
 const { query } = sdkModule
 
 // ── stdout writer (newline-JSON; stderr is the only log sink: log.mjs) ───────
+function logerr(message) { log('warn', 'native.operation_failed', { error: String(message) }) }
+
 function emit(msg) {
   process.stdout.write(`${JSON.stringify(msg)}\n`)
 }
@@ -238,6 +245,7 @@ function createInputStream() {
 
 /** @type {Map<string, {inputStream:{push:Function,end:Function}, abort:AbortController, permissionMode?:string, cliSessionId?:string, pendingPermissions?:Map<string,any>, pendingQuestions?:Map<string,any>}>} */
 const sessions = new Map()
+const nativeChildClosures = new Set()
 
 function normalizeCommands(rows, strict = false) {
   if (!Array.isArray(rows)) return undefined
@@ -275,15 +283,25 @@ function publishCommandsIfChanged(sessionId, state) {
 }
 
 // ── SDK message -> sdk.* event (faithful port of SdkBridge.handleSdkMessage) ──
-function handleSdkMessage(sessionId, msg) {
+async function handleSdkMessage(sessionId, msg) {
   const st = sessions.get(sessionId)
   if (!st) return
   // Until `created` is sent nothing reaches Rust: a refused boot's
   // error_during_execution result (T5) is the refusal's evidence, not a turn.
   if (!st.booted) {
+    if (st.nativeChannel && msg.type === 'system' && msg.subtype === 'init') st.pendingNativeInit = msg
     if (msg.type === 'result' && Array.isArray(msg.errors)) st.bootEvidence.resultErrors.push(...msg.errors)
     return
   }
+  if (msg.type === 'user') {
+    const content = Array.isArray(msg.message?.content) ? msg.message.content.filter(block => block.type === 'tool_result') : []
+    if (st.nativeContinuation && msg.session_id === st.cliSessionId) for (const block of content) {
+      if (await st.nativeStore.finishNativeResult(block.tool_use_id, block.is_error)) st.nativeContinuation = undefined
+    }
+    if (content.length) emit({ type: 'sdk.tool.result', sessionId, nativeSessionId: msg.session_id,
+      uuid: msg.uuid, parentToolUseId: msg.parent_tool_use_id, content })
+  }
+  if (await handleNativeSdkMessage(sessionId, st, msg)) return
   // The lifecycle facts this message carries, for the server's turn
   // accounting (lifecycle-frames.mjs): command lifecycles, session state,
   // status ends, heartbeats.
@@ -294,6 +312,11 @@ function handleSdkMessage(sessionId, msg) {
       // The reset's new_conversation_id is a nonce, not the next session UUID
       // (pinned CLI T16). Its next init identifies the conversation to follow.
       st.pendingConversationReset = true
+      if (st.nativeChannel) {
+        st.nativeReady = false
+        emit({ type: 'sdk.session.loading', sessionId,
+          nativeBinding: { launch: st.launch, queryGeneration: st.queryGeneration } })
+      }
       break
     }
     case 'user': {
@@ -306,6 +329,27 @@ function handleSdkMessage(sessionId, msg) {
     }
     case 'system': {
       if (msg.subtype === 'init') {
+        if (st.nativeChannel && msg.session_id !== st.cliSessionId) {
+          if (!st.pendingConversationReset || !isUuid(msg.session_id)) throw new Error('native root changed without a conversation reset')
+          const previousNativeSessionId = st.cliSessionId
+          const observation = await st.nativeChannel.waitReady(st.query,
+            { clearFrom: previousNativeSessionId, clearTo: msg.session_id })
+          st.nativePendingOperation?.release(false)
+          cancelPending(st, emit, sessionId, { resolveDeny: true })
+          st.nativeContinuation = undefined
+          st.parentFork = undefined
+          st.nativeClearTransition = { previousNativeSessionId, nativeSessionId: observation.nativeSessionId }
+          st.nativeObservation = observation
+          st.nativeIdentityEvidence = { launch: st.launch, digest: observation.evidenceDigest,
+            source: observation.native.source, queryGeneration: st.queryGeneration, previousNativeSessionId }
+          st.nativeStore = createNativeCheckpointStore({ nativeSessionId: observation.nativeSessionId,
+            transcriptPath: observation.native.transcript_path,
+            recordPath: join(process.env.HOME, '.freshell', 'native-checkpoints', 'claude', observation.nativeSessionId + '.json'),
+            profileDigest: st.nativeProfileDigest, allowMissingTranscript: true, nativeClear: st.nativeClearTransition })
+          st.createRequest = { ...st.createRequest, boot: { kind: 'resume', resume: observation.nativeSessionId },
+            resumeSessionId: observation.nativeSessionId, sessionId: undefined }
+          st.nativeReady = true
+        }
         if (st.pendingConversationReset && isUuid(msg.session_id)) {
           st.pendingConversationReset = false
           emit({ type: 'sdk.session.rekeyed', sessionId, newSessionId: msg.session_id, reason: 'conversation_reset' })
@@ -317,8 +361,10 @@ function handleSdkMessage(sessionId, msg) {
           type: 'sdk.session.init',
           sessionId,
           cliSessionId: msg.session_id,
+          cliVersion: msg.claude_code_version,
           model: msg.model,
           cwd: msg.cwd,
+          ...(st.nativeIdentityEvidence ? { nativeIdentityEvidence: st.nativeIdentityEvidence } : {}),
           tools: Array.isArray(msg.tools) ? msg.tools.map((t) => ({ name: t })) : undefined,
           // The server's turn ledger reads msg_lifecycle_v1 from them (T8).
           ...(Array.isArray(msg.capabilities) ? { capabilities: msg.capabilities.filter((cap) => typeof cap === 'string') } : {}),
@@ -336,7 +382,9 @@ function handleSdkMessage(sessionId, msg) {
     case 'result': {
       // The facts the server's verdict reads (sdk-message-frames.mjs); the
       // server decides whether the turn rings and whether it failed.
-      for (const frame of resultFrames(sessionId, msg)) emit(frame)
+      for (const frame of resultFrames(sessionId, msg)) emit({ ...frame,
+        nativeSessionId: msg.session_id, uuid: msg.uuid, stopReason: msg.stop_reason,
+        permissionDenials: msg.permission_denials, deferredToolUse: msg.deferred_tool_use })
       break
     }
     default:
@@ -367,10 +415,13 @@ async function consumeStream(sessionId, sdkQuery) {
   const st = sessions.get(sessionId)
   let failure
   try {
-    for await (const msg of sdkQuery) handleSdkMessage(sessionId, msg)
+    for await (const msg of sdkQuery) {
+      if (st?.query === sdkQuery && sessions.get(sessionId) === st) await handleSdkMessage(sessionId, msg)
+    }
   } catch (error) {
     failure = { error }
   } finally {
+    if (st?.query !== sdkQuery || sessions.get(sessionId) !== st) return
     // A stream that ends before the CLI booted is a refused boot: bootSession
     // reports it (create.failed) with this end as part of its evidence.
     if (st && !st.booted) {
@@ -387,6 +438,12 @@ async function consumeStream(sessionId, sdkQuery) {
     // promises (LB-04: a late resolve lands inside the SDK's floating promise
     // chain → unhandled rejection → crash under Node 22 throw-mode).
     if (st) cancelPending(st, emit, sessionId, { resolveDeny: false })
+    if (st?.nativeChannel) {
+      st.nativeReady = false
+      emit({ type: 'sdk.session.closed', sessionId, nativeSessionId: st.cliSessionId, queryGeneration: st.queryGeneration,
+        nativeBinding: { launch: st.launch, queryGeneration: st.queryGeneration }, reason: requested ? 'aborted' : 'stream_end' })
+      await st.nativeChannel.cleanup()
+    }
     sessions.delete(sessionId)
     if (!requested) {
       // The end of the stream is the end of this sidecar (G02): report how
@@ -416,6 +473,419 @@ function exitWithoutSession(sdkQuery, code) {
   setTimeout(() => process.exit(code), EXIT_FLUSH_BUDGET_MS)
 }
 
+async function waitForNativeCheckpointRelease(state, input, generation, hookSignal) {
+  if (state.nativePendingOperation) return false
+  let release
+  const released = new Promise((resolve) => { release = resolve })
+  const pending = { generation, toolUseID: input.tool_use_id,
+    inputDigest: nativeInputDigest(input.tool_input), release }
+  state.nativePendingOperation = pending
+  const cancelled = () => release(false)
+  state.abort.signal.addEventListener('abort', cancelled, { once: true })
+  hookSignal?.addEventListener('abort', cancelled, { once: true })
+  try {
+    const record = await state.nativeStore.readRecoverable()
+    if (state.nativeContinuation) {
+      const original = state.nativeContinuation.checkpoint
+      return original.toolUseID === pending.toolUseID && original.inputDigest === pending.inputDigest
+    }
+    if (!record) return await state.nativeStore.inputState() === 'clear' ? null : false
+    if (record.toolUseID !== pending.toolUseID || record.inputDigest !== pending.inputDigest) return false
+    if (state.abort.signal.aborted || hookSignal?.aborted) return false
+    return await released && state.queryGeneration === generation && state.nativeReady
+      && state.nativeContinuation?.toolUseID === pending.toolUseID
+      && state.nativeContinuation?.inputDigest === pending.inputDigest
+  } catch {
+    return false
+  } finally {
+    state.abort.signal.removeEventListener('abort', cancelled)
+    hookSignal?.removeEventListener('abort', cancelled)
+    if (state.nativePendingOperation === pending) state.nativePendingOperation = undefined
+  }
+}
+
+async function routeNativePermission({ session, sessionId, req, launch, generation, toolName, input, options }) {
+  let currentOptions = options
+  if (session.nativeStore && req.resumeSessionId && !session.nativeContinuation) {
+    const resumed = await waitForNativeCheckpointRelease(session,
+      { tool_use_id: options?.toolUseID, tool_input: input }, generation, options?.signal)
+    if (resumed === false) return { behavior: 'deny', message: 'Original native checkpoint has no current fenced release' }
+  }
+  const record = session.nativeContinuation
+  if (record) {
+    const binding = { launch, queryGeneration: generation, nativeRequestId: options?.requestId,
+      ...(session.nativeClearTransition ? { nativeClear: session.nativeClearTransition } : {}) }
+    if (toolName !== 'Bash' || await nativeProfileDigest(req, session.settings) !== record.profileDigest
+      || !await session.nativeStore.parkPermission(options?.toolUseID, nativeInputDigest(input), binding)
+      || session.queryGeneration !== generation || !session.nativeReady) {
+      return { behavior: 'deny', message: 'Current original native checkpoint is unavailable' }
+    }
+    currentOptions = { ...options, publicDecisionId: 'checkpoint-' + record.checkpoint.checkpointUuid,
+      nativeCheckpoint: { ...record.checkpoint, profileDigest: record.profileDigest }, nativeBinding: binding }
+  }
+  return routeCanUseTool({ session, emit, nanoid, sessionId, toolName, input, options: currentOptions })
+}
+
+function nativeSoloTool(state) {
+  const batch = state.nativeBatch
+  if (!batch?.complete || batch.tools.size !== 1) return undefined
+  const tool = batch.tools.values().next().value
+  return batch.assistantToolIds.has(tool.id) ? tool : undefined
+}
+
+async function continueNativeCheckpoint(sessionId, state, record) {
+  const previousQuery = state.query
+  const previousAbort = state.abort
+  const previousNativeClosed = state.nativeChildClosed
+  state.query = undefined
+  state.nativeContinuation = record
+  state.nativeCheckpointTransition = true
+  state.nativeReady = false
+  emit({ type: 'sdk.session.loading', sessionId,
+    nativeBinding: { launch: state.launch, queryGeneration: state.queryGeneration + 1 } })
+  state.abort = new AbortController()
+  try {
+    previousQuery.close?.()
+    previousAbort.abort()
+    if (previousNativeClosed) {
+      let timeout
+      try {
+        await Promise.race([previousNativeClosed, new Promise((_, reject) => {
+          timeout = setTimeout(() => reject(new Error('original native writer did not close')), 5_000)
+        })])
+      } finally { clearTimeout(timeout) }
+    }
+    if (sessions.get(sessionId) !== state || state.abort.signal.aborted) throw new Error('native continuation cancelled before exact resume')
+    await openSessionQuery(sessionId, state, { ...state.createRequest, boot: { kind: 'resume', resume: record.nativeSessionId }, resumeSessionId: record.nativeSessionId, sessionId: undefined }, state.launch, false)
+    await state.nativeReadyPromise
+    await deliverNativeContinuation(sessionId, state, record)
+  } catch (error) {
+    // The previous stream no longer owns state.query, and a replacement might
+    // not exist yet. This transition owns failure until continuation is live.
+    previousAbort.abort()
+    if (sessions.get(sessionId) === state) {
+      log('warn', 'native.continuation_failed', { sessionId, error: errorText(error) })
+      emit({ type: 'sdk.error', sessionId, message: `native continuation: ${error?.message || error}` })
+      await closeSession(sessionId, state, 'stream_error', true)
+    }
+    throw error
+  } finally {
+    previousAbort.abort()
+    state.nativeCheckpointTransition = false
+  }
+}
+
+async function deliverNativeContinuation(sessionId, state, record) {
+  const generation = state.queryGeneration
+  const matchesOperation = (hook) => !hook || (hook.generation === generation
+    && hook.toolUseID === record.toolUseID && hook.inputDigest === record.inputDigest)
+  if (!state.nativeReady || !matchesOperation(state.nativePendingOperation)
+    || !await state.nativeStore.beginContinuation()) throw new Error('current native continuation could not be claimed')
+  if (sessions.get(sessionId) !== state || state.queryGeneration !== generation || !state.nativeReady || state.abort.signal.aborted) {
+    throw new Error('native continuation query changed before delivery')
+  }
+  state.nativeContinuation = record
+  const pendingOperation = state.nativePendingOperation
+  if (!matchesOperation(pendingOperation)) throw new Error('current native operation changed before release')
+  if (pendingOperation) {
+    pendingOperation.release(true)
+    return
+  }
+  state.inputStream.push({ type: 'user', message: { role: 'user', content: 'Continue only the original pending native operation. Do not select another tool.' },
+    parent_tool_use_id: null, session_id: record.nativeSessionId })
+}
+
+async function handleCheckpointResume(req) {
+  const state = sessions.get(req.sessionId)
+  const receipt = (ok, message) => emit({ type: 'sdk.checkpoint.dispatch', sessionId: req.sessionId,
+    requestId: req.requestId, nativeRequestId: req.requestId, ok, message })
+  try {
+    const binding = req.nativeBinding
+    if (!state?.nativeReady || !state.nativeStore || state.nativeContinuation
+      || typeof req.requestId !== 'string' || !req.requestId
+      || !Array.isArray(req.checkpoints) || req.checkpoints.length > 32
+      || binding?.queryGeneration !== state.queryGeneration
+      || !binding.launch || !Object.keys(state.launch).every((key) => binding.launch[key] === state.launch[key])) {
+      receipt(false, 'current native checkpoint release is unavailable')
+      return
+    }
+    const record = await state.nativeStore.readRecoverable()
+    const expected = record && { ...record.checkpoint, profileDigest: record.profileDigest }
+    if (!expected || !req.checkpoints.some((checkpoint) => checkpoint &&
+      Object.keys(expected).every((key) => checkpoint[key] === expected[key]))
+      || await nativeProfileDigest(state.createRequest, state.settings) !== record.profileDigest) {
+      receipt(false, 'trusted original native checkpoint does not match current source/profile')
+      return
+    }
+    await deliverNativeContinuation(req.sessionId, state, record)
+    receipt(true)
+  } catch (error) {
+    receipt(false, error?.message ?? 'native continuation release failed')
+  }
+}
+
+async function closeSession(sessionId, state, reason = 'aborted', failed = false) {
+  if (sessions.get(sessionId) !== state) return
+  state.nativeReady = false
+  state.inputStream?.end()
+  cancelPending(state, emit, sessionId, { resolveDeny: false })
+  sessions.delete(sessionId)
+  if (state.nativeChannel) emit({ type: 'sdk.session.closed', sessionId,
+    nativeSessionId: state.cliSessionId, queryGeneration: state.queryGeneration,
+    nativeBinding: { launch: state.launch, queryGeneration: state.queryGeneration }, reason })
+  try { state.abort.abort(); state.query?.close?.() } catch (error) { log('warn', 'native.close_failed', { sessionId, error: errorText(error) }) }
+  await state.nativeChannel?.cleanup()
+  if (failed) {
+    // A continuation may have already retired a writer that is no longer in
+    // the session map. Join it before a replacement sidecar can resume this
+    // conversation; the Rust tree reaper remains the timeout backstop.
+    try { await awaitNativeWriters([...nativeChildClosures]) }
+    catch (error) { log('warn', 'native.shutdown_failed', { sessionId, error: errorText(error) }) }
+    emit({ type: 'sdk.stream.ended', sessionId, reason: 'stream_error', message: 'The native Claude query could not continue.' })
+    exitWithoutSession(state.query, STREAM_ENDED_EXIT_CODE)
+  }
+}
+
+async function prepareNativeSession(state, req) {
+    let launch = process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH
+      ? JSON.parse(process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH) : undefined
+    if (req.nativeIdentityTransition) {
+      const transition = req.nativeIdentityTransition
+      const next = transition.launch
+      if (!launch || !next || next.incarnationId !== launch.incarnationId
+        || next.launchNonce !== launch.launchNonce || next.executionGeneration !== launch.executionGeneration
+        || !Number.isSafeInteger(next.evidenceRevision) || next.evidenceRevision <= launch.evidenceRevision
+        || next.requestedNativeSessionId !== null
+        || typeof transition.parentNativeSessionId !== 'string'
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(transition.parentNativeSessionId)
+        || (req.resumeSessionId && req.forkSession !== true)) throw new Error('invalid native rollback launch binding')
+      launch = next
+      state.nativeIdentityTransition = transition
+    }
+    if (req.nativeForkRecipe) {
+      const recipe = req.nativeForkRecipe
+      if (!launch || (!state.nativeIdentityTransition && launch.requestedNativeSessionId !== recipe.childSessionId)) {
+        throw new Error('native fork recipe does not match the current exact launch')
+      }
+      const path = (value, root) => {
+        if (typeof value !== 'string' || !value.startsWith('.claude/projects/') || value.split('/').some(part => !part || part === '..' || part === '.')
+          || !value.endsWith('/' + root + '.jsonl') || !isAbsolute(process.env.HOME ?? '')) throw new Error('invalid native fork source path')
+        return join(process.env.HOME, value)
+      }
+      state.parentFork = { ...recipe, parentTranscript: path(recipe.parentTranscript, recipe.parentSessionId),
+        childTranscript: path(recipe.childTranscript, recipe.childSessionId) }
+      await inspectNativeForkSource(state.parentFork, recipe.childSessionId)
+    }
+    state.createRequest = req
+    state.launch = launch
+    if (launch) {
+      state.nativeResourceDigest = await nativeResourceDigest(req)
+      state.nativeProfileDigest = await nativeProfileDigest(req, state.settings, process.env, state.nativeResourceDigest)
+    }
+
+    return launch
+}
+
+async function openSessionQuery(sessionId, state, req, launch, announceCreated = true) {
+  const abort = state.abort
+  const fork = state.parentFork
+  const prefix = fork?.target.kind === 'prefix'
+  const generation = state.queryGeneration = state.queryGeneration === undefined
+    ? Number.isSafeInteger(req.nativeQueryGeneration) && req.nativeQueryGeneration > 0 ? req.nativeQueryGeneration : 1
+    : state.queryGeneration + 1
+  state.nativeBatch = undefined
+  state.nativeReady = false
+  state.nativeIdentityEvidence = undefined
+  state.frameState = createFrameState()
+  state.booted = false
+  state.bootEvidence = { resultErrors: [], stderr: '', streamEnded: undefined }
+  const { iterable, handle } = createInputStream()
+  state.inputStream = handle
+  if (launch) state.nativeChannel = await createNativeSessionChannel({ launch, signal: abort.signal,
+    allowFork: prefix || req.boot?.kind === 'fork', expectedNativeSessionId: state.nativeClearTransition?.nativeSessionId })
+  const logCliStderr = cliStderrLogger(log, { hosted: isHostedSidecar(), fields: { sessionId } })
+  const sdkStderr = data => {
+    if (!state.booted) state.bootEvidence.stderr = (state.bootEvidence.stderr + String(data)).slice(-BOOT_STDERR_MAX_CHARS)
+    logCliStderr(data)
+  }
+  const sdkSpawn = managedSdkSpawn(sdkStderr)
+  const sdkBoot = fork ? prefix ? { resume: fork.parentTranscript, resumeSessionAt: fork.target.cutoffUuid,
+    forkSession: true, sessionId: fork.childSessionId, resumeDropsTurn: fork.target.dropTurnUuid || undefined }
+    : { sessionId: fork.childSessionId } : bootOptions(req.boot, req.sessionId)
+  const sdkQuery = query({ prompt: iterable, options: {
+cwd: req.cwd || undefined,
+...sdkBoot,
+model: req.model,
+permissionMode: req.permissionMode,
+allowDangerouslySkipPermissions: true,
+effort: req.effort,
+plugins: Array.isArray(req.plugins)
+          ? req.plugins.map(path => ({ type: 'local', path }))
+          : undefined,
+mcpServers: mcpServersFor(req, process.env, { fields: { sessionId } }),
+pathToClaudeCodeExecutable: process.env.CLAUDE_CMD || undefined,
+includePartialMessages: true,
+extraArgs: { 'replay-user-messages': null },
+abortController: abort,
+env: { ...withFreshellContext({ ...createClaudeSdkCleanEnv(process.env), CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' }, req.freshellContext), ...state.nativeChannel?.env },
+settingSources: ['user', 'project', 'local'],
+stderr: sdkStderr,
+canUseTool: async (toolName, input, options) => {
+    const s = sessions.get(sessionId)
+    if (!state.nativeChannel) return s ? routeCanUseTool({ session: s, emit, nanoid, sessionId, toolName, input, options })
+      : { behavior: 'deny', message: 'Current native session is not ready' }
+    if (!s || s !== state || state.queryGeneration !== generation || !state.nativeReady) return { behavior: 'deny', message: 'Current native session is not ready' }
+    return routeNativePermission({ session: s, sessionId, req, launch, generation, toolName, input, options })
+  },
+settings: state.nativeChannel?.settings,
+hooks: state.nativeChannel ? { PreToolUse: [{ matcher: 'Bash', hooks: [async (input, _toolUseID, hookOptions) => {
+        const deny = (reason) => ({ hookSpecificOutput: { hookEventName: 'PreToolUse',
+          permissionDecision: 'deny', permissionDecisionReason: reason } })
+        if (state.queryGeneration !== generation || !state.nativeReady || input.session_id !== state.cliSessionId) {
+          return deny('Current native query is not observed')
+        }
+        const original = state.nativeContinuation?.checkpoint
+        if (original) {
+          if (original.toolUseID !== input.tool_use_id || original.inputDigest !== nativeInputDigest(input.tool_input)) {
+            return deny('Native continuation changed its original operation')
+          }
+          return {}
+        }
+        if (req.resumeSessionId && state.nativeStore) {
+          const resumed = await waitForNativeCheckpointRelease(state, input, generation, hookOptions?.signal)
+          if (resumed !== null) return resumed ? {} : deny('Original native checkpoint has no current fenced release')
+        }
+        // SDK control callbacks and the output iterator have independent
+        // consumers. Wait briefly for the actual assistant batch; never infer
+        // solo execution from the hook's one-tool view alone.
+        const deadline = Date.now() + 100
+        while (!state.nativeBatch?.complete && Date.now() < deadline
+          && state.queryGeneration === generation && !abort.signal.aborted) {
+          await new Promise((resolve) => setTimeout(resolve, 1))
+        }
+        if (state.queryGeneration !== generation || !state.nativeReady || abort.signal.aborted) {
+          return deny('Current native query was replaced')
+        }
+        const solo = nativeSoloTool(state)
+        if (solo?.name !== 'Bash' || solo.id !== input.tool_use_id
+          || nativeInputDigest(solo.input) !== nativeInputDigest(input.tool_input)) return {}
+        return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'defer',
+          permissionDecisionReason: 'Managed native no-effect continuation checkpoint' } }
+      }] }] } : undefined,
+spawnClaudeCodeProcess: state.nativeChannel ? (options) => {
+        if (sdkSpawn) checkSdkExec(options)
+        const child = spawnObservedNative(options, {
+          onStderr: sdkStderr,
+          onControlWrite: (frame, error) => {
+            if (state.queryGeneration !== generation) return
+            const binding = state.nativeRequests?.get(frame.response.request_id)
+            if (!binding) return
+            state.nativeRequests.delete(frame.response.request_id)
+            emit({ type: `sdk.${binding.kind}.dispatch`, sessionId, requestId: binding.requestId,
+              nativeRequestId: frame.response.request_id, ok: !error && frame.response.subtype === 'success',
+              acceptanceAmbiguous: !!error, message: error?.message ?? frame.response.error })
+          },
+        })
+        const closed = new Promise((resolve) => child.once('close', resolve))
+        state.nativeChildClosed = closed
+        nativeChildClosures.add(closed)
+        closed.then(() => nativeChildClosures.delete(closed))
+        return child
+      } : sdkSpawn
+  } })
+  state.query = sdkQuery
+  const streamDone = consumeStream(sessionId, sdkQuery)
+  streamDone.catch(error => log('error', 'stream.consume_failed', { sessionId, error: errorText(error) }))
+  if (state.nativeChannel) {
+    state.nativeReadyPromise = state.nativeChannel.waitReady(sdkQuery).then(async (observation) => {
+      if (sessions.get(sessionId) !== state || state.queryGeneration !== generation || abort.signal.aborted) return
+      if (fork) {
+        if (observation.nativeSessionId !== fork.childSessionId
+          || observation.native.source !== (prefix ? 'fork' : 'startup')
+          || observation.native.transcript_path !== fork.childTranscript) throw new Error('native parent-backed fork did not observe its exact child')
+        await inspectNativeForkSource(fork, observation.nativeSessionId)
+        if (state.queryGeneration !== generation || abort.signal.aborted) return
+      } else if (state.nativeIdentityTransition) {
+        const expectedSource = req.forkSession === true ? 'fork' : 'startup'
+        if (observation.native.source !== expectedSource) throw new Error(`native rollback did not acknowledge a ${expectedSource}`)
+        if (observation.nativeSessionId === state.nativeIdentityTransition.parentNativeSessionId) throw new Error('native rollback retained the retired root')
+      } else if (req.resumeSessionId && observation.nativeSessionId !== req.resumeSessionId) throw new Error('native exact resume changed root')
+      if (state.queryGeneration !== generation || abort.signal.aborted) return
+      if (!process.env.HOME || !isAbsolute(process.env.HOME)) throw new Error('managed native checkpoint HOME is unavailable')
+      state.nativeStore = createNativeCheckpointStore({ nativeSessionId: observation.nativeSessionId,
+        transcriptPath: observation.native.transcript_path,
+        recordPath: join(process.env.HOME, '.freshell', 'native-checkpoints', 'claude', observation.nativeSessionId + '.json'),
+        profileDigest: state.nativeProfileDigest, allowMissingTranscript: !req.resumeSessionId && !fork, parentFork: fork,
+        nativeClear: state.nativeClearTransition })
+      state.nativeReady = true
+      state.cliSessionId = observation.nativeSessionId
+      if (state.nativeIdentityTransition || fork) {
+        // The operation selected this child once. Any later checkpoint query
+        // must resume it exactly, without repeating the original fork options.
+        state.createRequest = { ...req, boot: { kind: 'resume', resume: observation.nativeSessionId },
+          resumeSessionId: observation.nativeSessionId, sessionId: undefined }
+        delete state.createRequest.nativeIdentityTransition
+        delete state.createRequest.forkSession
+        delete state.createRequest.resumeSessionAt
+        delete state.createRequest.resumeDropsTurn
+        delete state.createRequest.nativeForkRecipe
+      }
+      state.nativeIdentityTransition = undefined
+      state.nativeIdentityEvidence = { launch, digest: observation.evidenceDigest,
+        source: observation.native.source, queryGeneration: generation,
+        ...(state.nativeClearTransition ? { previousNativeSessionId: state.nativeClearTransition.previousNativeSessionId } : {}) }
+      state.nativeObservation = observation
+      return observation
+    }).catch((error) => {
+      if (state.queryGeneration !== generation || sessions.get(sessionId) !== state) return
+      log('warn', 'native.startup_failed', { sessionId, error: errorText(error) })
+      emit({ type: 'sdk.error', sessionId, message: `native startup: ${error.message}` })
+      abort.abort()
+      throw error
+    })
+  }
+  state.nativeReadyPromise?.catch(() => {})
+  await bootSession({ req, sessionId, state, sdkQuery, streamDone, announceCreated })
+}
+
+async function handleNativeSdkMessage(sessionId, state, msg) {
+  if (!state.nativeChannel) return false
+  if (msg.type === 'stream_event' && msg.session_id === state.cliSessionId && msg.parent_tool_use_id == null) {
+    const event = msg.event
+    if (event?.type === 'message_start') state.nativeBatch = typeof event.message?.id === 'string' && event.message.id
+      ? { id: event.message.id, tools: new Map(), assistantToolIds: new Set(), complete: false } : undefined
+    else if (state.nativeBatch && event?.type === 'content_block_start' && event.content_block?.type === 'tool_use') state.nativeBatch.tools.set(event.content_block.id, event.content_block)
+    else if (state.nativeBatch && event?.type === 'message_stop') state.nativeBatch.complete = true
+  }
+  if (msg.type === 'assistant' && msg.session_id === state.cliSessionId && msg.parent_tool_use_id == null
+      && state.nativeBatch?.id === msg.message?.id) {
+    for (const tool of msg.message?.content ?? []) if (tool.type === 'tool_use') {
+      state.nativeBatch.tools.set(tool.id, tool)
+      state.nativeBatch.assistantToolIds.add(tool.id)
+    }
+  }
+  if (msg.type !== 'result' || msg.stop_reason !== 'tool_deferred') return false
+  const tool = msg.deferred_tool_use
+  if (!tool || tool.name !== 'Bash' || msg.session_id !== state.cliSessionId
+      || nativeSoloTool(state)?.id !== tool.id || nativeInputDigest(nativeSoloTool(state).input) !== nativeInputDigest(tool.input)) {
+    throw new Error('native deferred result does not match the original solo operation')
+  }
+  const query = state.query
+  const deadline = Date.now() + 3_000
+  let record
+  while (Date.now() < deadline) {
+    if (state.query !== query || state.abort.signal.aborted) throw new Error('native checkpoint publication cancelled')
+    record = await state.nativeStore.publish(tool.id, nativeInputDigest(tool.input))
+    if (record) break
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+  if (!record) throw new Error('native deferred checkpoint is unavailable or ambiguous')
+  if (state.query !== query || state.abort.signal.aborted) throw new Error('native checkpoint publication cancelled')
+  await continueNativeCheckpoint(sessionId, state, record)
+  return true
+}
+
+
 // ── request handlers ─────────────────────────────────────────────────────────
 
 /**
@@ -428,7 +898,7 @@ function failBoot(requestId, { code, message }, fields = {}, sdkQuery = undefine
   exitWithoutSession(sdkQuery, BOOT_FAILED_EXIT_CODE)
 }
 
-function handleCreate(req) {
+async function handleCreate(req) {
   const requestId = req.requestId
   if (createReceived) {
     log('warn', 'create.refused', { requestId, reason: 'second_create' })
@@ -445,9 +915,8 @@ function handleCreate(req) {
     })
     return
   }
-  let launch
   try {
-    launch = bootOptions(req.boot, req.sessionId)
+    bootOptions(req.boot, req.sessionId)
   } catch (error) {
     failBoot(requestId, { code: error?.code ?? 'BOOT_FAILED', message: errorText(error) })
     return
@@ -480,64 +949,18 @@ function handleCreate(req) {
   // events (macrotasks) cannot interleave inside that finally.
   sessions.set(sessionId, state)
 
-  const logCliStderr = cliStderrLogger(log, { hosted: isHostedSidecar(), fields: { sessionId } })
-  const sdkStderr = (data) => {
-    if (!state.booted) state.bootEvidence.stderr = (state.bootEvidence.stderr + String(data)).slice(-BOOT_STDERR_MAX_CHARS)
-    logCliStderr(data)
-  }
-  let sdkQuery
   try {
-    sdkQuery = query({
-      prompt: iterable,
-      options: {
-        cwd: req.cwd || undefined,
-        // Which conversation the CLI boots: fresh, resumed or forked (boot.mjs).
-        // A fork rides the query() options — NEVER the standalone forkSession()
-        // fn (it remaps every uuid).
-        ...launch,
-        model: req.model,
-        permissionMode: req.permissionMode,
-        // Enables the user's in-session permission selector; the selected mode
-        // still controls whether approval is required for each tool.
-        allowDangerouslySkipPermissions: true,
-        effort: req.effort,
-        plugins: Array.isArray(req.plugins)
-          ? req.plugins.map(path => ({ type: 'local', path }))
-          : undefined,
-        mcpServers: mcpServersFor(req, process.env, { fields: { sessionId } }),
-        pathToClaudeCodeExecutable: process.env.CLAUDE_CMD || undefined,
-        includePartialMessages: true,
-        // This is the SDK's native persisted-user witness. Without the replay
-        // flag a supplied SDKUserMessage UUID is not surfaced back to the
-        // sidecar, so checkpoint identity must remain unbound.
-        extraArgs: { 'replay-user-messages': null },
-        abortController: abort,
-        // The CLI reports when the session starts and stops working (T9):
-        // the server's turn accounting reads it (sdk.session.state).
-        env: withFreshellContext({ ...createClaudeSdkCleanEnv(process.env), CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' }, req.freshellContext),
-        settingSources: ['user', 'project', 'local'],
-        spawnClaudeCodeProcess: managedSdkSpawn(sdkStderr),
-        stderr: sdkStderr,
-        canUseTool: async (toolName, input, options) => {
-          const s = sessions.get(sessionId)
-          if (!s) return { behavior: 'allow', updatedInput: input }
-          // AskUserQuestion routes first (even under bypassPermissions), then the
-          // bypass fast-path, else park-and-surface a pending request — legacy
-          // ordering, sdk-bridge.ts:203-214.
-          return routeCanUseTool({ session: s, emit, nanoid, sessionId, toolName, input, options })
-        },
-      },
-    })
+    req = { ...req, resumeSessionId: ['resume', 'fork'].includes(req.boot.kind) ? req.boot.resume : undefined,
+      forkSession: req.boot.kind === 'fork', resumeSessionAt: req.boot.resumeSessionAt,
+      resumeDropsTurn: req.boot.dropsTurn }
+    const nativeLaunch = await prepareNativeSession(state, req)
+    await openSessionQuery(sessionId, state, req, nativeLaunch)
   } catch (error) {
     sessions.delete(sessionId)
-    failBoot(requestId, classifyBootError({ error }), { sessionId })
-    return
+    try { state.abort.abort(); state.query?.close?.() } catch {}
+    await state.nativeChannel?.cleanup()
+    failBoot(requestId, classifyBootError({ error }), { sessionId }, state.query)
   }
-  state.query = sdkQuery
-  const streamDone = consumeStream(sessionId, sdkQuery)
-  streamDone.catch((err) => log('error', 'stream.consume_failed', { sessionId, error: errorText(err) }))
-  bootSession({ req, sessionId, state, sdkQuery, streamDone })
-    .catch((err) => log('error', 'boot.handler_failed', { requestId, sessionId, error: errorText(err) }))
 }
 
 /**
@@ -545,7 +968,7 @@ function handleCreate(req) {
  * then answer `created` and publish the command catalog from the boot. A
  * refused boot (T4, T5) is answered `create.failed` with its typed code.
  */
-async function bootSession({ req, sessionId, state, sdkQuery, streamDone }) {
+async function bootSession({ req, sessionId, state, sdkQuery, streamDone, announceCreated = true }) {
   const requestId = req.requestId
   const startedAt = Date.now()
   const fields = () => ({ sessionId, sessionType: req.sessionType, boot: req.boot?.kind, ms: Date.now() - startedAt })
@@ -560,6 +983,7 @@ async function bootSession({ req, sessionId, state, sdkQuery, streamDone }) {
   try {
     if (typeof sdkQuery.initializationResult !== 'function') throw new Error('The Claude SDK cannot report its boot (no initializationResult).')
     init = await Promise.race([sdkQuery.initializationResult(), streamEndedFirst])
+    if (state.nativeChannel) await state.nativeReadyPromise
   } catch (rejection) {
     error = rejection
   }
@@ -572,8 +996,10 @@ async function bootSession({ req, sessionId, state, sdkQuery, streamDone }) {
     // the exit: wait for that end (bounded) so all the evidence is in.
     await Promise.race([streamDone, new Promise((resolve) => setTimeout(resolve, BOOT_FAILURE_SETTLE_MS))])
     const { resultErrors, stderr } = state.bootEvidence
-    sessions.delete(sessionId)
-    failBoot(requestId, classifyBootError({ error, resultErrors, stderr }), fields(), sdkQuery)
+    if (announceCreated) {
+      sessions.delete(sessionId)
+      failBoot(requestId, classifyBootError({ error, resultErrors, stderr }), fields(), sdkQuery)
+    } else await closeSession(sessionId, state, 'stream_error', true)
     return
   }
   // A shutdown or stdin close while the CLI booted: the sidecar is going away.
@@ -581,7 +1007,10 @@ async function bootSession({ req, sessionId, state, sdkQuery, streamDone }) {
   state.booted = true
   state.bootEvidence = undefined
   const cliPid = Number.isInteger(init?.pid) ? init.pid : undefined
-  emit({ type: 'created', requestId, sessionId, protocol: SIDECAR_PROTOCOL, ...(cliPid !== undefined ? { cliPid } : {}) })
+  if (announceCreated) emit({ type: 'created', requestId, sessionId, protocol: SIDECAR_PROTOCOL, ...(cliPid !== undefined ? { cliPid } : {}) })
+  if (state.nativeIdentityEvidence) emit({ type: 'sdk.session.init', sessionId, cliSessionId: state.cliSessionId,
+    cwd: state.nativeObservation.native.cwd, model: req.model, nativeIdentityEvidence: state.nativeIdentityEvidence,
+    ...(Array.isArray(state.pendingNativeInit?.capabilities) ? { capabilities: state.pendingNativeInit.capabilities } : {}) })
   log('info', 'boot.ok', { requestId, cliPid, ...fields() })
   const commands = normalizeCommands(init?.commands)
   if (commands !== undefined) {
@@ -605,16 +1034,30 @@ function rejectSend(req, code, message) {
   emit({ type: 'sdk.send.rejected', sessionId: req.sessionId, uuid, code, message })
 }
 
-function handleSend(req) {
+async function handleSend(req) {
   const st = sessions.get(req.sessionId)
   // Not a session this sidecar hosts: refused like any send the CLI never
   // saw, so the server takes it back.
   if (!st) { rejectSend(req, 'SESSION_NOT_FOUND', SESSION_NOT_HOSTED); return }
+  if (!st.booted) { rejectSend(req, 'INVALID_SEND', 'Claude is still starting; this message was not given to it.'); return }
   // Every send carries the uuid the server minted for it. The SDKUserMessage
   // carries it, so the CLI reports the command's lifecycle under it (T8) and
   // writes the user line with it: it is the turn id the server announced.
   if (!isUuid(req.uuid)) { rejectSend(req, 'INVALID_SEND', SEND_WITHOUT_UUID); return }
   if (typeof req.text !== 'string') { rejectSend(req, 'INVALID_SEND', SEND_WITHOUT_TEXT); return }
+  if (st.nativeChannel) {
+    const generation = st.queryGeneration
+    try {
+      if (!st.nativeReady || !st.nativeStore || await st.nativeStore.inputState() !== 'clear') {
+        rejectSend(req, 'INVALID_SEND', 'Native checkpoint requires a current fenced continuation; ordinary input is blocked.'); return
+      }
+      if (sessions.get(req.sessionId) !== st || generation !== st.queryGeneration || !st.nativeReady || st.abort.signal.aborted) {
+        rejectSend(req, 'SESSION_NOT_FOUND', SESSION_NOT_HOSTED); return
+      }
+      st.nativeStore.disableParentFork()
+      st.parentFork = undefined
+    } catch (error) { rejectSend(req, 'INVALID_SEND', errorText(error)); return }
+  }
   let content
   try {
     content = userMessageContent(req.text, req.images)
@@ -645,7 +1088,21 @@ async function handleConfigure(req) {
   try {
     // The server refuses a settings change while the session is busy (its
     // turn ledger); a request that says it is busy is refused here too.
-    const settings = await configureSession(st, req.settings ?? {}, { busy: req.busy === true })
+    const previousSettings = { ...st.settings }
+    const busy = req.busy === true || (st.nativeChannel && !st.nativeReady)
+      || (st.nativeStore && await st.nativeStore.inputState() !== 'clear')
+    const configuration = await configureSession(st, req.settings ?? {}, { busy }).then(settings => ({ settings }), error => ({ error }))
+    if (st.nativeStore && Object.keys(st.settings).some(key => st.settings[key] !== previousSettings[key])) {
+      try {
+        const resumeRequest = { ...st.createRequest, ...st.settings }
+        const digest = await nativeProfileDigest(resumeRequest, st.settings, process.env, st.nativeResourceDigest)
+        await st.nativeStore.setProfileDigest(digest)
+        st.nativeProfileDigest = digest
+        st.createRequest = resumeRequest
+      } catch (error) { await closeSession(req.sessionId, st, 'stream_error', true); throw error }
+    }
+    if ('error' in configuration) throw configuration.error
+    const settings = configuration.settings
     emit({ type: 'sdk.configured', sessionId: req.sessionId, requestId: req.requestId, ok: true, settings })
   } catch (err) {
     log('warn', 'configure.failed', { sessionId: req.sessionId, requestId: req.requestId, error: errorText(err) })
@@ -692,6 +1149,30 @@ function shutdown() {
   sessions.clear()
 }
 
+let pendingShutdown
+async function awaitNativeWriters(closures) {
+  let timer
+  try {
+    await Promise.race([Promise.all(closures), new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('native writer shutdown timed out')), 4_000)
+    })])
+  } finally { clearTimeout(timer) }
+}
+
+function shutdownAndExit(awaitNativeShutdown = false) {
+  if (pendingShutdown) return
+  if (!awaitNativeShutdown) { shutdown(); process.exit(0) }
+  const closures = [...nativeChildClosures, ...[...sessions.values()].map(state => state.nativeChannel && !state.nativeChildClosed
+    ? Promise.reject(new Error('native writer closure is unavailable')) : state.nativeChildClosed)]
+  shutdown()
+  pendingShutdown = (async () => {
+    try {
+      await awaitNativeWriters(closures)
+      process.exit(0)
+    } catch { process.exit(1) }
+  })()
+}
+
 // ── stdin dispatch loop (newline-JSON) ───────────────────────────────────────
 const rl = createInterface({ input: process.stdin })
 rl.on('line', (line) => {
@@ -704,10 +1185,22 @@ rl.on('line', (line) => {
   try { req = JSON.parse(trimmed) } catch { log('warn', 'request.unparseable', { bytes: Buffer.byteLength(trimmed) }); return }
   switch (req?.type) {
     case 'create': handleCreate(req); break
-    case 'send': handleSend(req); break
+    case 'send': {
+      const st = sessions.get(req.sessionId)
+      if (st?.nativeChannel) st.inputChain = (st.inputChain ?? Promise.resolve()).then(() => handleSend(req))
+      else void handleSend(req)
+      break
+    }
+    case 'checkpoint.resume': {
+      const st = sessions.get(req.sessionId)
+      if (st) st.controlChain = (st.controlChain ?? Promise.resolve()).then(() => handleCheckpointResume(req))
+      else void handleCheckpointResume(req)
+      break
+    }
     case 'configure': {
       const st = sessions.get(req.sessionId)
-      if (st) st.configureChain = (st.configureChain ?? Promise.resolve()).then(() => handleConfigure(req))
+      if (st?.nativeChannel) st.inputChain = (st.inputChain ?? Promise.resolve()).then(() => handleConfigure(req))
+      else if (st) st.configureChain = (st.configureChain ?? Promise.resolve()).then(() => handleConfigure(req))
       else void handleConfigure(req)
       break
     }
@@ -716,18 +1209,37 @@ rl.on('line', (line) => {
       const st = sessions.get(req.sessionId)
       if (!st) break
       // Missing decision: NEVER resolve — `undefined` is not a PermissionResult,
-      // and a synthesized default would fabricate the user's choice. Log-only
-      // no-op; the entry stays parked for a later valid respond (mirrors the
+      // and a synthesized default would fabricate the user's choice. Reject
+      // while the entry stays parked for a later valid respond (mirrors the
       // coerced-answers asymmetry one arm below).
       if (req.decision == null) {
         log('warn', 'respond.invalid', { kind: 'permission', sessionId: req.sessionId, requestId: req.requestId })
+        if (st.nativeChannel) emit({ type: 'sdk.permission.dispatch', sessionId: req.sessionId, requestId: req.requestId, ok: false, message: 'missing decision' })
         break
       }
-      // Unknown requestId: lose-safely (Rust validates its pending set first) —
-      // stderr log only, no frame.
-      if (!respondPermission(st, String(req.requestId), req.decision)) {
-        log('warn', 'respond.unknown', { kind: 'permission', sessionId: req.sessionId, requestId: req.requestId })
-      }
+      // Unknown requestId: reject without resolving any callback.
+      st.controlChain = (st.controlChain ?? Promise.resolve()).then(async () => {
+        const current = st.pendingPermissions?.get(String(req.requestId))
+        if (current?.nativeCheckpoint && (!st.nativeReady
+          || current.nativeBinding.queryGeneration !== st.queryGeneration
+          || await nativeProfileDigest(st.createRequest, st.settings) !== current.nativeCheckpoint.profileDigest
+          || (req.decision.behavior === 'allow'
+            && (req.decision.updatedInput == null
+              || nativeInputDigest(req.decision.updatedInput) !== current.nativeCheckpoint.inputDigest)))) {
+          emit({ type: 'sdk.permission.dispatch', sessionId: req.sessionId, requestId: req.requestId,
+            ok: false, message: 'current checkpoint input or profile changed' })
+          return
+        }
+        if (current?.nativeCheckpoint && !await st.nativeStore.beginDecision(current.nativeBinding.nativeRequestId)) {
+          emit({ type: 'sdk.permission.dispatch', sessionId: req.sessionId, requestId: req.requestId, ok: false, message: 'current checkpoint decision is unavailable' })
+          return
+        }
+        if (!respondPermission(st, String(req.requestId), req.decision)) {
+          log('warn', 'respond.unknown', { kind: 'permission', sessionId: req.sessionId, requestId: req.requestId })
+          if (st.nativeChannel) emit({ type: 'sdk.permission.dispatch', sessionId: req.sessionId, requestId: req.requestId, ok: false, message: 'current callback unavailable' })
+        }
+      }).catch((error) => emit({ type: 'sdk.permission.dispatch', sessionId: req.sessionId, requestId: req.requestId,
+        ok: false, message: error.message, acceptanceAmbiguous: true }))
       break
     }
     case 'question.respond': {
@@ -736,10 +1248,11 @@ rl.on('line', (line) => {
       const answers = req.answers && typeof req.answers === 'object' ? req.answers : {}
       if (!respondQuestion(st, String(req.requestId), answers)) {
         log('warn', 'respond.unknown', { kind: 'question', sessionId: req.sessionId, requestId: req.requestId })
+        if (st.nativeChannel) emit({ type: 'sdk.question.dispatch', sessionId: req.sessionId, requestId: req.requestId, ok: false, message: 'current callback unavailable' })
       }
       break
     }
-    case 'shutdown': shutdown(); process.exit(0); break
+    case 'shutdown': shutdownAndExit(req.awaitNativeShutdown === true); break
     default: log('warn', 'request.unknown_type', { requestType: String(req?.type) })
   }
 })

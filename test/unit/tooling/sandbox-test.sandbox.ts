@@ -77,6 +77,7 @@ with (root / 'receipt.jsonl').open('a') as log:
     const object = () => fs.existsSync(state) ? JSON.parse(fs.readFileSync(state, 'utf8')) : null;
     record({kind:'docker', args});
     if (args[0] === 'image') process.exit(0);
+    if (args[0] === 'network') process.exit(0);
     if (args[0] === 'run') {
       const name = args[args.indexOf('--name')+1], cidfile = args[args.indexOf('--cidfile')+1];
       record({kind:'run', name, cidfile});
@@ -131,6 +132,7 @@ with (root / 'receipt.jsonl').open('a') as log:
           ...process.env, PATH: `${root}/bin:${process.env.PATH}`, TMPDIR: path.join(root, 'control'),
           FIXTURE_MODE: mode, FIXTURE_STATE: state, FIXTURE_RECEIPT: receipt,
           FRESHELL_SANDBOX_OWNER_GUARD: '1',
+          FRESHELL_SANDBOX_DEPENDENCIES_READY: '1', FRESHELL_SANDBOX_PREPARE_ONLY: '',
           FRESHELL_TEST_COORDINATOR_PHASE_TIMEOUT_MS: '600', FRESHELL_TEST_COORDINATOR_PHASE_WATCH_POLL_MS: '25',
         }, false)
         watchdogEvents = [...watchdogLog.mock.calls]
@@ -141,17 +143,20 @@ with (root / 'receipt.jsonl').open('a') as log:
       }
       const events = readFileSync(receipt, 'utf8').trim().split('\n').map(line => JSON.parse(line))
       const run = events.find(event => event.kind === 'run')
+      if (!run) throw new Error(`Fixture never launched its owned workload: ${JSON.stringify(events)}`)
       return { status, events, watchdogEvents, control: path.dirname(run.cidfile), name: run.name }
     },
-    run(guard = false) {
+    run(guard = false, twoPhase = false) {
       const result = spawnSync('bash', [path.join(root, 'scripts/sandbox-test.sh'), '--runtime-suite', 'true'], {
         env: { ...process.env, PATH: `${root}/bin:${process.env.PATH}`, TMPDIR: path.join(root, 'control'),
           FIXTURE_MODE: mode, FIXTURE_STATE: state, FIXTURE_RECEIPT: receipt,
-          FRESHELL_SANDBOX_OWNER_GUARD: guard ? '1' : '0' },
+          FRESHELL_SANDBOX_OWNER_GUARD: guard ? '1' : '0',
+          FRESHELL_SANDBOX_DEPENDENCIES_READY: twoPhase ? '' : '1', FRESHELL_SANDBOX_PREPARE_ONLY: '' },
         encoding: 'utf8', timeout: 40_000,
       })
       const events = readFileSync(receipt, 'utf8').trim().split('\n').map(line => JSON.parse(line))
       const run = events.find(event => event.kind === 'run')
+      if (!run) throw new Error(`Fixture never launched its owned workload: ${result.stderr}`)
       return { ...result, events, control: path.dirname(run.cidfile), name: run.name }
     },
     cleanup() {
@@ -185,6 +190,40 @@ with (root / 'receipt.jsonl').open('a') as log:
 }
 
 describe('sandbox wrapper owned launch settlement', () => {
+  it('settles a separate networked preparation before launching its strict caller', () => {
+    const f = fixture('published-success')
+    try {
+      const result = f.run(true, true)
+      expect(result.status, result.stderr).toBe(0)
+      const runs = result.events.filter(event => event.kind === 'run')
+      expect(runs).toHaveLength(2)
+      expect(runs[0].name).not.toBe(runs[1].name)
+      expect(runs[0].cidfile).not.toBe(runs[1].cidfile)
+      const launches = result.events.filter(event => event.kind === 'docker' && event.args[0] === 'run')
+      expect(launches[0].args).toContain('freshell-sandbox')
+      expect(launches[0].args).not.toContain('--read-only')
+      expect(launches[1].args).toContain('none')
+      expect(launches[1].args).toContain('--read-only')
+      const firstRemoval = result.events.findIndex(event => event.kind === 'docker' && event.args[0] === 'rm')
+      const secondLaunch = result.events.findIndex(event => event.kind === 'run' && event.name === runs[1].name)
+      expect(firstRemoval).toBeGreaterThan(-1)
+      expect(secondLaunch).toBeGreaterThan(firstRemoval)
+      for (const run of runs) expect(existsSync(path.dirname(run.cidfile))).toBe(false)
+      expect(existsSync(f.state)).toBe(false)
+    } finally { f.cleanup() }
+  })
+
+  it('settles failed preparation and refuses to launch the caller', () => {
+    const f = fixture('published')
+    try {
+      const result = f.run(true, true)
+      expect(result.status, result.stderr).toBe(37)
+      expect(result.events.filter(event => event.kind === 'run')).toHaveLength(1)
+      expect(existsSync(f.state)).toBe(false)
+      expect(existsSync(result.control)).toBe(false)
+    } finally { f.cleanup() }
+  })
+
   it.each(['published', 'published-success'])('fails when the independent guard reports an error before %s completion', mode => {
     const f = fixture(mode)
     try {

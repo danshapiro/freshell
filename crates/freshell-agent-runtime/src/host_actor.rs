@@ -9,8 +9,8 @@ pub use freshell_runtime_protocol::{
 };
 use freshell_runtime_protocol::{
     CommandState, FreshAgentCapture, FreshAgentRollbackDirection, FreshAgentRollbackMode,
-    FreshAgentTurnSettings, ProviderLaunchContext, ProviderModelSelection, ProviderSecretReference,
-    ProviderSessionReference, RequestId,
+    FreshAgentTurnSettings, NativeIdentityLaunch, ProviderLaunchContext, ProviderModelSelection,
+    ProviderSecretReference, ProviderSessionReference, RequestId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -20,7 +20,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 use tokio::sync::Mutex;
 
@@ -136,7 +139,7 @@ impl FreshAgentProfile {
         if self
             .provider_launch_context
             .as_ref()
-            .is_some_and(|context| context.validate(self.provider.native_provider()).is_err())
+            .is_some_and(|context| context.validate(self.provider.native_family()).is_err())
         {
             return Err(ActorError::InvalidProfile);
         }
@@ -176,6 +179,16 @@ pub struct OperationAck {
     /// Some rollback implementations materialize a new provider-native
     /// conversation while retaining the Freshell presentation identity.
     pub native_session_id: Option<String>,
+}
+
+/// Private actor persistence. Only the body-free recipe crosses host/supervisor
+/// acknowledgement; the existing Claude rollback record stays in owned storage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeForkState {
+    pub native_session_id: String,
+    pub recipe: Option<freshell_runtime_protocol::ClaudeForkRecipe>,
+    pub rollback: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +243,35 @@ pub enum FreshAgentOperation {
 
 #[async_trait]
 pub trait FreshAgentTransport: Send + Sync {
+    async fn restore_claude_fork_state(&self, _state: ClaudeForkState) -> Result<(), String> {
+        Ok(())
+    }
+    async fn claude_fork_state(&self) -> Option<ClaudeForkState> {
+        None
+    }
+    async fn disable_claude_fork_recovery(
+        &self,
+        _destroys_redo: bool,
+    ) -> Result<Option<ClaudeForkState>, String> {
+        Ok(None)
+    }
+    async fn resume_native_permission_recovery(&self) -> Result<(), DispatchFailure> {
+        Ok(())
+    }
+    async fn prepare_native_permission_recovery(
+        &self,
+        _checkpoints: Vec<Value>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    async fn native_identity_evidence(&self) -> Option<Value> {
+        None
+    }
+    /// Restore provider readiness without sending a user turn or releasing a
+    /// retained permission/effect. The host revalidates native identity next.
+    async fn prepare_native_readiness(&self) -> Result<(), String> {
+        Ok(())
+    }
     async fn start(&self, profile: &FreshAgentProfile) -> Result<TransportStart, String>;
     async fn dispatch(
         &self,
@@ -318,6 +360,8 @@ pub enum ActorError {
     AmbiguousDispatch,
     #[error("provider does not support this operation")]
     UnsupportedOperation,
+    #[error("fresh-agent provider start failed (startup diagnostic: {diagnostic})")]
+    ProviderStartFailed { diagnostic: ProviderStartDiagnostic },
     #[error("permission request is unknown")]
     UnknownDecision,
     #[error("permission request is already resolved")]
@@ -326,6 +370,70 @@ pub enum ActorError {
     Transport(String),
     #[error("durable fresh-agent state failed: {0}")]
     Persistence(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderStartDiagnostic {
+    Authentication,
+    Arguments,
+    Listener,
+    Configuration,
+    Network,
+    Unclassified,
+    NoDiagnostic,
+}
+
+impl ProviderStartDiagnostic {
+    fn from_provider_error(error: &str) -> Self {
+        let Some((_, suffix)) = error.rsplit_once("startup diagnostic:") else {
+            return Self::NoDiagnostic;
+        };
+        let category = suffix
+            .trim_start()
+            .split(|character: char| !character.is_ascii_lowercase() && character != '-')
+            .next()
+            .unwrap_or_default();
+        match category {
+            "authentication" => Self::Authentication,
+            "arguments" => Self::Arguments,
+            "listener" => Self::Listener,
+            "configuration" => Self::Configuration,
+            "network" => Self::Network,
+            "no-diagnostic" => Self::NoDiagnostic,
+            _ => Self::Unclassified,
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderStartDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Authentication => "authentication",
+            Self::Arguments => "arguments",
+            Self::Listener => "listener",
+            Self::Configuration => "configuration",
+            Self::Network => "network",
+            Self::Unclassified => "unclassified",
+            Self::NoDiagnostic => "no-diagnostic",
+        })
+    }
+}
+
+impl From<ProviderStartDiagnostic>
+    for freshell_runtime_protocol::FreshAgentProviderStartDiagnostic
+{
+    fn from(diagnostic: ProviderStartDiagnostic) -> Self {
+        use freshell_runtime_protocol::FreshAgentProviderStartDiagnostic as RuntimeDiagnostic;
+        match diagnostic {
+            ProviderStartDiagnostic::Authentication => RuntimeDiagnostic::Authentication,
+            ProviderStartDiagnostic::Arguments => RuntimeDiagnostic::Arguments,
+            ProviderStartDiagnostic::Listener => RuntimeDiagnostic::Listener,
+            ProviderStartDiagnostic::Configuration => RuntimeDiagnostic::Configuration,
+            ProviderStartDiagnostic::Network => RuntimeDiagnostic::Network,
+            ProviderStartDiagnostic::Unclassified => RuntimeDiagnostic::Unclassified,
+            ProviderStartDiagnostic::NoDiagnostic => RuntimeDiagnostic::NoDiagnostic,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -338,6 +446,26 @@ struct PersistedCommand {
     operation_failure: Option<OperationFailureKind>,
 }
 
+fn validate_claude_fork_state(
+    context: &ClaudeForkState,
+    profile: &FreshAgentProfile,
+) -> Result<(), ActorError> {
+    if !matches!(
+        profile.provider,
+        FreshProvider::Claude | FreshProvider::Kilroy
+    ) || profile.native_session_id.as_deref() != Some(&context.native_session_id)
+        || serde_json::to_vec(context).map_err(persist)?.len() > 32 * 1024 * 1024
+    {
+        return Err(ActorError::NativeIdentityMismatch);
+    }
+    if let Some(recipe) = &context.recipe {
+        recipe
+            .validate(&context.native_session_id)
+            .map_err(|_| ActorError::NativeIdentityMismatch)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum DecisionState {
@@ -345,6 +473,7 @@ enum DecisionState {
     Dispatching,
     Resolved,
     Ambiguous,
+    Interrupted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -365,6 +494,8 @@ struct PersistedActorState {
     commands: BTreeMap<String, PersistedCommand>,
     #[serde(default)]
     completed_forks: BTreeMap<String, ForkTransition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claude_fork_state: Option<ClaudeForkState>,
     decisions: BTreeMap<String, PersistedDecision>,
     events: VecDeque<JournalEvent>,
     event_bytes: usize,
@@ -380,6 +511,7 @@ impl PersistedActorState {
             initialization_state: None,
             commands: BTreeMap::new(),
             completed_forks: BTreeMap::new(),
+            claude_fork_state: None,
             decisions: BTreeMap::new(),
             events: VecDeque::new(),
             event_bytes: 0,
@@ -424,17 +556,117 @@ impl Drop for WriterLock {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeRecoveryRelease {
+    Pending,
+    Unsettled,
+    Released,
+}
+
 pub struct FreshAgentHostActor {
     state_dir: PathBuf,
     transport: Arc<dyn FreshAgentTransport>,
     state: Mutex<PersistedActorState>,
+    /// Ephemeral acknowledgement from this transport start. Saved profile
+    /// identity remains a resume request and cannot populate this slot.
+    observed_native_session_id: Mutex<Option<String>>,
+    native_identity_transition: AtomicBool,
+    stopped: AtomicBool,
     dispatch_lock: Mutex<()>,
+    native_recovery_release: Mutex<NativeRecoveryRelease>,
+    native_recovery_prepared: bool,
     event_byte_cap: usize,
     event_count_cap: usize,
     _writer_lock: WriterLock,
 }
 
 impl FreshAgentHostActor {
+    /// The deterministic qualification transport persists its decision in its
+    /// owned provider store. This opening path is selected only after the
+    /// session host has admitted that typed fixture transport; it provides no
+    /// evidence for native provider recovery.
+    pub async fn open_deterministic_fixture(
+        state_dir: impl Into<PathBuf>,
+        profile: FreshAgentProfile,
+        transport: Arc<dyn FreshAgentTransport>,
+    ) -> Result<Arc<Self>, ActorError> {
+        Self::open_with_callback_lifetime(
+            state_dir,
+            profile,
+            transport,
+            DEFAULT_EVENT_BYTES,
+            DEFAULT_EVENT_COUNT,
+            true,
+        )
+        .await
+    }
+
+    pub async fn resume_pending_native_permissions(&self) -> Result<(), ActorError> {
+        let _serial = self.dispatch_lock.lock().await;
+        if !self.native_recovery_prepared {
+            eprintln!(
+                "{}",
+                serde_json::json!({"severity":"info", "event":"fresh_agent.native_checkpoint.release", "outcome":"not_prepared"})
+            );
+            return Ok(());
+        }
+        let mut release = self.native_recovery_release.lock().await;
+        if *release == NativeRecoveryRelease::Unsettled {
+            return Err(ActorError::AmbiguousDispatch);
+        }
+        let state = self.state.lock().await;
+        if !matches!(
+            state.profile.provider,
+            FreshProvider::Claude | FreshProvider::Kilroy
+        ) || (*release == NativeRecoveryRelease::Pending
+            && native_recovery_checkpoints(&state).is_empty())
+        {
+            return Ok(());
+        }
+        let expected = state.profile.native_session_id.clone();
+        drop(state);
+        let observed = self.observed_native_session_id().await;
+        let evidence = self
+            .transport
+            .native_identity_evidence()
+            .await
+            .ok_or(ActorError::NativeIdentityMismatch)?;
+        let launch: NativeIdentityLaunch = serde_json::from_value(evidence["launch"].clone())
+            .map_err(|_| ActorError::NativeIdentityMismatch)?;
+        if expected.is_none()
+            || observed != expected
+            || launch.execution_generation == 0
+            || evidence["queryGeneration"].as_u64().unwrap_or(0) == 0
+            || launch
+                .requested_native_session_id
+                .as_ref()
+                .is_some_and(|root| Some(root) != expected.as_ref())
+                && !expected
+                    .as_deref()
+                    .is_some_and(|root| native_clear_matches_root(&evidence, root))
+        {
+            return Err(ActorError::NativeIdentityMismatch);
+        }
+        if *release == NativeRecoveryRelease::Released {
+            return Ok(());
+        }
+        // This preparation belongs to this actor's transport. Cancellation or
+        // any failed dispatch stays fenced; only a confirmed acknowledgement
+        // permits later reattach to settle without another native continuation.
+        *release = NativeRecoveryRelease::Unsettled;
+        self.transport
+            .resume_native_permission_recovery()
+            .await
+            .map_err(|failure| {
+                if failure.acceptance_ambiguous {
+                    ActorError::AmbiguousDispatch
+                } else {
+                    ActorError::Transport(failure.message)
+                }
+            })?;
+        *release = NativeRecoveryRelease::Released;
+        Ok(())
+    }
     pub async fn open(
         state_dir: impl Into<PathBuf>,
         profile: FreshAgentProfile,
@@ -456,6 +688,25 @@ impl FreshAgentHostActor {
         transport: Arc<dyn FreshAgentTransport>,
         event_byte_cap: usize,
         event_count_cap: usize,
+    ) -> Result<Arc<Self>, ActorError> {
+        Self::open_with_callback_lifetime(
+            state_dir,
+            profile,
+            transport,
+            event_byte_cap,
+            event_count_cap,
+            false,
+        )
+        .await
+    }
+
+    async fn open_with_callback_lifetime(
+        state_dir: impl Into<PathBuf>,
+        profile: FreshAgentProfile,
+        transport: Arc<dyn FreshAgentTransport>,
+        event_byte_cap: usize,
+        event_count_cap: usize,
+        deterministic_fixture: bool,
     ) -> Result<Arc<Self>, ActorError> {
         profile.validate()?;
         if event_byte_cap == 0 || event_count_cap == 0 {
@@ -513,9 +764,17 @@ impl FreshAgentHostActor {
                         command.state = CommandState::Ambiguous;
                     }
                 }
+                let claude_replacement = !deterministic_fixture
+                    && matches!(
+                        loaded.profile.provider,
+                        FreshProvider::Claude | FreshProvider::Kilroy
+                    );
                 for decision in loaded.decisions.values_mut() {
                     if matches!(decision.state, DecisionState::Dispatching) {
                         decision.state = DecisionState::Ambiguous;
+                    } else if claude_replacement && matches!(decision.state, DecisionState::Pending)
+                    {
+                        decision.state = DecisionState::Interrupted;
                     }
                 }
                 (loaded, false)
@@ -526,6 +785,31 @@ impl FreshAgentHostActor {
             Err(error) => return Err(persist(error)),
         };
 
+        if let Some(context) = state.claude_fork_state.clone() {
+            validate_claude_fork_state(&context, &state.profile)?;
+            transport
+                .restore_claude_fork_state(context)
+                .await
+                .map_err(ActorError::Transport)?;
+        }
+        let mut native_recovery_prepared = false;
+        if matches!(
+            state.profile.provider,
+            FreshProvider::Claude | FreshProvider::Kilroy
+        ) {
+            let checkpoints = native_recovery_checkpoints(&state);
+            native_recovery_prepared = !checkpoints.is_empty();
+            eprintln!(
+                "{}",
+                serde_json::json!({"severity":"info", "event":"fresh_agent.native_checkpoint.prepared",
+                "provider":state.profile.provider.as_str(), "checkpointCount":checkpoints.len(), "decisionCount":state.decisions.len(),
+                "nativeSessionId":state.profile.native_session_id})
+            );
+            transport
+                .prepare_native_permission_recovery(checkpoints)
+                .await
+                .map_err(ActorError::Transport)?;
+        }
         if newly_initialized {
             // Publish intent before the first provider creation. A resumed
             // actor keeps its accepted preparation until exact identity is
@@ -533,10 +817,12 @@ impl FreshAgentHostActor {
             state.initialization_state = Some(CommandState::Dispatching);
             write_state(&state_dir, &state)?;
         }
-        let started = transport
-            .start(&state.profile)
-            .await
-            .map_err(ActorError::Transport)?;
+        let started = transport.start(&state.profile).await.map_err(|error| {
+            ActorError::ProviderStartFailed {
+                diagnostic: ProviderStartDiagnostic::from_provider_error(&error),
+            }
+        })?;
+        let observed_native_session_id = started.native_session_id.clone();
         if let Some(expected) = state.profile.native_session_id.as_deref() {
             if started.native_session_id.as_deref() != Some(expected) {
                 return Err(ActorError::NativeIdentityMismatch);
@@ -551,12 +837,21 @@ impl FreshAgentHostActor {
             )?;
         }
         state.initialization_state = Some(CommandState::Completed);
+        if let Some(context) = transport.claude_fork_state().await {
+            validate_claude_fork_state(&context, &state.profile)?;
+            state.claude_fork_state = Some(context);
+        }
         write_state(&state_dir, &state)?;
         let actor = Arc::new(Self {
             state_dir,
             transport: Arc::clone(&transport),
             state: Mutex::new(state),
+            observed_native_session_id: Mutex::new(observed_native_session_id),
+            native_identity_transition: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
             dispatch_lock: Mutex::new(()),
+            native_recovery_release: Mutex::new(NativeRecoveryRelease::Pending),
+            native_recovery_prepared,
             event_byte_cap,
             event_count_cap,
             _writer_lock: writer_lock,
@@ -590,21 +885,129 @@ impl FreshAgentHostActor {
         self.state.lock().await.profile.clone()
     }
 
+    pub async fn prepare_native_readiness(&self) -> Result<(), ActorError> {
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(ActorError::NativeIdentityMismatch);
+        }
+        self.transport
+            .prepare_native_readiness()
+            .await
+            .map_err(ActorError::Transport)?;
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(ActorError::NativeIdentityMismatch);
+        }
+        Ok(())
+    }
+
+    async fn prepare_claude_effect(
+        &self,
+        state: &mut PersistedActorState,
+        destroys_redo: bool,
+    ) -> Result<(), ActorError> {
+        if let Some(context) = self
+            .transport
+            .disable_claude_fork_recovery(destroys_redo)
+            .await
+            .map_err(ActorError::Transport)?
+        {
+            validate_claude_fork_state(&context, &state.profile)?;
+            state.claude_fork_state = Some(context);
+        }
+        if let Some(recipe) = state
+            .claude_fork_state
+            .as_mut()
+            .and_then(|context| context.recipe.as_mut())
+        {
+            recipe.recovery_disabled = true;
+        }
+        Ok(())
+    }
+
+    pub async fn claude_fork_recipe(&self) -> Option<freshell_runtime_protocol::ClaudeForkRecipe> {
+        let state = self.state.lock().await;
+        state
+            .claude_fork_state
+            .as_ref()
+            .and_then(|context| context.recipe.clone())
+    }
+
+    pub async fn observed_native_session_id(&self) -> Option<String> {
+        if !self.is_live().await {
+            return None;
+        }
+        let state = self.state.lock().await;
+        if self.native_identity_transition.load(Ordering::SeqCst) {
+            return None;
+        }
+        self.observed_native_session_id
+            .lock()
+            .await
+            .clone()
+            .filter(|observed| state.profile.native_session_id.as_ref() == Some(observed))
+    }
+
+    pub async fn observed_native_identity_evidence(&self) -> Option<Value> {
+        self.observed_native_session_id().await?;
+        self.transport.native_identity_evidence().await
+    }
+
     pub async fn observe_native_identity(
         &self,
         native_session_id: String,
     ) -> Result<(), ActorError> {
-        if native_session_id.is_empty() {
+        let evidence = self.transport.native_identity_evidence().await;
+        self.observe_native_identity_with_evidence(native_session_id, evidence)
+            .await
+    }
+
+    async fn observe_native_identity_with_evidence(
+        &self,
+        native_session_id: String,
+        evidence: Option<Value>,
+    ) -> Result<(), ActorError> {
+        if native_session_id.is_empty() || native_session_id.chars().any(char::is_control) {
             return Err(ActorError::NativeIdentityMismatch);
         }
         let mut state = self.state.lock().await;
+        if self.native_identity_transition.load(Ordering::SeqCst)
+            || self.stopped.load(Ordering::SeqCst)
+        {
+            // Native operation acknowledgements settle a root transition. A
+            // racing lifecycle event alone cannot adopt a child or revive its
+            // retired parent while that operation is incomplete.
+            return Err(ActorError::NativeIdentityMismatch);
+        }
         match state.profile.native_session_id.as_deref() {
             Some(existing) if existing != native_session_id => {
-                return Err(ActorError::NativeIdentityMismatch)
+                let proven_clear = matches!(
+                    state.profile.provider,
+                    FreshProvider::Claude | FreshProvider::Kilroy
+                ) && evidence.as_ref().is_some_and(|evidence| {
+                    evidence["nativeSessionId"].as_str() == Some(native_session_id.as_str())
+                        && evidence["nativeClear"]["previousNativeSessionId"].as_str()
+                            == Some(existing)
+                        && evidence["nativeClear"]["nativeSessionId"].as_str()
+                            == Some(native_session_id.as_str())
+                });
+                if !proven_clear {
+                    return Err(ActorError::NativeIdentityMismatch);
+                }
+                state.profile.native_session_id = Some(native_session_id.clone());
+                if let Some(reference) = state.profile.session_ref.as_mut() {
+                    reference.session_id = native_session_id.clone();
+                }
+                // The transport publishes this marker only after an actual
+                // native clear. The cleared conversation cannot use the old
+                // parent's fork recipe or rollback history on recovery.
+                state.claude_fork_state = None;
             }
-            Some(_) => return Ok(()),
+            Some(_) => {
+                *self.observed_native_session_id.lock().await = Some(native_session_id);
+                return Ok(());
+            }
             None => state.profile.native_session_id = Some(native_session_id.clone()),
         }
+        *self.observed_native_session_id.lock().await = Some(native_session_id.clone());
         push_event_bounded(
             &mut state,
             AgentEvent::Started { native_session_id },
@@ -635,6 +1038,11 @@ impl FreshAgentHostActor {
         // durability transition and provider acceptance boundary within the
         // same fence so concurrent gateways cannot become double writers.
         let _dispatch_guard = self.dispatch_lock.lock().await;
+        if self.native_identity_transition.load(Ordering::SeqCst)
+            || self.stopped.load(Ordering::SeqCst)
+        {
+            return Err(ActorError::NativeIdentityMismatch);
+        }
         // Preserve the exact historical digest for legacy sends so a command
         // journal created before this field existed remains idempotent after
         // upgrade. A modern checkpointed send additionally fences the logical
@@ -682,9 +1090,9 @@ impl FreshAgentHostActor {
                 .get_mut(request_id.as_str())
                 .expect("inserted")
                 .state = CommandState::Dispatching;
+            self.prepare_claude_effect(&mut state, true).await?;
             write_state(&self.state_dir, &state)?;
         }
-
         let result = self
             .transport
             .dispatch_with_checkpoint_identity(
@@ -775,6 +1183,11 @@ impl FreshAgentHostActor {
                     )),
                 };
             }
+            if self.native_identity_transition.load(Ordering::SeqCst)
+                || self.stopped.load(Ordering::SeqCst)
+            {
+                return Err(ActorError::NativeIdentityMismatch);
+            }
             if state.profile.native_session_id.as_deref() != Some(parent_session_id.as_str()) {
                 return Err(ActorError::NativeIdentityMismatch);
             }
@@ -798,16 +1211,24 @@ impl FreshAgentHostActor {
                     .as_slice(),
             )?;
             write_state(&self.state_dir, &state)?;
+            self.native_identity_transition
+                .store(true, Ordering::SeqCst);
         }
 
         let result = self
             .transport
             .fork(&request_id, &parent_session_id, input)
             .await;
+        let claude_context = if result.is_ok() {
+            self.transport.claude_fork_state().await
+        } else {
+            None
+        };
         let mut state = self.state.lock().await;
         match result {
             Ok(transition) => {
-                if transition.parent_session_id != parent_session_id
+                if self.stopped.load(Ordering::SeqCst)
+                    || transition.parent_session_id != parent_session_id
                     || transition.child_session_id.is_empty()
                     || transition.child_session_id == parent_session_id
                     || transition.child_session_id.chars().any(char::is_control)
@@ -822,6 +1243,15 @@ impl FreshAgentHostActor {
                 state.profile.native_session_id = Some(transition.child_session_id.clone());
                 if let Some(reference) = state.profile.session_ref.as_mut() {
                     reference.session_id = transition.child_session_id.clone();
+                }
+                if matches!(
+                    state.profile.provider,
+                    FreshProvider::Claude | FreshProvider::Kilroy
+                ) {
+                    if let Some(context) = claude_context.as_ref() {
+                        validate_claude_fork_state(context, &state.profile)?;
+                    }
+                    state.claude_fork_state = claude_context;
                 }
                 if let Some(command) = state.commands.get_mut(request_id.as_str()) {
                     command.provider_ack_id = Some(transition.child_session_id.clone());
@@ -848,6 +1278,10 @@ impl FreshAgentHostActor {
                     self.event_count_cap,
                 )?;
                 write_state(&self.state_dir, &state)?;
+                *self.observed_native_session_id.lock().await =
+                    Some(transition.child_session_id.clone());
+                self.native_identity_transition
+                    .store(false, Ordering::SeqCst);
                 Ok(transition)
             }
             Err(failure) => {
@@ -862,6 +1296,8 @@ impl FreshAgentHostActor {
                 if failure.acceptance_ambiguous {
                     Err(ActorError::AmbiguousDispatch)
                 } else {
+                    self.native_identity_transition
+                        .store(false, Ordering::SeqCst);
                     Err(ActorError::Transport(failure.message))
                 }
             }
@@ -917,6 +1353,11 @@ impl FreshAgentHostActor {
                     (other, _) => Ok(other),
                 };
             }
+        }
+        if self.native_identity_transition.load(Ordering::SeqCst)
+            || self.stopped.load(Ordering::SeqCst)
+        {
+            return Err(ActorError::NativeIdentityMismatch);
         }
         let live_supported = self
             .transport
@@ -974,13 +1415,23 @@ impl FreshAgentHostActor {
                 .get_mut(request_id.as_str())
                 .expect("inserted semantic operation")
                 .state = CommandState::Dispatching;
+            if matches!(operation, FreshAgentOperation::Compact { .. }) {
+                self.prepare_claude_effect(&mut state, false).await?;
+            }
             write_state(&self.state_dir, &state)?;
+            self.native_identity_transition
+                .store(true, Ordering::SeqCst);
         }
 
         let result = self
             .transport
             .dispatch_operation(&request_id, &operation)
             .await;
+        let claude_context = if result.is_ok() {
+            self.transport.claude_fork_state().await
+        } else {
+            None
+        };
         let mut state = self.state.lock().await;
         let (outcome, native_session_id) = {
             let command = state
@@ -988,6 +1439,10 @@ impl FreshAgentHostActor {
                 .get_mut(request_id.as_str())
                 .expect("durable semantic operation");
             match result {
+                Ok(_) if self.stopped.load(Ordering::SeqCst) => {
+                    command.state = CommandState::Ambiguous;
+                    (Err(ActorError::AmbiguousDispatch), None)
+                }
                 Ok(ack) => {
                     command.provider_ack_id = ack.provider_ack_id;
                     command.state = CommandState::ProviderAcked;
@@ -1015,18 +1470,45 @@ impl FreshAgentHostActor {
                 }
             }
         };
-        if let Some(native_session_id) = native_session_id {
-            if state.profile.native_session_id.as_deref() != Some(&native_session_id) {
+        let native_identity_changed = native_session_id.as_ref().is_some_and(|native| {
+            state.profile.native_session_id.as_deref() != Some(native.as_str())
+        });
+        if let Some(native_session_id) = native_session_id.as_ref() {
+            if native_session_id.is_empty() || native_session_id.chars().any(char::is_control) {
+                state
+                    .commands
+                    .get_mut(request_id.as_str())
+                    .expect("durable operation")
+                    .state = CommandState::Ambiguous;
+                write_state(&self.state_dir, &state)?;
+                return Err(ActorError::AmbiguousDispatch);
+            }
+            if state.profile.native_session_id.as_deref() != Some(native_session_id) {
                 state.profile.native_session_id = Some(native_session_id.clone());
                 if let Some(reference) = state.profile.session_ref.as_mut() {
                     reference.session_id = native_session_id.clone();
                 }
                 push_event_bounded(
                     &mut state,
-                    AgentEvent::Started { native_session_id },
+                    AgentEvent::Started {
+                        native_session_id: native_session_id.clone(),
+                    },
                     self.event_byte_cap,
                     self.event_count_cap,
                 )?;
+            }
+        }
+        if outcome.is_ok() {
+            if let Some(context) = claude_context {
+                validate_claude_fork_state(&context, &state.profile)?;
+                state.claude_fork_state = Some(context);
+            } else if native_identity_changed
+                && matches!(
+                    state.profile.provider,
+                    FreshProvider::Claude | FreshProvider::Kilroy
+                )
+            {
+                state.claude_fork_state = None;
             }
         }
         let command_state = state
@@ -1044,6 +1526,13 @@ impl FreshAgentHostActor {
             self.event_count_cap,
         )?;
         write_state(&self.state_dir, &state)?;
+        if outcome.is_ok() || command_state == CommandState::Cancelled {
+            if let Some(native_session_id) = native_session_id {
+                *self.observed_native_session_id.lock().await = Some(native_session_id);
+            }
+            self.native_identity_transition
+                .store(false, Ordering::SeqCst);
+        }
         outcome
     }
 
@@ -1114,11 +1603,79 @@ impl FreshAgentHostActor {
     }
 
     pub async fn record_event(&self, event: AgentEvent) -> Result<u64, ActorError> {
+        if let Some((native_session_id, evidence)) = self.admitted_clear_init(&event).await {
+            // The transport's watch may already contain the next clear. Its
+            // admitted init frames retain each actual clear in FIFO order.
+            // Stop/native-operation refusal still leaves the provider frame
+            // available to the existing journal and correlated ACK path.
+            let _ = self
+                .observe_native_identity_with_evidence(native_session_id, Some(evidence))
+                .await;
+        }
         let mut state = self.state.lock().await;
+        if let AgentEvent::Provider { payload } = &event {
+            let native = payload.get("event").unwrap_or(payload);
+            if matches!(
+                native.get("type").and_then(Value::as_str),
+                Some("freshAgent.permission.cancelled" | "freshAgent.question.cancelled")
+            ) {
+                if let Some(decision) = native
+                    .get("requestId")
+                    .and_then(Value::as_str)
+                    .and_then(|request| state.decisions.get_mut(request))
+                {
+                    if matches!(
+                        decision.state,
+                        DecisionState::Pending | DecisionState::Dispatching
+                    ) {
+                        decision.state = DecisionState::Interrupted;
+                    }
+                }
+            }
+        }
         let sequence =
             push_event_bounded(&mut state, event, self.event_byte_cap, self.event_count_cap)?;
         write_state(&self.state_dir, &state)?;
         Ok(sequence)
+    }
+
+    async fn admitted_clear_init(&self, event: &AgentEvent) -> Option<(String, Value)> {
+        let AgentEvent::Provider { payload } = event else {
+            return None;
+        };
+        let init = payload.get("event").unwrap_or(payload);
+        let proof = &init["nativeIdentityEvidence"];
+        if init["type"] != "freshAgent.session.init" || proof["source"] != "clear" {
+            return None;
+        }
+        let native = init["cliSessionId"].as_str()?;
+        let previous = proof["previousNativeSessionId"].as_str()?;
+        let launch: NativeIdentityLaunch = serde_json::from_value(proof["launch"].clone()).ok()?;
+        let generation = proof["queryGeneration"]
+            .as_u64()
+            .filter(|value| *value > 0)?;
+        let current = self.transport.native_identity_evidence().await?;
+        let current_launch: NativeIdentityLaunch =
+            serde_json::from_value(current["launch"].clone()).ok()?;
+        if launch != current_launch
+            || current["providerEvidence"]["launch"] != proof["launch"]
+            || current["queryGeneration"]
+                .as_u64()
+                .is_none_or(|value| value < generation)
+            || !current["nativeSessionId"]
+                .as_str()
+                .is_some_and(|root| native_clear_matches_root(&current, root))
+        {
+            return None;
+        }
+        Some((
+            native.into(),
+            serde_json::json!({
+                "nativeSessionId":native, "providerEvidence":proof, "launch":launch,
+                "nativeClear":{"previousNativeSessionId":previous,"nativeSessionId":native},
+                "queryGeneration":generation,
+            }),
+        ))
     }
 
     pub async fn record_permission(
@@ -1126,8 +1683,38 @@ impl FreshAgentHostActor {
         decision_id: String,
         payload: Value,
     ) -> Result<u64, ActorError> {
+        let current_root = self.observed_native_session_id().await;
+        let current_evidence = self.observed_native_identity_evidence().await;
+        let verified_checkpoint =
+            current_native_checkpoint(&payload, current_root.as_deref(), current_evidence.as_ref());
+        if payload.get("nativeCheckpoint").is_some() && verified_checkpoint.is_none() {
+            return Err(ActorError::NativeIdentityMismatch);
+        }
         let mut state = self.state.lock().await;
         if let Some(existing) = state.decisions.get(&decision_id) {
+            if matches!(existing.state, DecisionState::Interrupted)
+                && verified_checkpoint.is_some()
+                && existing.payload.get("nativeCheckpoint") == verified_checkpoint.as_ref()
+            {
+                let existing = state
+                    .decisions
+                    .get_mut(&decision_id)
+                    .expect("checked decision");
+                existing.payload = payload.clone();
+                existing.state = DecisionState::Pending;
+                existing.response_digest = None;
+                let sequence = push_event_bounded(
+                    &mut state,
+                    AgentEvent::PermissionRequested {
+                        decision_id,
+                        payload,
+                    },
+                    self.event_byte_cap,
+                    self.event_count_cap,
+                )?;
+                write_state(&self.state_dir, &state)?;
+                return Ok(sequence);
+            }
             if existing.payload != payload {
                 return Err(ActorError::RequestConflict);
             }
@@ -1204,6 +1791,7 @@ impl FreshAgentHostActor {
                 .ok_or(ActorError::UnknownDecision)?;
             match pending.state {
                 DecisionState::Pending => {}
+                DecisionState::Interrupted => return Err(ActorError::UnknownDecision),
                 DecisionState::Resolved
                     if pending.response_digest.as_deref() == Some(&response_digest) =>
                 {
@@ -1216,6 +1804,7 @@ impl FreshAgentHostActor {
             }
             pending.state = DecisionState::Dispatching;
             pending.response_digest = Some(response_digest);
+            self.prepare_claude_effect(&mut state, false).await?;
             write_state(&self.state_dir, &state)?;
         }
         let result = self
@@ -1227,6 +1816,9 @@ impl FreshAgentHostActor {
             .decisions
             .get_mut(decision_id)
             .expect("pending decision");
+        if matches!(pending.state, DecisionState::Interrupted) {
+            return Err(ActorError::UnknownDecision);
+        }
         match result {
             Ok(()) => {
                 pending.state = DecisionState::Resolved;
@@ -1283,11 +1875,12 @@ impl FreshAgentHostActor {
     }
 
     pub async fn is_live(&self) -> bool {
-        self.transport.is_live().await
+        !self.stopped.load(Ordering::SeqCst) && self.transport.is_live().await
     }
 
     /// Only the session host's supervisor-controlled stop path may call this.
     pub async fn stop(self: Arc<Self>) -> Result<(), ActorError> {
+        self.stopped.store(true, Ordering::SeqCst);
         Arc::clone(&self.transport)
             .stop()
             .await
@@ -1332,6 +1925,131 @@ fn pending_decision_ids(state: &PersistedActorState) -> BTreeSet<String> {
         .filter(|(_, decision)| matches!(decision.state, DecisionState::Pending))
         .map(|(decision_id, _)| decision_id.clone())
         .collect()
+}
+
+fn native_recovery_checkpoints(state: &PersistedActorState) -> Vec<Value> {
+    state.decisions.values().filter(|decision|
+        matches!(decision.state, DecisionState::Pending | DecisionState::Interrupted))
+        .filter_map(|decision| {
+            let binding = decision.payload.get("nativeBinding")?;
+            let evidence = serde_json::json!({"launch":binding["launch"],"queryGeneration":binding["queryGeneration"],
+                "nativeSessionId":state.profile.native_session_id,"nativeClear":binding["nativeClear"]});
+            current_native_checkpoint(&decision.payload, state.profile.native_session_id.as_deref(), Some(&evidence))
+        }).collect()
+}
+
+fn native_clear_matches_root(evidence: &Value, root: &str) -> bool {
+    evidence["nativeSessionId"].as_str() == Some(root)
+        && evidence["nativeClear"]["nativeSessionId"].as_str() == Some(root)
+        && evidence["nativeClear"]["previousNativeSessionId"]
+            .as_str()
+            .is_some_and(|prior| {
+                !prior.is_empty() && prior != root && !prior.chars().any(char::is_control)
+            })
+}
+
+fn current_native_checkpoint(
+    payload: &Value,
+    root: Option<&str>,
+    evidence: Option<&Value>,
+) -> Option<Value> {
+    let checkpoint = payload.get("nativeCheckpoint")?;
+    let binding = payload.get("nativeBinding")?;
+    let evidence = evidence?;
+    let launch: NativeIdentityLaunch = serde_json::from_value(binding["launch"].clone()).ok()?;
+    let current_launch: NativeIdentityLaunch =
+        serde_json::from_value(evidence["launch"].clone()).ok()?;
+    let native = root?;
+    let tool = checkpoint["toolUseID"]
+        .as_str()
+        .filter(|tool| tool.starts_with("toolu_") && tool.len() > 6)?;
+    let request = payload["nativeRequestId"]
+        .as_str()
+        .filter(|request| !request.is_empty())?;
+    let generation = binding["queryGeneration"]
+        .as_u64()
+        .filter(|generation| *generation > 0)?;
+    let hash = |value: &Value| {
+        value.as_str().is_some_and(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    };
+    if launch != current_launch
+        || launch.execution_generation == 0
+        || launch
+            .requested_native_session_id
+            .as_deref()
+            .is_some_and(|root| root != native)
+            && !(native_clear_matches_root(evidence, native)
+                && binding["nativeClear"] == evidence["nativeClear"])
+        || evidence["queryGeneration"].as_u64() != Some(generation)
+        || binding["nativeRequestId"] != request
+        || checkpoint["nativeSessionId"] != native
+        || payload["toolUseID"] != tool
+        || checkpoint["toolName"] != "Bash"
+        || payload["tool"]["name"] != "Bash"
+        || checkpoint["nativeVersion"] != "2.1.237"
+        || !["inputDigest", "profileDigest", "checkpointDigest"]
+            .iter()
+            .all(|key| hash(&checkpoint[key]))
+        || !["checkpointUuid", "assistantUuid"]
+            .iter()
+            .all(|key| checkpoint[key].as_str().is_some_and(|id| !id.is_empty()))
+        || checkpoint["inputDigest"] != native_input_digest(&payload["tool"]["input"])?
+    {
+        return None;
+    }
+    Some(checkpoint.clone())
+}
+
+fn native_input_digest(input: &Value) -> Option<String> {
+    // Match nativeInputDigest in native-session-channel.mjs exactly: recursive
+    // UTF-16 key ordering and ECMAScript Number formatting both affect bytes.
+    let mut canonical = String::new();
+    write_native_input_json(input, &mut canonical)?;
+    Some(digest(canonical.as_bytes()))
+}
+
+fn write_native_input_json(input: &Value, output: &mut String) -> Option<()> {
+    match input {
+        Value::Null => output.push_str("null"),
+        Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
+        Value::String(value) => output.push_str(&serde_json::to_string(value).ok()?),
+        Value::Number(value) => {
+            let value = value.as_f64().filter(|value| value.is_finite())?;
+            output.push_str(ryu_js::Buffer::new().format_finite(value));
+        }
+        Value::Array(values) => {
+            output.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                write_native_input_json(value, output)?;
+            }
+            output.push(']');
+        }
+        Value::Object(values) => {
+            let mut entries: Vec<_> = values.iter().collect();
+            entries.sort_unstable_by(|(left, _), (right, _)| {
+                left.encode_utf16().cmp(right.encode_utf16())
+            });
+            output.push('{');
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                output.push_str(&serde_json::to_string(key).ok()?);
+                output.push(':');
+                write_native_input_json(value, output)?;
+            }
+            output.push('}');
+        }
+    }
+    Some(())
 }
 
 fn event_is_pending_decision(entry: &JournalEvent, pending_ids: &BTreeSet<String>) -> bool {

@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -11,6 +12,74 @@ import {
 } from '../../../../scripts/testing/provider-parity-receipt.js'
 import { validateProviderQualificationReceipt } from '../../../../scripts/testing/provider-qualification-receipt.js'
 import { validateFreshAgentQualificationReceipt } from '../../../../scripts/testing/fresh-agent-qualification-receipt.js'
+import { exposeGrantsToHarness, fakeOnecliGrants } from '../../../helpers/provider-parity-onecli.js'
+
+describe('provider parity suite discovery', () => {
+  it.each([
+    { context: 'local', environment: {}, runtimeSuites: true },
+    { context: 'local Cloud dispatcher', environment: { FRESHELL_VITEST_BACKEND: 'cloud', CI: 'true' }, runtimeSuites: true },
+    { context: 'source-only Cloud Vitest worker', environment: { TEST_MODE: 'vitest' }, runtimeSuites: false },
+    { context: 'other container mode', environment: { TEST_MODE: 'playwright' }, runtimeSuites: true },
+  ])('collects the intended runtime and unit suites in $context', ({ environment, runtimeSuites }) => {
+    const repoRoot = path.resolve(import.meta.dirname, '../../../..')
+    const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'provider-parity-discovery-'))
+    const paritySuites = ['fresh-agent-parity.test.ts', 'managed-provider-parity.test.ts']
+      .map(file => `test/integration/server/${file}`)
+    const unitSuite = 'test/unit/tooling/testing/provider-parity-receipt.test.ts'
+    const realProviderSuite = 'test/integration/real/provider-contract.test.ts'
+    const env: NodeJS.ProcessEnv = { ...process.env, ...environment }
+    if (!('TEST_MODE' in environment)) delete env.TEST_MODE
+    delete env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS
+    try {
+      // Exercise the real config against a finite source tree. Cloud excludes
+      // the actual runtime suites; discovery must not require their sources.
+      for (const file of [...paritySuites, unitSuite, realProviderSuite]) {
+        const target = path.join(fixture, file)
+        fs.mkdirSync(path.dirname(target), { recursive: true })
+        fs.writeFileSync(target, 'throw new Error("discovery must never import a suite")\n')
+      }
+      const files: string[] = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', `
+        import { createVitest } from 'vitest/node'
+        import path from 'node:path'
+        const collector = await createVitest({ config: path.resolve('config/vitest/vitest.config.ts'), root: process.argv[1], watch: false }, {
+          configLoader: 'runner', cacheDir: path.join(process.argv[1], '.cache'),
+        })
+        try {
+          const specifications = await collector.globTestSpecifications()
+          process.stdout.write(JSON.stringify(specifications.map(specification => path.relative(process.argv[1], specification.moduleId))))
+        } finally { await collector.close() }
+      `, fixture], { cwd: repoRoot, env, encoding: 'utf8', timeout: 30_000 }))
+      expect(files.filter(file => paritySuites.includes(file)).sort()).toEqual(runtimeSuites ? paritySuites : [])
+      expect(files).toContain(unitSuite)
+      expect(files).not.toContain(realProviderSuite)
+    } finally { fs.rmSync(fixture, { recursive: true, force: true }) }
+  })
+})
+
+describe('fake provider parity grant isolation', () => {
+  it('exposes only owned fake references to actual child processes and restores ambient references', () => {
+    const ambient = {
+      FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: '/nonexistent/operator/auth.json',
+      FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: '/nonexistent/operator/ca.pem',
+      FRESHELL_MANAGED_CLAUDE_ONECLI_ENV_FILE: '/nonexistent/operator/claude.env',
+      FRESHELL_MANAGED_AMPLIFIER_ONECLI_CA_FILE: '/nonexistent/operator/amplifier.pem',
+    }
+    for (const [key, value] of Object.entries(ambient)) vi.stubEnv(key, value)
+    const fake = fakeOnecliGrants(['opencode'])
+    const restore = exposeGrantsToHarness(fake.serverEnv)
+    try {
+      const observed = JSON.parse(execFileSync(process.execPath, ['-e',
+        "process.stdout.write(JSON.stringify(Object.fromEntries(Object.entries(process.env).filter(([key])=>/^FRESHELL_MANAGED_(CLAUDE|CODEX|OPENCODE|AMPLIFIER)_ONECLI_/.test(key)))))"], { encoding: 'utf8' }))
+      expect(observed).toEqual(fake.serverEnv)
+      expect(fs.readFileSync(observed.FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE, 'utf8')).toContain('fixture-secret-byte-opencode')
+    } finally {
+      restore()
+      for (const [key, value] of Object.entries(ambient)) expect(process.env[key]).toBe(value)
+      fs.rmSync(fake.directory, { recursive: true, force: true })
+      vi.unstubAllEnvs()
+    }
+  })
+})
 
 const trace = {
   provider: 'claude',

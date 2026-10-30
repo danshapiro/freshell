@@ -8,8 +8,9 @@ mod claude;
 mod cli;
 mod codex;
 #[cfg(feature = "fresh-agent-fixtures")]
-mod deterministic_fresh_agent;
+pub(crate) mod deterministic_fresh_agent;
 mod fresh_agent;
+pub(crate) mod native_identity;
 mod opencode;
 
 #[cfg(feature = "fresh-agent-fixtures")]
@@ -23,7 +24,9 @@ pub(crate) use codex::PreparedCodexLaunch;
 use freshell_agent_runtime::ProviderStoreProbe;
 use freshell_runtime_protocol::{
     CheckpointReference, RecoveryBlockReason, RecoveryPath, RecoveryProbe, ResumeSpec, RetryHint,
+    RuntimeDiagnosticCode,
 };
+use std::fmt;
 
 pub struct PreparedTerminal {
     pub terminal: freshell_runtime_protocol::TerminalLaunchSpec,
@@ -32,8 +35,59 @@ pub struct PreparedTerminal {
     pub claude_settings: Option<String>,
 }
 
-pub fn prepare_provider_state_before_bootstrap(
+#[derive(Debug)]
+pub struct ProviderLaunchPreparationError {
+    message: String,
+    diagnostic_code: Option<RuntimeDiagnosticCode>,
+}
+
+impl ProviderLaunchPreparationError {
+    fn generic(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            diagnostic_code: None,
+        }
+    }
+
+    fn with_diagnostic_code(
+        message: impl Into<String>,
+        diagnostic_code: RuntimeDiagnosticCode,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            diagnostic_code: Some(diagnostic_code),
+        }
+    }
+
+    pub fn diagnostic_code_or(&self, fallback: RuntimeDiagnosticCode) -> RuntimeDiagnosticCode {
+        self.diagnostic_code.unwrap_or(fallback)
+    }
+}
+
+impl fmt::Display for ProviderLaunchPreparationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ProviderLaunchPreparationError {}
+
+impl From<String> for ProviderLaunchPreparationError {
+    fn from(message: String) -> Self {
+        Self::generic(message)
+    }
+}
+
+impl From<&str> for ProviderLaunchPreparationError {
+    fn from(message: &str) -> Self {
+        Self::generic(message)
+    }
+}
+
+pub fn prepare_provider_state_before_bootstrap_at(
     terminal: &mut freshell_runtime_protocol::TerminalLaunchSpec,
+    provider_home: &std::path::Path,
+    selected_user_root: &std::path::Path,
 ) -> Result<Vec<std::path::PathBuf>, String> {
     if terminal.mode != "amplifier" {
         return Ok(Vec::new());
@@ -45,12 +99,27 @@ pub fn prepare_provider_state_before_bootstrap(
         .ok_or_else(|| {
             "managed Amplifier launch requires one exact launcher-assigned session id".to_string()
         })?;
-    let provider_home = std::path::Path::new("/home/freshell/provider/.amplifier");
-    let ensured = freshell_sessions::amplifier_stub::ensure_session(
-        provider_home,
+    let amplifier_home = provider_home.join(".amplifier");
+    let settings_home = if terminal
+        .provider_launch_context
+        .as_ref()
+        .is_some_and(|context| {
+            context.config.iter().any(|reference| {
+                reference.root == freshell_runtime_protocol::ProviderConfigRoot::UserProvider
+                    && reference.relative_path == "settings.yaml"
+                    && reference.provider_relative_path == ".amplifier/settings.yaml"
+            })
+        }) {
+        selected_user_root
+    } else {
+        &amplifier_home
+    };
+    let ensured = freshell_sessions::amplifier_stub::ensure_session_with_settings_home(
+        &amplifier_home,
         session_id,
         &terminal.cwd,
         &terminal.terminal_id,
+        settings_home,
     )
     .map_err(|error| format!("prepare Amplifier session stub: {error}"))?;
     if let Some(recorded_cwd) = ensured.working_dir_of_existing {
@@ -162,16 +231,40 @@ fn prepare_amplifier_package_target() -> Result<(), String> {
 }
 
 pub async fn prepare_terminal(
+    terminal: freshell_runtime_protocol::TerminalLaunchSpec,
+    child_secret_env: &std::collections::BTreeMap<String, String>,
+    prepared_opencode_plan: Option<&freshell_platform::opencode_config::OpencodeConfigPlan>,
+    selected_claude_settings: Option<&str>,
+) -> Result<PreparedTerminal, ProviderLaunchPreparationError> {
+    prepare_terminal_with_provider_feature_runner(
+        terminal,
+        child_secret_env,
+        prepared_opencode_plan,
+        selected_claude_settings,
+        prepare_provider_features_for_identity,
+    )
+    .await
+}
+
+async fn prepare_terminal_with_provider_feature_runner<F>(
     mut terminal: freshell_runtime_protocol::TerminalLaunchSpec,
     child_secret_env: &std::collections::BTreeMap<String, String>,
     prepared_opencode_plan: Option<&freshell_platform::opencode_config::OpencodeConfigPlan>,
     selected_claude_settings: Option<&str>,
-) -> Result<PreparedTerminal, String> {
+    prepare_features: F,
+) -> Result<PreparedTerminal, ProviderLaunchPreparationError>
+where
+    F: Fn(u32, u32, &[&str]) -> Result<Option<String>, String>,
+{
     let mut child_env = child_secret_env.clone();
     prepare_scoped_mcp_environment(terminal.provider_launch_context.as_ref(), &mut child_env)
         .await?;
     if terminal.mode == "amplifier" {
-        prepare_provider_features(&terminal, "amplifier-packages")?;
+        prepare_features(
+            terminal.run_as_uid,
+            terminal.run_as_gid,
+            &["amplifier-packages"],
+        )?;
     }
     if terminal.mode == "claude"
         && terminal
@@ -179,7 +272,24 @@ pub async fn prepare_terminal(
             .as_ref()
             .is_some_and(|context| context.mcp_capability.is_some())
     {
-        prepare_provider_features(&terminal, "claude-mcp")?;
+        prepare_features(terminal.run_as_uid, terminal.run_as_gid, &["claude-mcp"])?;
+    }
+    if terminal.mode == "amplifier" {
+        let bundle = match terminal
+            .provider_launch_context
+            .as_ref()
+            .map(|context| &context.preparation)
+        {
+            Some(freshell_runtime_protocol::ProviderPreparation::Amplifier { bundle, .. }) => {
+                bundle.as_str()
+            }
+            _ => return Err("managed Amplifier launch lacks its selected ordinary bundle".into()),
+        };
+        prepare_features(
+            terminal.run_as_uid,
+            terminal.run_as_gid,
+            &["amplifier-profile", bundle],
+        )?;
     }
     if terminal.mode == "opencode" {
         if let Some(context) = terminal.provider_launch_context.as_ref() {
@@ -225,15 +335,20 @@ pub async fn prepare_terminal(
                 .get("OPENCODE_TUI_CONFIG")
                 .or_else(|| child_env.get("OPENCODE_TUI_CONFIG"))
                 .cloned();
-            if let Some(selector) = prepare_opencode_rebind(
-                terminal.run_as_uid,
-                terminal.run_as_gid,
-                prepared_tui,
-                source.as_deref(),
-            )? {
-                terminal
-                    .env
-                    .insert("OPENCODE_TUI_CONFIG".into(), selector.into());
+            if prepared_tui {
+                prepare_features(
+                    terminal.run_as_uid,
+                    terminal.run_as_gid,
+                    &["opencode-rebind-source"],
+                )?;
+            } else {
+                prepare_opencode_rebind_tui_config(
+                    &mut terminal.env,
+                    terminal.run_as_uid,
+                    terminal.run_as_gid,
+                    source.as_deref(),
+                    &prepare_features,
+                )?;
             }
         }
         let permission = terminal
@@ -282,7 +397,7 @@ pub async fn prepare_terminal(
 /// consuming the grant, alongside the terminal process dispatch.
 pub async fn start_terminal_sidecar(
     mut prepared: PreparedTerminal,
-) -> Result<PreparedTerminal, String> {
+) -> Result<PreparedTerminal, ProviderLaunchPreparationError> {
     if prepared.terminal.mode == "codex" {
         let mut sidecar_env = prepared.terminal.env.clone();
         sidecar_env.extend(prepared.child_env.clone());
@@ -349,7 +464,7 @@ async fn probe_managed_endpoint(endpoint: &str) -> Result<(), String> {
         .port_or_known_default()
         .ok_or_else(|| "managed MCP endpoint port is missing".to_string())?;
     tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        freshell_platform::provider_startup::PROVIDER_ENDPOINT_WAIT,
         tokio::net::TcpStream::connect(("host.docker.internal", port)),
     )
     .await
@@ -358,30 +473,187 @@ async fn probe_managed_endpoint(endpoint: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn prepare_provider_features(
-    terminal: &freshell_runtime_protocol::TerminalLaunchSpec,
-    operation: &str,
-) -> Result<(), String> {
-    prepare_provider_features_for_identity(terminal.run_as_uid, terminal.run_as_gid, &[operation])
-}
-
-fn prepare_provider_features_for_identity(uid: u32, gid: u32, args: &[&str]) -> Result<(), String> {
+fn prepare_provider_features_for_identity(
+    uid: u32,
+    gid: u32,
+    args: &[&str],
+) -> Result<Option<String>, String> {
     let exe = std::env::current_exe().map_err(|error| error.to_string())?;
-    let status = std::process::Command::new("/usr/bin/setpriv")
+    let output = std::process::Command::new("/usr/bin/setpriv")
         .args(crate::provider_identity_args(uid, gid))
         .arg(exe)
         .arg("prepare-provider-features")
         .args(args)
-        .status()
+        .output()
         .map_err(|error| format!("prepare provider features: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "prepare provider features failed: {}",
-            args.first().unwrap_or(&"unknown")
-        ))
+    finish_provider_feature_worker(args.first().copied().unwrap_or("unknown"), uid, gid, output)
+}
+
+fn finish_provider_feature_worker(
+    operation: &str,
+    uid: u32,
+    gid: u32,
+    output: std::process::Output,
+) -> Result<Option<String>, String> {
+    finish_provider_feature_worker_at_phase(operation, uid, gid, "feature_worker", output)
+}
+
+#[derive(Default)]
+struct AmplifierProfileFailureContext {
+    phase: Option<String>,
+    exception: Option<String>,
+    native_exit_code: Option<i64>,
+    native_signal: Option<i64>,
+}
+
+fn amplifier_profile_failure_context(stderr: &[u8]) -> AmplifierProfileFailureContext {
+    let mut result = AmplifierProfileFailureContext::default();
+    for line in stderr.split(|byte| *byte == b'\n') {
+        let Ok(event) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        let helper = event["event"] == "amplifier.selected_profile.failed";
+        let native_process = event["event"] == "provider.feature_preparation.failed"
+            && event["operation"] == "amplifier-profile"
+            && event["phase"] == "native_profile_process";
+        if !helper && !native_process {
+            continue;
+        }
+        let phase = event[if helper { "phase" } else { "profile_phase" }].as_str();
+        if let Some(
+            phase @ ("load_native_settings"
+            | "validate_bundle"
+            | "read_bundle"
+            | "validate_providers"
+            | "write_native_settings"
+            | "verify_native_settings"),
+        ) = phase
+        {
+            result.phase = Some(phase.to_owned());
+        }
+        if let Some(exception) = event[if helper {
+            "exception_type"
+        } else {
+            "profile_exception"
+        }]
+        .as_str()
+        {
+            if !exception.is_empty()
+                && exception.len() <= 64
+                && exception
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                result.exception = Some(exception.to_owned());
+            }
+        }
+        if native_process {
+            result.native_exit_code = event["exit_code"].as_i64();
+            result.native_signal = event["signal"].as_i64();
+        }
     }
+    result
+}
+
+fn finish_provider_feature_worker_at_phase(
+    operation: &str,
+    uid: u32,
+    gid: u32,
+    phase: &str,
+    output: std::process::Output,
+) -> Result<Option<String>, String> {
+    if !output.status.success() {
+        #[cfg(unix)]
+        let signal = std::os::unix::process::ExitStatusExt::signal(&output.status);
+        #[cfg(not(unix))]
+        let signal: Option<i32> = None;
+        let profile = if operation == "amplifier-profile" {
+            amplifier_profile_failure_context(&output.stderr)
+        } else {
+            AmplifierProfileFailureContext::default()
+        };
+        crate::emit_environment_event(serde_json::json!({
+            "event": "provider.feature_preparation.failed",
+            "severity": "error",
+            "operation": operation,
+            "phase": phase,
+            "exit_code": output.status.code(),
+            "signal": signal,
+            "uid": uid,
+            "gid": gid,
+            "stdout_bytes": output.stdout.len(),
+            "stderr_bytes": output.stderr.len(),
+            "profile_phase": profile.phase,
+            "profile_exception": profile.exception,
+            "native_exit_code": profile.native_exit_code,
+            "native_signal": profile.native_signal,
+        }));
+        if operation == "amplifier-profile" {
+            let mut detail = format!(
+                "phase={phase}, exit_code={}, signal={}",
+                output
+                    .status
+                    .code()
+                    .map_or_else(|| "none".into(), |code| code.to_string()),
+                signal.map_or_else(|| "none".into(), |signal| signal.to_string())
+            );
+            if let Some(code) = profile.native_exit_code {
+                detail.push_str(&format!(", native_exit_code={code}"));
+            }
+            if let Some(signal) = profile.native_signal {
+                detail.push_str(&format!(", native_signal={signal}"));
+            }
+            if let Some(phase) = profile.phase {
+                detail.push_str(&format!(", profile_phase={phase}"));
+            }
+            if let Some(exception) = profile.exception {
+                detail.push_str(&format!(", profile_exception={exception}"));
+            }
+            return Err(format!(
+                "prepare provider features failed: {operation} ({detail})"
+            ));
+        }
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), &output.stderr);
+        return Err(format!("prepare provider features failed: {operation}"));
+    }
+    parse_provider_feature_worker_output(operation, &output.stdout)
+}
+
+fn parse_provider_feature_worker_output(
+    operation: &str,
+    stdout: &[u8],
+) -> Result<Option<String>, String> {
+    if operation != "opencode-rebind" {
+        return Ok(None);
+    }
+    let output = std::str::from_utf8(stdout)
+        .map_err(|_| "OpenCode rebind worker returned an invalid selector path".to_string())?;
+    let path = output.trim_end_matches(['\r', '\n']);
+    if path.is_empty() || path.contains(['\r', '\n']) || !std::path::Path::new(path).is_absolute() {
+        return Err("OpenCode rebind worker did not return one absolute selector path".into());
+    }
+    Ok(Some(path.to_owned()))
+}
+
+fn prepare_opencode_rebind_tui_config<F>(
+    env: &mut std::collections::BTreeMap<String, String>,
+    uid: u32,
+    gid: u32,
+    source: Option<&str>,
+    prepare_features: &F,
+) -> Result<(), String>
+where
+    F: Fn(u32, u32, &[&str]) -> Result<Option<String>, String>,
+{
+    let mut args = vec!["opencode-rebind"];
+    if let Some(source) = source {
+        args.push(source);
+    }
+    let selector = prepare_features(uid, gid, &args)?
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| "OpenCode rebind worker returned no selector path".to_string())?;
+    env.insert("OPENCODE_TUI_CONFIG".into(), selector);
+    Ok(())
 }
 
 pub async fn prepare_fresh_agent_child_environment(
@@ -389,6 +661,24 @@ pub async fn prepare_fresh_agent_child_environment(
     child_env: &mut std::collections::BTreeMap<String, String>,
     prepared_opencode_plan: Option<&freshell_platform::opencode_config::OpencodeConfigPlan>,
 ) -> Result<(), String> {
+    prepare_fresh_agent_child_environment_with_provider_feature_runner(
+        launch,
+        child_env,
+        prepared_opencode_plan,
+        prepare_provider_features_for_identity,
+    )
+    .await
+}
+
+async fn prepare_fresh_agent_child_environment_with_provider_feature_runner<F>(
+    launch: &freshell_runtime_protocol::FreshAgentLaunchSpec,
+    child_env: &mut std::collections::BTreeMap<String, String>,
+    prepared_opencode_plan: Option<&freshell_platform::opencode_config::OpencodeConfigPlan>,
+    prepare_features: F,
+) -> Result<(), String>
+where
+    F: Fn(u32, u32, &[&str]) -> Result<Option<String>, String>,
+{
     use freshell_runtime_protocol::{FreshProvider, ProviderPreparation};
     prepare_scoped_mcp_environment(launch.provider_launch_context.as_ref(), child_env).await?;
     if launch.provider != FreshProvider::Opencode {
@@ -454,35 +744,23 @@ pub async fn prepare_fresh_agent_child_environment(
             .is_some_and(|context| context.prepared_inputs.is_some())
             && child_env.contains_key("OPENCODE_TUI_CONFIG");
         let source = child_env.get("OPENCODE_TUI_CONFIG").cloned();
-        if let Some(selector) = prepare_opencode_rebind(
-            launch.run_as_uid,
-            launch.run_as_gid,
-            prepared_tui,
-            source.as_deref(),
-        )? {
-            child_env.insert("OPENCODE_TUI_CONFIG".into(), selector.into());
+        if prepared_tui {
+            prepare_features(
+                launch.run_as_uid,
+                launch.run_as_gid,
+                &["opencode-rebind-source"],
+            )?;
+        } else {
+            prepare_opencode_rebind_tui_config(
+                child_env,
+                launch.run_as_uid,
+                launch.run_as_gid,
+                source.as_deref(),
+                &prepare_features,
+            )?;
         }
     }
     Ok(())
-}
-
-fn prepare_opencode_rebind(
-    uid: u32,
-    gid: u32,
-    prepared_source: bool,
-    selected: Option<&str>,
-) -> Result<Option<&'static str>, String> {
-    if prepared_source {
-        prepare_provider_features_for_identity(uid, gid, &["opencode-rebind-source"])?;
-        Ok(None)
-    } else {
-        let mut args = vec!["opencode-rebind"];
-        if let Some(selected) = selected {
-            args.push(selected);
-        }
-        prepare_provider_features_for_identity(uid, gid, &args)?;
-        Ok(Some("/home/freshell/provider/.freshell/opencode/tui.json"))
-    }
 }
 
 fn opencode_plan(
@@ -502,10 +780,37 @@ fn opencode_plan(
     .map_err(|error| error.to_string())
 }
 
-pub(crate) fn run_provider_features_worker(args: &[String]) -> Result<(), String> {
-    let provider_home = std::path::Path::new("/home/freshell/provider");
+pub(crate) fn run_provider_features_worker(
+    args: &[String],
+) -> Result<Option<std::path::PathBuf>, String> {
+    run_provider_features_worker_at(args, std::path::Path::new("/home/freshell/provider"))
+}
+
+fn run_provider_features_worker_at(
+    args: &[String],
+    provider_home: &std::path::Path,
+) -> Result<Option<std::path::PathBuf>, String> {
     match args {
-        [operation] if operation == "amplifier-packages" => prepare_amplifier_package_target(),
+        [operation] if operation == "amplifier-packages" => {
+            prepare_amplifier_package_target().map(|()| None)
+        }
+        [operation, bundle] if operation == "amplifier-profile" => {
+            let output = std::process::Command::new("/opt/amplifier-src/.venv/bin/python")
+                .arg("/opt/prepare-amplifier-profile.py")
+                .arg(bundle)
+                .env("HOME", provider_home)
+                .current_dir(provider_home)
+                .output()
+                .map_err(|_| "native Amplifier profile preparation did not start")?;
+            finish_provider_feature_worker_at_phase(
+                "amplifier-profile",
+                unsafe { libc::geteuid() },
+                unsafe { libc::getegid() },
+                "native_profile_process",
+                output,
+            )
+            .map(|_| None)
+        }
         [operation] if operation == "claude-mcp" => {
             use std::os::unix::fs::OpenOptionsExt;
             let destination = provider_home.join(".claude/freshell-mcp.json");
@@ -523,9 +828,11 @@ pub(crate) fn run_provider_features_worker(args: &[String]) -> Result<(), String
                 .open(destination)
                 .and_then(|mut file| std::io::Write::write_all(&mut file, &bytes))
                 .map_err(|error| error.to_string())
+                .map(|()| None)
         }
         [operation] if operation == "opencode-rebind-source" => {
             freshell_platform::opencode_plugin::ensure_rebind_plugin_source(provider_home)
+                .map(|_| None)
                 .map_err(|_| "managed OpenCode rebind plugin installation failed".into())
         }
         [operation] | [operation, _] if operation == "opencode-rebind" => {
@@ -541,7 +848,7 @@ pub(crate) fn run_provider_features_worker(args: &[String]) -> Result<(), String
                 provider_home,
                 selected,
             )
-            .map(|_| ())
+            .map(Some)
             .map_err(|error| error.to_string())
         }
         _ => Err("unknown provider feature preparation".into()),
@@ -627,6 +934,7 @@ pub async fn probe_resume(
     };
     match result {
         Ok(ProviderStoreProbe::Ready { evidence }) => {
+            resume_spec.claude_fork = None;
             if matches!(
                 provider.as_str(),
                 "phase1-fixture" | "native-session-fixture"
@@ -655,6 +963,10 @@ pub async fn probe_resume(
                 resume_spec: Box::new(resume_spec),
             }
         }
+        Ok(ProviderStoreProbe::ParentBackedClaudeFork { .. }) => RecoveryProbe::ResumeReady {
+            evidence_revision: resume_spec.evidence_revision,
+            resume_spec: Box::new(resume_spec),
+        },
         Ok(ProviderStoreProbe::DefinitivelyUnavailable {
             reason,
             evidence,
@@ -800,6 +1112,16 @@ mod provider_secret_context_tests {
     }
 
     #[test]
+    fn generic_provider_prepare_errors_keep_the_existing_diagnostic_fallback() {
+        let error = ProviderLaunchPreparationError::from("generic local preparation detail");
+        assert_eq!(
+            error.diagnostic_code_or(RuntimeDiagnosticCode::ProviderLaunchPrepareFailed),
+            RuntimeDiagnosticCode::ProviderLaunchPrepareFailed
+        );
+        assert_eq!(error.to_string(), "generic local preparation detail");
+    }
+
+    #[test]
     fn scoped_mcp_grant_becomes_provider_process_environment() {
         let grant = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
@@ -817,6 +1139,155 @@ mod provider_secret_context_tests {
             Some("fixture-scope")
         );
         assert_eq!(env.get("FRESHELL").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn feature_worker_nonzero_exit_preserves_opaque_error_and_selector_stdout() {
+        let owned = tempfile::tempdir().unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        let run_owned = |script: &str| {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", script])
+                .current_dir(owned.path())
+                .env("HOME", owned.path())
+                .output()
+                .unwrap()
+        };
+        let output =
+            run_owned("printf private-fixture-stdout; printf private-fixture-stderr >&2; exit 23");
+        assert_eq!(output.status.code(), Some(23));
+        let result = finish_provider_feature_worker("amplifier-profile", uid, gid, output);
+        assert_eq!(
+            result.unwrap_err(),
+            "prepare provider features failed: amplifier-profile (phase=feature_worker, exit_code=23, signal=none)"
+        );
+        let output = run_owned("printf '/owned/selector.json\\n'");
+        assert_eq!(
+            finish_provider_feature_worker("opencode-rebind", uid, gid, output).unwrap(),
+            Some("/owned/selector.json".into())
+        );
+    }
+
+    #[test]
+    fn feature_worker_spawned_failure_reports_body_free_exit_status() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "providers::provider_secret_context_tests::feature_worker_nonzero_exit_preserves_opaque_error_and_selector_stdout", "--nocapture"]).output().unwrap();
+        assert!(output.status.success(), "owned behavior child failed");
+        assert!(
+            std::str::from_utf8(&output.stdout)
+                .unwrap()
+                .contains("test result: ok. 1 passed;"),
+            "actual spawned behavior must execute exactly one test"
+        );
+        let events = std::str::from_utf8(&output.stderr)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events.len(),
+            1,
+            "actual nonzero worker status must produce one structured refusal"
+        );
+        assert_eq!(events[0]["event"], "provider.feature_preparation.failed");
+        assert_eq!(events[0]["severity"], "error");
+        assert_eq!(events[0]["operation"], "amplifier-profile");
+        assert_eq!(events[0]["exit_code"], 23);
+        assert!(events[0]["signal"].is_null());
+        assert_eq!(events[0]["uid"], unsafe { libc::geteuid() });
+        assert_eq!(events[0]["gid"], unsafe { libc::getegid() });
+        assert!(events[0]["stdout_bytes"].as_u64().unwrap() > 0);
+        assert!(events[0]["stderr_bytes"].as_u64().unwrap() > 0);
+        assert!(!serde_json::to_string(&events)
+            .unwrap()
+            .contains("private-fixture"));
+        assert!(!serde_json::to_string(&events).unwrap().contains("/owned"));
+    }
+
+    #[test]
+    fn amplifier_profile_failure_reaches_caller_without_private_output() {
+        let owned = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", "printf '%s\\n' '{\"event\":\"amplifier.selected_profile.failed\",\"severity\":\"error\",\"phase\":\"read_bundle\",\"exception_type\":\"FileNotFoundError\"}' >&2; printf private-fixture-details >&2; exit 19"])
+            .current_dir(owned.path())
+            .output()
+            .unwrap();
+        let error = finish_provider_feature_worker(
+            "amplifier-profile",
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() },
+            output,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("exit_code=19"),
+            "actual worker exit must reach caller: {error}"
+        );
+        assert!(
+            error.contains("profile_phase=read_bundle"),
+            "native phase must reach caller: {error}"
+        );
+        assert!(
+            error.contains("profile_exception=FileNotFoundError"),
+            "native exception class must reach caller: {error}"
+        );
+        assert!(!error.contains("private-fixture"));
+    }
+
+    #[test]
+    fn native_profile_failure_survives_both_worker_boundaries() {
+        const CHILD: &str = "FRESHELL_TEST_NATIVE_PROFILE_FAILURE_CHILD";
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        if std::env::var_os(CHILD).is_some() {
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", "printf '%s\\n' '{\"event\":\"amplifier.selected_profile.failed\",\"phase\":\"write_native_settings\",\"exception_type\":\"PermissionError\"}' >&2; printf private-fixture-details >&2; exit 17"])
+                .output()
+                .unwrap();
+            let error = finish_provider_feature_worker_at_phase(
+                "amplifier-profile",
+                uid,
+                gid,
+                "native_profile_process",
+                output,
+            )
+            .unwrap_err();
+            assert!(error.contains("exit_code=17"));
+            std::process::exit(1);
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "providers::provider_secret_context_tests::native_profile_failure_survives_both_worker_boundaries", "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("private-fixture"));
+        let error =
+            finish_provider_feature_worker("amplifier-profile", uid, gid, output).unwrap_err();
+        assert!(error.contains("exit_code=1"));
+        assert!(error.contains("native_exit_code=17"));
+        assert!(error.contains("profile_phase=write_native_settings"));
+        assert!(error.contains("profile_exception=PermissionError"));
+    }
+
+    #[test]
+    fn amplifier_profile_failure_does_not_copy_unrecognized_diagnostics() {
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", "printf '%s\\n' '{\"event\":\"amplifier.selected_profile.failed\",\"phase\":\"private-fixture-phase\",\"exception_type\":\"private-fixture-error\"}' >&2; exit 11"])
+            .output()
+            .unwrap();
+        let error = finish_provider_feature_worker(
+            "amplifier-profile",
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() },
+            output,
+        )
+        .unwrap_err();
+        assert!(error.contains("exit_code=11"));
+        assert!(!error.contains("private-fixture"));
+        assert!(!error.contains("profile_phase="));
+        assert!(!error.contains("profile_exception="));
     }
 
     #[test]
@@ -856,5 +1327,200 @@ mod provider_secret_context_tests {
                 "native-one"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn managed_amplifier_prepares_only_selected_ordinary_profile() {
+        let mut terminal: freshell_runtime_protocol::TerminalLaunchSpec =
+            serde_json::from_value(serde_json::json!({
+                "terminalId":"terminal-amplifier-profile", "streamId":"stream-amplifier-profile",
+                "mode":"amplifier", "program":"amplifier", "args":["run","--mode","chat"],
+                "cwd":"/workspace", "runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,
+                "projectKey":"selected-profile","workspacePath":"/workspace"
+            }))
+            .unwrap();
+        terminal.provider_launch_context = Some(ProviderLaunchContext {
+            preparation: ProviderPreparation::Amplifier {
+                bundle: "default".into(),
+                resume_args: vec![],
+            },
+            config: vec![],
+            mcp_capability: None,
+            prepared_inputs: None,
+        });
+        let invoked = std::cell::Cell::new(0);
+        let prepared = prepare_terminal_with_provider_feature_runner(
+            terminal,
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+            |uid, gid, args| {
+                assert_eq!((uid, gid), (65534, 0));
+                match invoked.get() {
+                    0 => assert_eq!(args, ["amplifier-packages"]),
+                    1 => assert_eq!(args, ["amplifier-profile", "default"]),
+                    _ => panic!("provider preparation repeated an ordinary feature"),
+                }
+                invoked.set(invoked.get() + 1);
+                Ok(None)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            invoked.get(),
+            2,
+            "package setup and only the selected profile must run under provider identity"
+        );
+        assert_eq!(prepared.terminal.args, ["run", "--mode", "chat"]);
+        let refusal = "prepare provider features failed: amplifier-profile (phase=feature_worker, exit_code=1, signal=none, profile_phase=read_bundle, profile_exception=FileNotFoundError)";
+        let result = prepare_terminal_with_provider_feature_runner(
+            prepared.terminal,
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+            |_, _, args| match args {
+                ["amplifier-packages"] => Ok(None),
+                ["amplifier-profile", "default"] => Err(refusal.into()),
+                _ => panic!("unexpected provider feature selection"),
+            },
+        )
+        .await;
+        assert_eq!(
+            result.err().unwrap().to_string(),
+            refusal,
+            "preparation refusal must reach the existing launch caller"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_terminal_uses_worker_returned_opencode_tui_selector_path() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = "/home/freshell/provider/.config/opencode/user-tui.jsonc";
+        let generated = "/home/freshell/provider/.freshell/opencode/tui-abc123.json";
+        let mut terminal: freshell_runtime_protocol::TerminalLaunchSpec =
+            serde_json::from_value(serde_json::json!({
+                "terminalId":"terminal-selected-tui", "streamId":"stream-selected-tui",
+                "mode":"opencode", "program":"opencode", "args":[],
+                "env":{"OPENCODE_TUI_CONFIG":source}, "cwd":workspace.path(),
+                "runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,
+                "projectKey":"selected-tui", "workspacePath":workspace.path()
+            }))
+            .unwrap();
+        terminal
+            .env
+            .insert("OPENCODE_TUI_CONFIG".into(), source.into());
+
+        let prepared = prepare_terminal_with_provider_feature_runner(
+            terminal,
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+            |uid, gid, args| {
+                assert_eq!((uid, gid), (65534, 0));
+                assert_eq!(args, ["opencode-rebind", source]);
+                Ok(Some(generated.into()))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            prepared.terminal.env.get("OPENCODE_TUI_CONFIG"),
+            Some(&generated.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_fresh_opencode_uses_worker_returned_tui_selector_path() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = "/home/freshell/provider/.config/opencode/user-tui.jsonc";
+        let generated = "/home/freshell/provider/.freshell/opencode/tui-def456.json";
+        let launch: freshell_runtime_protocol::FreshAgentLaunchSpec =
+            serde_json::from_value(serde_json::json!({
+                "sessionId":"fresh-selected-tui", "provider":"opencode",
+                "sessionType":"freshopencode", "runtimeVariant":"default",
+                "providerStoreId":"fresh-selected-tui-store", "cwd":workspace.path(),
+                "workspacePath":workspace.path(), "runAsUid":65534,"runAsGid":0
+            }))
+            .unwrap();
+        let mut child_env = std::collections::BTreeMap::from([(
+            "OPENCODE_TUI_CONFIG".to_string(),
+            source.to_string(),
+        )]);
+
+        prepare_fresh_agent_child_environment_with_provider_feature_runner(
+            &launch,
+            &mut child_env,
+            None,
+            |uid, gid, args| {
+                assert_eq!((uid, gid), (65534, 0));
+                assert_eq!(args, ["opencode-rebind", source]);
+                Ok(Some(generated.into()))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            child_env.get("OPENCODE_TUI_CONFIG").map(String::as_str),
+            Some(generated)
+        );
+    }
+
+    #[test]
+    fn opencode_feature_worker_returns_the_materialized_selected_selector() {
+        let provider_home = tempfile::tempdir().unwrap();
+        let source = provider_home.path().join("user-tui.jsonc");
+        std::fs::write(&source, r#"{"theme":"dark","plugin":["file:///user.ts"]}"#).unwrap();
+        let args = vec!["opencode-rebind".to_string(), source.display().to_string()];
+
+        let generated = run_provider_features_worker_at(&args, provider_home.path())
+            .unwrap()
+            .unwrap();
+        assert!(generated.starts_with(provider_home.path().join(".freshell/opencode")));
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&generated).unwrap()).unwrap();
+        assert_eq!(config["theme"], "dark");
+        assert_eq!(config["plugin"][0], "file:///user.ts");
+        assert_eq!(config["plugin"].as_array().unwrap().len(), 2);
+
+        let stdout = format!("{}\n", generated.display());
+        assert_eq!(
+            parse_provider_feature_worker_output("opencode-rebind", stdout.as_bytes()).unwrap(),
+            Some(generated.display().to_string())
+        );
+        assert_eq!(
+            parse_provider_feature_worker_output("claude-mcp", b"").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn opencode_feature_worker_returns_default_selector_path_without_selection() {
+        let provider_home = tempfile::tempdir().unwrap();
+        let args = vec!["opencode-rebind".to_string()];
+
+        let generated = run_provider_features_worker_at(&args, provider_home.path())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            generated,
+            freshell_platform::opencode_plugin::tui_config_path(provider_home.path())
+        );
+        assert_eq!(
+            std::fs::read_to_string(generated).unwrap(),
+            freshell_platform::opencode_plugin::tui_config_content(
+                &freshell_platform::opencode_plugin::rebind_plugin_path(provider_home.path())
+            )
+        );
+    }
+
+    #[test]
+    fn opencode_feature_worker_output_rejects_missing_or_ambiguous_selector_paths() {
+        for stdout in [b"".as_slice(), b"relative/path\n", b"/one\n/two\n"] {
+            assert!(parse_provider_feature_worker_output("opencode-rebind", stdout).is_err());
+        }
     }
 }

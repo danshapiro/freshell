@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto'
-import { spawn, spawnSync } from 'node:child_process'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
+import { createRequire } from 'node:module'
 import os from 'node:os'
 import fs from 'node:fs/promises'
 import http from 'node:http'
@@ -8,8 +9,10 @@ import { pathToFileURL } from 'node:url'
 import { describe, expect, it, vi } from 'vitest'
 
 import { parseHelperCreateDelay, RestrictedDockerBroker, type ClaudeCandidateAuthorization, type PreparedInputAuthorization } from '../../../../scripts/testing/runtime-test-broker.js'
+import { findInitialProviderVolume, type InitialProviderRegistrySource } from '../../../../scripts/testing/initial-provider-volume.js'
+import { buildRunOwnedRuntimeImage } from '../../../../scripts/testing/runtime-sandbox.js'
 import { authorizeFreshAgentParityRequest, authorizeProviderParityRequest, captureProviderParityVolumes, cleanupProviderParityVolumes } from '../../../helpers/provider-parity-broker.js'
-import { makeProviderParityResourcesReadable, providerParityCommands, providerParityFailureDiagnostics, writeProviderParityEnvironment } from '../../../helpers/provider-parity-environment.js'
+import { makeProviderParityResourcesReadable, providerParityCommands, providerParityFailureDiagnostics, providerParityFailureLogTail, writeProviderParityEnvironment } from '../../../helpers/provider-parity-environment.js'
 
 it('executes file and package TUI entrypoints while observing the selected project settings', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-parity-selection-'))
@@ -31,7 +34,7 @@ it('executes file and package TUI entrypoints while observing the selected proje
     const consumer = `import { observeOpenCodeParitySelection } from ${JSON.stringify(pathToFileURL(path.resolve('test/fixtures/providers/parity-provider.mjs')).href)};
 process.stdout.write(JSON.stringify(await observeOpenCodeParitySelection(...process.argv.slice(1), { command: 'actual-mcp', args: ['argument'] })));`
     const inspect = () => {
-      const child = spawnSync(process.execPath, ['--input-type=module', '-e', consumer, home, workspace, selectedTui], { encoding: 'utf8' })
+      const child = spawnSync(process.execPath, ['--experimental-transform-types', '--input-type=module', '-e', consumer, home, workspace, selectedTui], { encoding: 'utf8' })
       expect(child.error).toBeUndefined()
       expect(child.status, child.stderr).toBe(0)
       return JSON.parse(child.stdout)
@@ -177,6 +180,58 @@ it('serializes rejected target paths in managed provider launch broker failures'
   }
 })
 
+import { execFile } from 'node:child_process'
+
+import { TASK007_BATCH_STORE_PROBE } from '../../../../scripts/testing/runtime-sandbox.js'
+
+it.each(['owner-first', 'broker-first'])('initializes the actual ESM owner/broker cycle with %s', async order => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'task008-batch-esm-'))
+  const ownerUrl = pathToFileURL(path.join(process.cwd(), 'scripts/testing/runtime-sandbox.ts')).href
+  const brokerUrl = pathToFileURL(path.join(process.cwd(), 'scripts/testing/runtime-test-broker.ts')).href
+  const imports = order === 'owner-first' ? [ownerUrl, brokerUrl] : [brokerUrl, ownerUrl]
+  try {
+    const output = await new Promise<string>((resolve, reject) => execFile(process.execPath,
+      ['--import', path.join(process.cwd(), 'node_modules/tsx/dist/loader.mjs'), '--input-type=module', '-e',
+        `await import(${JSON.stringify(imports[0])});await import(${JSON.stringify(imports[1])});const {RestrictedDockerBroker}=await import(${JSON.stringify(brokerUrl)});const broker=new RestrictedDockerBroker(${JSON.stringify({ realSocketPath: path.join(directory, 'unused.sock'), proxySocketPath: path.join(directory, 'proxy.sock'),
+          runtimeRootPrefix: directory, allowedHostBinaryPaths: [], allowedImageRefs: [], testRunId: 'esm-owned', logPath: path.join(directory, 'broker.jsonl') })});await broker.start();await broker.close();process.stdout.write(String(broker.historyHelperNames().length));`],
+      { encoding: 'utf8', timeout: 15_000 }, (error, stdout) => error ? reject(error) : resolve(stdout)))
+    expect(output).toBe('0')
+    await expect(fs.stat(path.join(directory, 'proxy.sock'))).rejects.toHaveProperty('code', 'ENOENT')
+  } finally { await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+it('settles an owner request failure with a structured refusal and closes the exact socket', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'task008-broker-rejection-'))
+  const socket = path.join(root, 'broker.sock')
+  const instance = new RestrictedDockerBroker({
+    realSocketPath: path.join(root, 'unused-daemon.sock'), proxySocketPath: socket,
+    runtimeRootPrefix: path.join(root, 'r'), allowedHostBinaryPaths: new Set(),
+    allowedImageRefs: new Set(), testRunId: 'run-rejection', logPath: path.join(root, 'events.jsonl'),
+  })
+  const local = instance as unknown as { handle(): Promise<void> }
+  local.handle = async () => { throw new Error('private diagnostic must not enter the refusal') }
+  try {
+    await instance.start()
+    const result = await new Promise<string>((resolve) => {
+      const request = http.get({ socketPath: socket, path: '/_ping' })
+      request.on('response', response => {
+        response.resume()
+        response.on('end', () => resolve('unexpected response'))
+      })
+      request.on('error', (error: NodeJS.ErrnoException) => resolve(error.code ?? error.message))
+      request.setTimeout(500, () => request.destroy(new Error('probe timeout')))
+    })
+    expect(result).toBe('ECONNRESET')
+    expect(instance.eventsSnapshot()).toMatchObject([{
+      severity: 'warn', decision: 'block', reason: 'owner_request_failed', unsafeAttempt: false,
+    }])
+    expect(await fs.readFile(path.join(root, 'events.jsonl'), 'utf8')).not.toContain('private diagnostic')
+  } finally {
+    await instance.close()
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
 it('executes selected OpenCode resources after fixture readability preparation', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-parity-readable-'))
   try {
@@ -219,6 +274,84 @@ it('executes the isolated parity command from a different controller directory',
     expect(JSON.parse(execution.stdout)).toEqual({ dependency: 'installed-dependency-nonce', resource: 'selected-resource-nonce', entries: 4201 })
   } finally { await fs.rm(directory, { recursive: true, force: true }) }
 })
+it.each(['response', 'disconnect'])('records the actual upstream request and its %s settlement without private data', async settlement => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'frs-broker-transport-'))
+  const upstreamSocket = path.join(root, 'upstream.sock')
+  const proxySocket = path.join(root, 'proxy.sock')
+  const logPath = path.join(root, 'broker.jsonl')
+  let release!: () => void
+  const held = new Promise<void>(resolve => { release = resolve })
+  let accepted!: () => void
+  const arrived = new Promise<void>(resolve => { accepted = resolve })
+  const upstream = http.createServer(async (request, response) => {
+    request.resume()
+    accepted()
+    await held
+    if (settlement === 'disconnect') { request.socket.destroy(); return }
+    response.writeHead(503, { 'x-private-diagnostic': 'private-header' })
+    response.end('private-response-body')
+  })
+  const instance = new RestrictedDockerBroker({ realSocketPath: upstreamSocket, proxySocketPath: proxySocket,
+    runtimeRootPrefix: path.join(root, 'r'), allowedHostBinaryPaths: new Set(), allowedImageRefs: new Set(),
+    testRunId: 'transport-only', logPath })
+  const diagnostics = async () => (await fs.readFile(logPath, 'utf8').catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return ''
+    throw error
+  })).trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+    .filter(event => event.event?.startsWith('runtime.broker.request_'))
+  try {
+    await new Promise<void>(resolve => upstream.listen(upstreamSocket, resolve))
+    await instance.start()
+    const response = new Promise<{ status: number; body: string } | { error: string }>(resolve => {
+      const request = http.get({ socketPath: proxySocket, path: '/_ping' }, reply => {
+        const chunks: Buffer[] = []
+        reply.on('data', chunk => chunks.push(Buffer.from(chunk)))
+        reply.once('end', () => resolve({ status: reply.statusCode!, body: Buffer.concat(chunks).toString() }))
+      })
+      request.once('error', (error: NodeJS.ErrnoException) => resolve({ error: error.code! }))
+    })
+    await arrived
+    const started = await diagnostics()
+    expect(started).toHaveLength(1)
+    expect(started[0]).toMatchObject({ event: 'runtime.broker.request_started', severity: 'info', method: 'GET', route: 'daemon_ping' })
+    expect(started[0].requestId).toEqual(expect.any(String))
+    expect(instance.eventsSnapshot()).toEqual([])
+    const holdStarted = performance.now()
+    await new Promise(resolve => setTimeout(resolve, 25))
+    const holdDuration = performance.now() - holdStarted
+    release()
+    const result = await response
+    expect(result).toEqual(settlement === 'response' ? { status: 503, body: 'private-response-body' } : { error: 'ECONNRESET' })
+    const events = await diagnostics()
+    expect(events).toHaveLength(2)
+    expect(events[1]).toMatchObject({ event: 'runtime.broker.request_completed', requestId: started[0].requestId,
+      severity: settlement === 'response' ? 'info' : 'warn', method: 'GET', route: 'daemon_ping',
+      ...(settlement === 'response' ? { statusCode: 503 } : { errorCategory: 'upstream_request_failed' }) })
+    expect(events[1].durationMs).toEqual(expect.any(Number))
+    expect(events[1].durationMs).toBeGreaterThanOrEqual(holdDuration)
+    const phases = events[1].transportPhases
+    expect(phases).toMatchObject({ socketAssignedMs: expect.any(Number), requestFinishedMs: expect.any(Number),
+      reusedSocket: false, socketConnectingAtAssignment: expect.any(Boolean) })
+    expect(phases.requestFinishedMs).toBeGreaterThanOrEqual(phases.socketAssignedMs)
+    expect(phases.requestFinishedMs).toBeLessThanOrEqual(events[1].durationMs)
+    if (settlement === 'response') {
+      expect(phases.responseHeadersMs - phases.requestFinishedMs).toBeGreaterThanOrEqual(holdDuration)
+      expect(phases.responseEndMs).toBeGreaterThanOrEqual(phases.responseHeadersMs)
+      expect(phases.responseEndMs).toBeLessThanOrEqual(events[1].durationMs)
+    } else {
+      expect(phases.responseHeadersMs).toBeNull()
+      expect(phases.responseEndMs).toBeNull()
+    }
+    expect((await fs.readFile(logPath, 'utf8'))).not.toMatch(/private-header|private-response-body/)
+    expect(instance.unsafeAttempts()).toEqual([])
+  } finally {
+    release()
+    upstream.closeAllConnections()
+    await instance.close()
+    await new Promise<void>(resolve => upstream.close(() => resolve()))
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
 
 const runtimeDir = '/tmp/owned/r/scenario/x/incarnation-one'
 const actorKey = createHash('sha256').update('installation-one\0soul-one').digest('hex')
@@ -248,7 +381,7 @@ function createBody(
       ReadonlyRootfs: true,
       Privileged: false,
       CapDrop: ['ALL'],
-      CapAdd: ['CHOWN', 'SETGID', 'SETUID'],
+      CapAdd: ['CHOWN', 'KILL', 'SETGID', 'SETUID'],
       SecurityOpt: ['no-new-privileges:true'],
       RestartPolicy: { Name: 'no' },
       NanoCpus: 500_000_000,
@@ -370,6 +503,32 @@ describe('managed runtime broker actor storage', () => {
     expect(validate(createBody([
       ...ordinaryBinds,
       '/tmp/owned/r/scenario/x/souls/soul-other/actor:/run/freshell-host-actor:rw',
+    ])).ok).toBe(false)
+  })
+})
+
+describe('managed OpenCode transfer stage mount', () => {
+  it('allows only the read-only ready bundle owned by the active runtime root', () => {
+    const validate = (body: Buffer): { ok: boolean } => (
+      broker() as unknown as { validateCreate(body: Buffer): { ok: boolean } }
+    ).validateCreate(body)
+    const stageRoot = path.join(path.dirname(runtimeDir), 'opencode-transfers')
+    const target = '/run/freshell-opencode-transfer'
+
+    expect(validate(createBody([
+      ...ordinaryBinds,
+      actorBind,
+      `${path.join(stageRoot, 'opencode-transfer-123.ready')}:${target}:ro`,
+    ])).ok).toBe(true)
+    expect(validate(createBody([
+      ...ordinaryBinds,
+      actorBind,
+      `/tmp/owned/r/scenario/other/x/opencode-transfers/opencode-transfer-123.ready:${target}:ro`,
+    ])).ok).toBe(false)
+    expect(validate(createBody([
+      ...ordinaryBinds,
+      actorBind,
+      `${path.join(stageRoot, 'opencode-transfer-123.ready')}:${target}:rw`,
     ])).ok).toBe(false)
   })
 })
@@ -559,6 +718,101 @@ const ownedId = 'a'.repeat(64)
 const helperId = 'b'.repeat(64)
 const providerVolume = 'freshell-provider-aaaaaaaaaaaaaaaaaaaaaaaa'
 const helperName = 'freshell-history-11111111-1111-4111-8111-111111111111'
+function batchStoreHelperBody() {
+  const body = historyHelperBody()
+  return { ...body, Image: `sha256:${'b'.repeat(64)}`, Tty: false, Entrypoint: ['node'], WorkingDir: '/workspace',
+    Cmd: ['--no-warnings', '-e', TASK007_BATCH_STORE_PROBE, '/home/freshell/provider/.local/share/opencode/opencode.db', 'ses_batch'],
+    HostConfig: { ...body.HostConfig, Mounts: [body.HostConfig.Mounts[1],
+      { Type: 'bind', Source: '/workspace', Target: '/workspace', ReadOnly: true }] } }
+}
+
+function semanticBatchStoreHelperBody() {
+  const body = batchStoreHelperBody()
+  body.Cmd.push('/run/freshell-opencode-reader.frame', '/workspace')
+  body.Env.push('XDG_DATA_HOME=/home/freshell/provider/.local/share', 'XDG_CONFIG_HOME=/home/freshell/provider/.config',
+    'OPENCODE_DB=/home/freshell/provider/.local/share/opencode/opencode.db')
+  body.HostConfig.Mounts.push(
+    { Type: 'bind', Source: '/tmp/owned/freshell-session-host', Target: '/runtime/freshell-session-host', ReadOnly: true },
+    { Type: 'bind', Source: `${runtimeDir}/task007-reader-descriptor.frame`, Target: '/run/freshell-opencode-reader.frame', ReadOnly: true })
+  return body
+}
+it('routes only the exact owner-bound immutable descriptor reader and refuses wider transport', async () => {
+  await withHttpBroker(async ({ request, forwarded }) => {
+    const original = { ...JSON.parse(createBody([...ordinaryBinds, actorBind]).toString()), Image: `sha256:${'b'.repeat(64)}` }
+    expect((await request('POST', '/v1.47/containers/create?name=owned-runtime', original)).status).toBe(201)
+    const mutations = [
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.Image = 'sha256:other-approved-image' },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.User = '0:0' },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.User = '65534:1' },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.Cmd[4] = '../foreign' },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.Cmd[5] = '/foreign.frame' },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.Cmd.push('extra') },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.Cmd[2] += ';process.exit(0)' },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.HostConfig.Mounts[0].Source = 'foreign-volume' },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.HostConfig.Mounts[0].ReadOnly = false },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.HostConfig.Mounts[2].Source = '/tmp/owned/other-approved-host' },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.HostConfig.Mounts[3].Source = '/tmp/owned/r/foreign/task007-reader-descriptor.frame' },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.HostConfig.Mounts[3].ReadOnly = false },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.HostConfig.Mounts.push({Type:'bind',Source:'/foreign',Target:'/foreign',ReadOnly:true}) },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.Env.push('TOKEN=foreign') },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.WorkingDir = '/foreign' },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.Cmd[6] = '/foreign' },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { Object.assign(b, { Cmd: [...b.Cmd.slice(0, 6), {}] }) },
+    ]
+    for (const mutate of mutations) {
+      const body = semanticBatchStoreHelperBody(); mutate(body)
+      const before = forwarded.length
+      expect((await request('POST', `/v1.47/containers/create?name=${helperName}`, body)).status).toBe(403)
+      expect(forwarded).toHaveLength(before)
+    }
+    expect((await request('POST', `/v1.47/containers/create?name=${helperName}`, semanticBatchStoreHelperBody())).status).toBe(201)
+    expect((await request('POST', `/v1.47/containers/${helperId}/attach?stdin=1&stream=1`)).status).toBe(403)
+    expect((await request('POST', `/v1.47/containers/${helperId}/start`)).status).toBe(204)
+    expect((await request('POST', `/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200)
+    expect((await request('GET', `/v1.47/containers/${helperId}/logs?stdout=1&stderr=1`)).status).toBe(200)
+    expect((await request('DELETE', `/v1.47/containers/${helperName}?force=1`)).status).toBe(204)
+  })
+})
+
+it('tracks the fixed batch Node reader and refuses every altered capability before forwarding', async () => {
+  await withHttpBroker(async ({ request, forwarded, broker }) => {
+    const original = { ...JSON.parse(createBody([...ordinaryBinds, actorBind]).toString()), Image: `sha256:${'b'.repeat(64)}` }
+    expect((await request('POST', '/v1.47/containers/create?name=owned-runtime', original)).status).toBe(201)
+    const mutations = [
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.Cmd[2] += '\nprocess.exit(0)' },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.Cmd[3] = '/foreign.db' },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.Cmd[4] = '../foreign' },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.Cmd.push('foreign') },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.User = '0:0' },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.Tty = true },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.Image = 'sha256:fixture-image' },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.Image = `sha256:${'f'.repeat(64)}` },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.Env.push('TOKEN=foreign') },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.HostConfig.Mounts[0].Source = 'foreign-volume' },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.HostConfig.Mounts[0].ReadOnly = false },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.HostConfig.Mounts[1].Source = '/foreign' },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.WorkingDir = '/foreign' },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.HostConfig.CapDrop = [] },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { Object.assign(body.HostConfig, { CapAdd: ['SYS_ADMIN'] }) },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.HostConfig.SecurityOpt = [] },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.HostConfig.Tmpfs['/tmp'] = 'rw,exec,size=16m' },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.HostConfig.NetworkMode = 'bridge' },
+      (body: ReturnType<typeof batchStoreHelperBody>) => { body.HostConfig.ReadonlyRootfs = false },
+    ]
+    for (const mutate of mutations) {
+      const body = batchStoreHelperBody(); mutate(body)
+      const before = forwarded.length
+      expect((await request('POST', `/v1.47/containers/create?name=${helperName}`, body)).status).toBe(403)
+      expect(forwarded).toHaveLength(before)
+    }
+    expect((await request('POST', `/v1.47/containers/create?name=${helperName}`, batchStoreHelperBody())).status).toBe(201)
+    expect(broker.receiptIds()).toContain(helperId)
+    expect((await request('POST', `/v1.47/containers/${helperId}/start`)).status).toBe(204)
+    expect((await request('POST', `/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200)
+    expect((await request('GET', `/v1.47/containers/${helperId}/logs?stdout=1&stderr=1`)).status).toBe(200)
+    expect((await request('DELETE', `/v1.47/containers/${helperName}?force=1`)).status).toBe(204)
+  })
+})
 function historyHelperBody() {
   return {
     Image: 'sha256:fixture-image',
@@ -674,6 +928,9 @@ function candidateHelperBody(input: ClaudeCandidateAuthorization, role: 'mountpo
     { Type: 'bind', Source: input.workspacePath, Target: input.workspacePath, ReadOnly: true },
     { Type: 'bind', Source: `${exchange}/ordinary-stage`, Target: '/run/freshell-candidate-inputs', ReadOnly: true },
   )
+  if (input.gitCommonDir && input.gitCommonDir !== input.workspacePath && !input.gitCommonDir.startsWith(`${input.workspacePath}/`)) {
+    body.HostConfig.Mounts.push({ Type: 'bind', Source: input.gitCommonDir, Target: input.gitCommonDir, ReadOnly: true })
+  }
   const selected = new Set(['.freshell/claude-candidate-binding.json', '.freshell/prepared-context.json', '.freshell/prepared-result.json', input.manifestRelativePath,
     ...input.configurationBinds.map((bind) => bind.sourceRelativePath), ...input.resourceMounts.map((mount) => mount.stageRelativePath)])
   for (const relative of selected) body.HostConfig.Mounts.push({ Type: 'bind', Source: `${input.stageRoot}/${relative}`, Target: `/run/freshell-candidate-inputs/${relative}`, ReadOnly: true })
@@ -692,9 +949,38 @@ function candidateHelperBody(input: ClaudeCandidateAuthorization, role: 'mountpo
 }
 
 describe('fixed initial Claude candidate broker', () => {
-  it('observes retained sources through the exact frozen ordinary aliases and read-only owned HOME', async () => {
+  it('qualifies a linked checkout candidate using only its selected Git common directory', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker: instance }) => {
+      const input = { ...candidateAuthorization(), gitCommonDir: '/workspace-git' }
+      instance.authorizeInitialProviderVolume(sourceAuthorization())
+      expect(() => instance.authorizeClaudeCandidate({ ...input, gitCommonDir: '/outside-git' })).toThrow()
+      instance.authorizeClaudeCandidate(input)
+      const volume = `freshell-claude-candidate-${input.requestId}`
+      expect((await request('POST', '/v1.47/volumes/create', { Name: volume, Driver: 'local', DriverOpts: {}, Labels: candidateLabels(input) })).status).toBe(201)
+      const name = 'freshell-claude-candidate-reader-11111111-1111-4111-8111-111111111111'
+      const body = candidateHelperBody(input, 'reader'), before = forwarded.length
+      for (const mutation of ['outside', 'alias', 'writable', 'missing', 'duplicate']) {
+        const changed = structuredClone(body)
+        const common = changed.HostConfig.Mounts.find((mount: any) => mount.Source === input.gitCommonDir)
+        if (mutation === 'outside') common.Source = common.Target = '/outside-git'
+        if (mutation === 'alias') common.Target = '/workspace/.git'
+        if (mutation === 'writable') common.ReadOnly = false
+        if (mutation === 'missing') changed.HostConfig.Mounts = changed.HostConfig.Mounts.filter((mount: any) => mount !== common)
+        if (mutation === 'duplicate') changed.HostConfig.Mounts.push(structuredClone(common))
+        expect((await request('POST', `/v1.47/containers/create?name=${name}`, changed)).status, mutation).toBe(403)
+        expect(forwarded).toHaveLength(before)
+      }
+      expect((await request('POST', `/v1.47/containers/create?name=${name}`, body)).status).toBe(201)
+      expect((await request('POST', `/v1.47/containers/${helperId}/start`)).status).toBe(204)
+      expect((await request('POST', `/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200)
+      expect((await request('DELETE', `/v1.47/containers/${helperId}?force=1`)).status).toBe(204)
+      expect((await request('GET', `/v1.47/containers/${helperId}/json`)).status).toBe(404)
+      expect((await request('DELETE', `/v1.47/volumes/${volume}`)).status).toBe(204)
+    }, { gitWorkspace: '/workspace-git' })
+  })
+  it.each([undefined, '/workspace-git'])('observes retained sources through the exact frozen ordinary aliases and read-only owned HOME (%s)', async (gitCommonDir) => {
     await withHttpBroker(async ({request, forwarded, broker: instance}) => {
-      const input = candidateAuthorization(), body = sourceHelperBody()
+      const input = { ...candidateAuthorization(), gitCommonDir }, body = sourceHelperBody()
       instance.authorizeInitialProviderVolume(sourceAuthorization())
       instance.authorizeClaudeCandidate(input)
       body.HostConfig.Tmpfs = {}
@@ -703,16 +989,22 @@ describe('fixed initial Claude candidate broker', () => {
         ...input.configurationBinds.map(bind => ({Type:'bind',Source:`${input.stageRoot}/${bind.sourceRelativePath}`,Target:bind.effectiveDestination,ReadOnly:true})),
         ...input.resourceMounts.map(unit => ({Type:'volume',Source:input.providerVolumeName,Target:unit.effectiveDestination,ReadOnly:true,VolumeOptions:{NoCopy:true,Subpath:unit.providerRelativePath}})),
       )
+      if (gitCommonDir) body.HostConfig.Mounts.push({Type:'bind',Source:gitCommonDir,Target:gitCommonDir,ReadOnly:true})
       const before = forwarded.length
-      for (const mutation of ['home-write','foreign-home','alias-write','alias-subpath','alias-source','missing-alias','native-history']) {
+      for (const mutation of ['home-write','foreign-home','alias-write','alias-subpath','alias-source','missing-alias','native-history',
+        ...(gitCommonDir ? ['common-write','common-source','common-alias','missing-common'] : [])]) {
         const changed = structuredClone(body)
         if (mutation === 'home-write') changed.HostConfig.Mounts[3].ReadOnly = false
         if (mutation === 'foreign-home') changed.HostConfig.Mounts[3].Source = 'foreign-home'
-        if (mutation === 'alias-write') changed.HostConfig.Mounts.at(-1).ReadOnly = false
-        if (mutation === 'alias-subpath') changed.HostConfig.Mounts.at(-1).VolumeOptions.Subpath = '.claude/projects'
+        if (mutation === 'alias-write') changed.HostConfig.Mounts[5].ReadOnly = false
+        if (mutation === 'alias-subpath') changed.HostConfig.Mounts[5].VolumeOptions.Subpath = '.claude/projects'
         if (mutation === 'alias-source') changed.HostConfig.Mounts[4].Source = `${input.stageRoot}/.freshell/mcp-capability.json`
-        if (mutation === 'missing-alias') changed.HostConfig.Mounts.pop()
+        if (mutation === 'missing-alias') changed.HostConfig.Mounts.splice(5, 1)
         if (mutation === 'native-history') changed.HostConfig.Mounts.push({Type:'volume',Source:input.providerVolumeName,Target:'/history',ReadOnly:true,VolumeOptions:{NoCopy:true,Subpath:'.claude/projects'}})
+        if (mutation === 'common-write') changed.HostConfig.Mounts.at(-1).ReadOnly = false
+        if (mutation === 'common-source') changed.HostConfig.Mounts.at(-1).Source = '/outside-git'
+        if (mutation === 'common-alias') changed.HostConfig.Mounts.at(-1).Target = '/workspace/.git'
+        if (mutation === 'missing-common') changed.HostConfig.Mounts.pop()
         expect((await request('POST',`/v1.47/containers/create?name=${sourceName}`,changed)).status,mutation).toBe(403)
         expect(forwarded).toHaveLength(before)
       }
@@ -722,7 +1014,7 @@ describe('fixed initial Claude candidate broker', () => {
       expect((await request('POST',`/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200)
       expect((await request('DELETE',`/v1.47/containers/${helperId}?force=1`)).status).toBe(204)
       expect((await request('GET',`/v1.47/containers/${helperId}/json`)).status).toBe(404)
-    })
+    }, { gitWorkspace: '/workspace-git' })
   })
   it('qualifies retained candidates only through selected frozen inputs and read-only owned HOME', async () => {
     await withHttpBroker(async ({ request, forwarded, broker: instance }) => {
@@ -863,6 +1155,28 @@ describe('fixed initial Claude candidate broker', () => {
 })
 
 describe('scoped Claude source observer broker', () => {
+  it('allows the reserved reader selected Git common directory for a linked checkout', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker: instance }) => {
+      instance.authorizeInitialProviderVolume(sourceAuthorization())
+      const body = sourceHelperBody()
+      body.HostConfig.Mounts.push({ Type: 'bind', Source: '/workspace-git', Target: '/workspace-git', ReadOnly: true })
+      for (const mutation of ['outside', 'alias', 'writable', 'volume-options', 'duplicate', 'extra']) {
+        const changed = structuredClone(body)
+        const common = changed.HostConfig.Mounts[3]
+        if (mutation === 'outside') common.Source = common.Target = '/outside-git'
+        if (mutation === 'alias') common.Target = '/workspace/.git'
+        if (mutation === 'writable') common.ReadOnly = false
+        if (mutation === 'volume-options') common.VolumeOptions = { NoCopy: true }
+        if (mutation === 'duplicate') changed.HostConfig.Mounts.push(structuredClone(common))
+        if (mutation === 'extra') changed.HostConfig.Mounts.push({ Type: 'bind', Source: '/workspace', Target: '/workspace', ReadOnly: true })
+        expect((await request('POST', `/v1.47/containers/create?name=${sourceName}`, changed)).status, mutation).toBe(403)
+        expect(forwarded).toHaveLength(0)
+      }
+      expect((await request('POST', `/v1.47/containers/create?name=${sourceName}`, body)).status).toBe(201)
+      expect(forwarded).toHaveLength(1)
+    }, { gitWorkspace: '/workspace-git' })
+  })
+
   it.each(['source', 'mountpoints'] as const)('allows the producer %s exchange only directly under the owned shared root', async role => {
     await withHttpBroker(async ({ directory, request, forwarded, broker: instance }) => {
       const owner = { ...sourceAuthorization(), hostBinaryPath: path.join(directory, 'freshell-session-host') }
@@ -954,6 +1268,28 @@ describe('scoped Claude source observer broker', () => {
       expect(() => parseHelperCreateDelay(invalid), invalid).toThrow(/invalid helper create delay/)
     }
   })
+  it('bounds owner drain while a held helper create has not been forwarded', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker: instance }) => {
+      instance.authorizeInitialProviderVolume(sourceAuthorization())
+      instance.delayHelperCreates({ prefix: 'freshell-claude-source-', delayMs: 10_000, count: 1 })
+      const createPath = `/v1.47/containers/create?name=${sourceName}`
+      const owed = request('POST', createPath, sourceHelperBody()).catch(() => undefined)
+      const observedUntil = Date.now() + 2_000
+      while (!instance.eventsSnapshot().some(event => event.decision === 'inject_failure' && event.helperName === sourceName)) {
+        if (Date.now() >= observedUntil) throw new Error('the broker did not enter the held create')
+        await new Promise(resolve => setTimeout(resolve, 5))
+      }
+      expect(forwarded).toHaveLength(0)
+      const started = Date.now()
+      expect(await instance.awaitPendingRequests()).toEqual([
+        { method: 'POST', url: createPath, reason: 'cleanup_deadline_before_forward', allocationUnknown: false },
+      ])
+      expect(Date.now() - started, 'owner cleanup must not wait for the unforwarded artificial delay').toBeLessThan(7_500)
+      expect(forwarded, 'an unsent create cannot allocate after owner cleanup').toHaveLength(0)
+      expect(await instance.settleForwarded(100), 'cleanup joins the canceled delayed handler').toBe(true)
+      await owed
+    })
+  }, 20_000)
   it('records bounded upstream helper rejection and host exchange absence without daemon payloads', async () => {
     await withHttpBroker(async ({ request, broker: instance, rejectHelperCreate }) => {
       instance.authorizeInitialProviderVolume(sourceAuthorization())
@@ -1135,12 +1471,38 @@ describe('receipt-owned auth exchange HTTP routes', () => {
   })
 })
 
+function retainedStoreHelperBody() {
+  const body=historyHelperBody()
+  const image=`sha256:${'b'.repeat(64)}`
+  const request={providerStoreId:'exact-store',nativeSessionId:'ses_exact',imageRef:image,providerHome:'/home/freshell/provider',workspacePath:'/workspace',cwd:'/workspace',providerUid:65534,providerGid:0}
+  return {
+    ...body,Image:image,Tty:false,WorkingDir:'/workspace',
+    Cmd:['retained-opencode-store-worker',JSON.stringify(request)],
+    Env:['HOME=/home/freshell/provider','XDG_DATA_HOME=/home/freshell/provider/.local/share','XDG_CONFIG_HOME=/home/freshell/provider/.config','OPENCODE_DB=/home/freshell/provider/.local/share/opencode/opencode.db'],
+    HostConfig:{...body.HostConfig,Tmpfs:{'/tmp':'rw,noexec,nosuid,nodev,size=64m'},Mounts:[
+      {...body.HostConfig.Mounts[0],Source:'/tmp/owned/other-approved-host'},body.HostConfig.Mounts[1],
+      {Type:'bind',Source:'/workspace',Target:'/workspace',ReadOnly:true},
+    ]},
+  }
+}
+
+function dockerCliRetainedStoreHelperBody() {
+  const body = retainedStoreHelperBody()
+  // Captured from the actual installed-store producer and Docker 29.7.2
+  // create request. This Node HTTP fixture protects admission semantics;
+  // the separate private diagnostic exercises Docker serialization.
+  body.Env = [body.Env[3], body.Env[0], body.Env[1], body.Env[2]]
+  Object.assign(body.HostConfig, { CapAdd: null, Binds: null })
+  return body
+}
+
 type ForwardedRequest = { method: string; url: string; body: any }
 type BrokerHttpFixture = {
   directory: string
   setRuntimeRunning:(running:boolean)=>void
-  request(method: string, url: string, body?: unknown): Promise<{ status: number; body: string }>
+  request(method: string, url: string, body?: unknown, timeoutMs?: number): Promise<{ status: number; body: string }>
   forwarded: ForwardedRequest[]
+  logPath: string
   broker: RestrictedDockerBroker
   loseHelperAck(): void
   rejectHelperCreate(): void
@@ -1204,6 +1566,91 @@ async function publishControllerPreparation(directory: string, input: Pick<Prepa
 }
 
 describe('fixed indexed publisher broker',()=>{
+  it.each(['mountpoints', 'publisher'] as const)('keeps run-owned image provenance compatible with exact %s helper cleanup', async role => {
+    const imageLabels: Record<string, string> = {}
+    await withHttpBroker(async ({ directory, request, broker: instance }) => {
+      const project = path.join(directory, 'project')
+      await fs.mkdir(project)
+      execFileSync('git', ['init', '--quiet'], { cwd: project })
+      execFileSync('git', ['-c', 'user.name=Dan Shapiro', '-c', 'user.email=3732858+danshapiro@users.noreply.github.com',
+        '-c', 'commit.gpgsign=false', 'commit', '--quiet', '--allow-empty', '-m', 'Synthetic image source'], { cwd: project })
+      const candidate = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: project, encoding: 'utf8' }).trim()
+      const digest = `sha256:${'b'.repeat(64)}`
+      const execute = vi.fn<typeof execFileSync>().mockImplementation((_command, args) => {
+        if (args?.[0] === 'build') {
+          for (let index = 0; index < args.length; index++) {
+            if (args[index] !== '--label') continue
+            const label = String(args[index + 1])
+            const separator = label.indexOf('=')
+            imageLabels[label.slice(0, separator)] = label.slice(separator + 1)
+          }
+          return ''
+        }
+        return digest
+      })
+      const image = buildRunOwnedRuntimeImage(project, '11111111-1111-4111-8111-111111111111', candidate, execute)
+      const input = { ...publisherAuthorization(), imageRef: image.digest }
+      instance.authorizePreparedInputs(input)
+      const body = publisherBody(input)
+      let name = `${input.indexedFiles!.volumeName}-publisher`
+      if (role === 'mountpoints') {
+        name = 'freshell-mountpoints-11111111-1111-4111-8111-111111111111'
+        body.User = '0:0'
+        body.Cmd = ['prepare-provider-mountpoints']
+        body.Labels = { 'com.freshell.installation-id': input.installationId,
+          'com.freshell.soul-id': input.soulId, 'com.freshell.incarnation-id': input.incarnationId }
+        body.HostConfig.CapAdd = ['CHOWN', 'SETGID', 'SETUID']
+        body.HostConfig.Mounts[1] = { Type: 'volume', Source: input.providerVolumeName,
+          Target: '/home/freshell/provider', ReadOnly: false, VolumeOptions: { NoCopy: true } }
+      } else {
+        expect((await request('POST', '/v1.47/volumes/create', { Name: input.indexedFiles!.volumeName,
+          Driver: 'local', DriverOpts: indexedOptions, Labels: publisherLabels(input) })).status).toBe(201)
+      }
+      expect((await request('POST', `/v1.47/containers/create?name=${name}`, body)).status).toBe(201)
+      const inspected = await request('GET', `/v1.47/containers/${helperId}/json`)
+      expect(inspected.status).toBe(200)
+      expect(JSON.parse(inspected.body).Config.Labels).toMatchObject(imageLabels)
+      expect((await request('POST', `/v1.47/containers/${helperId}/start`)).status).toBe(204)
+      if (role === 'mountpoints') {
+        expect((await request('POST', `/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200)
+      }
+      expect((await request('DELETE', `/v1.47/containers/${name}?force=1`)).status).toBe(204)
+      expect((await request('GET', `/v1.47/containers/${helperId}/json`)).status).toBe(404)
+      if (role === 'publisher') {
+        expect((await request('DELETE', `/v1.47/volumes/${input.indexedFiles!.volumeName}`)).status).toBe(204)
+      }
+      expect(instance.unsafeAttempts()).toEqual([])
+    }, { imageLabels })
+  })
+
+  it('settles an indexed publisher without a runtime receipt after draining while refusing new work', async () => {
+    await withHttpBroker(async ({ directory, request, broker: instance }) => {
+      const input = publisherAuthorization()
+      instance.authorizePreparedInputs(input)
+      const volume = input.indexedFiles!.volumeName
+      expect((await request('POST', '/v1.47/volumes/create', {
+        Name: volume, Driver: 'local', DriverOpts: indexedOptions, Labels: publisherLabels(input),
+      })).status).toBe(201)
+      expect((await request('POST', `/v1.47/containers/create?name=${volume}-publisher`, publisherBody(input))).status).toBe(201)
+      expect(instance.receipts()).toEqual([])
+      expect(instance.receiptIds()).toContain(helperId)
+      expect(await instance.awaitPendingRequests()).toEqual([])
+      // The owner removes the exact acknowledged helper through its Docker
+      // transport after drain; only indexed-volume settlement uses the broker.
+      await new Promise<void>((resolve, reject) => {
+        const removal = http.request({ socketPath: path.join(directory, 'docker.sock'),
+          method: 'DELETE', path: `/v1.47/containers/${helperId}?force=1` }, response => {
+          response.resume()
+          response.on('end', () => response.statusCode === 204 ? resolve() : reject(new Error('owned helper removal failed')))
+        })
+        removal.on('error', reject)
+        removal.end()
+      })
+      expect((await request('DELETE', `/v1.47/volumes/${volume}`)).status).toBe(204)
+      expect((await request('GET', `/v1.47/volumes/${volume}`)).status).toBe(404)
+      expect((await request('POST', '/v1.47/volumes/create', {})).status).toBe(503)
+    })
+  })
   it.each(['/outside/selected-plugin', '/home/freshell/provider-sibling/config', '/home/freshell/provider/.codex/sessions'])(
     'retains the actual rejected preparation destination without widening authority (%s)', async destination => {
       await withHttpBroker(async ({ request, forwarded, broker: instance, directory }) => {
@@ -1321,7 +1768,107 @@ describe('fixed indexed publisher broker',()=>{
       }, undefined, true)
     },
   )
-  it('probes actual candidate absence before creation only with a qualified owned publication', async () => {
+  it('publishes a controller-authorized retained Claude candidate from both frozen generations', async () => {
+    await withHttpBroker(async ({ directory, request, forwarded, broker: instance, setRuntimeRunning,
+      clearCandidateVolumeInspection, replaceCandidateVolumeInspection }) => {
+      const input = candidateAuthorization()
+      const artifact = Buffer.from('retained candidate owned host')
+      input.hostBinaryPath = path.join(directory, 'freshell-session-host')
+      await fs.writeFile(input.hostBinaryPath, artifact)
+      input.binarySha256 = createHash('sha256').update(artifact).digest('hex')
+      input.stageRoot = path.join(directory, 'scenarios/scenario/control/provider-roots', input.generationId)
+      instance.authorizeInitialProviderVolume({ ...sourceAuthorization(), hostBinaryPath: input.hostBinaryPath,
+        binarySha256: input.binarySha256 })
+      expect((await request('POST', '/v1.47/volumes/create', { Name: input.providerVolumeName, Driver: 'local', Labels: {
+        'com.freshell.installation-id': input.installationId, 'com.freshell.soul-id': input.soulId,
+        'freshell.input.reservation': input.reservationId, 'freshell.input.incarnation': 'incarnation-one',
+        'freshell.input.intent': '1', 'freshell.input.daemon': input.daemonId,
+        'freshell.input.image': input.imageRef, 'freshell.input.binary-sha256': input.binarySha256,
+      } })).status).toBe(201)
+      const priorRuntime = path.join(directory, 'r/scenario/incarnation-one')
+      const actor = path.join(path.dirname(priorRuntime), 'souls',
+        createHash('sha256').update(`${input.installationId}\0${input.soulId}`).digest('hex'), 'actor')
+      const prior = JSON.parse(createBody([
+        `${input.hostBinaryPath}:/runtime/freshell-session-host:ro`, `${priorRuntime}:/run/freshell:rw`,
+        `${input.providerVolumeName}:/home/freshell/provider:rw`, '/workspace:/workspace:rw',
+        `${actor}:/run/freshell-host-actor:rw`,
+      ]).toString())
+      prior.Labels['com.freshell.soul-id'] = input.soulId
+      expect((await request('POST', '/v1.47/containers/create?name=retained-candidate-owner', prior)).status).toBe(201)
+      const generationId = 'grant-55555555-5555-4555-8555-555555555555'
+      input.retained = { generationId, stageRoot: path.join(path.dirname(input.stageRoot), generationId),
+        configurationBinds: structuredClone(input.configurationBinds), resourceMounts: structuredClone(input.resourceMounts),
+        attemptId: 'recovery-66666666-6666-4666-8666-666666666666' }
+      const priorPublication = await publishControllerPreparation(directory, { ...input, ...input.retained }, input.reservationId, 'claude')
+      instance.authorizePreparedInputs({ ...input, ...input.retained, incarnationId: 'incarnation-one', indexedSecretSources: [] })
+      const published = await publishControllerPreparation(directory, input, '', 'claude')
+      const capabilityPath = path.join(published.capabilities, `${input.generationId}.json`)
+      const capability = JSON.parse(await fs.readFile(capabilityPath, 'utf8'))
+      await fs.writeFile(capabilityPath, JSON.stringify({ ...capability,
+        preparation: { phase: 'pending', priorGrantIds: [generationId] },
+      }))
+      delete (published.context.preparedInputs as any).initialAuthReservation
+      const contextBytes = Buffer.from(JSON.stringify(published.context))
+      const resultBytes = Buffer.from(JSON.stringify({ providerLaunchContext: published.context, providerSecretReferences: [] }))
+      await fs.writeFile(path.join(published.metadata, 'prepared-context.json'), contextBytes)
+      await fs.writeFile(path.join(published.metadata, 'prepared-result.json'), resultBytes)
+      const binding = { version: 1, provider: 'claude', soulId: input.soulId, generationId: input.generationId,
+        initialReservationId: null, registryAttemptId: input.retained.attemptId, priorGenerationId: generationId,
+        intentRevision: 1, authoritySha256: 'a'.repeat(64), workspacePath: input.workspacePath, cwd: input.cwd,
+        gitCommonDir: null, manifestSha256: published.context.preparedInputs.manifest.sha256,
+        preparedContextSha256: createHash('sha256').update(contextBytes).digest('hex'),
+        preparedResultSha256: createHash('sha256').update(resultBytes).digest('hex') }
+      const bindingPath = path.join(published.metadata, 'claude-candidate-binding.json')
+      await fs.writeFile(bindingPath, JSON.stringify(binding))
+      const url = `/v1.47/volumes/freshell-claude-candidate-${input.requestId}`
+      clearCandidateVolumeInspection()
+      setRuntimeRunning(false)
+      expect((await request('GET', url)).status, JSON.stringify(instance.eventsSnapshot().slice(-2))).toBe(404)
+      // An absence probe grants no mutation ownership. The exact published
+      // recovery attempt and both immutable stages still qualify creation.
+      const volume = { Name: url.split('/').at(-1), Driver: 'local', DriverOpts: {}, Labels: candidateLabels(input) }
+      const changedAttempt = structuredClone(volume)
+      changedAttempt.Labels['com.freshell.source-recovery-attempt-id'] = 'recovery-77777777-7777-4777-8777-777777777777'
+      expect((await request('POST', '/v1.47/volumes/create', changedAttempt)).status).toBe(403)
+      setRuntimeRunning(true)
+      const beforeRead = forwarded.length
+      const candidateVolumes = instance.candidateVolumeNames()
+      expect((await request('GET', url)).status).toBe(404)
+      expect(forwarded.slice(beforeRead)).toMatchObject([{ method: 'GET', url }])
+      expect(instance.candidateVolumeNames(), 'a read-only absence probe creates no candidate volume').toEqual(candidateVolumes)
+      setRuntimeRunning(false)
+      for (const changed of [
+        { ...binding, soulId: 'foreign-soul' },
+        { ...binding, priorGenerationId: input.generationId },
+        { ...binding, preparedContextSha256: 'f'.repeat(64) },
+      ]) {
+        await fs.writeFile(bindingPath, JSON.stringify(changed))
+        expect((await request('GET', url)).status).toBe(403)
+        expect((await request('POST', '/v1.47/volumes/create', volume)).status).toBe(403)
+      }
+      await fs.writeFile(bindingPath, JSON.stringify(binding))
+      const priorContext = path.join(priorPublication.metadata, 'prepared-context.json')
+      await fs.writeFile(priorContext, JSON.stringify({ ...priorPublication.context,
+        preparedInputs: { ...priorPublication.context.preparedInputs, generationId: input.generationId } }))
+      expect((await request('GET', url)).status).toBe(403)
+      await fs.writeFile(priorContext, priorPublication.contextBytes)
+      replaceCandidateVolumeInspection()
+      const foreign = await request('GET', url)
+      expect(foreign.status).toBe(403)
+      expect(foreign.body).not.toContain('PRIVATE_FOREIGN_CANDIDATE')
+      clearCandidateVolumeInspection()
+      expect((await request('GET', url)).status).toBe(404)
+      expect((await request('POST', '/v1.47/volumes/create', volume)).status,
+        JSON.stringify(instance.eventsSnapshot().slice(-2))).toBe(201)
+      const name = 'freshell-claude-candidate-reader-11111111-1111-4111-8111-111111111111'
+      expect((await request('POST', `/v1.47/containers/create?name=${name}`, candidateHelperBody(input, 'reader'))).status).toBe(201)
+      expect((await request('POST', `/v1.47/containers/${helperId}/start`)).status).toBe(204)
+      expect((await request('POST', `/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200)
+      expect((await request('DELETE', `/v1.47/containers/${helperId}?force=1`)).status).toBe(204)
+      expect(forwarded.some(operation => operation.url.includes(name))).toBe(true)
+    }, undefined, true)
+  })
+  it.each(['claude', 'kilroy'])('probes actual %s candidate absence before creation only with a qualified owned publication', async provider => {
     await withHttpBroker(async ({ directory, request, forwarded, broker: instance, replaceCandidateVolumeInspection, clearCandidateVolumeInspection }) => {
       const input = candidateAuthorization()
       const binary = Buffer.from('candidate absence host artifact')
@@ -1330,7 +1877,7 @@ describe('fixed indexed publisher broker',()=>{
       input.binarySha256 = createHash('sha256').update(binary).digest('hex')
       input.stageRoot = path.join(directory, 'scenarios/scenario/control/provider-roots', input.generationId)
       const { metadata, context, contextBytes, resultBytes } = await publishControllerPreparation(directory, input, input.reservationId, 'claude')
-      const binding = { version: 1, provider: 'claude', soulId: input.soulId, generationId: input.generationId,
+      const binding = { version: 1, provider, soulId: input.soulId, generationId: input.generationId,
         initialReservationId: input.reservationId, intentRevision: 1, registryAttemptId: null,
         authoritySha256: createHash('sha256').update(JSON.stringify({ kind: 'initial_reservation', reservationId: input.reservationId })).digest('hex'), workspacePath: input.workspacePath, cwd: input.cwd,
         gitCommonDir: null,
@@ -1489,7 +2036,7 @@ describe('fixed indexed publisher broker',()=>{
       expect(exists).toBe(false)
     }, undefined, true)
   })
-  it('registers the exact owned published Claude candidate before its ordinary volume request', async () => {
+  it.each(['claude', 'kilroy'])('registers the exact owned published %s candidate before its ordinary volume request', async provider => {
     await withHttpBroker(async ({ request, forwarded, broker: instance, directory }) => {
       const input = candidateAuthorization()
       input.workspacePath = '/workspace/project'
@@ -1504,7 +2051,7 @@ describe('fixed indexed publisher broker',()=>{
       instance.authorizeInitialProviderVolume({ ...sourceAuthorization(), hostBinaryPath: input.hostBinaryPath, binarySha256: input.binarySha256 })
       const { metadata, context, contextBytes, resultBytes } = await publishControllerPreparation(directory, input, input.reservationId, 'claude')
       await fs.writeFile(path.join(metadata, 'claude-candidate-binding.json'), JSON.stringify({
-        version: 1, provider: 'claude', soulId: input.soulId, generationId: input.generationId,
+        version: 1, provider, soulId: input.soulId, generationId: input.generationId,
         initialReservationId: input.reservationId, intentRevision: 1, registryAttemptId: null,
         authoritySha256: createHash('sha256').update(JSON.stringify({ kind: 'initial_reservation', reservationId: input.reservationId })).digest('hex'),
         workspacePath: input.workspacePath, cwd: input.cwd, gitCommonDir: null,
@@ -1515,7 +2062,7 @@ describe('fixed indexed publisher broker',()=>{
       const volume = { Name: `freshell-claude-candidate-${input.requestId}`, Driver: 'local', DriverOpts: {}, Labels: candidateLabels(input) }
       const bindingPath = path.join(metadata, 'claude-candidate-binding.json')
       const originalBinding = await fs.readFile(bindingPath)
-      for (const field of ['soulId', 'generationId', 'initialReservationId', 'gitCommonDir', 'preparedContextSha256', 'preparedResultSha256', 'manifestSha256']) {
+      for (const field of ['provider', 'soulId', 'generationId', 'initialReservationId', 'gitCommonDir', 'preparedContextSha256', 'preparedResultSha256', 'manifestSha256']) {
         const changed = JSON.parse(originalBinding.toString())
         changed[field] = 'foreign'
         await fs.writeFile(bindingPath, JSON.stringify(changed))
@@ -1535,6 +2082,96 @@ describe('fixed indexed publisher broker',()=>{
       expect((await request('POST', '/v1.47/volumes/create', changed)).status).toBe(403)
       expect(forwarded).toHaveLength(before)
     }, undefined, true)
+  })
+  it.each(['claude', 'kilroy'].flatMap(provider => ['candidate', 'retained', 'workload'].map(consumer => ({ provider, consumer }))))('carries published $provider ancestor policy and imported files into the $consumer reader', async ({ provider, consumer }) => {
+    await withHttpBroker(async ({ request, forwarded, broker: instance, directory }) => {
+      const input = { ...candidateAuthorization(), gitCommonDir: '/workspace-git' }
+      input.configurationBinds[0].effectiveDestination = '/workspace/.claude/settings.json'
+      input.resourceMounts = ['/home/operator/.claude/CLAUDE.md', '/home/operator/.codex/AGENTS.md'].map((effectiveDestination, index) => ({
+        stageRelativePath: `.freshell/resource-units/root-${index}/source`,
+        providerRelativePath: `.freshell/provider-roots/root-${index}/source`, effectiveDestination, kind: 'file',
+      }))
+      input.hostBinaryPath = path.join(directory, 'freshell-session-host')
+      const binary = Buffer.from('published ancestor policy reader')
+      await fs.writeFile(input.hostBinaryPath, binary)
+      input.binarySha256 = createHash('sha256').update(binary).digest('hex')
+      input.stageRoot = path.join(directory, 'scenarios/scenario/control/provider-roots', input.generationId)
+      instance.authorizeInitialProviderVolume({ ...sourceAuthorization(), hostBinaryPath: input.hostBinaryPath, binarySha256: input.binarySha256 })
+      const { metadata, context, contextBytes, resultBytes } = await publishControllerPreparation(directory, input, input.reservationId, 'claude')
+      await fs.writeFile(path.join(metadata, 'claude-candidate-binding.json'), JSON.stringify({
+        version: 1, provider, soulId: input.soulId, generationId: input.generationId,
+        initialReservationId: input.reservationId, intentRevision: 1, registryAttemptId: null,
+        authoritySha256: createHash('sha256').update(JSON.stringify({ kind: 'initial_reservation', reservationId: input.reservationId })).digest('hex'),
+        workspacePath: input.workspacePath, cwd: input.cwd, gitCommonDir: input.gitCommonDir,
+        manifestSha256: context.preparedInputs.manifest.sha256,
+        preparedContextSha256: createHash('sha256').update(contextBytes).digest('hex'),
+        preparedResultSha256: createHash('sha256').update(resultBytes).digest('hex'),
+      }))
+      const volumeName = `freshell-claude-candidate-${input.requestId}`
+      expect((await request('GET', `/v1.47/volumes/${volumeName}`)).status).toBe(404)
+      expect((await request('POST', '/v1.47/volumes/create', { Name: volumeName, Driver: 'local', DriverOpts: {}, Labels: candidateLabels(input) })).status).toBe(201)
+      let body: any, name: string
+      if (consumer === 'candidate') {
+        body = candidateHelperBody(input, 'reader')
+        name = 'freshell-claude-candidate-reader-11111111-1111-4111-8111-111111111111'
+      } else if (consumer === 'retained') {
+        body = sourceHelperBody()
+        body.HostConfig.Mounts[0].Source = input.hostBinaryPath
+        body.Labels['com.freshell.source-binary-sha256'] = input.binarySha256
+        body.HostConfig.Tmpfs = {}
+        body.HostConfig.Mounts.push(
+          { Type: 'bind', Source: input.gitCommonDir, Target: input.gitCommonDir, ReadOnly: true },
+          { Type: 'volume', Source: input.providerVolumeName, Target: '/home/freshell/provider', ReadOnly: true, VolumeOptions: { NoCopy: true } },
+          ...input.configurationBinds.map(bind => ({ Type: 'bind', Source: path.join(input.stageRoot, bind.sourceRelativePath), Target: bind.effectiveDestination, ReadOnly: true })),
+          ...input.resourceMounts.map(mount => ({ Type: 'volume', Source: input.providerVolumeName, Target: mount.effectiveDestination, ReadOnly: true, VolumeOptions: { NoCopy: true, Subpath: mount.providerRelativePath } })),
+        )
+        name = sourceName
+      } else {
+        const prepared = { ...input, incarnationId: 'incarnation-one', indexedSecretSources: [] }
+        for (const mutation of ['unit', 'writable', 'generation', 'owner']) {
+          const changed = structuredClone(prepared)
+          if (mutation === 'unit') changed.resourceMounts[0].providerRelativePath = '.freshell/provider-roots/foreign/source'
+          if (mutation === 'writable') (changed.resourceMounts[0] as { writable?: boolean }).writable = true
+          if (mutation === 'generation') changed.generationId = 'grant-55555555-5555-4555-8555-555555555555'
+          if (mutation === 'owner') changed.soulId = 'foreign-soul'
+          expect(() => instance.authorizePreparedInputs(changed), mutation).toThrow()
+        }
+        expect((await request('POST', '/v1.47/volumes/create', { Name: input.providerVolumeName, Driver: 'local', Labels: {
+          'com.freshell.installation-id': input.installationId, 'com.freshell.soul-id': input.soulId,
+          'freshell.input.reservation': input.reservationId, 'freshell.input.incarnation': 'incarnation-one', 'freshell.input.intent': '1',
+          'freshell.input.daemon': input.daemonId, 'freshell.input.image': input.imageRef, 'freshell.input.binary-sha256': input.binarySha256,
+        } })).status).toBe(201)
+        const runtimeBinds = ordinaryBinds.map(bind => bind.replace('/tmp/owned/freshell-session-host', input.hostBinaryPath)
+          .replace('/tmp/owned/r/scenario/x/incarnation-one', path.join(directory, 'r/scenario/x/incarnation-one'))
+          .replace(providerVolume, input.providerVolumeName))
+        const actor = path.join(directory, 'r/scenario/x/souls', createHash('sha256').update(`${input.installationId}\0${input.soulId}`).digest('hex'), 'actor')
+        body = JSON.parse(createBody([...runtimeBinds, `${actor}:/run/freshell-host-actor:rw`]).toString())
+        body.Labels['com.freshell.soul-id'] = input.soulId
+        body.HostConfig.Mounts = [
+          ...input.configurationBinds.map(bind => ({ Type: 'bind', Source: path.join(input.stageRoot, bind.sourceRelativePath), Target: bind.effectiveDestination, ReadOnly: true })),
+          ...input.resourceMounts.map(mount => ({ Type: 'volume', Source: input.providerVolumeName, Target: mount.effectiveDestination, ReadOnly: true, VolumeOptions: { NoCopy: true, Subpath: mount.providerRelativePath } })),
+        ]
+        name = 'selected-ancestor-runtime'
+      }
+      const before = forwarded.length
+      for (const mutation of ['source', 'target', 'writable']) {
+        const changed = structuredClone(body)
+        const policy = changed.HostConfig.Mounts.find((mount: any) => mount.Target === '/home/operator/.claude/CLAUDE.md')
+        if (mutation === 'source') policy.Source = 'foreign-volume'
+        if (mutation === 'target') policy.Target = '/outside/unselected-policy'
+        if (mutation === 'writable') policy.ReadOnly = false
+        expect((await request('POST', `/v1.47/containers/create?name=${name}`, changed)).status, `${consumer}/${mutation}`).toBe(403)
+        expect(forwarded).toHaveLength(before)
+      }
+      expect((await request('POST', `/v1.47/containers/create?name=${name}`, body)).status, JSON.stringify(instance.eventsSnapshot().slice(-3))).toBe(201)
+      const id = consumer === 'workload' ? ownedId : helperId
+      expect((await request('POST', `/v1.47/containers/${id}/start`)).status).toBe(204)
+      if (consumer !== 'workload') {
+        expect((await request('POST', `/v1.47/containers/${id}/wait?condition=not-running`)).status).toBe(200)
+        expect((await request('DELETE', `/v1.47/containers/${id}?force=1`)).status).toBe(204)
+        expect((await request('GET', `/v1.47/containers/${id}/json`)).status).toBe(404)
+      }
+    }, { gitWorkspace: '/workspace-git' }, true)
   })
   it('registers the exact owned published preparation before its indexed volume request', async () => {
     await withHttpBroker(async ({ request, forwarded, broker: instance, directory }) => {
@@ -1861,8 +2498,10 @@ describe('fixed indexed publisher broker',()=>{
   });
 });
 
-async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>,gateways?:Set<string>, physicalStage = false,
+async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>,gatewaysOrOptions?:Set<string> | { allowTask2LegacyNegativeFixtures?: boolean; delayHelperWait?: boolean; gitWorkspace?: string; imageLabels?: Record<string, string>; initialProviderVolumeLookup?: (volume: string) => ReturnType<typeof sourceAuthorization> | undefined }, physicalStage = false,
   allowedProviderInputRoots = new Set<string>()) {
+  const gateways = gatewaysOrOptions instanceof Set ? gatewaysOrOptions : undefined
+  const options = gatewaysOrOptions instanceof Set ? {} : (gatewaysOrOptions ?? {})
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'frs-broker-history-'))
   const socket = path.join(dir, 'docker.sock')
   const proxy = path.join(dir, 'broker.sock')
@@ -1877,6 +2516,8 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
   let candidateVolumeMetadata: any
   let candidateVolumeAckUnavailable = false
   let candidateHelperDeleted = false
+  let waitingResponse: http.ServerResponse | undefined
+  const privateHelperCommands = ['observe-claude-sources-private', 'publish-provider-inputs', 'prepare-provider-mountpoints']
   const upstream = http.createServer(async (req, res) => {
     const chunks: Buffer[] = []
     for await (const chunk of req) chunks.push(Buffer.from(chunk))
@@ -1895,8 +2536,8 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
       if (req.method==='DELETE') {candidateVolumeMetadata=undefined;res.statusCode=204;res.end();return}
       res.statusCode=candidateVolumeMetadata?200:404;res.end(JSON.stringify(candidateVolumeMetadata ?? {}));return
     }
-    if (req.method==='GET' && req.url?.startsWith('/v1.47/volumes/freshell-inputs-') && indexedVolumeMetadata) {
-      res.statusCode=200;res.end(JSON.stringify(indexedVolumeMetadata));return;
+    if (req.method==='GET' && req.url?.startsWith('/v1.47/volumes/freshell-inputs-')) {
+      res.statusCode=indexedVolumeMetadata?200:404;res.end(JSON.stringify(indexedVolumeMetadata ?? {}));return;
     }
     if (req.method==='GET' && req.url===`/v1.47/containers/${ownedId}/json`) {
       const creation=forwarded.findLast(value=>value.url.includes('/containers/create?') && !value.body?.Entrypoint)!;
@@ -1911,13 +2552,14 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
       for (const mount of inspected.HostConfig.Mounts) if (mount.ReadOnly===false) delete mount.ReadOnly
       res.statusCode=200;res.end(JSON.stringify({Id:helperId,Config:foreignHelper?{...inspected,User:'foreign'}:inspected,HostConfig:inspected.HostConfig}));return
     }
-    if (req.method==='GET' && (req.url?.includes('-publisher/json') || req.url?.includes('/freshell-claude-source-')
-      || (req.url===`/v1.47/containers/${helperId}/json` && forwarded.some((operation)=>['observe-claude-sources-private','publish-provider-inputs'].includes(operation.body?.Cmd?.[0]))))) {
+    const privateHelper = forwarded.findLast(operation => privateHelperCommands.includes(operation.body?.Cmd?.[0])
+      && (req.url === `/v1.47/containers/${helperId}/json`
+        || req.url === `${operation.url.replace('/containers/create?name=', '/containers/')}/json`))
+    if (req.method==='GET' && privateHelper) {
       if (sourceHelperDeleted) { res.statusCode=404;res.end('{}');return }
-      const command=req.url?.includes('-publisher/json') || (req.url===`/v1.47/containers/${helperId}/json` && forwarded.some(operation=>operation.body?.Cmd?.[0]==='publish-provider-inputs'))?'publish-provider-inputs':'observe-claude-sources-private';
-      const config=forwarded.findLast((request)=>request.url.includes('/containers/create?') && request.body?.Cmd?.[0]===command)!.body;
-      const inspected=structuredClone(config);
+      const inspected=structuredClone(privateHelper.body);
       inspected.Labels['org.opencontainers.image.version']='24.04';
+      inspected.Labels = { ...options.imageLabels, ...inspected.Labels };
       // Docker reports an empty Tmpfs object as null on the retained reader.
       if (inspected.HostConfig.Tmpfs && Object.keys(inspected.HostConfig.Tmpfs).length === 0) inspected.HostConfig.Tmpfs = null;
       for (const mount of inspected.HostConfig.Mounts) if (mount.ReadOnly===false) delete mount.ReadOnly;
@@ -1938,52 +2580,634 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
       res.end(JSON.stringify({ Id: body.Entrypoint ? helperAckId : ownedId }))
       return
     }
+    const isHelperWait = /\/wait(?:\?|$)/.test(req.url ?? '')
+    if (options.delayHelperWait && isHelperWait) {
+      waitingResponse = res
+      return
+    }
     if (req.method === 'DELETE' || req.url?.endsWith('/start') || req.url?.endsWith('/update')) {
+      if (req.method === 'DELETE' && req.url?.startsWith('/v1.47/volumes/freshell-inputs-')) indexedVolumeMetadata = undefined
       if (req.method==='DELETE' && candidateCreation && req.url===`/v1.47/containers/${helperId}?force=1`) candidateHelperDeleted=true
-      if (req.method==='DELETE' && (req.url===`/v1.47/containers/${helperId}?force=1` || req.url===`/v1.47/containers/${sourceName}?force=1`)) sourceHelperDeleted=true
+      if (req.method==='DELETE' && (req.url===`/v1.47/containers/${helperId}?force=1` || req.url===`/v1.47/containers/${sourceName}?force=1`
+        || forwarded.some(operation => privateHelperCommands.includes(operation.body?.Cmd?.[0])
+          && req.url === `${operation.url.replace('/containers/create?name=', '/containers/')}?force=1`))) sourceHelperDeleted=true
+      if (req.method === 'DELETE') waitingResponse?.destroy()
       res.statusCode = 204
       res.end()
       return
     }
+    if (req.method === 'GET' && req.url === `/v1.47/containers/${negativeLegacyId}/json`) {
+      res.statusCode = 200
+      res.end(JSON.stringify(negativeLegacyInspection()))
+      return
+    }
     res.statusCode = 200
-    res.end(req.url?.includes('/wait?') ? '{"StatusCode":0}'
+    res.end(isHelperWait ? '{"StatusCode":0}'
       : req.url?.includes('/logs?') ? '{"threadId":"native-owned"}' : JSON.stringify({ Name: providerVolume }))
   })
   const instance = new RestrictedDockerBroker({
     allowedHostGatewayAddresses:gateways,
     realSocketPath: socket,
     proxySocketPath: proxy,
+    allowTask2LegacyNegativeFixtures: options.allowTask2LegacyNegativeFixtures,
     runtimeRootPrefix: physicalStage ? path.join(dir, 'r') : '/tmp/owned/r',
     allowedHostBinaryPaths: new Set(physicalStage ? [path.join(dir, 'freshell-session-host')] : ['/tmp/owned/freshell-session-host', '/tmp/owned/other-approved-host']),
-    allowedImageRefs: new Set(['sha256:fixture-image', 'sha256:other-approved-image']),
+    allowedImageRefs: new Set(['sha256:fixture-image', 'sha256:other-approved-image', `sha256:${'b'.repeat(64)}`]),
     allowTerminalWorkloads: true,
-    allowedWorkspaceRoots: new Set(['/workspace']),
+    allowedWorkspaceRoots: new Set(['/workspace', ...(options.gitWorkspace ? [options.gitWorkspace] : [])]),
     allowedProviderInputRoots,
+    initialProviderVolumeLookup: options.initialProviderVolumeLookup,
     testRunId: 'run-one',
     logPath: path.join(dir, 'broker.jsonl'),
   })
-  const request: BrokerHttpFixture['request'] = (method, url, body) => new Promise((resolve, reject) => {
+  const request: BrokerHttpFixture['request'] = (method, url, body, timeoutMs) => new Promise((resolve, reject) => {
     const req = http.request({ socketPath: proxy, path: url, method }, (res) => {
       const chunks: Buffer[] = []
       res.on('data', (chunk) => chunks.push(Buffer.from(chunk)))
       res.on('end', () => resolve({ status: res.statusCode!, body: Buffer.concat(chunks).toString() }))
     })
     req.on('error', reject)
+    if (timeoutMs !== undefined) req.setTimeout(timeoutMs, () => req.destroy(new Error('owned helper wait timed out')))
     req.end(body === undefined ? undefined : Buffer.isBuffer(body) ? body : JSON.stringify(body))
   })
   try {
     await new Promise<void>((resolve) => upstream.listen(socket, resolve))
     await instance.start()
-    await run({ directory: dir, request, forwarded, broker: instance, setRuntimeRunning:(running)=>{runtimeRunning=running}, loseHelperAck: () => { loseAck = true }, rejectHelperCreate: () => { rejectHelper = true }, returnHelperId: (id) => { helperAckId = id },replaceHelperInspection:()=>{foreignHelper=true},
+    await run({ directory: dir, logPath: path.join(dir, 'broker.jsonl'), request, forwarded, broker: instance, setRuntimeRunning:(running)=>{runtimeRunning=running}, loseHelperAck: () => { loseAck = true }, rejectHelperCreate: () => { rejectHelper = true }, returnHelperId: (id) => { helperAckId = id },replaceHelperInspection:()=>{foreignHelper=true},
       loseCandidateVolumeAck:()=>{candidateVolumeAckUnavailable=true},replaceCandidateVolumeInspection:()=>{candidateVolumeMetadata ??= { Name: 'PRIVATE_FOREIGN_CANDIDATE', Driver: 'local', Labels: {} }; candidateVolumeMetadata.Labels['com.freshell.soul-id']='foreign'}, clearCandidateVolumeInspection:()=>{candidateVolumeMetadata=undefined} })
   } finally {
+    upstream.closeAllConnections()
     await instance.close()
     await new Promise<void>((resolve) => upstream.close(() => resolve()))
     await fs.rm(dir, { recursive: true, force: true })
   }
 }
 
+it('admits only an exact owned published initial provider volume before its first workload receipt', async () => {
+  const owner = sourceAuthorization()
+  const lookup = vi.fn((volume: string) => volume === owner.providerVolumeName ? owner : undefined)
+  await withHttpBroker(async ({ request, forwarded, broker }) => {
+    expect(broker.receipts()).toEqual([])
+    expect((await request('GET', `/v1.47/volumes/${owner.providerVolumeName}`)).status).toBe(200)
+    expect(lookup).toHaveBeenCalledExactlyOnceWith(owner.providerVolumeName)
+    expect(broker.initialProviderVolumeCreations()).toEqual([])
+    expect((await request('POST', '/v1.47/volumes/create', {
+      Name: owner.providerVolumeName, Driver: 'local', Labels: {
+        'com.freshell.installation-id': owner.installationId, 'com.freshell.soul-id': owner.soulId,
+        'freshell.input.reservation': '11111111-1111-4111-8111-111111111111',
+        'freshell.input.incarnation': 'incarnation-owned', 'freshell.input.intent': '1',
+        'freshell.input.daemon': owner.daemonId, 'freshell.input.image': owner.imageRef,
+        'freshell.input.binary-sha256': owner.binarySha256,
+      },
+    })).status).toBe(201)
+    expect(broker.initialProviderVolumeCreations()).toEqual([owner])
+    expect((await request('GET', `/v1.47/volumes/freshell-provider-${'f'.repeat(24)}`)).status).toBe(403)
+    expect(forwarded.map(operation => operation.url)).toEqual([`/v1.47/volumes/${owner.providerVolumeName}`, '/v1.47/volumes/create'])
+  }, { initialProviderVolumeLookup: lookup })
+})
+
+it('authorizes Kilroy initial source observation from its actual committed registry row', async () => {
+  const { DatabaseSync }: typeof import('node:sqlite') = createRequire(import.meta.url)('node:sqlite')
+  let source: InitialProviderRegistrySource | undefined
+  await withHttpBroker(async ({ directory, request, forwarded }) => {
+    const owner = sourceAuthorization()
+    source = { ...owner, registryPath: path.join(directory, 'runtime.sqlite3') }
+    const db = new DatabaseSync(source.registryPath)
+    try {
+      db.exec(`CREATE TABLE provider_input_preparations (
+        soul_id TEXT, provider TEXT, image_ref TEXT, host_binary_path TEXT, host_binary_sha256 TEXT,
+        intent_revision INTEGER, consumed INTEGER, bound_incarnation_id TEXT)`)
+      const url = `/v1.47/volumes/${owner.providerVolumeName}`
+      expect((await request('GET', url)).status).toBe(403)
+      expect(forwarded).toHaveLength(0)
+      db.prepare('INSERT INTO provider_input_preparations VALUES(?,?,?,?,?,?,?,?)').run(
+        owner.soulId, 'kilroy', owner.imageRef, owner.hostBinaryPath, owner.binarySha256, 1, 0, null)
+      expect((await request('GET', url)).status).toBe(200)
+      const before = forwarded.length
+      expect((await request('GET', `/v1.47/volumes/freshell-provider-${'f'.repeat(24)}`)).status).toBe(403)
+      expect(forwarded).toHaveLength(before)
+      expect((await request('POST', `/v1.47/containers/create?name=${sourceName}`, sourceHelperBody())).status).toBe(201)
+      expect((await request('POST', `/v1.47/containers/${helperId}/start`)).status).toBe(204)
+      expect((await request('POST', `/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200)
+      expect((await request('DELETE', `/v1.47/containers/${helperId}?force=1`)).status).toBe(204)
+      expect((await request('GET', `/v1.47/containers/${helperId}/json`)).status).toBe(404)
+    } finally { db.close() }
+  }, { initialProviderVolumeLookup: name => source && findInitialProviderVolume(name, [source]) })
+})
+
+it('refuses a changed owner returned by initial provider volume discovery', async () => {
+  const owner = sourceAuthorization()
+  await withHttpBroker(async ({ request, forwarded }) => {
+    expect((await request('GET', `/v1.47/volumes/freshell-provider-${'f'.repeat(24)}`)).status).toBe(403)
+    expect(forwarded).toEqual([])
+  }, { initialProviderVolumeLookup: () => owner })
+})
+
+it('requires signal authority for new provider runtimes and retains exact Stop ownership', async () => {
+  await withHttpBroker(async ({ request, forwarded, broker }) => {
+    for (const capabilities of [
+      ['CHOWN', 'SETGID', 'SETUID', 'SYS_ADMIN'],
+      ['CHOWN', 'KILL', 'SETGID', 'SETUID', 'SYS_ADMIN'],
+    ]) {
+      const body = JSON.parse(createBody([...ordinaryBinds, actorBind]).toString())
+      body.HostConfig.CapAdd = capabilities
+      expect((await request('POST', '/v1.47/containers/create?name=refused-runtime', body)).status).toBe(403)
+    }
+    expect(forwarded).toEqual([])
+    expect(broker.receipts()).toEqual([])
+    const legacyProfile = JSON.parse(createBody([...ordinaryBinds, actorBind]).toString())
+    legacyProfile.HostConfig.CapAdd = ['CHOWN', 'SETGID', 'SETUID']
+    expect((await request('POST', '/v1.47/containers/create?name=owned-runtime', legacyProfile)).status).toBe(201)
+    expect(broker.receipts()).toHaveLength(1)
+    expect((await request('POST', `/v1.47/containers/${ownedId}/stop?t=2`)).status).toBe(200)
+    expect(forwarded.map(row => row.url)).toEqual(['/v1.47/containers/create?name=owned-runtime', `/v1.47/containers/${ownedId}/stop?t=2`])
+    expect(broker.destructiveRequestsFor(ownedId)).toHaveLength(1)
+    expect(broker.unsafeAttempts()).toMatchObject([
+      { decision: 'block', url: '/v1.47/containers/create?name=refused-runtime' },
+      { decision: 'block', url: '/v1.47/containers/create?name=refused-runtime' },
+    ])
+  })
+})
+
+it('omits private query fields from diagnostics for admitted owned requests', async () => {
+  await withHttpBroker(async ({ request, forwarded, broker, logPath }) => {
+    const privateValue = 'private encoded query/value'
+    const encoded = encodeURIComponent(privateValue)
+    const createUrl = `/v1.47/containers/create?name=owned-runtime&private=${encoded}`
+    expect((await request('POST', createUrl, createBody([...ordinaryBinds, actorBind]))).status).toBe(201)
+    const inspectUrl = `/v1.47/containers/${ownedId}/json?private=${encoded}`
+    expect((await request('GET', inspectUrl)).status).toBe(200)
+    expect(forwarded.map(row => row.url)).toEqual([createUrl, inspectUrl])
+    expect(broker.receipts()).toHaveLength(1)
+    expect(broker.receipts()[0].containerId).toBe(ownedId)
+    expect(broker.eventsSnapshot().map(row => row.url)).toEqual([createUrl, inspectUrl])
+    expect(broker.unsafeAttempts()).toEqual([])
+    const rows = (await fs.readFile(logPath, 'utf8')).trim().split('\n').map(line => JSON.parse(line)).filter(row => row.event)
+    expect(rows).toHaveLength(4)
+    const diagnostics = JSON.stringify(rows)
+    expect(diagnostics).not.toContain(encoded)
+    expect(diagnostics).not.toContain(privateValue)
+    expect(rows[0]).toMatchObject({ route: 'container_create' })
+    expect(rows[2]).toMatchObject({ route: 'container_json', containerId: ownedId })
+    expect(rows[0].requestId).toBe(rows[1].requestId)
+    expect(rows[2].requestId).toBe(rows[3].requestId)
+    const stopUrl = `/v1.47/containers/${ownedId}/stop?t=2&private=${encoded}`
+    expect((await request('POST', stopUrl)).status).toBe(200)
+    const stopRows = (await fs.readFile(logPath, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+      .filter(row => row.event && row.route === 'container_stop')
+    expect(stopRows).toHaveLength(2)
+    expect(stopRows[0]).toMatchObject({ containerId: ownedId, stopGraceSeconds: 2 })
+    expect(stopRows[1]).toMatchObject({ containerId: ownedId, stopGraceSeconds: 2, statusCode: 200 })
+    expect(JSON.stringify(stopRows)).not.toContain(encoded)
+    expect(broker.destructiveRequestsFor(ownedId)).toMatchObject([{ url: stopUrl, decision: 'forward', unsafeAttempt: false }])
+  })
+})
+
+const repairName = 'freshell-opencode-repair-11111111-1111-4111-8111-111111111111'
+const repairStageRoot = '/tmp/owned/r/scenario/x/opencode-transfers'
+const repairStageBasename = `stopped-repair-${'0123456789abcdef'.repeat(3)}.ready`
+const repairStage = path.join(repairStageRoot, repairStageBasename)
+const repairEnv = [
+  'HOME=/home/freshell/provider',
+  'OPENCODE_DB=/home/freshell/provider/.local/share/opencode/opencode.db',
+  'PATH=/usr/local/bin:/usr/bin:/bin',
+  'XDG_CONFIG_HOME=/home/freshell/provider/.config',
+  'XDG_DATA_HOME=/home/freshell/provider/.local/share',
+  'TERM=xterm-256color',
+  'OPENCODE_MODEL=fixture-configured',
+].sort()
+
+function stoppedRepairBody(stageSource = repairStage) {
+  return {
+    Image: 'sha256:fixture-image', User: '0:0', WorkingDir: '/workspace', Tty: false,
+    Entrypoint: ['/runtime/freshell-session-host'],
+    Cmd: ['opencode-stopped-repair-worker', '--stage-dir', '/run/freshell-opencode-transfer',
+      '--workspace-root', '/workspace', '--expected-cwd', '/workspace', '--provider-uid', '65534', '--provider-gid', '0'],
+    Env: [...repairEnv],
+    HostConfig: {
+      NetworkMode: 'none', ReadonlyRootfs: true, CapDrop: ['ALL'], CapAdd: ['SETUID', 'SETGID'],
+      SecurityOpt: ['no-new-privileges'], Memory: 256 * 1024 * 1024, MemorySwap: 256 * 1024 * 1024,
+      NanoCpus: 500_000_000, PidsLimit: 32, Tmpfs: { '/tmp': 'rw,noexec,nosuid,nodev,size=16m' },
+      Mounts: [
+        { Type: 'bind', Source: '/tmp/owned/freshell-session-host', Target: '/runtime/freshell-session-host', ReadOnly: true },
+        { Type: 'volume', Source: providerVolume, Target: '/home/freshell/provider', ReadOnly: false },
+        { Type: 'bind', Source: stageSource, Target: '/run/freshell-opencode-transfer', ReadOnly: true },
+        { Type: 'bind', Source: '/workspace', Target: '/workspace', ReadOnly: true },
+      ],
+    },
+  }
+}
+
+async function registerRepairOwner(request: BrokerHttpFixture['request']) {
+  const body = JSON.parse(createBody(ordinaryBinds).toString())
+  // OpenCode's ordinary host environment does not copy terminal.env; the repair helper does.
+  body.Env = []
+  expect((await request('POST', '/v1.47/containers/create?name=owned-runtime', body)).status).toBe(201)
+}
+
+describe('receipt-owned stopped OpenCode repair HTTP routes', () => {
+  it.each([
+    ['stopped-repair', repairStage],
+    ['opencode-transfer', path.join(repairStageRoot, 'opencode-transfer-one.ready')],
+  ])('admits the %s repair worker body and binds its lifecycle and cleanup to the original receipt', async (_family, stageSource) => {
+    await withHttpBroker(async ({ request, forwarded, broker }) => {
+      await registerRepairOwner(request)
+      expect((await request('GET', `/v1.47/volumes/${providerVolume}`)).status).toBe(200)
+      expect((await request('POST', `/v1.47/containers/create?name=${repairName}`, stoppedRepairBody(stageSource))).status).toBe(201)
+      expect(forwarded.at(-1)).toEqual({ method: 'POST', url: `/v1.47/containers/create?name=${repairName}`, body: stoppedRepairBody(stageSource) })
+      expect(forwarded.at(-1)?.body.Env).toEqual(repairEnv)
+      expect(forwarded[0].body.Env).toEqual([])
+      expect(broker.historyHelperNames()).toContain(repairName)
+      expect(broker.receiptIds().has(helperId)).toBe(true)
+      expect(broker.receipts()).toHaveLength(1)
+      expect(broker.eventsSnapshot().at(-1)).toMatchObject({ helperName: repairName, ownerContainerId: ownedId, providerVolumeName: providerVolume })
+      expect((await request('POST', `/v1.47/containers/${helperId}/start`)).status).toBe(204)
+      expect((await request('POST', `/v1.47/containers/${helperId}/wait?condition=not-running`)).body).toBe('{"StatusCode":0}')
+      expect((await request('GET', `/v1.47/containers/${helperId}/logs?stdout=1&stderr=0`)).status).toBe(200)
+      for (const [method, url] of [
+        ['POST', `/v1.47/containers/${helperId}/kill`],
+        ['POST', `/v1.47/containers/${helperId}/update`],
+        ['POST', `/v1.47/containers/${repairName}/start`],
+        ['DELETE', `/v1.47/containers/${helperId}?force=0`],
+        ['DELETE', '/v1.47/containers/freshell-opencode-repair-foreign?force=1'],
+      ]) {
+        const count = forwarded.length
+        expect((await request(method, url)).status).toBe(403)
+        expect(forwarded).toHaveLength(count)
+      }
+      const count = forwarded.length
+      expect((await request('POST', `/v1.47/containers/create?name=${repairName}`, stoppedRepairBody(stageSource))).status).toBe(403)
+      expect(forwarded).toHaveLength(count)
+      expect((await request('DELETE', `/v1.47/containers/${repairName}?force=1`)).status).toBe(204)
+      expect(forwarded.at(-1)?.url).toBe(`/v1.47/containers/${repairName}?force=1`)
+    })
+  })
+
+  it.each([
+    ['47 hex characters', `stopped-repair-${'a'.repeat(47)}.ready`],
+    ['49 hex characters', `stopped-repair-${'a'.repeat(49)}.ready`],
+    ['nonhex character', `stopped-repair-${'a'.repeat(47)}g.ready`],
+    ['uppercase hex', `stopped-repair-${'A'.repeat(48)}.ready`],
+    ['wrong prefix', `stopped-transfer-${'a'.repeat(48)}.ready`],
+    ['wrong suffix', `stopped-repair-${'a'.repeat(48)}.partial`],
+    ['trailing suffix', `stopped-repair-${'a'.repeat(48)}.ready.extra`],
+  ])('rejects a stopped-repair stage with %s without forwarding or granting cleanup authority', async (_reason, basename) => {
+    await withHttpBroker(async ({ request, forwarded, broker }) => {
+      await registerRepairOwner(request)
+      const before = forwarded.length
+      const body = stoppedRepairBody(path.join(repairStageRoot, basename))
+      expect((await request('POST', `/v1.47/containers/create?name=${repairName}`, body)).status).toBe(403)
+      expect(forwarded).toHaveLength(before)
+      expect(broker.historyHelperNames()).toEqual([])
+      expect([...broker.receiptIds()]).toEqual([ownedId])
+      expect((await request('DELETE', `/v1.47/containers/${repairName}?force=1`)).status).toBe(403)
+      expect(forwarded).toHaveLength(before)
+    })
+  })
+
+  it('keeps stopped-repair stages out of ordinary host transfer admission', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker }) => {
+      const body = createBody([...ordinaryBinds, actorBind, `${repairStage}:/run/freshell-opencode-transfer:ro`])
+      expect((await request('POST', '/v1.47/containers/create?name=owned-runtime', body)).status).toBe(403)
+      expect(forwarded).toHaveLength(0)
+      expect(broker.receipts()).toHaveLength(0)
+    })
+  })
+
+  it('rejects changed repair sources, identity, command and privileges before contacting Docker', async () => {
+    await withHttpBroker(async ({ request, forwarded }) => {
+      const create = (body: ReturnType<typeof stoppedRepairBody>) => request('POST', `/v1.47/containers/create?name=${repairName}`, body)
+      expect((await create(stoppedRepairBody())).status).toBe(403)
+      expect(forwarded).toHaveLength(0)
+      await registerRepairOwner(request)
+      const mutations: ((body: ReturnType<typeof stoppedRepairBody>) => void)[] = [
+        body => { body.Image = 'sha256:other-approved-image' },
+        body => { body.HostConfig.Mounts[0].Source = '/tmp/owned/other-approved-host' },
+        body => { body.HostConfig.Mounts[1].Source = 'freshell-provider-ffffffffffffffffffffffff' },
+        body => { body.HostConfig.Mounts[1].ReadOnly = true },
+        body => { body.HostConfig.Mounts[2].Source = `/tmp/owned/r/foreign/x/opencode-transfers/${repairStageBasename}` },
+        body => { body.HostConfig.Mounts[2].ReadOnly = false },
+        body => { body.HostConfig.Mounts[2].Source = `${repairStageRoot}/../opencode-transfers/${repairStageBasename}` },
+        body => { body.HostConfig.Mounts[2].Source = `tmp/owned/r/scenario/x/opencode-transfers/${repairStageBasename}` },
+        body => { body.HostConfig.Mounts[3].Source = '/foreign' },
+        body => { body.HostConfig.Mounts[3].ReadOnly = false },
+        body => { body.HostConfig.Mounts.push({ Type: 'bind', Source: '/etc', Target: '/etc', ReadOnly: true }) },
+        body => { body.Cmd[0] = 'serve' },
+        body => { body.Entrypoint = ['/bin/sh'] },
+        body => { body.Cmd[6] = '/foreign' },
+        body => { body.Cmd[8] = '0' },
+        body => { body.Cmd[10] = '65534' },
+        body => { body.Cmd.push('--extra') },
+        body => { body.WorkingDir = '/foreign' },
+        body => { body.Tty = true },
+        body => { body.User = '65534:0' },
+        body => { Object.assign(body, { Labels: { 'com.freshell.managed': 'true' } }) },
+        ...['HOME', 'OPENCODE_DB', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME'].map(key => (body: ReturnType<typeof stoppedRepairBody>) => {
+          body.Env[body.Env.findIndex(value => value.startsWith(`${key}=`))] = `${key}=/foreign`
+        }),
+        body => { body.Env = [] },
+        body => { body.Env.push('malformed') },
+        body => { body.Env.push('TERM=xterm\0foreign') },
+        body => { body.Env.push(body.Env[0]) },
+        body => { body.HostConfig.NetworkMode = 'bridge' },
+        body => { body.HostConfig.ReadonlyRootfs = false },
+        body => { body.HostConfig.CapAdd.push('CHOWN') },
+        body => { Object.assign(body.HostConfig, { Privileged: true }) },
+        body => { Object.assign(body.HostConfig, { Binds: ['/etc:/etc:rw'] }) },
+        body => { Object.assign(body.HostConfig, { PortBindings: { '80/tcp': [{ HostPort: '80' }] } }) },
+        body => { Object.assign(body.HostConfig, { ExtraHosts: ['foreign:127.0.0.1'] }) },
+        body => { body.HostConfig.SecurityOpt = [] },
+        body => { body.HostConfig.MemorySwap = 0 },
+        body => { body.HostConfig.PidsLimit = 0 },
+        body => { body.HostConfig.Tmpfs['/tmp'] = 'rw,size=1g' },
+      ]
+      for (const mutate of mutations) {
+        const body = stoppedRepairBody()
+        mutate(body)
+        const count = forwarded.length
+        expect((await create(body)).status).toBe(403)
+        expect(forwarded).toHaveLength(count)
+      }
+    })
+  })
+
+  it('admits the production optional read-only Git common directory with a workspace-local cwd', async () => {
+    await withHttpBroker(async ({ request, forwarded }) => {
+      await registerRepairOwner(request)
+      const body = stoppedRepairBody()
+      body.WorkingDir = '/workspace/nested'
+      body.Cmd[6] = body.WorkingDir
+      body.HostConfig.Mounts.push({ Type: 'bind', Source: '/workspace-git', Target: '/workspace-git', ReadOnly: true })
+      try {
+        expect((await request('POST', `/v1.47/containers/create?name=${repairName}`, body)).status).toBe(201)
+        expect(forwarded.at(-1)?.body).toEqual(body)
+      } finally {
+        expect((await request('DELETE', `/v1.47/containers/${repairName}?force=1`)).status).toBe(204)
+      }
+    }, { gitWorkspace: '/workspace-git' })
+  })
+
+  it('retains exact-name cleanup authority when the repair create acknowledgement is lost', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker, loseHelperAck }) => {
+      await registerRepairOwner(request)
+      loseHelperAck()
+      try {
+        expect((await request('POST', `/v1.47/containers/create?name=${repairName}`, stoppedRepairBody())).status).toBe(503)
+        expect(broker.historyHelperNames()).toContain(repairName)
+        expect(broker.receiptIds().has(helperId)).toBe(false)
+      } finally {
+        expect((await request('DELETE', `/v1.47/containers/${repairName}?force=1`)).status).toBe(204)
+      }
+      expect(forwarded.at(-1)?.url).toBe(`/v1.47/containers/${repairName}?force=1`)
+    })
+  })
+
+  it('permits exact-name cleanup after the owned repair wait times out', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker }) => {
+      await registerRepairOwner(request)
+      expect((await request('POST', `/v1.47/containers/create?name=${repairName}`, stoppedRepairBody())).status).toBe(201)
+      try {
+        expect((await request('POST', `/v1.47/containers/${helperId}/start`)).status).toBe(204)
+        await expect(request('POST', `/v1.47/containers/${helperId}/wait?condition=not-running`, undefined, 100)).rejects.toThrow('owned helper wait timed out')
+        expect(forwarded.some(entry => entry.url.endsWith('/wait?condition=not-running'))).toBe(true)
+        expect(broker.historyHelperNames()).toContain(repairName)
+      } finally {
+        expect((await request('DELETE', `/v1.47/containers/${repairName}?force=1`)).status).toBe(204)
+      }
+    }, { delayHelperWait: true })
+  })
+})
+
 describe('receipt-owned read-only history HTTP routes', () => {
+  it.each([
+    ['retained reader', helperName, dockerCliRetainedStoreHelperBody],
+    ['Node graph reader', helperName, batchStoreHelperBody],
+    ['native history reader', helperName, historyHelperBody],
+    ['stopped repair', repairName, stoppedRepairBody],
+    ['stopped transfer', repairName, () => stoppedRepairBody(path.join(repairStageRoot, 'opencode-transfer-one.ready'))],
+  ] as const)('forwards the captured CLI lifecycle for the already admitted %s', async (_family, name, helperBody) => {
+    await withHttpBroker(async ({ request, forwarded }) => {
+      const body = helperBody()
+      const owner = JSON.parse(createBody(ordinaryBinds).toString())
+      owner.Image = body.Image
+      owner.Env = []
+      expect((await request('POST', '/v1.47/containers/create?name=owned-runtime', owner)).status).toBe(201)
+      expect((await request('POST', `/v1.47/containers/create?name=${name}`, body)).status).toBe(201)
+      expect(forwarded.at(-1)?.body).toEqual(body)
+      const before = forwarded.length
+      for (const [method, url, status] of [
+        ['POST', `/v1.47/containers/${helperId}/start`, 204],
+        ['POST', `/v1.47/containers/${helperId}/wait`, 200],
+        ['GET', `/v1.47/containers/${helperId}/json`, 200],
+        ['GET', `/v1.47/containers/${helperId}/logs?stderr=1&stdout=1`, 200],
+        ['DELETE', `/v1.47/containers/${name}?force=1`, 204],
+      ] as const) {
+        expect((await request(method, url)).status).toBe(status)
+        expect(forwarded.at(-1)).toEqual({ method, url, body: undefined })
+      }
+      expect(forwarded).toHaveLength(before + 5)
+    })
+  })
+
+  it('admits the captured Docker CLI logs query order without accepting extra log controls', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker }) => {
+      await registerRepairOwner(request)
+      expect((await request('POST', `/v1.47/containers/create?name=${helperName}`, dockerCliRetainedStoreHelperBody())).status).toBe(201)
+      expect((await request('GET', `/v1.47/containers/${helperId}/logs?stderr=1&stdout=1`)).status).toBe(200)
+      expect(forwarded.at(-1)?.url).toBe(`/v1.47/containers/${helperId}/logs?stderr=1&stdout=1`)
+      expect(broker.eventsSnapshot().at(-1)).toMatchObject({
+        decision: 'forward', destructive: false, helperName, ownerContainerId: ownedId, providerVolumeName: providerVolume,
+      })
+      const before = forwarded.length
+      for (const [method, url] of [
+        ['POST', `/v1.47/containers/${helperId}/logs?stderr=1&stdout=1`],
+        ['GET', `/v1.47/containers/${helperName}/logs?stderr=1&stdout=1`],
+        ['GET', `/v1.47/containers/${'f'.repeat(64)}/logs?stderr=1&stdout=1`],
+        ['GET', `/v1.47/containers/${helperId.slice(0, 12)}/logs?stderr=1&stdout=1`],
+        ...['follow=1', 'tail=all', 'extra=1', 'stdout=1', 'stderr=1'].map(query =>
+          ['GET', `/v1.47/containers/${helperId}/logs?stderr=1&stdout=1&${query}`]),
+        ['GET', `/v1.47/containers/${helperId}/logs?stderr=1&stdout=0`],
+        ['DELETE', `/v1.47/containers/${helperName}?force=1&v=1`],
+        ['DELETE', `/v1.47/containers/${helperName}`],
+      ]) expect((await request(method, url)).status).toBe(403)
+      expect(forwarded).toHaveLength(before)
+      expect((await request('DELETE', `/v1.47/containers/${helperName}?force=1`)).status).toBe(204)
+    })
+  })
+
+  it('admits the captured Docker CLI log inspection only for an acknowledged exact helper ID', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker }) => {
+      await registerRepairOwner(request)
+      expect((await request('POST', `/v1.47/containers/create?name=${helperName}`, dockerCliRetainedStoreHelperBody())).status).toBe(201)
+      expect((await request('GET', `/v1.47/containers/${helperId}/json`)).status).toBe(200)
+      expect(forwarded.at(-1)?.url).toBe(`/v1.47/containers/${helperId}/json`)
+      expect(broker.eventsSnapshot().at(-1)).toMatchObject({
+        decision: 'forward', destructive: false, helperName, ownerContainerId: ownedId, providerVolumeName: providerVolume,
+      })
+      const before = forwarded.length
+      for (const [method, url] of [
+        ['POST', `/v1.47/containers/${helperId}/json`],
+        ['GET', `/v1.47/containers/${helperName}/json`],
+        ['GET', `/v1.47/containers/${'f'.repeat(64)}/json`],
+        ['GET', `/v1.47/containers/${helperId.slice(0, 12)}/json`],
+        ['GET', `/v1.47/containers/${helperId}/json?size=1`],
+        ['GET', `/v1.47/containers/${helperId}/json?extra=1`],
+      ]) expect((await request(method, url)).status).toBe(403)
+      expect(forwarded).toHaveLength(before)
+      expect((await request('DELETE', `/v1.47/containers/${helperName}?force=1`)).status).toBe(204)
+    })
+  })
+
+  it('admits the captured Docker CLI default wait only for an acknowledged exact helper ID', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker }) => {
+      await registerRepairOwner(request)
+      expect((await request('POST', `/v1.47/containers/create?name=${helperName}`, dockerCliRetainedStoreHelperBody())).status).toBe(201)
+      expect((await request('POST', `/v1.47/containers/${helperId}/start`)).status).toBe(204)
+      expect(await request('POST', `/v1.47/containers/${helperId}/wait`)).toEqual({ status: 200, body: '{"StatusCode":0}' })
+      expect(forwarded.at(-1)?.url).toBe(`/v1.47/containers/${helperId}/wait`)
+      expect(broker.eventsSnapshot().at(-1)).toMatchObject({
+        decision: 'forward', helperName, ownerContainerId: ownedId, providerVolumeName: providerVolume,
+      })
+      expect((await request('POST', `/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200)
+      const before = forwarded.length
+      for (const [method, url] of [
+        ['GET', `/v1.47/containers/${helperId}/wait`],
+        ['POST', `/v1.47/containers/${helperName}/wait`],
+        ['POST', `/v1.47/containers/${'f'.repeat(64)}/wait`],
+        ['POST', `/v1.47/containers/${helperId.slice(0, 12)}/wait`],
+        ...['condition=', 'condition=next-exit', 'condition=removed', 'condition=not-running&condition=not-running',
+          'condition=not-running&extra=1', 'extra=1'].map(query => ['POST', `/v1.47/containers/${helperId}/wait?${query}`]),
+        ['POST', `/v1.47/containers/${helperId}/wait/`],
+      ]) expect((await request(method, url)).status).toBe(403)
+      expect(forwarded).toHaveLength(before)
+      expect((await request('DELETE', `/v1.47/containers/${helperName}?force=1`)).status).toBe(204)
+    })
+  })
+
+  it('admits the captured Docker CLI retained-reader environment order without changing its authority', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker }) => {
+      await registerRepairOwner(request)
+      const body = dockerCliRetainedStoreHelperBody()
+      expect((await request('POST', `/v1.47/containers/create?name=${helperName}`, body)).status).toBe(201)
+      expect(forwarded.at(-1)?.body).toEqual(body)
+      expect(broker.eventsSnapshot().at(-1)).toMatchObject({
+        decision: 'forward', helperName, ownerContainerId: ownedId, providerVolumeName: providerVolume,
+      })
+      expect((await request('DELETE', `/v1.47/containers/${helperName}?force=1`)).status).toBe(204)
+    })
+  })
+
+  it('refuses changed retained-reader environment entries and ownership before forwarding or reserving a name', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker }) => {
+      await registerRepairOwner(request)
+      const mutations = [
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.Env.splice(0, 1) },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.Env[3] = body.Env[0] },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.Env.push('EXTRA=unexpected') },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.Env[1] = 'HOME=/foreign' },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.Env[0] = 'OPENCODE_DB=/foreign.db' },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.Env[2] = 'XDG_DATA_HOME=/foreign' },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.Env[3] = 'XDG_CONFIG_HOME=/foreign' },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { Object.assign(body, { Env: null }) },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.User = '0:0' },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.User = '65534:1' },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { Object.assign(body.HostConfig, { CapAdd: ['CHOWN'] }) },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.HostConfig.Mounts[1].Source = 'foreign-volume' },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.HostConfig.Mounts[1].ReadOnly = false },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.HostConfig.Mounts[0].Source = '/foreign-host' },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.HostConfig.Mounts[2].ReadOnly = false },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.WorkingDir = '/foreign' },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.HostConfig.Memory++ },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.HostConfig.NetworkMode = 'bridge' },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.Cmd[0] = 'foreign-worker' },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { const selected = JSON.parse(body.Cmd[1]); selected.providerUid = 0; body.Cmd[1] = JSON.stringify(selected) },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { const selected = JSON.parse(body.Cmd[1]); selected.providerGid = 1; body.Cmd[1] = JSON.stringify(selected) },
+      ]
+      for (const mutate of mutations) {
+        const body = dockerCliRetainedStoreHelperBody()
+        mutate(body)
+        const count = forwarded.length
+        expect((await request('POST', `/v1.47/containers/create?name=${helperName}`, body)).status).toBe(403)
+        expect(forwarded).toHaveLength(count)
+        expect(broker.historyHelperNames()).not.toContain(helperName)
+      }
+    })
+  })
+
+  it('admits only the fixed Node native reader on the exact receipt workspace and read-only provider source', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker }) => {
+      await request('POST', '/v1.47/containers/create?name=owned-runtime', createBody([...ordinaryBinds, actorBind]))
+      const body = () => {
+        const original = historyHelperBody()
+        return { ...original, Entrypoint: ['node'], WorkingDir: '/workspace',
+          Cmd: ['--no-warnings', '/workspace/dist/native-history-run-one/probe-cli.mjs',
+            'codex', '/home/freshell/provider/.codex/sessions', 'native-owned'],
+          HostConfig: { ...original.HostConfig, Mounts: [original.HostConfig.Mounts[1],
+            { Type: 'bind', Source: '/workspace', Target: '/workspace', ReadOnly: true }] } }
+      }
+      const mutations: ((input: ReturnType<typeof body>) => void)[] = [
+        input => { input.Entrypoint = ['/bin/sh'] },
+        input => { input.Cmd[0] = '-e' },
+        input => { input.Cmd[1] = '/workspace/dist/native-history-foreign-run/probe-cli.mjs' },
+        input => { input.Cmd[1] = '/workspace/dist/native-history-run-one/other-probe.mjs' },
+        input => { input.Cmd[2] = 'foreign-provider' },
+        input => { input.Cmd[3] = '/home/freshell/provider/foreign-source' },
+        input => { input.Cmd[4] = '' },
+        input => { input.Cmd.push('unexpected-argument') },
+        input => { input.HostConfig.Mounts[0].Source = 'foreign-volume' },
+        input => { input.HostConfig.Mounts[1].ReadOnly = false },
+        input => { input.HostConfig.Mounts[1].Target = '/other-workspace' },
+        input => { input.Image = 'sha256:other-approved-image' },
+        input => { input.HostConfig.NetworkMode = 'bridge' },
+      ]
+      for (const mutate of mutations) {
+        const input = body()
+        mutate(input)
+        const before = forwarded.length
+        expect((await request('POST', `/v1.47/containers/create?name=${helperName}`, input)).status).toBe(403)
+        expect(forwarded).toHaveLength(before)
+      }
+      expect((await request('POST', `/v1.47/containers/create?name=${helperName}`, body())).status).toBe(201)
+      expect(broker.historyHelperNames()).toContain(helperName)
+      expect(broker.eventsSnapshot().at(-1)).toMatchObject({ ownerContainerId: ownedId, providerVolumeName: providerVolume })
+      expect((await request('POST', `/v1.47/containers/${helperId}/start`)).status).toBe(204)
+      expect((await request('POST', `/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200)
+      expect((await request('GET', `/v1.47/containers/${helperId}/logs?stdout=1&stderr=0`)).body).toContain('native-owned')
+      expect((await request('POST', `/v1.47/containers/${helperId}/wait`)).status).toBe(200)
+      expect((await request('GET', `/v1.47/containers/${helperId}/json`)).status).toBe(200)
+      expect((await request('GET', `/v1.47/containers/${helperId}/logs?stderr=1&stdout=1`)).body).toContain('native-owned')
+      expect((await request('POST', `/v1.47/containers/${helperId}/kill`)).status).toBe(403)
+      expect((await request('DELETE', `/v1.47/containers/${helperName}?force=1`)).status).toBe(204)
+    })
+  })
+  it('admits current-image exact retained-store reads with no writer or provider control authority', async () => {
+    await withHttpBroker(async ({request,forwarded,broker})=>{
+      expect((await request('POST','/v1.47/containers/create?name=owned-runtime',createBody([...ordinaryBinds,actorBind]))).status).toBe(201)
+      const invalid=[
+        (body:any)=>{body.HostConfig.Mounts[1].ReadOnly=false},
+        (body:any)=>{body.HostConfig.Mounts[1].Source='foreign-volume'},
+        (body:any)=>{body.HostConfig.Mounts.push({...body.HostConfig.Mounts[2]})},
+        (body:any)=>{body.HostConfig.CapAdd=['CHOWN']},
+        (body:any)=>{body.Tty=true},
+        (body:any)=>{body.Cmd[1]='{}'},
+        (body:any)=>{const decoded=JSON.parse(body.Cmd[1]);decoded.imageRef='sha256:fixture-image';body.Cmd[1]=JSON.stringify(decoded)},
+        (body:any)=>{body.WorkingDir='/foreign'},
+      ]
+      for(const mutate of invalid){
+        const body=retainedStoreHelperBody();mutate(body)
+        const before=forwarded.length
+        expect((await request('POST',`/v1.47/containers/create?name=${helperName}`,body)).status).toBe(403)
+        expect(forwarded).toHaveLength(before)
+      }
+      expect((await request('POST',`/v1.47/containers/create?name=${helperName}`,retainedStoreHelperBody())).status).toBe(201)
+      expect(broker.receipts()).toHaveLength(1)
+      expect(broker.eventsSnapshot().at(-1)).toMatchObject({ownerContainerId:ownedId,providerVolumeName:providerVolume})
+      expect((await request('POST',`/v1.47/containers/${helperId}/start`)).status).toBe(204)
+      expect((await request('POST',`/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200)
+      expect((await request('POST',`/v1.47/containers/${helperId}/kill`)).status).toBe(403)
+      expect((await request('DELETE',`/v1.47/containers/${helperName}?force=1`)).status).toBe(204)
+    })
+  })
   it('forwards the owned volume and exact helper lifecycle while refusing foreign sources and controls', async () => {
     await withHttpBroker(async ({ request, forwarded, broker }) => {
       expect((await request('POST', '/v1.47/containers/create?name=owned-runtime', createBody([...ordinaryBinds, actorBind]))).status).toBe(201)
@@ -2058,9 +3282,13 @@ describe('receipt-owned read-only history HTTP routes', () => {
       loseHelperAck()
       expect((await request('POST', `/v1.47/containers/create?name=${helperName}`, historyHelperBody())).status).toBe(503)
       expect(broker.receiptIds().has(helperId)).toBe(false)
+      expect(broker.historyHelperNames()).toEqual([helperName])
       const before = forwarded.length
       expect((await request('DELETE', '/v1.47/containers/freshell-history-22222222-2222-4222-8222-222222222222?force=1')).status).toBe(403)
       expect((await request('POST', `/v1.47/containers/${helperId}/start`)).status).toBe(403)
+      expect((await request('POST', `/v1.47/containers/${helperId}/wait`)).status).toBe(403)
+      expect((await request('GET', `/v1.47/containers/${helperId}/json`)).status).toBe(403)
+      expect((await request('GET', `/v1.47/containers/${helperId}/logs?stderr=1&stdout=1`)).status).toBe(403)
       expect(forwarded).toHaveLength(before)
       expect((await request('DELETE', `/v1.47/containers/${helperName}?force=1`)).status).toBe(204)
       expect(forwarded.at(-1)?.url).toBe(`/v1.47/containers/${helperName}?force=1`)
@@ -2074,9 +3302,113 @@ describe('receipt-owned read-only history HTTP routes', () => {
       expect([...broker.receiptIds()]).toEqual([ownedId])
       const before = forwarded.length
       expect((await request('POST', '/v1.47/containers/short-id/start')).status).toBe(403)
+      expect((await request('POST', '/v1.47/containers/short-id/wait')).status).toBe(403)
+      expect((await request('GET', '/v1.47/containers/short-id/json')).status).toBe(403)
+      expect((await request('GET', '/v1.47/containers/short-id/logs?stderr=1&stdout=1')).status).toBe(403)
       expect(forwarded).toHaveLength(before)
       expect((await request('DELETE', `/v1.47/containers/${helperName}?force=1`)).status).toBe(204)
     })
   })
 
+})
+
+const negativeLegacyId = 'c'.repeat(64)
+function originalLegacyInspection() {
+  return { Id: ownedId, Image: 'sha256:fixture-image',
+    Config: { Labels: JSON.parse(createBody([...ordinaryBinds, actorBind]).toString()).Labels } }
+}
+function negativeLegacyInspection() {
+  const original = originalLegacyInspection()
+  return { ...original, Id: negativeLegacyId, State: { Status: 'created', Running: false, Pid: 0 },
+    Config: { Labels: { ...original.Config.Labels, 'com.freshell.task2-negative': 'foreign_binary' } } }
+}
+
+describe('finite Task2 legacy negative inspector admission', () => {
+  it('forwards only exact bound inspection without granting start, controls, discovery or writer receipts', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker }) => {
+      expect((await request('POST', '/v1.47/containers/create?name=owned-runtime', createBody([...ordinaryBinds, actorBind]))).status).toBe(201)
+      const beforeUnbound = forwarded.length
+      expect((await request('GET', `/v1.47/containers/${negativeLegacyId}/json`)).status).toBe(403)
+      expect(forwarded).toHaveLength(beforeUnbound)
+      broker.admitTask2LegacyNegativeInspection(negativeLegacyInspection(), originalLegacyInspection())
+      expect((await request('GET', `/v1.47/containers/${negativeLegacyId}/json`))).toMatchObject({
+        status: 200, body: JSON.stringify(negativeLegacyInspection()),
+      })
+      expect(forwarded.at(-1)).toMatchObject({ method: 'GET', url: `/v1.47/containers/${negativeLegacyId}/json` })
+      expect(broker.eventsSnapshot().at(-1)).toMatchObject({ severity: 'info', decision: 'forward', destructive: false,
+        containerId: negativeLegacyId, ownerContainerId: ownedId })
+      expect(broker.receipts()).toHaveLength(1)
+      expect([...broker.receiptIds()]).toEqual([ownedId])
+      for (const [method, url] of [
+        ...['start', 'stop', 'kill', 'unpause', 'update'].map(action => ['POST', `/v1.47/containers/${negativeLegacyId}/${action}`]),
+        ['DELETE', `/v1.47/containers/${negativeLegacyId}?force=1`],
+        ['GET', `/v1.47/containers/${negativeLegacyId}/logs?stdout=1`],
+        ['GET', `/v1.47/containers/${'f'.repeat(64)}/json`],
+        ['GET', '/v1.47/containers/json'],
+        ['POST', `/v1.47/containers/${negativeLegacyId}/create`],
+      ] as [string, string][]) {
+        const before = forwarded.length
+        expect((await request(method, url)).status).toBe(403)
+        expect(forwarded).toHaveLength(before)
+      }
+      broker.forgetTask2LegacyNegativeInspection(negativeLegacyId)
+      const beforeRevoke = forwarded.length
+      expect((await request('GET', `/v1.47/containers/${negativeLegacyId}/json`)).status).toBe(403)
+      expect(forwarded).toHaveLength(beforeRevoke)
+    }, { allowTask2LegacyNegativeFixtures: true })
+  })
+
+  it('requires an opted-in finite rig, existing receipt owner, exact labels/image/full ID and never-started state', async () => {
+    await withHttpBroker(async ({ request, broker }) => {
+      await request('POST', '/v1.47/containers/create?name=owned-runtime', createBody([...ordinaryBinds, actorBind]))
+      expect(() => broker.admitTask2LegacyNegativeInspection(negativeLegacyInspection(), originalLegacyInspection())).toThrow()
+    })
+    await withHttpBroker(async ({ request, broker }) => {
+      expect(() => broker.admitTask2LegacyNegativeInspection(negativeLegacyInspection(), originalLegacyInspection())).toThrow()
+      await request('POST', '/v1.47/containers/create?name=owned-runtime', createBody([...ordinaryBinds, actorBind]))
+      const modifications = [
+        (body: any) => { body.Id = 'short-id' },
+        (body: any) => { body.Id = ownedId },
+        (body: any) => { body.Image = 'sha256:foreign' },
+        (body: any) => { body.State.Status = 'exited' },
+        (body: any) => { body.State.Running = true },
+        (body: any) => { body.State.Pid = 1234 },
+        ...['runtime-test-run-id', 'soul-id', 'incarnation-id', 'installation-id', 'task2-negative'].map(key =>
+          (body: any) => { body.Config.Labels[`com.freshell.${key}`] = 'foreign' }),
+      ]
+      for (const modify of modifications) {
+        const candidate = negativeLegacyInspection()
+        modify(candidate)
+        expect(() => broker.admitTask2LegacyNegativeInspection(candidate, originalLegacyInspection())).toThrow()
+      }
+      expect(() => broker.admitTask2LegacyNegativeInspection(negativeLegacyInspection(), {
+        ...originalLegacyInspection(), Id: 'f'.repeat(64),
+      })).toThrow()
+      expect([...broker.receiptIds()]).toEqual([ownedId])
+      broker.admitTask2LegacyNegativeInspection(negativeLegacyInspection(), originalLegacyInspection())
+      expect(() => broker.admitTask2LegacyNegativeInspection(negativeLegacyInspection(), originalLegacyInspection())).toThrow()
+    }, { allowTask2LegacyNegativeFixtures: true })
+  })
+})
+
+it('retains bounded redacted structured callback diagnostics for failed provider cases', () => {
+  const secret = 'owned-callback-control-value'
+  const logs = [
+    'not structured',
+    JSON.stringify({ level: 'INFO', fields: { message: 'ordinary startup' } }),
+    ...Array.from({ length: 70 }, (_, n) => JSON.stringify({ level: 'WARN', target: 'freshell_server',
+      fields: { message: 'managed_mcp.callback_failed', error: `candidate reader failed ${n}; ${secret}; Bearer hidden-token`, payload: 'private provider bytes' } })),
+    JSON.stringify({ severity: 'error', event: 'session_host.fatal', error: 'native startup failure' }),
+  ].join('\n')
+  const retained = providerParityFailureLogTail(logs, [secret])
+  expect(retained).toHaveLength(32)
+  expect(retained.at(-2)).toMatchObject({ severity: 'warn', event: 'managed_mcp.callback_failed',
+    error: 'candidate reader failed 69; [redacted]; Bearer [redacted]' })
+  expect(retained.at(-1)).toMatchObject({ severity: 'error', event: 'session_host.fatal', error: 'native startup failure' })
+  expect(JSON.stringify(retained)).not.toContain(secret)
+  expect(JSON.stringify(retained)).not.toContain('private provider bytes')
+  expect(JSON.stringify(retained)).not.toContain('hidden-token')
+  const boundary = providerParityFailureLogTail(JSON.stringify({ severity: 'error', event: 'callback_failed',
+    error: 'x'.repeat(4080) + secret }), [secret])
+  expect(JSON.stringify(boundary)).not.toContain(secret.slice(0, 12))
 })

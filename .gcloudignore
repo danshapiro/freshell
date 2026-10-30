@@ -11,6 +11,8 @@ coverage/
 /server/
 /test/server/
 /test/unit/server/
+# Runtime integration suites run in the automatic local companion. Shared
+# fixture helpers live under test/helpers and remain in the source image.
 /test/integration/server/
 
 # Version control and CI
@@ -89,6 +91,12 @@ examples/extensions/live-counter/*
 !examples/extensions/status-dashboard/
 examples/extensions/status-dashboard/*
 !examples/extensions/status-dashboard/server.js
+
+# The default wire test runs this actual Rust serializer after the cloud copy.
+# Keep this exception after the broader examples rules above.
+!/crates/freshell-runtime-protocol/examples/
+/crates/freshell-runtime-protocol/examples/*
+!/crates/freshell-runtime-protocol/examples/native-identity-wire.rs
 
 !installers/
 installers/*
