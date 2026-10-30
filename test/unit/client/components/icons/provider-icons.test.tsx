@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach } from 'vitest'
 import { render, cleanup } from '@testing-library/react'
 import {
   AmplifierIcon,
+  AntigravityIcon,
   DefaultProviderIcon,
   PROVIDER_ICONS,
   ProviderIcon,
@@ -35,6 +36,25 @@ describe('PROVIDER_ICONS parity (picker "black circle" fix)', () => {
     // `DefaultProviderIcon` is the ONLY icon that renders a bare <circle>;
     // every real provider icon (including amplifier's brand mark) is built
     // from <path> elements instead.
+    expect(container.querySelector('circle')).toBeNull()
+    expect(container.querySelectorAll('path').length).toBeGreaterThan(0)
+  })
+
+  it('registers a dedicated antigravity icon in PROVIDER_ICONS', () => {
+    // Antigravity CLI (`agy`) is a first-class provider: it must resolve to
+    // its own icon, never the DefaultProviderIcon circle fallback (the same
+    // "black circle" regression class as amplifier above).
+    expect(typeof AntigravityIcon).toBe('function')
+    expect(PROVIDER_ICONS.antigravity).toBe(AntigravityIcon)
+  })
+
+  it('ProviderIcon renders the AntigravityIcon markup with its distinct testid, not the fallback circle', () => {
+    const { container } = render(<ProviderIcon provider="antigravity" />)
+    const svg = container.querySelector('svg')
+    expect(svg).not.toBeNull()
+    expect(svg?.getAttribute('data-testid')).toBe('provider-icon-antigravity')
+    // `DefaultProviderIcon` is the ONLY icon that renders a bare <circle>;
+    // a real provider icon is built from <path> elements instead.
     expect(container.querySelector('circle')).toBeNull()
     expect(container.querySelectorAll('path').length).toBeGreaterThan(0)
   })

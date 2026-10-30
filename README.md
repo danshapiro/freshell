@@ -207,6 +207,7 @@ Then unplug and replug the deck. Without the rule, the connection status shows "
 | `CODEX_CMD` | No | Codex CLI command override |
 | `OPENCODE_CMD` | No | OpenCode CLI command override |
 | `GEMINI_CMD` | No | Gemini CLI command override |
+| `ANTIGRAVITY_CMD` | No | Antigravity CLI command override |
 | `KIMI_CMD` | No | Kimi CLI command override |
 | `AMPLIFIER_CMD` | No | Amplifier CLI command override |
 | `GOOGLE_GENERATIVE_AI_API_KEY` | No | Gemini API key for automatic conversation names and terminal summaries; takes precedence over Settings at startup |

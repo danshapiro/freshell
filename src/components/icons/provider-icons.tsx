@@ -72,6 +72,24 @@ export function GeminiIcon(props: IconProps) {
   )
 }
 
+export function AntigravityIcon(props: IconProps) {
+  // Antigravity CLI mark: a large four-pointed star with a small companion
+  // star, mono-color like the other provider icons and distinct from
+  // Gemini's four-curved-arm sparkle.
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 24 24"
+      fill="currentColor"
+      data-testid="provider-icon-antigravity"
+      {...props}
+    >
+      <path d="M12 2c.9 4.06 3.04 7.2 6.9 8.6-3.86 1.4-6 4.54-6.9 8.6-.9-4.06-3.04-7.2-6.9-8.6C8.96 9.2 11.1 6.06 12 2Z" />
+      <path d="M18.5 14.5c.45 2.03 1.52 3.6 3.45 4.3-1.93.7-3 2.27-3.45 4.3-.45-2.03-1.52-3.6-3.45-4.3 1.93-.7 3-2.27 3.45-4.3Z" />
+    </svg>
+  )
+}
+
 export function AmplifierIcon(props: IconProps) {
   // Amplifier mark. Mono-color: paths inherit `currentColor` from the root svg
   // (original artwork's #10233A fills stripped) to match the other provider icons.
@@ -240,6 +258,7 @@ export const PROVIDER_ICONS: Record<CodingCliProviderName, React.ComponentType<I
   opencode: OpencodeIcon,
   gemini: GeminiIcon,
   amplifier: AmplifierIcon,
+  antigravity: AntigravityIcon,
 }
 
 export function ProviderIcon({

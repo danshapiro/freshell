@@ -587,7 +587,7 @@ mod tests {
     #[test]
     fn all_bundled_manifests_validate_and_register_through_scan() {
         // Boot-path regression: the repo's extensions/ tree must survive the
-        // strict schema (all six are CLI-category today). Read-only: the
+        // strict schema (all seven are CLI-category today). Read-only: the
         // dir is only scanned, never written.
         let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../extensions"));
         let reg = ExtensionRegistry::scan(&[dir]);
@@ -595,7 +595,15 @@ mod tests {
         names.sort();
         assert_eq!(
             names,
-            ["amplifier", "claude", "codex", "gemini", "kimi", "opencode"],
+            [
+                "amplifier",
+                "antigravity",
+                "claude",
+                "codex",
+                "gemini",
+                "kimi",
+                "opencode"
+            ],
             "every bundled extension must validate under the strict schema"
         );
     }

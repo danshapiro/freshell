@@ -1,0 +1,14 @@
+{
+  "name": "antigravity",
+  "version": "1.0.0",
+  "label": "Antigravity CLI",
+  "description": "Google's Antigravity CLI agent",
+  "category": "cli",
+  "cli": {
+    "command": "agy",
+    "envVar": "ANTIGRAVITY_CMD"
+  },
+  "picker": {
+    "group": "agents"
+  }
+}
