@@ -92,7 +92,6 @@ import OverviewView from '@/components/OverviewView'
 import TabsView from '@/components/TabsView'
 import PaneDivider from '@/components/panes/PaneDivider'
 import { AuthRequiredModal } from '@/components/AuthRequiredModal'
-import { DeadSessionPanel } from '@/components/DeadSessionPanel'
 import { TerminalInterestReporter } from '@/components/TerminalInterestReporter'
 import { ReconcileWarmingBanner } from '@/components/ReconcileWarmingBanner'
 import { SetupWizard } from '@/components/SetupWizard'
@@ -2548,7 +2547,6 @@ pnpm run serve`}</pre>
       )}
       <AuthRequiredModal />
       <TerminalInterestReporter workspaceVisible={view === 'terminal'} />
-      <DeadSessionPanel />
       <ReconcileWarmingBanner />
       {showSetupWizard && (
         <SetupWizard

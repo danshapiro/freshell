@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, cleanup, waitFor, act } from '@testing-library/react'
+import { render, cleanup, screen, waitFor, act } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import App from '@/App'
@@ -577,6 +577,22 @@ describe('App pane.reconcile adoption', () => {
     await receiveServerFrame(attachResultFor(req2, 'term-new'))
     expect(store.getState().panes.reconcileWarming).toBeNull()
     expect(store.getState().panes.deadSessionAdjudication ?? []).toHaveLength(0)
+  })
+
+  it('renders no dead-sessions dialog even when adjudication state is populated', async () => {
+    // No-modal contract: dead panes explain themselves in their own pane
+    // (restoreError latch + buffer notice); populating the adjudication
+    // state must NOT raise a blocking dialog. This suite mocks no
+    // dead-session panel, so a reintroduced modal mounted by App would
+    // surface here.
+    seedPersistedTerminalPane({ createRequestId: 'cr-1' })
+    const { store } = await bootAppWithReady({ capabilities: { paneReconcileV1: true } })
+    act(() => {
+      store.dispatch(setDeadSessionAdjudication([
+        { tabId: 'tab-1', paneId: 'pane-1', title: 'x', mode: 'claude' },
+      ]))
+    })
+    expect(screen.queryByRole('dialog', { name: 'Dead sessions' })).toBeNull()
   })
 
   it('re-sends the reconcile request on EVERY ready (reconnect covers loss windows)', async () => {
