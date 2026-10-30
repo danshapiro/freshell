@@ -711,7 +711,9 @@ function appendThreadOperation(method, params, result) {
     method,
     threadId,
     params,
-    listenUrl,
+    listenUrl: portFile ? `ws://${host}:${wss.address().port}` : listenUrl,
+    sidecarOwnershipId: process.env.FRESHELL_CODEX_SIDECAR_ID ?? null,
+    pid: process.pid,
     at: new Date().toISOString(),
   }) + '\n', 'utf8')
 }

@@ -28516,6 +28516,246 @@ pub(crate) mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct SidecarIncarnation {
+        ownership_id: String,
+        pid: u32,
+    }
+
+    async fn snapshot_live_sidecars(
+        st: &FreshCodexState,
+        session_ids: &[&str],
+    ) -> Vec<SidecarIncarnation> {
+        let sessions = st.sessions.lock().await;
+        assert_eq!(
+            sessions.len(),
+            session_ids.len(),
+            "exact live registrations"
+        );
+        session_ids
+            .iter()
+            .map(|id| {
+                let session = sessions.get(*id).expect("the sidecar is registered");
+                assert!(
+                    !session.exited.load(Ordering::SeqCst),
+                    "the registered sidecar for {id} is live"
+                );
+                assert!(!session.sidecar_ownership_id.is_empty());
+                SidecarIncarnation {
+                    ownership_id: session.sidecar_ownership_id.clone(),
+                    pid: session.sidecar_pid.expect("a genuine sidecar child PID"),
+                }
+            })
+            .collect()
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct SidecarThreadOperation {
+        method: String,
+        thread_id: String,
+        params: Value,
+        listen_url: String,
+        sidecar_ownership_id: String,
+        pid: u32,
+    }
+
+    /// Join real RPC witnesses to the captured launch owners. Retired endpoints and
+    /// PIDs may be reused; the inherited ownership tag identifies each incarnation.
+    fn assert_sidecar_operation_sequences(
+        log_text: &str,
+        expected: &[(&SidecarIncarnation, &[(&str, &str)])],
+    ) -> Vec<String> {
+        let operations: Vec<SidecarThreadOperation> = log_text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("owned operation witness parses"))
+            .collect();
+        let owners: std::collections::HashSet<_> = expected
+            .iter()
+            .map(|(owner, _)| owner.ownership_id.as_str())
+            .collect();
+        assert_eq!(
+            owners.len(),
+            expected.len(),
+            "distinct launch ownership tags"
+        );
+        assert_eq!(
+            operations.len(),
+            expected
+                .iter()
+                .map(|(_, sequence)| sequence.len())
+                .sum::<usize>(),
+            "exactly the expected operations: {log_text}"
+        );
+        expected
+            .iter()
+            .map(|(owner, sequence)| {
+                assert!(!owner.ownership_id.is_empty());
+                let rows: Vec<_> = operations
+                    .iter()
+                    .filter(|row| row.sidecar_ownership_id == owner.ownership_id)
+                    .collect();
+                let actual: Vec<_> = rows
+                    .iter()
+                    .map(|row| (row.method.as_str(), row.thread_id.as_str()))
+                    .collect();
+                assert_eq!(actual, *sequence, "RPC sequence for {owner:?}: {log_text}");
+                let url = rows
+                    .first()
+                    .expect("each launch served an operation")
+                    .listen_url
+                    .clone();
+                assert!(!url.is_empty(), "the endpoint remains diagnostic evidence");
+                for row in rows {
+                    assert_eq!(row.pid, owner.pid, "RPC served by the owned child: {row:?}");
+                    assert_eq!(row.listen_url, url, "one endpoint per launch: {row:?}");
+                    if row.method != "thread/start" && row.method != "thread/fork" {
+                        assert_eq!(
+                            row.params["threadId"].as_str(),
+                            Some(row.thread_id.as_str()),
+                            "handoff targets the witnessed thread: {row:?}"
+                        );
+                    }
+                }
+                url
+            })
+            .collect()
+    }
+
+    /// Match PID occurrences from the same global event window as `spawn_count`.
+    /// The operation audit separately joins these real launches to ownership tags.
+    fn assert_spawn_pids_match_incarnations(
+        capture: &tracing_capture::GlobalCapture,
+        incarnations: &[SidecarIncarnation],
+    ) {
+        let mut spawned_pids: Vec<u32> = capture
+            .untagged_events_since_start()
+            .into_iter()
+            .filter(|event| event.message == "freshagent.sidecar.spawned")
+            .map(|event| event.fields["pid"].parse().expect("successful spawn PID"))
+            .collect();
+        let mut owned_pids: Vec<_> = incarnations.iter().map(|owner| owner.pid).collect();
+        spawned_pids.sort_unstable();
+        owned_pids.sort_unstable();
+        assert_eq!(
+            spawned_pids, owned_pids,
+            "one successful spawn per owned incarnation"
+        );
+    }
+
+    #[tokio::test]
+    async fn sidecar_operation_identity_survives_retired_endpoint_reuse() {
+        let _guard = ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("fixture evidence directory");
+        let log_path = dir.path().join("operations.jsonl");
+        let port_file = dir.path().join("port");
+        let mut endpoint = "ws://127.0.0.1:0".to_string();
+        let mut incarnations = Vec::new();
+        for thread_id in ["reuse-first", "reuse-second"] {
+            let ownership_id = mint_ownership_id();
+            let mut command = tokio::process::Command::new("node");
+            command
+                .arg(fake_codex_app_server_cmd())
+                .arg("--listen")
+                .arg(&endpoint)
+                .env(CODEX_SIDECAR_OWNERSHIP_ENV, &ownership_id)
+                .env(
+                    "FAKE_CODEX_APP_SERVER_BEHAVIOR",
+                    json!({
+                        "threadStartThreadId": thread_id,
+                        "appendThreadOperationLogPath": log_path,
+                    })
+                    .to_string(),
+                )
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::inherit())
+                .kill_on_drop(true);
+            if incarnations.is_empty() {
+                command.env("FAKE_CODEX_APP_SERVER_PORT_FILE", &port_file);
+            } else {
+                command.env_remove("FAKE_CODEX_APP_SERVER_PORT_FILE");
+            }
+            let mut child = command.spawn().expect("spawn this test's own fixture");
+            let owner = SidecarIncarnation {
+                ownership_id,
+                pid: child.id().expect("fixture child PID"),
+            };
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let transport = loop {
+                if incarnations.is_empty() {
+                    if let Ok(report) = std::fs::read_to_string(&port_file) {
+                        if let Ok(port) = report.trim().parse::<u16>() {
+                            endpoint = format!("ws://127.0.0.1:{port}");
+                        }
+                    }
+                }
+                if let Ok(Some(status)) = child.try_wait() {
+                    panic!("owned endpoint-reuse fixture exited before listening: {status}");
+                }
+                if let Ok(Ok(transport)) = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    TungsteniteTransport::connect(&endpoint),
+                )
+                .await
+                {
+                    break transport;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "owned fixture did not bind {endpoint}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            let (client, _notifications) = CodexAppServerClient::connect(Arc::new(transport));
+            let started = client
+                .start_thread(StartThreadParams::default())
+                .await
+                .expect("real RPC served by the owned fixture");
+            assert_eq!(started.thread_id, thread_id);
+            client.close().await;
+            tokio::time::timeout(Duration::from_secs(5), child.kill())
+                .await
+                .expect("owned child teardown completed")
+                .expect("kill and reap only this child");
+            incarnations.push(owner);
+        }
+        let log_text = read_op_log_when_complete(&log_path, 2).await;
+        let urls = assert_sidecar_operation_sequences(
+            &log_text,
+            &[
+                (&incarnations[0], &[("thread/start", "reuse-first")]),
+                (&incarnations[1], &[("thread/start", "reuse-second")]),
+            ],
+        );
+        assert_eq!(
+            urls[0], urls[1],
+            "the two genuine launches reused one endpoint"
+        );
+        assert_eq!(
+            urls.iter().collect::<std::collections::HashSet<_>>().len(),
+            1,
+            "historical URL grouping conflates two distinct launch owners"
+        );
+        let aliased_owner = SidecarIncarnation {
+            ownership_id: incarnations[1].ownership_id.clone(),
+            pid: incarnations[0].pid,
+        };
+        assert!(
+            std::panic::catch_unwind(|| {
+                assert_sidecar_operation_sequences(
+                    &log_text,
+                    &[
+                        (&aliased_owner, &[("thread/start", "reuse-first")]),
+                        (&incarnations[0], &[("thread/start", "reuse-second")]),
+                    ],
+                );
+            })
+            .is_err(),
+            "a wrong owner must fail despite two genuine launches"
+        );
+    }
+
     /// Whole-branch review M-2: a Compact click on a crash-stale session (sidecar
     /// hand-flagged exited-unrequested, see `simulate_unrequested_crash`; the
     /// self-heal design keeps the session MAPPED) must transparently
@@ -28645,6 +28885,7 @@ pub(crate) mod tests {
             .to_string(),
         );
         let parent_id = create_real_fake_session(&st, &mut rx).await;
+        let original_owner = snapshot_live_sidecars(&st, &[&parent_id]).await.remove(0);
         simulate_unrequested_crash(&st, &parent_id).await;
         assert_eq!(
             spawn_count(&capture),
@@ -28689,54 +28930,46 @@ pub(crate) mod tests {
             spawn_count(&capture)
         );
 
-        // Per-connection RPC order over THREE sidecars: first spawn (kept alive,
-        // hand-flagged crashed — D8) = thread/start; respawned parent =
-        // thread/resume → thread/fork → thread/archive; child =
-        // thread/unarchive → thread/resume.
+        let mut incarnations = vec![original_owner];
+        incarnations.extend(snapshot_live_sidecars(&st, &[&parent_id, "child-after-crash"]).await);
+        assert_spawn_pids_match_incarnations(&capture, &incarnations);
         let log_text = read_op_log_when_complete(&log_path, 6).await;
-        let mut by_url: HashMap<String, Vec<String>> = HashMap::new();
-        for line in log_text.lines() {
-            let entry: Value = serde_json::from_str(line).expect("op log line parses");
-            by_url
-                .entry(entry["listenUrl"].as_str().expect("listenUrl").to_string())
-                .or_default()
-                .push(entry["method"].as_str().expect("method").to_string());
-        }
+        let urls = assert_sidecar_operation_sequences(
+            &log_text,
+            &[
+                (&incarnations[0], &[("thread/start", &parent_id)]),
+                (
+                    &incarnations[1],
+                    &[
+                        ("thread/resume", &parent_id),
+                        ("thread/fork", "child-after-crash"),
+                        ("thread/archive", "child-after-crash"),
+                    ],
+                ),
+                (
+                    &incarnations[2],
+                    &[
+                        ("thread/unarchive", "child-after-crash"),
+                        ("thread/resume", "child-after-crash"),
+                    ],
+                ),
+            ],
+        );
+        assert_ne!(
+            urls[1], urls[2],
+            "the live parent and child have distinct endpoints"
+        );
+        let targets: Vec<Value> = log_text
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|row| row["method"] == "thread/fork")
+            .map(|row| row["params"]["threadId"].clone())
+            .collect();
         assert_eq!(
-            by_url.len(),
-            3,
-            "exactly three sidecar connections (first + respawned parent + child): {log_text}"
+            targets,
+            vec![json!(parent_id)],
+            "only the recovered parent is forked"
         );
-        let mut sequences: Vec<Vec<String>> = by_url.values().cloned().collect();
-        sequences.sort();
-        // Sorted order: ["thread/resume", ...] < ["thread/start"] < ["thread/unarchive", ...].
-        assert_eq!(
-            sequences[0],
-            vec!["thread/resume", "thread/fork", "thread/archive"],
-            "the respawned parent was forked, never the dead connection: {log_text}"
-        );
-        assert_eq!(
-            sequences[1],
-            vec!["thread/start"],
-            "the first spawn served only the create: {log_text}"
-        );
-        assert_eq!(
-            sequences[2],
-            vec!["thread/unarchive", "thread/resume"],
-            "the child sidecar completed the archive→unarchive→resume handoff: {log_text}"
-        );
-
-        // Both the respawned parent and the child are registered and live.
-        let guard = st.sessions.lock().await;
-        assert!(
-            guard.contains_key(&parent_id),
-            "the respawned parent stays registered under the SAME id"
-        );
-        assert!(
-            guard.contains_key("child-after-crash"),
-            "the forked child is registered on its own sidecar"
-        );
-        drop(guard);
 
         // The recovery was transparent: no user-facing error frame names the parent.
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
@@ -28800,6 +29033,7 @@ pub(crate) mod tests {
         );
         let old_id = create_real_fake_session(&st, &mut rx).await;
         assert_eq!(old_id, "parent-old-mint", "fixture sanity: the clicked id");
+        let original_owner = snapshot_live_sidecars(&st, &[&old_id]).await.remove(0);
         simulate_unrequested_crash(&st, &old_id).await;
         assert_eq!(
             spawn_count(&capture),
@@ -28855,68 +29089,51 @@ pub(crate) mod tests {
             spawn_count(&capture)
         );
 
-        // Per-connection RPC order over THREE sidecars: first spawn (kept alive,
-        // hand-flagged crashed — D8) = thread/start; respawned parent =
-        // thread/start (the mint) → thread/fork → thread/archive, with the fork
-        // RPC TARGETING the minted parent id; child = unarchive → resume.
+        let mut incarnations = vec![original_owner];
+        incarnations
+            .extend(snapshot_live_sidecars(&st, &["parent-new-mint", "child-after-mint"]).await);
+        assert!(
+            !st.sessions.lock().await.contains_key(&old_id),
+            "old record retired"
+        );
+        assert_spawn_pids_match_incarnations(&capture, &incarnations);
         let log_text = read_op_log_when_complete(&log_path, 6).await;
-        let mut by_url: HashMap<String, Vec<String>> = HashMap::new();
-        let mut fork_target: Option<String> = None;
-        for line in log_text.lines() {
-            let entry: Value = serde_json::from_str(line).expect("op log line parses");
-            by_url
-                .entry(entry["listenUrl"].as_str().expect("listenUrl").to_string())
-                .or_default()
-                .push(entry["method"].as_str().expect("method").to_string());
-            if entry["method"].as_str() == Some("thread/fork") {
-                fork_target = Some(
-                    entry["params"]["threadId"]
-                        .as_str()
-                        .expect("fork threadId")
-                        .to_string(),
-                );
-            }
-        }
-        assert_eq!(
-            fork_target.as_deref(),
-            Some("parent-new-mint"),
-            "thread/fork runs against the RESPAWNED parent thread: {log_text}"
+        let urls = assert_sidecar_operation_sequences(
+            &log_text,
+            &[
+                (&incarnations[0], &[("thread/start", &old_id)]),
+                (
+                    &incarnations[1],
+                    &[
+                        ("thread/start", "parent-new-mint"),
+                        ("thread/fork", "child-after-mint"),
+                        ("thread/archive", "child-after-mint"),
+                    ],
+                ),
+                (
+                    &incarnations[2],
+                    &[
+                        ("thread/unarchive", "child-after-mint"),
+                        ("thread/resume", "child-after-mint"),
+                    ],
+                ),
+            ],
         );
-        assert_eq!(
-            by_url.len(),
-            3,
-            "exactly three sidecar connections (first + respawned parent + child): {log_text}"
+        assert_ne!(
+            urls[1], urls[2],
+            "the live parent and child have distinct endpoints"
         );
-        let mut sequences: Vec<Vec<String>> = by_url.values().cloned().collect();
-        sequences.sort();
-        // Sorted order: ["thread/start"] < ["thread/start", "thread/fork", ...] < ["thread/unarchive", ...].
+        let targets: Vec<Value> = log_text
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|row| row["method"] == "thread/fork")
+            .map(|row| row["params"]["threadId"].clone())
+            .collect();
         assert_eq!(
-            sequences[0],
-            vec!["thread/start"],
-            "the first spawn served only the original create: {log_text}"
+            targets,
+            vec![json!("parent-new-mint")],
+            "only the resolved parent is forked"
         );
-        assert_eq!(
-            sequences[1],
-            vec!["thread/start", "thread/fork", "thread/archive"],
-            "the respawned parent minted its new thread, then ran fork + archive: {log_text}"
-        );
-        assert_eq!(
-            sequences[2],
-            vec!["thread/unarchive", "thread/resume"],
-            "the child sidecar completed the archive→unarchive→resume handoff: {log_text}"
-        );
-
-        // Registrations: the old id is GONE (the respawn re-keyed the session map), the
-        // minted parent and the child are live.
-        {
-            let guard = st.sessions.lock().await;
-            assert!(
-                !guard.contains_key(&old_id),
-                "the mint-new respawn removed the old parent id"
-            );
-            assert!(guard.contains_key("parent-new-mint"));
-            assert!(guard.contains_key("child-after-mint"));
-        }
 
         // Broadcast leg audit: the materialized OLD→NEW pair DID go out (the client re-key
         // this whole finding hinges on), and NO broadcast error frame is keyed to the old id
@@ -29117,6 +29334,7 @@ pub(crate) mod tests {
         );
         let old_id = create_real_fake_session(&st, &mut rx).await;
         assert_eq!(old_id, "parent-old-mint", "fixture sanity: the clicked id");
+        let original_owner = snapshot_live_sidecars(&st, &[&old_id]).await.remove(0);
         simulate_unrequested_crash(&st, &old_id).await;
         // Dead-thread negative cache: ensure-alive goes straight to the mint-new
         // respawn fallback (the F-1 route).
@@ -29276,7 +29494,7 @@ pub(crate) mod tests {
 
         // Wire audit: exactly TWO thread/fork RPCs crossed the wire (fork #1 and the
         // post-completion fork #3 — the refused duplicate produced NONE), both
-        // targeting the respawned parent, over exactly four sidecar connections
+        // targeting the respawned parent, across exactly four owned launches
         // (parent spawn + respawn + one sidecar per child).
         assert_eq!(
             spawn_count(&capture),
@@ -29301,19 +29519,45 @@ pub(crate) mod tests {
             vec!["parent-new-mint".to_string(), "parent-new-mint".to_string()],
             "exactly the two legitimate forks hit the wire — the refused duplicate none: {log_text}"
         );
-        let urls: std::collections::HashSet<String> = log_text
-            .lines()
-            .map(|line| {
-                serde_json::from_str::<Value>(line).unwrap()["listenUrl"]
-                    .as_str()
-                    .unwrap()
-                    .to_string()
-            })
-            .collect();
+        let mut incarnations = vec![original_owner];
+        incarnations
+            .extend(snapshot_live_sidecars(&st, &["parent-new-mint", &child1, &child2]).await);
+        assert!(
+            !st.sessions.lock().await.contains_key(&old_id),
+            "old record retired"
+        );
+        assert_spawn_pids_match_incarnations(&capture, &incarnations);
+        let urls = assert_sidecar_operation_sequences(
+            &log_text,
+            &[
+                (&incarnations[0], &[("thread/start", &old_id)]),
+                (
+                    &incarnations[1],
+                    &[
+                        ("thread/start", "parent-new-mint"),
+                        ("thread/fork", &child1),
+                        ("thread/archive", &child1),
+                        ("thread/fork", &child2),
+                        ("thread/archive", &child2),
+                    ],
+                ),
+                (
+                    &incarnations[2],
+                    &[("thread/unarchive", &child1), ("thread/resume", &child1)],
+                ),
+                (
+                    &incarnations[3],
+                    &[("thread/unarchive", &child2), ("thread/resume", &child2)],
+                ),
+            ],
+        );
         assert_eq!(
-            urls.len(),
-            4,
-            "crashed + respawned parent + two child sidecars: {log_text}"
+            urls[1..]
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3,
+            "the recovered parent and both live child sidecars have distinct endpoints: {log_text}"
         );
 
         let _ = std::fs::remove_file(&log_path);
