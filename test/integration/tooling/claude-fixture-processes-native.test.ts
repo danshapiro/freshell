@@ -1,5 +1,5 @@
 import type { ChildProcess } from 'node:child_process'
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { once } from 'node:events'
 import fs from 'node:fs/promises'
 import os from 'node:os'
@@ -64,7 +64,7 @@ const WRITER = `
   const path = require('node:path')
   const { spawn } = require('node:child_process')
   const [root, control, mcp] = process.argv.slice(1)
-  const child = spawn(process.execPath, ['-e', mcp, root, control], { stdio: 'ignore' })
+  const child = spawn(process.execPath, ['-e', mcp, root, control], { stdio: 'ignore', detached: process.platform === 'win32' })
   child.unref()
   fs.writeFileSync(path.join(control, 'writer.pid'), String(process.pid))
   setInterval(() => {
@@ -80,7 +80,7 @@ const SIDECAR = `
   const { spawn } = require('node:child_process')
   const [root, control, mode, writer, mcp] = process.argv.slice(1)
   fs.writeFileSync(path.join(control, 'root.pid'), String(process.pid))
-  const child = spawn(process.execPath, ['-e', writer, root, control, mcp], { stdio: 'ignore' })
+  const child = spawn(process.execPath, ['-e', writer, root, control, mcp], { stdio: 'ignore', detached: process.platform === 'win32' })
   child.unref()
   const ready = setInterval(() => {
     if (!fs.existsSync(path.join(control, 'writer.pid')) || !fs.existsSync(path.join(control, 'mcp.pid'))) return
@@ -155,6 +155,63 @@ describe('native Claude fixture process ownership', () => {
         await fixture.cleanup()
         await other.cleanup()
         await fs.rm(control, { recursive: true, force: true })
+      }
+    })
+  }
+
+  if (process.platform === 'win32') {
+    it('settles the Job host and its process tree when the owning Node controller exits without cleanup', async () => {
+      const control = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-abandoned-job-'))
+      const fixtureModule = new URL('../providers/claude-local-provider.mjs', import.meta.url).href
+      const controller = spawn(process.execPath, ['--input-type=module', '-e', `
+        import fs from 'node:fs/promises'
+        import path from 'node:path'
+        import { setTimeout as delay } from 'node:timers/promises'
+        const [moduleUrl, control, sidecar, writer, mcp] = process.argv.slice(1)
+        const { createClaudeFixture } = await import(moduleUrl)
+        const fixture = await createClaudeFixture({ parent: control })
+        const child = fixture.spawn(process.execPath, ['-e', sidecar, fixture.root, control, 'hard-killed', writer, mcp], { stdio: 'ignore' })
+        child.on('error', (error) => { process.stderr.write(String(error)); process.exit(2) })
+        while (!await fs.stat(path.join(control, 'ready')).then(() => true, () => false)) await delay(20)
+        await fs.writeFile(path.join(control, 'owner.pid'), String(child.fixtureHostPid))
+        await fs.writeFile(path.join(control, 'controller-ready.json'), JSON.stringify({ pid: process.pid, root: fixture.root }))
+        while (!await fs.stat(path.join(control, 'exit-controller')).then(() => true, () => false)) await delay(20)
+        // Deliberately omit fixture.cleanup(): the Job host's owner-process
+        // watch must end the entire tree and then the host itself.
+        process.exit(0)
+      `, fixtureModule, control, SIDECAR, WRITER, MCP], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+      const output = observe(controller)
+      let stderr = ''
+      controller.stderr!.on('data', (data: Buffer) => { stderr += data.toString() })
+      let ownedPids: number[] | undefined
+      try {
+        await waitUntil(async () => {
+          if (controller.exitCode !== null || controller.signalCode !== null) throw new Error(`native controller exited before readiness: ${stderr}`)
+          return fs.stat(path.join(control, 'controller-ready.json')).then(() => true, () => false)
+        })
+        const metadata = JSON.parse(await fs.readFile(path.join(control, 'controller-ready.json'), 'utf8')) as { pid: number; root: string }
+        expect(controller.pid).toBe(metadata.pid)
+        const reportedPids = await Promise.all(['owner.pid', 'root.pid', 'writer.pid', 'mcp.pid'].map(async (file) => Number(await fs.readFile(path.join(control, file), 'utf8'))))
+        expect(reportedPids.every((pid) => Number.isSafeInteger(pid) && pid > 0)).toBe(true)
+        ownedPids = reportedPids
+        expect(new Set(ownedPids).size).toBe(4)
+        expect(await Promise.all(ownedPids.map(live))).toEqual([true, true, true, true])
+
+        await fs.writeFile(path.join(control, 'exit-controller'), 'exit without cleanup')
+        await output.closed
+        expect(controller.exitCode).toBe(0)
+        expect(controller.signalCode).toBeNull()
+        await waitUntil(async () => (await Promise.all(ownedPids!.map(live))).every((running) => !running))
+        expect(await Promise.all(ownedPids.map(live))).toEqual([false, false, false, false])
+      } finally {
+        if (controller.exitCode === null && controller.signalCode === null) controller.kill('SIGKILL')
+        await output.closed
+        if (ownedPids !== undefined) {
+          // Retain all evidence if any real process survives. Only confirmed
+          // exits permit removing the abandoned fixture and control files.
+          await waitUntil(async () => (await Promise.all(ownedPids!.map(live))).every((running) => !running))
+          await fs.rm(control, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+        }
       }
     })
   }
