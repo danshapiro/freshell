@@ -2939,7 +2939,7 @@ fn rename_decision(
                     "the record moved to revision {} while the editor held {expected}",
                     record.revision
                 ),
-                current: Some(record),
+                current: Some(Box::new(record)),
             });
         }
     }
@@ -3073,7 +3073,7 @@ fn bind_pending_decision(
         }
         return Err(NameError::Conflict {
             message: "the pending handle is already bound to a different durable session".into(),
-            current: document.record_at(&target_key).cloned(),
+            current: document.record_at(&target_key).cloned().map(Box::new),
         });
     }
 
@@ -3761,7 +3761,7 @@ fn recover_interrupted_generation_decision(
     meta: &TxnMeta,
 ) -> Result<Decision<usize>, NameError> {
     let mut recovered = 0usize;
-    for (_key, series) in document.generation.iter_mut() {
+    for series in document.generation.values_mut() {
         if series.status != GenerationStatus::InFlight {
             continue;
         }

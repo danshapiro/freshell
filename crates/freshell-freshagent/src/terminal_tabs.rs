@@ -1234,7 +1234,7 @@ pub(crate) async fn spawn_terminal_pane(
     body: &Value,
     tab_id: &str,
     pane_id: &str,
-) -> Result<TerminalSpawnResult, Response> {
+) -> Result<TerminalSpawnResult, Box<Response>> {
     spawn_terminal_pane_with_handoff(state, body, tab_id, pane_id, None).await
 }
 
@@ -1263,7 +1263,7 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
     tab_id: &str,
     pane_id: &str,
     handoff: Option<&HandoffToken>,
-) -> Result<TerminalSpawnResult, Response> {
+) -> Result<TerminalSpawnResult, Box<Response>> {
     let mode = body
         .get("mode")
         .and_then(Value::as_str)
@@ -1280,14 +1280,16 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                  {{\"agent\":\"opencode\"}} for the fresh-agent path, or open an issue if you \
                  need this mode."
             ),
-        ));
+        )
+        .into());
     }
 
     let Some(registry) = state.terminal_registry.clone() else {
         return Err(fail_json(
             StatusCode::SERVICE_UNAVAILABLE,
             "terminal registry not wired on this server".to_string(),
-        ));
+        )
+        .into());
     };
     // Freeze the launch lane before the coordinator's pre-spawn witness is
     // registered. Its cancel target and the eventual registry row must use
@@ -1321,7 +1323,8 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
             return Err(fail_json(
                 StatusCode::BAD_REQUEST,
                 format!("cwd \"{dir}\" does not exist"),
-            ));
+            )
+            .into());
         }
     }
 
@@ -1416,11 +1419,9 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
         } else {
             format!("The saved {mode} session {blocked} could not be verified for recovery.")
         };
-        return Err(crate::fail_json_code(
-            StatusCode::CONFLICT,
-            "RECOVERY_BLOCKED",
-            message,
-        ));
+        return Err(
+            crate::fail_json_code(StatusCode::CONFLICT, "RECOVERY_BLOCKED", message).into(),
+        );
     }
     if let Some(stale) = rest_outcome.stale_session_id.as_deref() {
         // b8ke ext r16 F3: a DEFINITIVELY MISSING exact-resume target no
@@ -1449,7 +1450,8 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                 "The durable session {stale} is gone. No replacement was started — \
                  start a fresh conversation explicitly if you want a new session."
             ),
-        ));
+        )
+        .into());
     }
 
     // Fresh-claude preallocation (kata hbsa): WS parity. The WS door's
@@ -1517,7 +1519,7 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
             return Err(fail_json(
                 StatusCode::BAD_REQUEST,
                 "Amplifier terminals require the default system shell on a unix host (cwd is part of the session identity contract).".to_string(),
-            ));
+            ).into());
         }
         if resume_session_id
             .as_deref()
@@ -1532,7 +1534,7 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                     "Invalid amplifier sessionRef '{}': synthetic terminal placeholder ids are not resumable sessions.",
                     resume_session_id.as_deref().unwrap_or_default()
                 ),
-            ));
+            ).into());
         }
         // Launcher-assigned identity: a fresh (non-restore) create mints the
         // session UUID up front. Legacy persisted panes with NO resume id
@@ -1559,7 +1561,8 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                 return Err(fail_json(
                     StatusCode::CONFLICT,
                     format!("Amplifier session {requested} is already open in a live terminal."),
-                ));
+                )
+                .into());
             }
             // ONE effective spawn cwd (F4). The falsified path this closes:
             // cwd=None used to flow into build_cli_spawn_spec → spec.cwd =
@@ -1577,7 +1580,7 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                     return Err(fail_json(
                         StatusCode::BAD_REQUEST,
                         "Amplifier requires a resolvable working directory (cwd is part of the session identity contract).".to_string(),
-                    ));
+                    ).into());
                 }
             };
             // A10/B2 guard (validated falsification): REST's is_dir check
@@ -1595,13 +1598,14 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                     format!(
                         "Amplifier working directory \"{raw_effective_cwd}\" must be an absolute path."
                     ),
-                ));
+                ).into());
             };
             if !std::path::Path::new(&effective_cwd).is_dir() {
                 return Err(fail_json(
                     StatusCode::BAD_REQUEST,
                     format!("Amplifier working directory \"{effective_cwd}\" does not exist."),
-                ));
+                )
+                .into());
             }
             let ensured = freshell_sessions::amplifier_stub::resolve_amplifier_home()
                 .ok_or_else(|| {
@@ -1644,7 +1648,7 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                                             .as_deref()
                                             .unwrap_or("an unknown directory")
                                     ),
-                                ));
+                                ).into());
                             }
                         }
                     }
@@ -1661,7 +1665,8 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                     return Err(fail_json(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("Failed to pre-create amplifier session {requested}: {detail}"),
-                    ));
+                    )
+                    .into());
                 }
             }
         }
@@ -1940,7 +1945,7 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                             "SESSION_RESERVED",
                             "A lifecycle operation is in flight for this session; retry after it settles"
                                 .to_string(),
-                        ));
+                        ).into());
                     }
                     freshell_ownership::AttachGuardOutcome::StaleGeneration { .. } => {
                         tracing::warn!(target: "freshell_freshagent::terminal_tabs",
@@ -1958,7 +1963,8 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                                  refresh and retry. (session {})",
                                 locator.session_id
                             ),
-                        ));
+                        )
+                        .into());
                     }
                 }
             }
@@ -2019,7 +2025,7 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                         (StatusCode::CONFLICT, Json(stale_body)).into_response()
                     }
                     _ => unreachable!("the refused arms are exhaustive above"),
-                });
+                }.into());
             }
         }
     }
@@ -2056,7 +2062,8 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                 live_sid,
                 Some(&owner_terminal_id),
                 owner_fields.as_ref(),
-            ));
+            )
+            .into());
         }
 
         // kata b8ke Task 10 (REST-door D7 parity, the WS door's Task 13b
@@ -2087,11 +2094,9 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                         &ownership.observe(&mode, live_sid),
                     )
                 });
-                return Err(fail_json_restore_unavailable(
-                    live_sid,
-                    None,
-                    owner_fields.as_ref(),
-                ));
+                return Err(
+                    fail_json_restore_unavailable(live_sid, None, owner_fields.as_ref()).into(),
+                );
             }
         }
 
@@ -2142,7 +2147,8 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                     live_sid,
                     Some(&terminal_id),
                     owner_fields.as_ref(),
-                ));
+                )
+                .into());
             }
             SessionRefClaim::Held { .. } | SessionRefClaim::ExpiredNeedsKill { .. } => {
                 tracing::warn!(
@@ -2157,11 +2163,9 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                         &ownership.observe(&mode, live_sid),
                     )
                 });
-                return Err(fail_json_restore_unavailable(
-                    live_sid,
-                    None,
-                    owner_fields.as_ref(),
-                ));
+                return Err(
+                    fail_json_restore_unavailable(live_sid, None, owner_fields.as_ref()).into(),
+                );
             }
         }
     }
@@ -2244,7 +2248,8 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
         Err(join_err) => Err(fail_json(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("terminal create task panicked: {join_err}"),
-        )),
+        )
+        .into()),
     }
 }
 
@@ -2333,7 +2338,9 @@ struct GatedSettleInputs {
 /// held from before the PTY fork until every settle step (meta, lease bind,
 /// codex adopt, pane bookkeeping) completed — the same spawn-to-settled
 /// scope the WS door pins with `hold_permit_across`.
-async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnResult, Response> {
+async fn settle_gated_create(
+    inputs: GatedSettleInputs,
+) -> Result<TerminalSpawnResult, Box<Response>> {
     // D-C-R (2026-07-30): the spawn-gate permit is now acquired BELOW, after
     // the (possibly ~long) codex managed plan, so codex planning never holds a
     // server-wide spawn permit. Declared first so it drops last (RAII scope:
@@ -2469,7 +2476,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             use freshell_opencode::serve::PortAllocator as _;
             match freshell_opencode::transport::LoopbackPortAllocator.allocate() {
                 Ok(ep) => Some(ep),
-                Err(e) => return Err(fail_json(StatusCode::BAD_REQUEST, e)),
+                Err(e) => return Err(fail_json(StatusCode::BAD_REQUEST, e).into()),
             }
         } else {
             None
@@ -2517,7 +2524,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                 .await
             {
                 Ok(launch) => Some(launch),
-                Err(error) => return Err(codex_launch_error_response(error)),
+                Err(error) => return Err(codex_launch_error_response(error).into()),
             }
         } else {
             None
@@ -2541,7 +2548,8 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                     return Err(fail_json(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "managed Codex terminal setup did not match its spawn id".to_string(),
-                    ));
+                    )
+                    .into());
                 }
                 let CodexManagedLaunchSetup {
                     terminal_id: _,
@@ -2567,7 +2575,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                     ) {
                         Ok(injection) => injection,
                         Err(error) => {
-                            return Err(fail_json(StatusCode::BAD_REQUEST, error.message))
+                            return Err(fail_json(StatusCode::BAD_REQUEST, error.message).into())
                         }
                     }
                 };
@@ -2646,7 +2654,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         };
         let launch = match resolve_coding_cli_command(&state.cli_commands, &inputs, &RealEnv) {
             Ok(l) => l,
-            Err(e) => return Err(fail_json(StatusCode::BAD_REQUEST, e.message())),
+            Err(e) => return Err(fail_json(StatusCode::BAD_REQUEST, e.message()).into()),
         };
 
         let effective_shell = resolve_shell(shell_type, host_os, is_wsl);
@@ -2806,7 +2814,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                 if let Some(stub) = amplifier_stub.as_ref().filter(|s| s.created) {
                     let _ = freshell_sessions::amplifier_stub::gc_stub_if_unused(&stub.session_dir);
                 }
-                return Err(spawn_gate_error_response(err, rest_gate.timeout));
+                return Err(spawn_gate_error_response(err, rest_gate.timeout).into());
             }
         }
     }
@@ -2952,7 +2960,8 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                     "Amplifier session {} is already open in a live terminal.",
                     resume_session_id.as_deref().unwrap_or_default()
                 ),
-            ));
+            )
+            .into());
         }
         // A stub written for a spawn that never happened is pure litter.
         if let Some(stub) = amplifier_stub.as_ref().filter(|s| s.created) {
@@ -2978,7 +2987,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             env_var.as_deref(),
             resume_session_id.is_some(),
         );
-        return Err(fail_json(StatusCode::BAD_REQUEST, message));
+        return Err(fail_json(StatusCode::BAD_REQUEST, message).into());
     }
 
     // D8: arm the lease's TTL kill path -- record the just-spawned child's pid
@@ -3009,7 +3018,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             .await
         {
             registry.kill(&terminal_id);
-            return Err(fail_json(StatusCode::INTERNAL_SERVER_ERROR, message));
+            return Err(fail_json(StatusCode::INTERNAL_SERVER_ERROR, message).into());
         }
     }
 
@@ -3094,7 +3103,8 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                         "the terminal target's durable recovery registration failed; \
                          the spawned terminal was reaped: {reg_err}"
                     ),
-                ));
+                )
+                .into());
             }
             // The REST create rung keeps its documented degradation policy
             // (a create is never blocked by durability degradation); the
@@ -3164,7 +3174,8 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                     "Session {} is still running on the server.",
                     locator.session_id
                 ),
-            ));
+            )
+            .into());
         }
     }
 
@@ -3255,7 +3266,8 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                         "Session {} is still running on the server.",
                         locator.session_id
                     ),
-                ));
+                )
+                .into());
             }
         }
     }
@@ -3353,7 +3365,8 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                             "Session {} is still running on the server.",
                             locator.session_id
                         ),
-                    ));
+                    )
+                    .into());
                 }
             }
         }
@@ -3566,7 +3579,7 @@ async fn create_terminal_tab(
             // (`layoutStore.closeTab(createdTabId)`, `router.ts:824-830`) —
             // no phantom tab survives a failed spawn.
             state.layout.close_tab(&tab_id);
-            return resp;
+            return *resp;
         }
     };
     let TerminalSpawnResult {

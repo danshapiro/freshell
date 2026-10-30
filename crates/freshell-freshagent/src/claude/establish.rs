@@ -799,7 +799,7 @@ impl FreshClaudeState {
                 )
                 .await
             {
-                if let Some(session) = { self.sessions.lock().await.remove(&map_key) } {
+                if let Some(session) = self.sessions.lock().await.remove(&map_key) {
                     let _teardown: LoggedTeardown =
                         self.teardown_removed_session_logged(session).await;
                 }
@@ -814,7 +814,7 @@ impl FreshClaudeState {
             }
             if let Some(claim) = claim.as_ref() {
                 if self.claim_dead_state_advanced(&claim.durable, claim.dead_state) {
-                    if let Some(session) = { self.sessions.lock().await.remove(&map_key) } {
+                    if let Some(session) = self.sessions.lock().await.remove(&map_key) {
                         let _teardown: LoggedTeardown =
                             self.teardown_removed_session_logged(session).await;
                     }

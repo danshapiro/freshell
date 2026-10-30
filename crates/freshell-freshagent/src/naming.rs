@@ -193,7 +193,7 @@ pub enum NameError {
     /// record at the time of the check.
     Conflict {
         message: String,
-        current: Option<SessionNameRecord>,
+        current: Option<Box<SessionNameRecord>>,
     },
     /// Durable document read/write/parse failure with old state intact
     /// (HTTP 503).
@@ -930,7 +930,7 @@ pub(crate) mod test_support {
                                     message: format!(
                                         "the record moved to revision {actual} while the editor held {expected}"
                                     ),
-                                    current: Some(record),
+                                    current: Some(Box::new(record)),
                                 })
                             });
                         }
@@ -1156,7 +1156,7 @@ mod tests {
             (
                 NameError::Conflict {
                     message: "moved".into(),
-                    current: Some(SessionNameRecord {
+                    current: Some(Box::new(SessionNameRecord {
                         name_ref: SessionNameRef::Pending { id: "h".into() },
                         name: "current".into(),
                         source: NameSource::Manual,
@@ -1164,7 +1164,7 @@ mod tests {
                         manual_revision: None,
                         renamed_at: None,
                         legacy_origin: None,
-                    }),
+                    })),
                 },
                 409,
                 "NAME_REVISION_CONFLICT",

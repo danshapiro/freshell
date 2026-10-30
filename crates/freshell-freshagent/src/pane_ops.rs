@@ -318,7 +318,7 @@ pub(crate) async fn split_pane(
     } else {
         match spawn_terminal_pane(&state, &body, &tab_id, &new_pane_id).await {
             Ok(TerminalSpawnResult { pane_content, .. }) => pane_content,
-            Err(resp) => return resp,
+            Err(resp) => return *resp,
         }
     };
 
@@ -974,7 +974,7 @@ pub(crate) async fn respawn_pane(
 
     let spawned = match spawn_terminal_pane(&state, &body, &tab_id, &pane_id).await {
         Ok(s) => s,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let TerminalSpawnResult {
         pane_content,
@@ -1067,11 +1067,9 @@ pub(crate) async fn attach_pane(
     let snapshot =
         state.canonical_ownership_snapshot(&session_ref.provider, &session_ref.session_id);
     match snapshot.state {
-        freshell_ownership::OwnershipState::Live {
-            ref owner,
-            generation: _,
-            ..
-        } if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal => {
+        freshell_ownership::OwnershipState::Live { ref owner, .. }
+            if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal =>
+        {
             let Some(terminal_id) = owner.terminal_id.clone().or_else(|| {
                 state.session_identity.as_ref().and_then(|lookup| {
                     lookup.terminal_for_session(&session_ref.provider, &session_ref.session_id)

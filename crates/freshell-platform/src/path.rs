@@ -349,10 +349,9 @@ pub fn convert_wsl_drive_path_to_windows_path(input: &str, env: &dyn Env) -> Opt
     let after_letter = &rest_after_slash[1..];
     let rest: Option<&str> = if after_letter.is_empty() {
         None
-    } else if let Some(r) = after_letter.strip_prefix('/') {
-        Some(r) // `(.*)` after the slash (may be empty)
     } else {
-        return None; // letter followed by a non-slash char (e.g. `/mnt/cc`)
+        let r = after_letter.strip_prefix('/')?;
+        Some(r) // `(.*)` after the slash (may be empty)
     };
     match rest {
         Some(r) if !r.is_empty() => Some(format!("{drive}:\\{}", r.replace('/', "\\"))),

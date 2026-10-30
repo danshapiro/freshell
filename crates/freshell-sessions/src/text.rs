@@ -399,15 +399,11 @@ pub fn extract_user_authored_text(text: &str) -> Option<String> {
                 return None;
             }
             let close = format!("</{tag}>");
-            match find_ci(&rest, &close) {
-                Some(idx) => {
-                    let _ = open_len;
-                    rest = rest[idx + close.len()..].to_string();
-                    removed_structured_block = true;
-                    continue;
-                }
-                None => return None,
-            }
+            let idx = find_ci(&rest, &close)?;
+            let _ = open_len;
+            rest = rest[idx + close.len()..].to_string();
+            removed_structured_block = true;
+            continue;
         }
 
         if rest == before {

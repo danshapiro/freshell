@@ -375,7 +375,7 @@ async fn scoped_session_rename(
     .await
     {
         Ok(update) => update,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     // The request's NON-title fields still patch through the legacy store

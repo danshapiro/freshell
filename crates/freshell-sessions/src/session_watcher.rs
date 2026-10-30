@@ -2001,7 +2001,7 @@ impl SessionWatcher {
         self.stop_tx = Some(stop_tx);
 
         let index = Arc::clone(&self.index);
-        let providers: Vec<_> = self.providers.drain(..).collect();
+        let providers = std::mem::take(&mut self.providers);
         let rearm_secs = self.rearm_interval_secs;
         let amplifier_book = self.amplifier_book.clone();
         let subagent_interest = Arc::clone(&self.subagent_interest);

@@ -1190,7 +1190,7 @@ async fn scoped_terminal_rename(
     .await
     {
         Ok(update) => update,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let next = state
         .settings

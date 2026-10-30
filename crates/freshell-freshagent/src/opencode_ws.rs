@@ -4838,13 +4838,7 @@ impl FreshOpencodeState {
             // hands the interrupt a live SEND task with no real id,
             // preserve its observation exactly like the Err arm (clear the
             // flag + restore-if-empty) instead of strangling it.
-            if let InterruptedOp::SendTaken {
-                task,
-                clock: _,
-                clock_at_flag: _,
-                ..
-            } = taken
-            {
+            if let InterruptedOp::SendTaken { task, .. } = taken {
                 turn_aborted.store(false, Ordering::SeqCst);
                 let mut session = session_arc.lock().await;
                 if session.turn_task.is_none() && !session.killed.load(Ordering::SeqCst) {
