@@ -28,6 +28,7 @@ import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { randomUUID } from 'node:crypto'
 import { createClaudeFixture, FAKE_MODEL, resolvePinnedClaude, startLocalProvider } from './claude-local-provider.mjs'
+import { stopFixtureProcess } from '../../support/stop-fixture-process.mjs'
 import { SUBAGENT_MARKER } from '../../fixtures/claude-cli-sim/prompt-markers.mjs'
 
 const repoRoot = process.argv[2]
@@ -221,7 +222,7 @@ try {
 } finally {
   polling = false
   await poller?.catch(() => {})
-  if (sidecar && !sidecarExit) sidecar.kill('SIGKILL')
+  await stopFixtureProcess(sidecar)
   if (provider) await provider.close()
   await fixture.cleanup()
 }

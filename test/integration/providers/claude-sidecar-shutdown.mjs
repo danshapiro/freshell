@@ -19,6 +19,7 @@ import { spawn, execFileSync } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { randomUUID } from 'node:crypto'
 import { createClaudeFixture, FAKE_MODEL, resolvePinnedClaude } from './claude-local-provider.mjs'
+import { stopFixtureProcess } from '../../support/stop-fixture-process.mjs'
 
 const repoRoot = process.argv[2]
 if (!repoRoot) throw new Error('repository root argument is required')
@@ -162,7 +163,7 @@ try {
     message: String(error?.message ?? 'unknown error').slice(0, 500),
   })}\n`)
 } finally {
-  if (sidecar && sidecarExitedAt === undefined) sidecar.kill('SIGKILL')
+  await stopFixtureProcess(sidecar)
   if (cliPid && alive(cliPid)) { try { process.kill(cliPid, 'SIGKILL') } catch {} }
   if (server) {
     server.closeAllConnections()

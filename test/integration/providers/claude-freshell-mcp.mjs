@@ -19,6 +19,7 @@ import { createInterface } from 'node:readline'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { createClaudeFixture, FAKE_MODEL, resolvePinnedClaude, startLocalProvider } from './claude-local-provider.mjs'
+import { stopFixtureProcess } from '../../support/stop-fixture-process.mjs'
 
 const repoRoot = process.argv[2]
 if (!repoRoot) throw new Error('repository root argument is required')
@@ -189,7 +190,7 @@ try {
     message: String(error?.message ?? 'unknown error').replaceAll(token, '<token>').slice(0, 800),
   })}\n`)
 } finally {
-  if (sidecar && sidecar.exitCode === null) sidecar.kill('SIGKILL')
+  await stopFixtureProcess(sidecar)
   if (receipt.probe?.pid) { try { process.kill(receipt.probe.pid, 'SIGKILL') } catch {} }
   await provider?.close()
   await fixture.cleanup()

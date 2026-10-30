@@ -34,6 +34,7 @@ import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { randomUUID } from 'node:crypto'
 import { createClaudeFixture, FAKE_MODEL, resolvePinnedClaude, startLocalProvider } from './claude-local-provider.mjs'
+import { stopFixtureProcess } from '../../support/stop-fixture-process.mjs'
 
 const repoRoot = process.argv[2]
 if (!repoRoot) throw new Error('repository root argument is required')
@@ -223,7 +224,7 @@ async function runScenario(name, spec) {
     failure = String(error?.message ?? error).slice(0, 1000)
     log('error', 'scenario.failed', { scenario: name, error: failure })
   } finally {
-    if (sidecar && !sidecarExit) sidecar.kill('SIGKILL')
+    await stopFixtureProcess(sidecar)
     if (provider) await provider.close()
     await fixture.cleanup()
   }

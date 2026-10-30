@@ -1,3 +1,5 @@
+import { stopFixtureProcess as stopFixtureProcessRuntime } from './stop-fixture-process.mjs'
+
 /** The minimal child-process surface owned by a test fixture. */
 export interface FixtureProcess {
   exitCode: number | null
@@ -12,73 +14,9 @@ export interface StopFixtureProcessOptions {
   forceTimeoutMs?: number
 }
 
-const DEFAULT_GRACEFUL_TIMEOUT_MS = 3_000
-const DEFAULT_FORCE_TIMEOUT_MS = 3_000
-
-function hasExited(child: FixtureProcess): boolean {
-  return child.exitCode !== null || child.signalCode !== null
-}
-
-/**
- * Wait for one exact captured child, disposing both the listener and deadline
- * on every outcome. It never leaves a timer or an exit listener running after
- * the caller has resumed teardown.
- */
-function waitForExit(child: FixtureProcess, timeoutMs: number): Promise<boolean> {
-  if (hasExited(child)) return Promise.resolve(true)
-
-  return new Promise((resolve) => {
-    let settled = false
-    let timer: ReturnType<typeof setTimeout> | undefined
-
-    const finish = (exited: boolean) => {
-      if (settled) return
-      settled = true
-      if (timer !== undefined) clearTimeout(timer)
-      child.off('exit', onExit)
-      resolve(exited)
-    }
-    const onExit = () => finish(true)
-
-    child.once('exit', onExit)
-    timer = setTimeout(() => finish(false), timeoutMs)
-    // The child can exit between the initial state check and listener setup.
-    if (hasExited(child)) finish(true)
-  })
-}
-
-function sendExactSignal(child: FixtureProcess, signal: NodeJS.Signals): void {
-  let delivered: boolean
-  try {
-    delivered = child.kill(signal)
-  } catch (error) {
-    throw new Error(`sending ${signal} to the captured fixture process failed`, { cause: error })
-  }
-  if (!delivered && !hasExited(child)) {
-    throw new Error(`the captured fixture process rejected ${signal}`)
-  }
-}
-
-/**
- * Contain a fixture process before its scratch directory is removed. SIGTERM
- * gets one bounded grace period; a surviving exact child receives SIGKILL and
- * must then prove exit before this resolves. A survivor is a teardown error,
- * not a reason to race its writes with directory removal.
- */
-export async function stopFixtureProcess(
+// Keep the existing typed API; native Node contract harnesses import the same
+// implementation directly without needing a TypeScript loader.
+export const stopFixtureProcess: (
   child: FixtureProcess | undefined,
-  options: StopFixtureProcessOptions = {},
-): Promise<void> {
-  if (!child || hasExited(child)) return
-
-  const gracefulTimeoutMs = options.gracefulTimeoutMs ?? DEFAULT_GRACEFUL_TIMEOUT_MS
-  const forceTimeoutMs = options.forceTimeoutMs ?? DEFAULT_FORCE_TIMEOUT_MS
-
-  sendExactSignal(child, 'SIGTERM')
-  if (await waitForExit(child, gracefulTimeoutMs)) return
-
-  sendExactSignal(child, 'SIGKILL')
-  if (!await waitForExit(child, forceTimeoutMs)) {
-    throw new Error(`captured fixture process did not exit within ${forceTimeoutMs}ms after SIGKILL`)
-  }
-}
+  options?: StopFixtureProcessOptions,
+) => Promise<void> = stopFixtureProcessRuntime

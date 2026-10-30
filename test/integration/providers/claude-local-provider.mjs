@@ -187,7 +187,15 @@ export async function createClaudeFixture({ parent = os.tmpdir(), prefix = 'fres
       return complete.split('\n').filter(Boolean).map((line) => JSON.parse(line))
     },
     async cleanup() {
-      await fs.rm(root, { recursive: true, force: true })
+      // The sidecar can exit before its native CLI finishes flushing. A final
+      // write after recursive traversal yields ENOTEMPTY; force only handles
+      // an already absent path. Retry briefly, then expose a persistent leak.
+      try {
+        await fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+      } catch (error) {
+        process.stderr.write(`${JSON.stringify({ ts: new Date().toISOString(), severity: 'error', component: 'claude-local-provider', event: 'fixture.cleanup_failed', root, code: error?.code ?? null, message: String(error?.message ?? error) })}\n`)
+        throw error
+      }
     },
   }
 }
