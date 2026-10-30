@@ -17,10 +17,13 @@
 //!   `workspacePaths` CONTAIN the pane's cwd (normalized), and whose
 //! - LATEST user-authored record (`user_message`) text EQUALS the pane's
 //!   captured submit line (normalized, bounded comparison), and whose
-//! - newest record was written AT/AFTER that submit (recency window — a
-//!   transcript whose newest record predates the submit can never match,
-//!   which is what rejects re-typed old prompts and dead-launch late
-//!   writes alike).
+//! - MATCHING user record was written AT/AFTER that submit (recency is
+//!   proven by the matching record's OWN `at` — a later record of
+//!   another type, e.g. an assistant record still streaming after the
+//!   submit, never vouches for a user record written before it; a
+//!   transcript whose matching record predates the submit can never
+//!   match, which is what rejects re-typed old prompts and dead-launch
+//!   late writes alike; unprovable timestamps fail toward refusal).
 //!
 //! Outcomes per tick per pane: exactly one matching candidate == current id
 //! ⇒ no-op (the ws association decides; the locator has no current-id
@@ -46,8 +49,8 @@
 //!   itself), while antigravity's candidates are CONTENT-matched across
 //!   every transcript in the root — the pane's own conversation is proved
 //!   by the prompt text it just submitted, not by the file being new. The
-//!   recency rule replaces the baseline: a transcript whose newest record
-//!   predates the submit can never match.
+//!   matching-record recency rule replaces the baseline: a transcript
+//!   whose matching user record predates the submit can never match.
 //! - NO separate fork lane: codex needs `watch_fork`/`tick_forks` because
 //!   its first-bind rule (new file in cwd) cannot see an in-CLI switch;
 //!   antigravity's unified rule catches BOTH the fresh conversation and
@@ -270,11 +273,16 @@ impl AntigravityLocator {
                 if summary.latest_user_text != submit.text {
                     continue;
                 }
-                match summary.latest_record_at {
+                // Recency is proven by the MATCHING user record's own
+                // timestamp: a transcript whose matching record predates
+                // the submit can never match (re-typed old prompts,
+                // dead-launch late writes), and a later record of another
+                // type (an assistant record still streaming after the
+                // submit) never vouches for it. Unprovable timestamps
+                // (the matching record's own `at` unparseable) fail
+                // toward refusal.
+                match summary.latest_user_at {
                     Some(at) if at >= submit.at_ms => {}
-                    // Unprovable recency (no parseable timestamp anywhere
-                    // in the tail) fails toward refusal; a record written
-                    // BEFORE the submit fails the window outright.
                     _ => continue,
                 }
                 matches.push(AntigravityLocated {
@@ -379,16 +387,20 @@ struct TranscriptSummary {
     /// The LATEST user-authored record's text (normalized+bounded the same
     /// way the captured submit was).
     latest_user_text: String,
-    /// The newest record's timestamp anywhere in the tail window (any
-    /// record type — a fresh assistant/tool record also proves liveness).
-    latest_record_at: Option<i64>,
+    /// That SAME record's own `at` timestamp — recency is proven by the
+    /// MATCHING record, never by a later record of another type (a
+    /// still-streaming assistant record written after the submit must not
+    /// vouch for a user record written before it). `None` when the
+    /// matching record's own timestamp is unparseable — fails toward
+    /// refusal.
+    latest_user_at: Option<i64>,
 }
 
 /// Bounded probe of one transcript: the ownership record from the head
-/// window, the latest user record + newest timestamp from the tail
-/// window. `None` = not a candidate this tick (unreadable, no ownership
-/// id, or no user record in the tail window) — a transient state the next
-/// window re-probes; never a panic on malformed content.
+/// window, the latest user record's text + its own timestamp from the
+/// tail window. `None` = not a candidate this tick (unreadable, no
+/// ownership id, or no user record in the tail window) — a transient
+/// state the next window re-probes; never a panic on malformed content.
 fn probe_transcript(path: &Path) -> Option<TranscriptSummary> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -429,8 +441,9 @@ fn probe_transcript(path: &Path) -> Option<TranscriptSummary> {
     }
     let conversation_id = conversation_id?;
 
-    // Tail window: latest user record + newest record timestamp. Skip a
-    // potentially partial first line when the window starts mid-line.
+    // Tail window: latest user record's text + that record's own
+    // timestamp. Skip a potentially partial first line when the window
+    // starts mid-line.
     let file_len = file.metadata().ok()?.len();
     let tail_start = file_len.saturating_sub(MAX_TAIL_BYTES);
     file.seek(SeekFrom::Start(tail_start)).ok()?;
@@ -442,7 +455,7 @@ fn probe_transcript(path: &Path) -> Option<TranscriptSummary> {
         lines.next(); // a fragment, unless the file is smaller than the bound
     }
     let mut latest_user_text: Option<String> = None;
-    let mut latest_record_at: Option<i64> = None;
+    let mut latest_user_at: Option<i64> = None;
     for line in lines {
         let line = line.strip_suffix('\r').unwrap_or(line);
         if line.is_empty() {
@@ -455,12 +468,14 @@ fn probe_transcript(path: &Path) -> Option<TranscriptSummary> {
             .get("at")
             .or_else(|| obj.get("startedAt"))
             .and_then(parse_timestamp_ms);
-        if let Some(at) = at {
-            latest_record_at = Some(latest_record_at.map_or(at, |prev: i64| prev.max(at)));
-        }
         if obj.get("type").and_then(|v| v.as_str()) == Some("user_message") {
             if let Some(text) = obj.get("text").and_then(serde_json::Value::as_str) {
+                // Text and its OWN timestamp move together: recency is
+                // proven by the matching record, so the two facts must
+                // describe the same record (a later record of another
+                // type never vouches for an earlier user record).
                 latest_user_text = Some(normalize_prompt_text(text));
+                latest_user_at = at;
             }
         }
     }
@@ -470,7 +485,7 @@ fn probe_transcript(path: &Path) -> Option<TranscriptSummary> {
         conversation_id,
         workspace_paths,
         latest_user_text,
-        latest_record_at,
+        latest_user_at,
     })
 }
 
@@ -593,13 +608,13 @@ mod tests {
     }
 
     #[test]
-    fn recency_rejects_transcripts_whose_newest_record_predates_the_submit() {
+    fn recency_rejects_transcripts_whose_matching_user_record_predates_the_submit() {
         let (locator, root) = locator_for("recency");
         let cwd = "/tmp/agy-recency";
         std::fs::create_dir_all(cwd).unwrap();
         locator.arm("t1", cwd);
         // An OLD transcript whose latest user record carries exactly the
-        // pane's re-typed prompt — its newest record predates the submit.
+        // pane's re-typed prompt — that record predates the submit.
         write_transcript(&root, "conv-old", cwd, &[("re-typed old prompt", T0)]);
         assert!(locator.note_submit("t1", "re-typed old prompt", T0 + 60_000));
         // The pane's own fresh conversation (same text, written now).
@@ -616,6 +631,56 @@ mod tests {
             "the old transcript is rejected by recency"
         );
         assert_eq!(located[0].conversation_id, "conv-own");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Adversarial recency shape: the transcript's LATEST user record
+    /// matches the submit text but was written BEFORE the submit, while a
+    /// LATER record of another type (an assistant record still streaming)
+    /// was written after it. Recency must be proven by the MATCHING user
+    /// record's own timestamp — a newest-record-of-any-type check alone
+    /// would let this foreign transcript through as the sole candidate.
+    #[test]
+    fn recency_requires_the_matching_user_records_own_timestamp_not_a_later_record() {
+        let (locator, root) = locator_for("matching-recency");
+        let cwd = "/tmp/agy-matching-recency";
+        std::fs::create_dir_all(cwd).unwrap();
+        locator.arm("t1", cwd);
+        let path = root
+            .join("conv-foreign")
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // The foreign transcript: its latest user record (the matching
+        // text) was written at T0, and an assistant record written at
+        // T0+60_050 keeps the file live AFTER the pane's submit.
+        std::fs::write(
+            &path,
+            format!(
+                concat!(
+                    r#"{{"type":"session_start","conversationId":"conv-foreign","workspacePaths":["{cwd}"],"startedAt":{t0}}}"#,
+                    "\n",
+                    r#"{{"type":"user_message","conversationId":"conv-foreign","text":"identical prompt text","at":{t0}}}"#,
+                    "\n",
+                    r#"{{"type":"assistant_message","conversationId":"conv-foreign","text":"a reply still streaming","at":{after}}}"#,
+                    "\n",
+                ),
+                cwd = cwd,
+                t0 = T0,
+                after = T0 + 60_050,
+            ),
+        )
+        .unwrap();
+        // The pane submits the identical text at T0+60_000: AFTER the
+        // matching user record, BEFORE the later assistant record.
+        assert!(locator.note_submit("t1", "identical prompt text", T0 + 60_000));
+        let located = locator.tick(T0 + 60_000 + ANTIGRAVITY_WINDOW_MS + 1);
+        assert!(
+            located.is_empty(),
+            "a matching user record written BEFORE the submit is not a candidate, \
+             even when a later non-user record postdates the submit: {located:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -50,6 +50,12 @@
 //!      grace/backoff) with the ADJACENT `--conversation <bound id>` argv
 //!      — the crash did not silently start a fresh conversation — and the
 //!      crash rings the unified attention edge exactly once.
+//!   8. Deliberate user quit (#612 parity): a pane that submits (arming
+//!      the provisional-Busy engagement), then types `/quit` and lets the
+//!      CLI exit on its own, rings NO death bell — the quit-intent
+//!      suppression must hold for antigravity panes exactly as it does
+//!      for tracker modes (scenario 7 pins the crash side of the same
+//!      engagement).
 //!
 //! Process-kill suite: the fakes this suite spawns are its own PTY children
 //! (killed via `registry.kill` of the created ids, which reaps the fake
@@ -112,6 +118,9 @@ fn transcript_path(home: &std::path::Path, conv: &str) -> std::path::PathBuf {
 ///   stdin line is appended as that transcript's LATEST user record.
 /// - `/crash` exits 1 (a real spontaneous non-zero death for the
 ///   auto-resume phase).
+/// - `/quit` or `/exit` exits 0 (a deliberate user quit: a spontaneous
+///   CLEAN exit — scenario 8's shape; the auto-resume lane settles it
+///   `clean_exit`, never a respawn).
 /// - When `AGY_ARGV_CAPTURE` is set, appends `"$@"` (space-joined) as one
 ///   row per invocation (O_APPEND — atomic for single lines).
 ///
@@ -161,6 +170,9 @@ while IFS= read -r line; do
     "/crash")
       exit 1
       ;;
+    "/quit"|"/exit")
+      exit 0
+      ;;
     *)
       printf '{"type":"user_message","conversationId":"%s","text":"%s","at":"%s"}\n' \
         "$CONV" "$line" "$(now)" >> "$TRANSCRIPT"
@@ -182,10 +194,12 @@ done
 /// The antigravity `CliCommandSpec`: the real manifest's launch shape
 /// (`extensions/antigravity/freshell.json`, whose field mapping
 /// `antigravity_launch_e2e.rs` already pins) with the ONE test-only
-/// override the suite needs — `default_cmd` points at the fake `agy`.
+/// override the suite needs — `default_cmd` points at the fake `agy`
+/// (written once by the suite and removed in its cleanup block).
 fn antigravity_fake_spec(
     home: &std::path::Path,
     argv_capture: &std::path::Path,
+    fake_agy: &std::path::Path,
 ) -> freshell_platform::CliCommandSpec {
     let mut base_env = std::collections::BTreeMap::new();
     base_env.insert("AGY_HOME".to_string(), home.to_string_lossy().into_owned());
@@ -197,7 +211,7 @@ fn antigravity_fake_spec(
         name: "antigravity".to_string(),
         label: "Antigravity CLI".to_string(),
         env_var: None,
-        default_cmd: write_fake_agy().to_string_lossy().into_owned(),
+        default_cmd: fake_agy.to_string_lossy().into_owned(),
         base_args: vec!["-i".to_string()],
         base_env,
         resume_args: Some(vec![
@@ -600,9 +614,12 @@ async fn antigravity_exact_live_identity_rebind_suite() {
     ));
     let _ = std::fs::remove_file(&argv_capture);
     let logs = log_capture::install();
+    // The fake `agy` script (written once; both servers point at it, and
+    // the cleanup block removes it — it must not outlive the suite).
+    let fake_agy = write_fake_agy();
 
     let server = spawn_antigravity_server(
-        vec![antigravity_fake_spec(home.path(), &argv_capture)],
+        vec![antigravity_fake_spec(home.path(), &argv_capture, &fake_agy)],
         home.path(),
         ledger_dir.path(),
     )
@@ -849,7 +866,11 @@ async fn antigravity_exact_live_identity_rebind_suite() {
     let _ = std::fs::remove_file(&argv_capture_2);
     let ledger_dir_2 = tempfile::tempdir().expect("restart pane ledger tempdir");
     let server2 = spawn_antigravity_server(
-        vec![antigravity_fake_spec(home.path(), &argv_capture_2)],
+        vec![antigravity_fake_spec(
+            home.path(),
+            &argv_capture_2,
+            &fake_agy,
+        )],
         home.path(),
         ledger_dir_2.path(),
     )
@@ -1028,6 +1049,31 @@ async fn antigravity_exact_live_identity_rebind_suite() {
         "the replacement pane carries the retained identity"
     );
 
+    // ── Scenario 8: a deliberate user quit rings NO death bell (#612) ──
+    // The pane submits (the flushed submit arms the idle gate's
+    // provisional Busy — the SAME engagement scenario 7's crash rings
+    // through), the user then types /quit and the CLI exits on its own:
+    // a spontaneous exit preceded by a quit-intent input. The #612
+    // suppression must hold for antigravity panes exactly as it does
+    // for tracker modes — NO unified attention edge. (The exit-0 quit
+    // also never auto-resumes: the lane settles it `clean_exit`, so the
+    // pane simply ends exited.)
+    let tid8 = create_pane(&mut ws, &cwd, "req-agy-sc8").await;
+    to_kill.push(tid8.clone());
+    submit_prompt(&mut ws, &tid8, "quit phase prompt juliet").await;
+    // A fresh connection for the absence proof (a fresh connection sees
+    // only post-connect broadcasts — no backlog ambiguity).
+    let mut ws8 = common::connect_and_capture_inventory(&server.url).await.0;
+    submit_prompt(&mut ws8, &tid8, "/quit").await;
+    assert!(
+        !frame_seen_within(&mut ws8, Duration::from_secs(4), |v| {
+            v["type"] == "terminal.idle" && v["terminalId"] == tid8.as_str()
+        })
+        .await,
+        "a deliberate user quit (quit-intent input + spontaneous exit) rings \
+         NO death bell (#612 parity)"
+    );
+
     // ── cleanup: only the terminals this suite created (never a broad kill) ──
     for tid in &to_kill {
         server.registry.kill(tid);
@@ -1035,4 +1081,5 @@ async fn antigravity_exact_live_identity_rebind_suite() {
     server2.registry.kill(&tid4);
     let _ = std::fs::remove_file(&argv_capture);
     let _ = std::fs::remove_file(&argv_capture_2);
+    let _ = std::fs::remove_file(&fake_agy);
 }

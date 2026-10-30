@@ -1266,14 +1266,17 @@ impl ActivityHub {
                 // tracker-modes yet — Task 8 adds the tracker). A flushed
                 // submit ALSO arms the idle gate's provisional Busy phase,
                 // which is what makes a mid-turn crash ENGAGED for the
-                // death bell below (the unified attention edge).
-                let antigravity_flushed = self
+                // death bell below (the unified attention edge); the tag
+                // half drives the #612 quit-intent gate inside the lock —
+                // a deliberate user quit must suppress that bell too.
+                let (antigravity_flushed, antigravity_tagged) = self
                     .inner
                     .lock()
                     .expect("activity hub lock")
                     .antigravity
                     .clone()
-                    .is_some_and(|association| association.note_input(&terminal_id, &data, at));
+                    .map(|association| association.note_input_tagged(&terminal_id, &data, at))
+                    .unwrap_or((false, false));
                 // The claude confirmable-submit path needs
                 // `transcript_len`, which does a locate() directory scan —
                 // filesystem IO that must NOT run under the hub lock.
@@ -1292,28 +1295,38 @@ impl ActivityHub {
                     if antigravity_flushed {
                         inner.idle.note_phase(&terminal_id, IdleGatePhase::Busy);
                     }
-                    let Some(mode) = inner.modes.get(&terminal_id).cloned() else {
+                    // #612: quit-intent bookkeeping on the input stream
+                    // freshell owns. Rules: see signal::classify_input.
+                    // Runs for tracker modes AND for antigravity-tagged
+                    // panes: they are not tracker-modes yet (Task 8), but
+                    // the provisional Busy above engages the same death
+                    // bell, so the deliberate-quit suppression (#612's
+                    // exact purpose) must hold for them too — this is why
+                    // the classification sits BEFORE the modes
+                    // early-return below.
+                    let mode = inner.modes.get(&terminal_id).cloned();
+                    if mode.is_some() || antigravity_tagged {
+                        let quit_state = inner
+                            .quit_intent_lines
+                            .entry(terminal_id.clone())
+                            .or_default();
+                        match freshell_activity::signal::classify_input(quit_state, &data) {
+                            freshell_activity::signal::InputClass::QuitIntent => {
+                                inner.quit_intents.insert(terminal_id.clone(), at);
+                            }
+                            freshell_activity::signal::InputClass::NonQuitSubmit => {
+                                inner.quit_intents.remove(&terminal_id);
+                            }
+                            freshell_activity::signal::InputClass::Other => {}
+                        }
+                    }
+                    let Some(mode) = mode else {
                         return;
                     };
                     // Any submit-shaped input means "a turn may be starting":
                     // cancel a pending idle window before the tracker runs.
                     if submit {
                         inner.idle.note_busy(&terminal_id);
-                    }
-                    // #612: quit-intent bookkeeping on the input stream
-                    // freshell owns. Rules: see signal::classify_input.
-                    let quit_state = inner
-                        .quit_intent_lines
-                        .entry(terminal_id.clone())
-                        .or_default();
-                    match freshell_activity::signal::classify_input(quit_state, &data) {
-                        freshell_activity::signal::InputClass::QuitIntent => {
-                            inner.quit_intents.insert(terminal_id.clone(), at);
-                        }
-                        freshell_activity::signal::InputClass::NonQuitSubmit => {
-                            inner.quit_intents.remove(&terminal_id);
-                        }
-                        freshell_activity::signal::InputClass::Other => {}
                     }
                     match mode.as_str() {
                         "claude" => {
@@ -1545,6 +1558,13 @@ impl ActivityHub {
                         .is_some_and(|association| association.note_exit(&terminal_id))
                     {
                         inner.idle.note_exit(&terminal_id);
+                        // #612 parity: the Input arm kept quit-intent
+                        // bookkeeping for this pane (the classification
+                        // gate for antigravity-tagged panes) — the
+                        // markers go with the pane, never leaking past
+                        // its exit.
+                        inner.quit_intents.remove(&terminal_id);
+                        inner.quit_intent_lines.remove(&terminal_id);
                     }
                     frames
                 };
@@ -2374,6 +2394,18 @@ mod tests {
         (hub, rx)
     }
 
+    /// A unique temp dir (the antigravity association fixtures' shape).
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "freshell-activity-agy-{label}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     fn observer_send(hub: &ActivityHub, event: ActivityEvent) {
         (hub.registry_observer())(event);
     }
@@ -2885,6 +2917,104 @@ mod tests {
                 .await
                 .expect("a NonQuitSubmit after the quit intent must clear the marker");
         assert_eq!(idle["reason"], "grace");
+    }
+
+    /// Antigravity plan Task 6 + #612 parity: an antigravity pane's
+    /// provisional-Busy engagement (armed at every flushed submit — the
+    /// crash death-bell engagement) must respect the quit-intent
+    /// suppression. Antigravity panes are not tracker-modes (Task 8 adds
+    /// the tracker), so this pins the Input arm's #612 classification
+    /// running for association-tagged panes BEFORE the modes early-return:
+    /// a deliberate user quit is silent, a mid-turn crash still rings.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn antigravity_quit_intent_suppresses_the_death_bell_and_a_crash_still_rings() {
+        let (hub, mut rx) = hub();
+        let home = unique_temp_dir("agy-quit-intent");
+        hub.set_antigravity_association(Arc::new(
+            crate::antigravity_association::AntigravityAssociation::new(home.clone()),
+        ));
+
+        // Pane 1: a flushed submit arms the provisional Busy (engagement),
+        // the user then quits deliberately (/quit + Enter — a quit intent
+        // on the input stream) and the CLI exits on its own — NO death
+        // bell on the canonical human quit.
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "agy-1".into(),
+                mode: "antigravity".into(),
+                resume_session_id: None,
+                at: now_ms(),
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "agy-1".into(),
+                data: "first prompt\r".into(),
+                at: now_ms(),
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "agy-1".into(),
+                data: "/quit\r".into(),
+                at: now_ms(),
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Exit {
+                terminal_id: "agy-1".into(),
+                at: now_ms(),
+                spontaneous: true,
+            },
+        );
+        assert!(
+            next_frame_matching(&mut rx, "terminal.idle", 300, |v| {
+                v["terminalId"] == "agy-1"
+            })
+            .await
+            .is_none(),
+            "a deliberate user quit must suppress the antigravity death bell"
+        );
+
+        // Pane 2: a flushed submit, then a spontaneous exit with NO quit
+        // intent (a mid-turn crash) — the death bell still rings.
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "agy-2".into(),
+                mode: "antigravity".into(),
+                resume_session_id: None,
+                at: now_ms(),
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "agy-2".into(),
+                data: "second prompt\r".into(),
+                at: now_ms(),
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Exit {
+                terminal_id: "agy-2".into(),
+                at: now_ms(),
+                spontaneous: true,
+            },
+        );
+        let idle = next_frame_matching(&mut rx, "terminal.idle", 3_000, |v| {
+            v["terminalId"] == "agy-2"
+        })
+        .await
+        .expect("an antigravity mid-turn crash still rings the death bell");
+        assert_eq!(idle["reason"], "grace");
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// Decision 3: exit while idle (no engagement) is silent — a human

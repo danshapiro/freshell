@@ -99,20 +99,26 @@ impl AntigravityAssociation {
     }
 
     /// Hub-side `ActivityEvent::Input` intake: fold one input chunk into
-    /// the pane's line buffer, flushing at every CR/LF byte. Returns
-    /// whether this chunk flushed at least one non-empty submit line
-    /// (the hub uses that to arm the idle gate's provisional busy phase
-    /// — the crash death-bell engagement).
+    /// the pane's line buffer, flushing at every CR/LF byte, and report
+    /// the pane's tag state in the same lock scope. Returns
+    /// `(flushed, tagged)`: `flushed` = whether this chunk flushed at
+    /// least one non-empty submit line (the hub uses that to arm the
+    /// idle gate's provisional busy phase — the crash death-bell
+    /// engagement); `tagged` = whether the hub has this pane tagged
+    /// (the hub's #612 quit-intent gate for antigravity panes, which are
+    /// not tracker-modes until Task 8 — a deliberate user quit must
+    /// suppress that death bell too, so the classification needs to see
+    /// every input byte of a tagged pane).
     ///
     /// Byte discipline (the `is_submit_input`-style classification seam):
     /// DEL (0x7f) and BS (0x08) pop the last buffered char (the CLI's
     /// recorded text reflects the line editor's deletions, so the capture
     /// must too); ESC-prefixed sequences (arrow keys etc.) are dropped
     /// whole; other C0 controls except TAB are dropped; the rest append.
-    pub fn note_input(&self, terminal_id: &str, data: &str, at_ms: i64) -> bool {
+    pub fn note_input_tagged(&self, terminal_id: &str, data: &str, at_ms: i64) -> (bool, bool) {
         let mut panes = self.panes.lock().unwrap();
         let Some(pane) = panes.get_mut(terminal_id) else {
-            return false;
+            return (false, false);
         };
         let mut flushed = false;
         #[derive(PartialEq)]
@@ -171,7 +177,14 @@ impl AntigravityAssociation {
                 }
             }
         }
-        flushed
+        (flushed, true)
+    }
+
+    /// The `flushed` half of [`Self::note_input_tagged`] (the capture
+    /// tests' projection): whether this chunk flushed at least one
+    /// non-empty submit line.
+    pub fn note_input(&self, terminal_id: &str, data: &str, at_ms: i64) -> bool {
+        self.note_input_tagged(terminal_id, data, at_ms).0
     }
 
     /// Hub-side `ActivityEvent::Exit` intake: drop the pane's capture and
@@ -479,6 +492,27 @@ pub(crate) async fn adopt_antigravity_identity(
     )
     .await;
     if !applied {
+        // r39 parity (codex_identity.rs:102-110): the durable binding
+        // write failed with NOTHING installed or announced (the identity
+        // homes keep the consistent prior state, no association frame
+        // broadcast). The held authority COMMITS instead of failing —
+        // the live terminal process IS the conversation's writer, so
+        // failing the ticket to Vacant would let a later lifecycle
+        // command start a SECOND writer beside it. The warn carries
+        // codex's `committed_owner_kept` outcome marker so an operator
+        // grepping incident logs for it finds antigravity incidents too.
+        tracing::warn!(
+            target: "freshell_ws::antigravity_association",
+            terminal_id = %terminal_id,
+            conversation_id = %conversation_id,
+            event = "antigravity_identity.adoption_binding_failed",
+            outcome = "committed_owner_kept",
+            failure_reason = "DURABLE_BINDING_WRITE_FAILED",
+            "antigravity_adopt_refused: the durable binding write failed — \
+             nothing installed/announced; the held authority commits so the \
+             live terminal stays the named owner (never a \
+             Vacant-with-live-writer)"
+        );
         crate::identity_ownership::coordinator_commit_identity(
             state,
             authority,
@@ -561,6 +595,25 @@ pub(crate) async fn rebind_antigravity_identity(
     )
     .await;
     if !applied {
+        // r39 parity (codex_identity.rs:208-217 — the rebind twin of the
+        // adopt tail's marker above): the durable binding write failed
+        // with NOTHING installed or announced (the identity homes still
+        // name the OLD conversation); the held authority COMMITS so the
+        // live switched CLI stays the named writer (never a
+        // Vacant-with-live-writer).
+        tracing::warn!(
+            target: "freshell_ws::antigravity_association",
+            terminal_id = %terminal_id,
+            old_conversation_id = %old_conversation_id,
+            new_conversation_id = %new_conversation_id,
+            event = "antigravity_identity.rebind_binding_failed",
+            outcome = "committed_owner_kept",
+            failure_reason = "DURABLE_BINDING_WRITE_FAILED",
+            "antigravity_rebind_refused: the durable binding write failed — \
+             nothing installed/announced; the held authority commits so the \
+             live terminal stays the named owner (never a \
+             Vacant-with-live-writer)"
+        );
         crate::identity_ownership::coordinator_commit_identity(
             state,
             authority,
@@ -768,6 +821,16 @@ mod tests {
             vec!["t1".to_string()],
             "only antigravity panes buffer input"
         );
+        // The tagged half of the Input intake (the hub's #612 quit-intent
+        // gate for antigravity panes): a tagged pane reports true, every
+        // other pane false — in the same lock scope as the capture.
+        let (flushed, tagged) = association.note_input_tagged("t1", "x\r", 1_000);
+        assert!(tagged, "a tagged antigravity pane reports tagged");
+        assert!(flushed);
+        let (_, tagged) = association.note_input_tagged("t2", "x\r", 1_000);
+        assert!(!tagged, "a codex pane is never tagged");
+        let (_, tagged) = association.note_input_tagged("t-unknown", "x\r", 1_000);
+        assert!(!tagged, "an unknown pane is never tagged");
     }
 
     #[test]
