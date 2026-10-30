@@ -48,31 +48,36 @@ Fix four fresh-agent "code rewind" defects:
 
 **Files:**
 - Modify: `src/components/fresh-agent/FreshAgentView.tsx` — extract the fallback policy as a pure exported helper directly below `isModernCheckpointTurn` (:381-390), and move `getRewindAvailability` from :1333-1342 down to just after `isBusy`/`sessionEnded` (:3973-3974), rewritten per Step 3 (the move avoids a temporal-dead-zone `ReferenceError` on `isBusy`)
-- Test: `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`
+- Test: `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`, plus a NEW focused policy file `test/unit/client/components/fresh-agent/rewind-availability-policy.test.tsx`
 
 **Interfaces:**
-- Consumes: `getCheckpointAvailability(turn): CheckpointTurnAvailability | undefined` (FreshAgentView.tsx:1311, unchanged), `isModernCheckpointTurn(turn)` (:381), `isBusy` (derived at :3973, `BUSY_STATES.has(effectiveStatus)`).
-- Produces: `export function unboundRewindAvailability(turn: FreshAgentTurn, agentBusy: boolean): FreshAgentTurnRewindAvailability | undefined` — the pure fallback policy: non-user turns → `undefined`; modern user turns while the agent is busy → `{ status: 'pending' }`; modern user turns while idle → `{ status: 'unavailable', reason: MODERN_TURN_CHECKPOINT_UNAVAILABLE }`; non-modern turns → `undefined`. `getRewindAvailability` becomes: role/bound lookup first (unchanged), then `unboundRewindAvailability(turn, isBusy)`, with `isBusy` added to its `useCallback` deps.
-- Semantics decision (round-2 review finding 1): a BOUND availability always wins over the busy fallback, and that is honest — the capture completes at the barrier BEFORE the turn runs, so a row that has bound an `available` capture outcome genuinely has a snapshot while the agent works (the existing e2e `fresh-agent-checkpoint-unavailable-rust.spec.ts:123` already asserts the mid-turn available state as a pinned journey, and the snapshot-refreshed `msg_`-id rows cannot bind the request-keyed capture frame — :1329-1331 requires `turn.requestId`, which schema rows do not carry — so THOSE unbound modern rows are exactly the mid-turn surface the pending state serves). The pending state therefore applies ONLY to unbound modern user rows; it must never override a bound `available`.
+- Consumes: `getCheckpointAvailability(turn): CheckpointTurnAvailability | undefined` (FreshAgentView.tsx:1311, unchanged), `isModernCheckpointTurn(turn)` (:381), `isBusy` (derived at :3973, `BUSY_STATES.has(effectiveStatus)`), and the pane's transcript turn order (to identify the newest user row).
+- Produces: `export function unboundRewindAvailability(turn: FreshAgentTurn, agentBusy: boolean, isNewestUserTurn: boolean): FreshAgentTurnRewindAvailability | undefined` — the pure fallback policy: non-user turns → `undefined`; non-modern turns → `undefined`; modern user turns that are NOT the newest user row → `{ status: 'unavailable', reason: MODERN_TURN_CHECKPOINT_UNAVAILABLE }` (honest for older MCP/CLI-driven rows: nothing is being saved for them, even while a later turn runs — round-3 review finding 1); the NEWEST modern user row while the agent is busy → `{ status: 'pending' }`; the newest modern user row while idle → `{ status: 'unavailable', reason: MODERN_TURN_CHECKPOINT_UNAVAILABLE }`. `getRewindAvailability` becomes: role/bound lookup first (unchanged), then `unboundRewindAvailability(turn, isBusy, turnIsNewestUserRow)`, with `isBusy` added to its `useCallback` deps; the component computes the newest-user-row comparison once from the pane's transcript order (the last user turn's display key — mid-turn the newest user row IS the running send's row, since the assistant has not yet replied; the exact key derivation follows the transcript's existing ordering, `getFreshAgentDisplayTurnKey`).
+- Semantics decisions (round-2 finding 1 + round-3 finding 1): a BOUND availability always wins over the busy fallback, and that is honest — the capture completes at the barrier BEFORE the turn runs, so a row that has bound an `available` capture outcome genuinely has a snapshot while the agent works (the existing e2e `fresh-agent-checkpoint-unavailable-rust.spec.ts:123` already asserts the mid-turn available state as a pinned journey, and the snapshot-refreshed `msg_`-id rows cannot bind the request-keyed capture frame — :1329-1331 requires `turn.requestId`, which schema rows do not carry — so the NEWEST unbound modern row is exactly the mid-turn surface the pending state serves). The pending state therefore applies ONLY to the newest unbound modern user row while busy; older unbound rows (e.g. historical MCP/CLI-driven turns) keep the honest unavailable verdict at all times, per the User Request's "MCP/CLI-driven turns stay honestly rewind-unavailable" constraint.
 
-- [ ] **Step 1: Write the failing behavioral test (no new module imports)**
+- [ ] **Step 1: Write the failing behavioral tests (no new module imports in the existing file)**
 
-In `FreshAgentView.test.tsx`, add one `describe('fresh-agent rewind availability honesty', ...)` with the tests below, using the file's existing harness idioms (frame-driven `onMessage`, snapshot turns via the outcome/snapshot frames — see the test at :3492 for the accepted-turn flow and the `isBusyEvent` frame kinds `freshAgent.status` / `freshAgent.session.snapshot` at :3144 for driving busy). IMPORTANT (round-2 review finding 6): this first batch must NOT import `unboundRewindAvailability` — an import of a not-yet-existing export breaks the whole test file's module load and the red step never runs. The helper-import assertions are added AFTER implementation, in Step 4.
+In `FreshAgentView.test.tsx`, add one `describe('fresh-agent rewind availability honesty', ...)` with the tests below, using the file's existing harness idioms (frame-driven `onMessage`, snapshot turns via the outcome/snapshot frames — see the test at :3492 for the accepted-turn flow and the `isBusyEvent` frame kinds `freshAgent.status` / `freshAgent.session.snapshot` at :3144 for driving busy). IMPORTANT (round-2 review finding 6): this file's batch must NOT import `unboundRewindAvailability` — an import of a not-yet-existing export breaks the whole file's module load and the red step never runs. The helper-level assertions live in a SEPARATE new test file (Test A below), whose import failure is its own isolated red and cannot break Test B's red (round-3 review finding 2).
 
-Test B (the red test) — `shows the honest still-saving state while the agent turn is running`:
-1. Render the pane with a modern user snapshot turn (turnId `msg_…`, `source: 'durable'`) that has NO bound checkpoint outcome, and drive the pane busy with a `freshAgent.session.snapshot` frame carrying a busy status (idiom per :3144).
-2. Hover the user turn's article; assert the rewind button is disabled with `aria-label="Saving code rewind checkpoint"` and `title="Saving the code state from before this message"`.
-3. RED today: the button instead says `aria-label="Rewind unavailable for this message"` with `title` containing `No exact code checkpoint is available for this message.`
+Test B (the red test) — `shows the honest still-saving state on the newest user row while the agent turn is running, and keeps older unbound rows honestly unavailable`:
+1. Render the pane with TWO modern user snapshot turns (turnIds `msg_a…` older, `msg_b…` newest, both `source: 'durable'`, NEITHER with a bound checkpoint outcome), and drive the pane busy with a `freshAgent.session.snapshot` frame carrying a busy status (idiom per :3144).
+2. Hover the NEWEST user turn's article; assert the rewind button is disabled with `aria-label="Saving code rewind checkpoint"` and `title="Saving the code state from before this message"`. RED today: it says `aria-label="Rewind unavailable for this message"`.
+3. Hover the OLDER user turn's article; assert the disabled `aria-label="Rewind unavailable for this message"` button with `title` containing `No exact code checkpoint is available for this message.` — pinning that older MCP/CLI-shaped rows never claim "saving" (round-3 finding 1; green today, must stay green).
 
 Test C (green pin, keeps passing) — `keeps a settled unbound modern turn unavailable when the agent is idle`: the idle case still shows the disabled `Rewind unavailable for this message` button (existing pinned behavior at :4103; assert through the hover surface so it survives Task 2).
 
 Test D (green pin, keeps passing) — `a bound available capture keeps showing available while the agent is busy` (round-2 review finding 1): render a pane busy per Test B, with a user turn that HAS a bound `available` checkpoint outcome (bind it through the request-key frame path exactly as the :3492 test does); assert the hover button is ENABLED `Rewind code to here` — never downgraded to pending. This pin protects the bound-wins semantics against a future "fix" that turns mid-turn available into pending.
 
+Test A (policy unit, in a NEW file `test/unit/client/components/fresh-agent/rewind-availability-policy.test.ts(x)`, own red = the missing-export import failure, isolated from Test B's red) — `does not consider agent response turns for rewind status at all`:
+1. Import `unboundRewindAvailability` from `../../../../src/components/fresh-agent/FreshAgentView.js` (or via the `@/` alias per test-config convention); assert `unboundRewindAvailability(assistantTurn, false, false)`, `unboundRewindAvailability(assistantTurn, true, true)`, and `unboundRewindAvailability(assistantTurn, true, false)` are ALL `undefined` — the role gate holds for agent turns regardless of busy/newest inputs.
+2. Also pin the user-row matrix at the policy level: newest+busy → pending; newest+idle → unavailable; older+busy → unavailable; older+idle → unavailable; non-modern user row → undefined.
+3. NOTE on scope: this file tests the POLICY helper. The view-level wiring (the fallback actually running for user rows) is proven by Test B; the hover surface's own assistant-row role gate (canRewind) is a pre-existing, separately-tested behavior — no assertion here protects that gate, and none needs to (round-3 finding 2's observation about the toolbar gate is precisely why this file asserts the policy, not the toolbar).
+
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
-Run: `pnpm run test:vitest run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx --config config/vitest/vitest.config.ts`
+Run: `pnpm run test:vitest run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/components/fresh-agent/rewind-availability-policy.test.tsx --config config/vitest/vitest.config.ts`
 
-Expected: FAIL — the module loads (no new imports yet); Test B fails with the button showing "Rewind unavailable for this message" instead of "Saving code rewind checkpoint"; Tests C and D pass (they pin current behavior).
+Expected: FAIL — `FreshAgentView.test.tsx` loads (no new imports there) and Test B fails on the newest row with the button showing "Rewind unavailable for this message" instead of "Saving code rewind checkpoint" (Test B's older-row half, Test C, and Test D pass — they pin current behavior); the new policy file fails on the missing-export import (its own isolated red).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -81,18 +86,21 @@ In `FreshAgentView.tsx`, directly below `isModernCheckpointTurn` (:381-390):
 ```ts
 // The fallback for a modern turn with no bound checkpoint outcome. Agent
 // response turns are never rewindable and never even considered (defect 2).
-// While this pane's agent turn is still running, the capture/identity for
-// the just-sent message is legitimately in flight, so the honest state is
-// "still saving" (defect 4); the definitive unavailable verdict belongs to
-// settled turns only. The state is computed, never stored: it dies at the
-// busy→idle edge, so it can never wedge as an immortal "saving".
+// "Still saving" (defect 4) belongs to the NEWEST user row only, while this
+// pane's agent turn is running: mid-turn the newest user row IS the running
+// send's row (the assistant has not replied yet), so its capture/identity is
+// legitimately in flight. Older unbound rows (historical MCP/CLI-driven
+// turns) keep the honest unavailable verdict — nothing is being saved for
+// them even while a later turn runs. The state is computed, never stored: it
+// dies at the busy→idle edge, so it can never wedge as an immortal "saving".
 export function unboundRewindAvailability(
   turn: FreshAgentTurn,
   agentBusy: boolean,
+  isNewestUserTurn: boolean,
 ): FreshAgentTurnRewindAvailability | undefined {
   if (turn.role !== 'user') return undefined
   if (!isModernCheckpointTurn(turn)) return undefined
-  return agentBusy
+  return agentBusy && isNewestUserTurn
     ? { status: 'pending' }
     : { status: 'unavailable', reason: MODERN_TURN_CHECKPOINT_UNAVAILABLE }
 }
@@ -101,27 +109,33 @@ export function unboundRewindAvailability(
 And REPLACE the `getRewindAvailability` definition by MOVING it from :1333-1342 down to immediately after `sessionEnded` (:3974), rewriting it as:
 
 ```ts
+const newestUserTurnKey = useMemo(() => {
+  const userTurns = transcriptTurns.filter((turn) => turn.role === 'user')
+  return userTurns.length > 0 ? getFreshAgentDisplayTurnKey(userTurns[userTurns.length - 1]) : undefined
+}, [transcriptTurns])
 const getRewindAvailability = useCallback((turn: FreshAgentTurn): FreshAgentTurnRewindAvailability | undefined => {
   const availability = getCheckpointAvailability(turn)
-  if (!availability) return unboundRewindAvailability(turn, isBusy)
+  if (!availability) {
+    return unboundRewindAvailability(
+      turn,
+      isBusy,
+      newestUserTurnKey !== undefined && getFreshAgentDisplayTurnKey(turn) === newestUserTurnKey,
+    )
+  }
   if (availability.status === 'unavailable') return { status: 'unavailable', reason: availability.reason }
   return { status: availability.status }
-}, [getCheckpointAvailability, isBusy])
+}, [getCheckpointAvailability, isBusy, newestUserTurnKey])
 ```
 
-The move is required, not cosmetic: `isBusy` is declared at :3973, and its first mention inside a `useCallback` dependency array evaluated at :1333 would be a temporal-dead-zone `ReferenceError` at render time. Both consumers (:4861 JSX prop, :5013 dependency list) sit after :3973, and nothing between the current definition and `isBusy` references `getRewindAvailability` (verified by `rg -n 'getRewindAvailability' src/components/fresh-agent/FreshAgentView.tsx`), so the definition must simply live below its new dependency.
+(`transcriptTurns` names whatever state already feeds the pane's rendered transcript rows — the snapshot turns list the component renders articles from; reuse the existing source of truth rather than adding a parallel one, and follow its existing display-key derivation. The move is required, not cosmetic: `isBusy` is declared at :3973, and its first mention inside a `useCallback` dependency array evaluated at :1333 would be a temporal-dead-zone `ReferenceError` at render time. Both consumers (:4861 JSX prop, :5013 dependency list) sit after :3973, and nothing between the current definition and `isBusy` references `getRewindAvailability` (verified by `rg -n 'getRewindAvailability' src/components/fresh-agent/FreshAgentView.tsx`), so the definition must simply live below its new dependency.)
 
 (Keep the `FreshAgentTurnRewindAvailability` import; the hover button, context-menu builder and action sheet consume the result unchanged.)
 
-- [ ] **Step 4: Add the helper-level role-gate pin and run the focused test**
+- [ ] **Step 4: Run the focused tests**
 
-Now that the export exists, add Test A — `does not consider agent response turns for rewind status at all`:
-1. Import `unboundRewindAvailability` from the module; build the turn objects as the harness does and assert `unboundRewindAvailability(assistantTurn, false)` and `unboundRewindAvailability(assistantTurn, true)` are both `undefined` — the role gate holds even while busy (agent turns never become "saving").
-2. Render a fresh-agent pane with an opencode-style snapshot: one assistant turn with `source: 'durable'` and a `nativeTurnId`, plus one user turn; assert the assistant article's hover toolbar has no rewind button at all — not `Rewind code to here`, not `Rewind unavailable for this message` (pins that the hover role gate in canRewind is not regressed). Do NOT assert on the transcript note here; Task 2 removes it.
+Run: `pnpm run test:vitest run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/components/fresh-agent/rewind-availability-policy.test.tsx --config config/vitest/vitest.config.ts`
 
-Run: `pnpm run test:vitest run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx --config config/vitest/vitest.config.ts`
-
-Expected: PASS (the whole file — including the pre-existing tests at :3492, :3706, :4103, :4622, which pin hover/notice/persistence behavior that the role gate and busy-pending must not disturb; :4103's idle-unavailable expectation must keep passing because that test's pane is idle; and Test D keeps the mid-turn bound-available journey green).
+Expected: PASS (both files — including the pre-existing tests at :3492, :3706, :4103, :4622, which pin hover/notice/persistence behavior that the role gate and busy-pending must not disturb; :4103's idle-unavailable expectation must keep passing because that test's pane is idle; Test B's older-row half and Test D keep the honest-verdict and bound-wins journeys green; and Test A's policy matrix pins the role gate at the helper level, where it actually lives).
 
 - [ ] **Step 5: Refactor while green**
 
@@ -138,7 +152,7 @@ Expected: PASS.
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/components/fresh-agent/FreshAgentView.tsx test/unit/client/components/fresh-agent/FreshAgentView.test.tsx
+git add src/components/fresh-agent/FreshAgentView.tsx test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/components/fresh-agent/rewind-availability-policy.test.tsx
 git commit -m "fix(fresh-agent): role-gate rewind status and show still-saving while the turn runs"
 ```
 
@@ -159,7 +173,7 @@ git commit -m "fix(fresh-agent): role-gate rewind status and show still-saving w
 
 1. In `FreshAgentTranscript.test.tsx:2057` (`shows unavailable rewind state and disables the action on the affected turn`): delete the `getByRole('note', …)` assertion (:2071-2072); KEEP the disabled hover-button assertion (:2073) and the builder label `Rewind unavailable: <reason>` (:2075-2077); ADD `expect(screen.queryByRole('note')).toBeNull()` and `expect(screen.queryByRole('status', { name: /Code rewind available for this message/ })).toBeNull()` to pin absence.
 2. In `FreshAgentView.test.tsx`: in each listed block, replace every `getByRole('note'|'status', …)` assertion on the per-turn rewind text with either a pin of absence (`queryByRole(...)` null) or — where the block was asserting an available/pending/unavailable STATE — an assertion of the hover button's state: enabled `getByRole('button', { name: 'Rewind code to here' })` not disabled; pending `disabled` button with `aria-label` `Saving code rewind checkpoint`; unavailable `disabled` button with `aria-label` `Rewind unavailable for this message`. Keep every send-frame shape, outcome fold, persistence, restore-by-id and reload-rebind assertion untouched.
-3. In both e2e specs: replace the `getByRole('status'/'note', …)` transcript-text assertions with the corresponding hover assertions already used elsewhere in those specs (`.hover()` then `getByRole('button', { name: 'Rewind code to here' })` / `{ name: 'Rewind unavailable for this message' })` with disabled state; the reason remains visible via the button `title`), AND add per-pane absence pins for the removed text (round-2 review finding 2 — hover assertions alone can pass while the note still renders): `await expect(paneRoot.getByRole('note')).toHaveCount(0)` and `await expect(paneRoot.getByRole('status', { name: /Code rewind (is available|unavailable) for this message|Saving code rewind checkpoint for this message/ })).toHaveCount(0)` at the same points the old note assertions ran, so the REMOVAL itself is e2e-protected, not just the hover state.
+3. In both e2e specs: replace the `getByRole('status'/'note', …)` transcript-text assertions with the corresponding hover assertions already used elsewhere in those specs (`.hover()` then `getByRole('button', { name: 'Rewind code to here' })` / `{ name: 'Rewind unavailable for this message' })` with disabled state), AND (round-3 review finding 5 — the User Request explicitly preserves the reason) keep each replaced assertion's REASON claim alive by asserting the button's `title` contains the exact reason text the old note assertion carried (e.g. `await expect(rewind).toHaveAttribute('title', /No exact code checkpoint is available for this message\./)` wherever the old assertion matched that string). AND add per-pane absence pins for the removed text (round-2 finding 2 — hover assertions alone can pass while the note still renders; round-3 finding 4 — a hand-typed regex can miss the real accessible names): FIRST enumerate the removed block's EXACT aria-labels and rendered text strings by reading `FreshAgentTranscript.tsx:1000-1021` (the available note's accessible name is `Code rewind available for this message` — NOT "is available" — and its visible text is `Code rewind is available for this message.`; enumerate all four states' names and texts verbatim from the source), THEN pin each: `await expect(paneRoot.getByRole('note')).toHaveCount(0)`, plus a `toHaveCount(0)` for each enumerated `getByRole('status', { name: <exact accessible name> })` and each enumerated `getByText(<exact visible string>)`, at the same points the old note assertions ran — so the REMOVAL itself is e2e-protected by exact-string membership, not a lossy regex.
 
 - [ ] **Step 2: Run the unit tests and verify the intended failure**
 
@@ -393,6 +407,7 @@ git commit -m "fix(checkpoints): broadcast identity-enriched outcomes to every s
 
 **Files:**
 - Test: `test/e2e-browser/specs/freshopencode-first-send-reload-repro.spec.ts` — add one test reusing the file's fake-opencode harness pieces (`installFakeOpencode`, `createSetupHome`, `TestHarness`, `RustServer`), and parameterize the spec-local `createServerOptions` helper (it currently HARD-CODES `FAKE_OPENCODE_HANG_SESSION_CREATE: '1'` at :50-63, so "call it freshly without the flag" is impossible — round-2 review finding 5; add an optional `hangSessionCreate?: boolean` input defaulting to `true` so the existing test's call sites are unchanged, and the new test passes `false`)
+- Test infra: `test/e2e-browser/fixtures/fake-opencode.cjs` — add the `FAKE_OPENCODE_HOLD_PROMPT_GATE_PATH` knob (round-3 review finding 3) gating `/prompt_async` turn completion, mirroring the existing summarize-gate pattern (:667, :1632); default unset = today's behavior, so every other spec is untouched
 
 **Interfaces:**
 - Consumes: the fake `opencode` fixture (`test/e2e-browser/fixtures/fake-opencode.cjs`) — it validates and persists the server-supplied `messageID` prompt ids (`msg_[0-9a-f]{32}`, fixture :123-124, :174-200), so the deterministic identity observation succeeds end to end; Task 4's per-alias broadcast; Task 2's hover-only surfaces. This spec is in `CLOUD_SKIP_SPECS` (`playwright.cloud.config.ts:41`, provider-boot-timing class) and its new test inherits that membership — the cloud lane's `testIgnore` silently drops it, so this spec runs on the LOCAL lane only (load-bearing finding LB4, reports/load-bearing-finder.md).
@@ -419,10 +434,15 @@ test('binds the first message\'s code checkpoint live, without a reload', async 
   //   await userTurn.hover()
   //   → assert the rewind button is DISABLED with aria-label
   //     "Saving code rewind checkpoint" and title "Saving the code state from
-  //     before this message". If the fake's turn settles too fast to make this
-  //     window deterministic, hold it open with the fixture's existing
-  //     summarize gate (FAKE_OPENCODE_HOLD_SUMMARIZE_GATE_PATH, fixture
-  //     :667/:1632), assert, then release the gate.
+  //     before this message". DETERMINISM (round-3 review finding 3): the
+  //     fake emits idle ~25 ms after /prompt_async, so this window is NOT
+  //     reliably observable bare, and the existing
+  //     FAKE_OPENCODE_HOLD_SUMMARIZE_GATE_PATH gates only the /summarize lane.
+  //     Add a NEW fixture knob — FAKE_OPENCODE_HOLD_PROMPT_GATE_PATH — gating
+  //     the /prompt_async turn completion exactly like the summarize gate
+  //     pattern (fixture :667, :1632): set it, submit the message, wait for
+  //     the user row, assert the pending hover, then release the gate and let
+  //     the turn settle.
   // ROLE GATE + NOTE ABSENCE (Task 1/2 e2e): on the assistant row, assert NO
   // rewind button at all (not enabled, not disabled); assert the pane has no
   // role="note"/"status" rewind-status text (toHaveCount(0) pins the removal).
@@ -445,7 +465,7 @@ Expected: PASS for the new test (and the existing one, which keeps its hang-flag
 
 - [ ] **Step 3: No production implementation (test-infra only)**
 
-None in src/ or crates/. If the spec fails, diagnose in this order: (1) harness-suspect-first — verify the server options really dropped the hang flag (the parameterized helper default must still keep the EXISTING test green), the fake materialized a durable `ses_*` id, the snapshot shows both rows, and the server JSONL shows the capture + identity observation + per-alias broadcast frames; (2) only then consider a contract break between Task 4's fan-out and the client gates. Never relax the spec to make it pass.
+None in src/ or crates/ — the only non-spec change is the new `FAKE_OPENCODE_HOLD_PROMPT_GATE_PATH` knob in `fake-opencode.cjs` (default unset preserves today's fixture behavior for every other spec). If the spec fails, diagnose in this order: (1) harness-suspect-first — verify the server options really dropped the hang flag (the parameterized helper default must still keep the EXISTING test green), the prompt gate actually held the turn (server stayed busy through the pending assertion) and was released after, the fake materialized a durable `ses_*` id, the snapshot shows both rows, and the server JSONL shows the capture + identity observation + per-alias broadcast frames; (2) only then consider a contract break between Task 4's fan-out and the client gates. Never relax the spec to make it pass.
 
 - [ ] **Step 4: Run the focused spec**
 
@@ -468,7 +488,7 @@ Expected: PASS on both.
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add test/e2e-browser/specs/freshopencode-first-send-reload-repro.spec.ts
+git add test/e2e-browser/specs/freshopencode-first-send-reload-repro.spec.ts test/e2e-browser/fixtures/fake-opencode.cjs
 git commit -m "test(e2e): freshopencode first message binds rewind live without reload"
 ```
 
@@ -484,6 +504,6 @@ Expected: PASS (covers the six note/status assertion conversions in `code-checkp
 
 ## Residuals (accepted)
 
-- While an agent turn runs, other unbound user rows in the same pane (e.g. historical MCP/CLI-driven rows) also display the pending "still saving" hover state; it self-corrects at the busy→idle edge. Cosmetic, rare (tooltip-only), accepted.
+- The "still saving" state keys on the newest-user-row heuristic, not exact send attribution: in the rare case an MCP/CLI-driven send lands as the NEWEST user row while a composer turn is also running, that row transiently shows pending until the busy→idle edge; and with two queued sends in flight, the older of the two can show unavailable instead of pending for the overlap. Both are tooltip-only, self-correcting, and far rarer than the alternative (blanket pending, which mislabeled every historical MCP/CLI row — rejected in round-3 review finding 1).
 - If identity observation fails server-side (`checkpoint_turn_identity_unobserved`), the row settles to the honest `unavailable: No exact code checkpoint…` at idle — per the managed-runtime identity contract, unchanged.
 - MCP/CLI-sent messages remain without code checkpoints (out of scope; separate REST-lane capture work).
