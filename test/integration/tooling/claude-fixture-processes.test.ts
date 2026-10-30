@@ -1,4 +1,6 @@
 import { execFile } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
+import { createInterface } from 'node:readline'
 import { existsSync } from 'node:fs'
 import fs from 'node:fs/promises'
 import os from 'node:os'
@@ -7,8 +9,9 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { describe, expect, it, vi } from 'vitest'
-import { createClaudeFixture } from '../providers/claude-local-provider.mjs'
+import { createClaudeFixture, FAKE_MODEL, resolvePinnedClaude, startLocalProvider } from '../providers/claude-local-provider.mjs'
 import { stopFixtureProcess, waitForFixtureProcessExit } from '../../support/stop-fixture-process.js'
+import { createFixtureProcessOwner } from '../../support/owned-fixture-processes.mjs'
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..')
 const IN_CONTAINER = existsSync('/.dockerenv') || existsSync('/run/.containerenv')
@@ -160,6 +163,136 @@ describe('Claude fixture native process ownership', () => {
     } finally {
       await fixture.cleanup()
       await otherFixture.cleanup()
+    }
+  })
+
+  it('settles a macOS-style process group using the portable process table', async () => {
+    const owner = createFixtureProcessOwner({ platform: 'darwin' })
+    const child = owner.spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+    try {
+      expect(await live(child.pid!)).toBe(true)
+      await owner.stop()
+      expect(await live(child.pid!)).toBe(false)
+    } finally {
+      await owner.stop()
+    }
+  })
+
+  for (const mode of ['flush', 'abrupt'] as const) {
+    it(`Windows ownership ${mode === 'flush' ? 'waits for a native flush without changing the sidecar PID' : 'refuses deletion after an unconfirmed sidecar exit'}`, async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-windows-owner-'))
+      const owner = createFixtureProcessOwner({ platform: 'win32', root })
+      const writer = `
+        const fs = require('node:fs')
+        const path = require('node:path')
+        const root = process.argv[1]
+        process.on('SIGTERM', () => setTimeout(() => {
+          fs.writeFileSync(path.join(root, 'flushed'), 'native flush completed')
+          process.exit(0)
+        }, 150))
+        fs.writeFileSync(path.join(root, 'native.pid'), String(process.pid))
+        setInterval(() => {}, 1000)
+      `
+      const script = `
+        import fs from 'node:fs'
+        import path from 'node:path'
+        import { spawn } from 'node:child_process'
+        const [root, mode, writer] = process.argv.slice(1)
+        fs.writeFileSync(path.join(root, 'sidecar.pid'), String(process.pid))
+        const native = spawn(process.execPath, ['-e', writer, root], { stdio: 'ignore' })
+        native.unref()
+        const ready = setInterval(() => {
+          if (!fs.existsSync(path.join(root, 'native.pid'))) return
+          clearInterval(ready)
+          if (mode === 'abrupt') throw new Error('synthetic sidecar crash')
+          native.kill('SIGTERM')
+          process.exit(0)
+        }, 5)
+      `
+      const child = owner.spawn(process.execPath, ['--input-type=module', '-e', script, root, mode, writer], { stdio: 'ignore', env: {} })
+      let nativePid: number | undefined
+      try {
+        await waitForFixtureProcessExit(child, 10_000)
+        nativePid = Number(await fs.readFile(path.join(root, 'native.pid'), 'utf8'))
+        expect(Number(await fs.readFile(path.join(root, 'sidecar.pid'), 'utf8'))).toBe(child.pid)
+        if (mode === 'flush') {
+          expect(child.exitCode).toBe(0)
+          expect(await live(nativePid)).toBe(false)
+          expect(await fs.readFile(path.join(root, 'flushed'), 'utf8')).toBe('native flush completed')
+          await owner.stop()
+        } else {
+          expect(child.exitCode).not.toBe(0)
+          await expect(owner.stop()).rejects.toThrow(/unconfirmed native process exit/)
+          expect(await live(nativePid)).toBe(true)
+          await expect(fs.stat(root)).resolves.toBeDefined()
+        }
+      } finally {
+        await stopFixtureProcess(child)
+        if (nativePid !== undefined && await live(nativePid)) {
+          process.kill(nativePid, 'SIGKILL')
+          await waitUntil(async () => !await live(nativePid!))
+        }
+        await fs.rm(root, { recursive: true, force: true })
+      }
+    })
+  }
+
+  it('Windows ownership waits for a directly launched native executable to exit', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-windows-native-'))
+    const owner = createFixtureProcessOwner({ platform: 'win32', root })
+    const child = owner.spawn('/bin/sleep', ['30'], { stdio: 'ignore' })
+    try {
+      expect(await live(child.pid!)).toBe(true)
+      await owner.stop()
+      expect(await live(child.pid!)).toBe(false)
+      expect(child.exitCode !== null || child.signalCode !== null).toBe(true)
+    } finally {
+      await owner.stop()
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('Windows exit observation joins the real pinned SDK native child', async () => {
+    const pinned = await resolvePinnedClaude(REPO_ROOT)
+    const fixture = await createClaudeFixture()
+    const owner = createFixtureProcessOwner({ platform: 'win32', root: fixture.root })
+    const provider = await startLocalProvider()
+    const child = owner.spawn(process.execPath, [path.join(REPO_ROOT, 'crates/freshell-claude-sidecar/index.mjs')], {
+      cwd: path.join(REPO_ROOT, 'crates/freshell-claude-sidecar'),
+      env: fixture.env(provider.url, { CLAUDE_CMD: pinned.nativeCli, FRESHELL_CLAUDE_ONECLI_API_KEY: '1' }),
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    child.stdin!.on('error', () => {})
+    child.stderr!.resume()
+    const lines = createInterface({ input: child.stdout! })
+    try {
+      const requestId = randomUUID()
+      const created = new Promise<{ type: string; cliPid: number; message?: string }>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('pinned sidecar create timed out')), 30_000)
+        lines.on('line', (line: string) => {
+          const frame = JSON.parse(line)
+          if (frame.requestId === requestId && ['created', 'create.failed'].includes(frame.type)) {
+            clearTimeout(timer)
+            resolve(frame)
+          }
+        })
+      })
+      child.stdin!.write(`${JSON.stringify({ type: 'create', protocol: 2, boot: { kind: 'fresh' }, requestId, sessionId: randomUUID(), cwd: fixture.cwd, model: FAKE_MODEL, permissionMode: 'default' })}\n`)
+      const frame = await created
+      expect(frame.type, frame.message).toBe('created')
+      expect(await live(frame.cliPid)).toBe(true)
+      child.stdin!.end(`${JSON.stringify({ type: 'shutdown' })}\n`)
+      await waitForFixtureProcessExit(child, 10_000)
+      expect(child.exitCode).toBe(0)
+      expect(await live(frame.cliPid)).toBe(false)
+      await owner.stop()
+    } finally {
+      lines.close()
+      await provider.close()
+      // If ownership cannot be established, stop() throws before directory
+      // removal; the enclosing disposable sandbox contains any survivor.
+      await owner.stop()
+      await fixture.cleanup()
     }
   })
 })

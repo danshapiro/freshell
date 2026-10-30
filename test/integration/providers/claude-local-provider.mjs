@@ -129,7 +129,7 @@ export async function createClaudeFixture({ parent = os.tmpdir(), prefix = 'fres
   const tmp = path.join(root, 'tmp')
   for (const directory of [home, cwd, tmp]) await fs.mkdir(directory, { recursive: true, mode: 0o700 })
   const claudeConfigDir = path.join(home, '.claude')
-  const processes = createFixtureProcessOwner()
+  const processes = createFixtureProcessOwner({ root })
   return {
     root,
     home,
