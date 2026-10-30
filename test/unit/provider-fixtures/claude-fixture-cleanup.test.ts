@@ -11,7 +11,7 @@ const fixtureModule = path.resolve(path.dirname(fileURLToPath(import.meta.url)),
 
 // Run in a fresh Node process so the public fs.rmdir hook is installed before
 // Node's recursive remover captures it. Every removal still hits the real
-// filesystem: a final native-CLI write lands after traversal, before rmdir.
+// filesystem: a late directory entry lands after traversal, before rmdir.
 async function cleanupDuringWrite(mode: 'transient' | 'persistent' | 'denied') {
   const { stdout } = await promisify(execFile)(process.execPath, ['--input-type=module', '-e', `
     import fs from 'node:fs'
@@ -31,7 +31,7 @@ async function cleanupDuringWrite(mode: 'transient' | 'persistent' | 'denied') {
           return queueMicrotask(() => callback(Object.assign(new Error('permission denied'), { code: 'EACCES' })))
         }
         if (removals % 2 === 0 && (mode === 'persistent' || writes === 0)) {
-          fs.writeFileSync(path.join(root, 'late-cli-write'), 'still flushing')
+          fs.writeFileSync(path.join(root, 'late-directory-entry'), 'transient entry')
           writes += 1
         }
       }
@@ -51,7 +51,7 @@ async function cleanupDuringWrite(mode: 'transient' | 'persistent' | 'denied') {
 }
 
 describe('Claude fixture cleanup', () => {
-  it('removes a late CLI write that makes the final directory removal fail with ENOTEMPTY', async () => {
+  it('retries a transient ENOTEMPTY during final directory removal', async () => {
     const result = await cleanupDuringWrite('transient')
 
     expect(result).toMatchObject({ removed: true, writes: 1 })

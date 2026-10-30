@@ -35,6 +35,7 @@ import { promisify } from 'node:util'
 import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { parsePromptMarkers, SUBAGENT_MARKER, HANG_MCP_QUALIFIED_TOOL, PLAN_TEXT } from '../../fixtures/claude-cli-sim/prompt-markers.mjs'
+import { createFixtureProcessOwner } from '../../support/owned-fixture-processes.mjs'
 
 export const PINNED_SDK_VERSION = '0.3.237'
 export const PINNED_CLI_VERSION = '2.1.237'
@@ -128,12 +129,14 @@ export async function createClaudeFixture({ parent = os.tmpdir(), prefix = 'fres
   const tmp = path.join(root, 'tmp')
   for (const directory of [home, cwd, tmp]) await fs.mkdir(directory, { recursive: true, mode: 0o700 })
   const claudeConfigDir = path.join(home, '.claude')
+  const processes = createFixtureProcessOwner()
   return {
     root,
     home,
     cwd,
     tmp,
     claudeConfigDir,
+    spawn: processes.spawn,
     env(baseUrl, extra = {}) {
       return {
         HOME: home,
@@ -187,10 +190,11 @@ export async function createClaudeFixture({ parent = os.tmpdir(), prefix = 'fres
       return complete.split('\n').filter(Boolean).map((line) => JSON.parse(line))
     },
     async cleanup() {
-      // The sidecar can exit before its native CLI finishes flushing. A final
-      // write after recursive traversal yields ENOTEMPTY; force only handles
-      // an already absent path. Retry briefly, then expose a persistent leak.
+      // Sidecar exit alone is not native CLI exit. Contain every owned launch
+      // before deleting its files; bounded retries cover transient filesystem
+      // removal errors, rather than an active writer recreating the fixture.
       try {
+        await processes.stop()
         await fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
       } catch (error) {
         process.stderr.write(`${JSON.stringify({ ts: new Date().toISOString(), severity: 'error', component: 'claude-local-provider', event: 'fixture.cleanup_failed', root, code: error?.code ?? null, message: String(error?.message ?? error) })}\n`)
