@@ -4,6 +4,7 @@ import {
   AmplifierIcon,
   AntigravityIcon,
   DefaultProviderIcon,
+  GeminiIcon,
   PROVIDER_ICONS,
   ProviderIcon,
 } from '@/components/icons/provider-icons'
@@ -57,6 +58,26 @@ describe('PROVIDER_ICONS parity (picker "black circle" fix)', () => {
     // a real provider icon is built from <path> elements instead.
     expect(container.querySelector('circle')).toBeNull()
     expect(container.querySelectorAll('path').length).toBeGreaterThan(0)
+  })
+
+  it('the antigravity icon is machine-distinct from the Gemini icon', () => {
+    // The two Google CLIs must never share artwork: a future copy-paste of
+    // Gemini's path data under the antigravity testid would otherwise be
+    // caught only by human review.
+    const antigravity = render(<AntigravityIcon />)
+    const gemini = render(<GeminiIcon />)
+    const antigravityPaths = Array.from(
+      antigravity.container.querySelectorAll('path'),
+    ).map((p) => p.getAttribute('d'))
+    const geminiPaths = Array.from(gemini.container.querySelectorAll('path')).map(
+      (p) => p.getAttribute('d'),
+    )
+    expect(antigravityPaths.length).toBeGreaterThan(0)
+    expect(geminiPaths.length).toBeGreaterThan(0)
+    expect(antigravityPaths).not.toEqual(geminiPaths)
+    for (const d of antigravityPaths) {
+      expect(geminiPaths).not.toContain(d)
+    }
   })
 
   it('an unknown provider still falls back to DefaultProviderIcon (the circle)', () => {
