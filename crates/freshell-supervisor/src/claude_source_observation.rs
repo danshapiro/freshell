@@ -278,6 +278,7 @@ mod tests {
         std::sync::atomic::AtomicUsize,
         // When the supervisor asked the read to end.
         StdMutex<Option<Instant>>,
+        Duration,
     );
     #[async_trait]
     impl RuntimeBackend for ReplyBackend {
@@ -317,6 +318,19 @@ mod tests {
             let action = self.0.lock().unwrap().take();
             if let Some(action) = action {
                 action();
+            }
+            if !self.4.is_zero() {
+                // Pause only the controlled reader wait. Registry IPC and
+                // authority revalidation keep using the ordinary live clock.
+                struct ReaderClock;
+                impl Drop for ReaderClock {
+                    fn drop(&mut self) {
+                        tokio::time::resume();
+                    }
+                }
+                tokio::time::pause();
+                let _clock = ReaderClock;
+                tokio::time::sleep(self.4).await;
             }
             // This is a synthetic transport reply, never native UID evidence.
             let selected = &request.observation_request;
@@ -387,12 +401,16 @@ mod tests {
         for mode in [
             "live",
             "short-scope",
+            "within-callback",
+            "candidate-within-callback",
             "dropped",
             "expired",
             "candidate",
             "candidate-dropped",
             "candidate-expired",
             "candidate-unrecorded-prior",
+            "candidate-complete-projection",
+            "candidate-projection-overrun",
         ] {
             let owned = tempfile::tempdir().unwrap();
             let binary = owned.path().join("host");
@@ -441,6 +459,7 @@ mod tests {
                 .commit_created(
                     prepared.incarnation_id,
                     BackendCreatedRecord {
+                        launch_policy: None,
                         daemon_id: DockerDaemonId::new(),
                         container_id: "owned-source-provider-never-stopped".into(),
                         image_ref: image.clone(),
@@ -464,6 +483,13 @@ mod tests {
                 StdMutex::new(None),
                 std::sync::atomic::AtomicUsize::new(0),
                 StdMutex::new(None),
+                match mode {
+                    // Two supported ordinary refreshes can outlast the old
+                    // metadata-only deadline without losing their authority.
+                    "candidate-complete-projection" => Duration::from_secs(36),
+                    "candidate-projection-overrun" => Duration::from_secs(120),
+                    _ => Duration::ZERO,
+                },
             ));
             let supervisor = Supervisor::new(
                 registry,
@@ -489,6 +515,18 @@ mod tests {
                 CLAUDE_RECOVERY_CALLBACK_BUDGET
             };
             let scope = supervisor.auth_lookup_scope(&start, lifetime);
+            if mode.ends_with("within-callback") {
+                // Model 31 seconds elapsed within the still-active preparation.
+                // Execute the real nested authority validation on that deadline.
+                supervisor
+                    .auth_lookup_authorities
+                    .lock()
+                    .unwrap()
+                    .get_mut(&scope.key)
+                    .unwrap()
+                    .expires -= Duration::from_secs(31);
+            }
+
             let scope_expires =
                 supervisor.auth_lookup_authorities.lock().unwrap()[&scope.key].expires;
             if matches!(
@@ -556,7 +594,14 @@ mod tests {
             );
             envelope.auth = Some("synthetic-control-secret".into());
             let result = tokio::time::timeout(
-                Duration::from_millis(250),
+                if matches!(
+                    mode,
+                    "candidate-complete-projection" | "candidate-projection-overrun"
+                ) {
+                    Duration::from_secs(150)
+                } else {
+                    Duration::from_millis(250)
+                },
                 supervisor.dispatch(envelope),
             )
             .await
@@ -570,7 +615,7 @@ mod tests {
             );
             assert_eq!(
                 result.is_ok(),
-                matches!(mode, "live" | "short-scope" | "candidate"),
+                matches!(mode, "live" | "short-scope" | "candidate" | "within-callback" | "candidate-within-callback" | "candidate-complete-projection"),
                 "{mode}: changed scoped authority after IPC cannot qualify source evidence: {result:?}"
             );
             if let Some(until) = *backend.3.lock().unwrap() {
@@ -594,22 +639,26 @@ mod tests {
                 .map(|event| event["data"].clone())
                 .collect::<Vec<_>>();
             if let Err(error) = result {
-                assert_eq!(error.code, RuntimeErrorCode::InvalidRequest);
-                // The web caller sees only the fixed refusal; the lifecycle log
-                // names the exact check that stopped the observation.
-                let expected_reason = if mode == "candidate-unrecorded-prior" {
-                    "retained owner has no provider launch context"
+                if mode == "candidate-projection-overrun" {
+                    assert_eq!(error.code, RuntimeErrorCode::HostUnreachable);
                 } else {
-                    "recovery attempt ended during observation"
-                };
-                assert_eq!(failures.len(), 1, "{mode}: {failures:?}");
-                assert_eq!(failures[0]["severity"], "warn");
-                assert_eq!(failures[0]["soulId"], serde_json::json!(soul));
-                assert_eq!(failures[0]["authority"], "recovery_attempt");
-                assert_eq!(failures[0]["candidate"], mode.starts_with("candidate"));
-                assert_eq!(failures[0]["errorCode"], "INVALID_REQUEST");
-                assert_eq!(failures[0]["reason"], expected_reason, "{mode}");
-                assert!(!error.message.contains(expected_reason));
+                    assert_eq!(error.code, RuntimeErrorCode::InvalidRequest);
+                    // The web caller sees only the fixed refusal; the lifecycle log
+                    // names the exact check that stopped the observation.
+                    let expected_reason = if mode == "candidate-unrecorded-prior" {
+                        "retained owner has no provider launch context"
+                    } else {
+                        "recovery attempt ended during observation"
+                    };
+                    assert_eq!(failures.len(), 1, "{mode}: {failures:?}");
+                    assert_eq!(failures[0]["severity"], "warn");
+                    assert_eq!(failures[0]["soulId"], serde_json::json!(soul));
+                    assert_eq!(failures[0]["authority"], "recovery_attempt");
+                    assert_eq!(failures[0]["candidate"], mode.starts_with("candidate"));
+                    assert_eq!(failures[0]["errorCode"], "INVALID_REQUEST");
+                    assert_eq!(failures[0]["reason"], expected_reason, "{mode}");
+                    assert!(!error.message.contains(expected_reason));
+                }
             } else {
                 assert!(failures.is_empty(), "{mode}: {failures:?}");
             }

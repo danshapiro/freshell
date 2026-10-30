@@ -22,11 +22,15 @@ import {
 } from '../../../../scripts/testing/provider-certification.js'
 import {
   buildProviderQualificationReceipt,
+  providerNativeProfileMatches,
   validateProviderQualificationReceipt,
   type ProviderQualificationRow,
 } from '../../../../scripts/testing/provider-qualification-receipt.js'
 import { parseGateArgs } from '../../../../scripts/testing/runtime-gate-args.js'
 import { PROVIDER_PARITY_CASE_IDS } from '../../../../scripts/testing/provider-parity-receipt.js'
+import { nativeTurnProof } from '../../../../scripts/testing/provider-native-history.js'
+import { readAmplifierNativeHistory } from '../../../e2e-browser/helpers/provider-native-history/amplifier.js'
+import { readClaudeNativeHistory } from '../../../e2e-browser/helpers/provider-native-history/claude.js'
 
 const repoRoot = path.resolve(__dirname, '../../../..')
 
@@ -36,35 +40,36 @@ afterEach(() => {
 })
 
 function manifestFixture(overrides: Record<string, unknown>[] = []): any {
+  // Explicit preliminary policy fixture: these tests protect pending behavior
+  // independently of the current production candidate.
   const base = loadCapabilityManifest(repoRoot)
-  if (!overrides.length) return base
-  const clone = JSON.parse(JSON.stringify(base))
-  for (const override of overrides) {
-    const row = clone.providers.find((entry: any) => entry.provider === override.provider)
-    Object.assign(row, override)
+  for (const row of base.providers) if (['claude', 'codex'].includes(row.provider)) {
+    Object.assign(row, { certificationState: PENDING_LIVE_PROVIDER_CERTIFICATION,
+      managedEnabled: false, durableRecoveryEnabled: false, blockedReason: 'PENDING_LIVE_QUALIFICATION' })
   }
-  return clone
+  base.releaseScope!.managedTerminalProviders = ['opencode']
+  base.certification.deferredProviders = deferredProviders(base)
+  base.certification.landingGate.deferrableProviders = deferredProviders(base)
+  base.certification.certifiedDurableProviders = certifiedDurableProviders(base)
+  for (const row of base.freshAgentModes) {
+    Object.assign(row, { enabledInReleaseScope: false, certified: false,
+      liveQualificationStatus: 'pending_authentic_receipt', releaseDeferralReason: PENDING_LIVE_PROVIDER_CERTIFICATION })
+  }
+  base.releaseScope!.freshAgentEnabled = false
+  base.releaseScope!.disabledFreshAgentModes = base.freshAgentModes.map(row => row.mode)
+  for (const doorway of base.doorways) {
+    if (doorway.id.startsWith('rest-')) Object.assign(doorway, { policy: 'blocked', enabledInReleaseScope: false })
+    else if (doorway.policy === 'managed') doorway.providers = doorway.providers.filter(provider => !['claude', 'codex'].includes(provider))
+  }
+  for (const override of overrides) {
+    Object.assign(base.providers.find(entry => entry.provider === override.provider)!, override)
+  }
+  return base
 }
 
 describe('checked-in provider certification manifest', () => {
-  it('marks exactly Claude, Codex, and Amplifier as pending live certification', () => {
-    const manifest = loadCapabilityManifest(repoRoot)
-    expect(deferredProviders(manifest)).toEqual(['claude', 'codex', 'amplifier'])
-    expect(certifiedDurableProviders(manifest)).toEqual(['opencode'])
-  })
-
-  it('keeps adapter readiness independent of live release certification', () => {
-    const manifest = loadCapabilityManifest(repoRoot)
-    for (const provider of ['claude', 'codex', 'amplifier']) {
-      const row = manifest.providers.find((candidate) => candidate.provider === provider)
-      expect(row?.qualificationReady).toBe(true)
-      expect(row?.certificationState).toBe(PENDING_LIVE_PROVIDER_CERTIFICATION)
-      expect(row?.managedEnabled).toBe(false)
-    }
-  })
-
   it('publishes a typed deferred-provider manifest with the live gate for each', () => {
-    const rows = deferredProviderManifest(loadCapabilityManifest(repoRoot))
+    const rows = deferredProviderManifest(manifestFixture())
     expect(rows).toHaveLength(3)
     for (const row of rows) {
       expect(row.reason).toBe(PENDING_LIVE_PROVIDER_CERTIFICATION)
@@ -115,8 +120,33 @@ describe('checked-in provider certification manifest', () => {
 })
 
 describe('production certification status', () => {
+  it('allows an advertised retained scope while Amplifier remains pending and disabled', () => {
+    const manifest = manifestFixture([
+      { provider: 'claude', certificationState: 'certified', managedEnabled: true, durableRecoveryEnabled: true, blockedReason: null },
+      { provider: 'codex', certificationState: 'certified', managedEnabled: true, durableRecoveryEnabled: true, blockedReason: null },
+    ])
+    manifest.certification.productionGate.requiredCertifiedProviders = ['shell', 'claude', 'codex', 'opencode']
+    manifest.releaseScope.managedTerminalProviders = ['claude', 'codex', 'opencode']
+    manifest.certification.deferredProviders = ['amplifier']
+    manifest.certification.landingGate.deferrableProviders = ['amplifier']
+    manifest.certification.certifiedDurableProviders = certifiedDurableProviders(manifest)
+    for (const row of manifest.freshAgentModes) if (row.mode !== 'kilroy') {
+      Object.assign(row, { enabledInReleaseScope: true, certified: true, liveQualificationStatus: 'certified' })
+      Object.assign(manifest.doorways.find((doorway: any) => doorway.id === `rest-${row.mode}-create`),
+        { policy: 'managed', enabledInReleaseScope: true })
+    }
+    manifest.releaseScope.freshAgentEnabled = true
+    manifest.releaseScope.disabledFreshAgentModes = ['kilroy']
+    expect(capabilityClaimViolations(manifest)).toEqual([])
+    expect(productionCertificationStatus(manifest).status).toBe('ELIGIBLE')
+    manifest.certification.productionGate.requiredCertifiedProviders = ['shell', 'claude', 'codex']
+    expect(capabilityClaimViolations(manifest).join(' ')).toContain('opencode')
+  })
+
   it('is blocked, never pass, while any provider awaits live certification', () => {
-    const status = productionCertificationStatus(loadCapabilityManifest(repoRoot))
+    const manifest = manifestFixture()
+    manifest.certification.productionGate.requiredCertifiedProviders = ['shell', 'opencode', 'claude', 'codex', 'amplifier']
+    const status = productionCertificationStatus(manifest)
     expect(status.status).toBe('BLOCKED_PENDING_LIVE_PROVIDER_CERTIFICATION')
     expect(status.reason).toBe(PENDING_LIVE_PROVIDER_CERTIFICATION)
     expect(status.blockingProviders).toEqual(['claude', 'codex', 'amplifier'])
@@ -135,7 +165,7 @@ describe('production certification status', () => {
 })
 
 describe('per-provider case classification', () => {
-  const manifest = loadCapabilityManifest(repoRoot)
+  const manifest = manifestFixture()
   const row = (provider: string) => manifest.providers.find((entry: any) => entry.provider === provider)
 
   it('defers an uncertified provider only in landing mode', () => {
@@ -262,7 +292,7 @@ describe('provider qualification receipt v2', () => {
       : provider === 'opencode'
         ? { providerVersion: '1.18.21', model: 'opencode/big-pickle', reasoningEffort: 'provider-default', nativeProvider: 'opencode' }
         : provider === 'amplifier'
-          ? { providerVersion: '0.1.1', model: 'glm-5.3', reasoningEffort: 'provider-default', nativeProvider: 'lunaroute' }
+          ? { providerVersion: '0.1.1', model: 'glm-5.3', reasoningEffort: 'provider-default', nativeProvider: 'vllm' }
           : { providerVersion: '2.1.263', model: 'haiku', reasoningEffort: 'low', nativeProvider: 'anthropic' }
     const stages = ['initial', 'after_session_host_crash', 'after_provider_process_crash'] as const
     return {
@@ -301,10 +331,10 @@ describe('provider qualification receipt v2', () => {
         toolCallTypes: [],
         resolvedProvider: profile.nativeProvider,
         resolvedModel: profile.model === 'haiku' ? 'claude-haiku-4-5-20251001' : profile.model.replace(/^opencode\//, ''),
-        resolvedReasoningEffort: profile.reasoningEffort,
-        providerProvenance: `${provider}-native.provider`,
-        modelProvenance: `${provider}-native.model`,
-        reasoningEffortProvenance: `${provider}-native.effort`,
+        resolvedReasoningEffort: provider === 'amplifier' ? 'unknown' : profile.reasoningEffort,
+        providerProvenance: provider === 'amplifier' ? 'amplifier-llm:response.provider' : `${provider}-native.provider`,
+        modelProvenance: provider === 'amplifier' ? 'amplifier-llm:response.model' : `${provider}-native.model`,
+        reasoningEffortProvenance: provider === 'amplifier' ? 'unsupported-native-telemetry' : `${provider}-native.effort`,
       })),
       actualProviderBinary: true,
       completedTurn: true,
@@ -404,6 +434,139 @@ describe('provider qualification receipt v2', () => {
       }),
     }
   }
+
+  function observedProviderRow(
+    provider: 'claude' | 'amplifier',
+    observed: { provider?: string; model?: string; effort?: string } = {},
+  ): ProviderQualificationRow {
+    const row = providerRow(provider)
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-native-profile-'))
+    tempRoots.push(root)
+    const nonce = 'receipt-profile-marker'
+    const stages = ['initial', 'after_session_host_crash', 'after_provider_process_crash'] as const
+    const writeJsonl = (filename: string, records: unknown[]) => {
+      fs.mkdirSync(path.dirname(filename), { recursive: true })
+      fs.writeFileSync(filename, records.map(record => JSON.stringify(record)).join('\n') + '\n')
+    }
+    if (provider === 'claude') {
+      writeJsonl(path.join(root, `${row.nativeSessionId}.jsonl`), stages.flatMap((_stage, index) => [
+        { type: 'user', uuid: `user-${index}`, sessionId: row.nativeSessionId,
+          message: { role: 'user', content: 'recall the marker' } },
+        { type: 'assistant', uuid: `assistant-${index}`, parentUuid: `user-${index}`, sessionId: row.nativeSessionId,
+          timestamp: `2026-09-01T00:00:0${index + 1}.000Z`, message: {
+            id: `message-${index}`, role: 'assistant', model: observed.model ?? 'claude-haiku-4-5-20251001',
+            stop_reason: 'end_turn', content: [{ type: 'text', text: `${nonce} ${index}` }],
+            ...(observed.effort === undefined ? {} : { effort: observed.effort }),
+          } },
+      ]))
+    } else {
+      const directory = path.join(root, 'project', 'sessions', row.nativeSessionId)
+      const at = (index: number, offset: number) => new Date(Date.parse('2026-09-01T00:00:00.000Z') + index * 1000 + offset).toISOString()
+      const event = (index: number, offset: number, name: string, data: unknown) => ({
+        event: name, ts: at(index, offset), session_id: row.nativeSessionId,
+        schema: { name: 'amplifier.log', ver: '1.0.0' }, data,
+      })
+      writeJsonl(path.join(directory, 'events.jsonl'), stages.flatMap((_stage, index) => {
+        const prompt = `recall the marker ${index}`, response = `${nonce} ${index}`
+        return [
+          event(index, 0, 'prompt:submit', { prompt }),
+          event(index, 100, 'llm:response', { model: observed.model ?? 'glm-5.3', provider: observed.provider ?? 'vllm',
+            continuation_count: null, parent_id: null,
+            ...(observed.effort === undefined ? {} : { reasoning_effort: observed.effort }) }),
+          event(index, 200, 'prompt:complete', { response_preview: response, length: response.length, parent_id: null }),
+          event(index, 300, 'prompt:complete', { prompt, response }),
+          event(index, 400, 'cleanup:store_end', {}),
+        ]
+      }))
+      writeJsonl(path.join(directory, 'transcript.jsonl'), stages.flatMap((_stage, index) => [
+        { role: 'user', content: `recall the marker ${index}`, metadata: { timestamp: at(index, 0) } },
+        { role: 'assistant', content: `${nonce} ${index}`, metadata: { timestamp: at(index, 300) } },
+      ]))
+    }
+    const history = provider === 'claude'
+      ? readClaudeNativeHistory(root, row.nativeSessionId)
+      : readAmplifierNativeHistory(root, row.nativeSessionId)
+    row.nativeTurnProofs = history.turns.map((turn, index) => nativeTurnProof(stages[index]!, row.nativeSessionId, turn, nonce))
+    return row
+  }
+
+  it.each(['claude', 'amplifier'] as const)(
+    'accepts actual %s native model evidence with unsupported optional effort telemetry', provider => {
+      const row = observedProviderRow(provider)
+      row.profileVerified = row.nativeTurnProofs.every(proof => providerNativeProfileMatches(row, proof))
+      expect(row.profileVerified).toBe(true)
+      const fixture = evidenceFixture([row])
+      const [validated] = validateProviderQualificationReceipt({
+        repoRoot: fixture.repoRoot, candidateSha, expectedRuntimeImage: runtimeImage, receipt: fixture.receipt,
+      }).providers
+      expect(validated.model).toBe(row.model)
+      expect(validated.reasoningEffort).toBe(row.reasoningEffort)
+      expect(validated.nativeTurnProofs).toEqual(row.nativeTurnProofs)
+      expect(validated.nativeTurnProofs[0]).toMatchObject({
+        resolvedProvider: provider === 'amplifier' ? 'vllm' : 'anthropic',
+        resolvedReasoningEffort: 'unknown', reasoningEffortProvenance: 'unsupported-native-telemetry',
+      })
+    },
+  )
+
+  it('accepts actual Amplifier vllm response provenance separately from the configured profile', () => {
+    const row = observedProviderRow('amplifier')
+    expect(row.nativeTurnProofs.every(proof => providerNativeProfileMatches(row, proof))).toBe(true)
+    expect(() => evidenceFixture([row])).not.toThrow()
+    expect(row.nativeTurnProofs[0]).toMatchObject({
+      resolvedProvider: 'vllm', resolvedModel: 'glm-5.3', providerProvenance: 'amplifier-llm:response.provider',
+      modelProvenance: 'amplifier-llm:response.model',
+    })
+  })
+
+  it.each(['claude', 'amplifier'] as const)('rejects a fabricated known %s effort with unsupported provenance', provider => {
+    const row = observedProviderRow(provider)
+    row.nativeTurnProofs = row.nativeTurnProofs.map(proof => ({
+      ...proof, resolvedReasoningEffort: row.reasoningEffort,
+    }))
+    expect(row.nativeTurnProofs.every(proof => providerNativeProfileMatches(row, proof))).toBe(false)
+    expect(() => evidenceFixture([row])).toThrow(/effort|telemetry|provenance/i)
+  })
+
+  it('rejects Amplifier configuration-only profile values masquerading as native observations', () => {
+    const row = providerRow('amplifier')
+    row.nativeTurnProofs = row.nativeTurnProofs.map(proof => ({
+      ...proof, resolvedProvider: 'lunaroute', resolvedReasoningEffort: row.reasoningEffort,
+      providerProvenance: 'amplifier-session:config.provider',
+      modelProvenance: 'amplifier-session:config.default_model',
+      reasoningEffortProvenance: 'amplifier-session:config.reasoning_effort',
+    }))
+    expect(row.nativeTurnProofs.every(proof => providerNativeProfileMatches(row, proof))).toBe(false)
+    expect(() => evidenceFixture([row])).toThrow(/configuration|native provenance|profile/i)
+  })
+
+  it.each(['claude', 'amplifier'] as const)('rejects a known mismatching %s native effort', provider => {
+    const row = observedProviderRow(provider, { effort: 'high' })
+    expect(row.nativeTurnProofs.every(proof => providerNativeProfileMatches(row, proof))).toBe(false)
+    expect(() => evidenceFixture([row])).toThrow(/reasoning effort/i)
+  })
+
+  it.each(['model', 'provider', 'provider-alias'] as const)('rejects a known mismatching Amplifier native %s', field => {
+    const row = observedProviderRow('amplifier', {
+      [field === 'model' ? 'model' : 'provider']: field === 'model' ? 'different-model'
+        : field === 'provider-alias' ? 'lunaroute' : 'different-provider' })
+    expect(row.nativeTurnProofs.every(proof => providerNativeProfileMatches(row, proof))).toBe(false)
+    expect(() => evidenceFixture([row])).toThrow(/Amplifier.*profile/i)
+  })
+
+  it('rejects unknown effort without unsupported-native-telemetry provenance', () => {
+    const row = observedProviderRow('claude')
+    row.nativeTurnProofs[0]!.reasoningEffortProvenance = 'claude-assistant-message.effort'
+    expect(row.nativeTurnProofs.every(proof => providerNativeProfileMatches(row, proof))).toBe(false)
+    expect(() => evidenceFixture([row])).toThrow(/effort|telemetry|provenance/i)
+  })
+
+  it('rejects a vllm profile whose provenance comes only from configuration', () => {
+    const row = observedProviderRow('amplifier')
+    row.nativeTurnProofs[0]!.modelProvenance = 'amplifier-session:config.default_model'
+    expect(row.nativeTurnProofs.every(proof => providerNativeProfileMatches(row, proof))).toBe(false)
+    expect(() => evidenceFixture([row])).toThrow(/provenance|Amplifier.*profile/i)
+  })
 
   it('builds a candidate/run/image-bound v2 receipt with hashed evidence artifacts', () => {
     const fixture = evidenceFixture()
@@ -699,6 +862,32 @@ describe('provider qualification receipt v2', () => {
         reasoningEffortProvenance: 'process-args',
       })),
     }])).toThrow(/provenance|process-args/i)
+  })
+
+  it.each(['gpt-5.6-sol', 'unknown', ''])('rejects a wrong or missing Codex native model (%j)', resolvedModel => {
+    const row = providerRow('codex')
+    const proof = { ...row.nativeTurnProofs[0]!, resolvedModel }
+    expect(providerNativeProfileMatches(row, proof)).toBe(false)
+    expect(() => evidenceFixture([{ ...row, nativeTurnProofs: [proof, ...row.nativeTurnProofs.slice(1)] }]))
+      .toThrow(/native|model|profile/i)
+  })
+
+  it('matches a different requested Codex model only to that native model', () => {
+    const row = { ...providerRow('codex'), model: 'gpt-5.2-codex' }
+    const proof = { ...row.nativeTurnProofs[0]!, resolvedModel: row.model }
+    expect(providerNativeProfileMatches(row, row.nativeTurnProofs[0]!)).toBe(false)
+    expect(providerNativeProfileMatches(row, proof)).toBe(true)
+    expect(providerNativeProfileMatches(row, { ...proof, modelProvenance: 'process-args' })).toBe(false)
+  })
+
+  it('keeps unsupported Codex native effort unknown without inventing the requested effort', () => {
+    const row = providerRow('codex')
+    const proof = { ...row.nativeTurnProofs[0]!, resolvedReasoningEffort: 'unknown',
+      reasoningEffortProvenance: 'unsupported-native-telemetry' }
+    expect(providerNativeProfileMatches(row, proof)).toBe(true)
+    expect(proof.resolvedReasoningEffort).toBe('unknown')
+    expect(providerNativeProfileMatches(row, { ...proof, reasoningEffortProvenance: 'codex-native.effort' })).toBe(false)
+    expect(providerNativeProfileMatches(row, { ...proof, resolvedReasoningEffort: row.reasoningEffort })).toBe(false)
   })
 
   it('rejects raw prompts, raw responses, nonce values, and synthetic secrets before writing evidence', () => {

@@ -13,6 +13,9 @@ import type { DeadSessionEntry, PaneNode, ReconcileWarmingState } from '@/store/
 import { buildRestoreError } from '@shared/session-contract'
 import { DeadSessionPanel } from '@/components/DeadSessionPanel'
 import { ReconcileWarmingBanner } from '@/components/ReconcileWarmingBanner'
+import { ManagedRuntimeRecoveryCard } from '@/components/ManagedRuntimeRecoveryCard'
+import { buildReconcileRequest, foldVerdicts } from '@/lib/pane-reconcile'
+import type { AppDispatch, RootState } from '@/store/store'
 
 // --- ws-client mock: capture sent frames, support multiple onMessage subscribers ---
 
@@ -161,6 +164,49 @@ describe('DeadSessionPanel + ReconcileWarmingBanner', () => {
 
   afterEach(() => {
     cleanup()
+  })
+
+  it.each([false, true])('managed stopped repair keeps its Resume decision when a legacy pane is present: %s', async (withLegacy) => {
+    const { store } = renderWithStore({
+      paneIds: withLegacy ? ['managed', 'legacy'] : ['managed'],
+      extraContentByPane: {
+        managed: { mode: 'opencode', terminalId: undefined, status: 'exited',
+          soulId: 'repaired-soul', viewIntentId: 'retained-view',
+          sessionRef: { provider: 'opencode', sessionId: 'ses_volume_only' },
+          recoverySummary: { desiredState: 'stopped', recoveryState: 'data_repair_complete',
+            durabilityState: 'resume_captured', allocationState: 'allocated' } },
+        legacy: { mode: 'claude', sessionRef: { provider: 'claude', sessionId: 'gone' } },
+      },
+    })
+    const before = findLeaf(store.getState().panes.layouts['tab-1'], 'managed').content
+    const request = buildReconcileRequest(store.getState() as RootState)
+    // The ordinary web disk index cannot see any of these saved sessions.
+    // Exercise the actual request/fold/store/panel chain rather than seeding
+    // adjudication directly: managed volume ownership must win before lookup.
+    if (request) act(() => {
+      foldVerdicts(store.dispatch as AppDispatch, request, {
+        type: 'pane.reconcile.result', reconcileId: request.reconcileId,
+        bootId: 'boot', serverInstanceId: 'server',
+        verdicts: request.panes.map(pane => ({ paneKey: pane.paneKey,
+          verdict: 'dead_session', reason: 'session_not_on_disk', sessionRef: pane.sessionRef })),
+      })
+    })
+    expect(store.getState().panes.deadSessionAdjudication?.map((row: DeadSessionEntry) => row.paneId))
+      .toEqual(withLegacy ? ['legacy'] : [])
+    expect(findLeaf(store.getState().panes.layouts['tab-1'], 'managed').content).toEqual(before)
+    if (withLegacy) {
+      expect(screen.getByRole('dialog', { name: 'Dead sessions' })).toBeVisible()
+      expect(screen.getAllByRole('button', { name: 'Start fresh here' })).toHaveLength(1)
+    } else {
+      expect(screen.queryByRole('dialog')).toBeNull()
+      const resume = vi.fn().mockResolvedValue(undefined)
+      const startFresh = vi.fn()
+      render(<ManagedRuntimeRecoveryCard recoverySummary={before.recoverySummary}
+        onRetry={resume} onStartFresh={startFresh} />)
+      await userEvent.click(screen.getByRole('button', { name: 'Resume restored session' }))
+      expect(resume).toHaveBeenCalledTimes(1)
+      expect(startFresh).not.toHaveBeenCalled()
+    }
   })
 
   // F11-human: one panel, never N modals.

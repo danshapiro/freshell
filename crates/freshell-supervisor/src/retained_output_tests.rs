@@ -113,6 +113,7 @@ async fn retained_output_replacement(
         .commit_created(
             replacement.prepared.incarnation_id.clone(),
             crate::registry::BackendCreatedRecord {
+                launch_policy: None,
                 daemon_id: freshell_runtime_protocol::DockerDaemonId::new(),
                 container_id: replacement
                     .prepared
@@ -233,6 +234,12 @@ async fn retained_output_failed_activation_without_spool_keeps_committed_prior()
             Some(replacement.attempt_id),
             RecoveryBlockReason::ProviderUnavailable,
             vec!["synthetic activation failure".into()],
+            supervisor
+                .registry
+                .recovery_context(context.soul_id.clone())
+                .await
+                .unwrap()
+                .write_fence(),
         )
         .await
         .unwrap();
@@ -260,6 +267,12 @@ async fn retained_output_wrong_identity_spool_cannot_displace_committed_prior() 
             Some(replacement.attempt_id),
             RecoveryBlockReason::WrongNativeIdentity,
             vec!["synthetic wrong identity".into()],
+            supervisor
+                .registry
+                .recovery_context(context.soul_id.clone())
+                .await
+                .unwrap()
+                .write_fence(),
         )
         .await
         .unwrap();
@@ -278,6 +291,12 @@ async fn retained_output_accepted_replacement_becomes_source_and_survives_later_
             context.soul_id.clone(),
             replacement.prepared.incarnation_id.clone(),
             replacement.attempt_id,
+            supervisor
+                .registry
+                .recovery_context(context.soul_id.clone())
+                .await
+                .unwrap()
+                .write_fence(),
         )
         .await
         .unwrap();
@@ -301,6 +320,12 @@ async fn retained_output_accepted_replacement_becomes_source_and_survives_later_
             Some(failed.attempt_id),
             RecoveryBlockReason::WrongNativeIdentity,
             vec![],
+            supervisor
+                .registry
+                .recovery_context(context.soul_id.clone())
+                .await
+                .unwrap()
+                .write_fence(),
         )
         .await
         .unwrap();
@@ -324,6 +349,12 @@ async fn retained_output_legacy_success_with_overwritten_attempt_keeps_accepted_
             context.soul_id.clone(),
             replacement.prepared.incarnation_id.clone(),
             replacement.attempt_id.clone(),
+            supervisor
+                .registry
+                .recovery_context(context.soul_id.clone())
+                .await
+                .unwrap()
+                .write_fence(),
         )
         .await
         .unwrap();
@@ -348,6 +379,12 @@ async fn retained_output_legacy_success_with_overwritten_attempt_keeps_accepted_
             Some(failed.attempt_id),
             RecoveryBlockReason::ProviderUnavailable,
             vec![],
+            supervisor
+                .registry
+                .recovery_context(context.soul_id.clone())
+                .await
+                .unwrap()
+                .write_fence(),
         )
         .await
         .unwrap();
@@ -384,6 +421,144 @@ async fn retained_output_blocked_handle_replays_without_input_authority() {
 }
 
 #[tokio::test]
+async fn retained_output_after_stop_does_not_wait_for_unavailable_host() {
+    let root = tempfile::tempdir().unwrap();
+    let (supervisor, context) =
+        retained_output_fixture(root.path(), BackendRuntimeState::Exited).await;
+    let runtime = context.prior_handle.runtime_dir();
+    std::fs::write(runtime.join("secret"), b"synthetic-retained-host-secret").unwrap();
+    assert!(!runtime.join("host.sock").exists());
+    let mut stop = freshell_runtime_protocol::Envelope::new(
+        freshell_runtime_protocol::RequestId::new(),
+        freshell_runtime_protocol::ControlRole::Web,
+        freshell_runtime_protocol::AdminCommand::Stop(freshell_runtime_protocol::StopRequest {
+            soul_id: context.soul_id.clone(),
+            expected_intent_revision: None,
+            expected_control_epoch: None,
+        }),
+    );
+    stop.auth = Some("synthetic-control-secret".into());
+    let stopped = supervisor.dispatch(stop).await.result.unwrap();
+    let freshell_runtime_protocol::AdminResult::Stop { outcome, view } = stopped else {
+        panic!("unexpected Stop reply: {stopped:?}")
+    };
+    assert_eq!(outcome, StopOutcome::VerifiedEmpty);
+    assert_eq!(view.desired_state, freshell_runtime_protocol::DesiredState::Stopped);
+    let mut before = supervisor.registry.inventory().await.unwrap();
+
+    let config = (*supervisor.config).clone();
+    let database_root = supervisor.registry.database_path().parent().unwrap().to_path_buf();
+    let mut supervisor = supervisor;
+    let mut reads = Vec::new();
+    for reader in 0..2 {
+        if reader == 1 {
+            drop(supervisor);
+            supervisor = Supervisor::new(
+                crate::registry::Registry::open(&database_root, None).unwrap(),
+                std::sync::Arc::new(RecoveryBackend(std::sync::Mutex::new(
+                    BackendRuntimeState::Exited,
+                ))),
+                config.clone(),
+            )
+            .unwrap();
+            // Reopening reconciles legacy view-intent metadata. Establish
+            // the read's baseline after that separate existing operation.
+            before = supervisor.registry.inventory().await.unwrap();
+        }
+        // The real WebSocket pre-attach output refresh has this 500ms bound.
+        // Keep the retained secret: missing it would bypass the host retry.
+        reads.push(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                retained_output_read(&supervisor, context.soul_id.clone(), 2),
+            )
+            .await,
+        );
+        assert_eq!(supervisor.registry.inventory().await.unwrap(), before);
+    }
+    assert!(
+        reads.iter().all(Result::is_ok),
+        "post-Stop output must reach the caller before its attach deadline: {reads:?}"
+    );
+    for read in reads {
+        let output = read.unwrap().expect("accepted stopped spool remains readable");
+        assert_eq!(output.incarnation_id, *context.prior_handle.incarnation_id());
+        assert_eq!(output.terminal_id, "retained-terminal");
+        assert_eq!(output.stream_epoch, "launch-prefix-hostboot-exact");
+        assert_eq!(output.native_session_id, context.native_session_id);
+        assert_eq!(output.frames.len(), 1);
+        assert_eq!(output.frames[0].data, "final diagnostic");
+        assert!(output.exited);
+        assert!(output.completion.is_some());
+    }
+    assert_eq!(supervisor.registry.inventory().await.unwrap(), before);
+    assert!(!runtime.join("host.sock").exists());
+}
+
+#[tokio::test]
+async fn retained_output_stop_intent_keeps_draining_spool_open() {
+    let root = tempfile::tempdir().unwrap();
+    let (supervisor, context) =
+        retained_output_fixture(root.path(), BackendRuntimeState::Running).await;
+    let runtime = context.prior_handle.runtime_dir();
+    std::fs::write(runtime.join("secret"), b"synthetic-retained-host-secret").unwrap();
+    supervisor
+        .registry
+        .record_native_session(
+            context.soul_id.clone(),
+            context.prior_handle.incarnation_id().clone(),
+            "retained-native-root".into(),
+        )
+        .await
+        .unwrap();
+    let stopping = supervisor
+        .registry
+        .begin_stop(context.soul_id.clone())
+        .await
+        .unwrap();
+    supervisor
+        .registry
+        .record_ordinary_stop_outcome(&stopping, StopOutcome::TerminationUnconfirmed)
+        .await
+        .unwrap();
+    let before = supervisor.registry.inventory().await.unwrap();
+    for after in [2, 3] {
+        if after == 3 {
+            use std::io::Write;
+            let mut spool = std::fs::OpenOptions::new()
+                .append(true)
+                .open(runtime.join("terminal-spool-current.jsonl"))
+                .unwrap();
+            writeln!(spool, "{}", serde_json::json!({"frame":{
+                "terminalId":"retained-terminal","streamEpoch":"launch-prefix-hostboot-exact",
+                "seqStart":4,"seqEnd":4,"data":"drained after Stop"
+            }})).unwrap();
+        }
+        let output = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            retained_output_read(&supervisor, context.soul_id.clone(), after),
+        )
+        .await
+        .expect("committed Stop must not wait for an unavailable host")
+        .expect("accepted draining bytes remain readable");
+        assert_eq!(output.incarnation_id, *context.prior_handle.incarnation_id());
+        assert_eq!(output.terminal_id, "retained-terminal");
+        assert_eq!(output.stream_epoch, "launch-prefix-hostboot-exact");
+        assert_eq!(output.native_session_id.as_deref(), Some("retained-native-root"));
+        assert_eq!(output.frames.len(), 1);
+        assert_eq!(
+            output.frames[0].data,
+            if after == 2 { "final diagnostic" } else { "drained after Stop" }
+        );
+        assert!(!output.exited, "Stop intent is not verified termination");
+        assert!(output.completion.is_none());
+        assert!(!runtime.join("terminal-spool-completion.json").exists());
+    }
+    assert_eq!(supervisor.registry.inventory().await.unwrap(), before);
+    assert!(!runtime.join("host.sock").exists());
+}
+
+#[tokio::test]
 async fn retained_output_verified_end_survives_cleanup_and_cold_supervisor() {
     let root = tempfile::tempdir().unwrap();
     let (supervisor, context) =
@@ -397,7 +572,7 @@ async fn retained_output_verified_end_survives_cleanup_and_cold_supervisor() {
         })
         .await
         .unwrap();
-    assert_eq!(result.outcome, RecoveryOutcome::Lost);
+    assert_eq!(result.outcome, RecoveryOutcome::Lost, "{result:?}");
     let config = (*supervisor.config).clone();
     let database_root = supervisor
         .registry
@@ -457,7 +632,11 @@ async fn concurrent_verified_empty_reads_share_one_completion_commit() {
             let source = crate::registry::RetainedOutputSource {
                 incarnation_id: incarnation_id.clone(),
                 runtime_dir: runtime_dir.clone(),
-                terminal: terminal.clone(),
+                terminal_id: terminal.terminal_id.clone(),
+                stream_id: terminal.stream_id.clone(),
+                read_fence: Default::default(),
+            stopped: false,
+            verified_empty: false,
                 native_session_id: None,
             };
             tokio::task::spawn_blocking(move || {

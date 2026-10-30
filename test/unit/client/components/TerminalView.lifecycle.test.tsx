@@ -36,6 +36,7 @@ import { getHydrationQueue, resetHydrationQueueForTests } from '@/lib/hydration-
 import { getTerminalActions } from '@/lib/pane-action-registry'
 import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { TERMINAL_CURSOR_STORAGE_KEY } from '@/store/storage-keys'
+import { installTestHarness } from '@/lib/test-harness'
 import {
   composeResolvedSettings,
   createDefaultServerSettings,
@@ -586,6 +587,38 @@ describe('TerminalView lifecycle updates', () => {
     const content = getLeafTerminalContent(store, tabId)
     expect(content.terminalId).toBe('term-theme')
     expect(content.status).toBe('running')
+  })
+
+  it('exposes the current actual emulator logical buffer through the registered harness accessors', async () => {
+    const actual = await vi.importActual<typeof import('@xterm/xterm')>('@xterm/xterm')
+    const emulator = new actual.Terminal({ cols: 13, rows: 12, allowProposedApi: true })
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal({
+      terminalId: 'term-accessor', streamId: 'stream-current', status: 'running',
+      sessionRef: { provider: 'claude', sessionId: 'native-root' },
+    })
+    installTestHarness(store as never, () => 'ready', async () => {}, () => {}, () => {})
+    const harness = window.__FRESHELL_TEST_HARNESS__!
+    const view = render(<Provider store={store}>
+      <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+    </Provider>)
+    const term = terminalInstances.at(-1)!
+    term.buffer = emulator.buffer
+    try {
+      const response = 'codename-public-test/after-host-current'
+      await new Promise<void>(done => emulator.write(`${response}\r\nHARD-LINE`, done))
+      expect(harness.getTerminalBuffer('term-accessor')).toContain(`${response}\nHARD-LINE`)
+      expect(harness.getTerminalSnapshot?.('term-accessor')).toMatchObject({
+        terminalId: 'term-accessor', paneId, streamId: 'stream-current', nativeSessionId: 'native-root',
+        writesPending: false, bufferType: 'normal',
+      })
+      expect(harness.getTerminalSnapshot?.('term-accessor')?.text).toContain(`${response}\nHARD-LINE`)
+      view.unmount()
+      expect(harness.getTerminalSnapshot?.('term-accessor')).toBeNull()
+      expect(harness.getTerminalBuffer('term-accessor')).toBeNull()
+    } finally {
+      view.unmount()
+      emulator.dispose()
+    }
   })
 
   it('skips terminal create when the e2e harness suppresses terminal network effects for the pane', () => {
@@ -5171,6 +5204,46 @@ describe('TerminalView lifecycle updates', () => {
     expectTerminalWriteContaining(term, 'Input not sent: Codex is checking whether the session is still active. Try again in a moment.')
   })
 
+  it.each(['opencode', 'codex'] as const)('shows terminal-scoped managed input feedback in ordinary %s mode', async mode => {
+    const terminalId = `term-managed-${mode}`
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal({ terminalId, status: 'running', mode })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+      expect(terminalInstances.length).toBeGreaterThan(0)
+    })
+
+    const term = terminalInstances[0]
+    term.write.mockClear()
+    for (const [reason, notice] of [
+      ['managed_recovery_pending', 'Input not sent: this managed session is recovering. Try again when the provider prompt returns.'],
+      ['managed_recovery_blocked', 'Input not sent: managed recovery is blocked. Repair the provider dependency, then retry this pane.'],
+    ] as const) {
+      const writesBeforeForeignFrame = term.write.mock.calls.length
+      act(() => {
+        messageHandler!({ type: 'terminal.input.blocked', terminalId: 'foreign-terminal', reason })
+      })
+      expect(term.write.mock.calls).toHaveLength(writesBeforeForeignFrame)
+
+      act(() => {
+        messageHandler!({ type: 'terminal.input.blocked', terminalId, reason })
+      })
+      expectTerminalWriteContaining(term, notice)
+      expect(term.write.mock.calls).toHaveLength(writesBeforeForeignFrame + 1)
+
+      act(() => {
+        messageHandler!({ type: 'terminal.input.blocked', terminalId, reason })
+      })
+      expect(term.write.mock.calls).toHaveLength(writesBeforeForeignFrame + 1)
+    }
+  })
+
   it('shows feedback when input is blocked because the terminal no longer exists', async () => {
     const { store, tabId, paneId, paneContent } = setupThemeTerminal({
       terminalId: 'term-gone',
@@ -6170,6 +6243,7 @@ describe('TerminalView lifecycle updates', () => {
        * PaneContainer's wiring) so store-only content folds — reconcile
        * verdicts — re-render the pane and re-fire the lifecycle effect. */
       fromStore?: boolean
+      testHarness?: boolean
     }) {
       const tabId = 'tab-v2-stream'
       const paneId = 'pane-v2-stream'
@@ -6244,6 +6318,10 @@ describe('TerminalView lifecycle updates', () => {
           connection: { status: 'connected', error: null, serverInstanceId: opts?.serverInstanceId ?? 'srv-v2-stream' },
         },
       })
+
+      if (opts?.testHarness) {
+        installTestHarness(store as never, () => 'ready', async () => {}, () => {}, () => {})
+      }
 
       const view = render(
         <Provider store={store}>
@@ -6968,6 +7046,209 @@ describe('TerminalView lifecycle updates', () => {
       expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId: 'new-host-epoch', serverInstanceId: 'server-managed-epoch',
       }, { paneId })?.parserAppliedSeq).toBe(2)
+    })
+
+    it.each(['single', 'batch', 'barrier-batch'] as const)('reports completed preprocessed output independently of conservative checkpoint coverage (%s)', async envelope => {
+      const { terminalId, paneId, term } = await renderTerminalHarness({
+        mode: 'opencode', terminalId: `term-startup-completed-${envelope}`,
+        ackInitialAttach: false, clearSends: false, testHarness: true,
+      })
+      term.buffer = { active: { type: 'alternate', length: 0 } }
+      const snapshot = () => window.__FRESHELL_TEST_HARNESS__!.getTerminalSnapshot!(terminalId)!
+      const attach = sentMessages().filter(msg => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId).at(-1)!
+      const streamId = 'startup-completed-stream'
+      const output = (seq: number, data: string) => messageHandler!({
+        terminalId, streamId, attachRequestId: attach.attachRequestId, seqStart: seq, seqEnd: seq, data,
+        ...(envelope === 'single' ? { type: 'terminal.output', source: seq === 1 ? 'replay' : 'live' } : {
+          type: 'terminal.output.batch', source: seq === 1 ? 'replay' : 'live', serializedBytes: data.length + 256,
+          segments: [{ seqStart: seq, seqEnd: seq, endOffset: data.length, rawFrameCount: 1,
+            ...(envelope === 'barrier-batch' ? { barrier: 'control' } : {}) }],
+        }),
+      })
+      act(() => { messageHandler!({ type: 'terminal.attach.ready', terminalId, streamId,
+        headSeq: 1, replayFromSeq: 1, replayToSeq: 1, attachRequestId: attach.attachRequestId }) })
+      term.deferWrites = true
+      act(() => { output(1, '\x1b]52;c;c3ludGhldGlj\x07READY') })
+      expect(snapshot()).toMatchObject({ highestObservedSeq: 1, completedSeq: 0, writesPending: true })
+      act(() => { term.releasePendingWrites() })
+      expect(snapshot()).toMatchObject({ highestObservedSeq: 1, completedSeq: 1, writesPending: false, replayPending: false })
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
+        streamId, serverInstanceId: 'srv-v2-stream',
+      }, { paneId })).toBeNull()
+      act(() => { output(2, 'NEXT') })
+      expect(snapshot()).toMatchObject({ highestObservedSeq: 2, completedSeq: 1, writesPending: true })
+      act(() => { term.releasePendingWrites() })
+      expect(snapshot()).toMatchObject({ highestObservedSeq: 2, completedSeq: 2, writesPending: false })
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
+        streamId, serverInstanceId: 'srv-v2-stream',
+      }, { paneId })).toBeNull()
+    })
+
+    it('reports completed retained-tail replay while preserving its checkpoint baseline', async () => {
+      const { terminalId, paneId, term } = await renderTerminalHarness({
+        mode: 'opencode', terminalId: 'term-retained-tail-completed',
+        ackInitialAttach: false, clearSends: false, testHarness: true,
+      })
+      term.buffer = { active: { type: 'alternate', length: 0 } }
+      const snapshot = () => window.__FRESHELL_TEST_HARNESS__!.getTerminalSnapshot!(terminalId)!
+      const attach = sentMessages().filter(msg => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId).at(-1)!
+      const streamId = 'retained-tail-stream'
+      act(() => { messageHandler!({ type: 'terminal.attach.ready', terminalId, streamId,
+        headSeq: 17, replayFromSeq: 10, replayToSeq: 17, attachRequestId: attach.attachRequestId }) })
+      term.deferWrites = true
+      act(() => { messageHandler!({ type: 'terminal.output.batch', terminalId, streamId,
+        attachRequestId: attach.attachRequestId, source: 'replay', seqStart: 10, seqEnd: 17,
+        data: 'RETAINED', serializedBytes: 256,
+        segments: [{ seqStart: 10, seqEnd: 17, endOffset: 8, rawFrameCount: 8 }],
+      }) })
+      expect(snapshot()).toMatchObject({ highestObservedSeq: 17, completedSeq: 0, writesPending: true })
+      act(() => { term.releasePendingWrites() })
+      expect(snapshot()).toMatchObject({ highestObservedSeq: 17, completedSeq: 17, writesPending: false, replayPending: false })
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
+        streamId, serverInstanceId: 'srv-v2-stream',
+      }, { paneId })).toMatchObject({ parserAppliedSeq: 17, surfaceCoverageSeq: 17 })
+    })
+
+    it.each(['single', 'batch'] as const)('counts completed lower sequences in each recovered stream as genuine recovery progress (%s)', async envelope => {
+      const { terminalId, term } = await renderTerminalHarness({
+        mode: 'claude', terminalId: 'term-managed-progress-domains',
+        ackInitialAttach: false, clearSends: false, testHarness: true,
+      })
+      term.buffer = { active: { type: 'normal', length: 0 } }
+      const snapshot = () => window.__FRESHELL_TEST_HARNESS__!.getTerminalSnapshot!(terminalId)!
+      const attaches = () => sentMessages().filter(msg => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      const output = (streamId: string, attachRequestId: string, seqStart: number, seqEnd: number, data: string) => {
+        messageHandler!({ terminalId, streamId, attachRequestId, seqStart, seqEnd, data,
+          ...(envelope === 'single' ? { type: 'terminal.output' } : {
+            type: 'terminal.output.batch', source: 'live', serializedBytes: 256,
+            segments: [{ seqStart, seqEnd, endOffset: data.length, rawFrameCount: seqEnd - seqStart + 1 }],
+          }),
+        })
+      }
+      const first = attaches().at(-1)!
+      act(() => {
+        messageHandler!({ type: 'terminal.attach.ready', terminalId, streamId: 'first-progress-stream',
+          headSeq: 206, replayFromSeq: 1, replayToSeq: 206, attachRequestId: first.attachRequestId })
+        output('first-progress-stream', first.attachRequestId, 1, 206, 'COMPLETED FIRST STREAM')
+      })
+      expect(snapshot()).toMatchObject({ highestObservedSeq: 206, completedSeq: 206, writesPending: false })
+
+      // A physically in-flight old write must finish before the ordered reset,
+      // but its stale callback must never become progress for the new stream.
+      term.deferWrites = true
+      act(() => {
+        output('first-progress-stream', first.attachRequestId, 207, 207, 'DELAYED FIRST STREAM')
+        messageHandler!({ type: 'terminal.stream.changed', terminalId, streamId: 'second-progress-stream',
+          reason: 'new_pty_session', attachRequestId: first.attachRequestId })
+      })
+      expect(attaches()).toHaveLength(1)
+      expect(snapshot().writesPending).toBe(true)
+      act(() => { term.releasePendingWrites() })
+      // The reconstruction is also asynchronous; no replacement attach yet.
+      expect(attaches()).toHaveLength(1)
+      act(() => { term.releasePendingWrites() })
+      const second = attaches().at(-1)!
+      expect(second.attachRequestId).not.toBe(first.attachRequestId)
+      expect(snapshot()).toMatchObject({ highestObservedSeq: 0, completedSeq: 0, replayPending: true })
+      act(() => {
+        messageHandler!({ type: 'terminal.attach.ready', terminalId, streamId: 'second-progress-stream',
+          headSeq: 2, replayFromSeq: 1, replayToSeq: 2, attachRequestId: second.attachRequestId })
+        output('second-progress-stream', second.attachRequestId, 1, 2, 'COMPLETED SECOND STREAM')
+      })
+      expect(snapshot()).toMatchObject({ highestObservedSeq: 2, completedSeq: 0, writesPending: true })
+      act(() => { term.releasePendingWrites() })
+      expect(snapshot()).toMatchObject({ highestObservedSeq: 2, completedSeq: 2, replayPending: false, writesPending: false })
+      term.deferWrites = false
+
+      // The real completed replacement output refunds the attempt even though
+      // its sequence is below the retired stream's 206. Two idle reconnects
+      // followed by another physical recovery must still fit the fresh budget.
+      for (let i = 0; i < 2; i++) {
+        act(() => { reconnectHandler?.() })
+        const reconnect = attaches().at(-1)!
+        act(() => {
+          messageHandler!({ type: 'terminal.attach.ready', terminalId, streamId: 'second-progress-stream',
+            headSeq: 2, replayFromSeq: 3, replayToSeq: 2, attachRequestId: reconnect.attachRequestId })
+        })
+      }
+      const beforeRecovery = attaches().at(-1)!
+      act(() => {
+        messageHandler!({ type: 'terminal.stream.changed', terminalId, streamId: 'third-progress-stream',
+          reason: 'new_pty_session', attachRequestId: beforeRecovery.attachRequestId })
+      })
+      const third = attaches().at(-1)!
+      expect(third.attachRequestId).not.toBe(beforeRecovery.attachRequestId)
+      expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
+      act(() => {
+        messageHandler!({ type: 'terminal.attach.ready', terminalId, streamId: 'third-progress-stream',
+          headSeq: 1, replayFromSeq: 1, replayToSeq: 1, attachRequestId: third.attachRequestId })
+        output('third-progress-stream', third.attachRequestId, 1, 1, 'COMPLETED THIRD STREAM')
+      })
+      expect(snapshot()).toMatchObject({ streamId: 'third-progress-stream', attachStreamId: 'third-progress-stream',
+        highestObservedSeq: 1, completedSeq: 1, replayPending: false, writesPending: false })
+      expect(sentMessages().filter(msg => msg?.type === 'terminal.create' || msg?.type === 'terminal.kill')).toHaveLength(0)
+    })
+
+    it('does not attribute a delayed old write to a stream whose reconstruction was refused', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        terminalId: 'term-refused-stream-old-callback', clearSends: false, testHarness: true,
+      })
+      term.buffer = { active: { type: 'normal', length: 0 } }
+      const attaches = () => sentMessages().filter(msg => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      act(() => {
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 5, data: 'OLD COMPLETED OUTPUT' })
+      })
+      for (let i = 0; i < 3; i++) {
+        act(() => { reconnectHandler?.() })
+        act(() => {
+          messageHandler!({ type: 'terminal.attach.ready', terminalId,
+            headSeq: 5, replayFromSeq: 6, replayToSeq: 5, attachRequestId: attaches().at(-1)!.attachRequestId })
+        })
+      }
+      const last = attaches().at(-1)!
+      term.deferWrites = true
+      act(() => {
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 6, seqEnd: 6,
+          data: 'DELAYED RETIRED OUTPUT', attachRequestId: last.attachRequestId })
+        messageHandler!({ type: 'terminal.stream.changed', terminalId, streamId: 'refused-new-stream',
+          reason: 'new_pty_session', attachRequestId: last.attachRequestId })
+      })
+      expect(attaches()).toHaveLength(4)
+      expect(screen.getByRole('button', { name: 'Retry terminal restore' })).toBeTruthy()
+      act(() => { term.releasePendingWrites() })
+      expect(screen.getByRole('button', { name: 'Retry terminal restore' })).toBeTruthy()
+      expect(window.__FRESHELL_TEST_HARNESS__!.getTerminalSnapshot!(terminalId)).toMatchObject({
+        streamId: 'refused-new-stream', highestObservedSeq: 6, completedSeq: 5, writesPending: false,
+      })
+      act(() => { reconnectHandler?.() })
+      expect(attaches()).toHaveLength(4)
+    })
+
+    it('keeps physical stream changes without completed output bounded', async () => {
+      const { terminalId } = await renderTerminalHarness({
+        terminalId: 'term-progressless-stream-changes', clearSends: false,
+      })
+      const attaches = () => sentMessages().filter(msg => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      for (let i = 1; i <= 3; i++) {
+        const current = attaches().at(-1)!
+        act(() => {
+          messageHandler!({ type: 'terminal.stream.changed', terminalId, streamId: `idle-stream-${i}`,
+            reason: 'new_pty_session', attachRequestId: current.attachRequestId })
+        })
+        expect(attaches()).toHaveLength(i + 1)
+        const next = attaches().at(-1)!
+        act(() => {
+          messageHandler!({ type: 'terminal.attach.ready', terminalId, streamId: `idle-stream-${i}`,
+            headSeq: 0, replayFromSeq: 1, replayToSeq: 0, attachRequestId: next.attachRequestId })
+        })
+      }
+      const before = attaches().at(-1)!
+      act(() => {
+        messageHandler!({ type: 'terminal.stream.changed', terminalId, streamId: 'idle-stream-4',
+          reason: 'new_pty_session', attachRequestId: before.attachRequestId })
+      })
+      expect(attaches()).toHaveLength(4)
+      expect(screen.getByRole('button', { name: 'Retry terminal restore' })).toBeTruthy()
     })
 
     it('does not rewind a managed epoch on a duplicate stream-change notification', async () => {

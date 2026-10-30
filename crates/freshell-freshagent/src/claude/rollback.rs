@@ -187,6 +187,16 @@ impl FreshClaudeState {
         op: crate::rollback_record::RollbackRequest,
         reply_sink: freshell_terminal::FrameSink,
     ) {
+        self.handle_rollback_with_native_launch(op, reply_sink, None)
+            .await;
+    }
+
+    pub async fn handle_rollback_with_native_launch(
+        &self,
+        op: crate::rollback_record::RollbackRequest,
+        reply_sink: freshell_terminal::FrameSink,
+        native_launch: Option<Value>,
+    ) {
         let Some(map_key) = self.resolve_session_key(&op.session_id).await else {
             reply_sink(rollback_error_frame(
                 &op,
@@ -498,138 +508,224 @@ impl FreshClaudeState {
         }
 
         let now = now_ms();
-        let existing = self
-            .identity_sink()
-            .and_then(|s| s.load_rollback(PROVIDER, &durable_id));
+        let existing = self.load_rollback_record(&durable_id).await;
 
-        let plan = match op.direction {
-            RollbackDirection::Undo => {
-                let current = match self.effective_transcript(&durable_id).await {
-                    Ok(current) => current,
-                    Err(EffectiveTranscriptError::Missing) => {
-                        reply_sink(rollback_error_frame(
-                            &op,
-                            "NOTHING_TO_UNDO",
-                            UNDO_EMPTY_MESSAGE,
-                        ));
-                        return;
-                    }
-                    Err(error) => {
-                        reply_sink(error.refusal(&op, &durable_id));
-                        return;
-                    }
-                };
-                let target = match op.mode {
-                    RollbackModeReq::Step => snap::ResumeTarget::Step,
-                    RollbackModeReq::ToTurn => {
-                        snap::ResumeTarget::ToTurn(op.turn_id.clone().expect("validated"))
-                    }
-                };
-                let point = match snap::resolve_resume_point(&current.text, &durable_id, target) {
-                    Ok(p) => p, // resume_at_uuid None = "before the first message" — LEGAL (r2)
-                    Err(snap::ResumeResolveError::Empty) => {
-                        reply_sink(rollback_error_frame(
-                            &op,
-                            "NOTHING_TO_UNDO",
-                            UNDO_EMPTY_MESSAGE,
-                        ));
-                        return;
-                    }
-                    Err(_) => {
-                        reply_sink(rollback_error_frame(
-                            &op,
-                            "INVALID_ROLLBACK_TARGET",
-                            &format!("turn {:?} is not in this conversation", op.turn_id),
-                        ));
-                        return;
-                    }
-                };
-                // Epoch rule (r2/r3): an undo landing while redo_destroyed is set
-                // re-roots the chain to the CURRENT durable id — the retained old
-                // original describes a branch a resend already permanently
-                // replaced; O's redo stays permanently dead.
-                let chain_root = existing
-                    .as_ref()
-                    .filter(|r| !r.redo_destroyed)
-                    .and_then(|r| r.original_session_id.clone())
-                    .unwrap_or_else(|| durable_id.clone());
-                // Tip anchor at UNDO time = the last raw-chain uuid of the
-                // CHAIN-ROOT transcript (at the first undo the current
-                // conversation IS the root).
-                let root_text = if chain_root == durable_id {
-                    current.text.clone()
-                } else {
-                    match self.read_located_transcript(&chain_root) {
-                        Ok(Some(text)) => text,
-                        Ok(None) => {
+        let plan = if self.managed_forks {
+            let mut request = self.managed_history_request("rollback", &durable_id).await;
+            request["rollback"] = json!(existing);
+            request["redo"] = json!(op.direction == RollbackDirection::Redo);
+            request["toTurn"] = json!(op.turn_id);
+            let resolved = self.read_managed_history(request).await.and_then(|value| {
+                serde_json::from_value::<
+                    Result<super::managed_history::ClaudeRollbackResolution, (String, String)>,
+                >(value)
+                .map_err(|_| "invalid managed Claude rollback response".to_string())
+            });
+            let resolved = match resolved {
+                Ok(Ok(resolved)) => resolved,
+                Ok(Err((code, message))) => {
+                    reply_sink(rollback_error_frame(&op, &code, &message));
+                    return;
+                }
+                Err(message) => {
+                    reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &message));
+                    return;
+                }
+            };
+            let genesis = match &resolved.resume_at_uuid {
+                Some(at) => ClaudeGenesis::Fork {
+                    parent: resolved.resume_from.clone(),
+                    at: Some(at.clone()),
+                    drops_turn: resolved.guard_uuid,
+                },
+                None => ClaudeGenesis::Fresh,
+            };
+            RollbackPlan {
+                removed_turns: resolved.removed_turns,
+                prompt_text: resolved.prompt_text,
+                chain_root: resolved.chain_root,
+                original_tip_uuid: resolved.original_tip_uuid,
+                can_redo_after: resolved.can_redo_after,
+                genesis,
+                source: resolved.resume_from,
+                source_path: Some(resolved.source_path),
+            }
+        } else {
+            match op.direction {
+                RollbackDirection::Undo => {
+                    let current = match self.effective_transcript(&durable_id).await {
+                        Ok(current) => current,
+                        Err(EffectiveTranscriptError::Missing) => {
                             reply_sink(rollback_error_frame(
                                 &op,
-                                "INTERNAL_ERROR",
-                                "chain-root transcript unreadable",
+                                "NOTHING_TO_UNDO",
+                                UNDO_EMPTY_MESSAGE,
                             ));
                             return;
                         }
                         Err(error) => {
-                            reply_sink(error.refusal(&op, &chain_root));
+                            reply_sink(error.refusal(&op, &durable_id));
                             return;
                         }
+                    };
+                    let target = match op.mode {
+                        RollbackModeReq::Step => snap::ResumeTarget::Step,
+                        RollbackModeReq::ToTurn => {
+                            snap::ResumeTarget::ToTurn(op.turn_id.clone().expect("validated"))
+                        }
+                    };
+                    let point = match snap::resolve_resume_point(&current.text, &durable_id, target)
+                    {
+                        Ok(p) => p, // resume_at_uuid None = "before the first message" — LEGAL (r2)
+                        Err(snap::ResumeResolveError::Empty) => {
+                            reply_sink(rollback_error_frame(
+                                &op,
+                                "NOTHING_TO_UNDO",
+                                UNDO_EMPTY_MESSAGE,
+                            ));
+                            return;
+                        }
+                        Err(_) => {
+                            reply_sink(rollback_error_frame(
+                                &op,
+                                "INVALID_ROLLBACK_TARGET",
+                                &format!("turn {:?} is not in this conversation", op.turn_id),
+                            ));
+                            return;
+                        }
+                    };
+                    // Epoch rule (r2/r3): an undo landing while redo_destroyed is set
+                    // re-roots the chain to the CURRENT durable id — the retained old
+                    // original describes a branch a resend already permanently
+                    // replaced; O's redo stays permanently dead.
+                    let chain_root = existing
+                        .as_ref()
+                        .filter(|r| !r.redo_destroyed)
+                        .and_then(|r| r.original_session_id.clone())
+                        .unwrap_or_else(|| durable_id.clone());
+                    // Tip anchor at UNDO time = the last raw-chain uuid of the
+                    // CHAIN-ROOT transcript (at the first undo the current
+                    // conversation IS the root).
+                    let root_text = if chain_root == durable_id {
+                        current.text.clone()
+                    } else {
+                        match self.read_located_transcript(&chain_root) {
+                            Ok(Some(text)) => text,
+                            Ok(None) => {
+                                reply_sink(rollback_error_frame(
+                                    &op,
+                                    "INTERNAL_ERROR",
+                                    "chain-root transcript unreadable",
+                                ));
+                                return;
+                            }
+                            Err(error) => {
+                                reply_sink(error.refusal(&op, &chain_root));
+                                return;
+                            }
+                        }
+                    };
+                    let tip = snap::raw_chain_tip(&root_text);
+                    // The fork reads the source's REAL transcript, so the guard is
+                    // computed over it (§4.5 source collapse: a pending fork's
+                    // source is its parent, past the point the earlier undo kept).
+                    let genesis = match point.resume_at_uuid.clone() {
+                        Some(at) => ClaudeGenesis::Fork {
+                            parent: current.source.clone(),
+                            drops_turn: snap::drops_turn_guard(&current.source_text, Some(&at)),
+                            at: Some(at),
+                        },
+                        None => ClaudeGenesis::Fresh,
+                    };
+                    // can_redo after the undo: the removed content provably exists in
+                    // the original beyond the resume point (on the r2 first-turn leg
+                    // the fresh conversation's tip is NONE — strictly beyond holds
+                    // whenever a tip exists).
+                    RollbackPlan {
+                        removed_turns: point.removed_turns,
+                        prompt_text: point.prompt_text,
+                        chain_root,
+                        original_tip_uuid: tip,
+                        can_redo_after: true,
+                        genesis,
+                        source: current.source,
+                        source_path: current.source_path,
                     }
-                };
-                let tip = snap::raw_chain_tip(&root_text);
-                // The fork reads the source's REAL transcript, so the guard is
-                // computed over it (§4.5 source collapse: a pending fork's
-                // source is its parent, past the point the earlier undo kept).
-                let genesis = match point.resume_at_uuid.clone() {
-                    Some(at) => ClaudeGenesis::Fork {
-                        parent: current.source.clone(),
-                        drops_turn: snap::drops_turn_guard(&current.source_text, Some(&at)),
-                        at: Some(at),
-                    },
-                    None => ClaudeGenesis::Fresh,
-                };
-                // can_redo after the undo: the removed content provably exists in
-                // the original beyond the resume point (on the r2 first-turn leg
-                // the fresh conversation's tip is NONE — strictly beyond holds
-                // whenever a tip exists).
-                RollbackPlan {
-                    removed_turns: point.removed_turns,
-                    prompt_text: point.prompt_text,
-                    chain_root,
-                    original_tip_uuid: tip,
-                    can_redo_after: true,
-                    genesis,
-                    source: current.source,
-                    source_path: current.source_path,
                 }
-            }
-            RollbackDirection::Redo => {
-                let Some(record) = existing.clone() else {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "REDO_UNAVAILABLE",
-                        REDO_EMPTY_MESSAGE,
-                    ));
-                    return;
-                };
-                if record.redo_destroyed {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "REDO_UNAVAILABLE",
-                        REDO_DESTROYED_MESSAGE,
-                    ));
-                    return;
-                }
-                let Some(original) = record.original_session_id.clone() else {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "REDO_UNAVAILABLE",
-                        REDO_EMPTY_MESSAGE,
-                    ));
-                    return;
-                };
-                let original_path = match self.locate_transcript(&original) {
-                    snap::TranscriptLocation::Found(path) => path,
-                    snap::TranscriptLocation::Absent => {
+                RollbackDirection::Redo => {
+                    let Some(record) = existing.clone() else {
+                        reply_sink(rollback_error_frame(
+                            &op,
+                            "REDO_UNAVAILABLE",
+                            REDO_EMPTY_MESSAGE,
+                        ));
+                        return;
+                    };
+                    if record.redo_destroyed {
+                        reply_sink(rollback_error_frame(
+                            &op,
+                            "REDO_UNAVAILABLE",
+                            REDO_DESTROYED_MESSAGE,
+                        ));
+                        return;
+                    }
+                    let Some(original) = record.original_session_id.clone() else {
+                        reply_sink(rollback_error_frame(
+                            &op,
+                            "REDO_UNAVAILABLE",
+                            REDO_EMPTY_MESSAGE,
+                        ));
+                        return;
+                    };
+                    let original_path = match self.locate_transcript(&original) {
+                        snap::TranscriptLocation::Found(path) => path,
+                        snap::TranscriptLocation::Absent => {
+                            reply_sink(rollback_error_frame(
+                                &op,
+                                "REDO_UNAVAILABLE",
+                                REDO_REMOVED_HISTORY_COPY,
+                            ));
+                            return;
+                        }
+                        snap::TranscriptLocation::Unreadable(error) => {
+                            reply_sink(snap::unreadable_rollback_refusal(&op, &original, &error));
+                            return;
+                        }
+                    };
+                    let original_text = match std::fs::read_to_string(&original_path) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &e.to_string()));
+                            return;
+                        }
+                    };
+                    // The current conversation is the session's effective
+                    // transcript: empty after a first-turn undo, the kept prefix of
+                    // a pending fork. A real read error is a loud INTERNAL_ERROR,
+                    // never a silent empty chain yielding a false `redone` ack.
+                    let current_text = match self.effective_transcript(&durable_id).await {
+                        Ok(current) => current.text,
+                        Err(EffectiveTranscriptError::Missing) => {
+                            reply_sink(rollback_error_frame(
+                                &op,
+                                "INTERNAL_ERROR",
+                                "current transcript missing",
+                            ));
+                            return;
+                        }
+                        Err(error) => {
+                            reply_sink(error.refusal(&op, &durable_id));
+                            return;
+                        }
+                    };
+                    // Redo validity contract (wire design; LBC-9): the original must
+                    // BE the history the undo observed — raw-chain tip == the
+                    // recorded tip — AND the current chain must still be a strict
+                    // prefix of it (the LCP resolves PAST the current tip). Any
+                    // miss => loud REDO_UNAVAILABLE + REDO_REMOVED_HISTORY_COPY;
+                    // never silently re-fork over moved history.
+                    let original_tip = snap::raw_chain_tip(&original_text);
+                    if original_tip != record.original_tip_uuid {
                         reply_sink(rollback_error_frame(
                             &op,
                             "REDO_UNAVAILABLE",
@@ -637,102 +733,62 @@ impl FreshClaudeState {
                         ));
                         return;
                     }
-                    snap::TranscriptLocation::Unreadable(error) => {
-                        reply_sink(snap::unreadable_rollback_refusal(&op, &original, &error));
-                        return;
-                    }
-                };
-                let original_text = match std::fs::read_to_string(&original_path) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &e.to_string()));
-                        return;
-                    }
-                };
-                // The current conversation is the session's effective
-                // transcript: empty after a first-turn undo, the kept prefix of
-                // a pending fork. A real read error is a loud INTERNAL_ERROR,
-                // never a silent empty chain yielding a false `redone` ack.
-                let current_text = match self.effective_transcript(&durable_id).await {
-                    Ok(current) => current.text,
-                    Err(EffectiveTranscriptError::Missing) => {
-                        reply_sink(rollback_error_frame(
-                            &op,
-                            "INTERNAL_ERROR",
-                            "current transcript missing",
-                        ));
-                        return;
-                    }
-                    Err(error) => {
-                        reply_sink(error.refusal(&op, &durable_id));
-                        return;
-                    }
-                };
-                // Redo validity contract (wire design; LBC-9): the original must
-                // BE the history the undo observed — raw-chain tip == the
-                // recorded tip — AND the current chain must still be a strict
-                // prefix of it (the LCP resolves PAST the current tip). Any
-                // miss => loud REDO_UNAVAILABLE + REDO_REMOVED_HISTORY_COPY;
-                // never silently re-fork over moved history.
-                let original_tip = snap::raw_chain_tip(&original_text);
-                if original_tip != record.original_tip_uuid {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "REDO_UNAVAILABLE",
-                        REDO_REMOVED_HISTORY_COPY,
-                    ));
-                    return;
-                }
-                if snap::raw_lcp_end(&current_text, &original_text)
-                    != snap::raw_chain_tip(&current_text)
-                {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "REDO_UNAVAILABLE",
-                        REDO_REMOVED_HISTORY_COPY,
-                    ));
-                    return;
-                }
-                // The resume point = the LAST raw-chain uuid of the restored
-                // step's group — its assistant tail (r3 boundary rule).
-                let resume_at = match snap::redo_resume_target(&original_text, &current_text, &op) {
-                    Ok(Some(uuid)) => uuid,
-                    Ok(None) => {
+                    if snap::raw_lcp_end(&current_text, &original_text)
+                        != snap::raw_chain_tip(&current_text)
+                    {
                         reply_sink(rollback_error_frame(
                             &op,
                             "REDO_UNAVAILABLE",
-                            REDO_EMPTY_MESSAGE,
+                            REDO_REMOVED_HISTORY_COPY,
                         ));
                         return;
                     }
-                    Err(msg) => {
-                        reply_sink(rollback_error_frame(&op, "INVALID_ROLLBACK_TARGET", &msg));
-                        return;
+                    // The resume point = the LAST raw-chain uuid of the restored
+                    // step's group — its assistant tail (r3 boundary rule).
+                    let resume_at =
+                        match snap::redo_resume_target(&original_text, &current_text, &op) {
+                            Ok(Some(uuid)) => uuid,
+                            Ok(None) => {
+                                reply_sink(rollback_error_frame(
+                                    &op,
+                                    "REDO_UNAVAILABLE",
+                                    REDO_EMPTY_MESSAGE,
+                                ));
+                                return;
+                            }
+                            Err(msg) => {
+                                reply_sink(rollback_error_frame(
+                                    &op,
+                                    "INVALID_ROLLBACK_TARGET",
+                                    &msg,
+                                ));
+                                return;
+                            }
+                        };
+                    // The ack payload for a redo = the RESTORED slice (display
+                    // projection of the original's range just-after-the-prefix
+                    // through the resume point).
+                    let restored =
+                        snap::restored_slice_turns(&original_text, &current_text, &resume_at);
+                    let can_redo_after_redo = original_tip.as_deref() != Some(resume_at.as_str());
+                    // The guard: the one prompted turn of the original the redo
+                    // still leaves out, when exactly one (`None` redoing TO the
+                    // tip: nothing is discarded).
+                    let drops_turn = snap::drops_turn_guard(&original_text, Some(&resume_at));
+                    RollbackPlan {
+                        removed_turns: restored.turns,
+                        prompt_text: restored.prompt_text,
+                        chain_root: original.clone(),
+                        original_tip_uuid: record.original_tip_uuid.clone(),
+                        can_redo_after: can_redo_after_redo,
+                        genesis: ClaudeGenesis::Fork {
+                            parent: original.clone(),
+                            at: Some(resume_at),
+                            drops_turn,
+                        },
+                        source: original,
+                        source_path: Some(original_path),
                     }
-                };
-                // The ack payload for a redo = the RESTORED slice (display
-                // projection of the original's range just-after-the-prefix
-                // through the resume point).
-                let restored =
-                    snap::restored_slice_turns(&original_text, &current_text, &resume_at);
-                let can_redo_after_redo = original_tip.as_deref() != Some(resume_at.as_str());
-                // The guard: the one prompted turn of the original the redo
-                // still leaves out, when exactly one (`None` redoing TO the
-                // tip: nothing is discarded).
-                let drops_turn = snap::drops_turn_guard(&original_text, Some(&resume_at));
-                RollbackPlan {
-                    removed_turns: restored.turns,
-                    prompt_text: restored.prompt_text,
-                    chain_root: original.clone(),
-                    original_tip_uuid: record.original_tip_uuid.clone(),
-                    can_redo_after: can_redo_after_redo,
-                    genesis: ClaudeGenesis::Fork {
-                        parent: original.clone(),
-                        at: Some(resume_at),
-                        drops_turn,
-                    },
-                    source: original,
-                    source_path: Some(original_path),
                 }
             }
         };
@@ -902,6 +958,29 @@ impl FreshClaudeState {
             return;
         }
 
+        let recipe = match self
+            .make_managed_fork_recipe(
+                &source,
+                &replacement,
+                match &genesis {
+                    ClaudeGenesis::Fresh => None,
+                    ClaudeGenesis::Fork { at, .. } => at.as_deref(),
+                },
+                match &genesis {
+                    ClaudeGenesis::Fresh => None,
+                    ClaudeGenesis::Fork { drops_turn, .. } => drops_turn.as_deref(),
+                },
+            )
+            .await
+        {
+            Ok(recipe) => recipe,
+            Err(message) => {
+                self.compensate_rollback_record(&durable_id, existing.clone())
+                    .await;
+                reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &message));
+                return;
+            }
+        };
         let spec = ClaudeLaunchSpec::new(
             format!("rollback-{}", uuid::Uuid::new_v4()),
             session_type,
@@ -911,7 +990,12 @@ impl FreshClaudeState {
             self.hosted_mcp,
         )
         .with_session_id(Some(replacement.clone()))
-        .with_freshell_context(freshell_context);
+        .with_freshell_context(freshell_context)
+        .with_native_fork_recipe(recipe.clone())
+        .with_native_identity_transition(
+            native_launch
+                .map(|launch| json!({"launch":launch, "parentNativeSessionId":durable_id})),
+        );
         // A lease the rollback took on the original completes onto the
         // replacement (the original's durable id resolves to it); a lease the
         // original already held as its live owner is cleared once it is gone.
@@ -1099,6 +1183,15 @@ impl FreshClaudeState {
             removed = removed_ids.len(),
             "the rollback's replacement is live and the original is stopped"
         );
+        if self.managed_forks {
+            *self.managed_prefix.lock().await = recipe.clone();
+            *self.managed_fork.lock().await =
+                Some(freshell_agent_runtime::host_actor::ClaudeForkState {
+                    native_session_id: replacement.clone(),
+                    recipe,
+                    rollback: Some(json!(record)),
+                });
+        }
         reply_sink(rollback_ack_frame(
             &switch,
             &replacement,

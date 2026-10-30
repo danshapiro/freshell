@@ -105,6 +105,7 @@ struct Entry {
     /// The [`FINGERPRINT_BYTES`] before `offset`.
     fingerprint: Vec<u8>,
     projector: ClaudeTranscriptProjector,
+    has_records: bool,
     last_used: u64,
 }
 
@@ -189,15 +190,21 @@ impl ProjectionCache {
         // The entry leaves the cache while this read works on it: a concurrent
         // read of the same transcript parses in full (correct, only slower).
         let cached = self.take(&key);
-        let (mut projector, start, full) = match cached {
+        let (mut projector, start, full, mut has_records) = match cached {
             None => (
                 ClaudeTranscriptProjector::new(thread_id),
                 0,
                 Some(FullReason::Uncached),
+                false,
             ),
             Some(entry) => match Self::continuation(&mut transcript, &metadata, file, &entry)? {
-                None => (entry.projector, entry.offset, None),
-                Some(reason) => (ClaudeTranscriptProjector::new(thread_id), 0, Some(reason)),
+                None => (entry.projector, entry.offset, None, entry.has_records),
+                Some(reason) => (
+                    ClaudeTranscriptProjector::new(thread_id),
+                    0,
+                    Some(reason),
+                    false,
+                ),
             },
         };
 
@@ -211,7 +218,7 @@ impl ProjectionCache {
         let lines = std::str::from_utf8(&bytes[..complete])
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         for line in lines.split('\n') {
-            projector.push_line(line);
+            has_records |= projector.push_line(line);
         }
         let offset = start + complete as u64;
         let fingerprint = Self::fingerprint(&mut transcript, offset)?;
@@ -219,8 +226,16 @@ impl ProjectionCache {
         // An unterminated last line is a write in progress: a tail that
         // already parses counts for this read only, never for the cache.
         let mut result = projector.clone();
-        if let Ok(tail) = std::str::from_utf8(&bytes[complete..]) {
-            result.push_line(tail);
+        match std::str::from_utf8(&bytes[complete..]) {
+            Ok(tail) => {
+                result.push_line(tail);
+            }
+            Err(error) if !has_records => {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+            }
+            // A native writer can stop halfway through its next UTF-8 line.
+            // Keep the valid prefix instead of hiding its existing history.
+            Err(_) => {}
         }
         self.store(
             key,
@@ -229,6 +244,7 @@ impl ProjectionCache {
                 offset,
                 fingerprint,
                 projector,
+                has_records,
                 last_used: 0,
             },
         );

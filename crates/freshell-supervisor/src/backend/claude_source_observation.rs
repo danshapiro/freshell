@@ -5,7 +5,9 @@ use freshell_platform::claude_inputs::observation::{
     ObservationReply, MAX_REPLY_BYTES, MAX_REQUEST_BYTES,
 };
 use freshell_runtime_protocol::ObserveClaudeSourcesRequest;
-use helper_lifecycle::{AttemptStep, HelperContainer, HelperDeadlines, HelperFailure, HelperKind};
+use helper_lifecycle::{
+    AttemptStep, HelperContainer, HelperDeadlines, HelperFailure, HelperKind, HelperOwner,
+};
 use tokio::net::UnixListener;
 
 fn fail(reason: &'static str) -> BackendError {
@@ -209,7 +211,8 @@ struct CandidateObjects {
     mountpoints: Option<HelperContainer>,
     reader: Option<HelperContainer>,
     scratch: Option<CandidateScratch>,
-    views: Vec<CandidateInputView>,
+    input_view: Option<CandidateInputView>,
+    retained_view: Option<CandidateInputView>,
     directory: Option<native_auth::ExchangeDirectory>,
 }
 
@@ -244,7 +247,11 @@ impl helper_lifecycle::HelperObjects for CandidateObjects {
         for helper in self.mountpoints.iter_mut().chain(self.reader.iter_mut()) {
             helper.remove(backend).await?;
         }
-        for view in &mut self.views {
+        for view in self
+            .input_view
+            .iter_mut()
+            .chain(self.retained_view.iter_mut())
+        {
             view.cleanup()?;
         }
         // The skeletons lived inside the private exchange; it goes after them.
@@ -316,12 +323,26 @@ impl DockerEngineBackend {
         use freshell_runtime_protocol::{bounded_json_bytes, MAX_CONTROL_FRAME_BYTES};
         let deadline = deadlines.operation;
         let name = format!("freshell-claude-candidate-reader-{}", uuid::Uuid::new_v4());
-        let mut scratch = None::<CandidateScratch>;
-        let mut mountpoint_helper = None::<HelperContainer>;
-        let mut reader = None::<HelperContainer>;
-        let mut directory = None::<native_auth::ExchangeDirectory>;
-        let mut input_view = None::<CandidateInputView>;
-        let mut retained_view = None::<CandidateInputView>;
+        let mut owned = HelperOwner::new(
+            self,
+            "claude_candidate_reader",
+            CandidateObjects {
+                scratch: None,
+                mountpoints: None,
+                reader: None,
+                directory: None,
+                input_view: None,
+                retained_view: None,
+            },
+        );
+        let CandidateObjects {
+            scratch,
+            mountpoints: mountpoint_helper,
+            reader,
+            directory,
+            input_view,
+            retained_view,
+        } = owned.objects_mut();
         let step = AttemptStep::new();
         let operation = async {
             let projection = qualify_candidate_stage(root, owner, request)?;
@@ -403,7 +424,7 @@ impl DockerEngineBackend {
             } else if let Some(attempt) = &projection.publication.registry_attempt_id {
                 labels["com.freshell.source-recovery-attempt-id"] = json!(attempt);
             }
-            scratch = Some(CandidateScratch {
+            *scratch = Some(CandidateScratch {
                 name: format!(
                     "freshell-claude-candidate-{}",
                     request.observation_request.request_id
@@ -427,11 +448,11 @@ impl DockerEngineBackend {
                 provider_mountpoints::selections(&mounts)?,
                 deadlines,
                 &step,
-                &mut mountpoint_helper,
+                mountpoint_helper,
             )
             .await?;
             step.enter("prepare");
-            directory = Some(native_auth::ExchangeDirectory::create_input()?);
+            *directory = Some(native_auth::ExchangeDirectory::create_input()?);
             let exchange_directory = directory.as_ref().unwrap();
             let socket = exchange_directory.0.join("reply.sock");
             let listener = UnixListener::bind(&socket)
@@ -439,7 +460,7 @@ impl DockerEngineBackend {
             exchange_directory.mode(&socket, 0o660)?;
             let (view, view_bindings) =
                 CandidateInputView::create(root, exchange_directory, &mounts, false)?;
-            input_view = Some(view);
+            *input_view = Some(view);
             let mut descriptors = vec![
                 json!({"Type":"bind","Source":binary,"Target":"/runtime/freshell-session-host","ReadOnly":true}),
                 json!({"Type":"bind","Source":workspace,"Target":workspace,"ReadOnly":true}),
@@ -457,7 +478,7 @@ impl DockerEngineBackend {
                 )?;
                 let (view, bindings) =
                     CandidateInputView::create(stage, exchange_directory, &ordinary, true)?;
-                retained_view = Some(view);
+                *retained_view = Some(view);
                 descriptors.extend(bindings);
                 descriptors.push(json!({"Type":"volume","Source":handle.provider_volume_name(),"Target":"/run/freshell-retained-home","ReadOnly":true,"VolumeOptions":{"NoCopy":true}}));
             }
@@ -655,15 +676,13 @@ impl DockerEngineBackend {
             });
         // One release covers both helpers and the ordinary backing. Any
         // uncertain helper removal prevents deleting its still-mounted HOME.
-        let objects = CandidateObjects {
-            mountpoints: mountpoint_helper,
-            reader,
-            scratch,
-            views: input_view.into_iter().chain(retained_view).collect(),
-            directory,
-        };
         let result = self
-            .release_helper_objects("claude_candidate_reader", objects, deadlines, result)
+            .release_helper_objects(
+                "claude_candidate_reader",
+                owned.into_objects(),
+                deadlines,
+                result,
+            )
             .await;
         tracing::debug!(event="provider.inputs.claude_candidate_helper.settled",soul_id=%request.soul_id,succeeded=result.is_ok(),"Claude candidate reader settled after owned cleanup");
         result
@@ -1361,7 +1380,8 @@ impl DockerEngineBackend {
         prior_stage: Option<&Path>,
     ) -> Result<ObservationReply, HelperFailure> {
         let name = format!("freshell-claude-source-{}", uuid::Uuid::new_v4());
-        let mut helper = None::<HelperContainer>;
+        let mut owned = HelperOwner::new(self, "claude_source_reader", None::<HelperContainer>);
+        let helper = owned.objects_mut();
         let mut directory = None::<native_auth::ExchangeDirectory>;
         let step = AttemptStep::new();
         let operation = async {
@@ -1483,15 +1503,15 @@ impl DockerEngineBackend {
                 })
                 .transpose()?;
             directory = Some(native_auth::ExchangeDirectory::create_input()?);
-            let directory = directory.as_ref().unwrap();
-            let socket = directory.0.join("reply.sock");
+            let exchange_directory = directory.as_ref().unwrap();
+            let socket = exchange_directory.0.join("reply.sock");
             let listener = UnixListener::bind(&socket)
                 .map_err(|_| fail("Claude source private exchange bind failed"))?;
-            directory.mode(&socket, 0o660)?;
+            exchange_directory.mode(&socket, 0o660)?;
             let mut mounts = vec![
                 json!({"Type":"bind","Source":binary,"Target":"/runtime/freshell-session-host","ReadOnly":true}),
                 json!({"Type":"bind","Source":workspace,"Target":workspace,"ReadOnly":true}),
-                json!({"Type":"bind","Source":directory.0,"Target":"/run/freshell-source-exchange","ReadOnly":true}),
+                json!({"Type":"bind","Source":exchange_directory.0,"Target":"/run/freshell-source-exchange","ReadOnly":true}),
             ];
             if let Some(common) = common
                 .as_ref()
@@ -1540,11 +1560,12 @@ impl DockerEngineBackend {
             .map_err(|_| fail("Claude source request exceeds metadata profile"))?;
             step.enter("create");
             let created = helper
-                .insert(HelperContainer::new(
-                    HelperKind::ClaudeSource,
-                    name.clone(),
-                    body.clone(),
-                ))
+                .insert(
+                    HelperContainer::new(HelperKind::ClaudeSource, name.clone(), body.clone())
+                        .with_exchange_directory(
+                            directory.take().expect("source exchange prepared"),
+                        ),
+                )
                 .create(self)
                 .await
                 .map_err(|_| {
@@ -1679,7 +1700,7 @@ impl DockerEngineBackend {
                     &step,
                 ))
             });
-        let result = match helper {
+        let result = match owned.into_objects() {
             Some(helper) => {
                 self.release_helper_objects("claude_source_reader", helper, deadlines, result)
                     .await

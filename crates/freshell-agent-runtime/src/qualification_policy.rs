@@ -79,27 +79,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn requested_terminal_adapters_are_ready_independently_of_release_certification() {
-        for provider in ["claude", "codex", "amplifier"] {
-            let capability = crate::capability(provider).unwrap();
-            assert!(capability.qualification_ready, "{provider}");
-            assert_eq!(
-                capability.certification_state,
-                crate::CertificationState::PendingLiveProviderCertification
-            );
-            assert!(!capability.managed_enabled);
-        }
-    }
-
-    #[test]
     fn qualification_selection_is_bounded_to_pending_terminal_providers() {
         for value in [
             "shell",
             "opencode",
             "freshclaude",
             "gemini",
-            "claude,unknown",
-            "claude,claude",
+            "claude",
+            "codex",
+            "amplifier,unknown",
+            "amplifier,amplifier",
             "all",
             "",
         ] {
@@ -108,15 +97,22 @@ mod tests {
                 "qualification allowlist unexpectedly accepted {value:?}"
             );
         }
+        assert!(qualification_policy_from_value(Some("amplifier,amplifier"))
+            .unwrap_err()
+            .contains("duplicate"));
+        assert!(qualification_policy_from_value(None)
+            .unwrap()
+            .selected
+            .is_empty());
     }
 
     #[cfg(feature = "provider-qualification")]
     #[test]
     fn qualification_build_routes_only_explicitly_selected_pending_providers() {
-        let policy = qualification_policy_from_value(Some("claude,codex")).unwrap();
-        assert!(policy.permits("claude"));
-        assert!(policy.permits("codex"));
-        assert!(!policy.permits("amplifier"));
+        let policy = qualification_policy_from_value(Some("amplifier")).unwrap();
+        assert!(!policy.permits("claude"));
+        assert!(!policy.permits("codex"));
+        assert!(policy.permits("amplifier"));
         assert!(!policy.permits("opencode"));
         assert!(!policy.permits("shell"));
     }
@@ -124,7 +120,7 @@ mod tests {
     #[cfg(not(feature = "provider-qualification"))]
     #[test]
     fn ordinary_build_ignores_the_qualification_environment_switch() {
-        let policy = qualification_policy_from_value(Some("claude,codex,amplifier")).unwrap();
+        let policy = qualification_policy_from_value(Some("amplifier")).unwrap();
         for provider in pending_terminal_adapters() {
             assert!(!policy.permits(provider));
         }

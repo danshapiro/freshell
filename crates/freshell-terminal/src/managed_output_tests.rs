@@ -3,6 +3,32 @@ use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::task::{Context, Poll, Waker};
 
+#[test]
+fn managed_registration_announces_the_native_activity_lifecycle() {
+    let registry = TerminalRegistry::new();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let capture = events.clone();
+    registry.set_activity_observer(Arc::new(move |event| capture.lock().unwrap().push(event)));
+    registry.register_managed(
+        ManagedTerminalDescriptor {
+            soul_id: "activity-soul".into(),
+            incarnation_id: "activity-incarnation".into(),
+            terminal_id: "activity-terminal".into(),
+            stream_id: "activity-epoch".into(),
+            mode: "opencode".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: Some("ses_native".into()),
+            create_request_id: None,
+        },
+        "OpenCode".into(),
+    );
+    assert!(
+        matches!(events.lock().unwrap().as_slice(), [ActivityEvent::Created {
+        terminal_id, mode, resume_session_id: Some(session), ..
+    }] if terminal_id == "activity-terminal" && mode == "opencode" && session == "ses_native")
+    );
+}
+
 fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
     future.poll(&mut Context::from_waker(Waker::noop()))
 }
@@ -39,7 +65,7 @@ impl ManagedTerminalController for Controller {
         &'a self,
         _: ManagedTerminalDescriptor,
         _: String,
-    ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+    ) -> ManagedTerminalFuture<'a, Result<(), ManagedTerminalInputError>> {
         panic!("output recovery must not replay input")
     }
     fn resize<'a>(
@@ -100,6 +126,8 @@ fn fixture() -> (TerminalRegistry, Arc<Controller>) {
         response: Mutex::new(ManagedOutputRead {
             lifecycle: None,
             completion: None,
+            codex_activity: None,
+            opencode_activity: None,
             stream_epoch: Some("epoch-new".into()),
             incarnation_id: Some("incarnation-new".into()),
             reset_required: true,

@@ -8,10 +8,20 @@ use super::*;
 use crate::rest_lane;
 use axum::body::Body;
 use axum::http::Request;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tower::util::ServiceExt;
 
-struct SplitHostedGateway;
+const FRESH_SPLIT_MODES: [(&str, &str, &str); 4] = [
+    ("claude", "claude", "freshclaude"),
+    ("kilroy", "claude", "kilroy"),
+    ("codex", "codex", "freshcodex"),
+    ("opencode", "opencode", "freshopencode"),
+];
+
+struct SplitHostedGateway {
+    session_id: String,
+    creates: Mutex<Vec<rest_lane::RestLaneCreate>>,
+}
 
 #[async_trait::async_trait]
 impl rest_lane::FreshAgentRestLane for SplitHostedGateway {
@@ -19,12 +29,9 @@ impl rest_lane::FreshAgentRestLane for SplitHostedGateway {
         self: Arc<Self>,
         request: rest_lane::RestLaneCreate,
     ) -> Result<rest_lane::RestLaneCreated, rest_lane::RestLaneError> {
-        assert_eq!(
-            (request.provider.as_str(), request.session_type.as_str()),
-            ("claude", "freshclaude")
-        );
+        self.creates.lock().unwrap().push(request);
         Ok(rest_lane::RestLaneCreated {
-            session_id: "managed-split-claude".into(),
+            session_id: self.session_id.clone(),
             ..Default::default()
         })
     }
@@ -148,8 +155,26 @@ pub(super) async fn get(router: Router, uri: &str, auth: bool) -> (StatusCode, V
 #[tokio::test]
 async fn split_pane_requires_auth() {
     let state = state_with_registry();
-    let (status, _) = post(app(state), "/api/panes/nope/split", json!({}), false).await;
+    let gateway = Arc::new(SplitHostedGateway {
+        session_id: "unused-presentation".into(),
+        creates: Mutex::new(Vec::new()),
+    });
+    state.set_hosted_rest_gateway(gateway.clone()).unwrap();
+    let router = app(state.clone());
+    let (_, pane_id) = create_browser_tab(router.clone()).await;
+    let before = state.layout.get_normalized_snapshot(None);
+    let mut rx = state.broadcast_tx.subscribe();
+    let (status, _) = post(
+        router,
+        &format!("/api/panes/{pane_id}/split"),
+        json!({"agent":"claude"}),
+        false,
+    )
+    .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(state.layout.get_normalized_snapshot(None), before);
+    assert!(gateway.creates.lock().unwrap().is_empty());
+    assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -190,7 +215,9 @@ async fn split_unknown_pane_on_empty_store_is_404_no_layout_snapshot() {
 async fn split_agent_without_durable_gateway_is_503_and_rolls_back_layout() {
     let state = state_with_registry();
     let router = app(state.clone());
-    let (_tab_id, pane_id, _terminal_id) = create_shell_tab(router.clone()).await;
+    let (_, pane_id) = create_browser_tab(router.clone()).await;
+    let before = state.layout.get_normalized_snapshot(None);
+    let mut rx = state.broadcast_tx.subscribe();
 
     let (status, body) = post(
         router,
@@ -203,28 +230,176 @@ async fn split_agent_without_durable_gateway_is_503_and_rolls_back_layout() {
     let msg = body["message"].as_str().unwrap();
     assert!(msg.contains("gateway"), "{msg}");
     assert_eq!(state.layout.list_panes(None).unwrap().len(), 1);
+    assert_split_layout_unchanged(&state, &before);
+    assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test]
 async fn split_agent_routes_to_durable_gateway_and_attaches_fresh_content() {
-    let state = state_with_registry();
-    state
-        .set_hosted_rest_gateway(Arc::new(SplitHostedGateway))
-        .unwrap();
-    let router = app(state.clone());
-    let (tab_id, pane_id, _terminal_id) = create_shell_tab(router.clone()).await;
+    for (agent, provider, session_type) in FRESH_SPLIT_MODES {
+        for resume in [false, true] {
+            let native_id = format!("native-split-{session_type}");
+            // The real gateway allocates a presentation ID for a new session,
+            // and uses the canonical native root when resuming a sessionRef.
+            let session_id = if resume {
+                native_id.clone()
+            } else {
+                format!("managed-split-{session_type}")
+            };
+            let gateway = Arc::new(SplitHostedGateway {
+                session_id: session_id.clone(),
+                creates: Mutex::new(Vec::new()),
+            });
+            let state = state_with_registry();
+            state.set_hosted_rest_gateway(gateway.clone()).unwrap();
+            let router = app(state.clone());
+            let (tab_id, pane_id) = create_browser_tab(router.clone()).await;
+            let mut rx = state.broadcast_tx.subscribe();
+            let mut request = json!({
+                "agent": agent, "cwd": "/workspace", "direction": "vertical",
+                "model": "route-model", "effort": "high",
+                "plugins": ["/workspace/plugin"], "modelSelection": null,
+                "permissionMode": "default", "sandbox": "workspace-write"
+            });
+            if resume {
+                request["sessionRef"] = json!({"provider":provider,"sessionId":native_id});
+            }
+            let (status, body) = post(
+                router.clone(),
+                &format!("/api/panes/{pane_id}/split"),
+                request,
+                true,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{agent} resume={resume}: {body}");
+            let new_pane_id = body["data"]["paneId"].as_str().unwrap();
+            assert_ne!(new_pane_id, pane_id);
+            let content = state
+                .layout
+                .get_pane_snapshot(new_pane_id)
+                .unwrap()
+                .pane_content
+                .unwrap();
+            assert_eq!(content["kind"], "fresh-agent");
+            assert_eq!(content["provider"], provider);
+            assert_eq!(content["sessionType"], session_type);
+            assert_eq!(content["sessionId"], session_id);
+            assert_eq!(content["initialCwd"], "/workspace");
+            assert_eq!(content["model"], "route-model");
+            assert_eq!(content["effort"], "high");
+            let frame: Value =
+                serde_json::from_str(&rx.try_recv().expect("pane.split broadcast")).unwrap();
+            assert_eq!(frame["command"], "pane.split");
+            assert_eq!(frame["payload"]["tabId"], tab_id);
+            assert_eq!(frame["payload"]["paneId"], pane_id);
+            assert_eq!(frame["payload"]["newPaneId"], new_pane_id);
+            assert_eq!(frame["payload"]["newContent"], content);
+            let (status, snapshot) = get(router, "/api/layout/snapshot", true).await;
+            assert_eq!(status, StatusCode::OK);
+            let node = &snapshot["data"]["layouts"][&tab_id];
+            assert_eq!(node["type"], "split");
+            assert_eq!(node["direction"], "vertical");
+            assert_eq!(node["children"][0]["id"], pane_id);
+            assert_eq!(node["children"][1]["id"], new_pane_id);
+            assert_eq!(node["children"][1]["content"], content);
+            let creates = gateway.creates.lock().unwrap();
+            assert_eq!(creates.len(), 1);
+            let created = &creates[0];
+            assert_eq!(created.provider, provider);
+            assert_eq!(created.session_type, session_type);
+            assert_eq!(
+                created.native_session_id,
+                resume.then_some(native_id.clone())
+            );
+            assert_eq!(created.cwd.as_deref(), Some("/workspace"));
+            assert_eq!(created.model.as_deref(), Some("route-model"));
+            assert_eq!(created.effort.as_deref(), Some("high"));
+            assert_eq!(created.plugins, Some(vec!["/workspace/plugin".into()]));
+            assert_eq!(created.model_selection, Some(None));
+            assert_eq!(created.permission_mode.as_deref(), Some("default"));
+            assert_eq!(
+                created.sandbox,
+                Some(freshell_protocol::Sandbox::WorkspaceWrite)
+            );
+            assert_eq!(content["createRequestId"], created.request_id);
+            assert_ne!(session_id, created.request_id);
+            if !resume {
+                assert_ne!(session_id, native_id);
+            }
+            // Verify the reply only after proving successful creation, stored
+            // content, broadcast content, split geometry and gateway inputs.
+            assert_eq!(
+                body["data"]["sessionId"], session_id,
+                "{agent} resume={resume}: {body}"
+            );
+            assert!(body["data"]["terminalId"].is_null());
+            assert_eq!(body["message"], "pane split (non-terminal)");
+        }
+    }
+}
+
+async fn create_browser_tab(router: Router) -> (String, String) {
     let (status, body) = post(
         router,
-        &format!("/api/panes/{pane_id}/split"),
-        json!({ "agent": "claude", "cwd": "/workspace" }),
+        "/api/tabs",
+        json!({"browser":"https://example.com"}),
         true,
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let new_pane_id = body["data"]["paneId"].as_str().unwrap();
-    let rows = state.layout.list_panes(Some(&tab_id)).unwrap();
-    let created = rows.iter().find(|row| row.id == new_pane_id).unwrap();
-    assert_eq!(created.kind.as_deref(), Some("fresh-agent"));
+    (
+        body["data"]["tabId"].as_str().unwrap().into(),
+        body["data"]["paneId"].as_str().unwrap().into(),
+    )
+}
+
+fn assert_split_layout_unchanged(state: &FreshAgentState, before: &Value) {
+    let after = state.layout.get_normalized_snapshot(None);
+    // Rollback may prune an empty paneTitleSetByUser map. Compare the actual
+    // layout, content, selection and titles rather than that empty-map shape.
+    for key in ["tabs", "layouts", "activeTabId", "activePane", "paneTitles"] {
+        assert_eq!(after[key], before[key], "changed {key} on rejected split");
+    }
+}
+
+#[tokio::test]
+async fn split_agent_rejects_invalid_session_ref_without_layout_mutation_or_gateway_call() {
+    let state = state_with_registry();
+    let gateway = Arc::new(SplitHostedGateway {
+        session_id: "unused-presentation".into(),
+        creates: Mutex::new(Vec::new()),
+    });
+    state.set_hosted_rest_gateway(gateway.clone()).unwrap();
+    let router = app(state.clone());
+    let (_, pane_id) = create_browser_tab(router.clone()).await;
+    let before = state.layout.get_normalized_snapshot(None);
+    let mut rx = state.broadcast_tx.subscribe();
+    for (agent, provider, _) in FRESH_SPLIT_MODES {
+        let mismatched_provider = if provider == "claude" {
+            "codex"
+        } else {
+            "claude"
+        };
+        for session_ref in [
+            json!({"provider":"wrong-provider","sessionId":"native-root"}),
+            json!({"provider":mismatched_provider,"sessionId":"native-root"}),
+            json!({"provider":provider,"sessionId":""}),
+            json!({"provider":provider}),
+            json!("native-root"),
+        ] {
+            let (status, body) = post(
+                router.clone(),
+                &format!("/api/panes/{pane_id}/split"),
+                json!({"agent":agent,"sessionRef":session_ref}),
+                true,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{agent}: {body}");
+            assert_split_layout_unchanged(&state, &before);
+        }
+    }
+    assert!(gateway.creates.lock().unwrap().is_empty());
+    assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -247,6 +422,10 @@ async fn split_terminal_pane_spawns_real_pty_and_broadcasts_pane_split() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let new_pane_id = body["data"]["paneId"].as_str().unwrap().to_string();
     let new_terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+    assert_eq!(
+        body["data"],
+        json!({"paneId":new_pane_id,"terminalId":new_terminal_id})
+    );
     assert_ne!(new_pane_id, pane_id);
     assert!(state
         .terminal_registry
@@ -292,6 +471,10 @@ async fn split_browser_pane_registers_cheap_content_no_terminal() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body["data"]["terminalId"].is_null());
+    assert_eq!(
+        body["data"],
+        json!({"paneId":body["data"]["paneId"],"terminalId":null})
+    );
     assert_eq!(body["message"], json!("pane split (non-terminal)"));
 }
 
@@ -310,6 +493,10 @@ async fn split_host_stats_pane_registers_cheap_content_no_terminal() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body["data"]["terminalId"].is_null());
+    assert_eq!(
+        body["data"],
+        json!({"paneId":body["data"]["paneId"],"terminalId":null})
+    );
     assert_eq!(body["message"], json!("pane split (non-terminal)"));
 }
 

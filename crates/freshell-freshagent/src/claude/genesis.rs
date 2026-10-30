@@ -193,6 +193,36 @@ impl FreshClaudeState {
     ) -> Result<Value, ClaudeSnapshotError> {
         let rollback = self.load_rollback_record(thread_id).await;
         let genesis = self.load_genesis(thread_id).await;
+        let fork = self
+            .managed_prefix
+            .lock()
+            .await
+            .clone()
+            .filter(|recipe| recipe.child_session_id == thread_id);
+        if crate::native_history::managed_provider_identity()
+            .map_err(ClaudeSnapshotError::Io)?
+            .is_some()
+            || fork.is_some()
+        {
+            let genesis = genesis.as_ref().map(|record| {
+                json!({
+                    "genesis": record.genesis, "updatedAtMs": record.updated_at_ms,
+                })
+            });
+            let snapshot = self.read_managed_history(json!({
+                "kind":"snapshot", "sessionType":session_type, "sessionId":thread_id,
+                "rollback":rollback, "fork":fork, "genesis":genesis, "roots":self.transcript_roots(),
+            })).await.map_err(ClaudeSnapshotError::Io);
+            let snapshot = snapshot?;
+            return match rollback {
+                Some(record) => tokio::task::spawn_blocking(move || {
+                    super::managed_history::stamp_managed_snapshot(snapshot, record)
+                })
+                .await
+                .map_err(|error| ClaudeSnapshotError::Io(error.to_string())),
+                None => Ok(snapshot),
+            };
+        }
         crate::claude_snapshot::get_claude_snapshot_in(
             &self.transcript_roots(),
             session_type,

@@ -80,7 +80,7 @@ pub use durability::{
 };
 pub use events::{
     next_monotonic_turn_complete_at, normalize_codex_thread_status, CodexAdapterEvent, CodexStatus,
-    CodexSubscription,
+    CodexSubscription, CodexTurnOutcome,
 };
 pub use model::{
     normalize_freshcodex_effort, normalize_freshcodex_model, to_codex_reasoning_effort,

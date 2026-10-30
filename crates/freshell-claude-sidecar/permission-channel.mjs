@@ -26,13 +26,19 @@ function subscribeSignal({ signal, clear }) {
   if (signal && !signal.aborted) signal.addEventListener('abort', clear, { once: true })
 }
 
+function retireNativeRequest(session, requestId) {
+  for (const [nativeId, binding] of session.nativeRequests ?? []) {
+    if (binding.requestId === requestId) session.nativeRequests.delete(nativeId)
+  }
+}
+
 export function raisePermissionRequest({ session, emit, nanoid, sessionId, toolName, input, options }) {
   // Already-aborted provider: nothing to park, no card to raise — deny at once.
   if (options?.signal?.aborted) {
     return Promise.resolve({ behavior: 'deny', message: 'Aborted by provider' })
   }
   ensurePending(session)
-  const requestId = nanoid()
+  const requestId = options?.publicDecisionId ?? nanoid()
   return new Promise((resolve) => {
     session.pendingPermissions.set(requestId, {
       toolName,
@@ -41,12 +47,19 @@ export function raisePermissionRequest({ session, emit, nanoid, sessionId, toolN
       suggestions: options?.suggestions,
       blockedPath: options?.blockedPath,
       decisionReason: options?.decisionReason,
+      nativeCheckpoint: options?.nativeCheckpoint,
+      nativeBinding: options?.nativeBinding,
       resolve,
     })
+    if (session.nativeChannel && options?.requestId) {
+      session.nativeRequests ??= new Map()
+      session.nativeRequests.set(options.requestId, { requestId, kind: 'permission' })
+    }
     subscribeSignal({
       signal: options?.signal,
       clear: () => {
         if (!session.pendingPermissions.delete(requestId)) return
+        retireNativeRequest(session, requestId)
         emit({ type: 'sdk.permission.cancelled', sessionId, requestId })
         resolve({ behavior: 'deny', message: 'Aborted by provider' })
       },
@@ -58,6 +71,9 @@ export function raisePermissionRequest({ session, emit, nanoid, sessionId, toolN
       subtype: 'can_use_tool',
       tool: { name: toolName, input },
       toolUseID: options?.toolUseID,
+      nativeRequestId: options?.requestId,
+      nativeCheckpoint: options?.nativeCheckpoint,
+      nativeBinding: options?.nativeBinding,
       suggestions: options?.suggestions,
       blockedPath: options?.blockedPath,
       decisionReason: options?.decisionReason,
@@ -65,7 +81,7 @@ export function raisePermissionRequest({ session, emit, nanoid, sessionId, toolN
   })
 }
 
-export function raiseQuestionRequest({ session, emit, nanoid, sessionId, input, signal }) {
+export function raiseQuestionRequest({ session, emit, nanoid, sessionId, input, signal, nativeRequestId }) {
   ensurePending(session)
   const rawQuestions = input?.questions
   if (!Array.isArray(rawQuestions) || rawQuestions.length === 0) {
@@ -100,15 +116,20 @@ export function raiseQuestionRequest({ session, emit, nanoid, sessionId, input, 
   const requestId = nanoid()
   return new Promise((resolve) => {
     session.pendingQuestions.set(requestId, { originalInput: input, questions, resolve })
+    if (session.nativeChannel && nativeRequestId) {
+      session.nativeRequests ??= new Map()
+      session.nativeRequests.set(nativeRequestId, { requestId, kind: 'question' })
+    }
     subscribeSignal({
       signal,
       clear: () => {
         if (!session.pendingQuestions.delete(requestId)) return
+        retireNativeRequest(session, requestId)
         emit({ type: 'sdk.question.cancelled', sessionId, requestId })
         resolve({ behavior: 'deny', message: 'Aborted by provider' })
       },
     })
-    emit({ type: 'sdk.question.request', sessionId, requestId, questions })
+    emit({ type: 'sdk.question.request', sessionId, requestId, nativeRequestId, questions })
   })
 }
 
@@ -150,10 +171,12 @@ export function cancelPending(session, emit, sessionId, { resolveDeny }) {
   session.pendingPermissions.clear()
   session.pendingQuestions.clear()
   for (const [requestId, pending] of permissions) {
+    retireNativeRequest(session, requestId)
     emit({ type: 'sdk.permission.cancelled', sessionId, requestId })
     if (resolveDeny) pending.resolve({ behavior: 'deny', message: 'Interrupted' })
   }
   for (const [requestId, pending] of questions) {
+    retireNativeRequest(session, requestId)
     emit({ type: 'sdk.question.cancelled', sessionId, requestId })
     if (resolveDeny) pending.resolve({ behavior: 'deny', message: 'Interrupted' })
   }
@@ -164,9 +187,11 @@ export function cancelPending(session, emit, sessionId, { resolveDeny }) {
 // still answers interactive questions.
 export function canUseTool({ session, emit, nanoid, sessionId, toolName, input, options }) {
   if (toolName === 'AskUserQuestion') {
-    return raiseQuestionRequest({ session, emit, nanoid, sessionId, input, signal: options?.signal })
+    return raiseQuestionRequest({ session, emit, nanoid, sessionId, input, signal: options?.signal, nativeRequestId: options?.requestId })
   }
-  if (session.permissionMode === 'bypassPermissions') {
+  // Managed callbacks arrive only after native policy selected an ask. Even
+  // bypass mode can have explicit/org/safety-required native asks; preserve it.
+  if (session.permissionMode === 'bypassPermissions' && !session.nativeChannel) {
     return { behavior: 'allow', updatedInput: input }
   }
   return raisePermissionRequest({ session, emit, nanoid, sessionId, toolName, input, options })

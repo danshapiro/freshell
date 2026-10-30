@@ -5,6 +5,7 @@ type TurnCompletePayload = {
   paneId: string
   terminalId: string
   at: number
+  outcome?: 'completed' | 'failed'
   /**
    * DR5-3 (delta round 5): the RECEIPT-time witness bit — stamped
    * synchronously at the dispatch that queues the event by

@@ -7,6 +7,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+freshell-activity = { path = "../freshell-activity" }
 # The SpawnSpec + shell resolution this crate consumes (Phase 3.2).
 freshell-platform = { path = "../freshell-platform" }
 # The frozen wire types this crate emits (terminal.output) — Phase 3.1.

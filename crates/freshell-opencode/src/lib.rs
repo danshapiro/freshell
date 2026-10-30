@@ -33,6 +33,9 @@
 //! the unchanged outer deadline; a wedged serve fails as the bounded "did not become
 //! healthy" error instead of hanging. Pinned by `tests/serve_health_bounded.rs`.
 
+#[cfg(feature = "real-transport")]
+pub mod activity_lane;
+
 pub mod catalog;
 pub mod events;
 pub mod model;

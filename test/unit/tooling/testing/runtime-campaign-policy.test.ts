@@ -9,6 +9,7 @@ import {
   resolveCampaignOutcome,
   validateGateSummary,
   validateProducerEvidence,
+  validateProductionCampaignCoverage,
   type CampaignStepDescriptor,
 } from '../../../../scripts/testing/runtime-campaign-policy.js'
 
@@ -35,13 +36,18 @@ describe('runtime campaign CLI policy', () => {
     })).toThrow(/receipt/)
   })
 
-  it('selects the full default campaign only when --only is absent', () => {
-    expect(parseCampaignArguments([], steps)).toEqual({ list: false, allowDirty: false, only: null })
+  it('distinguishes default and partial selection', () => {
+    expect(parseCampaignArguments([], steps)).toEqual({ list: false, allowDirty: false, only: null, scope: 'default' })
     expect(parseCampaignArguments(['--only', 'landing-gate'], steps)).toEqual({
       list: false,
       allowDirty: false,
       only: ['landing-gate'],
+      scope: null,
     })
+  })
+
+  it('selects explicit production scope', () => {
+    expect(parseCampaignArguments(['--scope', 'production'], steps)).toEqual({ list: false, allowDirty: false, only: null, scope: 'production' })
   })
 
   it.each([
@@ -52,6 +58,11 @@ describe('runtime campaign CLI policy', () => {
     ['--allow-dirty', '--allow-dirty'],
     ['--list', '--allow-dirty'],
     ['--wat'],
+    ['--scope'],
+    ['--scope', 'other'],
+    ['--scope', 'production', '--scope', 'production'],
+    ['--scope', 'production', '--only', 'producer'],
+    ['--scope', 'production', '--list'],
     ['producer'],
   ])('rejects empty, unknown, duplicate, or ambiguous arguments: %j', (...args) => {
     expect(() => parseCampaignArguments(args, steps)).toThrow()
@@ -115,6 +126,31 @@ describe('runtime campaign receipt provenance', () => {
         after: { ...base.receipts[0].after, value: { status: 'PASS', candidateSha: 'b'.repeat(40) } },
       }],
     })).toContain('RECEIPT_A belongs to a different candidate')
+  })
+})
+
+describe('structured browser adapter counts', () => {
+  const base = {
+    candidateSha: 'a'.repeat(40), runner: 'playwright' as const,
+    log: '', receipts: [{ envName: 'RECEIPT_A', before: { exists: false },
+      after: { exists: true, regularFile: true, digestSha256: 'd'.repeat(64),
+        value: { status: 'PASS', candidateSha: 'a'.repeat(40) } } }],
+  }
+  const counts = { selected: 2, executed: 2, passed: 2, failed: 0, skipped: 0, timedOut: 0 }
+  const log = (value: unknown) => JSON.stringify({ event: 'managed_external_browser_passed', counts: value })
+  it('accepts the actual aggregated adapter summary without fabricated text', () => {
+    expect(validateProducerEvidence({ ...base, log: log(counts) })).toEqual([])
+  })
+  it.each([
+    { selected: 0, executed: 0, passed: 0 }, { executed: 1 }, { passed: 1 },
+    { skipped: 1 }, { failed: 1 }, { timedOut: 1 }, { selected: 1.5 }, { passed: '2' },
+  ])('refuses invalid structured execution even with passing legacy text: %j', (change) => {
+    expect(validateProducerEvidence({ ...base, log: log({ ...counts, ...change }) + '\n2 passed' }).length).toBeGreaterThan(0)
+  })
+  it('refuses malformed, missing, or duplicated completion summaries', () => {
+    for (const text of [log(undefined), log(counts) + '\n' + log(counts), '{"event":"managed_external_browser_passed",bad}']) {
+      expect(validateProducerEvidence({ ...base, log: text }).length).toBeGreaterThan(0)
+    }
   })
 })
 
@@ -252,6 +288,24 @@ describe('runtime campaign final classification', () => {
       stepsOk: true,
       candidateOk: true,
       productionGatePassed: false,
-    })).toMatchObject({ status: 'PASS', qualifying: true, productionApproval: false })
+    })).toMatchObject({ status: 'FAIL', qualifying: false, productionApproval: false })
+  })
+})
+
+// These artifact-free fictional inputs protect refusal, not provider qualification.
+describe('production campaign completed coverage', () => {
+  const selectedIds = ['provider-parity-local', 'continuity', 'fresh-agent-qualification', 'resurrection',
+    'opencode-qualification', 'managed-provider-qualification', 'rehydrate', 'loss-notice', 'chaos', 'soak',
+    'landing-gate', 'production-gate']
+  const candidate = { sha: 'a'.repeat(40), dirty: false, diffHash: 'd'.repeat(64), statusHash: 'e'.repeat(64) }
+  const input = { selectedIds, completedSteps: [], originals: { repoRoot: process.cwd(), campaignRunId: 'fictional' },
+    candidate: { before: candidate, after: candidate }, images: { runtimeImage: `sha256:${'b'.repeat(64)}`, browserImage: `sha256:${'c'.repeat(64)}` } }
+  it('refuses a production flag without actual completed producer and gate originals', () => {
+    const result = validateProductionCampaignCoverage(input)
+    expect(result.complete).toBe(false)
+    expect(result.failures.some(failure => failure.includes('completed'))).toBe(true)
+  })
+  it.each([selectedIds.slice(1), [...selectedIds, 'extra'], [...selectedIds].reverse()].map(selectedIds => ({ selectedIds })))('refuses missing, extra or reordered selection: %j', ({ selectedIds }) => {
+    expect(validateProductionCampaignCoverage({ ...input, selectedIds }).failures).toContain('production selection must contain exactly the twelve registered steps in order')
   })
 })

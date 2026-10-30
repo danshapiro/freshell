@@ -1203,7 +1203,7 @@ mod tests {
     async fn claude_locator_with_a_live_but_empty_pending_set_keeps_the_empty_shape() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let durable = "83838383-8383-4838-8838-838383838383";
-        let (_home, content) = stage_transcript(durable);
+        let (_home, _content) = stage_transcript(durable);
         let claude = claude_state();
         crate::claude::tests::insert_fake_claude_session_with_pending(
             &claude,
@@ -1220,17 +1220,13 @@ mod tests {
             claude,
         );
         let (status, value) = get_json_with_state(state, "freshclaude", durable).await;
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
         assert_eq!(status, StatusCode::OK);
-        let mut expected = crate::claude_snapshot::build_claude_snapshot_json(
-            "freshclaude",
-            durable,
-            content,
-            0,
-            None,
-        );
-        // `revision` is transcript-mtime-derived — not the shape under test.
-        expected["revision"] = value["revision"].clone();
+        let mut expected =
+            crate::claude_snapshot::get_claude_snapshot("freshclaude", durable, None)
+                .await
+                .unwrap();
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        // The empty live overlay retains every current projection field.
         expected["extensions"]["claude"]["statusFromLiveState"] = json!(true);
         assert_eq!(
             value, expected,
@@ -1445,6 +1441,7 @@ mod tests {
 
     #[tokio::test]
     async fn codex_snapshot_success_returns_200_with_camelcase_body() {
+        let native_home = crate::codex::tests::small_native_home("thread-1");
         let (transport, peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
         let client = Arc::new(client);
@@ -1477,7 +1474,7 @@ mod tests {
         let (init_id, _m, _p) = peer.expect_request().await;
         peer.respond(
             &init_id,
-            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+            json!({ "userAgent": "x", "codexHome": native_home.path(), "platformFamily": "u", "platformOs": "l" }),
         );
         let _ = peer.expect_notification().await;
         let (id, method, _params) = peer.expect_request().await;

@@ -83,10 +83,28 @@ mod uncertain_launch {
             let listener = UnixListener::bind(handle.runtime_dir().join("host.sock")).unwrap();
             let secret = std::fs::read(handle.runtime_dir().join("secret")).unwrap();
             let limits = handle.requested_limits();
+            let source = if handle.fresh_agent().is_some() {
+                NativeIdentitySource::FreshProviderHandshake
+            } else {
+                match handle
+                    .terminal()
+                    .expect("synthetic terminal caller")
+                    .mode
+                    .as_str()
+                {
+                    "claude" => NativeIdentitySource::ClaudeNativeEvent,
+                    "codex" => NativeIdentitySource::CodexAppServer,
+                    "amplifier" => NativeIdentitySource::AmplifierNativeLoadedContext,
+                    provider => panic!("unsupported synthetic caller provider {provider}"),
+                }
+            };
             let state = self.0.clone();
             let (shutdown, mut stopped) = tokio::sync::oneshot::channel();
             let task = tokio::spawn(async move {
                 let boot = HostBootId::new();
+                let mut observation: Option<NativeIdentityObservation> = None;
+                let mut epoch = 0;
+                let mut generation = 0;
                 loop {
                     let (mut stream, _) =
                         tokio::select! {v=listener.accept()=>v.unwrap(), _=&mut stopped=>break};
@@ -98,12 +116,38 @@ mod uncertain_launch {
                         } => HostResult::Hello {
                             host_boot_id: boot.clone(),
                             proof: host_proof(&secret, &challenge, &boot, &incarnation_id),
-                            capabilities: vec![],
+                            capabilities: vec![
+                                "native-identity-observation-v1".into(),
+                                "owned-provider-config-v1".into(),
+                                "provider-store-probe-v1".into(),
+                            ],
                             effective_limits: limits,
                         },
-                        HostCommand::GrantExecution { .. } => {
+                        HostCommand::GrantExecution {
+                            native_identity_launch,
+                            control_epoch,
+                            execution_generation,
+                            ..
+                        } => {
+                            let binding =
+                                native_identity_launch.expect("current native launch binding");
+                            assert_eq!(binding.execution_generation, execution_generation);
+                            observation = Some(NativeIdentityObservation {
+                                native_session_id: "native-exact-caller".into(),
+                                incarnation_id: binding.incarnation_id,
+                                launch_nonce: binding.launch_nonce,
+                                evidence_revision: binding.evidence_revision,
+                                source: source.clone(),
+                                evidence_digest: "a".repeat(64),
+                            });
+                            epoch = control_epoch;
+                            generation = execution_generation;
                             state.lock().unwrap().dispatches += 1;
                             HostResult::GrantAccepted {
+                                native_identity_observation: observation.clone(),
+                                opencode_adoption:
+                                    freshell_runtime_protocol::OpenCodeAdoptionStatus::NotRequired,
+                                opencode_transfer_receipt: None,
                                 host_boot_id: boot.clone(),
                                 worker_pid: 1234,
                                 worker_launch_count: 1,
@@ -112,14 +156,20 @@ mod uncertain_launch {
                             }
                         }
                         HostCommand::Status { .. } => HostResult::Status {
+                            native_identity_observation: observation.clone(),
+                            opencode_adoption:
+                                freshell_runtime_protocol::OpenCodeAdoptionStatus::NotRequired,
+                            opencode_transfer_receipt: None,
                             host_boot_id: boot.clone(),
                             worker_pid: Some(1234),
                             worker_launch_count: 1,
-                            max_control_epoch: 100,
-                            max_execution_generation: 100,
+                            max_control_epoch: epoch,
+                            max_execution_generation: generation,
                             fixture_evidence: serde_json::Value::Null,
                             exited: false,
-                            native_session_id: Some("native-exact-caller".into()),
+                            native_session_id: observation
+                                .as_ref()
+                                .map(|value| value.native_session_id.clone()),
                         },
                         HostCommand::ProbeRecovery {
                             resume_spec: Some(spec),
@@ -128,6 +178,19 @@ mod uncertain_launch {
                             evidence_revision: spec.evidence_revision,
                             resume_spec: spec,
                         }),
+                        HostCommand::FreshAgentResumePending { incarnation_id } => {
+                            let current = observation
+                                .as_ref()
+                                .expect("accepted current native launch");
+                            assert_eq!(incarnation_id, current.incarnation_id);
+                            // This fixture starts no turns or permissions. The
+                            // real reattach still releases that empty gate.
+                            HostResult::FreshAgentCommand {
+                                state: CommandState::ProviderAcked,
+                                claude_fork: None,
+                                native_session_id: Some(current.native_session_id.clone()),
+                            }
+                        }
                         other => panic!("unexpected fixture host command {other:?}"),
                     };
                     write_frame(
@@ -263,6 +326,13 @@ mod uncertain_launch {
         .unwrap();
         std::env::set_var("HOME", &home);
         std::env::set_var("FRESHELL_MANAGED_FRESH_AGENT_V1", "1");
+        if route == "fresh" && provider == "kilroy" {
+            // Kilroy's live path is excluded; this existing fixture transport
+            // keeps its synthetic initial-caller coverage explicit.
+            std::env::set_var("FRESHELL_MANAGED_FRESH_AGENT_FIXTURE_MODES", "kilroy");
+        } else {
+            std::env::remove_var("FRESHELL_MANAGED_FRESH_AGENT_FIXTURE_MODES");
+        }
         std::env::set_var(
             "FRESHELL_MANAGED_PROVIDER_QUALIFICATION",
             "claude,codex,amplifier",

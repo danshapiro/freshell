@@ -50,7 +50,9 @@ use crate::launch_plan::{
     CodexLaunchPlan, CodexLaunchPlanInput, CodexLaunchRetryDecision, CodexSidecarLaunchContext,
     CODEX_INITIAL_LAUNCH_RETRY_DELAY_MS,
 };
-use crate::remote_proxy::{CodexRemoteProxy, CodexRemoteProxyOptions, RemoteProxyEvent};
+use crate::remote_proxy::{
+    CodexRemoteProxy, CodexRemoteProxyOptions, ProxyStartError, RemoteProxyEvent,
+};
 use crate::runtime_select::select_codex_runtime;
 use crate::sidecar_reconcile::{codex_sidecar_reconciler, write_record_loudly};
 use crate::sidecar_store::{
@@ -69,7 +71,7 @@ pub const CODEX_SIDECAR_NOT_ADOPTABLE_MESSAGE: &str =
 
 /// How long a spawned app-server gets to bring its WS listener up — the shared
 /// sidecar-spawn budget (S5.d.1 unification; also `freshell-freshagent`'s spawn).
-pub const SIDECAR_START_BUDGET: Duration = Duration::from_secs(45);
+pub use crate::launch_plan::{SIDECAR_START_BUDGET, SIDECAR_TEARDOWN_BUDGET};
 
 // ─── the runtime seam (CodexRuntimeLike, launch-planner.ts:34-52, scoped) ───────────────
 
@@ -165,7 +167,11 @@ pub enum LaunchClass {
 pub enum CodexLaunchError {
     /// Non-retryable configuration error (invalid sandbox, `codex-launch-config.ts`).
     Config(CodexLaunchConfigError),
-    /// Retryable launch failure (runtime/proxy IO, planner shutdown).
+    /// Retryable app-server startup or readiness failure.
+    AppServerStart(String),
+    /// Retryable failure starting the loopback proxy.
+    ProxyStart(String),
+    /// Retryable unclassified launch failure (for example, planner shutdown).
     Failed(String),
     /// Restore-class plan queue overflow (more than the configured cap of
     /// waiters). The true backpressure backstop: the WS door maps it to
@@ -181,6 +187,8 @@ impl std::fmt::Display for CodexLaunchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CodexLaunchError::Config(error) => f.write_str(&error.message),
+            CodexLaunchError::AppServerStart(message) => f.write_str(message),
+            CodexLaunchError::ProxyStart(message) => f.write_str(message),
             CodexLaunchError::Failed(message) => f.write_str(message),
             CodexLaunchError::QueueFull => {
                 f.write_str("codex plan queue full; too many queued codex launches")
@@ -191,6 +199,22 @@ impl std::fmt::Display for CodexLaunchError {
 }
 
 impl std::error::Error for CodexLaunchError {}
+
+impl CodexLaunchError {
+    fn with_cleanup_failure(self, cleanup_error: String) -> Self {
+        match self {
+            CodexLaunchError::AppServerStart(message) => CodexLaunchError::AppServerStart(format!(
+                "{message}; sidecar teardown failed: {cleanup_error}"
+            )),
+            CodexLaunchError::ProxyStart(message) => CodexLaunchError::ProxyStart(format!(
+                "{message}; sidecar teardown failed: {cleanup_error}"
+            )),
+            error => CodexLaunchError::Failed(format!(
+                "{error}; sidecar teardown failed: {cleanup_error}"
+            )),
+        }
+    }
+}
 
 // ─── the sidecar handle (launch-planner.ts:221-316, scoped) ─────────────────────────────
 
@@ -393,24 +417,29 @@ impl CodexLaunchPlanner {
         });
         self.active.lock().unwrap().insert(id, sidecar.clone());
 
-        let started: Result<(CodexRemoteProxy, mpsc::UnboundedReceiver<RemoteProxyEvent>), String> =
-            async {
-                let ready = runtime.ensure_ready(plan.runtime_cwd.clone()).await?;
-                // Task 4: resume launches know their session id at plan time —
-                // note it so the runtime's durable record carries the
-                // restore-time reattach key. Best-effort (the record write
-                // path logs its own failures); never fails the plan.
-                if let Some(sid) = plan.session_id.clone() {
-                    let _ = runtime.note_session_id(sid).await;
-                }
-                CodexRemoteProxy::start(CodexRemoteProxyOptions::new(
-                    ready.ws_url,
-                    plan.require_candidate_persistence,
-                ))
+        let started: Result<
+            (CodexRemoteProxy, mpsc::UnboundedReceiver<RemoteProxyEvent>),
+            CodexLaunchError,
+        > = async {
+            let ready = runtime
+                .ensure_ready(plan.runtime_cwd.clone())
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(CodexLaunchError::AppServerStart)?;
+            // Task 4: resume launches know their session id at plan time —
+            // note it so the runtime's durable record carries the
+            // restore-time reattach key. Best-effort (the record write
+            // path logs its own failures); never fails the plan.
+            if let Some(sid) = plan.session_id.clone() {
+                let _ = runtime.note_session_id(sid).await;
             }
-            .await;
+            CodexRemoteProxy::start(CodexRemoteProxyOptions::new(
+                ready.ws_url,
+                plan.require_candidate_persistence,
+            ))
+            .await
+            .map_err(|error: ProxyStartError| CodexLaunchError::ProxyStart(error.to_string()))
+        }
+        .await;
 
         match started {
             Ok((proxy, events)) => {
@@ -430,14 +459,10 @@ impl CodexLaunchPlanner {
                     events,
                 })
             }
-            Err(message) => {
-                if let Err(teardown) = sidecar.shutdown().await {
-                    return Err(CodexLaunchError::Failed(format!(
-                        "Codex launch sidecar teardown failed after planning error: {teardown}"
-                    )));
-                }
-                Err(CodexLaunchError::Failed(message))
-            }
+            Err(error) => match sidecar.shutdown().await {
+                Ok(()) => Err(error),
+                Err(teardown) => Err(error.with_cleanup_failure(teardown)),
+            },
         }
     }
 
@@ -572,7 +597,7 @@ struct AdoptedTerminalLaunch {
 /// Interactive waiter behind K queued restores waits ~ceil(K/2) x T
 /// (T = healthy plan time, seconds).
 pub const CODEX_SIDECAR_PLAN_CONCURRENCY: usize = 2;
-pub const CODEX_SIDECAR_PLAN_WAIT: Duration = Duration::from_secs(30);
+pub use crate::launch_plan::CODEX_SIDECAR_PLAN_WAIT;
 
 /// Env knob for the restore-class plan queue cap. Mirrors
 /// `FRESHELL_SPAWN_GATE_QUEUE_CAP` semantics (create_limit.rs): unset,
@@ -1333,7 +1358,7 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
                     }
                     None => {
                         let _ = child.start_kill();
-                        let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+                        let _ = tokio::time::timeout(SIDECAR_TEARDOWN_BUDGET, child.wait()).await;
                         tracing::error!(
                             target: "freshell_codex::launch",
                             ownership_id = %ownership_id,
@@ -1442,7 +1467,7 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
                     // Record-less: the ynfn gate — teardown exactly as today.
                     let _ = spawned.child.start_kill();
                     let _ =
-                        tokio::time::timeout(Duration::from_secs(5), spawned.child.wait()).await;
+                        tokio::time::timeout(SIDECAR_TEARDOWN_BUDGET, spawned.child.wait()).await;
                     reap_owned_codex_sidecars(&spawned.ownership_id);
                     self.scrub_record(&spawned.ownership_id);
                     Ok(())
@@ -1456,7 +1481,7 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
             let mut state = self.state.lock().await;
             if let Some(mut spawned) = state.take() {
                 let _ = spawned.child.start_kill();
-                let _ = tokio::time::timeout(Duration::from_secs(5), spawned.child.wait()).await;
+                let _ = tokio::time::timeout(SIDECAR_TEARDOWN_BUDGET, spawned.child.wait()).await;
                 reap_owned_codex_sidecars(&spawned.ownership_id);
                 // Explicit teardown scrubs the record (Task 3): a cleanly
                 // shut-down sidecar must leave nothing for boot reconcile.
@@ -1479,7 +1504,7 @@ async fn persist_record_or_terminate_exact_child(
     if let Err(error) = store.write(row) {
         let pid = child.id();
         let kill_error = child.start_kill().err().map(|e| e.to_string());
-        let wait_result = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+        let wait_result = tokio::time::timeout(SIDECAR_TEARDOWN_BUDGET, child.wait()).await;
         let cleanup = match wait_result {
             Ok(Ok(status)) => format!("exact child {pid:?} exited with {status}"),
             Ok(Err(wait_error)) => format!("exact child {pid:?} wait failed: {wait_error}"),
@@ -1532,6 +1557,67 @@ mod tests {
         }
     }
     use super::*;
+
+    struct AppServerReadinessFailure;
+
+    impl CodexLaunchRuntime for AppServerReadinessFailure {
+        fn ensure_ready(
+            &self,
+            _cwd: Option<String>,
+        ) -> BoxFuture<'_, Result<CodexRuntimeReady, String>> {
+            Box::pin(async { Err("test app-server readiness failure".to_string()) })
+        }
+
+        fn update_ownership_metadata(
+            &self,
+            _terminal_id: String,
+            _generation: u64,
+        ) -> BoxFuture<'_, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn shutdown(&self) -> BoxFuture<'_, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn app_server_readiness_failure_keeps_its_typed_stage() {
+        let runtime_factory: CodexRuntimeFactory = Box::new(|_| {
+            Box::pin(async { Arc::new(AppServerReadinessFailure) as Arc<dyn CodexLaunchRuntime> })
+        });
+        let planner = CodexLaunchPlanner::new(runtime_factory);
+        let error = planner
+            .plan_create(&CodexLaunchPlanInput::default())
+            .await
+            .expect_err("readiness failure should reject the launch plan");
+
+        assert!(
+            matches!(&error, CodexLaunchError::AppServerStart(_)),
+            "app-server readiness failure should keep its stage classification, got {error:?}"
+        );
+        assert!(error
+            .to_string()
+            .contains("test app-server readiness failure"));
+    }
+
+    #[test]
+    fn cleanup_failure_keeps_the_codex_prepare_stage() {
+        let app_server_error = CodexLaunchError::AppServerStart("readiness failed".into())
+            .with_cleanup_failure("shutdown failed".into());
+        assert!(matches!(
+            &app_server_error,
+            CodexLaunchError::AppServerStart(_)
+        ));
+        assert!(app_server_error.to_string().contains("readiness failed"));
+        assert!(app_server_error.to_string().contains("shutdown failed"));
+
+        let proxy_error = CodexLaunchError::ProxyStart("bind failed".into())
+            .with_cleanup_failure("shutdown failed".into());
+        assert!(matches!(&proxy_error, CodexLaunchError::ProxyStart(_)));
+        assert!(proxy_error.to_string().contains("bind failed"));
+        assert!(proxy_error.to_string().contains("shutdown failed"));
+    }
 
     #[tokio::test]
     async fn durable_record_failure_terminates_exact_detached_child_and_refuses_success() {

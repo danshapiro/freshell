@@ -1282,12 +1282,16 @@ name = "freshell-agent-runtime"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "flate2",
  "freshell-runtime-protocol",
  "freshell-sessions",
+ "hex",
  "libc",
  "rusqlite",
+ "ryu-js",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
@@ -1360,7 +1364,9 @@ dependencies = [
 name = "freshell-opencode"
 version = "0.1.0"
 dependencies = [
+ "freshell-activity",
  "freshell-platform",
+ "futures",
  "libc",
  "reqwest",
  "serde",
@@ -1387,6 +1393,7 @@ dependencies = [
  "percent-encoding",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "url",
  "windows-sys 0.61.2",
@@ -1427,7 +1434,10 @@ dependencies = [
 name = "freshell-runtime-protocol"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "freshell-activity",
  "freshell-platform",
+ "hex",
  "hmac",
  "serde",
  "serde_json",
@@ -1447,6 +1457,7 @@ dependencies = [
  "chrono",
  "ctor",
  "dotenvy",
+ "freshell-activity",
  "freshell-agent-runtime",
  "freshell-api",
  "freshell-codex",
@@ -1497,15 +1508,19 @@ name = "freshell-session-host"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "freshell-activity",
  "freshell-agent-runtime",
  "freshell-codex",
  "freshell-freshagent",
+ "freshell-opencode",
  "freshell-platform",
  "freshell-protocol",
  "freshell-runtime-observability",
  "freshell-runtime-protocol",
  "freshell-sessions",
+ "freshell-supervisor",
  "freshell-terminal",
+ "hex",
  "libc",
  "rusqlite",
  "serde",
@@ -1523,7 +1538,9 @@ name = "freshell-sessions"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "flate2",
  "freshell-platform",
+ "hex",
  "libc",
  "notify",
  "regex",
@@ -1531,10 +1548,14 @@ dependencies = [
  "saphyr",
  "serde",
  "serde_json",
+ "sha1",
+ "sha2",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1545,9 +1566,12 @@ dependencies = [
  "async-trait",
  "chrono",
  "freshell-agent-runtime",
+ "freshell-codex",
  "freshell-platform",
  "freshell-runtime-observability",
  "freshell-runtime-protocol",
+ "freshell-sessions",
+ "hex",
  "libc",
  "rusqlite",
  "serde",
@@ -1583,6 +1607,7 @@ dependencies = [
 name = "freshell-terminal"
 version = "0.1.0"
 dependencies = [
+ "freshell-activity",
  "freshell-ownership",
  "freshell-platform",
  "freshell-protocol",
@@ -4140,6 +4165,12 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "ryu-js"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04d056b875a9d2e6cb9a61d127afee9ac5999b9f87bcb32079d1318e505be714"
 
 [[package]]
 name = "same-file"

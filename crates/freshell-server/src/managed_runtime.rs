@@ -2,14 +2,16 @@
 
 use freshell_runtime_client::{ClientError, RuntimeClient};
 use freshell_runtime_protocol::{
-    CleanupState, DesiredState, LaunchRequest, LaunchState, RecoveryBlockReason, RecoveryOutcome,
+    CleanupState, DesiredState, IncarnationId, LaunchRequest, LaunchState, OpenCodeTransferChunk,
+    OpenCodeTransferDescriptor, OpenCodeTransferFile, OpenCodeTransferResult, RecoveryOutcome,
     RecoveryProbe, RecoveryResult, RecoveryState, RecoveryTrigger, RequestId, RuntimeErrorCode,
     RuntimeLimits, RuntimeProfile, RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec,
+    MAX_OPENCODE_TRANSFER_CHUNK_BYTES, OPENCODE_TRANSFER_DESTINATION_DB,
 };
 use freshell_terminal::registry::{
     ManagedLifecycle, ManagedLifecycleState, ManagedOutputChunk, ManagedOutputCompletion,
     ManagedOutputRead, ManagedTerminalController, ManagedTerminalDescriptor, ManagedTerminalFuture,
-    ManagedTerminalLaunch,
+    ManagedTerminalInputError, ManagedTerminalLaunch,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -22,6 +24,11 @@ use std::{
     },
 };
 use tokio::sync::Mutex;
+use tokio::{
+    fs::File as TokioFile,
+    io::{AsyncReadExt, AsyncSeekExt},
+};
+use uuid::Uuid;
 
 #[path = "managed_output_validation.rs"]
 mod managed_output_validation;
@@ -244,7 +251,6 @@ impl ServerManagedRuntimeController {
         self.client.clone()
     }
 
-    #[cfg(test)]
     async fn recovery_in_flight(&self, soul_id: &str) -> bool {
         self.recovery
             .slots
@@ -258,6 +264,48 @@ impl ServerManagedRuntimeController {
     async fn hydrate(&self, view: RuntimeView) {
         let generation = self.recovery.next_generation();
         self.hydrate_at_generation(view, generation).await;
+    }
+
+    async fn blocked_recovery(&self, soul_id: &str) -> Result<Option<String>, String> {
+        let needs_refresh = self
+            .recovery
+            .slots
+            .lock()
+            .await
+            .get(soul_id)
+            .is_some_and(|slot| {
+                !slot.task_in_flight
+                    && lifecycle(&slot.publication).state != ManagedLifecycleState::Running
+            });
+        if !needs_refresh {
+            return Ok(None);
+        }
+        let inventory_generation = self.recovery.next_generation();
+        let views = self
+            .client
+            .inventory()
+            .await
+            .map_err(|error| error.to_string())?;
+        let current = views
+            .into_iter()
+            .rev()
+            .find(|view| view.soul_id.as_str() == soul_id)
+            .ok_or_else(|| "managed soul is no longer in supervisor inventory".to_string())?;
+        self.hydrate_at_generation(current.clone(), inventory_generation)
+            .await;
+        Ok(matches!(
+            current.recovery_state,
+            RecoveryState::Blocked
+                | RecoveryState::Lost
+                | RecoveryState::Stopped
+                | RecoveryState::DataRepairComplete
+        )
+        .then(|| {
+            current
+                .recovery_reason
+                .clone()
+                .unwrap_or_else(|| "managed soul recovery is blocked".into())
+        }))
     }
 
     async fn hydrate_at_generation(&self, view: RuntimeView, generation: u64) {
@@ -280,7 +328,9 @@ impl ServerManagedRuntimeController {
                 RecoveryState::Recovering => RecoveryOutcome::Blocked,
                 RecoveryState::Blocked => RecoveryOutcome::Blocked,
                 RecoveryState::Lost => RecoveryOutcome::Lost,
-                RecoveryState::Stopped => RecoveryOutcome::Stopped,
+                RecoveryState::Stopped | RecoveryState::DataRepairComplete => {
+                    RecoveryOutcome::Stopped
+                }
             },
             attempt_id: view.recovery_attempt_id.clone(),
             incident_id: view.incident_id.clone(),
@@ -464,7 +514,7 @@ impl ServerManagedRuntimeController {
             if let Some(delay) = managed_recovery_test_delay() {
                 tokio::time::sleep(delay).await;
             }
-            let result = recover_with_policy(&controller.client, soul.clone(), trigger).await;
+            let result = controller.client.recover(soul.clone(), trigger).await;
             controller.publish_recovery(&soul, sequence, &result).await;
         });
     }
@@ -475,12 +525,15 @@ impl ServerManagedRuntimeController {
         soul: SoulId,
         revision: u64,
     ) -> Result<RecoveryResult, ClientError> {
-        let sequence = self.begin_recovery(&soul, true).await.ok_or_else(|| {
-            ClientError::Runtime(
-                RuntimeErrorCode::InvalidRequest,
-                "recovery is already in progress".into(),
-            )
-        })?;
+        let sequence =
+            self.begin_recovery(&soul, true)
+                .await
+                .ok_or_else(|| ClientError::Runtime {
+                    code: RuntimeErrorCode::InvalidRequest,
+                    message: "recovery is already in progress".into(),
+                    diagnostic_code: None,
+                    fresh_agent_provider_start_diagnostic: None,
+                })?;
         let result = self
             .client
             .recover_expected_with_request_id(
@@ -567,6 +620,29 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             // server's resolved child environment wholesale (which can carry
             // AUTH_TOKEN, provider API keys, cloud credentials, proxy creds, ...).
             let env = managed_provider_env(&request.mode, &request.env);
+            let mut pending_opencode_transfer = if request.mode == "opencode" {
+                match request.resume_session_id.as_deref() {
+                    Some(native_session_id) => Some(
+                        stage_opencode_resume_bundle(
+                            &self.client,
+                            native_session_id,
+                            &workspace,
+                            &soul_id,
+                            create_key,
+                        )
+                        .await?,
+                    ),
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let opencode_transfer = pending_opencode_transfer
+                .as_ref()
+                .map(|pending| pending.descriptor.clone());
+            let opencode_transfer_attempt_id = pending_opencode_transfer
+                .as_ref()
+                .map(|pending| pending.attempt_id().to_owned());
             let mut provider_secret_references = {
                 crate::managed_provider_bootstrap::named_provider_onecli_references(&request.mode)?
             };
@@ -765,6 +841,9 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     provider_bootstrap_files: Vec::new(),
                     provider_secret_references,
                     provider_launch_context,
+                    opencode_transfer,
+                    opencode_transfer_attempt_id,
+                    opencode_adoption: None,
                 }),
                 view_intent: Some(crate::managed_view_intent::automatic_primary_view_request(
                     project_key.clone(),
@@ -834,6 +913,9 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     }
                 }
             };
+            if let Some(pending) = pending_opencode_transfer.as_mut() {
+                pending.disarm();
+            }
             self.hydrate_at_generation(result.view.clone(), launch_generation)
                 .await;
             Ok(ManagedTerminalDescriptor {
@@ -853,29 +935,44 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
         &'a self,
         terminal: ManagedTerminalDescriptor,
         data: String,
-    ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+    ) -> ManagedTerminalFuture<'a, Result<(), ManagedTerminalInputError>> {
         Box::pin(async move {
             let soul_key = terminal.soul_id;
             let soul = SoulId::parse(&soul_key).map_err(|e| e.to_string())?;
-            if self
-                .recovery
-                .slots
-                .lock()
-                .await
-                .get(&soul_key)
-                .is_some_and(|slot| {
-                    lifecycle(&slot.publication).state != ManagedLifecycleState::Running
-                })
-            {
-                return Err(
-                    "managed runtime is not running; input was not dispatched; use explicit retry"
-                        .into(),
-                );
+            if self.recovery_in_flight(&soul_key).await {
+                return Err(ManagedTerminalInputError::RecoveryPending);
+            }
+            if self.blocked_recovery(&soul_key).await?.is_some() {
+                // New user input is an explicit retry/repair signal. Re-arm the
+                // persisted flap ceiling and prove continuity before accepting
+                // any bytes; never substitute a fresh provider session.
+                let sequence = self
+                    .begin_recovery(&soul, true)
+                    .await
+                    .ok_or(ManagedTerminalInputError::RecoveryPending)?;
+                let result = self
+                    .client
+                    .recover(soul.clone(), RecoveryTrigger::ManualRetry)
+                    .await;
+                self.publish_recovery(&soul, sequence, &result).await;
+                let recovered = result.map_err(managed_terminal_input_error)?;
+                match recovered.outcome {
+                    RecoveryOutcome::Reattached
+                    | RecoveryOutcome::Replaced
+                    | RecoveryOutcome::AlreadyLive => {}
+                    _ => {
+                        return Err(if recovery_pending(&recovered) {
+                            ManagedTerminalInputError::RecoveryPending
+                        } else {
+                            ManagedTerminalInputError::RecoveryBlocked
+                        });
+                    }
+                }
             }
             self.client
                 .input(RequestId::new(), soul, data)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(managed_terminal_input_error)?;
             Ok(())
         })
     }
@@ -960,6 +1057,16 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                 Err(error) => return Err(error.to_string()),
             };
             managed_output_validation::validate(&output, &terminal.terminal_id)?;
+            // The observer may have recovered independently of our last cached
+            // verdict. Failed inventory refresh must not discard readable output.
+            if let Err(error) = self.blocked_recovery(&soul_key).await {
+                tracing::warn!(
+                    event = "managed_runtime.lifecycle_refresh_failed",
+                    soul_id = %soul_key,
+                    error = %error,
+                    "managed lifecycle inventory refresh failed"
+                );
+            }
             let mut observation = self
                 .recovery
                 .slots
@@ -1016,6 +1123,8 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             Ok(ManagedOutputRead {
                 lifecycle: Some(observation),
                 completion: ended.then_some(completion).flatten(),
+                codex_activity: output.codex_activity,
+                opencode_activity: output.opencode_activity,
                 stream_epoch: Some(output.stream_epoch.clone()),
                 incarnation_id: Some(output.incarnation_id.to_string()),
                 // Replacement starts a new durable output epoch. Force the
@@ -1067,52 +1176,27 @@ fn recoverable_host_error(error: &ClientError) -> bool {
     )
 }
 
-const AUTOMATIC_RECOVERY_RETRY_DELAYS: [std::time::Duration; 2] = [
-    std::time::Duration::from_secs(2),
-    std::time::Duration::from_secs(10),
-];
-
-async fn recover_with_policy(
-    client: &RuntimeClient,
-    soul: SoulId,
-    trigger: RecoveryTrigger,
-) -> Result<RecoveryResult, ClientError> {
-    let mut last_result = None;
-    let mut last_error = None;
-    for attempt in 0..=AUTOMATIC_RECOVERY_RETRY_DELAYS.len() {
-        if attempt > 0 {
-            tokio::time::sleep(AUTOMATIC_RECOVERY_RETRY_DELAYS[attempt - 1]).await;
+fn managed_terminal_input_error(error: ClientError) -> ManagedTerminalInputError {
+    match error.runtime_code() {
+        Some(RuntimeErrorCode::RecoveryInProgress) => ManagedTerminalInputError::RecoveryPending,
+        Some(RuntimeErrorCode::RecoveryBlocked | RuntimeErrorCode::RecoveryRetryBudget) => {
+            ManagedTerminalInputError::RecoveryBlocked
         }
-        match client.recover(soul.clone(), trigger).await {
-            Ok(result) => {
-                if !automatic_retryable(&result) {
-                    return Ok(result);
-                }
-                last_result = Some(result);
-            }
-            Err(error) => last_error = Some(error),
-        }
+        _ => ManagedTerminalInputError::Unavailable(error.to_string()),
     }
-    if last_result.is_some() {
-        return client.recover(soul, RecoveryTrigger::RetryExhausted).await;
-    }
-    Err(last_error.unwrap_or(ClientError::UnexpectedResult))
 }
 
-fn automatic_retryable(result: &RecoveryResult) -> bool {
+fn recovery_pending(result: &RecoveryResult) -> bool {
     if result.outcome != RecoveryOutcome::Blocked {
         return false;
     }
     matches!(
         result.probe.as_ref(),
         Some(RecoveryProbe::Blocked {
-            reason: RecoveryBlockReason::RateLimited
-                | RecoveryBlockReason::CapabilityPending
-                | RecoveryBlockReason::ProviderUnavailable
-                | RecoveryBlockReason::StoreUnreadable
-                | RecoveryBlockReason::WorkspaceUnavailable
-                | RecoveryBlockReason::InsufficientResources
-                | RecoveryBlockReason::OldRuntimeNotEmpty,
+            retry_hint: freshell_runtime_protocol::RetryHint {
+                automatic_after_ms: Some(_),
+                ..
+            },
             ..
         })
     )
@@ -1240,11 +1324,298 @@ fn original_provider_home(
         .ok_or("managed provider HOME unavailable")
 }
 
+async fn stage_opencode_resume_bundle(
+    client: &RuntimeClient,
+    root_session_id: &str,
+    workspace: &Path,
+    destination_store_id: &SoulId,
+    create_key: &str,
+) -> Result<PendingOpenCodeTransfer, String> {
+    let (target_image_ref, target_schema, target_build_receipt) = client
+        .opencode_transfer_target()
+        .await
+        .map_err(|error| format!("OpenCode transfer target is unavailable: {error}"))?;
+    let workspace_for_export = workspace.to_path_buf();
+    let root_for_export = root_session_id.to_string();
+    let snapshot = tokio::task::spawn_blocking(move || {
+        let inventory = freshell_sessions::opencode_transfer::HostOpenCodeInventory::from_process_environment_discovering_channels()
+            .map_err(|error| freshell_sessions::opencode_transfer::TransferError::Blocked(error.to_string()))?
+            .with_trusted_mount_for_selected_session(workspace_for_export);
+        freshell_sessions::opencode_transfer::export_exact_session(
+            &inventory,
+            &root_for_export,
+            freshell_sessions::opencode_transfer::ExportOptions::default(),
+        )
+    })
+    .await
+    .map_err(|error| format!("OpenCode exact-session export did not settle: {error}"))?
+    .map_err(|error| error.to_string())?;
+    let manifest = snapshot.manifest();
+    if manifest.provider_schema != target_schema {
+        return Err("OpenCode source schema is incompatible with the pinned runtime image".into());
+    }
+    let transfer_identity = format!(
+        "{create_key}:{}:{}:{}",
+        manifest.generation,
+        manifest.source_store_id,
+        destination_store_id.as_str()
+    );
+    let transfer_id = format!("opencode-transfer-{}", stable_hex(&transfer_identity));
+    let incarnation_id = IncarnationId::parse(format!(
+        "incarnation-opencode-{}",
+        stable_hex(&transfer_identity)
+    ))
+    .map_err(|error| error.to_string())?;
+    let file = OpenCodeTransferFile {
+        index: 0,
+        relative_path: "payload.json".into(),
+        size_bytes: manifest.payload_bytes,
+        sha256: manifest.payload_sha256.clone(),
+    };
+    let mut descriptor = OpenCodeTransferDescriptor {
+        transfer_id,
+        provider: "opencode".into(),
+        source_store_id: manifest.source_store_id.clone(),
+        root_session_id: manifest.root_session_id.clone(),
+        source_generation: manifest.generation.clone(),
+        provider_schema: manifest.provider_schema.clone(),
+        source_schema_fingerprint: manifest.source_schema_fingerprint.clone(),
+        migration_journal_fingerprint: manifest.migration_journal_fingerprint.clone(),
+        destination_store_id: destination_store_id.to_string(),
+        destination_database_path: OPENCODE_TRANSFER_DESTINATION_DB.into(),
+        target_image_ref,
+        target_build_receipt,
+        incarnation_id: incarnation_id.to_string(),
+        manifest_json: serde_json::to_string(manifest)
+            .map_err(|error| format!("encode OpenCode transfer manifest: {error}"))?,
+        files: vec![file],
+        total_bytes: manifest.payload_bytes,
+        bundle_sha256: String::new(),
+    };
+    descriptor.bundle_sha256 = freshell_runtime_protocol::opencode_transfer_bundle_digest(
+        &descriptor.manifest_json,
+        &descriptor.files,
+    );
+    descriptor
+        .validate()
+        .map_err(|error| format!("OpenCode transfer descriptor is invalid: {}", error.message))?;
+
+    let payload = TokioFile::from_std(
+        snapshot
+            .open_payload()
+            .map_err(|error| format!("OpenCode exact-session payload is unavailable: {error}"))?,
+    );
+    stage_opencode_transfer_payload(client, descriptor, payload).await
+}
+
+async fn stage_opencode_transfer_payload(
+    client: &RuntimeClient,
+    descriptor: OpenCodeTransferDescriptor,
+    mut payload: TokioFile,
+) -> Result<PendingOpenCodeTransfer, String> {
+    let attempt_id = Uuid::new_v4().simple().to_string();
+    let mut abort_on_drop = OpenCodeTransferAbortOnDrop::new(
+        client.clone(),
+        descriptor.transfer_id.clone(),
+        attempt_id.clone(),
+    );
+    let result = async {
+        let begin_result = client
+            .opencode_transfer_begin(descriptor.clone(), attempt_id.clone())
+            .await
+            .map_err(|error| format!("OpenCode transfer staging could not begin: {error}"))?;
+        let (mut sequence, mut offset) = match begin_result {
+            OpenCodeTransferResult::Started {
+                next_sequence,
+                file_offsets,
+            } => {
+                let [file_offset] = file_offsets.as_slice() else {
+                    return Err("OpenCode staging returned unexpected file offsets".into());
+                };
+                if file_offset.file_index != 0 {
+                    return Err("OpenCode staging returned an unexpected payload file".into());
+                }
+                (next_sequence, file_offset.next_offset)
+            }
+            OpenCodeTransferResult::Queued { transfer_id } => {
+                if transfer_id != descriptor.transfer_id {
+                    return Err("OpenCode staging queued a different transfer".into());
+                }
+                match client
+                    .opencode_transfer_wait_for_capacity(transfer_id, attempt_id.clone())
+                    .await
+                    .map_err(|error| {
+                        format!("OpenCode transfer capacity wait did not settle: {error}")
+                    })? {
+                    OpenCodeTransferResult::Started {
+                        next_sequence,
+                        file_offsets,
+                    } => {
+                        let [file_offset] = file_offsets.as_slice() else {
+                            return Err("OpenCode staging returned unexpected file offsets".into());
+                        };
+                        if file_offset.file_index != 0 {
+                            return Err(
+                                "OpenCode staging returned an unexpected payload file".into()
+                            );
+                        }
+                        (next_sequence, file_offset.next_offset)
+                    }
+                    _ => return Err("OpenCode capacity wait returned an unexpected result".into()),
+                }
+            }
+            _ => return Err("OpenCode staging returned an unexpected begin result".into()),
+        };
+        let expected_sequence = offset.div_ceil(MAX_OPENCODE_TRANSFER_CHUNK_BYTES as u64);
+        if offset > descriptor.total_bytes || sequence != expected_sequence {
+            return Err("OpenCode staging resume cursor is inconsistent".into());
+        }
+        if offset != descriptor.total_bytes
+            && offset % MAX_OPENCODE_TRANSFER_CHUNK_BYTES as u64 != 0
+        {
+            return Err("OpenCode staging resume offset is not chunk aligned".into());
+        }
+
+        payload
+            .seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|error| format!("OpenCode payload seek failed: {error}"))?;
+        while offset < descriptor.total_bytes {
+            let remaining = descriptor.total_bytes - offset;
+            let chunk_size = remaining.min(MAX_OPENCODE_TRANSFER_CHUNK_BYTES as u64) as usize;
+            let mut data = vec![0; chunk_size];
+            payload
+                .read_exact(&mut data)
+                .await
+                .map_err(|error| format!("OpenCode payload read failed: {error}"))?;
+            let chunk = OpenCodeTransferChunk {
+                transfer_id: descriptor.transfer_id.clone(),
+                attempt_id: attempt_id.clone(),
+                sequence,
+                file_index: 0,
+                offset,
+                sha256: format!("{:x}", Sha256::digest(&data)),
+                data,
+            };
+            match client
+                .opencode_transfer_chunk(chunk)
+                .await
+                .map_err(|error| format!("OpenCode transfer chunk was rejected: {error}"))?
+            {
+                OpenCodeTransferResult::ChunkStored { sequence: stored } if stored == sequence => {}
+                _ => return Err("OpenCode staging returned an unexpected chunk result".into()),
+            }
+            offset += chunk_size as u64;
+            sequence += 1;
+        }
+        match client
+            .opencode_transfer_finalize(descriptor.transfer_id.clone(), attempt_id.clone())
+            .await
+            .map_err(|error| format!("OpenCode transfer could not be finalized: {error}"))?
+        {
+            OpenCodeTransferResult::Ready { transfer_id }
+                if transfer_id == descriptor.transfer_id =>
+            {
+                Ok(descriptor.clone())
+            }
+            _ => Err("OpenCode staging did not return the ready transfer".into()),
+        }
+    }
+    .await;
+
+    match result {
+        Ok(descriptor) => Ok(PendingOpenCodeTransfer {
+            descriptor,
+            abort_on_drop,
+        }),
+        Err(error) => {
+            abort_on_drop.abort().await;
+            Err(error)
+        }
+    }
+}
+
+struct PendingOpenCodeTransfer {
+    descriptor: OpenCodeTransferDescriptor,
+    abort_on_drop: OpenCodeTransferAbortOnDrop,
+}
+
+impl PendingOpenCodeTransfer {
+    fn attempt_id(&self) -> &str {
+        &self.abort_on_drop.attempt_id
+    }
+
+    fn disarm(&mut self) {
+        self.abort_on_drop.disarm();
+    }
+}
+
+struct OpenCodeTransferAbortOnDrop {
+    client: RuntimeClient,
+    transfer_id: String,
+    attempt_id: String,
+    armed: bool,
+}
+
+impl OpenCodeTransferAbortOnDrop {
+    fn new(client: RuntimeClient, transfer_id: String, attempt_id: String) -> Self {
+        Self {
+            client,
+            transfer_id,
+            attempt_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    async fn abort(&mut self) {
+        if self.armed {
+            let _ = self
+                .client
+                .opencode_transfer_abort(self.transfer_id.clone(), self.attempt_id.clone())
+                .await;
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for OpenCodeTransferAbortOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let (Ok(handle), client, transfer_id, attempt_id) = (
+            tokio::runtime::Handle::try_current(),
+            self.client.clone(),
+            self.transfer_id.clone(),
+            self.attempt_id.clone(),
+        ) else {
+            return;
+        };
+        handle.spawn(async move {
+            let _ = client
+                .opencode_transfer_abort(transfer_id, attempt_id)
+                .await;
+        });
+    }
+}
+
 fn managed_provider_env(
     mode: &str,
     source: &std::collections::BTreeMap<String, String>,
 ) -> std::collections::BTreeMap<String, String> {
     let mut env = managed_env_allowlist(source);
+    // The workload has a browser PTY even when the web server was launched
+    // without a terminal. Codex otherwise waits for confirmation at startup.
+    if env
+        .get("TERM")
+        .is_none_or(|term| term.is_empty() || term == "dumb")
+    {
+        env.insert("TERM".into(), "xterm-256color".into());
+    }
     // Never persist the web host's PATH into a pinned workload image. It may
     // contain host-only homes, version-manager shims, or credential helpers.
     let runtime_path = if mode == "amplifier" {
@@ -1297,6 +1668,10 @@ fn managed_provider_env(
     );
     if mode == "opencode" {
         env.insert("TMPDIR".into(), "/run/opencode-tmp".into());
+        env.insert(
+            "OPENCODE_DB".into(),
+            "/home/freshell/provider/.local/share/opencode/opencode.db".into(),
+        );
         if let Some(value) = source
             .get("FRESHELL_OPENCODE_REBIND")
             .filter(|value| matches!(value.as_str(), "0" | "false"))
@@ -1395,6 +1770,13 @@ fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use freshell_runtime_protocol::{
+        read_frame, write_frame, AdminReply, AdminResult, ControlRole, Envelope,
+        OpenCodeTransferAction, OpenCodeTransferFile, OpenCodeTransferFileOffset, RuntimeError,
+        RuntimeErrorCode,
+    };
+    use std::collections::HashSet;
+    use tokio::net::{UnixListener, UnixStream};
     #[cfg(unix)]
     mod lifecycle_directory {
         include!("tests/managed_runtime_lifecycle_tests.rs");
@@ -1438,6 +1820,8 @@ mod tests {
                     AdminCommand::Inventory => AdminResult::Inventory(vec![view.clone()]),
                     AdminCommand::TerminalReadOutput(_) => {
                         AdminResult::TerminalOutput(RuntimeOutputBatch {
+                            codex_activity: None,
+                            opencode_activity: None,
                             incarnation_id: incarnation.clone(),
                             terminal_id: "ended-shell".into(),
                             stream_epoch: "actual-host-epoch".into(),
@@ -1501,6 +1885,889 @@ mod tests {
         include!("tests/managed_recovery_budget_tests.rs");
     }
 
+    mod recovery_integration {
+        use super::*;
+        use freshell_runtime_protocol::{
+            host_proof, AdminCommand, CommandState, DockerDaemonId, FixtureKind, HostBootId,
+            HostCommand, HostReply, HostResult, RecoveryState, RuntimeOutputBatch,
+            RuntimeOutputFrame,
+        };
+        use freshell_supervisor::{
+            backend::{
+                BackendCreated, BackendError, BackendInspection, BackendRuntimeState,
+                CreateRuntimeSpec, RuntimeBackend,
+            },
+            registry::{BackendCreatedRecord, LaunchPreparation, OwnedRuntimeHandle, Registry},
+            service::{Supervisor, SupervisorConfig},
+        };
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Mutex as StdMutex,
+        };
+        use tokio::{
+            sync::Notify,
+            task::JoinHandle,
+            time::{timeout, Duration},
+        };
+
+        #[derive(Default)]
+        struct ReplyGate {
+            hold_next: AtomicBool,
+            ready: Notify,
+            release: Notify,
+            recover_calls: AtomicUsize,
+            manual_calls: AtomicUsize,
+            exhausted_calls: AtomicUsize,
+        }
+
+        #[derive(Clone, Debug, PartialEq)]
+        struct InputObservation {
+            incarnation_id: IncarnationId,
+            native_session_id: String,
+            data: String,
+            intent_revision: u64,
+            recovery_state: String,
+            command_state: String,
+        }
+
+        struct RecoveryBackend {
+            provider_home: PathBuf,
+            failure: AtomicUsize,
+            creates: AtomicUsize,
+            reads: Arc<AtomicUsize>,
+            inputs: Arc<StdMutex<Vec<InputObservation>>>,
+            hosts: StdMutex<Vec<JoinHandle<()>>>,
+        }
+        impl Drop for RecoveryBackend {
+            fn drop(&mut self) {
+                for host in self.hosts.get_mut().unwrap().drain(..) {
+                    host.abort();
+                }
+            }
+        }
+        #[async_trait::async_trait]
+        impl RuntimeBackend for RecoveryBackend {
+            async fn inspect(
+                &self,
+                handle: &OwnedRuntimeHandle,
+            ) -> Result<BackendInspection, BackendError> {
+                match self.failure.load(Ordering::SeqCst) {
+                    1 => {
+                        return Err(BackendError::Unavailable(
+                            "private test dependency unavailable".into(),
+                        ))
+                    }
+                    2 => {
+                        return Err(BackendError::OwnershipMismatch(
+                            "private test ownership mismatch".into(),
+                        ))
+                    }
+                    _ => {}
+                }
+                Ok(BackendInspection {
+                    state: if handle.runtime_dir().join("stopped").exists() {
+                        BackendRuntimeState::Exited
+                    } else if handle.runtime_dir().join("created").exists() {
+                        BackendRuntimeState::Running
+                    } else {
+                        BackendRuntimeState::Missing
+                    },
+                    configured_limits: handle.requested_limits(),
+                })
+            }
+            async fn create_stopped(
+                &self,
+                spec: &CreateRuntimeSpec,
+            ) -> Result<BackendCreated, BackendError> {
+                self.creates.fetch_add(1, Ordering::SeqCst);
+                let container = format!("web-retry-{}", spec.incarnation_id);
+                std::fs::write(spec.runtime_dir.join("created"), &container).unwrap();
+                Ok(BackendCreated {
+                    daemon_id: DockerDaemonId::new(),
+                    container_id: container,
+                    immutable_config_digest: "private-retry".into(),
+                })
+            }
+            async fn start_host(&self, handle: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+                let listener = UnixListener::bind(handle.runtime_dir().join("host.sock")).unwrap();
+                let secret = std::fs::read(handle.runtime_dir().join("secret")).unwrap();
+                let incarnation = handle.incarnation_id().clone();
+                let original = handle.container_id() == "web-retry-original";
+                let limits = handle.requested_limits();
+                let provider_home = self.provider_home.clone();
+                let reads = self.reads.clone();
+                let inputs = self.inputs.clone();
+                let task = tokio::spawn(async move {
+                    let boot = HostBootId::new();
+                    let mut generation = u64::from(original);
+                    loop {
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        let request: Envelope<HostCommand> = read_frame(&mut stream).await.unwrap();
+                        let native: serde_json::Value = serde_json::from_slice(
+                            &std::fs::read(provider_home.join("native-session-state.json"))
+                                .unwrap(),
+                        )
+                        .unwrap();
+                        let native = native["sessionId"].as_str().unwrap().to_owned();
+                        let result = match request.body {
+                            HostCommand::Hello {
+                                incarnation_id,
+                                challenge,
+                            } => HostResult::Hello {
+                                proof: host_proof(&secret, &challenge, &boot, &incarnation_id),
+                                host_boot_id: boot.clone(),
+                                capabilities: vec![],
+                                effective_limits: limits,
+                            },
+                            HostCommand::GrantExecution {
+                                execution_generation,
+                                resume_spec,
+                                ..
+                            } => {
+                                assert_eq!(
+                                    resume_spec.unwrap().provider_session.native_session_id,
+                                    native
+                                );
+                                generation = execution_generation;
+                                HostResult::GrantAccepted {
+                                    host_boot_id: boot.clone(),
+                                    worker_pid: 42,
+                                    worker_launch_count: 1,
+                                    fixture_evidence: serde_json::json!({}),
+                                    native_session_id: Some(native),
+                                    native_identity_observation: None,
+                                    opencode_transfer_receipt: None,
+                                    opencode_adoption: Default::default(),
+                                }
+                            }
+                            HostCommand::Status { .. } => HostResult::Status {
+                                host_boot_id: boot.clone(),
+                                worker_pid: Some(42),
+                                worker_launch_count: 1,
+                                max_control_epoch: 1,
+                                max_execution_generation: generation,
+                                fixture_evidence: serde_json::json!({}),
+                                exited: original,
+                                native_session_id: Some(native),
+                                native_identity_observation: None,
+                                opencode_transfer_receipt: None,
+                                opencode_adoption: Default::default(),
+                            },
+                            HostCommand::ProbeRecovery { resume_spec, .. } => {
+                                let spec = resume_spec.unwrap();
+                                assert!(matches!(
+                                    freshell_agent_runtime::probe_provider_store(
+                                        &provider_home,
+                                        &spec
+                                    ),
+                                    freshell_agent_runtime::ProviderStoreProbe::Ready { .. }
+                                ));
+                                HostResult::RecoveryProbe(RecoveryProbe::ResumeReady {
+                                    evidence_revision: spec.evidence_revision,
+                                    resume_spec: spec,
+                                })
+                            }
+                            HostCommand::TerminalReadOutput { .. } if original => {
+                                write_frame(
+                                    &mut stream,
+                                    &HostReply {
+                                        request_id: request.request_id,
+                                        result: Err(RuntimeError::new(
+                                            RuntimeErrorCode::HostUnreachable,
+                                            "private original output transport unavailable",
+                                        )),
+                                    },
+                                )
+                                .await
+                                .unwrap();
+                                continue;
+                            }
+                            HostCommand::TerminalReadOutput { .. } => {
+                                reads.fetch_add(1, Ordering::SeqCst);
+                                let epoch = incarnation.to_string();
+                                HostResult::TerminalOutput(RuntimeOutputBatch {
+                                    completion: None,
+                                    incarnation_id: incarnation.clone(),
+                                    terminal_id: "web-retry-terminal".into(),
+                                    codex_activity: None,
+                                    opencode_activity: None,
+                                    stream_epoch: epoch.clone(),
+                                    retained_from_seq: 1,
+                                    head_seq: 1,
+                                    reset_required: true,
+                                    truncated: false,
+                                    exited: false,
+                                    exit_code: None,
+                                    native_session_id: Some(native),
+                                    frames: vec![RuntimeOutputFrame {
+                                        terminal_id: "web-retry-terminal".into(),
+                                        stream_epoch: epoch,
+                                        seq_start: 1,
+                                        seq_end: 1,
+                                        data: "recovered output".into(),
+                                    }],
+                                })
+                            }
+                            HostCommand::TerminalInput {
+                                incarnation_id,
+                                request_id,
+                                data,
+                            } => {
+                                let connection = rusqlite::Connection::open(
+                                    provider_home
+                                        .parent()
+                                        .unwrap()
+                                        .join("registry/runtime.sqlite3"),
+                                )
+                                .unwrap();
+                                let (intent_revision, recovery_state, command_state) = connection
+                                    .query_row(
+                                        "SELECT s.intent_revision,s.recovery_state,c.state FROM souls s JOIN input_commands c ON c.soul_id=s.soul_id WHERE c.request_id=?1",
+                                        [request_id.as_str()],
+                                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                                    )
+                                    .unwrap();
+                                inputs.lock().unwrap().push(InputObservation {
+                                    incarnation_id,
+                                    native_session_id: native,
+                                    data,
+                                    intent_revision,
+                                    recovery_state,
+                                    command_state,
+                                });
+                                HostResult::TerminalInput {
+                                    state: CommandState::Completed,
+                                }
+                            }
+                            HostCommand::Stop { .. } => HostResult::Stopped,
+                            other => panic!("unexpected recovery integration command: {other:?}"),
+                        };
+                        write_frame(
+                            &mut stream,
+                            &HostReply {
+                                request_id: request.request_id,
+                                result: Ok(result),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    }
+                });
+                self.hosts.lock().unwrap().push(task);
+                Ok(())
+            }
+            async fn request_stop(
+                &self,
+                handle: &OwnedRuntimeHandle,
+                _: u64,
+            ) -> Result<(), BackendError> {
+                if handle.runtime_dir().exists() {
+                    std::fs::write(handle.runtime_dir().join("stopped"), b"stopped").unwrap();
+                }
+                Ok(())
+            }
+            async fn force_stop(&self, handle: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+                self.request_stop(handle, 0).await
+            }
+            async fn verify_empty(
+                &self,
+                handle: &OwnedRuntimeHandle,
+            ) -> Result<bool, BackendError> {
+                Ok(!handle.runtime_dir().join("created").exists()
+                    || handle.runtime_dir().join("stopped").exists())
+            }
+            async fn read_limits(
+                &self,
+                handle: &OwnedRuntimeHandle,
+            ) -> Result<RuntimeLimits, BackendError> {
+                Ok(handle.requested_limits())
+            }
+            async fn enable_long_lived(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+                Ok(())
+            }
+            async fn list_known(
+                &self,
+                handles: &[OwnedRuntimeHandle],
+            ) -> Result<Vec<(IncarnationId, BackendInspection)>, BackendError> {
+                let mut result = vec![];
+                for handle in handles {
+                    result.push((handle.incarnation_id().clone(), self.inspect(handle).await?));
+                }
+                Ok(result)
+            }
+        }
+
+        struct RecoveryFixture {
+            dir: tempfile::TempDir,
+            supervisor: Supervisor,
+            backend: Arc<RecoveryBackend>,
+            controller: ServerManagedRuntimeController,
+            terminal: ManagedTerminalDescriptor,
+            soul: SoulId,
+            gate: Arc<ReplyGate>,
+            ipc: Option<JoinHandle<()>>,
+        }
+        impl Drop for RecoveryFixture {
+            fn drop(&mut self) {
+                if let Some(ipc) = self.ipc.take() {
+                    ipc.abort();
+                }
+            }
+        }
+        impl RecoveryFixture {
+            async fn new() -> Self {
+                let dir = tempfile::tempdir().unwrap();
+                let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+                let soul = SoulId::new();
+                let limits = RuntimeLimits {
+                    cpu_milli: 1000,
+                    memory_bytes: 128 * 1024 * 1024,
+                    swap_bytes: 0,
+                    pids_max: 64,
+                };
+                let prepared = registry
+                    .prepare_launch(LaunchPreparation {
+                        soul_id: soul.clone(),
+                        provider: "native-session-fixture".into(),
+                        provider_store_id: "web-retry-store".into(),
+                        native_session_id: None,
+                        creation_seed_ref: "web-retry-seed".into(),
+                        request_id: RequestId::new(),
+                        payload_digest: "web-retry".into(),
+                        requested_limits: limits,
+                        profile: RuntimeProfile::Custom,
+                        project_key: "web-retry".into(),
+                        fixture: Some(FixtureKind::NativeSession),
+                        terminal: Some(serde_json::from_value(serde_json::json!({
+                            "terminalId":"web-retry-terminal", "streamId":"original-stream",
+                            "mode":"native-session-fixture", "program":"/usr/bin/true",
+                            "env":{"HOME":"/home/freshell/provider"},
+                            "cwd":dir.path(), "workspacePath":dir.path(), "projectKey":"web-retry",
+                            "runAsUid":65534, "runAsGid":0, "cols":80, "rows":24
+                        })).unwrap()),
+                        fresh_agent: None,
+                        view_intent: None,
+                        admission: Default::default(),
+                    })
+                    .await
+                    .unwrap();
+                let runtime = dir
+                    .path()
+                    .join("runtime")
+                    .join(prepared.incarnation_id.as_str());
+                std::fs::create_dir_all(&runtime).unwrap();
+                std::fs::write(runtime.join("secret"), b"private-host-secret").unwrap();
+                std::fs::write(runtime.join("stopped"), b"stopped").unwrap();
+                // The original enclosure has ended. Retained polling observes
+                // its owned empty spool while backend recovery waits.
+                use freshell_runtime_protocol::terminal_spool::{
+                    TerminalExitObservation, TerminalSpoolCompletion, TerminalSpoolDescriptor,
+                    SPOOL_COMPLETION_FILE, SPOOL_CURRENT_FILE, SPOOL_DESCRIPTOR_FILE,
+                };
+                let descriptor = TerminalSpoolDescriptor {
+                    schema_version: 1,
+                    incarnation_id: prepared.incarnation_id.clone(),
+                    terminal_id: "web-retry-terminal".into(),
+                    stream_epoch: "original-stream-retained".into(),
+                    segment_limit_bytes: 1024,
+                };
+                let completion = TerminalSpoolCompletion {
+                    incarnation_id: descriptor.incarnation_id.clone(),
+                    terminal_id: descriptor.terminal_id.clone(),
+                    stream_epoch: descriptor.stream_epoch.clone(),
+                    retained_from_seq: 1,
+                    head_seq: 0,
+                    exit: TerminalExitObservation::Known { code: 0 },
+                };
+                std::fs::write(
+                    runtime.join(SPOOL_DESCRIPTOR_FILE),
+                    serde_json::to_vec(&descriptor).unwrap(),
+                )
+                .unwrap();
+                std::fs::write(
+                    runtime.join(SPOOL_COMPLETION_FILE),
+                    serde_json::to_vec(&completion).unwrap(),
+                )
+                .unwrap();
+                std::fs::write(runtime.join(SPOOL_CURRENT_FILE), b"").unwrap();
+                registry
+                    .commit_created(
+                        prepared.incarnation_id.clone(),
+                        BackendCreatedRecord {
+                            daemon_id: DockerDaemonId::new(),
+                            container_id: "web-retry-original".into(),
+                            image_ref: "private-test-image".into(),
+                            runtime_dir: runtime,
+                            host_binary_path: std::env::current_exe().unwrap(),
+                            immutable_config_digest: "private-test".into(),
+                            launch_policy: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                registry
+                    .commit_execution_grant(
+                        prepared.incarnation_id.clone(),
+                        HostBootId::new(),
+                        limits,
+                    )
+                    .await
+                    .unwrap();
+                registry
+                    .mark_running(prepared.incarnation_id.clone())
+                    .await
+                    .unwrap();
+                registry
+                    .record_native_session(
+                        soul.clone(),
+                        prepared.incarnation_id.clone(),
+                        "web-retry-root".into(),
+                    )
+                    .await
+                    .unwrap();
+                let mut context = registry.recovery_context(soul.clone()).await.unwrap();
+                // Use the deterministic native-session fixture adapter for
+                // resume evidence; the terminal spec separately owns output.
+                context.terminal = None;
+                let resume =
+                    freshell_supervisor::resume_catalog::exact_resume_candidate(&context, None)
+                        .unwrap()
+                        .unwrap();
+                registry
+                    .store_verified_resume_spec(soul.clone(), resume)
+                    .await
+                    .unwrap();
+                let provider_home = dir.path().join("provider");
+                std::fs::create_dir(&provider_home).unwrap();
+                std::fs::write(
+                    provider_home.join("native-session-state.json"),
+                    b"{\"sessionId\":\"web-retry-root\",\"history\":[\"synthetic\"]}",
+                )
+                .unwrap();
+                let backend = Arc::new(RecoveryBackend {
+                    provider_home,
+                    failure: AtomicUsize::new(0),
+                    creates: AtomicUsize::new(0),
+                    reads: Arc::new(AtomicUsize::new(0)),
+                    inputs: Arc::new(StdMutex::new(vec![])),
+                    hosts: StdMutex::new(vec![]),
+                });
+                backend
+                    .start_host(
+                        &registry
+                            .owned_handle(prepared.incarnation_id.clone())
+                            .await
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let socket = dir.path().join("control.sock");
+                let supervisor = Supervisor::new(
+                    registry,
+                    backend.clone(),
+                    SupervisorConfig {
+                        runtime_root: dir.path().join("runtime"),
+                        control_socket_path: socket.clone(),
+                        host_binary_path: std::env::current_exe().unwrap(),
+                        image_ref: format!("sha256:{}", "a".repeat(64)),
+                        test_run_id: "web-recovery-integration".into(),
+                        control_secret: "private-test-secret".into(),
+                        lifecycle_log: dir.path().join("lifecycle.jsonl"),
+                        admission: Default::default(),
+                    },
+                )
+                .unwrap();
+                let listener = UnixListener::bind(&socket).unwrap();
+                let service = supervisor.clone();
+                let gate = Arc::new(ReplyGate::default());
+                let listener_gate = gate.clone();
+                let ipc = tokio::spawn(async move {
+                    let mut clients = tokio::task::JoinSet::new();
+                    loop {
+                        tokio::select! {
+                            accepted = listener.accept() => {
+                                let (mut stream, _) = accepted.unwrap();
+                                let service = service.clone();
+                                let gate = listener_gate.clone();
+                                clients.spawn(async move {
+                                    let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+                                    let recovery = matches!(&request.body, AdminCommand::Recover(_));
+                                    if let AdminCommand::Recover(request) = &request.body {
+                                        gate.recover_calls.fetch_add(1, Ordering::SeqCst);
+                                        if request.trigger == RecoveryTrigger::ManualRetry { gate.manual_calls.fetch_add(1, Ordering::SeqCst); }
+                                        if request.trigger == RecoveryTrigger::RetryExhausted { gate.exhausted_calls.fetch_add(1, Ordering::SeqCst); }
+                                    }
+                                    let reply = service.dispatch(request).await;
+                                    if recovery && gate.hold_next.swap(false, Ordering::SeqCst) {
+                                        gate.ready.notify_one();
+                                        gate.release.notified().await;
+                                    }
+                                    write_frame(&mut stream, &reply).await.unwrap();
+                                });
+                            }
+                            result = clients.join_next(), if !clients.is_empty() => { result.unwrap().unwrap(); }
+                        }
+                    }
+                });
+                let controller = ServerManagedRuntimeController {
+                    client: RuntimeClient::new(&socket, "private-test-secret"),
+                    recovery: Arc::new(ManagedRecoveryState::default()),
+                };
+                let terminal = ManagedTerminalDescriptor {
+                    soul_id: soul.to_string(),
+                    incarnation_id: prepared.incarnation_id.to_string(),
+                    terminal_id: "web-retry-terminal".into(),
+                    stream_id: "original-stream".into(),
+                    mode: "native-session-fixture".into(),
+                    cwd: dir.path().to_string_lossy().into_owned(),
+                    resume_session_id: Some("web-retry-root".into()),
+                    create_request_id: None,
+                };
+                Self {
+                    dir,
+                    supervisor,
+                    backend,
+                    controller,
+                    terminal,
+                    soul,
+                    gate,
+                    ipc: Some(ipc),
+                }
+            }
+            async fn wait_for_request(&self) {
+                timeout(Duration::from_secs(1), async {
+                    while self.gate.recover_calls.load(Ordering::SeqCst) == 0
+                        || self.controller.recovery_in_flight(self.soul.as_str()).await
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the web request must settle without owning supervisor retry delays");
+            }
+            fn attempts(&self) -> u64 {
+                rusqlite::Connection::open(self.dir.path().join("registry/runtime.sqlite3"))
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM recovery_attempts", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
+            }
+            async fn close(&mut self) {
+                if let Some(ipc) = self.ipc.take() {
+                    ipc.abort();
+                    assert!(ipc.await.unwrap_err().is_cancelled());
+                }
+                let hosts: Vec<_> = self.backend.hosts.lock().unwrap().drain(..).collect();
+                for host in hosts {
+                    host.abort();
+                    assert!(host.await.unwrap_err().is_cancelled());
+                }
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn observer_retry_reaches_web_output_without_input() {
+            let mut fixture = Box::pin(RecoveryFixture::new()).await;
+            fixture.backend.failure.store(1, Ordering::SeqCst);
+            Box::pin(fixture.supervisor.observe_once()).await.unwrap();
+            assert_eq!(fixture.attempts(), 1);
+            fixture
+                .controller
+                .read_output(fixture.terminal.clone(), 0, 4096)
+                .await
+                .unwrap();
+            fixture.wait_for_request().await;
+            let pending = fixture
+                .controller
+                .read_output(fixture.terminal.clone(), 0, 4096)
+                .await;
+            assert_eq!(
+                fixture.attempts(),
+                1,
+                "web polling cannot spend the supervisor's pending attempt"
+            );
+            fixture.backend.failure.store(0, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(2_100)).await;
+            Box::pin(fixture.supervisor.observe_once()).await.unwrap();
+            let current = fixture
+                .supervisor
+                .registry()
+                .recovery_context(fixture.soul.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                current.recovery_state,
+                RecoveryState::Live,
+                "supervisor must independently recover first; lifecycle: {}",
+                std::fs::read_to_string(fixture.dir.path().join("lifecycle.jsonl")).unwrap()
+            );
+            assert_eq!(current.successful_recoveries_in_window, 1);
+            assert_eq!(current.native_session_id.as_deref(), Some("web-retry-root"));
+            let output = fixture
+                .controller
+                .read_output(fixture.terminal.clone(), 0, 4096)
+                .await
+                .expect(
+                    "observer recovery must clear a stale web block without input or manual retry",
+                );
+            assert_eq!(output.chunks[0].data, "recovered output");
+            assert_eq!(
+                output.lifecycle.as_ref().unwrap().state,
+                ManagedLifecycleState::Running,
+                "successful automatic recovery must restore a usable pane lifecycle"
+            );
+            assert_eq!(
+                output
+                    .lifecycle
+                    .as_ref()
+                    .unwrap()
+                    .recovery_summary
+                    .as_ref()
+                    .unwrap()
+                    .recovery_state,
+                "live"
+            );
+            assert_eq!(
+                fixture.controller.recovery.slots.lock().await[fixture.soul.as_str()]
+                    .incarnation_id
+                    .as_deref(),
+                Some(current.prior_handle.incarnation_id().as_str()),
+                "reconciliation must select the current incarnation from retained inventory"
+            );
+            assert!(
+                fixture
+                    .controller
+                    .begin_recovery(&fixture.soul, false)
+                    .await
+                    .is_some(),
+                "the next automatic recovery must not be rejected by the stale cached block"
+            );
+            assert!(pending
+                .expect("pending recovery keeps the pane attached")
+                .chunks
+                .is_empty());
+            assert_eq!(fixture.backend.creates.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.attempts(), 2);
+            assert_eq!(fixture.gate.exhausted_calls.load(Ordering::SeqCst), 0);
+            fixture.close().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn web_recovery_request_does_not_own_retry_delays() {
+            let mut fixture = Box::pin(RecoveryFixture::new()).await;
+            fixture.backend.failure.store(1, Ordering::SeqCst);
+            fixture
+                .controller
+                .read_output(fixture.terminal.clone(), 0, 4096)
+                .await
+                .unwrap();
+            fixture.wait_for_request().await;
+            assert_eq!(fixture.attempts(), 1);
+            assert_eq!(fixture.gate.recover_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.gate.exhausted_calls.load(Ordering::SeqCst), 0);
+            fixture.close().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn current_policy_block_survives_but_late_old_intent_reply_does_not() {
+            let mut fixture = Box::pin(RecoveryFixture::new()).await;
+            fixture.backend.failure.store(2, Ordering::SeqCst);
+            Box::pin(fixture.supervisor.observe_once()).await.unwrap();
+            // Hold the first automatically admitted request after its policy
+            // verdict. A cached block correctly refuses another automatic task.
+            fixture.gate.hold_next.store(true, Ordering::SeqCst);
+            fixture
+                .controller
+                .read_output(fixture.terminal.clone(), 0, 4096)
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(1), fixture.gate.ready.notified())
+                .await
+                .unwrap();
+            fixture.backend.failure.store(0, Ordering::SeqCst);
+            let blocked = fixture.controller.client.inventory().await.unwrap();
+            let current = blocked
+                .iter()
+                .rev()
+                .find(|view| view.soul_id == fixture.soul)
+                .unwrap();
+            assert_eq!(
+                current.recovery_state,
+                RecoveryState::Blocked,
+                "repairing a dependency alone cannot erase a current policy block"
+            );
+            assert_eq!(fixture.backend.creates.load(Ordering::SeqCst), 0);
+            let revision = fixture
+                .supervisor
+                .registry()
+                .recovery_context(fixture.soul.clone())
+                .await
+                .unwrap()
+                .intent_revision;
+            let current = fixture
+                .controller
+                .client
+                .recover_expected(
+                    fixture.soul.clone(),
+                    RecoveryTrigger::ManualRetry,
+                    Some(revision),
+                )
+                .await
+                .unwrap();
+            assert_eq!(current.outcome, RecoveryOutcome::Replaced);
+            assert_eq!(current.view.intent_revision, revision + 1);
+            fixture.gate.release.notify_one();
+            fixture.wait_for_request().await;
+            let output = fixture
+                .controller
+                .read_output(fixture.terminal.clone(), 0, 4096)
+                .await
+                .expect("late old-intent reply cannot hide the current live output");
+            assert_eq!(output.chunks[0].data, "recovered output");
+            assert_eq!(
+                output.lifecycle.unwrap().state,
+                ManagedLifecycleState::Running
+            );
+            assert_eq!(fixture.backend.creates.load(Ordering::SeqCst), 1);
+            assert!(fixture.backend.inputs.lock().unwrap().is_empty());
+            fixture.close().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn newer_policy_block_survives_output_poll_until_deliberate_input_recovers() {
+            let mut fixture = Box::pin(RecoveryFixture::new()).await;
+            fixture.backend.failure.store(2, Ordering::SeqCst);
+            Box::pin(fixture.supervisor.observe_once()).await.unwrap();
+            fixture
+                .controller
+                .read_output(fixture.terminal.clone(), 0, 4096)
+                .await
+                .unwrap();
+            fixture.wait_for_request().await;
+            assert!(fixture
+                .controller
+                .blocked_recovery(fixture.soul.as_str())
+                .await
+                .unwrap()
+                .is_some());
+            let revision = fixture
+                .supervisor
+                .registry()
+                .recovery_context(fixture.soul.clone())
+                .await
+                .unwrap()
+                .intent_revision;
+            // The public retry route delegates directly to RuntimeClient, so
+            // its newer result does not enter the controller's local cache.
+            let newer = fixture
+                .controller
+                .runtime_client()
+                .recover_expected_with_request_id(
+                    RequestId::new(),
+                    fixture.soul.clone(),
+                    RecoveryTrigger::ManualRetry,
+                    Some(revision),
+                )
+                .await
+                .unwrap();
+            assert_eq!(newer.outcome, RecoveryOutcome::Blocked);
+            assert_eq!(newer.view.intent_revision, revision + 1);
+            assert!(!recovery_pending(&newer));
+            assert_eq!(fixture.attempts(), 2);
+            assert_eq!(fixture.backend.creates.load(Ordering::SeqCst), 0);
+            let newer_message = newer.view.recovery_reason.unwrap();
+            let blocked_output = fixture
+                .controller
+                .read_output(fixture.terminal.clone(), 0, 4096)
+                .await
+                .unwrap();
+            let blocked_lifecycle = blocked_output.lifecycle.unwrap();
+            assert_eq!(blocked_lifecycle.state, ManagedLifecycleState::Blocked);
+            assert_eq!(
+                blocked_lifecycle
+                    .recovery_summary
+                    .unwrap()
+                    .reason
+                    .as_deref(),
+                Some(newer_message.as_str())
+            );
+            let retained_block = fixture
+                .controller
+                .blocked_recovery(fixture.soul.as_str())
+                .await
+                .unwrap();
+            assert_eq!(fixture.gate.recover_calls.load(Ordering::SeqCst), 2);
+            assert!(fixture.backend.inputs.lock().unwrap().is_empty());
+
+            fixture.backend.failure.store(0, Ordering::SeqCst);
+            let input = fixture
+                .controller
+                .input(fixture.terminal.clone(), "deliberate input".into())
+                .await;
+            let current = fixture
+                .supervisor
+                .registry()
+                .recovery_context(fixture.soul.clone())
+                .await
+                .unwrap();
+            let connection =
+                rusqlite::Connection::open(fixture.dir.path().join("registry/runtime.sqlite3"))
+                    .unwrap();
+            let attempts: Vec<(u64, String, bool)> = connection
+                .prepare("SELECT intent_revision,verdict,finished_at IS NOT NULL FROM recovery_attempts ORDER BY intent_revision")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let completed_inputs: u64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM input_commands WHERE state='completed'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            drop(connection);
+            fixture.close().await;
+
+            assert_eq!(
+                retained_block,
+                Some(newer_message),
+                "output polling must retain the newer block for deliberate retry; input result: {input:?}"
+            );
+            input.expect("deliberate input must recover the blocked soul before dispatch");
+            assert_eq!(current.intent_revision, revision + 2);
+            assert_eq!(current.recovery_state, RecoveryState::Live);
+            assert_eq!(current.native_session_id.as_deref(), Some("web-retry-root"));
+            assert_eq!(current.successful_recoveries_in_window, 1);
+            assert_eq!(
+                attempts,
+                vec![
+                    (revision, "blocked".into(), true),
+                    (revision + 1, "blocked".into(), true),
+                    (revision + 2, "succeeded".into(), true),
+                ]
+            );
+            assert_eq!(fixture.gate.recover_calls.load(Ordering::SeqCst), 3);
+            assert_eq!(fixture.gate.manual_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(fixture.gate.exhausted_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.backend.creates.load(Ordering::SeqCst), 1);
+            assert_eq!(completed_inputs, 1);
+            assert_eq!(
+                *fixture.backend.inputs.lock().unwrap(),
+                vec![InputObservation {
+                    incarnation_id: current.prior_handle.incarnation_id().clone(),
+                    native_session_id: "web-retry-root".into(),
+                    data: "deliberate input".into(),
+                    intent_revision: revision + 2,
+                    recovery_state: "live".into(),
+                    command_state: "dispatching".into(),
+                }]
+            );
+        }
+    }
+
     #[test]
     fn managed_env_drops_server_and_provider_secrets() {
         let source = [
@@ -1540,6 +2807,7 @@ mod tests {
     fn running_soul_is_reused_before_launch_payload_rehash_and_mismatches_fail_closed() {
         let soul = SoulId::parse("soul-terminal-test").unwrap();
         let running = freshell_runtime_protocol::RuntimeView {
+            native_identity_observation: None,
             soul_id: soul.clone(),
             incarnation_id: freshell_runtime_protocol::IncarnationId::new(),
             launch_state: freshell_runtime_protocol::LaunchState::Running,
@@ -1618,6 +2886,31 @@ mod tests {
         let mut stopped = running;
         stopped.launch_state = freshell_runtime_protocol::LaunchState::Stopped;
         assert!(reusable_running_view(&[stopped], &soul, "terminal-stable").is_err());
+    }
+
+    #[test]
+    fn managed_terminal_environment_replaces_headless_host_terminal_types() {
+        for mode in ["codex", "opencode", "claude", "amplifier"] {
+            for inherited in [None, Some(""), Some("dumb")] {
+                let source = inherited
+                    .map(|term| ("TERM".to_string(), term.to_string()))
+                    .into_iter()
+                    .collect();
+                let environment = managed_provider_env(mode, &source);
+                assert_eq!(
+                    environment.get("TERM").map(String::as_str),
+                    Some("xterm-256color"),
+                    "{mode} browser PTY must not inherit {inherited:?} from a headless host"
+                );
+            }
+            let source = [("TERM".to_string(), "screen-256color".to_string())].into();
+            assert_eq!(
+                managed_provider_env(mode, &source)
+                    .get("TERM")
+                    .map(String::as_str),
+                Some("screen-256color")
+            );
+        }
     }
 
     #[test]
@@ -1753,7 +3046,7 @@ mod tests {
             "--mcp-config".into(),
             "/tmp/freshell-mcp/t1.json".into(),
             "--session-id".into(),
-            "s1".into(),
+            "4a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d".into(),
         ];
         assert_eq!(
             managed_provider_args("claude", args).unwrap(),
@@ -1763,7 +3056,7 @@ mod tests {
                     freshell_platform::cli_launch::ProviderTarget::Unix,
                 ),
                 "--session-id".to_string(),
-                "s1".to_string(),
+                "4a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d".to_string(),
             ]
         );
     }
@@ -1786,6 +3079,411 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test]
+    async fn failed_connected_transfer_sends_abort_before_returning() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let client = RuntimeClient::new(&socket, "0123456789abcdef");
+        let payload_bytes = b"synthetic-payload";
+        let payload_path = dir.path().join("payload.json");
+        std::fs::write(&payload_path, payload_bytes).unwrap();
+        let descriptor = transfer_test_descriptor(payload_bytes, "transfer-client-error");
+        let expected_id = descriptor.transfer_id.clone();
+
+        let supervisor = tokio::spawn(async move {
+            let mut reserved = HashSet::new();
+            let mut current_attempt = None;
+            for expected in ["begin", "chunk", "abort"] {
+                let (mut stream, request) = accept_control_request(&listener).await;
+                assert_eq!(request.role, ControlRole::Web);
+                let (actual, result) = match request.body {
+                    freshell_runtime_protocol::AdminCommand::OpenCodeTransfer(
+                        OpenCodeTransferAction::Begin {
+                            descriptor,
+                            attempt_id,
+                        },
+                    ) => {
+                        assert_eq!(expected, "begin");
+                        reserved.insert(descriptor.transfer_id.clone());
+                        current_attempt = Some(attempt_id);
+                        (
+                            "begin",
+                            Ok(AdminResult::OpenCodeTransfer(
+                                OpenCodeTransferResult::Started {
+                                    next_sequence: 0,
+                                    file_offsets: vec![OpenCodeTransferFileOffset {
+                                        file_index: 0,
+                                        next_offset: 0,
+                                    }],
+                                },
+                            )),
+                        )
+                    }
+                    freshell_runtime_protocol::AdminCommand::OpenCodeTransfer(
+                        OpenCodeTransferAction::Chunk(chunk),
+                    ) => {
+                        assert_eq!(expected, "chunk");
+                        assert!(reserved.contains(&chunk.transfer_id));
+                        assert_eq!(current_attempt.as_ref(), Some(&chunk.attempt_id));
+                        (
+                            "chunk",
+                            Err(RuntimeError::new(
+                                RuntimeErrorCode::InvalidRequest,
+                                "synthetic chunk rejection",
+                            )),
+                        )
+                    }
+                    freshell_runtime_protocol::AdminCommand::OpenCodeTransfer(
+                        OpenCodeTransferAction::Abort {
+                            transfer_id,
+                            attempt_id,
+                        },
+                    ) => {
+                        assert_eq!(expected, "abort");
+                        assert_eq!(transfer_id, expected_id);
+                        assert_eq!(current_attempt.as_ref(), Some(&attempt_id));
+                        assert!(reserved.remove(&transfer_id));
+                        (
+                            "abort",
+                            Ok(AdminResult::OpenCodeTransfer(
+                                OpenCodeTransferResult::Aborted { transfer_id },
+                            )),
+                        )
+                    }
+                    other => panic!("unexpected transfer action: {other:?}"),
+                };
+                assert_eq!(actual, expected);
+                write_frame(
+                    &mut stream,
+                    &AdminReply {
+                        request_id: request.request_id,
+                        result,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            assert!(reserved.is_empty(), "abort should release staged quota");
+        });
+
+        let payload = TokioFile::open(payload_path).await.unwrap();
+        let result = stage_opencode_transfer_payload(&client, descriptor, payload).await;
+        assert!(result.is_err());
+        supervisor.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finalized_transfer_drop_before_launch_registration_sends_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let client = RuntimeClient::new(&socket, "0123456789abcdef");
+        let payload_bytes = b"synthetic-finalized-payload";
+        let payload_path = dir.path().join("payload.json");
+        std::fs::write(&payload_path, payload_bytes).unwrap();
+        let descriptor = transfer_test_descriptor(payload_bytes, "transfer-finalized-drop");
+        let expected_id = descriptor.transfer_id.clone();
+        let supervisor_expected_id = expected_id.clone();
+
+        let supervisor = tokio::spawn(async move {
+            let mut current_attempt = None;
+            let mut ready = false;
+            for expected in ["begin", "wait", "chunk", "finalize", "abort"] {
+                let (mut stream, request) = accept_control_request(&listener).await;
+                let (actual, result) = match request.body {
+                    freshell_runtime_protocol::AdminCommand::OpenCodeTransfer(
+                        OpenCodeTransferAction::Begin {
+                            descriptor,
+                            attempt_id,
+                        },
+                    ) => {
+                        assert_eq!(expected, "begin");
+                        assert_eq!(descriptor.transfer_id, supervisor_expected_id);
+                        current_attempt = Some(attempt_id);
+                        (
+                            "begin",
+                            Ok(AdminResult::OpenCodeTransfer(
+                                OpenCodeTransferResult::Queued {
+                                    transfer_id: descriptor.transfer_id,
+                                },
+                            )),
+                        )
+                    }
+                    freshell_runtime_protocol::AdminCommand::OpenCodeTransfer(
+                        OpenCodeTransferAction::WaitForCapacity {
+                            transfer_id,
+                            attempt_id,
+                        },
+                    ) => {
+                        assert_eq!(expected, "wait");
+                        assert_eq!(transfer_id, supervisor_expected_id);
+                        assert_eq!(current_attempt.as_ref(), Some(&attempt_id));
+                        (
+                            "wait",
+                            Ok(AdminResult::OpenCodeTransfer(
+                                OpenCodeTransferResult::Started {
+                                    next_sequence: 0,
+                                    file_offsets: vec![OpenCodeTransferFileOffset {
+                                        file_index: 0,
+                                        next_offset: 0,
+                                    }],
+                                },
+                            )),
+                        )
+                    }
+                    freshell_runtime_protocol::AdminCommand::OpenCodeTransfer(
+                        OpenCodeTransferAction::Chunk(chunk),
+                    ) => {
+                        assert_eq!(expected, "chunk");
+                        assert_eq!(chunk.transfer_id, supervisor_expected_id);
+                        assert_eq!(current_attempt.as_ref(), Some(&chunk.attempt_id));
+                        (
+                            "chunk",
+                            Ok(AdminResult::OpenCodeTransfer(
+                                OpenCodeTransferResult::ChunkStored {
+                                    sequence: chunk.sequence,
+                                },
+                            )),
+                        )
+                    }
+                    freshell_runtime_protocol::AdminCommand::OpenCodeTransfer(
+                        OpenCodeTransferAction::Finalize {
+                            transfer_id,
+                            attempt_id,
+                        },
+                    ) => {
+                        assert_eq!(expected, "finalize");
+                        assert_eq!(transfer_id, supervisor_expected_id);
+                        assert_eq!(current_attempt.as_ref(), Some(&attempt_id));
+                        ready = true;
+                        (
+                            "finalize",
+                            Ok(AdminResult::OpenCodeTransfer(
+                                OpenCodeTransferResult::Ready { transfer_id },
+                            )),
+                        )
+                    }
+                    freshell_runtime_protocol::AdminCommand::OpenCodeTransfer(
+                        OpenCodeTransferAction::Abort {
+                            transfer_id,
+                            attempt_id,
+                        },
+                    ) => {
+                        assert_eq!(expected, "abort");
+                        assert!(
+                            ready,
+                            "the pending launch owner must remain armed after finalize"
+                        );
+                        assert_eq!(transfer_id, supervisor_expected_id);
+                        assert_eq!(current_attempt.as_ref(), Some(&attempt_id));
+                        ready = false;
+                        (
+                            "abort",
+                            Ok(AdminResult::OpenCodeTransfer(
+                                OpenCodeTransferResult::Aborted { transfer_id },
+                            )),
+                        )
+                    }
+                    other => panic!("unexpected transfer action: {other:?}"),
+                };
+                assert_eq!(actual, expected);
+                write_frame(
+                    &mut stream,
+                    &AdminReply {
+                        request_id: request.request_id,
+                        result,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            assert!(
+                !ready,
+                "pre-registration abort should release the ready stage"
+            );
+        });
+
+        let payload = TokioFile::open(payload_path).await.unwrap();
+        let pending = stage_opencode_transfer_payload(&client, descriptor, payload)
+            .await
+            .unwrap();
+        assert_eq!(pending.descriptor.transfer_id, expected_id);
+        drop(pending); // Models a local launch preparation failure before registration.
+        tokio::time::timeout(std::time::Duration::from_secs(5), supervisor)
+            .await
+            .expect("dropping the pending owner should send a matching abort")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_connected_transfer_sends_supervisor_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let client = RuntimeClient::new(&socket, "0123456789abcdef");
+        let payload_bytes = b"synthetic-payload";
+        let payload_path = dir.path().join("payload.json");
+        std::fs::write(&payload_path, payload_bytes).unwrap();
+        let descriptor = transfer_test_descriptor(payload_bytes, "transfer-client-cancel");
+        let expected_id = descriptor.transfer_id.clone();
+        let (chunk_seen_tx, chunk_seen_rx) = tokio::sync::oneshot::channel();
+
+        let supervisor = tokio::spawn(async move {
+            let mut reserved = HashSet::new();
+            let (mut stream, begin) = accept_control_request(&listener).await;
+            let freshell_runtime_protocol::AdminCommand::OpenCodeTransfer(
+                OpenCodeTransferAction::Begin {
+                    descriptor,
+                    attempt_id,
+                },
+            ) = begin.body
+            else {
+                panic!("expected transfer begin");
+            };
+            reserved.insert(descriptor.transfer_id.clone());
+            let current_attempt = attempt_id;
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: begin.request_id,
+                    result: Ok(AdminResult::OpenCodeTransfer(
+                        OpenCodeTransferResult::Started {
+                            next_sequence: 0,
+                            file_offsets: vec![OpenCodeTransferFileOffset {
+                                file_index: 0,
+                                next_offset: 0,
+                            }],
+                        },
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+
+            let (_chunk_stream, chunk) = accept_control_request(&listener).await;
+            let freshell_runtime_protocol::AdminCommand::OpenCodeTransfer(
+                OpenCodeTransferAction::Chunk(chunk),
+            ) = chunk.body
+            else {
+                panic!("expected transfer chunk");
+            };
+            assert!(reserved.contains(&chunk.transfer_id));
+            assert_eq!(current_attempt, chunk.attempt_id);
+            chunk_seen_tx.send(()).unwrap();
+
+            let (mut stream, abort) = accept_control_request(&listener).await;
+            let freshell_runtime_protocol::AdminCommand::OpenCodeTransfer(
+                OpenCodeTransferAction::Abort {
+                    transfer_id,
+                    attempt_id,
+                },
+            ) = abort.body
+            else {
+                panic!("expected transfer abort after cancellation");
+            };
+            assert_eq!(transfer_id, expected_id);
+            assert_eq!(current_attempt, attempt_id);
+            assert!(reserved.remove(&transfer_id));
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: abort.request_id,
+                    result: Ok(AdminResult::OpenCodeTransfer(
+                        OpenCodeTransferResult::Aborted { transfer_id },
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(reserved.is_empty(), "abort should release staged quota");
+        });
+
+        let payload = TokioFile::open(payload_path).await.unwrap();
+        let transfer_client = client.clone();
+        let transfer = tokio::spawn(async move {
+            stage_opencode_transfer_payload(&transfer_client, descriptor, payload).await
+        });
+        chunk_seen_rx.await.unwrap();
+        transfer.abort();
+        assert!(transfer
+            .await
+            .err()
+            .is_some_and(|error| error.is_cancelled()));
+        tokio::time::timeout(std::time::Duration::from_secs(5), supervisor)
+            .await
+            .expect("supervisor should receive the cancellation abort")
+            .unwrap();
+    }
+
+    async fn accept_control_request(
+        listener: &UnixListener,
+    ) -> (
+        UnixStream,
+        Envelope<freshell_runtime_protocol::AdminCommand>,
+    ) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_frame(&mut stream).await.unwrap();
+        (stream, request)
+    }
+
+    fn transfer_test_descriptor(payload: &[u8], transfer_id: &str) -> OpenCodeTransferDescriptor {
+        let source_store_id = "b".repeat(64);
+        let source_generation = "e".repeat(64);
+        let source_schema_fingerprint = "c".repeat(64);
+        let migration_journal_fingerprint = "d".repeat(64);
+        let target_image_ref = format!("sha256:{}", "a".repeat(64));
+        let payload_sha256 = format!("{:x}", Sha256::digest(payload));
+        let files = vec![OpenCodeTransferFile {
+            index: 0,
+            relative_path: "payload.json".into(),
+            size_bytes: payload.len() as u64,
+            sha256: payload_sha256.clone(),
+        }];
+        let manifest_json = serde_json::json!({
+            "version": 1,
+            "provider_schema": "opencode-1.18.21",
+            "root_session_id": "ses_exact",
+            "source_store_id": source_store_id,
+            "source_schema_fingerprint": source_schema_fingerprint,
+            "migration_journal_fingerprint": migration_journal_fingerprint,
+            "generation": source_generation,
+            "assets": [],
+            "payload_bytes": payload.len(),
+            "payload_sha256": payload_sha256,
+            "rows": []
+        })
+        .to_string();
+        let descriptor = OpenCodeTransferDescriptor {
+            transfer_id: transfer_id.into(),
+            provider: "opencode".into(),
+            source_store_id,
+            root_session_id: "ses_exact".into(),
+            source_generation,
+            provider_schema: "opencode-1.18.21".into(),
+            source_schema_fingerprint,
+            migration_journal_fingerprint,
+            destination_store_id: "soul-test".into(),
+            destination_database_path: freshell_runtime_protocol::OPENCODE_TRANSFER_DESTINATION_DB
+                .into(),
+            target_build_receipt: freshell_runtime_protocol::opencode_target_build_receipt(
+                &target_image_ref,
+                "opencode-1.18.21",
+            ),
+            target_image_ref,
+            incarnation_id: "incarnation-test-transfer".into(),
+            bundle_sha256: freshell_runtime_protocol::opencode_transfer_bundle_digest(
+                &manifest_json,
+                &files,
+            ),
+            manifest_json,
+            files,
+            total_bytes: payload.len() as u64,
+        };
+        descriptor.validate().unwrap();
+        descriptor
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -1799,3 +3497,7 @@ mod opencode_replan_tests;
 #[cfg(all(test, unix))]
 #[path = "managed_launch_view_title_tests.rs"]
 mod launch_view_title_tests;
+
+#[cfg(all(test, unix))]
+#[path = "managed_input_rpc_tests.rs"]
+mod managed_input_rpc_tests;

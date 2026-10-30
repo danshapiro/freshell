@@ -1221,6 +1221,34 @@ impl OpencodeServeManager {
         dispatch_witnesses: &[std::sync::Arc<std::sync::atomic::AtomicBool>],
         timeout_override: Option<Duration>,
     ) -> Result<Value, ServeError> {
+        self.json_request_over_base_with_status(
+            method,
+            path,
+            body,
+            not_found_value,
+            base,
+            discard_on_timeout,
+            dispatch_witnesses,
+            timeout_override,
+        )
+        .await
+        .map(|(value, _)| value)
+    }
+
+    /// Status-preserving form used by callers that need to distinguish an empty
+    /// successful response from the documented 404-as-empty fallback.
+    #[allow(clippy::too_many_arguments)]
+    async fn json_request_over_base_with_status(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        body: Option<Value>,
+        not_found_value: Option<Value>,
+        base: String,
+        discard_on_timeout: DiscardOnTimeout,
+        dispatch_witnesses: &[std::sync::Arc<std::sync::atomic::AtomicBool>],
+        timeout_override: Option<Duration>,
+    ) -> Result<(Value, u16), ServeError> {
         let url = format!("{base}{path}");
         let timeout = timeout_override.unwrap_or_else(|| self.config().request_timeout);
         let method_str = format!("{method:?}").to_uppercase();
@@ -1278,7 +1306,7 @@ impl OpencodeServeManager {
         if !resp.ok() && resp.status != 204 {
             if resp.status == 404 {
                 if let Some(value) = not_found_value {
-                    return Ok(value);
+                    return Ok((value, resp.status));
                 }
             }
             return Err(ServeError::Http {
@@ -1289,9 +1317,10 @@ impl OpencodeServeManager {
             });
         }
         if resp.status == 204 {
-            return Ok(Value::Null);
+            return Ok((Value::Null, resp.status));
         }
-        resp.json()
+        let status = resp.status;
+        resp.json().map(|value| (value, status))
     }
 
     /// `createSession({title?, parentID?, directory?})` (`serve-manager.ts:337-346`).
@@ -1462,11 +1491,25 @@ impl OpencodeServeManager {
         route: &Route,
         base: &str,
     ) -> Result<Value, ServeError> {
+        self.list_messages_at_with_status(id, route, base)
+            .await
+            .map(|(messages, _)| messages)
+    }
+
+    /// `listMessages` with the native HTTP status preserved for safe
+    /// transcript-read diagnostics. The 404 fallback remains an empty array,
+    /// with status 404 distinguishing it from a successful empty page.
+    pub async fn list_messages_at_with_status(
+        &self,
+        id: &str,
+        route: &Route,
+        base: &str,
+    ) -> Result<(Value, u16), ServeError> {
         let path = with_route(
             &format!("/session/{}/message", encode_path_segment(id)),
             route,
         );
-        self.json_request_over_base(
+        self.json_request_over_base_with_status(
             HttpMethod::Get,
             &path,
             None,
@@ -2480,6 +2523,42 @@ mod tests {
         assert!(body.get("variant").is_none(), "empty effort omitted");
     }
 
+    #[tokio::test]
+    async fn list_messages_at_with_status_preserves_the_native_http_status() {
+        let http = Arc::new(RecordingHttp::new());
+        let manager = started_recording_manager(Arc::clone(&http)).await;
+
+        let (messages, status) = manager
+            .list_messages_at_with_status("ses_diagnostic", &None, "http://127.0.0.1:4312")
+            .await
+            .expect("the native message list succeeds");
+
+        assert_eq!(status, 200);
+        assert_eq!(messages, json!([]));
+        let request = http
+            .recorded()
+            .into_iter()
+            .find(|(_, url, _)| url.contains("/session/ses_diagnostic/message"))
+            .expect("the message read was dispatched");
+        assert_eq!(request.0, "GET");
+    }
+
+    #[tokio::test]
+    async fn list_messages_at_with_status_keeps_the_empty_fallback_marked_as_not_found() {
+        let mut response = RecordingHttp::new();
+        response.message_status = 404;
+        response.message_body = br#"{"error":"not found"}"#.to_vec();
+        let manager = started_recording_manager(Arc::new(response)).await;
+
+        let (messages, status) = manager
+            .list_messages_at_with_status("ses_missing_messages", &None, "http://127.0.0.1:4312")
+            .await
+            .expect("the documented 404 fallback is still a successful empty page");
+
+        assert_eq!(messages, json!([]));
+        assert_eq!(status, 404);
+    }
+
     // ── compact (POST /session/:id/summarize) + get_config (GET /config) ────────
 
     /// A `ServeHttp` fake that records every request (`METHOD url body?`) and scripts
@@ -2497,6 +2576,8 @@ mod tests {
         summarize_pending: bool,
         fork_status: u16,
         fork_body: Vec<u8>,
+        message_status: u16,
+        message_body: Vec<u8>,
         config_body: Vec<u8>,
         config_pending: bool,
         revert_status: u16,
@@ -2512,6 +2593,8 @@ mod tests {
                 summarize_pending: false,
                 fork_status: 200,
                 fork_body: br#"{"id":"ses_child","directory":"/tmp/x"}"#.to_vec(),
+                message_status: 200,
+                message_body: b"[]".to_vec(),
                 config_body: br#"{"model":null}"#.to_vec(),
                 config_pending: false,
                 revert_status: 200,
@@ -2555,6 +2638,11 @@ mod tests {
             ));
             if req.url.contains("/global/health") {
                 return Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) });
+            }
+            if req.url.contains("/message") {
+                let status = self.message_status;
+                let body = self.message_body.clone();
+                return Box::pin(async move { Ok(ServeHttpResponse::new(status, body)) });
             }
             if req.url.contains("/summarize") {
                 if self.summarize_pending {

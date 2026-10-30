@@ -181,9 +181,10 @@ export default function TabItem({
             ),
         isDragging && 'opacity-50'
       )}
-      role="button"
+      role="tab"
       tabIndex={0}
       aria-label={tab.title}
+      aria-selected={isActive}
       data-context={ContextIds.Tab}
       data-tab-id={tab.id}
       onClick={onClick}

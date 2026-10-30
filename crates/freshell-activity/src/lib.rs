@@ -41,12 +41,16 @@ pub mod signal;
 pub enum TrackerEffect<R> {
     /// `*.activity.updated` — `{ upsert, remove }`.
     Changed { upsert: Vec<R>, remove: Vec<String> },
-    /// `terminal.turn.complete` — one per real positive turn end.
+    /// `terminal.turn.complete` — one per recorded terminal turn end. Codex
+    /// may emit a same-sequence outcome update when another lane observed the
+    /// turn end before the proxy reported whether it completed or failed.
     TurnComplete {
         terminal_id: String,
         session_id: Option<String>,
         at: i64,
         completion_seq: i64,
+        outcome: Option<freshell_protocol::TerminalTurnOutcome>,
+        outcome_update: bool,
     },
     /// Amplifier only: force-read the events tail (missed-signal failsafe).
     ForceRead { terminal_id: String, at: i64 },

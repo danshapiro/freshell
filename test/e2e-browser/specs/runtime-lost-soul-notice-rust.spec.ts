@@ -8,13 +8,12 @@
  * a pane-local recovery decision for the lost conversation, and zero
  * foreign/credential access.
  */
-import fs from 'node:fs'
-import path from 'node:path'
 import { expect, type Page } from '@playwright/test'
 
 import { test } from '../helpers/fixtures.js'
 import {
-  ManagedRuntimeBrowserRig,
+  createManagedRuntimeBrowserRig,
+  type ManagedFixtureRig,
   P2_OPENCODE_MODEL,
   P2_OPENCODE_VERSION,
   type ManagedRuntimeView,
@@ -22,17 +21,6 @@ import {
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { TestHarness } from '../helpers/test-harness.js'
-import {
-  captureRuntimeReceiptCandidate,
-  sha256,
-} from '../../../scripts/testing/runtime-phase5-evidence-common.js'
-import {
-  buildPhase5LossReceipt,
-  PHASE5_CAPABILITY_INVENTORY_FILE,
-  PHASE5_LOSS_ASSERTIONS_FILE,
-  PHASE5_LOSS_INCIDENT_FILE,
-} from '../../../scripts/testing/runtime-phase5-loss-evidence.js'
-
 function leavesByMode(node: any, mode: string): any[] {
   if (!node) return []
   if (node.type === 'leaf') return node.content?.mode === mode ? [node] : []
@@ -123,7 +111,7 @@ async function waitForPaneOutput(
 }
 
 function waitForRunningView(
-  rig: ManagedRuntimeBrowserRig,
+  rig: ManagedFixtureRig,
   terminalId: string,
   timeoutMs: number,
 ): Promise<ManagedRuntimeView> {
@@ -133,74 +121,23 @@ function waitForRunningView(
   }, timeoutMs)
 }
 
-function dataOf(result: any, kind: string): any {
-  if (!result || result.kind !== kind) throw new Error(`expected ${kind}, got ${JSON.stringify(result)}`)
-  return result.data
-}
-
-function providerFileEvidence(rig: ManagedRuntimeBrowserRig, containerId: string, filePath: string): {
-  path: string
-  exists: boolean
-  sha256: string
-} {
-  const script = String.raw`
-const crypto = require('node:crypto');
-const fs = require('node:fs');
-const target = process.argv[1];
-let exists = false;
-let digest = crypto.createHash('sha256').update('absent').digest('hex');
-try {
-  const stat = fs.lstatSync(target);
-  exists = stat.isFile();
-  if (exists) digest = crypto.createHash('sha256').update(fs.readFileSync(target)).digest('hex');
-} catch (error) {
-  if (error.code !== 'ENOENT') throw error;
-}
-process.stdout.write(JSON.stringify({ path: target, exists, sha256: digest }));
-`
-  return JSON.parse(rig.ownedProviderExec(containerId, ['node', '-e', script, filePath]))
-}
-
-function exactAbsenceCheck(rig: ManagedRuntimeBrowserRig, containerId: string, target: string) {
-  const script = String.raw`
-const fs = require('node:fs');
-const target = process.argv[1];
-let state = 'absent';
-try { fs.lstatSync(target); state = 'present'; } catch (error) { if (error.code !== 'ENOENT') state = 'unknown'; }
-process.stdout.write(JSON.stringify({ path: target, state, probe: 'lstat' }));
-`
-  return JSON.parse(rig.ownedProviderExec(containerId, ['node', '-e', script, target]))
-}
-
-function writePrivateJson(filePath: string, value: unknown): void {
-  fs.writeFileSync(filePath, JSON.stringify(value, null, 2), { mode: 0o600 })
-  fs.chmodSync(filePath, 0o600)
-}
-
 test.describe.serial('Phase 5 certified provider loss', () => {
   test('P5-G02: real OpenCode loss persists incident before exact cleanup and shows the actionable pane path', async ({ page }) => {
     test.skip(process.env.FRESHELL_RUNTIME_PHASE5_LIVE !== '1', 'set FRESHELL_RUNTIME_PHASE5_LIVE=1 for the live loss receipt')
     test.setTimeout(1_200_000)
 
-    const candidateBefore = captureRuntimeReceiptCandidate(process.cwd())
-    const rig = new ManagedRuntimeBrowserRig(
+    const rig = createManagedRuntimeBrowserRig(
       process.cwd(),
       5,
       {},
       { FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '60000' },
     )
+    await rig.captureCandidateIntegrity()
     let receiptReady = false
     try {
       const info = await rig.start()
       const controlEpoch = await rig.controlEpoch()
-      const migration = dataOf(await rig.runtime.adminOk(
-        rig.supervisor,
-        rig.runtime.migrationPlanBody({
-          requestedMode: 'managed-opt-in',
-          apply: true,
-          expectedControlEpoch: controlEpoch,
-        }),
-      ), 'migration_plan')
+      const migration = await rig.applyManagedOptIn(controlEpoch)
       expect(migration.currentMode).toBe('managed-opt-in')
 
       await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
@@ -240,7 +177,7 @@ test.describe.serial('Phase 5 certified provider loss', () => {
       )
       const before = await waitForRunningView(rig, terminalId, 90_000)
       if (!before.containerId) throw new Error('OpenCode managed view lacks container identity')
-      expect(rig.ownedContainerExec(before.containerId, ['opencode', '--version']).trim()).toBe(P2_OPENCODE_VERSION)
+      expect((await rig.openCodeVersionFacts(rig.runtimeEnclosureHandle(before))).version).toBe(P2_OPENCODE_VERSION)
 
       const diagnostic = 'phase5-diagnostic-retained-no-credential'
       await executeInPane(
@@ -248,9 +185,7 @@ test.describe.serial('Phase 5 certified provider loss', () => {
         paneId,
         `Use the bash tool exactly once to run: printf '${diagnostic}\\n' > "$HOME/p5-diagnostic-only". Reply with exactly P5_STATE_READY when complete.`,
       )
-      await expect.poll(() => rig.ownedProviderExec(before.containerId!, [
-        'sh', '-lc', 'cat "$HOME/p5-diagnostic-only" 2>/dev/null || true',
-      ]).trim(), { timeout: 180_000 }).toBe(diagnostic)
+      await expect.poll(() => rig.lossDiagnosticRetained(rig.runtimeEnclosureHandle(before)), { timeout: 180_000 }).toBe(true)
       const providerSessionId = await waitForValue('native OpenCode session id', async () => {
         const content = leavesByMode(await harness.getPaneLayout(tabId), 'opencode')
           .find((candidate) => candidate.id === paneId)?.content
@@ -258,13 +193,12 @@ test.describe.serial('Phase 5 certified provider loss', () => {
       }, 120_000)
       expect(providerSessionId).toMatch(/^ses_/)
 
-      const runtimeDir = rig.runtime.runtimeDir(rig.supervisor, before.incarnationId)
-      const hostState = JSON.parse(fs.readFileSync(path.join(runtimeDir, 'host-state.json'), 'utf8'))
-      const workerPid = Number(hostState.workerPid)
+      const workerHandle = rig.exactRuntimeHandle({ ...before, nativeSessionId: providerSessionId })
+      const workerPid = (await rig.chaosHostFacts(workerHandle)).workerPid
       expect(workerPid).toBeGreaterThan(1)
 
       const credentialPath = '/home/freshell/provider/.local/share/opencode/auth.json'
-      const credentialBefore = providerFileEvidence(rig, before.containerId, credentialPath)
+      const credentialBefore = await rig.lossCredentialEvidence(rig.runtimeEnclosureHandle(before))
 
       // Retain only a diagnostic marker; remove OpenCode session DB/artifacts
       // and all Freshell checkpoint copies without reading or mutating host
@@ -289,45 +223,21 @@ test.describe.serial('Phase 5 certified provider loss', () => {
         observation.observer.observe(document.body, { childList: true, subtree: true })
         ;(window as any).__FRESHELL_PHASE5_NOTICE_OBSERVATION__ = observation
       })
-      rig.runtime.killOwnedRuntimePidExact(before.containerId, workerPid)
-      rig.ownedContainerExec(before.containerId, [
-        'node', '-e', String.raw`
-const fs = require('node:fs');
-for (const target of [
-  '/home/freshell/provider/.local/share/opencode/opencode.db',
-  '/home/freshell/provider/.local/share/opencode/opencode.db-wal',
-  '/home/freshell/provider/.local/share/opencode/opencode.db-shm',
-]) {
-  try { fs.unlinkSync(target); } catch (error) { if (error.code !== 'ENOENT') throw error; }
-}
-const checkpoints = '/home/freshell/provider/.freshell/checkpoints';
-try { fs.rmSync(checkpoints, { recursive: true }); } catch (error) { if (error.code !== 'ENOENT') throw error; }
-if (!fs.statSync('/home/freshell/provider/p5-diagnostic-only').isFile()) process.exit(2);
-`,
-      ])
-      const diagnosticOnlyRetained = rig.ownedProviderExec(before.containerId, [
-        'sh', '-lc', 'cat "$HOME/p5-diagnostic-only"',
-      ]).trim() === diagnostic
+      await rig.crashProviderWorker(workerHandle)
+      await rig.removeLossStorage(workerHandle)
+      const diagnosticOnlyRetained = await rig.lossDiagnosticRetained(rig.runtimeEnclosureHandle(before))
       expect(diagnosticOnlyRetained).toBe(true)
-      const credentialAfter = providerFileEvidence(rig, before.containerId, credentialPath)
+      const credentialAfter = await rig.lossCredentialEvidence(rig.runtimeEnclosureHandle(before))
       expect(credentialAfter).toEqual(credentialBefore)
-      const exactAbsenceChecks = [
-        '/home/freshell/provider/.local/share/opencode/opencode.db',
-        '/home/freshell/provider/.local/share/opencode/opencode.db-wal',
-        '/home/freshell/provider/.local/share/opencode/opencode.db-shm',
-        '/home/freshell/provider/.freshell/checkpoints',
-      ].map((target) => exactAbsenceCheck(rig, before.containerId!, target))
+      const exactAbsenceChecks = await rig.lossAbsenceEvidence(rig.runtimeEnclosureHandle(before))
       expect(exactAbsenceChecks.every((row) => row.state === 'absent')).toBe(true)
 
-      const result = dataOf(await rig.runtime.adminOk(
-        rig.supervisor,
-        rig.runtime.recoverBody(before.soulId, 'provider_exit', await rig.controlEpoch()),
-      ), 'recovery')
+      const result = await rig.recoverLoss(workerHandle)
       expect(result.outcome).toBe('lost')
       expect(result.incidentId).toMatch(/^incident-/)
       expect(result.view.cleanupState).toBe('verified_empty')
       expect(result.view.nativeSessionId).toBe(providerSessionId)
-      expect(rig.runtime.isContainerRunning(before.containerId)).toBe(false)
+      expect(await rig.lossContainerRunning(result.incidentId)).toBe(false)
 
       const ended = await waitForValue('ended managed pane projection', async () => {
         const state = await page.evaluate(() => (window as any).__FRESHELL_TEST__?.getState?.())
@@ -376,30 +286,15 @@ if (!fs.statSync('/home/freshell/provider/p5-diagnostic-only').isFile()) process
       })
       expect(routineNoticeCount).toBe(0)
 
-      const incident = dataOf(await rig.runtime.adminOk(
-        rig.supervisor,
-        rig.runtime.incidentSummaryBody(result.incidentId, await rig.controlEpoch()),
-      ), 'incident_summary')
-      const incidentPath = path.join('/var/lib/freshell-supervisor/incidents', `${result.incidentId}.closed.json`)
-      const incidentPersisted = rig.runtime.runCommand('docker', [
-        'exec', rig.supervisor.containerId, 'test', '-s', incidentPath,
-      ]) === ''
-      expect(incidentPersisted).toBe(true)
-      const artifact = rig.runtime.runCommand('docker', [
-        'exec', rig.supervisor.containerId, 'cat', incidentPath,
-      ])
-      expect(artifact).not.toContain(providerSessionId)
-      expect(artifact).not.toContain(rig.supervisor.controlSecret)
-
-      const incidentArtifact = JSON.parse(artifact)
+      const incidentArtifact = await rig.lossIncidentEvidence(result.incidentId)
+      expect(incidentArtifact.persisted).toBe(true)
+      expect(incidentArtifact.containsNativeSessionId).toBe(false)
+      expect(incidentArtifact.containsControlSecret).toBe(false)
       expect(incidentArtifact.certificateSha256).toMatch(/^[0-9a-f]{64}$/)
       expect(incidentArtifact.certificate.intentRevision).toBe(before.intentRevision)
       expect(result.view.intentRevision).toBe(before.intentRevision + 1)
-      writePrivateJson(path.join(rig.runtime.evidenceDir, PHASE5_LOSS_INCIDENT_FILE), incidentArtifact)
-      writePrivateJson(path.join(rig.runtime.evidenceDir, PHASE5_LOSS_ASSERTIONS_FILE), {
+      await rig.publishLossAssertions(result.incidentId, {
         schemaVersion: 2,
-        candidateSha: rig.runtime.candidateSha,
-        receiptRunId: rig.runtime.runId,
         caseId: 'P5-G02',
         test: { total: 1, passed: 1, failed: 0, skipped: 0 },
         identity: {
@@ -409,7 +304,7 @@ if (!fs.statSync('/home/freshell/provider/p5-diagnostic-only').isFile()) process
           soulId: before.soulId,
           incarnationId: before.incarnationId,
           containerId: before.containerId,
-          hostBootId: before.hostBootId,
+          hostBootId: workerHandle.hostBootId,
           nativeSessionIdHash: incidentArtifact.certificate.nativeSessionRefHash,
           incidentId: result.incidentId,
           paneId,
@@ -448,23 +343,8 @@ if (!fs.statSync('/home/freshell/provider/p5-diagnostic-only').isFile()) process
       expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
     }
     expect(receiptReady).toBe(true)
-    fs.copyFileSync(
-      path.join(rig.repoRoot, 'docs/development/runtime-provider-capabilities.json'),
-      path.join(rig.runtime.evidenceDir, PHASE5_CAPABILITY_INVENTORY_FILE),
-    )
-    fs.chmodSync(path.join(rig.runtime.evidenceDir, PHASE5_CAPABILITY_INVENTORY_FILE), 0o600)
-    const receipt = buildPhase5LossReceipt({
-      repoRoot: rig.repoRoot,
-      evidenceDir: rig.runtime.evidenceDir,
-      candidateSha: rig.runtime.candidateSha,
-      runtimeImage: rig.runtime.imageRef,
-      receiptRunId: rig.runtime.runId,
-      candidateBefore,
-      candidateAfter: captureRuntimeReceiptCandidate(rig.repoRoot),
-    })
-    const receiptPath = rig.writePhase5LossReceipt(receipt)
-    expect(sha256(fs.readFileSync(receiptPath))).toMatch(/^[0-9a-f]{64}$/)
-    // eslint-disable-next-line no-console
-    console.log(`[P5-G02] real OpenCode loss receipt: ${receiptPath}`)
+    const receipt = await rig.finalizeLossReceipt()
+    expect(receipt.artifactRef).toMatch(/^phase5-loss:[0-9a-f]{64}$/)
+    console.log(`[P5-G02] real OpenCode loss receipt: ${receipt.artifactRef}`)
   })
 })

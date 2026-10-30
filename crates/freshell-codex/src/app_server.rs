@@ -565,6 +565,17 @@ impl CodexAppServerClient {
         .await
     }
 
+    /// Read the newest complete native turn. Older turns stay in the existing
+    /// bounded native-history reader, while this preserves current tool output.
+    pub async fn read_recent_turn(&self, thread_id: &str) -> Result<Value, CodexAppServerError> {
+        self.request_with_timeout(
+            "thread/turns/list",
+            json!({"threadId":thread_id,"limit":1,"sortDirection":"desc","itemsView":"full"}),
+            self.read_timeout,
+        )
+        .await
+    }
+
     /// Unified agent names (Task 3): `thread/name/set` — set the native name
     /// of a thread this connection can address (loaded threads and persisted
     /// rollouts alike — the official API supports name/set for both, so an

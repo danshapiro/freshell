@@ -6,14 +6,17 @@
 
 use freshell_runtime_protocol::{
     write_frame, AcknowledgeViewProjectionRequest, AdminCommand, AdminReply, AdminResult,
-    ControlRole, Envelope, FreshAgentCapture, FreshAgentCaptureRequest, FreshAgentCompactRequest,
-    FreshAgentConfigureRequest, FreshAgentForkRequest, FreshAgentInterruptRequest,
-    FreshAgentReadEventsRequest, FreshAgentResolveRequest, FreshAgentRollbackDirection,
-    FreshAgentRollbackMode, FreshAgentRollbackRequest, FreshAgentSendRequest, IncidentId,
-    IncidentSummaryRequest, LaunchRequest, LossIncidentSummary, ManagedRolloutMode, MigrationPlan,
+    CanonicalOwnerChoice, ControlRole, Envelope, FreshAgentCapture, FreshAgentCaptureRequest,
+    FreshAgentCompactRequest, FreshAgentConfigureRequest, FreshAgentForkRequest,
+    FreshAgentInterruptRequest, FreshAgentProviderStartDiagnostic, FreshAgentReadEventsRequest,
+    FreshAgentResolveRequest, FreshAgentRollbackDirection, FreshAgentRollbackMode,
+    FreshAgentRollbackRequest, FreshAgentSendRequest, IncidentId, IncidentSummaryRequest,
+    LaunchRequest, LossIncidentSummary, LostSoulRepairTarget, ManagedRolloutMode, MigrationPlan,
     MigrationPlanRequest, NoticeDeliveryState, NoticeId, NoticeReceiptRequest,
+    OpenCodeTransferAction, OpenCodeTransferDescriptor, OpenCodeTransferResult,
     PendingNoticesRequest, PendingViewProjectionsRequest, RecoverRequest, RecoveryProbeRequest,
-    RecoveryTrigger, RepairAudit, RepairRequest, RequestId, RuntimeError, RuntimeErrorCode,
+    RecoveryTrigger, RepairAudit, RepairRequest, RequestId, RestoreLostSoulsRequest,
+    RestoreLostSoulsResult, RuntimeDiagnosticCode, RuntimeError, RuntimeErrorCode,
     RuntimeInventorySnapshot, RuntimeMetricsRequest, RuntimeMetricsSnapshot, RuntimeNotice,
     RuntimeView, SoulId, StopOutcome, StopRequest, TerminalInputRequest, TerminalReadOutputRequest,
     TerminalResizeRequest, UpdateLimitsRequest, UpdateLimitsResult, UpdateViewVisibilityRequest,
@@ -28,8 +31,13 @@ pub enum ClientError {
     Io(#[from] std::io::Error),
     #[error("runtime supervisor protocol failed: {0}")]
     Protocol(String),
-    #[error("runtime supervisor rejected request: {0:?}: {1}")]
-    Runtime(RuntimeErrorCode, String),
+    #[error("runtime supervisor rejected request: {code:?}: {message}")]
+    Runtime {
+        code: RuntimeErrorCode,
+        message: String,
+        diagnostic_code: Option<RuntimeDiagnosticCode>,
+        fresh_agent_provider_start_diagnostic: Option<FreshAgentProviderStartDiagnostic>,
+    },
     #[error("runtime supervisor returned an unexpected result")]
     UnexpectedResult,
 }
@@ -37,10 +45,59 @@ pub enum ClientError {
 impl ClientError {
     pub fn runtime_code(&self) -> Option<RuntimeErrorCode> {
         match self {
-            Self::Runtime(code, _) => Some(*code),
+            Self::Runtime { code, .. } => Some(*code),
             _ => None,
         }
     }
+
+    pub fn diagnostic_code(&self) -> Option<RuntimeDiagnosticCode> {
+        match self {
+            Self::Runtime {
+                diagnostic_code, ..
+            } => *diagnostic_code,
+            _ => None,
+        }
+    }
+
+    pub fn fresh_agent_provider_start_diagnostic(
+        &self,
+    ) -> Option<FreshAgentProviderStartDiagnostic> {
+        match self {
+            Self::Runtime {
+                fresh_agent_provider_start_diagnostic,
+                ..
+            } => *fresh_agent_provider_start_diagnostic,
+            _ => None,
+        }
+    }
+}
+
+fn validate_stopped_repair_reply(
+    operation: &RequestId,
+    request: &RestoreLostSoulsRequest,
+    result: RestoreLostSoulsResult,
+) -> Result<RestoreLostSoulsResult, ClientError> {
+    let roots = result
+        .roots
+        .iter()
+        .map(|root| root.root_session_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let selected = request
+        .source
+        .root_session_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    if result.operation_id != *operation
+        || result.scope_id != request.scope_id
+        || result.total_target_count as usize != request.targets.len()
+        || result.repaired_target_count > result.total_target_count
+        || roots.len() != result.roots.len()
+        || roots != selected
+    {
+        return Err(ClientError::UnexpectedResult);
+    }
+    Ok(result)
 }
 
 #[derive(Clone)]
@@ -173,6 +230,119 @@ impl RuntimeClient {
             return Ok(epoch);
         }
         self.health().await.map(|(epoch, _)| epoch)
+    }
+
+    pub async fn opencode_transfer_target(&self) -> Result<(String, String, String), ClientError> {
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::OpenCodeTransfer(OpenCodeTransferAction::TargetInfo),
+            )
+            .await?
+        {
+            AdminResult::OpenCodeTransfer(OpenCodeTransferResult::TargetInfo {
+                image_ref,
+                provider_schema,
+                build_receipt,
+            }) => Ok((image_ref, provider_schema, build_receipt)),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
+    pub async fn opencode_transfer_begin(
+        &self,
+        descriptor: OpenCodeTransferDescriptor,
+        attempt_id: String,
+    ) -> Result<OpenCodeTransferResult, ClientError> {
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::OpenCodeTransfer(OpenCodeTransferAction::Begin {
+                    descriptor: Box::new(descriptor),
+                    attempt_id,
+                }),
+            )
+            .await?
+        {
+            AdminResult::OpenCodeTransfer(result) => Ok(result),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
+    pub async fn opencode_transfer_wait_for_capacity(
+        &self,
+        transfer_id: String,
+        attempt_id: String,
+    ) -> Result<OpenCodeTransferResult, ClientError> {
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::OpenCodeTransfer(OpenCodeTransferAction::WaitForCapacity {
+                    transfer_id,
+                    attempt_id,
+                }),
+            )
+            .await?
+        {
+            AdminResult::OpenCodeTransfer(result) => Ok(result),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
+    pub async fn opencode_transfer_chunk(
+        &self,
+        chunk: freshell_runtime_protocol::OpenCodeTransferChunk,
+    ) -> Result<OpenCodeTransferResult, ClientError> {
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::OpenCodeTransfer(OpenCodeTransferAction::Chunk(chunk)),
+            )
+            .await?
+        {
+            AdminResult::OpenCodeTransfer(result) => Ok(result),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
+    pub async fn opencode_transfer_finalize(
+        &self,
+        transfer_id: String,
+        attempt_id: String,
+    ) -> Result<OpenCodeTransferResult, ClientError> {
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::OpenCodeTransfer(OpenCodeTransferAction::Finalize {
+                    transfer_id,
+                    attempt_id,
+                }),
+            )
+            .await?
+        {
+            AdminResult::OpenCodeTransfer(result) => Ok(result),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
+    pub async fn opencode_transfer_abort(
+        &self,
+        transfer_id: String,
+        attempt_id: String,
+    ) -> Result<OpenCodeTransferResult, ClientError> {
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::OpenCodeTransfer(OpenCodeTransferAction::Abort {
+                    transfer_id,
+                    attempt_id,
+                }),
+            )
+            .await?
+        {
+            AdminResult::OpenCodeTransfer(result) => Ok(result),
+            _ => Err(ClientError::UnexpectedResult),
+        }
     }
 
     pub async fn inventory(
@@ -496,6 +666,86 @@ impl RuntimeClient {
             }
             Ok(_) => Err(ClientError::UnexpectedResult),
             Err(error) => Err(error),
+        }
+    }
+
+    pub async fn restore_lost_souls(
+        &self,
+        request_id: RequestId,
+        scope_id: String,
+        source: freshell_runtime_protocol::RepairBatchSourceSelection,
+        targets: Vec<LostSoulRepairTarget>,
+        canonical_owners: Vec<CanonicalOwnerChoice>,
+    ) -> Result<RestoreLostSoulsResult, ClientError> {
+        let mut request = RestoreLostSoulsRequest {
+            scope_id,
+            source,
+            targets,
+            canonical_owners,
+            expected_control_epoch: Some(self.current_epoch().await?),
+        };
+        request
+            .validate_payload()
+            .map_err(|error| ClientError::Runtime {
+                code: RuntimeErrorCode::InvalidRequest,
+                message: error.message,
+                diagnostic_code: None,
+                fresh_agent_provider_start_diagnostic: None,
+            })?;
+        let original = request.clone();
+        match self
+            .request(request_id.clone(), AdminCommand::RestoreLostSouls(request))
+            .await
+        {
+            Ok(AdminResult::RestoreLostSouls(result)) => {
+                validate_stopped_repair_reply(&request_id, &original, result)
+            }
+            Err(error) if error.runtime_code() == Some(RuntimeErrorCode::StaleControlEpoch) => {
+                request = original;
+                request.expected_control_epoch = Some(self.health().await?.0);
+                match self
+                    .request(
+                        request_id.clone(),
+                        AdminCommand::RestoreLostSouls(request.clone()),
+                    )
+                    .await?
+                {
+                    AdminResult::RestoreLostSouls(result) => {
+                        validate_stopped_repair_reply(&request_id, &request, result)
+                    }
+                    _ => Err(ClientError::UnexpectedResult),
+                }
+            }
+            Ok(_) => Err(ClientError::UnexpectedResult),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn preflight_lost_souls(
+        &self,
+        source: freshell_runtime_protocol::RepairBatchSourceSelection,
+    ) -> Result<freshell_runtime_protocol::RepairBatchScope, ClientError> {
+        self.preflight_lost_souls_at_epoch(source, None).await
+    }
+
+    pub async fn preflight_lost_souls_at_epoch(
+        &self,
+        source: freshell_runtime_protocol::RepairBatchSourceSelection,
+        expected_control_epoch: Option<u64>,
+    ) -> Result<freshell_runtime_protocol::RepairBatchScope, ClientError> {
+        let request = freshell_runtime_protocol::PreflightLostSoulsRequest {
+            source,
+            expected_control_epoch: Some(match expected_control_epoch {
+                Some(epoch) => epoch,
+                None => self.current_epoch().await?,
+            }),
+        };
+        match self
+            .request(RequestId::new(), AdminCommand::PreflightLostSouls(request))
+            .await?
+        {
+            AdminResult::PreflightLostSouls(scope) => Ok(scope),
+            _ => Err(ClientError::UnexpectedResult),
         }
     }
 
@@ -931,6 +1181,27 @@ impl RuntimeClient {
         }
     }
 
+    pub async fn fresh_agent_prepare_native(&self, soul_id: SoulId) -> Result<(), ClientError> {
+        let epoch = self.current_epoch().await?;
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::FreshAgentPrepareNative(FreshAgentInterruptRequest {
+                    soul_id,
+                    expected_control_epoch: Some(epoch),
+                }),
+            )
+            .await?
+        {
+            AdminResult::FreshAgentCommand {
+                state:
+                    freshell_runtime_protocol::CommandState::Completed
+                    | freshell_runtime_protocol::CommandState::ProviderAcked,
+            } => Ok(()),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
     pub async fn fresh_agent_events(
         &self,
         soul_id: SoulId,
@@ -1170,7 +1441,12 @@ impl RuntimeClient {
 }
 
 fn runtime_error(error: RuntimeError) -> ClientError {
-    ClientError::Runtime(error.code, error.message)
+    ClientError::Runtime {
+        code: error.code,
+        message: error.message,
+        diagnostic_code: error.diagnostic_code,
+        fresh_agent_provider_start_diagnostic: error.fresh_agent_provider_start_diagnostic,
+    }
 }
 
 #[cfg(test)]
@@ -1180,6 +1456,143 @@ mod tests {
         read_frame, write_frame, AdminReply, AdminResult, InstallationId,
     };
     use tokio::net::UnixListener;
+
+    #[test]
+    fn client_error_preserves_typed_provider_start_diagnostics() {
+        let error = runtime_error(
+            RuntimeError::new(RuntimeErrorCode::HostUnreachable, "private provider detail")
+                .with_diagnostic_code(RuntimeDiagnosticCode::FreshAgentProviderStartFailed)
+                .with_fresh_agent_provider_start_diagnostic(
+                    FreshAgentProviderStartDiagnostic::Authentication,
+                ),
+        );
+
+        assert_eq!(
+            error.runtime_code(),
+            Some(RuntimeErrorCode::HostUnreachable)
+        );
+        assert_eq!(
+            error.diagnostic_code(),
+            Some(RuntimeDiagnosticCode::FreshAgentProviderStartFailed)
+        );
+        assert_eq!(
+            error.fresh_agent_provider_start_diagnostic(),
+            Some(FreshAgentProviderStartDiagnostic::Authentication)
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_souls_scoped_reply_uses_existing_epoch_retry_and_rejects_substitution() {
+        use freshell_runtime_protocol::{
+            RepairBatchSourceSelection, RestoreLostSoulRootResult, RootRepairImportStatus,
+            SoulRepairStatus,
+        };
+        for wrong_scope in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("scoped.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let operation = RequestId::new();
+            let scope_id = "a".repeat(64);
+            let roots = (0..7)
+                .map(|index| format!("ses_fixture_{index}"))
+                .collect::<Vec<_>>();
+            let targets = (0..9)
+                .map(|_| LostSoulRepairTarget {
+                    soul_id: SoulId::new(),
+                    incident_id: IncidentId::new(),
+                    expected_intent_revision: 2,
+                })
+                .collect::<Vec<_>>();
+            let expected = RestoreLostSoulsResult {
+                operation_id: operation.clone(),
+                scope_id: if wrong_scope {
+                    "b".repeat(64)
+                } else {
+                    scope_id.clone()
+                },
+                status: SoulRepairStatus::Complete,
+                repaired_target_count: 9,
+                total_target_count: 9,
+                roots: roots
+                    .iter()
+                    .enumerate()
+                    .map(|(index, root)| RestoreLostSoulRootResult {
+                        root_session_id: root.clone(),
+                        canonical_soul_id: Some(targets[index].soul_id.clone()),
+                        import_status: RootRepairImportStatus::Complete,
+                        intent_revision: Some(2),
+                        native_import_revision: Some(1),
+                        owner_candidates: vec![],
+                        reason_code: None,
+                    })
+                    .collect(),
+            };
+            let sent = expected.clone();
+            let server = tokio::spawn(async move {
+                let mut attempts = Vec::new();
+                for index in 0..3 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let envelope: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+                    let result = if index == 1 {
+                        assert!(matches!(envelope.body, AdminCommand::Health));
+                        Ok(AdminResult::Health {
+                            control_epoch: 3,
+                            installation_id: InstallationId::new(),
+                        })
+                    } else {
+                        let AdminCommand::RestoreLostSouls(request) = envelope.body else {
+                            panic!("expected scoped restore")
+                        };
+                        attempts.push((envelope.request_id.clone(), request));
+                        if index == 0 {
+                            Err(RuntimeError::new(
+                                RuntimeErrorCode::StaleControlEpoch,
+                                "epoch changed",
+                            ))
+                        } else {
+                            Ok(AdminResult::RestoreLostSouls(sent.clone()))
+                        }
+                    };
+                    write_frame(
+                        &mut stream,
+                        &AdminReply {
+                            request_id: envelope.request_id,
+                            result,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                assert_eq!(attempts[0].0, attempts[1].0);
+                let mut first = attempts[0].1.clone();
+                first.expected_control_epoch = Some(3);
+                assert_eq!(first, attempts[1].1);
+            });
+            let client = RuntimeClient::new(&socket, "0123456789abcdef");
+            *client.control_epoch.write().await = Some(1);
+            let result = client
+                .restore_lost_souls(
+                    operation,
+                    scope_id,
+                    RepairBatchSourceSelection {
+                        source_store_id: "c".repeat(64),
+                        root_session_ids: roots,
+                    },
+                    targets,
+                    vec![],
+                )
+                .await;
+            server.await.unwrap();
+            if wrong_scope {
+                assert!(
+                    matches!(result, Err(ClientError::UnexpectedResult)),
+                    "a typed accepted reply cannot substitute another inspected scope"
+                );
+            } else {
+                assert_eq!(result.unwrap(), expected);
+            }
+        }
+    }
 
     #[derive(Clone, Copy, Debug)]
     enum FreshAgentReadKind {
@@ -1463,7 +1876,7 @@ mod tests {
             assert_refreshed_read(kind, &requests);
             assert_eq!(cached, Some(2));
             assert!(
-                matches!(actual, Err(ClientError::Runtime(RuntimeErrorCode::StaleControlEpoch, message)) if message == "changed again")
+                matches!(actual, Err(ClientError::Runtime { code: RuntimeErrorCode::StaleControlEpoch, message, .. }) if message == "changed again")
             );
         }
     }
@@ -1482,7 +1895,7 @@ mod tests {
                 .await;
                 assert_cached_read(kind, &requests, cached);
                 assert!(
-                    matches!(actual, Err(ClientError::Runtime(actual_code, message)) if actual_code == code && message == "original refusal")
+                    matches!(actual, Err(ClientError::Runtime { code: actual_code, message, .. }) if actual_code == code && message == "original refusal")
                 );
             }
         }
@@ -1510,7 +1923,7 @@ mod tests {
             assert!(matches!(requests[1].body, AdminCommand::Health));
             assert_eq!(cached, Some(1));
             assert!(
-                matches!(actual, Err(ClientError::Runtime(RuntimeErrorCode::UnauthorizedRole, message)) if message == "health refused")
+                matches!(actual, Err(ClientError::Runtime { code: RuntimeErrorCode::UnauthorizedRole, message, .. }) if message == "health refused")
             );
         }
     }

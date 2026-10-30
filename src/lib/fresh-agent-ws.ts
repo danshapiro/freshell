@@ -523,10 +523,14 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         log.warn('dropping malformed freshAgent.turn.complete without a numeric at', { sessionId, at: event.at })
         return true
       }
+      const outcome = event.outcome === 'completed' || event.outcome === 'failed'
+        ? event.outcome
+        : undefined
       dispatch(applyFreshAgentCompletion({
         provider: locator.provider,
         sessionId,
         at: event.at,
+        ...(outcome ? { outcome } : {}),
       }))
       return true
     }

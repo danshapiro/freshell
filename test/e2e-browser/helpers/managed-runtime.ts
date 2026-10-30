@@ -1,585 +1,258 @@
-import { execFileSync } from 'node:child_process'
-import fs from 'node:fs'
-import fsp from 'node:fs/promises'
-import os from 'node:os'
-import path from 'node:path'
-
-import { defaultReceiptFileName } from '../../../scripts/testing/runtime-receipts.js'
-import {
-  buildProviderQualificationReceipt,
-  type ProviderQualificationReceiptV2,
-  type ProviderQualificationRow,
-} from '../../../scripts/testing/provider-qualification-receipt.js'
-import { RuntimeHarness, type RuntimeFixtureInputs, type SupervisorInstance } from '../../../scripts/testing/runtime-sandbox.js'
-import { preparedRuntimeBinary } from '../../../scripts/testing/runtime-build-preflight.js'
+import { ManagedRuntimeOwner, requireOpenCodeOnecliBootstrap } from '../../../scripts/testing/runtime-sandbox.js'
 import { RustServer } from './rust-server.js'
-import type { E2eServerInfo as TestServerInfo } from './server-fixture-support.js'
-import type { QualifiableTerminalProvider } from '../../../scripts/testing/provider-qualification-selection.js'
-import {
-  buildFreshAgentQualificationReceipt,
-  type FreshAgentQualificationReceiptV1,
-  type FreshAgentQualificationRow,
-} from '../../../scripts/testing/fresh-agent-qualification-receipt.js'
+import type { E2eServerInfo } from './server-fixture-support.js'
+import { resolveManagedExternalDescriptor, type ManagedHistoryWindowFacts, type ManagedHistoryWindowStage } from '../../../scripts/testing/runtime-external-browser.js'
+import { ExternalManagedRuntimeRig } from './external-managed-runtime.js'
+import { expect, type Page } from '@playwright/test'
+import { executeAction } from '../../../tools/freshell-mcp/freshell-tool.js'
+import { resolveCanonicalAction } from '../../../tools/node-client-runtime/action-capabilities.js'
 
-export const P2_OPENCODE_VERSION = '1.18.21'
-export const P2_OPENCODE_MODEL = 'openai/gpt-5.6-luna'
-
-export type ManagedEnvironmentInputs = RuntimeFixtureInputs & { defaultCwd: string }
-
-export type ManagedRuntimeView = {
-  soulId: string
-  incarnationId: string
-  launchState: string
-  cleanupState?: string
-  intentRevision: number
-  executionGeneration?: number
-  effectiveLimits?: {
-    cpuMilli: number
-    memoryBytes: number
-    swapBytes: number
-    pidsMax: number
+/** Observe the real MCP client's create transport; callers retain native alias checks. */
+export async function observeFreshMcpIngress(action: string, params: Record<string, unknown>, invoke = executeAction) {
+  const prior = globalThis.fetch
+  const requests: any[] = []
+  const dataOf = (result: any): any => result?.data?.data ?? result?.data ?? result
+  const hasPaneId = (result: any): boolean => typeof result?.paneId === 'string' && result.paneId.trim().length > 0
+  let result: any
+  let invocationFailed = false
+  globalThis.fetch = async (input, init) => {
+    const response = await prior(input, init)
+    const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url)
+    if (init?.method === 'POST' && /^\/api\/(?:tabs|panes\/[^/]+\/split)$/.test(url.pathname)) {
+      const observation = { request: { method: init.method, path: url.pathname, body: JSON.parse(String(init.body)) },
+        reply: undefined as any, httpOk: response.ok, status: 'absent', errorPresent: false }
+      requests.push(observation)
+      const envelope = await response.clone().json()
+      observation.reply = dataOf(envelope)
+      observation.status = envelope?.status === undefined ? 'absent'
+        : envelope.status === 'ok' || envelope.status === 'error' ? envelope.status : 'other'
+      observation.errorPresent = Boolean(envelope?.error || observation.reply?.error)
+    }
+    return response
   }
-  desiredState?: string
-  recoveryState?: string
-  durabilityState?: string
-  allocationState?: string
-  containerId?: string
-  hostBootId?: string
-  terminalId?: string
-  terminalStreamId?: string
-  terminalMode?: string
-  terminalCwd?: string
-  terminalCreateRequestId?: string
-  terminalResumeSessionId?: string
-  freshAgentSessionId?: string
-  freshAgentSessionType?: string
-  freshAgentRuntimeVariant?: string
-  projectKey?: string
-  profile?: string
-  provider?: string
-  nativeSessionId?: string
-  recoveryReason?: string
-  priorIncarnationId?: string
-  recoveryAttemptId?: string
-  evidenceRevision?: number
-  successfulRecoveriesInWindow?: number
+  try {
+    try { result = dataOf(await invoke(action, params)) } catch { invocationFailed = true }
+    const observed = requests[0]
+    const errorPresent = invocationFailed || Boolean(result?.error) || requests.some(row => row.errorPresent)
+    if (requests.length !== 1 || !hasPaneId(result) || errorPresent || !observed?.httpOk
+      || !['ok', 'absent'].includes(observed.status) || !hasPaneId(observed.reply) || observed.reply.paneId !== result.paneId) {
+      // Log only finite transport facts: provider errors and input bodies can contain secrets.
+      throw new Error('actual MCP request/reply was not observed: ' + JSON.stringify({
+        action: resolveCanonicalAction(action) ?? 'unknown', requestCount: requests.length,
+        paneIdPresent: hasPaneId(result), errorPresent, status: observed?.status ?? 'absent',
+      }))
+    }
+    return { request: observed.request, reply: observed.reply }
+  } finally { globalThis.fetch = prior }
 }
 
-/**
- * Owned managed-runtime browser rig: restricted Docker broker + supervisor +
- * a feature-enabled Rust web server. Web restart methods touch only the web
- * process; dynamic session-host containers are outside its process tree and
- * remain owned by the supervisor/harness receipts.
- */
-export class ManagedRuntimeBrowserRig {
-  readonly repoRoot: string
-  readonly runtime: RuntimeHarness
-  supervisor!: SupervisorInstance
-  web!: RustServer
-  info!: TestServerInfo
-  private serverBin = ''
-  private readonly serverEnv: Record<string, string>
-  private readonly webHomeDir: string | undefined
-  private readonly resolvedOperatorHome: string | undefined
-  private readonly supervisorEnv: Record<string, string>
-  private readonly supervisorBinaryKind: 'test' | 'release'
-  private readonly enabledProviders: string[]
-  private readonly providerSettings: Record<string, Record<string, unknown>>
-  private readonly freshAgentModes: string[]
-  private readonly fixtureFreshAgentModes: string[]
-  private readonly defaultCwd: string
-  private qualificationSupervisorBin: string | undefined
+/** Runs inside the browser; indexed rows and diagnostics describe one state read. */
+export function observeManagedHistoryWindow({ provider, nativeSessionId }: { provider: string; nativeSessionId: string }) {
+  const sessions = window.__FRESHELL_TEST_HARNESS__?.getState().sessions
+  const history = sessions?.windows?.history
+  const projects = history?.projects ?? []
+  const indexed = projects.flatMap(project => project.sessions
+    .filter(session => session.provider === provider && session.sessionId === nativeSessionId)
+    .map(session => ({ projectPath: project.projectPath, cwd: session.cwd, checkoutPath: session.checkoutPath })))
+  const count = (groups: typeof projects | undefined) => groups?.reduce((total, project) => total + project.sessions
+    .filter(session => session.provider === provider && session.sessionId === nativeSessionId).length, 0)
+  if (!history) return { indexed, facts: { available: false, exactIdentityCount: indexed.length,
+    sidebarExactIdentityCount: count(sessions?.windows?.sidebar?.projects), topLevelExactIdentityCount: count(sessions?.projects) } as ManagedHistoryWindowFacts }
+  const tier = (value: string | undefined): 'absent' | 'title' | 'other' => value === undefined ? 'absent' : value === 'title' ? 'title' : 'other'
+  const facts: ManagedHistoryWindowFacts = { available: Boolean(history), exactIdentityCount: indexed.length,
+    resultVersion: typeof history?.resultVersion === 'number' && Number.isSafeInteger(history.resultVersion) && history.resultVersion >= 0
+      ? history.resultVersion : undefined,
+    lastLoadedAtPresent: typeof history?.lastLoadedAt === 'number', loading: history?.loading,
+    loadingKind: history?.loadingKind === undefined ? 'absent'
+      : ['initial', 'search', 'background', 'pagination'].includes(history.loadingKind) ? history.loadingKind : 'other',
+    errorPresent: Boolean(history?.error), requestedQueryEmpty: !(history?.query ?? '').trim(), appliedQueryEmpty: !(history?.appliedQuery ?? '').trim(),
+    requestedTier: tier(history?.searchTier), appliedTier: tier(history?.appliedSearchTier), partial: history?.partial,
+    integrity: !history ? 'unknown' : !history.integrityError ? 'none' : history.integrityError.kind === 'identity_collision' ? 'identity_collision' : 'other',
+    activeSurface: sessions?.activeSurface === undefined ? 'absent' : sessions.activeSurface === 'history' ? 'history' : sessions.activeSurface === 'sidebar' ? 'sidebar' : 'other',
+    sidebarExactIdentityCount: count(sessions?.windows?.sidebar?.projects), topLevelExactIdentityCount: count(sessions?.projects) }
+  return { indexed, facts }
+}
 
-  constructor(
-    repoRoot = process.cwd(),
-    phase: 2 | 3 | 4 | 5 = 2,
-    serverEnv: Record<string, string> = {},
-    supervisorEnv: Record<string, string> = {},
-    supervisorBinaryKind: 'test' | 'release' = 'test',
-    qualificationProviders: {
-      enabledProviders: string[]
-      providerSettings?: Record<string, Record<string, unknown>>
-      freshAgentModes?: string[]
-      fixtureFreshAgentModes?: string[]
-    } = { enabledProviders: ['opencode'] },
-    webHomeDir?: string,
-    fixtureInputs?: ManagedEnvironmentInputs,
-    /**
-     * Operator home for the managed-runtime supervisor: passed to the
-     * supervisor as `--operator-home`, so every terminal/fresh-agent soul
-     * receives the home as a read-only same-path bind with tmpfs masks over
-     * the operator's secret directories. Doubles as the web server's HOME
-     * unless webHomeDir is given (the server stages the user-provider root
-     * from it at pane creation). A relative name places the home under the
-     * harness testRoot — the only root the supervisor container can see;
-     * an absolute path must already be visible inside the supervisor
-     * container.
-     */
-    operatorHome?: string,
-  ) {
-    this.repoRoot = fs.realpathSync(repoRoot)
-    this.runtime = new RuntimeHarness(this.repoRoot, undefined, phase, webHomeDir, serverEnv.XDG_CONFIG_HOME, fixtureInputs)
-    this.defaultCwd = fixtureInputs?.defaultCwd ?? this.repoRoot
-    if (fixtureInputs && !fixtureInputs.workspaceRoots.includes(this.defaultCwd)) {
-      throw new Error('managed environment default cwd must be an explicitly selected workspace')
+export interface ManagedHistoryWindowObservation {
+  begin(deadline: number): void
+  captureWindow(stage: ManagedHistoryWindowStage, read: () => Promise<ManagedHistoryWindowFacts>): void
+  window(stage: ManagedHistoryWindowStage, facts: ManagedHistoryWindowFacts): void
+}
+
+/** Open the indexed native session through the actual Projects history UI. */
+export async function openFreshHistorySession(page: Page, identity: {
+  repoRoot: string; provider: string; nativeSessionId: string
+}, observation?: ManagedHistoryWindowObservation): Promise<void> {
+  const deadline = Date.now() + 60_000
+  const capture = (stage: ManagedHistoryWindowStage) => {
+    try { observation?.captureWindow(stage, async () => (await page.evaluate(observeManagedHistoryWindow, identity)).facts) } catch { /* diagnostics preserve the original action */ }
+  }
+  try { observation?.begin(deadline) } catch { /* diagnostic setup cannot replace an assertion */ }
+  const remaining = () => {
+    const timeout = deadline - Date.now()
+    if (timeout <= 0) throw new Error('history opening deadline expired')
+    return timeout
+  }
+  try {
+    capture('before-projects')
+    await page.getByRole('button', { name: /^Projects/ }).click({ timeout: remaining() })
+    const refresh = page.getByRole('button', { name: 'Refresh sessions', exact: true })
+    capture('before-refresh')
+    await refresh.click({ timeout: remaining() })
+    // Wait for refresh to finish before looking for the exact history row;
+    // a visible Sidebar row cannot stand in for indexed history.
+    await expect(refresh).toBeEnabled({ timeout: remaining() })
+    // The actual indexed row owns its project group. A linked checkout can
+    // group under its common repository while retaining a different cwd.
+    const { indexed, facts } = await page.evaluate(observeManagedHistoryWindow, identity)
+    try { observation?.window('indexed', facts) } catch { /* keep the exact indexed assertion */ }
+    expect(indexed, 'exact provider/native root must have one indexed History group').toHaveLength(1)
+    const checkout = indexed[0].checkoutPath ?? indexed[0].cwd
+    if (checkout) expect(checkout, 'indexed host checkout must match the owned launch').toBe(identity.repoRoot)
+    const project = page.locator('[data-context="history-project"][data-project-path=' + JSON.stringify(indexed[0].projectPath) + ']')
+    await expect(project).toBeVisible({ timeout: remaining() })
+    const history = page.locator('[data-context="history-session"][data-provider=' + JSON.stringify(identity.provider)
+      + '][data-session-id=' + JSON.stringify(identity.nativeSessionId) + ']')
+    if (!await history.isVisible()) {
+      await project.click({ timeout: remaining() })
     }
-    this.serverEnv = { ...serverEnv }
-    this.webHomeDir = webHomeDir
-    this.resolvedOperatorHome = operatorHome === undefined
-      ? undefined
-      : path.isAbsolute(operatorHome)
-        ? operatorHome
-        : path.join(this.runtime.testRoot, operatorHome)
-    this.supervisorEnv = { ...supervisorEnv }
-    this.supervisorBinaryKind = supervisorBinaryKind
-    this.enabledProviders = [...qualificationProviders.enabledProviders]
-    this.providerSettings = { ...qualificationProviders.providerSettings }
-    this.freshAgentModes = [...(qualificationProviders.freshAgentModes ?? [])]
-    this.fixtureFreshAgentModes = [...(qualificationProviders.fixtureFreshAgentModes ?? [])]
-    if (this.fixtureFreshAgentModes.length > 0 && supervisorBinaryKind !== 'test') {
-      throw new Error('deterministic fresh-agent fixtures require the test session-host build')
-    }
+    await expect(history).toBeVisible({ timeout: remaining() })
+    await history.getByRole('button', { name: 'Open session', exact: true }).click({ timeout: remaining() })
+    capture('complete')
+  } catch (error) {
+    capture('failed')
+    throw error
+  }
+}
+
+/** Split the observed fresh pane through the actual browser menu within one finite action budget. */
+export async function splitFreshBrowserPane(page: Page, paneId: string): Promise<void> {
+  const deadline = Date.now() + 30_000
+  const remaining = () => {
+    const timeout = deadline - Date.now()
+    if (timeout <= 0) throw new Error(`browser split deadline expired for pane ${paneId}`)
+    return timeout
+  }
+  await page.locator('[data-context="pane-header"]').and(page.locator('[data-pane-id="' + paneId + '"]'))
+    .click({ button: 'right', timeout: remaining() })
+  await page.getByRole('menuitem', { name: 'Split right', exact: true }).click({ timeout: remaining() })
+  await expect(page.getByRole('toolbar', { name: /pane type picker/i }).last()).toBeVisible({ timeout: remaining() })
+}
+
+export {
+  P2_OPENCODE_VERSION, P2_OPENCODE_MODEL,
+  type ManagedEnvironmentInputs,
+  type ManagedRuntimeView, type ManagedOpenCodeAdoptionStatus,
+  type ExactRuntimeHandle, type FixtureNativeState, type RuntimeHostFacts, type NativeToolEvidence,
+  type SyntheticOpenCodeSourceFacts,
+  type SyntheticStoppedRepairBatchFacts, type SyntheticStoppedRepairBatchObservation,
+  type SyntheticStoppedRepairFault,
+  type Phase3BrowserObservation,
+  type RuntimeTerminalContinuityObservation,
+  type OpencodeQualificationTurn, type OpencodeQualificationProofStage,
+  type OpencodeReadinessDiagnostic,
+  type FreshCodexHistoryMeasurementError, type FreshCodexHistoryMeasurementFinish,
+  FreshCodexSavedHistoryMeasurementSchema, FreshCodexSavedHistoryPreservationSchema,
+} from '../../../scripts/testing/runtime-sandbox.js'
+
+/** The browser fixture supplies its owned web process to the shared owner. */
+export class ManagedRuntimeBrowserRig extends ManagedRuntimeOwner {
+  constructor(...args: ConstructorParameters<typeof ManagedRuntimeOwner> extends [unknown, ...infer Rest] ? Rest : never) {
+    super((options) => new RustServer(options), ...args)
   }
 
-  /** Absolute operator-home path this rig wires into the supervisor and web
-    * server (undefined when the rig runs without an operator home). */
-  get operatorHomePath(): string | undefined {
-    return this.resolvedOperatorHome
+  async start(): Promise<E2eServerInfo> {
+    return super.start()
   }
+}
 
-  async start(): Promise<TestServerInfo> {
-    await this.runtime.prepare(this.resolvedOperatorHome === undefined
-      ? {}
-      : { operatorHome: this.resolvedOperatorHome })
-    this.qualificationSupervisorBin = this.buildQualificationSupervisor()
-    this.serverBin = this.buildManagedServer()
-    const selected = this.pendingQualificationProviders()
-    this.runtime.recordProviderQualificationBuild({
-      kind: selected.length ? 'qualification_fixture' : 'production',
-      serverFeatures: [selected.length ? 'managed-provider-qualification' : 'managed-runtime-v1'],
-      supervisorFeatures: selected.length ? ['provider-qualification'] : [],
-      qualificationProviders: selected,
-      serverBinary: this.serverBin,
-      supervisorBinary: this.qualificationSupervisorBin
-        ?? (this.supervisorBinaryKind === 'test'
-          ? this.runtime.testSupervisorBinary
-          : this.runtime.releaseSupervisorBinary),
-    })
-    if (this.freshAgentModes.length > 0) {
-      const supervisorBinary = this.qualificationSupervisorBin
-        ?? (this.supervisorBinaryKind === 'test'
-          ? this.runtime.testSupervisorBinary
-          : this.runtime.releaseSupervisorBinary)
-      this.runtime.recordFreshAgentQualificationBuild({
-        kind: this.fixtureFreshAgentModes.length > 0 ? 'deterministic_fixture' : 'production',
-        serverFeatures: [this.fixtureFreshAgentModes.length > 0
-          ? 'managed-fresh-agent-fixtures'
-          : 'managed-runtime-v1'],
-        sessionHostFeatures: this.fixtureFreshAgentModes.length > 0 ? ['fresh-agent-fixtures'] : [],
-        selectedModes: this.freshAgentModes,
-        fixtureModes: this.fixtureFreshAgentModes,
-        serverBinary: this.serverBin,
-        supervisorBinary,
-        sessionHostBinary: this.supervisorBinaryKind === 'test'
-          ? this.runtime.testHostBinary
-          : this.runtime.releaseHostBinary,
-      })
-    }
-    this.supervisor = await this.runtime.startSupervisor({
-      scenarioId: 'browser-managed-runtime',
-      binaryKind: this.supervisorBinaryKind,
-      env: { ...this.supervisorEnv, ...this.qualificationEnvironment() },
-      binaryPath: this.qualificationSupervisorBin,
-      operatorHome: this.resolvedOperatorHome,
-    })
-    this.web = new RustServer({
-      preserveHomeOnStop: true,
-      homeDir: this.webHomeDir ?? this.resolvedOperatorHome,
-      env: {
-        // Managed MCP calls back from Docker workloads, so this owned
-        // ephemeral-port server must override RustServer's loopback default.
-        FRESHELL_BIND_HOST: '0.0.0.0',
-        FRESHELL_MANAGED_RUNTIME_V1: '1',
-        ...(this.freshAgentModes.length > 0
-          ? { FRESHELL_MANAGED_FRESH_AGENT_V1: '1' }
-          : {}),
-        ...(this.fixtureFreshAgentModes.length > 0
-          ? { FRESHELL_MANAGED_FRESH_AGENT_FIXTURE_MODES: this.fixtureFreshAgentModes.join(',') }
-          : {}),
-        FRESHELL_RUNTIME_CONTROL_SOCKET: this.supervisor.controlSocket,
-        FRESHELL_RUNTIME_CONTROL_SECRET_FILE: this.supervisor.controlSecretFile,
-        ...this.serverEnv,
-        ...this.qualificationEnvironment(),
-      },
-      setupHome: async (homeDir) => {
-        const freshell = path.join(homeDir, '.freshell')
-        await fsp.mkdir(freshell, { recursive: true })
-        await fsp.writeFile(path.join(freshell, 'config.json'), JSON.stringify({
-          version: 1,
-          settings: {
-            defaultCwd: this.defaultCwd,
-            codingCli: {
-              enabledProviders: this.enabledProviders,
-              providers: {
-                ...(this.enabledProviders.includes('opencode')
-                  ? { opencode: { model: P2_OPENCODE_MODEL } }
-                  : {}),
-                ...this.providerSettings,
-              },
-            },
-            ...(this.freshAgentModes.length > 0
-              ? {
-                  freshAgent: {
-                    enabled: true,
-                    providers: this.providerSettings,
-                  },
-                }
-              : {}),
-          },
-        }, null, 2))
-      },
-    })
-    const previous = process.env.FRESHELL_E2E_RUST_SERVER_BIN
-    process.env.FRESHELL_E2E_RUST_SERVER_BIN = this.serverBin
+export type ManagedFixtureRig = ManagedRuntimeBrowserRig | ExternalManagedRuntimeRig
+
+export function createManagedRuntimeBrowserRig(...args: ConstructorParameters<typeof ManagedRuntimeBrowserRig>): ManagedFixtureRig {
+  const descriptor = resolveManagedExternalDescriptor(process.env)
+  if (!descriptor) return new ManagedRuntimeBrowserRig(...args)
+  const configured = args[5] ?? { enabledProviders: ['opencode'] }
+  return new ExternalManagedRuntimeRig(descriptor, fetch, {
+    phase: args[1] ?? 2, enabledProviders: [...configured.enabledProviders],
+    freshAgentModes: [...(configured.freshAgentModes ?? [])], fixtureFreshAgentModes: [...(configured.fixtureFreshAgentModes ?? [])],
+  })
+}
+
+/** Remote setup reads private grants in its owner; local setup preserves the same validator. */
+export function createManagedOpenCodeRuntimeBrowserRig(...args: ConstructorParameters<typeof ManagedRuntimeBrowserRig>): ManagedFixtureRig {
+  if (resolveManagedExternalDescriptor(process.env)) return createManagedRuntimeBrowserRig(...args)
+  const bootstrap = requireOpenCodeOnecliBootstrap(process.env,
+    args[1] === 5 ? 'OpenCode provider qualification' : 'P2-G04')
+  const configured: ConstructorParameters<typeof ManagedRuntimeBrowserRig> = [...args]
+  configured[2] = { ...args[2], FRESHELL_BIND_HOST: '0.0.0.0',
+    FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: bootstrap.authFile,
+    FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE: bootstrap.environmentFile,
+    FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: bootstrap.caFile }
+  return new ManagedRuntimeBrowserRig(...configured)
+}
+
+/** Observe the exact current address and revisions before sending the finite Stop request. */
+export async function stopManagedRuntimeSoul(rig: ManagedFixtureRig, soulId: string) {
+  const rows = (await rig.inventory()).filter(row => row.soulId === soulId && row.launchState !== 'stopped')
+  if (rows.length !== 1) throw new Error('exact Stop soul is absent or ambiguous')
+  const current = rows[0]
+  return rig.stopRuntimeSoul(rig.exactRuntimeHandle(current), await rig.controlEpoch(), current.intentRevision)
+}
+
+/** Submit one Stop, then observe that same durable transaction before proof capture. */
+export async function completeManagedRuntimeStop(rig: ManagedFixtureRig, soulId: string) {
+  const rows = (await rig.inventory()).filter(row => row.soulId === soulId && row.launchState !== 'stopped')
+  if (rows.length !== 1) throw new Error('exact Stop soul is absent or ambiguous')
+  const current = rows[0], handle = rig.exactRuntimeHandle(current)
+  const generation = current.executionGeneration
+  if (generation === undefined || !Number.isSafeInteger(generation) || generation < 0) throw new Error('Stop execution generation is absent')
+  const writerBeforeStop = await rig.writerClaimFacts(handle)
+  if (writerBeforeStop.provider !== current.provider || !writerBeforeStop.providerStoreId
+    || writerBeforeStop.soulId !== handle.soulId || writerBeforeStop.incarnationId !== handle.incarnationId
+    || writerBeforeStop.nativeSessionId !== handle.nativeSessionId || writerBeforeStop.activeClaimCount !== 1
+    || writerBeforeStop.globalConflictingClaimCount !== 0) throw new Error('Stop requires its exact current writer and store')
+  const initial = await rig.stopRuntimeSoul(handle, await rig.controlEpoch(), current.intentRevision)
+  if (initial.outcome === 'blocked_ownership') throw new Error('Stop ownership is blocked')
+  const revision = initial.view.intentRevision
+  if (revision !== current.intentRevision + 1 || initial.view.executionGeneration !== generation
+    || (['soulId', 'incarnationId', 'containerId', 'hostBootId', 'nativeSessionId'] as const)
+      .some(field => initial.view[field] !== handle[field]) || initial.view.desiredState !== 'stopped') {
+    throw new Error('initial Stop reply differs from the captured transaction')
+  }
+  const deadline = Date.now() + 60_000
+  async function bounded<T>(operation: () => Promise<T>): Promise<T> {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) throw new Error('Stop completion observation deadline expired')
+    let timer: ReturnType<typeof setTimeout> | undefined
     try {
-      this.info = await this.web.start()
-    } finally {
-      if (previous === undefined) delete process.env.FRESHELL_E2E_RUST_SERVER_BIN
-      else process.env.FRESHELL_E2E_RUST_SERVER_BIN = previous
+      const value = await Promise.race([operation(), new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('Stop completion observation timed out')), remaining)
+      })])
+      if (Date.now() >= deadline) throw new Error('Stop completion observation deadline expired')
+      return value
+    } finally { clearTimeout(timer) }
+  }
+  for (;;) {
+    const completion = await bounded(() => rig.stopCompletionFacts(handle, revision, generation))
+    if (completion.providerStoreId !== writerBeforeStop.providerStoreId || completion.view.provider !== current.provider) {
+      throw new Error('Stop completion provider store identity changed')
     }
-    return this.info
-  }
-
-  async restartWebGracefully(): Promise<TestServerInfo> {
-    return this.withManagedBin(() => this.web.restart())
-  }
-
-  async restartWeb(): Promise<TestServerInfo> {
-    return this.restartWebGracefully()
-  }
-
-  async crashAndRestartWeb(): Promise<TestServerInfo> {
-    return this.withManagedBin(() => this.web.restartAbrupt())
-  }
-
-  async crashWeb(): Promise<TestServerInfo> {
-    return this.crashAndRestartWeb()
-  }
-
-  async restartSupervisor(): Promise<SupervisorInstance> {
-    return this.replaceSupervisor('graceful')
-  }
-
-  async restartSupervisorAbrupt(): Promise<SupervisorInstance> {
-    return this.replaceSupervisor('abrupt')
-  }
-
-  private async replaceSupervisor(mode: 'graceful' | 'abrupt'): Promise<SupervisorInstance> {
-    const previous = this.supervisor
-    if (mode === 'abrupt') this.runtime.killTrackedContainerExact(previous.containerId)
-    else this.runtime.stopSupervisorExact(previous)
-    this.runtime.removeContainerExact(previous.containerId)
-    this.supervisor = await this.runtime.startSupervisor({
-      scenarioId: previous.scenarioId,
-      volumeName: previous.volumeName,
-      binaryKind: previous.binaryKind,
-      reuseSecret: true,
-      env: { ...this.supervisorEnv, ...this.qualificationEnvironment() },
-      binaryPath: this.qualificationSupervisorBin,
-      operatorHome: this.resolvedOperatorHome,
-    })
-    return this.supervisor
-  }
-
-  async stopSoul(soulId: string): Promise<any> {
-    const epoch = await this.controlEpoch()
-    const result = await this.runtime.adminOk(this.supervisor, this.runtime.stopBody(soulId, epoch))
-    return this.dataOf(result, 'stop')
-  }
-
-  async stop(): Promise<{ ok: boolean; errors: string[] }> {
-    await this.web?.stop().catch(() => undefined)
-    return this.runtime.cleanup()
-  }
-
-  async destroyTestRig(): Promise<{ ok: boolean; errors: string[] }> {
-    return this.stop()
-  }
-
-  async controlEpoch(): Promise<number> {
-    const health = await this.runtime.adminOk(this.supervisor, { method: 'health' })
-    const data = this.dataOf(health, 'health')
-    return data.controlEpoch ?? data.control_epoch
-  }
-
-  async inventory(): Promise<ManagedRuntimeView[]> {
-    const result = await this.runtime.adminOk(this.supervisor, { method: 'inventory' })
-    return this.dataOf(result, 'inventory') as ManagedRuntimeView[]
-  }
-
-  async inventorySnapshot(): Promise<any> {
-    const result = await this.runtime.adminOk(this.supervisor, { method: 'inventory_snapshot' })
-    return this.dataOf(result, 'inventory_snapshot')
-  }
-
-  async qualificationWriterClaim(input: {
-    provider: string
-    nativeSessionId: string
-    soulId: string
-    incarnationId: string
-  }): Promise<any> {
-    const result = await this.runtime.adminOk(this.supervisor, {
-      method: 'qualification_writer_claim',
-      params: input,
-    })
-    return this.dataOf(result, 'qualification_writer_claim')
-  }
-
-  async runningViewForTerminal(terminalId: string): Promise<ManagedRuntimeView | null> {
-    return (await this.inventory()).find((row) => row.terminalId === terminalId && row.launchState === 'running') ?? null
-  }
-
-  async runningViewForFreshSession(sessionId: string): Promise<ManagedRuntimeView | null> {
-    return (await this.inventory()).find((row: any) => (
-      row.freshAgentSessionId === sessionId && row.launchState === 'running'
-    )) ?? null
-  }
-
-  signalOwnedSessionHostExact(containerId: string, incarnationId: string, signal: 'SIGSTOP' | 'SIGCONT', expectedPid?: number): number {
-    const pid = this.runtime.ownedContainerHostPidExact(containerId)
-    if (expectedPid !== undefined && pid !== expectedPid) throw new Error('owned session-host PID changed')
-    const rows = this.runtime.topOwnedContainerExact(containerId, ['-eo', 'pid,args']).split('\n')
-    const row = rows.find((line) => Number(line.trim().split(/\s+/)[0]) === pid)
-    if (!row || !/(?:^|\s)\/[^ ]*freshell-session-host\s+serve\s+--control-socket\s/.test(row)
-      || !row.includes(`--incarnation-id ${incarnationId}`)) {
-      throw new Error('owned container PID is not the requested session host')
+    if (completion.outcome === 'blocked_ownership') throw new Error('Stop completion ownership is blocked')
+    if (completion.settled) {
+      if (completion.outcome !== 'verified_empty' || completion.revokePending
+        || completion.view.launchState !== 'stopped' || completion.view.cleanupState !== 'verified_empty') {
+        throw new Error('recorded Stop completion is inconsistent')
+      }
+      const claim = await bounded(() => rig.writerClaimFacts(handle))
+      if (claim.soulId !== handle.soulId || claim.incarnationId !== handle.incarnationId
+        || claim.nativeSessionId !== handle.nativeSessionId || claim.provider !== completion.view.provider
+        || claim.providerStoreId !== completion.providerStoreId || claim.activeClaimCount !== 0 || claim.globalConflictingClaimCount !== 0) {
+        throw new Error('Stop completion still has a current or conflicting writer')
+      }
+      const enclosure = await bounded(() => rig.ownedContainerState(rig.runtimeEnclosureHandle(completion.view)))
+      if (enclosure.running) throw new Error('Stop completion enclosure is still running')
+      return { initial, completion }
     }
-    // The session host is namespace PID1. SIGSTOP from inside that namespace
-    // is ignored; signal only its receipt-proven PID from the ancestor namespace.
-    process.kill(pid, signal)
-    return pid
-  }
-
-  ownedContainerExec(containerId: string, args: string[]): string {
-    return this.runtime.execOwnedContainerExact(containerId, args)
-  }
-
-  ownedProviderExec(containerId: string, args: string[]): string {
-    // docker exec starts a fresh process and does not inherit the managed PTY's HOME.
-    return this.runtime.execOwnedContainerAsExact(containerId, '65534:0', [
-      'env',
-      'HOME=/home/freshell/provider',
-      ...args,
-    ])
-  }
-
-  ownedContainerHasPid(containerId: string, pid: number): boolean {
-    if (!Number.isSafeInteger(pid) || pid <= 0) return false
-    const result = this.runtime.execOwnedContainerExact(containerId, [
-      'sh',
-      '-lc',
-      `if test -d /proc/${pid}; then printf alive; fi`,
-    ])
-    return result.trim() === 'alive'
-  }
-
-  ownedContainerProcessTable(containerId: string): string {
-    // docker top reports host PIDs, while killOwnedRuntimePidExact signals
-    // inside the container's PID namespace. Read both from the same namespace.
-    return this.runtime.execOwnedContainerExact(containerId, ['ps', '-eo', 'pid,args'])
-  }
-
-  writeBrowserReceipt(value: unknown): string {
-    const target = process.env.FRESHELL_RUNTIME_BROWSER_RECEIPT
-      || path.join(this.runtime.browserDir, defaultReceiptFileName('FRESHELL_RUNTIME_BROWSER_RECEIPT'))
-    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
-    fs.writeFileSync(target, JSON.stringify(value, null, 2), { mode: 0o600 })
-    return target
-  }
-
-  writeOpencodeReceipt(value: unknown): string {
-    const target = process.env.FRESHELL_RUNTIME_OPENCODE_RECEIPT
-      || path.join(this.runtime.browserDir, defaultReceiptFileName('FRESHELL_RUNTIME_OPENCODE_RECEIPT'))
-    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
-    fs.writeFileSync(target, JSON.stringify(value, null, 2), { mode: 0o600 })
-    return target
-  }
-
-  writeProviderQualificationReceipt(
-    value: unknown,
-    defaultFileName = 'opencode-provider-qualification.json',
-  ): string[] {
-    const targets = new Set([
-      process.env.FRESHELL_RUNTIME_PHASE3_PROVIDER_RECEIPT,
-      process.env.FRESHELL_RUNTIME_PHASE5_PROVIDER_RECEIPT,
-    ].filter((value): value is string => Boolean(value?.trim())))
-    if (targets.size === 0) {
-      targets.add(path.join(this.runtime.browserDir, defaultFileName))
-    }
-    const written: string[] = []
-    for (const target of targets) {
-      fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
-      fs.writeFileSync(target, JSON.stringify(value, null, 2), { mode: 0o600 })
-      written.push(target)
-    }
-    return written
-  }
-
-  finalizeProviderQualificationReceipt(providers: ProviderQualificationRow[]): {
-    receipt: ProviderQualificationReceiptV2
-    paths: string[]
-  } {
-    const receipt = buildProviderQualificationReceipt({
-      repoRoot: this.repoRoot,
-      evidenceDir: this.runtime.evidenceDir,
-      candidateSha: this.runtime.candidateSha,
-      receiptRunId: this.runtime.runId,
-      runtimeImage: this.runtime.imageRef,
-      providers,
-    })
-    return {
-      receipt,
-      paths: this.writeProviderQualificationReceipt(
-        receipt,
-        providers.length > 1
-          ? 'managed-provider-qualification.json'
-          : `${providers[0]?.provider ?? 'provider'}-provider-qualification.json`,
-      ),
-    }
-  }
-
-  finalizeFreshAgentQualificationReceipt(rows: FreshAgentQualificationRow[]): {
-    receipt: FreshAgentQualificationReceiptV1
-    paths: string[]
-  } {
-    const receipt = buildFreshAgentQualificationReceipt({
-      repoRoot: this.repoRoot,
-      evidenceDir: this.runtime.evidenceDir,
-      candidateSha: this.runtime.candidateSha,
-      receiptRunId: this.runtime.runId,
-      runtimeImage: this.runtime.imageRef,
-      selectedModes: rows.map(({ mode }) => mode),
-      rows,
-    })
-    const targets = new Set([
-      process.env.FRESHELL_RUNTIME_PHASE3_FRESH_AGENT_RECEIPT,
-      process.env.FRESHELL_RUNTIME_PHASE5_FRESH_AGENT_RECEIPT,
-    ].filter((value): value is string => Boolean(value?.trim())))
-    if (targets.size === 0) {
-      targets.add(path.join(this.runtime.browserDir, 'fresh-agent-qualification.json'))
-    }
-    for (const target of targets) {
-      fs.mkdirSync(path.dirname(target), { recursive: true })
-      fs.writeFileSync(target, JSON.stringify(receipt, null, 2))
-    }
-    return { receipt, paths: [...targets] }
-  }
-
-  writePhase3BrowserReceipt(value: unknown): string {
-    const target = process.env.FRESHELL_RUNTIME_PHASE3_BROWSER_RECEIPT
-      || path.join(this.runtime.browserDir, defaultReceiptFileName('FRESHELL_RUNTIME_PHASE3_BROWSER_RECEIPT'))
-    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
-    fs.writeFileSync(target, JSON.stringify(value, null, 2), { mode: 0o600 })
-    return target
-  }
-
-  writePhase4BrowserReceipt(value: unknown): string {
-    const target = process.env.FRESHELL_RUNTIME_PHASE4_BROWSER_RECEIPT
-      || path.join(this.runtime.browserDir, defaultReceiptFileName('FRESHELL_RUNTIME_PHASE4_BROWSER_RECEIPT'))
-    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
-    fs.writeFileSync(target, JSON.stringify(value, null, 2), { mode: 0o600 })
-    return target
-  }
-
-  writePhase5LossReceipt(value: unknown): string {
-    const target = this.canonicalPhase5ReceiptTarget('FRESHELL_RUNTIME_PHASE5_LOSS_RECEIPT')
-    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
-    fs.writeFileSync(target, JSON.stringify(value, null, 2), { mode: 0o600 })
-    return target
-  }
-
-  writePhase5ChaosReceipt(value: unknown): string {
-    const target = this.canonicalPhase5ReceiptTarget('FRESHELL_RUNTIME_PHASE5_CHAOS_RECEIPT')
-    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
-    fs.writeFileSync(target, JSON.stringify(value, null, 2), { mode: 0o600 })
-    return target
-  }
-
-  private canonicalPhase5ReceiptTarget(
-    envName: 'FRESHELL_RUNTIME_PHASE5_LOSS_RECEIPT' | 'FRESHELL_RUNTIME_PHASE5_CHAOS_RECEIPT',
-  ): string {
-    const canonical = path.join(this.runtime.browserDir, defaultReceiptFileName(envName))
-    const requested = process.env[envName]?.trim()
-    if (requested && path.resolve(this.repoRoot, requested) !== canonical) {
-      throw new Error(`${envName} must name the canonical candidate/run browser receipt path`)
-    }
-    return canonical
-  }
-
-  private buildManagedServer(): string {
-    const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
-    const qualification = this.pendingQualificationProviders()
-    const features = this.fixtureFreshAgentModes.length > 0
-      ? 'managed-fresh-agent-fixtures'
-      : qualification.length ? 'managed-provider-qualification' : 'managed-runtime-v1'
-    const prepared = features === 'managed-runtime-v1' ? undefined
-      : preparedRuntimeBinary(this.repoRoot, `server-${features}`)
-    if (!prepared) execFileSync(mise, [
-      'exec', 'rust@1.96', '--', 'cargo', 'build', '--release', '-p', 'freshell-server',
-      '--features', features,
-    ], { cwd: this.repoRoot, stdio: 'inherit' })
-    const source = prepared ?? path.join(this.repoRoot, 'target', 'release', 'freshell-server')
-    const target = path.join(this.runtime.buildDir, 'freshell-server-managed')
-    fs.copyFileSync(source, target)
-    fs.chmodSync(target, 0o755)
-    return target
-  }
-
-  private buildQualificationSupervisor(): string | undefined {
-    if (this.pendingQualificationProviders().length === 0) return undefined
-    const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
-    const prepared = preparedRuntimeBinary(this.repoRoot, 'supervisor-qualification')
-    if (!prepared) execFileSync(mise, [
-      'exec', 'rust@1.96', '--', 'cargo', 'build', '--release', '-p', 'freshell-supervisor',
-      '--features', 'provider-qualification',
-    ], { cwd: this.repoRoot, stdio: 'inherit' })
-    const target = path.join(this.runtime.buildDir, 'freshell-supervisor-qualification')
-    fs.copyFileSync(prepared ?? path.join(this.repoRoot, 'target', 'release', 'freshell-supervisor'), target)
-    fs.chmodSync(target, 0o755)
-    return target
-  }
-
-  private pendingQualificationProviders(): QualifiableTerminalProvider[] {
-    return this.enabledProviders.filter(
-      (provider): provider is QualifiableTerminalProvider => (
-        provider === 'claude' || provider === 'codex' || provider === 'amplifier'
-      ),
-    )
-  }
-
-  private qualificationEnvironment(): Record<string, string> {
-    const selected = this.pendingQualificationProviders()
-    if (selected.length === 0) return {}
-    return {
-      FRESHELL_MANAGED_PROVIDER_QUALIFICATION: selected.join(','),
-    }
-  }
-
-  private async withManagedBin<T>(operation: () => Promise<T>): Promise<T> {
-    const previous = process.env.FRESHELL_E2E_RUST_SERVER_BIN
-    process.env.FRESHELL_E2E_RUST_SERVER_BIN = this.serverBin
-    try {
-      return await operation()
-    } finally {
-      if (previous === undefined) delete process.env.FRESHELL_E2E_RUST_SERVER_BIN
-      else process.env.FRESHELL_E2E_RUST_SERVER_BIN = previous
-    }
-  }
-
-  private dataOf(result: any, expectedKind: string): any {
-    if (!result || result.kind !== expectedKind) {
-      throw new Error(`expected ${expectedKind} supervisor result, got ${JSON.stringify(result)}`)
-    }
-    return result.data
+    await bounded(() => new Promise<void>(resolve => setTimeout(resolve, 250)))
   }
 }

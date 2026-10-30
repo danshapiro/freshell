@@ -24,6 +24,20 @@ function checkedRoot(root: string, label: string): string {
   return real
 }
 
+/** Only a fresh canonical Claude projects directory may not exist before the first turn. */
+export function isAbsentClaudeProjectsRoot(root: string): boolean {
+  if (!path.isAbsolute(root) || root !== path.resolve(root) || path.basename(root) !== 'projects'
+    || path.basename(path.dirname(root)) !== '.claude') return false
+  const parent = checkedRoot(path.dirname(root), 'Claude storage parent')
+  fs.accessSync(parent, fs.constants.R_OK | fs.constants.X_OK)
+  try { fs.lstatSync(root) }
+  catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return true
+    throw error
+  }
+  return false
+}
+
 /** Bounded walk that fails on every symlink and returns matching regular files. */
 export function findFiles(root: string, matches: (basename: string) => boolean): string[] {
   const safeRoot = checkedRoot(root, 'native history root')

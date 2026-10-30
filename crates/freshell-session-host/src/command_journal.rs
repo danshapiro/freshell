@@ -63,22 +63,10 @@ impl CommandJournal {
         request_id: &RequestId,
         payload: &[u8],
     ) -> Result<BeginDisposition, RuntimeError> {
-        let digest = format!("sha256:{:x}", Sha256::digest(payload));
-        if let Some(record) = self.file.commands.get(request_id.as_str()) {
-            if record.payload_digest != digest {
-                return Err(RuntimeError::new(
-                    RuntimeErrorCode::RequestIdConflict,
-                    "input request id reused with different payload",
-                ));
-            }
-            return Ok(match record.state {
-                CommandState::Completed | CommandState::Cancelled => BeginDisposition::Completed,
-                CommandState::Ambiguous
-                | CommandState::Dispatching
-                | CommandState::ProviderAcked => BeginDisposition::Ambiguous,
-                CommandState::Queued => BeginDisposition::Dispatch,
-            });
+        if let Some(disposition) = self.existing_disposition(request_id, payload)? {
+            return Ok(disposition);
         }
+        let digest = format!("sha256:{:x}", Sha256::digest(payload));
         self.file.commands.insert(
             request_id.to_string(),
             CommandRecord {
@@ -88,6 +76,33 @@ impl CommandJournal {
         );
         self.persist().map_err(runtime_io)?;
         Ok(BeginDisposition::Dispatch)
+    }
+
+    /// Read the current idempotency state without creating a journal row.
+    /// Callers that have an external precondition (such as the OpenCode
+    /// adoption gate) can check it before claiming a new request.
+    pub fn existing_disposition(
+        &self,
+        request_id: &RequestId,
+        payload: &[u8],
+    ) -> Result<Option<BeginDisposition>, RuntimeError> {
+        let Some(record) = self.file.commands.get(request_id.as_str()) else {
+            return Ok(None);
+        };
+        let digest = format!("sha256:{:x}", Sha256::digest(payload));
+        if record.payload_digest != digest {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::RequestIdConflict,
+                "input request id reused with different payload",
+            ));
+        }
+        Ok(Some(match record.state {
+            CommandState::Completed | CommandState::Cancelled => BeginDisposition::Completed,
+            CommandState::Ambiguous | CommandState::Dispatching | CommandState::ProviderAcked => {
+                BeginDisposition::Ambiguous
+            }
+            CommandState::Queued => BeginDisposition::Dispatch,
+        }))
     }
 
     pub fn mark_dispatching(&mut self, request_id: &RequestId) -> Result<(), RuntimeError> {

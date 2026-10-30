@@ -3,6 +3,55 @@ import { z } from 'zod'
 const NonEmptyIdSchema = z.string().trim().min(1).max(160)
 const NonNegativeIntSchema = z.number().int().nonnegative()
 
+const RepairDigestSchema = z.string().regex(/^[a-f0-9]{64}$/)
+const RepairTargetSchema = z.object({
+  soulId: NonEmptyIdSchema, incidentId: NonEmptyIdSchema,
+  expectedIntentRevision: z.number().int().positive(),
+}).strict()
+
+export const ManagedRuntimeRepairBatchSourceSelectionSchema = z.object({
+  sourceStoreId: RepairDigestSchema,
+  rootSessionIds: z.array(NonEmptyIdSchema).min(1),
+}).strict().refine((value) => new Set(value.rootSessionIds).size === value.rootSessionIds.length)
+
+export const ManagedRuntimeRepairBatchScopeSchema = z.object({
+  scopeId: RepairDigestSchema, sourceStoreId: RepairDigestSchema,
+  sourceFingerprint: RepairDigestSchema,
+  targets: z.array(z.object({
+    target: RepairTargetSchema, providerStoreId: NonEmptyIdSchema, rootSessionId: NonEmptyIdSchema,
+    incidentRevision: NonNegativeIntSchema, identityRevision: NonNegativeIntSchema,
+    nativeImportRevision: NonNegativeIntSchema, evidenceRevision: NonNegativeIntSchema,
+  }).strict()).min(1),
+  roots: z.array(z.object({
+    rootSessionId: NonEmptyIdSchema, graphDigest: RepairDigestSchema,
+    eligibleOwners: z.array(NonEmptyIdSchema).min(1), canonicalSoulId: NonEmptyIdSchema.nullable(),
+  }).strict()).min(1),
+}).strict()
+
+export const ManagedRuntimeRestoreLostSoulsRequestSchema = z.object({
+  idempotencyKey: NonEmptyIdSchema, scopeId: RepairDigestSchema,
+  source: ManagedRuntimeRepairBatchSourceSelectionSchema,
+  targets: z.array(RepairTargetSchema).min(1),
+  canonicalOwners: z.array(z.object({
+    rootSessionId: NonEmptyIdSchema, soulId: NonEmptyIdSchema,
+    expectedIntentRevision: z.number().int().positive(),
+  }).strict()).default([]),
+}).strict().refine((value) => new Set(value.targets.map((target) => target.soulId)).size === value.targets.length
+  && new Set(value.targets.map((target) => target.incidentId)).size === value.targets.length
+  && new Set(value.canonicalOwners.map((choice) => choice.rootSessionId)).size === value.canonicalOwners.length)
+
+export const ManagedRuntimeRestoreLostSoulsResultSchema = z.object({
+  operationId: NonEmptyIdSchema, scopeId: RepairDigestSchema,
+  status: z.enum(['pending', 'owner_decision_required', 'complete']),
+  repairedTargetCount: NonNegativeIntSchema, totalTargetCount: NonNegativeIntSchema,
+  roots: z.array(z.object({
+    rootSessionId: NonEmptyIdSchema, canonicalSoulId: NonEmptyIdSchema.nullable(),
+    importStatus: z.enum(['pending', 'owner_decision_required', 'structurally_verified', 'provider_readable', 'complete']),
+    intentRevision: NonNegativeIntSchema.nullable(), nativeImportRevision: NonNegativeIntSchema.nullable(),
+    ownerCandidates: z.array(NonEmptyIdSchema).default([]), reasonCode: z.string().optional(),
+  }).strict()),
+}).strict()
+
 export const ManagedRuntimeLaunchStateSchema = z.enum([
   'prepared',
   'created',
@@ -26,6 +75,7 @@ export const ManagedRuntimeRecoveryStateSchema = z.enum([
   'blocked',
   'lost',
   'stopped',
+  'data_repair_complete',
 ])
 export const ManagedRuntimeDurabilityStateSchema = z.enum([
   'unknown',
@@ -80,6 +130,16 @@ export const ManagedRuntimeReadinessSchema = z.object({
   initialScanDurationMs: NonNegativeIntSchema.optional(),
 }).strict()
 
+export const ManagedRuntimeNativeIdentityObservationSchema = z.object({
+  nativeSessionId: NonEmptyIdSchema,
+  incarnationId: NonEmptyIdSchema,
+  launchNonce: NonEmptyIdSchema,
+  evidenceRevision: NonNegativeIntSchema,
+  source: z.enum(['codex_app_server', 'opencode_tui', 'claude_native_event',
+    'amplifier_native_loaded_context', 'fresh_provider_handshake']),
+  evidenceDigest: z.string().regex(/^[a-f0-9]{64}$/),
+}).strict()
+
 export const ManagedRuntimeSoulSchema = z.object({
   soulId: NonEmptyIdSchema,
   incarnationId: NonEmptyIdSchema,
@@ -110,6 +170,7 @@ export const ManagedRuntimeSoulSchema = z.object({
   allocationState: ManagedRuntimeAllocationStateSchema,
   provider: z.string().optional(),
   nativeSessionId: z.string().optional(),
+  nativeIdentityObservation: ManagedRuntimeNativeIdentityObservationSchema.optional(),
   recoveryReason: z.string().optional(),
   incidentId: NonEmptyIdSchema.optional(),
   priorIncarnationId: z.string().optional(),

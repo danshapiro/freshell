@@ -575,11 +575,11 @@ impl RuntimeBackend for BrokerAuthorizedBackend {
     ) -> Result<InitialAuthVolumeObservation, BackendError> {
         self.real().observe_initial_auth_volume(reservation).await
     }
-    async fn discard_rejected_provider_inputs(
+    async fn discard_stopped_provider_inputs(
         &self,
         handle: &OwnedRuntimeHandle,
     ) -> Result<(), BackendError> {
-        self.real().discard_rejected_provider_inputs(handle).await
+        self.real().discard_stopped_provider_inputs(handle).await
     }
     async fn commit_prepared_inputs(
         &self,

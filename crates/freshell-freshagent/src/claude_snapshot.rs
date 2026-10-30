@@ -1328,6 +1328,27 @@ pub(crate) fn raw_chain_tip(transcript: &str) -> Option<String> {
     raw_chain(transcript).last().map(|l| l.uuid.clone())
 }
 
+/// In-memory view of a native query's retained prefix. Rows and UUID anchors
+/// come unchanged from the verified parent; this never creates a transcript.
+pub(crate) fn fork_prefix(transcript: &str, cutoff: Option<&str>) -> Result<String, String> {
+    let Some(cutoff) = cutoff else {
+        return Ok(String::new());
+    };
+    let chain = raw_chain(transcript);
+    let end = chain
+        .iter()
+        .position(|line| line.uuid == cutoff)
+        .ok_or("native fork cutoff is not on the current raw chain")?;
+    chain[..=end]
+        .iter()
+        .map(|line| {
+            serde_json::to_string(&line.obj)
+                .map(|value| value + "\n")
+                .map_err(|error| error.to_string())
+        })
+        .collect()
+}
+
 /// Chain-entry equality for LCP: `uuid` + `message` content ONLY (never
 /// sessionId/entrypoint/gitBranch/promptId — a fork rewrites those metadata
 /// fields on the kept prefix lines).
@@ -1732,6 +1753,29 @@ pub(crate) fn redo_resume_target(
     }
 }
 
+fn raw_chain_tip_from_path(path: &Path) -> Result<Option<String>, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let extent = file.metadata().map_err(|error| error.to_string())?.len();
+    let retention = crate::native_history::Retention::new();
+    let records =
+        crate::native_history::Records::new(std::io::BufReader::new(file.take(extent)), &retention);
+    let mut tip = None;
+    // raw_chain's last UUID is the last non-bookend candidate, even when its
+    // earlier parent links dangle after native compaction.
+    for record in records {
+        let Some((record, _)) = record.map_err(|error| error.to_string())? else {
+            continue;
+        };
+        if !FORK_BOOKEND_KINDS.contains(&record["type"].as_str().unwrap_or("")) {
+            if let Some(uuid) = record["uuid"].as_str().filter(|uuid| !uuid.is_empty()) {
+                tip = Some(uuid.to_owned());
+            }
+        }
+    }
+    Ok(tip)
+}
+
 /// The canRedo chain-root RECHECK (kata 1wxv Task 5): the stored bit is a
 /// necessary but NOT sufficient condition — the CURRENT-epoch redo state comes
 /// from the chain root, so when `original_session_id` resolves, the original's
@@ -1740,7 +1784,7 @@ pub(crate) fn redo_resume_target(
 /// recorded tip) forces `canRedo:false` so no device shows a redo that Task 4
 /// would refuse with `REDO_UNAVAILABLE` + `REDO_REMOVED_HISTORY_COPY`. A record
 /// without an `original_session_id` keeps the stored bit as-is.
-fn claude_can_redo_now(record: &crate::rollback_record::RollbackRecord) -> bool {
+pub(crate) fn claude_can_redo_now(record: &crate::rollback_record::RollbackRecord) -> bool {
     if !record.can_redo() {
         return false;
     }
@@ -1748,8 +1792,8 @@ fn claude_can_redo_now(record: &crate::rollback_record::RollbackRecord) -> bool 
         return true;
     };
     let tip = locate_transcript(original)
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|text| raw_chain_tip(&text));
+        .and_then(|path| raw_chain_tip_from_path(&path).ok())
+        .flatten();
     tip == record.original_tip_uuid
 }
 
@@ -1855,6 +1899,7 @@ pub(crate) fn build_claude_snapshot_from_projection(
         );
         snapshot["revision"] = json!(floored);
     }
+    crate::native_history::retain_snapshot_display("claude", &mut snapshot);
     snapshot
 }
 
@@ -1895,6 +1940,31 @@ pub(crate) async fn get_claude_snapshot_in(
     genesis: Option<&crate::identity_sink::RecordedGenesis>,
     rollback: Option<&crate::rollback_record::RollbackRecord>,
 ) -> Result<Value, ClaudeSnapshotError> {
+    let roots = roots.to_vec();
+    let session_type = session_type.to_owned();
+    let thread_id = thread_id.to_owned();
+    let genesis = genesis.cloned();
+    let rollback = rollback.cloned();
+    tokio::task::spawn_blocking(move || {
+        get_claude_snapshot_sync_in(
+            &roots,
+            &session_type,
+            &thread_id,
+            genesis.as_ref(),
+            rollback.as_ref(),
+        )
+    })
+    .await
+    .map_err(|error| ClaudeSnapshotError::Io(error.to_string()))?
+}
+
+pub(crate) fn get_claude_snapshot_sync_in(
+    roots: &[PathBuf],
+    session_type: &str,
+    thread_id: &str,
+    genesis: Option<&crate::identity_sink::RecordedGenesis>,
+    rollback: Option<&crate::rollback_record::RollbackRecord>,
+) -> Result<Value, ClaudeSnapshotError> {
     let path = match locate_transcript_state_in(roots, thread_id) {
         TranscriptLocation::Found(path) => path,
         // Clean miss in EVERY candidate root: the genesis, when the session has
@@ -1903,7 +1973,7 @@ pub(crate) async fn get_claude_snapshot_in(
         TranscriptLocation::Absent => {
             return match genesis {
                 Some(recorded) => {
-                    pending_snapshot(roots, session_type, thread_id, recorded, rollback).await
+                    pending_snapshot(roots, session_type, thread_id, recorded, rollback)
                 }
                 None => Err(ClaudeSnapshotError::NotFound),
             };
@@ -1917,7 +1987,7 @@ pub(crate) async fn get_claude_snapshot_in(
             return Err(ClaudeSnapshotError::Io(error.to_string()));
         }
     };
-    let (mtime_ms, projection) = project_transcript_file(path, thread_id, None).await?;
+    let (mtime_ms, projection) = project_transcript_file(path, thread_id, None)?;
     let mut snapshot =
         build_claude_snapshot_from_projection(session_type, thread_id, projection, 0, rollback);
     let turn_count = snapshot["turns"]
@@ -1934,7 +2004,7 @@ pub(crate) async fn get_claude_snapshot_in(
 /// conversation through the fork point, with the parent's turn ids (the fork
 /// keeps them, T6). A fork whose parent is gone, or no longer holds the fork
 /// point, cannot boot (the CLI refuses it), so its session is gone too.
-async fn pending_snapshot(
+fn pending_snapshot(
     roots: &[PathBuf],
     session_type: &str,
     thread_id: &str,
@@ -1958,7 +2028,7 @@ async fn pending_snapshot(
                     return Err(ClaudeSnapshotError::Io(error.to_string()));
                 }
             };
-            match project_transcript_file(parent_path, thread_id, Some(at.clone())).await {
+            match project_transcript_file(parent_path, thread_id, Some(at.clone())) {
                 Ok((_, projection)) => projection,
                 Err(ClaudeSnapshotError::NotFound) => {
                     log_pending_fork_unservable(
@@ -1994,36 +2064,32 @@ async fn pending_snapshot(
 /// ([`crate::claude_projection_cache::read_transcript`]). `fork_at` projects
 /// only the conversation a lazy fork of it holds ([`fork_prefix_transcript`]);
 /// a fork point the transcript does not hold answers `NotFound`.
-async fn project_transcript_file(
+fn project_transcript_file(
     path: PathBuf,
     thread_id: &str,
     fork_at: Option<Option<String>>,
 ) -> Result<(Option<i64>, crate::claude_projection::ClaudeProjection), ClaudeSnapshotError> {
     let thread = thread_id.to_string();
-    tokio::task::spawn_blocking(move || {
-        let mtime_ms = std::fs::metadata(&path)
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as i64);
-        let subagents = crate::claude_projection::FsSubagents::for_transcript(&path);
-        let projection = match fork_at {
-            None => crate::claude_projection_cache::read_transcript(&path, &thread, &subagents)
-                .map_err(|error| ClaudeSnapshotError::Io(error.to_string()))?,
-            Some(at) => {
-                let content = std::fs::read_to_string(&path)
-                    .map_err(|error| ClaudeSnapshotError::Io(error.to_string()))?;
-                let content = fork_prefix_transcript(&content, at.as_deref())
-                    .ok_or(ClaudeSnapshotError::NotFound)?;
-                crate::claude_projection::ClaudeTranscriptProjector::project_with(
-                    &thread, &content, &subagents,
-                )
-            }
-        };
-        Ok((mtime_ms, projection))
-    })
-    .await
-    .map_err(|e| ClaudeSnapshotError::Io(e.to_string()))?
+    let mtime_ms = std::fs::metadata(&path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64);
+    let subagents = crate::claude_projection::FsSubagents::for_transcript(&path);
+    let projection = match fork_at {
+        None => crate::claude_projection_cache::read_transcript(&path, &thread, &subagents)
+            .map_err(|error| ClaudeSnapshotError::Io(error.to_string()))?,
+        Some(at) => {
+            let content = std::fs::read_to_string(&path)
+                .map_err(|error| ClaudeSnapshotError::Io(error.to_string()))?;
+            let content = fork_prefix_transcript(&content, at.as_deref())
+                .ok_or(ClaudeSnapshotError::NotFound)?;
+            crate::claude_projection::ClaudeTranscriptProjector::project_with(
+                &thread, &content, &subagents,
+            )
+        }
+    };
+    Ok((mtime_ms, projection))
 }
 
 /// `basis` floored at the rollback record's last operation (kata 1wxv Task 5).
@@ -3319,6 +3385,23 @@ pub(crate) mod tests {
             Some("a2")
         );
         assert_eq!(raw_chain_tip(""), None, "no chain lines => no tip");
+    }
+
+    #[test]
+    fn parent_backed_prefix_preserves_native_anchors_for_successive_undo_and_redo() {
+        let original = uuid_transcript_with_carriers();
+        let first = resolve_resume_point(&original, "native-child", ResumeTarget::Step).unwrap();
+        let current = fork_prefix(&original, first.resume_at_uuid.as_deref()).unwrap();
+        assert_eq!(raw_chain_tip(&current), first.resume_at_uuid);
+        assert_eq!(raw_lcp_end(&current, &original), raw_chain_tip(&current));
+        let earlier =
+            resolve_resume_point(&current, "native-next-child", ResumeTarget::Step).unwrap();
+        let empty = fork_prefix(&original, earlier.resume_at_uuid.as_deref()).unwrap();
+        assert!(raw_chain_tip(&empty).is_none());
+        assert_eq!(raw_lcp_end(&empty, &original), None);
+        assert!(fork_prefix(&original, Some("missing-native-anchor")).is_err());
+        let restored = fork_prefix(&original, raw_chain_tip(&original).as_deref()).unwrap();
+        assert_eq!(raw_lcp_end(&restored, &original), raw_chain_tip(&original));
     }
 
     #[test]

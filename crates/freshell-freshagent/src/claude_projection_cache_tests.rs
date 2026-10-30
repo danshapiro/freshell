@@ -47,6 +47,40 @@ fn append(path: &Path, bytes: &str) {
         .expect("append to the transcript");
 }
 
+#[test]
+fn invalid_utf8_without_any_native_record_is_unreadable_but_a_torn_tail_keeps_valid_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("t.jsonl");
+    let cache = ProjectionCache::new(4);
+    for bytes in [vec![0xff], vec![b' ', b'\n', 0xff]] {
+        std::fs::write(&path, bytes).unwrap();
+        let error = match cache.read(&path, THREAD, &NoSubagents) {
+            Ok(_) => panic!("an unreadable transcript must not look like an empty conversation"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    // A native session may exist before it has any messages. Empty and valid
+    // metadata-only transcripts remain valid empty histories.
+    for content in ["", "{\"type\":\"system\",\"sessionId\":\"s\"}\n"] {
+        std::fs::write(&path, content).unwrap();
+        let (projection, _) = read(&cache, &path);
+        assert_eq!(projection, full_parse(content, &NoSubagents));
+    }
+
+    let prefix = real_cli_fixture!("tools-sync");
+    let mut bytes = prefix.as_bytes().to_vec();
+    bytes.push(0xff);
+    std::fs::write(&path, &bytes).unwrap();
+    let (projection, _) = read(&cache, &path);
+    assert_eq!(projection, full_parse(prefix, &NoSubagents));
+    // The same partial UTF-8 write is also harmless on a cached read.
+    let (projection, outcome) = read(&cache, &path);
+    assert_eq!(projection, full_parse(prefix, &NoSubagents));
+    assert_eq!(outcome, ReadOutcome::Unchanged);
+}
+
 /// Every split point: each line boundary and the middle of each line.
 fn split_points(content: &str) -> Vec<usize> {
     let mut points = Vec::new();

@@ -54,7 +54,7 @@ impl ManagedTerminalController for InventoryController {
         &'a self,
         _: ManagedTerminalDescriptor,
         _: String,
-    ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+    ) -> ManagedTerminalFuture<'a, Result<(), ManagedTerminalInputError>> {
         panic!("adoption must never replay input")
     }
     fn resize<'a>(

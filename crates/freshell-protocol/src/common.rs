@@ -143,6 +143,14 @@ pub enum AgentProvider {
     Amplifier,
 }
 
+/// Outcome for a provider-reported terminal turn completion, when available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TerminalTurnOutcome {
+    Completed,
+    Failed,
+}
+
 /// fresh-agent session flavour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

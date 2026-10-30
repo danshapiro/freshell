@@ -6,7 +6,7 @@ import { once } from 'node:events'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { createRequire } from 'node:module'
-import { afterEach, describe, expect, it } from 'vitest'
+import { describe, expect, it } from 'vitest'
 import {
   ACTION_CAPABILITIES,
   unsupportedInvocationResult,
@@ -30,6 +30,7 @@ async function runCli(args: string[], url: string): Promise<{ code: number | nul
   const child = spawn(process.execPath, ['--import', tsxLoader, cliPath, ...args], {
     env: { ...process.env, NODE_NO_WARNINGS: '1', FRESHELL_URL: url, FRESHELL_TOKEN: 'test-token' },
     stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 10_000,
   })
   let stdout = ''
   let stderr = ''
@@ -120,10 +121,8 @@ describe('standalone CLI capability contract', () => {
     ['run', 'echo', 'blocked'],
     ['fresh-send', 'blocked'],
     ['attach', '--terminal', 'term-1'],
-    ['new-tab', '--agent', 'codex'],
-    ['split-pane', '--agent', 'opencode'],
-    ['split-pane', '--model', 'model'],
-    ['split-pane', '--effort', 'high'],
+    ['new-tab', '--agent', 'unknown'],
+    ['split-pane', '--agent', 'unknown'],
     ['wait-for'],
     ['wait-for', '--pattern', 'ready', '--stable', '1'],
     ['wait-for', '--pattern', 'ready', '--exit'],
@@ -154,6 +153,98 @@ describe('standalone CLI capability contract', () => {
       await once(server, 'close')
     }
   })
+
+  it.each([
+    ['new-tab', '--agent', 'codex', '--resume', 'raw-thread'],
+    ['new-tab', '--agent', 'codex', '--resumeSessionId', 'raw-thread'],
+    ['split-pane', '--agent', 'codex', '--resume', 'raw-thread'],
+    ['split-pane', '--agent', 'codex', '--resumeSessionId', 'raw-thread'],
+    ['new-tab', '--agent', 'kilroy', '--sessionRef', 'kilroy:wrong-provider'],
+    ['split-pane', '--agent', 'kilroy', '--sessionRef', 'kilroy:wrong-provider'],
+    ['new-tab', '--agent', 'claude', '--sessionRef', 'codex:wrong-provider'],
+    ['split-pane', '--agent', 'claude', '--sessionRef', 'codex:wrong-provider'],
+  ])('preserves local restore identity refusal for %j', async (...args: string[]) => {
+    let requests = 0
+    const server = createServer((_request, response) => {
+      requests += 1
+      response.statusCode = 500
+      response.end('unexpected request')
+    })
+    server.listen(0, '127.0.0.1')
+    await once(server, 'listening')
+    const address = server.address()
+    if (!address || typeof address === 'string') throw new Error('test server did not listen')
+    try {
+      const result = await runCli(args, `http://127.0.0.1:${address.port}`)
+      expect(result.code).toBe(1)
+      expect(result.stdout).toBe('')
+      expect(requests).toBe(0)
+      expect(result.stderr.trim().split('\n').map(line => JSON.parse(line)))
+        .toEqual(expect.arrayContaining([expect.objectContaining({ severity: 'error', event: 'cli.error' })]))
+    } finally {
+      const closed = once(server, 'close')
+      server.close()
+      await closed
+      expect(server.listening).toBe(false)
+    }
+  })
+
+  for (const action of ['new-tab', 'split-pane']) {
+    it.each([
+      { agent: 'claude', provider: 'claude', model: 'haiku', effort: 'low' },
+      { agent: 'kilroy', provider: 'claude', model: 'haiku', effort: 'low' },
+      { agent: 'codex', provider: 'codex', model: 'gpt-5.6-luna', effort: 'low' },
+      { agent: 'opencode', provider: 'opencode', model: 'opencode/big-pickle', effort: undefined },
+    ])('forwards an actual ' + action + ' $agent profile and canonical root', async profile => {
+      const posts: { path: string; body: any }[] = []
+      const server = createServer((request, response) => {
+        let body = ''
+        request.on('data', chunk => { body += String(chunk) })
+        request.on('end', () => {
+          response.setHeader('content-type', 'application/json')
+          if (request.method === 'POST') {
+            posts.push({ path: request.url ?? '', body: JSON.parse(body) })
+            response.end(JSON.stringify({ status: 'ok', data: { paneId: 'alias-pane', sessionId: 'native-root' } }))
+          } else if (request.url === '/api/tabs') {
+            response.end(JSON.stringify({ tabs: [{ id: 't1', activePaneId: 'p1' }], activeTabId: 't1' }))
+          } else if (request.url === '/api/panes?tabId=t1') {
+            response.end(JSON.stringify({ panes: [{ id: 'p1', index: 0, kind: 'fresh-agent' }] }))
+          } else {
+            response.statusCode = 404
+            response.end(JSON.stringify({ error: 'unexpected loopback route' }))
+          }
+        })
+      })
+      server.listen(0, '127.0.0.1')
+      await once(server, 'listening')
+      const address = server.address()
+      if (!address || typeof address === 'string') throw new Error('test server did not listen')
+      try {
+        const result = await runCli([action, '--agent', profile.agent, '--model', profile.model,
+          ...(profile.effort ? ['--effort', profile.effort] : []), '--permissionMode', 'default',
+          '--cwd', '/workspace', '--sessionRef', profile.provider + ':native-root',
+          ...(action === 'split-pane' ? ['--target', 'p1'] : []),
+        ], `http://127.0.0.1:${address.port}`)
+        expect(result.code).toBe(0)
+        expect(result.stderr).toBe('')
+        expect(JSON.parse(result.stdout)).toEqual({ status: 'ok', data: { paneId: 'alias-pane', sessionId: 'native-root' } })
+        expect(posts).toHaveLength(1)
+        expect(posts[0].path).toBe(action === 'new-tab' ? '/api/tabs' : '/api/panes/p1/split')
+        expect(posts[0].body).toMatchObject({
+          agent: profile.agent, model: profile.model, permissionMode: 'default', cwd: '/workspace',
+          sessionRef: { provider: profile.provider, sessionId: 'native-root' },
+        })
+        if (profile.effort) expect(posts[0].body.effort).toBe(profile.effort)
+        else expect(posts[0].body).not.toHaveProperty('effort')
+      } finally {
+        const closed = once(server, 'close')
+        server.close()
+        server.closeAllConnections()
+        await closed
+        expect(server.listening).toBe(false)
+      }
+    })
+  }
 
   it('accepts the short -p alias for a Rust pattern wait-for request', async () => {
     const requests: string[] = []

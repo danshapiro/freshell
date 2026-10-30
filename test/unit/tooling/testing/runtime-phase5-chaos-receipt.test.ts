@@ -1,12 +1,17 @@
 import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
+import http from 'node:http'
 import path from 'node:path'
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { runCampaign } from '../../../../scripts/testing/runtime-landing-campaign.js'
+import { ManagedRuntimeOwner } from '../../../../scripts/testing/runtime-sandbox.js'
+import { RestrictedDockerBroker } from '../../../../scripts/testing/runtime-test-broker.js'
 
 import {
   CHAOS_MAX_CYCLE_GAP_MS,
+  buildPhase5ChaosReceipt,
   PHASE5_CHAOS_ASSERTIONS_FILE,
   PHASE5_CHAOS_PROVIDER_EVENTS_FILE,
   phase5ChaosRetainedBundle,
@@ -15,7 +20,7 @@ import {
 
 const sha = 'a'.repeat(40)
 const image = `sha256:${'b'.repeat(64)}`
-const runId = 'chaos-run-1234'
+const runId = '14700000-0000-4000-8000-000000000001'
 const soulId = 'soul-chaos'
 const incarnationId = 'incarnation-chaos'
 const containerId = 'c'.repeat(64)
@@ -231,6 +236,152 @@ function validate(fx: ReturnType<typeof fixture>) {
 }
 
 describe('Phase 5 chaos receipt validation', () => {
+  it('campaign consumes the canonical chaos owner original and reopens its actual evidence references', async () => {
+    const fx = fixture()
+    const canonical = path.join(fx.evidenceDir, 'browser', 'p5-g09-browser-chaos.json')
+    const owned = Object.create(ManagedRuntimeOwner.prototype) as ManagedRuntimeOwner
+    Object.assign(owned, { repoRoot: fx.repoRoot, runtime: { browserDir: path.dirname(canonical) } })
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const candidate = { sha, dirty: false, diffHash: 'e'.repeat(64), statusHash: 'e'.repeat(64) }
+    let dispatchTarget: string | undefined
+    try {
+      const exit = await runCampaign(['--only', 'chaos'], { repoRoot: fx.repoRoot, captureCandidate: () => candidate,
+        environment: {}, execute: async (_command, _args, environment, logPath) => {
+          dispatchTarget = environment.FRESHELL_RUNTIME_PHASE5_CHAOS_RECEIPT
+          vi.stubEnv('FRESHELL_RUNTIME_PHASE5_CHAOS_RECEIPT', dispatchTarget)
+          const target = owned.writePhase5ChaosReceipt(fx.receipt)
+          expect(target).toBe(canonical)
+          expect(validatePhase5ChaosReceipt({ ...fx, candidateSha: sha, runtimeImage: image, receipt: JSON.parse(fs.readFileSync(target, 'utf8')) }).summary).toEqual(fx.receipt.summary)
+          fs.mkdirSync(path.dirname(logPath), { recursive: true })
+          fs.writeFileSync(logPath, JSON.stringify({ event: 'managed_external_browser_passed', counts: { selected: 1, executed: 1, passed: 1, failed: 0, skipped: 0, timedOut: 0 },
+            originals: [{ candidateSha: sha, runId, runtimeImage: image, receiptDigests: { FRESHELL_RUNTIME_PHASE5_CHAOS_RECEIPT: createHash('sha256').update(fs.readFileSync(target)).digest('hex') } }] }), { mode: 0o600 })
+          return 0
+        } })
+      expect(exit).toBe(0)
+      expect(dispatchTarget).toBeUndefined()
+      const campaigns = path.join(fx.repoRoot, '.runtime-evidence', sha, 'campaigns')
+      const campaign = JSON.parse(fs.readFileSync(path.join(campaigns, fs.readdirSync(campaigns)[0], 'campaign.json'), 'utf8'))
+      const reference = campaign.receipts.FRESHELL_RUNTIME_PHASE5_CHAOS_RECEIPT
+      expect(path.join(fx.repoRoot, reference.path)).toBe(canonical)
+      expect(campaign.steps[0].outcome).toBe('PASS')
+      vi.stubEnv('FRESHELL_RUNTIME_PHASE5_CHAOS_RECEIPT', path.join(fx.repoRoot, 'foreign-receipt.json'))
+      expect(() => owned.writePhase5ChaosReceipt(fx.receipt)).toThrow(/canonical/)
+      fx.rewrite('cleanup.json', row => { row.ok = false; row.errors = ['failed']; })
+      expect(() => validatePhase5ChaosReceipt({ ...fx, candidateSha: sha, runtimeImage: image, receipt: JSON.parse(fs.readFileSync(canonical, 'utf8')) })).toThrow()
+    } finally { log.mockRestore(); error.mockRestore(); vi.unstubAllEnvs() }
+  })
+
+  it.each(['success', 'connection failure'] as const)('builds and validates actual socket broker diagnostics without weakening decisions (%s)', async (outcome) => {
+    const fx = fixture()
+    const upstream = http.createServer((request, response) => { request.resume(); response.end('OK') })
+    const socket = path.join(fx.repoRoot, 'up.sock')
+    const proxy = path.join(fx.repoRoot, 'proxy.sock')
+    const logPath = path.join(fx.evidenceDir, 'broker.jsonl')
+    const broker = new RestrictedDockerBroker({ realSocketPath: socket, proxySocketPath: proxy,
+      runtimeRootPrefix: fx.repoRoot, allowedHostBinaryPaths: new Set(), allowedImageRefs: new Set(),
+      testRunId: runId, logPath })
+    try {
+      if (outcome === 'success') await new Promise<void>(resolve => upstream.listen(socket, resolve))
+      await broker.start()
+      const transportOutcome = await new Promise<number | string>((resolve) => {
+        const request = http.get({ socketPath: proxy, path: '/_ping' }, response => {
+          response.resume(); response.once('end', () => resolve(response.statusCode!))
+        })
+        request.once('error', (error: NodeJS.ErrnoException) => resolve(error.code!))
+      })
+      expect(transportOutcome).toBe(outcome === 'success' ? 200 : 'ECONNRESET')
+      const bytes = fs.readFileSync(logPath, 'utf8')
+      const rows = bytes.trim().split('\n').map(line => JSON.parse(line))
+      expect(rows.filter(row => row.event)).toHaveLength(2)
+      expect(broker.eventsSnapshot()).toMatchObject(outcome === 'success'
+        ? [{ decision: 'forward', destructive: false, unsafeAttempt: false }]
+        : [
+          { decision: 'block', reason: 'upstream_request_failed', allocationUnknown: false, destructive: false, unsafeAttempt: false },
+          { decision: 'block', reason: 'owner_request_failed', destructive: false, unsafeAttempt: false },
+        ])
+      const completed = rows.find(row => row.event === 'runtime.broker.request_completed')
+      expect(completed).toMatchObject(outcome === 'success'
+        ? { severity: 'info', statusCode: 200 }
+        : { severity: 'warn', errorCategory: 'upstream_request_failed' })
+      const timingFields = ['socketAssignedMs', 'socketConnectMs', 'requestFinishedMs', 'responseHeadersMs', 'responseEndMs']
+      expect(completed.transportPhases).toEqual({
+        socketAssignedMs: expect.any(Number),
+        socketConnectMs: outcome === 'success' ? expect.any(Number) : null,
+        requestFinishedMs: outcome === 'success' ? expect.any(Number) : null,
+        responseHeadersMs: outcome === 'success' ? expect.any(Number) : null,
+        responseEndMs: outcome === 'success' ? expect.any(Number) : null,
+        reusedSocket: false, socketConnectingAtAssignment: true,
+      })
+      const build = () => buildPhase5ChaosReceipt({ ...fx, candidateSha: sha, runtimeImage: image, receiptRunId: runId,
+        candidateBefore: fx.receipt.candidateIntegrity.before, candidateAfter: fx.receipt.candidateIntegrity.after })
+      const receipt = build()
+      expect(validatePhase5ChaosReceipt({ ...fx, candidateSha: sha, runtimeImage: image, receipt }).summary).toEqual(fx.receipt.summary)
+      for (const mutation of [
+        (row: any) => { delete row.transportPhases },
+        (row: any) => {
+          for (const key of timingFields) row.transportPhases[key] = null
+          row.transportPhases.socketConnectingAtAssignment = null
+        },
+        (row: any) => {
+          row.transportPhases.reusedSocket = true
+          row.transportPhases.socketConnectingAtAssignment = false
+          row.transportPhases.socketConnectMs = null
+        },
+      ]) {
+        const modified = structuredClone(rows)
+        mutation(modified.find(row => row.event === 'runtime.broker.request_completed'))
+        fs.writeFileSync(logPath, modified.map(row => JSON.stringify(row)).join('\n') + '\n')
+        expect(build().summary).toEqual(receipt.summary)
+      }
+      for (const mutation of [
+        (row: any) => { row.event = 'runtime.broker.unknown' },
+        (row: any) => { row.durationMs = -1 },
+        (row: any) => { row.statusCode = 999 },
+        (row: any) => { row.errorCategory = 'private detail' },
+        (row: any) => { delete row.requestId },
+        (row: any) => { row.unsafeAttempt = true },
+        (row: any) => { row.privatePayload = 'unexpected' },
+        (row: any) => { row.transportPhases = null },
+        (row: any) => { row.transportPhases = [] },
+        (row: any) => { row.transportPhases.privatePayload = 'unexpected' },
+        (row: any) => { row.transportPhases.reusedSocket = null },
+        (row: any) => { row.transportPhases.reusedSocket = 'false' },
+        (row: any) => { row.transportPhases.socketConnectingAtAssignment = 0 },
+        (row: any) => { row.transportPhases.socketConnectingAtAssignment = 'true' },
+        ...[...timingFields, 'reusedSocket', 'socketConnectingAtAssignment'].map(key =>
+          (row: any) => { delete row.transportPhases[key] }),
+        ...timingFields.flatMap(key => [
+          (row: any) => { row.transportPhases[key] = -1 },
+          (row: any) => { row.transportPhases[key] = '0' },
+          (row: any) => { row.transportPhases[key] = false },
+        ]),
+      ]) {
+        const modified = structuredClone(rows)
+        mutation(modified.find(row => row.event === 'runtime.broker.request_completed'))
+        fs.writeFileSync(logPath, modified.map(row => JSON.stringify(row)).join('\n') + '\n')
+        expect(build).toThrow(/broker/)
+      }
+      const withStartPhases = structuredClone(rows)
+      withStartPhases.find(row => row.event === 'runtime.broker.request_started').transportPhases = completed.transportPhases
+      fs.writeFileSync(logPath, withStartPhases.map(row => JSON.stringify(row)).join('\n') + '\n')
+      expect(build).toThrow(/broker/)
+      for (const allocationUnknown of [true, null, 'false', 0]) {
+        const modified = structuredClone(rows)
+        modified.find(row => row.url === '/_ping').allocationUnknown = allocationUnknown
+        fs.writeFileSync(logPath, modified.map(row => JSON.stringify(row)).join('\n') + '\n')
+        expect(build).toThrow(/broker.*allocation/)
+      }
+      fs.writeFileSync(logPath, rows.filter(row => row.event).map(row => JSON.stringify(row)).join('\n') + '\n')
+      expect(build).toThrow(/broker.*decision/)
+
+    } finally {
+      upstream.closeAllConnections()
+      await broker.close()
+      await new Promise<void>(resolve => upstream.close(() => resolve()))
+    }
+  })
+
   it('derives PASS from all 100/20 exact cycle rows and hashed provider/native evidence', () => {
     const fx = fixture()
     const validated = validate(fx)
@@ -241,7 +392,7 @@ describe('Phase 5 chaos receipt validation', () => {
   it('rejects schema v1, unknown fields, skipped tests, and summary self-assertions', () => {
     for (const mutate of [
       (fx: ReturnType<typeof fixture>) => { fx.receipt.schemaVersion = 1 },
-      (fx: ReturnType<typeof fixture>) => { fx.receipt.duplicateWriters = 0 },
+      (fx: ReturnType<typeof fixture>) => { Object.assign(fx.receipt, { duplicateWriters: 0 }) },
       (fx: ReturnType<typeof fixture>) => {
         fx.receipt.candidateIntegrity.before.statusHash = '1'.repeat(64)
         fx.receipt.candidateIntegrity.after.statusHash = '1'.repeat(64)

@@ -5,6 +5,9 @@ pub(super) fn validate(output: &RuntimeOutputBatch, terminal_id: &str) -> Result
     if output.terminal_id != terminal_id || output.stream_epoch.is_empty() {
         return Err("managed output source identity mismatch".into());
     }
+    if let Some(native) = &output.opencode_activity {
+        native.validate().map_err(str::to_string)?;
+    }
     if output.head_seq > i64::MAX as u64
         || output.retained_from_seq == 0
         || output.retained_from_seq > output.head_seq.saturating_add(1)
@@ -57,6 +60,8 @@ mod tests {
         RuntimeOutputBatch {
             incarnation_id: IncarnationId::new(),
             terminal_id: "owned".into(),
+            codex_activity: None,
+            opencode_activity: None,
             stream_epoch: "source".into(),
             retained_from_seq: 1,
             head_seq: 2,

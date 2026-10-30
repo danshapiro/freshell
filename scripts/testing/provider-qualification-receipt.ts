@@ -499,47 +499,52 @@ function validateNativeTurnProofs(provider: string, row: Record<string, any>): v
       'modelProvenance',
       'reasoningEffortProvenance',
     ] as const) boundedEvidenceString(proof[field], `${provider}.nativeTurnProofs[${index}].${field}`)
-    for (const field of ['providerProvenance', 'modelProvenance', 'reasoningEffortProvenance'] as const) {
-      if (/(?:process|argv|command)[-_ ]?(?:args?|line)?|launch[-_ ]?policy|picker|configured[-_ ]?value/i.test(proof[field])) {
-        throw new Error(`${provider}.nativeTurnProofs[${index}].${field} is not native provenance`)
-      }
-    }
     validateNativeProfile(provider, row, proof, index)
   }
 }
 
 function validateNativeProfile(provider: string, row: Record<string, any>, proof: Record<string, any>, index: number): void {
-  const label = `${provider}.nativeTurnProofs[${index}]`
-  if (proof.resolvedReasoningEffort !== row.reasoningEffort) {
-    throw new Error(`${label} native reasoning effort does not match the qualified profile`)
+  if (!providerNativeProfileMatches({ provider, model: row.model, reasoningEffort: row.reasoningEffort }, proof as ProviderNativeTurnProof)) {
+    throw new Error(`${provider}.nativeTurnProofs[${index}] native model/provider/reasoning effort provenance does not match the qualified ${provider} profile`)
   }
-  if (provider === 'claude') {
-    if (proof.resolvedProvider !== 'anthropic' || !String(proof.resolvedModel).toLowerCase().includes('haiku')
-      || !String(row.model).toLowerCase().includes('haiku')) {
-      throw new Error(`${label} does not prove the native Claude Haiku profile`)
+}
+
+/** Compare native observations to the configured profile without inventing
+ * optional effort telemetry or treating adapter configuration as observation. */
+export function providerNativeProfileMatches(
+  profile: Pick<ProviderQualificationRow, 'provider' | 'model' | 'reasoningEffort'>,
+  proof: ProviderNativeTurnProof,
+): boolean {
+  for (const field of ['providerProvenance', 'modelProvenance', 'reasoningEffortProvenance'] as const) {
+    if (/(?:process|argv|command)[-_ ]?(?:args?|line)?|launch[-_ ]?policy|picker|configured[-_ ]?value|amplifier-session:config/i.test(proof[field])) {
+      return false
     }
-    return
   }
-  if (provider === 'codex') {
-    if (proof.resolvedProvider !== 'openai' || proof.resolvedModel !== row.model) {
-      throw new Error(`${label} does not prove the native Codex model profile`)
-    }
-    return
+  const unsupportedEffort = proof.reasoningEffortProvenance === 'unsupported-native-telemetry'
+  if ((proof.resolvedReasoningEffort === 'unknown') !== unsupportedEffort
+    || (!unsupportedEffort && proof.resolvedReasoningEffort !== profile.reasoningEffort)) {
+    return false
   }
-  if (provider === 'opencode') {
+  if (profile.provider === 'claude') {
+    return proof.resolvedProvider === 'anthropic' && proof.resolvedModel.toLowerCase().includes('haiku')
+      && profile.model.toLowerCase().includes('haiku')
+  }
+  if (profile.provider === 'codex') {
+    return proof.resolvedProvider === 'openai' && proof.resolvedModel === profile.model
+  }
+  if (profile.provider === 'opencode') {
     const qualified = proof.resolvedModel.includes('/')
       ? proof.resolvedModel
       : `${proof.resolvedProvider}/${proof.resolvedModel}`
-    if (qualified !== row.model) throw new Error(`${label} does not prove the native OpenCode model profile`)
-    return
+    return qualified === profile.model
   }
-  if (provider === 'amplifier') {
-    if (proof.resolvedProvider !== 'lunaroute' || proof.resolvedModel !== row.model) {
-      throw new Error(`${label} does not prove the approved native Amplifier OneCLI profile`)
-    }
-    return
+  if (profile.provider === 'amplifier') {
+    return proof.resolvedProvider === 'vllm' && proof.resolvedModel === profile.model
+      && proof.providerProvenance === 'amplifier-llm:response.provider'
+      && proof.modelProvenance === 'amplifier-llm:response.model'
+      && (unsupportedEffort || proof.reasoningEffortProvenance === 'amplifier-llm:response.reasoning_effort')
   }
-  throw new Error(`${provider} has no native profile validation contract`)
+  return false
 }
 
 function nativeCompletionMillis(value: unknown, label: string): number {

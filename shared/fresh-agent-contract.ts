@@ -363,6 +363,14 @@ export const FreshAgentSessionCommandSchema = z.object({
   aliases: z.array(z.string()).optional(),
 }).strict()
 
+export const FreshAgentManagedDirectorySchema = z.object({
+  incarnationId: z.string().min(1),
+  cwd: z.string(),
+  workspacePath: z.string(),
+  gitCommonDir: z.string().nullable(),
+  sessionType: FreshAgentSessionTypeSchema,
+}).strict()
+
 export const FreshAgentSnapshotSchema = FreshAgentThreadLocatorSchema.extend({
   sessionId: z.string().min(1).optional(),
   revision: z.number().int().nonnegative(),
@@ -393,6 +401,9 @@ export const FreshAgentSnapshotSchema = FreshAgentThreadLocatorSchema.extend({
     redoableTurnIds: z.array(z.string()).optional(),
   }).strict().optional(),
   extensions: FreshAgentExtensionsSchema.default({}),
+  // Managed native-history reads carry this presentation context from the
+  // durable launch record. It does not add provider or lifecycle authority.
+  managedDirectory: FreshAgentManagedDirectorySchema.optional(),
   // Provider-advertised session commands. Optional on purpose: absence means
   // the provider has nothing to advertise (freshcodex, Rust port, offline),
   // and old servers/clients keep parsing unchanged (graceful absence).
@@ -451,6 +462,7 @@ export const FRESH_AGENT_CONTRACT_SCHEMA_NAMES = [
   'FreshAgentChildThreadSchema',
   'FreshAgentExtensionsSchema',
   'FreshAgentSessionCommandSchema',
+  'FreshAgentManagedDirectorySchema',
   'FreshAgentSnapshotSchema',
   'FreshAgentTurnPageSchema',
   'FreshAgentTurnBodySchema',
@@ -466,6 +478,7 @@ export type FreshAgentPendingApproval = z.infer<typeof FreshAgentPendingApproval
 export type FreshAgentPermissionUpdate = z.infer<typeof FreshAgentPermissionUpdateSchema>
 export type FreshAgentPendingQuestion = z.infer<typeof FreshAgentPendingQuestionSchema>
 export type FreshAgentSessionCommand = z.infer<typeof FreshAgentSessionCommandSchema>
+export type FreshAgentManagedDirectory = z.infer<typeof FreshAgentManagedDirectorySchema>
 export type FreshAgentSnapshot = z.infer<typeof FreshAgentSnapshotSchema>
 export type FreshAgentTurnPage = z.infer<typeof FreshAgentTurnPageSchema>
 export type FreshAgentTurnBody = z.infer<typeof FreshAgentTurnBodySchema>

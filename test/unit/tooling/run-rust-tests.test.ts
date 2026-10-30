@@ -20,7 +20,7 @@ describe('Rust test launcher children', () => {
       const result = f.run({ CARGO_BUILD_JOBS: '7' })
       expect(result.status, result.stderr).toBe(0)
       expect(result.events.map(e => e.args)).toEqual([
-        ['build', '-p', 'freshell-server', '--locked'], ['test', '--workspace', '--locked'],
+        ['build', '-p', 'freshell-server', '--locked'], ['test', '--workspace', '--locked', 'fixture_filter'],
       ])
       expect(result.events[1].binary).toBe(path.join(f.root, 'target/debug/freshell-server'))
       expect(result.events[1].jobs).toBe('7')
@@ -111,6 +111,36 @@ describe('Rust test launcher children', () => {
       expect(result.events[2].tmp).toBeTruthy()
       expect(existsSync(result.events[2].tmp)).toBe(false)
       expect(existsSync(result.events[2].executableTmp)).toBe(false)
+    } finally { f.cleanup() }
+  })
+})
+
+
+import { shouldRunProviderCrashRecoveryGate } from '../../../scripts/testing/run-rust-tests.js'
+
+describe('shouldRunProviderCrashRecoveryGate', () => {
+  it('schedules crash recovery after a full Unix Rust run', () => {
+    expect(shouldRunProviderCrashRecoveryGate('linux', [])).toBe(true)
+  })
+
+  it('skips the Unix-only crash selector on Windows', () => {
+    expect(shouldRunProviderCrashRecoveryGate('win32', [])).toBe(false)
+  })
+
+  it('does not add the full crash suite to a filtered Rust run', () => {
+    expect(shouldRunProviderCrashRecoveryGate('linux', ['provider_environment::tests'])).toBe(false)
+  })
+})
+
+
+describe('combined enclosed Rust recovery route', () => {
+  it.each([0, 29])('runs one inner recovery selector without nested Docker and propagates status %s', exit => {
+    const f = fixture()
+    try {
+      const result = f.run({ FRESHELL_RUST_TEST_SANDBOX: '1', RECOVERY_EXIT: String(exit) }, [])
+      expect(result.status, result.stderr).toBe(exit)
+      expect(result.events.map(event => event.kind)).toEqual(['sandbox', 'cargo', 'cargo', 'recovery'])
+      expect(result.events[3].mode).toBe('runtime-suite')
     } finally { f.cleanup() }
   })
 })

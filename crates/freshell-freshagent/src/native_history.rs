@@ -1,7 +1,11 @@
 //! Read a selected native transcript without creating a provider runtime.
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::{json, Value};
-use std::{collections::VecDeque, io::Read, path::Path};
+use std::{
+    collections::VecDeque,
+    io::{Read, Seek},
+    path::Path,
+};
 
 #[path = "native_history_source.rs"]
 mod source;
@@ -9,6 +13,27 @@ pub(crate) use source::{Records, Retention};
 pub(crate) const RETAINED_TURN_BYTES: usize = MAX_HISTORY_BYTES as usize / 4;
 
 pub const MAX_HISTORY_BYTES: u64 = 16 * 1024 * 1024;
+
+pub(crate) fn managed_provider_identity() -> Result<Option<(u32, u32)>, String> {
+    match (
+        std::env::var("FRESHELL_PROVIDER_RUN_AS_UID").ok(),
+        std::env::var("FRESHELL_PROVIDER_RUN_AS_GID").ok(),
+    ) {
+        (None, None) => Ok(None),
+        (Some(uid), Some(gid)) => {
+            let identity = (
+                uid.parse().map_err(|_| "invalid managed provider uid")?,
+                gid.parse().map_err(|_| "invalid managed provider gid")?,
+            );
+            #[cfg(unix)]
+            if identity == (unsafe { libc::geteuid() }, unsafe { libc::getegid() }) {
+                return Ok(None);
+            }
+            Ok(Some(identity))
+        }
+        _ => Err("incomplete managed provider identity".into()),
+    }
+}
 
 pub fn read(provider: &str, home: &Path, session_id: &str) -> Result<Value, String> {
     if session_id.is_empty() || session_id.contains(['/', '\\']) {
@@ -21,6 +46,99 @@ pub fn read(provider: &str, home: &Path, session_id: &str) -> Result<Value, Stri
         _ => return Err("native history reader does not support this provider".into()),
     };
     readonly_snapshot(provider, snapshot)
+}
+
+/// Optional live-display source; this does not grant ownership or live controls.
+pub fn read_large_codex_display(
+    codex_home: &Path,
+    session_id: &str,
+) -> Result<Option<Value>, String> {
+    crate::codex::read_large_native_display(codex_home, session_id)
+}
+
+pub(crate) async fn large_codex_display(
+    codex_home: &Path,
+    session_id: &str,
+) -> Result<Option<Value>, String> {
+    let Some((uid, gid)) = managed_provider_identity()? else {
+        let home = codex_home.to_owned();
+        let id = session_id.to_owned();
+        return tokio::task::spawn_blocking(move || read_large_codex_display(&home, &id))
+            .await
+            .map_err(|error| error.to_string())?;
+    };
+    use tokio::io::AsyncReadExt;
+    let mut child = tokio::process::Command::new("/usr/bin/setpriv")
+        .args([
+            "--reuid",
+            &uid.to_string(),
+            "--regid",
+            &gid.to_string(),
+            "--clear-groups",
+            "--no-new-privs",
+            "--",
+        ])
+        .arg(std::env::current_exe().map_err(|error| error.to_string())?)
+        .arg("native-history-only")
+        .args(["--provider", "codex", "--provider-home"])
+        .arg(std::env::var("HOME").map_err(|_| "managed provider HOME unavailable")?)
+        .args(["--session-id", session_id, "--codex-home"])
+        .arg(codex_home)
+        .arg("--if-large")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(freshell_codex::app_server::SNAPSHOT_READ_TIMEOUT_MS),
+        async {
+            let mut bytes = Vec::new();
+            child
+                .stdout
+                .take()
+                .ok_or("native history worker has no stdout")?
+                .take(MAX_HISTORY_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|_| "native history read failed")?;
+            if bytes.len() as u64 > MAX_HISTORY_BYTES {
+                return Err("native history response exceeds retained display budget");
+            }
+            if !child
+                .wait()
+                .await
+                .map_err(|_| "native history worker wait failed")?
+                .success()
+            {
+                return Err(
+                    "provider UID native history worker could not read selected Codex history",
+                );
+            }
+            serde_json::from_slice(&bytes).map_err(|_| "invalid native history worker response")
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(snapshot)) => Ok(snapshot),
+        failure => {
+            let _ = child.kill().await;
+            let reason = match failure {
+                Ok(Err(reason)) => reason,
+                Err(_) => "native history read timed out",
+                Ok(Ok(_)) => unreachable!(),
+            };
+            tracing::warn!(
+                event = "freshagent.codex.native_history_read_failed",
+                session_id,
+                provider_uid = uid,
+                provider_gid = gid,
+                reason
+            );
+            Err(reason.to_owned())
+        }
+    }
 }
 
 pub(crate) fn readonly_snapshot(provider: &str, mut snapshot: Value) -> Result<Value, String> {
@@ -48,6 +166,7 @@ pub(crate) struct RetainedTurns {
     values: VecDeque<(Value, usize)>,
     bytes: usize,
     pub(crate) omitted: usize,
+    pub(crate) omitted_items: usize,
     retention: Retention,
 }
 
@@ -57,12 +176,25 @@ impl RetainedTurns {
             values: VecDeque::new(),
             bytes: 0,
             omitted: 0,
+            omitted_items: 0,
             retention: retention.clone(),
         }
     }
     pub(crate) fn push(&mut self, mut value: Value) {
-        if serde_json::to_vec(&value).unwrap().len() > RETAINED_TURN_BYTES {
-            omit_large_bodies(&mut value, &self.retention);
+        let encoded = serde_json::to_vec(&value).expect("JSON value serializes");
+        if encoded.len() > RETAINED_TURN_BYTES {
+            // Use the same bounded JSON projection as native file reads. This
+            // covers unknown display fields, raw mirrors and many small items.
+            match source::bounded_value(std::io::Cursor::new(encoded), &self.retention) {
+                Ok((projected, omitted)) => {
+                    value = projected;
+                    self.omitted_items += omitted;
+                }
+                Err(error) => {
+                    tracing::warn!(event = "freshagent.native_history.display_projection_failed", reason = %error);
+                    omit_large_bodies(&mut value, &self.retention);
+                }
+            }
         }
         let size = serde_json::to_vec(&value)
             .expect("JSON value serializes")
@@ -77,6 +209,41 @@ impl RetainedTurns {
     pub(crate) fn values(self) -> Vec<Value> {
         self.values.into_iter().map(|(value, _)| value).collect()
     }
+}
+
+/// Retain display history without changing the live owner's controls or state.
+pub(crate) fn retain_snapshot_display(provider: &str, snapshot: &mut Value) {
+    let retention = Retention::new();
+    let mut omitted = 0;
+    let mut omitted_items = 0;
+    for key in ["turns", "rolledBackTurns"] {
+        if let Some(turns) = snapshot.get_mut(key).and_then(Value::as_array_mut) {
+            let mut retained = RetainedTurns::new(&retention);
+            for turn in std::mem::take(turns) {
+                retained.push(turn);
+            }
+            omitted += retained.omitted;
+            omitted_items += retained.omitted_items;
+            *turns = retained.values();
+        }
+    }
+    let bodies = retention.finish(snapshot);
+    let provider = if provider == "kilroy" {
+        "claude"
+    } else {
+        provider
+    };
+    let old = &snapshot["extensions"][provider]["nativeHistoryRetention"];
+    let omitted_turns = omitted + old["omittedNativeTurns"].as_u64().unwrap_or(0) as usize;
+    let omitted_items = omitted_items + old["omittedItems"].as_u64().unwrap_or(0) as usize;
+    let omitted_bodies = bodies + old["omittedBodies"].as_u64().unwrap_or(0) as usize;
+    record_retention(
+        provider,
+        snapshot,
+        omitted_turns,
+        omitted_items,
+        omitted_bodies,
+    );
 }
 
 /// Preserve the item and native control metadata while omitting a display body.
@@ -204,6 +371,23 @@ pub(crate) fn finish_retention(
         }
         omitted_turns += usize::from(turns.len() != before);
     }
+    record_retention(
+        provider,
+        snapshot,
+        omitted_turns,
+        omitted_items,
+        omitted_bodies,
+    );
+    Ok(())
+}
+
+fn record_retention(
+    provider: &str,
+    snapshot: &mut Value,
+    omitted_turns: usize,
+    omitted_items: usize,
+    omitted_bodies: usize,
+) {
     if omitted_turns + omitted_items + omitted_bodies > 0 {
         snapshot["extensions"][provider]["nativeHistoryRetention"] = json!({
             "partial":true, "omittedNativeTurns":omitted_turns, "omittedItems":omitted_items,
@@ -219,7 +403,6 @@ pub(crate) fn finish_retention(
             "freshagent.native_history.retained_window"
         );
     }
-    Ok(())
 }
 
 fn read_opencode(home: &Path, id: &str) -> Result<Value, String> {
@@ -350,6 +533,9 @@ pub(crate) fn read_opencode_path(path: &Path, id: &str) -> Result<Value, String>
     let active = active.values();
     let rolled_back = rolled_back.values();
     let mut snapshot = crate::build_opencode_snapshot_json(id, &info, &json!([]), None);
+    snapshot["extensions"]["opencode"]["nativeHistoryActivity"] = json!({
+        "at":info["time"]["updated"],"source":"native_timestamp",
+    });
     snapshot["latestTurnId"] = active
         .last()
         .map(|turn| turn["turnId"].clone())
@@ -403,18 +589,42 @@ fn read_sql_json(
 fn read_claude(home: &Path, id: &str, provider: &str) -> Result<Value, String> {
     let path = crate::claude_snapshot::find_transcript(&home.join(".claude"), id)
         .ok_or("saved native session not found")?;
-    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    read_claude_path(
+        &path,
+        id,
+        if provider == "kilroy" {
+            "kilroy"
+        } else {
+            "freshclaude"
+        },
+        None,
+    )
+}
+
+pub(crate) fn read_claude_path(
+    path: &Path,
+    id: &str,
+    session_type: &str,
+    rollback: Option<&crate::rollback_record::RollbackRecord>,
+) -> Result<Value, String> {
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let metadata = file.metadata().map_err(|e| e.to_string())?;
     let extent = metadata.len();
     let retention = Retention::new();
-    let source = Records::new(std::io::BufReader::new(file.take(extent)), &retention);
+    let source = Records::new(std::io::BufReader::new((&file).take(extent)), &retention);
     let mut turns = RetainedTurns::new(&retention);
     let mut ordinal = 0;
     let mut omitted_items = 0;
+    let mut native_activity = None;
+    let mut has_record = false;
     for record in source {
         let Some((record, omitted)) = record.map_err(|e| e.to_string())? else {
             continue;
         };
+        has_record = true;
+        if let Some(at) = freshell_sessions::time::parse_timestamp_ms(&record["timestamp"]) {
+            native_activity = Some(native_activity.map_or(at, |prior: i64| prior.max(at)));
+        }
         if let Some(turn) = crate::claude_snapshot::parse_transcript_turn_indexed(
             &record,
             id,
@@ -426,7 +636,19 @@ fn read_claude(home: &Path, id: &str, provider: &str) -> Result<Value, String> {
             ordinal += 1;
         }
     }
+    if !has_record && extent > 0 {
+        // Preserve empty/new and valid partial JSONL sources, but do not claim
+        // unreadable bytes are an available empty conversation. A valid prefix
+        // already supplies readable history even if a crash interrupted its tail.
+        file.rewind().map_err(|error| error.to_string())?;
+        if let Err(error) = validate_utf8_text(file.take(extent)) {
+            tracing::warn!(event = "freshagent.native_history.unreadable_claude_source",
+                session_id = id, source_bytes = extent, reason = %error);
+            return Err(format!("selected Claude transcript is unreadable: {error}"));
+        }
+    }
     let omitted = turns.omitted;
+    omitted_items += turns.omitted_items;
     let turns = turns.values();
     let revision = metadata
         .modified()
@@ -435,27 +657,123 @@ fn read_claude(home: &Path, id: &str, provider: &str) -> Result<Value, String> {
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0);
     let mut snapshot = crate::claude_snapshot::build_claude_snapshot_json(
-        if provider == "kilroy" {
-            "kilroy"
-        } else {
-            "freshclaude"
-        },
+        session_type,
         id,
         "",
         revision,
-        None,
+        rollback,
     );
     snapshot["latestTurnId"] = turns
         .last()
         .map(|turn| turn["turnId"].clone())
         .unwrap_or(Value::Null);
     snapshot["turns"] = json!(turns);
+    snapshot["extensions"]["claude"]["nativeHistoryActivity"] = json!({
+        "at":native_activity.unwrap_or(revision),
+        "source":if native_activity.is_some(){"native_timestamp"}else{"source_modification"},
+    });
     finish_retention(
-        provider,
+        "claude",
         &mut snapshot,
         omitted,
         omitted_items,
         Some(&retention),
     )?;
     Ok(snapshot)
+}
+
+fn validate_utf8_text(mut source: impl Read) -> std::io::Result<()> {
+    let mut bytes = [0; 64 * 1024];
+    let mut pending = 0;
+    loop {
+        let read = match source.read(&mut bytes[pending..]) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        let used = pending + read;
+        match std::str::from_utf8(&bytes[..used]) {
+            Ok(_) => pending = 0,
+            Err(error) if read == 0 || error.error_len().is_some() => {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+            }
+            Err(error) => {
+                pending = used - error.valid_up_to();
+                bytes.copy_within(error.valid_up_to()..used, 0);
+            }
+        }
+        if read == 0 {
+            return Ok(());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read_claude_source(bytes: &[u8]) -> Result<Value, String> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("saved-native.jsonl");
+        std::fs::write(&path, bytes).unwrap();
+        let result = read_claude_path(&path, "saved-native", "freshclaude", None);
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        result
+    }
+
+    #[test]
+    fn streaming_claude_snapshot_rejects_wholly_unreadable_native_bytes() {
+        for bytes in [
+            vec![0xff, 0xfe],
+            b"{\"type\":\"user\",\xff".to_vec(),
+            vec![0xf0, 0x9f],
+        ] {
+            assert!(
+                read_claude_source(&bytes).is_err(),
+                "unreadable bytes must not become an available empty conversation"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_claude_snapshot_keeps_empty_and_metadata_only_sources() {
+        for bytes in [
+            b"".as_slice(),
+            b"\n \t\n",
+            b"{\"type\":\"system\",\"subtype\":\"init\"}\n",
+        ] {
+            let snapshot = read_claude_source(bytes).unwrap();
+            assert_eq!(snapshot["turns"], json!([]));
+            assert_eq!(snapshot["threadId"], "saved-native");
+        }
+    }
+
+    #[test]
+    fn streaming_claude_snapshot_keeps_partial_utf8_sources_across_buffer_boundaries() {
+        for character in ['é', '中', '🙂'] {
+            let mut bytes = vec![b'"'];
+            bytes.extend(std::iter::repeat_n(b'x', 64 * 1024 - 2));
+            bytes.extend(character.to_string().repeat(4).as_bytes());
+            let snapshot = read_claude_source(&bytes).unwrap();
+            assert_eq!(snapshot["turns"], json!([]));
+            bytes.pop();
+            assert!(
+                read_claude_source(&bytes).is_err(),
+                "an incomplete UTF8 character with no readable record is unavailable"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_claude_snapshot_preserves_complete_prefix_before_crash_tail() {
+        let mut bytes = b"{\"type\":\"user\",\"uuid\":\"first-user\",\"message\":{\"role\":\"user\",\"content\":\"Saved prompt before interrupted append\"}}\n".to_vec();
+        bytes.extend(b"{\"type\":\"assistant\",\"message\":\xff\xfe");
+        let snapshot = read_claude_source(&bytes).unwrap();
+        assert_eq!(snapshot["turns"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["turns"][0]["turnId"], "first-user");
+        assert_eq!(
+            snapshot["turns"][0]["items"][0]["text"],
+            "Saved prompt before interrupted append"
+        );
+    }
 }

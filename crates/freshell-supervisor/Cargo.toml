@@ -11,6 +11,8 @@ runtime-test-faults = []
 provider-qualification = ["freshell-agent-runtime/provider-qualification"]
 
 [dependencies]
+freshell-sessions = { path = "../freshell-sessions" }
+freshell-codex = { path = "../freshell-codex", default-features = false }
 freshell-agent-runtime = { path = "../freshell-agent-runtime" }
 freshell-runtime-protocol = { path = "../freshell-runtime-protocol" }
 freshell-platform = { path = "../freshell-platform" }
@@ -22,6 +24,7 @@ rusqlite = { package = "rusqlite", version = "0.31", features = ["bundled"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "fs"] }
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
+hex = "0.4"
 async-trait = "0.1"
 thiserror = "2"
 tracing = "0.1"

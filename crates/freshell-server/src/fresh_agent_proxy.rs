@@ -11,13 +11,14 @@ use freshell_freshagent::rest_lane::{
 use freshell_protocol::session_names::NamedProvider;
 use freshell_protocol::{
     AgentProvider, FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent, FreshAgentForked,
-    FreshAgentKilled, FreshAgentRecoveryStopped, FreshAgentSend, ServerMessage, SessionLocator,
-    SessionType, StringOrNumber,
+    FreshAgentKilled, FreshAgentRecoveryStopped, FreshAgentSend, FreshAgentSessionMaterialized,
+    ServerMessage, SessionLocator, SessionType, StringOrNumber,
 };
 use freshell_runtime_client::RuntimeClient;
 use freshell_runtime_protocol::{
     AgentEvent, DesiredState, FreshAgentFixtureTransport, FreshAgentLaunchSpec,
-    FreshAgentRollbackDirection, FreshAgentRollbackMode, FreshProvider, LaunchRequest, RequestId,
+    FreshAgentProviderStartDiagnostic, FreshAgentRollbackDirection, FreshAgentRollbackMode,
+    FreshProvider, LaunchRequest, ProviderBootstrapFile, RequestId, RuntimeDiagnosticCode,
     RuntimeErrorCode, RuntimeLimits, RuntimeProfile, SoulId, StopOutcome,
 };
 use freshell_ws::hosted_fresh_agent::{HostedFreshAgentCommand, HostedFreshAgentGateway};
@@ -48,7 +49,7 @@ pub(crate) struct HostedFreshAgentProxy {
     client: RuntimeClient,
     broadcast: Arc<broadcast::Sender<String>>,
     aliases: Mutex<HashMap<(String, String), SoulId>>,
-    presentation_ids: Mutex<HashMap<SoulId, String>>,
+    presentation_routes: Mutex<HashMap<SoulId, PresentationRoute>>,
     pollers: Mutex<HashSet<SoulId>>,
     fixture_modes: HashSet<String>,
     naming: OnceLock<Arc<dyn SessionNaming>>,
@@ -66,6 +67,40 @@ struct RollbackInvocation {
     mode: Option<freshell_protocol::RollbackMode>,
     turn_id: Option<String>,
     cwd: Option<String>,
+}
+
+#[derive(Debug)]
+enum FreshAgentCreateFailure {
+    Unavailable,
+    ProviderStart(FreshAgentProviderStartDiagnostic),
+}
+
+impl From<()> for FreshAgentCreateFailure {
+    fn from((): ()) -> Self {
+        Self::Unavailable
+    }
+}
+
+#[derive(Clone)]
+struct PresentationRoute {
+    session_id: String,
+    materialized: bool,
+}
+
+impl PresentationRoute {
+    fn initial(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            materialized: false,
+        }
+    }
+
+    fn materialized(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            materialized: true,
+        }
+    }
 }
 
 impl HostedFreshAgentProxy {
@@ -95,7 +130,7 @@ impl HostedFreshAgentProxy {
             client,
             broadcast,
             aliases: Mutex::new(HashMap::new()),
-            presentation_ids: Mutex::new(HashMap::new()),
+            presentation_routes: Mutex::new(HashMap::new()),
             pollers: Mutex::new(HashSet::new()),
             fixture_modes,
             naming: OnceLock::new(),
@@ -203,12 +238,25 @@ impl HostedFreshAgentProxy {
         match command {
             HostedFreshAgentCommand::Create(message) => {
                 let request_id = message.request_id.clone();
-                if self.create(message).await.is_err() {
-                    tracing::warn!(request_id, "fresh_agent.create.failed");
+                if let Err(failure) = self.create(message).await {
+                    let (code, message) = match failure {
+                        FreshAgentCreateFailure::ProviderStart(diagnostic) => (
+                            "FRESH_AGENT_PROVIDER_START_FAILED",
+                            format!(
+                                "hosted fresh-agent provider failed to start (startup diagnostic: {})",
+                                diagnostic.as_str()
+                            ),
+                        ),
+                        FreshAgentCreateFailure::Unavailable => (
+                            "FRESH_AGENT_CREATE_FAILED",
+                            "managed fresh-agent host could not be created".to_string(),
+                        ),
+                    };
+                    tracing::warn!(request_id, code, "fresh_agent.create.failed");
                     self.send(ServerMessage::FreshAgentCreateFailed(
                         FreshAgentCreateFailed {
-                            code: "FRESH_AGENT_CREATE_FAILED".into(),
-                            message: "managed fresh-agent host could not be created".into(),
+                            code: code.into(),
+                            message,
                             request_id,
                             retryable: Some(true),
                             owner_kind: None,
@@ -219,6 +267,7 @@ impl HostedFreshAgentProxy {
                 }
             }
             HostedFreshAgentCommand::Attach(message) => {
+                let attention_since = chrono::Utc::now().timestamp_millis();
                 if let Some(soul) = self
                     .resolve_soul(&message.provider, message.session_type, &message.session_id)
                     .await
@@ -231,6 +280,7 @@ impl HostedFreshAgentProxy {
                             provider_name.clone(),
                             message.session_id.clone(),
                             session_type.clone(),
+                            attention_since,
                         )
                         .await;
                     if !started {
@@ -443,10 +493,10 @@ impl HostedFreshAgentProxy {
                                 soul.clone(),
                             );
                         }
-                        self.presentation_ids
-                            .lock()
-                            .await
-                            .insert(soul, transition.child_session_id.clone());
+                        self.presentation_routes.lock().await.insert(
+                            soul,
+                            PresentationRoute::materialized(transition.child_session_id.clone()),
+                        );
                         self.send(ServerMessage::FreshAgentForked(FreshAgentForked {
                             request_id: message.request_id,
                             parent_session_id: transition.parent_session_id,
@@ -501,75 +551,95 @@ impl HostedFreshAgentProxy {
     async fn create(
         self: &Arc<Self>,
         message: freshell_protocol::FreshAgentCreate,
-    ) -> Result<Option<(SoulId, u64)>, ()> {
-        let provider = fresh_provider(&message.provider, message.session_type).ok_or(())?;
+    ) -> Result<Option<(SoulId, u64)>, FreshAgentCreateFailure> {
+        // A fast provider may finish before its creation reply arrives. Keep
+        // those new edges while suppressing older retained journal history.
+        let attention_since = chrono::Utc::now().timestamp_millis();
+        let provider =
+            fresh_provider(&message.provider, message.session_type).ok_or_else(|| {
+                tracing::warn!(
+                    event = "fresh_agent.create.preparation_failed",
+                    reason = "unsupported_provider",
+                    request_id = message.request_id.as_str(),
+                    session_type = session_type_wire(message.session_type).as_str()
+                );
+            })?;
         let public_provider = fresh_provider_wire(&provider);
+        let session_type = session_type_wire(message.session_type);
+        let fixture_selected = cfg!(feature = "managed-fresh-agent-fixtures")
+            && self.fixture_modes.contains(&session_type);
+        if !fixture_selected
+            && !freshell_agent_runtime::managed_native_fresh_agent_enabled(&provider, &session_type)
+        {
+            tracing::warn!(
+                event = "fresh_agent.create.preparation_failed",
+                reason = "mode_not_release_qualified",
+                request_id = message.request_id.as_str(),
+                provider = provider.as_str(),
+                session_type = session_type.as_str()
+            );
+            return Err(FreshAgentCreateFailure::Unavailable);
+        }
         if let Some(session_ref) = message.session_ref.as_ref() {
             if session_ref.provider != public_provider {
-                return Err(());
+                tracing::warn!(
+                    event = "fresh_agent.create.preparation_failed",
+                    reason = "resume_provider_mismatch",
+                    request_id = message.request_id.as_str(),
+                    provider = provider.as_str(),
+                    session_type = session_type_wire(message.session_type).as_str()
+                );
+                return Err(FreshAgentCreateFailure::Unavailable);
             }
-            let inventory = self.client.inventory().await.map_err(|_| ())?;
+            let inventory = self.client.inventory().await.map_err(|error| {
+                let runtime_code = error
+                    .runtime_code()
+                    .and_then(|code| serde_json::to_value(code).ok())
+                    .and_then(|value| value.as_str().map(str::to_owned));
+                tracing::warn!(
+                    event = "fresh_agent.create.resume_inventory_failed",
+                    reason = create_client_error_reason(&error),
+                    runtime_code = runtime_code.as_deref().unwrap_or("none"),
+                    request_id = message.request_id.as_str(),
+                    provider = provider.as_str(),
+                    session_type = session_type_wire(message.session_type).as_str()
+                );
+            })?;
             let view = inventory
                 .into_iter()
                 .rev()
                 .find(|view| resume_view_matches(view, provider.as_str(), &session_ref.session_id));
             if let Some(view) = view {
-                let public_session_id = session_ref.session_id.clone();
-                let projection = session_projection(
-                    &self.naming.get().cloned(),
-                    named_provider(&provider),
-                    &public_session_id,
+                if matches!(provider, FreshProvider::Claude | FreshProvider::Kilroy) {
+                    self.client.fresh_agent_prepare_native(view.soul_id.clone()).await.map_err(|error| {
+                        tracing::warn!(event="fresh_agent.create.resume_preparation_failed",
+                            reason=create_client_error_reason(&error), request_id=message.request_id.as_str(),
+                            provider=provider.as_str(), soul_id=%view.soul_id,
+                            "Existing fresh-agent native session could not resume");
+                        FreshAgentCreateFailure::Unavailable
+                    })?;
+                }
+                self.reuse_created_view(
+                    &message,
+                    &provider,
+                    view,
+                    session_ref.session_id.clone(),
+                    attention_since,
                 )
                 .await;
-                let soul = view.soul_id;
-                let provider_name = public_provider.to_string();
-                let canonical_session_id = view.fresh_agent_session_id;
-                {
-                    let mut aliases = self.aliases.lock().await;
-                    aliases.insert(
-                        (provider_name.clone(), public_session_id.clone()),
-                        soul.clone(),
-                    );
-                    if let Some(canonical_session_id) = canonical_session_id {
-                        aliases.insert((provider_name.clone(), canonical_session_id), soul.clone());
-                    }
-                }
-                self.send(ServerMessage::FreshAgentCreated(FreshAgentCreated {
-                    provider: provider_name.clone(),
-                    request_id: message.request_id,
-                    runtime_provider: provider.as_str().into(),
-                    session_id: public_session_id.clone(),
-                    session_type: session_type_wire(message.session_type),
-                    session_ref: Some(SessionLocator {
-                        provider: provider_name.clone(),
-                        session_id: public_session_id.clone(),
-                    }),
-                    session_name: projection.as_ref().map(|(_, record)| record.clone()),
-                    name_ref: projection.map(|(reference, _)| reference),
-                }));
-                let started = self
-                    .start_poller(
-                        soul.clone(),
-                        provider_name,
-                        public_session_id.clone(),
-                        session_type_wire(message.session_type),
-                    )
-                    .await;
-                if !started {
-                    self.replay_once(
-                        soul,
-                        public_provider,
-                        &public_session_id,
-                        &session_type_wire(message.session_type),
-                    )
-                    .await;
-                }
                 return Ok(None);
             }
         }
-        let cwd = canonical_cwd(message.cwd.as_deref()).map_err(|_| ())?;
-        let workspace = workspace_root(&cwd);
-        let soul = stable_soul_id(provider.as_str(), &message.request_id).map_err(|_| ())?;
+
+        let soul = stable_soul_id(provider.as_str(), &message.request_id).map_err(|_| {
+            tracing::warn!(
+                event = "fresh_agent.create.preparation_failed",
+                reason = "invalid_soul_id",
+                request_id = message.request_id.as_str(),
+                provider = provider.as_str(),
+                session_type = session_type_wire(message.session_type).as_str()
+            );
+        })?;
         let public_session_id = presentation_id_for_create(
             &provider,
             &message.request_id,
@@ -578,19 +648,64 @@ impl HostedFreshAgentProxy {
                 .as_ref()
                 .map(|value| value.session_id.as_str()),
         );
+        if message.session_ref.is_none() {
+            // A lost creation ACK retries the same deterministic soul. Once it
+            // is running, input preparation belongs to that original launch;
+            // trying to reserve it again would reject an otherwise valid retry.
+            let inventory = self.client.inventory().await.map_err(|error| {
+                tracing::warn!(event="fresh_agent.create.inventory_failed",
+                    reason=create_client_error_reason(&error), request_id=message.request_id.as_str(),
+                    provider=provider.as_str(), session_type=session_type.as_str(), soul_id=%soul);
+            })?;
+            if let Some(view) = inventory.into_iter().rev().find(|view| {
+                view.soul_id == soul
+                    && view.desired_state == DesiredState::Running
+                    && view.launch_state == freshell_runtime_protocol::LaunchState::Running
+                    && view.provider.as_deref() == Some(provider.as_str())
+                    && view.fresh_agent_session_id.as_deref() == Some(public_session_id.as_str())
+            }) {
+                self.reuse_created_view(
+                    &message,
+                    &provider,
+                    view,
+                    public_session_id,
+                    attention_since,
+                )
+                .await;
+                return Ok(None);
+            }
+        }
+        let cwd = canonical_cwd(message.cwd.as_deref()).map_err(|_| {
+            tracing::warn!(
+                event = "fresh_agent.create.preparation_failed",
+                reason = "cwd_unavailable",
+                request_id = message.request_id.as_str(),
+                provider = provider.as_str(),
+                session_type = session_type_wire(message.session_type).as_str()
+            );
+        })?;
+        let workspace = workspace_root(&cwd);
         let native_session_id = message
             .session_ref
             .as_ref()
             .map(|value| value.session_id.clone());
-        let session_type = session_type_wire(message.session_type);
-        let request_id = stable_request_id(&message.request_id).map_err(|_| ())?;
-        let provider_bootstrap_files = Vec::new();
+        let request_id = stable_request_id(&message.request_id).map_err(|_| {
+            tracing::warn!(event="fresh_agent.create.preparation_failed", reason="invalid_request_id",
+                request_id=message.request_id.as_str(), provider=provider.as_str(), session_type=session_type.as_str(), soul_id=%soul);
+        })?;
+        let provider_bootstrap_files = provider_bootstrap_files(&provider).map_err(|_| {
+            tracing::warn!(event="fresh_agent.create.preparation_failed", reason="bootstrap_reference_unavailable",
+                request_id=message.request_id.as_str(), provider=provider.as_str(), session_type=session_type.as_str(), soul_id=%soul);
+        })?;
         let mut provider_secret_references =
             crate::managed_provider_bootstrap::named_provider_onecli_references(
-                provider.native_provider(),
+                provider.native_family(),
             )
-            .map_err(|_| ())?;
-        let (mcp_capability, mut provider_launch_context) = if provider == FreshProvider::Opencode {
+            .map_err(|_| {
+                tracing::warn!(event="fresh_agent.create.preparation_failed", reason="onecli_reference_unavailable",
+                    request_id=message.request_id.as_str(), provider=provider.as_str(), session_type=session_type.as_str(), soul_id=%soul);
+            })?;
+        let (pending_capability, provider_launch_context) = if provider == FreshProvider::Opencode {
             let home = std::env::var_os("HOME")
                 .map(std::path::PathBuf::from)
                 .ok_or(())?;
@@ -624,7 +739,10 @@ impl HostedFreshAgentProxy {
             })?;
             provider_secret_references = prepared.references;
             let capability = prepared.context.mcp_capability.clone().ok_or(())?;
-            (capability, Some(prepared.context))
+            (
+                crate::managed_mcp_capability::PendingMcpCapability::new(capability),
+                Some(prepared.context),
+            )
         } else if provider == FreshProvider::Codex {
             let home = std::env::var_os("HOME")
                 .map(std::path::PathBuf::from)
@@ -647,7 +765,12 @@ impl HostedFreshAgentProxy {
             .map_err(|error| {
                 tracing::warn!(event="fresh_agent.create.provider_inputs_failed",%error);
             })?;
-            (context.mcp_capability.clone().ok_or(())?, Some(context))
+            (
+                crate::managed_mcp_capability::PendingMcpCapability::new(
+                    context.mcp_capability.clone().ok_or(())?,
+                ),
+                Some(context),
+            )
         } else if matches!(provider, FreshProvider::Claude | FreshProvider::Kilroy) {
             let home = std::env::var_os("HOME")
                 .map(std::path::PathBuf::from)
@@ -676,11 +799,16 @@ impl HostedFreshAgentProxy {
             .map_err(|error| {
                 tracing::warn!(event="fresh_agent.create.provider_inputs_failed",%error);
             })?;
-            (context.mcp_capability.clone().ok_or(())?, Some(context))
+            (
+                crate::managed_mcp_capability::PendingMcpCapability::new(
+                    context.mcp_capability.clone().ok_or(())?,
+                ),
+                Some(context),
+            )
         } else {
-            let mcp_capability = crate::managed_mcp_capability::issue_mcp_capability(
+            let pending_capability = crate::managed_mcp_capability::issue_mcp_capability(
                 &soul,
-                provider.as_str(),
+                provider.native_family(),
                 crate::managed_mcp_capability::OpencodeEphemeralInput {
                     cwd: Some(&cwd),
                     workspace: Some(&workspace),
@@ -689,20 +817,23 @@ impl HostedFreshAgentProxy {
             )
             .map_err(|error| {
                 tracing::warn!(%error, "fresh_agent.create.capability_failed");
-            })?;
+            })
+            .map(crate::managed_mcp_capability::PendingMcpCapability::new)?;
             let provider_launch_context =
                 crate::managed_provider_bootstrap::provider_launch_context_for_managed_at(
-                    provider.as_str(),
+                    provider.native_family(),
                     &workspace,
                     &cwd,
-                    Some(mcp_capability.clone()),
+                    Some(pending_capability.reference()),
                 )
                 .map_err(|error| {
                     tracing::warn!(event="fresh_agent.create.provider_environment_failed", %error);
                 })?;
-            (mcp_capability, provider_launch_context)
+            (pending_capability, provider_launch_context)
         };
-        provider_launch_context = context_for_fresh_provider(provider_launch_context);
+        // Keep the prepared sources and fixed hosted MCP selection intact.
+        let provider_launch_context = context_for_fresh_provider(provider_launch_context);
+        let mcp_capability = pending_capability.reference();
         let launch = FreshAgentLaunchSpec {
             session_id: public_session_id.clone(),
             provider: provider.clone(),
@@ -738,9 +869,7 @@ impl HostedFreshAgentProxy {
                     session_id: reference.session_id.clone(),
                 }
             }),
-            fixture_transport: self
-                .fixture_modes
-                .contains(&session_type)
+            fixture_transport: fixture_selected
                 .then_some(FreshAgentFixtureTransport::Deterministic),
             provider_bootstrap_files,
             provider_secret_references,
@@ -767,7 +896,7 @@ impl HostedFreshAgentProxy {
             view_intent: Some(crate::managed_view_intent::automatic_primary_view_request(
                 project_key,
                 message.tab_id.clone(),
-                None,
+                message.pane_id.clone(),
             )),
             expected_control_epoch: None,
         };
@@ -783,7 +912,10 @@ impl HostedFreshAgentProxy {
                 .filter(|r| !r.profile.is_configuration_file())
                 .cloned()
                 .collect();
-            crate::managed_provider_references::launch_initial_opencode(
+            // Preparation is complete. The existing input journal owns cleanup
+            // from this point; a lost launch reply cannot prove non-dispatch.
+            pending_capability.retain_for_reconciliation();
+            crate::managed_provider_references::launch_initial_opencode_typed(
                 crate::managed_provider_references::OpencodePreparation {
                     client: &self.client,
                     soul: &soul,
@@ -809,24 +941,33 @@ impl HostedFreshAgentProxy {
                 request,
             )
             .await
-            .map_err(|error| {
-                tracing::warn!(event="fresh_agent.create.initial_opencode_failed",%error);
-            })?
         } else {
-            self.client
-                .launch(request_id, request)
-                .await
-                .map_err(|error| {
-                    // A failed reply cannot establish that this exact
-                    // preparation was never accepted. Preserve its journal and
-                    // stage for existing same-conversation reconciliation.
-                    tracing::warn!(event="provider.inputs.initial_launch.unconfirmed",
-                        provider=provider.as_str(),soul_id=%soul,
-                        grant_id=%mcp_capability.grant_id,
-                        stage="controller",operation="launch",%error,
-                        "Retain provider inputs until dispatch outcome is confirmed");
-                })?
-        };
+            // Keep the staged context if the waiter is cancelled or its reply
+            // is ambiguous: the supervisor may already have accepted it.
+            pending_capability.retain_for_reconciliation();
+            self.client.launch(request_id, request).await
+        }
+        .map_err(|error| {
+            let runtime_code = error.runtime_code().and_then(|code| serde_json::to_value(code).ok())
+                .and_then(|value| value.as_str().map(str::to_owned));
+            let provider_start_diagnostic = error.fresh_agent_provider_start_diagnostic();
+            tracing::warn!(event="fresh_agent.create.launch_failed", reason=create_client_error_reason(&error),
+                runtime_code=runtime_code.as_deref().unwrap_or("none"), request_id=message.request_id.as_str(),
+                provider=provider.as_str(), session_type=session_type.as_str(), soul_id=%soul,
+                provider_start_diagnostic=provider_start_diagnostic.map(FreshAgentProviderStartDiagnostic::as_str).unwrap_or("none"));
+            if provider != FreshProvider::Opencode {
+                tracing::warn!(event="provider.inputs.initial_launch.unconfirmed",
+                    provider=provider.as_str(), soul_id=%soul, grant_id=%mcp_capability.grant_id,
+                    stage="controller", operation="launch", reason=create_client_error_reason(&error),
+                    "Retain provider inputs until dispatch outcome is confirmed");
+            }
+            match (error.diagnostic_code(), provider_start_diagnostic) {
+                (Some(RuntimeDiagnosticCode::FreshAgentProviderStartFailed), Some(diagnostic)) => {
+                    FreshAgentCreateFailure::ProviderStart(diagnostic)
+                }
+                _ => FreshAgentCreateFailure::Unavailable,
+            }
+        })?;
         let cleanup_receipt = (soul.clone(), launched.view.intent_revision);
         let naming_projection = match message.naming_handle.as_deref() {
             Some(handle) if !handle.trim().is_empty() => {
@@ -867,9 +1008,87 @@ impl HostedFreshAgentProxy {
             public_provider.into(),
             public_session_id,
             session_type,
+            attention_since,
         )
         .await;
         Ok(Some(cleanup_receipt))
+    }
+
+    async fn reuse_created_view(
+        self: &Arc<Self>,
+        message: &freshell_protocol::FreshAgentCreate,
+        provider: &FreshProvider,
+        view: freshell_runtime_protocol::RuntimeView,
+        public_session_id: String,
+        attention_since: i64,
+    ) {
+        let public_provider = fresh_provider_wire(provider);
+        let session_ref = message
+            .session_ref
+            .as_ref()
+            .map(|reference| SessionLocator {
+                provider: reference.provider.clone(),
+                session_id: reference.session_id.clone(),
+            })
+            .or_else(|| {
+                view.native_session_id
+                    .as_ref()
+                    .map(|session_id| SessionLocator {
+                        provider: public_provider.into(),
+                        session_id: session_id.clone(),
+                    })
+            });
+        if view.native_session_id.as_deref() == Some(public_session_id.as_str()) {
+            self.observe_native_session(&view.soul_id, &public_session_id)
+                .await;
+        }
+        let projection = session_projection(
+            &self.naming.get().cloned(),
+            named_provider(provider),
+            &public_session_id,
+        )
+        .await;
+        let soul = view.soul_id;
+        let provider_name = public_provider.to_string();
+        let canonical_session_id = view.fresh_agent_session_id;
+        {
+            let mut aliases = self.aliases.lock().await;
+            aliases.insert(
+                (provider_name.clone(), public_session_id.clone()),
+                soul.clone(),
+            );
+            if let Some(canonical_session_id) = canonical_session_id {
+                aliases.insert((provider_name.clone(), canonical_session_id), soul.clone());
+            }
+        }
+        self.send(ServerMessage::FreshAgentCreated(FreshAgentCreated {
+            provider: provider_name.clone(),
+            request_id: message.request_id.clone(),
+            runtime_provider: provider.as_str().into(),
+            session_id: public_session_id.clone(),
+            session_type: session_type_wire(message.session_type),
+            session_ref,
+            session_name: projection.as_ref().map(|(_, record)| record.clone()),
+            name_ref: projection.map(|(reference, _)| reference),
+        }));
+        let started = self
+            .start_poller(
+                soul.clone(),
+                provider_name,
+                public_session_id.clone(),
+                session_type_wire(message.session_type),
+                attention_since,
+            )
+            .await;
+        if !started {
+            self.replay_once(
+                soul,
+                public_provider,
+                &public_session_id,
+                &session_type_wire(message.session_type),
+            )
+            .await;
+        }
     }
 
     async fn resolve_decision(
@@ -974,6 +1193,9 @@ impl HostedFreshAgentProxy {
                 && (view.fresh_agent_session_id.as_deref() == Some(session_id)
                     || view.native_session_id.as_deref() == Some(session_id))
         })?;
+        if view.native_session_id.as_deref() == Some(session_id) {
+            self.observe_native_session(&view.soul_id, session_id).await;
+        }
         self.aliases.lock().await.insert(
             (public_provider, session_id.to_string()),
             view.soul_id.clone(),
@@ -987,12 +1209,13 @@ impl HostedFreshAgentProxy {
         provider: String,
         presentation_session_id: String,
         session_type: String,
+        attention_since: i64,
     ) -> bool {
-        self.presentation_ids
+        self.presentation_routes
             .lock()
             .await
             .entry(soul.clone())
-            .or_insert_with(|| presentation_session_id.clone());
+            .or_insert_with(|| PresentationRoute::initial(presentation_session_id.clone()));
         if !self.pollers.lock().await.insert(soul.clone()) {
             return false;
         }
@@ -1007,35 +1230,38 @@ impl HostedFreshAgentProxy {
                 {
                     Ok(batch) => {
                         if batch.reset_required {
+                            let current_presentation = proxy
+                                .presentation_routes
+                                .lock()
+                                .await
+                                .get(&soul)
+                                .map(|route| route.session_id.clone())
+                                .unwrap_or_else(|| presentation_session_id.clone());
                             proxy.send(ServerMessage::FreshAgentEvent(FreshAgentEvent {
                                 event: serde_json::json!({
                                     "type":"freshAgent.host.journal.reset",
                                     "retainedFrom":batch.retained_from,
                                 }),
                                 provider: provider.clone(),
-                                session_id: presentation_session_id.clone(),
+                                session_id: current_presentation,
                                 session_type: session_type.clone(),
                             }));
                         }
                         for event in batch.events {
                             cursor = cursor.max(event.sequence);
-                            // Provider-native identity is nested provider state. The public
-                            // routing alias changes only through an explicit same-soul fork
-                            // transition or durable inventory reconciliation, never merely
-                            // because initial startup observed a native ID.
-                            let current_presentation = proxy
-                                .presentation_ids
-                                .lock()
-                                .await
-                                .get(&soul)
-                                .cloned()
-                                .unwrap_or_else(|| presentation_session_id.clone());
-                            proxy.forward_host_event(
-                                event.event,
-                                &provider,
-                                &current_presentation,
-                                &session_type,
-                            );
+                            // Materialization is the explicit event transition at which the
+                            // client rekeys its pane to the provider-native session id. Keep
+                            // subsequent invalidators on that same route.
+                            proxy
+                                .forward_polled_event(
+                                    &soul,
+                                    event.event,
+                                    &provider,
+                                    &presentation_session_id,
+                                    &session_type,
+                                    Some(attention_since),
+                                )
+                                .await;
                         }
                     }
                     Err(_) => {
@@ -1055,7 +1281,8 @@ impl HostedFreshAgentProxy {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             proxy.pollers.lock().await.remove(&soul);
-            proxy.presentation_ids.lock().await.remove(&soul);
+            // A replacement poller replays from cursor zero; keep the current
+            // route so historical materialization cannot revive a retired ID.
         });
         true
     }
@@ -1067,11 +1294,193 @@ impl HostedFreshAgentProxy {
         presentation_session_id: &str,
         session_type: &str,
     ) {
-        let Ok(batch) = self.client.fresh_agent_events(soul, 0, 4096).await else {
+        let Ok(batch) = self.client.fresh_agent_events(soul.clone(), 0, 4096).await else {
             return;
         };
         for event in batch.events {
-            self.forward_host_event(event.event, provider, presentation_session_id, session_type);
+            self.forward_polled_event(
+                &soul,
+                event.event,
+                provider,
+                presentation_session_id,
+                session_type,
+                None,
+            )
+            .await;
+        }
+    }
+
+    async fn forward_polled_event(
+        &self,
+        soul: &SoulId,
+        event: AgentEvent,
+        provider: &str,
+        fallback_presentation_id: &str,
+        session_type: &str,
+        attention_since: Option<i64>,
+    ) {
+        let materialized_session_id = materialized_session_id(&event);
+        let confirmed_clear = self
+            .confirmed_claude_clear(soul, &event, provider, session_type)
+            .await;
+        let clear_name = if let Some((_, session_id)) = confirmed_clear.as_ref() {
+            if session_type == "kilroy" {
+                None
+            } else {
+                session_projection(
+                    &self.naming.get().cloned(),
+                    NamedProvider::Claude,
+                    session_id,
+                )
+                .await
+            }
+        } else {
+            None
+        };
+        let mut presentation_routes = self.presentation_routes.lock().await;
+        let route = presentation_routes
+            .entry(soul.clone())
+            .or_insert_with(|| PresentationRoute::initial(fallback_presentation_id));
+        if let Some((previous_session_id, session_id)) = confirmed_clear {
+            if route.materialized && route.session_id == previous_session_id {
+                // The SDK's provisional rekey precedes its actual native init.
+                // Publish the pane's durable ref only once that later init has
+                // committed this same soul's new root in the registry.
+                self.send(ServerMessage::FreshAgentSessionMaterialized(
+                    FreshAgentSessionMaterialized {
+                        previous_session_id,
+                        provider: provider.into(),
+                        session_ref: Some(SessionLocator {
+                            provider: provider.into(),
+                            session_id: session_id.clone(),
+                        }),
+                        session_id: session_id.clone(),
+                        session_type: session_type.into(),
+                        name_ref: clear_name.as_ref().map(|(reference, _)| reference.clone()),
+                        session_name: clear_name.map(|(_, record)| record),
+                    },
+                ));
+                tracing::info!(event = "fresh_agent.proxy.native_clear_materialized",
+                    soul_id = %soul, provider, session_id,
+                    "the pane follows its confirmed native clear");
+                route.session_id = session_id;
+            }
+        }
+        if materialized_session_id
+            .as_ref()
+            .is_some_and(|session_id| route.materialized && session_id != &route.session_id)
+        {
+            // The journal replays from cursor zero. After a fork, an older
+            // parent materialization must not move this soul back off its
+            // current native session.
+            return;
+        }
+
+        if let AgentEvent::Provider { payload } = &event {
+            if let Some(edge) = payload.get("event").filter(|event| {
+                matches!(
+                    event.get("type").and_then(serde_json::Value::as_str),
+                    Some("freshAgent.turn.complete" | "freshAgent.turn.waiting")
+                )
+            }) {
+                // Reattachment needs state, transcript invalidations and pending
+                // approvals. Completion/waiting are discrete notifications;
+                // replaying them creates new attention for already finished work.
+                let new_edge = attention_since.is_some_and(|since| {
+                    edge.get("at")
+                        .and_then(serde_json::Value::as_i64)
+                        .is_some_and(|at| at >= since)
+                });
+                // Claude's sidecar can retain its original public envelope ID
+                // after native materialization. Codex/OpenCode envelopes name
+                // native sessions and can also reject a retired fork parent.
+                let retired_route = matches!(provider, "codex" | "opencode")
+                    && route.materialized
+                    && payload
+                        .get("sessionId")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|session_id| session_id != route.session_id);
+                if !new_edge || retired_route {
+                    return;
+                }
+            }
+        }
+
+        self.forward_host_event(event, provider, &route.session_id, session_type);
+        if let Some(session_id) = materialized_session_id {
+            route.session_id = session_id;
+            route.materialized = true;
+        }
+    }
+
+    async fn confirmed_claude_clear(
+        &self,
+        soul: &SoulId,
+        event: &AgentEvent,
+        provider: &str,
+        session_type: &str,
+    ) -> Option<(String, String)> {
+        if provider != "claude" || !matches!(session_type, "freshclaude" | "kilroy") {
+            return None;
+        }
+        let AgentEvent::Provider { payload } = event else {
+            return None;
+        };
+        let init = payload.get("event").unwrap_or(payload);
+        let evidence = &init["nativeIdentityEvidence"];
+        if init["type"] != "freshAgent.session.init" || evidence["source"] != "clear" {
+            return None;
+        }
+        let session_id = init["cliSessionId"].as_str()?;
+        let previous = evidence["previousNativeSessionId"].as_str()?;
+        if session_id == previous {
+            return None;
+        }
+        let launch: freshell_runtime_protocol::NativeIdentityLaunch =
+            serde_json::from_value(evidence["launch"].clone()).ok()?;
+        // A background poller can miss more than one clear before catching up.
+        // Recheck this presentation ID after registry/naming awaits so a
+        // concurrent fork or newer clear cannot be overwritten.
+        let presentation_id = self
+            .presentation_routes
+            .lock()
+            .await
+            .get(soul)
+            .filter(|route| route.materialized && route.session_id != session_id)
+            .map(|route| route.session_id.clone())?;
+        let runtime_provider = if session_type == "kilroy" {
+            "kilroy"
+        } else {
+            "claude"
+        };
+        let views = self.client.inventory().await.ok()?;
+        views.iter().any(|view| {
+            view.soul_id == *soul
+                && view.desired_state == DesiredState::Running
+                && view.launch_state == freshell_runtime_protocol::LaunchState::Running
+                && view.provider.as_deref() == Some(runtime_provider)
+                && view.fresh_agent_session_type.as_deref() == Some(session_type)
+                && view.native_session_id.as_deref() == Some(session_id)
+                && view.incarnation_id == launch.incarnation_id
+                && view.execution_generation == launch.execution_generation
+                && view.native_identity_observation.as_ref().is_some_and(|observation| {
+                    observation.source == freshell_runtime_protocol::NativeIdentitySource::ClaudeNativeClear
+                        && observation.native_session_id == session_id
+                        && observation.matches_launch(&launch)
+                })
+        }).then(|| (presentation_id, session_id.into()))
+    }
+
+    async fn observe_native_session(&self, soul: &SoulId, session_id: &str) {
+        let mut presentation_routes = self.presentation_routes.lock().await;
+        match presentation_routes.entry(soul.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(PresentationRoute::materialized(session_id));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) if !entry.get().materialized => {
+                entry.insert(PresentationRoute::materialized(session_id));
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {}
         }
     }
 
@@ -1358,6 +1767,16 @@ fn operation_error_code(error: &freshell_runtime_client::ClientError) -> &'stati
     }
 }
 
+fn create_client_error_reason(error: &freshell_runtime_client::ClientError) -> &'static str {
+    use freshell_runtime_client::ClientError;
+    match error {
+        ClientError::Io(_) => "supervisor_io",
+        ClientError::Protocol(_) => "supervisor_protocol",
+        ClientError::Runtime { .. } => "runtime_rejection",
+        ClientError::UnexpectedResult => "unexpected_supervisor_result",
+    }
+}
+
 fn fresh_agent_error_payload(code: &str, message: &str) -> serde_json::Value {
     serde_json::json!({
         "type":"freshAgent.error",
@@ -1398,6 +1817,27 @@ fn rewrite_presentation_id(payload: &mut serde_json::Value, presentation_id: &st
     for child in object.values_mut() {
         rewrite_presentation_id(child, presentation_id);
     }
+}
+
+fn materialized_session_id(event: &AgentEvent) -> Option<String> {
+    let AgentEvent::Provider { payload } = event else {
+        return None;
+    };
+    find_materialized_session_id(payload)
+}
+
+fn find_materialized_session_id(payload: &serde_json::Value) -> Option<String> {
+    let object = payload.as_object()?;
+    if object.get("type").and_then(serde_json::Value::as_str)
+        == Some("freshAgent.session.materialized")
+    {
+        return object
+            .get("sessionId")
+            .and_then(serde_json::Value::as_str)
+            .filter(|session_id| !session_id.is_empty())
+            .map(str::to_owned);
+    }
+    object.values().find_map(find_materialized_session_id)
 }
 
 fn stable_hex(value: &str) -> String {
@@ -1464,6 +1904,40 @@ fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn provider_bootstrap_files(
+    provider: &FreshProvider,
+) -> Result<Vec<ProviderBootstrapFile>, String> {
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let (override_key, fallback, relative) = match provider {
+        FreshProvider::Kilroy => (
+            "FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE",
+            home.map(|value| value.join(".claude/.credentials.json")),
+            ".claude/.credentials.json",
+        ),
+        FreshProvider::Claude | FreshProvider::Codex | FreshProvider::Opencode => {
+            return Ok(Vec::new())
+        }
+    };
+    let candidate = std::env::var(override_key)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or(fallback)
+        .filter(|value| value.is_file());
+    let Some(candidate) = candidate else {
+        return Ok(Vec::new());
+    };
+    let source_path = std::fs::canonicalize(candidate)
+        .map_err(|_| "provider credential reference is unreadable".to_string())?;
+    Ok(vec![ProviderBootstrapFile {
+        source_path: source_path.to_string_lossy().into_owned(),
+        provider_relative_path: relative.into(),
+    }])
 }
 
 #[cfg(test)]

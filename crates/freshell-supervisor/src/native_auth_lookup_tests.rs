@@ -512,6 +512,7 @@ async fn provider_native_auth_nested_callback_uses_current_attempt_without_reloc
         .commit_created(
             launch.incarnation_id,
             BackendCreatedRecord {
+                launch_policy: None,
                 daemon_id: DockerDaemonId::new(),
                 container_id: "owned-container".into(),
                 image_ref: "sha256:synthetic-image".into(),

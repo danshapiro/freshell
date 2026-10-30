@@ -19,6 +19,11 @@ export function fixture() {
     ? '/freshell-test-artifacts/XXX'
     : path.join(os.tmpdir(), 'XXX')
   copyFileSync(launcher, path.join(root, 'scripts/testing/run-rust-tests.ts'))
+  writeFileSync(path.join(root, 'scripts/testing/provider-crash-recovery-tests.ts'), `
+    import fs from 'node:fs';
+    fs.appendFileSync(process.env.RECEIPT!, JSON.stringify({kind:'recovery', mode:process.env.FRESHELL_SANDBOX_MODE})+'\\n');
+    process.exit(Number(process.env.RECOVERY_EXIT || 0));
+  `)
   writeFileSync(path.join(root, 'package.json'), '{"type":"module"}')
   symlinkSync(path.resolve('node_modules'), path.join(root, 'node_modules'), 'dir')
   const receipt = path.join(root, 'receipt.jsonl')
@@ -76,18 +81,19 @@ export function fixture() {
     const args = process.argv.slice(2);
     fs.appendFileSync(process.env.RECEIPT, JSON.stringify({kind:'sandbox', args, ownerGuard:process.env.FRESHELL_SANDBOX_OWNER_GUARD})+'\\n');
     if (process.env.SANDBOX_EXIT) process.exit(Number(process.env.SANDBOX_EXIT));
+    if (args[1].includes('provider-crash-recovery-tests.ts')) process.exit(Number(process.env.RECOVERY_EXIT || 0));
     const command = args[1]
       .replaceAll('/freshell-test-artifacts/targets/', ${JSON.stringify(artifacts)} + '/targets/')
       .replace('mktemp -d /freshell-test-artifacts/.freshell-rust-tests-', 'mktemp -d ' + ${JSON.stringify(artifacts)} + '/.freshell-rust-tests-')
       .replace('mktemp -d /freshell-test-artifacts/XXX', 'mktemp -d ' + ${JSON.stringify(runtimeTemplate)})
       .replace('mktemp -d /workspace/target/', 'mktemp -d ' + ${JSON.stringify(root)} + '/target/')
       .replace('node --import tsx /workspace/scripts/testing/run-rust-tests.ts', 'node --import tsx ' + ${JSON.stringify(root)} + '/scripts/testing/run-rust-tests.ts');
-    const result = cp.spawnSync('bash', ['-c', command], {env:process.env, stdio:'inherit'});
+    const result = cp.spawnSync('bash', ['-c', command], {env:{...process.env, FRESHELL_SANDBOX_MODE:'runtime-suite'}, stdio:'inherit'});
     process.exit(result.status ?? 1);
   `)
   return {
     root, artifacts,
-    run(env: NodeJS.ProcessEnv = {}, args: string[] = []) {
+    run(env: NodeJS.ProcessEnv = {}, args: string[] = ['fixture_filter']) {
       const result = spawnSync(process.execPath, ['--import', tsx, path.join(root, 'scripts/testing/run-rust-tests.ts'), ...args], {
         env: { ...process.env, PATH: `${root}/bin:${process.env.PATH}`, RECEIPT: receipt,
           FRESHELL_RUST_TEST_SANDBOX: '0', CARGO_TARGET_DIR: '', FRESHELL_SERVER_BIN: '/host/stale-server', ...env },

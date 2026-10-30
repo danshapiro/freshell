@@ -44,6 +44,7 @@ ARG AMPLIFIER_OPENAI_SDK_VERSION=2.8.1
 ARG AMPLIFIER_OPENAI_HARMONY_VERSION=0.0.8
 ENV DEBIAN_FRONTEND=noninteractive
 COPY --from=node-source /usr/local/ /usr/local/
+COPY extensions/amplifier/freshell-native-resume.patch /opt/freshell-native-resume.patch
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       bash ca-certificates git openssh-client procps python3 python3-venv make g++ \
@@ -57,6 +58,12 @@ RUN apt-get update \
  && /opt/uv/bin/pip install --no-cache-dir "uv==${AMPLIFIER_UV_VERSION}" \
  && git clone --filter=blob:none https://github.com/microsoft/amplifier-app-cli /opt/amplifier-src \
  && git -C /opt/amplifier-src checkout --detach "${AMPLIFIER_APP_CLI_COMMIT}" \
+ && git -C /opt/amplifier-src rev-parse HEAD | grep -Fx '1873aa980535c99a743b17172e4231833f6c8741' \
+ && echo 'fd305d3037fa6bc3087d5aa13ecbb9aba1c21a5a5a57cefd57dad394f54fe770  /opt/amplifier-src/amplifier_app_cli/session_store.py' | sha256sum --check \
+ && echo '7be66414b114c3c2ea7a892b4ada3ae74289d417c73bef8f5cd6cacf944f1071  /opt/amplifier-src/amplifier_app_cli/session_runner.py' | sha256sum --check \
+ && echo 'e2a04418d82731a37a98c228ed8a78bbe9ea4282db0d6410f22e8342db892c86  /opt/amplifier-src/amplifier_app_cli/runtime/config.py' | sha256sum --check \
+ && git -C /opt/amplifier-src apply --check /opt/freshell-native-resume.patch \
+ && git -C /opt/amplifier-src apply /opt/freshell-native-resume.patch \
  && /opt/uv/bin/uv sync --locked --no-dev --project /opt/amplifier-src \
  && git clone --filter=blob:none https://github.com/microsoft/amplifier-module-provider-vllm /opt/amplifier-provider-vllm \
  && git -C /opt/amplifier-provider-vllm checkout --detach "${AMPLIFIER_PROVIDER_VLLM_COMMIT}" \
@@ -75,6 +82,45 @@ RUN apt-get update \
  && /opt/amplifier-src/.venv/bin/python -c 'import importlib.metadata as m; assert m.version("amplifier-app-cli") == "0.1.1"' \
  && /opt/amplifier-src/.venv/bin/python -c 'import importlib.metadata as m; assert m.version("openai") == "2.8.1"; assert m.version("openai-harmony") == "0.0.8"; assert m.version("amplifier-module-provider-vllm") == "1.0.0"' \
  && /lib/x86_64-linux-gnu/libc.so.6 | grep -F '2.39'
+
+# Preinstall the ordinary bundle modules so read-only provider runtimes
+# resolve source-less references without a runtime dependency installer.
+ARG AMPLIFIER_LOOP_BASIC_COMMIT=ae0954cc41be54afef3ca97181a0876a29ad1b4c
+ARG AMPLIFIER_CONTEXT_SIMPLE_COMMIT=c7ec55db96888200ba619adedc857278daf787c5
+ARG AMPLIFIER_HOOKS_LOGGING_COMMIT=a4efafc834938ea53006808313e840b1136cb296
+RUN git clone --filter=blob:none https://github.com/microsoft/amplifier-module-loop-basic /opt/amplifier-loop-basic \
+ && git -C /opt/amplifier-loop-basic checkout --detach "${AMPLIFIER_LOOP_BASIC_COMMIT}" \
+ && git -C /opt/amplifier-loop-basic rev-parse HEAD | grep -Fx "${AMPLIFIER_LOOP_BASIC_COMMIT}" \
+ && git clone --filter=blob:none https://github.com/microsoft/amplifier-module-context-simple /opt/amplifier-context-simple \
+ && git -C /opt/amplifier-context-simple checkout --detach "${AMPLIFIER_CONTEXT_SIMPLE_COMMIT}" \
+ && git -C /opt/amplifier-context-simple rev-parse HEAD | grep -Fx "${AMPLIFIER_CONTEXT_SIMPLE_COMMIT}" \
+ && git clone --filter=blob:none https://github.com/microsoft/amplifier-module-hooks-logging /opt/amplifier-hooks-logging \
+ && git -C /opt/amplifier-hooks-logging checkout --detach "${AMPLIFIER_HOOKS_LOGGING_COMMIT}" \
+ && git -C /opt/amplifier-hooks-logging rev-parse HEAD | grep -Fx "${AMPLIFIER_HOOKS_LOGGING_COMMIT}" \
+ && /opt/uv/bin/uv pip install --python /opt/amplifier-src/.venv/bin/python --no-deps /opt/amplifier-loop-basic /opt/amplifier-context-simple /opt/amplifier-hooks-logging \
+ && rm -rf /opt/amplifier-loop-basic/.git \
+ && rm -rf /opt/amplifier-context-simple/.git \
+ && rm -rf /opt/amplifier-hooks-logging/.git \
+ && /opt/amplifier-src/.venv/bin/python -c 'import importlib.metadata as m; assert m.version("amplifier-app-cli") == "0.1.1"; assert m.version("amplifier-core") == "1.6.0"; assert m.version("amplifier-foundation") == "1.0.0"; assert m.version("openai") == "2.8.1"; assert m.version("openai-harmony") == "0.0.8"; assert m.version("amplifier-module-provider-vllm") == "1.0.0"'
+
+# The ordinary CLI always composes the modes behavior, including its context
+# and definitions. Keep that complete bundle and install its ordinary modules
+# before a provider enters the read-only runtime.
+ARG AMPLIFIER_MODES_COMMIT=4b86243d9f19c0718985caae923cfe66a0d266aa
+ARG AMPLIFIER_HOOKS_APPROVAL_COMMIT=c149f1e09757567d0dfc82a83bf21ac274a2061d
+COPY docker/runtime/prepare-amplifier-modes.py /opt/prepare-amplifier-modes.py
+COPY docker/runtime/prepare-amplifier-profile.py /opt/prepare-amplifier-profile.py
+RUN git clone --filter=blob:none https://github.com/microsoft/amplifier-bundle-modes /opt/amplifier-modes \
+ && git -C /opt/amplifier-modes checkout --detach "${AMPLIFIER_MODES_COMMIT}" \
+ && git -C /opt/amplifier-modes rev-parse HEAD | grep -Fx "${AMPLIFIER_MODES_COMMIT}" \
+ && git clone --filter=blob:none https://github.com/microsoft/amplifier-module-hooks-approval /opt/amplifier-hooks-approval \
+ && git -C /opt/amplifier-hooks-approval checkout --detach "${AMPLIFIER_HOOKS_APPROVAL_COMMIT}" \
+ && git -C /opt/amplifier-hooks-approval rev-parse HEAD | grep -Fx "${AMPLIFIER_HOOKS_APPROVAL_COMMIT}" \
+ && /opt/uv/bin/uv pip install --python /opt/amplifier-src/.venv/bin/python --no-deps \
+      /opt/amplifier-modes/modules/hooks-mode /opt/amplifier-modes/modules/tool-mode /opt/amplifier-hooks-approval \
+ && /opt/amplifier-src/.venv/bin/python /opt/prepare-amplifier-modes.py \
+ && rm -rf /opt/amplifier-modes/.git /opt/amplifier-hooks-approval/.git \
+ && /opt/amplifier-src/.venv/bin/python -c 'import importlib.metadata as m; assert m.version("amplifier-module-hooks-mode") == "1.0.0"; assert m.version("amplifier-module-tool-mode") == "1.0.0"; assert m.version("amplifier-module-hooks-approval") == "0.1.0"'
 
 # FreshClaude/Kilroy run inside the soul host, so their JS SDK bridge and its
 # pinned dependency must be part of the workload image rather than resolved

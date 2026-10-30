@@ -174,6 +174,11 @@ if (resumeIndex !== -1) {
 } else {
 
   process.stdout.write('codex> \r\n')
+  // The controlled managed parity wrapper has to acknowledge startup before
+  // its host admits input. Reuse that actual proxy response at first Enter;
+  // ordinary locator fixtures still start the handshake only on Enter.
+  const startupThread = process.env.FAKE_CODEX_TERMINAL_PARITY_STARTUP === '1'
+    ? managedThread() : null
   let wrote = false
   process.stdin.on('data', (chunk) => {
     if (wrote) return
@@ -193,7 +198,8 @@ if (resumeIndex !== -1) {
       process.stdout.write(`codex: session ${threadId} started\r\n`)
     }
     const gate = process.env.FAKE_CODEX_TERMINAL_ROLLOUT_GATE_PATH
-    managedThread().then((managedThreadId) => {
+    const currentThread = startupThread ?? managedThread()
+    currentThread.then((managedThreadId) => {
       const finishWith = () => finish(managedThreadId)
       if (gate) {
         const poll = setInterval(() => {

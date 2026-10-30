@@ -32,9 +32,9 @@ function contextFor(payload: Record<string, any>): TurnContext {
   const effortProvenance = effortCandidates.find(([value]) => typeof value === 'string' && value)?.[1]
   return {
     model: requiredString(model, 'Codex turn_context model'),
-    effort: requiredString(effort, 'Codex turn_context reasoning effort'),
+    effort: typeof effort === 'string' ? effort : 'unknown',
     modelProvenance: requiredString(modelProvenance, 'Codex model provenance'),
-    effortProvenance: requiredString(effortProvenance, 'Codex effort provenance'),
+    effortProvenance: effortProvenance ?? 'unsupported-native-telemetry',
   }
 }
 
@@ -63,30 +63,52 @@ function ownsThread(filePath: string, threadId: string): boolean {
 }
 
 /** Reads the exact Codex 0.147.0 rollout, never a newest-rollout guess. */
-export function readCodexNativeHistory(sessionsRoot: string, exactThreadId: string): NativeHistory {
-  const threadId = safeOpaqueId(exactThreadId, 'Codex native thread id')
-  // Rollout basenames vary by timestamp, so inspect bounded *.jsonl candidates' line-zero session_meta.
-  const candidates = findFiles(
-    sessionsRoot,
-    (basename) => basename.endsWith('.jsonl') && basename.includes(threadId),
-  )
-  const matches = candidates.filter((candidate) => ownsThread(candidate, threadId))
-  if (matches.length === 0) throw new Error(`Codex exact thread session_meta is missing: ${threadId}`)
-  if (matches.length !== 1) throw new Error(`Codex exact thread rollout is ambiguous or duplicated: ${threadId}`)
+export type CodexNativeInput = { turnId: string; text: string }
 
-  const rows = readBoundedJsonl(matches[0], 'Codex native rollout')
+export function readCodexNativeHistory(sessionsRoot: string, exactThreadId: string): NativeHistory {
+  const { history } = readCodexNativeObservation(sessionsRoot, exactThreadId)
+  if (history.turns.length === 0) throw new Error('Codex exact native thread has no completed assistant response')
+  return history
+}
+
+/** Includes native inputs for independently checking serialized request/turn association. */
+export function readCodexNativeObservation(sessionsRoot: string, exactThreadId: string): { history: NativeHistory; inputs: CodexNativeInput[] } {
+  const threadId = safeOpaqueId(exactThreadId, 'Codex native thread id')
+  const selectedSource = selectCodexNativeSource(sessionsRoot, threadId)
+  const rows = readBoundedJsonl(selectedSource, 'Codex native rollout')
   const meta = object(rows[0]?.payload, 'Codex session_meta payload')
   const provider = requiredString(meta.model_provider, 'Codex session_meta model provider')
   const contexts = new Map<string, TurnContext>()
   const assistantItems: { id: string | null; text: string; parent: string | null }[] = []
   const pendingTools: NativeToolCall[] = []
   const turns: NativeAssistantTurn[] = []
+  const inputs: CodexNativeInput[] = []
+  let currentTurn: string | undefined
+  const nativeInputSources = new Map<string, Set<string>>()
+  const completed = new Set<string>()
   for (const row of rows.slice(1)) {
     const payload = object(row.payload, 'Codex rollout payload')
     if (row.type === 'turn_context') {
-      contexts.set(requiredString(payload.turn_id, 'Codex turn_context turn id'), contextFor(payload))
+      currentTurn = requiredString(payload.turn_id, 'Codex turn_context turn id')
+      if (contexts.has(currentTurn)) throw new Error('Codex duplicate native turn context')
+      contexts.set(currentTurn, contextFor(payload))
       assistantItems.length = 0
       pendingTools.length = 0
+      continue
+    }
+    const userEvent = row.type === 'event_msg' && payload.type === 'user_message'
+    const userResponse = row.type === 'response_item' && payload.type === 'message' && payload.role === 'user'
+    if (userEvent || userResponse) {
+      if (!currentTurn || completed.has(currentTurn)) throw new Error('Codex native user input lacks current turn context')
+      const text = userEvent ? requiredString(payload.message, 'Codex native user message')
+        : boundedText((payload.content as { type: string; text?: string }[]).filter(part => part.type === 'input_text').map(part => requiredString(part.text, 'Codex native input text')).join(''), 'Codex native input')
+      const sources = nativeInputSources.get(currentTurn) ?? new Set<string>()
+      const source = userEvent ? 'event' : 'response'
+      if (sources.has(source)) throw new Error('Codex duplicate native user input')
+      const prior = inputs.find(input => input.turnId === currentTurn)
+      if (prior && prior.text !== text) throw new Error('Codex native input mirrors disagree')
+      if (!prior) inputs.push({ turnId: currentTurn, text })
+      sources.add(source); nativeInputSources.set(currentTurn, sources)
       continue
     }
     if (row.type === 'response_item') {
@@ -102,6 +124,8 @@ export function readCodexNativeHistory(sessionsRoot: string, exactThreadId: stri
     const turnId = requiredString(payload.turn_id, 'Codex task_complete turn id')
     const context = contexts.get(turnId)
     if (!context) throw new Error(`Codex completed turn ${turnId} lacks turn_context profile metadata`)
+    if (turnId !== currentTurn || completed.has(turnId)) throw new Error('Codex native completion is duplicated or out of order')
+    completed.add(turnId)
     const finalText = requiredString(payload.last_agent_message, 'Codex task_complete last assistant message')
     const response = [...assistantItems].reverse().find((item) => item.text === finalText)
     // Codex rollouts do not promise a response_item id; the native completed turn UUID is authoritative.
@@ -125,6 +149,20 @@ export function readCodexNativeHistory(sessionsRoot: string, exactThreadId: stri
     pendingTools.length = 0
     if (turns.length > MAX_NATIVE_TURNS) throw new Error('Codex native completed turns exceed the evidence bound')
   }
-  if (turns.length === 0) throw new Error('Codex exact native thread has no completed assistant response')
-  return { schemaVersion: NATIVE_HISTORY_SCHEMA_VERSION, provider: 'codex', nativeSessionId: threadId, turns }
+  return { history: { schemaVersion: NATIVE_HISTORY_SCHEMA_VERSION, provider: 'codex', nativeSessionId: threadId, turns }, inputs }
+}
+
+/** The same exact rollout selection used by the semantic reader and raw capture. */
+export function selectCodexNativeSource(sessionsRoot: string, exactThreadId: string): string {
+  const threadId = safeOpaqueId(exactThreadId, 'Codex native thread id')
+  // Rollout basenames vary by timestamp, so inspect bounded *.jsonl candidates' line-zero session_meta.
+  const candidates = findFiles(
+    sessionsRoot,
+    (basename) => basename.endsWith('.jsonl') && basename.includes(threadId),
+  )
+  const matches = candidates.filter((candidate) => ownsThread(candidate, threadId))
+  if (matches.length === 0) throw new Error(`Codex exact thread session_meta is missing: ${threadId}`)
+  if (matches.length !== 1) throw new Error(`Codex exact thread rollout is ambiguous or duplicated: ${threadId}`)
+
+  return matches[0]!
 }

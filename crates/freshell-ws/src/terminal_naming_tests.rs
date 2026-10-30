@@ -166,7 +166,8 @@ impl ManagedTerminalController for SoulInventory {
         &'a self,
         _terminal: ManagedTerminalDescriptor,
         _data: String,
-    ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+    ) -> ManagedTerminalFuture<'a, Result<(), freshell_terminal::registry::ManagedTerminalInputError>>
+    {
         Box::pin(async { Ok(()) })
     }
 

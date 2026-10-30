@@ -1,5 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
+import { redactNativeDiagnostic } from '../../scripts/testing/opencode-restoration-rehearsal.js'
 
 /** Select each managed environment scenario's own relative configuration. */
 export function managedEnvironmentOpencodeSelection(): Record<string, string> {
@@ -17,6 +18,26 @@ export function prepareProviderParityUserRoots(home: string, xdgConfigHome: stri
     fs.mkdirSync(path.join(home, root), { recursive: true })
   }
   fs.mkdirSync(path.join(xdgConfigHome, 'opencode'), { recursive: true })
+}
+
+/** Restore user-owned OpenCode inputs between shuffled recovery cases. */
+export function resetProviderParityOpenCodeInputs(workspace: string, xdgConfigHome: string, inputs: {
+  tui: string
+  project: string
+  user: string
+}): void {
+  const projectConfig = path.join(workspace, '.opencode')
+  const userConfig = path.join(xdgConfigHome, 'opencode')
+  fs.writeFileSync(path.join(userConfig, 'tui.jsonc'), inputs.tui)
+  // Recovery removes the original selected directory to exercise refresh.
+  fs.mkdirSync(projectConfig, { recursive: true })
+  fs.writeFileSync(path.join(projectConfig, 'opencode.json'), inputs.project)
+  // Every provider observes this shared project file. Prepare the selected
+  // owned subtree for the provider user independently of shuffled case order.
+  makeProviderParityResourcesReadable(projectConfig)
+  fs.writeFileSync(path.join(userConfig, 'opencode.jsonc'), inputs.user)
+  fs.rmSync(path.join(userConfig, 'new-provider.jsonc'), { force: true })
+  fs.writeFileSync(path.join(userConfig, 'plugins/parity-plugin.js'), 'export default { name: "parity" }\n')
 }
 
 const providerFailureOperations = [
@@ -164,4 +185,23 @@ export function supervisorRegistrySecretScan(markers: string[], directory = '/va
     + 'for(let attempt=0;;attempt++){try{'
     + `for(const f of fs.readdirSync(p).filter(x=>x.startsWith('runtime.sqlite3'))){const value=fs.readFileSync(p+'/'+f);if(markers.some(marker=>value.includes(marker)))process.exit(4)}`
     + "break}catch(error){if(error.code!=='ENOENT'||attempt>=20)throw error}}"]
+}
+
+/** Preserve the owning process's bounded warning/error details only on failure. */
+export function providerParityFailureLogTail(logs: string, secrets: readonly string[]) {
+  return logs.slice(-256 * 1024).split('\n').flatMap(line => {
+    try {
+      const row = JSON.parse(line)
+      if (!row || typeof row !== 'object' || Array.isArray(row)) return []
+      const fields = row.fields && typeof row.fields === 'object' ? row.fields : row
+      const severity = String(row.level ?? row.severity ?? '').toLowerCase()
+      if (!['warn', 'warning', 'error'].includes(severity)) return []
+      const text = (value: unknown) => typeof value === 'string'
+        ? redactNativeDiagnostic(value, secrets).slice(0, 4096) : undefined
+      return [JSON.parse(redactNativeDiagnostic(JSON.stringify({
+        severity, event: text(row.event ?? fields.message), timestamp: text(row.timestamp ?? row.at),
+        target: text(row.target), error: text(fields.error ?? fields.cause),
+      }), secrets))]
+    } catch { return [] }
+  }).slice(-32)
 }

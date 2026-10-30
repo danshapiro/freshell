@@ -39,6 +39,36 @@ pub const CODEX_INITIAL_LAUNCH_ATTEMPTS: u32 = 5;
 /// `CODEX_INITIAL_LAUNCH_RETRY_DELAY_MS` (`launch-retry.ts:6`).
 pub const CODEX_INITIAL_LAUNCH_RETRY_DELAY_MS: u64 = 100;
 
+/// Per-attempt app-server readiness, exact child teardown and interactive queue bounds.
+pub const SIDECAR_START_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
+pub const SIDECAR_TEARDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+pub const CODEX_SIDECAR_PLAN_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// FreshCodex retries initialize within the listener deadline; its final RPC
+/// can finish after that deadline. Resume uses the longer snapshot RPC budget.
+pub const SIDECAR_INITIALIZE_RETRY_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(150);
+pub fn managed_fresh_startup_budget() -> std::time::Duration {
+    SIDECAR_START_BUDGET
+        + SIDECAR_INITIALIZE_RETRY_DELAY
+        + std::time::Duration::from_millis(crate::app_server::DEFAULT_REQUEST_TIMEOUT_MS)
+        + std::time::Duration::from_millis(crate::app_server::SNAPSHOT_READ_TIMEOUT_MS)
+}
+
+/// The managed terminal uses the existing initial retry schedule, including
+/// linear sleeps between failed attempts and the interactive planner queue.
+pub fn managed_sidecar_startup_budget() -> std::time::Duration {
+    let attempts = CODEX_INITIAL_LAUNCH_ATTEMPTS;
+    CODEX_SIDECAR_PLAN_WAIT
+        + (SIDECAR_START_BUDGET + SIDECAR_TEARDOWN_BUDGET) * attempts
+        + std::time::Duration::from_millis(
+            CODEX_INITIAL_LAUNCH_RETRY_DELAY_MS
+                * u64::from(attempts)
+                * u64::from(attempts.saturating_sub(1))
+                / 2,
+        )
+}
+
 /// `terminal-registry.ts:301` — `new URL(wsUrl)` threw.
 pub const CODEX_REMOTE_INVALID_URL_MESSAGE: &str =
     "Codex launch requires a valid loopback app-server websocket URL.";

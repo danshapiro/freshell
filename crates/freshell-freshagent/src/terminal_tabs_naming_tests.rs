@@ -61,7 +61,10 @@ impl freshell_terminal::registry::ManagedTerminalController for LaunchingManaged
         &'a self,
         _: freshell_terminal::registry::ManagedTerminalDescriptor,
         _: String,
-    ) -> freshell_terminal::registry::ManagedTerminalFuture<'a, Result<(), String>> {
+    ) -> freshell_terminal::registry::ManagedTerminalFuture<
+        'a,
+        Result<(), freshell_terminal::registry::ManagedTerminalInputError>,
+    > {
         Box::pin(async { Ok(()) })
     }
 

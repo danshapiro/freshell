@@ -6,13 +6,16 @@ import os from 'node:os'
 import path from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 
-const fakeDocker = vi.hoisted(() => ({ settled: false, commands: [] as string[][], supervisorCommands: [] as string[][] }))
+const fakeDocker = vi.hoisted(() => ({ settled: false, publisherName: '', commands: [] as string[][], supervisorCommands: [] as string[][] }))
 vi.mock('node:child_process', () => {
   const api = {
     spawn: () => { throw new Error('unexpected spawned process in isolated harness fixture') },
     execFileSync: (program: string, args: string[]) => {
       if (program === 'git' && args.join(' ') === 'rev-parse HEAD') return 'cleanup-fixture-commit\n'
       if (program === 'docker' && args[0] === 'volume' && args[1] === 'create') return `${args[2]}\n`
+      if (program === 'docker' && [
+        'ps -aq --no-trunc', 'volume ls --format {{.Name}}', 'ps -a --format {{.Names}}',
+      ].includes(args.join(' '))) return ''
       if (program === 'docker' && args[0] === 'run' && args.includes('/var/lib/freshell-supervisor')) {
         fakeDocker.supervisorCommands.push(args)
         return `${'f'.repeat(64)}\n`
@@ -20,10 +23,13 @@ vi.mock('node:child_process', () => {
       throw new Error('unexpected executable in isolated cleanup fixture')
     },
     spawnSync: (program: string, args: string[]) => {
-      if (program !== 'docker' || !['inspect', 'rm'].includes(args[0]) || !args.at(-1)?.match(/^[a-f0-9]{64}$/)) {
+      if (program !== 'docker' || !['inspect', 'rm'].includes(args[0])
+        || !(args.at(-1)?.match(/^[a-f0-9]{64}$/) || args.at(-1) === fakeDocker.publisherName)) {
         throw new Error('unexpected child process in isolated cleanup fixture')
       }
       fakeDocker.commands.push(args)
+      // The owned name and ID identify one publisher; later lookups see its removal.
+      if (args[0] === 'inspect' && fakeDocker.settled) return { status: 1, stdout: '', stderr: 'No such container' }
       if (args[0] === 'rm') fakeDocker.settled = true
       return { status: 0, stdout: '', stderr: '' }
     },
@@ -861,6 +867,7 @@ describe('runtime harness indexed input cleanup', () => {
           configurationBinds: [], resourceMounts: [], indexedSecretSources: [],
           indexedFiles: { volumeName: `freshell-inputs-${createHash('sha256').update(`${soulId}\0${generationId}`).digest('hex').slice(0, 24)}`, aliases: [] } }
         broker.authorizePreparedInputs(input)
+        fakeDocker.publisherName = `${input.indexedFiles!.volumeName}-publisher`
         const labels = { 'com.freshell.managed-inputs': 'true', 'com.freshell.installation-id': input.installationId,
           'com.freshell.soul-id': soulId, 'com.freshell.incarnation-id': input.incarnationId, 'com.freshell.input-generation': generationId }
         expect(await request('POST', '/v1.47/volumes/create', { Name: input.indexedFiles!.volumeName, Driver: 'local',
@@ -880,8 +887,11 @@ describe('runtime harness indexed input cleanup', () => {
         if (outcome === 'foreign-label') volume.Labels['com.freshell.soul-id'] = 'foreign'
         const result = await harness.cleanup()
         expect(fakeDocker.settled).toBe(true)
-        expect(fakeDocker.commands).toEqual([['inspect', 'a'.repeat(64)], ['rm', '-f', 'a'.repeat(64)]])
-        expect(result.ok).toBe(outcome === 'removed')
+        expect(fakeDocker.commands).toEqual([
+          ['inspect', fakeDocker.publisherName], ['rm', '-f', fakeDocker.publisherName],
+          ['inspect', 'a'.repeat(64)], ['inspect', fakeDocker.publisherName],
+        ])
+        expect(result.ok, JSON.stringify(result.errors)).toBe(outcome === 'removed')
         expect(exists).toBe(outcome !== 'removed')
         const deletes = calls.filter(call => call.method === 'DELETE')
         expect(deletes).toEqual(outcome === 'foreign-label' ? [] : [{ method: 'DELETE', url: `/v1.47/volumes/${input.indexedFiles!.volumeName}` }])
@@ -967,7 +977,7 @@ describe('runtime harness candidate scratch cleanup', () => {
         if (outcome === 'already-gone') volume = undefined
         if (outcome === 'foreign-label') volume.Labels['com.freshell.soul-id'] = 'foreign'
         const result = await harness.cleanup()
-        expect(result.ok).toBe(outcome !== 'foreign-label')
+        expect(result.ok, result.errors.join('\n')).toBe(outcome !== 'foreign-label')
         expect(volume === undefined).toBe(outcome !== 'foreign-label')
         const deletes = calls.filter(call => call.method === 'DELETE')
         expect(deletes).toEqual(outcome === 'foreign-label' ? [] : [{ method: 'DELETE', url: `/v1.47/volumes/${name}` }])

@@ -21,6 +21,11 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=FRESHELL_WS_BUILD_COMMIT={commit}");
     println!("cargo:rerun-if-env-changed=FRESHELL_BUILD_COMMIT");
+    // Match the server's cache trigger: copied incremental artifacts can still
+    // watch another worktree's Git paths until this script runs here again.
+    // The trigger only invalidates the cache; provenance still comes from git
+    // or the separately validated FRESHELL_BUILD_COMMIT input above.
+    println!("cargo:rerun-if-env-changed=FRESHELL_BUILD_SOURCE_STATE");
     for path in rerun_paths() {
         println!("cargo:rerun-if-changed={}", path.display());
     }

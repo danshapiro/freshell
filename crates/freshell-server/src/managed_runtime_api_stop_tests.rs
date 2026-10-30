@@ -12,6 +12,7 @@ use freshell_supervisor::{
     registry::{BackendCreatedRecord, LaunchPreparation, OwnedRuntimeHandle, Registry},
     service::{serve_control, Supervisor, SupervisorConfig},
 };
+use sha2::Digest;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Mutex,
@@ -23,6 +24,9 @@ use tower::ServiceExt;
 #[derive(Default)]
 struct StopBackend {
     uncertain: AtomicBool,
+    // Observation is independent of signal errors; default handles are occupied.
+    empty: AtomicBool,
+    empty_after_error: AtomicBool,
     stopped: Mutex<Vec<(SoulId, IncarnationId)>>,
     history_home: Option<PathBuf>,
 }
@@ -59,11 +63,15 @@ impl RuntimeBackend for StopBackend {
             .unwrap()
             .push((handle.soul_id().clone(), handle.incarnation_id().clone()));
         if self.uncertain.load(Ordering::SeqCst) {
+            if self.empty_after_error.load(Ordering::SeqCst) {
+                self.empty.store(true, Ordering::SeqCst);
+            }
             Err(BackendError::DockerHttp {
                 status: 503,
                 body: "cleanup unconfirmed".into(),
             })
         } else {
+            self.empty.store(true, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -71,7 +79,7 @@ impl RuntimeBackend for StopBackend {
         unreachable!()
     }
     async fn verify_empty(&self, _: &OwnedRuntimeHandle) -> Result<bool, BackendError> {
-        Ok(true)
+        Ok(self.empty.load(Ordering::SeqCst))
     }
     async fn list_known(
         &self,
@@ -114,6 +122,18 @@ async fn fixture_fresh_soul(
     session_type: &str,
     native_id: &str,
 ) -> (Registry, RuntimeView) {
+    fixture_fresh_soul_with_cleanup(root, certify_loss, provider, session_type, native_id, false)
+        .await
+}
+
+pub(super) async fn fixture_fresh_soul_with_cleanup(
+    root: &std::path::Path,
+    certify_loss: bool,
+    provider: &str,
+    session_type: &str,
+    native_id: &str,
+    verified_empty: bool,
+) -> (Registry, RuntimeView) {
     let registry = Registry::open(root, None).unwrap();
     let soul_id = SoulId::new();
     let fresh_agent: FreshAgentLaunchSpec = serde_json::from_value(json!({
@@ -153,24 +173,102 @@ async fn fixture_fresh_soul(
                 runtime_dir: root.join("runtime"),
                 host_binary_path: root.join("host"),
                 immutable_config_digest: format!("sha256:{}", "c".repeat(64)),
+                launch_policy: None,
             },
         )
         .await
         .unwrap();
-    registry
+    let grant = registry
         .commit_execution_grant(prepared.incarnation_id.clone(), HostBootId::new(), limits())
+        .await
+        .unwrap();
+    let context = registry.recovery_context(soul_id.clone()).await.unwrap();
+    let launch = registry
+        .bind_native_identity_launch(NativeIdentityLaunch {
+            incarnation_id: prepared.incarnation_id.clone(),
+            launch_nonce: context.prior_handle.launch_nonce().as_str().into(),
+            evidence_revision: context.evidence_revision,
+            execution_generation: grant.execution_generation,
+            requested_native_session_id: context.native_session_id.clone(),
+        })
+        .await
+        .unwrap();
+    let context = registry.recovery_context(soul_id.clone()).await.unwrap();
+    // Controlled setup for the retained-runtime backend fixture, not native
+    // qualification: exercise the production current-launch publication gate.
+    registry
+        .record_native_identity_observation(
+            soul_id.clone(),
+            NativeIdentityObservation {
+                native_session_id: native_id.into(),
+                incarnation_id: launch.incarnation_id,
+                launch_nonce: launch.launch_nonce,
+                evidence_revision: launch.evidence_revision,
+                source: NativeIdentitySource::FreshProviderHandshake,
+                evidence_digest: "a".repeat(64),
+            },
+            context.write_fence(),
+        )
         .await
         .unwrap();
     registry
         .mark_running(prepared.incarnation_id)
         .await
         .unwrap();
+    // The backend fixture represents a previously observed durable native
+    // store; process launch alone deliberately no longer certifies it.
+    rusqlite::Connection::open(root.join("runtime.sqlite3"))
+        .unwrap()
+        .execute(
+            "UPDATE souls SET allocation_state='verified_durable' WHERE soul_id=?1",
+            [soul_id.as_str()],
+        )
+        .unwrap();
     if !certify_loss {
-        let view = registry.inventory().await.unwrap().pop().unwrap();
+        let view = registry
+            .inventory()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|view| view.soul_id == soul_id)
+            .unwrap();
         assert_eq!(view.desired_state, DesiredState::Running);
         return (registry, view);
     }
     let context = registry.recovery_context(soul_id.clone()).await.unwrap();
+    let provider_home = root
+        .join("qualified-empty-provider-store")
+        .join(soul_id.as_str());
+    std::fs::create_dir_all(&provider_home).unwrap();
+    let mut spec = freshell_supervisor::resume_catalog::exact_resume_candidate(&context, None)
+        .unwrap()
+        .unwrap();
+    // This injected reader owns one exact synthetic database. Recording its
+    // selector makes a missing DB authoritative; an unrecorded default could
+    // belong to a different native channel and must remain inconclusive.
+    if provider == "opencode" {
+        spec.environment.insert(
+            "OPENCODE_DB".into(),
+            provider_home
+                .join(".local/share/opencode/opencode.db")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        spec = registry
+            .store_verified_resume_spec(soul_id.clone(), spec)
+            .await
+            .unwrap();
+    }
+    let context = registry.recovery_context(soul_id.clone()).await.unwrap();
+    let freshell_agent_runtime::ProviderStoreProbe::DefinitivelyUnavailable {
+        reason: native_reason,
+        evidence: native_evidence,
+        store_state: native_store_state,
+        negative_paths: _,
+    } = freshell_agent_runtime::probe_provider_store(&provider_home, &spec)
+    else {
+        panic!("loss fixture requires an actual complete native reader negative");
+    };
     let paths = [
         (
             RecoveryPath::Reattach,
@@ -181,6 +279,11 @@ async fn fixture_fresh_soul(
             RecoveryPath::NativeResume,
             EvidenceStoreState::Missing,
             "provider_store_missing",
+        ),
+        (
+            RecoveryPath::NativeImport,
+            EvidenceStoreState::NotApplicable,
+            "no_native_import_configured",
         ),
         (
             RecoveryPath::CheckpointRestore,
@@ -196,10 +299,22 @@ async fn fixture_fresh_soul(
     .into_iter()
     .map(|(path, store_state, reason)| RecoveryPathEvidence {
         path,
-        store_state,
+        store_state: if path == RecoveryPath::NativeResume {
+            native_store_state
+        } else {
+            store_state
+        },
         verdict: RecoveryEvidenceVerdict::DefinitiveNegative,
-        reason_code: reason.into(),
-        evidence_refs: vec![format!("fixture://{reason}")],
+        reason_code: if path == RecoveryPath::NativeResume {
+            native_reason.clone()
+        } else {
+            reason.into()
+        },
+        evidence_refs: if path == RecoveryPath::NativeResume {
+            native_evidence.clone()
+        } else {
+            vec![format!("fixture://{reason}")]
+        },
     })
     .collect();
     let decision = LostDecision::try_new(LossDecisionInput {
@@ -237,27 +352,44 @@ async fn fixture_fresh_soul(
     registry
         .finalize_loss_cleanup(
             loss.certificate.incident_id,
-            StopOutcome::TerminationUnconfirmed,
+            if verified_empty {
+                StopOutcome::VerifiedEmpty
+            } else {
+                StopOutcome::TerminationUnconfirmed
+            },
             LossCleanupReport {
                 owned_handle_ref: loss.certificate.cleanup_target.owned_handle_ref,
                 ownership_verified: true,
                 graceful_attempt: "failed".into(),
                 forced_attempt: "not_attempted".into(),
-                verified_empty: false,
+                verified_empty,
                 verified_at: None,
                 foreign_objects_touched: 0,
             },
         )
         .await
         .unwrap();
-    let view = registry.inventory().await.unwrap().pop().unwrap();
+    let view = registry
+        .inventory()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|view| view.soul_id == soul_id)
+        .unwrap();
     assert_eq!(view.desired_state, DesiredState::Stopped);
     assert_eq!(view.recovery_state, RecoveryState::Lost);
-    assert_eq!(view.cleanup_state, CleanupState::TerminationUnconfirmed);
+    assert_eq!(
+        view.cleanup_state,
+        if verified_empty {
+            CleanupState::VerifiedEmpty
+        } else {
+            CleanupState::TerminationUnconfirmed
+        }
+    );
     (registry, view)
 }
 
-async fn web_router(socket: &std::path::Path, root: &std::path::Path) -> Router {
+pub(super) async fn web_router(socket: &std::path::Path, root: &std::path::Path) -> Router {
     let (tx, _) = tokio::sync::broadcast::channel(16);
     router(
         ManagedRuntimeApiState::new(
@@ -298,10 +430,10 @@ async fn stop(
     (status, serde_json::from_slice(&body).unwrap())
 }
 
-async fn start_control(
+pub(super) async fn start_control(
     root: &std::path::Path,
     registry: Registry,
-    backend: Arc<StopBackend>,
+    backend: Arc<dyn RuntimeBackend>,
 ) -> (PathBuf, tokio::task::JoinHandle<()>) {
     let socket = root.join("control.sock");
     let supervisor = Supervisor::new(
@@ -377,16 +509,169 @@ async fn automatic_view(registry: &Registry, soul: &RuntimeView) -> ViewIntent {
 }
 
 #[tokio::test]
+async fn stop_backend_observes_occupied_failure_then_successful_cleanup() {
+    let temp = tempfile::Builder::new()
+        .prefix("task007-server-stop-fixture-")
+        .tempdir()
+        .unwrap();
+    let (registry, before) = fixture_soul(temp.path(), false).await;
+    let handle = registry
+        .recovery_context(before.soul_id.clone())
+        .await
+        .unwrap()
+        .prior_handle;
+    let backend = StopBackend::default();
+    assert!(!backend.verify_empty(&handle).await.unwrap());
+
+    backend.uncertain.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        backend.request_stop(&handle, 2).await,
+        Err(BackendError::DockerHttp { status: 503, .. })
+    ));
+    assert!(!backend.verify_empty(&handle).await.unwrap());
+
+    backend.uncertain.store(false, Ordering::SeqCst);
+    backend.request_stop(&handle, 2).await.unwrap();
+    assert!(backend.verify_empty(&handle).await.unwrap());
+    assert_eq!(
+        *backend.stopped.lock().unwrap(),
+        vec![(before.soul_id.clone(), before.incarnation_id.clone()); 2]
+    );
+
+    let concurrent_cleanup = StopBackend::default();
+    concurrent_cleanup.uncertain.store(true, Ordering::SeqCst);
+    concurrent_cleanup
+        .empty_after_error
+        .store(true, Ordering::SeqCst);
+    assert!(!concurrent_cleanup.verify_empty(&handle).await.unwrap());
+    assert!(matches!(
+        concurrent_cleanup.request_stop(&handle, 2).await,
+        Err(BackendError::DockerHttp { status: 503, .. })
+    ));
+    assert!(concurrent_cleanup.verify_empty(&handle).await.unwrap());
+    assert_eq!(
+        *concurrent_cleanup.stopped.lock().unwrap(),
+        vec![(before.soul_id, before.incarnation_id)]
+    );
+}
+
+#[tokio::test]
+async fn stop_error_with_observed_empty_releases_the_exact_owned_writer() {
+    for certify_loss in [false, true] {
+        let backend = Arc::new(StopBackend::default());
+        backend.uncertain.store(true, Ordering::SeqCst);
+        backend.empty_after_error.store(true, Ordering::SeqCst);
+        assert_verified_empty_stop(backend, certify_loss, 1).await;
+    }
+}
+
+#[tokio::test]
+async fn already_empty_stop_releases_the_owned_writer_without_a_signal() {
+    let backend = Arc::new(StopBackend::default());
+    backend.empty.store(true, Ordering::SeqCst);
+    // Even a failing signal must remain unattempted when emptiness is observed first.
+    backend.uncertain.store(true, Ordering::SeqCst);
+    assert_verified_empty_stop(backend, false, 0).await;
+}
+
+async fn assert_verified_empty_stop(
+    backend: Arc<StopBackend>,
+    certify_loss: bool,
+    expected_stop_attempts: usize,
+) {
+    let temp = tempfile::Builder::new()
+        .prefix("task007-server-stop-fixture-")
+        .tempdir()
+        .unwrap();
+    let (registry, before) = fixture_soul(temp.path(), certify_loss).await;
+    let connection = rusqlite::Connection::open(temp.path().join("runtime.sqlite3")).unwrap();
+    let writer_count = || {
+        connection
+            .query_row(
+                "SELECT count(*) FROM writer_claims WHERE soul_id=?1 AND incarnation_id=?2",
+                rusqlite::params![before.soul_id.as_str(), before.incarnation_id.as_str()],
+                |row| row.get::<_, u64>(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(writer_count(), 1);
+    let certificate = if let Some(incident) = before.incident_id.clone() {
+        Some(serde_json::to_value(registry.loss_certificate(incident).await.unwrap()).unwrap())
+    } else {
+        None
+    };
+    let handle = registry
+        .recovery_context(before.soul_id.clone())
+        .await
+        .unwrap()
+        .prior_handle;
+    assert_eq!(
+        backend.verify_empty(&handle).await.unwrap(),
+        expected_stop_attempts == 0
+    );
+    let (socket, control) = start_control(temp.path(), registry.clone(), backend.clone()).await;
+    let web = web_router(&socket, temp.path()).await;
+    let (status, stopped) = stop(&web, &before, before.intent_revision).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stopped["outcome"], "verified_empty");
+    assert_eq!(stopped["soul"]["cleanupState"], "verified_empty");
+    assert_eq!(stopped["soul"]["desiredState"], "stopped");
+    assert_eq!(
+        stopped["soul"]["recoveryState"],
+        if certify_loss { "lost" } else { "stopped" }
+    );
+    assert_eq!(stopped["soul"]["soulId"], before.soul_id.as_str());
+    assert_eq!(
+        stopped["soul"]["incarnationId"],
+        before.incarnation_id.as_str()
+    );
+    assert_eq!(stopped["soul"]["nativeSessionId"], "retained-thread");
+    assert_eq!(
+        stopped["soul"]["freshAgentSessionId"],
+        "fresh-retained-thread"
+    );
+    assert_eq!(
+        stopped["soul"]["intentRevision"],
+        before.intent_revision + 1
+    );
+    assert_eq!(writer_count(), 0);
+    assert!(backend.verify_empty(&handle).await.unwrap());
+    assert_eq!(
+        *backend.stopped.lock().unwrap(),
+        vec![(before.soul_id.clone(), before.incarnation_id.clone()); expected_stop_attempts]
+    );
+    if let Some(incident) = before.incident_id.clone() {
+        assert_eq!(
+            Some(serde_json::to_value(registry.loss_certificate(incident).await.unwrap()).unwrap()),
+            certificate
+        );
+    }
+    control.abort();
+    assert!(control.await.unwrap_err().is_cancelled());
+    let owned_root = temp.path().to_path_buf();
+    drop(web);
+    drop(connection);
+    drop(registry);
+    drop(temp);
+    assert!(!socket.exists());
+    assert!(!owned_root.exists());
+}
+
+#[tokio::test]
 async fn stopped_hidden_view_satisfies_stale_detach_without_mutating_new_authority() {
     let temp = tempfile::tempdir().unwrap();
     let (registry, before) = fixture_soul(temp.path(), false).await;
     let frozen = automatic_view(&registry, &before).await;
     let backend = Arc::new(StopBackend::default());
-    let (socket, control) = start_control(temp.path(), registry.clone(), backend).await;
+    let (socket, control) = start_control(temp.path(), registry.clone(), backend.clone()).await;
     let web = web_router(&socket, temp.path()).await;
     let (status, stopped) = stop(&web, &before, before.intent_revision).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(stopped["outcome"], "verified_empty");
+    assert_eq!(
+        *backend.stopped.lock().unwrap(),
+        vec![(before.soul_id.clone(), before.incarnation_id.clone())]
+    );
     let hidden = registry.inventory_snapshot().await.unwrap().view_intents[0].clone();
     assert_eq!(hidden.visibility, ViewVisibilityIntent::Hidden);
     assert!(hidden.revision > frozen.revision);
@@ -520,13 +805,15 @@ async fn restored_web_stops_persisted_lost_soul_only_after_verified_cleanup() {
     assert_eq!(backend.stopped.lock().unwrap().len(), 1);
 
     backend.uncertain.store(false, Ordering::SeqCst);
-    let (status, verified) = stop(&restored, &before, before.intent_revision).await;
+    let returned_revision = uncertain["soul"]["intentRevision"].as_u64().unwrap();
+    assert_eq!(returned_revision, before.intent_revision + 1);
+    let (status, verified) = stop(&restored, &before, returned_revision).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(verified["outcome"], "verified_empty");
     assert_eq!(verified["soul"]["cleanupState"], "verified_empty");
     assert_eq!(verified["soul"]["recoveryState"], "lost");
     assert_eq!(verified["soul"]["nativeSessionId"], "retained-thread");
-    assert_eq!(verified["soul"]["intentRevision"], before.intent_revision);
+    assert_eq!(verified["soul"]["intentRevision"], returned_revision + 1);
     assert_eq!(
         *backend.stopped.lock().unwrap(),
         vec![(before.soul_id.clone(), before.incarnation_id.clone()); 2]
@@ -561,7 +848,7 @@ async fn running_soul_uncertain_stop_returns_the_revision_for_immediate_retry() 
     let (status, verified) = stop(&router, &before, returned_revision).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(verified["outcome"], "verified_empty");
-    assert_eq!(verified["soul"]["intentRevision"], returned_revision);
+    assert_eq!(verified["soul"]["intentRevision"], returned_revision + 1);
     assert_eq!(verified["soul"]["nativeSessionId"], "retained-thread");
     assert_eq!(
         *backend.stopped.lock().unwrap(),
@@ -655,12 +942,17 @@ async fn restored_web_reads_large_retained_codex_history_without_source_or_regis
         "large-native-thread",
     )
     .await;
+    let fence = registry
+        .recovery_write_fence(before.soul_id.clone())
+        .await
+        .unwrap();
     registry
         .mark_recovery_blocked(
             before.soul_id.clone(),
             None,
             RecoveryBlockReason::ProviderUnavailable,
             vec!["fixture://provider-unavailable".into()],
+            fence,
         )
         .await
         .unwrap();
@@ -821,12 +1113,17 @@ async fn restored_api_reads_managed_claude_and_kilroy_native_history_without_an_
         let id = "44444444-4444-4444-8444-444444444444";
         let (registry, before) =
             fixture_fresh_soul(temp.path(), false, provider, session_type, id).await;
+        let fence = registry
+            .recovery_write_fence(before.soul_id.clone())
+            .await
+            .unwrap();
         registry
             .mark_recovery_blocked(
                 before.soul_id.clone(),
                 None,
                 RecoveryBlockReason::StoreUnreadable,
                 vec!["fixture native store temporarily unavailable".into()],
+                fence,
             )
             .await
             .unwrap();
@@ -878,5 +1175,406 @@ async fn restored_api_reads_managed_claude_and_kilroy_native_history_without_an_
         assert!(backend.stopped.lock().unwrap().is_empty());
         control.abort();
         let _ = control.await;
+    }
+}
+
+#[tokio::test]
+async fn restore_lost_souls_route_requires_auth_and_runtime_connection() {
+    let temp = tempfile::tempdir().unwrap();
+    let (tx, _) = tokio::sync::broadcast::channel(16);
+    let state = ManagedRuntimeApiState::new(
+        Arc::new("web-token".into()),
+        None,
+        Some(temp.path().join("projections.json")),
+        Arc::new(PaneLedger::new(Some(temp.path().join("ledger")))),
+        Arc::new(tx),
+    )
+    .await
+    .unwrap();
+    let app = router(state);
+    let targets = (0..9)
+        .map(|_| {
+            json!({
+                "soulId": SoulId::new(),
+                "incidentId": IncidentId::new(),
+                "expectedIntentRevision": 1
+            })
+        })
+        .collect::<Vec<_>>();
+    let body = json!({
+        "idempotencyKey": RequestId::new(),
+        "scopeId": "a".repeat(64),
+        "source": {"sourceStoreId": "b".repeat(64), "rootSessionIds": ["ses_fixture_root_alpha"]},
+        "targets": targets
+    })
+    .to_string();
+
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/runtime/soul-loss-repairs")
+                .header("content-type", "application/json")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let unavailable = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/runtime/soul-loss-repairs")
+                .header("x-auth-token", "web-token")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn durable_souls_routes_refuse_actual_stale_preview_and_unknown_members_without_writes() {
+    let temp = tempfile::tempdir().unwrap();
+    let registry = Registry::open(temp.path(), None).unwrap();
+    let (socket, control) = start_control(
+        temp.path(),
+        registry.clone(),
+        Arc::new(StopBackend::default()),
+    )
+    .await;
+    let app = web_router(&socket, temp.path()).await;
+    for (route, body) in [
+        (
+            "/api/runtime/soul-loss-repairs/preflight",
+            json!({"sourceStoreId":"a".repeat(64),"rootSessionIds":["ses_fixture_root"],"expectedControlEpoch":registry.control_epoch()+1}),
+        ),
+        (
+            "/api/runtime/soul-loss-repairs",
+            json!({"idempotencyKey":RequestId::new(),"scopeId":"b".repeat(64),"source":{"sourceStoreId":"a".repeat(64),"rootSessionIds":["ses_fixture_root"]},"targets":[{"soulId":SoulId::new(),"incidentId":IncidentId::new(),"expectedIntentRevision":2}]}),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(route)
+                    .header("x-auth-token", "web-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(!response.status().is_success());
+        assert_ne!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "valid wire requests reach real supervisor validation"
+        );
+    }
+    assert!(registry.inventory().await.unwrap().is_empty());
+    let connection = rusqlite::Connection::open(temp.path().join("runtime.sqlite3")).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM stopped_repair_operations",
+                [],
+                |row| row.get::<_, u64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    control.abort();
+    let _ = control.await;
+}
+
+// Keep production source discovery in a child with an empty environment so
+// neither parallel tests nor any real provider store can influence admission.
+#[tokio::test]
+async fn durable_souls_routes_refuse_substituted_member_and_stale_existing_target() {
+    const CHILD: &str = "FRESHELL_TEST_SCOPED_REPAIR_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let home = tempfile::tempdir().unwrap();
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "managed_runtime_api::stop_contract_tests::durable_souls_routes_refuse_substituted_member_and_stale_existing_target",
+                "--exact",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env(CHILD, "1")
+            .env("HOME", home.path())
+            .env("XDG_DATA_HOME", home.path().join("data"))
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(60), child.output())
+            .await
+            .expect("isolated scoped-route fixture completes within one minute")
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("1 passed"),
+            "the child must execute the route case: {stdout}"
+        );
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let data_home = freshell_sessions::parse::default_opencode_data_home();
+    std::fs::create_dir_all(&data_home).unwrap();
+    let source_path = data_home.join("opencode.db");
+    let roots = (0..7)
+        .map(|index| format!("ses_route_root_{index}"))
+        .collect::<Vec<_>>();
+    scoped_repair_source(&source_path, temp.path(), &roots);
+    let source_before = std::fs::read(&source_path).unwrap();
+    let source = RepairBatchSourceSelection {
+        source_store_id: format!(
+            "{:x}",
+            sha2::Sha256::digest(
+                source_path
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_bytes()
+            )
+        ),
+        root_session_ids: roots.clone(),
+    };
+    let registry_root = temp.path().join("registry");
+    for index in 0..9 {
+        fixture_fresh_soul_with_cleanup(
+            &registry_root,
+            true,
+            "opencode",
+            "freshopencode",
+            &roots[index % 7],
+            true,
+        )
+        .await;
+    }
+    let registry = Registry::open(&registry_root, None).unwrap();
+    let connection = rusqlite::Connection::open(registry_root.join("runtime.sqlite3")).unwrap();
+    // Represent migrated, unbound legacy false-loss metadata. This records no
+    // source absence or import proof; the real preflight must inspect SQLite.
+    connection.execute_batch(
+        "UPDATE souls SET native_import_state='legacy_unknown',native_import_authority='legacy_unknown';
+         UPDATE loss_incidents SET captured_native_import_state='legacy_unknown',captured_native_import_authority='legacy_unknown';",
+    ).unwrap();
+    let terminal = json!({"terminalId":"terminal-scoped-route","streamId":"stream-scoped-route","mode":"opencode","program":"opencode","env":{},"runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"workspace","workspacePath":temp.path(),"cwd":temp.path()});
+    connection
+        .execute(
+            "UPDATE incarnations SET terminal_spec=?1,fresh_agent_spec=NULL",
+            [terminal.to_string()],
+        )
+        .unwrap();
+    let backend = Arc::new(StopBackend::default());
+    let (socket, control) = start_control(&registry_root, registry.clone(), backend.clone()).await;
+    let app = web_router(&socket, &registry_root).await;
+    let before = scoped_repair_registry_state(&connection);
+    let inventory_before = registry.inventory().await.unwrap();
+    assert_eq!(inventory_before.len(), 9);
+    assert!(inventory_before
+        .iter()
+        .all(|view| view.desired_state == DesiredState::Stopped
+            && view.recovery_state == RecoveryState::Lost
+            && view.intent_revision == 2));
+    let (status, body) = repair_post(
+        &app,
+        "/api/runtime/soul-loss-repairs/preflight",
+        serde_json::to_value(&source).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let scope: RepairBatchScope = serde_json::from_value(body).unwrap();
+    assert_eq!(scope.targets.len(), 9);
+    assert_eq!(scope.roots.len(), 7);
+    assert_eq!(
+        scope
+            .roots
+            .iter()
+            .filter(|root| root.eligible_owners.len() == 2 && root.canonical_soul_id.is_none())
+            .count(),
+        2
+    );
+    let request = RestoreLostSoulsRequest {
+        scope_id: scope.scope_id.clone(),
+        source,
+        targets: scope
+            .targets
+            .iter()
+            .map(|member| member.target.clone())
+            .collect(),
+        canonical_owners: scope
+            .roots
+            .iter()
+            .map(|root| {
+                let owner = root.eligible_owners.first().unwrap();
+                CanonicalOwnerChoice {
+                    root_session_id: root.root_session_id.clone(),
+                    soul_id: owner.clone(),
+                    expected_intent_revision: scope
+                        .targets
+                        .iter()
+                        .find(|member| member.target.soul_id == *owner)
+                        .unwrap()
+                        .target
+                        .expected_intent_revision,
+                }
+            })
+            .collect(),
+        expected_control_epoch: None,
+    };
+    // Validity comes from the independently resolved production scope, not a
+    // caller-built descriptor. No import or conversation is started here.
+    request.validate_exact_batch(&scope).unwrap();
+    assert_eq!(scoped_repair_registry_state(&connection), before);
+
+    let mut substituted = request.clone();
+    substituted.targets[0].incident_id = IncidentId::new();
+    let mut stale = request.clone();
+    stale.targets[0].expected_intent_revision = 1;
+    for (invalid, expected_status, expected_error) in [
+        (substituted, StatusCode::BAD_REQUEST, "runtime supervisor rejected request: InvalidRequest: stopped restoration differs from the independently resolved exact scope"),
+        (stale, StatusCode::CONFLICT, "runtime supervisor rejected request: StaleIntentRevision: stale soul intent revision: expected 1, current 2"),
+    ] {
+        invalid.validate_payload().unwrap();
+        let mut body = serde_json::to_value(&invalid).unwrap();
+        body.as_object_mut().unwrap().remove("expectedControlEpoch");
+        body["idempotencyKey"] = json!(RequestId::new());
+        let (status, reply) = repair_post(&app, "/api/runtime/soul-loss-repairs", body).await;
+        assert_eq!(status, expected_status, "{reply}");
+        assert_eq!(reply, json!({"error": expected_error}));
+        assert_eq!(scoped_repair_registry_state(&connection), before);
+        assert_eq!(registry.inventory().await.unwrap(), inventory_before);
+        assert_eq!(std::fs::read(&source_path).unwrap(), source_before);
+        assert!(backend.stopped.lock().unwrap().is_empty());
+    }
+    control.abort();
+    let _ = control.await;
+}
+
+async fn repair_post(
+    app: &Router,
+    route: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(route)
+                .header("x-auth-token", "web-token")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+fn scoped_repair_registry_state(
+    connection: &rusqlite::Connection,
+) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+    [
+        "souls",
+        "incarnations",
+        "loss_incidents",
+        "stopped_repair_operations",
+        "stopped_repair_root_receipts",
+        "stopped_repair_withdrawals",
+        "native_origin_owners",
+        "view_intents",
+        "outbox",
+        "runtime_notices",
+        "notice_receipts",
+    ]
+    .into_iter()
+    .map(|table| {
+        let mut statement = connection
+            .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+            .unwrap();
+        let columns = statement.column_count();
+        statement
+            .query_map([], |row| (0..columns).map(|index| row.get(index)).collect())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    })
+    .collect()
+}
+
+fn scoped_repair_source(path: &std::path::Path, workspace: &std::path::Path, roots: &[String]) {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .execute_batch(include_str!(
+            "../../freshell-sessions/src/opencode_schema_v1_18_21.sql"
+        ))
+        .unwrap();
+    const MIGRATIONS: &[&str] = &[
+        "20260127222353_familiar_lady_ursula",
+        "20260211171708_add_project_commands",
+        "20260213144116_wakeful_the_professor",
+        "20260225215848_workspace",
+        "20260227213759_add_session_workspace_id",
+        "20260228203230_blue_harpoon",
+        "20260303231226_add_workspace_fields",
+        "20260309230000_move_org_to_state",
+        "20260312043431_session_message_cursor",
+        "20260323234822_events",
+        "20260410174513_workspace-name",
+        "20260413175956_chief_energizer",
+        "20260423070820_add_icon_url_override",
+        "20260427172553_slow_nightmare",
+        "20260428004200_add_session_path",
+        "20260501142318_next_venus",
+        "20260504145000_add_sync_owner",
+        "20260507164347_add_workspace_time",
+        "20260510033149_session_usage",
+        "20260511000411_data_migration_state",
+        "20260511173437_session-metadata",
+        "20260601010001_normalize_storage_paths",
+        "20260601202201_amazing_prowler",
+        "20260602002951_lowly_union_jack",
+        "20260602182828_add_project_directories",
+        "20260603001617_session_message_projection_indexes",
+        "20260603040000_session_message_projection_order",
+        "20260603141458_session_input_inbox",
+        "20260603160727_jittery_ezekiel_stane",
+        "20260604172448_event_sourced_session_input",
+        "20260605003541_add_session_context_snapshot",
+        "20260605042240_add_context_epoch_agent",
+        "20260611035744_credential",
+        "20260611192811_lush_chimera",
+        "20260612174303_project_dir_strategy",
+        "20260622142730_simplify_session_context_epoch",
+        "20260622170816_reset_v2_session_state",
+        "20260622202450_simplify_session_input",
+    ];
+    for (index, migration) in MIGRATIONS.iter().enumerate() {
+        connection
+            .execute(
+                "INSERT INTO migration VALUES (?1,?2)",
+                rusqlite::params![migration, index],
+            )
+            .unwrap();
+    }
+    connection.execute("INSERT INTO project(id,worktree,time_created,time_updated,sandboxes) VALUES ('route-project',?1,1,1,'[]')", [workspace.to_string_lossy().as_ref()]).unwrap();
+    for root in roots {
+        connection.execute("INSERT INTO session(id,project_id,slug,directory,title,version,time_created,time_updated) VALUES (?1,'route-project',?1,?2,'route fixture','1.18.21',1,1)", rusqlite::params![root,workspace.to_string_lossy().as_ref()]).unwrap();
+        connection.execute("INSERT INTO message(id,session_id,time_created,time_updated,data) VALUES (?1,?2,1,1,?3)", rusqlite::params![format!("msg_{root}"),root,json!({"role":"user","content":"synthetic retained history"}).to_string()]).unwrap();
     }
 }

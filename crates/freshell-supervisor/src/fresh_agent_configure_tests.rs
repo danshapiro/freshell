@@ -112,6 +112,7 @@ async fn running_fresh_claude() -> RunningFreshClaude {
         .commit_created(
             prepared.incarnation_id.clone(),
             BackendCreatedRecord {
+                launch_policy: Default::default(),
                 daemon_id: DockerDaemonId::new(),
                 container_id: "a".repeat(64),
                 image_ref: format!("sha256:{}", "b".repeat(64)),
@@ -122,11 +123,46 @@ async fn running_fresh_claude() -> RunningFreshClaude {
         )
         .await
         .unwrap();
-    registry
+    let grant = registry
         .commit_execution_grant(
             prepared.incarnation_id.clone(),
             HostBootId::new(),
             crate::checkpoints::tests::limits(),
+        )
+        .await
+        .unwrap();
+    let current = registry.recovery_context(soul.clone()).await.unwrap();
+    let launch = registry
+        .bind_native_identity_launch(NativeIdentityLaunch {
+            incarnation_id: prepared.incarnation_id.clone(),
+            launch_nonce: prepared.launch_nonce.as_str().into(),
+            evidence_revision: current.evidence_revision,
+            execution_generation: grant.execution_generation,
+            requested_native_session_id: Some("native-claude".into()),
+        })
+        .await
+        .unwrap();
+    registry
+        .record_native_session(
+            soul.clone(),
+            prepared.incarnation_id.clone(),
+            "native-claude".into(),
+        )
+        .await
+        .unwrap();
+    let current = registry.recovery_context(soul.clone()).await.unwrap();
+    registry
+        .record_native_identity_observation(
+            soul.clone(),
+            NativeIdentityObservation {
+                native_session_id: "native-claude".into(),
+                incarnation_id: prepared.incarnation_id.clone(),
+                launch_nonce: launch.launch_nonce.clone(),
+                evidence_revision: launch.evidence_revision,
+                source: NativeIdentitySource::FreshProviderHandshake,
+                evidence_digest: "a".repeat(64),
+            },
+            current.write_fence(),
         )
         .await
         .unwrap();
@@ -186,6 +222,7 @@ fn fake_host(
                     effective_limits: crate::checkpoints::tests::limits(),
                 },
                 HostCommand::FreshAgentConfigure { .. } => HostResult::FreshAgentCommand {
+                    claude_fork: None,
                     state: CommandState::ProviderAcked,
                     native_session_id: Some("native-claude".into()),
                 },

@@ -115,6 +115,7 @@ function isRetiredServerConfigSelector(arg: string): boolean {
     'test/integration/server/managed-provider-parity.test.ts',
     'test/integration/server/fresh-agent-parity.test.ts',
     'test/integration/server/provider-parity-contract.test.ts',
+    'test/integration/server/runtime-cargo-artifacts.test.ts',
     'test/unit/server/e2e-cloud-external-target.test.ts',
   ].includes(normalized.replace(/^\.\//, ''))) {
     return false

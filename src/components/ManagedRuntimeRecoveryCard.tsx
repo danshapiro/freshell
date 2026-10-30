@@ -14,6 +14,7 @@ export function isManagedRuntimeRecoveryDecision(
 ): boolean {
   return recoverySummary?.recoveryState === 'blocked'
     || recoverySummary?.recoveryState === 'lost'
+    || recoverySummary?.recoveryState === 'data_repair_complete'
 }
 
 export function ManagedRuntimeRecoveryCard({
@@ -25,15 +26,16 @@ export function ManagedRuntimeRecoveryCard({
   const [actionError, setActionError] = useState<string>()
   const recoveryState = recoverySummary?.recoveryState
 
-  if (recoveryState !== 'blocked' && recoveryState !== 'lost') return null
+  if (recoveryState !== 'blocked' && recoveryState !== 'lost' && recoveryState !== 'data_repair_complete') return null
 
   const blocked = recoveryState === 'blocked'
+  const repaired = recoveryState === 'data_repair_complete'
   const handleAction = async () => {
     if (pending) return
     setPending(true)
     setActionError(undefined)
     try {
-      await (blocked ? onRetry() : onStartFresh())
+      await (blocked || repaired ? onRetry() : onStartFresh())
     } catch (error) {
       setActionError(error instanceof Error ? error.message : 'The action failed. Try again.')
     } finally {
@@ -51,7 +53,9 @@ export function ManagedRuntimeRecoveryCard({
         <span>
           {blocked
             ? `This session needs attention before it can continue. ${managedRecoveryBlockedMessage(recoverySummary?.reason)}`
-            : 'This session could not be recovered. Start a new conversation when you are ready.'}
+            : repaired
+              ? 'The restored conversation is ready to resume.'
+              : 'This session could not be recovered. Start a new conversation when you are ready.'}
         </span>
         {actionError ? (
           <span role="status" className="ml-2 text-xs text-amber-700 dark:text-amber-300">
@@ -67,6 +71,15 @@ export function ManagedRuntimeRecoveryCard({
           className="shrink-0 rounded border border-border/70 px-2 py-1 text-xs"
         >
           {pending ? 'Retrying…' : 'Retry recovery'}
+        </button>
+      ) : repaired ? (
+        <button
+          type="button"
+          disabled={pending}
+          onClick={() => void handleAction()}
+          className="shrink-0 rounded border border-border/70 px-2 py-1 text-xs"
+        >
+          {pending ? 'Resuming…' : 'Resume restored session'}
         </button>
       ) : (
         <button

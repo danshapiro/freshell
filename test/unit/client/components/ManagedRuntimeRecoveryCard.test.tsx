@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ManagedRuntimeRecoverySummary } from '@shared/managed-runtime'
-import { ManagedRuntimeRecoveryCard } from '@/components/ManagedRuntimeRecoveryCard'
+import { isManagedRuntimeRecoveryDecision, ManagedRuntimeRecoveryCard } from '@/components/ManagedRuntimeRecoveryCard'
 
 function summary(recoveryState: ManagedRuntimeRecoverySummary['recoveryState']): ManagedRuntimeRecoverySummary {
   return {
@@ -70,6 +70,49 @@ describe('ManagedRuntimeRecoveryCard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Retry recovery' }))
     expect(await screen.findByRole('status')).toHaveTextContent('Provider is unavailable')
     expect(screen.getByRole('alert')).toBeInTheDocument()
+  })
+
+  it('resumes a repaired conversation through retry and prevents duplicate activation', async () => {
+    let resolveRetry!: () => void
+    const onRetry = vi.fn(() => new Promise<void>((resolve) => { resolveRetry = resolve }))
+    const onStartFresh = vi.fn()
+    const recoverySummary = summary('data_repair_complete')
+    render(
+      <>{isManagedRuntimeRecoveryDecision(recoverySummary)
+        ? <ManagedRuntimeRecoveryCard recoverySummary={recoverySummary} onRetry={onRetry} onStartFresh={onStartFresh} />
+        : null}</>,
+    )
+
+    const alert = screen.getByRole('alert')
+    expect(alert).toHaveTextContent(/restored conversation is ready to resume/i)
+    const resumeButton = screen.getByRole('button', { name: 'Resume restored session' })
+    fireEvent.click(resumeButton)
+    expect(resumeButton).toBeDisabled()
+    fireEvent.click(resumeButton)
+    expect(onRetry).toHaveBeenCalledTimes(1)
+    expect(onStartFresh).not.toHaveBeenCalled()
+
+    resolveRetry()
+    await waitFor(() => expect(resumeButton).toBeEnabled())
+  })
+
+  it('keeps a repaired conversation card and shows resume failures without calling start-fresh', async () => {
+    const onRetry = vi.fn().mockRejectedValue(new Error('The restored conversation has not resumed yet. Try again.'))
+    const onStartFresh = vi.fn()
+    render(
+      <ManagedRuntimeRecoveryCard
+        recoverySummary={summary('data_repair_complete')}
+        onRetry={onRetry}
+        onStartFresh={onStartFresh}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Resume restored session' }))
+    expect(await screen.findByRole('status')).toHaveTextContent('The restored conversation has not resumed yet. Try again.')
+    expect(screen.getByRole('alert')).toBeInTheDocument()
+    expect(screen.getByRole('alert')).not.toHaveTextContent(/could not be recovered|lost/i)
+    expect(onRetry).toHaveBeenCalledTimes(1)
+    expect(onStartFresh).not.toHaveBeenCalled()
   })
 
   it('renders neutral lost copy and waits for an explicit start-new click', () => {

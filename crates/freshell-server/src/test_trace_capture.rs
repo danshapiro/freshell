@@ -129,6 +129,9 @@ fn is_captured(metadata: &tracing::Metadata<'_>) -> bool {
     match metadata.target() {
         "freshell_server::extensions" => level == tracing::Level::WARN,
         "freshell_server::session_directory" => level == tracing::Level::ERROR,
+        "freshell_server::fresh_agent_proxy" | "freshell_server::managed_provider_bootstrap" => {
+            level == tracing::Level::WARN
+        }
         "freshell_server::session_names" => {
             level == tracing::Level::WARN || level == tracing::Level::INFO
         }

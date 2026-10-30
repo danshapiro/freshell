@@ -659,6 +659,7 @@ mod tests {
         });
         let backend = DockerEngineBackend::new(temp.path().join("docker.sock"));
         let spec = CreateRuntimeSpec {
+            opencode_transfer_dir: None,
             prior_provider_owner: None,
             initial_input_reservation: Some(binding.clone()),
             installation_id: registry.installation_id().clone(),
@@ -807,6 +808,7 @@ mod tests {
             let handle = OwnedRuntimeHandle::from_registry(
                 InstallationId::new(),
                 SoulId::new(),
+                "store".into(),
                 IncarnationId::new(),
                 LaunchNonce::new(),
                 daemon.clone(),

@@ -4,6 +4,7 @@ use crate::{
     registry::{BackendCreatedRecord, LaunchPreparation, Registry},
 };
 use freshell_runtime_protocol::*;
+use sha2::{Digest, Sha256};
 
 pub(crate) fn limits() -> RuntimeLimits {
     RuntimeLimits {
@@ -11,6 +12,18 @@ pub(crate) fn limits() -> RuntimeLimits {
         memory_bytes: 64 * 1024 * 1024,
         swap_bytes: 0,
         pids_max: 32,
+    }
+}
+
+pub(crate) fn create_empty_opencode_store(path: &std::path::Path) {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .execute_batch(freshell_sessions::opencode_transfer::pinned_destination_schema_sql())
+        .unwrap();
+    for migration in freshell_sessions::opencode_transfer::pinned_destination_migration_ids() {
+        connection
+            .execute("INSERT INTO migration VALUES (?1,0)", [migration])
+            .unwrap();
     }
 }
 
@@ -63,6 +76,7 @@ pub(crate) async fn context_with_native_identity(
         .commit_created(
             prepared.incarnation_id.clone(),
             BackendCreatedRecord {
+                launch_policy: None,
                 daemon_id: DockerDaemonId::new(),
                 container_id: "a".repeat(64),
                 image_ref: format!("sha256:{}", "b".repeat(64)),
@@ -74,10 +88,49 @@ pub(crate) async fn context_with_native_identity(
         .await
         .unwrap();
     if dispatched {
-        registry
+        let grant = registry
             .commit_execution_grant(prepared.incarnation_id.clone(), HostBootId::new(), limits())
             .await
             .unwrap();
+        if provider == "opencode" {
+            // These callers start with a valid observed runtime. Resume and
+            // checkpoint evidence remain absent until each test supplies it.
+            // The dispatched-false branch deliberately models unobserved
+            // legacy state and must not acquire admission evidence here.
+            let current = registry.recovery_context(soul.clone()).await.unwrap();
+            let native_session_id = current
+                .native_session_id
+                .clone()
+                .expect("dispatched OpenCode checkpoint fixtures require a selected native ID");
+            let launch = registry
+                .bind_native_identity_launch(NativeIdentityLaunch {
+                    incarnation_id: prepared.incarnation_id.clone(),
+                    launch_nonce: current.prior_handle.launch_nonce().as_str().into(),
+                    evidence_revision: current.evidence_revision,
+                    execution_generation: grant.execution_generation,
+                    requested_native_session_id: Some(native_session_id.clone()),
+                })
+                .await
+                .unwrap();
+            registry
+                .record_native_identity_observation(
+                    soul.clone(),
+                    NativeIdentityObservation {
+                        native_session_id,
+                        incarnation_id: launch.incarnation_id,
+                        launch_nonce: launch.launch_nonce,
+                        evidence_revision: launch.evidence_revision,
+                        source: NativeIdentitySource::OpencodeTui,
+                        evidence_digest: format!(
+                            "{:x}",
+                            Sha256::digest(b"synthetic checkpoint fixture native admission")
+                        ),
+                    },
+                    current.write_fence(),
+                )
+                .await
+                .unwrap();
+        }
         registry
             .mark_running(prepared.incarnation_id)
             .await
@@ -276,10 +329,7 @@ async fn inspected_shared_store_absence_remains_definitive() {
     let (_, ctx) = context(temp.path(), "opencode", true).await;
     let db = temp.path().join(".local/share/opencode/opencode.db");
     std::fs::create_dir_all(db.parent().unwrap()).unwrap();
-    let connection = rusqlite::Connection::open(&db).unwrap();
-    connection
-        .execute("CREATE TABLE session(id TEXT PRIMARY KEY)", [])
-        .unwrap();
+    create_empty_opencode_store(&db);
     let mut effective_spec = spec("opencode");
     effective_spec
         .environment

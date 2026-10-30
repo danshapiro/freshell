@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { expect, it } from 'vitest'
 import { fixture } from './run-rust-tests-fixture.js'
@@ -10,6 +10,63 @@ import { descendantPids, readProcessSnapshot } from '../../../scripts/testing/pr
 if (process.env.FRESHELL_SANDBOX_MODE !== 'runtime-suite') {
   throw new Error('Rust resource regression requires the disposable runtime sandbox')
 }
+
+it.each([0, 31])('removes sealed transfer fixtures only inside its owned roots and preserves child status %s', status => {
+  const f = fixture()
+  const marker = path.join(f.root, 'sealed-fixtures.json')
+  const sentinel = path.join(f.artifacts, 'retained-ready')
+  const probe = path.join(f.root, 'seal-fixtures.cjs')
+  mkdirSync(sentinel)
+  writeFileSync(path.join(sentinel, 'private'), 'keep', { mode: 0o400 })
+  chmodSync(sentinel, 0o500)
+  writeFileSync(probe, `#!/usr/bin/env node
+const fs = require('node:fs');
+const path = require('node:path');
+const roots = [process.env.TMPDIR, process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR];
+const observations = roots.map(root => {
+  const ready = path.join(root, 'opencode-transfers', 'transfer.ready');
+  fs.mkdirSync(ready, {recursive:true});
+  for (const name of ['descriptor.json', 'READY', 'entry-0000.bin']) {
+    fs.writeFileSync(path.join(ready, name), 'private', {mode:name === 'descriptor.json' ? 0o600 : 0o400});
+  }
+  fs.symlinkSync(${JSON.stringify(sentinel)}, path.join(root, 'external-ready'));
+  fs.chmodSync(ready, 0o500);
+  let unlinkError;
+  try { fs.unlinkSync(path.join(ready, 'entry-0000.bin')); } catch (error) { unlinkError = error.code; }
+  return {root, readyMode:fs.statSync(ready).mode & 0o777,
+    fileMode:fs.statSync(path.join(ready, 'entry-0000.bin')).mode & 0o777,
+    uid:fs.statSync(ready).uid, unlinkError};
+});
+fs.writeFileSync(${JSON.stringify(marker)}, JSON.stringify({uid:process.getuid(), observations}));
+process.exit(${status});
+`, { mode: 0o700 })
+  try {
+    const result = f.run({ FRESHELL_RUST_TEST_SANDBOX: '1', RUNTIME_PROBE: probe })
+    const state = JSON.parse(readFileSync(marker, 'utf8'))
+    expect(state.uid).not.toBe(0)
+    expect(state.observations).toHaveLength(2)
+    for (const observation of state.observations) {
+      expect(observation).toMatchObject({ readyMode: 0o500, fileMode: 0o400, uid: state.uid, unlinkError: 'EACCES' })
+    }
+    expect(result.status, result.stderr).toBe(status)
+    for (const { root } of state.observations) expect(existsSync(root)).toBe(false)
+    expect(readFileSync(path.join(sentinel, 'private'), 'utf8')).toBe('keep')
+    expect(statSync(sentinel).mode & 0o777).toBe(0o500)
+    expect(statSync(path.join(sentinel, 'private')).mode & 0o777).toBe(0o400)
+  } finally {
+    // Settle this test's exact fixtures even while demonstrating the RED.
+    if (existsSync(marker)) {
+      for (const { root } of JSON.parse(readFileSync(marker, 'utf8')).observations) {
+        if (existsSync(root)) {
+          chmodSync(path.join(root, 'opencode-transfers', 'transfer.ready'), 0o700)
+          rmSync(root, { recursive: true, force: true })
+        }
+      }
+    }
+    chmodSync(sentinel, 0o700)
+    f.cleanup()
+  }
+})
 
 it('removes its temporary artifacts when an interrupted child ignores termination', async () => {
   const f = fixture()

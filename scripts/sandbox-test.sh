@@ -13,8 +13,9 @@
 #   scripts/sandbox-test.sh --runtime-suite "cargo test -p freshell-codex ..."
 #   scripts/sandbox-test.sh --runtime-suite --checkpoint-fixture "cargo test -p freshell-server --features managed-runtime-v1 --locked --test code_checkpoint_permissions"
 #
-# --runtime-suite is the stricter managed-runtime lifecycle mode: no network,
-# no real provider corpus, no Docker/admin socket, read-only container root.
+# --runtime-suite prepares dependencies first, then runs the caller in the
+# stricter managed-runtime lifecycle mode: no network, no real provider corpus,
+# no Docker/admin socket, read-only container root.
 #
 # --corpus mounts ~/.codex/sessions and ~/.claude/projects READ-ONLY at their
 # natural paths inside the container, for realistic-data perf tests. Without
@@ -32,6 +33,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 IMAGE_TAG="freshell-sandbox:latest"
+CACHE_PREFIX="${FRESHELL_SANDBOX_CACHE_PREFIX:-freshell-sandbox}"
 
 if [ "${1:-}" = "--provider-mountpoints" ]; then
   shift
@@ -133,6 +135,36 @@ else
   fi
   CMD="$1"
 
+  # This exact stopped-repair route already owns its dedicated enclosure.
+  if [ "${RUNTIME_SUITE}" -eq 1 ] && [ "$#" -eq 1 ] && \
+     [ "${CMD}" = "cargo test -p freshell-supervisor stopped_repair_crash_ -- --ignored" ]; then
+    cd "${REPO_ROOT}"
+    exec pnpm exec tsx "${REPO_ROOT}/scripts/testing/task007-destructive-sandbox.ts"
+  fi
+  if [[ ! "${CACHE_PREFIX}" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
+    echo '[sandbox] FRESHELL_SANDBOX_CACHE_PREFIX must be a Docker volume name prefix, not a path' >&2
+    exit 2
+  fi
+
+  # Each phase runs the same owned wrapper lifecycle with its own name, CID,
+  # guard and completed settlement. Only the fixed preparation has networking.
+  if [ "${RUNTIME_SUITE}" -eq 1 ] && [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" != 1 ] \
+     && [ "${FRESHELL_SANDBOX_DEPENDENCIES_READY:-}" != 1 ]; then
+    env FRESHELL_SANDBOX_PREPARE_ONLY=1 bash "${BASH_SOURCE[0]}" --runtime-suite \
+      'if [ -f Cargo.lock ]; then cargo fetch --locked; fi' &
+    PREPARATION_PID=$!
+    trap 'kill -INT "${PREPARATION_PID}" 2>/dev/null || true; wait "${PREPARATION_PID}" 2>/dev/null || true; exit 130' INT
+    trap 'kill -TERM "${PREPARATION_PID}" 2>/dev/null || true; wait "${PREPARATION_PID}" 2>/dev/null || true; exit 143' TERM
+    trap 'kill -HUP "${PREPARATION_PID}" 2>/dev/null || true; wait "${PREPARATION_PID}" 2>/dev/null || true; exit 129' HUP
+    PREPARATION_STATUS=0
+    wait "${PREPARATION_PID}" || PREPARATION_STATUS=$?
+    trap - INT TERM HUP
+    if [ "${PREPARATION_STATUS}" -ne 0 ]; then exit "${PREPARATION_STATUS}"; fi
+    CALLER_FLAGS=(--runtime-suite)
+    if [ "${CHECKPOINT_FIXTURE}" -eq 1 ]; then CALLER_FLAGS+=(--checkpoint-fixture); fi
+    exec env FRESHELL_SANDBOX_DEPENDENCIES_READY=1 bash "${BASH_SOURCE[0]}" "${CALLER_FLAGS[@]}" "${CMD}"
+  fi
+
   # Keep Cargo targets reusable within one canonical working copy while
   # isolating concurrent checkouts. Labels are attached by Docker in the same
   # --mount request that creates and references a fresh volume; there is no
@@ -225,7 +257,7 @@ PY
   # Managed-runtime lifecycle tests are stricter: no network at all. Neither mode
   # ever uses the host network.
   NETWORK_ARGS=()
-  if [ "${RUNTIME_SUITE}" -eq 1 ]; then
+  if [ "${RUNTIME_SUITE}" -eq 1 ] && [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" != 1 ]; then
     NETWORK_ARGS=(--network none)
   else
     NETWORK_NAME="freshell-sandbox"
@@ -425,21 +457,21 @@ DOCKER_ARGS=(
   --pids-limit 512
   --memory 8g
   -v "${REPO_ROOT}:/workspace"
-  -v freshell-sandbox-cargo-registry:/usr/local/cargo/registry
-  -v freshell-sandbox-cargo-git:/usr/local/cargo/git
-  -v freshell-sandbox-pnpm-store:/home/sandbox/.local/share/pnpm/store
+  -v "${CACHE_PREFIX}-cargo-registry:/usr/local/cargo/registry"
+  -v "${CACHE_PREFIX}-cargo-git:/usr/local/cargo/git"
+  -v "${CACHE_PREFIX}-pnpm-store:/home/sandbox/.local/share/pnpm/store"
   --mount "type=volume,src=${TARGET_CACHE_VOLUME},dst=/workspace/target,${TARGET_CACHE_LABEL_OPTIONS}"
-  -v freshell-sandbox-node-modules:/workspace/node_modules
+  -v "${CACHE_PREFIX}-node-modules:/workspace/node_modules"
   # pnpm workspace members with their own dependencies get their own
   # sandbox-owned node_modules (the entrypoint chowns and, on fingerprint
   # changes, purges these only as mounted volumes). On legacy npm-era
   # branches these stay mounted-but-unused and harmless.
-  -v freshell-sandbox-sidecar-node-modules:/workspace/crates/freshell-claude-sidecar/node_modules
-  -v freshell-sandbox-mcp-node-modules:/workspace/packages/freshell-mcp-runtime/node_modules
-  -v freshell-sandbox-playwright-cache:/home/sandbox/.cache/ms-playwright
+  -v "${CACHE_PREFIX}-sidecar-node-modules:/workspace/crates/freshell-claude-sidecar/node_modules"
+  -v "${CACHE_PREFIX}-mcp-node-modules:/workspace/packages/freshell-mcp-runtime/node_modules"
+  -v "${CACHE_PREFIX}-playwright-cache:/home/sandbox/.cache/ms-playwright"
 )
 
-if [ "${RUNTIME_SUITE}" -eq 1 ]; then
+if [ "${RUNTIME_SUITE}" -eq 1 ] && [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" != 1 ]; then
   # shellcheck disable=SC2054 # Commas belong to each single tmpfs option string.
   DOCKER_ARGS+=(
     --read-only
@@ -452,6 +484,7 @@ if [ "${RUNTIME_SUITE}" -eq 1 ]; then
     -e FRESHELL_TEST_EXECUTABLE_TMP_DIR=/freshell-test-artifacts
     --security-opt no-new-privileges
     -e FRESHELL_SANDBOX_MODE=runtime-suite
+    -e CARGO_NET_OFFLINE=true
   )
   if [ "${CHECKPOINT_FIXTURE}" -eq 1 ]; then
     DOCKER_ARGS+=(-e FRESHELL_SANDBOX_CHECKPOINT_FIXTURE=1)

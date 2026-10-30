@@ -125,6 +125,17 @@ impl FreshClaudeState {
         provenance: Option<crate::BindProvenance>,
         reply_sink: freshell_terminal::FrameSink,
     ) {
+        self.handle_fork_with_native_launch(msg, provenance, reply_sink, None)
+            .await;
+    }
+
+    pub async fn handle_fork_with_native_launch(
+        &self,
+        msg: FreshAgentFork,
+        provenance: Option<crate::BindProvenance>,
+        reply_sink: freshell_terminal::FrameSink,
+        native_launch: Option<Value>,
+    ) {
         let session_type = session_type_str(msg.session_type);
         let refuse = |code: &str, message: &str| {
             reply_sink(fork_error_frame(
@@ -133,6 +144,16 @@ impl FreshClaudeState {
                 code,
                 message,
             ));
+        };
+        let refuse_before_child = |code: &str, message: &str| {
+            let mut frame = fork_error_frame(&msg.session_id, session_type, code, message);
+            if self.managed_forks {
+                if let ServerMessage::FreshAgentEvent(event) = &mut frame {
+                    event.event["nativeParentUnchanged"] = json!(true);
+                    event.event["requestId"] = json!(msg.request_id);
+                }
+            }
+            reply_sink(frame);
         };
         // The delayed-request fence's shape (send/attach/rollback parity): a
         // half-sent pair is the typed INVALID_FENCE refusal. A fork never touches
@@ -144,7 +165,7 @@ impl FreshClaudeState {
                 event = "freshagent.claude.fork_refused",
                 session_id = %msg.session_id, code = err.code(),
                 "the fork's observed fence is half-sent");
-            refuse(err.code(), err.message());
+            refuse_before_child(err.code(), err.message());
             return;
         }
         let Some(map_key) = self.resolve_session_key(&msg.session_id).await else {
@@ -156,7 +177,7 @@ impl FreshClaudeState {
                 event = "freshagent.claude.fork_refused",
                 session_id = %msg.session_id, code = "FORK_IN_PROGRESS",
                 "a fork of this session is already booting its child");
-            refuse("FORK_IN_PROGRESS", FORK_IN_PROGRESS_MESSAGE);
+            refuse_before_child("FORK_IN_PROGRESS", FORK_IN_PROGRESS_MESSAGE);
             return;
         };
         let (turn_lock, durable_before) = {
@@ -183,51 +204,78 @@ impl FreshClaudeState {
                 event = "freshagent.claude.fork_refused",
                 session_id = %parent.durable, code = "BUSY_TURN",
                 "a fork waits for the parent's turn to finish");
-            refuse("BUSY_TURN", FORK_BUSY_MESSAGE);
+            refuse_before_child("BUSY_TURN", FORK_BUSY_MESSAGE);
             return;
         }
 
         // The keep point, on what the parent holds now (its transcript, or for
         // a pending fork its parent's chain through the fork point).
-        let current = match self.effective_transcript(&parent.durable).await {
-            Ok(current) => current,
-            Err(EffectiveTranscriptError::Missing) => {
-                refuse("FORK_REFUSED", FORK_EMPTY_MESSAGE);
-                return;
-            }
-            Err(EffectiveTranscriptError::Unreadable(error)) => {
-                snap::log_transcript_unreadable("fork", &parent.durable, &error);
-                refuse(
-                    "INTERNAL_ERROR",
-                    &format!("claude transcript store unreadable: {}", error.kind_label()),
-                );
-                return;
-            }
-            Err(EffectiveTranscriptError::Read(message)) => {
-                refuse("INTERNAL_ERROR", &message);
-                return;
-            }
-        };
         let at_turn_id = msg
             .input
             .as_ref()
             .and_then(|input| input.get("atTurnId"))
             .and_then(Value::as_str);
-        let at = match snap::fork_point(&current.text, at_turn_id) {
-            Ok(at) => at,
-            Err(snap::ForkPointError::Empty) => {
-                refuse("FORK_REFUSED", FORK_EMPTY_MESSAGE);
-                return;
+        let (source, source_path, at) = if self.managed_forks {
+            let mut request = self.managed_history_request("fork", &parent.durable).await;
+            request["atTurnId"] = json!(at_turn_id);
+            let resolved = self.read_managed_history(request).await.and_then(|value| {
+                serde_json::from_value::<super::managed_history::ClaudeForkResolution>(value)
+                    .map_err(|_| "invalid managed Claude fork response".to_string())
+            });
+            match resolved {
+                Ok(resolved) => (
+                    resolved.source_session_id,
+                    Some(resolved.source_path),
+                    resolved.at,
+                ),
+                Err(message) => {
+                    let code =
+                        if message == FORK_EMPTY_MESSAGE || message == FORK_TURN_MISSING_MESSAGE {
+                            "FORK_REFUSED"
+                        } else {
+                            "INTERNAL_ERROR"
+                        };
+                    refuse_before_child(code, &message);
+                    return;
+                }
             }
-            Err(snap::ForkPointError::TurnNotFound) => {
-                refuse("FORK_REFUSED", FORK_TURN_MISSING_MESSAGE);
-                return;
-            }
+        } else {
+            let current = match self.effective_transcript(&parent.durable).await {
+                Ok(current) => current,
+                Err(EffectiveTranscriptError::Missing) => {
+                    refuse_before_child("FORK_REFUSED", FORK_EMPTY_MESSAGE);
+                    return;
+                }
+                Err(EffectiveTranscriptError::Unreadable(error)) => {
+                    snap::log_transcript_unreadable("fork", &parent.durable, &error);
+                    refuse_before_child(
+                        "INTERNAL_ERROR",
+                        &format!("claude transcript store unreadable: {}", error.kind_label()),
+                    );
+                    return;
+                }
+                Err(EffectiveTranscriptError::Read(message)) => {
+                    refuse_before_child("INTERNAL_ERROR", &message);
+                    return;
+                }
+            };
+            let at = match snap::fork_point(&current.text, at_turn_id) {
+                Ok(at) => at,
+                Err(snap::ForkPointError::Empty) => {
+                    refuse_before_child("FORK_REFUSED", FORK_EMPTY_MESSAGE);
+                    return;
+                }
+                Err(snap::ForkPointError::TurnNotFound) => {
+                    refuse_before_child("FORK_REFUSED", FORK_TURN_MISSING_MESSAGE);
+                    return;
+                }
+            };
+            (current.source, current.source_path, at)
         };
         // A fork discards nothing of its source that the pane shows as its own
         // conversation, so no drops-turn guard is armed (that guard is undo's).
         let genesis = ClaudeGenesis::Fork {
-            parent: current.source.clone(),
+            parent: source.clone(),
             at: Some(at.clone()),
             drops_turn: None,
         };
@@ -236,10 +284,9 @@ impl FreshClaudeState {
         // selection, resuming the source by id under its ORIGINAL cwd while that
         // cwd exists (ledger A15), else by the transcript path the read above
         // located (G28: never a second scan).
-        let located = current
-            .source_path
+        let located = source_path
             .as_deref()
-            .map(|path| crate::claude_launch::resume_target(&current.source, path));
+            .map(|path| crate::claude_launch::resume_target(&source, path));
         let spawn_cwd = located
             .as_ref()
             .and_then(|(_, cwd)| cwd.clone())
@@ -248,7 +295,7 @@ impl FreshClaudeState {
         let boot = ClaudeBoot::Fork {
             resume: located
                 .map(|(resume, _)| resume)
-                .unwrap_or_else(|| current.source.clone()),
+                .unwrap_or_else(|| source.clone()),
             at: Some(at.clone()),
             drops_turn: None,
         };
@@ -280,7 +327,7 @@ impl FreshClaudeState {
                     event = "freshagent.claude.fork_refused",
                     session_id = %parent.durable, child = %child, code = "SESSION_RESERVED",
                     "the ownership coordinator found a live owner under the minted fork child id");
-                refuse(
+                refuse_before_child(
                     "SESSION_RESERVED",
                     "Another resume for this session is in flight",
                 );
@@ -292,7 +339,7 @@ impl FreshClaudeState {
                     session_id = %parent.durable, child = %child, code = "SESSION_RESERVED",
                     outcome = ?outcome,
                     "the ownership coordinator refused the fork child's claim");
-                refuse(
+                refuse_before_child(
                     "SESSION_RESERVED",
                     "Another resume for this session is in flight",
                 );
@@ -339,7 +386,7 @@ impl FreshClaudeState {
                     event = "freshagent.claude.fork_refused",
                     child = %child, claim = ?other,
                     "a freshly minted fork child id already holds a lease");
-                refuse(
+                refuse_before_child(
                     "SESSION_RESERVED",
                     "Another resume for this session is in flight",
                 );
@@ -351,11 +398,21 @@ impl FreshClaudeState {
             event = "freshagent.claude.fork_boot",
             session_id = %parent.durable,
             child = %child,
-            source = %current.source,
+            source = %source,
             at = %at,
             at_turn_id = ?at_turn_id,
             "the fork boots its child beside the live parent"
         );
+        let recipe = match self
+            .make_managed_fork_recipe(&source, &child, Some(&at), None)
+            .await
+        {
+            Ok(recipe) => recipe,
+            Err(message) => {
+                refuse_before_child("INTERNAL_ERROR", &message);
+                return;
+            }
+        };
         let spec = ClaudeLaunchSpec::new(
             format!("fork-{}", uuid::Uuid::new_v4()),
             session_type,
@@ -365,7 +422,12 @@ impl FreshClaudeState {
             self.hosted_mcp,
         )
         .with_session_id(Some(child.clone()))
-        .with_freshell_context(parent.freshell_context.clone());
+        .with_freshell_context(parent.freshell_context.clone())
+        .with_native_fork_recipe(recipe.clone())
+        .with_native_identity_transition(
+            native_launch
+                .map(|launch| json!({"launch":launch, "parentNativeSessionId":parent.durable})),
+        );
         let established = match self
             .establish_runtime(
                 EstablishPlan {
@@ -479,6 +541,15 @@ impl FreshClaudeState {
             session_type,
             "the fork's child is live beside its parent"
         );
+        if self.managed_forks {
+            *self.managed_prefix.lock().await = recipe.clone();
+            *self.managed_fork.lock().await =
+                Some(freshell_agent_runtime::host_actor::ClaudeForkState {
+                    native_session_id: child.clone(),
+                    recipe,
+                    rollback: None,
+                });
+        }
         reply_sink(ServerMessage::FreshAgentForked(FreshAgentForked {
             request_id: msg.request_id.clone(),
             parent_session_id: parent.reply_id,

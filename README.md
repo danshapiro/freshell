@@ -137,6 +137,13 @@ Reopening a session in another mode keeps the same provider session and conversa
 
 **Stop and reopen** is available only when freshell can confirm the old writer and its owned child processes have stopped. The new mode starts only after that confirmation. On platforms where freshell cannot establish that proof, the request is refused before changing the session, and the existing session remains usable. The current atomic handoff implementation supports this operation when the Freshell server runs on Linux; Windows and macOS receive the explicit refusal and can still use clear-only bookkeeping repair.
 
+Managed runtime is opt-in for Claude, Codex, and OpenCode in terminal and
+fresh-agent modes. Live checks in this repair cover the four Codex/OpenCode
+modes; Claude remains unverified. Back up existing session stores before
+upgrading. Existing sessions are not automatically imported and may need to be
+moved manually. Managed Amplifier and Kilroy remain disabled; ordinary legacy
+CLI integrations remain available.
+
 ## Stream Deck
 
 Freshell can drive an Elgato Stream Deck straight from the browser. Each key shows a tab — by default the **Status icons** style: title on top, centered repo icons, and a status background (green for tabs that want attention), with keys sorted so attention-seeking tabs come first. Press a key to focus that tab; long-press (500 ms) to open an action layer with BACK / APPROVE / STOP keys (it closes itself after 10 s). When you have more tabs than keys, the last key pages through them (wrapping around). On a Stream Deck +, the dials cycle tabs and flip pages and the touch strip shows the active tab plus busy/waiting counts (waiting = tabs that finished a turn or are waiting for approval). The deck dims after a configurable idle timeout and wakes on activity.
@@ -229,14 +236,15 @@ Freshell indexes local session history and can launch terminals for these coding
 | **Amplifier** | Yes | Yes | `~/.amplifier` |
 
 Enable/disable providers and set defaults in the Settings UI or via `~/.freshell/config.json`.
-OpenCode sessions are discovered directly from OpenCode's local session database, so existing OpenCode work can be resumed from freshell without importing anything manually.
+OpenCode sessions are discovered directly from OpenCode's local session database, so you can resume a selected session from freshell on demand. Freshell does not import existing sessions automatically at startup or during runtime transitions.
 
 OpenCode permissions are controlled by the OpenCode configuration for the OS user running freshell. Freshell does not set `OPENCODE_PERMISSION` or pass `--dangerously-skip-permissions` for OpenCode sessions; OS filesystem permissions remain the hard boundary.
 
 Amplifier loads the freshell MCP only if its bundle mounts `tool-mcp` (the default `anchors` bundle does not). Add `tool-mcp` to your Amplifier bundle to enable orchestration.
 
-Managed Amplifier sessions use the configured bundle, provider, model, and
-plugins. If the provider needs a secret, give Freshell a private OneCLI grant
+The unreleased managed Amplifier adapter uses the configured bundle, provider,
+model, and plugins. For a separately authorized qualification, supply a private
+OneCLI grant
 through `FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENV_FILE` or
 `FRESHELL_MANAGED_AMPLIFIER_ONECLI_AUTH_FILE`. Freshell resolves the grant for
 the provider child when the session starts.

@@ -15,6 +15,7 @@ Object.defineProperty(globalThis, 'localStorage', { value: localStorageMock, wri
 
 import panesReducer, {
   initLayout,
+  updatePaneContent,
   applyReconcileAttach,
   applyFreshAgentReconcileAttach,
   resetFreshAgentPaneForReconcileCreate,
@@ -175,15 +176,18 @@ describe('managed bootstrap history fold', () => {
     ['kilroy', 'claude', DURABLE],
     ['freshcodex', 'codex', 'native-managed-codex'],
     ['freshopencode', 'opencode', 'ses_managed_opencode'],
-  ] as const)('preserves the %s canonical source through an actual fresh fold', (sessionType, provider, nativeId) => {
+  ] as const)('preserves the %s canonical source when managed ownership arrives during an in-flight fresh fold', (sessionType, provider, nativeId) => {
     const store = configureStore({ reducer: { panes: panesReducer } })
     const sessionRef = { provider, sessionId: nativeId }
     store.dispatch(initLayout({ tabId: 'owned-tab', paneId: 'owned-pane', content: {
       kind: 'fresh-agent', sessionType, provider, createRequestId: FA_CREATE_REQUEST_ID,
       sessionId: 'old-live-handle', sessionRef, resumeSessionId: nativeId, status: 'connected',
-      soulId: 'owned-soul', soulIntentRevision: 7,
     } }))
     const request = buildReconcileRequest(store.getState() as RootState, { includeFreshAgent: true })!
+    const beforeOwnership = store.getState().panes.layouts['owned-tab']
+    if (beforeOwnership.type !== 'leaf') throw new Error('expected owned pane')
+    store.dispatch(updatePaneContent({ tabId: 'owned-tab', paneId: 'owned-pane',
+      content: { ...beforeOwnership.content, soulId: 'owned-soul', soulIntentRevision: 7 } }))
     const result = resultFor(request, [{ paneKey: request.panes[0].paneKey, verdict: 'fresh', reason: 'identity_never_observed' }])
     const outcome = foldVerdicts(store.dispatch as AppDispatch, request, result)
     expect(outcome.fresh).toBe(1)
@@ -193,8 +197,7 @@ describe('managed bootstrap history fold', () => {
     expect(root.content).toMatchObject({ sessionRef, resumeSessionId: nativeId, soulId: 'owned-soul',
       soulIntentRevision: 7, createRequestId: FA_CREATE_REQUEST_ID, pendingReconcile: 'fresh', reconcileEpoch: 1, status: 'creating' })
     expect((root.content as FreshAgentPaneContent).sessionId).toBeUndefined()
-    expect(buildReconcileRequest(store.getState() as RootState, { includeFreshAgent: true })!.panes[0])
-      .toMatchObject({ createRequestId: FA_CREATE_REQUEST_ID, sessionRef })
+    expect(buildReconcileRequest(store.getState() as RootState, { includeFreshAgent: true })).toBeNull()
   })
 })
 
@@ -209,6 +212,32 @@ describe('fresh-agent reconcile capability latch', () => {
 })
 
 describe('buildReconcileRequest with fresh-agent panes', () => {
+  it.each([
+    ['freshclaude', 'claude', DURABLE],
+    ['kilroy', 'claude', DURABLE],
+    ['freshcodex', 'codex', 'native-managed-codex'],
+    ['freshopencode', 'opencode', 'ses_managed_opencode'],
+  ] as const)(
+    'leaves supervisor-owned %s panes to managed recovery in both builders', (sessionType, provider, nativeId) => {
+      let panes = addFreshAgentPane(emptyPanesState(), 'managed-tab', 'managed-pane', {
+        sessionType, provider, soulId: 'managed-soul',
+        sessionRef: { provider, sessionId: nativeId },
+      })
+      expect(buildReconcileRequest(asRootState(panes), { includeFreshAgent: true })).toBeNull()
+      expect(buildReconcileRequestForPanes(asRootState(panes), [
+        { tabId: 'managed-tab', paneId: 'managed-pane' },
+      ])).toBeNull()
+      panes = addFreshAgentPane(panes, 'legacy-tab', 'legacy-pane')
+      const state = asRootState(panes)
+      for (const request of [buildReconcileRequest(state, { includeFreshAgent: true }),
+        buildReconcileRequestForPanes(state, [
+          { tabId: 'managed-tab', paneId: 'managed-pane' },
+          { tabId: 'legacy-tab', paneId: 'legacy-pane' },
+        ])]) {
+        expect(request?.panes.map(pane => pane.paneKey)).toEqual(['legacy-tab:legacy-pane'])
+      }
+    })
+
   it('excludes fresh-agent panes by default (frozen behavior)', () => {
     const req = buildReconcileRequest(stateWithBothKinds())
     expect(req!.panes).toHaveLength(1)

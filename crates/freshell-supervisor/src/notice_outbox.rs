@@ -61,22 +61,7 @@ pub(crate) fn enqueue_notice_in_tx(
     now: i64,
 ) -> Result<RuntimeNotice, RegistryError> {
     let notice_id = stable_notice_id(kind, incidents);
-    let reference = notice_reference(kind, incidents);
-    let count = incidents.len().max(1);
-    let message = match kind {
-        NoticeKind::CleanupSucceeded => format!(
-            "Found and cleaned up {count} lost agent {}. Details are in the server logs. Reference: {reference}.",
-            if count == 1 { "process" } else { "processes" }
-        ),
-        NoticeKind::CleanupFailed => format!(
-            "Found {count} lost agent {}, but cleanup could not be verified. No unrelated process was touched. Reference: {reference}.",
-            if count == 1 { "process" } else { "processes" }
-        ),
-        NoticeKind::EndedWithoutProcess => format!(
-            "{count} managed agent {} ended after every recovery path was exhausted. No process cleanup signal was required. Reference: {reference}.",
-            if count == 1 { "session" } else { "sessions" }
-        ),
-    };
+    let (message, reference) = notice_copy(kind, incidents);
     let incident_json = serde_json::to_string(incidents)?;
     tx.execute(
         "INSERT OR IGNORE INTO runtime_notices \
@@ -111,6 +96,396 @@ pub(crate) fn enqueue_notice_in_tx(
         delivery_state: NoticeDeliveryState::Pending,
         created_at: millis_to_timestamp(now),
     })
+}
+
+fn notice_copy(kind: NoticeKind, incidents: &[IncidentId]) -> (String, String) {
+    let reference = notice_reference(kind, incidents);
+    let count = incidents.len().max(1);
+    let message = match kind {
+        NoticeKind::CleanupSucceeded => format!(
+            "Found and cleaned up {count} lost agent {}. Details are in the server logs. Reference: {reference}.",
+            if count == 1 { "process" } else { "processes" }
+        ),
+        NoticeKind::CleanupFailed => format!(
+            "Found {count} lost agent {}, but cleanup could not be verified. No unrelated process was touched. Reference: {reference}.",
+            if count == 1 { "process" } else { "processes" }
+        ),
+        NoticeKind::EndedWithoutProcess => format!(
+            "{count} managed agent {} ended after every recovery path was exhausted. No process cleanup signal was required. Reference: {reference}.",
+            if count == 1 { "session" } else { "sessions" }
+        ),
+    };
+    (message, reference)
+}
+
+#[derive(Debug)]
+struct NoticeReceiptRow {
+    profile_id: String,
+    state: NoticeDeliveryState,
+    rendered_at: Option<i64>,
+    acknowledged_at: Option<i64>,
+    dismissed_at: Option<i64>,
+    updated_at: i64,
+}
+
+#[derive(Debug)]
+struct NoticeRow {
+    id: NoticeId,
+    kind: NoticeKind,
+    incidents: Vec<IncidentId>,
+    superseded_by: Option<String>,
+    created_at: i64,
+}
+
+/// Remove false IDs from every affected notice and rebuild deterministic
+/// identities. Receipt merging preserves the strongest prior suppression.
+pub(crate) fn sanitize_false_incident_notices_in_tx(
+    tx: &Transaction<'_>,
+    false_incidents: &std::collections::BTreeSet<String>,
+    now: i64,
+) -> Result<(), RegistryError> {
+    let notices = {
+        let mut statement = tx.prepare(
+            "SELECT notice_id,kind,incident_ids_json,superseded_by,created_at FROM runtime_notices ORDER BY notice_id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(id, kind, incidents, superseded_by, created_at)| {
+                Ok(NoticeRow {
+                    id: NoticeId::parse(id)
+                        .map_err(|_| RegistryError::Integrity("invalid notice id".into()))?,
+                    kind: parse_notice_kind(&kind)?,
+                    incidents: serde_json::from_str(&incidents)?,
+                    superseded_by,
+                    created_at,
+                })
+            })
+            .collect::<Result<Vec<_>, RegistryError>>()?
+    };
+    let affected = notices
+        .iter()
+        .filter(|notice| {
+            notice
+                .incidents
+                .iter()
+                .any(|id| false_incidents.contains(id.as_str()))
+        })
+        .collect::<Vec<_>>();
+    if affected.is_empty() {
+        return Ok(());
+    }
+
+    let affected_ids = affected
+        .iter()
+        .map(|notice| notice.id.to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut replacements = std::collections::BTreeMap::<String, Option<String>>::new();
+    let mut groups =
+        std::collections::BTreeMap::<String, (NoticeKind, Vec<IncidentId>, Vec<String>, i64)>::new(
+        );
+    for notice in &affected {
+        let remaining = notice
+            .incidents
+            .iter()
+            .filter(|id| !false_incidents.contains(id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if remaining.is_empty() {
+            replacements.insert(notice.id.to_string(), None);
+        } else {
+            let new_id = stable_notice_id(notice.kind, &remaining).to_string();
+            replacements.insert(notice.id.to_string(), Some(new_id.clone()));
+            groups
+                .entry(new_id)
+                .and_modify(|(_, _, ids, created)| {
+                    ids.push(notice.id.to_string());
+                    *created = (*created).min(notice.created_at);
+                })
+                .or_insert_with(|| {
+                    (
+                        notice.kind,
+                        remaining,
+                        vec![notice.id.to_string()],
+                        notice.created_at,
+                    )
+                });
+        }
+    }
+
+    // Follow complete supersession chains through notices that are removed.
+    for notice in &notices {
+        let Some(superseded_by) = notice.superseded_by.as_ref() else {
+            continue;
+        };
+        if !affected_ids.contains(superseded_by) {
+            continue;
+        }
+        let destination = resolve_rebuilt_supersession(superseded_by, &replacements, &notices)?;
+        tx.execute(
+            "UPDATE runtime_notices SET superseded_by=?1,updated_at=?2 WHERE notice_id=?3",
+            params![destination, now, notice.id.as_str()],
+        )?;
+    }
+
+    for (new_id, (kind, incidents, old_ids, created_at)) in &groups {
+        let mut source_ids = old_ids.clone();
+        if !affected_ids.contains(new_id) {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM runtime_notices WHERE notice_id=?1)",
+                params![new_id],
+                |row| row.get(0),
+            )?;
+            if exists {
+                source_ids.push(new_id.clone());
+            }
+        }
+        let receipts = {
+            let mut statement = tx.prepare(
+                "SELECT profile_id,state,rendered_at,acknowledged_at,dismissed_at,updated_at FROM notice_receipts WHERE notice_id=?1",
+            )?;
+            let mut values = Vec::new();
+            for id in &source_ids {
+                values.extend(
+                    statement
+                        .query_map(params![id], |row| {
+                            let state: String = row.get(1)?;
+                            Ok(NoticeReceiptRow {
+                                profile_id: row.get(0)?,
+                                state: parse_delivery_state(&state).map_err(|error| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        1,
+                                        rusqlite::types::Type::Text,
+                                        Box::new(error),
+                                    )
+                                })?,
+                                rendered_at: row.get(2)?,
+                                acknowledged_at: row.get(3)?,
+                                dismissed_at: row.get(4)?,
+                                updated_at: row.get(5)?,
+                            })
+                        })?
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+            }
+            values
+        };
+        let mut merged = std::collections::BTreeMap::<String, NoticeReceiptRow>::new();
+        for receipt in receipts {
+            let rank = repair_receipt_rank(receipt.state);
+            match merged.get_mut(&receipt.profile_id) {
+                Some(current) => {
+                    current.rendered_at = current.rendered_at.max(receipt.rendered_at);
+                    current.acknowledged_at = current.acknowledged_at.max(receipt.acknowledged_at);
+                    current.dismissed_at = current.dismissed_at.max(receipt.dismissed_at);
+                    if rank > repair_receipt_rank(current.state)
+                        || (rank == repair_receipt_rank(current.state)
+                            && receipt.updated_at > current.updated_at)
+                    {
+                        current.state = receipt.state;
+                    }
+                    current.updated_at = current.updated_at.max(receipt.updated_at);
+                }
+                None => {
+                    merged.insert(receipt.profile_id.clone(), receipt);
+                }
+            }
+        }
+        let mut delivered_at: Option<i64> = None;
+        for source_id in &source_ids {
+            let rows = {
+                let mut statement = tx.prepare(
+                    "SELECT delivered_at,payload FROM outbox WHERE event_kind='runtime.notice' AND json_extract(payload,'$.noticeId')=?1",
+                )?;
+                let values = statement
+                    .query_map(params![source_id], |row| {
+                        Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                values
+            };
+            for (delivered, payload) in rows {
+                let payload: serde_json::Value = serde_json::from_str(&payload)?;
+                if payload.get("noticeId").and_then(serde_json::Value::as_str)
+                    != Some(source_id.as_str())
+                {
+                    return Err(RegistryError::Integrity(
+                        "runtime.notice projection identity does not match its row".into(),
+                    ));
+                }
+                if let Some(delivered) = delivered {
+                    delivered_at = Some(delivered_at.map_or(delivered, |old| old.max(delivered)));
+                }
+            }
+        }
+        for old_id in old_ids {
+            tx.execute(
+                "DELETE FROM notice_receipts WHERE notice_id=?1",
+                params![old_id],
+            )?;
+            tx.execute(
+                "DELETE FROM runtime_notices WHERE notice_id=?1",
+                params![old_id],
+            )?;
+            tx.execute(
+                "DELETE FROM outbox WHERE event_kind='runtime.notice' AND json_extract(payload,'$.noticeId')=?1",
+                params![old_id],
+            )?;
+        }
+        if source_ids.iter().any(|id| id == new_id) {
+            // Destination collision already exists; receipts are moved and
+            // deterministic notice fields replace any stale message text.
+            tx.execute(
+                "DELETE FROM notice_receipts WHERE notice_id=?1",
+                params![new_id],
+            )?;
+        }
+        let (message, reference) = notice_copy(*kind, incidents);
+        let mut superseded_destinations = old_ids
+            .iter()
+            .filter_map(|id| notices.iter().find(|row| row.id.as_str() == id))
+            .filter_map(|row| row.superseded_by.as_deref())
+            .map(|id| resolve_rebuilt_supersession(id, &replacements, &notices))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<std::collections::BTreeSet<_>>();
+        if !affected_ids.contains(new_id) {
+            if let Some(existing) = notices.iter().find(|row| row.id.as_str() == new_id) {
+                if let Some(target) = existing.superseded_by.as_deref() {
+                    if let Some(target) =
+                        resolve_rebuilt_supersession(target, &replacements, &notices)?
+                    {
+                        superseded_destinations.insert(target);
+                    }
+                }
+            }
+        }
+        // A collapsed source can resolve its supersession edge back to the
+        // rebuilt notice itself. That edge is internal to the collapsed
+        // group and must not suppress the surviving notice or conflict with
+        // a separate valid successor.
+        superseded_destinations.remove(new_id);
+        if superseded_destinations.len() > 1 {
+            return Err(RegistryError::Integrity(
+                "collapsed runtime notices have conflicting supersession targets".into(),
+            ));
+        }
+        let superseded_by = superseded_destinations.into_iter().next();
+        tx.execute(
+            "INSERT OR REPLACE INTO runtime_notices(notice_id,kind,message,reference,incident_ids_json,superseded_by,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![new_id, notice_kind_name(*kind), message, reference, serde_json::to_string(incidents)?, superseded_by, created_at, now],
+        )?;
+        for receipt in merged.values() {
+            tx.execute(
+                "INSERT INTO notice_receipts(notice_id,profile_id,state,rendered_at,acknowledged_at,dismissed_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![new_id, receipt.profile_id, delivery_state_name(receipt.state), receipt.rendered_at, receipt.acknowledged_at, receipt.dismissed_at, receipt.updated_at],
+            )?;
+        }
+        let payload = serde_json::to_string(&serde_json::json!({
+            "noticeId": new_id,
+            "kind": kind,
+            "incidentIds": incidents,
+            "foreignObjectsTouched": 0,
+        }))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO outbox(event_id,event_kind,payload,created_at,delivered_at) VALUES (?1,'runtime.notice',?2,?3,?4)",
+            params![format!("projection-{new_id}"), payload, now, delivered_at],
+        )?;
+    }
+
+    for notice in &affected {
+        if replacements
+            .get(notice.id.as_str())
+            .is_some_and(Option::is_none)
+        {
+            tx.execute(
+                "DELETE FROM notice_receipts WHERE notice_id=?1",
+                params![notice.id.as_str()],
+            )?;
+            tx.execute(
+                "DELETE FROM runtime_notices WHERE notice_id=?1",
+                params![notice.id.as_str()],
+            )?;
+            tx.execute(
+                "DELETE FROM outbox WHERE event_kind='runtime.notice' AND json_extract(payload,'$.noticeId')=?1",
+                params![notice.id.as_str()],
+            )?;
+        }
+    }
+    for notice in notices {
+        let superseded_by: Option<String> = tx
+            .query_row(
+                "SELECT superseded_by FROM runtime_notices WHERE notice_id=?1",
+                params![notice.id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(old_target) = superseded_by else {
+            continue;
+        };
+        if let Some(Some(new_target)) = replacements.get(&old_target) {
+            tx.execute(
+                "UPDATE runtime_notices SET superseded_by=?1,updated_at=?2 WHERE notice_id=?3",
+                params![new_target, now, notice.id.as_str()],
+            )?;
+        } else if replacements.contains_key(&old_target) {
+            tx.execute(
+                "UPDATE runtime_notices SET superseded_by=NULL,updated_at=?1 WHERE notice_id=?2",
+                params![now, notice.id.as_str()],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn resolve_rebuilt_supersession(
+    initial_id: &str,
+    replacements: &std::collections::BTreeMap<String, Option<String>>,
+    notices: &[NoticeRow],
+) -> Result<Option<String>, RegistryError> {
+    let mut current = initial_id.to_string();
+    let mut visited = std::collections::BTreeSet::new();
+    loop {
+        if !visited.insert(current.clone()) {
+            return Err(RegistryError::Integrity(
+                "runtime notice supersession graph contains a cycle".into(),
+            ));
+        }
+        let Some(replacement) = replacements.get(&current) else {
+            return Ok(Some(current));
+        };
+        if let Some(replacement) = replacement {
+            return Ok(Some(replacement.clone()));
+        }
+        let next = notices
+            .iter()
+            .find(|notice| notice.id.as_str() == current)
+            .and_then(|notice| notice.superseded_by.clone());
+        let Some(next) = next else {
+            return Ok(None);
+        };
+        current = next;
+    }
+}
+
+fn repair_receipt_rank(state: NoticeDeliveryState) -> u8 {
+    match state {
+        NoticeDeliveryState::Pending => 0,
+        NoticeDeliveryState::Rendered => 1,
+        NoticeDeliveryState::Acknowledged => 2,
+        NoticeDeliveryState::Dismissed => 3,
+    }
 }
 
 impl Registry {
@@ -510,6 +885,307 @@ mod tests {
         assert!(id.as_str().starts_with("notice-"));
         assert_eq!(reference.len(), 8);
     }
+
+    #[test]
+    fn false_incident_notice_rebuild_merges_receipts_and_removes_false_only_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let mut conn =
+            crate::registry::open_connection(&registry.registry_root().join("runtime.sqlite3"))
+                .unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let false_one = IncidentId::parse("incident-false-one").unwrap();
+        let false_two = IncidentId::parse("incident-false-two").unwrap();
+        let keep = IncidentId::parse("incident-keep").unwrap();
+        let old_one = enqueue_notice_in_tx(
+            &tx,
+            NoticeKind::CleanupSucceeded,
+            &[false_one.clone(), keep.clone()],
+            0,
+            1,
+        )
+        .unwrap();
+        let old_two = enqueue_notice_in_tx(
+            &tx,
+            NoticeKind::CleanupSucceeded,
+            &[false_two.clone(), keep.clone()],
+            0,
+            2,
+        )
+        .unwrap();
+        let target = enqueue_notice_in_tx(
+            &tx,
+            NoticeKind::CleanupSucceeded,
+            std::slice::from_ref(&keep),
+            0,
+            3,
+        )
+        .unwrap();
+        let false_only = enqueue_notice_in_tx(
+            &tx,
+            NoticeKind::CleanupFailed,
+            std::slice::from_ref(&false_one),
+            0,
+            4,
+        )
+        .unwrap();
+        for (notice, profile, state, time) in [
+            (&old_one, "one", "rendered", 10),
+            (&old_two, "one", "dismissed", 20),
+            (&target, "one", "acknowledged", 15),
+            (&false_only, "two", "dismissed", 30),
+        ] {
+            tx.execute(
+                "INSERT INTO notice_receipts(notice_id,profile_id,state,rendered_at,acknowledged_at,dismissed_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    notice.notice_id.as_str(),
+                    profile,
+                    state,
+                    Some(time),
+                    (state == "acknowledged").then_some(time),
+                    (state == "dismissed").then_some(time),
+                    time
+                ],
+            )
+            .unwrap();
+        }
+        tx.execute(
+            "UPDATE runtime_notices SET superseded_by=?1 WHERE notice_id=?2",
+            params![false_only.notice_id.as_str(), old_one.notice_id.as_str()],
+        )
+        .unwrap();
+        for (notice, delivered_at) in [(&old_one, 11), (&old_two, 40), (&target, 15)] {
+            tx.execute(
+                "UPDATE outbox SET delivered_at=?1 WHERE event_kind='runtime.notice' AND json_extract(payload,'$.noticeId')=?2",
+                params![delivered_at, notice.notice_id.as_str()],
+            )
+            .unwrap();
+        }
+
+        sanitize_false_incident_notices_in_tx(
+            &tx,
+            &std::collections::BTreeSet::from([false_one.to_string(), false_two.to_string()]),
+            100,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let conn =
+            crate::registry::open_connection(&registry.registry_root().join("runtime.sqlite3"))
+                .unwrap();
+        let notice: (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT notice_id,incident_ids_json,superseded_by FROM runtime_notices",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(notice.0, target.notice_id.as_str());
+        assert_eq!(
+            notice.1,
+            serde_json::to_string(std::slice::from_ref(&keep)).unwrap()
+        );
+        assert_eq!(notice.2, None);
+        let receipt: (String, Option<i64>) = conn
+            .query_row(
+                "SELECT state,dismissed_at FROM notice_receipts WHERE notice_id=?1 AND profile_id='one'",
+                params![target.notice_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(receipt, ("dismissed".into(), Some(20)));
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM notice_receipts WHERE profile_id='two'",
+                [],
+                |row| row.get::<_, u32>(0)
+            )
+            .unwrap(),
+            0
+        );
+        let projections = {
+            let mut statement = conn
+                .prepare("SELECT payload FROM outbox WHERE event_kind='runtime.notice'")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(projections.len(), 1);
+        assert!(projections[0].contains(keep.as_str()));
+        assert!(!projections[0].contains(false_one.as_str()));
+        assert!(!projections[0].contains(false_two.as_str()));
+        assert_eq!(
+            conn.query_row(
+                "SELECT delivered_at FROM outbox WHERE event_kind='runtime.notice' AND json_extract(payload,'$.noticeId')=?1",
+                params![target.notice_id.as_str()],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .unwrap(),
+            Some(40),
+            "notice delivery remains terminal after deterministic identity rebuild"
+        );
+    }
+
+    #[tokio::test]
+    async fn withdrawing_false_member_from_coalesced_startup_notice_preserves_real_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let real_incident = IncidentId::parse("incident-real").unwrap();
+        let false_incident = IncidentId::parse("incident-false").unwrap();
+        let real_notice = stable_notice_id(
+            NoticeKind::CleanupSucceeded,
+            std::slice::from_ref(&real_incident),
+        );
+
+        let mut conn = crate::registry::open_connection(registry.database_path()).unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        enqueue_notice_in_tx(
+            &tx,
+            NoticeKind::CleanupSucceeded,
+            std::slice::from_ref(&real_incident),
+            0,
+            100,
+        )
+        .unwrap();
+        enqueue_notice_in_tx(
+            &tx,
+            NoticeKind::CleanupSucceeded,
+            std::slice::from_ref(&false_incident),
+            0,
+            101,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        drop(conn);
+
+        registry.coalesce_startup_notices(100, 101).await.unwrap();
+
+        let mut conn = crate::registry::open_connection(registry.database_path()).unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        sanitize_false_incident_notices_in_tx(
+            &tx,
+            &std::collections::BTreeSet::from([false_incident.to_string()]),
+            200,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let superseded_by: Option<String> = conn
+            .query_row(
+                "SELECT superseded_by FROM runtime_notices WHERE notice_id=?1",
+                params![real_notice.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            superseded_by, None,
+            "the real notice must not supersede itself"
+        );
+
+        let pending = registry
+            .pending_notices("fresh-profile".into(), 10)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].notice_id, real_notice);
+        assert_eq!(pending[0].incident_ids, vec![real_incident]);
+    }
+
+    #[tokio::test]
+    async fn collapsed_notice_ignores_self_edge_and_preserves_external_successor() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let real_incident = IncidentId::parse("incident-real-with-successor").unwrap();
+        let false_incident = IncidentId::parse("incident-false-with-successor").unwrap();
+        let successor_incident = IncidentId::parse("incident-successor").unwrap();
+        let real_notice = stable_notice_id(
+            NoticeKind::CleanupSucceeded,
+            std::slice::from_ref(&real_incident),
+        );
+        let batch_notice = stable_notice_id(
+            NoticeKind::CleanupSucceeded,
+            &[real_incident.clone(), false_incident.clone()],
+        );
+
+        let mut conn = crate::registry::open_connection(registry.database_path()).unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        enqueue_notice_in_tx(
+            &tx,
+            NoticeKind::CleanupSucceeded,
+            std::slice::from_ref(&real_incident),
+            0,
+            100,
+        )
+        .unwrap();
+        enqueue_notice_in_tx(
+            &tx,
+            NoticeKind::CleanupSucceeded,
+            std::slice::from_ref(&false_incident),
+            0,
+            101,
+        )
+        .unwrap();
+        let external_successor = enqueue_notice_in_tx(
+            &tx,
+            NoticeKind::CleanupFailed,
+            std::slice::from_ref(&successor_incident),
+            0,
+            102,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        drop(conn);
+
+        registry.coalesce_startup_notices(100, 101).await.unwrap();
+
+        let mut conn = crate::registry::open_connection(registry.database_path()).unwrap();
+        conn.execute(
+            "UPDATE runtime_notices SET superseded_by=?1 WHERE notice_id=?2",
+            params![external_successor.notice_id.as_str(), batch_notice.as_str()],
+        )
+        .unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        sanitize_false_incident_notices_in_tx(
+            &tx,
+            &std::collections::BTreeSet::from([false_incident.to_string()]),
+            200,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let superseded_by: Option<String> = conn
+            .query_row(
+                "SELECT superseded_by FROM runtime_notices WHERE notice_id=?1",
+                params![real_notice.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            superseded_by.as_deref(),
+            Some(external_successor.notice_id.as_str())
+        );
+
+        let pending = registry
+            .pending_notices("fresh-profile".into(), 10)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].notice_id, external_successor.notice_id);
+    }
+
     #[tokio::test]
     async fn duplicate_notice_receipt_is_a_noop_across_restart_including_metrics() {
         let dir = tempfile::tempdir().unwrap();

@@ -257,6 +257,8 @@ impl ClaudeActivityTracker {
                 session_id: state.session_id.clone(),
                 at,
                 completion_seq: seq,
+                outcome: Some(freshell_protocol::TerminalTurnOutcome::Completed),
+                outcome_update: false,
             });
         }
         state.last_observed_at = at;
@@ -380,6 +382,8 @@ impl ClaudeActivityTracker {
                 .and_then(|s| s.session_id.clone()),
             at,
             completion_seq: seq,
+            outcome: Some(freshell_protocol::TerminalTurnOutcome::Completed),
+            outcome_update: false,
         });
         effects
     }
@@ -570,6 +574,22 @@ mod tests {
         // A second BEL while idle is a false positive: ignored.
         let effects = tracker.note_output("t1", "\u{07}", 40);
         assert!(completions(&effects).is_empty());
+    }
+
+    #[test]
+    fn terminal_stop_boundary_reports_explicit_success_outcome() {
+        let mut tracker = ClaudeActivityTracker::new();
+        tracker.track_terminal("t1", Some("session-1"), 0);
+        tracker.note_input("t1", "\r", 10, false);
+
+        let effects = tracker.note_output("t1", "\u{07}", 20);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            TrackerEffect::TurnComplete {
+                outcome: Some(freshell_protocol::TerminalTurnOutcome::Completed),
+                ..
+            }
+        )));
     }
 
     #[test]

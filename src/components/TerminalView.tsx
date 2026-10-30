@@ -210,6 +210,7 @@ import {
 import { nanoid } from 'nanoid'
 import { cn } from '@/lib/utils'
 import { Terminal, type ILogger } from '@xterm/xterm'
+import { terminalBufferText } from '@/lib/terminal-buffer-text.js'
 import { Loader2 } from 'lucide-react'
 import { ConfirmModal } from '@/components/ui/confirm-modal'
 import type { PaneContent, PaneContentInput, PaneRefreshRequest, TerminalPaneContent } from '@/store/paneTypes'
@@ -1106,6 +1107,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   const terminalIdRef = useRef<string | undefined>(terminalContent?.terminalId)
   const seqStateRef = useRef<AttachSeqState>(createAttachSeqState())
   const parserAppliedSeqRef = useRef(0)
+  // Ordered output completed for the current attach, independent of whether
+  // preprocessing permits a reconstruction-safe persisted checkpoint.
+  const completedOutputSeqRef = useRef(0)
   // Surface-coverage cursor (responsive-terminal-restore WS1/WS2): the
   // reconstruction-safe contiguous coverage of the stream on THIS surface —
   // advanced by applied frames AND fully-consumed null-screen-effect
@@ -1137,6 +1141,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // consumption high-water. Only newly consumed positions or explicit user
   // retry/refresh reset the streak; attach.ready/completion alone cannot.
   const recoveryAccountingRef = useRef<TerminalRecoveryAccounting>(createTerminalRecoveryAccounting())
+  // Recovery progress is monotonic within a stream, not across physical PTYs.
+  // Change this identity only when current-generation output really completes;
+  // a stream announcement or an empty attach must never refund the budget.
+  const recoveryProgressStreamIdRef = useRef<string | null>(null)
   // Delivery-loss repair fallback (responsive-terminal-restore WS3): the
   // attach generation of a full-hydrate repair that must NOT clear the
   // viewport at attach time — the surface is replaced only when that
@@ -1725,6 +1733,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         lastKnownTerminalIdRef.current = terminalContent.terminalId
       }
       if (terminalContent.terminalId !== prevTerminalId) {
+        completedOutputSeqRef.current = 0
         resetParserAppliedSurface()
         geometryEpochRef.current = 1
         geometryAuthorityRef.current = 'single_client'
@@ -1763,15 +1772,31 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       () => {
         const t = termRef.current
         if (!t) return ''
-        const buf = t.buffer.active
-        const lines: string[] = []
-        for (let y = 0; y < buf.length; y++) {
-          const line = buf.getLine(y)
-          if (line) lines.push(line.translateToString(true))
-        }
-        return lines.join('\n')
+        return terminalBufferText(t.buffer.active)
       },
     )
+    window.__FRESHELL_TEST_HARNESS__.registerTerminalSnapshot?.(tid, () => {
+      const t = termRef.current
+      if (!t || terminalIdRef.current !== tid) return null
+      const attach = currentAttachRef.current
+      const seq = seqStateRef.current
+      return {
+        terminalId: tid,
+        paneId: paneIdRef.current,
+        streamId: contentRef.current?.streamId ?? null,
+        attachStreamId: attach?.terminalId === tid ? attach.streamId ?? null : null,
+        attachRequestId: attach?.requestId ?? null,
+        nativeSessionId: contentRef.current?.sessionRef?.sessionId ?? null,
+        replayPending: seq.awaitingFreshSequence || seq.pendingReplay !== null,
+        writesPending: writeQueueRef.current?.hasInFlightWrites() === true,
+        highestObservedSeq: seq.highestObservedSeq,
+        completedSeq: completedOutputSeqRef.current,
+        cols: t.cols,
+        rows: t.rows,
+        bufferType: t.buffer.active.type,
+        text: terminalBufferText(t.buffer.active),
+      }
+    })
     window.__FRESHELL_TEST_HARNESS__.registerTerminalModes(tid, () => {
       const t = termRef.current
       if (!t) {
@@ -1792,6 +1817,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
 
     return () => {
       window.__FRESHELL_TEST_HARNESS__?.unregisterTerminalBuffer(tid)
+      window.__FRESHELL_TEST_HARNESS__?.unregisterTerminalSnapshot?.(tid)
       window.__FRESHELL_TEST_HARNESS__?.unregisterTerminalModes(tid)
     }
   }, [terminalContent?.terminalId])
@@ -2755,6 +2781,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     surfaceWritesSinceFreshRef.current = 0
     // A brand-new surface has no covered stream position.
     surfaceCoverageSeqRef.current = 0
+    completedOutputSeqRef.current = 0
     unsafeSurfaceCheckpointRef.current = false
     failedConsumptionGenerationRef.current = null
     const writeQueue = createTerminalWriteQueue({
@@ -2976,6 +3003,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         surfaceFreshMarkerRef.current = null
         surfaceWritesSinceFreshRef.current = 0
         surfaceCoverageSeqRef.current = 0
+        completedOutputSeqRef.current = 0
       },
       scrollToBottom: () => {
         if (!allowCurrentTerminalAction()) return
@@ -3577,6 +3605,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         intent,
         attempts: recoveryDecision.state.attempts,
         coverageSeq: surfaceCoverageSeqRef.current,
+        streamId: getTerminalCheckpointStreamId(),
+        progressStreamId: recoveryProgressStreamIdRef.current,
+        lastProgressSeq: recoveryDecision.state.lastProgressSeq,
       })
       return
     }
@@ -3771,6 +3802,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         expectedGeometryEpoch,
         expectedGeometryAuthority,
       }
+      completedOutputSeqRef.current = sinceSeq
       if (fullHydrateFallbackReason) {
         recordTerminalPerfAuditEvent('terminal.catchup.full_hydrate_fallback', {
           terminalId: tid,
@@ -4733,6 +4765,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
 
         const completeAcceptedOutput = (input: {
           attachRequestId?: string
+          streamId?: string | null
           mode: TerminalPaneContent['mode']
           terminalInstanceId: string
           parserAppliedSeq: number
@@ -4746,6 +4779,18 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           const activeAttach = currentAttachRef.current
           if (!activeAttach || activeAttach.requestId !== input.attachRequestId) return
           if (activeAttach.terminalId !== tid || terminalIdRef.current !== tid) return
+          // A refused reconstruction can leave the attach generation in place
+          // while its stream changes. Retired bytes cannot complete that new
+          // stream. Preserve the legacy path before an identity is established.
+          if (input.streamId !== undefined && input.streamId !== activeAttach.streamId) {
+            recordTerminalPerfAuditEvent('terminal.output_completion_stale_rejected', {
+              terminalId: tid, attachRequestId: input.attachRequestId,
+              streamId: input.streamId, activeStreamId: activeAttach.streamId,
+              seqStart: input.seqStart, seqEnd: input.seqEnd,
+              reason: 'stream_identity_changed',
+            })
+            return
+          }
           if (terminalInstanceIdRef.current !== input.terminalInstanceId) return
           if (failedConsumptionGenerationRef.current === input.attachRequestId) return
           const allowedByWriteScope = shouldAllowTerminalOutputSideEffect({
@@ -4762,8 +4807,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           // Successful ownership of original stream bytes is independent of
           // fidelity, safe coverage, and the replay target (live can exceed it).
           advancePacedReplayConsumption(input.attachRequestId, input.seqEnd)
+          completedOutputSeqRef.current = Math.max(completedOutputSeqRef.current, input.seqEnd)
           const wasExhausted = recoveryAccountingRef.current.exhausted
-          recoveryAccountingRef.current = recordRecoveryProgress(recoveryAccountingRef.current, input.seqEnd, Date.now())
+          const completedStreamId = activeAttach.streamId ?? null
+          const progressAccounting = recoveryProgressStreamIdRef.current === completedStreamId
+            ? recoveryAccountingRef.current
+            : { ...recoveryAccountingRef.current, lastProgressSeq: 0 }
+          recoveryAccountingRef.current = recordRecoveryProgress(progressAccounting, input.seqEnd, Date.now())
+          recoveryProgressStreamIdRef.current = completedStreamId
           if (wasExhausted && !recoveryAccountingRef.current.exhausted) setRecoveryExhausted(false)
           if (input.submittedBytesEqualInput) {
             const nextSeqState = markParserAppliedSeq(seqStateRef.current, input.parserAppliedSeq)
@@ -4855,8 +4906,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           const inputBytesEqualSubmission = raw === input.raw
           if (!inputBytesEqualSubmission) unsafeSurfaceCheckpointRef.current = true
           const outputTerminalInstanceId = terminalInstanceIdRef.current
+          const outputStreamId = currentAttachRef.current?.streamId
           const complete = (submittedBytesEqualInput: boolean, safeCoverage: boolean, noWrite: boolean) => completeAcceptedOutput({
             attachRequestId: input.attachRequestId,
+            streamId: outputStreamId,
             mode: input.mode,
             terminalInstanceId: outputTerminalInstanceId,
             parserAppliedSeq: input.parserAppliedSeq,

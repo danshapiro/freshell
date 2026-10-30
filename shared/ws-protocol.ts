@@ -324,6 +324,7 @@ export const TerminalTurnCompleteSchema = z.object({
   terminalId: z.string().min(1),
   provider: z.enum(['opencode', 'claude', 'codex', 'amplifier']),
   sessionId: z.string().min(1).optional(),
+  outcome: z.enum(['completed', 'failed']).optional(),
   at: z.number().int().nonnegative(),
   completionSeq: z.number().int().positive(),
 })
@@ -870,7 +871,7 @@ export const FreshAgentCreateSchema = z.object({
   tabId: z.string().min(1).optional(),
   /** G19: the creating pane's id. With `tabId` it is the pane context the
    * agent's Freshell MCP acts for (FRESHELL_TAB_ID / FRESHELL_PANE_ID).
-   * Additive optional. */
+   * It also binds managed view intent. Additive optional. */
   paneId: z.string().min(1).optional(),
   /** Unified agent names (Task 1): the pane's pre-durable naming handle — see
    * `terminal.create.namingHandle`. Additive optional. */

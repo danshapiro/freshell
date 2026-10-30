@@ -7,33 +7,25 @@
  * gate. Claude, Codex, and Amplifier are adapter-ready but release-disabled
  * until their corresponding live campaign can produce the same receipt.
  */
-import { execFileSync } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
-import fs from 'node:fs'
-import os from 'node:os'
-import path from 'node:path'
 
 import { expect, type Page } from '@playwright/test'
 
 import { test } from '../helpers/fixtures.js'
 import {
-  ManagedRuntimeBrowserRig,
+  createManagedOpenCodeRuntimeBrowserRig, type ManagedFixtureRig, completeManagedRuntimeStop,
   P2_OPENCODE_MODEL,
   P2_OPENCODE_VERSION,
   type ManagedRuntimeView,
+  type OpencodeQualificationTurn, type OpencodeQualificationProofStage,
+  type OpencodeReadinessDiagnostic,
 } from '../helpers/managed-runtime.js'
-import { requireOpenCodeOnecliBootstrap } from '../helpers/opencode-auth-file.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import {
   hasOpenCodePromptModelText,
-  nativeTurnProof,
   openCodeCredentialFailureMessage,
-  openCodeTerminalReady,
-  OPENCODE_NATIVE_HISTORY_SCRIPT,
-  selectNativeAssistantTurn,
-  type NativeAssistantTurn,
 } from '../helpers/opencode-native-history.js'
 import type { ProviderQualificationRow } from '../../../scripts/testing/provider-qualification-receipt.js'
 
@@ -96,7 +88,7 @@ function waitForModeLeaf(
 }
 
 function waitForRunningView(
-  rig: ManagedRuntimeBrowserRig,
+  rig: ManagedFixtureRig,
   terminalId: string,
   predicate: (view: ManagedRuntimeView) => boolean,
   timeoutMs: number,
@@ -105,13 +97,6 @@ function waitForRunningView(
     const view = await rig.runningViewForTerminal(terminalId)
     return view && predicate(view) ? view : null
   }, timeoutMs)
-}
-
-function dataOf(result: any, expectedKind: string): any {
-  if (!result || result.kind !== expectedKind) {
-    throw new Error(`expected ${expectedKind}, got ${JSON.stringify(result)}`)
-  }
-  return result.data
 }
 
 async function waitForPaneTerminal(page: Page, paneId: string, timeoutMs = 90_000): Promise<void> {
@@ -183,7 +168,7 @@ async function createOpencodePane(
   page: Page,
   harness: TestHarness,
   terminal: TerminalHelper,
-  rig: ManagedRuntimeBrowserRig,
+  rig: ManagedFixtureRig,
   tabId: string,
   priorPaneIds: Set<string>,
 ): Promise<{ paneId: string; terminalId: string; view: ManagedRuntimeView }> {
@@ -246,7 +231,7 @@ async function paneStreamId(harness: TestHarness, tabId: string, paneId: string)
 async function waitForReplacementPrompt(
   page: Page,
   harness: TestHarness,
-  rig: ManagedRuntimeBrowserRig,
+  rig: ManagedFixtureRig,
   tabId: string,
   paneId: string,
   view: ManagedRuntimeView,
@@ -259,7 +244,7 @@ async function waitForReplacementPrompt(
   if (!terminalId) throw new Error('replacement provider has no terminal identity')
   if (!view.terminalStreamId) throw new Error('replacement provider has no stable launch stream identity')
   const modelTexts = ['GPT-5.6 Luna', P2_OPENCODE_MODEL]
-  let diagnostic: Record<string, unknown> = {
+  let diagnostic: Omit<OpencodeReadinessDiagnostic, 'observedStreamChanges' | 'observedWebSocketFrameTypes' | 'observedWebSocketCount'> = {
     soulId: view.soulId,
     incarnationId: view.incarnationId,
     terminalId,
@@ -303,17 +288,8 @@ async function waitForReplacementPrompt(
     // The host epoch is distinct from the supervisor's stable launch ID. Read
     // it once after the browser reports the changed stream, so the QA probe
     // does not compete with the server's live output poll.
-    const output = dataOf(await rig.runtime.adminOk(
-      rig.supervisor,
-      rig.runtime.terminalReadOutputBody(view.soulId, 0, 256 * 1024, await rig.controlEpoch()),
-    ), 'terminal_output')
-    const sourceText = (output.frames ?? []).map((frame) => {
-      if (frame.streamEpoch !== output.streamEpoch || frame.terminalId !== terminalId) {
-        throw new Error('replacement prompt frame has mismatched ownership')
-      }
-      return frame.data
-    }).join('').slice(-512 * 1024)
-    const sourceReady = openCodeTerminalReady(sourceText, modelTexts)
+    const output = await rig.openCodeReplacementReadiness(rig.runtimeEnclosureHandle(view), terminalId)
+    const sourceReady = output.sourceReady
     diagnostic = {
       ...diagnostic,
       sourceIncarnationId: output.incarnationId,
@@ -332,21 +308,23 @@ async function waitForReplacementPrompt(
     ) {
       throw new Error('replacement provider source and browser stream identities did not agree')
     }
-    rig.runtime.assert('PC-OPENCODE', true, 'replacement TUI prompt is source-observed and rendered before input', {
-      soulId: view.soulId,
-      incarnationId: view.incarnationId,
+    await rig.confirmOpenCodeReplacementReadiness(rig.runtimeEnclosureHandle(view), {
       terminalId,
       streamEpoch: output.streamEpoch,
-      cursor: output.headSeq,
+      headSeq: output.headSeq,
     })
   } catch (error) {
     // Keep identity/readiness facts, never conversation text, in failure receipts.
-    rig.runtime.writeBrowserArtifact('opencode-replacement-readiness', {
-      ...diagnostic,
-      observedStreamChanges: observedStreamChanges.slice(-10),
-      observedWebSocketFrameTypes: [...observedWebSocketFrameTypes].sort(),
-      observedWebSocketCount: observedWebSocketCount.value,
-    })
+    try {
+      await rig.publishOpenCodeReadinessDiagnostic(rig.runtimeEnclosureHandle(view), {
+        ...diagnostic,
+        observedStreamChanges: observedStreamChanges.slice(-10),
+        observedWebSocketFrameTypes: [...observedWebSocketFrameTypes].sort(),
+        observedWebSocketCount: observedWebSocketCount.value,
+      })
+    } catch (diagnosticError) {
+      throw new AggregateError([error, diagnosticError], 'OpenCode readiness failure and owner diagnostic publication failed')
+    }
     throw error
   }
 }
@@ -361,26 +339,16 @@ async function paneSessionId(
   return typeof content?.sessionRef?.sessionId === 'string' ? content.sessionRef.sessionId : null
 }
 
-function nativeAssistantTurns(rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView, sessionId: string): NativeAssistantTurn[] {
-  if (!view.containerId) throw new Error('native evidence probe has no exact owned container')
-  const raw = rig.ownedProviderExec(view.containerId, [
-    'node', '--no-warnings', '-e', OPENCODE_NATIVE_HISTORY_SCRIPT,
-    '/home/freshell/provider/.local/share/opencode/opencode.db', sessionId,
-  ])
-  const evidence = JSON.parse(raw)
-  expect(evidence.schemaVersion).toBe(1)
-  expect(evidence.nativeSessionId).toBe(sessionId)
-  return evidence.turns
-}
-
 async function nextNativeAssistantTurn(
   page: Page,
   terminalId: string,
-  rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView, sessionId: string,
-  priorMessageIds: ReadonlySet<string>, expectedText: string,
-): Promise<NativeAssistantTurn> {
-  return waitForValue('the correlated completed native assistant response, not a rendered echo', () => (
-    selectNativeAssistantTurn(nativeAssistantTurns(rig, view, sessionId), priorMessageIds, expectedText)
+  rig: ManagedFixtureRig, view: ManagedRuntimeView, sessionId: string,
+  challengeId: string, stage: OpencodeQualificationProofStage,
+  priorMessageIds: ReadonlySet<string>, otherChallengeId?: string,
+): Promise<OpencodeQualificationTurn> {
+  return waitForValue('the correlated completed native assistant response, not a rendered echo', async () => (
+    rig.openCodeQualificationTurn(rig.exactRuntimeHandle({ ...view, nativeSessionId: sessionId }),
+      challengeId, stage, [...priorMessageIds], otherChallengeId)
   ), 180_000, async () => {
     const terminalOutput = await page.evaluate((id) => (
       window.__FRESHELL_TEST_HARNESS__?.getTerminalBuffer?.(id) ?? ''
@@ -390,21 +358,16 @@ async function nextNativeAssistantTurn(
   })
 }
 
-function verifyMemoryAnswer(turn: NativeAssistantTurn, projectName: string): void {
-  expect(turn.toolCalls, 'conversation recall must not consult workspace files or tools').toEqual([])
-  expect(`${turn.resolvedProvider}/${turn.resolvedModel}`).toBe(P2_OPENCODE_MODEL)
-  expect(turn.text).toContain(projectName)
+function verifyMemoryAnswer(turn: OpencodeQualificationTurn): void {
+  expect(turn.proof.toolCallCount, 'conversation recall must not consult workspace files or tools').toBe(0)
+  expect(turn.proof.toolCallTypes).toEqual([])
+  expect(`${turn.proof.resolvedProvider}/${turn.proof.resolvedModel}`).toBe(P2_OPENCODE_MODEL)
+  expect(turn.proof.responseContainsNonce).toBe(true)
 }
 
-function cgroupLimitEvidence(rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView): ProviderQualificationRow['limitEvidence'] {
-  if (!view.containerId) throw new Error('OpenCode view has no container for limit evidence')
+function cgroupLimitEvidence(view: ManagedRuntimeView, actual: NonNullable<ProviderQualificationRow['limitEvidence']>): ProviderQualificationRow['limitEvidence'] {
   const expected = (view as any).effectiveLimits
   if (!expected) throw new Error('OpenCode view has no effective limits')
-  const raw = rig.ownedContainerExec(view.containerId, [
-    'sh', '-lc',
-    `printf '{"cpuMax":"%s","memoryMax":"%s","swapMax":"%s","pidsMax":"%s"}' "$(cat /sys/fs/cgroup/cpu.max)" "$(cat /sys/fs/cgroup/memory.max)" "$(cat /sys/fs/cgroup/memory.swap.max)" "$(cat /sys/fs/cgroup/pids.max)"`,
-  ])
-  const actual = JSON.parse(raw)
   const [quotaRaw, periodRaw] = String(actual.cpuMax).trim().split(/\s+/)
   const cpuMilli = quotaRaw === 'max'
     ? Number.POSITIVE_INFINITY
@@ -416,21 +379,6 @@ function cgroupLimitEvidence(rig: ManagedRuntimeBrowserRig, view: ManagedRuntime
   return actual
 }
 
-function runBlockerMatrixTests(repoRoot: string): string[] {
-  const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
-  const tests = [
-    ['freshell-agent-runtime', 'release_qualified_opencode_blocker_matrix_is_explicit'],
-    ['freshell-agent-runtime', 'opencode_probe_reads_exact_row_without_guessing_latest'],
-    ['freshell-supervisor', 'retry_budget_is_persisted_and_manual_retry_rearms_without_identity_change'],
-  ]
-  for (const [crate, filter] of tests) {
-    execFileSync(mise, [
-      'exec', 'rust@1.96', '--', 'cargo', 'test', '-p', crate, filter, '--', '--nocapture',
-    ], { cwd: repoRoot, stdio: 'inherit' })
-  }
-  return tests.map(([crate, filter]) => `${crate}:${filter}`)
-}
-
 test.describe.serial('OpenCode provider qualification', () => {
   test('release-enabled OpenCode proves exact native recovery, isolation, and cleanup', async ({ page }) => {
     test.skip(
@@ -439,31 +387,18 @@ test.describe.serial('OpenCode provider qualification', () => {
     )
     test.setTimeout(1_800_000)
 
-    const onecli = requireOpenCodeOnecliBootstrap(process.env, 'OpenCode provider qualification')
-    const blockerEvidence = runBlockerMatrixTests(process.cwd())
-    const rig = new ManagedRuntimeBrowserRig(
+    const rig = createManagedOpenCodeRuntimeBrowserRig(
       process.cwd(),
       5,
-      {
-        FRESHELL_BIND_HOST: '0.0.0.0',
-        FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: onecli.authFile,
-        FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE: onecli.environmentFile,
-        FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: onecli.caFile,
-      },
+      {},
       { FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '750' },
       'release',
     )
     let providerRow: ProviderQualificationRow | undefined
     try {
+      const blockerEvidence = await rig.runOpenCodeQualificationBlockers()
       const info = await rig.start()
-      const rollout = dataOf(await rig.runtime.adminOk(
-        rig.supervisor,
-        rig.runtime.migrationPlanBody({
-          requestedMode: 'managed-opt-in',
-          apply: true,
-          expectedControlEpoch: await rig.controlEpoch(),
-        }),
-      ), 'migration_plan')
+      const rollout = await rig.applyManagedOptIn(await rig.controlEpoch())
       expect(rollout.currentMode).toBe('managed-opt-in')
 
       let qualifiedTerminalId: string | undefined
@@ -484,6 +419,7 @@ test.describe.serial('OpenCode provider qualification', () => {
             if (typeof message.type === 'string') observedWebSocketFrameTypes.add(message.type)
             if (
               message.type === 'terminal.stream.changed'
+              && typeof message.terminalId === 'string'
               && message.terminalId === qualifiedTerminalId
               && typeof message.streamId === 'string'
               && typeof message.reason === 'string'
@@ -522,18 +458,13 @@ test.describe.serial('OpenCode provider qualification', () => {
       if (!first.view.containerId || !first.view.hostBootId) {
         throw new Error('first OpenCode view lacks exact runtime identity')
       }
-      expect(rig.ownedContainerExec(first.view.containerId, ['opencode', '--version']).trim())
+      expect((await rig.openCodeVersionFacts(rig.runtimeEnclosureHandle(first.view))).version)
         .toBe(P2_OPENCODE_VERSION)
-      const processArgs = rig.ownedContainerProcessTable(first.view.containerId)
-      expect(processArgs).toContain(P2_OPENCODE_MODEL)
-      const authProbe = rig.ownedProviderExec(first.view.containerId, [
-        'node', '--no-warnings', '-e',
-        "const fs=require('node:fs');const auth=JSON.parse(fs.readFileSync('/home/freshell/provider/.local/share/opencode/auth.json','utf8'));const openai=auth.openai;if(!openai||openai.type!=='oauth'||openai.access!=='onecli-managed'||openai.refresh!=='onecli-managed'||openai.expires<Date.now()+3600000)process.exit(2);fs.accessSync('/home/freshell/provider/.config/onecli/gateway-ca.pem',fs.constants.R_OK);process.stdout.write('OneCLI OpenAI stub and CA present')",
-      ])
-      expect(authProbe.trim()).toBe('OneCLI OpenAI stub and CA present')
-      const availableModels = rig.ownedProviderExec(first.view.containerId, ['opencode', 'models', 'openai'])
-      expect(availableModels).toContain(P2_OPENCODE_MODEL.split('/')[1])
-      const exactLimits = cgroupLimitEvidence(rig, first.view)
+      const startup = await rig.openCodeQualificationStartupFacts(rig.runtimeEnclosureHandle(first.view))
+      expect(startup.modelProcessPresent).toBe(true)
+      expect(startup.authPresent).toBe(true)
+      expect(startup.modelAvailable).toBe(true)
+      const exactLimits = cgroupLimitEvidence(first.view, startup.limits)
       expect(exactLimits.swapMax).toBe('0')
 
       // A plain conversation task avoids synthetic marker-assembly prompts.
@@ -551,14 +482,16 @@ test.describe.serial('OpenCode provider qualification', () => {
         await paneSessionId(harness, tabId, first.paneId)
       ), 120_000)
       expect(nativeSessionId).toMatch(/^ses_/)
-      const firstAnswer = await nextNativeAssistantTurn(page, first.terminalId, rig, first.view, nativeSessionId, new Set(), nonce)
-      verifyMemoryAnswer(firstAnswer, nonce)
-      const nativeTurnProofs = [nativeTurnProof('initial', nativeSessionId, firstAnswer, nonce)]
+      const firstChallenge = await rig.registerOpenCodeQualificationNonce(rig.exactRuntimeHandle({ ...first.view, nativeSessionId }), nonce)
+      const firstAnswer = await nextNativeAssistantTurn(page, first.terminalId, rig, first.view, nativeSessionId,
+        firstChallenge.challengeId, 'initial', new Set())
+      verifyMemoryAnswer(firstAnswer)
+      const nativeTurnProofs = [firstAnswer.proof]
 
       // Session-host/container loss: exact old enclosure must be empty before
       // the new incarnation becomes the sole writer.
       const beforeHostCrashStreamId = await paneStreamId(harness, tabId, first.paneId)
-      rig.runtime.killOwnedRuntimeExact(first.view.containerId)
+      await rig.crashRuntimeHost(rig.exactRuntimeHandle({ ...first.view, nativeSessionId }))
       const afterHostCrash = await waitForRunningView(
         rig,
         first.terminalId,
@@ -568,7 +501,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       if (!afterHostCrash.containerId) throw new Error('host-crash replacement lacks container')
       expect(afterHostCrash.soulId).toBe(first.view.soulId)
       expect(afterHostCrash.nativeSessionId).toBe(nativeSessionId)
-      expect(rig.runtime.isContainerRunning(first.view.containerId)).toBe(false)
+      expect((await rig.ownedContainerState(rig.runtimeEnclosureHandle(first.view))).running).toBe(false)
       await waitForPaneIncarnation(
         harness,
         tabId,
@@ -582,25 +515,24 @@ test.describe.serial('OpenCode provider qualification', () => {
         page, harness, rig, tabId, first.paneId, afterHostCrash, beforeHostCrashStreamId,
         observedStreamChanges, observedWebSocketFrameTypes, observedWebSocketCount,
       )
-      const beforeRecall = new Set(nativeAssistantTurns(rig, afterHostCrash, nativeSessionId).map((turn) => turn.messageId))
+      const beforeRecall = new Set(await rig.openCodeQualificationAssistantMessageIds(
+        rig.exactRuntimeHandle({ ...afterHostCrash, nativeSessionId })))
       await executeInPane(page, first.paneId,
         'What exact string did I ask you to remember? Reply with only the string. Do not search files or call tools.')
-      const recalledAnswer = await nextNativeAssistantTurn(page, first.terminalId, rig, afterHostCrash, nativeSessionId, beforeRecall, nonce)
-      verifyMemoryAnswer(recalledAnswer, nonce)
+      const recalledAnswer = await nextNativeAssistantTurn(page, first.terminalId, rig, afterHostCrash, nativeSessionId,
+        firstChallenge.challengeId, 'after_session_host_crash', beforeRecall)
+      verifyMemoryAnswer(recalledAnswer)
       expect(recalledAnswer.messageId).not.toBe(firstAnswer.messageId)
-      nativeTurnProofs.push(nativeTurnProof('after_session_host_crash', nativeSessionId, recalledAnswer, nonce))
+      nativeTurnProofs.push(recalledAnswer.proof)
       const recalledNonce = true
 
       // Provider-process loss: kill only the exact host-recorded worker PID,
       // then require another exact native resume and usable follow-up.
       const beforeProviderCrashStreamId = await paneStreamId(harness, tabId, first.paneId)
-      const hostStatePath = path.join(
-        rig.runtime.runtimeDir(rig.supervisor, afterHostCrash.incarnationId),
-        'host-state.json',
-      )
-      const workerPid = Number(JSON.parse(fs.readFileSync(hostStatePath, 'utf8')).workerPid)
+      const workerHandle = rig.exactRuntimeHandle(afterHostCrash)
+      const workerPid = (await rig.chaosHostFacts(workerHandle)).workerPid
       expect(workerPid).toBeGreaterThan(1)
-      rig.runtime.killOwnedRuntimePidExact(afterHostCrash.containerId, workerPid)
+      await rig.crashProviderWorker(workerHandle)
       const afterProviderCrash = await waitForRunningView(
         rig,
         first.terminalId,
@@ -610,7 +542,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       if (!afterProviderCrash.containerId) throw new Error('provider-crash replacement lacks container')
       expect(afterProviderCrash.soulId).toBe(first.view.soulId)
       expect(afterProviderCrash.nativeSessionId).toBe(nativeSessionId)
-      expect(rig.runtime.isContainerRunning(afterHostCrash.containerId)).toBe(false)
+      expect((await rig.ownedContainerState(rig.runtimeEnclosureHandle(afterHostCrash))).running).toBe(false)
       await waitForPaneIncarnation(
         harness,
         tabId,
@@ -621,13 +553,15 @@ test.describe.serial('OpenCode provider qualification', () => {
         page, harness, rig, tabId, first.paneId, afterProviderCrash, beforeProviderCrashStreamId,
         observedStreamChanges, observedWebSocketFrameTypes, observedWebSocketCount,
       )
-      const beforeProviderFollowup = new Set(nativeAssistantTurns(rig, afterProviderCrash, nativeSessionId).map((turn) => turn.messageId))
+      const beforeProviderFollowup = new Set(await rig.openCodeQualificationAssistantMessageIds(
+        rig.exactRuntimeHandle({ ...afterProviderCrash, nativeSessionId })))
       await executeInPane(page, first.paneId,
         'What exact string did I ask you to remember? Reply with only the string. Do not search files or call tools.')
-      const providerAnswer = await nextNativeAssistantTurn(page, first.terminalId, rig, afterProviderCrash, nativeSessionId, beforeProviderFollowup, nonce)
-      verifyMemoryAnswer(providerAnswer, nonce)
+      const providerAnswer = await nextNativeAssistantTurn(page, first.terminalId, rig, afterProviderCrash, nativeSessionId,
+        firstChallenge.challengeId, 'after_provider_process_crash', beforeProviderFollowup)
+      verifyMemoryAnswer(providerAnswer)
       expect(providerAnswer.messageId).not.toBe(recalledAnswer.messageId)
-      nativeTurnProofs.push(nativeTurnProof('after_provider_process_crash', nativeSessionId, providerAnswer, nonce))
+      nativeTurnProofs.push(providerAnswer.proof)
       const providerFollowUpCompleted = true
 
       // A second OpenCode soul is independently owned, while an explicit
@@ -641,36 +575,23 @@ test.describe.serial('OpenCode provider qualification', () => {
       const secondSessionId = await waitForValue('second exact OpenCode session id', async () => (
         await paneSessionId(harness, tabId, second.paneId)
       ), 120_000)
-      const secondAnswer = await nextNativeAssistantTurn(page, second.terminalId, rig, second.view, secondSessionId, new Set(), secondNonce)
-      verifyMemoryAnswer(secondAnswer, secondNonce)
-      expect(secondAnswer.text).not.toContain(nonce)
+      const secondChallenge = await rig.registerOpenCodeQualificationNonce(rig.exactRuntimeHandle({ ...second.view, nativeSessionId: secondSessionId }), secondNonce)
+      const secondAnswer = await nextNativeAssistantTurn(page, second.terminalId, rig, second.view, secondSessionId,
+        secondChallenge.challengeId, 'initial', new Set(), firstChallenge.challengeId)
+      verifyMemoryAnswer(secondAnswer)
+      expect(secondAnswer.containsOtherNonce).toBe(false)
       expect(second.view.soulId).not.toBe(first.view.soulId)
       expect(second.view.containerId).not.toBe(afterProviderCrash.containerId)
       expect(secondSessionId).not.toBe(nativeSessionId)
-      expect(cgroupLimitEvidence(rig, second.view).swapMax).toBe('0')
+      expect(cgroupLimitEvidence(second.view, await rig.openCodeQualificationLimits(rig.runtimeEnclosureHandle(second.view))).swapMax).toBe('0')
 
       let snapshot = await rig.inventorySnapshot()
       const firstSoul = snapshot.souls
         .filter((candidate: any) => candidate.soulId === first.view.soulId)
         .at(-1)
-      dataOf(await rig.runtime.adminOk(
-        rig.supervisor,
-        rig.runtime.upsertViewIntentBody({
-          soulId: first.view.soulId,
-          intent: {
-            ownerId: 'opencode-qualification-second-view',
-            workspaceId: firstSoul.projectKey || 'opencode-qualification',
-            kind: 'explicit',
-            preferredTabId: 'opencode-qualification-second-tab',
-            preferredPaneId: 'opencode-qualification-second-pane',
-            title: 'OpenCode qualification second view',
-            placementGroup: 'Recovered agents',
-            visibility: 'visible',
-          },
-          expectedSoulIntentRevision: firstSoul.intentRevision,
-          expectedControlEpoch: await rig.controlEpoch(),
-        }),
-      ), 'view_intent')
+      if (!firstSoul) throw new Error('OpenCode qualification inventory has no exact first soul')
+      const writerHandle = rig.exactRuntimeHandle(afterProviderCrash)
+      await rig.addOpenCodeQualificationSecondView(writerHandle, firstSoul.intentRevision, await rig.controlEpoch())
       snapshot = await rig.inventorySnapshot()
       const firstRunning = snapshot.souls.filter((candidate: any) => (
         candidate.soulId === first.view.soulId && candidate.launchState === 'running'
@@ -680,40 +601,27 @@ test.describe.serial('OpenCode provider qualification', () => {
       ))
       expect(firstRunning).toHaveLength(1)
       expect(firstViews).toHaveLength(2)
-      const writerClaim = await rig.qualificationWriterClaim({
-        provider: 'opencode',
-        nativeSessionId,
-        soulId: first.view.soulId,
-        incarnationId: afterProviderCrash.incarnationId,
-      })
+      const writerClaim = await rig.writerClaimFacts(writerHandle)
+      expect(writerClaim.provider).toBe('opencode')
       expect(writerClaim.activeClaimCount).toBe(1)
       expect(writerClaim.globalConflictingClaimCount).toBe(0)
 
-      const notices = dataOf(await rig.runtime.adminOk(
-        rig.supervisor,
-        rig.runtime.pendingNoticesBody(
-          'profile:opencode-provider-qualification',
-          100,
-          await rig.controlEpoch(),
-        ),
-      ), 'pending_notices')
-      expect(notices).toHaveLength(0)
+      const noticeCount = await rig.openCodeQualificationNoticeCount()
+      expect(noticeCount).toBe(0)
 
-      const firstStop = await rig.stopSoul(first.view.soulId)
-      const secondStop = await rig.stopSoul(second.view.soulId)
-      expect(firstStop.outcome).toBe('verified_empty')
-      expect(secondStop.outcome).toBe('verified_empty')
-      const claimAfterStop = await rig.qualificationWriterClaim({
-        provider: 'opencode',
-        nativeSessionId,
-        soulId: first.view.soulId,
-        incarnationId: afterProviderCrash.incarnationId,
-      })
+      const firstStop = await completeManagedRuntimeStop(rig, first.view.soulId)
+      const secondStop = await completeManagedRuntimeStop(rig, second.view.soulId)
+      expect(firstStop.completion.outcome).toBe('verified_empty')
+      expect(secondStop.completion.outcome).toBe('verified_empty')
+      if (firstStop.completion.outcome !== 'verified_empty' || secondStop.completion.outcome !== 'verified_empty') {
+        throw new Error('OpenCode qualification Stop did not verify both enclosures empty')
+      }
+      const claimAfterStop = await rig.writerClaimFacts(writerHandle)
       expect(claimAfterStop.activeClaimCount).toBe(0)
       expect(claimAfterStop.globalConflictingClaimCount).toBe(0)
-      const oldContainerRunningAfterStop = rig.runtime.isContainerRunning(afterProviderCrash.containerId!)
+      const oldContainerRunningAfterStop = (await rig.ownedContainerState(rig.runtimeEnclosureHandle(afterProviderCrash))).running
       expect(oldContainerRunningAfterStop).toBe(false)
-      expect(rig.runtime.broker.unsafeAttempts()).toHaveLength(0)
+      expect((await rig.ownershipFacts()).unsafeBrokerAttempts).toBe(0)
 
       providerRow = {
         provider: 'opencode',
@@ -735,7 +643,7 @@ test.describe.serial('OpenCode provider qualification', () => {
           sameSoul: afterHostCrash.soulId === first.view.soulId,
           sameNativeSession: afterHostCrash.nativeSessionId === nativeSessionId,
           newIncarnation: afterHostCrash.incarnationId !== first.view.incarnationId,
-          oldEnclosureVerifiedEmpty: !rig.runtime.isContainerRunning(first.view.containerId),
+          oldEnclosureVerifiedEmpty: !(await rig.ownedContainerState(rig.runtimeEnclosureHandle(first.view))).running,
           recalledNonce,
           followUpCompleted: providerFollowUpCompleted,
           workspaceOrToolReadUsed: nativeTurnProofs.some((proof) => proof.toolCallCount > 0),
@@ -761,17 +669,17 @@ test.describe.serial('OpenCode provider qualification', () => {
         repairedSameSoul: afterProviderCrash.soulId === first.view.soulId,
         repairedSameNativeSession: afterProviderCrash.nativeSessionId === nativeSessionId,
         nativeRecovery: true,
-        lostNoticeCount: notices.length,
-        oldEnclosureVerifiedEmpty: !rig.runtime.isContainerRunning(first.view.containerId)
-          && !rig.runtime.isContainerRunning(afterHostCrash.containerId),
+        lostNoticeCount: noticeCount,
+        oldEnclosureVerifiedEmpty: !(await rig.ownedContainerState(rig.runtimeEnclosureHandle(first.view))).running
+          && !(await rig.ownedContainerState(rig.runtimeEnclosureHandle(afterHostCrash))).running,
         verifiedEmptyOrdering: {
-          stopOutcome: firstStop.outcome,
+          stopOutcome: firstStop.completion.outcome,
           activeClaimCountAfterStop: claimAfterStop.activeClaimCount,
           globalConflictingClaimCountAfterStop: claimAfterStop.globalConflictingClaimCount,
           oldContainerRunningAfterStop,
         },
         followUpCompleted: providerFollowUpCompleted,
-        releaseBinary: rig.supervisor.binaryKind === 'release',
+        releaseBinary: (await rig.ownershipFacts()).supervisorBinaryKind === 'release',
       }
       expect((providerRow.nonceRecovery as { recalledNonce: boolean }).recalledNonce).toBe(true)
       expect(providerRow.onlyOneWriter).toBe(true)
@@ -786,9 +694,9 @@ test.describe.serial('OpenCode provider qualification', () => {
       expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
     }
     if (!providerRow) throw new Error('OpenCode qualification produced no provider evidence')
-    const finalized = rig.finalizeProviderQualificationReceipt([providerRow])
-    expect(finalized.receipt.schemaVersion).toBe(2)
-    // eslint-disable-next-line no-console
-    console.log(`[provider-qualification] OpenCode receipts: ${finalized.paths.join(', ')}`)
+    const finalized = await rig.publishProviderQualification([providerRow])
+    expect(finalized.schemaVersion).toBe(2)
+    expect(finalized.rowCount).toBe(1)
+    console.log(`[provider-qualification] OpenCode receipts: ${finalized.artifactRefs.join(', ')}`)
   })
 })

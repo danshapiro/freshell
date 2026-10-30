@@ -418,15 +418,19 @@ function resolveExistingLocalOnlyDirs(): string[] {
 
 function dispatchCloudVitest(cloudScript: string, forwardedArgs: string[]): Promise<void> {
   return new Promise((resolveDispatch, rejectDispatch) => {
+    // Inherit the descriptors directly: execFile's callback buffers output
+    // even with stdio: 'inherit', hiding diagnostics and imposing maxBuffer.
     const child = spawn(
       cloudScript,
       ['run', '--cloud', '--config=default', ...forwardedArgs],
       { stdio: 'inherit', cwd: PROJECT_ROOT, env: process.env, windowsHide: true },
     )
     child.once('error', rejectDispatch)
-    child.once('exit', (code, signal) => {
+    child.once('close', (code, signal) => {
       if (code === 0) resolveDispatch()
-      else rejectDispatch(new Error(`Cloud Vitest phase exited with code ${code ?? 1}${signal ? ` (${signal})` : ''}`))
+      else rejectDispatch(new Error(signal
+        ? `Cloud Vitest phase terminated by signal ${signal}`
+        : `Cloud Vitest phase exited with code ${code}`))
     })
   })
 }

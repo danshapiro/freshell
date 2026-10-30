@@ -17,17 +17,22 @@ runtime env var alone arms nothing.
 
 ## Current release qualification
 
-OpenCode 1.18.21 (`openai/gpt-5.6-luna`, using the configured OpenAI OAuth
-credential) is the only release-qualified durable coding provider in this
-landing. Claude, Codex, and
-Amplifier remain adapter-ready but route through their legacy ownership paths
-until their real live campaigns pass. The checked-in capability manifest is
-the source of truth for managed terminal admission. All hosted fresh-agent
-modes are disabled in this release. Their separate
-`FRESHELL_MANAGED_FRESH_AGENT_V1=1` opt-in is for isolated qualification only:
-their live candidate-bound certification receipts are still pending. Historical sections below describe
-adapter construction and earlier phase sequencing; they do not override the
-current release flags.
+This unmerged, **UNVERIFIED** candidate enables managed shell and terminal
+Claude/Codex/OpenCode routing, plus Freshclaude/Freshcodex/Freshopencode.
+This repair requires ordinary-use checks for terminal Codex and OpenCode plus
+FreshCodex and FreshOpenCode, the configured test suite, affected browser
+checks, and independent reviews. Claude live behavior remains unverified by
+explicit agreement. Native recovery campaigns and the backup/upgrade drill
+are not acceptance gates for this repair. The source flags do not prove
+recovery or authorize installation. Managed Amplifier and Kilroy remain
+disabled; ordinary legacy CLI integrations remain available.
+
+The Rust server needs `managed-runtime-v1`, an authenticated supervisor, and
+`FRESHELL_MANAGED_RUNTIME_V1=1`; fresh routes also need
+`FRESHELL_MANAGED_FRESH_AGENT_V1=1`. Candidate verification uses this normal
+build with no qualification overrides. The checked-in capability manifest and
+compiled policy must agree. Historical sections below describe adapter
+construction and earlier sequencing; they do not override the candidate scope.
 
 ## Certification state and the two release gates
 
@@ -37,7 +42,7 @@ are tracked on separate axes in
 
 | Field | Meaning |
 |---|---|
-| `certificationState` | Whether a live, candidate-bound certification campaign has actually passed for this provider. One of `certified`, `pending_live_provider_certification`, `not_applicable`. |
+| `certificationState` | Source policy used for candidate routing: `certified`, `pending_live_provider_certification`, or `not_applicable`. A source flag is not evidence that a live check passed. |
 | `qualificationReady` | Whether the adapter can run in an explicitly selected qualification build. It does not enable a release route. |
 | `managedEnabled` | Whether managed routing may own this provider at all. |
 | `durableRecoveryEnabled` | Whether a durable-soul recovery promise is made for it. |
@@ -52,14 +57,19 @@ manifest and the compiled table ever disagree. Deterministic adapter support
 for a deferred provider may exist and be unit-tested; it grants no capability
 negotiation, API, or UI durability claim.
 
-Two gates consume that state:
+Two existing runtime gates consume that state. They remain available for the
+broader release claims they test, but are not additional acceptance gates for
+this four-mode repair:
 
 | Gate | Command | Meaning |
 |---|---|---|
-| Landing / pre-certification | `npm run test:runtime -- gate landing --require-live` | The cumulative `P1-G*`…`P5-G*` body plus one `PC-<PROVIDER>` case each. It may PASS while exactly the manifest's `certification.landingGate.deferrableProviders` are recorded `DEFERRED_LIVE_PROVIDER_CERTIFICATION`. Every other case must genuinely PASS. |
-| Full production Gate 5 | `npm run test:runtime -- gate phase-5 --require-live` | The same body in production mode. While any required provider is uncertified it exits 2 with status `BLOCKED` and `blockedReason: "pending_live_provider_certification"`. |
+| Landing / pre-certification | `pnpm run test:runtime gate landing --require-live` | The cumulative `P1-G*`…`P5-G*` body plus one `PC-<PROVIDER>` case each. It may PASS while exactly the manifest's `certification.landingGate.deferrableProviders` are recorded `DEFERRED_LIVE_PROVIDER_CERTIFICATION`. Every other case must genuinely PASS. |
+| Full production Gate 5 | `pnpm run test:runtime gate phase-5 --require-live` | The same body in production mode. While any required provider is uncertified it exits 2 with status `BLOCKED` and `blockedReason: "pending_live_provider_certification"`. |
 
-`BLOCKED` is never `PASS`. A landing run that defers anything other than the
+Source eligibility is never a native evidence result. Receipt gates still
+require original evidence bound to the exact candidate/image and verified
+cleanup. Selected four-mode results do not imply the separate global campaign
+or Gate 5 passed. `BLOCKED` is never `PASS`. A landing run that defers anything other than the
 manifest's deferrable set fails, and a deferral in production mode fails. Each
 run writes `deferred-providers.json` next to `summary.json` so what is *not*
 proven is explicit rather than inferred.
@@ -702,7 +712,7 @@ is not complete until it has zero calls into these legacy ownership paths.
 Run:
 
 ```bash
-npm run test:runtime -- gate phase-2 --require-live
+pnpm run test:runtime gate phase-2 --require-live
 ```
 
 The gate executes cumulative `P1-G01` through `P1-G10` and `P2-G01` through
@@ -714,7 +724,7 @@ any unsafe destructive request fail the gate. Legacy process-kill regressions ru
 through `scripts/sandbox-test.sh --runtime-suite`, whose no-network/read-only-root
 mode is validated by `scripts/sandbox-selftest.sh`.
 
-The runtime suite is excluded from ordinary Vitest discovery so `npm test`
+The runtime suite is excluded from ordinary Vitest discovery so `pnpm run test`
 never performs destructive lifecycle tests accidentally.
 
 ## Phase 4 durable views and startup reconciliation

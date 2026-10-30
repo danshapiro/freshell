@@ -174,7 +174,12 @@ async fn read_child(
             .map_err(|_| "native auth reader completion unavailable")?;
         Ok((reply, status))
     };
-    let completed = match tokio::time::timeout(std::time::Duration::from_secs(20), exchange).await {
+    let completed = match tokio::time::timeout(
+        freshell_platform::provider_startup::PROVIDER_METADATA_READ_RUN,
+        exchange,
+    )
+    .await
+    {
         Ok(result) => result.map_err(str::to_string),
         Err(_) => Err("native auth reader timed out".into()),
     };
@@ -217,9 +222,12 @@ async fn read_child(
                     .await
                     .map_err(|_| "native auth reader join failed")
             };
-            tokio::time::timeout(std::time::Duration::from_secs(5), cleanup)
-                .await
-                .map_err(|_| "native auth reader cleanup timed out")??;
+            tokio::time::timeout(
+                freshell_platform::provider_startup::PROVIDER_METADATA_READ_CLEANUP,
+                cleanup,
+            )
+            .await
+            .map_err(|_| "native auth reader cleanup timed out")??;
             return Err(cause);
         }
     };

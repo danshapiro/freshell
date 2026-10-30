@@ -127,7 +127,19 @@ fn checkpoint_attempt_for_send(msg: &FreshAgentSend) -> Option<Value> {
 /// is `FRESHELL_CODEX_SIDECAR_ID`); the `/proc` reaper keys on it.
 const CLAUDE_SIDECAR_OWNERSHIP_ENV: &str = crate::claude_spawn::CLAUDE_SIDECAR_OWNERSHIP_ENV;
 /// Cold-boot budget for the sidecar to answer the `create` request (`created`).
-const SIDECAR_CREATE_BUDGET: Duration = Duration::from_secs(45);
+const SIDECAR_CREATE_BUDGET: Duration = freshell_platform::provider_startup::CLAUDE_SIDECAR_CREATE;
+// One host process can replace several SDK children. Seed each new child's
+// local query counter beyond every native query already observed by this host.
+static NEXT_MANAGED_QUERY_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+mod managed_history;
+pub use managed_history::run_claude_history_read_worker;
+use managed_history::{claude_history_read, managed_claude_history_read, ClaudeRollbackSource};
+#[cfg(test)]
+use managed_history::{
+    read_claude_rollback_transcript, ClaudeRollbackTranscript, MANAGED_HISTORY_BYTES,
+};
 
 /// Shared, cheaply-cloneable freshclaude WS state (mergeable into the server app + WsState).
 #[derive(Clone)]
@@ -147,6 +159,9 @@ pub struct FreshClaudeState {
     /// the CLI simulator or a local endpoint with an isolated HOME, without
     /// mutating this process's environment.
     sidecar_environment: Option<Arc<[(String, String)]>>,
+    managed_forks: bool,
+    managed_fork: Arc<TokioMutex<Option<freshell_agent_runtime::host_actor::ClaudeForkState>>>,
+    managed_prefix: Arc<TokioMutex<Option<freshell_agent_runtime::ClaudeForkRecipe>>>,
     /// The shared WS broadcast bus (pre-serialized frames), fanned out by every
     /// `freshell-ws` connection so the oracle's capture socket records
     /// `freshAgent.created` / `freshAgent.send.accepted` / `freshAgent.event`.
@@ -309,6 +324,36 @@ fn claude_session_ref(session_id: &str) -> freshell_protocol::SessionLocator {
 struct ClaudePending {
     permissions: Vec<PendingApprovalEntry>,
     questions: Vec<PendingQuestionEntry>,
+    // The managed query can retire before its Node bridge closes. A later
+    // query's proof must not be revoked by an earlier query's delayed close.
+    native_query: Option<(u64, bool)>,
+    native_requests: std::collections::BTreeMap<String, String>,
+    native_dispatches: std::collections::BTreeMap<
+        String,
+        (
+            String,
+            tokio::sync::oneshot::Sender<Result<(), NativeControlFailure>>,
+        ),
+    >,
+}
+
+#[derive(Debug)]
+pub struct NativeControlFailure {
+    pub message: String,
+    pub acceptance_ambiguous: bool,
+}
+
+impl ClaudePending {
+    fn cancel_native_control(&mut self, kind: &str, request_id: &str) {
+        let key = format!("{kind}:{request_id}");
+        self.native_requests.remove(&key);
+        if let Some((_, sender)) = self.native_dispatches.remove(&key) {
+            let _ = sender.send(Err(NativeControlFailure {
+                message: "native callback cancelled before dispatch".into(),
+                acceptance_ambiguous: false,
+            }));
+        }
+    }
 }
 
 /// One pending claude approval (an `sdk.permission.request` not yet answered/cancelled),
@@ -510,6 +555,221 @@ pub struct AdoptionTestPause {
 }
 
 impl FreshClaudeState {
+    pub fn with_managed_forks(mut self) -> Self {
+        self.managed_forks = true;
+        self
+    }
+
+    /// Establish the native query before the managed host admits ordinary
+    /// input. This is the existing transparent recovery path, without a send.
+    pub async fn prepare_managed_native_session(
+        &self,
+        session_id: &str,
+        session_type: SessionType,
+        cwd: Option<&str>,
+    ) -> Result<(), String> {
+        let ready = async {
+            loop {
+                if self.has_live_session(session_id).await {
+                    return Ok(());
+                }
+                self.ensure_runtime(session_id, session_type, cwd, None)
+                    .await
+                    .map_err(|error| match error {
+                        recovery::RuntimeResumeError::Lost => {
+                            "Claude session not found".to_string()
+                        }
+                        recovery::RuntimeResumeError::Closed => {
+                            "Claude session was closed".to_string()
+                        }
+                        recovery::RuntimeResumeError::Unavailable { message, .. } => message,
+                    })?;
+                if self.has_live_session(session_id).await {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        };
+        tokio::time::timeout(SIDECAR_CREATE_BUDGET, ready)
+            .await
+            .map_err(|_| "Claude native readiness timed out".to_string())?
+    }
+    pub async fn restore_managed_fork_state(
+        &self,
+        mut state: freshell_agent_runtime::host_actor::ClaudeForkState,
+    ) -> Result<(), String> {
+        if let Some(recipe) = &state.recipe {
+            recipe.validate(&state.native_session_id)?;
+        }
+        if let Some(record) = &state.rollback {
+            serde_json::from_value::<crate::rollback_record::RollbackRecord>(record.clone())
+                .map_err(|_| "invalid private Claude rollback state")?;
+        }
+        if state.recipe.is_some()
+            && !self
+                .read_managed_history(json!({"kind":"source","sessionId":state.native_session_id}))
+                .await?
+                .is_null()
+        {
+            state.recipe = None;
+        }
+        *self.managed_prefix.lock().await = state
+            .recipe
+            .clone()
+            .filter(|recipe| !recipe.recovery_disabled);
+        *self.managed_fork.lock().await = Some(state);
+        Ok(())
+    }
+
+    pub async fn managed_fork_state(
+        &self,
+    ) -> Option<freshell_agent_runtime::host_actor::ClaudeForkState> {
+        self.managed_fork.lock().await.clone()
+    }
+
+    pub async fn disable_managed_fork_recovery(
+        &self,
+        destroys_redo: bool,
+    ) -> Result<Option<freshell_agent_runtime::host_actor::ClaudeForkState>, String> {
+        *self.managed_prefix.lock().await = None;
+        let mut current = self.managed_fork.lock().await;
+        if let Some(context) = current.as_mut() {
+            if let Some(recipe) = context.recipe.as_mut() {
+                recipe.recovery_disabled = true;
+            }
+            if destroys_redo {
+                if let Some(value) = &context.rollback {
+                    let mut record: crate::rollback_record::RollbackRecord =
+                        serde_json::from_value(value.clone())
+                            .map_err(|_| "invalid managed rollback record")?;
+                    record.destroy_redo(crate::rollback_record::now_ms());
+                    context.rollback = Some(json!(record));
+                }
+            }
+        }
+        Ok(current.clone())
+    }
+
+    async fn read_managed_history(&self, request: Value) -> Result<Value, String> {
+        let request = managed_history::worker_request(request);
+        #[cfg(all(test, unix))]
+        if let Some(worker) = std::env::var_os("FRESHELL_TEST_CLAUDE_HISTORY_WORKER") {
+            let mut command = tokio::process::Command::new(worker);
+            command.arg("claude-history-read-worker");
+            return managed_history::history_read_command(
+                request,
+                command,
+                (unsafe { libc::geteuid() }, unsafe { libc::getegid() }),
+            )
+            .await;
+        }
+        if crate::native_history::managed_provider_identity()?.is_some() {
+            managed_claude_history_read(request).await
+        } else {
+            tokio::task::spawn_blocking(move || claude_history_read(&request))
+                .await
+                .map_err(|error| error.to_string())?
+        }
+    }
+
+    async fn managed_history_request(&self, kind: &str, session_id: &str) -> Value {
+        let fork = self
+            .managed_prefix
+            .lock()
+            .await
+            .clone()
+            .filter(|recipe| recipe.child_session_id == session_id);
+        let genesis = self.load_genesis(session_id).await.map(|record| {
+            json!({
+                "genesis":record.genesis, "updatedAtMs":record.updated_at_ms,
+            })
+        });
+        json!({"kind":kind, "sessionId":session_id, "fork":fork,
+            "genesis":genesis, "roots":self.transcript_roots()})
+    }
+
+    async fn make_managed_fork_recipe(
+        &self,
+        source_id: &str,
+        child: &str,
+        at: Option<&str>,
+        drops_turn: Option<&str>,
+    ) -> Result<Option<freshell_agent_runtime::ClaudeForkRecipe>, String> {
+        if !self.managed_forks {
+            return Ok(None);
+        }
+        let source = self
+            .read_rollback_source(source_id)
+            .await?
+            .ok_or("native fork source unavailable")?;
+        let home = std::env::var("HOME").map_err(|_| "managed HOME unavailable")?;
+        let parent = source
+            .path
+            .strip_prefix(&home)
+            .map_err(|_| "native fork source is outside managed HOME")?;
+        let child_path = source
+            .path
+            .parent()
+            .ok_or("native fork source has no parent")?
+            .join(format!("{child}.jsonl"));
+        let recipe = freshell_agent_runtime::ClaudeForkRecipe {
+            recovery_disabled: false,
+            child_session_id: child.into(),
+            parent_session_id: source_id.into(),
+            parent_transcript: parent.to_string_lossy().into_owned(),
+            child_transcript: child_path
+                .strip_prefix(&home)
+                .map_err(|_| "native fork child is outside managed HOME")?
+                .to_string_lossy()
+                .into_owned(),
+            parent_sha256: source.sha256,
+            target: match at {
+                Some(cutoff) => freshell_agent_runtime::ClaudeForkTarget::Prefix {
+                    cutoff_uuid: cutoff.into(),
+                    drop_turn_uuid: drops_turn.map(str::to_owned),
+                },
+                None => freshell_agent_runtime::ClaudeForkTarget::Empty,
+            },
+        };
+        recipe.validate(child)?;
+        Ok(Some(recipe))
+    }
+
+    async fn read_rollback_source(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ClaudeRollbackSource>, String> {
+        let recipe = self
+            .managed_prefix
+            .lock()
+            .await
+            .clone()
+            .filter(|recipe| recipe.child_session_id == session_id);
+        let value = self
+            .read_managed_history(json!({"kind":"source","sessionId":session_id,"fork":recipe}))
+            .await?;
+        serde_json::from_value(value).map_err(|_| "invalid managed Claude source metadata".into())
+    }
+
+    #[cfg(test)]
+    async fn read_current_rollback_transcript(
+        &self,
+        session_id: &str,
+        allow_removed: bool,
+    ) -> Result<Option<ClaudeRollbackTranscript>, String> {
+        let recipe = self
+            .managed_prefix
+            .lock()
+            .await
+            .clone()
+            .filter(|recipe| recipe.child_session_id == session_id);
+        if recipe.is_none() {
+            return read_claude_rollback_transcript(session_id, allow_removed).await;
+        }
+        let value = self.read_managed_history(json!({"kind":"transcript","sessionId":session_id,"allowRemoved":false,"fork":recipe})).await?;
+        serde_json::from_value(value).map_err(|_| "invalid managed Claude history response".into())
+    }
+
     /// Build the state around the shared broadcast bus.
     pub fn new(broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>) -> Self {
         Self {
@@ -517,6 +777,9 @@ impl FreshClaudeState {
             freshell_mcp: Default::default(),
             sidecar_environment: None,
             edges: crate::claude_edges::ClaudeEdgeHub::new(Arc::clone(&broadcast_tx)),
+            managed_forks: false,
+            managed_fork: Arc::new(TokioMutex::new(None)),
+            managed_prefix: Arc::new(TokioMutex::new(None)),
             broadcast_tx,
             checkpoint_event_sink: crate::CheckpointEventSink::default(),
             sessions: Arc::new(TokioMutex::new(HashMap::new())),
@@ -4245,6 +4508,163 @@ impl FreshClaudeState {
             .await;
     }
 
+    pub async fn dispatch_approval_checked(
+        &self,
+        msg: FreshAgentApprovalRespond,
+    ) -> Result<(), NativeControlFailure> {
+        if !msg.decision.is_object() {
+            return Err(NativeControlFailure {
+                message: "approval requires an object decision".into(),
+                acceptance_ambiguous: false,
+            });
+        }
+        self.dispatch_native_control_checked(
+            &msg.session_id,
+            msg.session_type,
+            "permission",
+            request_id_string(&msg.request_id),
+            json!({"decision":msg.decision}),
+        )
+        .await
+    }
+
+    pub async fn dispatch_question_checked(
+        &self,
+        msg: FreshAgentQuestionRespond,
+    ) -> Result<(), NativeControlFailure> {
+        self.dispatch_native_control_checked(
+            &msg.session_id,
+            msg.session_type,
+            "question",
+            request_id_string(&msg.request_id),
+            json!({"answers":msg.answers}),
+        )
+        .await
+    }
+
+    /// Private managed recovery control. Its receipt certifies only admission
+    /// of the exact checkpoint continuation to the current sidecar input stream.
+    pub async fn resume_native_checkpoint_checked(
+        &self,
+        session_id: &str,
+        session_type: SessionType,
+        checkpoints: Vec<Value>,
+        native_binding: Value,
+    ) -> Result<(), NativeControlFailure> {
+        self.dispatch_native_control_checked(
+            session_id,
+            session_type,
+            "checkpoint",
+            uuid::Uuid::new_v4().to_string(),
+            json!({"checkpoints":checkpoints,"nativeBinding":native_binding}),
+        )
+        .await
+    }
+
+    async fn dispatch_native_control_checked(
+        &self,
+        session_id: &str,
+        session_type: SessionType,
+        kind: &str,
+        request_id: String,
+        payload: Value,
+    ) -> Result<(), NativeControlFailure> {
+        let reject = |message: &str, acceptance_ambiguous| NativeControlFailure {
+            message: message.into(),
+            acceptance_ambiguous,
+        };
+        let Some(session) = self.response_session(session_id, session_type).await else {
+            return Err(reject("current native session is unavailable", false));
+        };
+        let key = format!("{kind}:{request_id}");
+        let pending = Arc::clone(&session.pending);
+        let (send, receive) = tokio::sync::oneshot::channel();
+        {
+            let mut state = pending.lock().expect("pending lock");
+            let present = match kind {
+                "permission" => state
+                    .permissions
+                    .iter()
+                    .any(|entry| entry.request_id == request_id),
+                "question" => state
+                    .questions
+                    .iter()
+                    .any(|entry| entry.request_id == request_id),
+                "checkpoint" => {
+                    payload["checkpoints"]
+                        .as_array()
+                        .is_some_and(|keys| !keys.is_empty() && keys.len() <= 32)
+                        && payload["nativeBinding"]["launch"].is_object()
+                        && payload["nativeBinding"]["queryGeneration"]
+                            .as_u64()
+                            .is_some_and(|generation| generation > 0)
+                }
+                _ => false,
+            };
+            let native_request_id = if kind == "checkpoint" {
+                Some(request_id.clone())
+            } else {
+                state.native_requests.get(&key).cloned()
+            };
+            if !present || native_request_id.is_none() || state.native_dispatches.contains_key(&key)
+            {
+                return Err(reject(
+                    "current native callback is unavailable or already dispatching",
+                    false,
+                ));
+            }
+            state
+                .native_dispatches
+                .insert(key.clone(), (native_request_id.unwrap(), send));
+        }
+        let mut command = payload;
+        command["type"] = json!(if kind == "checkpoint" {
+            "checkpoint.resume".into()
+        } else {
+            format!("{kind}.respond")
+        });
+        command["sessionId"] = json!(session.sidecar_session_id);
+        command["requestId"] = json!(request_id);
+        let written = session.stdin.write(&command).await;
+        if let Err(message) = written {
+            pending
+                .lock()
+                .expect("pending lock")
+                .native_dispatches
+                .remove(&key);
+            return Err(NativeControlFailure {
+                message,
+                acceptance_ambiguous: true,
+            });
+        }
+        let result = match tokio::time::timeout(Duration::from_secs(5), receive).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(reject("native dispatch channel closed", true)),
+            Err(_) => Err(reject("native dispatch acknowledgement timed out", true)),
+        };
+        {
+            let mut state = pending.lock().expect("pending lock");
+            state.native_dispatches.remove(&key);
+            if result.is_ok() {
+                state.native_requests.remove(&key);
+            }
+        }
+        if result.is_ok() {
+            match kind {
+                "permission" => {
+                    self.complete_pending_response(&session, &request_id, PendingResponse::Approval)
+                        .await
+                }
+                "question" => {
+                    self.complete_pending_response(&session, &request_id, PendingResponse::Question)
+                        .await
+                }
+                _ => {}
+            }
+        }
+        result
+    }
+
     /// Handle a `freshAgent.question.respond` for claude/kilroy: identical ordering
     /// discipline to [`Self::handle_approval_respond`]; the frame is
     /// `question.respond` with the answers as a JSON object (the sidecar wraps them
@@ -4581,6 +5001,18 @@ impl FreshClaudeState {
         any_id: &str,
     ) -> Option<crate::rollback_record::RollbackRecord> {
         let durable = self.durable_session_id(any_id).await;
+        if let Some(context) = self
+            .managed_fork
+            .lock()
+            .await
+            .as_ref()
+            .filter(|context| context.native_session_id == durable)
+        {
+            return context
+                .rollback
+                .as_ref()
+                .and_then(|value| serde_json::from_value(value.clone()).ok());
+        }
         self.identity_sink()
             .and_then(|s| s.load_rollback(PROVIDER, &durable))
     }
@@ -4588,7 +5020,17 @@ impl FreshClaudeState {
     /// Reconcile liveness follows current and prior native UUIDs for both
     /// Freshclaude and Kilroy runtimes.
     pub async fn has_live_session(&self, session_id: &str) -> bool {
-        self.resolve_session_key(session_id).await.is_some()
+        let Some(key) = self.resolve_session_key(session_id).await else {
+            return false;
+        };
+        self.sessions.lock().await.get(&key).is_some_and(|session| {
+            session
+                .pending
+                .lock()
+                .expect("pending lock")
+                .native_query
+                .is_none_or(|(_, live)| live)
+        })
     }
 
     /// A runtime that disappears after a successful resolution is a transient
@@ -4962,6 +5404,25 @@ impl FreshClaudeState {
                         .await;
                     continue;
                 };
+                if matches!(
+                    value["type"].as_str(),
+                    Some(
+                        "sdk.session.loading"
+                            | "sdk.session.init"
+                            | "sdk.session.closed"
+                            | "sdk.permission.dispatch"
+                            | "sdk.question.dispatch"
+                            | "sdk.checkpoint.dispatch"
+                    )
+                ) {
+                    pending.lock().expect("pending lock").fold_frame(&value);
+                }
+                if value["type"] == "sdk.session.init"
+                    && value["nativeIdentityEvidence"]["source"] == "clear"
+                {
+                    *state.managed_prefix.lock().await = None;
+                    *state.managed_fork.lock().await = None;
+                }
                 if let Some(ended) = crate::claude_sidecar_exit::StreamEnded::from_line(&value) {
                     state
                         .note_claude_stdout(&session_id, &ownership_id, Some(&value))
@@ -5512,6 +5973,69 @@ fn fold_pending_line(pending: &mut ClaudePending, value: &Value) {
         return;
     };
     match sdk_type {
+        "sdk.session.loading" | "sdk.session.init" => {
+            let generation = if sdk_type == "sdk.session.loading" {
+                value["nativeBinding"]["queryGeneration"].as_u64()
+            } else {
+                value["nativeIdentityEvidence"]["queryGeneration"].as_u64()
+            };
+            if let Some(generation) = generation.filter(|generation| *generation > 0) {
+                NEXT_MANAGED_QUERY_GENERATION.fetch_max(
+                    generation.saturating_add(1),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                if pending
+                    .native_query
+                    .is_none_or(|(current, _)| generation >= current)
+                {
+                    pending.native_query = Some((generation, sdk_type == "sdk.session.init"));
+                }
+            }
+        }
+        "sdk.session.closed" => {
+            if let Some((generation, live)) = pending.native_query.as_mut() {
+                if value["queryGeneration"].as_u64() == Some(*generation) {
+                    *live = false;
+                }
+            }
+        }
+        "sdk.permission.dispatch" | "sdk.question.dispatch" | "sdk.checkpoint.dispatch" => {
+            let Some(request_id) = value.get("requestId").and_then(frame_request_id) else {
+                return;
+            };
+            let kind = match sdk_type {
+                "sdk.permission.dispatch" => "permission",
+                "sdk.question.dispatch" => "question",
+                _ => "checkpoint",
+            };
+            let key = format!("{kind}:{request_id}");
+            let state = pending;
+            let Some((expected, _)) = state.native_dispatches.get(&key) else {
+                return;
+            };
+            let ok = value.get("ok").and_then(Value::as_bool) == Some(true);
+            if ok && value.get("nativeRequestId").and_then(Value::as_str) != Some(expected) {
+                return;
+            }
+            if let Some((_, sender)) = state.native_dispatches.remove(&key) {
+                let result = if ok {
+                    Ok(())
+                } else {
+                    Err(NativeControlFailure {
+                        message: value
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("native control dispatch rejected")
+                            .into(),
+                        acceptance_ambiguous: value
+                            .get("acceptanceAmbiguous")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    })
+                };
+                let _ = sender.send(result);
+            }
+        }
         "sdk.permission.request" => {
             let Some(request_id) = value.get("requestId").and_then(frame_request_id) else {
                 return;
@@ -5542,6 +6066,15 @@ fn fold_pending_line(pending: &mut ClaudePending, value: &Value) {
                     value.get("suggestions"),
                 ),
             };
+            if let Some(native) = value
+                .get("nativeRequestId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            {
+                pending
+                    .native_requests
+                    .insert(format!("permission:{}", entry.request_id), native.into());
+            }
             pending
                 .permissions
                 .retain(|e| e.request_id != entry.request_id);
@@ -5550,6 +6083,7 @@ fn fold_pending_line(pending: &mut ClaudePending, value: &Value) {
         "sdk.permission.cancelled" => {
             if let Some(request_id) = value.get("requestId").and_then(frame_request_id) {
                 pending.permissions.retain(|e| e.request_id != request_id);
+                pending.cancel_native_control("permission", &request_id);
             }
         }
         "sdk.question.request" => {
@@ -5568,6 +6102,15 @@ fn fold_pending_line(pending: &mut ClaudePending, value: &Value) {
                 request_id,
                 questions: normalize_question_definitions(value.get("questions")),
             };
+            if let Some(native) = value
+                .get("nativeRequestId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            {
+                pending
+                    .native_requests
+                    .insert(format!("question:{}", entry.request_id), native.into());
+            }
             pending
                 .questions
                 .retain(|e| e.request_id != entry.request_id);
@@ -5576,6 +6119,7 @@ fn fold_pending_line(pending: &mut ClaudePending, value: &Value) {
         "sdk.question.cancelled" => {
             if let Some(request_id) = value.get("requestId").and_then(frame_request_id) {
                 pending.questions.retain(|e| e.request_id != request_id);
+                pending.cancel_native_control("question", &request_id);
             }
         }
         _ => {}
@@ -5704,11 +6248,16 @@ fn normalize_sdk_type(sdk_type: &str) -> Option<&'static str> {
         "sdk.session.changed" => "freshAgent.session.changed",
         "sdk.session.init" => "freshAgent.session.init",
         "sdk.checkpointTurnIdentity" => "checkpointTurnIdentity",
+        "sdk.session.loading" => "freshAgent.session.loading",
+        "sdk.session.closed" => "freshAgent.session.closed",
         "sdk.session.metadata" => "freshAgent.session.metadata",
         "sdk.assistant" => "freshAgent.assistant",
+        "sdk.tool.result" => "freshAgent.tool.result",
         "sdk.stream" => "freshAgent.stream",
         "sdk.result" => "freshAgent.result",
         "sdk.permission.request" => "freshAgent.permission.request",
+        "sdk.permission.dispatch" => "freshAgent.permission.dispatch",
+        "sdk.question.dispatch" => "freshAgent.question.dispatch",
         "sdk.permission.cancelled" => "freshAgent.permission.cancelled",
         "sdk.question.request" => "freshAgent.question.request",
         // Task 2 (fresh-eyes round-3 F3): forwarded, not dropped — the client folds
@@ -6595,6 +7144,7 @@ pub(crate) mod tests {
     mod create_binding_tests;
     mod create_cleanup_tests;
     mod deadman_tests;
+    mod large_worker_request_tests;
     mod real_fixture_tests;
     mod recovery_stop_tests;
     mod recovery_tests;
@@ -7352,6 +7902,29 @@ pub(crate) mod tests {
         assert_eq!(normalize_sdk_type("created"), None);
         assert_eq!(normalize_sdk_type("create.failed"), None);
         assert_eq!(normalize_sdk_type("sdk.unknown"), None);
+    }
+
+    #[test]
+    fn native_loading_frame_preserves_current_binding_through_the_actual_normalizer() {
+        let binding = json!({"launch":{"incarnationId":"current","launchNonce":"nonce",
+            "evidenceRevision":0,"executionGeneration":1,"requestedNativeSessionId":null},"queryGeneration":2});
+        for flavor in ["freshclaude", "kilroy"] {
+            let frame = sdk_line_to_frame(
+                &json!({"type":"sdk.session.loading", "sessionId":"local-key",
+                "nativeBinding":binding}),
+                "native-public-root",
+                flavor,
+            )
+            .expect("current loading must reach the host before another query can be certified");
+            let wire: ServerMessage = serde_json::from_str(&frame).unwrap();
+            let ServerMessage::FreshAgentEvent(wire) = wire else {
+                panic!("wrong normalized envelope")
+            };
+            assert_eq!(wire.session_id, "native-public-root");
+            assert_eq!(wire.session_type, flavor);
+            assert_eq!(wire.event["type"], "freshAgent.session.loading");
+            assert_eq!(wire.event["nativeBinding"], binding);
+        }
     }
 
     #[test]
@@ -14148,6 +14721,7 @@ pub(crate) mod tests {
                 suggestions: None,
             }],
             questions: Vec::new(),
+            ..ClaudePending::default()
         };
         insert_dead_stdin_session(&st, "dead-stdin-approval", pending).await;
 
@@ -14168,6 +14742,152 @@ pub(crate) mod tests {
             vec!["req-9".to_string()],
             "a failed write leaves the entry pending (never clear-then-fail)"
         );
+    }
+
+    #[tokio::test]
+    async fn checked_native_approval_refuses_absent_current_callback() {
+        let (state, _) = state_with_bus();
+        let result = state
+            .dispatch_approval_checked(approval_respond_msg(
+                "absent-current-session",
+                SessionType::Freshclaude,
+                "old-request",
+                json!({ "behavior": "allow" }),
+            ))
+            .await;
+        assert!(
+            result.is_err(),
+            "an absent native callback must not report successful dispatch"
+        );
+        assert!(!result.unwrap_err().acceptance_ambiguous);
+    }
+
+    #[tokio::test]
+    async fn native_dispatch_fold_requires_exact_current_native_request() {
+        let pending = std::sync::Mutex::new(ClaudePending::default());
+        fold_pending_frame(
+            &pending,
+            &json!({"type":"sdk.permission.request","requestId":"current-card","nativeRequestId":"current-native","tool":{"name":"Bash","input":{"command":"owned"}}}),
+        );
+        let (send, mut receive) = tokio::sync::oneshot::channel();
+        pending.lock().unwrap().native_dispatches.insert(
+            "permission:current-card".into(),
+            ("current-native".into(), send),
+        );
+        fold_pending_frame(
+            &pending,
+            &json!({"type":"sdk.permission.dispatch","requestId":"old-card","nativeRequestId":"current-native","ok":true}),
+        );
+        assert!(matches!(
+            receive.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        fold_pending_frame(
+            &pending,
+            &json!({"type":"sdk.permission.dispatch","requestId":"current-card","nativeRequestId":"old-native","ok":true}),
+        );
+        assert!(matches!(
+            receive.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        fold_pending_frame(
+            &pending,
+            &json!({"type":"sdk.permission.dispatch","requestId":"current-card","nativeRequestId":"current-native","ok":true}),
+        );
+        assert!(receive.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn checked_checkpoint_release_uses_the_actual_owned_child_receipt() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let (state, _events) = state_with_bus();
+        let session_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let owned_stdin =
+            insert_rollback_fixture_session(&state, "checkpoint-child", session_id).await;
+        let checkpoints = json!([{"nativeSessionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","toolUseID":"toolu_original1"}]);
+        let binding =
+            json!({"launch":{"incarnationId":"owned","launchNonce":"current"},"queryGeneration":1});
+        let result = state
+            .dispatch_native_control_checked(
+                &session_id,
+                SessionType::Freshclaude,
+                "checkpoint",
+                "release-current".into(),
+                json!({"checkpoints":checkpoints,"nativeBinding":binding}),
+            )
+            .await;
+        state.shutdown().await;
+        assert!(
+            result.is_ok(),
+            "only the current real child receipt may certify private release dispatch: {result:?}"
+        );
+        let commands: Vec<Value> = std::fs::read_to_string(&owned_stdin)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let command = commands
+            .iter()
+            .find(|command| command["type"] == "checkpoint.resume")
+            .expect("private release must reach owned child stdin");
+        assert_eq!(command["checkpoints"], checkpoints);
+        assert_eq!(command["nativeBinding"], binding);
+        assert_eq!(command["requestId"], "release-current");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_dispatch_fold_requires_current_release_request_and_native_receipt() {
+        let pending = std::sync::Mutex::new(ClaudePending::default());
+        let (send, mut receive) = tokio::sync::oneshot::channel();
+        pending.lock().unwrap().native_dispatches.insert(
+            "checkpoint:release-current".into(),
+            ("release-current".into(), send),
+        );
+        for frame in [
+            json!({"type":"sdk.checkpoint.dispatch","requestId":"release-old","nativeRequestId":"release-current","ok":true}),
+            json!({"type":"sdk.checkpoint.dispatch","requestId":"release-current","nativeRequestId":"release-old","ok":true}),
+        ] {
+            fold_pending_frame(&pending, &frame);
+            assert!(matches!(
+                receive.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+        }
+        fold_pending_frame(
+            &pending,
+            &json!({"type":"sdk.checkpoint.dispatch","requestId":"release-current","nativeRequestId":"release-current","ok":true}),
+        );
+        assert!(receive
+            .try_recv()
+            .expect("current release receipt must settle the checked private control")
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn native_dispatch_fold_returns_provider_cancellation_before_dispatch() {
+        let pending = std::sync::Mutex::new(ClaudePending::default());
+        fold_pending_frame(
+            &pending,
+            &json!({"type":"sdk.permission.request","requestId":"current-card","nativeRequestId":"current-native","tool":{"name":"Bash","input":{"command":"owned"}}}),
+        );
+        let (send, mut receive) = tokio::sync::oneshot::channel();
+        pending.lock().unwrap().native_dispatches.insert(
+            "permission:current-card".into(),
+            ("current-native".into(), send),
+        );
+        fold_pending_frame(
+            &pending,
+            &json!({"type":"sdk.permission.cancelled","requestId":"current-card"}),
+        );
+        let result = receive
+            .try_recv()
+            .expect("native cancellation must settle the checked response");
+        assert!(!result.unwrap_err().acceptance_ambiguous);
+        assert!(!pending
+            .lock()
+            .unwrap()
+            .native_requests
+            .contains_key("permission:current-card"));
     }
 
     /// D2-M3 (delta-review round 2): the shared protocol requires the decision to be a
@@ -16029,6 +16749,339 @@ pub(crate) mod tests {
         std::fs::write(dir.join(format!("{durable}.jsonl")), out.join("\n")).unwrap();
     }
 
+    #[tokio::test]
+    async fn live_claude_snapshot_retains_large_native_history_and_pending_controls() {
+        use std::io::Write;
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        let prior_config = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        let id = "large-live-history";
+        let directory = home.path().join("projects/-large");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(format!("{id}.jsonl"));
+        let mut file = std::fs::File::create(&path).unwrap();
+        let text = "ordinary large output ".repeat(50_000);
+        for index in 0..34 {
+            writeln!(
+                file,
+                "{}",
+                json!({"type":"assistant","uuid":format!("message-{index}"),
+                "message":{"role":"assistant","content":[{"type":"text","text":text}]}})
+            )
+            .unwrap();
+        }
+        assert!(file.metadata().unwrap().len() > MANAGED_HISTORY_BYTES);
+        let direct = claude_history_read(
+            &json!({"kind":"snapshot", "sessionId":id, "sessionType":"freshclaude", "rollback":null}),
+        );
+        let (state, _rx) = state_with_bus();
+        insert_rollback_fixture_session(&state, "large-live", id).await;
+        {
+            let sessions = state.sessions.lock().await;
+            let live = &sessions[id];
+            live.ledger.lock().unwrap().arm(
+                "large-live-turn".into(),
+                None,
+                crate::claude_turns::SendKind::Turn,
+            );
+            fold_pending_frame(
+                &live.pending,
+                &json!({"type":"sdk.permission.request","requestId":"pending-real-request",
+                "nativeRequestId":"native-request","tool":{"name":"Bash","input":{"command":"pwd"}}}),
+            );
+        }
+        let snapshot = state.get_snapshot(SessionType::Freshclaude, id).await;
+        state.shutdown().await;
+        match prior_config {
+            Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+        let direct = direct.expect("managed display read must stream large transcripts");
+        assert!(
+            serde_json::to_vec(&direct).unwrap().len()
+                < crate::native_history::MAX_HISTORY_BYTES as usize
+        );
+        let snapshot = snapshot.unwrap();
+        assert_eq!(snapshot["threadId"], id);
+        assert_eq!(snapshot["status"], "running");
+        assert_eq!(snapshot["capabilities"]["send"], true);
+        assert_eq!(snapshot["capabilities"]["approvals"], true);
+        assert_eq!(
+            snapshot["pendingApprovals"][0]["requestId"],
+            "pending-real-request"
+        );
+        assert_eq!(
+            snapshot["extensions"]["claude"]["statusFromLiveState"],
+            true
+        );
+        assert_eq!(
+            snapshot["turns"].as_array().unwrap().last().unwrap()["turnId"],
+            "message-33"
+        );
+        assert_eq!(
+            snapshot["extensions"]["claude"]["nativeHistoryRetention"]["partial"],
+            true
+        );
+        assert_ne!(snapshot["extensions"]["claude"]["ownerKind"], "vacant");
+    }
+
+    #[tokio::test]
+    async fn managed_claude_history_worker_reads_native_snapshot_and_rollback_anchors_without_writes(
+    ) {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        write_rollback_transcript(home.path(), "managed-read", &two_turn_transcript());
+        let path = home.path().join("projects/-t/managed-read.jsonl");
+        let before = std::fs::read(&path).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let transcript: ClaudeRollbackTranscript = serde_json::from_value(
+            claude_history_read(&json!({
+                "kind":"transcript", "sessionId":"managed-read",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(transcript.path, path);
+        assert_eq!(transcript.cwd.as_deref(), Some("/tmp"));
+        let point = crate::claude_snapshot::resolve_resume_point(
+            &transcript.content,
+            "managed-read",
+            crate::claude_snapshot::ResumeTarget::Step,
+        )
+        .unwrap();
+        assert_eq!(
+            point.resume_at_uuid.as_deref(),
+            Some("aaaaaaaa-1111-4111-8111-111111111111")
+        );
+        assert_eq!(
+            crate::claude_snapshot::drops_turn_guard(
+                &transcript.content,
+                point.resume_at_uuid.as_deref()
+            )
+            .as_deref(),
+            Some("22222222-2222-4222-8222-222222222222")
+        );
+        let snapshot = claude_history_read(&json!({"kind":"snapshot", "sessionId":"managed-read", "sessionType":"freshclaude", "rollback":null})).unwrap();
+        let expected =
+            crate::claude_snapshot::get_claude_snapshot("freshclaude", "managed-read", None)
+                .await
+                .unwrap();
+        assert_eq!(snapshot, expected);
+        assert!(
+            claude_history_read(&json!({"kind":"transcript", "sessionId":"absent"}))
+                .unwrap()
+                .is_null()
+        );
+        assert!(claude_history_read(&json!({"kind":"snapshot", "sessionId":"absent", "sessionType":"freshclaude", "rollback":null})).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+        let oversized = home.path().join("projects/-t/oversized.jsonl");
+        std::fs::File::create(&oversized)
+            .unwrap()
+            .set_len(MANAGED_HISTORY_BYTES + 1)
+            .unwrap();
+        assert!(
+            claude_history_read(&json!({"kind":"transcript", "sessionId":"oversized"})).is_err()
+        );
+        match previous {
+            Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_history_read_failure_never_claims_an_empty_or_lost_conversation() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _environment = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        write_rollback_transcript(home.path(), "managed-unreadable", &two_turn_transcript());
+        let project = home.path().join("projects/-t");
+        std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let cannot_read = std::fs::read_dir(&project).is_err();
+        let rollback = claude_history_read(
+            &json!({"kind":"rollback", "sessionId":"managed-unreadable", "rollback":null}),
+        );
+        let snapshot = claude_history_read(
+            &json!({"kind":"snapshot", "sessionId":"managed-unreadable", "sessionType":"freshclaude", "rollback":null}),
+        );
+        std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            cannot_read,
+            "run this regression as the unprivileged sandbox user"
+        );
+        assert_eq!(
+            rollback.unwrap()["Err"][0],
+            "INTERNAL_ERROR",
+            "an unavailable store cannot prove there is nothing to undo"
+        );
+        let error = snapshot.expect_err("an unreadable store cannot serve an empty snapshot");
+        assert_ne!(
+            error, "claude session not found",
+            "a temporary read failure cannot prove a conversation lost"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_parent_backed_undo_redo_preserves_native_anchors_after_reopen() {
+        assert_managed_parent_backed_undo_redo(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_parent_backed_undo_redo_retains_large_history_controls() {
+        assert_managed_parent_backed_undo_redo(true).await;
+    }
+
+    #[cfg(unix)]
+    async fn assert_managed_parent_backed_undo_redo(large_history: bool) {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _sidecar = FakeClaudeSidecarEnv::install();
+        struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+        let keys = [
+            "HOME",
+            "CLAUDE_CONFIG_DIR",
+            "FRESHELL_PROVIDER_RUN_AS_UID",
+            "FRESHELL_PROVIDER_RUN_AS_GID",
+            "FRESHELL_NATIVE_IDENTITY_LAUNCH",
+            "FRESHELL_CLAUDE_SDK_QUERY_MODULE",
+            "FRESHELL_SIDECAR_TEST_NATIVE_PROJECT",
+        ];
+        let _restore = RestoreEnv(
+            keys.into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect(),
+        );
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join(".claude");
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("CLAUDE_CONFIG_DIR", &config);
+        std::env::remove_var("FRESHELL_PROVIDER_RUN_AS_UID");
+        std::env::remove_var("FRESHELL_PROVIDER_RUN_AS_GID");
+        let parent = uuid::Uuid::new_v4().to_string();
+        let anchors: Vec<_> = (0..4).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+        let content: String = (0..4).map(|i| format!("{}\n", json!({"type":if i % 2 == 0 {"user"} else {"assistant"},
+            "uuid":anchors[i], "parentUuid":if i == 0 {None} else {Some(&anchors[i-1])}, "sessionId":parent,
+            "cwd":"/tmp", "message":{"role":if i % 2 == 0 {"user"} else {"assistant"},"content":[{"type":"text","text":if large_history && i % 2 == 1 { "native reply ".repeat(1_500_000) } else { format!("native turn {i}") }}]}}))).collect();
+        if large_history {
+            assert!(content.len() as u64 > MANAGED_HISTORY_BYTES);
+        }
+        let project = config.join("projects/-t");
+        std::fs::create_dir_all(&project).unwrap();
+        let source = project.join(format!("{parent}.jsonl"));
+        std::fs::write(&source, &content).unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        std::env::set_var(
+            "FRESHELL_CLAUDE_SDK_QUERY_MODULE",
+            freshell_platform::opencode_plugin::plugin_file_spec(
+                &root.join("test/unit/claude-sidecar/fixtures/native-startup-query.mjs"),
+            ),
+        );
+        std::env::set_var("FRESHELL_SIDECAR_TEST_NATIVE_PROJECT", &project);
+        std::env::set_var(
+            "FRESHELL_NATIVE_IDENTITY_LAUNCH",
+            json!({"incarnationId":"owned", "launchNonce":"nonce",
+            "evidenceRevision":1, "executionGeneration":1, "requestedNativeSessionId":parent})
+            .to_string(),
+        );
+        let (st, _rx) = state_with_bus();
+        let mut st = st.with_managed_forks();
+        insert_rollback_fixture_session(&st, "managed-live", &parent).await;
+        let mut current = parent.clone();
+        for (index, direction, tip) in [
+            (0, RollbackDirection::Undo, Some(1)),
+            (1, RollbackDirection::Undo, None),
+            (2, RollbackDirection::Redo, Some(1)),
+            (3, RollbackDirection::Redo, Some(3)),
+        ] {
+            let (sink, frames) = capturing_sink();
+            st.handle_rollback_with_native_launch(rollback_op(&current, &format!("native-op-{index}"), direction), sink,
+                Some(json!({"incarnationId":"owned", "launchNonce":"nonce", "evidenceRevision":index+2,
+                    "executionGeneration":1, "requestedNativeSessionId":null}))).await;
+            assert!(
+                !captured_json(&frames)
+                    .iter()
+                    .any(|frame| frame["event"]["type"] == "freshAgent.error"),
+                "{:?}",
+                captured_json(&frames)
+            );
+            let context = st
+                .managed_fork_state()
+                .await
+                .expect("native acknowledgement publishes recipe");
+            assert_ne!(context.native_session_id, current);
+            current = context.native_session_id.clone();
+            assert!(
+                !project.join(format!("{current}.jsonl")).exists(),
+                "controlled native child has no invented transcript"
+            );
+            let snapshot = st
+                .get_snapshot(SessionType::Freshclaude, &current)
+                .await
+                .unwrap();
+            assert_eq!(snapshot["threadId"], current);
+            assert_eq!(
+                snapshot["latestTurnId"],
+                json!(tip.map(|i| anchors[i].clone()))
+            );
+            assert!(
+                serde_json::to_vec(&snapshot).unwrap().len()
+                    < crate::native_history::MAX_HISTORY_BYTES as usize
+            );
+            if index == 0 {
+                let durable: freshell_agent_runtime::host_actor::ClaudeForkState =
+                    serde_json::from_slice(&serde_json::to_vec(&context).unwrap()).unwrap();
+                st.shutdown().await;
+                let (reopened, _rx) = state_with_bus();
+                let reopened = reopened.with_managed_forks();
+                reopened.restore_managed_fork_state(durable).await.unwrap();
+                insert_rollback_fixture_session(&reopened, "managed-live", &current).await;
+                st = reopened;
+            }
+        }
+        let retired = st
+            .disable_managed_fork_recovery(true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(retired.recipe.unwrap().recovery_disabled);
+        assert!(
+            st.read_current_rollback_transcript(&current, false)
+                .await
+                .unwrap()
+                .is_none(),
+            "a possibly accepted input must retire the live parent projection too"
+        );
+        let rollback: RollbackRecord = serde_json::from_value(retired.rollback.unwrap()).unwrap();
+        assert!(rollback.redo_destroyed);
+        assert!(!rollback.can_redo);
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), content);
+        st.shutdown().await;
+    }
+
     /// A rollback-fixture live session: a `tee <stdin_log>` child stands in for the
     /// sidecar — every byte the handler writes to its stdin lands in stdin_log (the
     /// "no sidecar churn" oracle for the refusal legs) — registered with
@@ -16055,6 +17108,13 @@ rl.on('line', (line) => {
   fs.appendFileSync(stdinLog, `${line}\n`)
   try {
     const msg = JSON.parse(line)
+    if (msg && msg.type === 'shutdown') { process.exit(0); return }
+    if (msg && msg.type === 'checkpoint.resume') {
+      process.stdout.write(JSON.stringify({
+        type: 'sdk.checkpoint.dispatch', sessionId: msg.sessionId,
+        requestId: msg.requestId, nativeRequestId: msg.requestId, ok: true,
+      }) + '\n')
+    }
     if (msg && msg.type === 'interrupt') {
       process.stdout.write(JSON.stringify({
         type: 'sdk.interrupt_settled',

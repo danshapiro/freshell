@@ -1,0 +1,33 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "incremental": false,
+    "rootDir": ".",
+    "types": [
+      "node",
+      "vite/client",
+      "w3c-web-hid"
+    ]
+  },
+  "include": [
+    "src/vite-env.d.ts",
+    "test/e2e-browser/helpers/selection-nonvacuity.test.ts",
+    "test/e2e-browser/helpers/managed-runtime.ts",
+    "test/e2e-browser/helpers/external-managed-runtime.ts",
+    "test/e2e-browser/helpers/runtime-chaos-evidence.ts",
+    "test/e2e-browser/specs/runtime-provider-resurrection-rust.spec.ts",
+    "test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts",
+    "test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts",
+    "test/e2e-browser/specs/runtime-terminal-continuity-rust.spec.ts",
+    "test/e2e-browser/specs/runtime-lost-soul-notice-rust.spec.ts",
+    "test/e2e-browser/specs/runtime-opencode-provider-qualification-rust.spec.ts",
+    "test/e2e-browser/specs/runtime-tabs-rehydrate-rust.spec.ts",
+    "test/e2e-browser/specs/runtime-chaos-rust.spec.ts",
+    "test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts",
+    "test/e2e-browser/specs/runtime-external-target-smoke-rust.spec.ts",
+    "test/integration/server/managed-provider-parity.test.ts",
+    "test/integration/server/fresh-agent-parity.test.ts",
+    "test/integration/server/runtime-cargo-artifacts.test.ts"
+  ]
+}

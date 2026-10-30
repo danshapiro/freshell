@@ -1,12 +1,18 @@
 //! Freshell's opencode TUI rebind plugin: embedded source and idempotent
-//! install of TWO freshell-owned files into ~/.freshell/opencode/ — the
-//! plugin itself and a generated tui.json pointing at it. When the user has
-//! selected a TUI config, its settings and plugins are copied into that
-//! generated file before the rebind plugin is appended.
+//! install of Freshell-owned files into ~/.freshell/opencode/ — the plugin
+//! itself and generated TUI configs pointing at it. When the user has selected
+//! a TUI config, its settings and plugins are copied into a content-addressed
+//! config before the rebind plugin is appended. That keeps concurrent launches
+//! with different selections isolated.
 
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+use sha2::{Digest, Sha256};
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 /// The TUI plugin shipped with freshell (single source of truth lives in the
 /// repo at extensions/opencode/freshell-rebind-plugin.ts; embedded at compile
@@ -26,11 +32,23 @@ pub fn rebind_plugin_package_path(home: &Path) -> PathBuf {
     home.join(".freshell/opencode")
 }
 
-/// The freshell-owned TUI config injected per-pane via OPENCODE_TUI_CONFIG.
-/// Lives under ~/.freshell/opencode/ — deliberately NOT an ancestor of any
-/// pane cwd (opencode's project tui.json discovery walks up to `/`).
+/// Default Freshell-owned TUI config injected via OPENCODE_TUI_CONFIG when the
+/// user has not selected a TUI config. Lives under ~/.freshell/opencode/ —
+/// deliberately NOT an ancestor of any pane cwd (opencode's project tui.json
+/// discovery walks up to `/`).
 pub fn tui_config_path(home: &Path) -> PathBuf {
     home.join(".freshell").join("opencode").join("tui.json")
+}
+
+/// Stable per-content path for a generated selector that includes the user's
+/// selected TUI config. Different launch settings cannot overwrite each other,
+/// and a config edited while a previous OpenCode process is running gets a new
+/// path instead of changing underneath it.
+fn selected_tui_config_path(home: &Path, content: &str) -> PathBuf {
+    let digest = Sha256::digest(content.as_bytes());
+    home.join(".freshell")
+        .join("opencode")
+        .join(format!("tui-{:x}.json", digest))
 }
 
 /// File-URL *path* percent-encode set: byte-parity with `pathToFileURL` as
@@ -96,20 +114,36 @@ fn write_atomic_if_changed(path: &Path, content: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(content.as_bytes())?;
-        f.sync_all()?;
+    let (tmp, mut file) = loop {
+        let id = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), id));
+        match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(file) => break (tmp, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    let write_result = file
+        .write_all(content.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
     }
-    std::fs::rename(&tmp, path)
+    let rename_result = std::fs::rename(&tmp, path);
+    if rename_result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    rename_result
 }
 
-/// Idempotently materialize BOTH freshell-owned files into
-/// `~/.freshell/opencode/`: the plugin source and generated tui.json.
-/// Atomic (tmp + rename); rewrites only when content
-/// differs, so a running opencode never observes a torn file. Returns the
-/// tui.json path — the value cli_launch.rs injects as OPENCODE_TUI_CONFIG.
+/// Idempotently materialize the plugin source and generated TUI config into
+/// `~/.freshell/opencode/`. Without a selected user config, the generated path
+/// is `tui.json`; selected configs use a stable content-addressed path so
+/// launches with different settings stay isolated. Atomic (tmp + rename);
+/// rewrites only when content differs, so OpenCode never observes a torn file.
+/// Returns the path cli_launch.rs injects as OPENCODE_TUI_CONFIG.
 /// Bun caches failed imports for the process lifetime, so this MUST run
 /// (and succeed) before the TUI launches.
 pub fn ensure_rebind_plugin_installed(home: &Path) -> std::io::Result<PathBuf> {
@@ -118,19 +152,23 @@ pub fn ensure_rebind_plugin_installed(home: &Path) -> std::io::Result<PathBuf> {
 
 /// Materialize a TUI selector that includes Freshell's plugin and every key
 /// from the user's selected TUI config. The user file remains byte-for-byte
-/// unchanged; only the file under `.freshell/opencode` is regenerated.
+/// unchanged; generated selectors live under `.freshell/opencode`.
 pub fn ensure_rebind_plugin_with_user_config(
     home: &Path,
     selected: Option<&Path>,
 ) -> std::io::Result<PathBuf> {
     let plugin = rebind_plugin_path(home);
     write_atomic_if_changed(&plugin, REBIND_PLUGIN_SOURCE)?;
-    let tui_json = tui_config_path(home);
     let content = if let Some(selected) = selected {
         let raw = std::fs::read_to_string(selected)?;
         selected_tui_content(&raw, &plugin)?
     } else {
         tui_config_content(&plugin)
+    };
+    let tui_json = if selected.is_some() {
+        selected_tui_config_path(home, &content)
+    } else {
+        tui_config_path(home)
     };
     write_atomic_if_changed(&tui_json, &content)?;
     Ok(tui_json)
@@ -338,6 +376,54 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_install_calls_do_not_fail_or_leave_incomplete_files() {
+        use std::sync::{Arc, Barrier};
+
+        let home = tempfile::tempdir().unwrap();
+        let plugin = rebind_plugin_path(home.path());
+        let tui_json = tui_config_path(home.path());
+        let worker_count = 16;
+
+        for round in 0..12 {
+            if let Some(parent) = plugin.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&plugin, format!("stale plugin {round}")).unwrap();
+            std::fs::write(&tui_json, format!("stale tui config {round}")).unwrap();
+
+            let barrier = Arc::new(Barrier::new(worker_count));
+            let home_path = home.path();
+            std::thread::scope(|scope| {
+                let workers = (0..worker_count)
+                    .map(|_| {
+                        let barrier = barrier.clone();
+                        scope.spawn(move || {
+                            barrier.wait();
+                            ensure_rebind_plugin_installed(home_path)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+
+                for worker in workers {
+                    worker
+                        .join()
+                        .expect("install worker must not panic")
+                        .expect("concurrent install must not fail");
+                }
+            });
+
+            assert_eq!(
+                std::fs::read_to_string(&plugin).unwrap(),
+                REBIND_PLUGIN_SOURCE
+            );
+            assert_eq!(
+                std::fs::read_to_string(&tui_json).unwrap(),
+                tui_config_content(&plugin)
+            );
+        }
+    }
+
+    #[test]
     fn tui_config_content_is_exactly_the_plugin_key_and_nothing_else() {
         let content = tui_config_content(Path::new("/h/.freshell/opencode/p.ts"));
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -468,6 +554,128 @@ mod tests {
             assert_eq!(selected_tui_content(&content, plugin).unwrap(), content);
             assert!(selected_tui_content_bounded(raw, plugin, content.len() - 1).is_err());
             assert_eq!(selected_tui_content_bounded(raw, plugin, content.len()).unwrap(), content);
+        }
+    }
+
+    #[test]
+    fn different_selected_tui_configs_get_isolated_stable_paths() {
+        let home = tempfile::tempdir().unwrap();
+        let selected_a = home.path().join("project-a-tui.jsonc");
+        let selected_b = home.path().join("project-b-tui.jsonc");
+        std::fs::write(&selected_a, r#"{"theme":"dark","plugin":["file:///a.ts"]}"#).unwrap();
+        std::fs::write(
+            &selected_b,
+            r#"{"theme":"light","plugin":["file:///b.ts"]}"#,
+        )
+        .unwrap();
+
+        let generated_a =
+            ensure_rebind_plugin_with_user_config(home.path(), Some(&selected_a)).unwrap();
+        let content_a = std::fs::read_to_string(&generated_a).unwrap();
+        let generated_b =
+            ensure_rebind_plugin_with_user_config(home.path(), Some(&selected_b)).unwrap();
+
+        assert_ne!(generated_a, generated_b);
+        assert_eq!(std::fs::read_to_string(&generated_a).unwrap(), content_a);
+        let config_a: serde_json::Value = serde_json::from_str(&content_a).unwrap();
+        let config_b: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&generated_b).unwrap()).unwrap();
+        assert_eq!(config_a["theme"], "dark");
+        assert_eq!(config_a["plugin"][0], "file:///a.ts");
+        assert_eq!(config_b["theme"], "light");
+        assert_eq!(config_b["plugin"][0], "file:///b.ts");
+        assert_eq!(config_a["plugin"].as_array().unwrap().len(), 2);
+        assert_eq!(config_b["plugin"].as_array().unwrap().len(), 2);
+
+        let generated_a_again =
+            ensure_rebind_plugin_with_user_config(home.path(), Some(&selected_a)).unwrap();
+        assert_eq!(generated_a_again, generated_a);
+        assert_eq!(std::fs::read_to_string(&generated_a).unwrap(), content_a);
+        assert_eq!(
+            std::fs::read_to_string(&generated_b).unwrap(),
+            serde_json::to_string(&config_b).unwrap()
+        );
+    }
+
+    #[test]
+    fn concurrent_selected_tui_configs_keep_their_own_payloads() {
+        use std::sync::{Arc, Barrier};
+
+        let home = tempfile::tempdir().unwrap();
+        let selected_a = home.path().join("project-a-tui.jsonc");
+        let selected_b = home.path().join("project-b-tui.jsonc");
+        let rebind_plugin = plugin_file_spec(&rebind_plugin_path(home.path()));
+
+        // Give every round new content so both workers materialize fresh output
+        // files while racing through the same install helper.
+        for round in 0..16 {
+            let setting_a = format!("project-a-round-{round}");
+            let setting_b = format!("project-b-round-{round}");
+            let user_plugin_a = format!("file:///project-a-round-{round}.ts");
+            let user_plugin_b = format!("file:///project-b-round-{round}.ts");
+            std::fs::write(
+                &selected_a,
+                serde_json::json!({
+                    "theme": setting_a,
+                    "plugin": [user_plugin_a],
+                })
+                .to_string(),
+            )
+            .unwrap();
+            std::fs::write(
+                &selected_b,
+                serde_json::json!({
+                    "theme": setting_b,
+                    "plugin": [user_plugin_b],
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+            let barrier = Arc::new(Barrier::new(2));
+            let (generated_a, generated_b) = std::thread::scope(|scope| {
+                let barrier_a = barrier.clone();
+                let home_a = home.path();
+                let selected_a = &selected_a;
+                let worker_a = scope.spawn(move || {
+                    barrier_a.wait();
+                    ensure_rebind_plugin_with_user_config(home_a, Some(selected_a))
+                });
+
+                let barrier_b = barrier.clone();
+                let home_b = home.path();
+                let selected_b = &selected_b;
+                let worker_b = scope.spawn(move || {
+                    barrier_b.wait();
+                    ensure_rebind_plugin_with_user_config(home_b, Some(selected_b))
+                });
+
+                (
+                    worker_a.join().expect("project A worker must not panic"),
+                    worker_b.join().expect("project B worker must not panic"),
+                )
+            });
+            let generated_a = generated_a.expect("project A install must succeed");
+            let generated_b = generated_b.expect("project B install must succeed");
+
+            assert_ne!(generated_a, generated_b);
+            let config_a: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&generated_a).unwrap()).unwrap();
+            let config_b: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&generated_b).unwrap()).unwrap();
+
+            assert_eq!(config_a["theme"], setting_a);
+            assert_eq!(config_b["theme"], setting_b);
+            let plugins_a = config_a["plugin"].as_array().unwrap();
+            let plugins_b = config_b["plugin"].as_array().unwrap();
+            assert_eq!(plugins_a.len(), 2);
+            assert_eq!(plugins_b.len(), 2);
+            assert!(plugins_a.iter().any(|plugin| plugin == &user_plugin_a));
+            assert!(plugins_a.iter().any(|plugin| plugin == &rebind_plugin));
+            assert!(!plugins_a.iter().any(|plugin| plugin == &user_plugin_b));
+            assert!(plugins_b.iter().any(|plugin| plugin == &user_plugin_b));
+            assert!(plugins_b.iter().any(|plugin| plugin == &rebind_plugin));
+            assert!(!plugins_b.iter().any(|plugin| plugin == &user_plugin_a));
         }
     }
 

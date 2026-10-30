@@ -86,11 +86,12 @@ use crate::remote_proxy_envelope::{
 use crate::remote_proxy_side_effects::{
     extract_fork_response_candidate, extract_fs_changed_repair_trigger,
     extract_initialize_codex_home, extract_thread_lifecycle_event, extract_thread_name_set_request,
-    extract_thread_start_response_candidate, extract_thread_started_notification_side_effects,
-    extract_turn_notification_event, extract_upstream_thread_name_updated,
-    normalize_thread_fork_response_for_tui, rewrite_thread_fork_request_exclude_turns,
-    ForkResponseOptions, RemoteProxyCandidate, ThreadLifecycleEvent, ThreadStartResponseOptions,
-    ThreadStartedLifecycle, TurnEvent as SideEffectTurnEvent,
+    extract_thread_resume_response_candidate, extract_thread_start_response_candidate,
+    extract_thread_started_notification_side_effects, extract_turn_notification_event,
+    extract_upstream_thread_name_updated, normalize_thread_fork_response_for_tui,
+    rewrite_thread_fork_request_exclude_turns, ForkResponseOptions, RemoteProxyCandidate,
+    ThreadLifecycleEvent, ThreadStartResponseOptions, ThreadStartedLifecycle,
+    TurnEvent as SideEffectTurnEvent,
 };
 use crate::ws_config::ws_config_with_caps;
 
@@ -1573,8 +1574,8 @@ impl Hub {
                 None => (None, None),
             };
 
-            if method.as_deref() == Some("thread/start") {
-                self.handle_thread_start_response(conn_id, data, binary, req_id);
+            if let Some(method @ ("thread/start" | "thread/resume")) = method.as_deref() {
+                self.handle_thread_response(conn_id, data, binary, req_id, method);
                 return;
             }
             if method.as_deref() == Some("thread/fork") || fork_request.is_some() {
@@ -1687,13 +1688,26 @@ impl Hub {
         }
     }
 
-    fn handle_thread_start_response(
+    fn handle_thread_response(
         &mut self,
         conn_id: u64,
         data: Vec<u8>,
         binary: bool,
         req_id: Option<RequestId>,
+        method: &str,
     ) {
+        let extract_candidate = |raw: &[u8], pending: &HashSet<RequestId>| {
+            if method == "thread/resume" {
+                extract_thread_resume_response_candidate(raw, pending)
+            } else {
+                extract_thread_start_response_candidate(
+                    raw,
+                    &ThreadStartResponseOptions {
+                        pending_thread_start_request_ids: pending,
+                    },
+                )
+            }
+        };
         // Legacy parity (`handleThreadStartResponse`, `remote-proxy.ts:526-543`): a frame
         // small enough for a full parse is forwarded REGARDLESS — the candidate is emitted
         // only when the response actually carries a valid thread
@@ -1704,12 +1718,7 @@ impl Hub {
             if let Some(req_id) = req_id {
                 let mut pending = HashSet::new();
                 pending.insert(req_id);
-                if let Ok(candidate) = extract_thread_start_response_candidate(
-                    &data,
-                    &ThreadStartResponseOptions {
-                        pending_thread_start_request_ids: &pending,
-                    },
-                ) {
+                if let Ok(candidate) = extract_candidate(&data, &pending) {
                     self.emit(RemoteProxyEvent::Candidate(candidate));
                 }
             }
@@ -1718,31 +1727,23 @@ impl Hub {
         }
 
         let Some(req_id) = req_id else {
-            self.fail_unsafe_upstream_frame(
-                conn_id,
-                Some("thread/start"),
-                "id_not_pending_thread_start",
-            );
+            self.fail_unsafe_upstream_frame(conn_id, Some(method), "id_not_pending_thread_start");
             return;
         };
         let mut pending = HashSet::new();
         pending.insert(req_id);
-        match extract_thread_start_response_candidate(
-            &data,
-            &ThreadStartResponseOptions {
-                pending_thread_start_request_ids: &pending,
-            },
-        ) {
+        match extract_candidate(&data, &pending) {
             Ok(candidate) => {
                 self.emit(RemoteProxyEvent::Candidate(candidate));
                 self.send_to_client(conn_id, data, binary);
             }
+            Err(_) if method == "thread/resume" => {
+                // A resume error or absent/unsafe identity was always relayed.
+                // It supplies no candidate and cannot release host input.
+                self.send_to_client(conn_id, data, binary);
+            }
             Err(reason) => {
-                self.fail_unsafe_upstream_frame(
-                    conn_id,
-                    Some("thread/start"),
-                    &format!("{reason:?}"),
-                );
+                self.fail_unsafe_upstream_frame(conn_id, Some(method), &format!("{reason:?}"));
             }
         }
     }
@@ -1885,8 +1886,10 @@ impl Hub {
                 return None;
             }
             let turn_id = params
-                .get("turnId")
-                .and_then(|v| v.as_str())
+                .get("turn")
+                .and_then(|turn| turn.get("id"))
+                .and_then(Value::as_str)
+                .or_else(|| params.get("turnId").and_then(Value::as_str))
                 .map(str::to_string);
             let event = TurnEventParams {
                 thread_id,

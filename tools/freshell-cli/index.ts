@@ -459,6 +459,7 @@ async function main() {
       const editor = getFlag(flags, 'editor') as string | undefined
       const model = getFlag(flags, 'model') as string | undefined
       const effort = getFlag(flags, 'effort') as string | undefined
+      const permissionMode = getFlag(flags, 'permissionMode') as string | undefined
       const resumeSessionId = getFlag(flags, 'resume') as string | undefined
       const resumeProvider = mode ?? freshAgentResumeProvider(agent)
       const sessionRefResult = resolveSessionRefFlag(resumeProvider, getFlag(flags, 'session-ref'))
@@ -479,6 +480,7 @@ async function main() {
         agent,
         model,
         effort,
+        permissionMode,
         ...(isTruthy(getFlag(flags, 'hostStats')) ? { hostStats: true } : {}),
         ...(promoted.sessionRef ? { sessionRef: promoted.sessionRef } : {}),
       })
@@ -577,11 +579,12 @@ async function main() {
       const browser = getFlag(flags, 'browser') as string | undefined
       const editor = getFlag(flags, 'editor') as string | undefined
       const mode = getFlag(flags, 'mode') as string | undefined
-      const shell = getFlag(flags, 'shell') as string | undefined
-      const cwd = getFlag(flags, 'cwd') as string | undefined
       const agent = getFlag(flags, 'agent') as string | undefined
       const model = getFlag(flags, 'model') as string | undefined
       const effort = getFlag(flags, 'effort') as string | undefined
+      const permissionMode = getFlag(flags, 'permissionMode') as string | undefined
+      const shell = getFlag(flags, 'shell') as string | undefined
+      const cwd = getFlag(flags, 'cwd') as string | undefined
       const resumeSessionId = getFlag(flags, 'resume') as string | undefined
       const resumeProvider = mode ?? freshAgentResumeProvider(agent)
       const sessionRefResult = resolveSessionRefFlag(resumeProvider, getFlag(flags, 'session-ref'))
@@ -607,6 +610,7 @@ async function main() {
         agent,
         model,
         effort,
+        permissionMode,
         ...(isTruthy(getFlag(flags, 'hostStats')) ? { hostStats: true } : {}),
         ...(promoted.sessionRef ? { sessionRef: promoted.sessionRef } : {}),
       })

@@ -58,6 +58,25 @@ pub fn resolve_environment_profile(
     profile: EnvironmentProfile,
     raw: &str,
 ) -> Result<BTreeMap<String, String>, GrantError> {
+    resolve_environment_profile_with_native_auth(profile, raw, false)
+}
+
+/// Decode transport-only values only after the caller validates typed native auth.
+pub fn resolve_environment_profile_with_native_auth(
+    profile: EnvironmentProfile,
+    raw: &str,
+    native_auth: bool,
+) -> Result<BTreeMap<String, String>, GrantError> {
+    let parsed = parse_environment_values(profile, raw)?;
+    decode_profile(profile, &parsed, native_auth)
+        .map_err(|reason| error(profile, GrantOperation::Decode, reason))
+}
+
+/// Shared finite parser for typed native keys and ordinary environment grants.
+pub fn parse_environment_values(
+    profile: EnvironmentProfile,
+    raw: &str,
+) -> Result<BTreeMap<String, String>, GrantError> {
     if raw.len() > MAX_KEYS_BYTES as usize {
         return Err(error(
             profile,
@@ -65,7 +84,7 @@ pub fn resolve_environment_profile(
             "grant exceeds 128 KiB".into(),
         ));
     }
-    decode_profile(profile, raw).map_err(|reason| error(profile, GrantOperation::Decode, reason))
+    parse_keys_env(raw).map_err(|reason| error(profile, GrantOperation::Decode, reason))
 }
 
 /// Charge actual bytes, including source growth after metadata inspection.
@@ -94,16 +113,46 @@ pub fn read_environment_grant(
     path: &Path,
     profile: EnvironmentProfile,
 ) -> Result<BTreeMap<String, String>, GrantError> {
+    read_environment_grant_with_native_auth(path, profile, false)
+}
+
+/// Transport-only grants require a separately validated typed native authority.
+pub fn read_environment_grant_with_native_auth(
+    path: &Path,
+    profile: EnvironmentProfile,
+    native_auth: bool,
+) -> Result<BTreeMap<String, String>, GrantError> {
     let raw = read_private_grant(path, profile)?;
-    resolve_environment_profile(profile, &raw)
+    resolve_environment_profile_with_native_auth(profile, &raw, native_auth)
 }
 
 pub fn read_opencode_auth_environment(
     path: &Path,
     needed: &[String],
 ) -> Result<BTreeMap<String, String>, GrantError> {
+    Ok(read_opencode_auth_grant(path, needed)?.environment)
+}
+
+pub struct OpencodeAuthGrant {
+    pub environment: BTreeMap<String, String>,
+    pub valid_native_auth: bool,
+}
+
+/// Read one private grant generation for both source overlays and native auth.
+/// Well-known source overlays remain valid independently of API/OAuth authority.
+pub fn read_opencode_auth_grant(
+    path: &Path,
+    needed: &[String],
+) -> Result<OpencodeAuthGrant, GrantError> {
     let raw = read_private_grant(path, EnvironmentProfile::Opencode)?;
-    resolve_opencode_auth_environment(&raw, needed)
+    Ok(OpencodeAuthGrant {
+        environment: resolve_opencode_auth_environment(&raw, needed)?,
+        valid_native_auth: crate::provider_native_auth::validate_native_auth(
+            "opencode",
+            raw.as_bytes(),
+        )
+        .is_ok(),
+    })
 }
 
 fn read_private_grant(path: &Path, profile: EnvironmentProfile) -> Result<String, GrantError> {
@@ -138,6 +187,8 @@ const ALLOWED_NAMES: &[&str] = &[
     "GOOGLE_GENERATIVE_AI_API_KEY",
     "HTTP_PROXY",
     "HTTPS_PROXY",
+    "VLLM_API_KEY",
+    "VLLM_BASE_URL",
     "LUNAROUTE_API_KEY",
     "LUNAROUTE_BASE_URL",
     "NODE_EXTRA_CA_CERTS",
@@ -164,24 +215,28 @@ const CERTIFICATE_CHILD_NAMES: &[&str] = &[
 
 fn decode_profile(
     profile: EnvironmentProfile,
-    raw: &str,
+    parsed: &BTreeMap<String, String>,
+    native_auth: bool,
 ) -> Result<BTreeMap<String, String>, String> {
-    let parsed = parse_keys_env(raw)?;
     match profile {
         EnvironmentProfile::Claude => resolve_provider_environment(
-            &parsed,
+            parsed,
             &[
                 "ANTHROPIC_API_KEY",
                 "ANTHROPIC_BASE_URL",
                 "CLAUDE_CODE_OAUTH_TOKEN",
             ],
             false,
+            native_auth,
         ),
-        EnvironmentProfile::Codex => {
-            resolve_provider_environment(&parsed, &["OPENAI_API_KEY", "OPENAI_BASE_URL"], false)
-        }
+        EnvironmentProfile::Codex => resolve_provider_environment(
+            parsed,
+            &["OPENAI_API_KEY", "OPENAI_BASE_URL"],
+            false,
+            native_auth,
+        ),
         EnvironmentProfile::Opencode => resolve_provider_environment(
-            &parsed,
+            parsed,
             &[
                 "ANTHROPIC_API_KEY",
                 "ANTHROPIC_BASE_URL",
@@ -194,14 +249,17 @@ fn decode_profile(
                 "OPENCODE_API_KEY",
             ],
             true,
+            native_auth,
         ),
         EnvironmentProfile::Amplifier => resolve_provider_environment(
-            &parsed,
+            parsed,
             &[
                 "ANTHROPIC_API_KEY",
                 "ANTHROPIC_BASE_URL",
                 "OPENAI_API_KEY",
                 "OPENAI_BASE_URL",
+                "VLLM_API_KEY",
+                "VLLM_BASE_URL",
                 "LUNAROUTE_API_KEY",
                 "LUNAROUTE_BASE_URL",
                 "GLM_RUNPOD_API_KEY",
@@ -211,15 +269,16 @@ fn decode_profile(
                 "OPENROUTER_API_KEY",
             ],
             false,
+            native_auth,
         ),
         EnvironmentProfile::AmplifierLunarouteGlm53 => {
             // The approved proxy may replace a provider placeholder key, so
             // only non-emptiness is required here. The credentialed gateway
             // URL itself must never retain its operator placeholder.
-            let api_key = required(&parsed, "LUNAROUTE_API_KEY")?;
-            let upstream = required(&parsed, "LUNAROUTE_BASE_URL")?;
+            let api_key = required(parsed, "LUNAROUTE_API_KEY")?;
+            let upstream = required(parsed, "LUNAROUTE_BASE_URL")?;
             validate_https_upstream(upstream)?;
-            let gateway = required(&parsed, "ONECLI_GATEWAY")?;
+            let gateway = required(parsed, "ONECLI_GATEWAY")?;
             if gateway != "1" && !gateway.eq_ignore_ascii_case("enabled") {
                 return Err(
                     "Amplifier OneCLI profile requires ONECLI_GATEWAY to be enabled".into(),
@@ -261,6 +320,7 @@ fn resolve_provider_environment(
     parsed: &BTreeMap<String, String>,
     provider_names: &[&str],
     allow_opencode_proxy_settings: bool,
+    native_auth: bool,
 ) -> Result<BTreeMap<String, String>, String> {
     let mut child = BTreeMap::new();
     for (name, value) in parsed {
@@ -295,9 +355,10 @@ fn resolve_provider_environment(
         }
     }
     if child.is_empty()
-        || !child
-            .keys()
-            .any(|name| provider_names.contains(&name.as_str()))
+        || (!native_auth
+            && !child
+                .keys()
+                .any(|name| provider_names.contains(&name.as_str())))
     {
         return Err("OneCLI environment profile has no provider values".into());
     }

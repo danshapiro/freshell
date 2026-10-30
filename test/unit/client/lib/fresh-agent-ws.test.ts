@@ -4,7 +4,7 @@ import freshAgentReducer, { materializeSession, sessionCreated } from '@/store/f
 import freshAgentLiveReducer, { liveTailViewerAdded } from '@/store/freshAgentLiveSlice'
 import { LIVE_STREAM_FLUSH_MS } from '@/lib/fresh-agent-stream-batcher'
 import panesReducer, { initLayout, materializeFreshAgentSession, type PanesState } from '@/store/panesSlice'
-import turnCompletionReducer, { markPaneAttention, markTabAttention } from '@/store/turnCompletionSlice'
+import turnCompletionReducer, { markPaneAttention, markTabAttention, resetCompletionDedupeBaselines } from '@/store/turnCompletionSlice'
 import {
   foldReadyRuntimeOwners,
   foldSessionRuntimeOwnerFrame,
@@ -50,6 +50,7 @@ function createFreshAgentPaneStore(seenActionTypes: string[] = []) {
     reducer: {
       freshAgent: freshAgentReducer,
       panes: panesReducer,
+      turnCompletion: turnCompletionReducer,
     },
     preloadedState: {
       panes: emptyPanesState(),
@@ -636,6 +637,38 @@ describe('fresh-agent-ws', () => {
     })
   })
 
+  it('rebuilds managed state without attention and accepts current edges after a server restart', () => {
+    const store = createFreshAgentPaneStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-restored', paneId: 'pane-restored',
+      content: {
+        kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex',
+        sessionId: 'native-child', createRequestId: 'restored', status: 'running',
+      },
+    }))
+    store.dispatch(resetCompletionDedupeBaselines())
+    const receive = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event', provider: 'codex', sessionType: 'freshcodex',
+      sessionId: 'native-child', event: { sessionId: 'native-child', ...event },
+    })
+    // The managed proxy replays state while withholding old attention edges.
+    expect(receive({ type: 'freshAgent.session.snapshot', latestTurnId: 'restored-turn', status: 'waiting', revision: 1 })).toBe(true)
+    expect(receive({ type: 'freshAgent.status', status: 'waiting' })).toBe(true)
+    expect(receive({ type: 'freshAgent.session.changed' })).toBe(true)
+    expect(receive({ type: 'freshAgent.permission.request', requestId: 'pending-tool', tool: { name: 'exec_command', input: { cmd: 'pwd' } } })).toBe(true)
+    expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
+    const restored = store.getState().freshAgent.sessions['freshcodex:codex:native-child']
+    expect(restored.status).toBe('waiting')
+    expect(restored.latestTurnId).toBe('restored-turn')
+    expect(restored.pendingPermissions['pending-tool']).toMatchObject({ toolName: 'exec_command', input: { cmd: 'pwd' } })
+    expect(receive({ type: 'freshAgent.turn.complete', at: 43, outcome: 'completed' })).toBe(true)
+    expect(receive({ type: 'freshAgent.turn.waiting', at: 44 })).toBe(true)
+    expect(store.getState().turnCompletion.pendingEvents).toMatchObject([
+      { terminalId: 'codex:native-child', at: 43, outcome: 'completed' },
+      { terminalId: 'codex:native-child#waiting', at: 44 },
+    ])
+  })
+
   it('folds freshAgent.status(stuck) with no attention action; a companion turn.complete edge folds attention independently', () => {
     // Wedged-sidecar deadman fold: the STATUS frame itself dispatches no
     // attention — it must land (and stop the busy-driving streaming flag)
@@ -706,12 +739,13 @@ describe('fresh-agent-ws', () => {
       sessionId,
       sessionType: 'freshcodex',
       provider: 'codex',
-      event: { type: 'freshAgent.turn.complete', sessionId, at: 1_700_000_000_000 },
+      event: { type: 'freshAgent.turn.complete', sessionId, at: 1_700_000_000_000, outcome: 'failed' },
     })).toBe(true)
     expect(actionTypes.filter((type) => type === 'turnCompletion/recordTurnComplete')).toHaveLength(1)
     expect(actionTypes.filter((type) => type.startsWith('turnCompletion/') && type !== 'turnCompletion/advanceCompletionBaseline')).toEqual([
       'turnCompletion/recordTurnComplete',
     ])
+    expect(store.getState().turnCompletion.pendingEvents[0]).toMatchObject({ outcome: 'failed' })
     // The status fold itself stays untouched by the companion: still 'stuck',
     // still not streaming.
     const after = store.getState().freshAgent.sessions[`freshcodex:codex:${sessionId}`]

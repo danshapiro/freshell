@@ -50,7 +50,7 @@ pub(crate) fn provider_launch_context_from_home(
     provider_launch_context_from_home_at(provider, workspace, workspace, home, mcp_capability)
 }
 
-fn provider_launch_context_from_home_at(
+pub(crate) fn provider_launch_context_from_home_at(
     provider: &str,
     workspace: &Path,
     project_dir: &Path,
@@ -78,7 +78,26 @@ pub(crate) fn provider_launch_context_from_home_at_with_xdg(
     xdg_config_home: Option<&Path>,
     mcp_capability: Option<McpCapabilityReference>,
 ) -> Result<Option<ProviderLaunchContext>, String> {
-    let mcp_enabled = mcp_capability.is_some();
+    provider_launch_context_from_home_at_with_selected_roots(
+        provider,
+        workspace,
+        project_dir,
+        home,
+        xdg_config_home,
+        mcp_capability,
+        &[],
+    )
+}
+
+pub(crate) fn provider_launch_context_from_home_at_with_selected_roots(
+    provider: &str,
+    workspace: &Path,
+    project_dir: &Path,
+    home: &Path,
+    xdg_config_home: Option<&Path>,
+    mcp_capability: Option<McpCapabilityReference>,
+    selected_roots: &[freshell_platform::opencode_recipe::DiscoveryRoot],
+) -> Result<Option<ProviderLaunchContext>, String> {
     let (root, entries, preparation) = match provider {
         "claude" => (
             ".claude",
@@ -93,27 +112,15 @@ pub(crate) fn provider_launch_context_from_home_at_with_xdg(
                 "agents",
             ][..],
             ProviderPreparation::Claude {
-                mcp_args: if mcp_enabled {
-                    vec!["--mcp-config".into(), ".claude/freshell-mcp.json".into()]
-                } else {
-                    Vec::new()
-                },
+                mcp_args: Vec::new(),
             },
         ),
         "codex" => (
             ".codex",
             &["config.toml", "AGENTS.md", "skills", "rules"][..],
             ProviderPreparation::Codex {
-                tui_args: if mcp_enabled {
-                    managed_codex_mcp_args().ok_or("managed Codex MCP preparation unavailable")?
-                } else {
-                    Vec::new()
-                },
-                sidecar_args: if mcp_enabled {
-                    managed_codex_mcp_args().ok_or("managed Codex MCP preparation unavailable")?
-                } else {
-                    Vec::new()
-                },
+                tui_args: Vec::new(),
+                sidecar_args: Vec::new(),
             },
         ),
         "opencode" => (
@@ -168,13 +175,45 @@ pub(crate) fn provider_launch_context_from_home_at_with_xdg(
                     .to_str()
                     .ok_or("managed config path is not UTF-8")?
                     .replace(std::path::MAIN_SEPARATOR, "/");
-                if !optional_resource_exists(&workspace.join(&relative_path))? {
+                if !optional_resource_exists(
+                    &workspace.join(&relative_path),
+                    &relative_path,
+                    "workspace",
+                )? {
                     continue;
                 }
-                let source = approved_config_path(workspace, &relative_path)?;
+                let source = approved_config_path(workspace, &relative_path, "workspace")?;
+                let mounted_workspace = std::fs::canonicalize(workspace)
+                    .map_err(|_| "mounted managed workspace is unavailable")?;
+                let selected_workspace_root = selected_roots.iter().any(|root| {
+                    root.role == freshell_platform::opencode_recipe::DiscoveryRole::Workspace
+                        && root.logical_path.starts_with(workspace)
+                        && workspace
+                            .join(&relative_path)
+                            .starts_with(&root.logical_path)
+                        && std::fs::canonicalize(&root.logical_path)
+                            .ok()
+                            .is_some_and(|canonical| {
+                                canonical.is_dir()
+                                    && canonical != Path::new("/")
+                                    && canonical != home
+                                    && source.starts_with(canonical)
+                            })
+                });
+                if !source.starts_with(&mounted_workspace) && !selected_workspace_root {
+                    return Err(discovery_refusal(
+                        "workspace",
+                        &relative_path,
+                        "outside_workspace",
+                        "repair the link inside the mounted workspace and retry",
+                    ));
+                }
                 if !source.is_file() {
-                    return Err(format!(
-                        "selected project configuration {relative_path} is not a regular file"
+                    return Err(discovery_refusal(
+                        "workspace",
+                        &relative_path,
+                        "not_regular_file",
+                        "select a regular configuration file and retry",
                     ));
                 }
                 project_config.push(ProviderConfigReference {
@@ -210,12 +249,17 @@ pub(crate) fn provider_launch_context_from_home_at_with_xdg(
         .iter()
         .map(|entry| (*entry).to_owned())
         .collect::<std::collections::BTreeSet<_>>();
-    if optional_resource_exists(&provider_root)? {
-        for item in std::fs::read_dir(&provider_root)
-            .map_err(|error| format!("inspect provider root: {:?}", error.kind()))?
-        {
-            let item =
-                item.map_err(|error| format!("inspect provider entry: {:?}", error.kind()))?;
+    if optional_resource_exists(&provider_root, ".", "user_provider")? {
+        let root_enumeration_error = |error: std::io::Error| {
+            discovery_refusal(
+                "user_provider",
+                ".",
+                &format!("{:?}", error.kind()),
+                "repair the provider root directory, its link, or permissions and retry",
+            )
+        };
+        for item in std::fs::read_dir(&provider_root).map_err(root_enumeration_error)? {
+            let item = item.map_err(root_enumeration_error)?;
             let name = item
                 .file_name()
                 .into_string()
@@ -242,10 +286,10 @@ pub(crate) fn provider_launch_context_from_home_at_with_xdg(
     }
     let mut config = Vec::new();
     for entry in selected {
-        if !optional_resource_exists(&provider_root.join(&entry))? {
+        if !optional_resource_exists(&provider_root.join(&entry), &entry, "user_provider")? {
             continue;
         }
-        let path = approved_config_path(&provider_root, &entry)?;
+        let path = approved_config_path(&provider_root, &entry, "user_provider")?;
         let format = if path.is_dir() {
             "directory"
         } else if path.is_file() {
@@ -257,8 +301,11 @@ pub(crate) fn provider_launch_context_from_home_at_with_xdg(
                 _ => "text",
             }
         } else {
-            return Err(format!(
-                "selected provider resource {entry} is an unsupported filesystem node"
+            return Err(discovery_refusal(
+                "user_provider",
+                &entry,
+                "unsupported_node",
+                "select a regular file or directory and retry",
             ));
         };
         config.push(ProviderConfigReference {
@@ -268,8 +315,10 @@ pub(crate) fn provider_launch_context_from_home_at_with_xdg(
             format: format.into(),
         });
     }
-    if provider == "codex" && optional_resource_exists(&home.join(".agents/skills"))? {
-        approved_config_path(home, ".agents/skills")?;
+    if provider == "codex"
+        && optional_resource_exists(&home.join(".agents/skills"), ".agents/skills", "user_home")?
+    {
+        approved_config_path(home, ".agents/skills", "user_home")?;
         config.push(ProviderConfigReference {
             root: ProviderConfigRoot::UserProvider,
             relative_path: "freshell-discovered-agents".into(),
@@ -291,12 +340,39 @@ pub(crate) fn provider_launch_context_from_home_at_with_xdg(
                 .into(),
         );
     }
-    Ok(Some(ProviderLaunchContext {
+    let context = ProviderLaunchContext {
         prepared_inputs: None,
         preparation,
-        mcp_capability,
+        mcp_capability: None,
         config,
+    };
+    Ok(Some(match mcp_capability {
+        Some(reference) => with_managed_mcp_reference(context, reference)?,
+        None => context,
     }))
+}
+
+pub(crate) fn with_managed_mcp_reference(
+    mut context: ProviderLaunchContext,
+    reference: McpCapabilityReference,
+) -> Result<ProviderLaunchContext, String> {
+    match &mut context.preparation {
+        ProviderPreparation::Claude { mcp_args } => {
+            *mcp_args = vec!["--mcp-config".into(), ".claude/freshell-mcp.json".into()]
+        }
+        ProviderPreparation::Codex {
+            tui_args,
+            sidecar_args,
+        } => {
+            let args =
+                managed_codex_mcp_args().ok_or("managed Codex MCP preparation unavailable")?;
+            *tui_args = args.clone();
+            *sidecar_args = args;
+        }
+        ProviderPreparation::Opencode { .. } | ProviderPreparation::Amplifier { .. } => {}
+    }
+    context.mcp_capability = Some(reference);
+    Ok(context)
 }
 
 struct ManagedImageMcpRuntime;
@@ -335,18 +411,46 @@ pub(crate) fn managed_codex_mcp_args() -> Option<Vec<String>> {
     Some(renderings.tui.args)
 }
 
+fn discovery_refusal(
+    resource_root: &str,
+    relative_path: &str,
+    cause: &str,
+    corrective_message: &str,
+) -> String {
+    // These fields come only from selectors and filesystem classifications:
+    // never file contents, resolved link targets, or provider error payloads.
+    tracing::warn!(
+        event = "provider.environment.discovery.failed",
+        resource_root,
+        relative_path,
+        cause,
+        corrective_message,
+    );
+    format!("selected provider resource {relative_path}: {cause}; {corrective_message}")
+}
+
 /// Absence is optional only before a provider root/resource is selected.
-fn optional_resource_exists(path: &Path) -> Result<bool, String> {
+fn optional_resource_exists(
+    path: &Path,
+    relative: &str,
+    resource_root: &str,
+) -> Result<bool, String> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(format!(
-            "inspect selected provider resource: {:?}; repair permissions and retry",
-            error.kind()
+        Err(error) => Err(discovery_refusal(
+            resource_root,
+            relative,
+            &format!("{:?}", error.kind()),
+            "repair permissions and retry",
         )),
     }
 }
-fn approved_config_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
+fn approved_config_path(
+    root: &Path,
+    relative: &str,
+    resource_root: &str,
+) -> Result<PathBuf, String> {
     if relative.is_empty()
         || Path::new(relative)
             .components()
@@ -354,7 +458,14 @@ fn approved_config_path(root: &Path, relative: &str) -> Result<PathBuf, String> 
     {
         return Err("managed provider resource selector is unsafe".into());
     }
-    std::fs::canonicalize(root.join(relative)).map_err(|error| format!("resolve selected provider resource {relative}: {:?}; repair the selected resource or link and retry",error.kind()))
+    std::fs::canonicalize(root.join(relative)).map_err(|error| {
+        discovery_refusal(
+            resource_root,
+            relative,
+            &format!("{:?}", error.kind()),
+            "repair the selected resource or link and retry",
+        )
+    })
 }
 
 pub fn named_provider_onecli_references(
@@ -366,13 +477,13 @@ pub fn named_provider_onecli_references(
             "CLAUDE",
             ProviderSecretProfile::ClaudeOnecliEnvironment,
             ProviderSecretProfile::ClaudeOnecliAuthFile,
-            None,
+            Some(ProviderSecretProfile::ClaudeOnecliCaFile),
         ),
         "codex" => (
             "CODEX",
             ProviderSecretProfile::CodexOnecliEnvironment,
             ProviderSecretProfile::CodexOnecliAuthFile,
-            None,
+            Some(ProviderSecretProfile::CodexOnecliCaFile),
         ),
         "opencode" => (
             "OPENCODE",
@@ -384,7 +495,7 @@ pub fn named_provider_onecli_references(
             "AMPLIFIER",
             ProviderSecretProfile::AmplifierOnecliEnvironment,
             ProviderSecretProfile::AmplifierOnecliKeysFile,
-            None,
+            Some(ProviderSecretProfile::AmplifierOnecliCaFile),
         ),
         _ => return Ok(Vec::new()),
     };
@@ -424,6 +535,40 @@ pub fn named_provider_onecli_references(
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn named_provider_ca_references_resolve_exact_private_files_for_native_transports() {
+        let mut env = crate::test_env_lock::TestEnv::lock_blocking();
+        let root = tempfile::tempdir().unwrap();
+        let ca = root.path().join("gateway-ca.pem");
+        fs::write(&ca, "fixture-ca").unwrap();
+        fs::set_permissions(&ca, fs::Permissions::from_mode(0o600)).unwrap();
+        let names = [
+            "FRESHELL_MANAGED_CLAUDE_ONECLI_CA_FILE",
+            "FRESHELL_MANAGED_CODEX_ONECLI_CA_FILE",
+            "FRESHELL_MANAGED_AMPLIFIER_ONECLI_CA_FILE",
+        ];
+        for (name, provider) in names.into_iter().zip(["claude", "codex", "amplifier"]) {
+            env.set(name, &ca);
+            let references = named_provider_onecli_references(provider).unwrap();
+            let matching = references
+                .iter()
+                .filter(|reference| reference.source_path == ca.to_string_lossy())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matching.len(),
+                1,
+                "{provider} needs a narrowly typed CA mount"
+            );
+            assert_eq!(
+                matching[0].profile.provider_file_relative_path(),
+                Some(".config/onecli/gateway-ca.pem")
+            );
+            fs::set_permissions(&ca, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(named_provider_onecli_references(provider).is_err());
+            fs::set_permissions(&ca, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
 
     #[test]
     fn named_opencode_onecli_references_include_private_environment_auth_and_ca_files() {
@@ -790,13 +935,15 @@ mod tests {
     }
 
     #[test]
-    fn opencode_context_retains_selected_external_and_in_root_links() {
+    fn opencode_context_accepts_in_root_links_and_refuses_unmounted_project_links() {
         use std::os::unix::fs::symlink;
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().join("workspace");
         let outside = root.path().join("outside");
+        let home = root.path().join("home");
         fs::create_dir_all(workspace.join("inside")).unwrap();
         fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(&home).unwrap();
         fs::write(workspace.join("inside/opencode.json"), "{}").unwrap();
         fs::write(outside.join("opencode.json"), "{}").unwrap();
         symlink(
@@ -804,16 +951,72 @@ mod tests {
             workspace.join("opencode.json"),
         )
         .unwrap();
-        symlink(&outside, workspace.join(".opencode")).unwrap();
-        let context = provider_launch_context("opencode", &workspace).unwrap();
+        let context = provider_launch_context_from_home_at_with_xdg(
+            "opencode", &workspace, &workspace, &home, None, None,
+        )
+        .unwrap()
+        .unwrap();
         let ProviderPreparation::Opencode { project_config, .. } = context.preparation else {
-            panic!("expected OpenCode preparation");
+            panic!("OpenCode preparation");
         };
         assert!(project_config
             .iter()
             .any(|entry| entry.relative_path == "opencode.json"));
-        assert!(project_config
-            .iter()
-            .any(|entry| entry.relative_path == ".opencode/opencode.json"));
+        symlink(&outside, workspace.join(".opencode")).unwrap();
+        assert!(provider_launch_context_from_home_at_with_xdg(
+            "opencode", &workspace, &workspace, &home, None, None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn opencode_project_alias_requires_its_selected_workspace_resource_mount() {
+        use freshell_platform::opencode_recipe::{DiscoveryRole, DiscoveryRoot};
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let shared = root.path().join("shared");
+        let home = root.path().join("home");
+        for directory in [&workspace, &shared, &home] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        fs::write(shared.join("opencode.json"), "{}").unwrap();
+        symlink(&shared, workspace.join(".opencode")).unwrap();
+        symlink(&shared, home.join(".opencode")).unwrap();
+        let selected = DiscoveryRoot {
+            logical_path: workspace.join(".opencode"),
+            role: DiscoveryRole::Workspace,
+        };
+        let prepare = |roots: &[DiscoveryRoot]| {
+            provider_launch_context_from_home_at_with_selected_roots(
+                "opencode", &workspace, &workspace, &home, None, None, roots,
+            )
+        };
+        let context = prepare(std::slice::from_ref(&selected)).unwrap().unwrap();
+        let ProviderPreparation::Opencode { project_config, .. } = context.preparation else {
+            panic!("OpenCode preparation");
+        };
+        assert_eq!(project_config.len(), 1);
+        assert_eq!(project_config[0].relative_path, ".opencode/opencode.json");
+        assert!(
+            prepare(&[]).is_err(),
+            "an accepted empty selection cannot rediscover a mount"
+        );
+        assert!(
+            prepare(&[DiscoveryRoot {
+                logical_path: home.join(".opencode"),
+                role: DiscoveryRole::Home
+            }])
+            .is_err(),
+            "HOME alone does not mount the workspace target"
+        );
+        let outside = root.path().join("outside.json");
+        fs::write(&outside, "{}").unwrap();
+        fs::remove_file(shared.join("opencode.json")).unwrap();
+        symlink(outside, shared.join("opencode.json")).unwrap();
+        assert!(
+            prepare(&[selected]).is_err(),
+            "a file escaping the selected directory is not mounted"
+        );
     }
 }

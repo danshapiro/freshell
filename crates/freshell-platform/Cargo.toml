@@ -11,6 +11,7 @@ publish.workspace = true
 # will add deps when implemented in a later sub-step.
 [dependencies]
 percent-encoding = "2"
+sha2 = "0.10"
 serde_json = { workspace = true }
 serde = { workspace = true }
 url = "2"

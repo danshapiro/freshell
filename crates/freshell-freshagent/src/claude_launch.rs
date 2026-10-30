@@ -173,6 +173,10 @@ pub(crate) struct ClaudeLaunchSpec {
     /// The pane the session runs for (G19): a create's or an attach's pane, or
     /// the replaced or forked session's.
     pub(crate) freshell_context: Option<ClaudeFreshellContext>,
+    /// Managed host's per-operation producer binding and verified native fork.
+    /// Absent on ordinary SDK launches; the public boot protocol stays the same.
+    pub(crate) native_identity_transition: Option<Value>,
+    pub(crate) native_fork_recipe: Option<freshell_agent_runtime::ClaudeForkRecipe>,
 }
 
 impl ClaudeLaunchSpec {
@@ -202,6 +206,8 @@ impl ClaudeLaunchSpec {
             session_id: None,
             freshell_mcp: None,
             freshell_context: None,
+            native_identity_transition: None,
+            native_fork_recipe: None,
         }
     }
 
@@ -220,6 +226,19 @@ impl ClaudeLaunchSpec {
     /// This launch carrying the client's `modelSelection` (a create's).
     pub(crate) fn with_model_selection(mut self, model_selection: Option<Value>) -> Self {
         self.model_selection = model_selection.filter(|selection| !selection.is_null());
+        self
+    }
+
+    pub(crate) fn with_native_identity_transition(mut self, transition: Option<Value>) -> Self {
+        self.native_identity_transition = transition;
+        self
+    }
+
+    pub(crate) fn with_native_fork_recipe(
+        mut self,
+        recipe: Option<freshell_agent_runtime::ClaudeForkRecipe>,
+    ) -> Self {
+        self.native_fork_recipe = recipe;
         self
     }
 
@@ -246,6 +265,12 @@ impl ClaudeLaunchSpec {
         line.insert("freshellContext".into(), json!(self.freshell_context));
         if let Some(selection) = &self.model_selection {
             line.insert("modelSelection".into(), selection.clone());
+        }
+        if let Some(transition) = &self.native_identity_transition {
+            line.insert("nativeIdentityTransition".into(), transition.clone());
+        }
+        if let Some(recipe) = &self.native_fork_recipe {
+            line.insert("nativeForkRecipe".into(), json!(recipe));
         }
         Value::Object(line)
     }

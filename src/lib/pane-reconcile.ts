@@ -146,6 +146,10 @@ function effectiveReconcileSessionRef(
 }
 
 function toReconcilePane(tabId: string, paneId: string, content: TerminalPaneContent): ReconcilePane | null {
+  // The supervisor owns this pane even while stopped or unavailable. Its
+  // provider store is private to the runtime; the web disk index cannot
+  // adjudicate it. The managed inventory refresh reconciles its saved view.
+  if (content.soulId) return null
   // Panes without a createRequestId cannot be reconciled — skip.
   if (!content.createRequestId) return null
   // A failed managed preparation never registered a backend terminal. Its
@@ -183,6 +187,8 @@ function toFreshAgentReconcilePane(
   paneId: string,
   content: FreshAgentPaneContent,
 ): ReconcilePane | null {
+  // Managed fresh-agent panes have the same supervisor-owned recovery path.
+  if (content.soulId) return null
   // Panes without a createRequestId cannot be reconciled — skip.
   if (!content.createRequestId) return null
   const sessionRef = effectiveReconcileSessionRef(content.sessionRef, content.resumeSessionId, content.provider)
@@ -217,8 +223,8 @@ function buildRequestFromPanes(panes: ReconcilePane[]): PaneReconcileRequest | n
 }
 
 /**
- * Build a reconcile request covering every terminal pane in the store —
- * plus every fresh-agent pane when `includeFreshAgent` is set (capability
+ * Build a legacy reconcile request covering unmanaged terminal panes —
+ * plus unmanaged fresh-agent panes when `includeFreshAgent` is set (capability
  * gated by the caller) — or null if there are none.
  */
 export function buildReconcileRequest(
@@ -241,8 +247,8 @@ export function buildReconcileRequest(
 
 /**
  * Build a reconcile request for specific panes only (e.g. a single exhausted
- * pane), or null if none resolve. Kind-agnostic: each target folds by its
- * own content kind (terminal or fresh-agent).
+ * pane), or null if none resolve to unmanaged panes. Kind-agnostic: each
+ * target folds by its own content kind (terminal or fresh-agent).
  */
 export function buildReconcileRequestForPanes(
   state: RootState,

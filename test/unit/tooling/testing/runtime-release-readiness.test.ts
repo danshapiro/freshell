@@ -4,9 +4,14 @@ import { describe, expect, it } from 'vitest'
 
 import {
   capabilityClaimViolations,
+  certifiedDurableProviders,
+  deferredProviders,
+  classifyProviderCertificationCase,
   DEFERRED_CASE_STATUS,
   loadCapabilityManifest,
   PENDING_LIVE_PROVIDER_CERTIFICATION,
+  productionCertificationStatus,
+  providerCertificationCaseId,
   resolveGateOutcome,
   type GateOutcomeInput,
 } from '../../../../scripts/testing/provider-certification.js'
@@ -115,8 +120,8 @@ describe('release qualification cannot pass by omission', () => {
 describe('release-scope audit covers the advertised provider set', () => {
   it('rejects an uncertified provider named only in the managed release scope', () => {
     const manifest = loadCapabilityManifest(repoRoot)
-    manifest.releaseScope!.managedTerminalProviders!.push('claude')
-    expect(capabilityClaimViolations(manifest).join(' ')).toMatch(/releaseScope.*claude|claude.*releaseScope/)
+    manifest.releaseScope!.managedTerminalProviders!.push('kimi')
+    expect(capabilityClaimViolations(manifest).join(' ')).toMatch(/releaseScope.*kimi|kimi.*releaseScope/)
   })
 
   it('rejects an unknown provider at a managed doorway', () => {
@@ -139,10 +144,50 @@ describe('release-scope audit covers the advertised provider set', () => {
     expect(capabilityClaimViolations(manifest).join(' ')).toMatch(/requiredCertifiedProviders/)
   })
 
-  it('rejects removing a claimed or pending provider from production requirements', () => {
+  it.each(['shell', 'opencode'])('rejects removing advertised managed provider %s from production requirements', (provider) => {
     const manifest = loadCapabilityManifest(repoRoot)
-    manifest.certification.productionGate.requiredCertifiedProviders = ['shell', 'opencode']
-    expect(capabilityClaimViolations(manifest).join(' ')).toContain('claude')
+    expect(capabilityClaimViolations(manifest)).toEqual([])
+    manifest.certification.productionGate.requiredCertifiedProviders =
+      manifest.certification.productionGate.requiredCertifiedProviders.filter((required) => required !== provider)
+    expect(capabilityClaimViolations(manifest)).toContain(`requiredCertifiedProviders omits managed provider ${provider}`)
+  })
+
+  it.each(['claude', 'codex', 'amplifier'])('allows disabled pending provider %s to remain omitted without claiming release or PASS', (provider) => {
+    const manifest = loadCapabilityManifest(repoRoot)
+    const pending = manifest.providers.find(row => row.provider === provider)!
+    Object.assign(pending, { certificationState: PENDING_LIVE_PROVIDER_CERTIFICATION,
+      managedEnabled: false, durableRecoveryEnabled: false, blockedReason: 'PENDING_LIVE_QUALIFICATION' })
+    manifest.certification.deferredProviders = deferredProviders(manifest)
+    manifest.certification.landingGate.deferrableProviders = deferredProviders(manifest)
+    manifest.certification.certifiedDurableProviders = certifiedDurableProviders(manifest)
+    manifest.releaseScope!.managedTerminalProviders = manifest.releaseScope!.managedTerminalProviders!
+      .filter(name => name !== provider)
+    for (const row of manifest.freshAgentModes) if (row.provider === provider) {
+      Object.assign(row, { enabledInReleaseScope: false, certified: false,
+        liveQualificationStatus: 'pending_authentic_receipt', releaseDeferralReason: PENDING_LIVE_PROVIDER_CERTIFICATION })
+      Object.assign(manifest.doorways.find(doorway => doorway.id === `rest-${row.mode}-create`)!,
+        { policy: 'blocked', enabledInReleaseScope: false })
+    }
+    manifest.releaseScope!.disabledFreshAgentModes = manifest.freshAgentModes
+      .filter(row => !row.enabledInReleaseScope).map(row => row.mode)
+    for (const doorway of manifest.doorways) if (doorway.policy === 'managed') {
+      doorway.providers = doorway.providers.filter(name => name !== provider)
+    }
+    manifest.certification.productionGate.requiredCertifiedProviders = manifest.providers
+      .filter(row => row.managedEnabled).map(row => row.provider)
+    expect(capabilityClaimViolations(manifest)).toEqual([])
+    expect(productionCertificationStatus(manifest).status).toBe('ELIGIBLE')
+    const row = manifest.providers.find((candidate) => candidate.provider === provider)!
+    const classification = classifyProviderCertificationCase('production', row)
+    expect(classification).toEqual({ status: 'BLOCKED', reason: PENDING_LIVE_PROVIDER_CERTIFICATION })
+    expect(outcome({ mode: 'production', caseResults: [{
+      caseId: providerCertificationCaseId(provider), provider,
+      status: classification.status, reason: classification.reason!,
+    }] })).toMatchObject({ status: 'BLOCKED', exitCode: 2 })
+    manifest.releaseScope!.managedTerminalProviders!.push(provider)
+    expect(capabilityClaimViolations(manifest)).toContain(
+      `releaseScope.managedTerminalProviders includes unknown or uncertified provider ${provider}`,
+    )
   })
 
   it('rejects unknown or duplicate required providers', () => {

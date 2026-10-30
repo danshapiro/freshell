@@ -94,6 +94,37 @@ pub fn next_monotonic_turn_complete_at(last_at: Option<i64>, now: i64) -> i64 {
     }
 }
 
+/// Normalized provider result carried beside the turn-ended attention edge.
+/// The edge fires for failed and unknown turns too, so consumers that need to
+/// prove a successful response must inspect this value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodexTurnOutcome {
+    Completed,
+    Failed,
+    Interrupted,
+    Unknown,
+}
+
+impl CodexTurnOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn from_status(status: Option<&str>) -> Self {
+        match status {
+            Some("completed") => Self::Completed,
+            Some("failed") => Self::Failed,
+            Some("interrupted") => Self::Interrupted,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 /// The adapter-level events a codex subscription emits downstream (the `sdk.*` provider
 /// events, `adapter.ts:876-946`), normalized to the fields the runtime/oracle care about.
 #[derive(Clone, Debug, PartialEq)]
@@ -105,11 +136,16 @@ pub enum CodexAdapterEvent {
         status: CodexStatus,
         revision: Option<f64>,
     },
-    /// `sdk.turn.complete { at }` — the UNIFIED "needs attention" edge, emitted for
+    /// `sdk.turn.complete { at, outcome }` — the UNIFIED "needs attention" edge, emitted for
     /// every turn END except a USER-initiated interrupt (the marker-armed
     /// `interrupted` the interrupt lane owns) and the non-terminal `inProgress`.
-    /// This is the T2 `provider.emits-completion-signal` edge.
-    TurnComplete { session_id: String, at: i64 },
+    /// The outcome is kept separate because this attention edge also fires for
+    /// failed and unknown turn results.
+    TurnComplete {
+        session_id: String,
+        at: i64,
+        outcome: CodexTurnOutcome,
+    },
     /// `sdk.status { status: 'exited' }` — a terminal clear with NO chime, emitted on
     /// `thread_closed` (`adapter.ts:891-896`) and `onExit` crash/disconnect
     /// (`adapter.ts:935-946`).
@@ -333,6 +369,7 @@ impl CodexSubscription {
         out.push(CodexAdapterEvent::TurnComplete {
             session_id: self.session_id.clone(),
             at,
+            outcome: CodexTurnOutcome::from_status(status.as_deref()),
         });
         out
     }
@@ -444,7 +481,8 @@ mod tests {
             out[1],
             CodexAdapterEvent::TurnComplete {
                 session_id: "thread-1".into(),
-                at: 1000
+                at: 1000,
+                outcome: CodexTurnOutcome::Completed,
             }
         );
     }
@@ -646,6 +684,13 @@ mod tests {
                 CodexAdapterEvent::TurnComplete { at: 1000, .. }
             ]
         ));
+        assert!(matches!(
+            out[1],
+            CodexAdapterEvent::TurnComplete {
+                outcome: CodexTurnOutcome::Failed,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -673,6 +718,13 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!(matches!(out[0], CodexAdapterEvent::StatusSnapshot { .. }));
         assert!(matches!(out[1], CodexAdapterEvent::TurnComplete { .. }));
+        assert!(matches!(
+            out[1],
+            CodexAdapterEvent::TurnComplete {
+                outcome: CodexTurnOutcome::Unknown,
+                ..
+            }
+        ));
     }
 
     #[test]

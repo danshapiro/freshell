@@ -113,6 +113,9 @@ COPY --from=node-builder /app/node_modules ./node_modules
 # The pinned Claude contract exercises the isolated sidecar package directly.
 # Its node_modules links back to the root pnpm store copied above.
 COPY --from=node-builder /app/crates/freshell-claude-sidecar/node_modules ./crates/freshell-claude-sidecar/node_modules
+# The native-history producer invokes esbuild from this workspace member.
+# pnpm keeps its executable/dependency links beside the member manifest.
+COPY --from=node-builder /app/packages/freshell-mcp-runtime/node_modules ./packages/freshell-mcp-runtime/node_modules
 
 # Fail the image build if the copied test toolchain cannot execute in this
 # Debian runtime. A container-level test checks the configured runtime user.

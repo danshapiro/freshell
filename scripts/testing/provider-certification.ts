@@ -281,9 +281,8 @@ export function capabilityClaimViolations(manifest: CapabilityManifest): string[
     if (!byProvider.has(provider)) violations.push(`requiredCertifiedProviders references unknown provider ${provider}`)
   }
   for (const row of manifest.providers) {
-    if ((row.managedEnabled || row.certificationState === PENDING_LIVE_PROVIDER_CERTIFICATION)
-      && !required.includes(row.provider)) {
-      violations.push(`requiredCertifiedProviders omits managed or pending provider ${row.provider}`)
+    if (row.managedEnabled && !required.includes(row.provider)) {
+      violations.push(`requiredCertifiedProviders omits managed provider ${row.provider}`)
     }
   }
   const deferrable = manifest.certification.landingGate.deferrableProviders ?? []

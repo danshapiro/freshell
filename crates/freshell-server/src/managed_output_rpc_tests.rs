@@ -56,6 +56,47 @@ async fn read_fixture_cached(
                 AdminResult::TerminalOutput(RuntimeOutputBatch {
                     incarnation_id: incarnation.clone(),
                     terminal_id: terminal.into(),
+                    codex_activity: Some(freshell_activity::codex::CodexActivityBatch {
+                        retained_from_seq: 1,
+                        head_seq: 2,
+                        events: [false, true]
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, completed)| {
+                                freshell_activity::codex::CodexActivityEvent {
+                                    seq: index as u64 + 1,
+                                    at: index as i64 + 100,
+                                    thread_id: "native-owned".into(),
+                                    turn_id: Some("turn-owned".into()),
+                                    status: completed.then(|| "completed".into()),
+                                    completed,
+                                }
+                            })
+                            .collect(),
+                    }),
+                    opencode_activity: Some(freshell_activity::opencode::OpencodeActivityBatch {
+                        retained_from_seq: 1,
+                        head_seq: 2,
+                        events: [
+                            freshell_activity::opencode::OpencodeStatus::Busy,
+                            freshell_activity::opencode::OpencodeStatus::Idle,
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        .map(
+                            |(index, status)| freshell_activity::opencode::OpencodeActivityEvent {
+                                seq: index as u64 + 1,
+                                at: index as i64 + 100,
+                                cycle: 1,
+                                stream: 1,
+                                event: freshell_activity::opencode::OpencodeLaneEvent::Status {
+                                    session_id: "native-owned".into(),
+                                    status,
+                                },
+                            },
+                        )
+                        .collect(),
+                    }),
                     stream_epoch: source_for_server.clone(),
                     retained_from_seq: 1,
                     head_seq: 300,
@@ -171,6 +212,50 @@ async fn changed_host_epoch_replays_from_zero_in_one_supervisor_round_trip() {
     assert_eq!(output.native_session_id.as_deref(), Some("native-owned"));
     assert_eq!(output.chunks[0].seq_start, 1);
     assert_eq!(output.chunks[0].data, "whole retained new epoch");
+}
+
+#[tokio::test]
+async fn managed_control_rpc_preserves_native_codex_turns_independently_of_terminal_bytes() {
+    let output = read_fixture("same-epoch", "same-epoch", false)
+        .await
+        .unwrap();
+    let native = output
+        .codex_activity
+        .expect("Codex turns must cross the authenticated host output RPC");
+    native.validate().unwrap();
+    assert!(!native.events[0].completed);
+    assert!(native.events[1].completed);
+    assert_eq!(native.events[1].status.as_deref(), Some("completed"));
+    assert_eq!(output.chunks[0].seq_start, 207);
+}
+
+#[tokio::test]
+async fn managed_control_rpc_preserves_native_activity_independently_of_terminal_byte_cursor() {
+    let output = read_fixture("same-epoch", "same-epoch", false)
+        .await
+        .unwrap();
+    assert_eq!(output.chunks[0].seq_start, 207);
+    let native = output
+        .opencode_activity
+        .expect("native metadata must cross the authenticated output RPC");
+    native.validate().unwrap();
+    assert_eq!(native.events[0].at, 100);
+    assert_eq!(native.events[1].at, 101);
+    assert_eq!(native.events[0].seq, 1);
+    assert!(matches!(
+        native.events[0].event,
+        freshell_activity::opencode::OpencodeLaneEvent::Status {
+            status: freshell_activity::opencode::OpencodeStatus::Busy,
+            ..
+        }
+    ));
+    assert!(matches!(
+        native.events[1].event,
+        freshell_activity::opencode::OpencodeLaneEvent::Status {
+            status: freshell_activity::opencode::OpencodeStatus::Idle,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]
@@ -305,6 +390,8 @@ async fn first_eof_evidence() -> (
                 },
                 AdminCommand::TerminalReadOutput(_) => {
                     AdminResult::TerminalOutput(RuntimeOutputBatch {
+                        codex_activity: None,
+                        opencode_activity: None,
                         incarnation_id: server_incarnation.clone(),
                         terminal_id: "first-eof-terminal".into(),
                         stream_epoch: "actual-first-host-epoch".into(),

@@ -12,7 +12,7 @@ const SPEC = 'test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec
 export function selectedFreshAgentModeFromArgs(args: readonly string[]): string {
   const values = args[0] === '--mode' ? args.slice(1) : args
   if (values.length !== 1) {
-    throw new Error('usage: npm run test:runtime:fresh-agent-qualification -- --mode freshclaude|kilroy|freshcodex|freshopencode')
+    throw new Error('usage: pnpm run test:runtime:fresh-agent-qualification --mode freshclaude|kilroy|freshcodex|freshopencode')
   }
   const selected = parseFreshAgentQualificationModes(values[0])
   if (selected.length !== 1) {
@@ -21,10 +21,11 @@ export function selectedFreshAgentModeFromArgs(args: readonly string[]): string 
   return selected[0]
 }
 
-export function runSelectedFreshAgentQualification(args = process.argv.slice(2)): void {
+export function runSelectedFreshAgentQualification(args = process.argv.slice(2), execute: typeof execFileSync = execFileSync): void {
   const mode = selectedFreshAgentModeFromArgs(args)
-  execFileSync('npm', [
-    'run', 'test:e2e:local', '--', '--project=chromium', SPEC,
+  execute('pnpm', [
+    'exec', 'tsx', 'scripts/testing/runtime-external-browser.ts',
+    '--spec', SPEC, '--mode', mode,
   ], {
     cwd: process.cwd(),
     env: {

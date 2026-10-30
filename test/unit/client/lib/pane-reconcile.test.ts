@@ -161,6 +161,32 @@ describe('paneKeyFor', () => {
 })
 
 describe('buildReconcileRequest', () => {
+  it.each([undefined, 'stopped', 'data_repair_complete', 'blocked', 'lost', 'recovering', 'live'] as const)(
+    'keeps supervisor-owned terminal recovery (%s) out of bulk and targeted legacy requests', (recoveryState) => {
+      let panes = addTerminalPane(emptyPanesState(), 'managed-tab', 'managed-pane', {
+        mode: 'opencode', soulId: 'managed-soul', status: 'exited',
+        ...(recoveryState ? { sessionRef: { provider: 'opencode' as const, sessionId: 'ses_volume_only' } } : {}),
+        ...(recoveryState ? { recoverySummary: { desiredState: 'stopped', recoveryState,
+          durabilityState: 'resume_captured', allocationState: 'allocated' } } : {}),
+      })
+      const managedBefore = panes.layouts['managed-tab']
+      expect(buildReconcileRequest(asRootState(panes))).toBeNull()
+      expect(buildReconcileRequestForPanes(asRootState(panes), [
+        { tabId: 'managed-tab', paneId: 'managed-pane' },
+      ])).toBeNull()
+      panes = addTerminalPane(panes, 'legacy-tab', 'legacy-pane', {
+        sessionRef: { provider: 'claude', sessionId: 'legacy-missing' },
+      })
+      const state = asRootState(panes)
+      for (const request of [buildReconcileRequest(state), buildReconcileRequestForPanes(state, [
+        { tabId: 'managed-tab', paneId: 'managed-pane' },
+        { tabId: 'legacy-tab', paneId: 'legacy-pane' },
+      ])]) {
+        expect(request?.panes.map(pane => pane.paneKey)).toEqual(['legacy-tab:legacy-pane'])
+      }
+      expect(panes.layouts['managed-tab']).toEqual(managedBefore)
+    })
+
   it('collects terminal panes with paneKey tab:pane and required createRequestId', () => {
     const state = storeStateWith2TerminalPanes()
     const req = buildReconcileRequest(state)!
