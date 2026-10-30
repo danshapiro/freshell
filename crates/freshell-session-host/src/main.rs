@@ -6960,6 +6960,28 @@ fn refresh_provider_config_references(
             run_as_gid,
         );
     }
+    refresh_provider_config_with_mounted_context(
+        context,
+        context,
+        provider,
+        workspace,
+        user_provider_root,
+        provider_home,
+    )
+}
+
+fn refresh_provider_config_with_mounted_context(
+    context: &freshell_runtime_protocol::ProviderLaunchContext,
+    mounted_context: &freshell_runtime_protocol::ProviderLaunchContext,
+    provider: &str,
+    workspace: &Path,
+    user_provider_root: &Path,
+    provider_home: &Path,
+) -> Result<(), String> {
+    context.validate(provider).map_err(|error| error.message)?;
+    mounted_context
+        .validate(provider)
+        .map_err(|error| error.message)?;
     let _projection_lock = lock_provider_projection(provider_home)?;
     recover_provider_projection_transactions(provider_home)?;
     cleanup_orphaned_provider_refresh_stages(provider_home, None)?;
@@ -6969,6 +6991,7 @@ fn refresh_provider_config_references(
         .map_err(|error| error.to_string())?;
     refresh_provider_config_in_stage_locked(
         context,
+        mounted_context,
         provider,
         workspace,
         user_provider_root,
@@ -6991,6 +7014,7 @@ fn refresh_provider_config_in_stage(
     cleanup_orphaned_provider_refresh_stages(provider_home, Some(stage.path()))?;
     refresh_provider_config_in_stage_locked(
         context,
+        context,
         provider,
         workspace,
         user_provider_root,
@@ -7001,6 +7025,7 @@ fn refresh_provider_config_in_stage(
 
 fn refresh_provider_config_in_stage_locked(
     context: &freshell_runtime_protocol::ProviderLaunchContext,
+    mounted_context: &freshell_runtime_protocol::ProviderLaunchContext,
     provider: &str,
     workspace: &Path,
     user_provider_root: &Path,
@@ -7069,7 +7094,7 @@ fn refresh_provider_config_in_stage_locked(
     )
     .map_err(|_| "private mountpoint metadata write failed")?;
     let mounted = freshell_runtime_protocol::bounded_json_bytes(
-        &resource_mount_roots(context),
+        &resource_mount_roots(mounted_context),
         MAX_PROJECTION_METADATA_BYTES,
     )
     .map_err(|_| "resource mountpoint metadata profile exceeded")?;
@@ -7422,6 +7447,7 @@ fn refresh_provider_config_worker(args: &[String]) -> Result<(), String> {
                 format!("provider refresh transaction creation unavailable: {error}")
             })?;
         return refresh_provider_config_in_stage_locked(
+            &context,
             &context,
             &args[1],
             Path::new(&args[2]),
