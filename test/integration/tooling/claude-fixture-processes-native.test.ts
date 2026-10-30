@@ -64,8 +64,8 @@ const WRITER = `
   const fs = require('node:fs')
   const path = require('node:path')
   const { spawn } = require('node:child_process')
-  const [root, control, mcp] = process.argv.slice(1)
-  const child = spawn(process.execPath, ['-e', mcp, root, control], { stdio: 'ignore', detached: process.platform === 'win32' })
+  const [root, control, mcp, detached] = process.argv.slice(1)
+  const child = spawn(process.execPath, ['-e', mcp, root, control], { stdio: 'ignore', detached: detached === 'true' })
   child.unref()
   fs.writeFileSync(path.join(control, 'writer.pid'), String(process.pid))
   setInterval(() => {
@@ -79,9 +79,9 @@ const SIDECAR = `
   const fs = require('node:fs')
   const path = require('node:path')
   const { spawn } = require('node:child_process')
-  const [root, control, mode, writer, mcp] = process.argv.slice(1)
+  const [root, control, mode, writer, mcp, detached = 'true'] = process.argv.slice(1)
   fs.writeFileSync(path.join(control, 'root.pid'), String(process.pid))
-  const child = spawn(process.execPath, ['-e', writer, root, control, mcp], { stdio: 'ignore', detached: process.platform === 'win32' })
+  const child = spawn(process.execPath, ['-e', writer, root, control, mcp, detached], { stdio: 'ignore', detached: detached === 'true' })
   child.unref()
   const ready = setInterval(() => {
     if (!fs.existsSync(path.join(control, 'writer.pid')) || !fs.existsSync(path.join(control, 'mcp.pid'))) return
@@ -123,18 +123,22 @@ describe('native Claude fixture process ownership', () => {
     }
   })
 
-  for (const [mode, description] of [
+  const exitModes = [
     ['clean', 'a clean sidecar exit'],
     ['create-failed', 'creation fails without a created frame'],
     ['hard-killed', 'the sidecar is killed with SIGKILL'],
-  ] as const) {
-    it(`contains CLI and MCP descendants after ${description}`, async () => {
+  ] as const
+  const scenarios = (process.platform === 'win32' ? [true] : [false, true]).flatMap((detached) =>
+    exitModes.map(([mode, description]) => ({ detached, mode, description })),
+  )
+  for (const { detached, mode, description } of scenarios) {
+    it(`contains ${detached ? 'detached' : 'grouped'} CLI and MCP descendants after ${description}`, async () => {
       const control = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-native-tree-'))
       const fixture = await createClaudeFixture({ parent: control })
       const other = await createClaudeFixture({ parent: control })
       const unrelatedReport = path.join(control, 'unrelated.pid')
       const unrelated = other.spawn(process.execPath, ['-e', `require('node:fs').writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1000)`, unrelatedReport], { stdio: 'ignore' })
-      const sidecar = fixture.spawn(process.execPath, ['-e', SIDECAR, fixture.root, control, mode, WRITER, MCP], {
+      const sidecar = fixture.spawn(process.execPath, ['-e', SIDECAR, fixture.root, control, mode, WRITER, MCP, String(detached)], {
         cwd: fixture.cwd,
         stdio: ['ignore', 'pipe', 'pipe'],
       })
@@ -157,6 +161,16 @@ describe('native Claude fixture process ownership', () => {
         expect(sidecar.pid, 'ChildProcess.pid must identify the actual root process').toBe(rootPid)
         expect(await live(writerPid)).toBe(true)
         expect(await live(mcpPid)).toBe(true)
+        if (process.platform === 'darwin') {
+          const { stdout } = await promisify(execFile)('/bin/ps', ['-p', `${writerPid},${mcpPid}`, '-o', 'pid=,ppid=,pgid='])
+          const processes = new Map(stdout.trim().split('\n').map((line) => {
+            const [pid, parent, group] = line.trim().split(/\s+/).map(Number)
+            return [pid, { parent, group }] as const
+          }))
+          expect(processes.get(writerPid)?.parent, 'writer must be reparented after its root exits').not.toBe(rootPid)
+          expect(processes.get(writerPid)?.group).toBe(detached ? writerPid : rootPid)
+          expect(processes.get(mcpPid)?.group).toBe(detached ? mcpPid : rootPid)
+        }
         if (mode === 'clean') {
           expect(sidecar.exitCode).toBe(0)
           expect(sidecar.signalCode).toBeNull()
@@ -185,6 +199,15 @@ describe('native Claude fixture process ownership', () => {
         expect(await live(unrelatedPid)).toBe(true)
       } finally {
         await fixture.cleanup()
+        // The red regression deliberately leaves detached descendants alive.
+        // Settle only PIDs reported by this fixture before discarding controls.
+        for (const report of ['writer.pid', 'mcp.pid']) {
+          const pid = Number(await fs.readFile(path.join(control, report), 'utf8').catch(() => ''))
+          if (Number.isSafeInteger(pid) && pid > 0 && await live(pid)) {
+            process.kill(pid, 'SIGKILL')
+            await waitUntil(async () => !await live(pid))
+          }
+        }
         await other.cleanup()
         await fs.rm(control, { recursive: true, force: true })
       }
@@ -292,6 +315,29 @@ describe('native Claude fixture process ownership', () => {
   })
 
   if (process.platform === 'darwin') {
+    it('retains files when an orphaned detached writer refuses termination', async () => {
+      const control = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-native-detached-refusal-'))
+      const fixture = await createClaudeFixture({ parent: control })
+      const sidecar = fixture.spawn(process.execPath, ['-e', SIDECAR, fixture.root, control, 'create-failed', WRITER, MCP, 'true'], { stdio: 'ignore' })
+      const originalKill = process.kill
+      let denied: { mockRestore(): void } | undefined
+      try {
+        await waitForFixtureProcessExit(sidecar, 15_000)
+        const writerPid = Number(await fs.readFile(path.join(control, 'writer.pid'), 'utf8'))
+        denied = vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+          if (pid === writerPid && signal === 'SIGTERM') throw Object.assign(new Error('detached writer teardown denied'), { code: 'EPERM' })
+          return originalKill(pid, signal)
+        })
+        await expect(fixture.cleanup()).rejects.toMatchObject({ code: 'EPERM' })
+        await expect(fs.stat(fixture.root)).resolves.toBeDefined()
+        expect(await live(writerPid)).toBe(true)
+      } finally {
+        denied?.mockRestore()
+        await fixture.cleanup()
+        await fs.rm(control, { recursive: true, force: true })
+      }
+    })
+
     it('uses the native process table after a refused signal-zero probe', async () => {
       const fixture = await createClaudeFixture()
       const child = fixture.spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
