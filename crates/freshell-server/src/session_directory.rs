@@ -27,7 +27,7 @@
 //!   repo root of `cwd` (`resolveProjectPath` → `resolveGitRepoRoot`, a LIVE `git`
 //!   call); that resolution is deferred (documented). `cwd` is faithful data.
 //! * **all three search tiers.** The `title` metadata tier plus the SESSION-07
-//!   `userMessages`/`fullText` file-content tiers (`apply_file_search`, porting
+//!   `userMessages`/`fullText` content tiers (`apply_file_search`, porting
 //!   `server/session-directory/file-search.ts`).
 //! * **live terminal join + metadata-store flavor.** The sidebar join below
 //!   ([`join_live_terminals`], Fix Spec: Session Naming Cluster) fuses the live
@@ -52,8 +52,9 @@ use freshell_sessions::codex_history::CodexHistorySegment;
 use freshell_sessions::codex_segments::CodexUnresolvedIdentity;
 use freshell_sessions::directory_index::{IndexedSession, SessionIndex};
 use freshell_sessions::search::search_codex_history_segment;
-// SESSION-07: the `userMessages`/`fullText` tier file-content search
-// (`apply_file_search`, below) -- ports `server/session-directory/file-search.ts`.
+// SESSION-07: the `userMessages`/`fullText` content search (`apply_file_search`,
+// below) -- ports `server/session-directory/file-search.ts` and includes
+// runtime-owned normalized history already read by the managed projector.
 use freshell_sessions::{search_session_file, FileSearchTier};
 // Batch B: only the `#[cfg(test)]`-gated reference functions below
 // (`list_claude_sessions`/`parse_claude_file`/`item_from_meta`) still need the
@@ -66,6 +67,10 @@ use freshell_sessions::{parse_session_content, ParseSessionOptions};
 use serde_json::{json, Map, Value};
 
 use crate::boot::{is_authed, unauthorized};
+
+#[cfg(feature = "managed-runtime-v1")]
+#[path = "managed_session_directory.rs"]
+mod managed;
 
 /// `MAX_DIRECTORY_PAGE_ITEMS` (`shared/read-models.ts:6`).
 const MAX_DIRECTORY_PAGE_ITEMS: usize = 50;
@@ -117,6 +122,22 @@ pub struct SessionDirectoryState {
 /// later distinct full source set is logged even when its bounded sample is
 /// unchanged.
 pub(crate) type CollisionSignature = Vec<(String, Vec<String>)>;
+
+/// Text copied from an already-read, normalized FreshAgent history. Kept only
+/// on the in-memory row so managed sessions can use the normal content-search
+/// tiers without reopening provider-owned files or exposing history on the
+/// session-directory wire format.
+#[derive(Debug, Clone)]
+struct ManagedHistorySearch {
+    messages: Vec<ManagedSearchMessage>,
+    partial: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ManagedSearchMessage {
+    role: &'static str,
+    text: String,
+}
 
 /// One directory item, typed for the sort/filter/cursor derivation. Serialized to
 /// the `SessionDirectoryItem` shape by [`DirItem::to_value`].
@@ -176,6 +197,9 @@ struct DirItem {
     /// Selected Codex history bounds; absent for ordinary whole-file rows.
     /// Captured with the row from one index generation and never serialized.
     codex_history_segments: Option<Vec<CodexHistorySegment>>,
+    /// Private normalized text read once from the runtime-owned FreshAgent
+    /// history. Never serialized.
+    managed_history_search: Option<ManagedHistorySearch>,
     /// STATUS-STRIP: live token usage (`SessionDirectoryItem.tokenUsage`,
     /// `shared/read-models.ts`; Node's `CodingCliSession.tokenUsage`,
     /// `coding-cli/types.ts:190`). Powers the fresh-agent strip's context
@@ -543,15 +567,34 @@ fn validate_limit(raw_limit: &str) -> Result<usize, Value> {
 
 /// The session-directory sub-router (`GET /api/session-directory`).
 pub fn router(state: SessionDirectoryState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/api/session-directory", get(session_directory))
-        .with_state(state)
+        .with_state(state);
+    #[cfg(feature = "managed-runtime-v1")]
+    let router = router.layer(axum::Extension(managed::Cache::default()));
+    router
+}
+
+#[cfg(feature = "managed-runtime-v1")]
+pub fn router_with_managed_client(
+    state: SessionDirectoryState,
+    client: Option<freshell_runtime_client::RuntimeClient>,
+) -> Router {
+    let router = router(state);
+    match client {
+        Some(client) => router.layer(axum::Extension(client)),
+        None => router,
+    }
 }
 
 async fn session_directory(
     State(state): State<SessionDirectoryState>,
     headers: HeaderMap,
     Query(raw): Query<std::collections::HashMap<String, String>>,
+    #[cfg(feature = "managed-runtime-v1")] client: Option<
+        axum::Extension<freshell_runtime_client::RuntimeClient>,
+    >,
+    #[cfg(feature = "managed-runtime-v1")] axum::Extension(cache): axum::Extension<managed::Cache>,
 ) -> Response {
     if !is_authed(&headers, &state.auth_token) {
         return unauthorized();
@@ -618,6 +661,24 @@ async fn session_directory(
             }
             None => (Vec::new(), Arc::new(Vec::new())),
         };
+    #[cfg(feature = "managed-runtime-v1")]
+    let (items, managed_running, managed_partial) = {
+        let mut items = items;
+        let snapshot = match client {
+            Some(client) => managed::read(&client.0, &cache).await,
+            None => managed::Snapshot {
+                items: Vec::new(),
+                partial: false,
+            },
+        };
+        let running: std::collections::HashMap<_, _> = snapshot
+            .items
+            .iter()
+            .map(|item| (item.key(), item.is_running))
+            .collect();
+        items.extend(snapshot.items);
+        (items, running, snapshot.partial)
+    };
     // STATUS-STRIP: assign the monotonic snapshot sequence AFTER the index
     // snapshot is captured — captured order is authoritative, and a seq
     // assigned pre-await would interleave with concurrent requests.
@@ -732,6 +793,16 @@ async fn session_directory(
     // part of the sidebar's "running" set, matching the original's
     // `TerminalMetadataService.list()` input to `toItems`.
     let items = join_live_terminals(items, &identities);
+    #[cfg(feature = "managed-runtime-v1")]
+    let items = items
+        .into_iter()
+        .map(|mut item| {
+            if let Some(running) = managed_running.get(&item.key()) {
+                item.is_running = *running;
+            }
+            item
+        })
+        .collect();
     // Unified agent names (Task 2): resolve every scoped item's durable name
     // BEFORE the query (search/sort must see the manual rename), through the
     // SAME naming authority every rename route targets. A manual or
@@ -745,6 +816,10 @@ async fn session_directory(
     match apply_query(items, &query, &identities) {
         Ok(mut page) => {
             apply_checkpoint_workspace_projection(&mut page, &metadata_entries);
+            #[cfg(feature = "managed-runtime-v1")]
+            if managed_partial {
+                page["partial"] = json!(true);
+            }
             page["revision"] = json!(revision);
             page["snapshotSeq"] = json!(snapshot_seq);
             page["serverInstance"] = json!(state.server_instance.as_str());
@@ -1127,6 +1202,7 @@ fn dir_item_from_indexed_with_source_files(
         title_source: idx.title_source.clone(),
         source_files,
         codex_history_segments: None,
+        managed_history_search: None,
         token_usage: idx.token_usage.clone(),
         // Provenance is overlay-derived (`apply_session_overrides`), never
         // parsed from the transcript.
@@ -1294,6 +1370,7 @@ fn item_from_meta(
         title_source: meta.title_source.clone(),
         source_files: source_file.into_iter().collect(),
         codex_history_segments: None,
+        managed_history_search: None,
         token_usage: None,
         title_overridden: false,
         provider_title: None,
@@ -1709,6 +1786,7 @@ fn build_live_terminal_session_item(
         title_source: None,
         source_files: Vec::new(),
         codex_history_segments: None,
+        managed_history_search: None,
         // PARITY NOTE: Rust's `TerminalIdentity` carries no token usage, so a
         // live-terminal-only row reports none here — unlike Node, whose
         // `TerminalMeta` carries `tokenUsage`. Fresh-agent pane sessions are
@@ -1823,6 +1901,7 @@ mod join_tests {
             title_source: None,
             source_files: Vec::new(),
             codex_history_segments: None,
+            managed_history_search: None,
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -2160,8 +2239,8 @@ fn apply_query(
 
     // SESSION-07: search dispatch (service.ts:266-278). `title` stays the
     // existing metadata-only path (`applySearch:66-75`); `userMessages`/
-    // `fullText` scan the source transcripts (`applyFileSearch:153-226`) and
-    // may report `partial`/`partialReason`.
+    // `fullText` scan available transcripts and managed history
+    // (`applyFileSearch:153-226`) and may report `partial`/`partialReason`.
     let mut partial = false;
     let mut partial_reason: Option<&'static str> = None;
     if let Some(query_text) = q.query.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -2254,6 +2333,30 @@ struct FileSearchOutcome {
     partial_reason: Option<&'static str>,
 }
 
+fn search_managed_history(
+    history: &ManagedHistorySearch,
+    query_text: &str,
+    needle: &str,
+    tier: FileSearchTier,
+) -> Option<freshell_sessions::FileSearchMatch> {
+    history.messages.iter().find_map(|message| {
+        if (tier == FileSearchTier::FullText || message.role == "user")
+            && message.text.to_lowercase().contains(needle)
+        {
+            Some(freshell_sessions::FileSearchMatch {
+                matched_in: if message.role == "user" {
+                    "userMessage"
+                } else {
+                    "assistantMessage"
+                },
+                snippet: freshell_sessions::extract_snippet(&message.text, query_text, 50),
+            })
+        } else {
+            None
+        }
+    })
+}
+
 /// `applyFileSearch` (`service.ts:153-226`): scan each post-cursor item's
 /// source transcript for the `userMessages`/`fullText` tiers. Bounded by a
 /// scan budget (`maxScan = limit * 10`, `service.ts:176`) and an early stop
@@ -2262,11 +2365,10 @@ struct FileSearchOutcome {
 /// "more exist" without this function ever scanning the entire remaining
 /// list (unlike the title tier, which does).
 ///
-/// An item with no [`DirItem::source_files`] (a live-terminal-only item, or a
-/// provider with no per-file source -- opencode/amplifier) or an unsupported
-/// `provider` is skipped WITHOUT counting against the scan budget, mirroring
-/// `service.ts:191-195`'s `if (!sourceFile) continue` / `if (!provider) continue`
-/// (both `continue` before the `scanned++` at :197).
+/// An item with private in-memory managed history searches that copy directly;
+/// it does not reopen provider files. Rows without managed history and without
+/// a supported on-disk source are skipped WITHOUT counting against the scan
+/// budget, mirroring `service.ts:191-195`'s source/provider checks.
 fn apply_file_search(
     items: Vec<DirItem>,
     query_text: &str,
@@ -2278,10 +2380,33 @@ fn apply_file_search(
     let mut scanned = 0usize;
     let mut partial = false;
     let mut partial_reason: Option<&'static str> = None;
+    let needle = query_text.to_lowercase();
 
     'items: for item in items {
         if results.len() > limit {
             break;
+        }
+        if let Some(history) = &item.managed_history_search {
+            // A retained managed snapshot can be searched successfully while
+            // still omitting older native content. Keep that limitation visible
+            // even when this particular query has no match.
+            partial |= history.partial;
+            if scanned >= max_scan {
+                partial = true;
+                partial_reason = Some("budget");
+                break;
+            }
+            scanned += 1;
+
+            if let Some(matched_message) =
+                search_managed_history(history, query_text, &needle, tier)
+            {
+                let mut matched = item.clone();
+                matched.matched_in = Some(matched_message.matched_in.to_string());
+                matched.snippet = Some(matched_message.snippet);
+                results.push(matched);
+            }
+            continue;
         }
         if !matches!(item.provider.as_str(), "claude" | "codex") {
             continue;
@@ -2715,6 +2840,7 @@ mod tests {
             title_source: None,
             source_files: Vec::new(),
             codex_history_segments: None,
+            managed_history_search: None,
             token_usage: Some(freshell_sessions::meta::TokenSummary {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -2982,6 +3108,7 @@ mod tests {
             title_source: None,
             source_files: Vec::new(),
             codex_history_segments: None,
+            managed_history_search: None,
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -3202,6 +3329,7 @@ mod tests {
             title_source: None,
             source_files: Vec::new(),
             codex_history_segments: None,
+            managed_history_search: None,
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -3258,6 +3386,7 @@ mod tests {
             title_source: None,
             source_files: Vec::new(),
             codex_history_segments: None,
+            managed_history_search: None,
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -3357,6 +3486,7 @@ mod tests {
             title_source: None,
             source_files: Vec::new(),
             codex_history_segments: None,
+            managed_history_search: None,
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -3434,6 +3564,7 @@ mod tests {
             title_source: None,
             source_files: Vec::new(),
             codex_history_segments: None,
+            managed_history_search: None,
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -3506,6 +3637,7 @@ mod tests {
             title_source: None,
             source_files: Vec::new(),
             codex_history_segments: None,
+            managed_history_search: None,
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -3559,6 +3691,7 @@ mod tests {
             title_source: title_source.map(str::to_string),
             source_files: Vec::new(),
             codex_history_segments: None,
+            managed_history_search: None,
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -3704,6 +3837,7 @@ mod tests {
             title_source: None,
             source_files: Vec::new(),
             codex_history_segments: None,
+            managed_history_search: None,
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -6938,6 +7072,7 @@ mod tests {
             title_source: None,
             source_files: Vec::new(),
             codex_history_segments: None,
+            managed_history_search: None,
             token_usage: None,
             title_overridden: false,
             provider_title: None,
