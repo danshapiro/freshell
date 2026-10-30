@@ -114,6 +114,7 @@ import {
   getFreshAgentSnapshotThreadId,
   getManagedBootstrapHistoryThreadId,
 } from '@/lib/fresh-agent-snapshot-thread'
+import { isFreshAgentRevealRevisionFresh } from '@/lib/fresh-agent-reveal-freshness'
 import { CLAUDE_PERMISSION_MODE_VALUES, DEFAULT_FRESH_AGENT_STYLE, normalizeFreshAgentStyle } from '@shared/settings'
 import {
   pickCheckpointForTurn,
@@ -1122,6 +1123,7 @@ export function FreshAgentView({
   const snapshotDirtyRef = useRef(false)
   const snapshotDirtyVersionRef = useRef(0)
   const snapshotDirtyBaseRevisionRef = useRef<number | null>(null)
+  const snapshotDirtyRequiresRevisionAdvanceRef = useRef(false)
   const revealRefreshVersionRef = useRef<number | null>(null)
   const revealRefreshStartedAtRef = useRef<number | null>(null)
   const revealRefreshRetryTimerRef = useRef<number | null>(null)
@@ -1689,6 +1691,7 @@ export function FreshAgentView({
     surfaceRefreshOwedRef.current = false
     snapshotDirtyVersionRef.current += 1
     snapshotDirtyBaseRevisionRef.current = null
+    snapshotDirtyRequiresRevisionAdvanceRef.current = false
     revealRefreshVersionRef.current = null
     revealRefreshStartedAtRef.current = null
     if (revealRefreshRetryTimerRef.current !== null) {
@@ -1800,10 +1803,13 @@ export function FreshAgentView({
     setSnapshotRefreshNonce((value) => value + 1)
   }, [])
 
-  const markSnapshotDirty = useCallback(() => {
+  const markSnapshotDirty = useCallback((cause: 'reconnect' | 'transcript' | 'send-accepted') => {
     if (!snapshotDirtyRef.current) {
       const revision = snapshotRef.current?.revision
       snapshotDirtyBaseRevisionRef.current = typeof revision === 'number' ? revision : null
+      snapshotDirtyRequiresRevisionAdvanceRef.current = cause !== 'reconnect'
+    } else if (cause !== 'reconnect') {
+      snapshotDirtyRequiresRevisionAdvanceRef.current = true
     }
     snapshotDirtyVersionRef.current += 1
     snapshotDirtyRef.current = true
@@ -2868,7 +2874,7 @@ export function FreshAgentView({
           // Surface hydration (HTTP transcript snapshot fetch) is EXPENSIVE --
           // defer it until reveal instead of fetching for every hidden pane.
           pendingRevealRefreshRef.current = true
-          markSnapshotDirty()
+          markSnapshotDirty('reconnect')
         } else {
           sendAttach()
           requestSnapshotRefresh('reconnect')
@@ -3127,8 +3133,14 @@ export function FreshAgentView({
         } else {
           recordPendingSendMetadata(message.requestId, { legacyAccepted: true })
         }
-        if (hiddenRef.current) markSnapshotDirty()
-        else requestSnapshotRefresh('send-accepted')
+        if (hiddenRef.current) {
+          markSnapshotDirty('send-accepted')
+        } else if (snapshotDirtyRef.current) {
+          markSnapshotDirty('send-accepted')
+          requestRevealRefresh(true)
+        } else {
+          requestSnapshotRefresh('send-accepted')
+        }
       }
       if (message.type === 'error') {
         // Task 10: owned send failures. `requestId` is the only correlation
@@ -3246,7 +3258,7 @@ export function FreshAgentView({
       const eventClass = classifyHiddenPaneEvent(message, { busySnapshotSettled })
       const transcriptChanged = eventClass === 'transcript'
       if (messageBelongsToPane && transcriptChanged && (hiddenRef.current || snapshotDirtyRef.current)) {
-        markSnapshotDirty()
+        markSnapshotDirty('transcript')
       }
       if (messageBelongsToPane && !hiddenRef.current && transcriptChanged && snapshotDirtyRef.current) {
         requestRevealRefresh(true)
@@ -3497,11 +3509,17 @@ export function FreshAgentView({
         && revealRefreshVersionRef.current === snapshotDirtyVersionRef.current
         && refreshSerial === snapshotRefreshSerialRef.current
       )
-      const projectionRevisionIsFresh = projectionMetadata && liveProjection?.id === projectionMetadata.id && projectionMetadata.eventRevision >= liveProjection.eventRevision
-      const revealRevisionIsFresh = liveProjection?.needsResnapshot ? projectionRevisionIsFresh : snapshotDirtyBaseRevisionRef.current === null
-        || projectionRevisionIsFresh
-        || typeof resolved.revision !== 'number'
-        || resolved.revision > snapshotDirtyBaseRevisionRef.current
+      const projectionRevisionIsFresh = Boolean(projectionMetadata
+        && liveProjection?.id === projectionMetadata.id
+        && projectionMetadata.eventRevision >= liveProjection.eventRevision)
+      const revealRevisionIsFresh = isFreshAgentRevealRevisionFresh({
+        provider,
+        baseRevision: snapshotDirtyBaseRevisionRef.current,
+        requiresRevisionAdvance: snapshotDirtyRequiresRevisionAdvanceRef.current,
+        snapshotRevision: resolved.revision,
+        projectionNeedsResnapshot: liveProjection?.needsResnapshot === true,
+        projectionRevisionIsFresh,
+      })
       if (revealRefreshIsCurrent && revealRevisionIsFresh) {
         if (revealRefreshRetryTimerRef.current !== null) {
           clearTimeout(revealRefreshRetryTimerRef.current)
@@ -3509,6 +3527,7 @@ export function FreshAgentView({
         }
         snapshotDirtyRef.current = false
         snapshotDirtyBaseRevisionRef.current = null
+        snapshotDirtyRequiresRevisionAdvanceRef.current = false
         revealRefreshVersionRef.current = null
         revealRefreshStartedAtRef.current = null
         setSnapshotDirty(false)
