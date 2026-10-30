@@ -49,7 +49,7 @@ let receipt: Receipt
 let stderr = ''
 
 beforeAll(async () => {
-  child = spawn(process.execPath, [HARNESS, REPO_ROOT], {
+  child = spawn(process.execPath, ['--import', 'tsx', HARNESS, REPO_ROOT], {
     cwd: REPO_ROOT,
     env: { PATH: process.env.PATH ?? '/usr/bin:/bin', LANG: 'C.UTF-8' },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -200,7 +200,7 @@ describe('Claude permission contract harness survives a fixture-cleanup failure'
       })()
     }, 25)
 
-    const child = spawn(process.execPath, [HARNESS, REPO_ROOT], {
+    const child = spawn(process.execPath, ['--import', 'tsx', HARNESS, REPO_ROOT], {
       cwd: REPO_ROOT,
       env: { PATH: process.env.PATH ?? '/usr/bin:/bin', LANG: 'C.UTF-8' },
       stdio: ['ignore', 'pipe', 'pipe'],
