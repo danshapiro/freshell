@@ -229,6 +229,118 @@ describe('Claude fixture native process ownership', () => {
     }
   })
 
+  it('retries an environment refusal while the process is still finishing its exit', async () => {
+    const control = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-procfs-pending-exit-'))
+    const fixture = await createClaudeFixture({ parent: control })
+    const other = await createClaudeFixture({ parent: control })
+    const root = fixture.spawn(process.execPath, ['-e', 'process.exit(0)'], { stdio: 'ignore' })
+    const child = other.spawn(process.execPath, ['-e', `
+      const fs = require('node:fs')
+      const path = require('node:path')
+      const control = process.argv[1]
+      let stopping = false
+      process.on('SIGTERM', () => {
+        stopping = true
+        fs.writeFileSync(path.join(control, 'terminating'), 'yes')
+      })
+      fs.writeFileSync(path.join(control, 'ready'), 'yes')
+      setInterval(() => {
+        if (stopping && fs.existsSync(path.join(control, 'release'))) process.exit(0)
+      }, 5)
+    `, control], { stdio: 'ignore' })
+    const readFile = fs.readFile
+    let attempts = 0
+    let stopping: Promise<void> | undefined
+    let denied: { mockRestore(): void } | undefined
+    try {
+      await waitForFixtureProcessExit(root, 5_000)
+      await waitUntil(async () => fs.stat(path.join(control, 'ready')).then(() => true, () => false))
+      denied = vi.spyOn(fs, 'readFile').mockImplementation(async (file, options) => {
+        if (file === `/proc/${child.pid!}/environ`) {
+          attempts += 1
+          if (attempts === 1) {
+            stopping = stopFixtureProcess(child)
+            await waitUntil(async () => fs.stat(path.join(control, 'terminating')).then(() => true, () => false))
+            expect(await live(child.pid!)).toBe(true)
+          } else {
+            await fs.writeFile(path.join(control, 'release'), 'go')
+          }
+          throw Object.assign(new Error('process environment is unreadable while exiting'), { code: 'EACCES' })
+        }
+        return readFile(file, options)
+      })
+      await expect(fixture.cleanup()).resolves.toBeUndefined()
+      expect(attempts).toBeGreaterThanOrEqual(2)
+      expect(await live(child.pid!)).toBe(false)
+      await expect(fs.stat(fixture.root)).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      denied?.mockRestore()
+      await fs.writeFile(path.join(control, 'release'), 'go')
+      await stopping
+      await fixture.cleanup()
+      await other.cleanup()
+      await fs.rm(control, { recursive: true, force: true })
+    }
+  })
+
+  for (const code of ['EACCES', 'EPERM']) {
+    it(`finishes cleanup when a process exits before its environment read returns ${code}`, async () => {
+      const fixture = await createClaudeFixture()
+      const other = await createClaudeFixture()
+      const root = fixture.spawn(process.execPath, ['-e', 'process.exit(0)'], { stdio: 'ignore' })
+      const child = other.spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+      const readFile = fs.readFile
+      let intercepted = false
+      const denied = vi.spyOn(fs, 'readFile').mockImplementation(async (file, options) => {
+        if (file === `/proc/${child.pid!}/environ`) {
+          intercepted = true
+          await stopFixtureProcess(child)
+          throw Object.assign(new Error('process environment became unreadable during exit'), { code })
+        }
+        return readFile(file, options)
+      })
+      try {
+        await waitForFixtureProcessExit(root, 5_000)
+        await expect(fixture.cleanup()).resolves.toBeUndefined()
+        expect(intercepted).toBe(true)
+        expect(await live(child.pid!)).toBe(false)
+        await expect(fs.stat(fixture.root)).rejects.toMatchObject({ code: 'ENOENT' })
+      } finally {
+        denied.mockRestore()
+        await fixture.cleanup()
+        await other.cleanup()
+      }
+    })
+
+    it(`retains files when a living detached writer's environment returns ${code}`, async () => {
+      const control = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-detached-environ-'))
+      const fixture = await createClaudeFixture({ parent: control })
+      const root = fixture.spawn(process.execPath, ['-e', SIDECAR, fixture.root, control, 'create-failed', WRITER, MCP, 'true'], { stdio: 'ignore' })
+      let denied: { mockRestore(): void } | undefined
+      let intercepted = false
+      try {
+        await waitForFixtureProcessExit(root, 5_000)
+        const writerPid = Number(await fs.readFile(path.join(control, 'native.pid'), 'utf8'))
+        const readFile = fs.readFile
+        denied = vi.spyOn(fs, 'readFile').mockImplementation(async (file, options) => {
+          if (file === `/proc/${writerPid}/environ`) {
+            intercepted = true
+            throw Object.assign(new Error('living writer environment is unreadable'), { code })
+          }
+          return readFile(file, options)
+        })
+        await expect(fixture.cleanup()).rejects.toMatchObject({ code })
+        expect(intercepted).toBe(true)
+        expect(await live(writerPid)).toBe(true)
+        await expect(fs.stat(fixture.root)).resolves.toBeDefined()
+      } finally {
+        denied?.mockRestore()
+        await fixture.cleanup()
+        await fs.rm(control, { recursive: true, force: true })
+      }
+    })
+  }
+
   it('stops only its owned group and refuses new launches once cleanup starts', async () => {
     const fixture = await createClaudeFixture()
     const otherFixture = await createClaudeFixture()
