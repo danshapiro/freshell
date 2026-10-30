@@ -171,7 +171,7 @@ export function isDeadSessionReconcileNotice(notice: string | undefined): boolea
 
 Write TIMING is split by pane shape (round 3, finding 1 — a write must never precede a possible attach, because a dirty surface makes the next `viewport_hydrate` attach run `beginMountedReconstruction` (`:3933-3947` → reset `\x18\x1bc` at `:3889`), which wipes the buffer BEFORE the server rejects the attach):
 - **Retained-terminalId shape (live-reconnect):** the notice effect does NOT write and does NOT consume (it returns when `content.terminalId` is set). The write happens at the INVALID_TERMINAL_ID stand-down gate (Task 1's `deadSessionLatchRef.current` branch): by then the attach attempt — including any reconstruction — has already settled and been rejected, so the surface is final for the round. The gate writes DIRECT to the term (not the write queue; the queue's generation discipline is moot post-rejection), consumes the mint (`clearPaneReconcileNotice` dispatch), and sets the idempotency key.
-- **No-terminalId shape (reload / boot reconcile):** the notice effect writes and consumes directly — no attach can ever start without a terminalId, so the empty surface is stable.
+- **No-terminalId shape (reload / boot reconcile):** the notice effect writes and consumes directly — no attach can ever start without a terminalId, so the empty surface is stable. The un-anchored pane's create lane ALSO stands down on the latch (delta review round 1, finding 1): the fold's `setPaneRestoreError` clears the pre-verdict pending mark and re-fires the lifecycle effect, and the create path (plus the WS-reconnect re-drive and an armed SESSION_RESERVED redrive timer) refuses to send the retained sessionRef — no automatic duplicate resume attempt, resolution only through user chrome. The one exempt shape is the codex dead-live-handle breadcrumb's explicitly fresh recovery create (`fresh_after_restore_unavailable`), which is not a resume attempt.
 - **Re-connect re-adjudication (a LATER reconnect round after the pane already showed the line):** the attach attempt that round may legitimately reconstruct (the pane's surface is now dirty from the earlier notice) and wipe the line before its rejection. The gate must therefore RE-WRITE the line after a reconstruction wipe: idempotency keys on the rejection round, not the identity alone — reset the gate's key whenever `beginMountedReconstruction` completed for this surface (observe `surfaceFreshRef.current === true`, which the reconstruction sets on completion, `:3918`), so a wiped surface always gets the line re-written at the next rejection. The contract pin: after a SECOND full reconnect round (wipe + rejection), the line is present in the buffer again.
 - The existing anchor consumers (`terminal.created` `:5950-5959`, attach branch `:7013-7020`) keep explicit skip-guards for the dead-copy category (neither write nor clear it) — the mint has exactly two owners (gate, effect) and the anchors must never be a third.
 The fresh-agent dead arm does NOT mint the notice (FreshAgentView renders `reconcileNotice` as a 5-second transient status — an in-pane UI change the request forbids; fresh-agent panes keep their banner only). `reconcileNotice` is persistence-stripped (`persistMiddleware.ts:297`), so in the reload shape the notice arrives after the boot reconcile re-folds the verdict — not at mount; the reload-shape test reflects that timing.
@@ -187,7 +187,7 @@ The fresh-agent dead arm does NOT mint the notice (FreshAgentView renders `recon
 - Produces: `writeLocalXtermNoticeDirect` — a synchronous no-queue variant extracted from `writeLocalXtermNotice`'s existing fallback path (shared core; only the notice effect calls the direct variant), plus the two constants below.
 - Produces:
   - `DEAD_SESSION_RECONCILE_NOTICES` + `deadSessionReconcileNoticeFor(reason)` + `isDeadSessionReconcileNotice(notice)` in `src/lib/pane-reconcile.ts` (the fold-minted store-field copies, reason-honest — matched by CATEGORY via the predicate, so the `invalid`-arm and reset notices can never trigger the consumers);
-  - `const DEAD_SESSION_BUFFER_NOTICE = "[This pane's saved session no longer exists on disk - close this pane or start a new one]"` (module-level const in TerminalView.tsx — the xterm line; unit and e2e tests pin this literal).
+  - `const DEAD_SESSION_BUFFER_NOTICES = { missing: "[This pane's saved session no longer exists on disk - close this pane or start a new one]", respawnExhausted: "[This pane's saved session could not be resumed - close this pane or start a new one]" }` plus a mint→line selector (module-level in TerminalView.tsx — the xterm lines are REASON-HONEST like the store copies, selected from the dead-copy mint the writer consumed; delta review round 1, finding 3. Unit and e2e tests pin the missing-variant literal; the respawn variant is unit-pinned).
 
 - [ ] **Step 1: Write the failing behavioral tests**
 
@@ -195,7 +195,8 @@ In `TerminalView.session-reserved.test.tsx`, extend `exhaustion auto-resolves vi
 
 ```tsx
 // After the existing restoreError assertion (:401), add:
-// - exactly ONE xterm write containing the DEAD_SESSION_BUFFER_NOTICE line,
+// - exactly ONE xterm write containing the dead-session buffer notice line
+//   (missing variant — this fixture's verdict reason is session_file_missing),
 //   CRLF-framed: `\r\n[This pane's saved session no longer exists on disk - close this pane or start a new one]\r\n`
 //   (use the suite's write-capture helper pattern; see the reconcileNotice
 //   one-shot test :434 and terminalWriteStrings in TerminalView.lifecycle.test.tsx:324)
@@ -210,7 +211,7 @@ describe('dead-session notice line', () => {
     // Preload pane content with ONLY the persisted restoreError (no
     // terminalId, no reconcileNotice — it is persistence-stripped). Mount:
     // assert NO write yet. Fold the dead verdict (latch + mint). Assert
-    // exactly one DEAD_SESSION_BUFFER_NOTICE write and the mint consumed.
+    // exactly one dead-session buffer-notice write and the mint consumed.
     // Do NOT assert on terminal.create frames here.
   })
   it('retained-terminalId shape: the line is written at the stand-down gate AFTER the attach rejection settles — never before, never twice, never the raw copy', async () => {
@@ -219,7 +220,7 @@ describe('dead-session notice line', () => {
     // (pre-verdict absorption). Fold the dead verdict (latch + mint).
     // Emit the post-verdict attach attempt's INVALID_TERMINAL_ID: the gate
     // runs (stand-down) and the writer fires. Assert: exactly ONE write
-    // containing DEAD_SESSION_BUFFER_NOTICE; the RAW store copy strings are
+    // containing the buffer notice line; the RAW store copy strings are
     // never written; and — the round-3 contract — the assertion reads the
     // FINAL surviving buffer state (write sequence + any reset events), not
     // merely captured writes: after the rejection settles, the line is in
@@ -229,7 +230,7 @@ describe('dead-session notice line', () => {
     // Continue the previous scenario: a new ready/round re-folds the mint;
     // the new attach attempt reconstructs (dirty surface) and wipes the
     // buffer; its rejection re-runs the gate. Assert the FINAL buffer
-    // contains exactly ONE DEAD_SESSION_BUFFER_NOTICE line (rewritten
+    // contains exactly ONE dead-session buffer-notice line (rewritten
     // post-wipe). This is the binding idempotency contract — the signal
     // choice in the implementation may vary, this test may not.
   })
@@ -251,9 +252,10 @@ describe('dead-session notice line', () => {
   })
   it('copy honesty (round 3 finding 3): respawn_exhausted verdicts mint the could-not-be-resumed copy', async () => {
     // Fold a dead verdict with reason 'respawn_exhausted'. Assert the mint
-    // is the respawnExhausted copy and the written buffer line still uses
-    // DEAD_SESSION_BUFFER_NOTICE (the xterm line is shared; the STORE copy
-    // carries the reason distinction).
+    // is the respawnExhausted copy and the written buffer line derives from
+    // the consumed mint — the could-not-be-resumed buffer variant, never
+    // the false "no longer exists on disk" (the session file is present;
+    // delta review round 1, finding 3).
   })
   it('ignores non-dead reconcileNotice copies (invalid verdict)', async () => {
     // Mint the invalid-arm notice text. Assert NO buffer write.
@@ -302,9 +304,14 @@ dispatch(setPaneReconcileNotice({
 In `src/components/TerminalView.tsx` (module scope, near the other notice copy constants):
 
 ```tsx
-/** One-line explanation a dead terminal pane writes into its own buffer. */
-const DEAD_SESSION_BUFFER_NOTICE =
-  "[This pane's saved session no longer exists on disk - close this pane or start a new one]"
+/** One-line explanations a dead terminal pane writes into its own buffer —
+ *  reason-honest, selected from the consumed dead-copy mint. */
+const DEAD_SESSION_BUFFER_NOTICES = {
+  missing:
+    "[This pane's saved session no longer exists on disk - close this pane or start a new one]",
+  respawnExhausted:
+    "[This pane's saved session could not be resumed - close this pane or start a new one]",
+} as const
 ```
 
 In TerminalView, one shared writer callback plus two trigger sites (the split-by-shape contract from the Keying section):
@@ -324,7 +331,7 @@ Expected: PASS
 
 - [ ] **Step 5: Refactor while green**
 
-None expected — the effect is additive and self-contained. The `[Resume failed]` refusal line (`:6512`) and `[Restore failed]` arm (`:6596`) stay as-is: in the reload shape the verdict line and the server's typed-refusal line legitimately stack and read coherently.
+None expected — the effect is additive and self-contained. The `[Resume failed]` refusal line (`:6512`) and `[Restore failed]` arm (`:6596`) stay as-is for the timelines that still reach them: an UNLATCHED pane whose recovery create resumes a session deleted while it was down (a reload that lands BEFORE the dead verdict) still gets the typed refusal and its line. On the POST-VERDICT reload timeline the shipped behavior is the stand-down shape — the dead pane never sends the create at all (the create lane stands down on the latch; delta review round 1, finding 1), so no refusal ever stacks: the notice line is the only line that lands on that surface.
 
 - [ ] **Step 6: Run impacted-test verification**
 
@@ -511,7 +518,7 @@ All four browser specs that interact with the dialog get rewritten to pin the ne
 - Modify: `test/e2e-browser/specs/freshclaude-zero-turn-restart-rust.spec.ts` (`:229-235` state half; `:246` restoreError negative stays)
 
 **Interfaces:**
-- Consumes: Task 2's `DEAD_SESSION_BUFFER_NOTICE` literal (pin the same string in the specs), Task 4's final state shape.
+- Consumes: Task 2's missing-variant `DEAD_SESSION_BUFFER_NOTICES.missing` literal (pin the same string in the specs — this spec's deaths are session_file_missing), Task 4's final state shape.
 - Produces: the no-modal e2e contract: no `role="dialog"` named "Dead sessions" ever; dead panes show the notice line; latch stands; nothing auto-closes; resolution through existing chrome.
 
 - [ ] **Step 1: Rewrite the specs (test-first: these specs are red against the branch until Tasks 1-4 land — after they land, run them red→green in the same commit order)**
@@ -526,7 +533,7 @@ Act: server.restart() with both session files deleted (existing :594-596 recipe)
 Assert (live-reconnect shape):
  1. ZERO dialogs: await expect(page.getByRole('dialog', { name: 'Dead sessions' })).toHaveCount(0)
  2. Each dead pane's stale buffer (harness.getTerminalBuffer(<captured stale terminalId>))
-    contains DEAD_SESSION_BUFFER_NOTICE exactly once (count the occurrences === 1).
+    contains the missing-variant buffer notice line exactly once (count the occurrences === 1).
  3. TestHarness.getState(): both leaves carry
     content.restoreError.reason === 'durable_artifact_missing'.
  4. No auto-close: pane count and tab count unchanged from pre-restart;
@@ -535,37 +542,48 @@ Assert (live-reconnect shape):
     (listTerminals, filtered to these panes — the spec's initial SHELL
     pane legitimately gets its own fresh-verdict PTY after a restart, so
     server-WIDE counts must not be asserted; fresh-eyes round 3, finding 2).
-Act 2 (reload shape: pin the refusal path, then resolve via user-named chrome): page.reload(),
+Act 2 (reload shape: pin the stand-down path, then resolve via user-named chrome): page.reload(),
 waitForWsReady, retryWarmingIfVisible if the warming banner appears.
- 5. The boot reconcile re-adjudicates both panes dead; the post-verdict
-    create is refused typed SESSION_MISSING (no PTY); assert each pane's
-    buffer/visible text now also carries the existing `[Resume failed]`
-    refusal line stacked after the notice line, and each pane renders the
-    existing TerminalLaunchFailureCard with its Start fresh control
-    (presence only — do not click it; the resolution below must go through
-    the user-named pane chrome). NOTE (kata ebp6): this spec's codex
-    seeding has a known flake (seeded leaf null after 20s); if the
-    rewritten spec hits it, harden the seeding — do not skip.
- 6. Resolve pane A through the user-named "Replace pane" chrome route
-    (review round 1, finding 5): open the pane context menu → "Replace
-    pane" (menu-defs.ts:450) → the pane becomes a picker → select a
-    terminal-type option (Codex if offered for this cwd, else Shell). Assert
-    the same pane node carries a live, !restoreError terminal and exactly
-    ONE new identity-less PTY exists server-side (no --resume of the dead
-    session id in the terminal argv). This is the first e2e drive of
-    Replace pane — read src/components/panes/PanePicker.tsx and the
-    replace-pane React-e2e (test/e2e/replace-pane.test.tsx) for the
-    picker's structure first. FALLBACK (record which route was proven if
-    this differs): if the picker flow proves genuinely undrivable in this
-    spec's environment, substitute pane A's failure-card Start fresh
-    (existing in-pane affordance; validated wiring LB3: it drives
-    startNewManagedRuntimeConversation — createRequestId CHANGES by design,
-    new PTY is identity-less) and record the substitution in the spec
-    header — but a user-named chrome route (Replace pane / Reopen pane as /
-    + split) must be exercised SOMEWHERE in this spec or its sibling specs
-    for the resolution contract to count as covered. Assert the resolution
-    with pane-scoped counts: exactly ONE new identity-less PTY attributable
-    to pane A (no --resume of the dead session id in its argv).
+  5. The boot reconcile re-adjudicates both panes dead — and the reload
+     lands in the STAND-DOWN shape (the shipped behavior; delta review
+     round 1, finding 1's create-lane gate makes it the stand-down shape
+     on ALL timelines): the reloaded pane KEEPS its stale terminalId
+     (loadPersistedPanes strips transient fields, never terminal identity),
+     the boot reconcile re-folds the latch and a fresh notice mint, the
+     pane's attach to the stale terminal is rejected INVALID_TERMINAL_ID,
+     and with the latch already standing the stand-down gate owns the
+     round — NO recovery create is ever minted: no PTY, no typed
+     SESSION_MISSING refusal, no failure card. Assert each pane's fresh
+     post-reload buffer carries the notice line EXACTLY ONCE and NEVER a
+     `[Resume failed]` line, the pane carries NO launchFailure, and NO
+     TerminalLaunchFailureCard renders (the Start-fresh card belongs to a
+     DIFFERENT timeline — a reload that lands BEFORE the dead verdict,
+     when the unlatched pane's recovery create still resumes the deleted
+     session; that refusal path stays pinned by the TerminalView unit
+     tests and the server's wire tests). NOTE (kata ebp6): this spec's
+     codex seeding has a known flake (seeded leaf null after 20s); if the
+     rewritten spec hits it, harden the seeding — do not skip.
+  6. Resolve pane A through the user-named "Replace pane" chrome route
+     (review round 1, finding 5): open the pane context menu → "Replace
+     pane" (menu-defs.ts:450) → the pane becomes a picker → select a
+     terminal-type option (Codex if offered for this cwd, else Shell). Assert
+     the same pane node carries a live, !restoreError terminal and exactly
+     ONE new identity-less PTY exists server-side (no --resume of the dead
+     session id in the terminal argv). This is the first e2e drive of
+     Replace pane — read src/components/panes/PanePicker.tsx and the
+     replace-pane React-e2e (test/e2e/replace-pane.test.tsx) for the
+     picker's structure first. FALLBACK (record which route was proven if
+     this differs): if the picker flow proves genuinely undrivable in this
+     spec's environment, substitute another user-named chrome route
+     (Reopen pane as / + split) and record the substitution in the spec
+     header — but a user-named chrome route (Replace pane / Reopen pane as /
+     + split) must be exercised SOMEWHERE in this spec or its sibling specs
+     for the resolution contract to count as covered. (The originally
+     drafted failure-card Start fresh fallback is void on this timeline: the
+     stood-down pane never enters the create-refusal shape, so no card
+     exists to click.) Assert the resolution
+     with pane-scoped counts: exactly ONE new identity-less PTY attributable
+     to pane A (no --resume of the dead session id in its argv).
  7. Close pane B via its pane header close button
     (getByRole('button', { name: 'Close pane' })). LB4 (validated): each
     dead pane is its own single-pane tab, so closing pane B removes B's
