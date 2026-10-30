@@ -159,10 +159,21 @@ git commit -m "feat(terminal): stand down INVALID_TERMINAL_ID recovery on the de
 
 One buffer notice line, exactly once per dead adjudication per mount, into the pane's own stale xterm buffer (written directly, not through the write queue). Re-arms when the latch clears (user resolved the pane); survives reconnect re-adjudication via a ref key.
 
-**Keying (load-bearing-validated LB1; fresh-eyes round 2 finding 1):** the notice must NOT key on raw `restoreError` — `durable_artifact_missing` is also minted on LIVE panes by the codex dead-live-handle recovery breadcrumb (`TerminalView.tsx:6792`, pane goes live with the latch persisted) and the server-folded `terminal.created` restoreError (`:5842`, pinned live by `test/e2e/codex-refresh-rehydrate-flow.test.tsx:556-577`). Instead the fold's terminal `dead_session` arm additionally mints the existing one-shot store field `reconcileNotice` with a dedicated dead copy — a signal no other producer can mint — and ONLY the new notice effect owns that copy:
-- Both existing anchor consumers (`terminal.created` at `:5950-5959`, attach branch at `:7013-7020`) gain an explicit skip for the dead copy (neither write it nor clear it) — without the guard, the attach effect in the same post-verdict flush can read the mint from `contentRef.current` before the notice effect's clear lands, double-writing or writing the raw store copy.
-- The notice effect writes the buffer line DIRECTLY to the term surface (bypassing the terminal write queue): on the primary live-reconnect path the lifecycle effect's post-verdict re-fire starts another attach for the retained terminalId, and the generation bump would DROP a queued line (`:3696` drops prior-generation queued writes). A dead pane's surface is stable — no attach ever completes, so nothing later clears it — making the direct write safe and the queued write wrong.
-- Consume-and-clear happens only once a term surface exists (while it does not, e.g. an opencode provider-wait window, the mint stays pending and is neither consumed nor lost). The clear-on-consume prevents a stale copy riding `resetPaneForReconcileCreate` into the user's fresh pane via the `terminal.created` anchor.
+**Keying and write timing (load-bearing-validated LB1; fresh-eyes rounds 2+3):** the notice must NOT key on raw `restoreError` — `durable_artifact_missing` is also minted on LIVE panes by the codex dead-live-handle recovery breadcrumb (`TerminalView.tsx:6792`, pane goes live with the latch persisted) and the server-folded `terminal.created` restoreError (`:5842`, pinned live by `test/e2e/codex-refresh-rehydrate-flow.test.tsx:556-577`). The fold's terminal `dead_session` arm therefore additionally mints the existing one-shot store field `reconcileNotice` with a dedicated dead copy — a signal no other producer can mint. The copy is REASON-HONEST (round 3, finding 3): the server also returns `dead_session` with reason `respawn_exhausted` while the session file is PRESENT (`crates/freshell-ws/src/reconcile.rs:392-400`), so the fold selects the copy from `verdict.reason` — `session_not_on_disk`/`session_file_missing` get "…no longer exists on disk."; `respawn_exhausted` (and any unknown reason) get "…could not be resumed."; both variants live under one exported predicate so consumers match the mint by CATEGORY, not one string:
+
+```ts
+export const DEAD_SESSION_RECONCILE_NOTICES = {
+  missing: 'Saved session no longer exists on disk.',
+  respawnExhausted: 'Saved session could not be resumed.',
+} as const
+export function isDeadSessionReconcileNotice(notice: string | undefined): boolean
+```
+
+Write TIMING is split by pane shape (round 3, finding 1 — a write must never precede a possible attach, because a dirty surface makes the next `viewport_hydrate` attach run `beginMountedReconstruction` (`:3933-3947` → reset `\x18\x1bc` at `:3889`), which wipes the buffer BEFORE the server rejects the attach):
+- **Retained-terminalId shape (live-reconnect):** the notice effect does NOT write and does NOT consume (it returns when `content.terminalId` is set). The write happens at the INVALID_TERMINAL_ID stand-down gate (Task 1's `deadSessionLatchRef.current` branch): by then the attach attempt — including any reconstruction — has already settled and been rejected, so the surface is final for the round. The gate writes DIRECT to the term (not the write queue; the queue's generation discipline is moot post-rejection), consumes the mint (`clearPaneReconcileNotice` dispatch), and sets the idempotency key.
+- **No-terminalId shape (reload / boot reconcile):** the notice effect writes and consumes directly — no attach can ever start without a terminalId, so the empty surface is stable.
+- **Re-connect re-adjudication (a LATER reconnect round after the pane already showed the line):** the attach attempt that round may legitimately reconstruct (the pane's surface is now dirty from the earlier notice) and wipe the line before its rejection. The gate must therefore RE-WRITE the line after a reconstruction wipe: idempotency keys on the rejection round, not the identity alone — reset the gate's key whenever `beginMountedReconstruction` completed for this surface (observe `surfaceFreshRef.current === true`, which the reconstruction sets on completion, `:3918`), so a wiped surface always gets the line re-written at the next rejection. The contract pin: after a SECOND full reconnect round (wipe + rejection), the line is present in the buffer again.
+- The existing anchor consumers (`terminal.created` `:5950-5959`, attach branch `:7013-7020`) keep explicit skip-guards for the dead-copy category (neither write nor clear it) — the mint has exactly two owners (gate, effect) and the anchors must never be a third.
 The fresh-agent dead arm does NOT mint the notice (FreshAgentView renders `reconcileNotice` as a 5-second transient status — an in-pane UI change the request forbids; fresh-agent panes keep their banner only). `reconcileNotice` is persistence-stripped (`persistMiddleware.ts:297`), so in the reload shape the notice arrives after the boot reconcile re-folds the verdict — not at mount; the reload-shape test reflects that timing.
 
 **Files:**
@@ -175,7 +186,7 @@ The fresh-agent dead arm does NOT mint the notice (FreshAgentView renders `recon
 - Consumes: the `writeLocalXtermNotice` core (`TerminalView.tsx:1652` — side-effect gate, surface bookkeeping, write-scope framing; caller frames `\r\n`), `setPaneReconcileNotice` / `clearPaneReconcileNotice` (existing actions), `shouldWaitForProviderBehavior`, `termRef`.
 - Produces: `writeLocalXtermNoticeDirect` — a synchronous no-queue variant extracted from `writeLocalXtermNotice`'s existing fallback path (shared core; only the notice effect calls the direct variant), plus the two constants below.
 - Produces:
-  - `export const DEAD_SESSION_RECONCILE_NOTICE = 'Saved session no longer exists on disk.'` in `src/lib/pane-reconcile.ts` (the fold-minted store-field copy — matched exactly, so the `invalid`-arm and reset notices can never trigger the effect);
+  - `DEAD_SESSION_RECONCILE_NOTICES` + `deadSessionReconcileNoticeFor(reason)` + `isDeadSessionReconcileNotice(notice)` in `src/lib/pane-reconcile.ts` (the fold-minted store-field copies, reason-honest — matched by CATEGORY via the predicate, so the `invalid`-arm and reset notices can never trigger the consumers);
   - `const DEAD_SESSION_BUFFER_NOTICE = "[This pane's saved session no longer exists on disk - close this pane or start a new one]"` (module-level const in TerminalView.tsx — the xterm line; unit and e2e tests pin this literal).
 
 - [ ] **Step 1: Write the failing behavioral tests**
@@ -191,59 +202,61 @@ In `TerminalView.session-reserved.test.tsx`, extend `exhaustion auto-resolves vi
 // - content.reconcileNotice is CLEARED after the write (consumed one-shot)
 ```
 
-In `TerminalView.lifecycle.test.tsx`, add a focused describe. FIXTURE REQUIREMENT (review round 1, finding 3): the notice is read from the `paneContent` PROP, so store dispatches alone cannot reach the effect when the harness renders `<TerminalView paneContent={fixedObject}>`. Adapt the fixture so the rendered content is STORE-CONNECTED — mirror PaneContainer's leaf branch (select `s.panes.layouts[tabId]`'s leaf content and pass it as the `paneContent` prop through a small connected wrapper component in the test harness), so dispatching `setPaneRestoreError` + `setPaneReconcileNotice({ ..., notice: DEAD_SESSION_RECONCILE_NOTICE })` re-renders TerminalView with the folded content — exactly what the real fold does. Alternatively drive the pins through the real ws-fold flow in `TerminalView.session-reserved.test.tsx` (whose harness already flows folded content end-to-end). Then:
+In `TerminalView.lifecycle.test.tsx`, add a focused describe. FIXTURE REQUIREMENT (review round 1, finding 3): the notice machinery reads from `contentRef`/props, so store dispatches alone cannot reach the component when the harness renders `<TerminalView paneContent={fixedObject}>`. Adapt the fixture so the rendered content is STORE-CONNECTED — mirror PaneContainer's leaf branch (select `s.panes.layouts[tabId]`'s leaf content and pass it as the `paneContent` prop through a small connected wrapper component in the test harness), so dispatching `setPaneRestoreError` + `setPaneReconcileNotice({ ..., notice: deadSessionReconcileNoticeFor(reason) })` re-renders TerminalView with the folded content — exactly what the real fold does. Alternatively drive the pins through the real ws-fold flow in `TerminalView.session-reserved.test.tsx` (whose harness already flows folded content end-to-end). Then:
 
 ```tsx
 describe('dead-session notice line', () => {
-  it('consumes the dead reconcileNotice copy and writes the buffer line once', async () => {
-    // Latch + mint. Assert exactly one DEAD_SESSION_BUFFER_NOTICE write
-    // and reconcileNotice cleared.
-  })
-  it('a re-fold (fresh restoreError + fresh notice copy, same session identity) does not rewrite', async () => {
-    // Fold the SAME identity again (App's every-ready round does exactly
-    // this on each reconnect — new object identities each time).
-    // Assert the write count is STILL one (ref key absorbs), and the copy
-    // was consumed (cleared) again — no stale field rides a reset.
-  })
-  it('re-arms when the latch clears even with identity PRESERVED (live attach case)', async () => {
-    // Latch + mint → one write. Clear ONLY restoreError (attach-style fold:
-    // same createRequestId, same sessionRef) → ref resets. Re-latch +
-    // re-mint the SAME identity (the session file was deleted again while
-    // the page stayed open) → a SECOND write lands (count two).
-  })
-  it('reload shape: the persisted latch alone writes nothing; the boot re-fold mints and writes once', async () => {
+  it('no-terminalId shape (reload): the boot re-fold mints and the effect writes once; raw store copy never written', async () => {
     // Preload pane content with ONLY the persisted restoreError (no
     // terminalId, no reconcileNotice — it is persistence-stripped). Mount:
-    // assert NO write yet. Then simulate the boot reconcile verdict fold
-    // (latch + notice mint). Assert exactly one write. (Do NOT assert on
-    // terminal.create frames here — the mount create path is ungated by
-    // design and governed by the reconcile pending-window, not this effect.)
+    // assert NO write yet. Fold the dead verdict (latch + mint). Assert
+    // exactly one DEAD_SESSION_BUFFER_NOTICE write and the mint consumed.
+    // Do NOT assert on terminal.create frames here.
   })
-  it('provider-wait window: the mint stays pending until the surface mounts, then writes once', async () => {
-    // Mount an opencode-mode pane whose extension behavior is unresolved
-    // (shouldWaitForProviderBehavior true — the seam is
-    // providerUsesExtensionTerminalBehavior, src/lib/terminal-behavior.ts:15-19,
-    // resolved through the extension registry; use the existing registry seam
-    // the init effect keys on). Fold the dead verdict (latch + mint). Assert
-    // NO write yet AND reconcileNotice NOT consumed. Resolve the registry
-    // (surface mounts). Assert exactly one write and the copy consumed.
+  it('retained-terminalId shape: the line is written at the stand-down gate AFTER the attach rejection settles — never before, never twice, never the raw copy', async () => {
+    // Fixture: pane WITH a retained live terminalId and durable sessionRef.
+    // Emit INVALID_TERMINAL_ID while the pending window is armed
+    // (pre-verdict absorption). Fold the dead verdict (latch + mint).
+    // Emit the post-verdict attach attempt's INVALID_TERMINAL_ID: the gate
+    // runs (stand-down) and the writer fires. Assert: exactly ONE write
+    // containing DEAD_SESSION_BUFFER_NOTICE; the RAW store copy strings are
+    // never written; and — the round-3 contract — the assertion reads the
+    // FINAL surviving buffer state (write sequence + any reset events), not
+    // merely captured writes: after the rejection settles, the line is in
+    // the buffer.
   })
-  it('live-reconnect shape (round 2 F1): the line survives the post-verdict re-attach, written exactly once, and the raw store copy is never written', async () => {
-    // Fixture: pane WITH a retained live terminalId and durable sessionRef
-    // (setupReconcileOwnedPane donor). Emit INVALID_TERMINAL_ID while the
-    // reconcile pending window is armed (pre-verdict absorption — the
-    // existing :2410 test's pattern). Then fold the dead verdict (latch +
-    // mint). Assert: exactly ONE write containing DEAD_SESSION_BUFFER_NOTICE;
-    // the RAW store copy ('Saved session no longer exists on disk.') is
-    // never written (the attach anchor skipped it); and the line is NOT
-    // dropped by any post-verdict attach attempt settling afterwards (the
-    // direct write bypasses the queue's generation discipline — assert the
-    // line is still in the captured writes after the attach rejection
-    // settles).
+  it('survives a SECOND reconnect round: a reconstruction wipe re-arms the write and the line is present exactly once afterwards', async () => {
+    // Continue the previous scenario: a new ready/round re-folds the mint;
+    // the new attach attempt reconstructs (dirty surface) and wipes the
+    // buffer; its rejection re-runs the gate. Assert the FINAL buffer
+    // contains exactly ONE DEAD_SESSION_BUFFER_NOTICE line (rewritten
+    // post-wipe). This is the binding idempotency contract — the signal
+    // choice in the implementation may vary, this test may not.
+  })
+  it('re-arm when the latch clears with identity preserved', async () => {
+    // Write once (no-terminalId shape). Clear ONLY restoreError
+    // (attach-style fold: same createRequestId, same sessionRef). Re-latch
+    // + re-mint the SAME identity (file deleted again). A SECOND write
+    // lands (count two across the two adjudications).
+  })
+  it('provider-wait window: the mint stays pending until the surface mounts, then the line writes once', async () => {
+    // Opencode-mode pane, registry unresolved (shouldWaitForProviderBehavior
+    // true; seam: src/lib/terminal-behavior.ts:15-19). Fold the dead
+    // verdict; drive the rejection (gate) with termRef null → pending
+    // marker set, mint NOT consumed. Resolve the registry (surface mounts)
+    // → the effect completes the pending write. Assert exactly one write
+    // and the mint consumed. (For the no-terminalId variant the effect
+    // covers it directly — pin whichever shape the fixture makes tractable
+    // and note the other.)
+  })
+  it('copy honesty (round 3 finding 3): respawn_exhausted verdicts mint the could-not-be-resumed copy', async () => {
+    // Fold a dead verdict with reason 'respawn_exhausted'. Assert the mint
+    // is the respawnExhausted copy and the written buffer line still uses
+    // DEAD_SESSION_BUFFER_NOTICE (the xterm line is shared; the STORE copy
+    // carries the reason distinction).
   })
   it('ignores non-dead reconcileNotice copies (invalid verdict)', async () => {
-    // Mint the invalid-arm notice text instead. Assert NO buffer write of
-    // the dead line.
+    // Mint the invalid-arm notice text. Assert NO buffer write.
   })
 })
 ```
@@ -259,13 +272,21 @@ Expected: FAIL — no notice is written today (TerminalView renders nothing from
 In `src/lib/pane-reconcile.ts` (module scope):
 
 ```ts
-/**
- * Dead-session verdict copy minted (terminal arm only) onto the pane's
- * one-shot reconcileNotice field. Matched EXACTLY by TerminalView's notice
- * effect; no other producer may mint this string. Fresh-agent dead arms do
- * NOT mint it (FreshAgentView would render it as a transient status).
- */
-export const DEAD_SESSION_RECONCILE_NOTICE = 'Saved session no longer exists on disk.'
+export const DEAD_SESSION_RECONCILE_NOTICES = {
+  missing: 'Saved session no longer exists on disk.',
+  respawnExhausted: 'Saved session could not be resumed.',
+} as const
+
+export function deadSessionReconcileNoticeFor(reason: string | undefined): string {
+  return reason === 'respawn_exhausted'
+    ? DEAD_SESSION_RECONCILE_NOTICES.respawnExhausted
+    : DEAD_SESSION_RECONCILE_NOTICES.missing
+}
+
+export function isDeadSessionReconcileNotice(notice: string | undefined): boolean {
+  return notice === DEAD_SESSION_RECONCILE_NOTICES.missing
+    || notice === DEAD_SESSION_RECONCILE_NOTICES.respawnExhausted
+}
 ```
 
 In the terminal `dead_session` arm (`:556-574`), beside the existing `setPaneRestoreError` dispatch:
@@ -274,7 +295,7 @@ In the terminal `dead_session` arm (`:556-574`), beside the existing `setPaneRes
 dispatch(setPaneReconcileNotice({
   tabId,
   paneId,
-  notice: DEAD_SESSION_RECONCILE_NOTICE,
+  notice: deadSessionReconcileNoticeFor(verdict.reason),
 }))
 ```
 
@@ -286,74 +307,14 @@ const DEAD_SESSION_BUFFER_NOTICE =
   "[This pane's saved session no longer exists on disk - close this pane or start a new one]"
 ```
 
-Inside the component, after the init-xterm effect (after `:3162`):
+In TerminalView, one shared writer callback plus two trigger sites (the split-by-shape contract from the Keying section):
 
-First the direct-write helper (extract `writeLocalXtermNotice`'s existing no-queue fallback path — side-effect gate, surface bookkeeping, `beginTerminalOutputWriteScope`, `term.write` — into a shared core both callers use):
+1. `writeDeadSessionNoticeIfPending()` — a component-scope callback; it reads `contentRef.current`, no-ops unless `isDeadSessionReconcileNotice(content.reconcileNotice)`; when the term is not mounted yet it records a pending marker (`deadSessionNoticePendingRef`) instead of consuming; when it writes it (a) writes the line DIRECT to the term via the extracted `writeLocalXtermNoticeDirect` core (no write queue — the write must not be generation-dropped or reordered), (b) dispatches `clearPaneReconcileNotice` (consume), (c) sets the idempotency key (`createRequestId|sessionId`). Idempotency contract: no rewrite for the same un-wiped surface; RE-WRITE after a later `beginMountedReconstruction` wipe (candidate signal: `surfaceFreshRef.current`, set on reconstruction completion at `:3918`; verify the exact epoch mechanics against the code at execution — the binding contract is the test below, not the signal choice).
+2. Call it from the INVALID_TERMINAL_ID stand-down gate (Task 1's `deadSessionLatchRef.current` branch — the post-rejection moment; by then any reconstruction for this round has already completed, so the write lands on the final surface), right before `return`.
+3. Call it from the notice effect — but the effect handles ONLY shapes where no attach can ever occur: it returns immediately when `content.terminalId` is set (the gate owns that shape), and when the terminalId is absent it invokes the writer. The effect also completes a pending-marker left by the gate during a provider-wait window (the `shouldWaitForProviderBehavior` dep re-fires it when the deferred surface mounts).
+4. Skip-guards in the two anchor consumers (`:5950-5959`, `:7013-7020`): when `isDeadSessionReconcileNotice(contentRef.current.reconcileNotice)`, the anchor neither writes nor clears the copy — the mint has exactly two owners (gate, effect).
 
-```tsx
-/**
- * Synchronous variant of writeLocalXtermNotice for stable surfaces no
- * future attach will clear (dead-session panes): same side-effect gate and
- * surface bookkeeping, but bypasses the write queue so a concurrent
- * attach-generation bump cannot drop the line (fresh-eyes round 2, F1).
- */
-```
-
-(`writeLocalXtermNotice` keeps its queue path for all existing callers; only the notice effect calls the direct variant.)
-
-Anchor skip-guards — in the `terminal.created` reconcileNotice consume (`:5950-5959`) and the attach-branch consume (`:7013-7020`), before the existing `${reconcileNotice}` write-and-clear:
-
-```tsx
-if (contentRef.current.reconcileNotice === DEAD_SESSION_RECONCILE_NOTICE) {
-  // Owned by the dead-session notice effect — never written or cleared here.
-} else {
-  // ...existing consume-and-clear...
-}
-```
-
-The notice effect:
-
-```tsx
-// Dead-session notice (replaces the removed DeadSessionPanel modal). The
-// fold's terminal dead_session arm mints the one-shot reconcileNotice
-// dead copy (raw restoreError cannot discriminate dead verdicts from
-// live-recovery mints — validator LB1). This effect OWNS that copy: the
-// anchor consumers skip it, and the write goes DIRECT to the term surface
-// (not the write queue) so the post-verdict re-attach's generation bump
-// cannot drop it (round 2 F1); a dead pane's surface is stable because no
-// attach ever completes. Consume-and-clear ONLY once a term exists (the
-// opencode provider-wait window leaves the mint pending, not consumed).
-// The ref key gives exactly-once per dead adjudication; it resets whenever
-// the latch clears so a LATER re-death of the SAME identity (live attach
-// preserved identity, file deleted again) writes again.
-const deadSessionNoticeKeyRef = useRef<string | null>(null)
-useEffect(() => {
-  const content = terminalContent
-  if (!content) return
-  if (content.restoreError?.reason !== 'durable_artifact_missing') {
-    deadSessionNoticeKeyRef.current = null // latch cleared: re-arm
-    return
-  }
-  if (content.reconcileNotice !== DEAD_SESSION_RECONCILE_NOTICE) return
-  const term = termRef.current
-  if (!term) return // provider-wait window: mint stays pending, not consumed
-  dispatch(clearPaneReconcileNotice({ tabId, paneId })) // consume one-shot
-  const key = `${content.createRequestId ?? ''}|${content.sessionRef?.sessionId ?? '-'}`
-  if (deadSessionNoticeKeyRef.current === key) return // re-fold: announced already
-  deadSessionNoticeKeyRef.current = key
-  writeLocalXtermNoticeDirect(term, `\r\n${DEAD_SESSION_BUFFER_NOTICE}\r\n`)
-}, [
-  terminalContent?.reconcileNotice,
-  terminalContent?.restoreError,
-  terminalContent?.createRequestId,
-  terminalContent?.sessionRef?.sessionId,
-  shouldWaitForProviderBehavior,
-  writeLocalXtermNoticeDirect,
-  dispatch,
-])
-```
-
-(`clearPaneReconcileNotice` is already imported by the anchor consumers. The stale-copy ride-through window narrows to provider-wait panes only — a hidden dead pane has no resolution chrome.)
+(`clearPaneReconcileNotice` is already imported by the anchor consumers; `writeLocalXtermNoticeDirect` is the synchronous no-queue variant extracted from `writeLocalXtermNotice`'s existing fallback path — shared side-effect gate + surface bookkeeping + `beginTerminalOutputWriteScope` + `term.write`.)
 
 - [ ] **Step 4: Run the focused tests**
 
@@ -493,7 +454,7 @@ it('dead sessions get exactly one per-pane restoreError latch, one dead-copy rec
   expect(restoreErrors.every((a) => a.payload.restoreError.code === 'RESTORE_UNAVAILABLE'
     && a.payload.restoreError.reason === 'durable_artifact_missing')).toBe(true)
   const deadNotices = h.dispatches.filter((a) => a.type === 'panes/setPaneReconcileNotice'
-    && a.payload.notice === DEAD_SESSION_RECONCILE_NOTICE)
+    && isDeadSessionReconcileNotice(a.payload.notice))
   expect(deadNotices).toHaveLength(3)
 })
 ```
@@ -569,7 +530,11 @@ Assert (live-reconnect shape):
  3. TestHarness.getState(): both leaves carry
     content.restoreError.reason === 'durable_artifact_missing'.
  4. No auto-close: pane count and tab count unchanged from pre-restart;
-    server listTerminals shows no NEW PTYs (no duplicate --resume spawns).
+    NO PTY attributable to either dead pane's session was spawned: no
+    server terminal whose argv resumes either dead codex session id
+    (listTerminals, filtered to these panes — the spec's initial SHELL
+    pane legitimately gets its own fresh-verdict PTY after a restart, so
+    server-WIDE counts must not be asserted; fresh-eyes round 3, finding 2).
 Act 2 (reload shape: pin the refusal path, then resolve via user-named chrome): page.reload(),
 waitForWsReady, retryWarmingIfVisible if the warming banner appears.
  5. The boot reconcile re-adjudicates both panes dead; the post-verdict
@@ -598,14 +563,17 @@ waitForWsReady, retryWarmingIfVisible if the warming banner appears.
     new PTY is identity-less) and record the substitution in the spec
     header — but a user-named chrome route (Replace pane / Reopen pane as /
     + split) must be exercised SOMEWHERE in this spec or its sibling specs
-    for the resolution contract to count as covered.
+    for the resolution contract to count as covered. Assert the resolution
+    with pane-scoped counts: exactly ONE new identity-less PTY attributable
+    to pane A (no --resume of the dead session id in its argv).
  7. Close pane B via its pane header close button
     (getByRole('button', { name: 'Close pane' })). LB4 (validated): each
     dead pane is its own single-pane tab, so closing pane B removes B's
     TAB (pane A's tab survives); assert one tab gone, one fewer leaf, no
     PTY spawned.
- 8. Final: still zero dialogs for the whole test; one live PTY; the second
-    pane's departure was the user's click, not the verdict.
+ 8. Final: still zero dialogs for the whole test; pane A's resolution
+    produced exactly its one new identity-less PTY (pane-scoped count) and
+    pane B's tab was closed by the user's click, never by a verdict.
 ```
 
 **`freshclaude-identity-persistence-rust.spec.ts` HAZARD GUARD** (`:754`): keep the fixture and every keep-assertion (`:805-807` leaf fresh-agent + `restoreError.reason === 'durable_artifact_missing'`; `:824-840` identity not swapped, latch standing, ZERO `freshAgent.create`; `:849-858` the FreshAgentView `role="alert"` banner text "This session cannot be resumed because the saved session artifact is no longer available." after second reload). LB5 (validated): the deleted `state.panes.deadSessionAdjudication` poll at `:798-804` was the ONLY verdict-synchronization wait between reconnect and the `:805-807` leaf asserts — replacing it with a bare instant no-dialog assert would race the boot-reconcile fold. Replace it with the suite's own idiom: an `expect.poll` on the leaf's `content.restoreError.reason === 'durable_artifact_missing'` (same shape as this spec `:564/:581` and the adoption spec's leaf-latch polls), and only THEN assert `expect(page.getByRole('dialog', { name: 'Dead sessions' })).toHaveCount(0)` (replacing both the state poll `:798-804` and the modal-visible assert `:811`).
