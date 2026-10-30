@@ -183,7 +183,8 @@ async fn sweep_captured_tree_until_dead(
 /// never signaled) and sweeps the RECORDED tree, so reparented descendants
 /// whose tags became unreadable after the child died are still confirmed
 /// dead-by-starttime — never an empty-tree false confirmation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CondemnedRuntimeIdentity {
     /// The direct sidecar child's pid at kill time.
     pub pid: u32,
@@ -219,17 +220,41 @@ pub fn record_condemned_runtime_identity(
     ownership_env: &str,
     ownership_id: &str,
 ) -> CondemnedRuntimeIdentity {
+    record_condemned_runtime_identity_observing(pid, ownership_env, ownership_id, &mut |_, _| {})
+}
+
+#[cfg(target_os = "linux")]
+fn record_condemned_runtime_identity_observing(
+    pid: u32,
+    ownership_env: &str,
+    ownership_id: &str,
+    before_read: &mut impl FnMut(&str, i32),
+) -> CondemnedRuntimeIdentity {
+    before_read("root_stat", pid as i32);
     let child_observation = proc_starttime_observation(pid as i32);
     let mut capture_complete = child_observation.is_ok();
+    if let Err(error) = &child_observation {
+        capture_failure(pid as i32, None, ownership_id, error);
+    }
     let child_start = child_observation.ok().flatten();
-    let scan = scan_tagged_pids(ownership_env, ownership_id, Some(pid as i32));
+    let scan = scan_tagged_pids_observing(
+        ownership_env,
+        ownership_id,
+        Some(pid as i32),
+        child_start,
+        before_read,
+    );
     capture_complete &= scan.complete;
     let mut tree = Vec::new();
     for p in scan.pids {
+        before_read("member_stat", p);
         match proc_starttime_observation(p) {
             Ok(Some(st)) => tree.push((p, st)),
             Ok(None) => {}
-            Err(_) => capture_complete = false,
+            Err(error) => {
+                capture_failure(p, child_start, ownership_id, &error);
+                capture_complete = false;
+            }
         }
     }
     if !tree.iter().any(|(p, _)| *p == pid as i32) {
@@ -612,11 +637,11 @@ fn proc_entry_gone(error: &std::io::Error) -> bool {
 /// Read a process start time while preserving unavailable observations as a
 /// distinct result from a process that is gone.
 #[cfg(target_os = "linux")]
-fn proc_starttime_observation(pid: i32) -> Result<Option<u64>, ()> {
+fn proc_starttime_observation(pid: i32) -> Result<Option<u64>, ProcObservationError> {
     match std::fs::File::open(format!("/proc/{pid}/stat")) {
         Ok(stat) => proc_starttime_from_open_stat(stat),
         Err(error) if proc_entry_gone(&error) => Ok(None),
-        Err(_) => Err(()),
+        Err(error) => Err(ProcObservationError::io("stat_open", &error)),
     }
 }
 
@@ -624,24 +649,32 @@ fn proc_starttime_observation(pid: i32) -> Result<Option<u64>, ()> {
 /// already-open `/proc/<pid>/stat` (split out so the open→read window —
 /// the process reaped in between — is testable deterministically).
 #[cfg(target_os = "linux")]
-fn proc_starttime_from_open_stat(mut stat_file: std::fs::File) -> Result<Option<u64>, ()> {
+fn proc_starttime_from_open_stat(
+    mut stat_file: std::fs::File,
+) -> Result<Option<u64>, ProcObservationError> {
     use std::io::Read;
     let mut stat = String::new();
     match stat_file.read_to_string(&mut stat) {
         Ok(_) => {}
         Err(error) if proc_entry_gone(&error) => return Ok(None),
-        Err(_) => return Err(()),
+        Err(error) => return Err(ProcObservationError::io("stat_read", &error)),
     }
     // comm (field 2) may contain spaces/parens: split at the LAST ')' — the remainder
     // starts at field 3 (state), so starttime (field 22) is index 19 there.
-    let rest = stat.rsplit(')').next().ok_or(())?;
+    let invalid = || ProcObservationError::invalid("stat_parse");
+    let rest = stat.rsplit(')').next().ok_or_else(invalid)?;
     let fields: Vec<&str> = rest.split_whitespace().collect();
     match fields.first() {
         Some(&"Z") | Some(&"X") => return Ok(None),
-        None => return Err(()),
+        None => return Err(invalid()),
         Some(_) => {}
     }
-    fields.get(19).ok_or(())?.parse().map(Some).map_err(|_| ())
+    fields
+        .get(19)
+        .ok_or_else(invalid)?
+        .parse()
+        .map(Some)
+        .map_err(|_| invalid())
 }
 
 /// Classify the current occupant against the recorded process incarnation.
@@ -680,23 +713,93 @@ struct TaggedProcessScan {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcObservationError {
+    stage: &'static str,
+    kind: std::io::ErrorKind,
+    errno: Option<i32>,
+}
+
+#[cfg(target_os = "linux")]
+impl ProcObservationError {
+    fn io(stage: &'static str, error: &std::io::Error) -> Self {
+        Self {
+            stage,
+            kind: error.kind(),
+            errno: error.raw_os_error(),
+        }
+    }
+
+    fn invalid(stage: &'static str) -> Self {
+        Self {
+            stage,
+            kind: std::io::ErrorKind::InvalidData,
+            errno: None,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn capture_failure(
+    pid: i32,
+    expected_start: Option<u64>,
+    ownership_id: &str,
+    error: &ProcObservationError,
+) {
+    // Debug/test harnesses do not necessarily install a tracing subscriber.
+    // Keep failed observations diagnosable there with the same bounded fields.
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "{}",
+        serde_json::json!({"severity":"warn","event":"session_lease.capture_incomplete","stage":error.stage,"pid":pid,"expectedStart":expected_start,"ownershipId":ownership_id,"errorKind":format!("{:?}",error.kind),"errno":error.errno,"captureComplete":false})
+    );
+    tracing::warn!(stage=error.stage, pid, ?expected_start, ownership_id,
+        error_kind = ?error.kind, errno = ?error.errno,
+        capture_complete = false, "session_lease.capture_incomplete");
+}
+
+#[cfg(target_os = "linux")]
 fn scan_tagged_pids(
     ownership_env: &str,
     ownership_id: &str,
     owned_root_pid: Option<i32>,
 ) -> TaggedProcessScan {
+    scan_tagged_pids_observing(
+        ownership_env,
+        ownership_id,
+        owned_root_pid,
+        None,
+        &mut |_, _| {},
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn scan_tagged_pids_observing(
+    ownership_env: &str,
+    ownership_id: &str,
+    owned_root_pid: Option<i32>,
+    expected_start: Option<u64>,
+    before_read: &mut impl FnMut(&str, i32),
+) -> TaggedProcessScan {
     let needle = format!("{ownership_env}={ownership_id}");
     let mut out = Vec::new();
     let entries = match std::fs::read_dir("/proc") {
         Ok(entries) => entries,
-        Err(_) => {
+        Err(error) => {
+            capture_failure(
+                owned_root_pid.unwrap_or(0),
+                expected_start,
+                ownership_id,
+                &ProcObservationError::io("proc_directory", &error),
+            );
             return TaggedProcessScan {
                 pids: out,
                 complete: false,
-            }
+            };
         }
     };
     let mut complete = true;
+    before_read("proc_directory", owned_root_pid.unwrap_or(0));
     // `/proc/<pid>/environ` is intentionally unreadable for processes owned by
     // other users. Those processes cannot be part of this server's normally
     // inherited sidecar tree, so filter them by the readable ownership record
@@ -705,7 +808,13 @@ fn scan_tagged_pids(
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
-            Err(_) => {
+            Err(error) => {
+                capture_failure(
+                    owned_root_pid.unwrap_or(0),
+                    expected_start,
+                    ownership_id,
+                    &ProcObservationError::io("proc_directory_entry", &error),
+                );
                 // An unreadable directory entry leaves the process identity
                 // unknown, so this capture cannot prove the tree is gone.
                 complete = false;
@@ -714,6 +823,12 @@ fn scan_tagged_pids(
         };
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
+            capture_failure(
+                owned_root_pid.unwrap_or(0),
+                expected_start,
+                ownership_id,
+                &ProcObservationError::invalid("proc_directory_name"),
+            );
             complete = false;
             continue;
         };
@@ -721,11 +836,18 @@ fn scan_tagged_pids(
             continue;
         };
         let status_path = std::path::Path::new("/proc").join(name).join("status");
+        before_read("status", pid);
         let status = match std::fs::read_to_string(status_path) {
             Ok(status) => status,
             Err(error) if proc_entry_gone(&error) => continue,
-            Err(_) => {
+            Err(error) => {
                 if process_is_known_owned_process(pid, owned_root_pid) {
+                    capture_failure(
+                        pid,
+                        expected_start,
+                        ownership_id,
+                        &ProcObservationError::io("owned_status", &error),
+                    );
                     complete = false;
                 }
                 continue;
@@ -737,6 +859,12 @@ fn scan_tagged_pids(
             .and_then(|uid| uid.parse::<libc::uid_t>().ok())
         else {
             if process_is_known_owned_process(pid, owned_root_pid) {
+                capture_failure(
+                    pid,
+                    expected_start,
+                    ownership_id,
+                    &ProcObservationError::invalid("owned_uid"),
+                );
                 complete = false;
             }
             continue;
@@ -745,17 +873,24 @@ fn scan_tagged_pids(
             continue;
         }
         let environ = std::path::Path::new("/proc").join(name).join("environ");
+        before_read("environ", pid);
         let bytes = match std::fs::read(environ) {
             Ok(bytes) => bytes,
             // A process disappearing between the directory and environ read
             // is an expected race, not unknown surviving-writer evidence.
             Err(error) if proc_entry_gone(&error) => continue,
-            Err(_) => {
+            Err(error) => {
                 // Same-user processes can still make environ unreadable (for
                 // example a non-dumpable user service). An unrelated process
                 // cannot be evidence about this sidecar; an unreadable
                 // process in the known sidecar ancestry does.
                 if process_is_known_owned_process(pid, owned_root_pid) {
+                    capture_failure(
+                        pid,
+                        expected_start,
+                        ownership_id,
+                        &ProcObservationError::io("owned_environ", &error),
+                    );
                     complete = false;
                 }
                 continue;
@@ -1136,6 +1271,143 @@ mod tests {
     use super::*;
 
     const TTL: u64 = FRESH_AGENT_SESSION_LEASE_TTL_MS;
+
+    #[cfg(target_os = "linux")]
+    fn capture_child(non_dumpable: bool) -> (std::process::Child, String) {
+        use std::io::BufRead;
+        let tag = format!("capture-{}", uuid::Uuid::new_v4());
+        let mut child = std::process::Command::new("python3")
+            .args(["-c", if non_dumpable {
+                "import ctypes,sys; assert ctypes.CDLL(None).prctl(4,0,0,0,0)==0; print('ready',flush=True); assert sys.stdin.readline()=='exit\\n'"
+            } else {
+                "import sys; print('ready',flush=True); assert sys.stdin.readline()=='exit\\n'"
+            }])
+            .env("CAPTURE_TEST_OWNERSHIP", &tag)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn().unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+        (child, tag)
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn assert_capture_across_normal_exit(stage: &str, reap_before_read: bool) {
+        use std::io::Write;
+        let (mut child, tag) = capture_child(false);
+        let pid = child.id();
+        let start = proc_starttime(pid as i32).unwrap();
+        let zombie_identity = || {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+            let fields: Vec<_> = stat
+                .rsplit(')')
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .collect();
+            (fields[0].to_owned(), fields[19].parse::<u64>().unwrap())
+        };
+        let mut exited = false;
+        let recorded = record_condemned_runtime_identity_observing(
+            pid,
+            "CAPTURE_TEST_OWNERSHIP",
+            &tag,
+            &mut |observed, candidate| {
+                if observed == stage && candidate == pid as i32 {
+                    assert!(!exited);
+                    child.stdin.as_mut().unwrap().write_all(b"exit\n").unwrap();
+                    if reap_before_read {
+                        assert!(child.wait().unwrap().success());
+                    } else {
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(2);
+                        loop {
+                            let (state, observed_start) = zombie_identity();
+                            assert_eq!(observed_start, start);
+                            if state == "Z" {
+                                break;
+                            }
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "normal exit did not reach zombie state"
+                            );
+                            std::thread::yield_now();
+                        }
+                    }
+                    exited = true;
+                }
+            },
+        );
+        let confirmed =
+            kill_and_confirm_recorded_tree_dead(&recorded, "CAPTURE_TEST_OWNERSHIP").await;
+        if !reap_before_read {
+            // No wait/try_wait has run: confirmation observes exactly the
+            // original unreaped incarnation, then the owner finally reaps it.
+            assert_eq!(zombie_identity(), ("Z".into(), start));
+            assert!(child.wait().unwrap().success());
+        }
+        assert!(exited, "the {stage} barrier was actually exercised");
+        assert_eq!(recorded.start_time, Some(start));
+        assert_eq!(recorded.ownership_id, tag);
+        assert_eq!(recorded.tree, vec![(pid as i32, start)]);
+        assert!(
+            recorded.capture_complete,
+            "the {stage} exit lost coverage: {recorded:?}"
+        );
+        assert!(confirmed);
+    }
+
+    /// Each observation has its own barrier. These are controls: a green
+    /// reap window is not a missing-behavior Red.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn capture_preserves_identity_when_exit_precedes_each_tree_read() {
+        for stage in ["status", "environ", "member_stat"] {
+            assert_capture_across_normal_exit(stage, true).await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn capture_preserves_identity_during_unreaped_exit_at_each_tree_read() {
+        // proc_directory releases the normal exit after opening the iterator,
+        // before enumeration; member_stat releases it after tagged discovery.
+        for stage in ["proc_directory", "status", "environ", "member_stat"] {
+            assert_capture_across_normal_exit(stage, false).await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn capture_keeps_a_real_unavailable_live_root_unconfirmed() {
+        use std::io::Write;
+        let (mut child, tag) = capture_child(true);
+        let pid = child.id();
+        let start = proc_starttime(pid as i32).unwrap();
+        assert_eq!(
+            std::fs::read(format!("/proc/{pid}/environ"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let recorded = record_condemned_runtime_identity(pid, "CAPTURE_TEST_OWNERSHIP", &tag);
+        let confirmed =
+            kill_and_confirm_recorded_tree_dead(&recorded, "CAPTURE_TEST_OWNERSHIP").await;
+        let signaled = child.try_wait().unwrap().is_some();
+        child.stdin.as_mut().unwrap().write_all(b"exit\n").unwrap();
+        assert!(child.wait().unwrap().success());
+        assert_eq!(recorded.start_time, Some(start));
+        assert_eq!(recorded.tree, vec![(pid as i32, start)]);
+        assert!(!recorded.capture_complete);
+        assert!(!confirmed);
+        assert!(
+            !signaled,
+            "unavailable original evidence cannot authorize a signal"
+        );
+    }
 
     /// A process reaped between the open and the read of its `/proc` files
     /// reads as GONE — procfs answers ESRCH on the already-open descriptor —
