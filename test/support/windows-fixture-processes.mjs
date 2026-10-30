@@ -62,7 +62,7 @@ class FixtureChild extends EventEmitter {
   }
 
   maybeClose() {
-    if (this.closed || !exited(this) || this.openPipes.size !== 0) return
+    if (this.closed || !this.completedEvent || !exited(this) || this.openPipes.size !== 0) return
     this.closed = true
     this.emit('close', this.exitCode, this.signalCode)
   }
@@ -76,6 +76,7 @@ class FixtureChild extends EventEmitter {
         this.stdin?.destroy()
       }
       this.emit('error', this.failure)
+      if (status.pid === undefined) this.completedEvent = true
     }
     if (status.rootExited && !this.exitObserved) {
       this.exitObserved = true
@@ -83,6 +84,7 @@ class FixtureChild extends EventEmitter {
       this.signalCode = this.requestedSignal ?? null
       this.stdin?.destroy()
       this.emit('exit', this.exitCode, this.signalCode)
+      this.completedEvent = true
     }
     this.maybeClose()
   }
@@ -146,7 +148,11 @@ export function createWindowsFixtureSession(root) {
         cwd: options.cwd, env: options.env, stdio: options.stdio ?? ['pipe', 'pipe', 'pipe'], windowsHide: true,
       })
       this.child = new FixtureChild(this, this.controller, command, args)
-      this.controller.once('error', (error) => this.child.emit('error', error))
+      this.controller.once('error', (error) => {
+        this.child.emit('error', error)
+        if (this.child.pid === undefined) this.child.completedEvent = true
+        this.child.maybeClose()
+      })
       this.controller.once('exit', () => {
         this.refresh()
         if (!this.status?.settled) {

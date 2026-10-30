@@ -118,8 +118,8 @@ export async function resolvePinnedClaude(repoRoot = DEFAULT_REPO_ROOT) {
 
 /**
  * A throwaway HOME / CLAUDE_CONFIG_DIR / workspace. `env(baseUrl)` is the
- * complete environment for the CLI: nothing from the caller's environment
- * leaks in except PATH's node directory.
+ * complete environment for the CLI: only Node/system executable locations
+ * come from the caller; every profile, cache and temporary directory is owned.
  */
 export async function createClaudeFixture({ parent = os.tmpdir(), prefix = 'freshell-claude-contract-' } = {}) {
   await prepareFixtureProcessOwner()
@@ -139,9 +139,25 @@ export async function createClaudeFixture({ parent = os.tmpdir(), prefix = 'fres
     claudeConfigDir,
     spawn: processes.spawn,
     env(baseUrl, extra = {}) {
+      const systemRoot = process.env.SystemRoot || process.env.SYSTEMROOT || 'C:\\Windows'
+      const windowsEnv = process.platform === 'win32' ? {
+        SystemRoot: systemRoot,
+        WINDIR: systemRoot,
+        SystemDrive: path.parse(systemRoot).root.slice(0, 2),
+        ComSpec: path.join(systemRoot, 'System32', 'cmd.exe'),
+        USERPROFILE: home,
+        HOMEDRIVE: path.parse(home).root.slice(0, 2),
+        HOMEPATH: home.slice(2),
+        TEMP: tmp,
+        TMP: tmp,
+      } : {}
+      const executablePaths = process.platform === 'win32'
+        ? [path.dirname(process.execPath), path.join(systemRoot, 'System32'), systemRoot]
+        : [path.dirname(process.execPath), '/usr/bin', '/bin']
       return {
+        ...windowsEnv,
         HOME: home,
-        PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin`,
+        PATH: executablePaths.join(path.delimiter),
         TMPDIR: tmp,
         XDG_CONFIG_HOME: path.join(home, '.config'),
         XDG_CACHE_HOME: path.join(home, '.cache'),

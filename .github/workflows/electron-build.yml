@@ -89,6 +89,9 @@ jobs:
       - name: Test native fixture process ownership
         run: pnpm run test:vitest run test/integration/tooling/claude-fixture-processes-native.test.ts --config config/vitest/vitest.fixture-processes-native.config.ts
 
+      - name: Test pinned Claude SDK with the native process owner
+        run: pnpm run test:vitest run test/integration/providers/claude-checkpoint-uuid-replay.test.ts --config config/vitest/vitest.config.ts
+
   build:
     if: ${{ !inputs.fixture_processes_only }}
     strategy:
@@ -151,6 +154,10 @@ jobs:
       - name: Test native fixture process ownership
         if: matrix.os == 'windows-2022' || startsWith(matrix.os, 'macos')
         run: pnpm run test:vitest run test/integration/tooling/claude-fixture-processes-native.test.ts --config config/vitest/vitest.fixture-processes-native.config.ts
+
+      - name: Test pinned Claude SDK with the native process owner
+        if: matrix.os == 'windows-2022' || startsWith(matrix.os, 'macos')
+        run: pnpm run test:vitest run test/integration/providers/claude-checkpoint-uuid-replay.test.ts --config config/vitest/vitest.config.ts
 
       # Exercise the native Windows Claude profile lookup and the generated
       # terminal hook behavior. Keep this scoped to the two owning Rust crates.
