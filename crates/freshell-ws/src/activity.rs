@@ -305,6 +305,12 @@ struct HubInner {
     lane_retries: HashMap<String, LaneRetry>,
     codex_lanes: HashMap<String, CodexLane>,
     codex_rollout_locator: Option<CodexRolloutLocator>,
+    /// Antigravity plan Task 6: the hub-held antigravity association
+    /// (locator + input capture). Installed once at boot (the sweep reads
+    /// it back through `WsState::activity`); its whole input feed is this
+    /// hub's `ActivityEvent` stream, so its lifetime is bounded by the
+    /// hub's. `None` in tests that never exercise antigravity identity.
+    antigravity: Option<Arc<crate::antigravity_association::AntigravityAssociation>>,
     /// Task 8/9: terminal id → (hub-issued attach generation, lane task,
     /// verify-request sender — #603: `expire_due` asks the lane to
     /// re-fetch `/session/status` through it). The `OpencodeLane` ingress
@@ -648,6 +654,33 @@ impl ActivityHub {
     pub fn set_codex_rollout_locator(&self, locator: CodexRolloutLocator) {
         let mut inner = self.inner.lock().expect("activity hub lock");
         inner.codex_rollout_locator = Some(locator);
+    }
+
+    /// Antigravity plan Task 6: install the hub-held antigravity
+    /// association (locator rooted at the resolved antigravity home's
+    /// brain tree + the per-pane input capture). Called once at boot
+    /// (`freshell-server`) or by the test harness, BEFORE the first
+    /// antigravity terminal is created; the boot sweep
+    /// (`antigravity_association::spawn_antigravity_locator_sweep`) reads
+    /// it back through `WsState::activity`.
+    pub fn set_antigravity_association(
+        &self,
+        association: Arc<crate::antigravity_association::AntigravityAssociation>,
+    ) {
+        let mut inner = self.inner.lock().expect("activity hub lock");
+        inner.antigravity = Some(association);
+    }
+
+    /// The installed antigravity association, if any (the sweep's entry
+    /// point; `None` no-ops the whole association lane).
+    pub fn antigravity_association(
+        &self,
+    ) -> Option<Arc<crate::antigravity_association::AntigravityAssociation>> {
+        self.inner
+            .lock()
+            .expect("activity hub lock")
+            .antigravity
+            .clone()
     }
 
     /// G9: attach the rollout-reconcile lane for a bound codex terminal.
@@ -1100,6 +1133,23 @@ impl ActivityHub {
                 resume_session_id,
                 at,
             } => {
+                // Antigravity plan Task 6: tag the pane in the hub-held
+                // association so its input bytes buffer from the first
+                // keystroke (the sweep completes the arm with the
+                // registry's cwd — the Created event carries none).
+                // Channel-deferred by construction (this handler runs on
+                // the single hub task, never the WS dispatch thread).
+                if mode == "antigravity" {
+                    if let Some(association) = self
+                        .inner
+                        .lock()
+                        .expect("activity hub lock")
+                        .antigravity
+                        .clone()
+                    {
+                        association.note_created(&terminal_id, &mode);
+                    }
+                }
                 let mut frames = Vec::new();
                 {
                     let mut inner = self.inner.lock().expect("activity hub lock");
@@ -1211,6 +1261,19 @@ impl ActivityHub {
                 at,
             } => {
                 let submit = freshell_activity::signal::is_submit_input(&data);
+                // Antigravity plan Task 6: the association's line capture
+                // runs BEFORE the modes lookup (antigravity panes are not
+                // tracker-modes yet — Task 8 adds the tracker). A flushed
+                // submit ALSO arms the idle gate's provisional Busy phase,
+                // which is what makes a mid-turn crash ENGAGED for the
+                // death bell below (the unified attention edge).
+                let antigravity_flushed = self
+                    .inner
+                    .lock()
+                    .expect("activity hub lock")
+                    .antigravity
+                    .clone()
+                    .is_some_and(|association| association.note_input(&terminal_id, &data, at));
                 // The claude confirmable-submit path needs
                 // `transcript_len`, which does a locate() directory scan —
                 // filesystem IO that must NOT run under the hub lock.
@@ -1221,6 +1284,14 @@ impl ActivityHub {
                 // exactly as before.
                 let (frames, probe) = {
                     let mut inner = self.inner.lock().expect("activity hub lock");
+                    // Antigravity plan Task 6: a flushed submit is a
+                    // turn starting — provisional Busy on the idle gate
+                    // (engagement for the death bell; no tracker exists
+                    // yet, so nothing ever reports the phase back down —
+                    // Task 8's tracker takes this lane over).
+                    if antigravity_flushed {
+                        inner.idle.note_phase(&terminal_id, IdleGatePhase::Busy);
+                    }
                     let Some(mode) = inner.modes.get(&terminal_id).cloned() else {
                         return;
                     };
@@ -1459,6 +1530,21 @@ impl ActivityHub {
                             _ => Vec::new(),
                         };
                         frames.extend(tracker_frames);
+                    }
+                    // Antigravity plan Task 6: the association's pane
+                    // capture + locator arm go with the pane, and so does
+                    // the idle-gate state (antigravity panes are not
+                    // tracker-modes, so the modes-map teardown above never
+                    // ran for them). Runs AFTER the engagement read above,
+                    // per the "read engagement BEFORE any teardown"
+                    // invariant. `note_exit`'s answer says whether the hub
+                    // had the pane tagged at all.
+                    if inner
+                        .antigravity
+                        .clone()
+                        .is_some_and(|association| association.note_exit(&terminal_id))
+                    {
+                        inner.idle.note_exit(&terminal_id);
                     }
                     frames
                 };

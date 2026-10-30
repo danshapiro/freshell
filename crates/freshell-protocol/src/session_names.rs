@@ -20,22 +20,24 @@ pub type NameRevision = u64;
 /// revision / document-generation counter serialized to a JS client.
 pub const MAX_NAME_REVISION: NameRevision = 9_007_199_254_740_991;
 
-/// The three scoped coding-agent providers.
+/// The scoped coding-agent providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NamedProvider {
     Claude,
     Codex,
     Opencode,
+    Antigravity,
 }
 
 impl NamedProvider {
-    /// The exact wire string (`claude | codex | opencode`).
+    /// The exact wire string (`claude | codex | opencode | antigravity`).
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Opencode => "opencode",
+            Self::Antigravity => "antigravity",
         }
     }
 
@@ -45,6 +47,7 @@ impl NamedProvider {
             Self::Claude => "Claude",
             Self::Codex => "Codex",
             Self::Opencode => "OpenCode",
+            Self::Antigravity => "Antigravity CLI",
         }
     }
 }
@@ -463,4 +466,24 @@ pub struct LegacyNameImport {
 pub struct LegacyImportResult {
     pub acknowledged: Vec<String>,
     pub names: Vec<SessionNameUpdate>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Antigravity plan Task 6 pin: the `NamedProvider::Antigravity`
+    /// variant's wire string and display label (Task 9 wires the naming
+    /// surfaces that consume them).
+    #[test]
+    fn antigravity_wire_string_and_display_label() {
+        let provider = NamedProvider::Antigravity;
+        assert_eq!(provider.as_str(), "antigravity");
+        assert_eq!(provider.display_label(), "Antigravity CLI");
+        // Wire round-trip: the lowercase enum form both directions.
+        let json = serde_json::to_value(provider).expect("serialize");
+        assert_eq!(json, serde_json::json!("antigravity"));
+        let back: NamedProvider = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back, NamedProvider::Antigravity);
+    }
 }

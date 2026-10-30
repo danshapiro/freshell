@@ -21,6 +21,7 @@
 pub mod amplifier;
 pub mod amplifier_stub;
 pub mod antigravity;
+pub mod antigravity_locator;
 pub mod bundle_config;
 pub mod codex_history;
 pub mod codex_locator;

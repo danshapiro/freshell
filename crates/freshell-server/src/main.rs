@@ -1958,6 +1958,19 @@ async fn main() -> ExitCode {
             freshell_ws::locate_codex_rollout(&codex_sessions_root, session_id)
         }));
     }
+    // Antigravity plan Task 6: the hub-held antigravity association — the
+    // locator rooted at the resolved antigravity home's `brain/` tree (ONE
+    // resolution shared with the session watcher, `antigravity_home`) plus
+    // the per-pane input capture the hub's own ActivityEvent stream feeds.
+    // Its boot sweep is registered beside the codex/opencode locator sweeps
+    // below; `None` home (unresolvable HOME) skips the whole lane, mirroring
+    // the sibling locators' Option convention.
+    if let Some(home) = session_directory::provider_home() {
+        let antigravity_home = freshell_sessions::provider_layout::antigravity_home(&home);
+        activity_hub.set_antigravity_association(std::sync::Arc::new(
+            freshell_ws::antigravity_association::AntigravityAssociation::new(antigravity_home),
+        ));
+    }
     // Task 10: the opencode SSE lane's production IO seams (reqwest impls;
     // fakes in tests). Unset would leave OpencodeAttach retire-only.
     // Unified agent names (Task 3): the lane's native-title observer folds
@@ -2740,6 +2753,17 @@ async fn main() -> ExitCode {
     // Lane B2: codex locator sweep — same cadence as the sibling sweep.
     if codex_locator.is_some() {
         freshell_ws::codex_association::spawn_codex_locator_sweep(
+            ws_state.clone(),
+            LOCATOR_SWEEP_INTERVAL,
+        );
+    }
+    // Antigravity plan Task 6: the antigravity locator sweep — same cadence
+    // as the sibling sweeps. The association itself is hub-held (installed
+    // on the activity hub at construction); the sweep reads it back through
+    // `ws_state.activity`, so its whole lane no-ops when the home was
+    // unresolvable at boot.
+    if freshell_ws::antigravity_association::association_installed(&ws_state) {
+        freshell_ws::antigravity_association::spawn_antigravity_locator_sweep(
             ws_state.clone(),
             LOCATOR_SWEEP_INTERVAL,
         );

@@ -199,14 +199,15 @@ where
 /// opencode locator sweep; amplifier's post-spawn locator was deleted —
 /// kata qmpk — but fresh amplifier creates carry a launcher-minted resume
 /// id, so the marker branch only fires for the accepted legacy
-/// identity-less restore case). NOT "any non-shell mode" (V7.md):
+/// identity-less restore case; antigravity resolves via the disk locator —
+/// antigravity plan Task 6). NOT "any non-shell mode" (V7.md):
 /// claude has create-time identity (pre-allocation) and NO resolver — its
 /// degenerate no-identity payloads (mismatched-provider sessionRef,
 /// empty-string session id; V5.md) spawn un-resumable and stay ledgerless
 /// by design; kimi/gemini/custom extension modes have no resolver, so a
 /// marker for them could never resolve and would only leak until the TTL
 /// sweep. Every mode listed here MUST have a resolution hook (Tasks 8-9).
-pub(crate) const MARKER_MODES: [&str; 3] = ["codex", "opencode", "amplifier"];
+pub(crate) const MARKER_MODES: [&str; 4] = ["codex", "opencode", "amplifier", "antigravity"];
 
 /// Map the protocol `shell` enum to the platform `ShellType`.
 fn map_shell(shell: Shell) -> ShellType {

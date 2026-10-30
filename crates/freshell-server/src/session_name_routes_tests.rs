@@ -236,6 +236,11 @@ async fn bind_verified(
                 original_directory: None,
                 owned_local_endpoint: None,
             },
+            NamedProvider::Antigravity => NativeLocation::Antigravity {
+                home: "/h/.gemini/antigravity-cli".into(),
+                conversation_id: session_id.to_string(),
+                transcript_path: None,
+            },
         },
         evidence: NativeEvidenceKind::PersistedMetadata,
         persistence: NativePersistence::Verified,
