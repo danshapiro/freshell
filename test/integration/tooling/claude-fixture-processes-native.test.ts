@@ -8,6 +8,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { promisify } from 'node:util'
 import { beforeAll, describe, expect, it, vi } from 'vitest'
 import { createClaudeFixture } from '../providers/claude-local-provider.mjs'
+import { waitForFixtureProcessExit } from '../../support/stop-fixture-process.js'
 
 beforeAll(() => {
   const nativeRunner = (process.platform === 'win32' && process.env.RUNNER_OS === 'Windows')
@@ -122,7 +123,9 @@ describe('native Claude fixture process ownership', () => {
           await waitUntil(async () => fs.stat(path.join(control, 'ready')).then(() => true, () => false))
           expect(sidecar.kill('SIGKILL')).toBe(true)
         }
-        await output.closed
+        // Root exit precedes stream closure when a descendant still holds a
+        // stream. Join the full tree before requiring drained/closed stdio.
+        await waitForFixtureProcessExit(sidecar, 15_000)
         const rootPid = Number(await fs.readFile(path.join(control, 'root.pid'), 'utf8'))
         const writerPid = Number(await fs.readFile(path.join(control, 'writer.pid'), 'utf8'))
         const mcpPid = Number(await fs.readFile(path.join(control, 'mcp.pid'), 'utf8'))
@@ -132,15 +135,19 @@ describe('native Claude fixture process ownership', () => {
         if (mode === 'clean') {
           expect(sidecar.exitCode).toBe(0)
           expect(sidecar.signalCode).toBeNull()
-          expect(JSON.parse(output.stdout().trim())).toEqual({ type: 'created', pid: rootPid, cliPid: writerPid })
         } else if (mode === 'create-failed') {
           expect(sidecar.exitCode).toBe(2)
-          expect(output.stdout()).toBe('')
         } else {
           expect(await live(rootPid)).toBe(false)
         }
 
         await fixture.cleanup()
+        await output.closed
+        if (mode === 'clean') {
+          expect(JSON.parse(output.stdout().trim())).toEqual({ type: 'created', pid: rootPid, cliPid: writerPid })
+        } else if (mode === 'create-failed') {
+          expect(output.stdout()).toBe('')
+        }
         const writerAlive = await live(writerPid)
         const mcpAlive = await live(mcpPid)
         await fs.writeFile(path.join(control, 'release'), 'go')
