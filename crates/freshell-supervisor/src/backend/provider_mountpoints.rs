@@ -472,32 +472,10 @@ impl DockerEngineBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::FrozenClock;
     use freshell_runtime_protocol::{
         ProviderConfigBind, ProviderResourceKind, ProviderResourceMount,
     };
-
-    /// Holds the paused test clock still while real socket I/O runs: tokio
-    /// never auto-advances a paused clock while a blocking task is running.
-    /// A budget then expires only when the test advances the clock at the
-    /// exact stall it exercises, however loaded the machine is. The real-time
-    /// limit matters only if the code under test wedges: the hold ends, the
-    /// clock auto-advances, and the test's own bounds fail it instead of
-    /// letting it hang.
-    struct FrozenClock {
-        _release_on_drop: std::sync::mpsc::Sender<()>,
-    }
-
-    impl FrozenClock {
-        fn hold() -> Self {
-            let (release, held) = std::sync::mpsc::channel::<()>();
-            drop(tokio::task::spawn_blocking(move || {
-                let _ = held.recv_timeout(std::time::Duration::from_secs(60));
-            }));
-            Self {
-                _release_on_drop: release,
-            }
-        }
-    }
 
     #[tokio::test(start_paused = true)]
     async fn provider_mountpoint_candidate_target_joins_owned_preparation_and_cleanup() {

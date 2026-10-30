@@ -266,19 +266,22 @@ mod tests {
     use super::*;
     use crate::backend::*;
     use crate::registry::*;
+    use crate::test_support::FrozenClock;
     use async_trait::async_trait;
     use freshell_platform::claude_inputs::observation::{
         LocalDecision, NativeObservation, ObservationReply,
     };
     use freshell_runtime_protocol::*;
 
-    struct ReplyBackend(
-        StdMutex<Option<Box<dyn FnOnce() + Send>>>,
-        StdMutex<Option<ClaudeRecoverySourceBinding>>,
-        std::sync::atomic::AtomicUsize,
+    struct ReplyBackend {
+        before_reply: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+        expected_source: StdMutex<Option<ClaudeRecoverySourceBinding>>,
+        calls: std::sync::atomic::AtomicUsize,
         // When the supervisor asked the read to end.
-        StdMutex<Option<Instant>>,
-    );
+        until: StdMutex<Option<Instant>>,
+        // Synthetic scheduler/I/O contention, independent of Tokio's clock.
+        delay: Duration,
+    }
     #[async_trait]
     impl RuntimeBackend for ReplyBackend {
         async fn observe_claude_sources(
@@ -288,8 +291,14 @@ mod tests {
             _: &str,
             until: Instant,
         ) -> Result<ObservationReply, BackendError> {
-            self.2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            *self.3.lock().unwrap() = Some(until);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.until.lock().unwrap() = Some(until);
+            if !self.delay.is_zero() {
+                let delay = self.delay;
+                tokio::task::spawn_blocking(move || std::thread::sleep(delay))
+                    .await
+                    .unwrap();
+            }
             let ClaudeSourceOwner::Retained {
                 handle,
                 recovery_source,
@@ -298,7 +307,7 @@ mod tests {
                 panic!("requires retained fixture owner");
             };
             assert_eq!(handle.soul_id(), &request.soul_id);
-            if let Some(expected) = self.1.lock().unwrap().as_ref() {
+            if let Some(expected) = self.expected_source.lock().unwrap().as_ref() {
                 let supplied = recovery_source.as_ref().ok_or_else(|| {
                     BackendError::Unavailable("current registry source provenance missing".into())
                 })?;
@@ -314,7 +323,7 @@ mod tests {
                     ));
                 }
             }
-            let action = self.0.lock().unwrap().take();
+            let action = self.before_reply.lock().unwrap().take();
             if let Some(action) = action {
                 action();
             }
@@ -382,10 +391,11 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn provider_claude_nested_source_reply_requires_live_scope_after_private_ipc() {
         for mode in [
             "live",
+            "slow-live",
             "short-scope",
             "dropped",
             "expired",
@@ -394,6 +404,9 @@ mod tests {
             "candidate-expired",
             "candidate-unrecorded-prior",
         ] {
+            // Real SQLite and scheduler delays must not expire the deadlock
+            // guard or the authority whose expiry this test controls.
+            let _clock = FrozenClock::hold();
             let owned = tempfile::tempdir().unwrap();
             let binary = owned.path().join("host");
             std::fs::write(&binary, b"synthetic helper artifact").unwrap();
@@ -459,12 +472,17 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let backend = Arc::new(ReplyBackend(
-                StdMutex::new(None),
-                StdMutex::new(None),
-                std::sync::atomic::AtomicUsize::new(0),
-                StdMutex::new(None),
-            ));
+            let backend = Arc::new(ReplyBackend {
+                before_reply: StdMutex::new(None),
+                expected_source: StdMutex::new(None),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                until: StdMutex::new(None),
+                delay: if mode == "slow-live" {
+                    Duration::from_millis(350)
+                } else {
+                    Duration::ZERO
+                },
+            });
             let supervisor = Supervisor::new(
                 registry,
                 backend.clone(),
@@ -497,7 +515,7 @@ mod tests {
             ) {
                 let authorities = supervisor.auth_lookup_authorities.clone();
                 let key = scope.key.clone();
-                *backend.0.lock().unwrap() = Some(Box::new(move || {
+                *backend.before_reply.lock().unwrap() = Some(Box::new(move || {
                     let mut map = authorities.lock().unwrap();
                     if mode.ends_with("dropped") {
                         map.remove(&key);
@@ -547,7 +565,7 @@ mod tests {
                         prepared_result_sha256: "d".repeat(64),
                     },
                 );
-                *backend.1.lock().unwrap() = Some(source_binding);
+                *backend.expected_source.lock().unwrap() = Some(source_binding);
             }
             let mut envelope = Envelope::new(
                 RequestId::new(),
@@ -564,16 +582,16 @@ mod tests {
             .result;
             let returned = Instant::now();
             assert_eq!(
-                backend.2.load(std::sync::atomic::Ordering::SeqCst),
+                backend.calls.load(std::sync::atomic::Ordering::SeqCst),
                 usize::from(mode != "candidate-unrecorded-prior"),
                 "unrecorded prior inputs must block before the backend; valid provenance reaches it once"
             );
             assert_eq!(
                 result.is_ok(),
-                matches!(mode, "live" | "short-scope" | "candidate"),
+                matches!(mode, "live" | "slow-live" | "short-scope" | "candidate"),
                 "{mode}: changed scoped authority after IPC cannot qualify source evidence: {result:?}"
             );
-            if let Some(until) = *backend.3.lock().unwrap() {
+            if let Some(until) = *backend.until.lock().unwrap() {
                 // The read serves its recovery callback: it ends, its owned
                 // cleanup included, a reply slack before the scope does, and
                 // never later than the reader's whole retry.

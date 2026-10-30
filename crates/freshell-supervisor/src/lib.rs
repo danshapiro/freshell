@@ -14,3 +14,6 @@ pub mod resume_catalog;
 mod retained_output;
 pub mod service;
 pub mod view_intents;
+
+#[cfg(test)]
+mod test_support;
