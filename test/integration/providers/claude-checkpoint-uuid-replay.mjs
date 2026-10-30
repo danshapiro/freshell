@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { spawn, execFile } from 'node:child_process'
+import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { randomUUID } from 'node:crypto'
 import { pathToFileURL } from 'node:url'
@@ -118,7 +118,7 @@ try {
           throw new Error('SDK spawned the native CLI outside the isolated local-provider fixture')
         }
         replayFlagObservedByNativeCli = options.args.includes('--replay-user-messages')
-        nativeChild = spawn(options.command, options.args, {
+        nativeChild = fixture.spawn(options.command, options.args, {
           cwd: options.cwd,
           env: options.env,
           signal: options.signal,

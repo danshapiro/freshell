@@ -146,7 +146,8 @@ class Session {
         stderr: (data) => { self.stderr.push(String(data)) },
         ...(permissions ? { canUseTool: (toolName, input, opts) => self.canUseTool(permissions, toolName, input, opts) } : {}),
         spawnClaudeCodeProcess(spawnOptions) {
-          const child = spawn(spawnOptions.command, spawnOptions.args, {
+          const spawnChild = ctx.nativeCli ? ctx.fixture.spawn : spawn
+          const child = spawnChild(spawnOptions.command, spawnOptions.args, {
             cwd: spawnOptions.cwd,
             env: spawnOptions.env,
             signal: spawnOptions.signal,

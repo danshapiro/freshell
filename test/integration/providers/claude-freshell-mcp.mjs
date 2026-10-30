@@ -14,7 +14,6 @@
 //     probe's report.
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
@@ -68,7 +67,7 @@ try {
   })
 
   failureStage = 'sidecar start'
-  sidecar = spawn(process.execPath, [path.join(sidecarDir, 'index.mjs')], {
+  sidecar = fixture.spawn(process.execPath, [path.join(sidecarDir, 'index.mjs')], {
     cwd: sidecarDir,
     env: fixture.env(provider.url, {
       CLAUDE_CMD: pinned.nativeCli,
@@ -191,7 +190,6 @@ try {
   })}\n`)
 } finally {
   await stopFixtureProcess(sidecar)
-  if (receipt.probe?.pid) { try { process.kill(receipt.probe.pid, 'SIGKILL') } catch {} }
   await provider?.close()
   await fixture.cleanup()
 }

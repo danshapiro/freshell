@@ -20,6 +20,7 @@ export default defineConfig({
     include: [
       'test/integration/tooling/source-runtime-rust.test.ts',
       'test/integration/tooling/coordinator-watchdog-replay.test.ts',
+      'test/integration/tooling/claude-fixture-processes.test.ts',
     ],
     exclude: ['docs/plans/**', '**/node_modules/**', '**/.worktrees/**'],
     passWithNoTests: false,

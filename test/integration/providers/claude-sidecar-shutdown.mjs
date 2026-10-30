@@ -15,7 +15,7 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import http from 'node:http'
-import { spawn, execFileSync } from 'node:child_process'
+import { execFileSync } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { randomUUID } from 'node:crypto'
 import { createClaudeFixture, FAKE_MODEL, resolvePinnedClaude } from './claude-local-provider.mjs'
@@ -94,7 +94,7 @@ try {
   })
 
   failureStage = 'sidecar start'
-  sidecar = spawn(process.execPath, [path.join(sidecarDir, 'index.mjs')], {
+  sidecar = fixture.spawn(process.execPath, [path.join(sidecarDir, 'index.mjs')], {
     cwd: sidecarDir,
     // The shared fixture's complete environment (a dead proxy for any egress but the
     // loopback provider), plus the CLI to run and the managed-key flag that lets the
@@ -164,7 +164,6 @@ try {
   })}\n`)
 } finally {
   await stopFixtureProcess(sidecar)
-  if (cliPid && alive(cliPid)) { try { process.kill(cliPid, 'SIGKILL') } catch {} }
   if (server) {
     server.closeAllConnections()
     await new Promise(resolve => server.close(resolve))

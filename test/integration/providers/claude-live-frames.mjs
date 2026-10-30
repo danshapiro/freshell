@@ -24,7 +24,6 @@
 // receipt); structured progress and failures go to stderr as JSONL.
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { randomUUID } from 'node:crypto'
 import { createClaudeFixture, FAKE_MODEL, resolvePinnedClaude, startLocalProvider } from './claude-local-provider.mjs'
@@ -136,7 +135,7 @@ function slim(frame) {
 let poller
 try {
   provider = await startLocalProvider({ respond })
-  sidecar = spawn(process.execPath, [path.join(repoRoot, 'crates/freshell-claude-sidecar/index.mjs')], {
+  sidecar = fixture.spawn(process.execPath, [path.join(repoRoot, 'crates/freshell-claude-sidecar/index.mjs')], {
     cwd: path.join(repoRoot, 'crates/freshell-claude-sidecar'),
     env: fixture.env(provider.url, { CLAUDE_CMD: pinned.nativeCli, FRESHELL_CLAUDE_ONECLI_API_KEY: '1' }),
     stdio: ['pipe', 'pipe', 'pipe'],
