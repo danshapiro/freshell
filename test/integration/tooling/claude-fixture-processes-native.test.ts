@@ -315,6 +315,25 @@ describe('native Claude fixture process ownership', () => {
   })
 
   if (process.platform === 'darwin') {
+    it('excludes its inspector when the caller adopts the fixture environment', async () => {
+      const fixture = await createClaudeFixture()
+      const key = 'FRESHELL_CLAUDE_FIXTURE_OWNER'
+      const original = process.env[key]
+      const environment = fixture.env('http://127.0.0.1:9')
+      try {
+        expect(environment[key]).toBeTruthy()
+        process.env[key] = environment[key]
+        const child = fixture.spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+        await fixture.cleanup()
+        expect(await live(child.pid!)).toBe(false)
+        await expect(fs.stat(fixture.root)).rejects.toMatchObject({ code: 'ENOENT' })
+      } finally {
+        if (original === undefined) delete process.env[key]
+        else process.env[key] = original
+        await fixture.cleanup()
+      }
+    })
+
     it('retains files when an orphaned detached writer refuses termination', async () => {
       const control = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-native-detached-refusal-'))
       const fixture = await createClaudeFixture({ parent: control })

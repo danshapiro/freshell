@@ -13,6 +13,14 @@ const log = (severity, event, fields) => {
   process.stderr.write(`${JSON.stringify({ ts: new Date().toISOString(), severity, component: 'claude-fixture', event, ...fields })}\n`)
 }
 
+function inspectorEnvironment() {
+  const environment = { ...process.env }
+  // Some SDK harnesses adopt fixture.env() themselves. Inspectors must not
+  // inherit its ownership tag and appear as a new writer on every scan.
+  delete environment[OWNER_ENV]
+  return environment
+}
+
 async function liveGroupMembers(groupId, platform) {
   try { process.kill(-groupId, 0) } catch (error) {
     if (error.code === 'ESRCH') return []
@@ -23,7 +31,7 @@ async function liveGroupMembers(groupId, platform) {
   if (platform !== 'linux') {
     // Darwin's session field is not the numeric Linux SID. The PGID of our
     // detached child is sufficient, and ps exposes it on both POSIX systems.
-    const { stdout } = await promisify(execFile)('/bin/ps', ['-axo', 'pid=,pgid=,stat='], { timeout: EXIT_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 })
+    const { stdout } = await promisify(execFile)('/bin/ps', ['-axo', 'pid=,pgid=,stat='], { env: inspectorEnvironment(), timeout: EXIT_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 })
     return stdout.trim().split('\n').flatMap((line) => {
       const [pid, group, state] = line.trim().split(/\s+/)
       return Number(group) === groupId && state && !/^[ZX]/.test(state) ? [Number(pid)] : []
@@ -45,6 +53,22 @@ async function liveGroupMembers(groupId, platform) {
   return members.filter((pid) => pid !== undefined)
 }
 
+async function readLinuxEnvironment(directory) {
+  const deadline = Date.now() + EXIT_TIMEOUT_MS
+  while (true) {
+    try { return await fs.readFile(`${directory}/environ`, 'utf8') } catch (error) {
+      if (error.code !== 'EACCES' && error.code !== 'EPERM') throw error
+      // Linux can drop environment access before a dying process becomes a
+      // zombie. Recheck until it exits, becomes readable, or exhausts budget.
+      const stat = await fs.readFile(`${directory}/stat`, 'utf8')
+      const state = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[0]
+      if (state === 'Z' || state === 'X') return ''
+      if (Date.now() >= deadline) throw error
+      await delay(POLL_MS)
+    }
+  }
+}
+
 async function liveTaggedProcesses(owner, platform) {
   const marker = `${OWNER_ENV}=${owner}`
   if (platform !== 'linux') {
@@ -52,7 +76,7 @@ async function liveTaggedProcesses(owner, platform) {
     // preserve the marker even for long CLI arguments. Never log this output:
     // it includes unrelated processes' environment values.
     const { stdout } = await promisify(execFile)('/bin/ps', ['-E', '-ww', '-ax', '-o', 'pid=,stat=,command='], {
-      timeout: EXIT_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024,
+      env: inspectorEnvironment(), timeout: EXIT_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024,
     })
     return stdout.trim().split('\n').flatMap((line) => {
       const [pid, state, ...command] = line.trim().split(/\s+/)
@@ -70,7 +94,7 @@ async function liveTaggedProcesses(owner, platform) {
         const stat = await fs.readFile(`${directory}/stat`, 'utf8')
         const state = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[0]
         if (state === 'Z' || state === 'X') return undefined
-        const environment = await fs.readFile(`${directory}/environ`, 'utf8')
+        const environment = await readLinuxEnvironment(directory)
         return environment.split('\0').includes(marker) ? Number(entry) : undefined
       } catch (error) {
         if (error.code === 'ENOENT' || error.code === 'ESRCH') return undefined
