@@ -184,7 +184,7 @@ import TerminalView, {
   isEngagementInput,
   RESERVE_RETRY_FLOOR_MS,
 } from '@/components/TerminalView'
-import { deadSessionReconcileNoticeFor } from '@/lib/pane-reconcile'
+import { DEAD_SESSION_RECONCILE_NOTICES, deadSessionReconcileNoticeFor } from '@/lib/pane-reconcile'
 import { resetEnsureExtensionsRegistryCacheForTests } from '@/hooks/useEnsureExtensionsRegistry'
 
 // Delta round 3, finding 1: the flush writes THIS window's per-window layout key.
@@ -16177,8 +16177,11 @@ describe('dead-session notice line (no-modal contract)', () => {
     expect(leafContent(store).terminalId).toBe(TERMINAL_ID)
     expect(sentCreates()).toHaveLength(0)
 
-    // Re-adjudication without an intervening wipe must NOT write twice.
-    foldDeadVerdict(store, TAB_ID, PANE_ID)
+    // Re-adjudication without an intervening wipe must NOT write twice —
+    // and the idempotent skip must still CONSUME the re-folded mint: the
+    // line is already on this surface epoch, so the dead copy may not
+    // linger resident in the store (the next re-fold re-mints).
+    foldDeadVerdict(store)
     act(() => {
       messageHandler!({
         type: 'error',
@@ -16188,6 +16191,7 @@ describe('dead-session notice line (no-modal contract)', () => {
       })
     })
     expect(noticeWriteCount()).toBe(1)
+    expect(leafContent(store).reconcileNotice).toBeUndefined()
   })
 
   it('survives a SECOND reconnect round: a reconstruction wipe re-arms the write and the line is present exactly once afterwards', async () => {
@@ -16225,7 +16229,7 @@ describe('dead-session notice line (no-modal contract)', () => {
         terminalId: TERMINAL_ID,
       })
     })
-    foldDeadVerdict(store, TAB_ID, PANE_ID)
+    foldDeadVerdict(store)
     await waitFor(() => {
       expect(sentAttaches().length).toBe(2)
     })
@@ -16294,7 +16298,7 @@ describe('dead-session notice line (no-modal contract)', () => {
     )
 
     // First death: one line.
-    foldDeadVerdict(store, TAB_ID, PANE_ID)
+    foldDeadVerdict(store)
     await waitFor(() => {
       expect(noticeWriteCount()).toBe(1)
     })
@@ -16411,8 +16415,17 @@ describe('dead-session notice line (no-modal contract)', () => {
 
     // The server also returns dead_session with reason respawn_exhausted
     // while the session file is PRESENT (reconcile.rs) — the fold mints the
-    // honest could-not-be-resumed STORE copy.
-    foldDeadVerdict(store, TAB_ID, PANE_ID, 'respawn_exhausted')
+    // honest could-not-be-resumed STORE copy. The one-shot machinery
+    // consumes the mint inside the fold's act() flush, so capture the
+    // TRANSIENT store state per dispatch to pin WHICH copy was minted
+    // (never the missing copy this path must not produce).
+    const mints: string[] = []
+    store.subscribe(() => {
+      const notice = leafContent(store).reconcileNotice
+      if (notice) mints.push(notice)
+    })
+    foldDeadVerdict(store, 'respawn_exhausted')
+    expect(mints).toEqual([DEAD_SESSION_RECONCILE_NOTICES.respawnExhausted])
 
     await waitFor(() => {
       expect(noticeWriteCount()).toBe(1)

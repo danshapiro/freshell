@@ -1770,7 +1770,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // pending marker and does NOT consume the mint — the notice effect below
   // completes the write when the deferred surface mounts. On write it
   // consumes the mint one-shot and latches the idempotency key against the
-  // current surface epoch (see deadSessionNoticeStateRef).
+  // current surface epoch (see deadSessionNoticeStateRef). On an idempotent
+  // skip (same key + same surface epoch — a re-adjudication round without
+  // an intervening wipe) it consumes the re-folded mint as well: the line is
+  // already on the surface, so the mint's job is done and the next re-fold
+  // re-mints.
   const writeDeadSessionNoticeIfPending = useCallback(() => {
     const content = contentRef.current
     const notice = content?.reconcileNotice
@@ -1784,6 +1788,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     const key = `${content.createRequestId ?? ''}|${content.sessionRef?.sessionId ?? '-'}`
     const written = deadSessionNoticeStateRef.current
     if (written && written.key === key && written.surfaceEpoch === deadSessionNoticeSurfaceEpochRef.current) {
+      // The line is already on this surface epoch: consume the re-folded
+      // mint so the dead copy cannot linger resident in the store. The
+      // pending-marker and latch semantics are untouched.
+      dispatch(clearPaneReconcileNotice({ tabId, paneId: paneIdRef.current }))
       return
     }
     writeLocalXtermNoticeDirect(term, `\r\n${DEAD_SESSION_BUFFER_NOTICE}\r\n`)
