@@ -3452,10 +3452,12 @@ export class RuntimeHarness {
     let brokerSettlementComplete = true
     for (const broker of brokers) {
       try {
-        if (!(await broker.settleForwarded(BROKER_SETTLE_MS))) {
+        // Cancellation starts the bounded drain immediately. Ordinary cleanup
+        // first lets healthy late creates publish their ownership receipts.
+        // An expired passive wait must still cancel and join the transports.
+        if (!this.task007Cancellation.signal.aborted && !(await broker.settleForwarded(BROKER_SETTLE_MS))) {
           brokerSettlementComplete = false
           errors.push(`docker requests forwarded by the broker were still unanswered after ${BROKER_SETTLE_MS / 1000}s`)
-          continue
         }
         const failures = await broker.awaitPendingRequests()
         brokerSettlementFailures.push(...failures)
