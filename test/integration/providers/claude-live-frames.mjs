@@ -28,6 +28,7 @@ import { createInterface } from 'node:readline'
 import { randomUUID } from 'node:crypto'
 import { createClaudeFixture, FAKE_MODEL, resolvePinnedClaude, startLocalProvider } from './claude-local-provider.mjs'
 import { stopFixtureProcess, waitForFixtureProcessExit } from '../../support/stop-fixture-process.mjs'
+import { cleanupFixture } from '../../support/cleanup-fixture.mjs'
 import { SUBAGENT_MARKER } from '../../fixtures/claude-cli-sim/prompt-markers.mjs'
 
 const repoRoot = process.argv[2]
@@ -221,9 +222,10 @@ try {
 } finally {
   polling = false
   await poller?.catch(() => {})
-  await stopFixtureProcess(sidecar)
-  if (provider) await provider.close()
-  await fixture.cleanup()
+  await cleanupFixture(fixture,
+    () => stopFixtureProcess(sidecar),
+    () => provider?.close(),
+  )
 }
 
 const fixtureRemoved = !(await fs.stat(fixture.root).catch(() => null))

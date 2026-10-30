@@ -34,6 +34,7 @@ import { createInterface } from 'node:readline'
 import { randomUUID } from 'node:crypto'
 import { createClaudeFixture, FAKE_MODEL, resolvePinnedClaude, startLocalProvider } from './claude-local-provider.mjs'
 import { stopFixtureProcess, waitForFixtureProcessExit } from '../../support/stop-fixture-process.mjs'
+import { cleanupFixture } from '../../support/cleanup-fixture.mjs'
 
 const repoRoot = process.argv[2]
 if (!repoRoot) throw new Error('repository root argument is required')
@@ -223,9 +224,10 @@ async function runScenario(name, spec) {
     failure = String(error?.message ?? error).slice(0, 1000)
     log('error', 'scenario.failed', { scenario: name, error: failure })
   } finally {
-    await stopFixtureProcess(sidecar)
-    if (provider) await provider.close()
-    await fixture.cleanup()
+    await cleanupFixture(fixture,
+      () => stopFixtureProcess(sidecar),
+      () => provider?.close(),
+    )
   }
   const fixtureRemoved = !(await fs.stat(fixture.root).catch(() => null))
   const relabel = (value) => JSON.parse(JSON.stringify(value).replaceAll(fixture.root, '<root>'))

@@ -20,6 +20,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import fs from 'node:fs/promises'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { cleanupFixture } from '../../support/cleanup-fixture.mjs'
 import {
   createClaudeFixture,
   DEFAULT_REPO_ROOT,
@@ -942,9 +943,10 @@ export async function runScenario(target, name, { repoRoot = DEFAULT_REPO_ROOT }
   } catch (error) {
     failure = String(error?.stack ?? error)
   } finally {
-    await Promise.all(sessions.map((s) => s.close().catch(() => {})))
-    await provider.close()
-    await fixture.cleanup()
+    await cleanupFixture(fixture,
+      () => Promise.all(sessions.map((s) => s.close().catch(() => {}))),
+      () => provider.close(),
+    )
   }
   return {
     target,

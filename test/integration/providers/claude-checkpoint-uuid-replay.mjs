@@ -4,6 +4,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { randomUUID } from 'node:crypto'
 import { pathToFileURL } from 'node:url'
+import { cleanupFixture } from '../../support/cleanup-fixture.mjs'
 import {
   createClaudeFixture,
   FAKE_MODEL,
@@ -173,8 +174,7 @@ try {
   })}\n`)
 } finally {
   if (timer) clearTimeout(timer)
-  await closeProvider()
-  await fixture.cleanup()
+  await cleanupFixture(fixture, closeProvider)
 }
 
 const fixtureRemoved = !(await fs.stat(fixture.root).catch(() => null))
