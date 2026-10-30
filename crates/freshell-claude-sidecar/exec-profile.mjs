@@ -79,15 +79,17 @@ export function checkSdkExec(options) {
   executable(resolveProgram(options.command, options.cwd, environment))
 }
 
-export function managedSdkSpawn(stderr, environment = process.env) {
-  if (process.platform !== 'linux' || !usesHostedClaudeRuntime(environment)) return undefined
+export function managedSdkSpawn(stderr, environment = process.env, ownProcess) {
+  const checkProfile = process.platform === 'linux' && usesHostedClaudeRuntime(environment)
+  if (!checkProfile && !ownProcess) return undefined
   return options => {
-    checkSdkExec(options)
+    if (checkProfile) checkSdkExec(options)
     const child = spawn(options.command, options.args, {
       cwd: options.cwd, env: options.env, signal: options.signal,
       stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
     })
     child.stderr.on('data', stderr)
+    ownProcess?.(child)
     return child
   }
 }
