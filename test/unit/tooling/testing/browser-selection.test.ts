@@ -190,7 +190,12 @@ describe('browser selection non-vacuity', () => {
     expect(ci.labels).toEqual(['chromium', 'firefox', 'webkit'])
     const retiredProjectNames = [`legacy${'-chromium'}`, `rust${'-chromium'}`]
     expect(ci.output).not.toMatch(new RegExp(`${retiredProjectNames.join('|')}|Total:\\s*0 tests in`, 'i'))
-  })
+    // Two full-roster --list passes (base lane + the 3-project CI lane) ran
+    // ~25-30 s in cloud shards and one loaded shard (job
+    // freshell-vitest-5be2481fa684-quhpuc, 2026-10-30) pushed the heavier
+    // pass past the 30 s default and failed the suite — the same headroom
+    // reason the single-spec siblings above carry 90_000.
+  }, 180_000)
 
   it('creates Rust fixtures and selects the supported cloud projects', async () => {
     const server = await createE2eServerHandle({})
