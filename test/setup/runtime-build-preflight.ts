@@ -15,7 +15,10 @@ type Project = {
 }
 
 export async function setupRuntimeBuildPreflight(project: Project, options: { command?: RuntimeBuildCommand } = {}): Promise<(() => void) | undefined> {
-  if (process.platform === 'win32' && project.vitest.state.getPaths().some((file) => file.replaceAll('\\', '/').includes('/test/integration/providers/'))) {
+  if (process.platform === 'win32' && project.vitest.state.getPaths().some((file) => {
+    const normalized = file.replaceAll('\\', '/')
+    return normalized.includes('/test/integration/providers/') || normalized.includes('/test/unit/provider-fixtures/')
+  })) {
     // Compile the small native owner before suite-hook deadlines start.
     await prepareFixtureProcessOwner()
   }

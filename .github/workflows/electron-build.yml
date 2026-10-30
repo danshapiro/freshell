@@ -31,6 +31,9 @@ on:
       - 'test/integration/electron/**'
       - 'test/integration/tooling/claude-fixture-processes-native.test.ts'
       - 'test/integration/providers/claude-local-provider.mjs'
+      - 'test/integration/providers/claude-checkpoint-uuid-replay.*'
+      - 'test/unit/provider-fixtures/**'
+      - 'test/setup/runtime-build-preflight.ts'
       - 'test/support/**'
       - 'scripts/electron-dev-prerequisites.ts'
       - 'scripts/prepare-electron-runtime.ts'
@@ -77,6 +80,11 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Test cleanup before preparing the native fixture host
+        run: pnpm run test:vitest run test/unit/provider-fixtures/claude-fixture-cleanup.test.ts --config config/vitest/vitest.config.ts
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fixture-cleanup-target
 
       - name: Build Windows fixture Job Object host
         if: runner.os == 'Windows'
@@ -142,6 +150,12 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Test cleanup before preparing the native fixture host
+        if: matrix.os == 'windows-2022' || startsWith(matrix.os, 'macos')
+        run: pnpm run test:vitest run test/unit/provider-fixtures/claude-fixture-cleanup.test.ts --config config/vitest/vitest.config.ts
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fixture-cleanup-target
 
       - name: Build Windows fixture Job Object host
         if: matrix.os == 'windows-2022'
