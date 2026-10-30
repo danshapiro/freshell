@@ -38,7 +38,7 @@ import { confirmManagedRuntimeStopped } from '@/lib/managed-runtime-stop'
 import { isManagedRuntimeRecoveryDecision, ManagedRuntimeRecoveryCard } from '@/components/ManagedRuntimeRecoveryCard'
 import { isManagedRuntimeRecoveryPending } from '@/lib/managed-runtime-recovery-message'
 import { canReplayManagedTerminal, managedTerminalPaneStatus } from '@/lib/managed-terminal.js'
-import { buildReconcileRequestForPanes, foldVerdicts, isDeadSessionReconcileNotice } from '@/lib/pane-reconcile'
+import { buildReconcileRequestForPanes, DEAD_SESSION_RECONCILE_NOTICES, foldVerdicts, isDeadSessionReconcileNotice } from '@/lib/pane-reconcile'
 import type { PaneReconcileRequest, SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import {
   derivePaneOwnerDivergence,
@@ -414,11 +414,25 @@ const PENDING_INPUT_LOSS_NOTICE: Record<PendingInputLossReason, string> = {
  * (no-modal contract): a pane whose saved session was deleted from disk
  * explains itself in place — resolution stays with the existing pane chrome
  * (close button; +/split, Replace pane, Reopen pane as for a fresh start).
- * The store-side reason distinction lives on the fold-minted dead-copy
- * `reconcileNotice` (pane-reconcile.ts); the buffer line itself is shared.
+ * REASON-HONEST (delta review round 1, finding 3): the server also returns
+ * dead_session with reason respawn_exhausted while the session file is
+ * PRESENT, so the buffer line is selected from the store mint the writer
+ * consumed — the same reason-honesty rule the store copy follows
+ * (DEAD_SESSION_RECONCILE_NOTICES in pane-reconcile.ts).
  */
-const DEAD_SESSION_BUFFER_NOTICE =
-  "[This pane's saved session no longer exists on disk - close this pane or start a new one]"
+const DEAD_SESSION_BUFFER_NOTICES = {
+  missing:
+    "[This pane's saved session no longer exists on disk - close this pane or start a new one]",
+  respawnExhausted:
+    "[This pane's saved session could not be resumed - close this pane or start a new one]",
+} as const
+
+/** Buffer-line variant for a consumed dead-copy mint (category match). */
+function deadSessionBufferNoticeForMint(notice: string): string {
+  return notice === DEAD_SESSION_RECONCILE_NOTICES.respawnExhausted
+    ? DEAD_SESSION_BUFFER_NOTICES.respawnExhausted
+    : DEAD_SESSION_BUFFER_NOTICES.missing
+}
 
 type StartupProbeReplayDiscardState = {
   remainder: string | null
@@ -1794,7 +1808,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       dispatch(clearPaneReconcileNotice({ tabId, paneId: paneIdRef.current }))
       return
     }
-    writeLocalXtermNoticeDirect(term, `\r\n${DEAD_SESSION_BUFFER_NOTICE}\r\n`)
+    writeLocalXtermNoticeDirect(term, `\r\n${deadSessionBufferNoticeForMint(notice)}\r\n`)
     deadSessionNoticePendingRef.current = null
     deadSessionNoticeStateRef.current = { key, surfaceEpoch: deadSessionNoticeSurfaceEpochRef.current }
     dispatch(clearPaneReconcileNotice({ tabId, paneId: paneIdRef.current }))
@@ -4363,6 +4377,31 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       return freshRecoveryIntentRef.current
     }
 
+    // Dead-session create stand-down (delta review round 1, finding 1): an
+    // un-anchored pane latched dead by a reconcile verdict must not auto-
+    // send its create either — sendCreate would carry the retained
+    // sessionRef and resume the dead session (a duplicate
+    // `--resume <dead-session>` attempt; for respawn_exhausted verdicts
+    // the session file is still PRESENT and the failing process would
+    // restart). The pane waits for the user's explicit resolution through
+    // existing chrome, exactly like the INVALID_TERMINAL_ID lane above and
+    // like FreshAgentView's restoreError create gate. THE ONE EXEMPT SHAPE
+    // is the codex dead-live-handle breadcrumb's recovery collapse
+    // (fresh_after_restore_unavailable): that pane was never verdict-dead,
+    // lost its live handle with no durable identity, and its create is an
+    // explicitly FRESH one — not a resume attempt, so it may proceed. The
+    // exemption is exact by construction: verdict-dead panes always hold a
+    // sessionRef (the dead adjudication requires one) and never carry a
+    // fresh-recovery intent, while the breadcrumb pane never has one — so
+    // keying the exemption on the fresh-recovery intent can never leak a
+    // verdict-dead resume through this gate. Recovery folds (attach/reset)
+    // clear the latch, re-arming auto-recovery the moment the pane
+    // legitimately moves on; user-driven retries and launch-failure retries
+    // (scheduleCreateRetry, retryLaunch) call sendCreate directly and are
+    // unaffected by this gate.
+    const shouldStandDownDeadCreate = (requestId: string): boolean =>
+      deadSessionLatchRef.current && !getFreshRecoveryIntent(requestId)
+
     const sendCreate = (requestId: string) => {
       if (isManagedRuntimeRecoveryPending(contentRef.current?.recoverySummary)) return
       // Reconcile verdict precedence (Task 12): a folded respawn verdict's
@@ -4718,6 +4757,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           if (requestIdRef.current !== requestId) return
           if (terminalIdRef.current) return // anchored meanwhile
           if (isManagedRuntimeRecoveryPending(contentRef.current?.recoverySummary)) return
+          // Dead-session stand-down: a verdict folded mid-standoff must
+          // not turn the armed re-drive into a resume of the dead session.
+          if (shouldStandDownDeadCreate(requestId)) return
           // Re-send the SAME terminal.create — createRequestId is NEVER
           // re-minted (council rule 2).
           sendCreate(requestId)
@@ -7024,6 +7066,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             ) {
               return
             }
+            // Dead-session create stand-down (delta review round 1,
+            // finding 1): a transport flap must not resume the
+            // adjudicated-dead session either — same gate as the effect's
+            // create path below.
+            if (shouldStandDownDeadCreate(current.createRequestId)) return
             sendCreate(current.createRequestId)
           }
           return
@@ -7250,6 +7297,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           pendingReason: 'initial_hydrate',
         }
         if (contentRef.current && retainedManagedPreparationFailure(contentRef.current)) return
+        // Dead-session create stand-down (no-modal contract, delta review
+        // round 1 finding 1): the fold's setPaneRestoreError cleared the
+        // pre-verdict pending mark and re-fired this effect; a verdict-dead
+        // pane must stand down here too — auto-sending its create would
+        // resume the dead session (sendCreate carries the retained
+        // sessionRef). Resolution waits for the user's existing chrome.
+        // The one exempt shape (an explicitly fresh recovery create) and
+        // the latch-clearing recovery folds are documented on
+        // shouldStandDownDeadCreate.
+        if (shouldStandDownDeadCreate(createRequestId)) return
         sendCreate(createRequestId)
       }
     }

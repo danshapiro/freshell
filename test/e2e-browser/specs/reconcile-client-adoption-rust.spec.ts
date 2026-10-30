@@ -175,10 +175,12 @@ const CODEX_DEAD_SESSION_B = 'aaaaaaaa-1111-4222-8333-000000000002'
 const CODEX_DEAD_TITLE_A = 'adoption dead codex A'
 const CODEX_DEAD_TITLE_B = 'adoption dead codex B'
 
-// The dead-session buffer notice line (no-modal contract): pins Task 2's
-// DEAD_SESSION_BUFFER_NOTICE literal in src/components/TerminalView.tsx
-// byte-for-byte -- a pane whose saved session was deleted explains itself
-// with exactly ONE line in its own xterm buffer.
+// The dead-session buffer notice line (no-modal contract): pins the
+// missing-variant buffer literal (DEAD_SESSION_BUFFER_NOTICES.missing in
+// src/components/TerminalView.tsx — the line is reason-honest, and this
+// spec's deaths are session_file_missing) byte-for-byte -- a pane whose
+// saved session was deleted explains itself with exactly ONE line in its
+// own xterm buffer.
 const DEAD_SESSION_BUFFER_NOTICE =
   "[This pane's saved session no longer exists on disk - close this pane or start a new one]"
 

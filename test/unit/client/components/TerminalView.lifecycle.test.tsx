@@ -12,6 +12,7 @@ import panesReducer, {
   setPaneReconcileNotice,
   setPaneRestoreError,
   applyReconcileAttach,
+  resetPaneForReconcileCreate,
   setReconcilePendingPanes,
   clearAllReconcilePendingPanes,
 } from '@/store/panesSlice'
@@ -15895,6 +15896,12 @@ describe('dead-session notice line (no-modal contract)', () => {
   const NOTICE_LINE =
     "[This pane's saved session no longer exists on disk - close this pane or start a new one]"
   const FRAMED_NOTICE = `\r\n${NOTICE_LINE}\r\n`
+  // Reason-honest buffer variant (delta review round 1, finding 3): a
+  // respawn_exhausted death (session file PRESENT, resume failed) must not
+  // claim the file is gone.
+  const RESPAWN_NOTICE_LINE =
+    "[This pane's saved session could not be resumed - close this pane or start a new one]"
+  const FRAMED_RESPAWN_NOTICE = `\r\n${RESPAWN_NOTICE_LINE}\r\n`
 
   function setupDeadSessionNoticePane(
     contentExtra: Partial<TerminalPaneContent> = {},
@@ -16114,6 +16121,90 @@ describe('dead-session notice line (no-modal contract)', () => {
     expect(leafContent(store).reconcileNotice).toBeUndefined()
     // The fold's STORE copy is never the buffer line.
     expect(terminalWriteStrings(term()).some((data) => data.includes('Saved session no longer exists on disk.'))).toBe(false)
+
+    // Create-lane stand-down (delta review round 1, finding 1): the fold's
+    // setPaneRestoreError cleared the pre-verdict pending mark, so the
+    // lifecycle effect re-fired into its create path — it must STAND DOWN
+    // there: no terminal.create carrying the dead sessionRef is ever sent
+    // (no automatic duplicate resume attempt; resolution waits for the
+    // user's existing chrome, exactly like the INVALID_TERMINAL_ID lane and
+    // FreshAgentView's create gate).
+    await act(async () => {})
+    expect(sentCreates()).toHaveLength(0)
+    expect(sentCreates().some((msg) => msg?.sessionRef?.sessionId === 'sess-dead-1')).toBe(false)
+    expect(leafContent(store).createRequestId).toBe('req-dead-notice')
+  })
+
+  it('create-lane stand-down: a WS reconnect re-drive never resumes the dead session either', async () => {
+    // Same reload shape (un-anchored, latched, verdict re-folded) — then a
+    // transport flap. The onReconnect re-drive lane (the un-anchored
+    // 'creating' pane's create re-drive) must stand down on the dead latch
+    // exactly like the effect's create path: a flap must not become a
+    // resume attempt.
+    const { store } = await renderDeadSessionNoticePane(
+      {
+        terminalId: undefined,
+        status: 'creating',
+        restoreError: buildRestoreError('durable_artifact_missing'),
+      },
+      { reconcilePendingPanes: { [PANE_KEY]: Date.now() } },
+    )
+
+    foldDeadVerdict(store)
+    await waitFor(() => {
+      expect(noticeWriteCount()).toBe(1)
+    })
+    await act(async () => {})
+    expect(sentCreates()).toHaveLength(0)
+
+    act(() => {
+      reconnectHandler!()
+    })
+    await act(async () => {})
+    expect(sentCreates()).toHaveLength(0)
+    expect(sentCreates().some((msg) => msg?.sessionRef?.sessionId === 'sess-dead-1')).toBe(false)
+    expect(leafContent(store).createRequestId).toBe('req-dead-notice')
+  })
+
+  it('create-lane stand-down re-arms on reset: a respawn fold after the death creates normally', async () => {
+    // The stand-down keys on the durable latch, so it must clear with it:
+    // a later respawn verdict (the server re-adjudicates the session
+    // alive) resets the pane — latch cleared, pendingReconcile 'respawn',
+    // epoch bump — and the create lane fires the resume create with the
+    // server-named sessionRef (user chrome driving
+    // resetPaneForReconcileCreate takes the same path).
+    const { store } = await renderDeadSessionNoticePane(
+      {
+        terminalId: undefined,
+        status: 'creating',
+        restoreError: buildRestoreError('durable_artifact_missing'),
+      },
+      { reconcilePendingPanes: { [PANE_KEY]: Date.now() } },
+    )
+
+    foldDeadVerdict(store)
+    await waitFor(() => {
+      expect(noticeWriteCount()).toBe(1)
+    })
+    await act(async () => {})
+    expect(sentCreates()).toHaveLength(0)
+
+    act(() => {
+      store.dispatch(resetPaneForReconcileCreate({
+        tabId: TAB_ID,
+        paneId: PANE_ID,
+        intent: 'respawn',
+        sessionRef: { provider: 'claude', sessionId: 'sess-dead-1' },
+      }))
+    })
+    await waitFor(() => {
+      expect(sentCreates()).toHaveLength(1)
+    })
+    const create = sentCreates()[0]
+    expect(create.requestId).toBe('req-dead-notice')
+    expect(create.restore).toBe(true)
+    expect(create.sessionRef).toMatchObject({ provider: 'claude', sessionId: 'sess-dead-1' })
+    expect(leafContent(store).restoreError).toBeUndefined()
   })
 
   it('retained-terminalId shape: the line is written at the stand-down gate AFTER the rejection settles — never before, never twice, never the raw copy', async () => {
@@ -16403,7 +16494,7 @@ describe('dead-session notice line (no-modal contract)', () => {
     expect(leafContent(store).reconcileNotice).toBeUndefined()
   })
 
-  it('copy honesty: a respawn_exhausted mint writes the SHARED buffer line — the could-not-be-resumed copy stays store-side', async () => {
+  it('copy honesty: a respawn_exhausted mint writes the could-not-be-resumed buffer line — the file is PRESENT', async () => {
     const { store } = await renderDeadSessionNoticePane(
       {
         terminalId: undefined,
@@ -16428,11 +16519,14 @@ describe('dead-session notice line (no-modal contract)', () => {
     expect(mints).toEqual([DEAD_SESSION_RECONCILE_NOTICES.respawnExhausted])
 
     await waitFor(() => {
-      expect(noticeWriteCount()).toBe(1)
+      expect(terminalWriteStrings(term()).filter((data) => data === FRAMED_RESPAWN_NOTICE)).toHaveLength(1)
     })
-    // The xterm line is the SHARED const...
-    expect(terminalWriteStrings(term()).filter((data) => data === FRAMED_NOTICE)).toHaveLength(1)
-    // ...the STORE copy carries the reason distinction and never reaches the buffer.
+    // Reason honesty (delta review round 1, finding 3): the buffer line
+    // derives from the consumed mint — the respawn_exhausted variant says
+    // "could not be resumed" and NEVER the false "no longer exists on
+    // disk" (the session file is present; only the resume failed). The
+    // STORE copy still never reaches the buffer.
+    expect(terminalWriteStrings(term()).some((data) => data === FRAMED_NOTICE)).toBe(false)
     expect(terminalWriteStrings(term()).some((data) => data.includes('Saved session could not be resumed.'))).toBe(false)
     expect(terminalWriteStrings(term()).some((data) => data.includes('Saved session no longer exists on disk.'))).toBe(false)
     expect(leafContent(store).reconcileNotice).toBeUndefined()

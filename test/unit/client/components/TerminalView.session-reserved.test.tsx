@@ -6,11 +6,15 @@ import tabsReducer from '@/store/tabsSlice'
 import panesReducer, {
   applyReconcileAttach,
   resetPaneForReconcileCreate,
+  setPaneReconcileNotice,
+  setPaneRestoreError,
   RECONCILE_NOTICE_CORRECTED,
 } from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
+import { buildRestoreError } from '@shared/session-contract'
+import { deadSessionReconcileNoticeFor } from '@/lib/pane-reconcile'
 
 // Task 12: verdict-driven create args, SESSION_RESERVED bounded re-drive,
 // launch-time INVALID_TERMINAL_ID bounded re-drive (F9), and exhaustion
@@ -408,6 +412,111 @@ describe('TerminalView reconcile adoption: verdict-driven create + bounded re-dr
     expect(xtermWrites().filter((data) => data === deadNoticeLine)).toHaveLength(1)
     expect(xtermWrites().some((data) => data.includes('Saved session no longer exists on disk.'))).toBe(false)
     expect(paneContent(store).reconcileNotice).toBeUndefined()
+
+    // Create-lane stand-down (delta review round 1, finding 1): after the
+    // dead verdict fold NO further terminal.create may be sent — the pane
+    // waits for the user's explicit resolution through existing chrome,
+    // never an automatic duplicate resume attempt.
+    const createsAfterFold = countSentOfType('terminal.create')
+    await flushEffects()
+    expect(countSentOfType('terminal.create')).toBe(createsAfterFold)
+  })
+
+  it('a dead verdict folded mid-standoff stands the reserve-redrive timer down (no resume create after the fold)', async () => {
+    const { store } = await mountPane({
+      mode: 'claude',
+      pendingReconcile: 'respawn',
+      sessionRef: { provider: 'claude', sessionId: 'server-truth' },
+      status: 'creating',
+      createRequestId: 'cr-1',
+    })
+    expect(countSentOfType('terminal.create')).toBe(1)
+
+    // The standoff re-drive arms its 1s timer (no immediate resend).
+    act(() => {
+      wsHarness.emit({
+        type: 'error',
+        code: 'SESSION_RESERVED',
+        message: 'Session is reserved by another create',
+        requestId: 'cr-1',
+        retryAfterMs: 1000,
+      })
+    })
+    expect(countSentOfType('terminal.create')).toBe(1)
+
+    // A foreign reconcile round (e.g. the boot reconcile across a flap)
+    // adjudicates the pane dead while the timer is armed: dispatch exactly
+    // the fold's actions (the fold itself is pinned in pane-reconcile.test).
+    act(() => {
+      store.dispatch(setPaneRestoreError({
+        tabId: TAB_ID,
+        paneId: PANE_ID,
+        restoreError: buildRestoreError('durable_artifact_missing'),
+      }))
+      store.dispatch(setPaneReconcileNotice({
+        tabId: TAB_ID,
+        paneId: PANE_ID,
+        notice: deadSessionReconcileNoticeFor('session_file_missing'),
+      }))
+    })
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000)
+    })
+    // The timer fired and STOOD DOWN: the armed re-drive must not resume
+    // the adjudicated-dead session.
+    expect(paneContent(store).restoreError?.reason).toBe('durable_artifact_missing')
+    expect(countSentOfType('terminal.create')).toBe(1)
+    expect(lastSentOfType('terminal.create').requestId).toBe('cr-1')
+  })
+
+  it('the dead-latch stand-down exempts the codex dead-live-handle breadcrumb recovery create (explicitly fresh, not a resume attempt)', async () => {
+    // Delimiting pin for the create-lane gate (delta review round 1,
+    // finding 1): the codex live-only collapse latches the SAME
+    // durable_artifact_missing breadcrumb but mints an explicit
+    // FRESH-recovery create (fresh_after_restore_unavailable) — the stand-
+    // down keys on resume attempts, so that create must still fire. This
+    // suite does not mock terminal-restore: the real registry carries the
+    // registration -> consume round trip.
+    const { store } = await mountPane({
+      mode: 'codex',
+      status: 'running',
+      createRequestId: 'cr-codex-live',
+      terminalId: 'term-codex-live',
+      serverInstanceId: 'srv-local',
+      // No sessionRef, no codexDurability: genuinely no durable identity.
+    })
+    expect(lastAttachedTerminalId()).toBe('term-codex-live')
+
+    act(() => {
+      wsHarness.emit({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        message: 'terminal not found',
+        terminalId: 'term-codex-live',
+      })
+    })
+
+    // The collapse keeps the codex breadcrumb and mints the fresh-recovery
+    // requestId (mirrors the codex-identity breadcrumb pin).
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    const content = paneContent(store)
+    expect(content.terminalId).toBeUndefined()
+    expect(content.status).toBe('creating')
+    expect(content.restoreError?.reason).toBe('durable_artifact_missing')
+    expect(content.createRequestId).not.toBe('cr-codex-live')
+
+    // The latch stands — and the create lane still fires the FRESH create.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    const freshCreates = sentOfType('terminal.create')
+      .filter((msg) => msg?.recoveryIntent === 'fresh_after_restore_unavailable')
+    expect(freshCreates).toHaveLength(1)
+    expect(freshCreates[0]).not.toHaveProperty('sessionRef')
+    expect(freshCreates[0].restore).toBeUndefined()
   })
 
   it('INVALID_TERMINAL_ID at launch is retried bounded (F9), not a permanent error', async () => {
