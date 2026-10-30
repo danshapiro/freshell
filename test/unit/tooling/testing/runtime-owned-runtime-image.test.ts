@@ -13,7 +13,13 @@ const fakeDocker = vi.hoisted(() => ({
 
 vi.mock('node:child_process', () => {
   const execFileSync = (program: string, args: string[]) => {
-    if (program === 'git' && args.join(' ') === 'rev-parse HEAD') return `${'a'.repeat(40)}\n`
+    if (program === 'git') {
+      const operation = args.join(' ')
+      if (['rev-parse HEAD', 'rev-parse --verify HEAD'].includes(operation)) return `${'a'.repeat(40)}\n`
+      if (['status --porcelain=v1 -z --untracked-files=all',
+        'diff --no-ext-diff --no-textconv --binary HEAD --'].includes(operation)) return Buffer.alloc(0)
+      throw new Error(`unexpected Git command: ${operation}`)
+    }
     if (program !== 'docker') throw new Error(`unexpected executable: ${program}`)
 
     if (args[0] === 'build') {
@@ -41,6 +47,8 @@ vi.mock('node:child_process', () => {
       fakeDocker.removals.push(tag)
       return ''
     }
+    if (['ps -aq --no-trunc', 'volume ls --format {{.Name}}',
+      'ps -a --format {{.Names}}'].includes(args.join(' '))) return ''
     if (args[0] === 'run') {
       const imageRef = args.find(argument => /^sha256:[a-f0-9]{64}$/.test(argument))
       const image = [...fakeDocker.images.values()].find(candidate => candidate.id === imageRef)

@@ -16,7 +16,7 @@ afterEach(() => {
 })
 
 function fixture() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-build-preflight-'))
+  const root = fs.mkdtempSync(path.join(process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR ?? os.tmpdir(), 'freshell-build-preflight-'))
   owned.push(root)
   execFileSync('git', ['init', '--quiet', root])
   execFileSync('git', ['-C', root, '-c', 'user.name=Dan Shapiro', '-c', 'user.email=3732858+danshapiro@users.noreply.github.com', 'commit', '--allow-empty', '--quiet', '-m', 'fixture'])
@@ -114,6 +114,12 @@ describe('managed runtime build preparation before suite startup', () => {
 
   it('uses the prepared executables in the actual runtime and browser rig build methods without invoking Cargo again', async () => {
     const f = fixture()
+    const manifestPath = path.join(f.root, 'docs/development/runtime-provider-capabilities.json')
+    fs.mkdirSync(path.dirname(manifestPath), { recursive: true })
+    const manifest = JSON.parse(fs.readFileSync(path.resolve(import.meta.dirname,
+      '../../../../docs/development/runtime-provider-capabilities.json'), 'utf8'))
+    manifest.providers.find((provider: { provider: string }) => provider.provider === 'claude').certificationState = 'pending_live_provider_certification'
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest))
     const teardown = await setupRuntimeBuildPreflight(f.project, { command: f.command })
     vi.stubEnv(RUNTIME_BUILD_MANIFEST_ENV, f.project.config.env[RUNTIME_BUILD_MANIFEST_ENV])
     const runtime = new RuntimeHarness(f.root, undefined, 2)

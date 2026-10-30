@@ -30,7 +30,7 @@ let fixtureCandidateSha: string
 
 beforeEach(async () => {
   // Exercise the real Git provenance boundary even in source-only Cloud images.
-  fixtureRepoRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'runtime-owner-facts-repo-'))
+  fixtureRepoRoot = await fsp.mkdtemp(path.join(process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR ?? os.tmpdir(), 'runtime-owner-facts-repo-'))
   const schema = 'crates/freshell-sessions/src/opencode_schema_v1_18_21.sql'
   await fsp.mkdir(path.dirname(path.join(fixtureRepoRoot, schema)), { recursive: true })
   await fsp.copyFile(path.join(sourceRoot, schema), path.join(fixtureRepoRoot, schema))
