@@ -521,6 +521,18 @@ fi
 docker volume rm "${P6_VOL_PNPM}" "${P6_VOL_NPM}" >/dev/null 2>&1 || true
 rm -rf "${P6_FIXTURE_PNPM}" "${P6_FIXTURE_NPM}" 2>/dev/null || true
 
+# ---- Proof 7: per-worktree Rust target cache volume contract ----
+echo "--- Proof 7: per-worktree Rust target cache volumes ---"
+P7_STATUS=0
+P7_OUT="$("${REPO_ROOT}/scripts/sandbox-cache-selftest.sh" 2>&1)" || P7_STATUS=$?
+echo "${P7_OUT}"
+if [ "${P7_STATUS}" -eq 0 ] && echo "${P7_OUT}" | grep -q 'sandbox_cache_selftest_passed'; then
+  pass "per-worktree Cargo target volumes are writable, isolated, reusable, labeled, and protected while referenced"
+else
+  fail "per-worktree cache volume self-test: exit=${P7_STATUS} output=[${P7_OUT}]"
+fi
+echo
+
 # ---- final host isolation check ----
 FINAL_3001="$(host_3001)"
 FINAL_3002="$(host_3002)"

@@ -137,8 +137,16 @@ Named Docker volumes persist across runs to avoid re-fetching dependencies every
 of each is slower — see below):
 
 - `freshell-sandbox-cargo-registry`, `freshell-sandbox-cargo-git` — cargo's package cache
-- `freshell-sandbox-cargo-target` — **sandbox-owned**, not the host's `target/`. Sharing the host
-  target directory would cause lock contention with concurrent host builds.
+- `freshell-sandbox-rust-target-v1-<worktree-hash>` — **sandbox-owned**, not the host's
+  `target/`. The hash is derived from the canonical host path of the working copy, so repeat runs
+  reuse that copy's Rust build output while different copies get separate volumes. The ordinary
+  `/workspace/target` mount and the strict runtime suite's `/freshell-test-artifacts` alias use the
+  same volume. Docker applies the owner, purpose, schema, and worktree-hash labels as it creates and
+  attaches a fresh volume; an existing volume with mismatched labels is refused. This requires
+  Docker support for `docker run --mount` volume labels. If the installed Docker does not support
+  that option, the wrapper reports Docker's error and does not fall back to a shared target cache.
+- `freshell-sandbox-cargo-target` — the previous shared target cache. New wrapper runs leave it
+  untouched; no contents are migrated or removed automatically.
 - `freshell-sandbox-node-modules` — **sandbox-owned**, populated by the container's dependency
   preparation (fingerprinted `pnpm install --frozen-lockfile` on pnpm-era trees, `npm ci` on
   legacy npm-era branches) and carrying the `.sandbox-deps-state` fingerprint. The host's
@@ -150,14 +158,37 @@ of each is slower — see below):
   branches these stay mounted but unused.
 - `freshell-sandbox-playwright-cache` — downloaded browser binaries.
 
-Reset everything (forces a clean re-warm on next run):
+Reset shared dependency and browser-download caches (these will re-warm on the next run):
 
 ```bash
 docker volume rm freshell-sandbox-cargo-registry freshell-sandbox-cargo-git \
-  freshell-sandbox-cargo-target freshell-sandbox-node-modules \
+  freshell-sandbox-node-modules \
   freshell-sandbox-sidecar-node-modules freshell-sandbox-mcp-node-modules \
   freshell-sandbox-playwright-cache
 ```
+
+This command does not clear the per-worktree Rust target caches described below. The legacy
+`freshell-sandbox-cargo-target` volume is also left untouched.
+
+To reset one working copy's Rust target cache, first find its volume by the
+`com.freshell.cache.worktree-sha256` label and inspect all four
+`com.freshell.cache.*` labels. Remove only the exact matching volume name with
+`docker volume rm <volume-name>`; Docker refuses removal while any running or
+stopped container still references it. Do not use force removal. This cache
+reset is separate from the shared dependency-cache reset above.
+
+The focused acceptance test for these Rust target volumes is:
+
+```bash
+scripts/sandbox-cache-selftest.sh
+```
+
+It uses temporary checkouts and labeled volumes, verifies non-root writes,
+same-copy reuse, runtime aliasing, cross-copy isolation, concurrent first use,
+Docker's running/stopped container reference checks, and recreation after an
+explicit scratch-volume removal. It removes only its own labeled volumes after
+checking that no container references them. `scripts/sandbox-selftest.sh`
+also runs this focused test as Proof 7.
 
 ## Rebuilding the image
 
