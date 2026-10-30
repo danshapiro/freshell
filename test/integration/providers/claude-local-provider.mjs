@@ -187,7 +187,11 @@ export async function createClaudeFixture({ parent = os.tmpdir(), prefix = 'fres
       return complete.split('\n').filter(Boolean).map((line) => JSON.parse(line))
     },
     async cleanup() {
-      await fs.rm(root, { recursive: true, force: true })
+      // maxRetries makes fs.rm retry ENOTEMPTY/EBUSY/EPERM: a native CLI that
+      // is still draining into its fixture (HOME/TMPDIR live under root) can
+      // re-create a file between the unlink sweep and the final rmdir, and
+      // with the default maxRetries=0 that race rejects the whole cleanup.
+      await fs.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
     },
   }
 }
