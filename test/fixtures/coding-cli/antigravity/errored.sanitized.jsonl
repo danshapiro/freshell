@@ -1,0 +1,4 @@
+{"type":"session_start","conversationId":"44444444-5555-6666-7777-888888888888","workspacePaths":["/home/u/errored"],"model":"gemini-3-pro","startedAt":"2026-10-29T23:00:00.000Z"}
+{"type":"user_message","conversationId":"44444444-5555-6666-7777-888888888888","text":"Do the failing thing","at":"2026-10-29T23:00:01.000Z"}
+{"type":"assistant_message","conversationId":"44444444-5555-6666-7777-888888888888","text":"It failed with an error.","at":"2026-10-29T23:00:02.000Z"}
+{"type":"turn_settled","conversationId":"44444444-5555-6666-7777-888888888888","at":"2026-10-29T23:00:02.500Z","outcome":"errored","fullyIdle":true}

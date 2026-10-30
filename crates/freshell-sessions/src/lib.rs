@@ -7,8 +7,9 @@
 //!
 //! Three responsibilities:
 //!
-//! 1. [`parse`] — the three transcript parsers (claude `.jsonl`, codex rollout `.jsonl`,
-//!    opencode `opencode.db`). Corruption-tolerant: a malformed line/row can never panic
+//! 1. [`parse`] — the transcript parsers (claude `.jsonl`, codex rollout
+//!    `.jsonl`, opencode `opencode.db`, antigravity conversation `.jsonl`).
+//!    Corruption-tolerant: a malformed line/row can never panic
 //!    the parse. Graded by T2 `transcript.parseable` and pinned to the committed fixtures.
 //! 2. [`directory_index`] — the refreshable session-directory cache with dirty-marking
 //!    and change-notification support.
@@ -53,7 +54,8 @@ pub use name_evidence::{
     is_default_or_derived_name, is_provider_placeholder_title, NameEvidenceContext,
 };
 pub use parse::{
-    parse_codex_session_content, parse_session_content, ClaudeUsageAccumulator, ParseSessionOptions,
+    parse_antigravity_session_content, parse_codex_session_content, parse_session_content,
+    ClaudeUsageAccumulator, ParseSessionOptions,
 };
 pub use search::{extract_snippet, search_session_file, FileSearchMatch, FileSearchTier};
 

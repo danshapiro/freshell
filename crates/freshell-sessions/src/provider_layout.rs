@@ -32,7 +32,8 @@ pub enum WatchChangeScope {
 
 /// A provider's on-disk session layout. One trait, one source of truth.
 pub trait ProviderLayout: Send + Sync {
-    /// Short provider name: "claude", "codex", "opencode", "amplifier".
+    /// Short provider name: "claude", "codex", "opencode", "amplifier",
+    /// "antigravity".
     fn name(&self) -> &str;
 
     /// The root directory (or file, for opencode) containing this provider's
@@ -276,7 +277,117 @@ impl ProviderLayout for AmplifierLayout {
     }
 }
 
-/// All four provider layouts. Convenience for callers that need to iterate
+/// Antigravity: `<antigravity_home>/brain/<conversationId>/.system_generated/logs/transcript.jsonl`.
+///
+/// // Stage-1 candidate contract: the transcript PATH is
+/// documented+probe-validated, but only `transcript.jsonl` files with the
+/// full ancestor chain are treated as sessions; the record schema inside is
+/// fixture-validated only (see `parse/antigravity.rs`).
+///
+/// `home` here is the ALREADY-RESOLVED antigravity home (the
+/// `antigravity-cli` subtree — callers apply [`antigravity_home`] at their
+/// wiring seams; the layout must NOT re-apply it or the watcher
+/// double-expands to `.../antigravity-cli/.gemini/antigravity-cli/brain`).
+/// `cache/last_conversations.json` is deliberately NOT a session source or
+/// identity evidence (plan Global Constraint 2): it never qualifies and its
+/// churn never dirty-marks the provider.
+pub struct AntigravityLayout;
+
+impl ProviderLayout for AntigravityLayout {
+    fn name(&self) -> &str {
+        "antigravity"
+    }
+
+    fn session_root(&self, home: &Path) -> PathBuf {
+        home.join("brain")
+    }
+
+    fn watch_bases(&self, home: &Path) -> Vec<PathBuf> {
+        // TWO bases (the codex home+sessions split): the home itself,
+        // NonRecursive, catches a late-created `brain/` root without
+        // recursive config/cache churn; `brain` is watched recursively.
+        vec![home.to_path_buf(), home.join("brain")]
+    }
+
+    fn watch_mode(&self) -> WatchMode {
+        WatchMode::Recursive
+    }
+
+    fn watch_mode_for_base(&self, home: &Path, base: &Path) -> WatchMode {
+        if base == home {
+            WatchMode::NonRecursive
+        } else {
+            WatchMode::Recursive
+        }
+    }
+
+    fn watch_change_scope(&self, _home: &Path, path: &Path) -> Option<WatchChangeScope> {
+        // Only a qualifying transcript re-parses one file; EVERYTHING else
+        // is ignored entirely (cache/config churn never dirty-marks the
+        // provider — the trait default would say `Provider`, which is
+        // exactly what the override exists to prevent). A late-created
+        // `brain/` root is covered by the watcher's rearm tick, not by a
+        // provider-dirty mark here.
+        if self.qualifies(path) {
+            Some(WatchChangeScope::File)
+        } else {
+            None
+        }
+    }
+
+    fn qualifies(&self, path: &Path) -> bool {
+        // Pure path-shape check (no disk access): a file named
+        // `transcript.jsonl` whose ancestor chain is exactly
+        // `brain/<conversationId>/.system_generated/logs/`.
+        if path.file_name().and_then(|n| n.to_str()) != Some("transcript.jsonl") {
+            return false;
+        }
+        let Some(logs) = path.parent() else {
+            return false;
+        };
+        if logs.file_name().and_then(|n| n.to_str()) != Some("logs") {
+            return false;
+        }
+        let Some(system_generated) = logs.parent() else {
+            return false;
+        };
+        if system_generated.file_name().and_then(|n| n.to_str()) != Some(".system_generated") {
+            return false;
+        }
+        let Some(conversation) = system_generated.parent() else {
+            return false;
+        };
+        // The conversation dir must be a real, non-empty component
+        // (`file_name()` is None for a path terminating in `..`).
+        let Some(conversation_id) = conversation.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        if conversation_id.is_empty() {
+            return false;
+        }
+        let Some(brain) = conversation.parent() else {
+            return false;
+        };
+        brain.file_name().and_then(|n| n.to_str()) == Some("brain")
+    }
+}
+
+/// Antigravity home resolution — ONE resolution shared by every wiring seam
+/// (the `AntigravitySource::new` home, the `WatchedProvider` home, and the
+/// existence `provider_roots`): `FRESHELL_ANTIGRAVITY_HOME` (used as-is —
+/// the `amplifier_home` precedent, amplifier.rs:57) else
+/// `<home>/.gemini/antigravity-cli`. NEVER bare `~/.gemini`: that subtree is
+/// shared with the maintained Gemini CLI's config, and watching/indexing it
+/// would flood provider-dirty marks with unrelated config churn. Applied
+/// ONLY at wiring seams — never inside [`AntigravityLayout`].
+pub fn antigravity_home(home: &Path) -> PathBuf {
+    match std::env::var("FRESHELL_ANTIGRAVITY_HOME") {
+        Ok(v) if !v.is_empty() => PathBuf::from(v),
+        _ => home.join(".gemini").join("antigravity-cli"),
+    }
+}
+
+/// All five provider layouts. Convenience for callers that need to iterate
 /// all providers (e.g. the session watcher, the ledger GC).
 pub fn all_layouts() -> Vec<Box<dyn ProviderLayout>> {
     vec![
@@ -284,6 +395,7 @@ pub fn all_layouts() -> Vec<Box<dyn ProviderLayout>> {
         Box::new(CodexLayout),
         Box::new(OpencodeLayout),
         Box::new(AmplifierLayout),
+        Box::new(AntigravityLayout),
     ]
 }
 
@@ -531,5 +643,137 @@ mod tests {
             opencode.watch_change_scope(home, &home.join("opencode.db-wal")),
             Some(WatchChangeScope::File)
         );
+    }
+
+    // ── Antigravity: brain/<conversationId>/.system_generated/logs/ ──
+
+    const ANTIGRAVITY_HOME: &str = "/home/user/.gemini/antigravity-cli";
+
+    fn antigravity_transcript(id: &str) -> std::path::PathBuf {
+        Path::new(ANTIGRAVITY_HOME)
+            .join("brain")
+            .join(id)
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl")
+    }
+
+    #[test]
+    fn antigravity_layout_name_is_antigravity() {
+        assert_eq!(AntigravityLayout.name(), "antigravity");
+        assert!(!AntigravityLayout.is_direct_listed());
+    }
+
+    #[test]
+    fn antigravity_layout_session_root_joins_brain() {
+        // `home` is the ALREADY-RESOLVED antigravity home (the
+        // `antigravity-cli` subtree, never bare `~/.gemini`); the layout must
+        // NOT re-apply `antigravity_home()` or the watcher double-expands to
+        // `.../antigravity-cli/.gemini/antigravity-cli/brain`.
+        let root = AntigravityLayout.session_root(Path::new(ANTIGRAVITY_HOME));
+        assert_eq!(root, Path::new("/home/user/.gemini/antigravity-cli/brain"));
+    }
+
+    #[test]
+    fn antigravity_layout_qualifies_canonical_transcript_chain() {
+        assert!(AntigravityLayout.qualifies(&antigravity_transcript(
+            "11111111-2222-3333-4444-555555555555"
+        )));
+    }
+
+    #[test]
+    fn antigravity_layout_rejects_non_transcript_shapes() {
+        let home = Path::new(ANTIGRAVITY_HOME);
+        // Not a transcript.jsonl at all.
+        assert!(!AntigravityLayout.qualifies(&home.join("cache/last_conversations.json")));
+        assert!(!AntigravityLayout.qualifies(&home.join("brain/conv-1/notes.md")));
+        // transcript.jsonl at the wrong depth in the chain.
+        assert!(!AntigravityLayout.qualifies(&home.join("brain/conv-1/transcript.jsonl")));
+        assert!(!AntigravityLayout.qualifies(&home.join("brain/transcript.jsonl")));
+        assert!(!AntigravityLayout
+            .qualifies(&home.join("brain/conv-1/.system_generated/transcript.jsonl")));
+        assert!(!AntigravityLayout.qualifies(&home.join("brain/conv-1/logs/transcript.jsonl")));
+        // Deeper than logs/ (a sidecar under a nested dir).
+        assert!(!AntigravityLayout
+            .qualifies(&home.join("brain/conv-1/.system_generated/logs/sub/transcript.jsonl")));
+    }
+
+    #[test]
+    fn antigravity_layout_watch_bases_split_home_and_brain_with_per_base_modes() {
+        let layout = AntigravityLayout;
+        let home = Path::new(ANTIGRAVITY_HOME);
+        let bases = layout.watch_bases(home);
+        // TWO bases: the home (NonRecursive — catches a late-created
+        // `brain/` root without config/cache churn) and `brain` (Recursive).
+        assert_eq!(bases, vec![home.to_path_buf(), home.join("brain")]);
+        assert_eq!(
+            layout.watch_mode_for_base(home, &bases[0]),
+            WatchMode::NonRecursive
+        );
+        assert_eq!(
+            layout.watch_mode_for_base(home, &bases[1]),
+            WatchMode::Recursive
+        );
+    }
+
+    #[test]
+    fn antigravity_layout_watch_change_scope_is_transcript_file_or_ignore() {
+        let layout = AntigravityLayout;
+        let home = Path::new(ANTIGRAVITY_HOME);
+        // Qualifying transcript: re-parse exactly one file.
+        assert_eq!(
+            layout.watch_change_scope(home, &antigravity_transcript("conv-1")),
+            Some(WatchChangeScope::File)
+        );
+        // Everything else — cache churn (`cache/last_conversations.json` is
+        // never a session source or identity evidence), config writes, the
+        // brain root itself, non-qualifying files — is ignored ENTIRELY, so
+        // unrelated writes never dirty-mark the provider.
+        for path in [
+            home.join("cache/last_conversations.json"),
+            home.join("cache/last_conversations.json.tmp"),
+            home.join("config/settings.json"),
+            home.join("brain"),
+            home.join("brain/conv-1"),
+            home.join("brain/conv-1/notes.md"),
+            home.join("brain/conv-1/.system_generated/logs"),
+        ] {
+            assert_eq!(
+                layout.watch_change_scope(home, &path),
+                None,
+                "unrelated antigravity state {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_home_env_override_wins_and_default_is_antigravity_cli_subtree() {
+        // Mutates process env: serialize on the crate-wide
+        // HOME_ENV_TEST_LOCK (the `parse::opencode` home_dir tests and the
+        // directory_index persist-path test share it) and restore on drop.
+        let _lock = crate::HOME_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let saved = std::env::var_os("FRESHELL_ANTIGRAVITY_HOME");
+
+        // Env override is used AS-IS (the `amplifier_home` precedent).
+        std::env::set_var("FRESHELL_ANTIGRAVITY_HOME", "/custom/antigravity-home");
+        assert_eq!(
+            antigravity_home(Path::new("/home/user")),
+            Path::new("/custom/antigravity-home")
+        );
+
+        // Default: the `antigravity-cli` subtree of `~/.gemini` — NEVER bare
+        // `~/.gemini`, which is shared with the maintained Gemini CLI config.
+        std::env::remove_var("FRESHELL_ANTIGRAVITY_HOME");
+        assert_eq!(
+            antigravity_home(Path::new("/home/user")),
+            Path::new("/home/user/.gemini/antigravity-cli")
+        );
+
+        match saved {
+            Some(v) => std::env::set_var("FRESHELL_ANTIGRAVITY_HOME", v),
+            None => std::env::remove_var("FRESHELL_ANTIGRAVITY_HOME"),
+        }
     }
 }
