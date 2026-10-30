@@ -293,10 +293,11 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
       expect(preparation.codex.sidecar_args).toEqual(preparation.codex.tui_args)
     } else {
       expect(preparation.opencode).toMatchObject({ inline_config: false, tui_config: null })
-      expect(preparation.opencode.project_config.map((source: any) => source.relativePath)).toEqual(
+      expect(preparation.opencode.project_config.map((source: any) =>
+        path.resolve(workspace, source.relativePath))).toEqual(
         expect.arrayContaining([
-          '.opencode/opencode.json',
-          '.opencode/opencode.jsonc',
+          path.join(cwd, '.opencode/opencode.json'),
+          path.join(cwd, '.opencode/opencode.jsonc'),
         ]),
       )
       expect(consumed.userMcp.other_global).toEqual({ source: 'other-global' })
