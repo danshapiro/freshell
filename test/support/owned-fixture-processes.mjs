@@ -21,6 +21,18 @@ function inspectorEnvironment() {
   return environment
 }
 
+async function inspectLinuxProcesses(inspect) {
+  const entries = (await fs.readdir('/proc')).filter((entry) => /^\d+$/.test(entry))
+  const matches = []
+  // Both ownership scans share the same bound on simultaneous procfs reads.
+  // A developer machine can have thousands of live agent processes.
+  for (let index = 0; index < entries.length; index += 32) {
+    const batch = await Promise.all(entries.slice(index, index + 32).map(inspect))
+    matches.push(...batch.filter((pid) => pid !== undefined))
+  }
+  return matches
+}
+
 async function liveGroupMembers(groupId, platform) {
   try { process.kill(-groupId, 0) } catch (error) {
     if (error.code === 'ESRCH') return []
@@ -37,8 +49,7 @@ async function liveGroupMembers(groupId, platform) {
       return Number(group) === groupId && state && !/^[ZX]/.test(state) ? [Number(pid)] : []
     })
   }
-  const entries = await fs.readdir('/proc')
-  const members = await Promise.all(entries.filter((entry) => /^\d+$/.test(entry)).map(async (entry) => {
+  return inspectLinuxProcesses(async (entry) => {
     let stat
     try { stat = await fs.readFile(`/proc/${entry}/stat`, 'utf8') } catch (error) {
       if (error.code === 'ENOENT' || error.code === 'ESRCH') return undefined
@@ -49,8 +60,7 @@ async function liveGroupMembers(groupId, platform) {
     // starts its own session, whose id remains valid after its leader exits.
     if (Number(processGroup) === groupId && Number(session) === groupId && state !== 'Z' && state !== 'X') return Number(entry)
     return undefined
-  }))
-  return members.filter((pid) => pid !== undefined)
+  })
 }
 
 async function readLinuxEnvironment(directory) {
@@ -83,29 +93,22 @@ async function liveTaggedProcesses(owner, platform) {
       return state && !/^[ZX]/.test(state) && command.includes(marker) ? [Number(pid)] : []
     })
   }
-  const entries = (await fs.readdir('/proc')).filter((entry) => /^\d+$/.test(entry))
-  const owned = []
-  // Bound open files when the developer's machine has many concurrent agents.
-  for (let index = 0; index < entries.length; index += 32) {
-    const matches = await Promise.all(entries.slice(index, index + 32).map(async (entry) => {
-      try {
-        const directory = `/proc/${entry}`
-        if ((await fs.stat(directory)).uid !== process.geteuid()) return undefined
-        const stat = await fs.readFile(`${directory}/stat`, 'utf8')
-        const state = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[0]
-        if (state === 'Z' || state === 'X') return undefined
-        const environment = await readLinuxEnvironment(directory)
-        return environment.split('\0').includes(marker) ? Number(entry) : undefined
-      } catch (error) {
-        if (error.code === 'ENOENT' || error.code === 'ESRCH') return undefined
-        // Unreadable same-user environments leave ownership unknown. Retain
-        // the fixture instead of claiming no detached writer remains.
-        throw error
-      }
-    }))
-    owned.push(...matches.filter((pid) => pid !== undefined))
-  }
-  return owned
+  return inspectLinuxProcesses(async (entry) => {
+    try {
+      const directory = `/proc/${entry}`
+      if ((await fs.stat(directory)).uid !== process.geteuid()) return undefined
+      const stat = await fs.readFile(`${directory}/stat`, 'utf8')
+      const state = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[0]
+      if (state === 'Z' || state === 'X') return undefined
+      const environment = await readLinuxEnvironment(directory)
+      return environment.split('\0').includes(marker) ? Number(entry) : undefined
+    } catch (error) {
+      if (error.code === 'ENOENT' || error.code === 'ESRCH') return undefined
+      // Unreadable same-user environments leave ownership unknown. Retain
+      // the fixture instead of claiming no detached writer remains.
+      throw error
+    }
+  })
 }
 
 function signalProcess(pid, signal) {

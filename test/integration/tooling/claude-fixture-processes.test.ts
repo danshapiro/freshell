@@ -229,6 +229,45 @@ describe('Claude fixture native process ownership', () => {
     }
   })
 
+  it('cleans an owned process without exhausting descriptors while inspecting a large process table', async () => {
+    const fixture = await createClaudeFixture()
+    const child = fixture.spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+    const readdir = fs.readdir
+    const readFile = fs.readFile
+    let activeReads = 0
+    let inspected = false
+    // Repeating a real procfs row exercises hundreds of actual stat opens
+    // without creating hundreds of disposable native processes.
+    const directory = vi.spyOn(fs, 'readdir').mockImplementation(async (...args) => {
+      if (args[0] === '/proc') return Array.from({ length: 512 }, () => String(child.pid!))
+      return Reflect.apply(readdir, fs, args)
+    })
+    const descriptors = vi.spyOn(fs, 'readFile').mockImplementation(async (file, options) => {
+      if (file !== `/proc/${child.pid!}/stat`) return readFile(file, options)
+      inspected = true
+      if (activeReads >= 64) throw Object.assign(new Error('fixture process inspection exhausted open files'), { code: 'EMFILE' })
+      activeReads += 1
+      try {
+        const result = await readFile(file, options)
+        await delay(2)
+        return result
+      } finally {
+        activeReads -= 1
+      }
+    })
+    try {
+      await expect(fixture.cleanup()).resolves.toBeUndefined()
+      expect(inspected).toBe(true)
+      expect(await live(child.pid!)).toBe(false)
+      await expect(fs.stat(fixture.root)).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      descriptors.mockRestore()
+      directory.mockRestore()
+      await waitUntil(async () => activeReads === 0)
+      await fixture.cleanup()
+    }
+  })
+
   it('retries an environment refusal while the process is still finishing its exit', async () => {
     const control = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-procfs-pending-exit-'))
     const fixture = await createClaudeFixture({ parent: control })
