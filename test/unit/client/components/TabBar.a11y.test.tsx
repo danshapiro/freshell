@@ -64,7 +64,9 @@ describe('TabBar accessibility', () => {
 
   afterEach(() => cleanup())
 
-  it.each(['click', 'Enter', ' '] as const)('exposes and activates the preferred tab projected from a store-blocked managed soul with %j', (activation) => {
+  it.each((['click', 'Enter', ' '] as const).flatMap(activation =>
+    [false, true].map(hasSavedName => ({ activation, hasSavedName })),
+  ))('exposes and activates the preferred tab projected from a store-blocked managed soul with $activation (saved name=$hasSavedName)', ({ activation, hasSavedName }) => {
     const store = configureStore({
       reducer: {
         tabs: tabsReducer,
@@ -151,10 +153,20 @@ describe('TabBar accessibility', () => {
     expect(projectedTabRecord).toMatchObject(expectedBlockedProjection)
     expect(store.getState().tabs.activeTabId).toBe('local-tab')
 
+    const nameRef = projectedLayout.type === 'leaf' ? resolvePaneNameRef(projectedLayout.content) : undefined
+    expect(nameRef).toBeDefined()
+    if (hasSavedName) {
+      store.dispatch(receiveSessionNames([{
+        record: { ref: nameRef!, name: 'Saved managed name', source: 'manual', revision: 1 },
+        documentGeneration: 1, redirects: [], changed: true,
+      }]))
+    }
     render(<Provider store={store}><TabBar /></Provider>)
 
-    const projectedTab = screen.getByRole('tab', { name: 'synthetic config-blocked exact retry' })
+    const initialName = hasSavedName ? 'Saved managed name' : 'Opencode'
+    const projectedTab = screen.getByRole('tab', { name: initialName })
     expect(projectedTab).toBeVisible()
+    expect(screen.queryByRole('tab', { name: 'synthetic config-blocked exact retry' })).not.toBeInTheDocument()
     expect(projectedTab).toHaveAttribute('data-tab-id', 'config-tab')
     expect(projectedTab).toHaveAttribute('aria-selected', 'false')
     const tablist = screen.getByRole('tablist', { name: 'Workspace tabs' })
@@ -171,23 +183,22 @@ describe('TabBar accessibility', () => {
     expect(store.getState().panes.layouts[store.getState().tabs.activeTabId!]).toEqual(projectedLayout)
     expect(store.getState().tabs.tabs.find(tab => tab.id === 'config-tab')).toEqual(projectedTabRecord)
 
-    const nameRef = projectedLayout.type === 'leaf' ? resolvePaneNameRef(projectedLayout.content) : undefined
-    expect(nameRef).toBeDefined()
     act(() => {
       store.dispatch(receiveSessionNames([{
         record: {
           ref: nameRef!,
           name: 'Canonical managed name',
           source: 'manual',
-          revision: 1,
+          revision: 2,
         },
-        documentGeneration: 1,
+        documentGeneration: 2,
         redirects: [],
         changed: true,
       }]))
     })
     expect(within(tablist).getByRole('tab', { name: 'Canonical managed name', selected: true }))
       .toHaveAttribute('data-tab-id', 'config-tab')
+    expect(within(tablist).queryByRole('tab', { name: initialName })).not.toBeInTheDocument()
     expect(within(tablist).queryByRole('tab', { name: 'synthetic config-blocked exact retry' }))
       .not.toBeInTheDocument()
   })
