@@ -194,9 +194,18 @@ describe('Claude fixture native process ownership', () => {
     const sidecar = fixture.spawn(process.execPath, ['-e', SIDECAR, fixture.root, control, 'create-failed', WRITER, MCP, 'true'], { stdio: 'ignore' })
     const originalKill = process.kill
     let denied: { mockRestore(): void } | undefined
+    let ordered: { mockRestore(): void } | undefined
     try {
       await waitForFixtureProcessExit(sidecar, 5_000)
       const writerPid = Number(await fs.readFile(path.join(control, 'native.pid'), 'utf8'))
+      const mcpPid = Number(await fs.readFile(path.join(control, 'mcp.pid'), 'utf8'))
+      const readdir = fs.readdir
+      ordered = vi.spyOn(fs, 'readdir').mockImplementation(async (...args) => {
+        const entries = await Reflect.apply(readdir, fs, args)
+        return args[0] === '/proc'
+          ? [String(writerPid), ...entries.filter((entry: string) => entry !== String(writerPid))]
+          : entries
+      })
       denied = vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
         if (pid === writerPid && signal === 'SIGTERM') throw Object.assign(new Error('refused detached writer signal'), { code: 'EPERM' })
         return originalKill(pid, signal)
@@ -204,12 +213,53 @@ describe('Claude fixture native process ownership', () => {
       await expect(fixture.cleanup()).rejects.toMatchObject({ code: 'EPERM' })
       await expect(fs.stat(fixture.root)).resolves.toBeDefined()
       expect(await live(writerPid)).toBe(true)
+      expect(await live(mcpPid)).toBe(false)
     } finally {
       denied?.mockRestore()
+      ordered?.mockRestore()
       await fixture.cleanup()
       await fs.rm(control, { recursive: true, force: true })
     }
   })
+
+  for (const refusals of [1, 2]) {
+    it(`contains later launches and detached writers after ${refusals} process groups refuse termination`, async () => {
+      const control = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-multiple-owner-groups-'))
+      const fixture = await createClaudeFixture({ parent: control })
+      const other = await createClaudeFixture({ parent: control })
+      const groups = Array.from({ length: refusals + 1 }, () => fixture.spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }))
+      const sidecar = fixture.spawn(process.execPath, ['-e', SIDECAR, fixture.root, control, 'create-failed', WRITER, MCP, 'true'], { stdio: 'ignore' })
+      const unrelated = other.spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+      const errors = groups.slice(0, refusals).map((child) => Object.assign(new Error(`process group ${child.pid} refused termination`), { code: 'EPERM' }))
+      const originalKill = process.kill
+      let denied: { mockRestore(): void } | undefined
+      try {
+        await waitForFixtureProcessExit(sidecar, 5_000)
+        const descendants = await Promise.all(['native.pid', 'mcp.pid'].map(async (file) => Number(await fs.readFile(path.join(control, file), 'utf8'))))
+        denied = vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+          const index = groups.slice(0, refusals).findIndex((child) => pid === -child.pid!)
+          if (index !== -1 && signal === 'SIGTERM') throw errors[index]
+          return originalKill(pid, signal)
+        })
+        const failure = await fixture.cleanup().then(() => undefined, (error: unknown) => error)
+        if (refusals === 1) expect(failure).toBe(errors[0])
+        else {
+          expect(failure).toBeInstanceOf(AggregateError)
+          expect((failure as AggregateError).errors).toEqual(errors)
+        }
+        expect(await Promise.all(groups.slice(0, refusals).map((child) => live(child.pid!)))).toEqual(Array.from({ length: refusals }, () => true))
+        expect(await live(groups.at(-1)!.pid!)).toBe(false)
+        expect(await Promise.all(descendants.map(live))).toEqual([false, false])
+        expect(await live(unrelated.pid!)).toBe(true)
+        await expect(fs.stat(fixture.root)).resolves.toBeDefined()
+      } finally {
+        denied?.mockRestore()
+        await fixture.cleanup()
+        await other.cleanup()
+        await fs.rm(control, { recursive: true, force: true })
+      }
+    })
+  }
 
   it('inspects group membership when a signal-zero permission probe is refused', async () => {
     const fixture = await createClaudeFixture()
@@ -286,7 +336,7 @@ describe('Claude fixture native process ownership', () => {
       setInterval(() => {
         if (stopping && fs.existsSync(path.join(control, 'release'))) process.exit(0)
       }, 5)
-    `, control], { stdio: 'ignore' })
+    `, control], { cwd: fixture.cwd, stdio: 'ignore' })
     const readFile = fs.readFile
     let attempts = 0
     let stopping: Promise<void> | undefined
@@ -323,6 +373,33 @@ describe('Claude fixture native process ownership', () => {
   })
 
   for (const code of ['EACCES', 'EPERM']) {
+    it(`ignores an unrelated live process whose environment returns ${code}`, async () => {
+      const fixture = await createClaudeFixture()
+      const other = await createClaudeFixture()
+      const root = fixture.spawn(process.execPath, ['-e', 'process.exit(0)'], { stdio: 'ignore' })
+      const child = other.spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+      const readFile = fs.readFile
+      let intercepted = false
+      const denied = vi.spyOn(fs, 'readFile').mockImplementation(async (file, options) => {
+        if (file === `/proc/${child.pid!}/environ`) {
+          intercepted = true
+          throw Object.assign(new Error('unrelated process environment is private'), { code })
+        }
+        return readFile(file, options)
+      })
+      try {
+        await waitForFixtureProcessExit(root, 5_000)
+        await expect(fixture.cleanup()).resolves.toBeUndefined()
+        expect(intercepted).toBe(true)
+        expect(await live(child.pid!)).toBe(true)
+        await expect(fs.stat(fixture.root)).rejects.toMatchObject({ code: 'ENOENT' })
+      } finally {
+        denied.mockRestore()
+        await fixture.cleanup()
+        await other.cleanup()
+      }
+    })
+
     it(`finishes cleanup when a process exits before its environment read returns ${code}`, async () => {
       const fixture = await createClaudeFixture()
       const other = await createClaudeFixture()
@@ -360,6 +437,7 @@ describe('Claude fixture native process ownership', () => {
       try {
         await waitForFixtureProcessExit(root, 5_000)
         const writerPid = Number(await fs.readFile(path.join(control, 'native.pid'), 'utf8'))
+        const mcpPid = Number(await fs.readFile(path.join(control, 'mcp.pid'), 'utf8'))
         const readFile = fs.readFile
         denied = vi.spyOn(fs, 'readFile').mockImplementation(async (file, options) => {
           if (file === `/proc/${writerPid}/environ`) {
@@ -371,6 +449,7 @@ describe('Claude fixture native process ownership', () => {
         await expect(fixture.cleanup()).rejects.toMatchObject({ code })
         expect(intercepted).toBe(true)
         expect(await live(writerPid)).toBe(true)
+        expect(await live(mcpPid)).toBe(false)
         await expect(fs.stat(fixture.root)).resolves.toBeDefined()
       } finally {
         denied?.mockRestore()
@@ -379,6 +458,68 @@ describe('Claude fixture native process ownership', () => {
       }
     })
   }
+
+  it('retains a previously observed detached writer when its environment becomes unreadable outside the fixture directory', async () => {
+    const control = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-cached-writer-'))
+    const fixture = await createClaudeFixture({ parent: control })
+    const root = fixture.spawn(process.execPath, ['-e', SIDECAR, fixture.root, control, 'clean', WRITER, MCP, 'true'], { cwd: control, stdio: 'ignore' })
+    let denied: { mockRestore(): void } | undefined
+    let metadata: { mockRestore(): void } | undefined
+    let writerPid: number | undefined
+    let observations = 0
+    try {
+      await waitForFixtureProcessExit(root, 5_000)
+      writerPid = Number(await fs.readFile(path.join(control, 'native.pid'), 'utf8'))
+      const mcpPid = Number(await fs.readFile(path.join(control, 'mcp.pid'), 'utf8'))
+      expect(await fs.readlink(`/proc/${writerPid}/cwd`)).toBe(control)
+      const readFile = fs.readFile
+      denied = vi.spyOn(fs, 'readFile').mockImplementation(async (file, options) => {
+        if (file === `/proc/${writerPid}/environ`) {
+          observations += 1
+          if (observations > 1) throw Object.assign(new Error('observed writer environment became private'), { code: 'EACCES' })
+        }
+        return readFile(file, options)
+      })
+      const stat = fs.stat
+      metadata = vi.spyOn(fs, 'stat').mockImplementation(async (...args) => {
+        const value = await Reflect.apply(stat, fs, args)
+        // A non-dumpable process can change its proc-directory ownership.
+        // Its already-recorded identity must still count as fixture-owned.
+        return args[0] === `/proc/${writerPid}` && observations > 0
+          ? Object.assign(Object.create(value), { uid: process.geteuid!() + 1 })
+          : value
+      })
+      await expect(fixture.cleanup()).rejects.toMatchObject({ code: 'EACCES' })
+      expect(observations).toBeGreaterThan(1)
+      expect(await live(writerPid)).toBe(true)
+      expect(await live(mcpPid)).toBe(false)
+      await expect(fs.stat(fixture.root)).resolves.toBeDefined()
+    } finally {
+      denied?.mockRestore()
+      metadata?.mockRestore()
+      await fixture.cleanup()
+      if (writerPid !== undefined && await live(writerPid)) {
+        process.kill(writerPid, 'SIGKILL')
+        await waitUntil(async () => !await live(writerPid!))
+      }
+      await fs.rm(control, { recursive: true, force: true })
+    }
+  })
+
+  it('starts a fixture process in its private workspace when no directory is specified', async () => {
+    const fixture = await createClaudeFixture()
+    const child = fixture.spawn(process.execPath, ['-e', 'process.stdout.write(process.cwd())'], { stdio: ['ignore', 'pipe', 'ignore'] })
+    let output = ''
+    child.stdout!.on('data', (data: Buffer) => { output += data.toString() })
+    const closed = new Promise<void>((resolve) => child.once('close', () => resolve()))
+    try {
+      await waitForFixtureProcessExit(child, 5_000)
+      await closed
+      expect(output).toBe(fixture.cwd)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
 
   it('stops only its owned group and refuses new launches once cleanup starts', async () => {
     const fixture = await createClaudeFixture()
