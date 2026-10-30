@@ -25,14 +25,15 @@
 //                     ExitPlanMode with no input
 //   plan-empty        plan mode: ExitPlanMode with no input and no plan file
 //
-// Usage: node claude-permission-contract.mjs <repoRoot>. Prints ONE JSON line
-// (the receipt), with every fixture path replaced by `<root>`; structured
-// progress and failures go to stderr as JSONL.
+// Usage: node --import tsx claude-permission-contract.mjs <repoRoot>. Prints
+// ONE JSON line (the receipt), with every fixture path replaced by `<root>`;
+// structured progress and failures go to stderr as JSONL.
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { randomUUID } from 'node:crypto'
+import { stopFixtureProcessThen } from '../../support/stop-fixture-process.ts'
 import { createClaudeFixture, FAKE_MODEL, resolvePinnedClaude, startLocalProvider } from './claude-local-provider.mjs'
 
 const repoRoot = process.argv[2]
@@ -156,23 +157,30 @@ async function runScenario(name, spec) {
   let provider
   let sidecar
   let sidecarExit
-  // Resolves when the sidecar (and, after the group kill below, its whole
-  // process tree) has exited; the finally awaits it before touching the
-  // fixture so a draining native CLI cannot race fixture.cleanup().
+  // Resolves when the directly started sidecar exits; teardown waits for it
+  // before touching the fixture.
   let exited = Promise.resolve()
   let failure
   let settingsLocal = null
   const written = {}
+  let providerClosed = false
+  const closeProvider = async () => {
+    if (!provider || providerClosed) return
+    providerClosed = true
+    try {
+      await provider.close()
+    } catch (error) {
+      const detail = String(error?.code ?? error?.message ?? error)
+      failure ??= `provider close failed: ${detail}`
+      log('error', 'provider.close_failed', { scenario: name, error: detail })
+    }
+  }
   try {
     provider = await startLocalProvider({ respond })
-    // detached puts the sidecar in its own process group: the native CLI it
-    // spawns is the fixture's concurrent writer, so the force path below has
-    // to kill the group, not just the sidecar.
     sidecar = spawn(process.execPath, [path.join(repoRoot, 'crates/freshell-claude-sidecar/index.mjs')], {
       cwd: path.join(repoRoot, 'crates/freshell-claude-sidecar'),
       env: fixture.env(provider.url, { CLAUDE_CMD: pinned.nativeCli, FRESHELL_CLAUDE_ONECLI_API_KEY: '1', npm_config_update_notifier: 'false' }),
       stdio: ['pipe', 'pipe', 'pipe'],
-      detached: true,
     })
     sidecar.stdin.on('error', () => {})
     exited = new Promise((resolve) => sidecar.once('exit', (code, signal) => { sidecarExit = { code, signal }; resolve() }))
@@ -231,21 +239,23 @@ async function runScenario(name, spec) {
     failure = String(error?.message ?? error).slice(0, 1000)
     log('error', 'scenario.failed', { scenario: name, error: failure })
   } finally {
-    if (sidecar && !sidecarExit) {
-      if (process.platform !== 'win32') {
-        try { process.kill(-sidecar.pid, 'SIGKILL') } catch { /* the group is already gone */ }
-      }
-      sidecar.kill('SIGKILL')
-    }
-    await exited
-    if (provider) await provider.close()
     try {
-      await fixture.cleanup()
+      await stopFixtureProcessThen(sidecar, async () => {
+        await closeProvider()
+        await fixture.cleanup()
+      })
     } catch (error) {
-      // A cleanup failure is a reported outcome (fixtureRemoved=false below),
-      // never an unhandled rejection: the receipt is this harness's only
-      // contract, and a crash here eats it for every scenario at once.
-      log('error', 'fixture.cleanup_failed', { scenario: name, error: String(error?.code ?? error?.message ?? error) })
+      const detail = String(error?.code ?? error?.message ?? error)
+      const childExited = !sidecar || sidecar.exitCode !== null || sidecar.signalCode !== null
+      if (!childExited) {
+        failure ??= 'the sidecar did not exit; its fixture was retained'
+        log('error', 'sidecar.stop_failed', { scenario: name, error: detail })
+      } else {
+        failure ??= `fixture cleanup failed: ${detail}`
+        log('error', 'fixture.cleanup_failed', { scenario: name, error: detail })
+      }
+    } finally {
+      await closeProvider()
     }
   }
   const fixtureRemoved = !(await fs.stat(fixture.root).catch(() => null))
