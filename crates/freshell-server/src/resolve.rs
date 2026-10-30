@@ -1090,8 +1090,8 @@ mod tests {
             auth_token: Arc::new("tok".into()),
             // Isolated home: overrides read/write under `<dir>/.freshell/`,
             // never the developer's real config (same pattern as the
-            // session_directory router tests). All four Node providers are
-            // discovered, and the fresh-store default enables all four
+            // session_directory router tests). All discovered Node providers
+            // are enumerated, and the fresh-store default enables them all
             // (Node's `DEFAULT_ENABLED_CLI_PROVIDERS`), so the baseline
             // `unsearchedProviders` is `[]` — deterministic expectations.
             settings: crate::settings_store::SettingsStore::load(
@@ -1845,7 +1845,7 @@ mod tests {
         assert_eq!(body["status"], "ready");
         assert_eq!(body["providerErrors"], serde_json::json!([]));
         assert!(body["unsearchedProviders"].is_array());
-        // Baseline is [] — the fresh-store default enables all FOUR Node
+        // Baseline is [] — the fresh-store default enables all the discovered
         // providers (`DEFAULT_ENABLED_CLI_PROVIDERS` incl. amplifier); a
         // regression in that default must fail loudly here.
         assert_eq!(body["unsearchedProviders"], serde_json::json!([]));
