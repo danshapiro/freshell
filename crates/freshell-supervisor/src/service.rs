@@ -6322,10 +6322,11 @@ mod host_command_budget_tests {
         SupervisorConfig, FRESH_AGENT_COMMAND_TIMEOUT_ENV, HOST_COMMAND_TIMEOUT_ENV,
         TERMINAL_DISPATCH_TIMEOUT_ENV,
     };
-    use crate::registry::Registry;
+    use crate::registry::{BackendCreatedRecord, LaunchPreparation, Registry};
     use freshell_runtime_protocol::{
-        read_frame, write_frame, Envelope, GrantId, HostBootId, HostCommand, HostReply, HostResult,
-        IncarnationId, RequestId, RuntimeErrorCode, RuntimeLimits, SoulId, TerminalLaunchSpec,
+        read_frame, write_frame, DockerDaemonId, Envelope, HostBootId, HostCommand, HostReply,
+        HostResult, IncarnationId, RequestId, RuntimeErrorCode, RuntimeLimits, RuntimeProfile,
+        SoulId, TerminalLaunchSpec,
     };
     use std::path::Path;
     use std::sync::{Arc, Mutex as StdMutex};
@@ -6385,7 +6386,11 @@ mod host_command_budget_tests {
         supervisor
     }
 
-    fn terminal_grant(incarnation_id: &IncarnationId, root: &Path) -> HostCommand {
+    async fn terminal_grant(
+        supervisor: &Supervisor,
+        root: &Path,
+        host: &AuthenticatedHost,
+    ) -> (IncarnationId, HostCommand) {
         let terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
             "terminalId":"terminal-dispatch-budget","streamId":"stream-dispatch-budget",
             "mode":"codex","program":"codex","args":[],"env":{"HOME":"/home/freshell/provider"},
@@ -6393,21 +6398,68 @@ mod host_command_budget_tests {
             "projectKey":"project-dispatch-budget","workspacePath":root,
         }))
         .unwrap();
-        HostCommand::GrantExecution {
+        let prepared = supervisor
+            .registry
+            .prepare_launch(LaunchPreparation {
+                soul_id: SoulId::new(),
+                provider: "codex".into(),
+                provider_store_id: "store-dispatch-budget".into(),
+                native_session_id: None,
+                creation_seed_ref: "seed-dispatch-budget".into(),
+                request_id: RequestId::new(),
+                payload_digest: "dispatch-budget".into(),
+                requested_limits: limits(),
+                profile: RuntimeProfile::Custom,
+                project_key: terminal.project_key.clone(),
+                fixture: None,
+                terminal: Some(terminal.clone()),
+                fresh_agent: None,
+                view_intent: None,
+                admission: Default::default(),
+            })
+            .await
+            .unwrap();
+        supervisor
+            .registry
+            .commit_created(
+                prepared.incarnation_id.clone(),
+                BackendCreatedRecord {
+                    daemon_id: DockerDaemonId::new(),
+                    container_id: "a".repeat(64),
+                    image_ref: supervisor.config.image_ref.clone(),
+                    runtime_dir: root.join("incarnation"),
+                    host_binary_path: supervisor.config.host_binary_path.clone(),
+                    immutable_config_digest: "dispatch-budget".into(),
+                    launch_policy: None,
+                },
+            )
+            .await
+            .unwrap();
+        let grant = supervisor
+            .registry
+            .commit_execution_grant(
+                prepared.incarnation_id.clone(),
+                host.host_boot_id.clone(),
+                limits(),
+            )
+            .await
+            .unwrap();
+        let command = HostCommand::GrantExecution {
             native_identity_launch: None,
-            incarnation_id: incarnation_id.clone(),
-            soul_id: SoulId::new(),
-            host_boot_id: HostBootId::new(),
-            control_epoch: 1,
-            execution_generation: 1,
-            grant_id: GrantId::new(),
+            incarnation_id: prepared.incarnation_id.clone(),
+            soul_id: prepared.soul_id,
+            host_boot_id: grant.host_boot_id,
+            control_epoch: grant.control_epoch,
+            execution_generation: grant.execution_generation,
+            grant_id: grant.grant_id,
             fixture: None,
             provider_path_inputs: Default::default(),
             terminal: Some(Box::new(terminal)),
             fresh_agent: None,
             resume_spec: None,
             dispatch_budget_ms: None,
-        }
+        };
+        (prepared.incarnation_id, command)
     }
 
     type Received = Arc<StdMutex<Vec<HostCommand>>>;
@@ -6483,14 +6535,15 @@ mod host_command_budget_tests {
         std::fs::create_dir_all(&runtime_dir).unwrap();
         let supervisor = supervisor(root.path(), budgets("200", "5000", "9000"));
         let (host, _) = slow_host(&runtime_dir, Some(Duration::from_millis(700)));
-        let incarnation_id = IncarnationId::new();
+        let host_auth = authenticated();
+        let (incarnation_id, grant) = terminal_grant(&supervisor, root.path(), &host_auth).await;
 
         let granted = supervisor
             .send_authenticated_host_command(
                 incarnation_id.clone(),
                 &runtime_dir,
-                &authenticated(),
-                terminal_grant(&incarnation_id, root.path()),
+                &host_auth,
+                grant,
             )
             .await;
         assert!(
@@ -6502,7 +6555,7 @@ mod host_command_budget_tests {
             .send_authenticated_host_command(
                 incarnation_id.clone(),
                 &runtime_dir,
-                &authenticated(),
+                &host_auth,
                 HostCommand::Status {
                     incarnation_id: incarnation_id.clone(),
                 },
@@ -6527,14 +6580,15 @@ mod host_command_budget_tests {
         std::fs::create_dir_all(&runtime_dir).unwrap();
         let supervisor = supervisor(root.path(), budgets("100", "400", "9000"));
         let (host, _) = slow_host(&runtime_dir, None);
-        let incarnation_id = IncarnationId::new();
+        let host_auth = authenticated();
+        let (incarnation_id, grant) = terminal_grant(&supervisor, root.path(), &host_auth).await;
         let started = Instant::now();
         let error = supervisor
             .send_authenticated_host_command(
                 incarnation_id.clone(),
                 &runtime_dir,
-                &authenticated(),
-                terminal_grant(&incarnation_id, root.path()),
+                &host_auth,
+                grant,
             )
             .await
             .expect_err("a silent host must not hold a terminal grant forever");
@@ -6557,8 +6611,8 @@ mod host_command_budget_tests {
         std::fs::create_dir_all(&runtime_dir).unwrap();
         let supervisor = supervisor(root.path(), budgets("100", "300", "700"));
         let (host, _) = slow_host(&runtime_dir, None);
-        let incarnation_id = IncarnationId::new();
         let host_auth = authenticated();
+        let (incarnation_id, grant) = terminal_grant(&supervisor, root.path(), &host_auth).await;
         let send = |command| {
             supervisor.send_authenticated_host_command(
                 incarnation_id.clone(),
@@ -6568,9 +6622,7 @@ mod host_command_budget_tests {
             )
         };
 
-        let terminal = send(terminal_grant(&incarnation_id, root.path()))
-            .await
-            .expect_err("a silent host times out");
+        let terminal = send(grant).await.expect_err("a silent host times out");
         let fresh_agent = send(HostCommand::FreshAgentSend {
             incarnation_id: incarnation_id.clone(),
             request_id: RequestId::new(),
@@ -6609,14 +6661,15 @@ mod host_command_budget_tests {
         std::fs::create_dir_all(&runtime_dir).unwrap();
         let supervisor = supervisor(root.path(), budgets("100", "300", "700"));
         let (host, received) = slow_host(&runtime_dir, Some(Duration::from_millis(10)));
-        let incarnation_id = IncarnationId::new();
+        let host_auth = authenticated();
+        let (incarnation_id, grant) = terminal_grant(&supervisor, root.path(), &host_auth).await;
 
         supervisor
             .send_authenticated_host_command(
                 incarnation_id.clone(),
                 &runtime_dir,
-                &authenticated(),
-                terminal_grant(&incarnation_id, root.path()),
+                &host_auth,
+                grant,
             )
             .await
             .expect("the grant is accepted");
@@ -10189,23 +10242,80 @@ mod interrupted_transaction_tests {
 
     #[tokio::test]
     async fn startup_callback_waits_for_both_native_observation_operations() {
-        let root = tempfile::tempdir().unwrap();
-        let supervisor = open(root.path());
-        let soul = seed(&supervisor, root.path(), false).await;
-        let listener = UnixListener::bind(root.path().join("mcp.sock")).unwrap();
+        let fixture =
+            provider_callback_budget_tests::claude_recovery(ProviderCallbackBudgets::default())
+                .await;
+        let supervisor = &fixture.supervisor;
+        let lock = supervisor.lifecycle_lock(&fixture.soul).await;
+        let _held = lock.lock().await;
+        let scope = supervisor.auth_lookup_scope(
+            &fixture.start,
+            supervisor.provider_callback_budgets.claude_recovery,
+        );
+        let source = supervisor
+            .claude_recovery_source_binding(&fixture.start, &scope.key, &fixture.context)
+            .unwrap();
+        let expected_source = serde_json::to_value(&source).unwrap();
+        let expected_context = serde_json::to_value(&fixture.context).unwrap();
+        let expected_scope = scope.key.clone();
+        let authorities = supervisor.auth_lookup_authorities.clone();
+        let listener = UnixListener::bind(
+            supervisor
+                .config
+                .control_socket_path
+                .with_file_name("mcp.sock"),
+        )
+        .unwrap();
         let peer = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut body = Vec::new();
             stream.read_to_end(&mut body).await.unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(request["claudeRecoverySource"], expected_source);
+            assert_eq!(request["authLookupAuthority"], expected_scope);
+            assert_eq!(request["priorContext"], expected_context);
             sleep(Duration::from_secs(36)).await;
+            let expires = authorities
+                .lock()
+                .unwrap()
+                .get(&expected_scope)
+                .map(|authority| authority.expires)
+                .expect("the actual recovery scope remains registered during both observations");
+            assert!(expires > Instant::now());
             let _ = stream.write_all(b"prepared-complete").await;
         });
+        let terminal = fixture.start.context.prior_handle.terminal().unwrap();
+        let path_inputs = supervisor.bound_provider_path_inputs(
+            &fixture.soul,
+            fixture
+                .context
+                .prepared_inputs
+                .as_ref()
+                .map(|inputs| inputs.generation_id.as_str()),
+        );
         let result = supervisor
-            .mcp_capability_callback(startup_issue_request(&soul))
+            .mcp_capability_callback(McpCapabilityRequest {
+                action: "issue",
+                soul_id: &fixture.soul,
+                incarnation_id: None,
+                grant_id: None,
+                provider: Some("claude"),
+                tui_source: None,
+                workspace: Some(&terminal.workspace_path),
+                auth_lookup_authority: Some(&scope.key),
+                claude_recovery_source: Some(&source),
+                cwd: Some(&terminal.cwd),
+                prior_context: Some(&fixture.context),
+                provider_secret_references: Some(&[]),
+                provider_path_inputs: Some(&path_inputs),
+            })
             .await;
-        peer.abort();
-        let _ = peer.await;
+        if result.is_err() {
+            peer.abort();
+        }
+        let peer_result = peer.await;
         assert_eq!(result.unwrap(), b"prepared-complete");
+        peer_result.expect("the callback received the actual live recovery source and scope");
     }
 
     #[tokio::test]

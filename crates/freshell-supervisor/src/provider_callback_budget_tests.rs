@@ -6,17 +6,17 @@ use crate::registry::*;
 use freshell_runtime_protocol::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-struct RecoveryFixture {
+pub(super) struct RecoveryFixture {
     _root: tempfile::TempDir,
-    supervisor: Supervisor,
-    soul: SoulId,
-    start: RecoveryStart,
-    context: ProviderLaunchContext,
+    pub(super) supervisor: Supervisor,
+    pub(super) soul: SoulId,
+    pub(super) start: RecoveryStart,
+    pub(super) context: ProviderLaunchContext,
 }
 
 /// A retained Claude terminal with one accepted prepared-input generation,
 /// and a recovery attempt that begins from it.
-async fn claude_recovery(budgets: ProviderCallbackBudgets) -> RecoveryFixture {
+pub(super) async fn claude_recovery(budgets: ProviderCallbackBudgets) -> RecoveryFixture {
     let root = tempfile::tempdir().unwrap();
     let binary = root.path().join("host");
     std::fs::write(&binary, b"synthetic helper artifact").unwrap();
@@ -197,8 +197,9 @@ async fn claude_recovery_callback_outlasts_an_ordinary_callback_with_a_live_scop
         .unwrap_err();
 
     server.await.expect("the server saw a live scope");
+    assert_eq!(error.code, RuntimeErrorCode::RecoveryBlocked);
     assert!(
-        error.message.contains("invalid scoped grant reference"),
+        error.message.contains("invalid exact provider preparation"),
         "the callback was answered, not timed out: {}",
         error.message
     );
