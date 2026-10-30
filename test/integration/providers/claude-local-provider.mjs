@@ -177,6 +177,7 @@ export async function createClaudeFixture({ parent = os.tmpdir(), prefix = 'fres
         CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY: '1',
         LANG: 'C.UTF-8',
         ...extra,
+        ...processes.environment,
       }
     },
     /** Every transcript (.jsonl) under CLAUDE_CONFIG_DIR, as paths relative to it. */

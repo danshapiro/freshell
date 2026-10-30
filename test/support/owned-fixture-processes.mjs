@@ -2,10 +2,12 @@ import { execFile, spawn } from 'node:child_process'
 import fs from 'node:fs/promises'
 import { setTimeout as delay } from 'node:timers/promises'
 import { promisify } from 'node:util'
+import { randomUUID } from 'node:crypto'
 import { createWindowsFixtureSession, prepareWindowsFixtureHost } from './windows-fixture-processes.mjs'
 
 const EXIT_TIMEOUT_MS = 3_000
 const POLL_MS = 25
+const OWNER_ENV = 'FRESHELL_CLAUDE_FIXTURE_OWNER'
 
 const log = (severity, event, fields) => {
   process.stderr.write(`${JSON.stringify({ ts: new Date().toISOString(), severity, component: 'claude-fixture', event, ...fields })}\n`)
@@ -43,10 +45,70 @@ async function liveGroupMembers(groupId, platform) {
   return members.filter((pid) => pid !== undefined)
 }
 
-function signalGroup(groupId, signal) {
-  try { process.kill(-groupId, signal) } catch (error) {
+async function liveTaggedProcesses(owner, platform) {
+  const marker = `${OWNER_ENV}=${owner}`
+  if (platform !== 'linux') {
+    // Darwin -E includes launch environments; -ww and a final command column
+    // preserve the marker even for long CLI arguments. Never log this output:
+    // it includes unrelated processes' environment values.
+    const { stdout } = await promisify(execFile)('/bin/ps', ['-E', '-ww', '-ax', '-o', 'pid=,stat=,command='], {
+      timeout: EXIT_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024,
+    })
+    return stdout.trim().split('\n').flatMap((line) => {
+      const [pid, state, ...command] = line.trim().split(/\s+/)
+      return state && !/^[ZX]/.test(state) && command.includes(marker) ? [Number(pid)] : []
+    })
+  }
+  const entries = (await fs.readdir('/proc')).filter((entry) => /^\d+$/.test(entry))
+  const owned = []
+  // Bound open files when the developer's machine has many concurrent agents.
+  for (let index = 0; index < entries.length; index += 32) {
+    const matches = await Promise.all(entries.slice(index, index + 32).map(async (entry) => {
+      try {
+        const directory = `/proc/${entry}`
+        if ((await fs.stat(directory)).uid !== process.geteuid()) return undefined
+        const stat = await fs.readFile(`${directory}/stat`, 'utf8')
+        const state = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[0]
+        if (state === 'Z' || state === 'X') return undefined
+        const environment = await fs.readFile(`${directory}/environ`, 'utf8')
+        return environment.split('\0').includes(marker) ? Number(entry) : undefined
+      } catch (error) {
+        if (error.code === 'ENOENT' || error.code === 'ESRCH') return undefined
+        // Unreadable same-user environments leave ownership unknown. Retain
+        // the fixture instead of claiming no detached writer remains.
+        throw error
+      }
+    }))
+    owned.push(...matches.filter((pid) => pid !== undefined))
+  }
+  return owned
+}
+
+function signalProcess(pid, signal) {
+  try { process.kill(pid, signal) } catch (error) {
     if (error.code !== 'ESRCH') throw error
   }
+}
+
+async function stopTaggedProcesses(owner, platform) {
+  for (const signal of ['SIGTERM', 'SIGKILL']) {
+    const deadline = Date.now() + EXIT_TIMEOUT_MS
+    let members = await liveTaggedProcesses(owner, platform)
+    if (members.length === 0) return
+    log(signal === 'SIGTERM' ? 'info' : 'warn', 'fixture.detached_processes.stopping', { signal, members })
+    while (true) {
+      for (const pid of members) signalProcess(pid, signal)
+      await delay(POLL_MS)
+      members = await liveTaggedProcesses(owner, platform)
+      if (members.length === 0) return
+      if (Date.now() >= deadline) break
+    }
+    if (signal === 'SIGKILL') throw new Error(`owned fixture processes still alive after SIGKILL: ${members.join(', ')}`)
+  }
+}
+
+function signalGroup(groupId, signal) {
+  signalProcess(-groupId, signal)
 }
 
 async function waitForGroupExit(groupId, signal, platform) {
@@ -80,16 +142,21 @@ export async function prepareFixtureProcessOwner() {
 }
 
 /**
- * POSIX children own detached process groups. Windows starts every target
- * suspended in its own Job Object and keeps that job after the root exits.
- * Cleanup requires every member's actual process handle to report exit.
+ * POSIX children own process groups plus an inherited fixture tag, which
+ * follows ordinary detached descendants across sessions and reparenting.
+ * Windows starts every target suspended in its own Job Object. Both retain
+ * ownership after root exit and require writer exit before file deletion.
  */
 export function createFixtureProcessOwner({ root } = {}) {
   const platform = process.platform
+  const owner = randomUUID()
+  const environment = Object.freeze(platform === 'win32' ? {} : { [OWNER_ENV]: owner })
   const groups = new Set()
   const windowsSessions = new Set()
   let closing = false
+  let launched = false
   return {
+    environment,
     spawn(command, args, options = {}) {
       if (closing) throw new Error('cannot spawn a fixture process after cleanup has started')
       if (platform === 'win32') {
@@ -100,8 +167,11 @@ export function createFixtureProcessOwner({ root } = {}) {
       // Node establishes pgid = sid = child.pid before spawn returns. Ownership
       // is captured before any created frame or native-CLI initialization, and
       // survives an immediate sidecar exit without a PID-journal race.
-      const child = spawn(command, args, { ...options, detached: true })
-      if (child.pid !== undefined) groups.add(child.pid)
+      const child = spawn(command, args, { ...options, env: { ...(options.env ?? process.env), ...environment }, detached: true })
+      if (child.pid !== undefined) {
+        groups.add(child.pid)
+        launched = true
+      }
       return child
     },
     async stop() {
@@ -113,6 +183,10 @@ export function createFixtureProcessOwner({ root } = {}) {
       for (const groupId of groups) {
         await stopGroup(groupId, platform)
         groups.delete(groupId)
+      }
+      if (launched) {
+        await stopTaggedProcesses(owner, platform)
+        launched = false
       }
     },
   }
