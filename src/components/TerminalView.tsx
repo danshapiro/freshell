@@ -38,7 +38,7 @@ import { confirmManagedRuntimeStopped } from '@/lib/managed-runtime-stop'
 import { isManagedRuntimeRecoveryDecision, ManagedRuntimeRecoveryCard } from '@/components/ManagedRuntimeRecoveryCard'
 import { isManagedRuntimeRecoveryPending } from '@/lib/managed-runtime-recovery-message'
 import { canReplayManagedTerminal, managedTerminalPaneStatus } from '@/lib/managed-terminal.js'
-import { buildReconcileRequestForPanes, foldVerdicts } from '@/lib/pane-reconcile'
+import { buildReconcileRequestForPanes, foldVerdicts, isDeadSessionReconcileNotice } from '@/lib/pane-reconcile'
 import type { PaneReconcileRequest, SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import {
   derivePaneOwnerDivergence,
@@ -408,6 +408,17 @@ const PENDING_INPUT_LOSS_NOTICE: Record<PendingInputLossReason, string> = {
     'Input not sent: the terminal did not reconnect in time. Retype it once the prompt is back.',
   terminal_gone: 'Input not sent: the terminal went away before it could be delivered.',
 }
+
+/**
+ * One-line explanation a dead terminal pane writes into its own xterm buffer
+ * (no-modal contract): a pane whose saved session was deleted from disk
+ * explains itself in place — resolution stays with the existing pane chrome
+ * (close button; +/split, Replace pane, Reopen pane as for a fresh start).
+ * The store-side reason distinction lives on the fold-minted dead-copy
+ * `reconcileNotice` (pane-reconcile.ts); the buffer line itself is shared.
+ */
+const DEAD_SESSION_BUFFER_NOTICE =
+  "[This pane's saved session no longer exists on disk - close this pane or start a new one]"
 
 type StartupProbeReplayDiscardState = {
   remainder: string | null
@@ -912,6 +923,22 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   const deadSessionLatchRef = useRef(false)
   deadSessionLatchRef.current =
     terminalContent?.restoreError?.reason === 'durable_artifact_missing'
+  // ── Dead-session notice line (no-modal contract) ──
+  // Idempotency keys on the REJECTION ROUND, not identity alone: the state
+  // records the identity key (`createRequestId|sessionId`) AND the surface
+  // epoch of the buffer the line was written to. The epoch bumps at every
+  // xterm surface birth (init) and at every beginMountedReconstruction
+  // reset completion — i.e. at every event that can WIPE the buffer — so a
+  // wiped surface always gets the line re-written at the next rejection,
+  // while a re-adjudication of an un-wiped surface never duplicates it.
+  // Cleared when the latch clears (user resolved the pane), re-arming a
+  // later re-death of the same identity.
+  const deadSessionNoticeSurfaceEpochRef = useRef(0)
+  const deadSessionNoticeStateRef = useRef<{ key: string; surfaceEpoch: number } | null>(null)
+  // Pending marker for a mint that arrived while the xterm surface was not
+  // mounted (provider-wait window): the mint is NOT consumed until the
+  // deferred surface mounts and the write completes.
+  const deadSessionNoticePendingRef = useRef<string | null>(null)
   const managedReplayAvailable = canReplayManagedTerminal(terminalContent)
 
   // kata b8ke (round-1 review: convergence is bidirectional): a TERMINAL
@@ -1651,6 +1678,64 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     persistSurfaceCheckpointForAttach(terminalId, attach, parserAppliedSeq)
   }, [getTerminalCheckpointStreamId, persistSurfaceCheckpointForAttach, recordTerminalPerfAuditEvent])
 
+  // No-queue local-notice core: the existing writeLocalXtermNotice fallback
+  // path, extracted so the dead-session writer can call it directly. The
+  // dead pane's line must not be generation-dropped or reordered by the
+  // write queue — it is written after the round's attach already settled and
+  // was rejected, so the queue's generation discipline is moot and the write
+  // goes straight to the term inside its own output-write scope. The write
+  // still counts toward surface mutation (surfaceWritesSinceFresh): the
+  // line is real bytes on the surface, so a later full-hydrate attach must
+  // treat the surface as dirty and reconstruct it (the stand-down gate then
+  // re-writes the line post-rejection).
+  const writeLocalXtermNoticeDirect = useCallback((term: Terminal, data: string) => {
+    const terminalInstanceId = terminalInstanceIdRef.current
+    if (!shouldAllowTerminalOutputSideEffect({
+      terminalInstanceId,
+      source: 'live',
+      effect: 'local_xterm_notice',
+      mode: contentRef.current?.mode,
+    })) {
+      return
+    }
+    const invalidateAppliedSurface = () => {
+      // Keep the applied position (the notice does not unapply stream bytes),
+      // bump the epoch (stream-unpure surface state), and preserve the
+      // coverage cursor — the notice appends non-stream bytes but never
+      // un-accounts stream coverage.
+      resetParserAppliedSurface(parserAppliedSeqRef.current, {
+        surfaceCoverageSeq: surfaceCoverageSeqRef.current,
+      })
+    }
+    const generation = currentAttachRef.current?.requestId
+    const scope = beginTerminalOutputWriteScope({
+      terminalInstanceId,
+      source: 'live',
+      attachRequestId: generation,
+      generation: generation ?? 'local-notice',
+      suppressExternalSideEffects: false,
+    })
+    let didComplete = false
+    const complete = () => {
+      if (didComplete) return
+      didComplete = true
+      scope.complete()
+    }
+    try {
+      term.write(data, () => {
+        try {
+          invalidateAppliedSurface()
+          surfaceWritesSinceFreshRef.current += 1
+        } finally {
+          complete()
+        }
+      })
+    } catch {
+      // disposed
+      complete()
+    }
+  }, [resetParserAppliedSurface])
+
   const writeLocalXtermNotice = useCallback((term: Terminal, data: string) => {
     const terminalInstanceId = terminalInstanceIdRef.current
     if (!shouldAllowTerminalOutputSideEffect({
@@ -1676,32 +1761,36 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       queue.enqueue(data, invalidateAppliedSurface, { mode: 'live', generation })
       return
     }
-    const scope = beginTerminalOutputWriteScope({
-      terminalInstanceId,
-      source: 'live',
-      attachRequestId: generation,
-      generation: generation ?? 'local-notice',
-      suppressExternalSideEffects: false,
-    })
-    let didComplete = false
-    const complete = () => {
-      if (didComplete) return
-      didComplete = true
-      scope.complete()
+    writeLocalXtermNoticeDirect(term, data)
+  }, [resetParserAppliedSurface, writeLocalXtermNoticeDirect])
+
+  // Dead-session notice writer (no-modal contract): no-op unless the pane's
+  // store content holds the fold-minted dead-copy reconcileNotice. When the
+  // xterm surface is not mounted yet (provider-wait window) it records a
+  // pending marker and does NOT consume the mint — the notice effect below
+  // completes the write when the deferred surface mounts. On write it
+  // consumes the mint one-shot and latches the idempotency key against the
+  // current surface epoch (see deadSessionNoticeStateRef).
+  const writeDeadSessionNoticeIfPending = useCallback(() => {
+    const content = contentRef.current
+    const notice = content?.reconcileNotice
+    if (!notice || !isDeadSessionReconcileNotice(notice)) return
+    const term = termRef.current
+    if (!term) {
+      // Surface not mounted: the mint stays pending and unconsumed.
+      deadSessionNoticePendingRef.current = notice
+      return
     }
-    try {
-      term.write(data, () => {
-        try {
-          invalidateAppliedSurface()
-        } finally {
-          complete()
-        }
-      })
-    } catch {
-      // disposed
-      complete()
+    const key = `${content.createRequestId ?? ''}|${content.sessionRef?.sessionId ?? '-'}`
+    const written = deadSessionNoticeStateRef.current
+    if (written && written.key === key && written.surfaceEpoch === deadSessionNoticeSurfaceEpochRef.current) {
+      return
     }
-  }, [resetParserAppliedSurface])
+    writeLocalXtermNoticeDirect(term, `\r\n${DEAD_SESSION_BUFFER_NOTICE}\r\n`)
+    deadSessionNoticePendingRef.current = null
+    deadSessionNoticeStateRef.current = { key, surfaceEpoch: deadSessionNoticeSurfaceEpochRef.current }
+    dispatch(clearPaneReconcileNotice({ tabId, paneId: paneIdRef.current }))
+  }, [dispatch, tabId, writeLocalXtermNoticeDirect])
 
   useEffect(() => () => {
     clearQuarantineRepair()
@@ -2755,6 +2844,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     surfaceFreshRef.current = true
     surfaceFreshMarkerRef.current = null
     surfaceWritesSinceFreshRef.current = 0
+    // New xterm surface identity (dead-session notice idempotency): a
+    // renderer-recreated surface starts blank, so a previously written
+    // notice line must be re-armed for the next rejection round.
+    deadSessionNoticeSurfaceEpochRef.current += 1
     // A brand-new surface has no covered stream position.
     surfaceCoverageSeqRef.current = 0
     unsafeSurfaceCheckpointRef.current = false
@@ -3162,6 +3255,45 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isTerminal, providerBehavior.preferredRenderer, shouldWaitForProviderBehavior])
+
+  // Dead-session notice line (no-modal contract), the no-terminalId trigger
+  // site. Write timing is SPLIT BY PANE SHAPE:
+  // - no terminalId (reload/boot shape): no attach can ever start, the
+  //   empty surface is stable — this effect invokes the writer directly;
+  // - retained terminalId (live-reconnect shape): an attach can still start
+  //   (and its beginMountedReconstruction wipe the buffer) before the
+  //   server rejects it — the INVALID_TERMINAL_ID stand-down gate owns the
+  //   write there, post-rejection. This effect must NOT write or consume
+  //   for that shape.
+  // The effect also completes a pending write recorded while the xterm
+  // surface was deferred (provider-wait window): the
+  // shouldWaitForProviderBehavior dep re-fires it when the surface mounts.
+  // Declared AFTER the init-xterm effect so a mount-time run already sees
+  // termRef.current set (declaration-order effect execution).
+  useEffect(() => {
+    const content = contentRef.current
+    if (content?.restoreError?.reason !== 'durable_artifact_missing') {
+      // Latch cleared (or a non-dead reason): re-arm the idempotency state
+      // so a later re-death of the SAME identity writes again.
+      deadSessionNoticeStateRef.current = null
+      deadSessionNoticePendingRef.current = null
+      return
+    }
+    if (deadSessionNoticePendingRef.current && termRef.current) {
+      // The deferred surface mounted: complete the pending write.
+      deadSessionNoticePendingRef.current = null
+      writeDeadSessionNoticeIfPending()
+      return
+    }
+    if (content?.terminalId) return
+    writeDeadSessionNoticeIfPending()
+  }, [
+    terminalContent?.restoreError,
+    terminalContent?.reconcileNotice,
+    terminalContent?.terminalId,
+    shouldWaitForProviderBehavior,
+    writeDeadSessionNoticeIfPending,
+  ])
 
   // Ref for tab to avoid re-running effects when tab changes
   const tabRef = useRef(tab)
@@ -3888,7 +4020,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         })
         scheduleQuarantineRepair(tid, ticket.generation)
       }
-      writeQueue.enqueue('\x18\x1bc\x1b[?25h', () => { ticket.succeeded = true }, {
+      // The reset write's completion is the exact wipe moment: bump the
+      // surface epoch so the dead-session notice idempotency re-arms — a
+      // wiped surface always gets its line re-written at the next rejection
+      // (even when the reconstruction ticket is later abandoned, the reset
+      // bytes were already applied and the old line is gone; a dropped reset
+      // never completes and never bumps — no wipe, no re-arm).
+      writeQueue.enqueue('\x18\x1bc\x1b[?25h', () => {
+        ticket.succeeded = true
+        deadSessionNoticeSurfaceEpochRef.current += 1
+      }, {
         generation: ticket.generation, mode: 'replay', coalesce: false,
       })
       writeQueue.enqueueTask(() => {
@@ -5950,9 +6091,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             writeLocalXtermNotice(term, `\r\n${createdNotice}\r\n`)
           }
           // One-shot reconcile notice (respawn/fresh verdicts): render it now
-          // that the pane anchored, then clear it from the store.
+          // that the pane anchored, then clear it from the store. The
+          // dead-session mint has exactly TWO owners (the INVALID_TERMINAL_ID
+          // stand-down gate and the no-terminalId notice effect) — this
+          // anchor neither writes nor clears it.
           const createdReconcileNotice = contentRef.current?.reconcileNotice
-          if (createdReconcileNotice) {
+          if (createdReconcileNotice && !isDeadSessionReconcileNotice(createdReconcileNotice)) {
             writeLocalXtermNotice(term, `\r\n${createdReconcileNotice}\r\n`)
             if (createdReconcileNotice === RECONCILE_NOTICE_FRESH_BY_RACE) {
               setFreshByRaceNotice(createdReconcileNotice)
@@ -6707,7 +6851,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             //   create/attach round. On timeout the pending flag clears and
             //   the next attach-error round takes the recovery below -- the
             //   ensure() re-fire re-attaches, so this can never wedge.
-            if (deadSessionLatchRef.current) return
+            if (deadSessionLatchRef.current) {
+              // Post-rejection moment (no-modal contract): the round's
+              // attach attempt -- including any beginMountedReconstruction
+              // wipe -- has settled and been rejected, so the surface is
+              // final for the round. Write the one notice line now (the
+              // retained-terminalId shape's ONLY writer; idempotent per
+              // surface epoch, re-armed after a wipe).
+              writeDeadSessionNoticeIfPending()
+              return
+            }
             if (
               reconcilePendingSinceRef.current !== undefined
               && Date.now() - reconcilePendingSinceRef.current < RECONCILE_VERDICT_WAIT_MS
@@ -7021,9 +7174,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           })
           // One-shot reconcile notice (attach/corrected/duplicate verdicts):
           // render it on the attach that the verdict fold re-fired, then
-          // clear it from the store.
+          // clear it from the store. The dead-session mint has exactly TWO
+          // owners (the INVALID_TERMINAL_ID stand-down gate and the
+          // no-terminalId notice effect) — this anchor neither writes nor
+          // clears it.
           const attachReconcileNotice = contentRef.current?.reconcileNotice
-          if (attachReconcileNotice) {
+          if (attachReconcileNotice && !isDeadSessionReconcileNotice(attachReconcileNotice)) {
             writeLocalXtermNotice(term, `\r\n${attachReconcileNotice}\r\n`)
             dispatch(clearPaneReconcileNotice({ tabId, paneId: paneIdRef.current }))
           }
@@ -7183,6 +7339,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     runRefreshAttach,
     syncContentRefWithSessionAssociation,
     writeLocalXtermNotice,
+    writeDeadSessionNoticeIfPending,
   ])
 
   useEffect(() => {

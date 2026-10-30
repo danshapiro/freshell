@@ -48,6 +48,32 @@ const MAX_RECONCILE_PANES = 200
 /** Bounded wait for a boot `pane.reconcile.result`: > the server's single 2s warming deferral + round-trip margin. */
 export const RECONCILE_RESULT_WAIT_MS = 10_000
 
+/**
+ * Dead-session store-copy mints for the one-shot `reconcileNotice` field
+ * (no-modal contract). REASON-HONEST: the server also returns `dead_session`
+ * with reason `respawn_exhausted` while the session file is PRESENT, so the
+ * fold selects the copy from `verdict.reason`. Consumers match the mint by
+ * CATEGORY through `isDeadSessionReconcileNotice` — never one string — so
+ * the `invalid`-arm and reset notices can never trigger them. The xterm
+ * buffer line is a SEPARATE shared const in TerminalView; these copies stay
+ * store-side.
+ */
+export const DEAD_SESSION_RECONCILE_NOTICES = {
+  missing: 'Saved session no longer exists on disk.',
+  respawnExhausted: 'Saved session could not be resumed.',
+} as const
+
+export function deadSessionReconcileNoticeFor(reason: string | undefined): string {
+  return reason === 'respawn_exhausted'
+    ? DEAD_SESSION_RECONCILE_NOTICES.respawnExhausted
+    : DEAD_SESSION_RECONCILE_NOTICES.missing
+}
+
+export function isDeadSessionReconcileNotice(notice: string | undefined): boolean {
+  return notice === DEAD_SESSION_RECONCILE_NOTICES.missing
+    || notice === DEAD_SESSION_RECONCILE_NOTICES.respawnExhausted
+}
+
 export function paneKeyFor(tabId: string, paneId: string): string {
   return `${tabId}:${paneId}`
 }
@@ -569,6 +595,19 @@ export function foldVerdicts(
           tabId,
           paneId,
           restoreError: buildRestoreError('durable_artifact_missing'),
+        }))
+        // No-modal contract (Task 2): the terminal dead arm also mints the
+        // one-shot dead-copy reconcileNotice — the signal no other producer
+        // can mint (the latch alone is also set on LIVE panes by the codex
+        // dead-live-handle recovery breadcrumb). TerminalView's notice
+        // machinery consumes it into ONE xterm buffer line. Reason-honest
+        // copy selection; the fresh-agent arm above does NOT mint
+        // (FreshAgentView renders reconcileNotice as a transient status —
+        // its restoreError banner already explains the death).
+        dispatch(setPaneReconcileNotice({
+          tabId,
+          paneId,
+          notice: deadSessionReconcileNoticeFor(verdict.reason),
         }))
         outcome.dead++
         break

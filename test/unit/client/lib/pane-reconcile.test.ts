@@ -18,6 +18,7 @@ import panesReducer, {
   resetPaneForReconcileCreate,
   setDeadSessionAdjudication,
   setReconcileWarming,
+  setPaneReconcileNotice,
   setPaneRestoreError,
 } from '@/store/panesSlice'
 import type { PanesState } from '@/store/panesSlice'
@@ -31,6 +32,7 @@ import {
   collectTerminalPaneTargets,
   foldVerdicts,
   paneKeyFor,
+  DEAD_SESSION_RECONCILE_NOTICES,
 } from '@/lib/pane-reconcile'
 import type { UnknownAction } from '@reduxjs/toolkit'
 
@@ -381,6 +383,31 @@ describe('foldVerdicts', () => {
       paneId: 'p1',
       restoreError: { code: 'RESTORE_UNAVAILABLE' },
     })
+  })
+
+  it('dead terminal verdicts mint a reason-honest dead-copy reconcileNotice beside the latch', () => {
+    // Copy honesty (fresh-eyes round 3): the server also returns dead_session
+    // with reason respawn_exhausted while the session file is PRESENT — the
+    // fold selects the STORE copy from the verdict's reason. Both variants
+    // are the dead-copy CATEGORY (matched by predicate, never one string).
+    const { req, dispatch, dispatched } = foldHarness([
+      ['dead_session', { sessionRef: { provider: 'claude', sessionId: 'gone-file' }, reason: 'session_file_missing' }],
+      ['dead_session', { sessionRef: { provider: 'claude', sessionId: 'gone-respawn' }, reason: 'respawn_exhausted' }],
+      ['dead_session', { sessionRef: { provider: 'claude', sessionId: 'gone-unknown' } }],
+    ])
+    const outcome = foldVerdicts(dispatch, req, resultFor(req, dispatched.verdicts))
+    expect(outcome.dead).toBe(3)
+    const noticePayloads = dispatched.actions
+      .filter((a) => a.type === setPaneReconcileNotice.type)
+      .map((a) => (a as unknown as { payload: { tabId: string; paneId: string; notice: string } }).payload)
+    expect(noticePayloads).toHaveLength(3)
+    expect(noticePayloads.map((p) => p.notice)).toEqual([
+      DEAD_SESSION_RECONCILE_NOTICES.missing,
+      DEAD_SESSION_RECONCILE_NOTICES.respawnExhausted,
+      // An unknown reason is honest about the general case, not the disk.
+      DEAD_SESSION_RECONCILE_NOTICES.missing,
+    ])
+    expect(noticePayloads.map((p) => `${p.tabId}:${p.paneId}`)).toEqual(['tab1:p1', 'tab2:p2', 'tab3:p3'])
   })
 
   it('warming verdicts aggregate into ONE setReconcileWarming dispatch', () => {

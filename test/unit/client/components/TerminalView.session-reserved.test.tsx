@@ -400,6 +400,15 @@ describe('TerminalView reconcile adoption: verdict-driven create + bounded re-dr
 
     expect(paneContent(store).restoreError).toBeTruthy()
     expect(store.getState().panes.deadSessionAdjudication).toHaveLength(1)
+
+    // No-modal contract (Task 2): the dead verdict explains itself with
+    // exactly ONE notice line written directly into the pane's own stale
+    // buffer (CRLF-framed) — never a modal. The fold's dead-copy mint is
+    // consumed one-shot, and the STORE copy never reaches the buffer.
+    const deadNoticeLine = '\r\n[This pane\'s saved session no longer exists on disk - close this pane or start a new one]\r\n'
+    expect(xtermWrites().filter((data) => data === deadNoticeLine)).toHaveLength(1)
+    expect(xtermWrites().some((data) => data.includes('Saved session no longer exists on disk.'))).toBe(false)
+    expect(paneContent(store).reconcileNotice).toBeUndefined()
   })
 
   it('INVALID_TERMINAL_ID at launch is retried bounded (F9), not a permanent error', async () => {
