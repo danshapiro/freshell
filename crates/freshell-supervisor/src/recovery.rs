@@ -2117,10 +2117,7 @@ impl Supervisor {
                                 .await
                                 .map_err(map_registry)?;
                         }
-                        if context.provider != "shell"
-                            && context.resume_spec.is_none()
-                            && !deterministic_fresh_fixture(context)
-                        {
+                        if context.provider != "shell" && context.resume_spec.is_none() {
                             self.capture_live_resume_evidence(context, &host, &status)
                                 .await;
                         }
@@ -2263,7 +2260,6 @@ impl Supervisor {
             if context.resume_spec.is_none()
                 && context.native_session_id.is_some()
                 && context.fixture.is_none()
-                && !deterministic_fresh_fixture(context)
             {
                 return self.probe_offline_store(context, transient).await;
             }
@@ -6764,6 +6760,26 @@ pub(crate) mod tests {
                             opencode_transfer_receipt: None,
                             opencode_adoption: Default::default(),
                         },
+                        HostCommand::ProbeRecovery {
+                            incarnation_id,
+                            resume_spec,
+                            run_as_uid,
+                            run_as_gid,
+                            ..
+                        } => {
+                            assert_eq!(case, "current-fixture");
+                            assert_eq!(incarnation_id, hosted_incarnation);
+                            assert_eq!((run_as_uid, run_as_gid), (65534, 0));
+                            let candidate =
+                                resume_spec.expect("capture needs the exact current root");
+                            assert_eq!(candidate.provider_session.native_session_id, native);
+                            // This mock has a live worker but no saved provider
+                            // store. Optional capture may decline durability
+                            // without interrupting that existing worker.
+                            HostResult::RecoveryProbe(
+                                freshell_agent_runtime::unverified_native_probe(),
+                            )
+                        }
                         other => {
                             panic!("reattach must not dispatch or replace the worker: {other:?}")
                         }
@@ -8617,6 +8633,8 @@ pub(crate) mod automatic_retry_tests {
         atomic::{AtomicI64, Ordering},
         Mutex,
     };
+
+    include!("deterministic_fixture_recovery_tests.rs");
 
     // These four subprocess tests are only entered by the documented runtime
     // sandbox. Abrupt exit skips every Rust destructor, including SQLite owners.
@@ -11461,69 +11479,73 @@ pub(crate) mod automatic_retry_tests {
 
     #[tokio::test]
     async fn retry_manual_rearm_survives_early_transient_and_restart() {
-        let dir = tempfile::tempdir().unwrap();
-        let (supervisor, backend, _) = open(dir.path(), 0);
-        let soul = seed(&supervisor).await;
-        let context = supervisor
-            .registry
-            .recovery_context(soul.clone())
-            .await
-            .unwrap();
-        Connection::open(supervisor.registry.database_path()).unwrap().execute(
-            "UPDATE souls SET recovery_window_started_at=?1,successful_recoveries_in_window=5 WHERE soul_id=?2",
-            rusqlite::params![crate::registry::now_millis(), soul.as_str()],
-        ).unwrap();
-        backend.unavailable(true);
-        let first = supervisor
-            .recover(RecoverRequest {
-                soul_id: soul.clone(),
-                trigger: RecoveryTrigger::ManualRetry,
-                expected_intent_revision: Some(context.intent_revision),
-                expected_control_epoch: Some(supervisor.registry.control_epoch()),
-            })
-            .await
-            .unwrap();
-        assert_eq!(first.outcome, RecoveryOutcome::Blocked);
-        assert_eq!(due(dir.path()), Some(2_000));
-        assert_eq!(backend.count("creates"), 0);
-        drop(supervisor);
-        drop(backend);
+        // Keep the complete multi-reopen scenario off the test-thread stack.
+        Box::pin(async {
+            let dir = tempfile::tempdir().unwrap();
+            let (supervisor, backend, _) = open(dir.path(), 0);
+            let soul = seed(&supervisor).await;
+            let context = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            Connection::open(supervisor.registry.database_path()).unwrap().execute(
+                "UPDATE souls SET recovery_window_started_at=?1,successful_recoveries_in_window=5 WHERE soul_id=?2",
+                rusqlite::params![crate::registry::now_millis(), soul.as_str()],
+            ).unwrap();
+            backend.unavailable(true);
+            let first = supervisor
+                .recover(RecoverRequest {
+                    soul_id: soul.clone(),
+                    trigger: RecoveryTrigger::ManualRetry,
+                    expected_intent_revision: Some(context.intent_revision),
+                    expected_control_epoch: Some(supervisor.registry.control_epoch()),
+                })
+                .await
+                .unwrap();
+            assert_eq!(first.outcome, RecoveryOutcome::Blocked);
+            assert_eq!(due(dir.path()), Some(2_000));
+            assert_eq!(backend.count("creates"), 0);
+            drop(supervisor);
+            drop(backend);
 
-        let (supervisor, backend, clock) = open(dir.path(), 1_000);
-        backend.unavailable(false);
-        supervisor.reconcile_startup().await.unwrap();
-        assert_eq!(attempts(dir.path()).len(), 1);
-        clock.store(2_000, Ordering::SeqCst);
-        supervisor.observe_once().await.unwrap();
-        let current = supervisor
-            .registry
-            .recovery_context(soul.clone())
-            .await
-            .unwrap();
-        assert_eq!(current.recovery_state, RecoveryState::Live);
-        assert_eq!(current.intent_revision, context.intent_revision + 1);
-        assert_eq!(backend.count("creates"), 1);
-        assert_eq!(attempts(dir.path()).len(), 2);
-        assert_root_and_successes(&supervisor, &soul, 1).await;
-        assert_eq!(due(dir.path()), None);
-        // A subsequent automatic replacement spends another success from the
-        // same window; only the deliberate action above may rearm it.
-        backend
-            .request_stop(&current.prior_handle, 0)
-            .await
-            .unwrap();
-        let next = supervisor
-            .recover(RecoverRequest {
-                soul_id: soul.clone(),
-                trigger: RecoveryTrigger::ProviderExit,
-                expected_intent_revision: Some(current.intent_revision),
-                expected_control_epoch: Some(supervisor.registry.control_epoch()),
-            })
-            .await
-            .unwrap();
-        assert_eq!(next.outcome, RecoveryOutcome::Replaced);
-        assert_root_and_successes(&supervisor, &soul, 2).await;
-        assert_eq!(next.view.intent_revision, context.intent_revision + 1);
+            let (supervisor, backend, clock) = open(dir.path(), 1_000);
+            backend.unavailable(false);
+            supervisor.reconcile_startup().await.unwrap();
+            assert_eq!(attempts(dir.path()).len(), 1);
+            clock.store(2_000, Ordering::SeqCst);
+            supervisor.observe_once().await.unwrap();
+            let current = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            assert_eq!(current.recovery_state, RecoveryState::Live);
+            assert_eq!(current.intent_revision, context.intent_revision + 1);
+            assert_eq!(backend.count("creates"), 1);
+            assert_eq!(attempts(dir.path()).len(), 2);
+            assert_root_and_successes(&supervisor, &soul, 1).await;
+            assert_eq!(due(dir.path()), None);
+            // A subsequent automatic replacement spends another success from the
+            // same window; only the deliberate action above may rearm it.
+            backend
+                .request_stop(&current.prior_handle, 0)
+                .await
+                .unwrap();
+            let next = supervisor
+                .recover(RecoverRequest {
+                    soul_id: soul.clone(),
+                    trigger: RecoveryTrigger::ProviderExit,
+                    expected_intent_revision: Some(current.intent_revision),
+                    expected_control_epoch: Some(supervisor.registry.control_epoch()),
+                })
+                .await
+                .unwrap();
+            assert_eq!(next.outcome, RecoveryOutcome::Replaced);
+            assert_root_and_successes(&supervisor, &soul, 2).await;
+            assert_eq!(next.view.intent_revision, context.intent_revision + 1);
+        })
+        .await;
     }
 
     #[tokio::test]
