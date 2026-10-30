@@ -28,10 +28,10 @@
     },
     {
       "provider": "claude",
-      "certificationState": "pending_live_provider_certification",
+      "certificationState": "certified",
       "qualificationReady": true,
-      "managedEnabled": false,
-      "durableRecoveryEnabled": false,
+      "managedEnabled": true,
+      "durableRecoveryEnabled": true,
       "managedModes": [
         "claude"
       ],
@@ -43,14 +43,14 @@
       "checkpointPolicy": "provider-transcript-only",
       "bootstrap": "typed Claude OneCLI environment/auth-file reference resolved for provider child; legacy Kilroy raw bootstrap is separate",
       "liveGate": "haiku-lowest-reasoning",
-      "blockedReason": "PENDING_LIVE_QUALIFICATION",
+      "blockedReason": null,
       "recoveryPaths": [
         "reattach",
         "native_resume",
         "checkpoint_restore",
         "pristine_seed"
       ],
-      "qualificationStatus": "adapter-ready-live-gate-pending"
+      "qualificationStatus": "production-candidate-unverified"
     },
     {
       "provider": "opencode",
@@ -74,16 +74,40 @@
         "reattach",
         "native_resume",
         "checkpoint_restore",
-        "pristine_seed"
+        "pristine_seed",
+        "native_import"
       ],
+      "nativeImport": {
+        "transitionVerifier": "immutable-baseline-plus-ordered-pinned-durable-events",
+        "unsupportedTransitionShapes": [
+          "session_context_epoch snapshot or baseline changes have no exact durable value witness and block resume",
+          "V1 message/part removal events and baseline transcript deletions block until the exact revert-removal projection is qualified"
+        ],
+        "sourceStatuses": [
+          "pending",
+          "failed",
+          "available",
+          "absent",
+          "unresolved",
+          "expired_stage",
+          "completed"
+        ],
+        "importStatuses": [
+          "pending",
+          "failed",
+          "completed"
+        ],
+        "legacyUnknownStatus": "blocked",
+        "refreshAuthority": "complete_source_inventory_revalidation"
+      },
       "qualificationStatus": "live-qualified-release-enabled"
     },
     {
       "provider": "codex",
-      "certificationState": "pending_live_provider_certification",
+      "certificationState": "certified",
       "qualificationReady": true,
-      "managedEnabled": false,
-      "durableRecoveryEnabled": false,
+      "managedEnabled": true,
+      "durableRecoveryEnabled": true,
       "managedModes": [
         "codex"
       ],
@@ -95,14 +119,14 @@
       "checkpointPolicy": "provider-rollout-only",
       "bootstrap": "typed Codex OneCLI environment/auth-file reference resolved for provider child",
       "liveGate": "gpt-5.6-luna-lowest-reasoning",
-      "blockedReason": "PENDING_LIVE_QUALIFICATION",
+      "blockedReason": null,
       "recoveryPaths": [
         "reattach",
         "native_resume",
         "checkpoint_restore",
         "pristine_seed"
       ],
-      "qualificationStatus": "adapter-ready-live-gate-pending"
+      "qualificationStatus": "production-candidate-unverified"
     },
     {
       "provider": "amplifier",
@@ -178,12 +202,11 @@
       "mode": "freshclaude",
       "provider": "claude",
       "qualificationReady": true,
-      "releaseDeferralReason": "pending_live_provider_certification",
       "runtimeVariant": "claude-agent-sdk",
       "hostOwnedImplementation": true,
-      "enabledInReleaseScope": false,
-      "liveQualificationStatus": "pending_authentic_receipt",
-      "certified": false,
+      "enabledInReleaseScope": true,
+      "liveQualificationStatus": "certified",
+      "certified": true,
       "pendingApprovalSupported": true
     },
     {
@@ -202,24 +225,22 @@
       "mode": "freshcodex",
       "provider": "codex",
       "qualificationReady": true,
-      "releaseDeferralReason": "pending_live_provider_certification",
       "runtimeVariant": "codex-app-server",
       "hostOwnedImplementation": true,
-      "enabledInReleaseScope": false,
-      "liveQualificationStatus": "pending_authentic_receipt",
-      "certified": false,
+      "enabledInReleaseScope": true,
+      "liveQualificationStatus": "certified",
+      "certified": true,
       "pendingApprovalSupported": false
     },
     {
       "mode": "freshopencode",
       "provider": "opencode",
       "qualificationReady": true,
-      "releaseDeferralReason": "pending_live_provider_certification",
       "runtimeVariant": "opencode-per-soul-http",
       "hostOwnedImplementation": true,
-      "enabledInReleaseScope": false,
-      "liveQualificationStatus": "pending_authentic_receipt",
-      "certified": false,
+      "enabledInReleaseScope": true,
+      "liveQualificationStatus": "certified",
+      "certified": true,
       "pendingApprovalSupported": false
     }
   ],
@@ -229,7 +250,9 @@
       "name": "websocket-terminal-create-attach",
       "providers": [
         "shell",
-        "opencode"
+        "claude",
+        "opencode",
+        "codex"
       ],
       "policy": "managed",
       "identityRule": "allocate-or-capture-one-exact-native-id"
@@ -238,8 +261,6 @@
       "id": "deferred-managed-provider-create",
       "name": "deferred-managed-providers",
       "providers": [
-        "claude",
-        "codex",
         "amplifier"
       ],
       "policy": "legacy",
@@ -251,9 +272,9 @@
       "providers": [
         "claude"
       ],
-      "policy": "blocked",
-      "identityRule": "PENDING_LIVE_PROVIDER_CERTIFICATION",
-      "enabledInReleaseScope": false
+      "policy": "managed",
+      "identityRule": "current-provider-observation-before-input",
+      "enabledInReleaseScope": true
     },
     {
       "id": "rest-kilroy-create",
@@ -271,9 +292,9 @@
       "providers": [
         "opencode"
       ],
-      "policy": "blocked",
-      "identityRule": "PENDING_LIVE_PROVIDER_CERTIFICATION",
-      "enabledInReleaseScope": false
+      "policy": "managed",
+      "identityRule": "current-provider-observation-before-input",
+      "enabledInReleaseScope": true
     },
     {
       "id": "rest-freshcodex-create",
@@ -281,16 +302,18 @@
       "providers": [
         "codex"
       ],
-      "policy": "blocked",
-      "identityRule": "PENDING_LIVE_PROVIDER_CERTIFICATION",
-      "enabledInReleaseScope": false
+      "policy": "managed",
+      "identityRule": "current-provider-observation-before-input",
+      "enabledInReleaseScope": true
     },
     {
       "id": "supervisor-startup-reconcile",
       "name": "startup-reconcile-and-exit-observer",
       "providers": [
         "shell",
-        "opencode"
+        "claude",
+        "opencode",
+        "codex"
       ],
       "policy": "managed",
       "identityRule": "reattach-first-then-exact-resume"
@@ -300,7 +323,9 @@
       "name": "provider-exit-observer",
       "providers": [
         "shell",
-        "opencode"
+        "claude",
+        "opencode",
+        "codex"
       ],
       "policy": "managed",
       "identityRule": "provider-exit-does-not-commit-stop-intent"
@@ -342,23 +367,20 @@
     "stopIntentWins": true
   },
   "releaseScope": {
-    "freshAgentEnabled": false,
+    "freshAgentEnabled": true,
     "managedTerminalProviders": [
-      "opencode"
+      "claude",
+      "opencode",
+      "codex"
     ],
     "disabledFreshAgentModes": [
-      "freshclaude",
-      "kilroy",
-      "freshcodex",
-      "freshopencode"
+      "kilroy"
     ],
     "disabledExtensionModes": [
       "gemini",
       "kimi"
     ],
     "deferredManagedProviders": [
-      "claude",
-      "codex",
       "amplifier"
     ],
     "deferredReason": "PENDING_LIVE_QUALIFICATION"
@@ -367,40 +389,33 @@
     "schemaVersion": 1,
     "deferralReason": "pending_live_provider_certification",
     "certifiedDurableProviders": [
-      "opencode"
+      "claude",
+      "opencode",
+      "codex"
     ],
     "deferredProviders": [
-      "claude",
-      "codex",
       "amplifier"
     ],
     "landingGate": {
       "id": "durable-souls-landing",
       "description": "Cumulative P1-P5 qualification that may pass while exactly the deferred providers await live certification. Every non-deferred case must still PASS.",
       "deferrableProviders": [
-        "claude",
-        "codex",
         "amplifier"
       ],
       "deferredCaseStatus": "DEFERRED_LIVE_PROVIDER_CERTIFICATION"
     },
     "productionGate": {
       "id": "durable-souls-production-gate-5",
-      "status": "BLOCKED_PENDING_LIVE_PROVIDER_CERTIFICATION",
-      "reason": "pending_live_provider_certification",
+      "status": "UNVERIFIED_PRODUCTION_CANDIDATE",
+      "reason": "pending_current_candidate_verification",
       "description": "Full production certification. Requires live candidate-bound turn, recovery, and follow-up receipts for every provider that will be advertised production-ready. BLOCKED is never PASS.",
       "requiredCertifiedProviders": [
         "shell",
         "opencode",
         "claude",
-        "codex",
-        "amplifier"
+        "codex"
       ],
-      "blockingProviders": [
-        "claude",
-        "codex",
-        "amplifier"
-      ]
+      "blockingProviders": []
     }
   }
 }

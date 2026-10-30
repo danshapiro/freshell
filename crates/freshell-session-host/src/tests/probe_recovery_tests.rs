@@ -82,6 +82,7 @@ async fn startup_before_identity_retains_diagnostic() {
         std::collections::BTreeMap::new(),
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -166,7 +167,8 @@ async fn cold_initialization_without_worker_does_not_claim_live() {
         assert!(matches!(
             probe(&state, false).await,
             RecoveryProbe::Blocked {
-                reason: freshell_runtime_protocol::RecoveryBlockReason::AmbiguousIdentity,
+                path: RecoveryPath::NativeResume,
+                reason: freshell_runtime_protocol::RecoveryBlockReason::StoreUnreadable,
                 ..
             }
         ));
@@ -193,6 +195,7 @@ async fn shell_without_native_paths_uses_terminal_end_policy() {
             state.incarnation_id.clone(),
             &terminal,
             std::collections::BTreeMap::new(),
+            None,
             None,
             None,
         )

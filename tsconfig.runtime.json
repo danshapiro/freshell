@@ -8,6 +8,8 @@
   "include": [
     "scripts/testing/provider-certification.ts",
     "scripts/testing/provider-qualification-receipt.ts",
+    "scripts/testing/provider-native-history.ts",
+    "scripts/testing/qualification-observations.ts",
     "scripts/testing/provider-qualification-selection.ts",
     "scripts/testing/fresh-agent-qualification-receipt.ts",
     "scripts/testing/fresh-agent-qualification-selection.ts",
@@ -18,12 +20,19 @@
     "scripts/testing/runtime-gate.ts",
     "scripts/testing/runtime-gate-args.ts",
     "scripts/testing/runtime-sandbox.ts",
+    "scripts/testing/task007-destructive-sandbox.ts",
+    "scripts/testing/opencode-native-transfer-check.ts",
+    "scripts/testing/opencode-restoration-rehearsal.ts",
     "scripts/testing/runtime-test-broker.ts",
+    "scripts/testing/runtime-native-feasibility.ts",
+    "scripts/testing/runtime-external-browser.ts",
     "scripts/testing/runtime-phase5-soak.ts",
     "scripts/testing/runtime-soak-evidence.ts",
     "scripts/testing/runtime-landing-campaign.ts",
     "test/unit/server/testing/runtime-soak-evidence.test.ts",
     "test/runtime/**/*.ts",
-    "shared/**/*.ts"
+    "shared/**/*.ts",
+    "scripts/testing/task002-config-legacy-fixtures.ts",
+    "scripts/testing/task002-retained-fixture.ts"
   ]
 }

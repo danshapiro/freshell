@@ -60,7 +60,8 @@ impl ManagedTerminalController for SyntheticConfiguration {
         &'a self,
         _: ManagedTerminalDescriptor,
         _: String,
-    ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+    ) -> ManagedTerminalFuture<'a, Result<(), freshell_terminal::registry::ManagedTerminalInputError>>
+    {
         Box::pin(async { Ok(()) })
     }
     fn resize<'a>(

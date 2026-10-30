@@ -4,6 +4,7 @@ import reducer, { advanceCompletionBaseline, resetCompletionDedupeBaselines } fr
 import {
   applyFreshAgentCompletion,
   applyFreshAgentWaiting,
+  applyFreshAgentQuestionAvailable,
   foldReadyFreshAgentAttention,
   observeFreshAgentSession,
 } from '@/store/turnCompletionThunks'
@@ -78,6 +79,22 @@ describe('fresh-agent reconnect attention', () => {
       expect.objectContaining({ terminalId: 'claude:session-1', at: 101, watched: false }),
       expect.objectContaining({ terminalId: 'claude:session-1#waiting', at: 111, watched: false }),
     ])
+  })
+
+  it('keeps completion outcomes off independent approval and question attention', () => {
+    const { store, dispatch } = createStore()
+    const completion = { provider: 'claude', sessionId: 'session-1', at: 100, outcome: 'failed' as const }
+    dispatch(applyFreshAgentCompletion(completion))
+    dispatch(applyFreshAgentWaiting({ ...completion, at: 101 }))
+    dispatch(applyFreshAgentQuestionAvailable({ ...completion, at: 102 }))
+
+    const events = store.getState().turnCompletion.pendingEvents
+    expect(events).toHaveLength(3)
+    expect(events[0]).toMatchObject({ terminalId: 'claude:session-1', at: 100, outcome: 'failed' })
+    expect(events[1]).toMatchObject({ terminalId: 'claude:session-1#waiting', at: 101 })
+    expect(events[2]).toMatchObject({ terminalId: 'claude:session-1#question', at: 102 })
+    expect(events[1]).not.toHaveProperty('outcome')
+    expect(events[2]).not.toHaveProperty('outcome')
   })
 
   it('classifies replay at receipt using the current focus and active tab', () => {

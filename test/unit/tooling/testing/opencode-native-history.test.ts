@@ -7,6 +7,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { hasOpenCodePromptModelText, nativeTurnProof, openCodeCredentialFailureMessage, openCodeTerminalReady, selectNativeAssistantTurn, waitForOpenCodeTerminalCondition } from '../../../e2e-browser/helpers/opencode-native-history.js'
 import { readOpenCodeNativeHistory } from '../../../e2e-browser/helpers/provider-native-history/opencode.js'
+import type { NativeAssistantTurn } from '../../../e2e-browser/helpers/opencode-native-history.js'
 
 let root: string
 let filename: string
@@ -74,13 +75,24 @@ describe('live recovery proves new native assistant responses, never TUI echo or
   })
 
   it('waits past unrelated completed assistant rows for the correlated no-tool answer', () => {
-    const turns = [
-      { turnId: 'intro', messageId: 'intro', parentMessageId: 'u0', completedAt: 1, text: 'Freshell.', toolCalls: [], resolvedProvider: 'opencode', resolvedModel: 'big-pickle', resolvedReasoningEffort: 'provider-default', providerProvenance: 'opencode-message.providerID', modelProvenance: 'opencode-message.modelID', reasoningEffortProvenance: 'opencode-native-default' },
-      { turnId: 'tool', messageId: 'tool', parentMessageId: 'u1', completedAt: 2, text: 'p-target', toolCalls: [{ type: 'tool', name: 'read' }], resolvedProvider: 'opencode', resolvedModel: 'big-pickle', resolvedReasoningEffort: 'provider-default', providerProvenance: 'opencode-message.providerID', modelProvenance: 'opencode-message.modelID', reasoningEffortProvenance: 'opencode-native-default' },
-      { turnId: 'answer', messageId: 'answer', parentMessageId: 'u1', completedAt: 3, text: 'The project is p-target.', toolCalls: [], resolvedProvider: 'opencode', resolvedModel: 'big-pickle', resolvedReasoningEffort: 'provider-default', providerProvenance: 'opencode-message.providerID', modelProvenance: 'opencode-message.modelID', reasoningEffortProvenance: 'opencode-native-default' },
+    const turns: NativeAssistantTurn[] = [
+      { nativeEvidence: { kind: 'identified_message', turnId: 'intro', messageId: 'intro', parentMessageId: 'u0' }, turnId: 'intro', messageId: 'intro', parentMessageId: 'u0', completedAt: 1, text: 'Freshell.', toolCalls: [], resolvedProvider: 'opencode', resolvedModel: 'big-pickle', resolvedReasoningEffort: 'provider-default', providerProvenance: 'opencode-message.providerID', modelProvenance: 'opencode-message.modelID', reasoningEffortProvenance: 'opencode-native-default' },
+      { nativeEvidence: { kind: 'identified_message', turnId: 'tool', messageId: 'tool', parentMessageId: 'u1' }, turnId: 'tool', messageId: 'tool', parentMessageId: 'u1', completedAt: 2, text: 'p-target', toolCalls: [{ type: 'tool', name: 'read' }], resolvedProvider: 'opencode', resolvedModel: 'big-pickle', resolvedReasoningEffort: 'provider-default', providerProvenance: 'opencode-message.providerID', modelProvenance: 'opencode-message.modelID', reasoningEffortProvenance: 'opencode-native-default' },
+      { nativeEvidence: { kind: 'identified_message', turnId: 'answer', messageId: 'answer', parentMessageId: 'u1' }, turnId: 'answer', messageId: 'answer', parentMessageId: 'u1', completedAt: 3, text: 'The project is p-target.', toolCalls: [], resolvedProvider: 'opencode', resolvedModel: 'big-pickle', resolvedReasoningEffort: 'provider-default', providerProvenance: 'opencode-message.providerID', modelProvenance: 'opencode-message.modelID', reasoningEffortProvenance: 'opencode-native-default' },
     ]
     expect(selectNativeAssistantTurn(turns, new Set(['old']), 'p-target')?.messageId).toBe('answer')
     expect(selectNativeAssistantTurn(turns, new Set(['answer']), 'p-target')).toBeNull()
+  })
+
+  it.each([undefined, ''])('never selects a completed matching response without an actual message ID (%j)', (messageId) => {
+    message('identified-answer', 'ses_owned', 'assistant', 'matching-answer')
+    const identified = read().turns[0]
+    const unidentified = { ...identified, messageId }
+    expect(selectNativeAssistantTurn([unidentified], new Set(), 'matching-answer')).toBeNull()
+    expect(selectNativeAssistantTurn([unidentified, identified], new Set(), 'matching-answer'))
+      .toBe(identified)
+    expect(selectNativeAssistantTurn([unidentified, identified], new Set(['identified-answer']), 'matching-answer'))
+      .toBeNull()
   })
 
   it('keeps tool activity visible so a memory-only claim cannot hide a filesystem lookup', () => {
