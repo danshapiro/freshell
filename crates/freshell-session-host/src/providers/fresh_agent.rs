@@ -5877,12 +5877,9 @@ export function query({ prompt, options }) {
         )
         .unwrap();
         std::env::set_var("FRESHELL_SIDECAR_TEST_TRANSCRIPT", &transcript);
-        std::env::set_var(
-            "FRESHELL_NATIVE_IDENTITY_LAUNCH",
-            json!({"incarnationId":"normalized-init","launchNonce":"normalized-init-nonce",
-                "evidenceRevision":0,"executionGeneration":1,"requestedNativeSessionId":native})
-            .to_string(),
-        );
+        let launch = json!({"incarnationId":"normalized-init","launchNonce":"normalized-init-nonce",
+            "evidenceRevision":0,"executionGeneration":1,"requestedNativeSessionId":native});
+        std::env::set_var("FRESHELL_NATIVE_IDENTITY_LAUNCH", launch.to_string());
         for provider in [FreshProvider::Claude, FreshProvider::Kilroy] {
             let transport = HostedTransport::new(provider.clone()).await;
             let mut profile = parity_profile(FreshProvider::Claude);
@@ -5900,27 +5897,43 @@ export function query({ prompt, options }) {
             let created = transport.wait_created().await.unwrap();
             assert_eq!(started.native_session_id, profile.native_session_id);
             let observed_live = transport.is_live().await;
-            let observed_evidence = transport.native_identity_evidence().await;
-            let mut receiver = transport.native_rx.lock().await;
-            let native = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut receiver = transport.native_rx.lock().await.clone();
+            // The create ACK can announce the native UUID before the separate
+            // stdout consumer publishes its normalized native-init evidence.
+            let (native, observed_evidence) = tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
-                    if let Some(native) = receiver.borrow().clone() {
-                        return Some(native);
+                    let native = receiver.borrow().clone();
+                    let evidence = transport.native_identity_evidence().await;
+                    if native.is_some() && evidence.is_some() {
+                        return (native, evidence);
                     }
                     if receiver.changed().await.is_err() {
-                        return None;
+                        return (None, None);
                     }
                 }
             })
             .await
-            .unwrap_or(None);
-            drop(receiver);
+            .unwrap_or((None, None));
             state.shutdown().await;
             assert!(
                 observed_live,
                 "the observed native session must remain a live host transport after startup"
             );
             assert!(observed_evidence.is_some());
+            let evidence = observed_evidence.unwrap();
+            assert_eq!(evidence["nativeSessionId"], native.clone().unwrap());
+            assert_eq!(evidence["launch"], launch);
+            assert_eq!(evidence["providerEvidence"]["launch"], launch);
+            assert_eq!(evidence["providerEvidence"]["source"], "resume");
+            assert!(evidence["queryGeneration"]
+                .as_u64()
+                .is_some_and(|generation| generation > 0
+                    && Some(generation)
+                        == evidence["providerEvidence"]["queryGeneration"].as_u64()));
+            assert!(evidence["providerEvidence"]["digest"]
+                .as_str()
+                .is_some_and(|digest| digest.len() == 64
+                    && digest.bytes().all(|byte| byte.is_ascii_hexdigit())));
             assert_eq!(
                 created,
                 profile.native_session_id.clone().unwrap(),
