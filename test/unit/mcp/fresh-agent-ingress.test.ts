@@ -85,6 +85,20 @@ describe('shared actual MCP fresh-agent ingress observer', () => {
   }
 
   it.each([
+    { action: 'new-tab', params: { agent: 'codex', resume: 'raw-thread' } },
+    { action: 'new-tab', params: { agent: 'codex', resumeSessionId: 'raw-thread' } },
+    { action: 'split-pane', params: { agent: 'codex', target: 'p1', resume: 'raw-thread' } },
+  ])('promotes fresh Codex $action resume shorthand to canonical identity', async ({ action, params }) => {
+    const observed = await observeFreshMcpIngress(action, params)
+    const posts = requests.filter(request => request.method === 'POST')
+    expect(posts).toHaveLength(1)
+    expect(observed.request.path).toBe(action === 'new-tab' ? '/api/tabs' : '/api/panes/p1/split')
+    expect(observed.request.body).toMatchObject({ agent: 'codex', sessionRef: { provider: 'codex', sessionId: 'raw-thread' } })
+    expect(observed.request.body).not.toHaveProperty('resume')
+    expect(observed.request.body).not.toHaveProperty('resumeSessionId')
+  })
+
+  it.each([
     ['unknown-action', {}],
     ['run', { command: 'never run' }],
     ['fresh-send', { sessionId: 'root', text: 'never sent' }],
@@ -93,9 +107,9 @@ describe('shared actual MCP fresh-agent ingress observer', () => {
     ['split-pane', { agent: 'unknown', target: 'p1' }],
     ['new-tab', { agent: 'claude', unknownParameter: true }],
     ['split-pane', { agent: 'claude', target: 'p1', unknownParameter: true }],
-    ['new-tab', { agent: 'codex', resume: 'raw-thread' }],
-    ['new-tab', { agent: 'codex', resumeSessionId: 'raw-thread' }],
-    ['split-pane', { agent: 'codex', target: 'p1', resume: 'raw-thread' }],
+    ['new-tab', { mode: 'codex', resume: 'raw-thread' }],
+    ['new-tab', { mode: 'codex', resumeSessionId: 'raw-thread' }],
+    ['split-pane', { mode: 'codex', target: 'p1', resume: 'raw-thread' }],
   ] as const)('refuses %s locally without any creation POST', async (action, params) => {
     const result = await executeAction(action, params)
     expect(result).toHaveProperty('error')
