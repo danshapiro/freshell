@@ -33,7 +33,7 @@ Fix four fresh-agent "code rewind" defects:
 
 - Package manager: pnpm 10.34.5 exactly; never `npm ci`/`npm install` in this tree.
 - TypeScript NodeNext/ESM: relative imports need `.js` extensions.
-- Test lanes: focused Vitest via `pnpm run test:vitest run <paths> --config config/vitest/vitest.config.ts`; focused Rust via `cargo test -p freshell-server <filter>` (narrowed selectors are delegated — no coordinator gate); e2e on the cloud backend (`FRESHELL_E2E_BACKEND=cloud`), focused via `pnpm run test:e2e:cloud -- <spec path filter>` style; broad gates only via `scripts/base-gate.sh` with `GCLOUD_ROBOT_REQUIRE=1`.
+- Test lanes: focused Vitest via `pnpm run test:vitest run <paths> --config config/vitest/vitest.config.ts`; focused Rust via `cargo test -p freshell-server <filter>` (narrowed selectors are delegated — no coordinator gate); e2e runs per-spec on its legal lane (load-bearing finder LB4/LB5, reports/load-bearing-finder.md): cloud-legal specs via `FRESHELL_E2E_BACKEND=cloud pnpm run test:e2e <spec>`, `CLOUD_SKIP_SPECS` members (the whole freshopencode family) via `pnpm run test:e2e:local <spec>`, and the closed external-target spec (`code-checkpoint-workspace-external.spec.ts`) ONLY via `GCLOUD_ROBOT_REQUIRE=1 pnpm exec tsx scripts/testing/managed-provider-environment-target.ts --checkpoint`; broad gates only via `scripts/base-gate.sh` with `GCLOUD_ROBOT_REQUIRE=1`.
 - The wire frame `freshAgent.checkpoint.outcome` schema (Zod `FreshAgentCheckpointOutcomeSchema` in `shared/ws-protocol.ts:1897-1916`, Rust mirror in `crates/freshell-protocol/src/server_messages.rs:292-317`) must NOT change: the fix re-uses the existing `sessionId` field per-alias. `test/unit/port/ws-contract-freeze.test.ts` pins the type inventory.
 - Identity contract (docs/development/managed-runtime.md:593-615): rewind availability binds only from persisted native row identities; the per-alias re-addressing changes WHERE the frame is addressed, not WHAT identity it claims. Do not pre-stamp predicted identities on capture-time frames.
 - Hover surfaces already exist and must not be redesigned: enabled button `aria-label="Rewind code to here"`, disabled pending `aria-label="Saving code rewind checkpoint"` + `title="Saving the code state from before this message"`, disabled unavailable `aria-label="Rewind unavailable for this message"` + `title="Rewind unavailable: <reason>"` (FreshAgentTurnActions.tsx:153-170), sheet/menu labels `Rewind code to here` / `Saving code rewind checkpoint…` / `Rewind unavailable: <reason>` (:42-74).
@@ -184,14 +184,17 @@ Check for now-dead exports/strings: `rg -n "MODERN_TURN_CHECKPOINT_UNAVAILABLE|S
 
 - [ ] **Step 6: Run impacted-test verification (unit + e2e)**
 
-Run: `pnpm run test:vitest run test/unit/client/components/fresh-agent/ test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx --config config/vitest/vitest.config.ts`
+Run: `pnpm run test:vitest run test/unit/client/components/fresh-agent/ --config config/vitest/vitest.config.ts`
 
 Expected: PASS.
 
-Run (cloud, focused — both edited specs plus the two checkpoint suites that keep hover journeys):
-`FRESHELL_E2E_BACKEND=cloud pnpm run test:e2e test/e2e-browser/specs/fresh-agent-checkpoint-unavailable-rust.spec.ts test/e2e-browser/specs/code-checkpoint-workspace-external.spec.ts`
+E2e, split per lane (the two specs live on different lanes — `code-checkpoint-workspace-external.spec.ts` is a closed external-target spec that cannot be combined with other spec paths or run on the ordinary lane; load-bearing finding LB5, reports/load-bearing-finder.md):
 
-Expected: PASS (all tests in both specs, including the unchanged restore journeys).
+Run: `FRESHELL_E2E_BACKEND=cloud pnpm run test:e2e test/e2e-browser/specs/fresh-agent-checkpoint-unavailable-rust.spec.ts`
+
+Run (closed driver, the only supported invocation): `GCLOUD_ROBOT_REQUIRE=1 pnpm exec tsx scripts/testing/managed-provider-environment-target.ts --checkpoint`
+
+Expected: PASS on both (including the unchanged restore journeys and the six note/status assertion conversions in the external spec).
 
 - [ ] **Step 7: Commit the task**
 
@@ -202,7 +205,61 @@ git commit -m "fix(fresh-agent): remove the per-turn rewind status text; hover k
 
 ---
 
-### Task 3: Identity-enriched outcome frames are addressed to every session alias (defect 3, server)
+### Task 3: Client contract pin — the first message binds live through materialization (defect 3, client)
+
+**Files:**
+- Test: `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`
+
+**Interfaces:**
+- Consumes: the wire contract Task 4 will produce (enriched outcome frames may arrive addressed to the durable `ses_*` id); the pane frame handlers: `freshAgent.created` (:2886), `freshAgent.checkpoint.outcome` (:2987), `freshAgent.send.accepted` (:3021), `freshAgent.session.materialized` (:2934-2974); `locatorMatchesPane` (:786-825).
+- Produces: a regression pin (green now, protects the whole chain): the full first-message sequence ends with the user turn's hover button enabled WITHOUT reload or remount. Ordered BEFORE the server work so the executable proof of the client chain precedes Task 4 (load-bearing finder advisory, reports/load-bearing-finder.md LB1).
+
+- [ ] **Step 1: Write the pinning test**
+
+Add to `FreshAgentView.test.tsx` (opencode pane, mirroring :3492's harness setup): `binds a freshopencode first message's checkpoint live when the enriched outcome arrives addressed to the materialized session`
+
+1. Create the pane via `freshAgent.created` with placeholder `sessionId: 'freshopencode-req1'`.
+2. Send the first composer message (fire the send path as :3492 does); capture the emitted `freshAgent.send` frame and assert its `sessionId` is the placeholder and its `checkpointIntent.logicalAttemptId` matches the client's pending metadata.
+3. Feed frames in server order: the initial `freshAgent.checkpoint.outcome` (sessionId `freshopencode-req1`, status `available`, checkpointId, logicalAttemptId, requestId, NO native/display ids); `freshAgent.send.accepted` (same requestId, `submittedTurnId` absent — opencode); `freshAgent.session.materialized` (previousSessionId `freshopencode-req1`, sessionId `ses_durable`); a snapshot whose user turn row is `{ turnId: 'msg_55c25d96e4445f67b35ea116686e169c', role: 'user', source: 'durable' }` (the deterministic id for the known logical attempt id); then the identity-enriched `freshAgent.checkpoint.outcome` addressed to **`ses_durable`** with `nativeTurnId`/`displayTurnId` `msg_55c25d96e4445f67b35ea116686e169c`.
+4. Assert the user turn's hover button is enabled `Rewind code to here` — with NO remount and no outcome-page refetch (stub the outcome-page fetch with an assertion that it was not re-armed mid-test, or simply do not wire it — follow the :3492 idiom for its fetch stubbing).
+5. Assert the pane content's persisted `checkpointOutcomes` carries the outcome with the materialized `conversationSessionKey` (the :3673 idiom).
+
+- [ ] **Step 2: Run the test and verify it passes as a pin**
+
+Run: `pnpm run test:vitest run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx --config config/vitest/vitest.config.ts`
+
+Expected: PASS (this pins existing client behavior + the Task 4 wire contract; it is a regression pin, not a red test — if it fails, the client gates reject the durable-addressed enriched frame and the failure must be investigated before proceeding).
+
+- [ ] **Step 3: No production implementation**
+
+None — this task is the client-side pin. If Step 2 unexpectedly fails, STOP and investigate: the client's pending/locator gates at :2987-3019/:786-825 must already accept the durable-addressed enriched frame for a pane with matching pending metadata.
+
+- [ ] **Step 4: Run the focused test**
+
+Run: `pnpm run test:vitest run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx --config config/vitest/vitest.config.ts`
+
+Expected: PASS.
+
+- [ ] **Step 5: Refactor while green**
+
+None.
+
+- [ ] **Step 6: Run impacted-test verification**
+
+Run: `pnpm run test:vitest run test/unit/client/components/fresh-agent/ --config config/vitest/vitest.config.ts`
+
+Expected: PASS.
+
+- [ ] **Step 7: Commit the task**
+
+```bash
+git add test/unit/client/components/fresh-agent/FreshAgentView.test.tsx
+git commit -m "test(fresh-agent): pin live first-message checkpoint binding through materialization"
+```
+
+---
+
+### Task 4: Identity-enriched outcome frames are addressed to every session alias (defect 3, server)
 
 **Files:**
 - Modify: `crates/freshell-server/src/checkpoints.rs:2101-2111` (the re-broadcast loop in `observe_turn_identity_with_match`)
@@ -319,80 +376,33 @@ git commit -m "fix(checkpoints): broadcast identity-enriched outcomes to every s
 
 ---
 
-### Task 4: Client contract pin — the first message binds live through materialization (defect 3, client)
-
-**Files:**
-- Test: `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`
-
-**Interfaces:**
-- Consumes: Task 3's wire contract (enriched outcome frames may arrive addressed to the durable `ses_*` id); the pane frame handlers: `freshAgent.created` (:2886), `freshAgent.checkpoint.outcome` (:2987), `freshAgent.send.accepted` (:3021), `freshAgent.session.materialized` (:2934-2974); `locatorMatchesPane` (:786-825).
-- Produces: a regression pin (green now, protects the whole chain): the full first-message sequence ends with the user turn's hover button enabled WITHOUT reload or remount.
-
-- [ ] **Step 1: Write the pinning test**
-
-Add to `FreshAgentView.test.tsx` (opencode pane, mirroring :3492's harness setup): `binds a freshopencode first message's checkpoint live when the enriched outcome arrives addressed to the materialized session`
-
-1. Create the pane via `freshAgent.created` with placeholder `sessionId: 'freshopencode-req1'`.
-2. Send the first composer message (fire the send path as :3492 does); capture the emitted `freshAgent.send` frame and assert its `sessionId` is the placeholder and its `checkpointIntent.logicalAttemptId` matches the client's pending metadata.
-3. Feed frames in server order: the initial `freshAgent.checkpoint.outcome` (sessionId `freshopencode-req1`, status `available`, checkpointId, logicalAttemptId, requestId, NO native/display ids); `freshAgent.send.accepted` (same requestId, `submittedTurnId` absent — opencode); `freshAgent.session.materialized` (previousSessionId `freshopencode-req1`, sessionId `ses_durable`); a snapshot whose user turn row is `{ turnId: 'msg_55c25d96e4445f67b35ea116686e169c', role: 'user', source: 'durable' }` (the deterministic id for the known logical attempt id); then the identity-enriched `freshAgent.checkpoint.outcome` addressed to **`ses_durable`** with `nativeTurnId`/`displayTurnId` `msg_55c25d96e4445f67b35ea116686e169c`.
-4. Assert the user turn's hover button is enabled `Rewind code to here` — with NO remount and no outcome-page refetch (stub the outcome-page fetch with an assertion that it was not re-armed mid-test, or simply do not wire it — follow the :3492 idiom for its fetch stubbing).
-5. Assert the pane content's persisted `checkpointOutcomes` carries the outcome with the materialized `conversationSessionKey` (the :3673 idiom).
-
-- [ ] **Step 2: Run the test and verify it passes as a pin**
-
-Run: `pnpm run test:vitest run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx --config config/vitest/vitest.config.ts`
-
-Expected: PASS (this pins existing client behavior + the Task 3 wire contract; it is a regression pin, not a red test — if it fails, the client gates reject the durable-addressed enriched frame and the failure must be investigated before proceeding).
-
-- [ ] **Step 3: No production implementation**
-
-None — this task is the client-side pin. If Step 2 unexpectedly fails, STOP and investigate: the client's pending/locator gates at :2987-3019/:786-825 must already accept the durable-addressed enriched frame for a pane with matching pending metadata.
-
-- [ ] **Step 4: Run the focused test**
-
-Run: `pnpm run test:vitest run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx --config config/vitest/vitest.config.ts`
-
-Expected: PASS.
-
-- [ ] **Step 5: Refactor while green**
-
-None.
-
-- [ ] **Step 6: Run impacted-test verification**
-
-Run: `pnpm run test:vitest run test/unit/client/components/fresh-agent/ --config config/vitest/vitest.config.ts`
-
-Expected: PASS.
-
-- [ ] **Step 7: Commit the task**
-
-```bash
-git add test/unit/client/components/fresh-agent/FreshAgentView.test.tsx
-git commit -m "test(fresh-agent): pin live first-message checkpoint binding through materialization"
-```
-
----
-
 ### Task 5: E2E — a freshopencode first message offers rewind live, without reload (defect 3, end to end)
 
 **Files:**
-- Test: `test/e2e-browser/specs/freshopencode-first-send-reload-repro.spec.ts` (add one test reusing its fake-opencode harness: `installFakeOpencode`, `createSetupHome`, `createServerOptions`, `TestHarness`, `RustServer`)
+- Test: `test/e2e-browser/specs/freshopencode-first-send-reload-repro.spec.ts` (add one test reusing the file's fake-opencode harness pieces — `installFakeOpencode`, `createSetupHome`, `createServerOptions`, `TestHarness`, `RustServer` — but with a FRESH `createServerOptions` for the new test; see LB6 note in Step 1)
 
 **Interfaces:**
-- Consumes: the fake `opencode` fixture (`test/e2e-browser/fixtures/fake-opencode.cjs`) — it validates and persists the server-provided `messageID` prompt ids (`msg_[0-9a-f]{32}`, fixture :123-124, :174-200), so the deterministic identity observation succeeds end to end; Task 3's per-alias broadcast; Task 2's hover-only surfaces.
+- Consumes: the fake `opencode` fixture (`test/e2e-browser/fixtures/fake-opencode.cjs`) — it validates and persists the server-provided `messageID` prompt ids (`msg_[0-9a-f]{32}`, fixture :123-124, :174-200), so the deterministic identity observation succeeds end to end; Task 4's per-alias broadcast; Task 2's hover-only surfaces. This spec is in `CLOUD_SKIP_SPECS` (`playwright.cloud.config.ts:41`, provider-boot-timing class) and its new test inherits that membership — the cloud lane's `testIgnore` silently drops it, so this spec runs on the LOCAL lane only (load-bearing finding LB4, reports/load-bearing-finder.md).
 - Produces: one spec proving the first composer message's rewind button is enabled right after its turn completes, with no page reload.
 
 - [ ] **Step 1: Write the spec**
 
-Add to `freshopencode-first-send-reload-repro.spec.ts` (same harness wiring as its existing test):
+Add to `freshopencode-first-send-reload-repro.spec.ts`:
 
 ```ts
 test('binds the first message\'s code checkpoint live, without a reload', async ({ page }) => {
-  // … boot the Rust server + fake opencode harness exactly as the existing
-  // test in the file does; open a fresh freshopencode pane (picker → opencode
-  // mode with a Git workspace cwd so capture succeeds) …
+  // Boot the Rust server + fake opencode harness with the same pieces the
+  // existing test uses, BUT pass a fresh createServerOptions WITHOUT
+  // FAKE_OPENCODE_HANG_SESSION_CREATE: that flag pins session materialization
+  // in flight forever (fixture :1694-1702 never responds), so the durable
+  // ses_* id would never appear and this test could never pass (LB6,
+  // reports/load-bearing-finder.md). Do not inherit the existing test's
+  // flag-conditioned wait helpers either.
+  // … open a fresh freshopencode pane (picker → opencode mode with a Git
+  // workspace cwd so capture succeeds) …
   // … type the first composer message and submit …
-  // … wait for the assistant turn to complete (existing wait idiom) …
+  // … wait for the assistant turn to settle and the snapshot to show the
+  // user + assistant rows …
   const userTurn = page.getByRole('article').filter({ hasText: '<the sent text>' }).first()
   await userTurn.hover()
   const rewind = userTurn.getByRole('button', { name: 'Rewind code to here' })
@@ -400,21 +410,21 @@ test('binds the first message\'s code checkpoint live, without a reload', async 
 })
 ```
 
-(Fill in the exact harness bootstrap from the existing test in the file — same `RustServer`/`TestHarness` calls, same wait helpers. The sent text marker should be unique per run as that spec's existing test does.)
+(The sent text marker should be unique per run, as the file's existing test does.)
 
 - [ ] **Step 2: Run the spec and verify the live-binding passes**
 
-Run: `FRESHELL_E2E_BACKEND=cloud pnpm run test:e2e test/e2e-browser/specs/freshopencode-first-send-reload-repro.spec.ts`
+Run: `pnpm run test:e2e:local test/e2e-browser/specs/freshopencode-first-send-reload-repro.spec.ts`
 
-Expected: PASS for the new test (and the existing one). RED alternative: if Task 3 were not in place, the new test would fail with the button disabled (`Rewind unavailable for this message`) — run this spec BEFORE Task 3 lands only if you want to observe the red; Tasks are ordered so Task 3 has already landed when this runs.
+Expected: PASS for the new test (and the existing one, which keeps its hang-flag harness and reload journey). NOTE (LB6): no e2e anywhere has composed the freshopencode checkpoint journey before — every link is individually proven (fixture messageID persistence, provider-neutral capture, the LB1 client chain, the Task 4 Rust unit test), but the composition executes for the first time here. If the new test fails on first run, treat the HARNESS as suspect first (see Step 3).
 
 - [ ] **Step 3: No production implementation**
 
-None expected. If the spec fails, diagnose via the pane's checkpoint outcome frames (devtools WS or server JSONL logs under the Rust server harness output) before changing code — the failure is a contract break between Task 3's fan-out and the client gates, not a spec bug to be relaxed.
+None expected. If the spec fails, diagnose in this order: (1) harness-suspect-first — verify the server options really dropped `FAKE_OPENCODE_HANG_SESSION_CREATE`, the fake materialized a durable `ses_*` id, the snapshot shows both rows, and the server JSONL shows the capture + identity observation + per-alias broadcast frames; (2) only then consider a contract break between Task 4's fan-out and the client gates. Never relax the spec to make it pass.
 
 - [ ] **Step 4: Run the focused spec**
 
-Run: `FRESHELL_E2E_BACKEND=cloud pnpm run test:e2e test/e2e-browser/specs/freshopencode-first-send-reload-repro.spec.ts`
+Run: `pnpm run test:e2e:local test/e2e-browser/specs/freshopencode-first-send-reload-repro.spec.ts`
 
 Expected: PASS.
 
@@ -424,11 +434,15 @@ None.
 
 - [ ] **Step 6: Run impacted-test verification**
 
-The freshopencode spec family plus the checkpoint suites touched by this branch:
+The checkpoint suites touched by this branch, each on its legal lane (LB4/LB5, reports/load-bearing-finder.md):
 
-Run: `FRESHELL_E2E_BACKEND=cloud pnpm run test:e2e test/e2e-browser/specs/freshopencode-first-send-reload-repro.spec.ts test/e2e-browser/specs/fresh-agent-checkpoint-unavailable-rust.spec.ts test/e2e-browser/specs/code-checkpoint-workspace-external.spec.ts`
+Run: `pnpm run test:e2e:local test/e2e-browser/specs/freshopencode-first-send-reload-repro.spec.ts`
 
-Expected: PASS.
+Run: `FRESHELL_E2E_BACKEND=cloud pnpm run test:e2e test/e2e-browser/specs/fresh-agent-checkpoint-unavailable-rust.spec.ts`
+
+Run (closed external-target driver, the only supported invocation for this spec): `GCLOUD_ROBOT_REQUIRE=1 pnpm exec tsx scripts/testing/managed-provider-environment-target.ts --checkpoint`
+
+Expected: PASS on all three (the third includes the six note-assertion conversions Task 2 made in `code-checkpoint-workspace-external.spec.ts`).
 
 - [ ] **Step 7: Commit the task**
 
