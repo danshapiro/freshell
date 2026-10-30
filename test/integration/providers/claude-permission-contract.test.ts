@@ -15,6 +15,8 @@
 // (PinnedClaudeMissingError): nothing here is ever skipped.
 
 import { spawn, type ChildProcess } from 'node:child_process'
+import fs from 'node:fs/promises'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -161,4 +163,85 @@ describe(`Claude permission suggestions and plan approvals over the pinned CLI $
     const [empty] = requests('plan-empty')
     expect(empty!.tool.input).toEqual({})
   })
+})
+
+// The harness's contract with this suite is ONE parseable stdout line —
+// always. A cloud vitest shard (2026-10-29) lost a whole run because a
+// fixture-cleanup rejection (a draining native CLI re-creating files mid
+// `fs.rm`) escaped runScenario's finally as an unhandled rejection and
+// killed the harness before the receipt was printed. This pins the
+// containment: cleanup failures surface through the receipt
+// (fixtureRemoved=false), never as a crash that eats it.
+describe('Claude permission contract harness survives a fixture-cleanup failure', () => {
+  it('still prints one receipt line reporting fixtureRemoved=false for every scenario instead of crashing', async () => {
+    // Deterministic sabotage: once a scenario's own setup is complete (its
+    // outside/notes.txt marker exists, and nothing writes into the fixture
+    // root itself after that), make the root unwritable so fixture.cleanup()
+    // fails with EACCES — the same finally block that raced the live CLI.
+    const chmodded = new Set<string>()
+    const watcher = setInterval(() => {
+      void (async () => {
+        let entries: string[]
+        try {
+          entries = await fs.readdir(os.tmpdir())
+        } catch {
+          return
+        }
+        for (const entry of entries) {
+          if (!entry.startsWith('freshell-claude-perm-') || chmodded.has(entry)) continue
+          const root = path.join(os.tmpdir(), entry)
+          const setupDone = await fs.stat(path.join(root, 'outside', 'notes.txt')).then(() => true, () => false)
+          if (!setupDone) continue
+          chmodded.add(entry)
+          await fs.chmod(root, 0o500).catch(() => {
+            chmodded.delete(entry)
+          })
+        }
+      })()
+    }, 25)
+
+    const child = spawn(process.execPath, [HARNESS, REPO_ROOT], {
+      cwd: REPO_ROOT,
+      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', LANG: 'C.UTF-8' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout!.setEncoding('utf8').on('data', (chunk: string) => { stdout += chunk })
+    child.stderr!.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk })
+    try {
+      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          child.kill('SIGTERM')
+          reject(new Error(`the cleanup-failure harness run timed out; stderr=${stderr.slice(-2000)}`))
+        }, 200_000)
+        timer.unref()
+        child.once('error', (error) => {
+          clearTimeout(timer)
+          reject(error)
+        })
+        child.once('exit', (code, signal) => {
+          clearTimeout(timer)
+          resolve({ code, signal })
+        })
+      })
+      expect(chmodded, `sabotaged fixture roots (${[...chmodded].join(', ')}); stderr=${stderr.slice(-2000)}`).toHaveLength(8)
+      const lines = stdout.trim().split('\n').filter(Boolean)
+      expect(lines, `the receipt must survive a cleanup failure; stderr tail: ${stderr.slice(-2000)}`).toHaveLength(1)
+      const sabotagedReceipt = JSON.parse(lines[0]!) as Receipt
+      expect(Object.keys(sabotagedReceipt.scenarios)).toHaveLength(8)
+      for (const name of Object.keys(sabotagedReceipt.scenarios)) {
+        expect(sabotagedReceipt.scenarios[name]!.fixtureRemoved, `${name}: the receipt reports the cleanup failure`).toBe(false)
+      }
+      expect(exit.code).toBe(1)
+    } finally {
+      clearInterval(watcher)
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+      for (const entry of chmodded) {
+        const root = path.join(os.tmpdir(), entry)
+        await fs.chmod(root, 0o700).catch(() => {})
+        await fs.rm(root, { recursive: true, force: true }).catch(() => {})
+      }
+    }
+  }, 220_000)
 })

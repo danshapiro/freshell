@@ -207,7 +207,9 @@ export async function createClaudeFixture({ parent = os.tmpdir(), prefix = 'fres
       const outcomes = await Promise.allSettled([...ownedProcessLifetimes.values()].map(wait => wait()))
       const failures = outcomes.filter(result => result.status === 'rejected').map(result => result.reason)
       if (failures.length) throw new AggregateError(failures, `Claude fixture process cleanup incomplete; retained ${root}`)
-      await fs.rm(root, { recursive: true, force: true })
+      // Retain the main-branch retries for callers without registered writers
+      // and transient filesystem contention after all registered owners settle.
+      await fs.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
     },
   }
 }

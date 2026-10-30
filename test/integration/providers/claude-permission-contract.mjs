@@ -156,18 +156,26 @@ async function runScenario(name, spec) {
   let provider
   let sidecar
   let sidecarExit
+  // Resolves when the sidecar (and, after the group kill below, its whole
+  // process tree) has exited; the finally awaits it before touching the
+  // fixture so a draining native CLI cannot race fixture.cleanup().
+  let exited = Promise.resolve()
   let failure
   let settingsLocal = null
   const written = {}
   try {
     provider = await startLocalProvider({ respond })
+    // detached puts the sidecar in its own process group: the native CLI it
+    // spawns is the fixture's concurrent writer, so the force path below has
+    // to kill the group, not just the sidecar.
     sidecar = spawn(process.execPath, [path.join(repoRoot, 'crates/freshell-claude-sidecar/index.mjs')], {
       cwd: path.join(repoRoot, 'crates/freshell-claude-sidecar'),
       env: fixture.env(provider.url, { CLAUDE_CMD: pinned.nativeCli, FRESHELL_CLAUDE_ONECLI_API_KEY: '1', npm_config_update_notifier: 'false' }),
       stdio: ['pipe', 'pipe', 'pipe'],
+      detached: true,
     })
     sidecar.stdin.on('error', () => {})
-    const exited = new Promise((resolve) => sidecar.once('exit', (code, signal) => { sidecarExit = { code, signal }; resolve() }))
+    exited = new Promise((resolve) => sidecar.once('exit', (code, signal) => { sidecarExit = { code, signal }; resolve() }))
     createInterface({ input: sidecar.stderr }).on('line', () => {})
     const send = (message) => sidecar.stdin.write(`${JSON.stringify(message)}\n`)
     const waiters = []
@@ -223,9 +231,22 @@ async function runScenario(name, spec) {
     failure = String(error?.message ?? error).slice(0, 1000)
     log('error', 'scenario.failed', { scenario: name, error: failure })
   } finally {
-    if (sidecar && !sidecarExit) sidecar.kill('SIGKILL')
+    if (sidecar && !sidecarExit) {
+      if (process.platform !== 'win32') {
+        try { process.kill(-sidecar.pid, 'SIGKILL') } catch { /* the group is already gone */ }
+      }
+      sidecar.kill('SIGKILL')
+    }
+    await exited
     if (provider) await provider.close()
-    await fixture.cleanup()
+    try {
+      await fixture.cleanup()
+    } catch (error) {
+      // A cleanup failure is a reported outcome (fixtureRemoved=false below),
+      // never an unhandled rejection: the receipt is this harness's only
+      // contract, and a crash here eats it for every scenario at once.
+      log('error', 'fixture.cleanup_failed', { scenario: name, error: String(error?.code ?? error?.message ?? error) })
+    }
   }
   const fixtureRemoved = !(await fs.stat(fixture.root).catch(() => null))
   const relabel = (value) => JSON.parse(JSON.stringify(value).replaceAll(fixture.root, '<root>'))
