@@ -665,6 +665,7 @@ const port = Number(argValue('--port'))
 const sessionArg = argValue('--session')
 const sessionEventGatePath = process.env.FAKE_OPENCODE_SESSION_EVENT_GATE_PATH
 const holdSummarizeGatePath = process.env.FAKE_OPENCODE_HOLD_SUMMARIZE_GATE_PATH
+const holdPromptGatePath = process.env.FAKE_OPENCODE_HOLD_PROMPT_GATE_PATH
 const requireDirectoryRoute = process.env.FAKE_OPENCODE_REQUIRE_DIRECTORY_ROUTE === '1'
 const snapshotReadFailureMarkerPath = process.env.FAKE_OPENCODE_SNAPSHOT_READ_FAILURE_MARKER
 
@@ -1401,6 +1402,41 @@ const server = http.createServer(async (req, res) => {
         // `{providerID, modelID}` and effort is the string field `variant`.
         body: { model: body.model, variant: body.variant },
       })
+      // Mid-turn pending e2e lane (FAKE_OPENCODE_HOLD_PROMPT_GATE_PATH): the
+      // audit row + busy SSE + persisted rows above fire at REQUEST RECEIPT
+      // exactly as in the ungated arm; ONLY the response + idle emit park
+      // behind a one-shot 50ms gate-file check, so a spec can hold the turn
+      // deterministically in flight (the fake otherwise emits idle ~25ms
+      // after the prompt, a window too narrow to assert on). Parked-ness is
+      // observable in the audit: no session_idle_emitted can follow the
+      // prompt_async receipt until the file appears; the gate consumes/rm's
+      // the file the moment it does, then answers and emits the parked idle.
+      // Mirrors the FAKE_OPENCODE_HOLD_SUMMARIZE_GATE_PATH pattern
+      // (summarize arm above), including the --pure guard (the catalog
+      // probe's sidecar must never park) and .unref?.(). Default unset
+      // (every other spec): today's behavior, unchanged.
+      if (holdPromptGatePath && !process.argv.includes('--pure')) {
+        const gateInterval = setInterval(() => {
+          if (!fs.existsSync(holdPromptGatePath)) return
+          clearInterval(gateInterval)
+          try {
+            fs.rmSync(holdPromptGatePath, { force: true })
+          } catch {
+            // ignore
+          }
+          sendJson(res, 200, { ok: true })
+          setTimeout(() => {
+            emitSessionIdle(sessionId, {
+              routeDirectory: directory,
+              directory: session.directory,
+              prompt: appended.promptText,
+            })
+          }, 25).unref?.()
+        }, 50)
+        gateInterval.unref?.()
+        runTitleSequence(sessionId)
+        return
+      }
       sendJson(res, 200, { ok: true })
       setTimeout(() => {
         emitSessionIdle(sessionId, {

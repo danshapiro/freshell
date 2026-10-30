@@ -1,9 +1,11 @@
 import { expect, test, type Page } from '@playwright/test'
+import { execFileSync } from 'node:child_process'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { expectNoRewindStatusText } from '../helpers/fresh-agent-transcript.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { RustServer } from '../helpers/rust-server.js'
 
@@ -57,14 +59,21 @@ function createServerOptions(input: {
   auditLogPath: string
   logsDir: string
   sharedOpencodeDataDir: string
+  /** Keep FAKE_OPENCODE_HANG_SESSION_CREATE=1 (the default) to pin session
+   * materialization in flight forever, or pass false to let the fake answer
+   * POST /session and materialize the durable ses_* id. */
+  hangSessionCreate?: boolean
+  /** Extra env vars merged into the spawned server's environment. */
+  extraEnv?: Record<string, string>
 }) {
   return {
     setupHome: createSetupHome(input.sharedOpencodeDataDir),
     env: {
       PATH: `${input.binDir}${path.delimiter}${process.env.PATH ?? ''}`,
       FAKE_OPENCODE_AUDIT_LOG: input.auditLogPath,
-      FAKE_OPENCODE_HANG_SESSION_CREATE: '1',
+      ...(input.hangSessionCreate === false ? {} : { FAKE_OPENCODE_HANG_SESSION_CREATE: '1' }),
       FRESHELL_LOG_DIR: input.logsDir,
+      ...input.extraEnv,
     },
   }
 }
@@ -207,6 +216,133 @@ test.describe('Freshopencode first-send reload regression', () => {
       const afterReloadTranscript = page.locator('[data-context="fresh-agent-transcript"]')
 
       await expect(afterReloadTranscript.getByText(prompt, { exact: true })).toBeVisible({ timeout: 5_000 })
+    } finally {
+      await server.stop().catch(() => {})
+      await fsp.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+})
+
+test.describe('Freshopencode first-message code checkpoint', () => {
+  test('binds the first message\'s code checkpoint live, without a reload', async ({ page }) => {
+    test.setTimeout(180_000)
+    const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-freshopencode-live-'))
+    const binDir = path.join(sharedRoot, 'bin')
+    const logsDir = path.join(sharedRoot, 'logs')
+    const auditLogPath = path.join(sharedRoot, 'fake-opencode-audit.jsonl')
+    const sharedOpencodeDataDir = path.join(sharedRoot, 'opencode-data')
+    const cwd = path.join(sharedRoot, 'project')
+    const promptGatePath = path.join(sharedRoot, 'prompt-gate')
+    const prompt = `playwright live checkpoint prompt ${Date.now()}`
+    await fsp.mkdir(cwd, { recursive: true })
+    // A Git workspace cwd so the code checkpoint capture succeeds: the send's
+    // workspace intent has provenance 'resolved-project', which resolves
+    // through the checkout root (a non-Git scope is honestly unavailable).
+    await fsp.writeFile(path.join(cwd, 'tracked.txt'), 'fixture workspace file\n')
+    execFileSync('git', ['init', cwd], { stdio: 'ignore' })
+    execFileSync('git', ['-C', cwd, 'config', 'user.email', 'fixture@example.invalid'], { stdio: 'ignore' })
+    execFileSync('git', ['-C', cwd, 'config', 'user.name', 'Freshell fixture'], { stdio: 'ignore' })
+    execFileSync('git', ['-C', cwd, 'add', '--', 'tracked.txt'], { stdio: 'ignore' })
+    execFileSync('git', ['-C', cwd, 'commit', '-m', 'fixture'], { stdio: 'ignore' })
+    await installFakeOpencode(binDir)
+
+    // The existing test's harness pins session materialization in flight
+    // forever (FAKE_OPENCODE_HANG_SESSION_CREATE=1: the fixture never answers
+    // POST /session), so the durable ses_* id would never appear and this
+    // journey could never complete. Run the flag-less harness instead, and
+    // hold the /prompt_async turn completion behind the new gate so the
+    // mid-turn pending window is deterministically observable.
+    const server = new RustServer(createServerOptions({
+      binDir,
+      auditLogPath,
+      logsDir,
+      sharedOpencodeDataDir,
+      hangSessionCreate: false,
+      extraEnv: { FAKE_OPENCODE_HOLD_PROMPT_GATE_PATH: promptGatePath },
+    }))
+
+    try {
+      const info = await server.start()
+      await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+      const harness = new TestHarness(page)
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+      await enableFreshOpencode(page)
+      await createFreshopencodePane(page, cwd)
+
+      await expect.poll(async () => getFreshOpencodePaneState(page), { timeout: 15_000 }).toMatchObject({
+        sessionId: expect.stringMatching(/^freshopencode-/),
+      })
+
+      await sendFreshAgentPrompt(page, prompt)
+      // The fake answers POST /session, materializes the durable session and
+      // drives /prompt_async: the busy SSE, the persisted user+assistant rows
+      // and this audit row all fire at REQUEST RECEIPT — only the response +
+      // idle emit park behind the gate file.
+      await expect.poll(async () => {
+        const events = await readAuditEvents(auditLogPath)
+        return events.some((event) => event.event === 'prompt_async' && event.prompt === prompt)
+      }, { timeout: 30_000 }).toBe(true)
+
+      const paneRoot = page.locator('[data-context="fresh-agent"]').last()
+      // The snapshot's landed user row (msg_-id, source durable). toHaveCount(1)
+      // also proves the optimistic echo row cleared, so the pending hover below
+      // targets the landed durable row — the request-keyed capture outcome
+      // cannot bind it (Task 1 semantics: the outcome has no row identity and
+      // the durable row carries no requestId), so mid-turn it is honestly
+      // still-saving.
+      const userTurn = paneRoot.locator('[data-turn-role="user"]', { hasText: prompt })
+      await expect(userTurn).toHaveCount(1, { timeout: 20_000 })
+
+      // Parked-ness proof: the gate file does not exist yet, so the daemon
+      // cannot have emitted the turn's idle — the turn is deterministically
+      // still in flight at this point.
+      const idleEmitted = async () => (await readAuditEvents(auditLogPath))
+        .some((event) => event.event === 'session_idle_emitted')
+      await expect(await idleEmitted()).toBe(false)
+
+      // MID-TURN busy-pending (Task 1 e2e): the held turn keeps the pane's
+      // agent session busy, so the newest user row's hover shows the disabled
+      // still-saving state — deterministically, because the gate parks the
+      // idle emit.
+      await userTurn.hover()
+      const saving = userTurn.getByRole('button', { name: 'Saving code rewind checkpoint' })
+      await expect(saving).toBeVisible()
+      await expect(saving).toBeDisabled()
+      await expect(saving).toHaveAttribute('title', 'Saving the code state from before this message')
+
+      // ROLE GATE (Task 1 e2e): the assistant row renders its hover toolbar
+      // (Copy proves it is genuinely shown) but NO rewind control in ANY
+      // state — enabled, disabled-unavailable or still-saving.
+      const assistantTurn = paneRoot.locator('[data-turn-role="assistant"]', {
+        hasText: `Fake OpenCode response: ${prompt}`,
+      })
+      await expect(assistantTurn).toBeVisible({ timeout: 10_000 })
+      await assistantTurn.hover()
+      await expect(assistantTurn.getByRole('button', { name: 'Copy turn' })).toBeVisible()
+      await expect(assistantTurn.getByRole('button', { name: 'Rewind code to here' })).toHaveCount(0)
+      await expect(assistantTurn.getByRole('button', { name: 'Rewind unavailable for this message' })).toHaveCount(0)
+      await expect(assistantTurn.getByRole('button', { name: 'Saving code rewind checkpoint' })).toHaveCount(0)
+
+      // NOTE ABSENCE (Task 2 e2e): no per-turn rewind status text renders
+      // anywhere in the pane — the inline note block is gone; rewind state
+      // lives only on the hover button and in the sheet/menu labels.
+      await expectNoRewindStatusText(paneRoot)
+
+      // Release the gate: the parked response answers, the idle emit settles
+      // the turn server-side, the identity observation finds the persisted
+      // msg_-id row and the enriched outcome is re-broadcast to every session
+      // alias.
+      await fsp.writeFile(promptGatePath, 'release\n')
+      await expect.poll(idleEmitted, { timeout: 30_000 }).toBe(true)
+
+      // LIVE BINDING (defect 3): the pane never reloads — the hover flips from
+      // still-saving to the enabled rewind button the moment the enriched
+      // outcome binds (the brief unavailable window between idle and the
+      // enriched frame is retried through by the assertion itself).
+      await userTurn.hover()
+      const rewind = userTurn.getByRole('button', { name: 'Rewind code to here' })
+      await expect(rewind).toBeEnabled({ timeout: 30_000 })
     } finally {
       await server.stop().catch(() => {})
       await fsp.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
