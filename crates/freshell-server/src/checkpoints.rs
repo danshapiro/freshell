@@ -2232,7 +2232,7 @@ impl CheckpointService {
             .checkpoint_intent
             .as_ref()
             .and_then(|intent| serde_json::to_value(intent.workspace.as_ref()).ok())
-            .and_then(|value| if value.is_null() { None } else { Some(value) });
+            .filter(|value| !value.is_null());
         // An explicitly selected checkpoint workspace is independent from the
         // provider's launch cwd. Use it only as the resolver anchor when a
         // resumed pane no longer has its original cwd; never write it back to
