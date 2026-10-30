@@ -1,16 +1,28 @@
+import { execFile } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
-import { beforeAll, describe, expect, it, vi } from 'vitest'
+import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
+import { describe, expect, it, vi } from 'vitest'
 import { createClaudeFixture } from '../providers/claude-local-provider.mjs'
 import { stopFixtureProcess, waitForFixtureProcessExit } from '../../support/stop-fixture-process.js'
 
-beforeAll(async () => {
-  // This suite deliberately kills an orphaned writer. A direct invocation
-  // must fail before spawning it when it is outside a disposable container.
-  await expect(fs.stat('/.dockerenv'), 'run this lifecycle suite with scripts/sandbox-test.sh').resolves.toBeDefined()
-})
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..')
+const IN_CONTAINER = existsSync('/.dockerenv') || existsSync('/run/.containerenv')
+
+async function runInSandbox(): Promise<void> {
+  const result = await promisify(execFile)('bash', [
+    path.join(REPO_ROOT, 'scripts/sandbox-test.sh'),
+    'pnpm run test:vitest run test/integration/tooling/claude-fixture-processes.test.ts --config config/vitest/vitest.runtime.config.ts',
+  ], { cwd: REPO_ROOT, timeout: 540_000, maxBuffer: 1024 * 1024 }).catch((error: Error & { stdout?: string; stderr?: string }) => {
+    throw new Error(`Claude fixture lifecycle sandbox failed:\n${error.stdout ?? ''}\n${error.stderr ?? ''}`, { cause: error })
+  })
+  process.stdout.write(result.stdout)
+  process.stderr.write(result.stderr)
+}
 
 async function live(pid: number): Promise<boolean> {
   try {
@@ -59,6 +71,13 @@ const SIDECAR = `
 `
 
 describe('Claude fixture native process ownership', () => {
+  if (!IN_CONTAINER) {
+    // Ordinary source-runtime invocations keep their usual host behavior;
+    // only these process-kill checks move into the disposable sandbox.
+    it('runs its native process lifecycle checks in a disposable sandbox', runInSandbox, 600_000)
+    return
+  }
+
   for (const mode of ['clean', 'create-failed'] as const) {
     it(`stops a native writer after its sidecar ${mode === 'clean' ? 'exits cleanly' : 'fails before sending created'}`, async () => {
       const control = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-native-owner-'))
@@ -69,12 +88,18 @@ describe('Claude fixture native process ownership', () => {
       })
       let stdout = ''
       sidecar.stdout!.on('data', (data: Buffer) => { stdout += data.toString() })
+      const closed = new Promise<void>((resolve) => sidecar.once('close', () => resolve()))
       let nativePid: number | undefined
       try {
         await waitForFixtureProcessExit(sidecar, 5_000)
+        await closed
         nativePid = Number(await fs.readFile(path.join(control, 'native.pid'), 'utf8'))
         expect(await live(nativePid)).toBe(true)
-        if (mode === 'create-failed') {
+        if (mode === 'clean') {
+          expect(sidecar.exitCode).toBe(0)
+          expect(sidecar.signalCode).toBeNull()
+          expect(JSON.parse(stdout.trim())).toEqual({ type: 'created', cliPid: nativePid })
+        } else {
           expect(stdout).toBe('')
           expect(sidecar.exitCode).toBe(2)
         }
