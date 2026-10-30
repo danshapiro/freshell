@@ -18,7 +18,7 @@ Apply the smallest reliable fixes for the flaky supervisor lock timeout (`arnn`)
 
 **Goal:** Make the supervisor lock-timeout test insensitive to machine load and keep Claude fixture cleanup bounded, direct-child-only, and diagnosable.
 
-**Architecture:** Keep all changes in test code. Pause Tokio time for the supervisor test while holding that clock steady during real I/O. Reuse the existing exact-child stop helper and the shared fixture's existing bounded `fs.rm` retries; remove the permission harness's process-group kill and retain its fixture if the direct sidecar cannot be confirmed stopped.
+**Architecture:** Keep all changes in test code. Pause Tokio time in the supervisor test and include a delayed backend case to check the existing timeout against real blocking I/O. Reuse the existing exact-child stop helper and the shared fixture's existing bounded `fs.rm` retries; remove the permission harness's process-group kill and retain its fixture if the direct sidecar cannot be confirmed stopped.
 
 **Tech Stack:** Rust, Tokio test-util, Node.js ESM, TypeScript, Vitest, pnpm.
 
@@ -33,15 +33,12 @@ Apply the smallest reliable fixes for the flaky supervisor lock timeout (`arnn`)
 
 ---
 
-### Task 1: Freeze the Supervisor Test Timeout During Real I/O
+### Task 1: Pause the Supervisor Test Clock During Real I/O
 
 **Files:**
 - Modify: `crates/freshell-supervisor/src/claude_source_observation.rs`
-- Modify: `crates/freshell-supervisor/src/lib.rs`
-- Create: `crates/freshell-supervisor/src/test_support.rs`
 
 **Interfaces:**
-- Add test-only `FrozenClock::hold() -> FrozenClock` to keep Tokio's paused clock from auto-advancing while real blocking I/O is in flight.
 - Give the existing fake `ReplyBackend` a `delay: Duration` field used only by the `slow-live` regression case.
 - Do not change supervisor production code, timeout values, lock ownership, or authority assertions.
 
@@ -74,11 +71,11 @@ Add the `slow-live` mode to the existing mode list. Construct its backend with `
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `FRESHELL_RUST_TEST_SANDBOX=1 pnpm run test:rust -p freshell-supervisor --lib claude_source_observation::tests::provider_claude_nested_source_reply_requires_live_scope_after_private_ipc -- --exact`
+Run: `FRESHELL_RUST_TEST_SANDBOX=1 pnpm run test:rust -p freshell-supervisor --lib service::claude_source_observation::tests::provider_claude_nested_source_reply_requires_live_scope_after_private_ipc -- --exact`
 
-Expected: FAIL in `slow-live` because the 350 ms simulated backend I/O exceeds the unchanged 250 ms wall-clock timeout. The failure must be the timeout assertion, not a compile or setup failure.
+Expected: Exactly one test runs and FAILs in `slow-live` because the 350 ms simulated backend I/O exceeds the unchanged 250 ms timeout. The failure must be the timeout assertion, not a compile, setup, or zero-tests result.
 
-- [ ] **Step 3: Pause and hold only this test's clock**
+- [ ] **Step 3: Pause only this test's clock**
 
 Change the test annotation to:
 
@@ -86,52 +83,17 @@ Change the test annotation to:
 #[tokio::test(start_paused = true)]
 ```
 
-At the start of each mode iteration, hold the clock:
-
-```rust
-let _clock = FrozenClock::hold();
-```
-
-Import `FrozenClock` in the test module with `use crate::test_support::FrozenClock;`.
-
-Register the helper only for tests in `lib.rs`:
-
-```rust
-#[cfg(test)]
-mod test_support;
-```
-
-Create `test_support.rs` with a 60-second wall watchdog. Dropping the guard releases the blocking task; if the test wedges, the watchdog releases it so the test's timeout can advance and fail rather than hang:
-
-```rust
-pub(crate) struct FrozenClock {
-    _release_on_drop: std::sync::mpsc::Sender<()>,
-}
-
-impl FrozenClock {
-    pub(crate) fn hold() -> Self {
-        let (release, held) = std::sync::mpsc::channel::<()>();
-        drop(tokio::task::spawn_blocking(move || {
-            let _ = held.recv_timeout(std::time::Duration::from_secs(60));
-        }));
-        Self {
-            _release_on_drop: release,
-        }
-    }
-}
-```
-
-Import `FrozenClock` only in the test module. Keep the 350 ms delayed case so it proves that real I/O does not consume Tokio's test budget.
+Do not add a separate clock-holding task or wall watchdog. Keep the `slow-live` case so the focused test checks its existing timeout while the fake backend performs real blocking work.
 
 - [ ] **Step 4: Run the focused test**
 
-Run: `FRESHELL_RUST_TEST_SANDBOX=1 pnpm run test:rust -p freshell-supervisor --lib claude_source_observation::tests::provider_claude_nested_source_reply_requires_live_scope_after_private_ipc -- --exact`
+Run: `FRESHELL_RUST_TEST_SANDBOX=1 pnpm run test:rust -p freshell-supervisor --lib service::claude_source_observation::tests::provider_claude_nested_source_reply_requires_live_scope_after_private_ipc -- --exact`
 
-Expected: PASS, including `slow-live`; all existing authority, timeout, and lifecycle assertions remain active.
+Expected: Exactly one test runs and PASSes, including `slow-live`; all existing authority, timeout, and lifecycle assertions remain active.
 
 - [ ] **Step 5: Refactor while green**
 
-Keep the fake backend fields named rather than expanding its positional tuple. Confirm `FrozenClock` is compiled only under `cfg(test)` and that no production timeout or sleep was changed. No further refactor is needed if those boundaries hold.
+Keep the fake backend fields named rather than expanding its positional tuple. Confirm the change is limited to this test and that no production timeout or sleep was changed. No further refactor is needed if those boundaries hold.
 
 - [ ] **Step 6: Run impacted-test verification**
 
@@ -142,8 +104,8 @@ Expected: PASS for all supervisor crate tests.
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add crates/freshell-supervisor/src/claude_source_observation.rs crates/freshell-supervisor/src/lib.rs crates/freshell-supervisor/src/test_support.rs
-git commit -m "test(supervisor): freeze lock timeout clock during I/O"
+git add crates/freshell-supervisor/src/claude_source_observation.rs
+git commit -m "test(supervisor): pause lock test clock during I/O"
 ```
 
 ---
