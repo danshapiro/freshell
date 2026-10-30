@@ -893,9 +893,19 @@ mod sim {
     /// larger `at` (the client drops an edge whose `at` is not above the last).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_death_after_a_result_rings_with_a_strictly_larger_at() {
-        let program = json!({ "rules": [{
-            "on": "msg:prompt", "match": { "text": "die" }, "emit": [{ "kind": "crash" }],
-        }] })
+        let logs = log_capture::install();
+        let program = json!({ "rules": [
+            {
+                "on": "msg:prompt", "match": { "text": "hello" },
+                "emit": [
+                    { "kind": "approval", "data": { "tool": "Bash", "input": { "command": "ls" } } },
+                    { "kind": "completion", "data": { "subtype": "success" } },
+                ],
+            },
+            {
+                "on": "msg:prompt", "match": { "text": "die" }, "emit": [{ "kind": "crash" }],
+            },
+        ] })
         .to_string();
         let rig = ClaudeRig::start_with_env(
             RigKind::Sim,
@@ -906,14 +916,93 @@ mod sim {
         )
         .await;
         let mut conn = rig.connect().await;
-        let session_id = conn.create("create-1").await;
+        let created = conn
+            .request_create("create-1", json!({ "permissionMode": "default" }))
+            .await;
+        assert_eq!(created["type"], "freshAgent.created", "{created}");
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        let is_event = |v: &Value, event_type: &str| {
+            v["type"] == "freshAgent.event"
+                && v["sessionId"] == session_id
+                && v["event"]["type"] == event_type
+        };
+
+        // Acceptance orders the sends. The unanswered approval holds hello
+        // before completion and before the CLI can absorb another command.
         conn.send_text(&session_id, "send-1", "hello").await;
-        conn.send_text(&session_id, "send-2", "die").await;
-        conn.wait_for("the exit report", |v| {
-            v["event"]["code"] == "SIDECAR_EXITED"
+        let hello_uuid = accepted(&mut conn, "send-1").await["submittedTurnId"]
+            .as_str()
+            .expect("hello's submittedTurnId")
+            .to_string();
+        let request = conn
+            .wait_for("hello's approval", |v| {
+                is_event(v, "freshAgent.permission.request")
+            })
+            .await;
+        conn.wait_for("hello's waiting edge", |v| {
+            is_event(v, "freshAgent.turn.waiting")
         })
         .await;
-        conn.read_for(Duration::from_millis(500)).await;
+        let processes = rig.runtime_processes(&session_id);
+        conn.send_text(&session_id, "send-2", "die").await;
+        let die_uuid = accepted(&mut conn, "send-2").await["submittedTurnId"]
+            .as_str()
+            .expect("die's submittedTurnId")
+            .to_string();
+        logs.wait_for("die queued behind hello's unanswered approval", |event| {
+            event.message == "freshagent.claude.command"
+                && event.field("session_id") == Some(session_id.as_str())
+                && event.field("uuid") == Some(die_uuid.as_str())
+                && event.field("state") == Some("queued")
+        })
+        .await;
+        assert!(
+            rig.ledger_rows("result").is_empty(),
+            "hello cannot finish before its approval is answered"
+        );
+        assert!(
+            session_events(&conn, &session_id, "freshAgent.turn.complete").is_empty(),
+            "the held turn has not completed"
+        );
+
+        // Denial releases the explicit success completion without running a
+        // native tool; the already queued die then runs and crashes.
+        conn.send(json!({
+            "type": "freshAgent.approval.respond",
+            "provider": "claude",
+            "sessionType": "freshclaude",
+            "sessionId": session_id,
+            "requestId": request["event"]["requestId"],
+            "decision": { "behavior": "deny", "message": "Continue without the tool", "interrupt": false },
+        }))
+        .await;
+        conn.wait_for("the exit report", |v| {
+            is_event(v, "freshAgent.error") && v["event"]["code"] == "SIDECAR_EXITED"
+        })
+        .await;
+        let exit_at = index_of(&conn, "the exit report", |v| {
+            is_event(v, "freshAgent.error") && v["event"]["code"] == "SIDECAR_EXITED"
+        });
+        conn.wait_for_since(exit_at + 1, "the death's completion edge", |v| {
+            is_event(v, "freshAgent.turn.complete")
+        })
+        .await;
+        processes.wait_until_exited("the queued die crashed").await;
+
+        let result_frames = session_events(&conn, &session_id, "freshAgent.result");
+        assert_eq!(
+            result_frames.len(),
+            1,
+            "only hello returns a result: {:?}",
+            conn.frames
+        );
+        assert_eq!(result_frames[0]["event"]["subtype"], "success");
+        assert_eq!(result_frames[0]["event"]["isError"], false);
+        assert_eq!(
+            result_frames[0]["event"]["sessionBusy"], true,
+            "die is still owed"
+        );
+        assert_eq!(rig.ledger_rows("result")[0]["uuid"], hello_uuid);
         let rings: Vec<i64> = session_events(&conn, &session_id, "freshAgent.turn.complete")
             .iter()
             .map(|v| v["event"]["at"].as_i64().expect("a numeric at"))
@@ -925,6 +1014,33 @@ mod sim {
             conn.frames
         );
         assert!(rings[1] > rings[0], "{rings:?}");
+        let result_at = index_of(&conn, "hello's result", |v| {
+            is_event(v, "freshAgent.result")
+        });
+        let result_ring_at = index_of(&conn, "the result's edge", |v| {
+            is_event(v, "freshAgent.turn.complete") && v["event"]["at"] == rings[0]
+        });
+        assert!(result_at < result_ring_at && result_ring_at < exit_at);
+        let minted = logs.matching(|event| {
+            event.message == "freshagent.turn.complete"
+                && event.field("session_id") == Some(session_id.as_str())
+        });
+        assert_eq!(
+            minted
+                .iter()
+                .map(|event| event.field("source"))
+                .collect::<Vec<_>>(),
+            [Some("result"), Some("death")],
+            "{minted:?}"
+        );
+        assert_eq!(
+            minted
+                .iter()
+                .map(|event| event.field("at").unwrap().parse::<i64>().unwrap())
+                .collect::<Vec<_>>(),
+            rings,
+            "the logged sources mint the edges the client receives"
+        );
     }
 
     /// The waiting edge is the server's: on the 0 -> >=1 pending transition,
