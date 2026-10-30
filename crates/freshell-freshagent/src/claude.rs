@@ -14926,7 +14926,7 @@ pub(crate) mod tests {
             json!({"launch":{"incarnationId":"owned","launchNonce":"current"},"queryGeneration":1});
         let result = state
             .dispatch_native_control_checked(
-                &session_id,
+                session_id,
                 SessionType::Freshclaude,
                 "checkpoint",
                 "release-current".into(),
