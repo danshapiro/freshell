@@ -4,9 +4,10 @@
  * server (docs/plans reconcile-client-adoption lane, Tasks 2-13 merged).
  *
  * Three scenario contracts:
- *      destructive census never destroys a pane (F3 closed);
- *   2. dead sessions surface as ONE batched adjudication panel (council
- *      rule 1) -- nothing auto-closed, per-row explicit decisions;
+ *   1. destructive census never destroys a pane (F3 closed);
+ *   2. dead terminal sessions surface as ONE in-buffer notice line per pane,
+ *      never a modal (no-modal contract) -- nothing auto-closed, resolution
+ *      through the user-named pane chrome (Replace pane, header close);
  *   3. double-restart mid-reconcile converges: no permanent 'creating'
  *      wedge, exactly one live PTY per pane (no duplicates).
  *
@@ -174,6 +175,30 @@ const CODEX_DEAD_SESSION_B = 'aaaaaaaa-1111-4222-8333-000000000002'
 const CODEX_DEAD_TITLE_A = 'adoption dead codex A'
 const CODEX_DEAD_TITLE_B = 'adoption dead codex B'
 
+// The dead-session buffer notice line (no-modal contract): pins Task 2's
+// DEAD_SESSION_BUFFER_NOTICE literal in src/components/TerminalView.tsx
+// byte-for-byte -- a pane whose saved session was deleted explains itself
+// with exactly ONE line in its own xterm buffer.
+const DEAD_SESSION_BUFFER_NOTICE =
+  "[This pane's saved session no longer exists on disk - close this pane or start a new one]"
+
+// The typed SESSION_MISSING resume-refusal line prefix (byte-frozen wire
+// text, TerminalView's typed-refusal arm): the reload segment pins its
+// ABSENCE for a latched dead pane -- the stood-down pane never sends the
+// resume create that would be refused.
+const RESUME_FAILED_LINE_PREFIX = '[Resume failed]'
+
+/** Non-overlapping occurrence count of needle in haystack. */
+function countOccurrences(haystack: string, needle: string): number {
+  let count = 0
+  let idx = haystack.indexOf(needle)
+  while (idx !== -1) {
+    count += 1
+    idx = haystack.indexOf(needle, idx + needle.length)
+  }
+  return count
+}
+
 function codexSessionPath(homeDir: string, sessionId: string): string {
   return path.join(homeDir, '.codex', 'sessions', `${sessionId}.jsonl`)
 }
@@ -247,25 +272,35 @@ function seedCodexAdoptionHome(
  * the resume create records a durable pane-ledger binding, so 'ever
  * observed' survives a restart). Returns the pane's tab + leaf ids once the
  * pane is live with the expected sessionRef.
+ *
+ * Seeding-hardened (kata ebp6, "seeded codex leaf null after 20s"): the row
+ * wait is SESSION-ID-scoped -- the old title-text locator could match a
+ * label anywhere on the page before the sessions index had listed the
+ * fixture, clicking into a cold index whose resume create then never
+ * associated the pane. Waiting for the id-addressed row guarantees the
+ * index is warm BEFORE the click, and retryWarmingIfVisible is retried
+ * inside both settle polls.
  */
 async function openSeededCodexSession(
   page: Page,
   harness: TestHarness,
-  title: string,
   sessionId: string,
 ): Promise<{ tabId: string; leafId: string }> {
-  const sessionList = page.getByTestId('sidebar-session-list')
-  await expect(sessionList).toBeVisible({ timeout: 15_000 })
-  const sessionItem = page.getByText(title, { exact: false }).first()
-  await expect(sessionItem).toBeVisible({ timeout: 15_000 })
+  await retryWarmingIfVisible(page)
+  const sessionItem = page.locator(
+    `[data-context="sidebar-session"][data-session-id="${sessionId}"]`,
+  )
+  await expect(sessionItem).toBeVisible({ timeout: 20_000 })
   const tabCountBefore = await harness.getTabCount()
   await sessionItem.click()
   await expect(async () => {
+    await retryWarmingIfVisible(page)
     expect(await harness.getTabCount()).toBe(tabCountBefore + 1)
   }).toPass({ timeout: 15_000 })
   const tabId = (await harness.getActiveTabId())!
   const leafId: string = await expect
     .poll(async () => {
+      await retryWarmingIfVisible(page)
       const layout = await harness.getPaneLayout(tabId)
       const leaf = findLeavesByMode(layout, 'codex').find(
         (l) => l?.content?.terminalId && l?.content?.sessionRef?.sessionId === sessionId,
@@ -539,7 +574,7 @@ test.describe('reconcile client adoption (rust server, real SPA)', () => {
     }
   })
 
-  test('dead sessions surface as ONE batched adjudication panel', async ({
+  test('dead terminal sessions surface as one in-buffer notice line per pane, no modal', async ({
     page,
   }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-adopt-dead-'))
@@ -561,21 +596,16 @@ test.describe('reconcile client adoption (rust server, real SPA)', () => {
     try {
       // 1. Two fake-CLI codex panes opened from the seeded sidebar history
       //    (the resume creates record durable pane-ledger bindings, so
-      //    'ever observed' survives the restart); verify both live.
+      //    'ever observed' survives the restart); verify both live. Capture
+      //    each pane's terminalId pre-restart: the harness buffer registry
+      //    is keyed by terminalId, and a dead pane KEEPS its stale
+      //    terminalId through BOTH the live reconnect and the page reload
+      //    (the boot rehydrate -- loadPersistedPanes -- strips transient
+      //    fields, never terminal identity).
       await selectShellIfPickerShowing(page)
       await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
-      const paneA = await openSeededCodexSession(
-        page,
-        harness,
-        CODEX_DEAD_TITLE_A,
-        CODEX_DEAD_SESSION_A,
-      )
-      const paneB = await openSeededCodexSession(
-        page,
-        harness,
-        CODEX_DEAD_TITLE_B,
-        CODEX_DEAD_SESSION_B,
-      )
+      const paneA = await openSeededCodexSession(page, harness, CODEX_DEAD_SESSION_A)
+      const paneB = await openSeededCodexSession(page, harness, CODEX_DEAD_SESSION_B)
       expect(paneB.tabId).not.toBe(paneA.tabId)
       await expect
         .poll(async () =>
@@ -585,6 +615,12 @@ test.describe('reconcile client adoption (rust server, real SPA)', () => {
       await flushPersistence(page)
       const leavesBefore = await allTerminalLeaves(harness)
       const tabCountBefore = await harness.getTabCount()
+      const staleTerminalIds = new Map<string, string>()
+      for (const pane of [paneA, paneB]) {
+        const leaf = await findLeafById(harness, pane.tabId, pane.leafId)
+        expect(leaf?.content?.terminalId, 'the pre-restart pane carries its terminalId').toBeTruthy()
+        staleTerminalIds.set(pane.leafId, leaf!.content!.terminalId as string)
+      }
 
       // 2. Stop + delete both session files + start on the SAME home/port/
       //    token (RustServer.restart() -- the isolated HOME is never touched
@@ -596,46 +632,237 @@ test.describe('reconcile client adoption (rust server, real SPA)', () => {
       await server.restart()
       await waitForWsReady(page)
 
-      // 3. EXACTLY ONE [role=dialog] (aria-label "Dead sessions") listing
-      //    BOTH panes -- never one modal per pane, nothing auto-closed.
-      const dialog = page.getByRole('dialog', { name: 'Dead sessions' })
-      await expect(async () => {
-        await retryWarmingIfVisible(page)
-        await expect(dialog).toHaveCount(1)
-        await expect(dialog.getByRole('listitem')).toHaveCount(2)
-      }).toPass({ timeout: 90_000 })
-      // The adjudication panel is the ONLY dialog on screen.
-      await expect(page.getByRole('dialog')).toHaveCount(1)
-
-      // Click "Start fresh here" on the FIRST row -> that pane becomes a
-      // live terminal (same createRequestId -- the reducer preserves it;
-      // exactly ONE running codex PTY serves it).
-      await dialog.getByRole('listitem').first().getByRole('button', { name: 'Start fresh here' }).click()
-
-      // Exactly one of the two panes is now a live fresh terminal...
+      // 3. LIVE-RECONNECT SHAPE: the dead verdict folds onto each pane as
+      //    the durable restoreError latch (verdict sync for every assert
+      //    below -- the fold is what writes the notice and stands recovery
+      //    down).
       await expect
         .poll(async () => {
+          await retryWarmingIfVisible(page)
           const contents = await Promise.all(
             [paneA, paneB].map(async (p) => (await findLeafById(harness, p.tabId, p.leafId))?.content),
           )
-          const live = contents.filter(
-            (c) => c?.status === 'running' && c?.terminalId && !c?.restoreError,
-          )
-          return live.length
-        }, { timeout: 60_000 })
-        .toBe(1)
-      //    ...backed by EXACTLY ONE running codex PTY server-side (one
-      //    create for the pane's createRequestId, no duplicates).
-      await expect
-        .poll(async () =>
-          (await listTerminals(info)).filter((t) => t.mode === 'codex' && t.status === 'running').length,
-        { timeout: 30_000 })
-        .toBe(1)
+          return contents.filter((c) => c?.restoreError?.reason === 'durable_artifact_missing').length
+        }, { timeout: 90_000 })
+        .toBe(2)
 
-      // The second entry is STILL listed; nothing was auto-closed.
-      await expect(dialog.getByRole('listitem')).toHaveCount(1)
+      // 3a. ZERO dialogs for the whole test: the blocking DeadSessionPanel
+      //     modal is GONE -- a dead pane is announced only by its own
+      //     surfaces (the notice line + the latch), never a modal.
+      const deadSessionsDialog = page.getByRole('dialog', { name: 'Dead sessions' })
+      await expect(deadSessionsDialog).toHaveCount(0)
+
+      // 3b. Each dead pane's stale buffer carries the notice line EXACTLY
+      //     ONCE. The retained-terminalId line is written at the stand-down
+      //     gate AFTER the pane's post-fold attach round is rejected: for
+      //     the ACTIVE tab that round is the fold-driven reconcile attach;
+      //     for a pane in a BACKGROUND tab it is the REVEAL hydration -- a
+      //     background dead pane announces nothing until the user looks at
+      //     it (the accepted no-modal tradeoff). Visit each dead pane's tab
+      //     first (the user's own tab navigation -- existing chrome, no
+      //     new UI), then assert presence-and-count on the FINAL buffer
+      //     (read through the captured stale terminalId; a reconnect
+      //     reconstruction may legitimately wipe the pre-restart output
+      //     first -- the line lands on the post-rejection surface).
+      for (const pane of [paneA, paneB]) {
+        await page.locator(`[data-context="tab"][data-tab-id="${pane.tabId}"]`).click()
+        const staleTerminalId = staleTerminalIds.get(pane.leafId)!
+        await expect
+          .poll(async () => {
+            await retryWarmingIfVisible(page)
+            const buffer = (await harness.getTerminalBuffer(staleTerminalId)) ?? ''
+            return countOccurrences(buffer, DEAD_SESSION_BUFFER_NOTICE)
+          }, { timeout: 60_000 })
+          .toBe(1)
+      }
+
+      // 3c. No auto-close: NOTHING was removed by the verdicts -- the pane
+      //     count and tab count are unchanged from pre-restart.
       expect((await allTerminalLeaves(harness)).length).toBe(leavesBefore.length)
       expect(await harness.getTabCount()).toBe(tabCountBefore)
+
+      // 3d. NO PTY attributable to either dead pane's session was spawned:
+      //     no server terminal resuming either dead codex session id. This
+      //     is PANE-SCOPED only -- the spec's initial SHELL pane
+      //     legitimately gets its own fresh-verdict PTY after the restart,
+      //     so server-WIDE PTY counts must never be asserted.
+      const termsAfterReconnect = await listTerminals(info)
+      expect(
+        termsAfterReconnect.filter(
+          (t) => t.sessionRef?.sessionId === CODEX_DEAD_SESSION_A
+            || t.sessionRef?.sessionId === CODEX_DEAD_SESSION_B,
+        ),
+        'no terminal may resume either deleted session',
+      ).toEqual([])
+
+      // 4. RELOAD SHAPE (the persisted-latch timeline): the per-pane
+      //    restoreError latch DELIBERATELY survives the reload, and the
+      //    boot rehydrate keeps the pane's stale terminalId
+      //    (loadPersistedPanes strips transient fields, never terminal
+      //    identity), so the reloaded dead pane takes the SAME stand-down
+      //    path as the live reconnect: the boot reconcile re-adjudicates
+      //    both panes dead (re-folding the latch and a fresh notice mint)
+      //    and the pane's attach to the stale terminal is rejected
+      //    INVALID_TERMINAL_ID -- with the latch already standing, the
+      //    stand-down gate owns the round and NO recovery create is ever
+      //    minted: no PTY, no typed refusal, no failure card (the
+      //    resume-the-dead-session attempt never happens), and the one
+      //    notice line is re-written onto the fresh post-reload surface.
+      //    (The typed SESSION_MISSING [Resume failed] + failure-card shape
+      //    belongs to a DIFFERENT timeline -- a reload that lands BEFORE
+      //    the dead verdict, when the unlatched pane's recovery create
+      //    still resumes the deleted session; it stays pinned by the
+      //    TerminalView unit tests and the server's wire tests.)
+      await page.reload({ waitUntil: 'domcontentloaded' })
+      await harness.waitForHarness(60_000)
+      await harness.waitForConnection(120_000)
+      for (const pane of [paneA, paneB]) {
+        const staleTerminalId = staleTerminalIds.get(pane.leafId)!
+        // (a) The boot reconcile re-adjudicates the pane dead: the latch
+        //     (persisted AND re-folded) stands.
+        await expect
+          .poll(async () => {
+            await retryWarmingIfVisible(page)
+            return (await findLeafById(harness, pane.tabId, pane.leafId))?.content?.restoreError?.reason ?? null
+          }, { timeout: 90_000 })
+          .toBe('durable_artifact_missing')
+        // (b) The pane kept its stale terminalId and carries NO launch
+        //     failure: nothing was created and nothing was refused.
+        const reloadedContent = (await findLeafById(harness, pane.tabId, pane.leafId))?.content
+        expect(reloadedContent?.terminalId).toBe(staleTerminalId)
+        expect(reloadedContent?.launchFailure).toBeFalsy()
+        // (c) Visit the pane's tab (a BACKGROUND dead pane announces
+        //     nothing until the user looks at it -- the reveal drives the
+        //     pane's attach round), then the pane's fresh post-reload
+        //     buffer carries the notice line EXACTLY ONCE and NEVER a
+        //     [Resume failed] line (no create was refused).
+        await page.locator(`[data-context="tab"][data-tab-id="${pane.tabId}"]`).click()
+        await expect
+          .poll(async () => {
+            const buffer = (await harness.getTerminalBuffer(staleTerminalId)) ?? ''
+            return countOccurrences(buffer, DEAD_SESSION_BUFFER_NOTICE) === 1
+              && !buffer.includes(RESUME_FAILED_LINE_PREFIX)
+          }, { timeout: 60_000 })
+          .toBe(true)
+        // (d) NO typed failure card renders: the dead pane's only surfaces
+        //     are the notice line and the latch (the Start-fresh card
+        //     belongs to the create-refusal shape, which the stood-down
+        //     pane never enters).
+        const paneShell = page.locator(`[data-pane-shell="true"][data-pane-id="${pane.leafId}"]`)
+        await expect(paneShell).toBeVisible({ timeout: 15_000 })
+        await expect(paneShell.getByRole('alert', { name: /^Launch failed:/ })).toHaveCount(0)
+      }
+      // Still zero dialogs after the reload's re-adjudication.
+      await expect(deadSessionsDialog).toHaveCount(0)
+      const termsAfterReload = await listTerminals(info)
+      expect(
+        termsAfterReload.filter(
+          (t) => t.sessionRef?.sessionId === CODEX_DEAD_SESSION_A
+            || t.sessionRef?.sessionId === CODEX_DEAD_SESSION_B,
+        ),
+      ).toEqual([])
+
+      // 5. Resolve pane A through the user-named "Replace pane" chrome
+      //    route (review round 1, finding 5): the pane's own context menu
+      //    re-keys the SAME pane node to the type picker; picking a
+      //    terminal type mints a NEW identity-less conversation. First
+      //    e2e drive of Replace pane (structure donors: PanePicker.tsx,
+      //    test/e2e/replace-pane.test.tsx).
+      const paneATab = page.locator(`[data-context="tab"][data-tab-id="${paneA.tabId}"]`)
+      await paneATab.click()
+      const paneAShell = page.locator(`[data-pane-shell="true"][data-pane-id="${paneA.leafId}"]`)
+      await expect(paneAShell).toBeVisible({ timeout: 15_000 })
+      await paneAShell.locator('.xterm').click({ button: 'right' })
+      await page.getByRole('menuitem', { name: 'Replace pane' }).click()
+      // The SAME pane node becomes the type picker (replacePane re-keys the
+      // leaf's content; the pane id is preserved).
+      const paneAPicker = paneAShell.getByRole('toolbar', { name: /pane type picker/i })
+      await expect(paneAPicker).toBeVisible({ timeout: 15_000 })
+      // A terminal-type option: Codex CLI if offered for this cwd, else
+      // Shell (both are existing picker chrome; either proves the route).
+      const codexOption = paneAPicker.getByRole('button', { name: /^Codex CLI$/i })
+      let replacementMode = 'shell'
+      if (await codexOption.isVisible().catch(() => false)) {
+        replacementMode = 'codex'
+        await codexOption.click({ force: true })
+        const directoryInput = paneAShell.getByRole('combobox', {
+          name: /Starting directory for Codex/i,
+        })
+        await expect(directoryInput).toBeVisible({ timeout: 15_000 })
+        await directoryInput.fill(projectDir)
+        await directoryInput.press('Enter')
+      } else {
+        await paneAPicker.getByRole('button', { name: /^Shell$/i }).click({ force: true })
+      }
+      // The same pane node now carries a LIVE terminal: a NEW terminalId
+      // (never the stale one), running, latch cleared.
+      const paneANewTerminalId = await expect
+        .poll(async () => {
+          const content = (await findLeafById(harness, paneA.tabId, paneA.leafId))?.content
+          return content?.kind === 'terminal'
+            && content?.mode === replacementMode
+            && content?.terminalId
+            && content?.terminalId !== staleTerminalIds.get(paneA.leafId)
+            && content?.status === 'running'
+            && !content?.restoreError
+            ? content.terminalId
+            : null
+        }, { timeout: 60_000 })
+        .not.toBeNull()
+        .then(async () => {
+          const content = (await findLeafById(harness, paneA.tabId, paneA.leafId))!.content!
+          return content.terminalId as string
+        })
+      // The pane's new conversation is identity-less: its content carries
+      // neither dead session id.
+      const paneAContentAfterReplace = (await findLeafById(harness, paneA.tabId, paneA.leafId))!.content!
+      expect(paneAContentAfterReplace.sessionRef?.sessionId ?? null).not.toBe(CODEX_DEAD_SESSION_A)
+      expect(paneAContentAfterReplace.sessionRef?.sessionId ?? null).not.toBe(CODEX_DEAD_SESSION_B)
+      // Exactly ONE identity-less PTY attributable to pane A: the new
+      // terminalId names exactly one server terminal whose sessionRef (if
+      // any -- the directory derives it from RESUME args, and a fresh
+      // create has none) is neither dead id. No --resume of the dead
+      // session anywhere.
+      const termsAfterReplace = await listTerminals(info)
+      const paneANewTerminals = termsAfterReplace.filter((t) => t.terminalId === paneANewTerminalId)
+      expect(paneANewTerminals).toHaveLength(1)
+      expect(paneANewTerminals[0].status).toBe('running')
+      expect(paneANewTerminals[0].sessionRef?.sessionId ?? null).not.toBe(CODEX_DEAD_SESSION_A)
+      expect(paneANewTerminals[0].sessionRef?.sessionId ?? null).not.toBe(CODEX_DEAD_SESSION_B)
+      expect(
+        termsAfterReplace.filter(
+          (t) => t.sessionRef?.sessionId === CODEX_DEAD_SESSION_A
+            || t.sessionRef?.sessionId === CODEX_DEAD_SESSION_B,
+        ),
+      ).toEqual([])
+
+      // 6. Close pane B via its pane header close button (existing chrome).
+      //    LB4 (validated): each dead pane is its own single-pane tab, so
+      //    closing pane B removes B's TAB (pane A's tab survives) -- by the
+      //    user's click, never by a verdict.
+      const paneBTab = page.locator(`[data-context="tab"][data-tab-id="${paneB.tabId}"]`)
+      await paneBTab.click()
+      await page
+        .locator(`[data-pane-shell="true"][data-pane-id="${paneB.leafId}"]`)
+        .getByRole('button', { name: 'Close pane' })
+        .click()
+      await expect(paneBTab).toHaveCount(0, { timeout: 15_000 })
+      expect(await harness.getTabCount()).toBe(tabCountBefore - 1)
+      expect((await allTerminalLeaves(harness)).length).toBe(leavesBefore.length - 1)
+
+      // 7. FINAL: still zero dialogs for the whole test; pane A's
+      //    resolution produced exactly its one new identity-less PTY and
+      //    pane B's tab was closed by the user's click; no terminal ever
+      //    resumed either dead session id.
+      await expect(deadSessionsDialog).toHaveCount(0)
+      const termsFinal = await listTerminals(info)
+      expect(termsFinal.filter((t) => t.terminalId === paneANewTerminalId)).toHaveLength(1)
+      expect(
+        termsFinal.filter(
+          (t) => t.sessionRef?.sessionId === CODEX_DEAD_SESSION_A
+            || t.sessionRef?.sessionId === CODEX_DEAD_SESSION_B,
+        ),
+      ).toEqual([])
     } finally {
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
