@@ -215,6 +215,60 @@ describe('native Claude fixture process ownership', () => {
   }
 
   if (process.platform === 'win32') {
+    it('closes after a terminal Job host failure with a target PID and retains unconfirmed fixture files', async () => {
+      const fixture = await createClaudeFixture()
+      const report = path.join(fixture.root, 'started.pid')
+      const child = fixture.spawn(process.execPath, ['-e', `require('node:fs').writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1000)`, report], {
+        env: fixture.env('http://127.0.0.1:9'), stdio: 'pipe',
+      })
+      const hostPid = (child as ChildProcess & { fixtureHostPid?: number }).fixtureHostPid
+      const events: string[] = []
+      let hostFailure: Error | undefined
+      let closed = false
+      child.on('error', (error: Error) => { hostFailure = error; events.push('error') })
+      child.on('exit', () => events.push('exit'))
+      child.on('close', () => { closed = true; events.push('close') })
+      child.stdout!.resume()
+      child.stderr!.resume()
+      try {
+        await waitUntil(async () => fs.stat(report).then(() => true, () => false))
+        const rootPid = Number(await fs.readFile(report, 'utf8'))
+        expect(child.pid).toBe(rootPid)
+        expect(await live(rootPid)).toBe(true)
+        expect(await live(hostPid!)).toBe(true)
+
+        // The real host rejects this control message after target startup.
+        // It drops the Job, reports an error with the allocated PID, and
+        // cannot claim a root-exit or full-tree settlement observation.
+        expect(child.kill('SIGUSR1')).toBe(true)
+        await waitUntil(async () => hostFailure !== undefined)
+        expect(hostFailure?.message).toContain('unsupported fixture root termination signal')
+        await waitUntil(async () => closed)
+        expect(events).toEqual(['error', 'close'])
+        expect(child.exitCode).toBeNull()
+        expect(child.signalCode).toBeNull()
+        await waitUntil(async () => !await live(rootPid) && !await live(hostPid!))
+
+        await expect(fixture.cleanup()).rejects.toThrow('unsupported fixture root termination signal')
+        await expect(fs.stat(fixture.root)).resolves.toBeDefined()
+        const sessionDirectory = (await fs.readdir(fixture.root)).find((entry) => entry.startsWith('.process-job-'))
+        expect(sessionDirectory).toBeDefined()
+        const status = JSON.parse(await fs.readFile(path.join(fixture.root, sessionDirectory!, 'status.json'), 'utf8'))
+        expect(status).toMatchObject({ pid: rootPid, rootExited: false, settled: false })
+      } finally {
+        // This one-target fixture deliberately retains an error receipt.
+        // Delete it only after exact target and Job-host OS exits, even red.
+        await fixture.cleanup().catch(() => {})
+        const ownedPids = [child.pid, hostPid].filter((pid): pid is number => Number.isSafeInteger(pid) && pid! > 0)
+        for (const pid of ownedPids) if (await live(pid)) process.kill(pid, 'SIGKILL')
+        await waitUntil(async () => (await Promise.all(ownedPids.map(live))).every((running) => !running))
+        child.stdin?.destroy()
+        child.stdout?.destroy()
+        child.stderr?.destroy()
+        await fs.rm(fixture.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+      }
+    })
+
     it('settles the Job host and its process tree when the owning Node controller exits without cleanup', async () => {
       const control = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-abandoned-job-'))
       const fixtureModule = new URL('../providers/claude-local-provider.mjs', import.meta.url).href

@@ -38,7 +38,7 @@ function exited(child) {
 }
 
 /** Preserve the target's PID, pipes and exit events while its Job owner lives. */
-class FixtureChild extends EventEmitter {
+export class FixtureChild extends EventEmitter {
   pid
   exitCode = null
   signalCode = null
@@ -62,21 +62,26 @@ class FixtureChild extends EventEmitter {
   }
 
   maybeClose() {
-    if (this.closed || !this.completedEvent || !exited(this) || this.openPipes.size !== 0) return
+    if (this.closed || !this.completedEvent || (!exited(this) && !this.failure) || this.openPipes.size !== 0) return
     this.closed = true
     this.emit('close', this.exitCode, this.signalCode)
+  }
+
+  fail(error) {
+    if (this.failure) return
+    this.failure = error
+    if (this.pid === undefined) this.exitCode = -1
+    // A terminal controller failure closes the transport even when the
+    // target's exit was never confirmed. Do not invent a target exit event.
+    this.stdin?.destroy()
+    this.emit('error', this.failure)
+    this.completedEvent = true
   }
 
   observe(status) {
     this.pid ??= status.pid
     if (status.error && !this.failure) {
-      this.failure = Object.assign(new Error(status.error), { code: status.errorCode ?? 'EIO' })
-      if (status.pid === undefined) {
-        this.exitCode = -1
-        this.stdin?.destroy()
-      }
-      this.emit('error', this.failure)
-      if (status.pid === undefined) this.completedEvent = true
+      this.fail(Object.assign(new Error(status.error), { code: status.errorCode ?? 'EIO' }))
     }
     if (status.rootExited && !this.exitObserved) {
       this.exitObserved = true
@@ -149,8 +154,7 @@ export function createWindowsFixtureSession(root) {
       })
       this.child = new FixtureChild(this, this.controller, command, args)
       this.controller.once('error', (error) => {
-        this.child.emit('error', error)
-        if (this.child.pid === undefined) this.child.completedEvent = true
+        this.child.fail(error)
         this.child.maybeClose()
       })
       this.controller.once('exit', () => {
@@ -199,6 +203,7 @@ export function createWindowsFixtureSession(root) {
       try {
         this.poll()
         this.refresh()
+        if (this.status?.error && !this.status.settled) throw this.child.failure
         if (this.controllerFailure && !this.status?.settled) throw this.controllerFailure
         if (this.child?.pid !== undefined && !exited(this.child)) await stopFixtureProcess(this.child)
         if (!this.status?.settled) this.command({ action: 'stop' })
