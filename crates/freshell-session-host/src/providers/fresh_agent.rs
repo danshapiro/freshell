@@ -4604,18 +4604,23 @@ export function query({ prompt, options }) {
                 .dispatch(RequestId::new(), "one original send".into(), None)
                 .await
                 .map_err(|error| error.to_string())?;
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while !input_log.exists() {
+            let rows: Vec<Value> = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    // appendFile opens the receipt before its asynchronous
+                    // write completes. File existence is not SDK consumption
+                    // evidence; wait for a complete JSONL record instead.
+                    let receipt = std::fs::read_to_string(&input_log).unwrap_or_default();
+                    if receipt.ends_with('\n') {
+                        break receipt
+                            .lines()
+                            .map(|line| serde_json::from_str(line).unwrap())
+                            .collect();
+                    }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
             .await
             .map_err(|_| "original send did not reach recovered native query")?;
-            let rows: Vec<Value> = std::fs::read_to_string(&input_log)
-                .map_err(|error| error.to_string())?
-                .lines()
-                .map(|line| serde_json::from_str(line).unwrap())
-                .collect();
             if rows.len() != 1
                 || rows[0]["nativeSessionId"] != NATIVE
                 || rows[0]["text"][0]["text"] != "one original send"
