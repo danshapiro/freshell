@@ -142,6 +142,9 @@ import {
 
 const EARLY_STATES = new Set(['creating', 'starting'])
 const BUSY_STATES = FRESH_AGENT_BUSY_STATUSES
+// Stable empty list for the transcript-turn source (snapshot turns) so the
+// newest-user-row memo's dependency identity never churns on a missing snapshot.
+const EMPTY_TRANSCRIPT_TURNS: readonly FreshAgentTurn[] = []
 // Copy for the stuck-notice card (role="alert") shown while the store carries
 // the deadman's 'stuck' status; recovery actions live on the card itself.
 const FRESH_AGENT_STUCK_NOTICE_TEXT = 'Agent appears stuck — no events from the agent process for a while.'
@@ -387,6 +390,27 @@ function isModernCheckpointTurn(turn: FreshAgentTurn): boolean {
     || turn.source === 'durable'
     || turn.source === 'live'
     || turn.source === 'server'
+}
+
+// The fallback for a modern turn with no bound checkpoint outcome. Agent
+// response turns are never rewindable and never even considered (defect 2).
+// "Still saving" (defect 4) belongs to the NEWEST user row only, while this
+// pane's agent turn is running: mid-turn the newest user row IS the running
+// send's row (the assistant has not replied yet), so its capture/identity is
+// legitimately in flight. Older unbound rows (historical MCP/CLI-driven
+// turns) keep the honest unavailable verdict — nothing is being saved for
+// them even while a later turn runs. The state is computed, never stored: it
+// dies at the busy→idle edge, so it can never wedge as an immortal "saving".
+export function unboundRewindAvailability(
+  turn: FreshAgentTurn,
+  agentBusy: boolean,
+  isNewestUserTurn: boolean,
+): FreshAgentTurnRewindAvailability | undefined {
+  if (turn.role !== 'user') return undefined
+  if (!isModernCheckpointTurn(turn)) return undefined
+  return agentBusy && isNewestUserTurn
+    ? { status: 'pending' }
+    : { status: 'unavailable', reason: MODERN_TURN_CHECKPOINT_UNAVAILABLE }
 }
 
 function localEchoLanded(
@@ -1330,16 +1354,6 @@ export function FreshAgentView({
     if (typeof requestId !== 'string' || requestId.length === 0) return undefined
     return checkpointAvailabilityByTurn.get(checkpointAvailabilityKey(scope, 'request', requestId))
   }, [checkpointAvailabilityByTurn, paneContent.createRequestId, paneContent.provider])
-  const getRewindAvailability = useCallback((turn: FreshAgentTurn): FreshAgentTurnRewindAvailability | undefined => {
-    const availability = getCheckpointAvailability(turn)
-    if (!availability) {
-      return isModernCheckpointTurn(turn)
-        ? { status: 'unavailable', reason: MODERN_TURN_CHECKPOINT_UNAVAILABLE }
-        : undefined
-    }
-    if (availability.status === 'unavailable') return { status: 'unavailable', reason: availability.reason }
-    return { status: availability.status }
-  }, [getCheckpointAvailability])
   // Task 10: requestIds whose FRESH_AGENT_LOST_SESSION failure already fired a
   // retry, plus the retry requestIds themselves -- a retry is never retried,
   // so a resend can happen at most once per failed request (loop-proof).
@@ -3972,6 +3986,23 @@ export function FreshAgentView({
     : (agentSession?.status ?? paneContent.status)
   const isBusy = BUSY_STATES.has(effectiveStatus)
   const sessionEnded = effectiveStatus === 'exited' || effectiveStatus === 'create-failed'
+  const transcriptTurns = snapshot?.turns ?? EMPTY_TRANSCRIPT_TURNS
+  const newestUserTurnKey = useMemo(() => {
+    const userTurns = transcriptTurns.filter((turn) => turn.role === 'user')
+    return userTurns.length > 0 ? getFreshAgentDisplayTurnKey(userTurns[userTurns.length - 1]) : undefined
+  }, [transcriptTurns])
+  const getRewindAvailability = useCallback((turn: FreshAgentTurn): FreshAgentTurnRewindAvailability | undefined => {
+    const availability = getCheckpointAvailability(turn)
+    if (!availability) {
+      return unboundRewindAvailability(
+        turn,
+        isBusy,
+        newestUserTurnKey !== undefined && getFreshAgentDisplayTurnKey(turn) === newestUserTurnKey,
+      )
+    }
+    if (availability.status === 'unavailable') return { status: 'unavailable', reason: availability.reason }
+    return { status: availability.status }
+  }, [getCheckpointAvailability, isBusy, newestUserTurnKey])
   // The live tail (transcript-live plan §4.4): what the running turn shows
   // before its transcript lines land. This view never subscribes to the
   // tail's text — only to whether it shows anything, so the transcript's own

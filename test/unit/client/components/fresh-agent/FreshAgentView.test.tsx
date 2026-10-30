@@ -4152,6 +4152,215 @@ describe('FreshAgentView', () => {
     expect(apiMock.post).not.toHaveBeenCalledWith('/api/fresh-agent/checkpoints/restore', expect.anything())
   })
 
+  // Defects 2 and 4: rewind availability is role-gated and busy-gated. The
+  // newest unbound modern user row shows the honest "still saving" state only
+  // while this pane's agent turn runs; older unbound rows (historical
+  // MCP/CLI-driven turns) keep the honest unavailable verdict even mid-turn,
+  // and a bound capture is never downgraded by the busy fallback.
+  describe('fresh-agent rewind availability honesty', () => {
+    const unboundModernUserTurn = (id: string, text: string) => ({
+      id,
+      turnId: id,
+      source: 'durable' as const,
+      role: 'user' as const,
+      summary: text,
+      items: [{ id: `${id}-text`, kind: 'text' as const, text }],
+    })
+
+    const emitSessionSnapshotStatus = (
+      store: ReturnType<typeof createStore>,
+      onMessage: ((message: Record<string, unknown>) => void) | undefined,
+      sessionId: string,
+      status: string,
+    ) => {
+      const message = {
+        type: 'freshAgent.event',
+        sessionId,
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        event: {
+          type: 'freshAgent.session.snapshot',
+          sessionId,
+          latestTurnId: null,
+          timelineSessionId: sessionId,
+          status,
+        },
+      }
+      act(() => {
+        handleFreshAgentMessage(store.dispatch, message)
+        onMessage?.(message)
+      })
+    }
+
+    it('shows the honest still-saving state on the newest user row while the agent turn is running, and keeps older unbound rows honestly unavailable', async () => {
+      const sessionId = 'thread-rewind-busy-honesty'
+      const store = createStore()
+      let onMessage: ((message: Record<string, unknown>) => void) | undefined
+      wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+        onMessage = handler
+        return () => {}
+      })
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+        status: 'idle',
+        summary: 'two unbound modern user turns',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [
+          unboundModernUserTurn('msg_a', 'Older MCP-driven prompt'),
+          unboundModernUserTurn('msg_b', 'Newest prompt while the agent runs'),
+        ],
+      })
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-rewind-busy-honesty',
+          sessionId,
+          status: 'idle',
+        },
+      }))
+
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+
+      expect(await screen.findAllByRole('article', { name: 'You transcript turn' })).toHaveLength(2)
+      expect(onMessage).toBeTypeOf('function')
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'running')
+
+      const [olderRow, newestRow] = screen.getAllByRole('article', { name: 'You transcript turn' })
+      const savingButton = await within(newestRow!).findByRole('button', { name: 'Saving code rewind checkpoint' })
+      expect(savingButton).toBeDisabled()
+      expect(savingButton).toHaveAttribute('title', 'Saving the code state from before this message')
+      const olderButton = within(olderRow!).getByRole('button', { name: 'Rewind unavailable for this message' })
+      expect(olderButton).toBeDisabled()
+      expect(olderButton).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
+    })
+
+    it('keeps a settled unbound modern turn unavailable when the agent is idle', async () => {
+      const sessionId = 'thread-rewind-idle-settled'
+      const store = createStore()
+      let onMessage: ((message: Record<string, unknown>) => void) | undefined
+      wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+        onMessage = handler
+        return () => {}
+      })
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+        status: 'idle',
+        summary: 'one unbound modern user turn',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [unboundModernUserTurn('msg_settled', 'A prompt whose turn settled')],
+      })
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-rewind-idle-settled',
+          sessionId,
+          status: 'idle',
+        },
+      }))
+
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+
+      expect(await screen.findAllByRole('article', { name: 'You transcript turn' })).toHaveLength(1)
+      expect(onMessage).toBeTypeOf('function')
+      // The busy→idle edge must leave no wedged "saving" state behind: the
+      // pending fallback is computed, never stored.
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'running')
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'idle')
+
+      const [userRow] = screen.getAllByRole('article', { name: 'You transcript turn' })
+      const rewindButton = await within(userRow!).findByRole('button', { name: 'Rewind unavailable for this message' })
+      expect(rewindButton).toBeDisabled()
+      expect(rewindButton).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
+    })
+
+    it('a bound available capture keeps showing available while the agent is busy', async () => {
+      const sessionId = 'thread-rewind-bound-available'
+      const checkpointWorkspace = { path: '/repo/project', provenance: 'directory-picker' as const }
+      const resolvedCheckpointWorkspace = { path: '/repo/project-root', provenance: 'directory-picker' as const }
+      const store = createStore()
+      let onMessage: ((message: Record<string, unknown>) => void) | undefined
+      wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+        onMessage = handler
+        return () => {}
+      })
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+        status: 'idle',
+        summary: 'empty',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [],
+      })
+      apiMock.post.mockResolvedValue({ ok: true })
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-rewind-bound-available',
+          sessionId,
+          status: 'idle',
+          initialCwd: '/repo',
+          checkpointWorkspace,
+        },
+      }))
+
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+
+      await waitFor(() => {
+        expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+      })
+      wsMock.send.mockClear()
+      fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+        target: { value: 'Ship it' },
+      })
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+      const sendFrame = sentFreshAgentMessages('freshAgent.send')[0]
+      const requestId = String(sendFrame?.requestId)
+      const logicalAttemptId = String((sendFrame?.checkpointIntent as Record<string, unknown>)?.logicalAttemptId)
+      expect(requestId).not.toBe('undefined')
+      expect(logicalAttemptId).not.toBe('undefined')
+
+      act(() => {
+        onMessage?.({
+          type: 'freshAgent.checkpoint.outcome',
+          requestId,
+          logicalAttemptId,
+          sessionId,
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          status: 'available',
+          checkpointId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          workspace: resolvedCheckpointWorkspace,
+        })
+      })
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'running')
+
+      const [userRow] = await screen.findAllByRole('article', { name: 'You transcript turn' })
+      const rewindButton = await within(userRow!).findByRole('button', { name: 'Rewind code to here' })
+      expect(rewindButton).toBeEnabled()
+    })
+  })
+
   it('restores saved rewind availability when the same durable session opens with a new pane request', async () => {
     const sessionId = 'thread-reopened-checkpoints'
     const checkpointId = 'dddddddddddddddddddddddddddddddd'
