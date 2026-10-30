@@ -574,49 +574,48 @@ fn claude_history_read_inner(request: &Value) -> Result<Value, String> {
         }
         _ => {}
     }
-    if request["kind"] == "snapshot" {
-        if request["fork"].is_null()
+    if request["kind"] == "snapshot"
+        && (request["fork"].is_null()
             || crate::claude_snapshot::locate_transcript(session_id).is_some()
-            || !request["genesis"].is_null()
-        {
-            let session_type = request["sessionType"]
-                .as_str()
-                .filter(|kind| matches!(*kind, "freshclaude" | "kilroy"))
-                .ok_or("invalid Claude history session type")?;
-            let rollback: Option<crate::rollback_record::RollbackRecord> =
-                serde_json::from_value(request["rollback"].clone())
-                    .map_err(|_| "invalid Claude rollback record")?;
-            let genesis = if request["genesis"].is_null() {
-                None
-            } else {
-                Some(crate::identity_sink::RecordedGenesis {
-                    genesis: serde_json::from_value(request["genesis"]["genesis"].clone())
-                        .map_err(|_| "invalid Claude genesis")?,
-                    updated_at_ms: request["genesis"]["updatedAtMs"]
-                        .as_i64()
-                        .ok_or("invalid Claude genesis time")?,
-                })
-            };
-            let roots: Vec<PathBuf> = if request["roots"].is_null() {
-                crate::claude_snapshot::claude_home_candidates()
-            } else {
-                serde_json::from_value(request["roots"].clone())
-                    .map_err(|_| "invalid Claude store roots")?
-            };
-            return crate::claude_snapshot::get_claude_snapshot_sync_in(
-                &roots,
-                session_type,
-                session_id,
-                genesis.as_ref(),
-                rollback.as_ref(),
-            )
-            .map_err(|error| match error {
-                crate::claude_snapshot::ClaudeSnapshotError::NotFound => {
-                    "claude session not found".to_string()
-                }
-                crate::claude_snapshot::ClaudeSnapshotError::Io(message) => message,
-            });
-        }
+            || !request["genesis"].is_null())
+    {
+        let session_type = request["sessionType"]
+            .as_str()
+            .filter(|kind| matches!(*kind, "freshclaude" | "kilroy"))
+            .ok_or("invalid Claude history session type")?;
+        let rollback: Option<crate::rollback_record::RollbackRecord> =
+            serde_json::from_value(request["rollback"].clone())
+                .map_err(|_| "invalid Claude rollback record")?;
+        let genesis = if request["genesis"].is_null() {
+            None
+        } else {
+            Some(crate::identity_sink::RecordedGenesis {
+                genesis: serde_json::from_value(request["genesis"]["genesis"].clone())
+                    .map_err(|_| "invalid Claude genesis")?,
+                updated_at_ms: request["genesis"]["updatedAtMs"]
+                    .as_i64()
+                    .ok_or("invalid Claude genesis time")?,
+            })
+        };
+        let roots: Vec<PathBuf> = if request["roots"].is_null() {
+            crate::claude_snapshot::claude_home_candidates()
+        } else {
+            serde_json::from_value(request["roots"].clone())
+                .map_err(|_| "invalid Claude store roots")?
+        };
+        return crate::claude_snapshot::get_claude_snapshot_sync_in(
+            &roots,
+            session_type,
+            session_id,
+            genesis.as_ref(),
+            rollback.as_ref(),
+        )
+        .map_err(|error| match error {
+            crate::claude_snapshot::ClaudeSnapshotError::NotFound => {
+                "claude session not found".to_string()
+            }
+            crate::claude_snapshot::ClaudeSnapshotError::Io(message) => message,
+        });
     }
     let mut transcript = if request["kind"] == "snapshot" {
         read_claude_operation_transcript(request)?

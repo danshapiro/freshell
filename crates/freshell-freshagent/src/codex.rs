@@ -9808,7 +9808,7 @@ impl FreshCodexState {
         match ownership.state {
             freshell_ownership::OwnershipState::Vacant => {
                 Err(CodexSnapshotError::UntrackedReadonly {
-                    ownership: ownership.clone(),
+                    ownership: Box::new(ownership.clone()),
                 })
             }
             // An aliased (re-keyed) key has no writer under THIS id — the
@@ -9816,7 +9816,7 @@ impl FreshCodexState {
             // path answers the same untracked-vacant truth.
             freshell_ownership::OwnershipState::Aliased { .. } => {
                 Err(CodexSnapshotError::UntrackedReadonly {
-                    ownership: ownership.clone(),
+                    ownership: Box::new(ownership.clone()),
                 })
             }
             freshell_ownership::OwnershipState::Live {
@@ -10830,7 +10830,7 @@ pub enum CodexSnapshotError {
         /// untracked-vacant answer — the caller's read-only snapshot derives
         /// from THIS observation (opencode parity), never a second look
         /// that could pair a mid-transition generation with "vacant".
-        ownership: freshell_ownership::OwnershipSnapshot,
+        ownership: Box<freshell_ownership::OwnershipSnapshot>,
     },
     /// kata b8ke Task 5: a live runtime owner this GET cannot serve locally
     /// (a terminal PTY, or a fresh-agent runtime outside this process's live

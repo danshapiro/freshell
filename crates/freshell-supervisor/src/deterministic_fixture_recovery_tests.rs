@@ -370,7 +370,7 @@ async fn deterministic_native_fixture_stopped_census_requires_actual_readable_hi
                 std::fs::write(&fixture.transcript, b"{invalid native JSON\n").unwrap()
             }
             "unreadable" => {
-                std::fs::set_permissions(&fixture.transcript, std::fs::Permissions::from_mode(0))
+                std::fs::set_permissions(&fixture.transcript, std::fs::Permissions::from_mode(0o0))
                     .unwrap()
             }
             _ => {}
