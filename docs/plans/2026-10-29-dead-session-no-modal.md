@@ -60,7 +60,7 @@ The INVALID_TERMINAL_ID auto-recovery lane must stand down for a pane whose dura
 - Test: `test/unit/client/components/TerminalView.codex-identity.test.tsx` (new second-round breadcrumb pin)
 
 **Interfaces:**
-- Consumes: pane content `restoreError: RestoreError` (already on `contentRef`/`current` in the ws.onMessage closure — no new selector or ref needed; the branch already reads `current?.status`, `current?.sessionRef`).
+- Consumes: pane content `restoreError: RestoreError` (mirrored into a render-body ref exactly like the deleted `isDeadSessionAdjudicatedRef` — see Step 3).
 - Produces: none (internal gate); deletes the module's only read of `s.panes.deadSessionAdjudication`.
 
 - [ ] **Step 1: Write the failing behavioral test (re-key the existing pin)**
@@ -106,23 +106,25 @@ Expected: FAIL — the latch-seeded pane still auto-recovers (today the gate key
 In `src/components/TerminalView.tsx`:
 
 1. Delete the selector + ref mirror at `:709-719` (`isDeadSessionAdjudicated`, `isDeadSessionAdjudicatedRef`, and their assignments).
-2. Replace the gate at `:6701`:
+2. Replace them with a render-body ref mirror of the pane's own latch (identical freshness to the deleted mirror — assigned during render, not effect-synced like `contentRef`, so no fold-to-gate lag window):
 
 ```tsx
-// Dead-session stand-down (design invariant 7, re-keyed to the durable
-// latch): a pane whose saved session artifact is gone must not mint a
-// recovery create here — that would resume the dead session as an orphan
-// PTY nothing adopts (duplicate `--resume <dead-session>` spawns after a
-// restart). Key on the persisted per-pane restoreError latch
-// (durable_artifact_missing) — strictly more accurate than the old
+// Dead-session stand-down latch (design invariant 7, re-keyed to the
+// durable restoreError latch): a pane whose saved session artifact is gone
+// must not mint a recovery create on an INVALID_TERMINAL_ID round — that
+// would resume the dead session as an orphan PTY nothing adopts
+// (duplicate `--resume <dead-session>` spawns after a restart). The
+// persisted per-pane latch is strictly more accurate than the old
 // adjudication list: per-pane and reload-surviving, and cleared exactly by
 // the recovery folds (attach/reset), which re-arms auto-recovery the
 // moment the pane legitimately moves on. Other restoreError reasons
 // (dead_live_handle etc.) keep today's auto-recovery.
-if (current?.restoreError?.reason === 'durable_artifact_missing') return
+const deadSessionLatchRef = useRef(false)
+deadSessionLatchRef.current =
+  terminalContent?.restoreError?.reason === 'durable_artifact_missing'
 ```
 
-(`current` is the pane-content snapshot already read throughout this branch; `contentRef` is ref-synced per render exactly like the deleted selector mirror was.)
+3. Replace the gate at `:6701` with `if (deadSessionLatchRef.current) return`.
 
 - [ ] **Step 4: Run the focused test**
 
@@ -132,20 +134,7 @@ Expected: PASS
 
 - [ ] **Step 5: Refactor while green**
 
-Add the codex-breadcrumb interplay pin (documents the intended widening): in `TerminalView.codex-identity.test.tsx`, beside `preserves a durable-identity breadcrumb instead of silently wiping restoreError when a codex pane has no resumable identity on INVALID_TERMINAL_ID` (`:465`), add:
-
-```tsx
-it('stands down on a second INVALID_TERMINAL_ID after the codex recovery minted the durable_artifact_missing breadcrumb', async () => {
-  // Drive the first INVALID_TERMINAL_ID round exactly as the :465 test does
-  // (no sessionRef/codexDurability → recovery mints the breadcrumb
-  //  restoreError: durable_artifact_missing at TerminalView.tsx:6792).
-  // Then emit a SECOND INVALID_TERMINAL_ID: assert NO further recovery
-  // (createRequestId/terminalId unchanged, zero new terminal.create frames)
-  // — nothing durable remains to resume; standing down is correct.
-})
-```
-
-No other refactor expected (the deletion is itself the simplification).
+None — load-bearing validation showed the planned "second-round codex breadcrumb" pin is vacuous (post-mint the pane has no terminalId, so the gated sub-branch — which requires `currentTerminalId && status !== 'exited'` — is unreachable; validator LB9, reports/load-bearing-validator-lb1.md context). Do not add it. The `dead_live_handle` negative from Step 1 is the reachable delimiting pin.
 
 - [ ] **Step 6: Run impacted-test verification**
 
@@ -166,16 +155,21 @@ git commit -m "feat(terminal): stand down INVALID_TERMINAL_ID recovery on the de
 
 ### Task 2: Dead-session notice line in the terminal pane's buffer
 
-One `writeLocalXtermNotice` line, exactly once per dead adjudication per mount, into the pane's own stale xterm buffer. Re-arms when the latch clears (user resolved the pane); survives reconnect re-adjudication via a ref key; writes on mount when the persisted latch rehydrates after a reload.
+One `writeLocalXtermNotice` line, exactly once per dead adjudication per mount, into the pane's own stale xterm buffer. Re-arms when the latch clears (user resolved the pane); survives reconnect re-adjudication via a ref key.
+
+**Keying (load-bearing-validated, LB1):** the notice must NOT key on raw `restoreError` — `durable_artifact_missing` is also minted on LIVE panes by the codex dead-live-handle recovery breadcrumb (`TerminalView.tsx:6792`, pane goes live with the latch persisted) and the server-folded `terminal.created` restoreError (`:5842`, pinned live by `test/e2e/codex-refresh-rehydrate-flow.test.tsx:556-577`). Instead the fold's terminal `dead_session` arm additionally mints the existing one-shot store field `reconcileNotice` with a dedicated dead copy — a signal no other producer can mint — and the effect consumes exactly that copy, then clears it (preventing both anchor double-writes and a stale copy riding `resetPaneForReconcileCreate` into the user's fresh pane via the `terminal.created` anchor). The fresh-agent dead arm does NOT mint the notice (FreshAgentView renders `reconcileNotice` as a 5-second transient status — an in-pane UI change the request forbids; fresh-agent panes keep their banner only). `reconcileNotice` is persistence-stripped (`persistMiddleware.ts:297`), so in the reload shape the notice arrives after the boot reconcile re-folds the verdict — not at mount; the reload-shape test reflects that timing.
 
 **Files:**
-- Modify: `src/components/TerminalView.tsx` (new const + effect, placed immediately AFTER the "Init xterm once" effect block that ends at `:3162` — declaration order guarantees `termRef.current` is set for mount-time runs)
+- Modify: `src/lib/pane-reconcile.ts` (terminal dead arm `:556-574`: add the `setPaneReconcileNotice` dispatch beside the existing `setPaneRestoreError`; export the copy constant)
+- Modify: `src/components/TerminalView.tsx` (new const + consume effect, placed immediately AFTER the "Init xterm once" effect block that ends at `:3162` — declaration order guarantees `termRef.current` is set for mount-time runs; the effect needs no term for the reload shape because the mint arrives post-reconcile)
 - Test: `test/unit/client/components/TerminalView.session-reserved.test.tsx` (`:340` exhaustion test gains the notice assertions — the only unit test driving a real dead_session verdict end-to-end through TerminalView's own reconcile requester)
-- Test: `test/unit/client/components/TerminalView.lifecycle.test.tsx` (exactly-once, re-arm, reload-shape mount pins)
+- Test: `test/unit/client/components/TerminalView.lifecycle.test.tsx` (exactly-once, re-arm, reload-shape pins)
 
 **Interfaces:**
-- Consumes: `terminalContent.restoreError` (render-scope prop), `writeLocalXtermNotice(term, data)` (`TerminalView.tsx:1652`, caller frames `\r\n`), `shouldWaitForProviderBehavior` (opencode provider-wait window), `termRef`.
-- Produces: `const DEAD_SESSION_NOTICE = "[This pane's saved session no longer exists on disk - close this pane or start a new one]"` (module-level const in TerminalView.tsx; unit and e2e tests pin this literal).
+- Consumes: `writeLocalXtermNotice(term, data)` (`TerminalView.tsx:1652`, caller frames `\r\n`), `setPaneReconcileNotice` / `clearPaneReconcileNotice` (existing actions), `shouldWaitForProviderBehavior`, `termRef`.
+- Produces:
+  - `export const DEAD_SESSION_RECONCILE_NOTICE = 'Saved session no longer exists on disk.'` in `src/lib/pane-reconcile.ts` (the fold-minted store-field copy — matched exactly, so the `invalid`-arm and reset notices can never trigger the effect);
+  - `const DEAD_SESSION_BUFFER_NOTICE = "[This pane's saved session no longer exists on disk - close this pane or start a new one]"` (module-level const in TerminalView.tsx — the xterm line; unit and e2e tests pin this literal).
 
 - [ ] **Step 1: Write the failing behavioral tests**
 
@@ -183,34 +177,43 @@ In `TerminalView.session-reserved.test.tsx`, extend `exhaustion auto-resolves vi
 
 ```tsx
 // After the existing restoreError assertion (:401), add:
-// - exactly ONE xterm write containing DEAD_SESSION_NOTICE (use the
-//   suite's write-capture helper pattern; see reconcileNotice one-shot
-//   test :434 and terminalWriteStrings in TerminalView.lifecycle.test.tsx:324)
-// - the line is CRLF-framed (write payload contains
-//   `\r\n[This pane's saved session no longer exists on disk - close this pane or start a new one]\r\n`)
+// - exactly ONE xterm write containing the DEAD_SESSION_BUFFER_NOTICE line,
+//   CRLF-framed: `\r\n[This pane's saved session no longer exists on disk - close this pane or start a new one]\r\n`
+//   (use the suite's write-capture helper pattern; see the reconcileNotice
+//   one-shot test :434 and terminalWriteStrings in TerminalView.lifecycle.test.tsx:324)
+// - content.reconcileNotice is CLEARED after the write (consumed one-shot)
 ```
 
-In `TerminalView.lifecycle.test.tsx`, add a focused describe (fixture donor: the Task-1 latch-seeded helper):
+In `TerminalView.lifecycle.test.tsx`, add a focused describe (fixture donor: the Task-1 latch-seeded helper; simulate the fold by dispatching `setPaneRestoreError(...)` + `setPaneReconcileNotice({ ..., notice: DEAD_SESSION_RECONCILE_NOTICE })` together, exactly what the fold does):
 
 ```tsx
 describe('dead-session notice line', () => {
-  it('writes the notice exactly once for a latched pane; a re-fold with a fresh restoreError object does not rewrite', async () => {
-    // Mount with restoreError latched. Assert exactly one DEAD_SESSION_NOTICE write.
-    // Then simulate a reconnect re-adjudication: dispatch/fold the SAME
-    // session identity with a NEW buildRestoreError('durable_artifact_missing')
-    // object (new object identity — the every-ready re-fold does exactly this).
-    // Assert the write count is STILL one.
+  it('consumes the dead reconcileNotice copy and writes the buffer line once', async () => {
+    // Latch + mint. Assert exactly one DEAD_SESSION_BUFFER_NOTICE write
+    // and reconcileNotice cleared.
+  })
+  it('a re-fold (fresh restoreError + fresh notice copy, same session identity) does not rewrite', async () => {
+    // Fold the SAME identity again (App's every-ready round does exactly
+    // this on each reconnect — new object identities each time).
+    // Assert the write count is STILL one (ref key absorbs), and the copy
+    // was consumed (cleared) again — no stale field rides a reset.
   })
   it('re-arms after the latch clears', async () => {
-    // Mount latched → one write. Clear the latch (fold an attach/reset that
-    // clears restoreError) → ref resets. Re-latch (a NEW dead adjudication of
-    // the new identity) → a SECOND write lands (count two).
+    // Latch + mint → one write. Clear the latch (fold an attach/reset that
+    // clears restoreError) → ref resets. Re-latch + re-mint for the NEW
+    // identity → a SECOND write lands (count two).
   })
-  it('writes once on mount for a rehydrated latch (reload shape: empty buffer)', async () => {
-    // Preload the pane content with the persisted restoreError (no terminalId —
-    // the post-reload shape). Mount. Assert exactly one DEAD_SESSION_NOTICE
-    // write into the empty buffer, and no terminal.create sent (the reconcile
-    // pending-window + verdict flow governs creation, not this effect).
+  it('reload shape: the persisted latch alone writes nothing; the boot re-fold mints and writes once', async () => {
+    // Preload pane content with ONLY the persisted restoreError (no
+    // terminalId, no reconcileNotice — it is persistence-stripped). Mount:
+    // assert NO write yet. Then simulate the boot reconcile verdict fold
+    // (latch + notice mint). Assert exactly one write. (Do NOT assert on
+    // terminal.create frames here — the mount create path is ungated by
+    // design and governed by the reconcile pending-window, not this effect.)
+  })
+  it('ignores non-dead reconcileNotice copies (invalid verdict)', async () => {
+    // Mint the invalid-arm notice text instead. Assert NO buffer write of
+    // the dead line.
   })
 })
 ```
@@ -219,79 +222,99 @@ describe('dead-session notice line', () => {
 
 Run: `pnpm run test:vitest run test/unit/client/components/TerminalView.session-reserved.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx --config config/vitest/vitest.config.ts`
 
-Expected: FAIL — no notice is written today (TerminalView renders nothing from `restoreError`).
+Expected: FAIL — no notice is written today (TerminalView renders nothing from `restoreError`, and the fold mints no dead `reconcileNotice`).
 
 - [ ] **Step 3: Add the minimal production implementation**
+
+In `src/lib/pane-reconcile.ts` (module scope):
+
+```ts
+/**
+ * Dead-session verdict copy minted (terminal arm only) onto the pane's
+ * one-shot reconcileNotice field. Matched EXACTLY by TerminalView's notice
+ * effect; no other producer may mint this string. Fresh-agent dead arms do
+ * NOT mint it (FreshAgentView would render it as a transient status).
+ */
+export const DEAD_SESSION_RECONCILE_NOTICE = 'Saved session no longer exists on disk.'
+```
+
+In the terminal `dead_session` arm (`:556-574`), beside the existing `setPaneRestoreError` dispatch:
+
+```ts
+dispatch(setPaneReconcileNotice({
+  tabId,
+  paneId,
+  notice: DEAD_SESSION_RECONCILE_NOTICE,
+}))
+```
 
 In `src/components/TerminalView.tsx` (module scope, near the other notice copy constants):
 
 ```tsx
 /** One-line explanation a dead terminal pane writes into its own buffer. */
-const DEAD_SESSION_NOTICE =
+const DEAD_SESSION_BUFFER_NOTICE =
   "[This pane's saved session no longer exists on disk - close this pane or start a new one]"
 ```
 
 Inside the component, after the init-xterm effect (after `:3162`):
 
 ```tsx
-// Dead-session notice (replaces the removed DeadSessionPanel modal):
-// the persisted restoreError latch is the single dead-session state; the
-// pane explains itself with one local notice line — nothing else changes
-// (no status writes, no new UI). Exactly-once per dead adjudication per
-// mount via the ref key; re-armed when the latch clears (pane resolved
-// through existing chrome). Declared AFTER the init-xterm effect so a
-// mount-time run (rehydrated latch after reload) sees termRef set; the
-// shouldWaitForProviderBehavior dep re-fires the effect when an opencode
-// pane's deferred surface finally mounts.
-const deadSessionRestoreError =
-  terminalContent?.restoreError?.reason === 'durable_artifact_missing'
-    ? terminalContent.restoreError
-    : undefined
+// Dead-session notice (replaces the removed DeadSessionPanel modal). The
+// fold's terminal dead_session arm mints the one-shot reconcileNotice
+// dead copy (the persisted restoreError latch alone cannot discriminate
+// dead verdicts from live-recovery mints — see the run's load-bearing
+// validator LB1). Consume-and-clear the copy unconditionally (it must not
+// ride a reset into a fresh pane via the terminal.created anchor), then
+// write the buffer line exactly once per dead adjudication per mount via
+// the ref key. Declared AFTER the init-xterm effect so termRef is set for
+// mount-adjacent runs; the shouldWaitForProviderBehavior dep covers an
+// opencode pane whose surface mounts late.
 const deadSessionNoticeKeyRef = useRef<string | null>(null)
 useEffect(() => {
-  if (!deadSessionRestoreError) {
-    deadSessionNoticeKeyRef.current = null
-    return
-  }
   const content = terminalContent
   if (!content) return
+  if (content.reconcileNotice !== DEAD_SESSION_RECONCILE_NOTICE) return
+  dispatch(clearPaneReconcileNotice({ tabId, paneId })) // consume one-shot
   const key = `${content.createRequestId ?? ''}|${content.sessionRef?.sessionId ?? '-'}`
-  if (deadSessionNoticeKeyRef.current === key) return
-  const term = termRef.current
-  if (!term) return // provider-wait window; re-fires when the surface exists
+  if (deadSessionNoticeKeyRef.current === key) return // re-fold: announced already
   deadSessionNoticeKeyRef.current = key
-  writeLocalXtermNotice(term, `\r\n${DEAD_SESSION_NOTICE}\r\n`)
+  const term = termRef.current
+  if (!term) return // surface not mounted yet (rare provider-wait edge): line dropped this mount
+  writeLocalXtermNotice(term, `\r\n${DEAD_SESSION_BUFFER_NOTICE}\r\n`)
 }, [
-  deadSessionRestoreError,
+  terminalContent?.reconcileNotice,
   terminalContent?.createRequestId,
   terminalContent?.sessionRef?.sessionId,
   shouldWaitForProviderBehavior,
   writeLocalXtermNotice,
+  dispatch,
 ])
 ```
 
+(Re-arm: when the latch clears via an attach/reset fold, the pane identity changes with it — a later dead adjudication of the new identity mints a new copy with a new key and writes again. `clearPaneReconcileNotice` is already imported by the anchor consumers.)
+
 - [ ] **Step 4: Run the focused tests**
 
-Run: `pnpm run test:vitest run test/unit/client/components/TerminalView.session-reserved.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx --config config/vitest/vitest.config.ts`
+Run: `pnpm run test:vitest run test/unit/client/components/TerminalView.session-reserved.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/lib/pane-reconcile.test.ts --config config/vitest/vitest.config.ts`
 
 Expected: PASS
 
 - [ ] **Step 5: Refactor while green**
 
-None expected — the effect is additive and self-contained. Confirm no other notice path needs the same copy (the `[Resume failed]` refusal line at `:6512` and the `[Restore failed]` arm at `:6596` stay as-is: in the reload shape the two lines legitimately stack — the verdict line first, the server's typed refusal after — and read coherently).
+None expected — the effect is additive and self-contained. The `[Resume failed]` refusal line (`:6512`) and `[Restore failed]` arm (`:6596`) stay as-is: in the reload shape the verdict line and the server's typed-refusal line legitimately stack and read coherently.
 
 - [ ] **Step 6: Run impacted-test verification**
 
-Impacted set: all TerminalView unit suites + the React-level e2e restore suites that assert on xterm write strings.
+Impacted set: all TerminalView unit suites + the React-level e2e restore suites that assert on xterm write strings, plus the fold suite.
 
-Run: `pnpm run test:vitest run test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TerminalView.session-reserved.test.tsx test/unit/client/components/TerminalView.codex-identity.test.tsx test/unit/client/components/TerminalView.resumeSession.test.tsx test/unit/client/components/TerminalView.launchRetry.test.tsx test/e2e/terminal-create-attach-ordering.test.tsx test/e2e/codex-refresh-rehydrate-flow.test.tsx test/e2e/terminal-restart-recovery.test.tsx --config config/vitest/vitest.config.ts`
+Run: `pnpm run test:vitest run test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TerminalView.session-reserved.test.tsx test/unit/client/components/TerminalView.codex-identity.test.tsx test/unit/client/components/TerminalView.resumeSession.test.tsx test/unit/client/components/TerminalView.launchRetry.test.tsx test/unit/client/lib/pane-reconcile.test.ts test/e2e/terminal-create-attach-ordering.test.tsx test/e2e/codex-refresh-rehydrate-flow.test.tsx test/e2e/terminal-restart-recovery.test.tsx --config config/vitest/vitest.config.ts`
 
 Expected: PASS
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/components/TerminalView.tsx test/unit/client/components/TerminalView.session-reserved.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx
+git add src/components/TerminalView.tsx src/lib/pane-reconcile.ts test/unit/client/components/TerminalView.session-reserved.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx
 git commit -m "feat(terminal): dead-session panes explain themselves with one in-buffer notice line"
 ```
 
@@ -377,9 +400,10 @@ The store slice, fold batching, and App clear branch go away; the persisted per-
 - Modify: `src/store/paneTypes.ts` (`:626-640` delete `DeadSessionEntry` type; `:707-711` delete the `PanesState` field)
 - Modify: `src/store/panesSlice.ts` (`:12` type import; `:2913-2927` three reducers; `:3077-3079` exports; `:490`,`:512` initial state; `:1324` `clearPanesForMachine`; `:2239` `hydratePanes`)
 - Modify: `src/store/persistMiddleware.ts:681` (remove the `deadSessionAdjudication: _dsa` destructure-strip — a TS error surfaces once the field leaves `PanesState`)
-- Modify: `src/lib/pane-reconcile.ts` (`:25` `DeadSessionEntry` import; `:35` `setDeadSessionAdjudication` import; `:499` accumulator; `:557-564` terminal push; `:384-392` fresh-agent push; `:620-623` tail batch; `:291-304` delete `deadSessionTitle`; `:267` delete `FoldOutcome.dead`; `:398`,`:573` delete `outcome.dead++` — keep `folded = true` so `onVerdictFolded` still fires for dead panes, which App's held-create retract depends on)
+- Modify: `src/lib/pane-reconcile.ts` (`:25` `DeadSessionEntry` import; `:35` `setDeadSessionAdjudication` import; `:323` `foldFreshAgentVerdict`'s `deadEntries: DeadSessionEntry[]` PARAMETER — outside the arm ranges, easy to miss; `:499` accumulator; `:557-564` terminal push; `:384-392` fresh-agent push; `:620-623` tail batch; `:291-304` delete `deadSessionTitle`; `:267` delete `FoldOutcome.dead`; `:398`,`:573` delete `outcome.dead++` — keep `folded = true` so `onVerdictFolded` still fires for dead panes, which App's held-create retract depends on. The Task-2 dead-copy `setPaneReconcileNotice` mint in the terminal arm STAYS.)
 - Modify: `src/App.tsx:112` (import) and `:1565-1567` (delete the `outcome.dead === 0 → clear` branch; its whole reason — dismissing a batched dialog on a clean round — is gone; the latch clears itself via the attach/reset folds)
-- Test updates (dead-session expects/mocks removed, warming halves kept): `test/unit/client/lib/pane-reconcile.test.ts` (`:316` expect in the routing test; `:367-374` batching test re-keyed), `test/unit/client/lib/pane-reconcile.fresh-agent.test.ts` (`:358-374` split: restoreError asserts stay), `test/unit/client/store/panesSlice.reconcile.test.ts` (`:290-302` reducer trio test deleted; `:342-377` persistence test keeps the per-pane volatile strip expects, drops the two adjudication expects), `test/unit/client/store/panesSlice.fresh-agent-reconcile.test.ts` (`:488/:510` anchor expect removed), `test/unit/client/components/App.reconcile-adoption.test.tsx` (`:546` dead half dropped, warming half kept), state-shape preloads `test/unit/client/store/paneCloseGate.test.ts:1272`, `test/unit/client/store/terminalDetachMiddleware.test.ts:365`, `test/unit/lib/managed-runtime-recovery.test.ts:151` (drop the field literal)
+- Test updates (dead-session expects/mocks removed, warming halves kept): `test/unit/client/lib/pane-reconcile.test.ts` (`:316` expect in the routing test; `:367-374` batching test re-keyed), `test/unit/client/lib/pane-reconcile.fresh-agent.test.ts` (`:358-374` split: restoreError asserts stay), `test/unit/client/store/panesSlice.reconcile.test.ts` (`:290-302` reducer trio test deleted; `:342-377` persistence test keeps the per-pane volatile strip expects, drops the two adjudication expects), `test/unit/client/store/panesSlice.fresh-agent-reconcile.test.ts` (`:488/:510` anchor expect removed), `test/unit/client/components/App.reconcile-adoption.test.tsx` (`:546` dead half dropped, warming half kept; ALSO delete Task 3's added no-dialog test — its premise dispatches the deleted action; the no-dialog contract is pinned from here on by e2e + the component's absence), `test/unit/client/components/TerminalView.session-reserved.test.tsx:402` (drop the adjudication length assert; keep `:401`), `test/unit/client/components/ReconcileWarmingBanner.test.tsx` (strip the copied helper's `deadSessionAdjudication` seed/option and its `DeadSessionEntry` type import), state-shape preloads `test/unit/client/store/paneCloseGate.test.ts:1272`, `test/unit/client/store/terminalDetachMiddleware.test.ts:365`, `test/unit/lib/managed-runtime-recovery.test.ts:151` (drop the field literal)
+- Dangling imports: after the named edits, `pnpm run typecheck:client` enumerates every test file still importing the deleted action creators/type (`pane-reconcile.test.ts:19`, `pane-reconcile.fresh-agent.test.ts:21`, `panesSlice.reconcile.test.ts:24-26`, `panesSlice.fresh-agent-reconcile.test.ts`, `App.reconcile-adoption.test.tsx:11`) — remove them as flagged.
 
 **Interfaces:**
 - Consumes: Task 3 (no component reads the state).
@@ -390,7 +414,7 @@ The store slice, fold batching, and App clear branch go away; the persisted per-
 In `test/unit/client/lib/pane-reconcile.test.ts`, replace the batching test (`:367`, `dead sessions are batched into ONE setDeadSessionAdjudication dispatch (never N)`):
 
 ```ts
-it('dead sessions get exactly one per-pane restoreError latch and NO batched adjudication dispatch', () => {
+it('dead sessions get exactly one per-pane restoreError latch, one dead-copy reconcileNotice, and no batched dispatch', () => {
   const h = foldHarnessAllDead(3)
   const outcome = h.fold()
   expect(outcome.cardinalityViolation).toBe(false)
@@ -398,13 +422,18 @@ it('dead sessions get exactly one per-pane restoreError latch and NO batched adj
   expect(restoreErrors).toHaveLength(3)
   expect(restoreErrors.every((a) => a.payload.restoreError.code === 'RESTORE_UNAVAILABLE'
     && a.payload.restoreError.reason === 'durable_artifact_missing')).toBe(true)
-  expect(h.dispatches.some((a) => a.type === 'panes/setDeadSessionAdjudication')).toBe(false)
+  const deadNotices = h.dispatches.filter((a) => a.type === 'panes/setPaneReconcileNotice'
+    && a.payload.notice === DEAD_SESSION_RECONCILE_NOTICE)
+  expect(deadNotices).toHaveLength(3)
+  // The batched adjudication dispatch is gone with the state — its absence
+  // is compile-enforced once the action creator is deleted (nothing can
+  // dispatch it), so no negative assertion is needed or written here.
 })
 ```
 
-(Also drop the single `setDeadSessionAdjudication` expect from the routing test at `:316`; widen the latch-breadcrumb test at `:375` to pin `reason: 'durable_artifact_missing'`.)
+(Also drop the single `setDeadSessionAdjudication` expect from the routing test at `:316`; widen the latch-breadcrumb test at `:375` to pin `reason: 'durable_artifact_missing'` and the dead-copy notice mint. NOTE: this test is being written in Task 2 already if Task 2 ran first — reconcile the two edits into one final shape.)
 
-In `pane-reconcile.fresh-agent.test.ts`, split `:358` the same way (2 dead fresh-agent verdicts → 2 `setPaneRestoreError`, zero batch dispatch; the existing restoreError asserts stay).
+In `pane-reconcile.fresh-agent.test.ts`, split `:358` the same way for the LATCH only (2 dead fresh-agent verdicts → 2 `setPaneRestoreError`, zero batch dispatch, and ZERO `setPaneReconcileNotice` dead-copy mints — the fresh-agent arm must NOT mint the notice, per LB1's caveat; the existing restoreError asserts stay).
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
@@ -424,7 +453,7 @@ Expected: PASS + typecheck clean.
 
 - [ ] **Step 5: Refactor while green**
 
-`pnpm run lint`. Grep-check for stragglers: `rg -n 'deadSessionAdjudication|DeadSessionEntry|setDeadSessionAdjudication|resolveDeadSessionEntry|clearDeadSessionAdjudication|deadSessionTitle' src test/unit` must return only comment-only mentions in unrelated suites (optional cleanup) and nothing live.
+`pnpm run lint`. Grep-check for stragglers in PRODUCTION code: `rg -n 'deadSessionAdjudication|DeadSessionEntry|setDeadSessionAdjudication|resolveDeadSessionEntry|clearDeadSessionAdjudication|deadSessionTitle' src` must return nothing. In `test/unit`, typecheck already forbids live imports; remaining comment-only mentions in unrelated suites are optional cleanup only.
 
 - [ ] **Step 6: Run impacted-test verification**
 
@@ -454,7 +483,7 @@ All four browser specs that interact with the dialog get rewritten to pin the ne
 - Modify: `test/e2e-browser/specs/freshclaude-zero-turn-restart-rust.spec.ts` (`:229-235` state half; `:246` restoreError negative stays)
 
 **Interfaces:**
-- Consumes: Task 2's `DEAD_SESSION_NOTICE` literal (pin the same string in the specs), Task 4's final state shape.
+- Consumes: Task 2's `DEAD_SESSION_BUFFER_NOTICE` literal (pin the same string in the specs), Task 4's final state shape.
 - Produces: the no-modal e2e contract: no `role="dialog"` named "Dead sessions" ever; dead panes show the notice line; latch stands; nothing auto-closes; resolution through existing chrome.
 
 - [ ] **Step 1: Rewrite the specs (test-first: these specs are red against the branch until Tasks 1-4 land — after they land, run them red→green in the same commit order)**
@@ -469,7 +498,7 @@ Act: server.restart() with both session files deleted (existing :594-596 recipe)
 Assert (live-reconnect shape):
  1. ZERO dialogs: await expect(page.getByRole('dialog', { name: 'Dead sessions' })).toHaveCount(0)
  2. Each dead pane's stale buffer (harness.getTerminalBuffer(<captured stale terminalId>))
-    contains DEAD_SESSION_NOTICE exactly once (count the occurrences === 1).
+    contains DEAD_SESSION_BUFFER_NOTICE exactly once (count the occurrences === 1).
  3. TestHarness.getState(): both leaves carry
     content.restoreError.reason === 'durable_artifact_missing'.
  4. No auto-close: pane count and tab count unchanged from pre-restart;
@@ -481,19 +510,24 @@ waitForWsReady, retryWarmingIfVisible if the warming banner appears.
     the existing TerminalLaunchFailureCard. NOTE (kata ebp6): this spec's
     codex seeding has a known flake (seeded leaf null after 20s); if the
     rewritten spec hits it, harden the seeding — do not skip.
- 6. Click pane A's failure-card "Start fresh" (existing chrome, wired to
-    resetPaneForReconcileCreate): poll until pane A is live with
-    !restoreError and exactly ONE new codex PTY exists server-side.
+ 6. Click pane A's failure-card "Start fresh" (existing chrome; validated
+    wiring LB3: it drives startNewManagedRuntimeConversation — NOT
+    resetPaneForReconcileCreate — so assert pane A's createRequestId
+    CHANGES and the new codex PTY is identity-less: no --resume of the
+    dead session id in the server-side terminal argv; exactly ONE new PTY
+    exists; pane A live with !restoreError).
  7. Close pane B via its pane header close button
-    (getByRole('button', { name: 'Close pane' })): pane B leaves the layout,
-    no PTY spawned, tab survives.
+    (getByRole('button', { name: 'Close pane' })). LB4 (validated): each
+    dead pane is its own single-pane tab, so closing pane B removes B's
+    TAB (pane A's tab survives); assert one tab gone, one fewer leaf, no
+    PTY spawned.
  8. Final: still zero dialogs for the whole test; one live PTY; the second
     pane's departure was the user's click, not the verdict.
 ```
 
-**`freshclaude-identity-persistence-rust.spec.ts` HAZARD GUARD** (`:754`): keep the fixture and every keep-assertion (`:805-807` leaf fresh-agent + `restoreError.reason === 'durable_artifact_missing'`; `:824-840` identity not swapped, latch standing, ZERO `freshAgent.create`; `:849-858` the FreshAgentView `role="alert"` banner text "This session cannot be resumed because the saved session artifact is no longer available." after second reload). Replace `:798-804` (the `state.panes.deadSessionAdjudication` poll — deleted state) and `:811` (modal visible) with: `expect(page.getByRole('dialog', { name: 'Dead sessions' })).toHaveCount(0)` (never renders).
+**`freshclaude-identity-persistence-rust.spec.ts` HAZARD GUARD** (`:754`): keep the fixture and every keep-assertion (`:805-807` leaf fresh-agent + `restoreError.reason === 'durable_artifact_missing'`; `:824-840` identity not swapped, latch standing, ZERO `freshAgent.create`; `:849-858` the FreshAgentView `role="alert"` banner text "This session cannot be resumed because the saved session artifact is no longer available." after second reload). LB5 (validated): the deleted `state.panes.deadSessionAdjudication` poll at `:798-804` was the ONLY verdict-synchronization wait between reconnect and the `:805-807` leaf asserts — replacing it with a bare instant no-dialog assert would race the boot-reconcile fold. Replace it with the suite's own idiom: an `expect.poll` on the leaf's `content.restoreError.reason === 'durable_artifact_missing'` (same shape as this spec `:564/:581` and the adoption spec's leaf-latch polls), and only THEN assert `expect(page.getByRole('dialog', { name: 'Dead sessions' })).toHaveCount(0)` (replacing both the state poll `:798-804` and the modal-visible assert `:811`).
 
-**`unified-agent-names-restart.spec.ts` freshcodex branch** (`:223-228`): today it waits for the dialog and clicks "Start fresh here". Rewrite: after the zero-turn restart (natural `dead_session{session_not_on_disk}`), assert no dialog, the pane keeps its `restoreError` banner, and drive the remint through the fresh-agent pane's own existing affordances — read the spec's post-click assertions first and preserve their intent with the pane's actual chrome (the fresh-agent pane's own Start-new-conversation / composer affordance if present in this state, otherwise close the pane and let the spec's remaining assertions run against the surviving state). Do not leave the branch asserting the deleted dialog.
+**`unified-agent-names-restart.spec.ts` freshcodex branch** (`:223-228`): today it waits for the dialog and clicks "Start fresh here" (the modal's `resetFreshAgentPaneForReconcileCreate` — the one remint verb that preserved `createRequestId` and the name-inheritance record). LB7 (validated): the only existing-chrome remint reachable in the dead state is the composer's `/new` slash route, which calls `startNewManagedRuntimeConversation` — a NEW identity with the name record STRANDED (`panesSlice.ts:2018-2019` clears `nameRef`/`namingHandle`). No existing-chrome route preserves the modal's name-inheriting remint semantics, and adding one would violate the no-new-UI constraint. Re-scope the branch against the validated assertion map: KEEP `:236-238` (API-only readUpdate — pane-independent) and `:231-233` (pane-header PENDING_NAME — still passes while latched); REPLACE the dialog wait/click with: assert no dialog ever, the pane keeps its `restoreError` banner; DROP `:243+` (send-first-message materialization and every pane-dependent post-remint step — no honest existing-chrome route reaches them). Record the product residual in the spec's header comment: after this change a dead freshcodex session's durable name no longer carries onto a remint through pane chrome (`/new` starts a stranded-name new conversation; the pane's close button ends it) — surfaced to the user in the run recap as an accepted consequence of removing the modal.
 
 **`freshclaude-zero-turn-restart-rust.spec.ts`** (`:229-235`): drop the dialog-count and `deadSessionAdjudication` state asserts; the must-NOT-be-dead intent stays pinned by `:246` (`leaf.content.restoreError?.reason` NOT `durable_artifact_missing`) — keep that line byte-identical.
 
