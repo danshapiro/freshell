@@ -23,7 +23,7 @@
 
 **Goal:** A terminal pane whose saved session was deleted from disk explains itself with one line in its own xterm buffer instead of raising a blocking modal on every login/reconnect; every existing safety guarantee (no auto-close, no silent substitution, no duplicate resume PTYs, typed refusals) is preserved.
 
-**Architecture:** Delete the `DeadSessionPanel` modal component and the whole `deadSessionAdjudication` store slice (state, reducers, fold batching, App clear branch) — the per-pane persisted `restoreError` latch (`durable_artifact_missing`) becomes the single dead-session state. TerminalView re-keys its INVALID_TERMINAL_ID recovery stand-down gate from the (deleted) adjudication list to that latch, and gains one effect that writes a single `writeLocalXtermNotice` line into the pane's stale buffer, exactly once per dead adjudication (ref-latch idempotency, re-armed when the latch clears). Fresh-agent panes change nothing (their existing banner already reads the latch). All four `foldVerdicts` call sites keep dispatching `setPaneRestoreError`; only the entry accumulation and batch dispatch go away. Server code is untouched.
+**Architecture:** Delete the `DeadSessionPanel` modal component and the whole `deadSessionAdjudication` store slice (state, reducers, fold batching, App clear branch) — the per-pane persisted `restoreError` latch (`durable_artifact_missing`) becomes the single dead-session state. TerminalView re-keys its INVALID_TERMINAL_ID recovery stand-down gate from the (deleted) adjudication list to that latch, and gains one effect that writes a single notice line directly into the pane's stable stale buffer (bypassing the generation-scoped write queue), exactly once per dead adjudication, keyed on a fold-minted dead copy of the existing one-shot `reconcileNotice` field (ref-latch idempotency, re-armed when the latch clears). Fresh-agent panes change nothing (their existing banner already reads the latch). All four `foldVerdicts` call sites keep dispatching `setPaneRestoreError`; only the entry accumulation and batch dispatch go away. Server code is untouched.
 
 **Tech Stack:** React 18 + Redux Toolkit (src/store, src/components), xterm.js local notice idiom (`writeLocalXtermNotice`), Vitest (test/unit/client), Playwright against the real Rust server (test/e2e-browser). pnpm 10.34.5 only.
 
@@ -157,7 +157,7 @@ git commit -m "feat(terminal): stand down INVALID_TERMINAL_ID recovery on the de
 
 ### Task 2: Dead-session notice line in the terminal pane's buffer
 
-One `writeLocalXtermNotice` line, exactly once per dead adjudication per mount, into the pane's own stale xterm buffer. Re-arms when the latch clears (user resolved the pane); survives reconnect re-adjudication via a ref key.
+One buffer notice line, exactly once per dead adjudication per mount, into the pane's own stale xterm buffer (written directly, not through the write queue). Re-arms when the latch clears (user resolved the pane); survives reconnect re-adjudication via a ref key.
 
 **Keying (load-bearing-validated LB1; fresh-eyes round 2 finding 1):** the notice must NOT key on raw `restoreError` — `durable_artifact_missing` is also minted on LIVE panes by the codex dead-live-handle recovery breadcrumb (`TerminalView.tsx:6792`, pane goes live with the latch persisted) and the server-folded `terminal.created` restoreError (`:5842`, pinned live by `test/e2e/codex-refresh-rehydrate-flow.test.tsx:556-577`). Instead the fold's terminal `dead_session` arm additionally mints the existing one-shot store field `reconcileNotice` with a dedicated dead copy — a signal no other producer can mint — and ONLY the new notice effect owns that copy:
 - Both existing anchor consumers (`terminal.created` at `:5950-5959`, attach branch at `:7013-7020`) gain an explicit skip for the dead copy (neither write it nor clear it) — without the guard, the attach effect in the same post-verdict flush can read the mint from `contentRef.current` before the notice effect's clear lands, double-writing or writing the raw store copy.
@@ -172,7 +172,8 @@ The fresh-agent dead arm does NOT mint the notice (FreshAgentView renders `recon
 - Test: `test/unit/client/components/TerminalView.lifecycle.test.tsx` (exactly-once, re-arm, reload-shape, provider-wait, retained-terminalId race pins)
 
 **Interfaces:**
-- Consumes: `writeLocalXtermNotice(term, data)` (`TerminalView.tsx:1652`, caller frames `\r\n`), `setPaneReconcileNotice` / `clearPaneReconcileNotice` (existing actions), `shouldWaitForProviderBehavior`, `termRef`.
+- Consumes: the `writeLocalXtermNotice` core (`TerminalView.tsx:1652` — side-effect gate, surface bookkeeping, write-scope framing; caller frames `\r\n`), `setPaneReconcileNotice` / `clearPaneReconcileNotice` (existing actions), `shouldWaitForProviderBehavior`, `termRef`.
+- Produces: `writeLocalXtermNoticeDirect` — a synchronous no-queue variant extracted from `writeLocalXtermNotice`'s existing fallback path (shared core; only the notice effect calls the direct variant), plus the two constants below.
 - Produces:
   - `export const DEAD_SESSION_RECONCILE_NOTICE = 'Saved session no longer exists on disk.'` in `src/lib/pane-reconcile.ts` (the fold-minted store-field copy — matched exactly, so the `invalid`-arm and reset notices can never trigger the effect);
   - `const DEAD_SESSION_BUFFER_NOTICE = "[This pane's saved session no longer exists on disk - close this pane or start a new one]"` (module-level const in TerminalView.tsx — the xterm line; unit and e2e tests pin this literal).
