@@ -35,7 +35,14 @@ cd /home/dan/code/freshell
 curl -fsS --connect-timeout 5 --max-time 10 http://127.0.0.1:3001/api/health
 ```
 
-If the health check fails, start the server with the canonical launcher:
+If the health check fails, inspect the recorded owner's state and logs first;
+failure does not establish that the process is stopped. The launcher below is
+for a launcher-owned ordinary server or a confirmed inactive new instance.
+For managed installations use [Managed-runtime upgrades](#managed-runtime-upgrades)
+to preserve the verified feature build and stores. Use systemd for a
+systemd-owned instance.
+
+For an ordinary launcher-owned instance, start with the canonical launcher:
 
 ```bash
 scripts/launch-rust.sh --port 3001
@@ -56,6 +63,59 @@ launches the Rust binary directly — its `ExecStart` is the
 `freshell-server` executable, no package manager involved — so it performs
 no dependency preparation; prepare the checkout once on that machine as
 above, and the service restores the server after restarts.
+
+## Managed-runtime upgrades
+
+For a managed installation, complete the
+[preserving-store upgrade procedure](managed-runtime-rollout.md#upgrade-an-existing-installation-while-preserving-stores)
+before installation. It requires an isolated old-schema backup/upgrade/readability
+drill, current candidate verification, and a consistent verified live backup
+**before any candidate registry opener**. A migration preview does not create
+that backup. Prepare artifacts away from live binary/client/sidecar paths and
+preserve existing registry, control, runtime, provider, session, and configuration
+paths. This repair checks ordinary use in the four Codex/OpenCode modes;
+Claude live behavior remains unverified by explicit agreement. The backup
+drill below applies to a separately requested production upgrade, not to this
+repair's acceptance. Committing these instructions does not authorize
+production installation.
+
+Record the actual owners, effective units/commands and port before requesting
+the separate exact **APPROVED** for installation, necessary backup maintenance,
+and restarts. PR creation/landing approval is distinct. Keep prior artifacts,
+configuration, and image with the matching verified old-schema backup.
+
+With systemd ownership, use the recorded effective units. After installing the
+verified artifacts/settings, restart the supervisor first and verify control
+socket/readiness, then restart the server. The supplied unit names are
+`freshell-supervisor.service` and `freshell-rust.service`; confirm the actual
+units and override the server template's port 3002 to retain live port 3001.
+Do not run the launcher against a systemd-owned port.
+
+With launcher ownership, prepare/install the server built with
+`freshell-server/managed-runtime-v1`, supervisor/session-host, client, and
+sidecar first. Resolve the independently owned supervisor's restart command
+and verify its readiness before restarting the server. Only after the approved
+backup and installation, run from the recorded server checkout:
+
+```bash
+scripts/launch-rust.sh --skip-build --restart --port 3001
+```
+
+The default launcher rebuild uses no managed feature; use `--skip-build` to
+retain the verified candidate. Even this path checks sidecar prerequisites,
+so prepare their locked tree beforehand. Both server opt-ins
+`FRESHELL_MANAGED_RUNTIME_V1=1` and `FRESHELL_MANAGED_FRESH_AGENT_V1=1`, control
+socket/secret paths, and the supervisor's immutable `FRESHELL_RUNTIME_IMAGE`
+must be effective in their actual owners. Do not use qualification overrides
+or fixture modes for production. Managed Amplifier/Kilroy stay disabled.
+
+Check health, startup build identity/features, effective image, intended
+four-mode admission, structured errors, and preserved inventory/history metadata
+without starting or prompting historical sessions. On failure preserve new
+state and prefer a compatible fix-forward; an older binary may reject the
+upgraded schema. Restoring old state needs a matching verified backup and a
+separately approved concrete restore/restart that loses no later writes or
+changed user intent.
 
 On a managed-runtime instance (systemd topology, see "Redeploy managed
 runtime" below), do NOT recover a dead server with

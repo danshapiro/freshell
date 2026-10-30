@@ -129,6 +129,9 @@ COPY --from=node-builder /app/node_modules ./node_modules
 # Its node_modules links back to the root pnpm store copied above.
 COPY --from=node-builder /app/crates/freshell-claude-sidecar/node_modules ./crates/freshell-claude-sidecar/node_modules
 COPY --from=node-builder /opt/freshell-test-providers/codex/0.164.0-linux-x64 /opt/freshell-test-providers/codex/0.164.0-linux-x64
+# The native-history producer invokes esbuild from this workspace member.
+# pnpm keeps its executable/dependency links beside the member manifest.
+COPY --from=node-builder /app/packages/freshell-mcp-runtime/node_modules ./packages/freshell-mcp-runtime/node_modules
 
 # Fail the image build if the copied test toolchain cannot execute in this
 # Debian runtime. A container-level test checks the configured runtime user.

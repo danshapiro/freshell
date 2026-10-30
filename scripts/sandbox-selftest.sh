@@ -246,10 +246,7 @@ P3C_OUT="$("${REPO_ROOT}/scripts/sandbox-test.sh" --runtime-suite '
     echo "default-route-visible"
     exit 1
   fi
-  if touch /runtime-suite-root-write-probe 2>/dev/null; then
-    echo "root-writable"
-    exit 1
-  fi
+  bash scripts/test/assert-sandbox-readonly-root.sh
   cap_eff=$(awk "/^CapEff:/ {print \$2}" /proc/self/status)
   [ "$cap_eff" = "0000000000000000" ] || { echo "effective-capabilities:$cap_eff"; exit 1; }
   echo "runtime-suite-isolated"
@@ -530,6 +527,15 @@ if [ "${P7_STATUS}" -eq 0 ] && echo "${P7_OUT}" | grep -q 'sandbox_cache_selftes
   pass "per-worktree Cargo target volumes are writable, isolated, reusable, labeled, and protected while referenced"
 else
   fail "per-worktree cache volume self-test: exit=${P7_STATUS} output=[${P7_OUT}]"
+fi
+echo
+
+# ---- Proof 8: cold runtime-suite dependency preparation and confinement ----
+echo "--- Proof 8: cold runtime-suite startup ---"
+if bash "${REPO_ROOT}/scripts/test/sandbox-runtime-startup.test.sh"; then
+  pass "cold and stale runtime dependencies are prepared before confined execution; failures stop the caller"
+else
+  fail "runtime-suite startup regression"
 fi
 echo
 

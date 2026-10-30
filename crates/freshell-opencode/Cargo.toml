@@ -29,12 +29,14 @@ publish.workspace = true
 # are additive production backends behind this feature (verified to compile; wired
 # live in the next step). Default-off keeps the shared workspace build lean.
 default = []
-real-transport = ["dep:reqwest", "dep:libc", "tokio/process", "tokio/io-util"]
+real-transport = ["dep:freshell-activity", "dep:futures", "dep:reqwest", "dep:libc", "tokio/process", "tokio/io-util"]
 # The opt-in contract requires a separately provisioned pinned OpenCode binary; it
 # stays out of default workspace/pre-push behavior and reuses production transport.
 real-provider-contract-tests = ["real-transport"]
 
 [dependencies]
+freshell-activity = { path = "../freshell-activity", optional = true }
+futures = { version = "0.3", default-features = false, features = ["std"], optional = true }
 freshell-platform = { path = "../freshell-platform" }
 # Dynamic JSON parsing that mirrors the TS `Record<string, unknown>` event/property
 # model (JSON.parse parity, corruption-tolerant). preserve_order matches the object model.

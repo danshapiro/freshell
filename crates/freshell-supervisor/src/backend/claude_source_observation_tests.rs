@@ -3,7 +3,10 @@ use freshell_platform::claude_inputs::observation::{LocalDecision, NativeObserva
 use freshell_runtime_protocol::{
     ClaudeSourceAuthority, InitialAuthVolumeObservation, ReserveProviderInputsRequest,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::time::Duration;
 use tokio::{net::UnixListener, task::JoinSet};
 
@@ -164,6 +167,30 @@ fn provider_claude_private_candidate_metadata_enforces_inclusive_limits() {
 
 #[tokio::test]
 async fn provider_claude_physical_candidate_publication_gates_frozen_consumer() {
+    physical_candidate_publication_fixture(None).await;
+}
+
+#[tokio::test]
+async fn provider_claude_candidate_reader_removal_survives_caller_interruption() {
+    physical_candidate_publication_fixture(Some("cancel-reader-delete")).await;
+}
+
+#[tokio::test]
+async fn provider_claude_candidate_scratch_removal_does_not_recreate_helper_or_home() {
+    physical_candidate_publication_fixture(Some("cancel-scratch-delete")).await;
+}
+
+#[tokio::test]
+async fn provider_claude_candidate_cancelled_call_settles_late_scratch_creation() {
+    physical_candidate_publication_fixture(Some("cancel-scratch-create")).await;
+}
+
+#[tokio::test]
+async fn provider_claude_candidate_cancelled_call_settles_late_reader_creation() {
+    physical_candidate_publication_fixture(Some("cancel-reader-create")).await;
+}
+
+async fn physical_candidate_publication_fixture(interruption: Option<&'static str>) {
     use freshell_platform::claude_inputs::{
         AcceptedNativeSourcePlan, ClaudeInputManifest, ClaudeSettingSource, NativeSourceRuntime,
     };
@@ -458,6 +485,7 @@ async fn provider_claude_physical_candidate_publication_gates_frozen_consumer() 
                     handle: Box::new(OwnedRuntimeHandle::from_registry(
                         InstallationId::new(),
                         reservation.soul_id,
+                        "retained-store".into(),
                         IncarnationId::new(),
                         LaunchNonce::new(),
                         daemon_id,
@@ -495,7 +523,7 @@ async fn provider_claude_physical_candidate_publication_gates_frozen_consumer() 
             let qualified = qualify_candidate_stage(&stage, &owner, &request);
             assert_eq!(qualified.is_ok(),mode=="valid" || retained,"{flavor}/{runtime:?}/{mode}: physical issuer and current owner must qualify before consumer selection: {:?}",qualified.as_ref().err());
             if let Ok(projection) = qualified {
-                qualify_candidate_helper_transport(&owner, &request, &stage).await;
+                qualify_candidate_helper_transport(&owner, &request, &stage, interruption).await;
                 let selected = &projection
                     .provider_launch_context
                     .prepared_inputs
@@ -684,6 +712,7 @@ async fn qualify_transport(mode: &'static str) {
             handle: Box::new(OwnedRuntimeHandle::from_registry(
                 InstallationId::new(),
                 reservation.soul_id.clone(),
+                "synthetic-store".into(),
                 IncarnationId::new(),
                 LaunchNonce::new(),
                 daemon.clone(),
@@ -1016,6 +1045,7 @@ async fn qualify_candidate_helper_transport(
     owner: &ClaudeSourceOwner,
     request: &ObserveClaudeSourcesRequest,
     stage: &Path,
+    interruption: Option<&'static str>,
 ) {
     let mut modes = vec![
         "success",
@@ -1031,7 +1061,10 @@ async fn qualify_candidate_helper_transport(
         "slow-reader-delete",
         "late-scratch-create",
     ];
-    if matches!(owner, ClaudeSourceOwner::Retained { .. }) {
+    if let Some(mode) = interruption {
+        modes = vec![mode];
+    }
+    if interruption.is_none() && matches!(owner, ClaudeSourceOwner::Retained { .. }) {
         modes.extend([
             "writable-retained-home",
             "wrong-retained-volume",
@@ -1088,7 +1121,13 @@ async fn qualify_candidate_helper_transport(
         let volume = Arc::new(Mutex::new(None::<Value>));
         let listener = UnixListener::bind(owned.path().join("docker.sock")).unwrap();
         let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
-        let (seen, bodies, backing) = (calls.clone(), containers.clone(), volume.clone());
+        let phase_reached = Arc::new(AtomicBool::new(false));
+        let (seen, bodies, backing, phase) = (
+            calls.clone(),
+            containers.clone(),
+            volume.clone(),
+            phase_reached.clone(),
+        );
         // Docker has made the scratch volume whose create it answers late.
         let scratch_made = Arc::new(tokio::sync::Notify::new());
         let made = scratch_made.clone();
@@ -1106,7 +1145,7 @@ async fn qualify_candidate_helper_transport(
                     _=&mut stopped=>break,
                     accepted=listener.accept()=>{
                         let (mut stream,_)=accepted.unwrap();
-                        let (seen,bodies,backing,daemon,private_jobs,expected_scratch,retained_name,made)=(seen.clone(),bodies.clone(),backing.clone(),daemon.clone(),private_jobs.clone(),expected_scratch.clone(),retained_name.clone(),made.clone());
+                        let (seen,bodies,backing,daemon,private_jobs,expected_scratch,retained_name,made,phase)=(seen.clone(),bodies.clone(),backing.clone(),daemon.clone(),private_jobs.clone(),expected_scratch.clone(),retained_name.clone(),made.clone(),phase.clone());
                         jobs.spawn(async move {
                             let mut header=Vec::new();let mut byte=[0];
                             // A caller may abandon a request it no longer waits for.
@@ -1123,14 +1162,16 @@ async fn qualify_candidate_helper_transport(
                                 if serde_json::from_value::<BTreeMap<String,String>>(body["Labels"].clone()).is_err() { (400,json!({"message":"volume labels require string metadata"})) }
                                 else {
                                     // A stalled daemon makes the volume only after the reader's deadline.
-                                    if mode=="late-scratch-create" {tokio::time::sleep(Duration::from_millis(900)).await;}
+                                    if mode=="cancel-scratch-create" {phase.store(true, Ordering::SeqCst);}
+                                    if matches!(mode,"late-scratch-create"|"cancel-scratch-create") {tokio::time::sleep(Duration::from_millis(900)).await;}
                                     let actual=json!({"Name":body["Name"],"Driver":"local","Options":{},"Labels":body["Labels"],"Mountpoint":"/synthetic/ordinary-volume"});*backing.lock().unwrap()=Some(actual.clone());made.notify_one();(201,actual) }
                             }
                             else if line.starts_with("GET") && line.contains("/volumes/"){if retained_name.as_ref().is_some_and(|name|line.contains(name)) {(200,json!({"Name":retained_name,"Driver":"local","Options":{},"Mountpoint":"/synthetic/retained-home"}))} else {match backing.lock().unwrap().clone(){Some(v) if line.contains(v["Name"].as_str().unwrap())=>(200,v),_=>(404,json!({}))}}}
-                            else if line.starts_with("DELETE") && line.contains("/volumes/"){assert!(bodies.lock().unwrap().is_empty(),"candidate helpers must be gone before volume deletion");if mode!="volume-still-present" {*backing.lock().unwrap()=None;}(204,json!({}))}
+                            else if line.starts_with("DELETE") && line.contains("/volumes/"){assert!(bodies.lock().unwrap().is_empty(),"candidate helpers must be gone before volume deletion");if mode!="volume-still-present" {*backing.lock().unwrap()=None;}if mode=="cancel-scratch-delete" {phase.store(true, Ordering::SeqCst);tokio::time::sleep(Duration::from_millis(900)).await;}(204,json!({}))}
                             else if line.contains("/containers/create?"){
                                 if body["Cmd"]==json!(["project-claude-candidate-private"]) {let root=body["HostConfig"]["Mounts"].as_array().unwrap().iter().find(|m|m["Target"]=="/run/freshell-candidate-inputs").unwrap()["Source"].as_str().unwrap();assert!(!Path::new(root).join(".freshell/mcp-capability.json").exists(),"ordinary candidate input root must not expose capability credentials");}
                                 let name=line.split("name=").nth(1).unwrap().split_whitespace().next().unwrap().to_string();let id=if body["Cmd"]==json!(["prepare-provider-mountpoints"]) {"a".repeat(64)} else {"b".repeat(64)};let record=json!({"Id":id,"Config":body,"HostConfig":body["HostConfig"],"State":{"Running":false}});
+                                if mode=="cancel-reader-create" && body["Cmd"]==json!(["project-claude-candidate-private"]) {phase.store(true, Ordering::SeqCst);tokio::time::sleep(Duration::from_millis(900)).await;}
                                 if mode=="late-mountpoints-create" && body["Cmd"]==json!(["prepare-provider-mountpoints"]) {
                                     // Docker makes this helper after the reader's deadline,
                                     // whether or not the reader still waits for the answer.
@@ -1154,6 +1195,7 @@ async fn qualify_candidate_helper_transport(
                                 // Docker removes the reader but answers only after the
                                 // caller's cleanup window, as a force-remove that waits
                                 // on a host-wide writeback does.
+                                if mode=="cancel-reader-delete" && key=="b".repeat(64) {phase.store(true, Ordering::SeqCst);tokio::time::sleep(Duration::from_millis(900)).await;}
                                 if mode=="slow-reader-delete" && key=="b".repeat(64) {tokio::time::sleep(Duration::from_millis(5_500)).await;}
                                 (204,json!({}))}
                             else if line.contains("/start "){let id=line.split("/containers/").nth(1).unwrap().split('/').next().unwrap();let v=bodies.lock().unwrap().values().find(|v|v["Id"]==id).unwrap().clone();private_jobs.lock().unwrap().push(tokio::spawn(async move {
@@ -1221,16 +1263,51 @@ async fn qualify_candidate_helper_transport(
         } else {
             Duration::from_secs(3)
         };
-        let result = backend
-            .read_claude_candidate_helper(
-                owner,
-                request,
-                stage,
-                "synthetic-source-run",
-                HelperDeadlines::after(budget, Duration::from_secs(5)),
-                retained_name.as_ref().map(|_| prior_stage.as_path()),
-            )
-            .await;
+        let operation = backend.read_claude_candidate_helper(
+            owner,
+            request,
+            stage,
+            "synthetic-source-run",
+            HelperDeadlines::after(budget, Duration::from_secs(5)),
+            retained_name.as_ref().map(|_| prior_stage.as_path()),
+        );
+        let result = if interruption.is_some() {
+            let mut operation = Box::pin(operation);
+            let wait_phase = async {
+                while !phase_reached.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            };
+            tokio::select! {
+                result = &mut operation => panic!("{mode}: operation ended before the controlled phase: {result:?}"),
+                _ = tokio::time::timeout(Duration::from_secs(5), wait_phase) => {}
+            }
+            assert!(
+                phase_reached.load(Ordering::SeqCst),
+                "{mode}: controlled phase was reached"
+            );
+            // Drop the caller during a real Docker operation. Cleanup must
+            // transfer to the existing reaper, not depend on a later request.
+            drop(operation);
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let roots = candidate_input_roots(&calls.lock().unwrap());
+                if containers.lock().unwrap().is_empty()
+                    && volume.lock().unwrap().is_none()
+                    && roots.iter().all(|root| !root.exists())
+                {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(fail("controlled caller cancellation").into())
+        } else {
+            operation.await
+        };
         if mode == "late-scratch-create" {
             // Let Docker finish the volume the read gave up on, then give a
             // cleanup that settled the create time to remove it.
@@ -1290,6 +1367,29 @@ async fn qualify_candidate_helper_transport(
                         .contains(&format!("/containers/{}/start ", "b".repeat(64)))),
                 "{mode}: changed candidate topology must block before projection starts"
             );
+        }
+        if interruption.is_some() {
+            let roots = candidate_input_roots(&seen);
+            assert!(
+                roots.iter().all(|root| !root.exists()),
+                "{mode}: owned inputs release after helper cleanup"
+            );
+            assert_eq!(
+                seen.iter()
+                    .filter(
+                        |(line, _)| line.starts_with("POST") && line.contains("/volumes/create ")
+                    )
+                    .count(),
+                1,
+                "{mode}: cleanup cannot recreate the removed native HOME"
+            );
+            if mode == "cancel-reader-create" {
+                assert!(
+                    !seen.iter().any(|(line, _)| line
+                        .contains(&format!("/containers/{}/start ", "b".repeat(64)))),
+                    "a late retired reader must never START"
+                );
+            }
         }
         for (line, body) in seen.iter() {
             assert!(!line.contains("/logs"));

@@ -53,6 +53,9 @@ fn main() {
     println!("cargo:rustc-env=FRESHELL_BUILD_COMMIT={commit}");
     println!("cargo:rustc-env=FRESHELL_BUILD_DIRTY={dirty}");
     println!("cargo:rerun-if-env-changed=FRESHELL_BUILD_COMMIT");
+    // Owned build callers derive this cache trigger from their actual source
+    // state. It invalidates a cached stamp; provenance still comes from git.
+    println!("cargo:rerun-if-env-changed=FRESHELL_BUILD_SOURCE_STATE");
 
     for path in rerun_paths() {
         println!("cargo:rerun-if-changed={}", path.display());

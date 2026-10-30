@@ -356,10 +356,10 @@ async fn planning_error_tears_the_sidecar_down_and_surfaces_the_error() {
         .await
         .unwrap_err();
     match err {
-        CodexLaunchError::Failed(message) => {
+        CodexLaunchError::AppServerStart(message) => {
             assert!(message.contains("ensureReady failed"), "{message}");
         }
-        other => panic!("expected Failed, got {other:?}"),
+        other => panic!("expected AppServerStart, got {other:?}"),
     }
     // Cleanup-on-plan-failure: the sidecar (runtime) was shut down.
     assert_eq!(runtime.shutdown_calls.load(Ordering::SeqCst), 1);
@@ -463,7 +463,7 @@ async fn retry_gives_up_after_the_attempt_budget_on_transient_failures() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(err, CodexLaunchError::Failed(_)));
+    assert!(matches!(err, CodexLaunchError::AppServerStart(_)));
     // One ensureReady per attempt: the budget is honored.
     assert_eq!(runtime.ensure_ready_calls.lock().unwrap().len(), 3);
 }

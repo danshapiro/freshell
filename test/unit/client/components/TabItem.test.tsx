@@ -102,6 +102,31 @@ describe('TabItem', () => {
     expect(screen.getByText('Test Tab')).toBeInTheDocument()
   })
 
+  it.each([false, true])('exposes the tab selected state when active is %s', (isActive) => {
+    render(<TabItem {...defaultProps} isActive={isActive} />)
+    const tab = screen.getByRole('tab', { name: 'Test Tab', selected: isActive })
+    expect(tab).toHaveAttribute('data-tab-id', 'tab-1')
+    expect(tab).toHaveAttribute('tabindex', '0')
+  })
+
+  it.each(['Enter', ' '])('activates the tab with %j', (key) => {
+    const onClick = vi.fn()
+    render(<TabItem {...defaultProps} onClick={onClick} />)
+    const tab = screen.getByRole('tab', { name: 'Test Tab' })
+
+    expect(fireEvent.keyDown(tab, { key })).toBe(false)
+    expect(onClick).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps other keys from activating the tab', () => {
+    const onClick = vi.fn()
+    render(<TabItem {...defaultProps} onClick={onClick} />)
+
+    fireEvent.keyDown(screen.getByRole('tab', { name: 'Test Tab' }), { key: 'Escape' })
+
+    expect(onClick).not.toHaveBeenCalled()
+  })
+
   it('applies active styles when isActive is true', () => {
     render(<TabItem {...defaultProps} isActive={true} />)
     const el = getTabElement()
@@ -425,7 +450,7 @@ describe('TabItem', () => {
     it('shows full title in tooltip on hover', async () => {
       render(<TabItem {...defaultProps} tab={createTab({ title: 'My Long Tab Name' })} />)
 
-      const tabEl = screen.getByRole('button', { name: 'My Long Tab Name' })
+      const tabEl = screen.getByRole('tab', { name: 'My Long Tab Name' })
       fireEvent.mouseEnter(tabEl)
 
       const tooltip = await screen.findByRole('tooltip')
@@ -435,7 +460,7 @@ describe('TabItem', () => {
     it('hides tooltip on mouse leave', async () => {
       render(<TabItem {...defaultProps} tab={createTab({ title: 'My Long Tab Name' })} />)
 
-      const tabEl = screen.getByRole('button', { name: 'My Long Tab Name' })
+      const tabEl = screen.getByRole('tab', { name: 'My Long Tab Name' })
       fireEvent.mouseEnter(tabEl)
 
       // Wait for tooltip to appear
@@ -459,7 +484,7 @@ describe('TabItem', () => {
         />
       )
 
-      const tabEl = screen.getByRole('button', { name: 'Renaming Tab' })
+      const tabEl = screen.getByRole('tab', { name: 'Renaming Tab' })
       fireEvent.mouseEnter(tabEl)
 
       // Give React a chance to flush — tooltip should never appear
@@ -477,7 +502,7 @@ describe('TabItem', () => {
         />
       )
 
-      const tabEl = screen.getByRole('button', { name: 'Dragging Tab' })
+      const tabEl = screen.getByRole('tab', { name: 'Dragging Tab' })
       fireEvent.mouseEnter(tabEl)
 
       // Give React a chance to flush — tooltip should never appear
