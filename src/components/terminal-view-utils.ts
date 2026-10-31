@@ -32,6 +32,37 @@ export function getExpectedSessionRefForTerminalOperation(
   return content?.sessionRef
 }
 
+/**
+ * The ONE resumable-durable-identity guard shared by two call sites:
+ * - the dead-live-handle recovery arm (TerminalView) deciding between an
+ *   explicitly-FRESH recovery create and a resume create, and
+ * - the dead-latch create stand-down gate's fresh-recovery exemption
+ *   (delta review round 2, finding 1).
+ * It answers "does this pane hold a durable identity a create could
+ * resume RIGHT NOW?" from the exact three sources the recovery arm
+ * consults: the pane's own canonical sessionRef, a captured codex
+ * durability candidate, and the single-pane-tab sessionRef fallback
+ * (kept in sync for single-pane tabs by terminal-session-association).
+ * The exemption may license ONLY an identity-less (fresh) create, so a
+ * pane that HAS an identity by this guard must stand down on the dead
+ * latch regardless of any stale fresh-recovery registry history.
+ * `fallbackMode` is the pane's persisted mode (terminal content always
+ * carries one) used only when `content.mode` is somehow absent.
+ */
+export function paneHasResumableDurableIdentity(
+  content: TerminalPaneContent | null | undefined,
+  tabSessionRef: SessionLocator | undefined,
+  fallbackMode: string,
+): boolean {
+  const restoreMode = content?.mode || fallbackMode
+  const isCodingCliMode = restoreMode !== 'shell'
+  const hasCodexCapturedRestoreState = content?.mode === 'codex' && Boolean(content.codexDurability?.candidate)
+  const tabSessionRefFallback = !content?.sessionRef && isCodingCliMode
+    ? tabSessionRef
+    : undefined
+  return Boolean(content?.sessionRef) || hasCodexCapturedRestoreState || Boolean(tabSessionRefFallback)
+}
+
 export function getSafeLiveTerminalForCreate(
   content: TerminalPaneContent | null | undefined,
   options: { allowLiveTerminalWithSessionRef?: boolean } = {},

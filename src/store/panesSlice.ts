@@ -9,7 +9,6 @@ import {
   normalizeFreshAgentPendingLocalEcho,
   normalizeHandoffError,
   normalizeLaunchFailure,
-  type DeadSessionEntry,
   type CrashTrace,
   type FreshAgentCheckpointWorkspace,
   type FreshAgentCheckpointOutcome,
@@ -34,6 +33,7 @@ import { loadPersistedPanes, loadPersistedTabs } from './persistMiddleware.js'
 import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
 import { mergeHydratedPaneMetadata, mergeCrossWindowPaneTitles, paneTitleMetadataEquals, type HydratePanesMeta } from './hydrate-pane-metadata-merge.js'
 import { createLogger } from '@/lib/client-logger'
+import { isDeadSessionReconcileNotice } from '@/lib/dead-session-notice'
 import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
 import { sanitizeRestoreError, sanitizeCrashTrace, sanitizeSessionRef, type RestoreError } from '@shared/session-contract'
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
@@ -494,7 +494,6 @@ function loadInitialPanesState(): PanesState {
     zoomedPane: {},
     refreshRequestsByPane: {},
     restoreFallbackAttemptsByPane: {},
-    deadSessionAdjudication: [],
     reconcileWarming: null,
     reconcilePendingPanes: {},
     closingTabs: {},
@@ -516,7 +515,6 @@ function loadInitialPanesState(): PanesState {
       zoomedPane: {},
       refreshRequestsByPane: {},
       restoreFallbackAttemptsByPane: {},
-      deadSessionAdjudication: [],
       reconcileWarming: null,
       reconcilePendingPanes: {},
       // The close guard is strictly in-flight state: a reload has no pending
@@ -713,6 +711,14 @@ function foldLiveTerminalAttach(content: TerminalPaneContent, terminalId: string
   if (!sameTerminal) content.streamId = undefined
   content.status = 'running'
   content.restoreError = undefined
+  // No-modal contract (delta review round 4, finding 1): the dead-copy
+  // mint is the DURABLE notice copy source — it lives exactly as long as
+  // the dead latch it explains. This fold clears the latch, so a resident
+  // dead mint goes with it; a NON-dead notice (corrected/duplicate/
+  // invalid copies) keeps its own one-shot lifecycle at the anchors.
+  if (isDeadSessionReconcileNotice(content.reconcileNotice)) {
+    content.reconcileNotice = undefined
+  }
   // kata b8ke: anchoring onto a live terminal resolves any typed launch
   // failure — the recoverable card must not outlive its recovery.
   content.launchFailure = undefined
@@ -1328,7 +1334,6 @@ export const panesSlice = createSlice({
       state.refreshRequestsByPane = {}
       state.focusEpochByPaneId = {}
       state.restoreFallbackAttemptsByPane = {}
-      state.deadSessionAdjudication = []
       state.reconcileWarming = null
       state.reconcilePendingPanes = {}
       state.closingTabs = {}
@@ -2243,7 +2248,6 @@ export const panesSlice = createSlice({
           if (!live.has(id)) delete state.focusEpochByPaneId[id]
         }
       }
-      state.deadSessionAdjudication = []
       state.reconcileWarming = null
       state.reconcilePendingPanes = {}
     },
@@ -2756,6 +2760,12 @@ export const panesSlice = createSlice({
         content.reconcileNotice = RECONCILE_NOTICE_CORRECTED
       } else if (intent === 'fresh' && reason) {
         content.reconcileNotice = reconcileFreshNotice(reason)
+      } else if (isDeadSessionReconcileNotice(content.reconcileNotice)) {
+        // No-modal contract (delta review round 4, finding 1): the reset
+        // cleared the dead latch above, so the durable dead-copy mint —
+        // retained precisely while that latch holds — goes with it
+        // (unless this fold's own corrected/fresh copy replaced it).
+        content.reconcileNotice = undefined
       }
       clearRestoreFallbackAttemptForPane(state, tabId, paneId)
       clearReconcilePendingForPane(state, tabId, paneId)
@@ -2861,10 +2871,31 @@ export const panesSlice = createSlice({
 
     setPaneReconcileNotice: (
       state,
-      action: PayloadAction<{ tabId: string; paneId: string; notice: string }>
+      action: PayloadAction<{
+        tabId: string
+        paneId: string
+        notice: string
+        /** Stale-verdict identity guard (delta round 4, finding 2): the
+         * createRequestId the verdict's REQUEST observed on this pane. When
+         * present and the CURRENT content's createRequestId differs, the pane
+         * was replaced since the request (Replace pane keeps the paneId but
+         * re-keys the content) — the verdict describes the old content, and
+         * this fold no-ops. */
+        expectedCreateRequestId?: string
+      }>
     ) => {
+      const { expectedCreateRequestId } = action.payload
       const content = findReconcilePaneContent(state, action.payload.tabId, action.payload.paneId)
       if (!content) return
+      if (expectedCreateRequestId !== undefined && content.createRequestId !== expectedCreateRequestId) {
+        log.warn('ignoring a stale-verdict reconcile notice for replaced pane content', {
+          tabId: action.payload.tabId,
+          paneId: action.payload.paneId,
+          expectedCreateRequestId,
+          currentCreateRequestId: content.createRequestId ?? null,
+        })
+        return
+      }
       content.reconcileNotice = action.payload.notice
     },
 
@@ -2917,22 +2948,6 @@ export const panesSlice = createSlice({
       if (content && content.crashTrace) delete content.crashTrace
     },
 
-    /** Council rule 12: dead_session is a UI state, not a deletion — panes wait for the user. */
-    setDeadSessionAdjudication: (state, action: PayloadAction<DeadSessionEntry[]>) => {
-      state.deadSessionAdjudication = action.payload
-    },
-
-    resolveDeadSessionEntry: (state, action: PayloadAction<{ tabId: string; paneId: string }>) => {
-      const { tabId, paneId } = action.payload
-      state.deadSessionAdjudication = (state.deadSessionAdjudication ?? []).filter(
-        (entry) => !(entry.tabId === tabId && entry.paneId === paneId),
-      )
-    },
-
-    clearDeadSessionAdjudication: (state) => {
-      state.deadSessionAdjudication = []
-    },
-
     setReconcileWarming: (state, action: PayloadAction<ReconcileWarmingState>) => {
       state.reconcileWarming = action.payload
     },
@@ -2964,13 +2979,35 @@ export const panesSlice = createSlice({
      * Loud, non-destructive per-pane breadcrumb for reconcile
      * dead_session/invalid/error verdicts. Sets only restoreError —
      * never touches identity, handles, or createRequestId.
+     * The optional `expectedCreateRequestId` is the stale-verdict identity
+     * guard (delta round 4, finding 2): when present and the CURRENT
+     * content's createRequestId differs, the pane was replaced since the
+     * request that carried the verdict (Replace pane keeps the paneId but
+     * re-keys the content) — the verdict describes the old content, and the
+     * fold no-ops (no latch, no dead-copy mint, no pre-verdict pending
+     * release: the replacement's own verdict/window owns those).
      */
     setPaneRestoreError: (
       state,
-      action: PayloadAction<{ tabId: string; paneId: string; restoreError: RestoreError }>
+      action: PayloadAction<{
+        tabId: string
+        paneId: string
+        restoreError: RestoreError
+        expectedCreateRequestId?: string
+      }>
     ) => {
+      const { expectedCreateRequestId } = action.payload
       const content = findReconcilePaneContent(state, action.payload.tabId, action.payload.paneId)
       if (!content) return
+      if (expectedCreateRequestId !== undefined && content.createRequestId !== expectedCreateRequestId) {
+        log.warn('ignoring a stale-verdict restoreError for replaced pane content', {
+          tabId: action.payload.tabId,
+          paneId: action.payload.paneId,
+          expectedCreateRequestId,
+          currentCreateRequestId: content.createRequestId ?? null,
+        })
+        return
+      }
       content.restoreError = action.payload.restoreError
       // dead/invalid/error verdicts resolve the pre-verdict wait too
       clearReconcilePendingForPane(state, action.payload.tabId, action.payload.paneId)
@@ -3081,9 +3118,6 @@ export const {
   clearPaneCloseError,
   setPaneCrashTrace,
   clearPaneCrashTrace,
-  setDeadSessionAdjudication,
-  resolveDeadSessionEntry,
-  clearDeadSessionAdjudication,
   setReconcileWarming,
   clearReconcileWarming,
   setReconcilePendingPanes,

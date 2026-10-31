@@ -7,6 +7,15 @@ export type TerminalWriteQueue = {
     generation: string,
     options?: { dropQueuedStaleWrites?: boolean },
   ) => void
+  /**
+   * The queue's current active generation (undefined until an attach
+   * generation takes the queue over). Read-only introspection for callers
+   * that must detect a takeover between enqueue and flush — a queued write
+   * enqueued under a generation this no longer returns was dropped by
+   * `setActiveGeneration(_, { dropQueuedStaleWrites: true })` and will
+   * never apply.
+   */
+  getActiveGeneration: () => string | undefined
   hasInFlightWrites: (generation?: string) => boolean
   clear: () => void
 }
@@ -17,6 +26,22 @@ export type TerminalWriteQueueOptions = {
   mode?: TerminalWriteQueueMode
   generation?: string
   coalesce?: boolean
+  /**
+   * Surface-mutation completion exemption: the item's own completion
+   * callbacks record SURFACE facts (a mounted reconstruction reset's
+   * buffer wipe) that are true regardless of the enqueueing
+   * generation's fate — bytes already SUBMITTED to the surface apply
+   * even when a takeover abandons the generation before the completion
+   * lands. When set, a completed write runs the item's callbacks even
+   * for a stale generation; the generation-scoped hook contracts are
+   * unchanged (onItemApplied still requires a current generation — it
+   * consumes attach-scoped one-shot state; onWriteCompleted already
+   * fires for every completion). The flag never resurrects DROPPED
+   * writes: a queued item removed by a generation takeover still never
+   * applies. An alwaysComplete write is a hard coalescing boundary — its
+   * callbacks must not ride another item's completion.
+   */
+  alwaysComplete?: boolean
   /**
    * Atomic clear-then-write (round-4 F2): the flush invokes this callback
    * immediately before the item's bytes go to the surface, INSIDE the same
@@ -48,6 +73,16 @@ type TerminalWriteQueueArgs = {
    * the surface still matches its last checkpoint.
    */
   onWriteCompleted?: (item: { mode: TerminalWriteQueueMode; generation: string | undefined }) => void
+  /**
+   * Fired whenever the queue's active generation CHANGES (a
+   * `setActiveGeneration` call with a value different from the current one;
+   * same-value re-sets stay inert). Lets a caller observe attach takeovers —
+   * including the drop of a queued write enqueued under the previous
+   * generation — as a reactive signal (e.g. a state bump an effect can key
+   * on): the drop itself is otherwise invisible, producing no store change
+   * and no render.
+   */
+  onActiveGenerationChange?: (generation: string | undefined) => void
   /** A surface write failed before completion; no success hooks ran. */
   onWriteFailed?: (item: { mode: TerminalWriteQueueMode; generation: string | undefined; error: unknown }) => void
   budgetMs?: number
@@ -61,6 +96,7 @@ type WriteQueueItem = {
   mode: TerminalWriteQueueMode
   generation: string | undefined
   coalescible: boolean
+  alwaysComplete: boolean
   clearBeforeWrite?: () => void
   data: string
   callbacks: Array<() => void>
@@ -163,8 +199,16 @@ export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): Terminal
       if (didWriteComplete) return
       didWriteComplete = true
       try {
-        if (!isStaleGeneration(item.generation)) {
+        // An alwaysComplete write's own callbacks record SURFACE facts
+        // (the bytes were already submitted when the write went in
+        // flight), so they run even for a stale generation — the
+        // suppression below exists to stop stale ATTACH state
+        // (generation-scoped bookkeeping, marker consumption), not to
+        // hide surface wipes.
+        if (!isStaleGeneration(item.generation) || item.alwaysComplete) {
           for (const callback of item.callbacks) callback()
+        }
+        if (!isStaleGeneration(item.generation)) {
           args.onItemApplied?.({ mode: item.mode, generation: item.generation })
         }
         args.onWriteCompleted?.({ mode: item.mode, generation: item.generation })
@@ -247,7 +291,12 @@ export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): Terminal
       if (!data) return
       const mode = options?.mode ?? 'live'
       const generation = resolveGeneration(options)
-      const coalescible = options?.coalesce !== false
+      const alwaysComplete = options?.alwaysComplete === true
+      // An alwaysComplete write is a hard coalescing boundary in BOTH
+      // directions: it never merges into a previous item (its surface-fact
+      // callbacks belong to exactly its bytes) and later writes never merge
+      // into it (they must not ride — or be dropped with — its completion).
+      const coalescible = !alwaysComplete && options?.coalesce !== false
       const callbacks = onWritten ? [onWritten] : []
       const previous = queue[queue.length - 1]
       if (
@@ -270,6 +319,7 @@ export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): Terminal
           mode,
           generation,
           coalescible,
+          alwaysComplete,
           clearBeforeWrite: options?.clearBeforeWrite,
           data,
           callbacks,
@@ -287,10 +337,16 @@ export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): Terminal
       scheduleFlush()
     },
     setActiveGeneration(generation, options) {
-      activeGeneration = generation
+      if (activeGeneration !== generation) {
+        activeGeneration = generation
+        args.onActiveGenerationChange?.(generation)
+      }
       if (options?.dropQueuedStaleWrites) {
         dropQueuedWritesOutsideGeneration(generation)
       }
+    },
+    getActiveGeneration() {
+      return activeGeneration
     },
     hasInFlightWrites(generation) {
       if (generation === undefined) {

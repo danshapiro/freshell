@@ -678,7 +678,6 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
             zoomedPane: _zp,
             refreshRequestsByPane: _rrbp,
             restoreFallbackAttemptsByPane: _rfabp,
-            deadSessionAdjudication: _dsa,
             reconcileWarming: _rw,
             reconcilePendingPanes: _rpp,
             focusEpochByPaneId: _febp,

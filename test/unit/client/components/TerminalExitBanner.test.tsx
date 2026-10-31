@@ -14,7 +14,7 @@ const baseProps = {
 
 describe('TerminalExitBanner', () => {
   // This repo's vitest setup does not auto-cleanup between tests (globals off);
-  // sibling suites (DeadSessionPanel.test.tsx) call cleanup() explicitly.
+  // sibling suites (e.g. ReconcileWarmingBanner.test.tsx) call cleanup() explicitly.
   afterEach(() => cleanup())
 
   it('renders a loud error bar with the exit code and an accessible relaunch button', () => {

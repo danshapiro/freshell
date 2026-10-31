@@ -21,9 +21,6 @@ import panesReducer, {
   resetPaneForReconcileCreate,
   setPaneReconcileNotice,
   clearPaneReconcileNotice,
-  setDeadSessionAdjudication,
-  resolveDeadSessionEntry,
-  clearDeadSessionAdjudication,
   setReconcileWarming,
   clearReconcileWarming,
   setReconcilePendingPanes,
@@ -287,19 +284,6 @@ describe('reconcile reducers', () => {
     expect(terminalContent(s, 'tab1', 'p1').reconcileNotice).toBeUndefined()
   })
 
-  it('dead-session adjudication is one batched list', () => {
-    let s = panesReducer(undefined, setDeadSessionAdjudication([
-      { tabId: 't1', paneId: 'p1', title: 'a', mode: 'claude' },
-      { tabId: 't1', paneId: 'p2', title: 'b', mode: 'codex' },
-    ]))
-    expect(s.deadSessionAdjudication).toHaveLength(2)
-    s = panesReducer(s, resolveDeadSessionEntry({ tabId: 't1', paneId: 'p1' }))
-    expect(s.deadSessionAdjudication).toHaveLength(1)
-    expect(s.deadSessionAdjudication?.[0]?.paneId).toBe('p2')
-    s = panesReducer(s, clearDeadSessionAdjudication())
-    expect(s.deadSessionAdjudication).toHaveLength(0)
-  })
-
   it('reconcile warming is set and cleared as one slice-level field', () => {
     let s = panesReducer(undefined, setReconcileWarming({ count: 2, paneRefs: [{ tabId: 't1', paneId: 'p1' }, { tabId: 't1', paneId: 'p2' }] }))
     expect(s.reconcileWarming).toEqual({ count: 2, paneRefs: [{ tabId: 't1', paneId: 'p1' }, { tabId: 't1', paneId: 'p2' }] })
@@ -339,7 +323,7 @@ describe('reconcile persistence stripping', () => {
     vi.useRealTimers()
   })
 
-  it('strips per-pane volatile reconcile fields and slice-level adjudication/warming from persistence', () => {
+  it('strips per-pane volatile reconcile fields and slice-level warming from persistence', () => {
     const store = configureStore({
       reducer: { tabs: tabsReducer, panes: panesReducer },
       middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
@@ -350,7 +334,6 @@ describe('reconcile persistence stripping', () => {
     store.dispatch(initLayout({ tabId, paneId: 'p1', content: { kind: 'terminal', mode: 'claude', createRequestId: 'cr-keep' } }))
     // Sets all three per-pane volatile fields: pendingReconcile, reconcileNotice, reconcileEpoch
     store.dispatch(resetPaneForReconcileCreate({ tabId, paneId: 'p1', intent: 'fresh', reason: 'identity_never_observed' }))
-    store.dispatch(setDeadSessionAdjudication([{ tabId, paneId: 'p1', title: 'a', mode: 'claude' }]))
     store.dispatch(setReconcileWarming({ count: 1, paneRefs: [{ tabId, paneId: 'p1' }] }))
 
     // Live state has all volatile fields
@@ -359,7 +342,6 @@ describe('reconcile persistence stripping', () => {
     expect(liveContent.pendingReconcile).toBe('fresh')
     expect(liveContent.reconcileNotice).toBe('Started fresh (identity_never_observed).')
     expect(liveContent.reconcileEpoch).toBe(1)
-    expect(live.deadSessionAdjudication).toHaveLength(1)
     expect(live.reconcileWarming).not.toBeNull()
 
     vi.runAllTimers()
@@ -374,7 +356,6 @@ describe('reconcile persistence stripping', () => {
     expect('pendingReconcile' in leaf.content).toBe(false)
     expect('reconcileNotice' in leaf.content).toBe(false)
     expect('reconcileEpoch' in leaf.content).toBe(false)
-    expect('deadSessionAdjudication' in parsed.panes).toBe(false)
     expect('reconcileWarming' in parsed.panes).toBe(false)
   })
 })

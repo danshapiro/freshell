@@ -38,7 +38,7 @@ import { confirmManagedRuntimeStopped } from '@/lib/managed-runtime-stop'
 import { isManagedRuntimeRecoveryDecision, ManagedRuntimeRecoveryCard } from '@/components/ManagedRuntimeRecoveryCard'
 import { isManagedRuntimeRecoveryPending } from '@/lib/managed-runtime-recovery-message'
 import { canReplayManagedTerminal, managedTerminalPaneStatus } from '@/lib/managed-terminal.js'
-import { buildReconcileRequestForPanes, foldVerdicts } from '@/lib/pane-reconcile'
+import { buildReconcileRequestForPanes, DEAD_SESSION_RECONCILE_NOTICES, foldVerdicts, isDeadSessionReconcileNotice } from '@/lib/pane-reconcile'
 import type { PaneReconcileRequest, SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import {
   derivePaneOwnerDivergence,
@@ -93,6 +93,7 @@ import {
   buildTerminalResizeMessage,
   getCreateSessionStateFromRef,
   isStaleSessionIdentityMismatch,
+  paneHasResumableDurableIdentity,
 } from '@/components/terminal-view-utils'
 import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
 import { copyText, readText } from '@/lib/clipboard'
@@ -105,6 +106,7 @@ import {
   consumeRecoveredLiveTerminalTarget,
   consumeTerminalFreshRecoveryRequest,
   consumeTerminalRestoreRequestId,
+  hasTerminalFreshRecoveryRequest,
   type TerminalFreshRecoveryIntent,
 } from '@/lib/terminal-restore'
 import { isTerminalPasteShortcut } from '@/lib/terminal-input-policy'
@@ -409,6 +411,40 @@ const PENDING_INPUT_LOSS_NOTICE: Record<PendingInputLossReason, string> = {
   terminal_gone: 'Input not sent: the terminal went away before it could be delivered.',
 }
 
+/**
+ * One-line explanation a dead terminal pane writes into its own xterm buffer
+ * (no-modal contract): a pane whose saved session was deleted from disk
+ * explains itself in place — resolution stays with the existing pane chrome
+ * (close button; +/split, Replace pane, Reopen pane as for a fresh start).
+ * REASON-HONEST (delta review round 1, finding 3): the server also returns
+ * dead_session with reason respawn_exhausted while the session file is
+ * PRESENT, so the buffer line is selected from the resident store mint the
+ * writer read — the same reason-honesty rule the store copy follows
+ * (DEAD_SESSION_RECONCILE_NOTICES, dead-session-notice.ts).
+ */
+const DEAD_SESSION_BUFFER_NOTICES = {
+  missing:
+    "[This pane's saved session no longer exists on disk - close this pane or start a new one]",
+  respawnExhausted:
+    "[This pane's saved session could not be resumed - close this pane or start a new one]",
+} as const
+
+/** Buffer-line variant for a dead-copy mint (category match). */
+function deadSessionBufferNoticeForMint(notice: string): string {
+  return notice === DEAD_SESSION_RECONCILE_NOTICES.respawnExhausted
+    ? DEAD_SESSION_BUFFER_NOTICES.respawnExhausted
+    : DEAD_SESSION_BUFFER_NOTICES.missing
+}
+
+/**
+ * Idempotency identity for the dead-session notice line: a re-keyed pane
+ * (Replace pane, respawn, identity repair) is a NEW identity whose next
+ * death writes fresh; the same identity re-adjudicated is the same line.
+ */
+function deadSessionNoticeIdentityKey(content: TerminalPaneContent | null | undefined): string {
+  return `${content?.createRequestId ?? ''}|${content?.sessionRef?.sessionId ?? '-'}`
+}
+
 type StartupProbeReplayDiscardState = {
   remainder: string | null
   buffered: string
@@ -706,17 +742,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     createRequestId: string | undefined
     terminalId: string | undefined
   } | null>(null)
-  // Branch-5 / reconcile-verdict interaction (design invariant 7): a pane
-  // listed in the dead-session adjudication panel is owned by the user's
-  // explicit panel decision -- the INVALID_TERMINAL_ID auto-recovery must
-  // stand down for it (see the attach-error handler below).
-  const isDeadSessionAdjudicated = useAppSelector(
-    (s) => (s.panes.deadSessionAdjudication ?? []).some(
-      (entry) => entry.tabId === tabId && entry.paneId === paneId,
-    ),
-  )
-  const isDeadSessionAdjudicatedRef = useRef(isDeadSessionAdjudicated)
-  isDeadSessionAdjudicatedRef.current = isDeadSessionAdjudicated
   const verdictWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const connectionErrorCode = useAppSelector((s) => s.connection.lastErrorCode)
   const settings = useAppSelector((s) => s.settings.settings)
@@ -831,6 +856,17 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   const exhaustionReconcileRef = useRef<PaneReconcileRequest | null>(null)
   const freshRecoveryRequestIdRef = useRef<string | null>(null)
   const freshRecoveryIntentRef = useRef<TerminalFreshRecoveryIntent | undefined>(undefined)
+  // The dead-create stand-down gate's exemption read (shouldStandDownDeadCreate):
+  // a per-requestId cache seeded by the NON-CONSUMING, NON-GATED peek
+  // (hasTerminalFreshRecoveryRequest) -- deliberately separate from the
+  // consume-based freshRecoveryIntentRef above. The gate always runs before
+  // sendCreate for a given requestId, so its seed sees the registered intent
+  // (the recovery arm registers before the minted id ever reaches pane
+  // content), and the cache keeps the exemption stable across every retry
+  // lane (WS-reconnect re-drive, armed SESSION_RESERVED timer) even after
+  // sendCreate's consume has settled the registry entry.
+  const freshRecoveryExemptRequestIdRef = useRef<string | null>(null)
+  const freshRecoveryExemptRef = useRef(false)
   const turnCompleteSignalStateRef = useRef(createTurnCompleteSignalParserState())
   const startupProbeStateRef = useRef(createTerminalStartupProbeState())
   const startupProbeReplayDiscardStateRef = useRef<StartupProbeReplayDiscardState>({
@@ -910,6 +946,74 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // Extract terminal-specific fields (safe because we check kind later)
   const isTerminal = paneContent.kind === 'terminal'
   const terminalContent = isTerminal ? paneContent : null
+  // Dead-session stand-down latch (design invariant 7, re-keyed to the
+  // durable restoreError latch): a pane whose saved session artifact is gone
+  // must not mint a recovery create on an INVALID_TERMINAL_ID round -- that
+  // would resume the dead session as an orphan PTY nothing adopts
+  // (duplicate `--resume <dead-session>` spawns after a restart). The
+  // persisted per-pane latch is strictly more accurate than the old
+  // adjudication list: per-pane and reload-surviving, and cleared exactly by
+  // the recovery folds (attach/reset), which re-arms auto-recovery the
+  // moment the pane legitimately moves on. Other restoreError reasons
+  // (dead_live_handle etc.) keep today's auto-recovery.
+  const deadSessionLatchRef = useRef(false)
+  deadSessionLatchRef.current =
+    terminalContent?.restoreError?.reason === 'durable_artifact_missing'
+  // ── Dead-session notice line (no-modal contract, LEVEL-TRIGGERED —
+  // focused review 3, round 4) ──
+  // INVARIANT: whenever this pane is dead-adjudicated (restoreError reason
+  // durable_artifact_missing) and its CURRENT surface epoch has no APPLIED
+  // dead-notice record, the notice line is (re-)issued — queue-ordered,
+  // generation-adopting — into that surface. The at-apply record below
+  // (identity key `createRequestId|sessionId` + surface epoch + mint copy)
+  // is the loop guard: it only ever claims an epoch the line actually landed
+  // on, so the skip branch is honest (skip ⟺ the line is on the current
+  // surface). The epoch bumps at every xterm surface birth (init) and at
+  // every beginMountedReconstruction reset completion — i.e. at every event
+  // that can WIPE the buffer — and is MIRRORED INTO STATE
+  // (deadSessionNoticeSurfaceEpoch) so the invariant effect re-runs on each
+  // bump; the ref remains the source of truth for immediate (non-render)
+  // readers. The record's mint copy keeps re-issues reason-honest. The
+  // component-side records clear when the latch clears (user resolved the
+  // pane), re-arming a later re-death of the same identity; the STORE-side
+  // dead-copy mint (reconcileNotice) is the DURABLE copy source that
+  // survives this component's unmount and is cleared with the latch by
+  // the recovery folds (delta review round 4, finding 1).
+  const deadSessionNoticeSurfaceEpochRef = useRef(0)
+  const [deadSessionNoticeSurfaceEpoch, setDeadSessionNoticeSurfaceEpoch] = useState(0)
+  // Write-queue generation signal: the queue fires onActiveGenerationChange
+  // on every attach takeover; mirroring it into state lets the invariant
+  // effect OBSERVE a takeover that dropped a queued notice copy — a drop is
+  // otherwise invisible (no store change, no render).
+  const [writeQueueActiveGeneration, setWriteQueueActiveGeneration] = useState<string | undefined>(undefined)
+  const deadSessionNoticeStateRef = useRef<{ key: string; surfaceEpoch: number; notice: string } | null>(null)
+  // Outstanding-issue record (focused review 3, round 4): a dead-notice line
+  // ENQUEUED but not yet applied. The queue drops queued writes at every
+  // attach-generation takeover (`setActiveGeneration` +
+  // `dropQueuedStaleWrites`), so the record captures the queue object and
+  // the ACTIVE GENERATION the copy was enqueued under. Two roles in the
+  // invariant regime: (1) LIVENESS — while the record's queue is the
+  // current queue and its generation the current active generation, the
+  // copy is still the current regime's write and FIFO delivery is owed (the
+  // level check trusts it and never double-issues); (2) OWED COPY — once
+  // the copy is dropped (a takeover moved the generation) or its queue
+  // died (surface recreation disposed it), the record re-issues
+  // `record.data` at the very state change that revealed the drop (the
+  // epoch bump or the generation signal). At SURFACE BIRTH it is
+  // deliberately NOT cleared: the previous surface's queue died with that
+  // surface, so a still-pending copy died unapplied — the surviving record
+  // is the consumed-pending-at-dispose copy. It clears when the copy
+  // applies (the apply callback then writes the at-apply record), when the
+  // latch clears, and when a later issue replaces it. (The RESIDENT store
+  // mint is the primary copy source for every fresh surface; this record
+  // keeps the re-issue queue-ordered through takeover reveals.)
+  const deadSessionNoticeQueuedWriteRef = useRef<{
+    key: string
+    generation: string | undefined
+    queue: TerminalWriteQueue
+    data: string
+    notice: string
+  } | null>(null)
   const managedReplayAvailable = canReplayManagedTerminal(terminalContent)
 
   // kata b8ke (round-1 review: convergence is bidirectional): a TERMINAL
@@ -1649,6 +1753,70 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     persistSurfaceCheckpointForAttach(terminalId, attach, parserAppliedSeq)
   }, [getTerminalCheckpointStreamId, persistSurfaceCheckpointForAttach, recordTerminalPerfAuditEvent])
 
+  // No-queue local-notice core: the writeLocalXtermNotice fallback path,
+  // extracted so the dead-session writer can call it directly for its own
+  // no-queue fallback (its ONLY role for the dead line — with a queue the
+  // dead notice rides the write queue, see writeDeadSessionNoticeToSurface).
+  // The write still counts toward surface mutation (surfaceWritesSinceFresh):
+  // the line is real bytes on the surface, so a later full-hydrate attach must
+  // treat the surface as dirty and reconstruct it (the stand-down gate then
+  // re-writes the line post-rejection).
+  const writeLocalXtermNoticeDirect = useCallback((term: Terminal, data: string, onApplied?: () => void) => {
+    const terminalInstanceId = terminalInstanceIdRef.current
+    if (!shouldAllowTerminalOutputSideEffect({
+      terminalInstanceId,
+      source: 'live',
+      effect: 'local_xterm_notice',
+      mode: contentRef.current?.mode,
+    })) {
+      return
+    }
+    const invalidateAppliedSurface = () => {
+      // Keep the applied position (the notice does not unapply stream bytes),
+      // bump the epoch (stream-unpure surface state), and preserve the
+      // coverage cursor — the notice appends non-stream bytes but never
+      // un-accounts stream coverage.
+      resetParserAppliedSurface(parserAppliedSeqRef.current, {
+        surfaceCoverageSeq: surfaceCoverageSeqRef.current,
+      })
+    }
+    const generation = currentAttachRef.current?.requestId
+    const scope = beginTerminalOutputWriteScope({
+      terminalInstanceId,
+      source: 'live',
+      attachRequestId: generation,
+      generation: generation ?? 'local-notice',
+      suppressExternalSideEffects: false,
+    })
+    let didComplete = false
+    const complete = () => {
+      if (didComplete) return
+      didComplete = true
+      scope.complete()
+    }
+    try {
+      term.write(data, () => {
+        try {
+          // Surface-identity gate (focused review 3, round 5): this write's
+          // bytes went to the term captured at ENQUEUE time. A completion
+          // arriving after the surface was recreated (termRef moved on)
+          // belongs to the RETIRED surface — its bytes never touched the
+          // current one, so it must not mutate the current surface's
+          // stream-epoch accounting or run the applied hook.
+          if (termRef.current !== term) return
+          invalidateAppliedSurface()
+          surfaceWritesSinceFreshRef.current += 1
+          onApplied?.()
+        } finally {
+          complete()
+        }
+      })
+    } catch {
+      // disposed
+      complete()
+    }
+  }, [resetParserAppliedSurface])
+
   const writeLocalXtermNotice = useCallback((term: Terminal, data: string) => {
     const terminalInstanceId = terminalInstanceIdRef.current
     if (!shouldAllowTerminalOutputSideEffect({
@@ -1671,35 +1839,212 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     const generation = currentAttachRef.current?.requestId
     const queue = writeQueueRef.current
     if (queue) {
-      queue.enqueue(data, invalidateAppliedSurface, { mode: 'live', generation })
+      queue.enqueue(data, () => {
+        // Surface-identity gate (focused review 3, round 5): only the
+        // surface whose queue received the bytes may consume this
+        // completion — a retired surface's late completion must not bump
+        // the CURRENT surface's stream-epoch accounting.
+        if (writeQueueRef.current !== queue) return
+        invalidateAppliedSurface()
+      }, { mode: 'live', generation })
       return
     }
-    const scope = beginTerminalOutputWriteScope({
+    writeLocalXtermNoticeDirect(term, data)
+  }, [resetParserAppliedSurface, writeLocalXtermNoticeDirect])
+
+  // Dead-notice surface writer (no-modal contract, queue-ordered — focused
+  // review 3, round 2): the line rides the TERMINAL WRITE QUEUE whenever it
+  // exists, so FIFO ordering puts it AFTER any pending mounted-reconstruction
+  // reset — an issue can fire while a previously admitted attach still has
+  // its wipe queued, and a direct write would land the line BEFORE that
+  // reset only to be erased by it. The write adopts the queue's ACTIVE
+  // generation (never a stale attach id), so it is only dropped by a LATER
+  // generation takeover; the outstanding-issue record
+  // (deadSessionNoticeQueuedWriteRef) captures the adopted generation, and
+  // the level-triggered invariant effect re-issues the recorded line at the
+  // state change that reveals the drop (the queue's onActiveGenerationChange
+  // signal, or the epoch bump of a later reset). The apply callback records
+  // the write at the surface epoch READ THEN, and ONLY when the surface that
+  // received the bytes is still the current one (the captured queue object —
+  // the same identity the liveness check below trusts): a completion from a
+  // retired surface records nothing, so the idempotency record only ever
+  // claims an epoch the line actually landed on and the skip branch stays
+  // honest (skip ⟺ the line is on the current surface). The queue item
+  // is 'live'-mode: the queue's own onItemApplied hook counts it
+  // toward surface mutation (surfaceWritesSinceFresh), so a later
+  // full-hydrate attach treats the surface as dirty and reconstructs it
+  // (and the invariant re-issues the line after that wipe). The direct path
+  // remains ONLY as the no-queue fallback.
+  const writeDeadSessionNoticeToSurface = useCallback((
+    term: Terminal,
+    data: string,
+    key: string,
+    notice: string,
+  ) => {
+    const terminalInstanceId = terminalInstanceIdRef.current
+    if (!shouldAllowTerminalOutputSideEffect({
       terminalInstanceId,
       source: 'live',
-      attachRequestId: generation,
-      generation: generation ?? 'local-notice',
-      suppressExternalSideEffects: false,
-    })
-    let didComplete = false
-    const complete = () => {
-      if (didComplete) return
-      didComplete = true
-      scope.complete()
+      effect: 'local_xterm_notice',
+      mode: contentRef.current?.mode,
+    })) {
+      return
     }
-    try {
-      term.write(data, () => {
-        try {
-          invalidateAppliedSurface()
-        } finally {
-          complete()
-        }
-      })
-    } catch {
-      // disposed
-      complete()
+    const recordAppliedWrite = () => {
+      deadSessionNoticeQueuedWriteRef.current = null
+      deadSessionNoticeStateRef.current = {
+        key,
+        surfaceEpoch: deadSessionNoticeSurfaceEpochRef.current,
+        notice,
+      }
     }
-  }, [resetParserAppliedSurface])
+    const queue = writeQueueRef.current
+    if (queue) {
+      deadSessionNoticeQueuedWriteRef.current = {
+        key,
+        generation: queue.getActiveGeneration(),
+        queue,
+        data,
+        notice,
+      }
+      const invalidateAppliedSurface = () => {
+        // Keep the applied position (the notice does not unapply stream
+        // bytes), bump the epoch (stream-unpure surface state), and preserve
+        // the coverage cursor — the notice appends non-stream bytes but
+        // never un-accounts stream coverage.
+        resetParserAppliedSurface(parserAppliedSeqRef.current, {
+          surfaceCoverageSeq: surfaceCoverageSeqRef.current,
+        })
+      }
+      queue.enqueue(data, () => {
+        // Surface-identity gate (focused review 3, round 5): the at-apply
+        // record may be written ONLY by the surface whose queue received
+        // the bytes. A write SUBMITTED to the old xterm surface can
+        // COMPLETE after a renderer recreation — that late completion must
+        // not clear the NEW surface's outstanding-issue record nor stamp
+        // the NEW surface's epoch (a FALSE applied record for bytes that
+        // never touched it); otherwise a later generation takeover that
+        // drops the new surface's own queued copy meets an invariant that
+        // believes the line applied, and the dead pane never gets its
+        // notice. The gate leaves the outstanding record intact, so the
+        // invariant re-issues at the drop's reveal; the at-apply record
+        // per epoch remains the loop breaker.
+        if (writeQueueRef.current !== queue) return
+        invalidateAppliedSurface()
+        recordAppliedWrite()
+      }, { mode: 'live', generation: undefined })
+      return
+    }
+    // Direct no-queue fallback arm: the surface-identity gate lives in
+    // writeLocalXtermNoticeDirect's completion callback (focused review 3,
+    // round 5) — only the term that received the bytes may record the
+    // apply, exactly like the queue arm above.
+    writeLocalXtermNoticeDirect(term, data, recordAppliedWrite)
+  }, [resetParserAppliedSurface, writeLocalXtermNoticeDirect])
+
+  // A queued dead-notice copy that is STILL the current queue regime's write:
+  // FIFO delivery is owed for this identity — the level check below trusts it
+  // and never double-issues. A mismatch (a different queue object — surface
+  // recreation — or a moved active generation — an attach takeover dropped
+  // the copy) means the line is NOT coming from that copy: the invariant
+  // effect re-issues it from the outstanding-issue record (or the resident
+  // store mint) at the state change that revealed the drop (the epoch bump or
+  // the generation signal).
+  const deadSessionNoticeQueuedWriteIsLive = useCallback((key: string) => {
+    const queue = writeQueueRef.current
+    if (!queue) return false
+    const queued = deadSessionNoticeQueuedWriteRef.current
+    return queued !== null
+      && queued.queue === queue
+      && queued.key === key
+      && queued.generation === queue.getActiveGeneration()
+  }, [])
+
+  // Dead-session notice writer (no-modal contract, LEVEL-TRIGGERED — focused
+  // review 3, round 4): ONE level check shared by the invariant effect and
+  // the INVALID_TERMINAL_ID stand-down gate. The observation is the
+  // INVARIANT itself — a dead-adjudicated pane whose CURRENT surface epoch
+  // holds no APPLIED notice record is owed the line — and this writer issues
+  // whenever the observation says the line is missing, never on an edge. The
+  // copy is resolved in order: a live dead-copy mint (the RESIDENT store
+  // copy — the durable copy source that survives TerminalView unmounts and
+  // re-writes the line on every fresh surface; delta review round 4,
+  // finding 1 — it stays in the pane content while the dead latch holds
+  // and is never consumed at a write), an ISSUED copy that never applied
+  // (a generation takeover dropped it, or its queue died with a recreated
+  // surface — the outstanding-issue record re-issues the owed line), or
+  // the last APPLIED record's copy (re-issues stay reason-honest without a
+  // fresh mint). A queued copy that is still the current regime's write is
+  // TRUSTED (FIFO); a record matching the current surface epoch SATISFIES
+  // the invariant (the at-apply record per epoch is the loop guard, so a
+  // retained mint never causes repeat writes on one surface). With no
+  // mint, no issued copy, and no record, nothing explains a write: the
+  // persisted latch alone is not a copy source (the reload shape waits
+  // for the boot re-fold's mint). While the xterm surface is not mounted
+  // (provider-wait window) nothing can be written — the resident mint
+  // simply waits; the invariant effect completes the write when the
+  // deferred surface mounts.
+  const writeDeadSessionNoticeIfPending = useCallback(() => {
+    const content = contentRef.current
+    const notice = content?.reconcileNotice
+    const mint = notice !== undefined && isDeadSessionReconcileNotice(notice) ? notice : null
+    const term = termRef.current
+    if (!term) {
+      // Surface not mounted (provider-wait window): the resident mint
+      // stays in the store until a surface exists to write it.
+      return
+    }
+    const key = deadSessionNoticeIdentityKey(content)
+    if (deadSessionNoticeQueuedWriteIsLive(key)) {
+      // A queued copy of this identity is still the current queue regime's
+      // write: FIFO delivery is owed. The resident mint needs no action.
+      return
+    }
+    const written = deadSessionNoticeStateRef.current
+    if (written && written.key === key && written.surfaceEpoch === deadSessionNoticeSurfaceEpochRef.current) {
+      // The line is on the current surface epoch: the invariant is
+      // satisfied. A re-folded mint stays resident (the durable copy
+      // source), and its copy is adopted into the record so a later
+      // re-issue stays reason-honest. A surviving issue record here is
+      // stale garbage (its copy was dropped or died with an old queue).
+      deadSessionNoticeQueuedWriteRef.current = null
+      if (mint) {
+        deadSessionNoticeStateRef.current = { key, surfaceEpoch: written.surfaceEpoch, notice: mint }
+      }
+      return
+    }
+    if (mint) {
+      writeDeadSessionNoticeToSurface(term, `\r\n${deadSessionBufferNoticeForMint(mint)}\r\n`, key, mint)
+      return
+    }
+    const issued = deadSessionNoticeQueuedWriteRef.current
+    if (issued && issued.key === key) {
+      // A previously issued copy never applied — a generation takeover
+      // dropped it, or its queue died with a recreated surface. Re-issue
+      // it queue-ordered on the current regime. (Unreachable while a
+      // resident mint exists — the mint branch above owns that shape —
+      // but the reload window folds verdicts late, so the fallback
+      // stays.)
+      writeDeadSessionNoticeToSurface(term, issued.data, key, issued.notice)
+      return
+    }
+    if (written && written.key === key) {
+      // The line APPLIED on an earlier epoch of this surface history (a
+      // reconstruction reset or surface birth wiped it): re-issue the
+      // recorded reason-honest copy.
+      writeDeadSessionNoticeToSurface(
+        term,
+        `\r\n${deadSessionBufferNoticeForMint(written.notice)}\r\n`,
+        key,
+        written.notice,
+      )
+    }
+    // No mint, no issued copy, no record: nothing is owed that this writer
+    // can explain — the persisted latch alone is not a copy source.
+  }, [
+    deadSessionNoticeQueuedWriteIsLive,
+    writeDeadSessionNoticeToSurface,
+  ])
 
   useEffect(() => () => {
     clearQuarantineRepair()
@@ -2753,12 +3098,35 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     surfaceFreshRef.current = true
     surfaceFreshMarkerRef.current = null
     surfaceWritesSinceFreshRef.current = 0
+    // New xterm surface identity (dead-session notice invariant): a
+    // renderer-recreated surface starts blank, so a previously applied
+    // notice line no longer matches the current epoch — the state-mirrored
+    // bump re-fires the level-triggered invariant effect, which re-issues
+    // the line onto this new buffer exactly once (from the resident store
+    // mint — the durable copy source — or from the preserved
+    // outstanding-issue record when the owed copy never applied on the
+    // previous surface).
+    deadSessionNoticeSurfaceEpochRef.current += 1
+    setDeadSessionNoticeSurfaceEpoch(deadSessionNoticeSurfaceEpochRef.current)
+    // The outstanding-issue record is deliberately NOT cleared here: an
+    // applied copy clears it at apply time, so a surviving record is always
+    // an unapplied one — the pending-at-dispose copy, a queue-ordered
+    // record of the owed line. Its dead-queue fields make
+    // deadSessionNoticeQueuedWriteIsLive false on the new regime, and the
+    // epoch bump above re-fires the invariant effect, which re-issues it
+    // identity-keyed onto THIS surface exactly once.
     // A brand-new surface has no covered stream position.
     surfaceCoverageSeqRef.current = 0
     unsafeSurfaceCheckpointRef.current = false
     failedConsumptionGenerationRef.current = null
     const writeQueue = createTerminalWriteQueue({
       terminalInstanceId,
+      // Attach-takeover signal (dead-session notice invariant, focused
+      // review 3, round 4): every generation change is mirrored into state
+      // so the level-triggered notice effect re-runs its level check when a
+      // takeover could have dropped a queued notice copy — the drop itself
+      // is invisible (no store change, no render).
+      onActiveGenerationChange: setWriteQueueActiveGeneration,
       // One paced-replay credit per drain tick (Workstream 1): the flush is
       // idempotent (lastSentCreditSeq guard), so non-paced panes and drains
       // with no frontier movement are no-ops.
@@ -3160,6 +3528,64 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isTerminal, providerBehavior.preferredRenderer, shouldWaitForProviderBehavior])
+
+  // ── Dead-notice invariant effect (no-modal contract, LEVEL-TRIGGERED —
+  // focused review 3, round 4) ──
+  // INVARIANT: whenever this pane is dead-adjudicated (restoreError reason
+  // durable_artifact_missing) and its CURRENT surface epoch has no APPLIED
+  // dead-notice record, the notice line is (re-)issued — queue-ordered,
+  // generation-adopting — into that surface. The writer's level check
+  // (writeDeadSessionNoticeIfPending) IS the invariant observation; the
+  // at-apply record per epoch is the loop guard. This effect REPLACES the
+  // edge-triggered settle-event enumeration of the prior rounds (rejection
+  // ordering; pending reconstruction resets; surface recreation;
+  // queued-task sendAttach drops; abandoned attaches) — three review rounds
+  // each closed one edge while the next stayed un-pinned. Instead, every
+  // state that can INVALIDATE the observation is a dependency, and each
+  // change re-runs the level check (re-issuing the line only when it is
+  // missing):
+  // - the latch (restoreError): a dead verdict folds (turn on) or the pane
+  //   resolves (clear — re-arm);
+  // - a dead-copy mint (reconcileNotice): the RESIDENT store copy — the
+  //   durable copy source that survives this component's unmount and
+  //   re-writes the line onto every fresh surface (delta review round 4,
+  //   finding 1);
+  // - the surface epoch (state mirror): surface birth and every
+  //   reconstruction reset completion — a wipe invalidates the record;
+  // - the write queue's active generation (the queue's
+  //   onActiveGenerationChange signal): an attach takeover can DROP a
+  //   queued copy before it applies, invisibly to every other dep;
+  // - the attach-limiter state (recoveryExhausted) and the provider
+  //   renderer preference (surface recreation);
+  // - the provider-wait gate: the deferred surface mounting.
+  // A queued-live copy of the identity is TRUSTED (FIFO delivery is owed),
+  // so a re-run never duplicates an in-flight delivery, and spurious
+  // re-runs are inert by construction (the record check is the loop
+  // guard). The INVALID_TERMINAL_ID stand-down gate keeps its own writer
+  // call — the natural settle moment's belt-and-suspenders pass; the level
+  // check makes it a no-op whenever the line is already delivered.
+  // Declared AFTER the init-xterm effect so a mount-time run already sees
+  // termRef.current set (declaration-order effect execution).
+  useEffect(() => {
+    const content = contentRef.current
+    if (content?.restoreError?.reason !== 'durable_artifact_missing') {
+      // Latch cleared (or a non-dead reason): re-arm the idempotency state
+      // so a later re-death of the SAME identity writes again.
+      deadSessionNoticeStateRef.current = null
+      deadSessionNoticeQueuedWriteRef.current = null
+      return
+    }
+    writeDeadSessionNoticeIfPending()
+  }, [
+    terminalContent?.restoreError,
+    terminalContent?.reconcileNotice,
+    deadSessionNoticeSurfaceEpoch,
+    writeQueueActiveGeneration,
+    recoveryExhausted,
+    providerBehavior.preferredRenderer,
+    shouldWaitForProviderBehavior,
+    writeDeadSessionNoticeIfPending,
+  ])
 
   // Ref for tab to avoid re-running effects when tab changes
   const tabRef = useRef(tab)
@@ -3886,8 +4312,32 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         })
         scheduleQuarantineRepair(tid, ticket.generation)
       }
-      writeQueue.enqueue('\x18\x1bc\x1b[?25h', () => { ticket.succeeded = true }, {
+      // The reset write's completion is the exact wipe moment: bump the
+      // surface epoch (ref + state mirror) so the level-triggered
+      // dead-notice invariant re-fires — a wiped surface always gets its
+      // line re-issued at the next effect run. The wipe is a SURFACE fact,
+      // not attach state: the bytes were already submitted to xterm when
+      // the write went in flight, so they still flush when a
+      // disconnect/reconnect abandons this generation before the
+      // completion lands — alwaysComplete exempts this callback from the
+      // queue's stale-generation suppression (which exists to stop stale
+      // ATTACH payloads, not to hide surface wipes), so the epoch advances
+      // on every FLUSHED reset and never on a dropped one (a dropped reset
+      // never completes at all). The surface-identity gate (the notice
+      // write's round-5 rule, mirrored) keeps the epoch claim honest: only
+      // the surface whose queue received the bytes may record the wipe —
+      // a retired (recreated) surface's late completion must not stamp the
+      // NEW surface's epoch (its own birth bump already re-issued the
+      // line; a false bump here would force a duplicate re-issue onto a
+      // surface that already holds it).
+      writeQueue.enqueue('\x18\x1bc\x1b[?25h', () => {
+        ticket.succeeded = true
+        if (writeQueueRef.current !== writeQueue) return
+        deadSessionNoticeSurfaceEpochRef.current += 1
+        setDeadSessionNoticeSurfaceEpoch(deadSessionNoticeSurfaceEpochRef.current)
+      }, {
         generation: ticket.generation, mode: 'replay', coalesce: false,
+        alwaysComplete: true,
       })
       writeQueue.enqueueTask(() => {
         if (
@@ -4211,6 +4661,63 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       }
       return freshRecoveryIntentRef.current
     }
+
+    // Dead-session create stand-down (delta review round 1, finding 1): an
+    // un-anchored pane latched dead by a reconcile verdict must not auto-
+    // send its create either — sendCreate would carry the retained
+    // sessionRef and resume the dead session (a duplicate
+    // `--resume <dead-session>` attempt; for respawn_exhausted verdicts
+    // the session file is still PRESENT and the failing process would
+    // restart). The pane waits for the user's explicit resolution through
+    // existing chrome, exactly like the INVALID_TERMINAL_ID lane above and
+    // like FreshAgentView's restoreError create gate. THE ONE EXEMPT SHAPE
+    // is the codex dead-live-handle breadcrumb's recovery collapse
+    // (fresh_after_restore_unavailable): that pane was never verdict-dead,
+    // lost its live handle with no durable identity, and its create is an
+    // explicitly FRESH one — not a resume attempt, so it may proceed. The
+    // exemption reads the NON-CONSUMING peek
+    // (hasTerminalFreshRecoveryRequest), which answers identically with
+    // pane reconciliation active or inactive (focused episode 1, round 2
+    // — the fresheyes finding): the consume-based read is gated to
+    // not-armed on any real paneReconcileV1-negotiated connection, and an
+    // exemption that read through it went inert there, suppressing the
+    // fresh create and wedging the pane in 'creating'. The sendCreate
+    // frame keeps its consume-based semantics exactly as before (under
+    // active reconciliation it stays a plain-fresh create; the registry
+    // entry survives for this gate's peek).
+    //
+    // THE EXEMPTION REQUIRES THE CURRENT NO-IDENTITY SHAPE (delta review
+    // round 2, finding 1): the registry entry describes the identity-less
+    // recovery the dead-live-handle arm decided, and it can outlive that
+    // shape — under active reconciliation the entry is never consumed, so
+    // a pane that recovered fresh, later anchored a durable sessionRef,
+    // exited, and was then adjudicated dead_session would still hold the
+    // STALE entry, and an exemption keyed on history alone would let the
+    // create lane resume the deleted session. The exemption therefore
+    // holds only while paneHasResumableDurableIdentity is FALSE — the
+    // exact guard the dead-live-handle arm consults to decide a fresh
+    // recovery (same shared predicate): a pane WITH a resumable identity
+    // stands down on the dead latch regardless of registry history,
+    // because the only thing the exemption ever licenses is a FRESH
+    // (identity-less) create. All three gated lanes (this effect's create
+    // path, the WS-reconnect re-drive, the armed SESSION_RESERVED re-drive
+    // timer) call this one gate, so the condition covers them at once.
+    //
+    // Recovery folds (attach/reset) clear the latch, re-arming
+    // auto-recovery the moment the pane legitimately moves on; user-driven
+    // retries and launch-failure retries (scheduleCreateRetry, retryLaunch)
+    // call sendCreate directly and are unaffected by this gate.
+    const isFreshRecoveryCreate = (requestId: string): boolean => {
+      if (freshRecoveryExemptRequestIdRef.current !== requestId) {
+        freshRecoveryExemptRequestIdRef.current = requestId
+        freshRecoveryExemptRef.current = hasTerminalFreshRecoveryRequest(requestId)
+      }
+      return freshRecoveryExemptRef.current
+    }
+    const shouldStandDownDeadCreate = (requestId: string): boolean =>
+      deadSessionLatchRef.current
+      && (!isFreshRecoveryCreate(requestId)
+        || paneHasResumableDurableIdentity(contentRef.current, tabRef.current?.sessionRef, mode))
 
     const sendCreate = (requestId: string) => {
       if (isManagedRuntimeRecoveryPending(contentRef.current?.recoverySummary)) return
@@ -4567,6 +5074,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           if (requestIdRef.current !== requestId) return
           if (terminalIdRef.current) return // anchored meanwhile
           if (isManagedRuntimeRecoveryPending(contentRef.current?.recoverySummary)) return
+          // Dead-session stand-down: a verdict folded mid-standoff must
+          // not turn the armed re-drive into a resume of the dead session.
+          if (shouldStandDownDeadCreate(requestId)) return
           // Re-send the SAME terminal.create — createRequestId is NEVER
           // re-minted (council rule 2).
           sendCreate(requestId)
@@ -5822,6 +6332,26 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           // Ledger A2: remember the acquired tid so the terminal.input.blocked
           // backstop still matches after a recovery path clears terminalIdRef.
           lastKnownTerminalIdRef.current = newId
+          // Fresh-recovery breadcrumb resolution (delta-loop round 5): the
+          // codex dead-live-handle fresh-recovery arm persists
+          // durable_artifact_missing as a breadcrumb for the recovery it
+          // minted; this create anchoring is the recovery SUCCEEDING, which
+          // resolves it. A live pane must not carry the dead latch — a
+          // later INVALID_TERMINAL_ID on this new terminal must take the
+          // ordinary auto-recovery lane, not the stand-down gate. The latch
+          // only survives a FAILED recovery (no terminal.created ever
+          // lands), where standing down is the intended behavior. Both
+          // signal shapes answer here: under active reconciliation the
+          // registry entry survives the gated consume (the non-consuming
+          // peek answers), under inactive reconciliation the consumed
+          // intent lives on the launch attempt that sent this create. Only
+          // the breadcrumb's own reason is cleared — a verdict-dead latch
+          // never registers a fresh-recovery intent, so it stands — and a
+          // server-folded msg.restoreError below still wins (spread order).
+          const resolvesFreshRecoveryBreadcrumb =
+            contentRef.current?.restoreError?.reason === 'durable_artifact_missing'
+            && (hasTerminalFreshRecoveryRequest(reqId)
+              || (pendingLaunch?.requestId === reqId && pendingLaunch.recoveryIntent !== undefined))
           updateContent({
             terminalId: newId,
             serverInstanceId: serverInstanceIdRef.current,
@@ -5839,6 +6369,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             ...(createdNotice ? { sessionRef: undefined, resumeSessionId: undefined } : {}),
             ...(createdSessionUpdates ?? {}),
             ...(msg.clearCodexDurability ? { codexDurability: undefined } : {}),
+            ...(resolvesFreshRecoveryBreadcrumb ? { restoreError: undefined } : {}),
             ...(msg.restoreError ? { restoreError: msg.restoreError } : {}),
           })
           // Wedge-backstop clear-on-adoption (LB-8): the pane just adopted a
@@ -5947,10 +6478,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           if (createdNotice) {
             writeLocalXtermNotice(term, `\r\n${createdNotice}\r\n`)
           }
-          // One-shot reconcile notice (respawn/fresh verdicts): render it now
-          // that the pane anchored, then clear it from the store.
+          // One-shot reconcile notice (respawn/fresh verdicts — corrected,
+          // fresh-by-reason, duplicate copies): render it now that the pane
+          // anchored, then clear it from the store. The dead-session mint is
+          // the RESIDENT durable copy source with exactly TWO writers (the
+          // INVALID_TERMINAL_ID stand-down gate and the notice effect's
+          // settled-surface writers) and is cleared with the dead latch by
+          // the store folds — this anchor neither writes nor clears it.
           const createdReconcileNotice = contentRef.current?.reconcileNotice
-          if (createdReconcileNotice) {
+          if (createdReconcileNotice && !isDeadSessionReconcileNotice(createdReconcileNotice)) {
             writeLocalXtermNotice(term, `\r\n${createdReconcileNotice}\r\n`)
             if (createdReconcileNotice === RECONCILE_NOTICE_FRESH_BY_RACE) {
               setFreshByRaceNotice(createdReconcileNotice)
@@ -6687,18 +7223,38 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           // This prevents an infinite respawn loop when terminals fail immediately
           // (e.g., due to permission errors on cwd). User must explicitly restart.
           if (currentTerminalId && current?.status !== 'exited') {
-            // Branch-5 / reconcile-verdict interaction (design invariant 7):
-            // when the reconcile flow owns this pane's fate, stand down --
-            // - listed in the dead-session adjudication panel: the verdict
-            //   already declared the session dead; minting a recovery create
-            //   here would resume it as an orphan PTY the panel never adopts
-            //   (duplicate `--resume <dead-session>` spawns after a restart).
+            // Branch-5 / reconcile-verdict interaction (design invariant 7,
+            // re-keyed to the durable restoreError latch): when the
+            // reconcile flow owns this pane's fate, stand down --
+            // - the pane's persisted restoreError latch says the saved
+            //   session artifact is gone (durable_artifact_missing): the
+            //   verdict already declared the session dead; minting a
+            //   recovery create here would resume it as an orphan PTY
+            //   nothing adopts (duplicate `--resume <dead-session>` spawns
+            //   after a restart). The latch is cleared exactly by the
+            //   recovery folds (attach/reset), which re-arms auto-recovery
+            //   the moment the pane legitimately moves on. Other
+            //   restoreError reasons (dead_live_handle etc.) keep today's
+            //   auto-recovery.
             // - reconcile-pending within the bounded verdict window: the
             //   verdict fold (attach/respawn/dead_session) drives the next
             //   create/attach round. On timeout the pending flag clears and
             //   the next attach-error round takes the recovery below -- the
             //   ensure() re-fire re-attaches, so this can never wedge.
-            if (isDeadSessionAdjudicatedRef.current) return
+            if (deadSessionLatchRef.current) {
+              // Post-rejection moment (no-modal contract): the round's attach
+              // attempt — including any beginMountedReconstruction wipe — has
+              // settled and been rejected. The LEVEL-TRIGGERED notice
+              // invariant (the effect) already re-issues the line on every
+              // state change that can invalidate it (the fold, every wipe's
+              // epoch bump, every queue-generation takeover, exhaustion);
+              // this gate call is the natural settle moment's
+              // belt-and-suspenders pass — the writer's level check makes it
+              // a no-op whenever the line is already on the current surface
+              // (or a queued copy owns the delivery).
+              writeDeadSessionNoticeIfPending()
+              return
+            }
             if (
               reconcilePendingSinceRef.current !== undefined
               && Date.now() - reconcilePendingSinceRef.current < RECONCILE_VERDICT_WAIT_MS
@@ -6714,18 +7270,22 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               return
             }
             const restoreMode = current?.mode || (paneContent.kind === 'terminal' ? paneContent.mode : 'shell')
-            const isCodingCliMode = restoreMode !== 'shell'
-            const hasCodexCapturedRestoreState = current?.mode === 'codex' && Boolean(current.codexDurability?.candidate)
             // Last-known-durable-identity fallback: the pane's own sessionRef may
             // be missing (e.g. it never arrived before the live terminal died),
             // but a single-pane tab keeps its own sessionRef in sync (see
             // terminal-session-association.ts). Recovering from it here avoids
             // permanently abandoning a coding-CLI session that a moment's race
             // condition made the pane briefly forget.
-            const tabSessionRefFallback = !current?.sessionRef && isCodingCliMode
+            const tabSessionRefFallback = !current?.sessionRef && restoreMode !== 'shell'
               ? tabRef.current?.sessionRef
               : undefined
-            if (!current?.sessionRef && !hasCodexCapturedRestoreState && !tabSessionRefFallback) {
+            // The fresh-vs-resume decision runs through the ONE shared
+            // resumable-identity predicate
+            // (paneHasResumableDurableIdentity, terminal-view-utils.ts) —
+            // the dead-latch create stand-down gate's exemption requires
+            // the same no-identity shape, so the two sites cannot drift
+            // (delta review round 2, finding 1).
+            if (!paneHasResumableDurableIdentity(current, tabRef.current?.sessionRef, mode)) {
               const restoreDiagnostic = {
                 event: 'restore_unavailable' as const,
                 reason: 'dead_live_handle' as const,
@@ -6854,6 +7414,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             ) {
               return
             }
+            // Dead-session create stand-down (delta review round 1,
+            // finding 1): a transport flap must not resume the
+            // adjudicated-dead session either — same gate as the effect's
+            // create path below.
+            if (shouldStandDownDeadCreate(current.createRequestId)) return
             sendCreate(current.createRequestId)
           }
           return
@@ -7012,9 +7577,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           })
           // One-shot reconcile notice (attach/corrected/duplicate verdicts):
           // render it on the attach that the verdict fold re-fired, then
-          // clear it from the store.
+          // clear it from the store. The dead-session mint is the RESIDENT
+          // durable copy source with exactly TWO writers (the
+          // INVALID_TERMINAL_ID stand-down gate and the no-terminalId notice
+          // effect) and is cleared with the dead latch by the store folds —
+          // this anchor neither writes nor clears it.
           const attachReconcileNotice = contentRef.current?.reconcileNotice
-          if (attachReconcileNotice) {
+          if (attachReconcileNotice && !isDeadSessionReconcileNotice(attachReconcileNotice)) {
             writeLocalXtermNotice(term, `\r\n${attachReconcileNotice}\r\n`)
             dispatch(clearPaneReconcileNotice({ tabId, paneId: paneIdRef.current }))
           }
@@ -7077,6 +7646,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           pendingReason: 'initial_hydrate',
         }
         if (contentRef.current && retainedManagedPreparationFailure(contentRef.current)) return
+        // Dead-session create stand-down (no-modal contract, delta review
+        // round 1 finding 1): the fold's setPaneRestoreError cleared the
+        // pre-verdict pending mark and re-fired this effect; a verdict-dead
+        // pane must stand down here too — auto-sending its create would
+        // resume the dead session (sendCreate carries the retained
+        // sessionRef). Resolution waits for the user's existing chrome.
+        // The one exempt shape (an explicitly fresh recovery create) and
+        // the latch-clearing recovery folds are documented on
+        // shouldStandDownDeadCreate.
+        if (shouldStandDownDeadCreate(createRequestId)) return
         sendCreate(createRequestId)
       }
     }
@@ -7174,6 +7753,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     runRefreshAttach,
     syncContentRefWithSessionAssociation,
     writeLocalXtermNotice,
+    writeDeadSessionNoticeIfPending,
   ])
 
   useEffect(() => {

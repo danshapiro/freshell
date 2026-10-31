@@ -2534,8 +2534,9 @@ export function FreshAgentView({
   // server's D8 lease loser answer) re-drives the SAME create/attach after a
   // fixed floor; when the window exhausts, a single-pane reconcile resolves
   // the pane automatically (attach verdict -> silent attach to the winner;
-  // dead -> the visible dead-session panel/fresh flow). Never create-failed,
-  // never an error card, never a re-minted createRequestId.
+  // dead -> the pane's own restoreError latch and banner, the no-modal
+  // contract's in-pane death surface). Never create-failed, never an error
+  // card, never a re-minted createRequestId.
   const reserveRedriveRef = useRef<{
     windowStart: number | null
     timer: ReturnType<typeof setTimeout> | null

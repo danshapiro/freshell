@@ -101,6 +101,24 @@ export function addTerminalFreshRecoveryRequestId(
   freshRecoveryRequestIds.set(requestId, intent)
 }
 
+// Non-consuming existence check for the fresh-recovery registry, answering
+// "does this createRequestId carry a fresh-recovery intent registered by
+// the recovery path?" identically with pane reconciliation ACTIVE or
+// INACTIVE (focused episode 1, round 2 -- the fresheyes finding). The
+// consume-based readers stay gated by the reconcile bypass above (verdicts
+// own restore on a negotiated connection, so a latch firing alongside them
+// would double-restore), but the create-lane dead-latch exemption must NOT
+// be: a live-only codex pane's INVALID_TERMINAL_ID recovery registers an
+// intent AND latches the same durable_artifact_missing breadcrumb, and an
+// exemption that reads through the gated consume goes inert on any real
+// (paneReconcileV1-negotiated) connection -- suppressing the explicitly
+// FRESH create and wedging the pane in 'creating'. Peeking never removes
+// or settles anything; the consume keeps its one-shot semantics for every
+// existing caller.
+export function hasTerminalFreshRecoveryRequest(requestId: string): boolean {
+  return freshRecoveryRequestIds.has(requestId)
+}
+
 // Focused-episode-6 round 5 (Finding F1) — the restore offer's LIVE terminal
 // panes: a live pane is a genuinely-open session still running server-side, so
 // accepting the offer puts the pane back IN ITS TAB by reattaching to the

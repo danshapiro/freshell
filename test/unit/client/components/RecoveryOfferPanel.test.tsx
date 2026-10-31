@@ -223,7 +223,7 @@ describe('RecoveryOfferPanel', () => {
 
   // R1 (dialog containment): the dialog must be viewport-bounded with the
   // records list as the sole scroll region, so phone-sized viewports can reach
-  // the buttons (DeadSessionPanel.tsx:55,62 is the idiom donor).
+  // the buttons (a batched-dialog idiom this suite inherited).
   it('bounds the dialog to the viewport and makes the records <ul> the sole scroll region (R1: dialog containment)', async () => {
     const pane = INVENTORY.device!.tabs[0].panes[0]
     const multiInventory: RecoveryInventory = {
