@@ -10,10 +10,8 @@
 //      configure lane (the fake's sdk.configured receipt) and broadcasts the
 //      metadata frame; the simulator ledger records the SDK settings call.
 //
-// The codex lane's wire contract is pinned in-crate
-// (crates/freshell-freshagent/src/codex.rs configure tests against the real
-// fake app-server) — the e2e app-server fixture path used by sibling specs
-// is stale, so no codex leg here.
+// Codex uses the same real Rust configure and metadata path, with only its
+// native executable replaced by the current app-server fixture.
 //
 // Rust-only: raw-WS + owned RustServer per test (the rust-chromium project).
 // The client-side UI halves (dialog commit → configure frame; metadata fold →
@@ -142,6 +140,54 @@ function seedWallConfig(input: {
 }
 
 test.describe('fresh-agent live model convergence (rust)', () => {
+  test('codex: two connections converge settings and the next native turn carries the exact pair', async () => {
+    test.setTimeout(120_000)
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'fa-conv-codex-'))
+    const wrapper = path.join(root, 'codex.mjs')
+    const log = path.join(root, 'requests.jsonl')
+    const fixture = path.resolve(__dirname, '../../fixtures/coding-cli/codex-app-server/fake-app-server.mjs')
+    await fsp.writeFile(wrapper, `#!/usr/bin/env node\nimport ${JSON.stringify(fixture)}\n`)
+    await fsp.chmod(wrapper, 0o755)
+    const server = new RustServer({ env: { CODEX_CMD: wrapper, FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES: '1',
+      FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({ recordTurns: true, echoRequestedModel: true, appendRequestLogPath: log }) },
+    setupHome: seedWallConfig({ providers: ['codex'], freshAgent: true }) })
+    const wires: WsCapture[] = []
+    try {
+      const info = await server.start()
+      const first = new WsCapture(info.baseUrl, info.token)
+      const second = new WsCapture(info.baseUrl, info.token)
+      wires.push(first, second)
+      await Promise.all(wires.map(wire => wire.ready()))
+      first.send({ type: 'freshAgent.create', provider: 'codex', sessionType: 'freshcodex', requestId: 'codex-converge-create', cwd: root,
+        model: 'initial-native-model', effort: 'low' })
+      const created = await first.waitFor(frame => frame.requestId === 'codex-converge-create'
+        && ['freshAgent.created', 'freshAgent.create.failed'].includes(frame.type), 30_000, 'Codex creation')
+      expect(created.type, JSON.stringify(created)).toBe('freshAgent.created')
+      const sessionId = created.sessionId
+      first.send({ type: 'freshAgent.configure', provider: 'codex', sessionType: 'freshcodex', sessionId, requestId: 'codex-converge-configure',
+        settings: { model: 'catalog-native-model', effort: 'ultra', collaborationMode: 'plan' } })
+      for (const wire of wires) {
+        const metadata = await wire.waitFor(frame => frame.type === 'freshAgent.event' && frame.sessionId === sessionId
+          && frame.event?.type === 'freshAgent.session.metadata' && frame.event.model === 'catalog-native-model', 30_000, 'shared Codex metadata')
+        expect(metadata.event).toMatchObject({ model: 'catalog-native-model', effort: 'ultra', collaborationMode: 'plan' })
+      }
+      second.send({ type: 'freshAgent.send', provider: 'codex', sessionType: 'freshcodex', sessionId, requestId: 'codex-converge-send', text: 'Use the configured native model' })
+      await expect.poll(() => readJsonl(log).filter(row => row.method === 'turn/start').length).toBe(1)
+      expect(readJsonl(log).find(row => row.method === 'turn/start').params).toMatchObject({ threadId: sessionId,
+        model: 'catalog-native-model', effort: 'ultra', collaborationMode: { mode: 'plan', settings: { model: 'catalog-native-model', reasoning_effort: 'ultra' } } })
+      await second.waitFor(frame => frame.type === 'freshAgent.event' && frame.sessionId === sessionId
+        && frame.event?.type === 'freshAgent.turn.complete', 30_000, 'Codex native completion')
+      const response = await fetch(`${info.baseUrl}/api/fresh-agent/threads/freshcodex/codex/${sessionId}`, { headers: { 'x-auth-token': info.token } })
+      expect(response.ok).toBe(true)
+      expect((await response.json()).settings).toMatchObject({ model: 'catalog-native-model', effort: 'ultra', collaborationMode: 'plan' })
+      expect(readJsonl(log).filter(row => row.method === 'thread/start')).toHaveLength(1)
+    } finally {
+      wires.forEach(wire => wire.close())
+      await server.stop()
+      await fsp.rm(root, { recursive: true, force: true })
+    }
+  })
+
   test('opencode: configure broadcasts session metadata and the next turn carries the pair', async () => {
     test.setTimeout(180_000)
     const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'fa-conv-opencode-'))

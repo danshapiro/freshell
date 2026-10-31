@@ -10,6 +10,7 @@
 import type { FreshAgentPermissionUpdate } from '@shared/fresh-agent-contract'
 
 export type FreshAgentApprovalDecision =
+  | { nativeDecision: 'accept' | 'acceptForSession' | 'decline' | 'cancel' }
   | { behavior: 'allow'; updatedPermissions?: FreshAgentPermissionUpdate[] }
   | { behavior: 'deny'; message: string; interrupt: false }
 

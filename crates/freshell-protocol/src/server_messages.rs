@@ -1303,6 +1303,8 @@ pub struct FreshAgentAttentionMark {
     pub last_turn_complete_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_waiting_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_question_available_at: Option<i64>,
 }
 
 /// One `ready.runtimeOwners` replay record (kata b8ke reconnect-owner

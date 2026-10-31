@@ -45,7 +45,7 @@ export type FreshAgentRegistryEntry = {
   icon: React.ComponentType<{ className?: string }>
   defaultModel?: string
   defaultPermissionMode: string
-  defaultEffort: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+  defaultEffort: string
   settingsVisibility: {
     model: boolean
     permissionMode: boolean
@@ -53,6 +53,8 @@ export type FreshAgentRegistryEntry = {
     thinking: boolean
     tools: boolean
     timecodes: boolean
+    sandbox?: boolean
+    collaborationMode?: boolean
   }
   pickerShortcut: string
   hidden?: boolean
@@ -88,6 +90,8 @@ export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [
     defaultPermissionMode: 'on-request',
     defaultEffort: FRESHCODEX_DEFAULT_EFFORT,
     settingsVisibility: {
+      sandbox: true,
+      collaborationMode: true,
       model: true,
       permissionMode: true,
       effort: true,
@@ -286,9 +290,10 @@ function usesStampedEffortLevels(
  * keeps the static-table normalization, unchanged.
  */
 export function getEffectiveFreshAgentEffort(
-  content: Pick<FreshAgentPaneContent, 'sessionType' | 'provider' | 'model' | 'modelSelection' | 'effort' | 'modelEffortLevels'>,
+  content: Pick<FreshAgentPaneContent, 'sessionType' | 'provider' | 'model' | 'modelSelection' | 'effort' | 'modelEffortLevels' | 'effortIsNativeDefault'>,
   providerDefaults?: FreshAgentProviderDefaultsForModel,
 ): string | undefined {
+  if (content.provider === 'codex' && content.effortIsNativeDefault && !content.effort) return undefined
   const resolvedModel = resolveEffectiveFreshAgentModel(content, providerDefaults)
   if (usesStampedEffortLevels(content.sessionType, content.provider, resolvedModel, content.modelEffortLevels)) {
     return clampEffortToStampedLevels(content.modelEffortLevels, content.effort ?? providerDefaults?.effort)
@@ -299,6 +304,16 @@ export function getEffectiveFreshAgentEffort(
     resolvedModel,
     content.effort ?? providerDefaults?.effort,
   )
+}
+
+/** Public request spelling preserves an explicit Codex Default across resume
+ * and partial settings merges. Older panes still inherit provider defaults. */
+export function getFreshAgentRequestEffort(
+  content: Parameters<typeof getEffectiveFreshAgentEffort>[0],
+  providerDefaults?: FreshAgentProviderDefaultsForModel,
+): string | null | undefined {
+  return getEffectiveFreshAgentEffort(content, providerDefaults)
+    ?? (content.provider === 'codex' && content.effortIsNativeDefault ? null : undefined)
 }
 
 /**
@@ -319,6 +334,7 @@ export function resolveFreshAgentPaneCreateEffort(args: {
   modelEffortLevels?: readonly string[]
 }): string | undefined {
   const { sessionType, provider, model, providerEffort, fallbackEffort, modelEffortLevels } = args
+  if (provider === 'codex') return normalizeFreshAgentEffort(sessionType,provider,model,providerEffort)
   if (usesStampedEffortLevels(sessionType, provider, model, modelEffortLevels)) {
     return clampEffortToStampedLevels(modelEffortLevels, providerEffort ?? fallbackEffort)
   }

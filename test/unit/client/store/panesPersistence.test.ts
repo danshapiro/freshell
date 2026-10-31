@@ -497,6 +497,28 @@ describe('Panes Persistence Integration', () => {
     expect(restored.resumeSessionId).toBeUndefined() // always stripped; re-derived from sessionRef at create time
   })
 
+  it.each([undefined, false, true])('round-trips Codex settings and native Default intent %s through persist and hydrate', (effortIsNativeDefault) => {
+    const makeStore = () => configureStore({ reducer: { tabs: tabsReducer, panes: panesReducer }, middleware: (getDefault) => getDefault().concat(persistMiddleware as any) })
+    const before = makeStore()
+    before.dispatch(addTab({ mode: 'shell' }))
+    const tabId = before.getState().tabs.tabs[0].id
+    before.dispatch(initLayout({ tabId, content: {
+      kind: 'fresh-agent', provider: 'codex', sessionType: 'freshcodex', createRequestId: 'persist-codex-settings', status: 'idle',
+      model: 'provider-current', effort: effortIsNativeDefault ? undefined : 'future-effort',
+      effortIsNativeDefault, initialCwd: '/workspace/nested', sandbox: 'read-only', permissionMode: 'never', collaborationMode: 'plan',
+    } }))
+    vi.runAllTimers()
+    const tabs = loadPersistedTabs()
+    const panes = loadPersistedPanes()
+    const after = makeStore()
+    after.dispatch(hydrateTabs(tabs!.tabs))
+    after.dispatch(hydratePanes(panes!))
+    expect((after.getState().panes.layouts[tabId] as any).content).toMatchObject({
+      model: 'provider-current', effort: effortIsNativeDefault ? undefined : 'future-effort', effortIsNativeDefault,
+      initialCwd: '/workspace/nested', sandbox: 'read-only', permissionMode: 'never', collaborationMode: 'plan',
+    })
+  })
+
   it('round-trips a freshclaude pane’s stamped modelEffortLevels (probed-model effort survives reload)', () => {
     // A pane that selected a probed-only model via the settings popover
     // carries the row's effort levels as a stamp; the persist denylist keeps

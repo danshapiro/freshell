@@ -178,6 +178,8 @@ async fn run() -> Result<(), String> {
         Some("fresh-agent-fixture-state-worker") => providers::run_fresh_agent_fixture_state_worker(&args[2..]),
         Some("opencode-identity-worker") => pty::run_opencode_identity_worker(&args[2..]),
         Some("provider-probe-worker") => providers::run_probe_worker(&args[2..]),
+        Some("codex-naming-proof") => providers::run_naming_proof(&args[2..]),
+        Some("codex-owned-cleanup") => providers::run_owned_cleanup(&args[2..]).await,
         Some("refresh-provider-config") => refresh_provider_config_worker(&args[2..]),
         Some("prepare-provider-features") => providers::run_provider_features_worker(&args[2..]),
         Some("prepare-amplifier-state") => providers::run_amplifier_state_worker(&args[2..]),
@@ -300,7 +302,12 @@ async fn handle_connection(mut stream: UnixStream, state: Arc<HostState>) -> Res
             serde_json::json!({"errorCode":error.code,"message":error.message}),
         );
     }
-    let limit = if matches!(result, Ok(HostResult::FreshAgentSnapshot(_))) {
+    let limit = if matches!(
+        result,
+        Ok(HostResult::FreshAgentSnapshot(_)
+            | HostResult::FreshAgentChildSnapshot(_)
+            | HostResult::FreshAgentEvents(_))
+    ) {
         freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES
     } else {
         freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES
@@ -581,6 +588,7 @@ async fn dispatch(
                         .await
                         .clone()
                         .ok_or_else(unsupported_fresh_agent)?;
+                    let before = actor.profile().await;
                     let command_state = actor
                         .dispatch_with_checkpoint_identity(
                             request_id,
@@ -590,8 +598,24 @@ async fn dispatch(
                         )
                         .await
                         .map_err(map_actor_error)?;
-                    let native_session_id = actor.profile().await.native_session_id;
+                    let after = actor.profile().await;
+                    let native_session_id = after.native_session_id.clone();
+                    let native_identity =
+                        if after.provider == freshell_runtime_protocol::FreshProvider::Codex {
+                            before.native_session_id.zip(after.native_session_id).map(
+                                |(previous_native_session_id, native_session_id)| {
+                                    freshell_runtime_protocol::NativeDispatchIdentity {
+                                        previous_native_session_id,
+                                        native_session_id,
+                                        pending_naming_handle: after.naming_handle,
+                                    }
+                                },
+                            )
+                        } else {
+                            None
+                        };
                     Ok(HostResult::FreshAgentCommand {
+                        native_identity,
                         state: command_state,
                         native_session_id,
                     })
@@ -645,6 +669,7 @@ async fn dispatch(
                         .await
                         .map_err(map_actor_error)?;
                     Ok(HostResult::FreshAgentCommand {
+                        native_identity: None,
                         state: command_state,
                         native_session_id: actor.profile().await.native_session_id,
                     })
@@ -667,6 +692,7 @@ async fn dispatch(
                         .map_err(map_actor_error);
                     emit_environment_event(configure_outcome_event(&request_id, &outcome));
                     Ok(HostResult::FreshAgentCommand {
+                        native_identity: None,
                         state: outcome?,
                         native_session_id: actor.profile().await.native_session_id,
                     })
@@ -699,6 +725,7 @@ async fn dispatch(
                         .await
                         .map_err(map_actor_error)?;
                     Ok(HostResult::FreshAgentCommand {
+                        native_identity: None,
                         state: command_state,
                         native_session_id: actor.profile().await.native_session_id,
                     })
@@ -721,6 +748,43 @@ async fn dispatch(
                             .map_err(map_actor_error)?,
                     ))
                 }
+                HostCommand::FreshAgentModelCatalog {
+                    incarnation_id,
+                    cwd,
+                } => {
+                    ensure_incarnation(&incarnation_id, state)?;
+                    let actor = state
+                        .fresh_agent
+                        .lock()
+                        .await
+                        .clone()
+                        .ok_or_else(unsupported_fresh_agent)?;
+                    Ok(HostResult::FreshAgentModelCatalog(
+                        actor
+                            .model_catalog(cwd.as_deref())
+                            .await
+                            .map_err(map_actor_error)?,
+                    ))
+                }
+                HostCommand::FreshAgentNativeName {
+                    incarnation_id,
+                    native_session_id,
+                    codex_home,
+                    operation,
+                } => {
+                    ensure_incarnation(&incarnation_id, state)?;
+                    let actor = state
+                        .fresh_agent
+                        .lock()
+                        .await
+                        .clone()
+                        .ok_or_else(unsupported_fresh_agent)?;
+                    Ok(HostResult::FreshAgentNativeName(
+                        actor
+                            .native_name(&native_session_id, &codex_home, &operation)
+                            .await,
+                    ))
+                }
                 HostCommand::FreshAgentReadSnapshot { incarnation_id } => {
                     ensure_incarnation(&incarnation_id, state)?;
                     let actor = state
@@ -731,6 +795,24 @@ async fn dispatch(
                         .ok_or_else(unsupported_fresh_agent)?;
                     Ok(HostResult::FreshAgentSnapshot(
                         actor.snapshot().await.map_err(map_actor_error)?,
+                    ))
+                }
+                HostCommand::FreshAgentReadChild {
+                    incarnation_id,
+                    child_thread_id,
+                } => {
+                    ensure_incarnation(&incarnation_id, state)?;
+                    let actor = state
+                        .fresh_agent
+                        .lock()
+                        .await
+                        .clone()
+                        .ok_or_else(unsupported_fresh_agent)?;
+                    Ok(HostResult::FreshAgentChildSnapshot(
+                        actor
+                            .read_child(&child_thread_id)
+                            .await
+                            .map_err(map_actor_error)?,
                     ))
                 }
                 HostCommand::FreshAgentResolve {
@@ -751,6 +833,7 @@ async fn dispatch(
                         .map_err(map_actor_error)?;
                     let native_session_id = actor.profile().await.native_session_id;
                     Ok(HostResult::FreshAgentCommand {
+                        native_identity: None,
                         state: freshell_runtime_protocol::CommandState::Completed,
                         native_session_id,
                     })
@@ -9672,6 +9755,7 @@ mod tests {
         let context = ProviderLaunchContext {
             prepared_inputs: None,
             preparation: ProviderPreparation::Codex {
+                approval_default: None,
                 tui_args: vec![],
                 sidecar_args: vec![],
             },
@@ -10185,6 +10269,7 @@ mod tests {
         ) -> Result<DispatchAck, DispatchFailure> {
             self.dispatches.fetch_add(1, Ordering::SeqCst);
             Ok(DispatchAck {
+                native_identity: None,
                 provider_ack_id: Some(request_id.to_string()),
             })
         }
@@ -10202,6 +10287,7 @@ mod tests {
                 .unwrap()
                 .push(logical_attempt_id.map(str::to_owned));
             Ok(DispatchAck {
+                native_identity: None,
                 provider_ack_id: Some(request_id.to_string()),
             })
         }
@@ -10254,6 +10340,20 @@ mod tests {
             Ok(
                 serde_json::json!({"threadId":"fixture-native-thread","provider":"claude",
                 "sessionType":"freshclaude","status":"idle","turns":[{"turnId":"retained-rpc-turn","text":"x".repeat(2 * freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES)}]}),
+            )
+        }
+
+        async fn model_catalog(&self, cwd: Option<&str>) -> Result<serde_json::Value, String> {
+            assert_eq!(cwd, Some("/workspace"));
+            Ok(
+                serde_json::json!([{"id":"rpc-catalog","displayName":"RPC Catalog","supportedEffortLevels":["ultra"],"defaultEffort":"ultra","inputModalities":["text"]}]),
+            )
+        }
+
+        async fn read_child(&self, child_thread_id: &str) -> Result<serde_json::Value, String> {
+            assert_eq!(child_thread_id, "fixture-child");
+            Ok(
+                serde_json::json!({"parentThreadId":"fixture-native-thread","childThreadId":child_thread_id,"status":"saved","snapshot":{"threadId":child_thread_id,"provider":"codex","sessionType":"freshcodex","turns":[{"text":"x".repeat(2 * freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES)}]}}),
             )
         }
 
@@ -10311,6 +10411,8 @@ mod tests {
         let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
             state.state_dir.join("rpc-configure-agent"),
             FreshAgentProfile {
+                naming_handle: None,
+                collaboration_mode: None,
                 provider: FreshProvider::Claude,
                 runtime_variant: "fixture-sdk".into(),
                 cwd: "/workspace".into(),
@@ -10338,9 +10440,10 @@ mod tests {
                     incarnation_id: state.incarnation_id.clone(),
                     request_id: RequestId::parse("rpc-configure-one").unwrap(),
                     settings: freshell_runtime_protocol::FreshAgentTurnSettings {
+                        collaboration_mode: None,
                         cwd: None,
                         model: Some("opus".into()),
-                        effort: Some("high".into()),
+                        effort: Some(Some("high".into())),
                         permission_mode: None,
                         sandbox: None,
                     },
@@ -10355,6 +10458,7 @@ mod tests {
                 HostResult::FreshAgentCommand {
                     state: freshell_runtime_protocol::CommandState::ProviderAcked,
                     native_session_id: Some(ref native),
+                    ..
                 } if native == "fixture-native-thread"
             ));
         }
@@ -10456,6 +10560,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_child_observation_uses_parent_actor_and_large_read_reply_without_dispatch(
+    ) {
+        let state = test_host_state();
+        let transport = Arc::new(RpcFixtureTransport {
+            dispatches: AtomicUsize::new(0),
+            checkpoint_attempts: std::sync::Mutex::new(Vec::new()),
+            decisions: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            captures: AtomicUsize::new(0),
+            stops: AtomicUsize::new(0),
+        });
+        let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+            state.state_dir.join("child-observer"),
+            FreshAgentProfile {
+                naming_handle: None,
+                collaboration_mode: None,
+                provider: FreshProvider::Codex,
+                runtime_variant: "freshcodex".into(),
+                cwd: "/workspace".into(),
+                model: None,
+                effort: None,
+                permission_mode: None,
+                sandbox: None,
+                provider_store_id: "parent-volume".into(),
+                native_session_id: None,
+                plugins: None,
+                model_selection: None,
+                session_ref: None,
+                provider_launch_context: None,
+                provider_secret_references: vec![],
+            },
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+        let before = actor.profile().await;
+        *state.fresh_agent.lock().await = Some(actor.clone());
+        let (mut client_stream, server_stream) = UnixStream::pair().unwrap();
+        let serving = tokio::spawn(handle_connection(server_stream, state.clone()));
+        write_frame(
+            &mut client_stream,
+            &authenticated_host_envelope(
+                &state,
+                HostCommand::FreshAgentReadChild {
+                    incarnation_id: state.incarnation_id.clone(),
+                    child_thread_id: "fixture-child".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let reply: HostReply = freshell_runtime_protocol::read_frame_with_limit(
+            &mut client_stream,
+            freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES,
+        )
+        .await
+        .unwrap();
+        serving.await.unwrap().unwrap();
+        let HostResult::FreshAgentChildSnapshot(value) = reply.result.unwrap() else {
+            panic!("expected child observation");
+        };
+        assert_eq!(value["parentThreadId"], "fixture-native-thread");
+        assert_eq!(
+            value["snapshot"]["turns"][0]["text"]
+                .as_str()
+                .unwrap()
+                .len(),
+            2 * freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES
+        );
+        assert_eq!(
+            actor.profile().await.native_session_id,
+            before.native_session_id
+        );
+        assert_eq!(transport.dispatches.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.decisions.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.operations.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.stops.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn authenticated_model_catalog_reads_the_parent_actor_without_starting_work() {
+        let state = test_host_state();
+        let transport = Arc::new(RpcFixtureTransport {
+            dispatches: AtomicUsize::new(0),
+            checkpoint_attempts: std::sync::Mutex::new(Vec::new()),
+            decisions: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            captures: AtomicUsize::new(0),
+            stops: AtomicUsize::new(0),
+        });
+        let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+            state.state_dir.join("catalog-observer"),
+            FreshAgentProfile {
+                naming_handle: None,
+                collaboration_mode: None,
+                provider: FreshProvider::Codex,
+                runtime_variant: "freshcodex".into(),
+                cwd: "/workspace".into(),
+                model: None,
+                effort: None,
+                permission_mode: None,
+                sandbox: None,
+                provider_store_id: "parent-volume".into(),
+                native_session_id: None,
+                plugins: None,
+                model_selection: None,
+                session_ref: None,
+                provider_launch_context: None,
+                provider_secret_references: vec![],
+            },
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+        let before = actor.profile().await;
+        *state.fresh_agent.lock().await = Some(actor.clone());
+        let (mut client_stream, server_stream) = UnixStream::pair().unwrap();
+        let serving = tokio::spawn(handle_connection(server_stream, state.clone()));
+        write_frame(
+            &mut client_stream,
+            &authenticated_host_envelope(
+                &state,
+                HostCommand::FreshAgentModelCatalog {
+                    incarnation_id: state.incarnation_id.clone(),
+                    cwd: Some("/workspace".into()),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let reply: HostReply = freshell_runtime_protocol::read_frame_with_limit(
+            &mut client_stream,
+            freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
+        )
+        .await
+        .unwrap();
+        serving.await.unwrap().unwrap();
+        let HostResult::FreshAgentModelCatalog(value) = reply.result.unwrap() else {
+            panic!("expected model catalog");
+        };
+        assert_eq!(value[0]["id"], "rpc-catalog");
+        assert_eq!(value[0]["defaultEffort"], "ultra");
+        assert_eq!(
+            actor.profile().await.native_session_id,
+            before.native_session_id
+        );
+        assert_eq!(transport.dispatches.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.decisions.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.operations.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.stops.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn authenticated_fresh_agent_rpc_keeps_one_host_owned_transport_until_explicit_stop() {
         let state = test_host_state();
         let transport = Arc::new(RpcFixtureTransport {
@@ -10469,6 +10726,8 @@ mod tests {
         let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
             state.state_dir.join("rpc-fixture-agent"),
             FreshAgentProfile {
+                naming_handle: None,
+                collaboration_mode: None,
                 provider: FreshProvider::Claude,
                 runtime_variant: "fixture-sdk".into(),
                 cwd: "/workspace".into(),
@@ -10515,6 +10774,7 @@ mod tests {
             HostResult::FreshAgentCommand {
                 state: freshell_runtime_protocol::CommandState::ProviderAcked,
                 native_session_id: Some(ref native),
+                    ..
             }
             if native == "fixture-native-thread"
         ));

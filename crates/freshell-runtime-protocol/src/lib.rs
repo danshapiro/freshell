@@ -1022,6 +1022,35 @@ pub struct ProviderLaunchContext {
     pub config: Vec<ProviderConfigReference>,
 }
 
+/// Effective approval intent from the original active Codex config layers.
+/// Only owned public copies omit the deprecated declaration; typed requests
+/// retain this policy and its declaring source across preparation and replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CodexApprovalDefault {
+    pub policy: String,
+    pub logical_source: String,
+    pub canonical_source: String,
+    pub source_sha256: String,
+}
+impl CodexApprovalDefault {
+    pub fn validate(&self) -> bool {
+        matches!(self.policy.as_str(), "untrusted" | "on-request" | "never")
+            && [&self.logical_source, &self.canonical_source]
+                .iter()
+                .all(|source| {
+                    source.len() <= 4096
+                        && std::path::Path::new(source).is_absolute()
+                        && !source.chars().any(char::is_control)
+                })
+            && self.source_sha256.len() == 64
+            && self
+                .source_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProviderPreparation {
@@ -1031,6 +1060,8 @@ pub enum ProviderPreparation {
     Codex {
         tui_args: Vec<String>,
         sidecar_args: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approval_default: Option<CodexApprovalDefault>,
     },
     Opencode {
         project_config: Vec<ProviderConfigReference>,
@@ -1126,7 +1157,14 @@ impl ProviderLaunchContext {
             ProviderPreparation::Codex {
                 tui_args,
                 sidecar_args,
+                approval_default,
             } => {
+                if approval_default
+                    .as_ref()
+                    .is_some_and(|policy| !policy.validate())
+                {
+                    return Err(invalid());
+                }
                 let valid_recipe = |args: &[String]| {
                     args.len() == 6
                         && args[0] == "-c"
@@ -1754,6 +1792,10 @@ impl FreshProvider {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentLaunchSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub naming_handle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collaboration_mode: Option<String>,
     /// Stable presentation/session key used by the external Freshell wire.
     pub session_id: String,
     pub provider: FreshProvider,
@@ -1807,6 +1849,10 @@ impl FreshAgentLaunchSpec {
             FreshProvider::Opencode => "freshopencode",
         };
         if self.session_id.is_empty()
+            || self
+                .collaboration_mode
+                .as_deref()
+                .is_some_and(|mode| !matches!(mode, "default" | "plan"))
             || self.session_type != expected_type
             || self.runtime_variant.is_empty()
             || self.provider_store_id.is_empty()
@@ -1956,6 +2002,8 @@ pub struct AgentJournalEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentEventBatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_state: Option<serde_json::Value>,
     pub retained_from: u64,
     pub head: u64,
     pub reset_required: bool,
@@ -2032,6 +2080,24 @@ impl TerminalLaunchSpec {
                 RuntimeErrorCode::InvalidRequest,
                 "managed terminal launch exceeds argv/env/bootstrap bounds",
             ));
+        }
+        if self.mode == "codex" {
+            let projected = self
+                .provider_launch_context
+                .as_ref()
+                .is_some_and(|context| {
+                    matches!(
+                        &context.preparation,
+                        ProviderPreparation::Codex {
+                            approval_default: Some(_),
+                            ..
+                        }
+                    )
+                });
+            if self.provider_permission_mode.as_deref() == Some("untrusted") || projected {
+                return Err(RuntimeError::new(RuntimeErrorCode::InvalidRequest,
+                    "Codex providerPermissionMode/approval_policy untrusted is incompatible with the native0.164 terminal CLI; this prepared intent requires Freshcodex typed app-server requests"));
+            }
         }
         validate_managed_terminal_args(&self.mode, &self.args)?;
         for name in self.env.keys() {
@@ -2478,15 +2544,33 @@ pub struct TerminalInputRequest {
     pub expected_control_epoch: Option<u64>,
 }
 
+/// Correlated native acceptance inside the authenticated owning host.
+/// This never grants identity authority to asynchronous provider events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeDispatchIdentity {
+    pub previous_native_session_id: String,
+    pub native_session_id: String,
+    /// Existing provider pending-name intent: retained for initial recovery,
+    /// absent for an established new conversation.
+    pub pending_naming_handle: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentTurnSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collaboration_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effort: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "double_optional"
+    )]
+    pub effort: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2496,7 +2580,7 @@ pub struct FreshAgentTurnSettings {
 impl FreshAgentTurnSettings {
     /// The effort a provider's live `freshAgent.configure` ends on. A
     /// configure states only what changed, except that the model selector's
-    /// Default thinking row is sent as an absent effort. Claude and Kilroy
+    /// Default thinking row historically used an absent effort. Claude and Kilroy
     /// read that absence as Default when the model changes, OpenCode always
     /// does, and Codex keeps the session's effort. Every durable copy of a
     /// hosted profile (the host actor's and the supervisor's recovery record)
@@ -2509,7 +2593,7 @@ impl FreshAgentTurnSettings {
         current_effort: Option<&str>,
     ) -> Option<String> {
         if let Some(effort) = &self.effort {
-            return Some(effort.clone());
+            return effort.clone();
         }
         let absent_means_default = match provider {
             FreshProvider::Claude | FreshProvider::Kilroy => self
@@ -2603,6 +2687,25 @@ pub struct FreshAgentReadHistoryRequest {
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentReadSnapshotRequest {
     pub soul_id: SoulId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentModelCatalogRequest {
+    pub soul_id: SoulId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentReadChildRequest {
+    pub soul_id: SoulId,
+    pub child_thread_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_control_epoch: Option<u64>,
 }
@@ -2903,6 +3006,9 @@ pub enum AdminCommand {
     FreshAgentReadEvents(FreshAgentReadEventsRequest),
     FreshAgentReadHistory(FreshAgentReadHistoryRequest),
     FreshAgentReadSnapshot(FreshAgentReadSnapshotRequest),
+    FreshAgentModelCatalog(FreshAgentModelCatalogRequest),
+    FreshAgentNativeName(FreshAgentNativeNameRequest),
+    FreshAgentReadChild(FreshAgentReadChildRequest),
     RuntimeMetrics(RuntimeMetricsRequest),
     ProbeRecovery(RecoveryProbeRequest),
     Recover(RecoverRequest),
@@ -3417,6 +3523,9 @@ pub enum AdminResult {
     FreshAgentEvents(AgentEventBatch),
     FreshAgentHistory(serde_json::Value),
     FreshAgentSnapshot(serde_json::Value),
+    FreshAgentModelCatalog(serde_json::Value),
+    FreshAgentNativeName(FreshAgentNativeNameReply),
+    FreshAgentChildSnapshot(serde_json::Value),
     RuntimeMetrics(RuntimeMetrics),
     RecoveryProbe(RecoveryProbe),
     Recovery(RecoveryResult),
@@ -3535,6 +3644,20 @@ pub enum HostCommand {
     FreshAgentReadSnapshot {
         incarnation_id: IncarnationId,
     },
+    FreshAgentModelCatalog {
+        incarnation_id: IncarnationId,
+        cwd: Option<String>,
+    },
+    FreshAgentNativeName {
+        incarnation_id: IncarnationId,
+        native_session_id: String,
+        codex_home: String,
+        operation: FreshAgentNativeNameOperation,
+    },
+    FreshAgentReadChild {
+        incarnation_id: IncarnationId,
+        child_thread_id: String,
+    },
     FreshAgentResolve {
         incarnation_id: IncarnationId,
         decision_id: String,
@@ -3592,6 +3715,8 @@ pub enum HostResult {
         /// at the same acceptance boundary as this acknowledgement.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         native_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_identity: Option<NativeDispatchIdentity>,
     },
     FreshAgentFork(FreshAgentForkResult),
     FreshAgentInterrupted,
@@ -3599,6 +3724,9 @@ pub enum HostResult {
     FreshAgentEvents(AgentEventBatch),
     RuntimeMetrics(RuntimeMetrics),
     FreshAgentSnapshot(serde_json::Value),
+    FreshAgentModelCatalog(serde_json::Value),
+    FreshAgentNativeName(FreshAgentNativeNameReply),
+    FreshAgentChildSnapshot(serde_json::Value),
     Status {
         host_boot_id: HostBootId,
         worker_pid: Option<u32>,
@@ -4282,6 +4410,23 @@ mod tests {
     }
 
     #[test]
+    fn codex_terminal_untrusted_request_is_refused_before_dispatch() {
+        let mut spec: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+            "terminalId":"terminal", "streamId":"stream", "mode":"codex", "program":"codex", "args":[], "env":{}, "cwd":"/workspace", "runAsUid":65534, "runAsGid":0, "cols":80, "rows":24, "projectKey":"project", "workspacePath":"/workspace", "providerPermissionMode":"untrusted"
+        })).unwrap();
+        let error = spec
+            .validate()
+            .expect_err("the native terminal CLI cannot preserve typed untrusted request intent");
+        assert!(
+            error.message.contains("providerPermissionMode") && error.message.contains("untrusted")
+        );
+        for policy in ["on-request", "never"] {
+            spec.provider_permission_mode = Some(policy.into());
+            spec.validate().unwrap();
+        }
+    }
+
+    #[test]
     fn managed_provider_options_are_bounded_and_control_free() {
         let mut spec = TerminalLaunchSpec {
             terminal_id: "terminal-one".into(),
@@ -4323,6 +4468,8 @@ mod tests {
 
     fn fresh_agent_launch(provider: FreshProvider, session_type: &str) -> FreshAgentLaunchSpec {
         FreshAgentLaunchSpec {
+            naming_handle: None,
+            collaboration_mode: None,
             session_id: "presentation-one".into(),
             provider,
             session_type: session_type.into(),
@@ -4392,6 +4539,36 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn child_read_wire_retains_parent_soul_and_exact_child_without_writer_parameters() {
+        let request = FreshAgentReadChildRequest {
+            soul_id: SoulId::parse("parent-soul").unwrap(),
+            child_thread_id: "native-child".into(),
+            expected_control_epoch: Some(8),
+        };
+        let encoded =
+            serde_json::to_value(AdminCommand::FreshAgentReadChild(request.clone())).unwrap();
+        let decoded: AdminCommand = serde_json::from_value(encoded).unwrap();
+        assert!(matches!(decoded,AdminCommand::FreshAgentReadChild(value) if value == request));
+        let host = HostCommand::FreshAgentReadChild {
+            incarnation_id: IncarnationId::parse("parent-incarnation").unwrap(),
+            child_thread_id: "native-child".into(),
+        };
+        let decoded: HostCommand =
+            serde_json::from_value(serde_json::to_value(host).unwrap()).unwrap();
+        assert!(
+            matches!(decoded,HostCommand::FreshAgentReadChild {child_thread_id,..} if child_thread_id == "native-child")
+        );
+        let observation = serde_json::json!({"parentThreadId":"parent-native","childThreadId":"native-child","status":"unavailable","reason":"ephemeral_history_unavailable","retryable":false});
+        let decoded: HostResult = serde_json::from_value(
+            serde_json::to_value(HostResult::FreshAgentChildSnapshot(observation.clone())).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            matches!(decoded,HostResult::FreshAgentChildSnapshot(value) if value == observation)
+        );
     }
 
     #[test]

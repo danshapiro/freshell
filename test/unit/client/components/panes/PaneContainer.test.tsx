@@ -2543,7 +2543,7 @@ describe('PaneContainer', () => {
           expect(paneContent.provider).toBe('codex')
           expect(paneContent.initialCwd).toBe('/home/user/freshcodex-project')
           expect(paneContent.model).toBe('gpt-6-astra')
-          expect(paneContent.effort).toBe('max')
+          expect(paneContent.effort).toBeUndefined()
         }
       })
 
@@ -2555,7 +2555,7 @@ describe('PaneContainer', () => {
       }))
     })
 
-    it('normalizes saved Freshcodex effort from provider settings against the active model', async () => {
+    it.each(['xhigh', 'max'])('preserves saved Freshcodex effort %s from provider settings for native validation', async (effort) => {
       const node = createPickerNode('pane-1')
       const store = createStoreWithClaude(
         node,
@@ -2563,7 +2563,7 @@ describe('PaneContainer', () => {
         { codex: { model: 'gpt-5.6-luna' } },
         ['claude', 'codex'],
         { claude: true, codex: true },
-        { freshcodex: { effort: 'xhigh' } },
+        { freshcodex: { effort } },
       )
       mockApiPost.mockResolvedValueOnce({ valid: true, resolvedPath: '/home/user/freshcodex-project' })
 
@@ -2584,9 +2584,18 @@ describe('PaneContainer', () => {
         const paneContent = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
         expect(paneContent.kind).toBe('fresh-agent')
         if (paneContent.kind === 'fresh-agent') {
+          expect(paneContent.sessionType).toBe('freshcodex')
+          expect(paneContent.provider).toBe('codex')
+          expect(paneContent.initialCwd).toBe('/home/user/freshcodex-project')
+          expect(paneContent.status).toBe('creating')
+          expect(paneContent.createRequestId).toBeDefined()
           expect(paneContent.model).toBe('gpt-5.6-luna')
-          expect(paneContent.effort).toBe('max')
+          expect(paneContent.effort).toBe(effort)
         }
+      })
+
+      expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
+        codingCli: { providers: { codex: { model: 'gpt-5.6-luna', cwd: '/home/user/freshcodex-project' } } },
       })
     })
 

@@ -374,6 +374,40 @@ describe('managed runtime broker actor storage', () => {
   })
 })
 
+describe('Codex native workload policy admission', () => {
+  it.each(['missing', 'mutated', 'unconfined', 'duplicate', 'extra', 'plain-command', 'other-provider'])('refuses %s policy before forwarding an actual Docker request', async mutation => {
+    const resource = JSON.parse(await fs.readFile(path.resolve('docker/runtime/codex-native-sandbox.json'), 'utf8'))
+    await withHttpBroker(async ({ request, forwarded }) => {
+      const body = JSON.parse(createBody([...ordinaryBinds, actorBind]).toString())
+      body.Env.push(`CODEX_CMD=/usr/bin/setpriv --reuid 65534 --regid 0 --clear-groups --no-new-privs -- ${resource.native.launchWrapper}`)
+      const option = `seccomp=${JSON.stringify(resource.profile)}`
+      body.HostConfig.SecurityOpt.push(option)
+      if (mutation === 'missing') body.HostConfig.SecurityOpt.pop()
+      if (mutation === 'mutated') body.HostConfig.SecurityOpt[1] = `seccomp=${JSON.stringify({ ...resource.profile, defaultErrnoRet: 0 })}`
+      if (mutation === 'unconfined') body.HostConfig.SecurityOpt[1] = 'seccomp=unconfined'
+      if (mutation === 'duplicate') body.HostConfig.SecurityOpt.push(option)
+      if (mutation === 'extra') body.HostConfig.SecurityOpt.push('apparmor=unconfined')
+      if (mutation === 'plain-command') body.Env[1] = 'CODEX_CMD=codex'
+      if (mutation === 'other-provider') body.Env = ['FRESHELL_HOSTED_FRESH_AGENT=claude']
+      const response = await request('POST', '/v1.47/containers/create?name=native-policy-fixture', body)
+      expect(response.status).toBe(403)
+      expect(forwarded).toEqual([])
+    })
+  })
+
+  it('forwards the exact declared policy through the owned HTTP broker', async () => {
+    const resource = JSON.parse(await fs.readFile(path.resolve('docker/runtime/codex-native-sandbox.json'), 'utf8'))
+    await withHttpBroker(async ({ request, forwarded }) => {
+      const body = JSON.parse(createBody([...ordinaryBinds, actorBind]).toString())
+      body.Env.push(`CODEX_CMD=/usr/bin/setpriv --reuid 65534 --regid 0 --clear-groups --no-new-privs -- ${resource.native.launchWrapper}`)
+      body.HostConfig.SecurityOpt.push(`seccomp=${JSON.stringify(resource.profile)}`)
+      const response = await request('POST', '/v1.47/containers/create?name=native-policy-fixture', body)
+      expect(response.status).toBe(201)
+      expect(forwarded).toHaveLength(1)
+    })
+  })
+})
+
 describe('managed MCP mount', () => {
   it('accepts the exact private grant and approved provider root mounts', () => {
     const validate = (body: Buffer): { ok: boolean } => (
@@ -660,6 +694,7 @@ function candidateHelperBody(input: ClaudeCandidateAuthorization, role: 'mountpo
   body.Cmd = [role === 'reader' ? 'project-claude-candidate-private' : 'prepare-provider-mountpoints']
   body.HostConfig.CapAdd = ['CHOWN', 'SETGID', 'SETUID']
   body.HostConfig.Memory = body.HostConfig.MemorySwap = (role === 'reader' ? 256 : 128) * 1024 * 1024
+  body.HostConfig.NanoCpus = role === 'reader' ? 2_000_000_000 : 500_000_000
   body.HostConfig.Mounts = [
     { Type: 'bind', Source: input.hostBinaryPath, Target: '/runtime/freshell-session-host', ReadOnly: true },
     { Type: 'volume', Source: volume, Target: '/home/freshell/provider', ReadOnly: false, VolumeOptions: { NoCopy: true } },
@@ -817,7 +852,7 @@ describe('fixed initial Claude candidate broker', () => {
           instance.authorizeInitialProviderVolume(sourceAuthorization()); instance.authorizeClaudeCandidate(input)
           expect((await request('POST', '/v1.47/volumes/create', { Name: volume, Driver: 'local', DriverOpts: {}, Labels: candidateLabels(input) })).status).toBe(201)
           const body = candidateHelperBody(input, role), before = forwarded.length
-          for (const mutation of ['uid','command','credential','caps','network','memory','logs','reservation','generation','request','mount','readonly','volume']) {
+          for (const mutation of ['uid','command','credential','caps','network','memory','cpu','logs','reservation','generation','request','mount','readonly','volume']) {
             const changed = structuredClone(body)
             if (mutation === 'uid') changed.User = '65534:0'
             if (mutation === 'command') changed.Cmd.push('PRIVATE_CANDIDATE_SENTINEL')
@@ -825,6 +860,7 @@ describe('fixed initial Claude candidate broker', () => {
             if (mutation === 'caps') changed.HostConfig.CapAdd.push('DAC_OVERRIDE')
             if (mutation === 'network') changed.HostConfig.NetworkMode = 'bridge'
             if (mutation === 'memory') changed.HostConfig.Memory *= 2
+            if (mutation === 'cpu') changed.HostConfig.NanoCpus *= 2
             if (mutation === 'logs') changed.HostConfig.LogConfig.Type = 'json-file'
             if (mutation === 'reservation') changed.Labels['com.freshell.source-reservation-id'] = '33333333-3333-4333-8333-333333333333'
             if (mutation === 'generation') changed.Labels['com.freshell.input-generation'] = 'grant-33333333-3333-4333-8333-333333333333'

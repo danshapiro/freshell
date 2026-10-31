@@ -18,6 +18,8 @@ export const FreshAgentSettingScopesSchema = z.object({
   effort: FreshAgentSettingScopeSchema.optional(),
   sandbox: FreshAgentSettingScopeSchema.optional(),
   permissionMode: FreshAgentSettingScopeSchema.optional(),
+  cwd: FreshAgentSettingScopeSchema.optional(),
+  collaborationMode: FreshAgentSettingScopeSchema.optional(),
 }).strict()
 export type FreshAgentSettingScopes = z.infer<typeof FreshAgentSettingScopesSchema>
 
@@ -41,6 +43,8 @@ export const FreshAgentCapabilitiesSchema = z.object({
 }).strict()
 
 export const FreshAgentTokenUsageSchema = z.object({
+  observed: z.boolean().optional(),
+  modelContextWindow: z.number().int().nonnegative().optional(),
   inputTokens: z.number().int().nonnegative(),
   outputTokens: z.number().int().nonnegative(),
   cachedTokens: z.number().int().nonnegative().optional(),
@@ -51,9 +55,12 @@ export const FreshAgentTokenUsageSchema = z.object({
 }).strict()
 
 export const FreshAgentSettingsSchema = z.object({
+  cwd: z.string().min(1).optional(),
+  sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
+  collaborationMode: z.enum(['default', 'plan']).optional(),
   model: z.string().min(1).optional(),
   permissionMode: z.string().min(1).optional(),
-  effort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']).optional(),
+  effort: z.string().trim().min(1).nullable().optional(),
   plugins: z.array(z.string()).optional(),
 }).strict()
 
@@ -71,6 +78,7 @@ export const FreshAgentTranscriptItemSchema = z.discriminatedUnion('kind', [
     id: z.string().min(1),
     kind: z.literal('text'),
     text: z.string(),
+    extensions: z.record(z.string(), z.unknown()).optional(),
   }).strict(),
   z.object({
     id: z.string().min(1),
@@ -113,6 +121,7 @@ export const FreshAgentTranscriptItemSchema = z.discriminatedUnion('kind', [
   z.object({
     id: z.string().min(1),
     kind: z.literal('file_change'),
+    output: z.string().optional(),
     status: z.enum(['running', 'completed', 'failed', 'declined']),
     changes: z.array(z.record(z.string(), z.unknown())),
     extensions: z.record(z.string(), z.unknown()).optional(),
@@ -120,6 +129,7 @@ export const FreshAgentTranscriptItemSchema = z.discriminatedUnion('kind', [
   z.object({
     id: z.string().min(1),
     kind: z.literal('mcp_tool'),
+    progress: z.string().optional(),
     server: z.string(),
     tool: z.string(),
     status: z.enum(['running', 'completed', 'failed']),
@@ -144,7 +154,11 @@ export const FreshAgentTranscriptItemSchema = z.discriminatedUnion('kind', [
   z.object({
     id: z.string().min(1),
     kind: z.literal('task_delegation'),
-    status: z.enum(['running', 'completed', 'failed']),
+    status: z.enum(['running', 'completed', 'failed', 'interrupted']),
+    provider: FreshAgentRuntimeProviderSchema.optional(),
+    nativeStatus: z.string().nullable().optional(),
+    model: z.string().optional(),
+    reasoningEffort: z.string().optional(),
     title: z.string(),
     description: z.string().optional(),
     subagent: z.string().optional(),
@@ -226,6 +240,13 @@ export const FreshAgentTurnSchema = z.object({
   messageId: z.string().min(1).optional(),
   ordinal: z.number().int().nonnegative().optional(),
   source: z.enum(['durable', 'live', 'server']).optional(),
+  outputState: z.object({
+    provenance: z.enum(['saved', 'retained', 'saved-and-retained', 'preview']),
+    diagnostic: z.enum(['interrupted', 'unsaved', 'provider-truncated']).optional(),
+    refreshPending: z.boolean(),
+    retainedItems: z.array(FreshAgentTranscriptItemSchema).optional(),
+    savedItems: z.array(FreshAgentTranscriptItemSchema).optional(),
+  }).strict().optional(),
   role: z.enum(['user', 'assistant', 'system', 'tool']).optional(),
   timestamp: z.string().optional(),
   model: z.string().optional(),
@@ -260,6 +281,24 @@ export const FreshAgentTurnSchema = z.object({
   // presentation. Never stamped on live turns[].
   restorable: z.boolean().optional(),
 }).strict()
+
+const EventRevisionSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
+const TranscriptPatchBase = { revision: EventRevisionSchema, nativeTurnId: z.string().min(1) }
+export const FreshAgentTranscriptPatchSchema = z.object({
+  type: z.literal('freshAgent.transcript.patch').optional(),
+  sessionId: z.string().min(1),
+  projectionId: z.string().min(1),
+  historyGeneration: EventRevisionSchema,
+  afterRevision: EventRevisionSchema.optional(),
+  ops: z.array(z.discriminatedUnion('op', [
+    z.object({ ...TranscriptPatchBase, op: z.literal('resetTurn'), turns: z.array(FreshAgentTurnSchema), completedItemIds: z.array(z.string()).optional(), nonAppendableItemIds: z.array(z.string()).optional() }).strict(),
+    z.object({ ...TranscriptPatchBase, op: z.literal('upsertItem'), row: FreshAgentTurnSchema, item: FreshAgentTranscriptItemSchema, complete: z.boolean().optional() }).strict(),
+    z.object({ ...TranscriptPatchBase, op: z.literal('appendItem'), rowId: z.string().min(1), itemId: z.string().min(1), field: z.enum(['text', 'output', 'summary', 'content']), index: z.number().int().nonnegative().max(1023).nullable().optional(), text: z.string() }).strict(),
+    z.object({ ...TranscriptPatchBase, op: z.literal('settleTurn'), status: z.string().optional() }).strict(),
+  ])),
+}).strict()
+
+export type FreshAgentTranscriptPatch = z.infer<typeof FreshAgentTranscriptPatchSchema>
 
 // Claude's permission update (the SDK's `PermissionUpdate`): what the CLI
 // suggests on an approval, and what "Allow and don't ask again" sends back as
@@ -302,6 +341,7 @@ export const FreshAgentPendingApprovalSchema = z.object({
   blockedPath: z.string().optional(),
   decisionReason: z.string().optional(),
   input: z.record(z.string(), z.unknown()).optional(),
+  native: z.record(z.string(), z.unknown()).optional(),
   // Claude only: the CLI's own suggestions for not asking again.
   suggestions: z.array(FreshAgentPermissionUpdateSchema).optional(),
   providerRequest: z.record(z.string(), z.unknown()).optional(),
@@ -316,13 +356,38 @@ export const FreshAgentQuestionDefinitionSchema = z.object({
     description: z.string(),
   }).strict()).optional(),
   multiSelect: z.boolean().optional(),
+  isOther: z.boolean().optional(),
+  isSecret: z.boolean().optional(),
 }).strict()
 
 export const FreshAgentPendingQuestionSchema = z.object({
   requestId: FreshAgentRequestIdSchema,
+  isBlocking: z.boolean().optional(),
   questions: z.array(FreshAgentQuestionDefinitionSchema),
   providerRequest: z.record(z.string(), z.unknown()).optional(),
 }).strict()
+
+export const FreshAgentElicitationFieldSchema = z.object({
+  id: z.string().min(1), title: z.string(), description: z.string().optional(),
+  type: z.enum(['string', 'number', 'integer', 'boolean', 'array']),
+  required: z.boolean(), secret: z.boolean().optional(),
+  default: z.union([z.string(), z.number(), z.boolean(), z.array(z.string())]).optional(),
+  choices: z.array(z.object({ value: z.string(), label: z.string() }).strict()).optional(),
+  minimum: z.number().optional(), maximum: z.number().optional(),
+  minLength: z.number().int().nonnegative().optional(), maxLength: z.number().int().nonnegative().optional(),
+  minItems: z.number().int().nonnegative().optional(), maxItems: z.number().int().nonnegative().optional(),
+  format: z.string().optional(),
+}).strict()
+export const FreshAgentPendingElicitationSchema = z.object({
+  requestId: FreshAgentRequestIdSchema,
+  mode: z.enum(['form', 'openai/form', 'openaiForm', 'url']),
+  serverName: z.string(), message: z.string(), title: z.string().optional(),
+  fields: z.array(FreshAgentElicitationFieldSchema).max(32).optional(),
+  url: z.string().optional(), elicitationId: z.string().optional(),
+  providerRequest: z.record(z.string(), z.unknown()).optional(),
+}).strict()
+export type FreshAgentPendingElicitation = z.infer<typeof FreshAgentPendingElicitationSchema>
+export type FreshAgentElicitationContent = Record<string, string | number | boolean | string[]>
 
 export const FreshAgentWorktreeSchema = z.object({
   id: z.string().min(1),
@@ -335,6 +400,7 @@ export const FreshAgentDiffSummarySchema = z.object({
   path: z.string().optional(),
   title: z.string().optional(),
   status: z.string().optional(),
+  diff: z.string().optional(),
 }).strict()
 
 export const FreshAgentChildThreadSchema = z.object({
@@ -342,6 +408,10 @@ export const FreshAgentChildThreadSchema = z.object({
   threadId: z.string().min(1),
   origin: z.string(),
   title: z.string().optional(),
+  status: z.string().optional(),
+  model: z.string().optional(),
+  result: z.string().optional(),
+  error: z.string().optional(),
   receiverThreadIds: z.array(z.string().min(1)).optional(),
 }).strict()
 
@@ -374,6 +444,7 @@ export const FreshAgentSnapshotSchema = FreshAgentThreadLocatorSchema.extend({
   tokenUsage: FreshAgentTokenUsageSchema,
   pendingApprovals: z.array(FreshAgentPendingApprovalSchema).default([]),
   pendingQuestions: z.array(FreshAgentPendingQuestionSchema).default([]),
+  pendingElicitations: z.array(FreshAgentPendingElicitationSchema).optional(),
   worktrees: z.array(FreshAgentWorktreeSchema).default([]),
   diffs: z.array(FreshAgentDiffSummarySchema).default([]),
   childThreads: z.array(FreshAgentChildThreadSchema).default([]),
@@ -398,6 +469,27 @@ export const FreshAgentSnapshotSchema = FreshAgentThreadLocatorSchema.extend({
   // and old servers/clients keep parsing unchanged (graceful absence).
   commands: z.array(FreshAgentSessionCommandSchema).readonly().optional(),
 }).strict()
+
+export const FreshAgentChildReadSchema = z.object({
+  parentSessionId: z.string().min(1),
+  childThreadId: z.string().min(1),
+  observedEpoch: z.number().int().nonnegative().optional(),
+  observedGeneration: z.number().int().nonnegative().optional(),
+}).strict()
+
+const ChildIdentity = { parentThreadId: z.string().min(1), childThreadId: z.string().min(1) }
+export const FreshAgentChildObservationSchema = z.discriminatedUnion('status', [
+  z.object({ ...ChildIdentity, status: z.literal('live'), snapshot: FreshAgentSnapshotSchema }).strict(),
+  z.object({ ...ChildIdentity, status: z.literal('saved'), snapshot: FreshAgentSnapshotSchema }).strict(),
+  z.object({ ...ChildIdentity, status: z.literal('pending'), reason: z.literal('history_unmaterialized'), retryable: z.literal(true) }).strict(),
+  z.object({ ...ChildIdentity, status: z.literal('unavailable'), reason: z.enum(['ephemeral_history_unavailable', 'history_unavailable', 'source_unavailable']), retryable: z.boolean() }).strict(),
+]).superRefine((value, context) => {
+  if ('snapshot' in value && (value.snapshot.threadId !== value.childThreadId || value.snapshot.provider !== 'codex' || value.snapshot.sessionType !== 'freshcodex')) {
+    context.addIssue({ code: 'custom', message: 'Child snapshot identity mismatch', path: ['snapshot'] })
+  }
+})
+export type FreshAgentChildRead = z.infer<typeof FreshAgentChildReadSchema>
+export type FreshAgentChildObservation = z.infer<typeof FreshAgentChildObservationSchema>
 
 export const FreshAgentTurnPageSchema = FreshAgentThreadLocatorSchema.extend({
   revision: z.number().int().nonnegative(),
@@ -444,8 +536,11 @@ export const FRESH_AGENT_CONTRACT_SCHEMA_NAMES = [
   'FreshAgentSettingsSchema',
   'FreshAgentTranscriptItemSchema',
   'FreshAgentTurnSchema',
+  'FreshAgentTranscriptPatchSchema',
   'FreshAgentPendingApprovalSchema',
   'FreshAgentPendingQuestionSchema',
+  'FreshAgentElicitationFieldSchema',
+  'FreshAgentPendingElicitationSchema',
   'FreshAgentWorktreeSchema',
   'FreshAgentDiffSummarySchema',
   'FreshAgentChildThreadSchema',

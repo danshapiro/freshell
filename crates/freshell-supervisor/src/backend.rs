@@ -1,4 +1,5 @@
 mod claude_source_observation;
+mod codex_sandbox;
 pub mod docker;
 mod helper_lifecycle;
 pub(crate) use helper_lifecycle::CLAUDE_SOURCE_READER_RETRY;
@@ -42,6 +43,8 @@ pub enum BackendError {
     Malformed(String),
     #[error("runtime backend configuration rejected: {0}")]
     InvalidConfig(String),
+    #[error("Codex native configuration incompatible: {0}")]
+    CodexIncompatible(String),
 }
 
 #[derive(Debug, Clone)]
@@ -455,7 +458,9 @@ fn docker_create_body(
     operator_home_record: Option<String>,
     requested_limits: String,
     memory_swap: u64,
-) -> Value {
+) -> Result<Value, BackendError> {
+    let security_options =
+        codex_sandbox::security_options(spec.terminal.as_ref(), spec.fresh_agent.as_ref())?;
     let cap_add: Vec<&str> = if spec.terminal.is_some() || spec.fresh_agent.is_some() {
         vec!["CHOWN", "SETGID", "SETUID"]
     } else {
@@ -472,7 +477,7 @@ fn docker_create_body(
     if let Some(record) = operator_home_record {
         labels[OPERATOR_HOME_MOUNT_LABEL] = json!(record);
     }
-    json!({
+    Ok(json!({
         "Image": spec.image_ref,
         "Env": host_env,
         "Cmd": [
@@ -493,7 +498,7 @@ fn docker_create_body(
             "Privileged": false,
             "CapDrop": ["ALL"],
             "CapAdd": cap_add,
-            "SecurityOpt": ["no-new-privileges:true"],
+            "SecurityOpt": security_options,
             "RestartPolicy": {"Name":"no","MaximumRetryCount":0},
             "NanoCpus": spec.limits.cpu_milli.saturating_mul(1_000_000),
             "Memory": spec.limits.memory_bytes,
@@ -502,7 +507,7 @@ fn docker_create_body(
             "Binds": binds,
             "Tmpfs": runtime_tmpfs_config
         }
-    })
+    }))
 }
 
 fn workload_mcp_capability<'a>(
@@ -592,11 +597,16 @@ fn runtime_host_environment(
             );
         }
         if agent.provider == freshell_runtime_protocol::FreshProvider::Codex {
+            let program = if agent.fixture_transport.is_none() {
+                codex_sandbox::managed_program("codex")?
+            } else {
+                "codex".into()
+            };
             values.insert(
                 "CODEX_CMD".into(),
                 format!(
-                    "/usr/bin/setpriv --reuid {} --regid {} --clear-groups --no-new-privs -- codex",
-                    agent.run_as_uid, agent.run_as_gid
+                    "/usr/bin/setpriv --reuid {} --regid {} --clear-groups --no-new-privs -- {}",
+                    agent.run_as_uid, agent.run_as_gid, program
                 ),
             );
         }
@@ -626,7 +636,9 @@ fn runtime_host_environment(
             "CODEX_CMD".into(),
             format!(
                 "/usr/bin/setpriv --reuid {} --regid {} --clear-groups --no-new-privs -- {}",
-                terminal.run_as_uid, terminal.run_as_gid, terminal.program
+                terminal.run_as_uid,
+                terminal.run_as_gid,
+                codex_sandbox::managed_program(&terminal.program)?
             ),
         );
     }
@@ -883,7 +895,10 @@ impl RuntimeBackend for DockerEngineBackend {
         let operator_home = terminal_mounts
             .as_ref()
             .and_then(|mounts| mounts.operator_home.as_ref());
-        let expected = ExpectedConfig::new(spec, &binary, &runtime_dir);
+        let expected = ExpectedConfig::new(spec, &binary, &runtime_dir)?;
+        if let Some(policy) = &expected.codex_native_sandbox {
+            tracing::info!(provider = "codex", incarnation_id = spec.incarnation_id.as_str(), image = %spec.image_ref, profile_id = %policy.id, profile_sha256 = %policy.profile_sha256, declared_native_version = %policy.declared_managed_version, supported_native_version = %policy.supported_native_version, helper_sha256 = %policy.helper_sha256, "runtime.codex_native_sandbox.selected");
+        }
         let immutable_config_digest = digest_expected(&expected)?;
         let (daemon_id, rootless) = self.daemon_info().await?;
         self.ensure_reserved_initial_volume(spec, &daemon_id, rootless)
@@ -944,7 +959,7 @@ impl RuntimeBackend for DockerEngineBackend {
             operator_home_record,
             requested_limits,
             memory_swap,
-        );
+        )?;
         if let Some(mounts) = &terminal_mounts {
             let context = spec
                 .terminal
@@ -1258,6 +1273,8 @@ struct ExpectedConfig {
     terminal: Option<TerminalLaunchSpec>,
     fresh_agent: Option<ImmutableFreshAgentConfig>,
     provider_volume_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex_native_sandbox: Option<codex_sandbox::Identity>,
 }
 
 /// The registry updates session identity and turn settings while a container
@@ -1299,8 +1316,12 @@ impl From<&FreshAgentLaunchSpec> for ImmutableFreshAgentConfig {
 }
 
 impl ExpectedConfig {
-    fn new(spec: &CreateRuntimeSpec, binary: &Path, runtime_dir: &Path) -> Self {
-        Self {
+    fn new(
+        spec: &CreateRuntimeSpec,
+        binary: &Path,
+        runtime_dir: &Path,
+    ) -> Result<Self, BackendError> {
+        Ok(Self {
             image_ref: spec.image_ref.clone(),
             installation_id: spec.installation_id.to_string(),
             soul_id: spec.soul_id.to_string(),
@@ -1311,7 +1332,11 @@ impl ExpectedConfig {
             terminal: spec.terminal.clone(),
             fresh_agent: spec.fresh_agent.as_ref().map(Into::into),
             provider_volume_name: spec.provider_volume_name.clone(),
-        }
+            codex_native_sandbox: codex_sandbox::identity(
+                spec.terminal.as_ref(),
+                spec.fresh_agent.as_ref(),
+            )?,
+        })
     }
 }
 
@@ -1327,6 +1352,7 @@ fn immutable_digest_from_handle(handle: &OwnedRuntimeHandle) -> Result<String, B
         terminal: handle.terminal().cloned(),
         fresh_agent: handle.fresh_agent().map(Into::into),
         provider_volume_name: handle.provider_volume_name().to_owned(),
+        codex_native_sandbox: codex_sandbox::identity(handle.terminal(), handle.fresh_agent())?,
     })
 }
 
@@ -1479,6 +1505,9 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
     let host_config = value
         .get("HostConfig")
         .ok_or_else(|| BackendError::OwnershipMismatch("missing HostConfig".into()))?;
+    if codex_sandbox::selected(handle.terminal(), handle.fresh_agent()) {
+        codex_sandbox::verify(host_config)?;
+    }
     let expected_network = if handle.terminal().is_some() || handle.fresh_agent().is_some() {
         "bridge"
     } else {
@@ -1879,6 +1908,8 @@ mod tests {
         let binary = root.path().join("freshell-session-host");
         std::fs::write(&binary, b"host").unwrap();
         let agent = FreshAgentLaunchSpec {
+            naming_handle: None,
+            collaboration_mode: None,
             session_id: "session-one".into(),
             provider: FreshProvider::Codex,
             session_type: "freshcodex".into(),
@@ -1944,6 +1975,9 @@ mod tests {
                 "PidMode":"",
                 "Privileged":false,
                 "CapAdd":["CHOWN","SETGID","SETUID"],
+                "CapDrop":["ALL"],
+                "ReadonlyRootfs":true,
+                "SecurityOpt":codex_sandbox::security_options(None, handle.fresh_agent()).unwrap(),
                 "Tmpfs":runtime_tmpfs(Some("codex")),
             },
             "Mounts": [
@@ -2044,7 +2078,7 @@ mod tests {
         assert_eq!(response.body, b"test");
     }
     #[test]
-    fn codex_host_environment_drops_to_the_provider_uid_and_uses_soul_home() {
+    fn codex_host_environment_uses_soul_home_and_excludes_auth_token() {
         let terminal = TerminalLaunchSpec {
             terminal_id: "terminal-one".into(),
             stream_id: "stream-one".into(),
@@ -2081,7 +2115,7 @@ mod tests {
         assert!(env
             .iter()
             .any(|value| value == "CODEX_HOME=/home/freshell/provider/.codex"));
-        assert!(env.iter().any(|value| value == "CODEX_CMD=/usr/bin/setpriv --reuid 65534 --regid 0 --clear-groups --no-new-privs -- codex"));
+
         assert!(!env.iter().any(|value| value.contains("AUTH_TOKEN")));
     }
 
@@ -2172,7 +2206,7 @@ mod tests {
             serde_json::to_string(&spec.limits).unwrap(),
             spec.limits.memory_bytes,
         );
-        let durable_json = serde_json::to_string(&body).unwrap();
+        let durable_json = serde_json::to_string(&body.unwrap()).unwrap();
         assert!(durable_json.contains(&keys.to_string_lossy().to_string()));
         // Docker needs only the exact read-only mount. The profile selector is
         // delivered later over the authenticated host grant, while resolved
@@ -2224,6 +2258,8 @@ mod tests {
     #[test]
     fn fresh_agent_config_digest_survives_native_identity_and_turn_settings() {
         let agent = FreshAgentLaunchSpec {
+            naming_handle: None,
+            collaboration_mode: None,
             session_id: "presentation-one".into(),
             provider: FreshProvider::Codex,
             session_type: "freshcodex".into(),
@@ -2264,6 +2300,7 @@ mod tests {
                 terminal: None,
                 fresh_agent: Some((&agent).into()),
                 provider_volume_name: "freshell-provider-one".into(),
+                codex_native_sandbox: codex_sandbox::identity(None, Some(&agent)).unwrap(),
             })
             .unwrap()
         };
@@ -2305,6 +2342,7 @@ mod tests {
         let context = ProviderLaunchContext {
             prepared_inputs: Some(inputs),
             preparation: ProviderPreparation::Codex {
+                approval_default: None,
                 tui_args: vec![],
                 sidecar_args: vec![],
             },
@@ -2338,6 +2376,11 @@ mod tests {
                 terminal: (!fresh_route).then_some(terminal.clone()),
                 fresh_agent: fresh_route.then(|| (&fresh).into()),
                 provider_volume_name: "owned-provider".into(),
+                codex_native_sandbox: codex_sandbox::identity(
+                    (!fresh_route).then_some(&terminal),
+                    fresh_route.then_some(&fresh),
+                )
+                .unwrap(),
             };
             let before = digest_expected(&expected).unwrap();
             let context = if let Some(terminal) = expected.terminal.as_mut() {
@@ -2358,6 +2401,8 @@ mod tests {
 
     fn fresh_agent_spec_fixture() -> FreshAgentLaunchSpec {
         FreshAgentLaunchSpec {
+            naming_handle: None,
+            collaboration_mode: None,
             session_id: "session-fixture".into(),
             provider: FreshProvider::Codex,
             session_type: "freshcodex".into(),
@@ -2605,6 +2650,138 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (handle, inspected) = terminal_runtime_fixture(root.path(), None);
         assert!(verify_inspect_config(&handle, &inspected).is_ok());
+    }
+
+    fn codex_runtime_fixture(root: &Path) -> (OwnedRuntimeHandle, Value) {
+        let (original, mut inspected) = terminal_runtime_fixture(root, None);
+        let mut terminal = original.terminal().unwrap().clone();
+        terminal.mode = "codex".into();
+        terminal.program = "codex".into();
+        let make_handle = |digest: String| {
+            OwnedRuntimeHandle::from_registry(
+                original.installation_id().clone(),
+                original.soul_id().clone(),
+                original.incarnation_id().clone(),
+                original.launch_nonce().clone(),
+                original.daemon_id().clone(),
+                original.container_id().into(),
+                original.image_ref().into(),
+                original.runtime_dir().into(),
+                original.host_binary_path().into(),
+                digest,
+                original.requested_limits(),
+                None,
+                Some(terminal.clone()),
+                None,
+                original.provider_volume_name().into(),
+            )
+        };
+        let provisional = make_handle(original.immutable_config_digest().into());
+        let handle = make_handle(immutable_digest_from_handle(&provisional).unwrap());
+        inspected["Config"]["Env"] =
+            json!(runtime_host_environment(Some(&terminal), None, None).unwrap());
+        inspected["HostConfig"]["Tmpfs"] = json!(runtime_tmpfs(Some("codex")));
+        inspected["HostConfig"]["ReadonlyRootfs"] = json!(true);
+        inspected["HostConfig"]["CapDrop"] = json!(["ALL"]);
+        inspected["HostConfig"]["SecurityOpt"] =
+            json!(codex_sandbox::security_options(Some(&terminal), None).unwrap());
+        inspected["Id"] = json!(handle.container_id());
+        inspected["State"] = json!({"Status":"created","Running":false});
+        (handle, inspected)
+    }
+
+    #[test]
+    fn codex_native_sandbox_policy_is_required_before_reusing_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let (handle, mut inspected) = codex_runtime_fixture(root.path());
+        assert!(verify_inspect_config(&handle, &inspected).is_ok());
+        inspected["HostConfig"]["SecurityOpt"] = json!(["no-new-privileges:true"]);
+        assert!(
+            matches!(
+                verify_inspect_config(&handle, &inspected),
+                Err(BackendError::OwnershipMismatch(_))
+            ),
+            "a live Codex runtime without the required native sandbox policy must not be reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_native_policy_is_verified_before_docker_start() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let (handle, inspected) = codex_runtime_fixture(root.path());
+        let socket = root.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let inspected = Arc::new(Mutex::new(inspected));
+        let starts = Arc::new(AtomicUsize::new(0));
+        let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+        let (observed, calls, daemon) = (
+            inspected.clone(),
+            starts.clone(),
+            handle.daemon_id().to_string(),
+        );
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = tokio::select! {
+                    _ = &mut stopped => break,
+                    accepted = listener.accept() => accepted.unwrap(),
+                };
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0; 4096];
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..count]);
+                    if find_bytes(&request, b"\r\n\r\n").is_some() {
+                        break;
+                    }
+                }
+                let line = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                let (status, body) = if line.starts_with("GET /v1.47/info ") {
+                    (
+                        200,
+                        serde_json::to_vec(
+                            &json!({"ID":daemon,"SecurityOptions":["name=rootless"]}),
+                        )
+                        .unwrap(),
+                    )
+                } else if line.starts_with("GET /v1.47/containers/container-one/json ") {
+                    (200, serde_json::to_vec(&*observed.lock().unwrap()).unwrap())
+                } else if line.starts_with("POST /v1.47/containers/container-one/start ") {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    (204, Vec::new())
+                } else {
+                    (404, Vec::new())
+                };
+                stream.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+                stream.write_all(&body).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+        let backend = DockerEngineBackend::new(&socket);
+        backend.start_host(&handle).await.unwrap();
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        inspected.lock().unwrap()["HostConfig"]["SecurityOpt"] = json!(["no-new-privileges:true"]);
+        assert!(matches!(
+            backend.start_host(&handle).await,
+            Err(BackendError::OwnershipMismatch(_))
+        ));
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            1,
+            "missing native policy must not issue another Docker start"
+        );
+        stop.send(()).unwrap();
+        server.await.unwrap();
     }
 
     #[test]

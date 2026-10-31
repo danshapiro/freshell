@@ -1658,11 +1658,11 @@ fn codex_error_classes_preserve_their_native_classification() {
         matches!(
             classified(CodexAppServerError::Rpc {
                 method: "thread/name/set".into(),
-                error: RpcError {
+                error: Box::new(RpcError {
                     code: -32004,
                     message: "thread not found".into(),
                     data: None,
-                },
+                }),
             }),
             super::NativeClassified::Unsupported(_)
         ),
@@ -1672,11 +1672,11 @@ fn codex_error_classes_preserve_their_native_classification() {
         matches!(
             classified(CodexAppServerError::Rpc {
                 method: "thread/name/set".into(),
-                error: RpcError {
+                error: Box::new(RpcError {
                     code: -32603,
                     message: "internal error".into(),
                     data: None,
-                },
+                }),
             }),
             super::NativeClassified::Undelivered(_)
         ),

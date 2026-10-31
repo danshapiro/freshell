@@ -133,6 +133,36 @@ else
   fi
   CMD="$1"
 
+  # Only the closed native Codex contract entrypoint receives its declared
+  # sandbox construction policy. Every other runtime suite keeps Docker's
+  # existing default. Verify before the install-capable entrypoint can run.
+  CODEX_NATIVE_CONTRACT=0
+  if [ "${RUNTIME_SUITE}" -eq 1 ]; then
+    case "${CMD}" in
+      'node test/integration/providers/codex-cli-contract.mjs --scenario all' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario model-effort-usage' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario text-history --missing-policy-client-probe' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario mcp-form-url' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario parent-child-read --child-approval' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario mcp-form-url --history-mode paginated --large-output' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario mcp-form-url --history-mode legacy --large-output' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario active-input-stop' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario active-input-stop --startup-cancellation' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario approval-policy-restricted-exec --requirements-guard' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario approval-policy-restricted-exec --approval-control stdin' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario approval-policy-restricted-exec --approval-control network' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario text-history --history-mode paginated --persistence-mode delayed' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario text-history --history-mode legacy --persistence-mode delayed' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario text-history --history-mode legacy --persistence-mode missing' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario text-history --history-mode paginated --persistence-mode missing' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario approval-policy-restricted-exec')
+        node "${REPO_ROOT}/scripts/testing/prepare-codex-contract.mjs" --verify-sandbox >/dev/null
+        CODEX_NATIVE_CONTRACT=1
+        IMAGE_TAG="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).image)' "${REPO_ROOT}/.runtime-build/codex-contract/staged.json")"
+        ;;
+    esac
+  fi
+
   # Keep Cargo targets reusable within one canonical working copy while
   # isolating concurrent checkouts. Labels are attached by Docker in the same
   # --mount request that creates and references a fresh volume; there is no
@@ -217,6 +247,10 @@ PY
   fi
 
   if ! docker image inspect "${IMAGE_TAG}" >/dev/null 2>&1; then
+    if [ "${CODEX_NATIVE_CONTRACT}" -eq 1 ]; then
+      echo '[sandbox] prepared Codex contract image is unavailable; connected preparation is required' >&2
+      exit 2
+    fi
     echo "[sandbox] image ${IMAGE_TAG} not found, building it first..." >&2
     "${REPO_ROOT}/scripts/sandbox-build.sh"
   fi
@@ -453,6 +487,12 @@ if [ "${RUNTIME_SUITE}" -eq 1 ]; then
     --security-opt no-new-privileges
     -e FRESHELL_SANDBOX_MODE=runtime-suite
   )
+  if [ "${CODEX_NATIVE_CONTRACT:-0}" -eq 1 ]; then
+    DOCKER_ARGS+=(
+      --security-opt "seccomp=${REPO_ROOT}/.runtime-build/codex-contract/codex-policy.json"
+      -e FRESHELL_CODEX_CONTRACT_POLICY=prepared
+    )
+  fi
   if [ "${CHECKPOINT_FIXTURE}" -eq 1 ]; then
     DOCKER_ARGS+=(-e FRESHELL_SANDBOX_CHECKPOINT_FIXTURE=1)
   fi

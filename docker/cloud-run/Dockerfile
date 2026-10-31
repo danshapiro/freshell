@@ -15,7 +15,7 @@ ARG FRESHELL_BUILD_COMMIT
 # ---------------------------------------------------------------------------
 # Stage 1: build the Rust server.
 # ---------------------------------------------------------------------------
-FROM rust:1-bookworm AS rust-builder
+FROM rust:1.96.0-bookworm AS rust-builder
 
 ARG FRESHELL_BUILD_COMMIT
 
@@ -38,7 +38,19 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 COPY extensions/ ./extensions/
 COPY docker/runtime/provider-versions.json ./docker/runtime/provider-versions.json
-RUN FRESHELL_BUILD_COMMIT="$FRESHELL_BUILD_COMMIT" cargo build --release -p freshell-server --locked
+COPY docker/runtime/codex-native-sandbox.json ./docker/runtime/codex-native-sandbox.json
+RUN rustc --version && cargo --version \
+    && FRESHELL_BUILD_COMMIT="$FRESHELL_BUILD_COMMIT" cargo build --release -p freshell-server --locked
+# Compile the real-client requirement guard before entering native test lanes.
+RUN set -eu; cargo test --release -p freshell-codex --features native-policy-qualification --lib --no-run --locked \
+    ; set -- target/release/deps/freshell_codex-* \
+    ; count=0; for probe in "$@"; do \
+         if [ -f "$probe" ] && [ -x "$probe" ]; then \
+           cp "$probe" /build/codex-policy-client-probe; count=$((count + 1)); \
+         fi; \
+       done; test "$count" -eq 1 \
+    && chmod 755 /build/codex-policy-client-probe \
+    && sha256sum /build/codex-policy-client-probe > /build/codex-policy-client-probe.sha256
 
 # ---------------------------------------------------------------------------
 # Stage 2: build retained Node tooling and static artifacts.
@@ -68,6 +80,7 @@ RUN npm install -g pnpm@10.34.5 \
   && pnpm install --frozen-lockfile --ignore-scripts
 
 COPY . .
+RUN node scripts/testing/prepare-codex-contract.mjs --output /opt/freshell-test-providers/codex/0.164.0-linux-x64
 RUN FRESHELL_BUILD_COMMIT="$FRESHELL_BUILD_COMMIT" pnpm run build:client && pnpm run build:tools
 
 # ---------------------------------------------------------------------------
@@ -105,6 +118,8 @@ RUN pnpm dlx playwright@1.58.2 install --with-deps chromium
 
 WORKDIR /app
 COPY --from=rust-builder /build/target/release/freshell-server /app/target/release/freshell-server
+COPY --from=rust-builder /build/codex-policy-client-probe /opt/freshell-test-providers/codex/policy-client-probe
+COPY --from=rust-builder /build/codex-policy-client-probe.sha256 /opt/freshell-test-providers/codex/policy-client-probe.sha256
 COPY --from=rust-builder /usr/local/cargo /usr/local/cargo
 COPY --from=rust-builder /usr/local/rustup /usr/local/rustup
 COPY --from=node-builder /app/dist/client ./dist/client
@@ -113,6 +128,7 @@ COPY --from=node-builder /app/node_modules ./node_modules
 # The pinned Claude contract exercises the isolated sidecar package directly.
 # Its node_modules links back to the root pnpm store copied above.
 COPY --from=node-builder /app/crates/freshell-claude-sidecar/node_modules ./crates/freshell-claude-sidecar/node_modules
+COPY --from=node-builder /opt/freshell-test-providers/codex/0.164.0-linux-x64 /opt/freshell-test-providers/codex/0.164.0-linux-x64
 
 # Fail the image build if the copied test toolchain cannot execute in this
 # Debian runtime. A container-level test checks the configured runtime user.
@@ -123,6 +139,10 @@ RUN cargo --version && rustc --version
 # overwrite the staged artifacts.
 COPY . .
 
+# This controlled test-only requirements layer enables the native network
+# approval controller. No production runtime image receives it.
+RUN node --input-type=module -e 'import fs from "node:fs"; import { CODEX_NETWORK_REQUIREMENTS } from "./test/integration/providers/codex-local-provider.mjs"; fs.mkdirSync("/etc/codex", { recursive: true }); fs.writeFileSync("/etc/codex/requirements.toml", CODEX_NETWORK_REQUIREMENTS, { mode: 0o644 })'
+
 # Check the assembled runtime tree after all staged artifacts are present.
 # With --runtime-root the guard checks the required Rust/client/tools files and
 # executable, scans only shipped dist/, target/, and node_modules/ roots,
@@ -131,6 +151,9 @@ COPY . .
 RUN scripts/verify-container-layout.sh --fixture /app --runtime-root
 
 ENV FRESHELL_E2E_RUST_SERVER_BIN=/app/target/release/freshell-server
+ENV FRESHELL_CODEX_CONTRACT_ROOT=/opt/freshell-test-providers/codex/0.164.0-linux-x64
+ENV FRESHELL_CODEX_CONTRACT_CAPTURE_STDOUT=1
+ENV FRESHELL_CODEX_POLICY_CLIENT_PROBE=/opt/freshell-test-providers/codex/policy-client-probe
 
 # COPY's requested mode can still be narrowed by rootless build/ACL metadata.
 # Normalize the copied artifact in the image layer so the final unprivileged
@@ -142,6 +165,10 @@ RUN chmod 755 /usr/local/bin/e2e-entrypoint.sh \
 # The browser test harness needs an unprivileged user for permission checks.
 RUN chown -R node:node /app
 USER node
+
+# Verify the complete copied native tree as the final runtime identity,
+# including /opt ancestors outside /app's ownership adjustment.
+RUN node --input-type=module -e 'import { verifyArtifact, verifyPolicyClientProbe } from "./scripts/testing/prepare-codex-contract.mjs"; await verifyArtifact(process.env.FRESHELL_CODEX_CONTRACT_ROOT); await verifyPolicyClientProbe(process.env.FRESHELL_CODEX_POLICY_CLIENT_PROBE)'
 
 # Verify the final runtime user can read, syntax-check, and execute the exact
 # entrypoint artifact. `--dry-run` exits before Playwright and exercises the

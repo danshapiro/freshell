@@ -6,9 +6,9 @@
 
 use freshell_protocol::{
     ClientMessage, FreshAgentApprovalRespond, FreshAgentAttach, FreshAgentCompact,
-    FreshAgentConfigure, FreshAgentCreate, FreshAgentFork, FreshAgentInterrupt, FreshAgentKill,
-    FreshAgentQuestionRespond, FreshAgentRecoveryStop, FreshAgentRedo, FreshAgentSend,
-    FreshAgentUndo,
+    FreshAgentConfigure, FreshAgentCreate, FreshAgentElicitationRespond, FreshAgentFork,
+    FreshAgentInterrupt, FreshAgentKill, FreshAgentQuestionRespond, FreshAgentRecoveryStop,
+    FreshAgentRedo, FreshAgentSend, FreshAgentUndo,
 };
 use futures::future::BoxFuture;
 use std::sync::{Arc, OnceLock};
@@ -24,6 +24,7 @@ pub enum HostedFreshAgentCommand {
     RecoveryStop(FreshAgentRecoveryStop),
     Approval(FreshAgentApprovalRespond),
     Question(FreshAgentQuestionRespond),
+    Elicitation(FreshAgentElicitationRespond),
     Compact(FreshAgentCompact),
     Fork(FreshAgentFork),
     Undo(FreshAgentUndo),
@@ -58,6 +59,7 @@ pub(crate) fn hosted_route(message: &ClientMessage) -> HostedRoute {
         ClientMessage::FreshAgentRecoveryStop(value) => Command::RecoveryStop(value.clone()),
         ClientMessage::FreshAgentApprovalRespond(value) => Command::Approval(value.clone()),
         ClientMessage::FreshAgentQuestionRespond(value) => Command::Question(value.clone()),
+        ClientMessage::FreshAgentElicitationRespond(value) => Command::Elicitation(value.clone()),
         ClientMessage::FreshAgentCompact(value) => Command::Compact(value.clone()),
         ClientMessage::FreshAgentFork(value) => Command::Fork(value.clone()),
         ClientMessage::FreshAgentUndo(value) => Command::Undo(value.clone()),
@@ -97,6 +99,9 @@ pub(crate) fn hosted_route(message: &ClientMessage) -> HostedRoute {
 }
 
 pub trait HostedFreshAgentGateway: Send + Sync {
+    fn attention_marks(&self) -> BoxFuture<'_, Vec<freshell_protocol::FreshAgentAttentionMark>> {
+        Box::pin(async { Vec::new() })
+    }
     fn dispatch(self: Arc<Self>, command: HostedFreshAgentCommand) -> BoxFuture<'static, ()>;
 }
 
@@ -109,6 +114,13 @@ pub fn install_gateway(gateway: Arc<dyn HostedFreshAgentGateway>) -> Result<(), 
     GATEWAY
         .set(gateway)
         .map_err(|_| "hosted fresh-agent gateway is already installed")
+}
+
+pub(crate) async fn retained_attention_marks() -> Vec<freshell_protocol::FreshAgentAttentionMark> {
+    match GATEWAY.get() {
+        Some(gateway) => gateway.attention_marks().await,
+        None => Vec::new(),
+    }
 }
 
 pub(crate) fn dispatch_if_installed(message: &ClientMessage) -> bool {

@@ -12,6 +12,7 @@ import {
   FreshAgentRetryRow,
   FreshAgentToolBlock,
   itemToToolDisplay,
+  outputReferences,
   stripSystemReminders,
   type FreshAgentToolDisplay,
 } from './FreshAgentItemCard'
@@ -149,7 +150,7 @@ function buildActivity(
           previewOverride: item.title,
           output: item.result,
           isError: item.status === 'failed',
-          status: item.status === 'running' ? 'running' : 'complete',
+          status: item.status === 'completed' ? 'complete' : item.status,
         },
       })
       continue
@@ -168,6 +169,7 @@ function buildActivity(
           tool: {
             ...existing.tool,
             output: formatJson(item.content),
+            references: outputReferences(item.content),
             isError: item.isError,
             status: 'complete',
           },
@@ -181,6 +183,7 @@ function buildActivity(
             id: item.id,
             name: 'Result',
             output: formatJson(item.content),
+            references: outputReferences(item.content),
             isError: item.isError,
             status: 'complete',
           },
@@ -261,7 +264,10 @@ export type TurnLayout = { blocks: RenderBlock[] }
 /** Mirrors FreshAgentItemCard's null-render path for text items: a text item
  * that renders nothing must not close an open line (nothing visibly between). */
 function rendersVisibly(item: FreshAgentTranscriptItem): boolean {
-  if (item.kind === 'text') return stripSystemReminders(item.text).trim().length > 0
+  if (item.kind === 'text') {
+    const codex = item.extensions?.codex as { questions?: unknown } | undefined
+    return stripSystemReminders(item.text).trim().length > 0 || (Array.isArray(codex?.questions) && codex.questions.length > 0)
+  }
   return true
 }
 
@@ -508,6 +514,7 @@ function normalizeActivityRows(rows: ActivityRow[], live: boolean): ActivityRow[
     if (
       row.type !== 'tool'
       || row.tool.status !== 'running'
+      || row.tool.nativeOutcome === true
       || row.tool.id === activeRunningToolId
     ) {
       return row
@@ -1031,6 +1038,14 @@ export function FreshAgentTurnArticle({
         </div>
       ) : null}
       <div className="fresh-agent-transcript-copy space-y-1.5">
+        {turn.outputState && (turn.outputState.provenance !== 'saved' || turn.outputState.diagnostic) ? (
+          <div role="note" aria-label="Output persistence" className="my-1 text-xs text-muted-foreground">
+            {turn.outputState.provenance === 'saved-and-retained' ? 'Saved output and retained output.' : turn.outputState.provenance === 'retained' ? 'Retained output.' : turn.outputState.provenance === 'preview' ? 'Native preview.' : 'Saved output.'}{' '}
+            {turn.outputState.diagnostic === 'interrupted' ? (turn.outputState.provenance === 'saved' ? 'Interrupted. Only saved output remains.' : 'Interrupted.') : turn.outputState.diagnostic === 'unsaved' ? 'Saved output could not be confirmed.' : turn.outputState.diagnostic === 'provider-truncated' ? 'Codex shortened the saved tool output.' : turn.outputState.refreshPending ? 'Waiting for saved history.' : null}
+            {turn.outputState.retainedItems?.length ? <details><summary>Retained output</summary>{turn.outputState.retainedItems.map((item) => <FreshAgentItemCard key={item.id} item={item} />)}</details> : null}
+            {turn.outputState.savedItems?.length ? <details><summary>Saved representation</summary>{turn.outputState.savedItems.map((item) => <FreshAgentItemCard key={item.id} item={item} />)}</details> : null}
+          </div>
+        ) : null}
         {blocks.length > 0 ? (
           <TurnBlocks
             blocks={blocks}

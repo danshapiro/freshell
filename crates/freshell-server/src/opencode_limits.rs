@@ -240,6 +240,8 @@ mod tests {
         limit: Option<(i64, Option<i64>, Option<i64>)>,
     ) -> ModelCapability {
         ModelCapability {
+            default_effort: None,
+            input_modalities: None,
             id: id.to_string(),
             display_name: id.to_string(),
             provider: "opencode",

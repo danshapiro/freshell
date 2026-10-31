@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import fs from 'node:fs/promises'
 import http from 'node:http'
@@ -982,4 +982,32 @@ describe('runtime harness candidate scratch cleanup', () => {
       }
     },
   )
+})
+
+it('records the selected Codex pin from each owned runtime inventory', async () => {
+  for (const version of ['0.164.fixture-a', '0.164.fixture-b']) {
+    const repository = await fs.mkdtemp(path.join(os.tmpdir(), 'frs-codex-pin-'))
+    const home = path.join(repository, 'home')
+    const xdg = path.join(home, '.config')
+    const workspace = path.join(repository, 'workspace')
+    let harness: RuntimeHarness | undefined
+    try {
+      for (const directory of [workspace, path.join(repository, 'test/runtime'), path.join(repository, 'docker/runtime')]) await fs.mkdir(directory, { recursive: true })
+      prepareProviderParityUserRoots(home, xdg)
+      await fs.writeFile(path.join(repository, 'test/runtime/gate-manifest.json'), '{}')
+      await fs.writeFile(path.join(repository, 'docker/runtime/provider-versions.json'), JSON.stringify({ providers: { codex: { version } } }))
+      const host = path.join(repository, 'owned-host')
+      await fs.writeFile(host, 'owned host fixture')
+      harness = new RuntimeHarness(repository, randomUUID(), 3, home, xdg, { workspaceRoots: [workspace], bootstrapFiles: [] })
+      useOwnedHarnessArtifacts(harness, host)
+      await harness.prepare()
+      const result = JSON.parse(await fs.readFile(path.join(harness.evidenceDir, 'provider-results.json'), 'utf8'))
+      expect(result.providers.codex.version).toBe(version)
+    } finally {
+      await harness?.cleanup()
+      if (harness) await fs.rm(harness.testRoot, { recursive: true, force: true })
+      await fs.rm(repository, { recursive: true, force: true })
+      vi.restoreAllMocks()
+    }
+  }
 })

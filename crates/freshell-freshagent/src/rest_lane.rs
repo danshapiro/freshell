@@ -6,10 +6,22 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 pub type RestCreateSettingsReader = std::sync::Arc<
-    dyn Fn() -> futures_util::future::BoxFuture<'static, freshell_protocol::SettingsFreshAgent>
-        + Send
-        + Sync,
+    dyn Fn() -> futures_util::future::BoxFuture<'static, RestCreateSettings> + Send + Sync,
 >;
+
+pub struct RestCreateSettings {
+    pub fresh_agent: freshell_protocol::SettingsFreshAgent,
+    pub coding_cli: Option<freshell_protocol::SettingsCodingCli>,
+}
+
+impl From<freshell_protocol::SettingsFreshAgent> for RestCreateSettings {
+    fn from(fresh_agent: freshell_protocol::SettingsFreshAgent) -> Self {
+        Self {
+            fresh_agent,
+            coding_cli: None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RestLaneErrorKind {
@@ -29,6 +41,15 @@ pub struct RestLaneError {
     pub retryable: Option<bool>,
     pub retry_after_ms: Option<u64>,
     pub owner: Option<crate::ownership_lane::TerminalOwnerFields>,
+    pub correlation: Option<Box<RestLaneErrorCorrelation>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RestLaneErrorCorrelation {
+    pub session_id: Option<String>,
+    pub request_id: Option<String>,
+    pub incarnation_id: Option<String>,
+    pub submitted_turn_id: Option<String>,
 }
 
 impl RestLaneError {
@@ -44,6 +65,7 @@ impl RestLaneError {
             retryable: None,
             retry_after_ms: None,
             owner: None,
+            correlation: None,
         }
     }
 }
@@ -125,7 +147,8 @@ pub struct RestLaneCreate {
     pub session_type: String,
     pub cwd: Option<String>,
     pub model: Option<String>,
-    pub effort: Option<String>,
+    pub effort: Option<Option<String>>,
+    pub collaboration_mode: Option<String>,
     pub native_session_id: Option<String>,
     pub plugins: Option<Vec<String>>,
     pub model_selection: Option<Option<freshell_protocol::ModelSelection>>,
@@ -145,9 +168,15 @@ pub struct RestLaneCreated {
     /// table. It is not substituted for the provider's native identity.
     pub session_id: String,
     pub session_ref: Option<freshell_protocol::SessionLocator>,
+    /// Naming identity acknowledged by the owning create/resume operation.
+    /// A resumed conversation can already have a durable canonical record.
+    pub name_ref: Option<freshell_protocol::session_names::SessionNameRef>,
     /// Provider-owned identity of a runtime newly started by this create.
     /// An adopted existing writer has no cleanup token.
     pub cleanup_token: Option<String>,
+    /// Provider-resolved next-turn choices captured from the same writer.
+    /// Native thread echoes can differ from the requested launch defaults.
+    pub effective_settings: Option<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -200,6 +229,14 @@ pub struct RestLaneSnapshot {
     pub session_type: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestLaneChildRead {
+    pub parent_session_id: String,
+    pub child_thread_id: String,
+    pub observed_epoch: Option<u64>,
+    pub observed_generation: Option<u64>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RestLaneSnapshotError {
     OwnershipUnavailable,
@@ -208,6 +245,21 @@ pub enum RestLaneSnapshotError {
 
 #[async_trait]
 pub trait FreshAgentRestLane: Send + Sync {
+    async fn model_catalog_source(
+        &self,
+        _context: crate::model_capabilities::CodexCatalogContext,
+    ) -> Result<
+        crate::model_capabilities::CodexCatalogSource,
+        crate::model_capabilities::CapabilityError,
+    > {
+        Err(crate::model_capabilities::runtime_pending())
+    }
+    async fn read_child(
+        &self,
+        _request: RestLaneChildRead,
+    ) -> Result<Option<Value>, crate::codex::children::ChildReadError> {
+        Err(crate::codex::children::ChildReadError::SourceUnavailable)
+    }
     /// None leaves genuinely unmanaged threads on their existing read path.
     /// A hosted read failure must never fall back to saved history as live truth.
     async fn snapshot(

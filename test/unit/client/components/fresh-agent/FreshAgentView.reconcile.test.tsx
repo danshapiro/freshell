@@ -525,6 +525,35 @@ describe('FreshAgentView SESSION_RESERVED re-drive (Task 14)', () => {
     expect(document.querySelector('.fresh-agent-error-card')).toBeNull()
   })
 
+  it('keeps the Freshcodex prompt and settings when preparation refuses the selected configuration', async () => {
+    const key = 'fresh-agent-draft:freshcodex:req-codex-config'
+    const draft = 'Keep this prompt until the selected configuration is repaired.'
+    const selected = {
+      sessionType: 'freshcodex' as const, provider: 'codex' as const,
+      status: 'creating' as const, createRequestId: 'req-codex-config', initialCwd: '/owned/project',
+      model: 'contract-model', modelSelection: { kind: 'exact' as const, modelId: 'contract-model' },
+      effort: 'low', permissionMode: 'untrusted', sandbox: 'workspace-write' as const,
+    }
+    window.sessionStorage.setItem(key, draft)
+    try {
+      renderFreshAgentPane(selected)
+      await flush()
+      const creates = sentOfType('freshAgent.create').length
+      const message = 'Codex approval_policy in /owned/codex/config.toml cannot preserve the selected source.'
+      receiveWsBoth({ type: 'freshAgent.create.failed', requestId: selected.createRequestId,
+        code: 'INVALID_REQUEST', message, retryable: false })
+      await flush()
+      expect(screen.getByText(message)).toBeVisible()
+      expect(leafContent(store.getState())).toEqual(expect.objectContaining({ ...selected, status: 'create-failed' }))
+      expect(store.getState().freshAgent.pendingCreateFailures[selected.createRequestId]).toEqual({ code: 'INVALID_REQUEST', message, retryable: false })
+      expect(screen.getByRole('textbox')).toHaveValue(draft)
+      expect(window.sessionStorage.getItem(key)).toBe(draft)
+      await act(async () => { await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS + 20) })
+      expect(sentOfType('freshAgent.create')).toHaveLength(creates)
+      expect(sentOfType('freshAgent.send')).toHaveLength(0)
+    } finally { window.sessionStorage.removeItem(key) }
+  })
+
   it('non-reserved create.failed still lands create-failed status (regression)', async () => {
     renderFreshAgentPane({ status: 'creating', createRequestId: 'req-1' })
     await flush()

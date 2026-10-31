@@ -470,11 +470,14 @@ impl DockerEngineBackend {
                     .push(json!({"Type":"bind","Source":common,"Target":common,"ReadOnly":true}));
             }
             descriptors.extend(prepared_inputs::mount_descriptors(&mounts, &backing.name)?);
+            // A candidate performs the workload's full durable projection,
+            // including installed dependencies, rather than a metadata-only read.
+            // Give that preparation the ordinary managed workload's CPU budget.
             let body = json!({"Image":image,"User":"0:0","Tty":false,"WorkingDir":cwd,
                 "Entrypoint":["/runtime/freshell-session-host"],"Cmd":["project-claude-candidate-private"],"Labels":labels,
                 "Env":self.private_helper_environment(image,&["HOME=/home/freshell/provider"]).await?,
                 "HostConfig":{"NetworkMode":"none","ReadonlyRootfs":true,"CapDrop":["ALL"],"CapAdd":["CHOWN","SETGID","SETUID"],
-                    "SecurityOpt":["no-new-privileges"],"Memory":256*1024*1024,"MemorySwap":256*1024*1024,"NanoCpus":500_000_000,"PidsLimit":32,
+                    "SecurityOpt":["no-new-privileges"],"Memory":256*1024*1024,"MemorySwap":256*1024*1024,"NanoCpus":2_000_000_000,"PidsLimit":32,
                     "LogConfig":{"Type":"none","Config":{}},"Tmpfs":{},"Mounts":descriptors}});
             step.enter("create");
             let created = reader

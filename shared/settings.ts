@@ -153,6 +153,9 @@ export type FreshAgentModelEffortLevels = {
 }
 
 export type FreshAgentProviderDefaults = {
+  cwd?: string
+  sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'
+  collaborationMode?: 'default' | 'plan'
   modelSelection?: FreshAgentModelSelection
   defaultPermissionMode?: string
   effort?: FreshAgentEffort
@@ -768,6 +771,9 @@ const FreshAgentModelEffortLevelsSchema = z
 function createFreshAgentProviderDefaultsSchema() {
   return z
     .object({
+      cwd: z.string().min(1).optional(),
+      sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
+      collaborationMode: z.enum(['default', 'plan']).optional(),
       modelSelection: FreshAgentModelSelectionSchema.optional(),
       defaultPermissionMode: z.string().optional(),
       effort: FreshAgentModelCapabilitiesOpaqueStringSchema.optional(),
@@ -780,6 +786,9 @@ function createFreshAgentProviderDefaultsSchema() {
 function createFreshAgentProviderDefaultsPatchSchema() {
   return z
     .object({
+      cwd: z.string().min(1).optional(),
+      sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
+      collaborationMode: z.enum(['default', 'plan']).optional(),
       modelSelection: FreshAgentModelSelectionSchema.nullable().optional(),
       defaultPermissionMode: z.string().optional(),
       effort: z.union([FreshAgentModelCapabilitiesOpaqueStringSchema, z.literal('')]).nullable().optional(),
@@ -1036,6 +1045,9 @@ function sanitizeFreshAgentServerSettingsPatchInput(
         && Object.keys(normalizedProviderPatchInput).length > 0
       ) {
         const normalizedProviderPatch: FreshAgentProviderDefaults = {}
+        if (hasOwn(normalizedProviderPatchInput, 'cwd')) normalizedProviderPatch.cwd = parsed.data.cwd
+        if (hasOwn(normalizedProviderPatchInput, 'sandbox')) normalizedProviderPatch.sandbox = parsed.data.sandbox
+        if (hasOwn(normalizedProviderPatchInput, 'collaborationMode')) normalizedProviderPatch.collaborationMode = parsed.data.collaborationMode
         if (hasOwn(normalizedProviderPatchInput, 'modelSelection')) {
           normalizedProviderPatch.modelSelection = parsed.data.modelSelection ?? undefined
         }
@@ -1292,7 +1304,7 @@ function normalizeLegacyFreshAgentProviderDefaultsInput(
 
   const normalized = pickOwnKeysPreservingUndefined(
     providerPatch,
-    ['modelSelection', 'defaultPermissionMode', 'effort', 'style', 'modelEffortLevels'],
+    ['modelSelection', 'defaultPermissionMode', 'effort', 'style', 'modelEffortLevels', 'cwd', 'sandbox', 'collaborationMode'],
   )
 
   if (

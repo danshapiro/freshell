@@ -1,14 +1,17 @@
+import { FreshAgentClientMessageSchema } from '../../../shared/ws-protocol.js'
 import { describe, expect, it } from 'vitest'
 
 import {
   FRESH_AGENT_CONTRACT_SCHEMA_NAMES,
   FreshAgentActionResultSchema,
   FreshAgentCapabilitiesSchema,
+  FreshAgentChildObservationSchema,
   FreshAgentContractErrorSchema,
   FreshAgentRequestIdSchema,
   FreshAgentSessionCommandSchema,
   FreshAgentSnapshotSchema,
   FreshAgentTranscriptItemSchema,
+  FreshAgentTranscriptPatchSchema,
   FreshAgentTurnBodySchema,
   FreshAgentTurnPageSchema,
   FreshAgentTurnSchema,
@@ -25,6 +28,33 @@ import {
 } from '../../fixtures/fresh-agent/codex/contract-fixtures.js'
 
 describe('fresh-agent shared contract schemas', () => {
+  it('requires the exact child body only for readable observations and preserves finite unavailable states', () => {
+    const identity = { parentThreadId: 'parent', childThreadId: codexContractSnapshot.threadId }
+    const saved = FreshAgentChildObservationSchema.parse({ ...identity, status: 'saved', snapshot: codexContractSnapshot })
+    expect(saved.status).toBe('saved')
+    for (const reason of ['ephemeral_history_unavailable', 'history_unavailable', 'source_unavailable']) {
+      const unavailable = { ...identity, status: 'unavailable', reason, retryable: reason === 'source_unavailable' }
+      expect(FreshAgentChildObservationSchema.safeParse(unavailable).success).toBe(true)
+      expect(FreshAgentChildObservationSchema.safeParse({ ...unavailable, snapshot: codexContractSnapshot }).success).toBe(false)
+    }
+    expect(FreshAgentChildObservationSchema.safeParse({ ...identity, status: 'pending', reason: 'history_unmaterialized', retryable: true }).success).toBe(true)
+    expect(FreshAgentChildObservationSchema.safeParse({ ...identity, childThreadId: 'wrong', status: 'live', snapshot: codexContractSnapshot }).success).toBe(false)
+  })
+  it('validates native delta patches and rejects unsafe revisions or malformed operations', () => {
+    const patch = { type: 'freshAgent.transcript.patch', sessionId: 'thread', projectionId: 'runtime', historyGeneration: 0, ops: [{ op: 'appendItem', nativeTurnId: 'turn', rowId: 'turn:row-1', itemId: 'answer', field: 'text', text: '🙂', revision: 1 }] }
+    expect(FreshAgentTranscriptPatchSchema.parse(patch).ops[0]).toMatchObject({ text: '🙂', revision: 1 })
+    expect(FreshAgentTranscriptPatchSchema.safeParse({ ...patch, ops: [{ ...patch.ops[0], revision: Number.MAX_SAFE_INTEGER + 1 }] }).success).toBe(false)
+    expect(FreshAgentTranscriptPatchSchema.safeParse({ ...patch, ops: [{ ...patch.ops[0], field: 'credentials' }] }).success).toBe(false)
+    expect(FreshAgentTranscriptPatchSchema.safeParse({ ...patch, ops: [{ ...patch.ops[0], op: 'replaceEverything' }] }).success).toBe(false)
+  })
+
+  it('preserves observed zero usage, native model limit, supplied diff and finite interrupted provenance', () => {
+    const parsed = FreshAgentSnapshotSchema.parse({ ...codexContractSnapshot, tokenUsage: { observed: true, inputTokens: 0, outputTokens: 0, totalTokens: 0, modelContextWindow: 258400 }, diffs: [{ id: 'turn:t', title: 'Turn changes', diff: '+native' }], turns: [{ id: 't', turnId: 't', summary: '', items: [], outputState: { provenance: 'saved', diagnostic: 'interrupted', refreshPending: false } }] })
+    expect(parsed.tokenUsage.observed).toBe(true)
+    expect(parsed.tokenUsage.modelContextWindow).toBe(258400)
+    expect(parsed.diffs[0].diff).toBe('+native')
+    expect(parsed.turns[0].outputState?.diagnostic).toBe('interrupted')
+  })
   it('parses Claude and Codex snapshots through one shared durable contract', () => {
     const claudeSnapshot = FreshAgentSnapshotSchema.parse(claudeContractSnapshot)
     expect(claudeSnapshot.sessionType).toBe('freshclaude')
@@ -432,4 +462,23 @@ describe('durable opencode error projection (turn-level and tool-level)', () => 
       status: 'failed', arguments: {}, contentItems: null, success: null, error: 42,
     }).success).toBe(false)
   })
+})
+
+
+it('keeps native question flags and retained MCP forms in the durable contract', () => {
+  const parsed = FreshAgentSnapshotSchema.parse({ ...codexContractSnapshot, pendingQuestions: [{ requestId: '51', isBlocking: false, questions: [{ id: 'token', question: 'Token?', isOther: false, isSecret: true }] }], pendingElicitations: [{ requestId: '41', mode: 'openaiForm', serverName: 'contract', message: 'Form', fields: [{ id: 'enabled', title: 'Enabled', type: 'boolean', required: true }] }] })
+  expect(parsed.pendingQuestions[0]).toMatchObject({ isBlocking: false, questions: [{ isOther: false, isSecret: true }] })
+  expect(parsed.pendingElicitations[0]).toMatchObject({ mode: 'openaiForm', fields: [{ type: 'boolean' }] })
+})
+
+
+it('keeps elicitation replies separate from string-valued question answers and rejects nested content', () => {
+  const locator = { provider: 'codex', sessionType: 'freshcodex', sessionId: 'native-thread', requestId: '41' }
+  const frame = { ...locator, type: 'freshAgent.elicitation.respond', action: 'accept', content: { token: ' exact, answer! ', count: 3, enabled: false, colors: ['blue', 'green'] } }
+  expect(FreshAgentClientMessageSchema.parse(frame)).toEqual(frame)
+  for (const action of ['decline', 'cancel']) expect(FreshAgentClientMessageSchema.safeParse({ ...frame, action, content: null }).success).toBe(true)
+  expect(FreshAgentClientMessageSchema.safeParse({ ...frame, content: { nested: { value: 'unsupported' } } }).success).toBe(false)
+  expect(FreshAgentClientMessageSchema.safeParse({ ...frame, action: 'other' }).success).toBe(false)
+  const question = { ...locator, type: 'freshAgent.question.respond', answers: { token: ' exact, answer! ' } }
+  expect(FreshAgentClientMessageSchema.parse(question)).toEqual(question)
 })

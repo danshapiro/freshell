@@ -181,6 +181,7 @@ impl ClaudeEdgeHub {
                 session_type: mark.session_type,
                 last_turn_complete_at: mark.last_turn_complete_at,
                 last_waiting_at: mark.last_waiting_at,
+                last_question_available_at: None,
             })
             .collect()
     }

@@ -66,6 +66,7 @@ async fn a_configure_receipt_from_a_replaced_runtime_cannot_change_its_replaceme
                 .configure_for_send(
                     &id,
                     &freshell_protocol::FreshAgentSendSettings {
+                        collaboration_mode: None,
                         model: Some("old-runtime-model".into()),
                         cwd: None,
                         effort: None,

@@ -21,8 +21,10 @@ import type { FreshAgentPaneContent } from '@/store/paneTypes'
  * `freshAgent.send.settings` carries (all optional; an absent key means "no
  * statement", so the caller states ONLY what changed). */
 export type FreshAgentConfigureSettings = {
+  cwd?: string
+  collaborationMode?: 'default' | 'plan'
   model?: string
-  effort?: string
+  effort?: string | null
   permissionMode?: string
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'
 }
@@ -51,8 +53,8 @@ export function sendSuppressedAwareFreshAgentFrame(
  * (sessionId set) can apply settings — pre-create panes stage on the pane
  * content and the next `freshAgent.send` carries them, exactly as before.
  * The settings object states ONLY the fields the caller changed; an absent
- * effort key is the picker's explicit Default row (opencode clears it; the
- * per-send providers keep the session's current value).
+ * effort key preserves Codex's selection; explicit null selects its Default.
+ * Other providers retain their existing model/absent-effort behavior.
  */
 export function sendFreshAgentConfigure(
   paneId: string,

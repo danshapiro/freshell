@@ -2016,10 +2016,11 @@ impl FreshClaudeState {
         // `sdk.session.init` (claude has no sandbox concept: always `None`), and
         // the launch is built from the same values (G15: the plugins too).
         let settings = crate::identity_sink::FreshAgentSettings {
+            collaboration_mode: None,
             model: msg.model.clone(),
             sandbox: None,
             permission_mode: msg.permission_mode.clone(),
-            effort: msg.effort.clone(),
+            effort: msg.effort.clone().flatten(),
             cwd: msg.cwd.clone(),
             plugins: None,
         }
@@ -5961,10 +5962,64 @@ async fn spawn_sidecar(
 mod provider_exec_tests {
     use super::*;
 
+    const CASE: &str = "FRESHELL_EXEC_PROFILE_FIXTURE_CHILD";
+    const TEST: &str = "claude::provider_exec_tests::provider_exec_profile_checks_actual_managed_claude_sidecar_spawn";
+
+    fn process_observation(pid: u32) -> Result<Value, String> {
+        let start = crate::session_lease::proc_starttime(pid as i32)
+            .ok_or_else(|| format!("process {pid} has no live start time"))?;
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .map_err(|error| error.to_string())?;
+        let parent = status
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:")?.trim().parse::<u32>().ok())
+            .ok_or_else(|| format!("process {pid} has no parent observation"))?;
+        Ok(json!({"pid":pid,"start":start,"ppid":parent}))
+    }
+
+    fn assert_joined_cases(outputs: Vec<std::process::Output>) {
+        assert_eq!(outputs.len(), 2);
+        for (case, output) in ["large", "small"].into_iter().zip(outputs) {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                eprintln!("[provider-exec-child stdout] {line}");
+            }
+            assert!(stdout.lines().any(|line| line == "running 1 test"));
+            assert!(stdout
+                .lines()
+                .any(|line| line == format!("test {TEST} ... ok")));
+            assert!(stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"));
+            let observations: Vec<Value> = String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|value| value["event"] == "provider_exec_fixture_closed")
+                .collect();
+            assert_eq!(observations.len(), 1, "{observations:?}");
+            let observation = &observations[0];
+            assert_eq!(observation["test"], TEST);
+            assert_eq!(observation["case"], case);
+            let supervisor = &observation["supervisor"];
+            let native = observation["native"].as_array().unwrap();
+            assert_eq!(native.len(), usize::from(case == "small"));
+            for process in std::iter::once(supervisor).chain(native) {
+                let pid = u32::try_from(process["pid"].as_u64().unwrap()).unwrap();
+                let start = process["start"].as_u64().unwrap();
+                assert_eq!(
+                    crate::session_lease::recorded_process_evidence(pid, Some(start)),
+                    crate::session_lease::RecordedProcessEvidence::Gone
+                );
+            }
+            for process in native {
+                assert_eq!(process["ppid"], supervisor["pid"]);
+            }
+            eprintln!("{observation}");
+        }
+    }
+
     #[tokio::test]
     async fn provider_exec_profile_checks_actual_managed_claude_sidecar_spawn() {
-        const CASE: &str = "FRESHELL_EXEC_PROFILE_FIXTURE_CHILD";
         if let Ok(case) = std::env::var(CASE) {
+            let supervisor = process_observation(std::process::id());
             let owned = tempfile::tempdir().unwrap();
             let script = owned.path().join("synthetic-sidecar.mjs");
             std::fs::write(&script, "setInterval(()=>{},1000)\n").unwrap();
@@ -5977,30 +6032,87 @@ mod provider_exec_tests {
             )
             .unwrap();
             let mut result = spawn_sidecar(None, None, "freshclaude").await;
-            if let Ok(SpawnedSidecar { child, .. }) = &mut result {
-                let pid = child.id().unwrap();
-                child.kill().await.unwrap();
-                child.wait().await.unwrap();
-                eprintln!("synthetic owned sidecar pid {pid} stopped in fixture namespace");
-            }
+            let mut native = Vec::new();
+            let cleanup = if let Ok(SpawnedSidecar { child, .. }) = &mut result {
+                native.push(
+                    child
+                        .id()
+                        .ok_or_else(|| "native child has no pid".to_string())
+                        .and_then(process_observation),
+                );
+                Some((child.kill().await, child.wait().await))
+            } else {
+                None
+            };
             if case == "large" {
                 assert!(matches!(result,Err(ref cause) if cause.contains("provider exec profile")),"managed fresh sidecar must reject oversized actual inherited+selected environment before spawn");
             } else {
                 assert!(result.is_ok(),"valid finite selected environment must still launch the actual sidecar command");
             }
+            drop(result);
+            drop(owned);
+            if let Some((killed, waited)) = cleanup {
+                killed.unwrap();
+                waited.unwrap();
+            }
+            let native: Vec<Value> = native
+                .into_iter()
+                .collect::<Result<_, _>>()
+                .expect("observe actual spawned Claude identity");
+            let observation = json!({"severity":"info","event":"provider_exec_fixture_closed",
+                "test":TEST,"case":case,"supervisor":supervisor.expect("observe child libtest identity"),
+                "native":native});
+            use std::io::Write;
+            writeln!(std::io::stderr(), "{observation}").expect("report joined fixture identities");
             return;
         }
+        assert_joined_cases(run_profile_cases().await);
+    }
+
+    // The original exact test and the guard regression share this physical path.
+    async fn run_profile_cases() -> Vec<std::process::Output> {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
+        let mut outputs = Vec::new();
         for case in ["large", "small"] {
-            let output=std::process::Command::new(std::env::current_exe().unwrap()).env_clear()
-                .env("PATH","/usr/local/bin:/usr/bin:/bin").env(CASE,case)
-                .args(["--exact","claude::provider_exec_tests::provider_exec_profile_checks_actual_managed_claude_sidecar_spawn","--nocapture"])
-                .output().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .env_clear()
+                .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                .env(CASE, case)
+                .args(["--exact", TEST, "--nocapture"])
+                .output()
+                .unwrap();
             assert!(
                 output.status.success(),
                 "actual sidecar fixture case {case} failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
+            outputs.push(output);
         }
+        outputs
+    }
+
+    #[tokio::test]
+    async fn provider_exec_parent_waits_for_process_fixture() {
+        let held = crate::session_lease::process_fixture::lock().await;
+        let mut parent = Box::pin(run_profile_cases());
+        // Synchronous output either joins real children or waits at the parent guard.
+        let first_poll = futures_util::poll!(&mut parent);
+        let waited = first_poll.is_pending();
+        drop(held);
+        let outputs = match first_poll {
+            std::task::Poll::Ready(outputs) => outputs,
+            std::task::Poll::Pending => parent.await,
+        };
+        assert_joined_cases(outputs);
+        eprintln!(
+            "{}",
+            json!({"severity":"info","event":"provider_exec_parent_polled",
+            "test":TEST,"firstPollPending":waited})
+        );
+        assert!(
+            waited,
+            "actual Claude provider fixture spawned while the canonical process guard was held"
+        );
     }
 }
 
@@ -8092,6 +8204,7 @@ pub(crate) mod tests {
 
         let mut send = send_msg(&session_id, "carries an unsupported knob");
         send.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            collaboration_mode: None,
             cwd: None,
             model: None,
             effort: None,
@@ -8264,15 +8377,16 @@ pub(crate) mod tests {
         state.set_identity_sink(fake.clone());
         let mut create = dedup_create_msg("settings-send");
         create.model = Some("opus".into());
-        create.effort = Some("high".into());
+        create.effort = Some(Some("high".into()));
         state.handle_create(create, None).await;
         let created = await_claude_created(&mut rx, "settings-send").await;
         let session_id = created["sessionId"].as_str().unwrap();
         let mut send = send_msg(session_id, "Review this image");
         send.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            collaboration_mode: None,
             cwd: None,
             model: Some("sonnet".into()),
-            effort: Some("max".into()),
+            effort: Some(Some("max".into())),
             permission_mode: Some("plan".into()),
             sandbox: None,
         });
@@ -8335,14 +8449,15 @@ pub(crate) mod tests {
         state.set_identity_sink(fake.clone());
         let mut create = dedup_create_msg("partial-settings");
         create.model = Some("opus".into());
-        create.effort = Some("high".into());
+        create.effort = Some(Some("high".into()));
         state.handle_create(create, None).await;
         let created = await_claude_created(&mut rx, "partial-settings").await;
         let session_id = created["sessionId"].as_str().unwrap();
         let mut send = send_msg(session_id, "Keep this unsent");
         send.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            collaboration_mode: None,
             model: Some("sonnet".into()),
-            effort: Some("invalid".into()),
+            effort: Some(Some("invalid".into())),
             cwd: None,
             permission_mode: None,
             sandbox: None,
@@ -8390,6 +8505,7 @@ pub(crate) mod tests {
         let mut send = send_msg(session_id, "Do not lose this prompt");
         send.request_id = Some("retained-prompt".into());
         send.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            collaboration_mode: None,
             cwd: None,
             model: Some("unavailable".into()),
             effort: None,
@@ -8438,6 +8554,7 @@ pub(crate) mod tests {
 
     fn dedup_create_msg(request_id: &str) -> FreshAgentCreate {
         FreshAgentCreate {
+            collaboration_mode: None,
             pane_id: None,
             naming_handle: None,
             observed_epoch: None,
@@ -14981,7 +15098,7 @@ pub(crate) mod tests {
         msg.session_type = SessionType::Kilroy;
         msg.model = Some("opus-x".to_string());
         msg.permission_mode = Some("plan".to_string());
-        msg.effort = Some("high".to_string());
+        msg.effort = Some(Some("high".to_string()));
         msg.cwd = Some(env.dir.to_string_lossy().to_string());
         state.handle_create(msg, None).await;
         // Create publishes only after the native binding is durable.
@@ -15164,6 +15281,7 @@ pub(crate) mod tests {
             "claude",
             DURABLE,
             crate::identity_sink::FreshAgentSettings {
+                collaboration_mode: None,
                 model: Some("opus-x".into()),
                 sandbox: None,
                 permission_mode: Some("plan".into()),
@@ -16297,6 +16415,71 @@ rl.on('line', (line) => {
         // Even failed compaction settles its own command before rollback reopens.
         await_frame_of_inner_type(&mut rx, "freshAgent.result").await;
         await_ledger_busy(&st, &session_id, false).await;
+        // The simulator, like the CLI, flushes JSONL independently of result.
+        // Synchronize this fixture on its actual send identity and native point;
+        // a publicly advertised point without that backing is a product failure.
+        let compact_frames = env.request_frames_of_type("send", 1).await;
+        let compact_uuid = compact_frames[0]["uuid"]
+            .as_str()
+            .expect("compact send UUID")
+            .to_owned();
+        let point = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let public = st
+                    .get_snapshot(SessionType::Freshclaude, &session_id)
+                    .await
+                    .ok();
+                let advertised = public.as_ref().is_some_and(|snapshot| {
+                    snapshot["turns"].as_array().is_some_and(|turns| {
+                        turns.iter().any(|turn| turn["turnId"] == compact_uuid)
+                    })
+                });
+                let saved = st
+                    .effective_transcript(&session_id)
+                    .await
+                    .ok()
+                    .filter(|saved| {
+                        saved.source_path.is_some()
+                            && saved
+                                .text
+                                .lines()
+                                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                                .any(|line| line["type"] == "user" && line["uuid"] == compact_uuid)
+                    });
+                let point = saved.and_then(|saved| {
+                    let exact = crate::claude_snapshot::resolve_resume_point(
+                        &saved.text,
+                        &session_id,
+                        crate::claude_snapshot::ResumeTarget::ToTurn(compact_uuid.clone()),
+                    )
+                    .ok()?;
+                    let step = crate::claude_snapshot::resolve_resume_point(
+                        &saved.text,
+                        &session_id,
+                        crate::claude_snapshot::ResumeTarget::Step,
+                    )
+                    .ok()?;
+                    assert_eq!(step.resume_at_uuid, exact.resume_at_uuid);
+                    assert_eq!(step.prompt_text, exact.prompt_text);
+                    Some(step)
+                });
+                assert!(
+                    !advertised || point.is_some(),
+                    "public compact rollback point has no persisted native backing"
+                );
+                if let Some(point) = point {
+                    break point;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "compact send {compact_uuid} never became a persisted rollback point under {}",
+                env.dir.display()
+            )
+        });
         let (sink2, captured2) = capturing_sink();
         st.handle_rollback(
             rollback_op(&session_id, "rb-compact-2", RollbackDirection::Undo),
@@ -16307,6 +16490,15 @@ rl.on('line', (line) => {
         assert_eq!(
             frames2[0]["event"]["type"], "freshAgent.rolledBack",
             "{frames2:?}"
+        );
+        assert_eq!(frames2[0]["event"]["removedPromptText"], point.prompt_text);
+        assert_eq!(
+            frames2[0]["event"]["removedTurnIds"],
+            json!(point
+                .removed_turns
+                .iter()
+                .filter_map(|turn| turn["turnId"].as_str())
+                .collect::<Vec<_>>())
         );
         let replacement = frames2[0]["event"]["newSessionId"].as_str().unwrap();
         assert_eq!(
@@ -17061,11 +17253,12 @@ rl.on('line', (line) => {
             cwd: None,
             request_id: Some("req-configure".to_string()),
             settings: freshell_protocol::FreshAgentSendSettings {
+                collaboration_mode: None,
                 cwd: None,
                 model: model.map(|m| m.to_string()),
                 permission_mode: None,
                 sandbox: None,
-                effort: effort.map(|e| e.to_string()),
+                effort: effort.map(|e| e.to_string()).map(Some),
             },
         }
     }
@@ -17233,9 +17426,10 @@ rl.on('line', (line) => {
 
         let mut send = send_msg(&session_id, "carries a new model");
         send.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            collaboration_mode: None,
             cwd: None,
             model: Some("opus[1m]".to_string()),
-            effort: Some("high".to_string()),
+            effort: Some(Some("high".to_string())),
             permission_mode: None,
             sandbox: None,
         });
@@ -17277,9 +17471,10 @@ rl.on('line', (line) => {
         // exactly one metadata frame converges.
         let mut send = send_msg(&session_id, "carries a new model");
         send.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            collaboration_mode: None,
             cwd: None,
             model: Some("opus[1m]".to_string()),
-            effort: Some("high".to_string()),
+            effort: Some(Some("high".to_string())),
             permission_mode: None,
             sandbox: None,
         });
@@ -17303,9 +17498,10 @@ rl.on('line', (line) => {
         // no second configure), and the unchanged pair converges nothing.
         let mut resend = send_msg(&session_id, "same pair again");
         resend.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            collaboration_mode: None,
             cwd: None,
             model: Some("opus[1m]".to_string()),
-            effort: Some("high".to_string()),
+            effort: Some(Some("high".to_string())),
             permission_mode: None,
             sandbox: None,
         });
@@ -17346,6 +17542,7 @@ rl.on('line', (line) => {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn the_fenced_prior_probe_kills_a_reparented_descendant_from_the_recorded_identity() {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
         let st = state();
         let sid = format!("r37-reparent-{}", uuid::Uuid::new_v4());
         // The condemned "sidecar" child holding a tagged "CLI grandchild".
@@ -17461,6 +17658,7 @@ rl.on('line', (line) => {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn the_fenced_prior_probe_never_signals_a_reused_pid() {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
         let st = state();
         let sid = format!("r37-reuse-{}", uuid::Uuid::new_v4());
         // A live "unrelated replacement" process holding the recorded pid.

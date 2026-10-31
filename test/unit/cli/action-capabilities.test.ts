@@ -75,9 +75,11 @@ describe('standalone CLI capability contract', () => {
   it.each([
     ['new-tab', 'claude'],
     ['new-tab', 'kilroy'],
+    ['new-tab', 'codex'],
     ['split-pane', 'claude'],
     ['split-pane', 'kilroy'],
-  ])('%s sends %s fresh-agent options and canonical Claude resume identity', async (action, agent) => {
+    ['split-pane', 'codex'],
+  ])('%s sends %s fresh-agent options and canonical resume identity', async (action, agent) => {
     const bodies: Array<{ url: string; body: Record<string, unknown> }> = []
     const server = createServer(async (request, response) => {
       response.setHeader('content-type', 'application/json')
@@ -106,7 +108,7 @@ describe('standalone CLI capability contract', () => {
         url: action === 'new-tab' ? '/api/tabs' : '/api/panes/p1/split',
         body: {
           agent, model: 'catalog-model', effort: 'max',
-          sessionRef: { provider: 'claude', sessionId: '550e8400-e29b-41d4-a716-446655440000' },
+          sessionRef: { provider: agent === 'codex' ? 'codex' : 'claude', sessionId: '550e8400-e29b-41d4-a716-446655440000' },
         },
       })
       expect(bodies[0].body).not.toHaveProperty('resumeSessionId')
@@ -120,7 +122,6 @@ describe('standalone CLI capability contract', () => {
     ['run', 'echo', 'blocked'],
     ['fresh-send', 'blocked'],
     ['attach', '--terminal', 'term-1'],
-    ['new-tab', '--agent', 'codex'],
     ['split-pane', '--agent', 'opencode'],
     ['split-pane', '--model', 'model'],
     ['split-pane', '--effort', 'high'],

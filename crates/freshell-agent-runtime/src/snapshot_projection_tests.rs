@@ -23,6 +23,29 @@ fn advertised_capabilities() -> Value {
 }
 
 #[test]
+fn hosted_public_snapshots_keep_transcript_and_hide_internal_naming_facts() {
+    let snapshot = json!({"type":"freshAgent.session.snapshot","provider":"codex","sessionType":"freshcodex",
+        "capabilities":advertised_capabilities(),"turns":[{"role":"user","items":[{"kind":"text","text":"visible prompt"}]}],
+        "extensions":{"codex":{"usage":{"last":{"totalTokens":15}},"hostedNamingFacts":[{"kind":"activity","data":{"first_user_message":"internal naming input"}}]}}});
+    let mut event = json!({"type":"freshAgent.event","event":snapshot.clone()});
+    project_hosted_snapshot(&mut event, "codex", "freshcodex");
+    assert!(event["event"]["extensions"]["codex"]
+        .get("hostedNamingFacts")
+        .is_none());
+    assert_eq!(event["event"]["turns"], snapshot["turns"]);
+    assert_eq!(
+        event["event"]["extensions"]["codex"]["usage"],
+        snapshot["extensions"]["codex"]["usage"]
+    );
+    let mut rest = snapshot;
+    crate::snapshot_projection::project_hosted_rest_snapshot(&mut rest, "codex", "freshcodex");
+    assert!(rest["extensions"]["codex"]
+        .get("hostedNamingFacts")
+        .is_none());
+    assert_eq!(rest["turns"], event["event"]["turns"]);
+}
+
+#[test]
 fn every_hosted_provider_and_snapshot_envelope_intersects_native_and_gateway_truth() {
     let providers = [
         ("claude", "freshclaude", true, false),

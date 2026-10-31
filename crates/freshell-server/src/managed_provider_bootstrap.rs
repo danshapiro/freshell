@@ -104,6 +104,7 @@ pub(crate) fn provider_launch_context_from_home_at_with_xdg(
             ".codex",
             &["config.toml", "AGENTS.md", "skills", "rules"][..],
             ProviderPreparation::Codex {
+                approval_default: None,
                 tui_args: if mcp_enabled {
                     managed_codex_mcp_args().ok_or("managed Codex MCP preparation unavailable")?
                 } else {
@@ -512,6 +513,7 @@ mod tests {
         let ProviderPreparation::Codex {
             tui_args,
             sidecar_args,
+            ..
         } = context.preparation
         else {
             panic!("Codex preparation missing");

@@ -495,6 +495,8 @@ export type FreshAgentPaneContent = {
   status: SdkSessionStatus
   resumeSessionId?: string
   sessionRef?: SessionLocator
+  /** Parent-scoped display selection; never a child runtime identity. */
+  observedChildThreadId?: string
   /** Runtime-only server locality for same-server matching; never part of canonical durable identity. */
   serverInstanceId?: string
   /** Explicit restore failure when no canonical durable target exists. */
@@ -511,6 +513,9 @@ export type FreshAgentPaneContent = {
   model?: string
   permissionMode?: string
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'
+  collaborationMode?: 'default' | 'plan'
+  /** A stated native default differs from an older pane inheriting provider defaults. */
+  effortIsNativeDefault?: boolean
   effort?: string
   /** Effort levels for the current model as known at selection time (static
    * or probed catalog), stamped by the settings selector's model switch. An

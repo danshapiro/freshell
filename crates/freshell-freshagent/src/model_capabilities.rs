@@ -337,6 +337,8 @@ fn normalize_claude_catalog(raw: Value) -> CatalogOut {
         }
         if !models.iter().any(|model: &ModelCapability| model.id == id) {
             models.push(ModelCapability {
+                default_effort: None,
+                input_modalities: None,
                 id: id.into(),
                 display_name: name.into(),
                 provider: "claude",
@@ -422,18 +424,15 @@ impl ModelCapabilityRegistry {
 
     /// `getCapabilities` (`model-capability-registry.ts:211-234`): cache hit within
     /// TTL → `cached`; otherwise single-flight refresh → `fresh`; probe failure →
-    /// the `unavailable` envelope at 503 (cache untouched). Codex uses its
-    /// built-in catalog; Claude/Kilroy share their SDK catalog cache.
+    /// the `unavailable` envelope at 503 (cache untouched). Unbound Codex
+    /// callers receive RUNTIME_PENDING; bound reads use `codex` below.
+    /// Claude/Kilroy share their SDK catalog cache.
     pub async fn get(&self, session_type: SessionType, cwd: Option<String>) -> (StatusCode, Value) {
         if session_type == SessionType::FreshCodex {
+            let error = runtime_pending();
             return (
-                StatusCode::OK,
-                success_body(
-                    session_type,
-                    "fresh",
-                    (self.now)(),
-                    static_models(session_type),
-                ),
+                StatusCode::SERVICE_UNAVAILABLE,
+                failure_body(session_type, &error),
             );
         }
         let key = catalog_cache_key(session_type, cwd.as_deref());
@@ -465,14 +464,10 @@ impl ModelCapabilityRegistry {
         cwd: Option<String>,
     ) -> (StatusCode, Value) {
         if session_type == SessionType::FreshCodex {
+            let error = runtime_pending();
             return (
-                StatusCode::OK,
-                success_body(
-                    session_type,
-                    "fresh",
-                    (self.now)(),
-                    static_models(session_type),
-                ),
+                StatusCode::SERVICE_UNAVAILABLE,
+                failure_body(session_type, &error),
             );
         }
         self.finish_catalog(
@@ -486,21 +481,21 @@ impl ModelCapabilityRegistry {
     /// Typed internal read for server-side consumers (the session-directory
     /// context meter's model-limit snapshot): the same TTL/single-flight
     /// path as [`Self::get`], returning rows instead of the HTTP envelope.
-    /// Codex resolves from its static table; a probe failure returns `Err`
-    /// and leaves the last successful cache entry in place.
+    /// Codex requires a bound runtime source rather than this unscoped read.
+    /// A probe failure leaves the last successful cache entry in place.
     pub async fn models(
         &self,
         session_type: SessionType,
         cwd: Option<String>,
     ) -> Result<Vec<ModelCapability>, CapabilityError> {
         if session_type == SessionType::FreshCodex {
-            return Ok(static_models(session_type));
+            return Err(runtime_pending());
         }
         let key = catalog_cache_key(session_type, cwd.as_deref());
         if let Some(cached) = self.cached_within_ttl(&key).await {
             return Ok(cached.models);
         }
-        self.refreshed_catalog(session_type, key, cwd)
+        self.refreshed_catalog(session_type, key, cwd, None)
             .await
             .map(|catalog| catalog.models)
     }
@@ -511,7 +506,7 @@ impl ModelCapabilityRegistry {
         key: String,
         cwd: Option<String>,
     ) -> (StatusCode, Value) {
-        match self.refreshed_catalog(session_type, key, cwd).await {
+        match self.refreshed_catalog(session_type, key, cwd, None).await {
             Ok(catalog) => (
                 StatusCode::OK,
                 success_body(session_type, "fresh", catalog.fetched_at_ms, catalog.models),
@@ -531,17 +526,20 @@ impl ModelCapabilityRegistry {
         session_type: SessionType,
         key: String,
         cwd: Option<String>,
+        probe_override: Option<Arc<dyn ModelCatalogProbe>>,
     ) -> Result<CachedCatalog, CapabilityError> {
         let shared = {
             let mut state = self.state.lock().await;
             match state.inflight.get(&key) {
                 Some(existing) => existing.clone(),
                 None => {
-                    let probe = if session_type == SessionType::FreshOpencode {
-                        self.probe.clone()
-                    } else {
-                        self.claude_probe.clone()
-                    };
+                    let probe = probe_override.clone().unwrap_or_else(|| {
+                        if session_type == SessionType::FreshOpencode {
+                            self.probe.clone()
+                        } else {
+                            self.claude_probe.clone()
+                        }
+                    });
                     let now = self.now.clone();
                     let state_arc = self.state.clone();
                     let key_for_cleanup = key.clone();
@@ -582,56 +580,6 @@ fn catalog_cache_key(session_type: SessionType, cwd: Option<&str>) -> String {
     format!("opencode:{}", cwd.unwrap_or("<default>"))
 }
 
-/// `createStaticSuccess` (`:354-378`): the shared
-/// `FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE` tables
-/// (`shared/fresh-agent-models.ts:21-84`) as capability rows.
-fn static_models(session_type: SessionType) -> Vec<ModelCapability> {
-    type Row = (&'static str, &'static str, &'static [&'static str]);
-    let rows: &[Row] = match session_type {
-        SessionType::FreshCodex => &[
-            (
-                "gpt-6-astra",
-                "GPT-6 Astra",
-                &["low", "medium", "high", "xhigh", "max"],
-            ),
-            (
-                "gpt-5.6-sol",
-                "GPT-5.6 Sol",
-                &["none", "low", "medium", "high", "xhigh", "max"],
-            ),
-            (
-                "gpt-5.6-terra",
-                "GPT-5.6 Terra",
-                &["none", "low", "medium", "high", "xhigh", "max"],
-            ),
-            (
-                "gpt-5.6-luna",
-                "GPT-5.6 Luna",
-                &["none", "low", "medium", "high", "xhigh", "max"],
-            ),
-            (
-                "gpt-5.3-codex-spark",
-                "GPT-5.3 Codex Spark",
-                &["none", "minimal", "low", "medium", "high", "max"],
-            ),
-        ],
-        SessionType::FreshClaude | SessionType::Kilroy | SessionType::FreshOpencode => &[],
-    };
-    rows.iter()
-        .map(|(id, display_name, levels)| ModelCapability {
-            id: id.to_string(),
-            display_name: display_name.to_string(),
-            provider: session_type.runtime_provider(),
-            source: None,
-            // `:359-366`: effort support derives from the levels list, not the flag.
-            supports_effort: !levels.is_empty(),
-            supported_effort_levels: levels.iter().map(|s| s.to_string()).collect(),
-            supports_adaptive_thinking: !levels.is_empty(),
-            limit: None,
-        })
-        .collect()
-}
-
 /// `FreshAgentModelCapabilitiesSchema.extend({ok:true})` — the six keys, exactly.
 fn success_body(
     session_type: SessionType,
@@ -664,6 +612,191 @@ fn failure_body(session_type: SessionType, err: &CapabilityError) -> Value {
             "retryable": err.retryable,
         },
     })
+}
+
+/// A pane's conversation identity is an observation, never a supplied soul authority.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexCatalogContext {
+    pub session_id: String,
+    pub session_ref: Option<freshell_protocol::SessionLocator>,
+    pub cwd: Option<String>,
+    pub observed_epoch: Option<u64>,
+    pub observed_generation: Option<u64>,
+}
+impl CodexCatalogContext {
+    pub fn native_reference(&self) -> Result<&str, CapabilityError> {
+        if let Some(reference) = &self.session_ref {
+            if reference.provider != "codex" || reference.session_id.trim().is_empty() {
+                return Err(runtime_pending());
+            }
+            Ok(&reference.session_id)
+        } else if !self.session_id.trim().is_empty() {
+            Ok(&self.session_id)
+        } else {
+            Err(runtime_pending())
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct CodexCatalogSource {
+    pub key: String,
+    pub probe: Arc<dyn ModelCatalogProbe>,
+}
+
+pub fn runtime_pending() -> CapabilityError {
+    CapabilityError {
+        code: "RUNTIME_PENDING".into(),
+        message: "Waiting for the conversation's Codex runtime".into(),
+        retryable: true,
+    }
+}
+pub fn source_changed() -> CapabilityError {
+    CapabilityError {
+        code: "CAPABILITY_SOURCE_CHANGED".into(),
+        message: "The Codex runtime changed during model discovery. Try again.".into(),
+        retryable: true,
+    }
+}
+pub fn codex_probe_error(error: freshell_codex::CodexAppServerError) -> CapabilityError {
+    let code = match error {
+        freshell_codex::CodexAppServerError::Timeout { .. } => "CAPABILITY_PROBE_TIMEOUT",
+        freshell_codex::CodexAppServerError::InvalidResponse { .. } => "CAPABILITY_PAYLOAD_INVALID",
+        _ => "CAPABILITY_PROBE_FAILED",
+    };
+    CapabilityError {
+        code: code.into(),
+        message: error.to_string(),
+        retryable: true,
+    }
+}
+pub fn codex_capabilities(
+    models: Vec<freshell_codex::catalog::CodexModel>,
+) -> Vec<ModelCapability> {
+    models
+        .into_iter()
+        .map(|model| ModelCapability {
+            id: model.id,
+            display_name: model.display_name,
+            provider: "codex",
+            source: None,
+            supports_effort: !model.supported_effort_levels.is_empty(),
+            supported_effort_levels: model.supported_effort_levels,
+            default_effort: model.default_effort,
+            input_modalities: model.input_modalities,
+            supports_adaptive_thinking: false,
+            limit: None,
+        })
+        .collect()
+}
+
+impl ModelCapabilityRegistry {
+    pub async fn codex(
+        &self,
+        source: CodexCatalogSource,
+        cwd: Option<String>,
+        refresh: bool,
+    ) -> (StatusCode, Value) {
+        let key = serde_json::to_string(&("codex", source.key, cwd.as_deref().map(str::trim)))
+            .expect("catalog key");
+        if !refresh {
+            if let Some(cached) = self.cached_within_ttl(&key).await {
+                return (
+                    StatusCode::OK,
+                    success_body(
+                        SessionType::FreshCodex,
+                        "cached",
+                        cached.fetched_at_ms,
+                        cached.models,
+                    ),
+                );
+            }
+        }
+        match self
+            .refreshed_catalog(SessionType::FreshCodex, key, cwd, Some(source.probe))
+            .await
+        {
+            Ok(catalog) => (
+                StatusCode::OK,
+                success_body(
+                    SessionType::FreshCodex,
+                    "fresh",
+                    catalog.fetched_at_ms,
+                    catalog.models,
+                ),
+            ),
+            Err(error) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                failure_body(SessionType::FreshCodex, &error),
+            ),
+        }
+    }
+}
+
+async fn bound_codex_source(
+    state: &FreshAgentState,
+    context: &CodexCatalogContext,
+) -> Result<CodexCatalogSource, CapabilityError> {
+    if let Some(hosted) = state.hosted_rest_gateway() {
+        return hosted.model_catalog_source(context.clone()).await;
+    }
+    let local = state.codex_catalog.get().ok_or_else(runtime_pending)?;
+    local.model_catalog_source(context.clone()).await
+}
+async fn capabilities_for_request(
+    state: &FreshAgentState,
+    st: SessionType,
+    query: &HashMap<String, String>,
+    refresh: bool,
+) -> (StatusCode, Value) {
+    if st != SessionType::FreshCodex {
+        return if refresh {
+            state
+                .model_capabilities
+                .refresh(st, resolve_context(st, query))
+                .await
+        } else {
+            state
+                .model_capabilities
+                .get(st, resolve_context(st, query))
+                .await
+        };
+    }
+    let work = async {
+        let context = CodexCatalogContext {
+            session_id: query.get("sessionId").cloned().unwrap_or_default(),
+            session_ref: query
+                .get("sessionRef")
+                .map(|s| serde_json::from_str(s).map_err(|_| source_changed()))
+                .transpose()?,
+            cwd: query.get("cwd").cloned(),
+            observed_epoch: query
+                .get("observedEpoch")
+                .map(|s| s.parse::<u64>().map_err(|_| source_changed()))
+                .transpose()?,
+            observed_generation: query
+                .get("observedGeneration")
+                .map(|s| s.parse::<u64>().map_err(|_| source_changed()))
+                .transpose()?,
+        };
+        context.native_reference()?;
+        if context.observed_epoch.is_some() != context.observed_generation.is_some() {
+            return Err(source_changed());
+        }
+        let source = bound_codex_source(state, &context).await?;
+        let key = source.key.clone();
+        let response = state
+            .model_capabilities
+            .codex(source, context.cwd.clone(), refresh)
+            .await;
+        if response.0 == StatusCode::OK && bound_codex_source(state, &context).await?.key != key {
+            return Err(source_changed());
+        }
+        Ok(response)
+    }
+    .await;
+    work.unwrap_or_else(|error| (StatusCode::SERVICE_UNAVAILABLE, failure_body(st, &error)))
 }
 
 // ── HTTP surface (createFreshAgentModelCapabilitiesRouter) ─────────────────────
@@ -700,10 +833,7 @@ async fn get_capabilities(
         )
             .into_response();
     };
-    let (status, body) = state
-        .model_capabilities
-        .get(st, resolve_context(st, &query))
-        .await;
+    let (status, body) = capabilities_for_request(&state, st, &query, false).await;
     (status, Json(body)).into_response()
 }
 
@@ -724,10 +854,7 @@ async fn refresh_capabilities(
         )
             .into_response();
     };
-    let (status, body) = state
-        .model_capabilities
-        .refresh(st, resolve_context(st, &query))
-        .await;
+    let (status, body) = capabilities_for_request(&state, st, &query, true).await;
     (status, Json(body)).into_response()
 }
 

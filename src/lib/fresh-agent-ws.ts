@@ -1,4 +1,5 @@
 import type { AppDispatch } from '@/store/store'
+import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/fresh-agent'
 import type { SessionRef } from '@shared/session-contract'
 import type { FreshAgentRecoveryStoppedMessage, ReadyMessage, SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
@@ -7,15 +8,18 @@ import { consumeCancelledCreate, consumeCreateRoute, rememberCreateRoute } from 
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { KILL_FAILED_MESSAGE } from '@/lib/kill-ack'
 import { materializeFreshAgentSession as materializeFreshAgentPaneSession } from '@/store/panesSlice'
-import { applyFreshAgentCompletion, applyFreshAgentWaiting, observeFreshAgentSession, rekeyFreshAgentAttention } from '@/store/turnCompletionThunks'
+import { applyFreshAgentCompletion, applyFreshAgentWaiting, applyFreshAgentQuestionAvailable, observeFreshAgentSession, rekeyFreshAgentAttention } from '@/store/turnCompletionThunks'
 import { revokeFreshAgentAttention } from '@/store/turnCompletionAttention'
 import type { ObservedOwnerFence } from '@/store/selectors/runtimeOwner'
 import { streamBatcherFor } from '@/lib/fresh-agent-stream-batcher'
 import type { LiveBlockKind, LiveNotice, LiveNoticeLevel, LiveRateLimit, LiveRetry, LiveStreamOp } from '@/store/freshAgentLiveTypes'
-import { assistantBlockBound, liveNoticeReceived, liveRetrySet, transcriptAnnounced } from '@/store/freshAgentLiveSlice'
+import { assistantBlockBound, liveNoticeReceived, liveRetrySet, transcriptAnnounced, transcriptProjectionBound, transcriptPatchApplied, codexMetadataReceived, transcriptProjectionSnapshotReceived } from '@/store/freshAgentLiveSlice'
+import { FreshAgentSnapshotSchema, FreshAgentTranscriptPatchSchema } from '@shared/fresh-agent-contract'
 import {
   addPermissionRequest,
   addQuestionRequest,
+  addElicitationRequest,
+  removeElicitation,
   applyRuntimeOwner,
   clearPendingCreateFailure,
   createFailed,
@@ -469,6 +473,48 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
   if (event.type !== 'freshAgent.stream') streamBatcherFor(dispatch).flush(locator)
 
   switch (event.type) {
+    case 'freshAgent.host.backpressure':
+    case 'freshAgent.host.journal.reset': {
+      const retained = event.retainedState
+      if (!isObject(retained) || !isObject(retained.source)) return true
+      const source = retained.source
+      const parsed = FreshAgentSnapshotSchema.safeParse(retained.snapshot)
+      if (!parsed.success || parsed.data.provider !== locator.provider || parsed.data.sessionType !== locator.sessionType
+        || parsed.data.threadId !== (source.nativeSessionId ?? sessionId)
+        || !isObject(parsed.data.extensions?.codex?.projection)
+        || parsed.data.extensions.codex.projection.id !== source.projectionId) return true
+      const snapshot = parsed.data
+      const sourceKey = JSON.stringify([source.soulId, source.incarnationId, source.hostBootId, source.projectionId])
+      dispatch((innerDispatch, getState) => {
+        const root = getState()
+        const owner = root.freshAgent.runtimeOwners?.[`${locator.provider}:${sessionId}`]
+        if (owner && (owner.epoch !== source.ownerEpoch || owner.generation !== source.ownerGeneration || owner.ownerKind !== 'fresh-agent')) return
+        const soul = root.managedRuntime?.souls.find((soul) => soul.soulId === source.soulId)
+        if (soul && (soul.incarnationId !== source.incarnationId || soul.hostBootId && soul.hostBootId !== source.hostBootId)) return
+        innerDispatch(transcriptProjectionSnapshotReceived({ ...locator, snapshot, retainedSourceKey: sourceKey }))
+        const live = getState().freshAgentLive?.bySession[makeFreshAgentSessionKey(locator)]
+        if (live?.retainedSourceKey !== sourceKey || live.retainedSnapshot !== snapshot) return
+        const status = (['creating', 'starting', 'connected', 'running', 'idle', 'compacting', 'exited', 'stuck'] as const).find((status) => status === snapshot.status)
+        if (status) innerDispatch(sessionSnapshotReceived({ ...locator, status, latestTurnId: snapshot.latestTurnId ?? null, revision: snapshot.revision }))
+        for (const control of Array.isArray(retained.pendingControls) ? retained.pendingControls : []) {
+          if (isObject(control)) handleFreshAgentTransportEvent(innerDispatch, { ...msg, event: control })
+        }
+        for (const mark of Array.isArray(retained.attentionMarks) ? retained.attentionMarks : []) {
+          if (!isObject(mark)) continue
+          for (const [field, apply] of [['lastTurnCompleteAt', applyFreshAgentCompletion], ['lastWaitingAt', applyFreshAgentWaiting], ['lastQuestionAvailableAt', applyFreshAgentQuestionAvailable]] as const) {
+            const at = mark[field]
+            if (typeof at === 'number' && Number.isFinite(at)) innerDispatch(apply({ provider: locator.provider, sessionId, at }))
+          }
+        }
+      })
+      return true
+    }
+    case 'freshAgent.transcript.patch': {
+      const parsed = FreshAgentTranscriptPatchSchema.safeParse(event)
+      if (parsed.success && parsed.data.sessionId === sessionId) dispatch(transcriptPatchApplied({ ...locator, patch: parsed.data }))
+      else log.warn('dropping malformed native transcript patch', { sessionId })
+      return true
+    }
     case 'freshAgent.session.snapshot':
       dispatch(observeFreshAgentSession(locator))
       dispatch(sessionSnapshotReceived({
@@ -488,6 +534,10 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       }
       return true
     case 'freshAgent.session.init':
+      if (typeof event.projectionId === 'string' && Number.isSafeInteger(event.historyGeneration)) {
+        dispatch(transcriptProjectionBound({ ...locator, projectionId: event.projectionId, historyGeneration: event.historyGeneration as number }))
+        if (!['cliSessionId', 'model', 'effort', 'cwd', 'tools'].some((key) => key in event)) return true
+      }
       dispatch(sessionInit({
         ...locator,
         cliSessionId: event.cliSessionId as string | undefined,
@@ -498,6 +548,7 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       }))
       return true
     case 'freshAgent.session.metadata':
+      if (isObject(event.codex)) dispatch(codexMetadataReceived({ ...locator, metadata: event.codex }))
       dispatch(sessionMetadataReceived({
         ...locator,
         cliSessionId: event.cliSessionId as string | undefined,
@@ -505,6 +556,8 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         effort: event.effort as string | null | undefined,
         // Absent = no statement (as for model/effort); only a mode name states one.
         ...(typeof event.permissionMode === 'string' && event.permissionMode ? { permissionMode: event.permissionMode } : {}),
+        ...(['read-only', 'workspace-write', 'danger-full-access'].includes(event.sandbox as string) ? { sandbox: event.sandbox as 'read-only' | 'workspace-write' | 'danger-full-access' } : {}),
+        ...(event.collaborationMode === 'default' || event.collaborationMode === 'plan' ? { collaborationMode: event.collaborationMode } : {}),
         cwd: event.cwd as string | undefined,
         tools: event.tools as Array<{ name: string }> | undefined,
       }))
@@ -528,6 +581,10 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         sessionId,
         at: event.at,
       }))
+      return true
+    }
+    case 'freshAgent.question.available': {
+      if (typeof event.at === 'number' && Number.isFinite(event.at)) dispatch(applyFreshAgentQuestionAvailable({ provider: locator.provider, sessionId, at: event.at }))
       return true
     }
     case 'freshAgent.turn.waiting': {
@@ -613,6 +670,7 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         requestId: event.requestId as string,
         toolName: tool?.name,
         input: tool?.input,
+        ...(event.native && typeof event.native === 'object' ? { native: event.native as Record<string, unknown> } : {}),
         providerRequest: {
           subtype: event.subtype,
           tool,
@@ -631,8 +689,15 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         ...locator,
         requestId: event.requestId as string,
         questions: event.questions as never,
+        ...(typeof event.isBlocking === 'boolean' ? { isBlocking: event.isBlocking } : {}),
         providerRequest: event,
       }))
+      return true
+    case 'freshAgent.elicitation.request':
+      dispatch(addElicitationRequest({ ...locator, ...event, requestId: event.requestId as string } as never))
+      return true
+    case 'freshAgent.elicitation.cancelled':
+      dispatch(removeElicitation({ ...locator, requestId: event.requestId as string }))
       return true
     case 'freshAgent.question.cancelled':
       // Provider-originated cancellation: the Rust claude/kilroy slice forwards

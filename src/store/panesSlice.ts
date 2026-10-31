@@ -207,6 +207,7 @@ function normalizePaneContent(
     const modelEffortLevels = normalizeFreshAgentModelEffortLevels(rawFreshAgent.modelEffortLevels)
     const freshHandoffError = normalizeHandoffError(rawFreshAgent.handoffError)
     const checkpointWorkspace = normalizeCheckpointWorkspace(rawFreshAgent.checkpointWorkspace)
+    const observedChildThreadId = input.provider === 'codex' && typeof rawFreshAgent.observedChildThreadId === 'string' && rawFreshAgent.observedChildThreadId.trim() ? rawFreshAgent.observedChildThreadId : undefined
     const outcomeConversationRequestId = typeof rawFreshAgent.createRequestId === 'string'
       && rawFreshAgent.createRequestId
       ? rawFreshAgent.createRequestId
@@ -274,6 +275,7 @@ function normalizePaneContent(
           initialCwd: input.initialCwd,
           ...(checkpointWorkspace ? { checkpointWorkspace } : {}),
           ...(checkpointOutcomes ? { checkpointOutcomes } : {}),
+          ...(observedChildThreadId ? { observedChildThreadId } : {}),
           createError: input.createError,
           closeError,
           modelSelection: normalizeFreshAgentModelSelection(
@@ -284,6 +286,8 @@ function normalizePaneContent(
           ...(modelLabel ? { modelLabel } : {}),
           permissionMode: input.permissionMode,
           sandbox: input.sandbox,
+          collaborationMode: input.collaborationMode === 'plan' || input.collaborationMode === 'default' ? input.collaborationMode : undefined,
+          effortIsNativeDefault: typeof input.effortIsNativeDefault === 'boolean' ? input.effortIsNativeDefault : undefined,
           effort: normalizeFreshAgentEffortOverride(input.effort),
           ...(modelEffortLevels ? { modelEffortLevels } : {}),
           plugins: input.plugins,
@@ -361,6 +365,7 @@ function normalizePaneContent(
       initialCwd: input.initialCwd,
       ...(checkpointWorkspace ? { checkpointWorkspace } : {}),
       ...(checkpointOutcomes ? { checkpointOutcomes } : {}),
+      ...(observedChildThreadId ? { observedChildThreadId } : {}),
       createError: input.createError,
       modelSelection: normalizeFreshAgentModelSelection(
         (input as { modelSelection?: unknown }).modelSelection,
@@ -370,6 +375,8 @@ function normalizePaneContent(
       ...(modelLabel ? { modelLabel } : {}),
       permissionMode: input.permissionMode,
       sandbox: input.sandbox,
+          collaborationMode: input.collaborationMode === 'plan' || input.collaborationMode === 'default' ? input.collaborationMode : undefined,
+          effortIsNativeDefault: typeof input.effortIsNativeDefault === 'boolean' ? input.effortIsNativeDefault : undefined,
       effort: normalizeFreshAgentEffortOverride(input.effort),
       ...(modelEffortLevels ? { modelEffortLevels } : {}),
       plugins: input.plugins,

@@ -160,6 +160,13 @@ pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
                 }
                 target.bytes = 0;
                 target.finished |= finished;
+                if finished {
+                    target.value["status"] = json!(if payload["type"] == "turn_aborted" {
+                        "interrupted"
+                    } else {
+                        "completed"
+                    });
+                }
             }
             _ => {}
         }

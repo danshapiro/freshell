@@ -18,6 +18,18 @@ const singleQuestion = {
 describe('FreshAgentQuestionBanner', () => {
   afterEach(() => cleanup())
 
+  it('preserves the legacy no-flag Other entry and trimming behavior when choices are absent', () => {
+    const onAnswer = vi.fn()
+    render(<FreshAgentQuestionBanner providerLabel="Claude" onAnswer={onAnswer} question={{ requestId: 'legacy', questions: [{ question: 'Legacy question', header: 'Legacy', options: [], multiSelect: false }] }} />)
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Other', exact: true }))
+    const input = screen.getByRole('textbox', { name: 'Legacy question' })
+    expect(input).toHaveFocus()
+    fireEvent.change(input, { target: { value: '  legacy answer  ' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(onAnswer).toHaveBeenCalledWith({ 'Legacy question': 'legacy answer' })
+  })
+
   it('keeps distinct provider question IDs when question text repeats', () => {
     const onAnswer = vi.fn()
     render(<FreshAgentQuestionBanner providerLabel="Codex" onAnswer={onAnswer} question={{
@@ -173,5 +185,24 @@ describe('FreshAgentQuestionBanner', () => {
 
     expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Other' })).toBeDisabled()
+  })
+})
+
+
+describe('native question metadata', () => {
+  afterEach(cleanup)
+  it('masks free entry without requiring Other and preserves the exact native answer', () => {
+    const onAnswer = vi.fn()
+    render(<FreshAgentQuestionBanner providerLabel="Codex" onAnswer={onAnswer} question={{ requestId: '51', questions: [{ id: 'token', header: 'Token', question: 'Enter token', options: [], multiSelect: false, isOther: false, isSecret: true }] }} />)
+    const input = screen.getByLabelText('Enter token')
+    expect(input).toHaveAttribute('type', 'password')
+    expect(screen.queryByRole('button', { name: 'Other' })).not.toBeInTheDocument()
+    fireEvent.change(input, { target: { value: '  token, punctuation!  ' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Submit' }))
+    expect(onAnswer).toHaveBeenCalledWith({ token: '  token, punctuation!  ' })
+  })
+  it('omits Other for a native choice that forbids it', () => {
+    render(<FreshAgentQuestionBanner providerLabel="Codex" onAnswer={vi.fn()} question={{ requestId: '52', questions: [{ id: 'choice', header: 'Choice', question: 'Pick', options: [{ label: 'A', description: '' }], multiSelect: false, isOther: false }] }} />)
+    expect(screen.queryByRole('button', { name: 'Other' })).not.toBeInTheDocument()
   })
 })

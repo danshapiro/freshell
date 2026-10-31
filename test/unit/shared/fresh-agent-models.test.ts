@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { FreshAgentSettingsSchema } from '@shared/fresh-agent-contract'
 
 import {
   FRESHCODEX_DEFAULT_MODEL,
@@ -9,6 +10,16 @@ import {
   normalizeFreshAgentModel,
   resolveFreshAgentModelOption,
 } from '@shared/fresh-agent-models'
+
+describe('Codex exact native model choices', () => {
+  it('keeps custom and saved models and every explicit native effort for native validation', () => {
+    expect(normalizeFreshAgentModel('freshcodex', 'codex', 'provider-current')).toBe('provider-current')
+    for (const effort of ['ultra', 'none', 'xhigh', 'max']) {
+      expect(normalizeFreshAgentEffort('freshcodex', 'codex', 'provider-current', effort)).toBe(effort)
+      expect(FreshAgentSettingsSchema.parse({ model: 'provider-current', effort }).effort).toBe(effort)
+    }
+  })
+})
 
 describe('fresh-agent-models freshopencode static menu', () => {
   it('has no static fallback entries for freshopencode (models come from the live catalog)', () => {
@@ -31,21 +42,10 @@ describe('fresh-agent-models freshopencode static menu', () => {
 })
 
 describe('fresh-agent-models freshcodex static menu', () => {
-  it('tracks the current Codex model availability list', () => {
-    expect(FRESHCODEX_DEFAULT_MODEL).toBe('gpt-6-astra')
-    expect(FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE.freshcodex.map((option) => option.value)).toEqual([
-      'gpt-6-astra',
-      'gpt-5.6-sol',
-      'gpt-5.6-terra',
-      'gpt-5.6-luna',
-      'gpt-5.3-codex-spark',
-    ])
-  })
-
-  it('falls back retired or unknown freshcodex models to the current default', () => {
-    expect(normalizeFreshAgentModel('freshcodex', 'codex', 'gpt-5.4')).toBe('gpt-6-astra')
-    expect(normalizeFreshAgentModel('freshcodex', 'codex', 'gpt-5.4-mini')).toBe('gpt-6-astra')
-    expect(normalizeFreshAgentModel('freshcodex', 'codex', 'unknown-model')).toBe('gpt-6-astra')
+  it('preserves retired or custom model IDs for native validation', () => {
+    expect(normalizeFreshAgentModel('freshcodex', 'codex', 'gpt-5.4')).toBe('gpt-5.4')
+    expect(normalizeFreshAgentModel('freshcodex', 'codex', 'gpt-5.4-mini')).toBe('gpt-5.4-mini')
+    expect(normalizeFreshAgentModel('freshcodex', 'codex', 'unknown-model')).toBe('unknown-model')
   })
 })
 

@@ -1,0 +1,381 @@
+{
+  "source": {
+    "scenario": "parent-child-read",
+    "version": "0.164.0",
+    "receipt": "5768b31f-6e97-4aff-81bc-cb0ded210f0c.json",
+    "sha256": "6eb99ed11fc98523c961fbcf07aed8ad5c909260e8c8fc6d7ca906eb47b794a1"
+  },
+  "parent": {
+    "thread": {
+      "id": "01a17436-80b5-7d81-a429-133d30114b56",
+      "environments": [
+        {
+          "environmentId": "local",
+          "cwd": "/tmp/codex-contract-ooDX6r/workspace",
+          "runtimeWorkspaceRoots": [
+            "/tmp/codex-contract-ooDX6r/workspace"
+          ]
+        }
+      ],
+      "extra": null,
+      "sessionId": "01a17436-80b5-7d81-a429-133d30114b56",
+      "forkedFromId": null,
+      "parentThreadId": null,
+      "preview": "Run the controlled contract scenario.",
+      "ephemeral": false,
+      "section": null,
+      "sectionEnteredAt": null,
+      "projectId": null,
+      "historyMode": "paginated",
+      "modelProvider": "contract-loopback",
+      "model": "contract-model",
+      "reasoningEffort": "low",
+      "createdAt": 1792951091,
+      "updatedAt": 1792951091,
+      "recencyAt": 1792951091,
+      "status": {
+        "type": "idle"
+      },
+      "path": "/tmp/codex-contract-ooDX6r/codex/sessions/2026/10/25/rollout-2026-10-25T17-58-11-01a17436-80b5-7d81-a429-133d30114b56.jsonl",
+      "cwd": "/tmp/codex-contract-ooDX6r/workspace",
+      "cliVersion": "0.164.0",
+      "originator": "freshell_codex_contract",
+      "source": "vscode",
+      "canAcceptDirectInput": true,
+      "threadSource": null,
+      "agentNickname": null,
+      "agentRole": null,
+      "gitInfo": null,
+      "name": null,
+      "daybreakEnabled": null,
+      "turns": [
+        {
+          "id": "01a17436-80c2-7f80-9531-66f31f25b1f9",
+          "rootTurnId": "01a17436-80c2-7f80-9531-66f31f25b1f9",
+          "items": [
+            {
+              "type": "userMessage",
+              "id": "01a17436-80da-7843-a626-57d4c7c88671",
+              "clientId": null,
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Run the controlled contract scenario.",
+                  "text_elements": []
+                }
+              ]
+            },
+            {
+              "type": "collabAgentToolCall",
+              "id": "call_native_child",
+              "tool": "spawnAgent",
+              "status": "completed",
+              "senderThreadId": "01a17436-80b5-7d81-a429-133d30114b56",
+              "receiverThreadIds": [
+                "01a17436-80f3-7f33-84a6-319fdd160006"
+              ],
+              "prompt": "freshell-child-native-probe: return the controlled child answer.",
+              "model": "contract-model",
+              "reasoningEffort": "low",
+              "agentsStates": {
+                "01a17436-80f3-7f33-84a6-319fdd160006": {
+                  "status": "pendingInit",
+                  "message": null
+                }
+              }
+            },
+            {
+              "type": "agentMessage",
+              "id": "msg_contract_1",
+              "text": "First fragment and final fragment",
+              "phase": null,
+              "memoryCitation": null,
+              "delivery": null,
+              "questions": null
+            },
+            {
+              "type": "agentMessage",
+              "id": "msg_contract_3",
+              "text": "First fragment and final fragment",
+              "phase": null,
+              "memoryCitation": null,
+              "delivery": null,
+              "questions": null
+            }
+          ],
+          "itemsView": "full",
+          "status": "completed",
+          "error": null,
+          "startedAt": 1792951091,
+          "completedAt": 1792951091,
+          "durationMs": 119
+        }
+      ]
+    },
+    "readState": {
+      "firstUnread": {
+        "type": "turn",
+        "turnId": "01a17436-80c2-7f80-9531-66f31f25b1f9"
+      },
+      "revision": "dc18d800-0e12-45c5-9a59-fe87256b4fe3"
+    }
+  },
+  "active": {
+    "thread": {
+      "id": "01a17436-80f3-7f33-84a6-319fdd160006",
+      "environments": [
+        {
+          "environmentId": "local",
+          "cwd": "/tmp/codex-contract-ooDX6r/workspace",
+          "runtimeWorkspaceRoots": [
+            "/tmp/codex-contract-ooDX6r/workspace"
+          ]
+        }
+      ],
+      "extra": null,
+      "sessionId": "01a17436-80b5-7d81-a429-133d30114b56",
+      "forkedFromId": null,
+      "parentThreadId": "01a17436-80b5-7d81-a429-133d30114b56",
+      "preview": "freshell-child-native-probe: return the controlled child answer.",
+      "ephemeral": false,
+      "section": null,
+      "sectionEnteredAt": null,
+      "projectId": null,
+      "historyMode": "paginated",
+      "modelProvider": "contract-loopback",
+      "model": "contract-model",
+      "reasoningEffort": "low",
+      "createdAt": 1792951091,
+      "updatedAt": 1792951091,
+      "recencyAt": 1792951091,
+      "status": {
+        "type": "active",
+        "activeFlags": []
+      },
+      "path": "/tmp/codex-contract-ooDX6r/codex/sessions/2026/10/25/rollout-2026-10-25T17-58-11-01a17436-80f3-7f33-84a6-319fdd160006.jsonl",
+      "cwd": "/tmp/codex-contract-ooDX6r/workspace",
+      "cliVersion": "0.164.0",
+      "originator": "freshell_codex_contract",
+      "source": {
+        "subAgent": {
+          "thread_spawn": {
+            "parent_thread_id": "01a17436-80b5-7d81-a429-133d30114b56",
+            "depth": 1,
+            "agent_path": null,
+            "agent_nickname": "Sartre",
+            "agent_role": null
+          }
+        }
+      },
+      "canAcceptDirectInput": true,
+      "threadSource": "subagent",
+      "agentNickname": "Sartre",
+      "agentRole": null,
+      "gitInfo": null,
+      "name": null,
+      "daybreakEnabled": null,
+      "turns": [
+        {
+          "id": "01a17436-80f5-7bf3-bd56-9801e21e9047",
+          "rootTurnId": "01a17436-80c2-7f80-9531-66f31f25b1f9",
+          "items": [
+            {
+              "type": "userMessage",
+              "id": "01a17436-8101-7842-8b60-468e2881a86a",
+              "clientId": null,
+              "content": [
+                {
+                  "type": "text",
+                  "text": "freshell-child-native-probe: return the controlled child answer.",
+                  "text_elements": []
+                }
+              ]
+            }
+          ],
+          "itemsView": "full",
+          "status": "inProgress",
+          "error": null,
+          "startedAt": 1792951091,
+          "completedAt": null,
+          "durationMs": null
+        }
+      ]
+    },
+    "readState": null
+  },
+  "final": {
+    "thread": {
+      "id": "01a17436-80f3-7f33-84a6-319fdd160006",
+      "environments": [
+        {
+          "environmentId": "local",
+          "cwd": "/tmp/codex-contract-ooDX6r/workspace",
+          "runtimeWorkspaceRoots": [
+            "/tmp/codex-contract-ooDX6r/workspace"
+          ]
+        }
+      ],
+      "extra": null,
+      "sessionId": "01a17436-80b5-7d81-a429-133d30114b56",
+      "forkedFromId": null,
+      "parentThreadId": "01a17436-80b5-7d81-a429-133d30114b56",
+      "preview": "freshell-child-native-probe: return the controlled child answer.",
+      "ephemeral": false,
+      "section": null,
+      "sectionEnteredAt": null,
+      "projectId": null,
+      "historyMode": "paginated",
+      "modelProvider": "contract-loopback",
+      "model": "contract-model",
+      "reasoningEffort": "low",
+      "createdAt": 1792951091,
+      "updatedAt": 1792951091,
+      "recencyAt": 1792951091,
+      "status": {
+        "type": "active",
+        "activeFlags": []
+      },
+      "path": "/tmp/codex-contract-ooDX6r/codex/sessions/2026/10/25/rollout-2026-10-25T17-58-11-01a17436-80f3-7f33-84a6-319fdd160006.jsonl",
+      "cwd": "/tmp/codex-contract-ooDX6r/workspace",
+      "cliVersion": "0.164.0",
+      "originator": "freshell_codex_contract",
+      "source": {
+        "subAgent": {
+          "thread_spawn": {
+            "parent_thread_id": "01a17436-80b5-7d81-a429-133d30114b56",
+            "depth": 1,
+            "agent_path": null,
+            "agent_nickname": "Sartre",
+            "agent_role": null
+          }
+        }
+      },
+      "canAcceptDirectInput": true,
+      "threadSource": "subagent",
+      "agentNickname": "Sartre",
+      "agentRole": null,
+      "gitInfo": null,
+      "name": null,
+      "daybreakEnabled": null,
+      "turns": [
+        {
+          "id": "01a17436-80f5-7bf3-bd56-9801e21e9047",
+          "rootTurnId": "01a17436-80c2-7f80-9531-66f31f25b1f9",
+          "items": [
+            {
+              "type": "userMessage",
+              "id": "01a17436-8101-7842-8b60-468e2881a86a",
+              "clientId": null,
+              "content": [
+                {
+                  "type": "text",
+                  "text": "freshell-child-native-probe: return the controlled child answer.",
+                  "text_elements": []
+                }
+              ]
+            },
+            {
+              "type": "agentMessage",
+              "id": "msg_contract_2",
+              "text": "Exact child final answer.",
+              "phase": null,
+              "memoryCitation": null,
+              "delivery": null,
+              "questions": null
+            }
+          ],
+          "itemsView": "full",
+          "status": "inProgress",
+          "error": null,
+          "startedAt": 1792951091,
+          "completedAt": null,
+          "durationMs": null
+        }
+      ]
+    },
+    "readState": null
+  },
+  "saved": {
+    "thread": {
+      "id": "01a17436-80f3-7f33-84a6-319fdd160006",
+      "environments": null,
+      "extra": null,
+      "sessionId": "01a17436-80f3-7f33-84a6-319fdd160006",
+      "forkedFromId": null,
+      "parentThreadId": "01a17436-80b5-7d81-a429-133d30114b56",
+      "preview": "freshell-child-native-probe: return the controlled child answer.",
+      "ephemeral": false,
+      "section": null,
+      "sectionEnteredAt": null,
+      "projectId": null,
+      "historyMode": "paginated",
+      "modelProvider": "contract-loopback",
+      "model": "contract-model",
+      "reasoningEffort": "low",
+      "createdAt": 1792951091,
+      "updatedAt": 1792951091,
+      "recencyAt": 1792951091,
+      "status": {
+        "type": "notLoaded"
+      },
+      "path": "/tmp/codex-contract-ooDX6r/codex/sessions/2026/10/25/rollout-2026-10-25T17-58-11-01a17436-80f3-7f33-84a6-319fdd160006.jsonl",
+      "cwd": "/tmp/codex-contract-ooDX6r/workspace",
+      "cliVersion": "0.164.0",
+      "originator": "freshell_codex_contract",
+      "source": {
+        "subAgent": {
+          "thread_spawn": {
+            "parent_thread_id": "01a17436-80b5-7d81-a429-133d30114b56",
+            "depth": 1,
+            "agent_path": null,
+            "agent_nickname": "Sartre",
+            "agent_role": null
+          }
+        }
+      },
+      "canAcceptDirectInput": null,
+      "threadSource": "subagent",
+      "agentNickname": "Sartre",
+      "agentRole": null,
+      "gitInfo": null,
+      "name": null,
+      "daybreakEnabled": null,
+      "turns": [
+        {
+          "id": "01a17436-80f5-7bf3-bd56-9801e21e9047",
+          "rootTurnId": "01a17436-80c2-7f80-9531-66f31f25b1f9",
+          "items": [
+            {
+              "type": "userMessage",
+              "id": "01a17436-8101-7842-8b60-468e2881a86a",
+              "clientId": null,
+              "content": [
+                {
+                  "type": "text",
+                  "text": "freshell-child-native-probe: return the controlled child answer.",
+                  "text_elements": []
+                }
+              ]
+            },
+            {
+              "type": "agentMessage",
+              "id": "msg_contract_2",
+              "text": "Exact child final answer.",
+              "phase": null,
+              "memoryCitation": null,
+              "delivery": null,
+              "questions": null
+            }
+          ],
+          "itemsView": "full",
+          "status": "completed",
+          "error": null,
+          "startedAt": 1792951091,
+          "completedAt": 1792951091,
+          "durationMs": 43
+        }
+      ]
+    },
+    "readState": null
+  }
+}

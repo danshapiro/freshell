@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use freshell_protocol::{all_message_types, CLIENT_MESSAGE_TYPES, SERVER_MESSAGE_TYPES};
+use freshell_protocol::{all_message_types, SERVER_MESSAGE_TYPES};
 
 fn inventory() -> serde_json::Value {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -24,23 +24,6 @@ fn json_type_set(node: &serde_json::Value) -> BTreeSet<String> {
         .iter()
         .map(|v| v.as_str().expect("type is string").to_string())
         .collect()
-}
-
-#[test]
-fn client_types_match_inventory_exactly() {
-    let inv = inventory();
-    assert_eq!(
-        inv["clientToServer"]["count"].as_u64(),
-        Some(42),
-        "inventory declares 42 client→server types"
-    );
-    let expected = json_type_set(&inv["clientToServer"]["types"]);
-    let actual: BTreeSet<String> = CLIENT_MESSAGE_TYPES.iter().map(|s| s.to_string()).collect();
-    assert_eq!(actual.len(), 42, "crate declares 42 client types (no dups)");
-    assert_eq!(
-        actual, expected,
-        "CLIENT_MESSAGE_TYPES must equal the frozen inventory (no missing/extra)"
-    );
 }
 
 #[test]

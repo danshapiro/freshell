@@ -5,13 +5,14 @@ export const SETTING_SCOPE_COPY = {
   'create-only': 'Applies when a session starts — start a new conversation to change it.',
 } as const
 
-export type FreshAgentSettingKnob = 'model' | 'effort' | 'sandbox' | 'permissionMode'
+export type FreshAgentSettingKnob = 'model' | 'effort' | 'sandbox' | 'permissionMode' | 'cwd' | 'collaborationMode'
 
 /** Scope-driven hint. Older servers (field absent, or knob absent) fall back to
  * the pre-existing per-send copy: for a not-yet-created pane everything applies
  * at create, which that copy truthfully covers. */
 export function settingScopeHint(scopes: FreshAgentSettingScopes | undefined, knob: FreshAgentSettingKnob): string {
   const scope = scopes?.[knob]
+  if (scope === 'unsupported') return 'This setting is unavailable for this session.'
   if (scope === 'create-only') return SETTING_SCOPE_COPY['create-only']
   return SETTING_SCOPE_COPY['per-send']
 }

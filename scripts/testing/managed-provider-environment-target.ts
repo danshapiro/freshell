@@ -1193,7 +1193,7 @@ export async function runCodeCheckpointTarget() {
   assert.equal(process.env.GCLOUD_ROBOT_ACCOUNT, 'gcloud-robot@misc-puttering-project.iam.gserviceaccount.com')
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
   const candidateSha = committedAcceptanceSha(repoRoot)
-  execFileSync('mise', ['exec', 'rust@1.96', '--', 'cargo', 'build', '-p', 'freshell-server',
+  execFileSync('mise', ['exec', 'rust@1.96.0', '--', 'cargo', 'build', '-p', 'freshell-server',
     '--features', 'managed-runtime-v1', '--locked'], {
     cwd: repoRoot, env: { ...process.env, FRESHELL_BUILD_COMMIT: candidateSha }, stdio: 'inherit',
   })

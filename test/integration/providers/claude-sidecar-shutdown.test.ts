@@ -63,6 +63,7 @@ describe('Claude sidecar shutdown against the pinned CLI and a local provider', 
     const lines = stdout.trim().split('\n').filter(Boolean)
     expect(lines, stderr).toHaveLength(1)
     const receipt = JSON.parse(lines[0]!) as Record<string, any>
+    console.log(JSON.stringify({ event: 'claude.shutdown.receipt', receipt }))
     expect(receipt).toMatchObject({
       verdict: 'PASS',
       mode,

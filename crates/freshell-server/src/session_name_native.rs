@@ -128,7 +128,7 @@ pub enum NativeClassified {
 }
 
 impl NativeClassified {
-    fn into_call<T>(self) -> NativeCallResult<T> {
+    pub(crate) fn into_call<T>(self) -> NativeCallResult<T> {
         match self {
             Self::Undelivered(reason) => NativeCallResult::Undelivered(reason),
             Self::Ambiguous(reason) => NativeCallResult::Ambiguous(reason),
@@ -1299,11 +1299,21 @@ pub type CodexRootClientResolver = Arc<
 
 pub struct CodexNativeNameAdapter {
     client_for_root: CodexRootClientResolver,
+    hosted: Option<Arc<dyn NativeNameBackend>>,
 }
 
 impl CodexNativeNameAdapter {
     pub fn new(client_for_root: CodexRootClientResolver) -> Self {
-        Self { client_for_root }
+        Self {
+            client_for_root,
+            hosted: None,
+        }
+    }
+
+    #[cfg(feature = "managed-runtime-v1")]
+    pub fn with_hosted_backend(mut self, hosted: Option<Arc<dyn NativeNameBackend>>) -> Self {
+        self.hosted = hosted;
+        self
     }
 }
 
@@ -1383,7 +1393,7 @@ fn rpc_diagnoses_missing_target(error: &freshell_codex::protocol::RpcError) -> b
 /// failure (retryable) UNLESS it diagnoses the target as missing or the API
 /// as unsupported (a settled capability failure). Never reduced to a
 /// generic timeout or a blanket unsupported.
-fn classify_codex_error(
+pub(crate) fn classify_codex_error(
     error: freshell_codex::app_server::CodexAppServerError,
     what: &str,
 ) -> NativeClassified {
@@ -1421,9 +1431,13 @@ fn classify_codex_error(
 impl NativeNameBackend for CodexNativeNameAdapter {
     fn read(&self, target: NativeNameTarget) -> NativeFuture<NativeNameReadback> {
         let resolver = Arc::clone(&self.client_for_root);
+        let hosted = self.hosted.clone();
         Box::pin(async move {
             let (client, thread_id) = match codex_root_matched_thread(&resolver, &target).await {
                 Ok(pair) => pair,
+                Err(_) if hosted.is_some() => {
+                    return hosted.expect("checked hosted route").read(target).await
+                }
                 Err(classified) => return classified.into_call(),
             };
             // The metadata read rides its OWN 20-second native request bound
@@ -1440,10 +1454,14 @@ impl NativeNameBackend for CodexNativeNameAdapter {
 
     fn write(&self, attempt: NativeNameAttempt) -> NativeFuture<()> {
         let resolver = Arc::clone(&self.client_for_root);
+        let hosted = self.hosted.clone();
         Box::pin(async move {
             let (client, thread_id) =
                 match codex_root_matched_thread(&resolver, &attempt.target).await {
                     Ok(pair) => pair,
+                    Err(_) if hosted.is_some() => {
+                        return hosted.expect("checked hosted route").write(attempt).await
+                    }
                     Err(classified) => return classified.into_call(),
                 };
             match client.set_thread_name(&thread_id, &attempt.title).await {
@@ -1459,7 +1477,16 @@ impl NativeNameBackend for CodexNativeNameAdapter {
         // LIVE root-matched app-server connection — the series pauses until
         // one exists, consuming nothing.
         let resolver = Arc::clone(&self.client_for_root);
-        Box::pin(async move { codex_root_matched_thread(&resolver, &target).await.is_ok() })
+        let hosted = self.hosted.clone();
+        Box::pin(async move {
+            if codex_root_matched_thread(&resolver, &target).await.is_ok() {
+                return true;
+            }
+            match hosted {
+                Some(hosted) => hosted.route_available(target).await,
+                None => false,
+            }
+        })
     }
 }
 

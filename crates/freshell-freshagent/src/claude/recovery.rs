@@ -259,7 +259,7 @@ pub(super) fn updated_settings(
         next.model = Some(model.clone());
     }
     if let Some(effort) = &requested.effort {
-        next.effort = Some(effort.clone());
+        next.effort = effort.clone();
     }
     if let Some(permission_mode) = &requested.permission_mode {
         next.permission_mode = Some(permission_mode.clone());

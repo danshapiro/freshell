@@ -1,9 +1,9 @@
 /**
  * The live tail of a fresh-agent session (transcript-live plan §4.4): what a
- * running turn shows before its transcript lines land in a snapshot. Durable
- * content always comes from the snapshot (principle P1); this state holds
- * only what the transcript cannot hold yet — the blocks being streamed, the
- * API retry in progress, and the provider notices that never end a turn. It
+ * running turn shows before its transcript lines land in a snapshot. Claude
+ * blocks and Codex event-owned bodies stay here, with explicit provenance
+ * when native saving differs or is unavailable. API retries and provider
+ * notices never end a turn. This state
  * lives under its own root key so token-rate updates never touch
  * `state.freshAgent.sessions` (P3).
  */
@@ -82,7 +82,20 @@ export type LiveNotice = {
   rateLimit?: LiveRateLimit
 }
 
+import type { TranscriptProjection } from '@/lib/fresh-agent-transcript-projection'
+import type { FreshAgentSnapshot, FreshAgentTranscriptPatch } from '@shared/fresh-agent-contract'
+
 export type FreshAgentLiveSession = {
+  retainedSnapshot?: FreshAgentSnapshot
+  retainedSourceKey?: string
+  /** Small identity tombstones live until this session scope is removed.
+   * Transcript bodies and patch buffers have their own finite bounds. */
+  retiredRetainedSourceKeys?: Record<string, true>
+  retiredProjectionIds?: Record<string, true>
+  projection?: TranscriptProjection
+  codexMetadata?: Record<string, unknown>
+  unboundTranscriptPatches?: FreshAgentTranscriptPatch[]
+  unboundTranscriptWatermarks?: Record<string, { revision: number; gap: boolean }>
   blocks: LiveBlock[]
   retry?: LiveRetry
   /** Transcript line uuids announced by the CLI and not yet seen in a snapshot. */

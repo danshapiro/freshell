@@ -9,27 +9,7 @@ pub async fn probe_as_provider(
     run_as_gid: u32,
 ) -> Result<ProviderStoreProbe, String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    // Fixture hosts already run as their intended workload uid/gid and have no
-    // SETGID capability. Calling `setpriv --clear-groups` in that case fails
-    // before the read-only probe starts. Real managed terminals target the
-    // provider uid and therefore take the capability-scoped setpriv path.
-    let current_uid = unsafe { libc::geteuid() };
-    let current_gid = unsafe { libc::getegid() };
-    let mut child = if needs_privilege_drop(run_as_uid, run_as_gid, current_uid, current_gid) {
-        let mut command = tokio::process::Command::new("/usr/bin/setpriv");
-        command
-            .arg("--reuid")
-            .arg(run_as_uid.to_string())
-            .arg("--regid")
-            .arg(run_as_gid.to_string())
-            .arg("--clear-groups")
-            .arg("--no-new-privs")
-            .arg("--")
-            .arg(&executable);
-        command
-    } else {
-        tokio::process::Command::new(&executable)
-    };
+    let mut child = provider_command(&executable, run_as_uid, run_as_gid);
     child
         .arg("provider-probe-worker")
         .arg("--provider-home")
@@ -63,6 +43,34 @@ pub async fn probe_as_provider(
     }
     serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("decode provider recovery probe: {error}"))
+}
+
+pub(super) fn provider_command(
+    executable: &Path,
+    run_as_uid: u32,
+    run_as_gid: u32,
+) -> tokio::process::Command {
+    // Fixture hosts already run as their intended workload uid/gid and have no
+    // SETGID capability. Calling `setpriv --clear-groups` in that case fails
+    // before the read-only probe starts. Real managed terminals target the
+    // provider uid and therefore take the capability-scoped setpriv path.
+    let current_uid = unsafe { libc::geteuid() };
+    let current_gid = unsafe { libc::getegid() };
+    if needs_privilege_drop(run_as_uid, run_as_gid, current_uid, current_gid) {
+        let mut command = tokio::process::Command::new("/usr/bin/setpriv");
+        command
+            .arg("--reuid")
+            .arg(run_as_uid.to_string())
+            .arg("--regid")
+            .arg(run_as_gid.to_string())
+            .arg("--clear-groups")
+            .arg("--no-new-privs")
+            .arg("--")
+            .arg(executable);
+        command
+    } else {
+        tokio::process::Command::new(executable)
+    }
 }
 
 pub fn run_probe_worker(args: &[String]) -> Result<(), String> {

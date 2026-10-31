@@ -90,9 +90,10 @@ fn configure_request_round_trips_settings_and_the_epoch_fence() {
     let configure = FreshAgentConfigureRequest {
         soul_id: SoulId::parse("soul-configure").unwrap(),
         settings: FreshAgentTurnSettings {
+            collaboration_mode: None,
             cwd: None,
             model: Some("opus".into()),
-            effort: Some("high".into()),
+            effort: Some(Some("high".into())),
             permission_mode: Some("acceptEdits".into()),
             sandbox: None,
         },
@@ -117,6 +118,7 @@ fn configure_request_round_trips_settings_and_the_epoch_fence() {
 fn host_configure_command_keeps_the_semantic_request_id_and_settings() {
     let request_id = RequestId::parse("request-configure-1").unwrap();
     let settings = FreshAgentTurnSettings {
+        collaboration_mode: None,
         cwd: Some("/workspace/nested".into()),
         model: Some("opus".into()),
         effort: None,
@@ -149,6 +151,7 @@ fn admin_configure_envelope_keeps_the_semantic_request_id() {
         AdminCommand::FreshAgentConfigure(FreshAgentConfigureRequest {
             soul_id: SoulId::parse("soul-admin-configure").unwrap(),
             settings: FreshAgentTurnSettings {
+                collaboration_mode: None,
                 cwd: None,
                 model: Some("opus".into()),
                 effort: None,

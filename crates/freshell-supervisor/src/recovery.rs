@@ -96,6 +96,16 @@ impl Supervisor {
                     {
                         Ok(status) => status,
                         Err(_) if context.resume_spec.is_some() => return offline_probe(&context),
+                        Err(error)
+                            if error.code == RuntimeErrorCode::HostUnreachable
+                                && context.fresh_agent.as_ref().is_some_and(|agent| {
+                                    agent.provider
+                                        == freshell_runtime_protocol::FreshProvider::Codex
+                                })
+                                && context.native_session_id.is_some() =>
+                        {
+                            return self.probe_unconfirmed_worker_store(&context, &host).await;
+                        }
                         Err(error) => {
                             return Ok(blocked(
                                 RecoveryPath::Reattach,
@@ -142,33 +152,7 @@ impl Supervisor {
                             "probe": store_probe,
                         }),
                     );
-                    let captured = match store_probe {
-                        RecoveryProbe::ResumeReady { resume_spec, .. } => {
-                            let stored = self
-                                .registry
-                                .store_verified_resume_spec_for_live_incarnation(
-                                    context.soul_id.clone(),
-                                    context.prior_handle.incarnation_id().clone(),
-                                    context.evidence_revision,
-                                    *resume_spec,
-                                )
-                                .await
-                                .map_err(map_registry)?;
-                            let Some(stored) = stored else {
-                                return Ok(blocked(
-                                    RecoveryPath::NativeResume,
-                                    RecoveryBlockReason::ProviderUnavailable,
-                                    "provider-store evidence was superseded by a newer incarnation or recovery state; retry the probe",
-                                    Some(2_000),
-                                ));
-                            };
-                            RecoveryProbe::ResumeReady {
-                                evidence_revision: stored.evidence_revision,
-                                resume_spec: Box::new(stored),
-                            }
-                        }
-                        other => other,
-                    };
+                    let captured = self.persist_resume_probe(&context, store_probe).await?;
 
                     return Ok(after_native_probe(&context, captured));
                 }
@@ -200,6 +184,78 @@ impl Supervisor {
             ),
             Some(2_000),
         ))
+    }
+
+    async fn probe_unconfirmed_worker_store(
+        &self,
+        context: &RecoveryContext,
+        host: &crate::service::AuthenticatedHost,
+    ) -> Result<RecoveryProbe, RuntimeError> {
+        // A restarted host cannot certify a surviving
+        // worker from initialization alone. It can still
+        // inspect its exact owned store as the provider UID.
+        let candidate = match resume_catalog::exact_resume_candidate(context, None) {
+            Ok(Some(candidate)) => candidate,
+            Ok(None) => {
+                return Ok(blocked(
+                    RecoveryPath::NativeResume,
+                    RecoveryBlockReason::AmbiguousIdentity,
+                    "native identity is unrecorded",
+                    None,
+                ))
+            }
+            Err(probe) => return Ok(probe),
+        };
+        let probe = self
+            .probe_host_store(context, host, Some(candidate))
+            .await?;
+        crate::service::append_event(
+            &self.config.lifecycle_log,
+            "supervisor.recovery.unconfirmed_worker_store_probe",
+            serde_json::json!({
+                "severity":"info", "soulId":context.soul_id, "incarnationId":context.prior_handle.incarnation_id(),
+                "nativeSessionId":context.native_session_id, "probe":probe
+            }),
+        );
+        match probe {
+            ready @ RecoveryProbe::ResumeReady { .. } => {
+                self.persist_resume_probe(context, ready).await
+            }
+            other @ RecoveryProbe::Blocked { .. } => Ok(other),
+            _ => Ok(blocked(
+                RecoveryPath::NativeResume,
+                RecoveryBlockReason::ProviderUnavailable,
+                "unconfirmed worker requires a positive exact-session store proof",
+                Some(2_000),
+            )),
+        }
+    }
+
+    async fn persist_resume_probe(
+        &self,
+        context: &RecoveryContext,
+        probe: RecoveryProbe,
+    ) -> Result<RecoveryProbe, RuntimeError> {
+        let RecoveryProbe::ResumeReady { resume_spec, .. } = probe else {
+            return Ok(probe);
+        };
+        let stored = self
+            .registry
+            .store_verified_resume_spec_for_live_incarnation(
+                context.soul_id.clone(),
+                context.prior_handle.incarnation_id().clone(),
+                context.evidence_revision,
+                *resume_spec,
+            )
+            .await
+            .map_err(map_registry)?;
+        Ok(match stored {
+            Some(stored) => RecoveryProbe::ResumeReady {
+                evidence_revision:stored.evidence_revision, resume_spec:Box::new(stored),
+            },
+            None => blocked(RecoveryPath::NativeResume, RecoveryBlockReason::ProviderUnavailable,
+                "provider-store evidence was superseded by a newer incarnation or recovery state; retry the probe", Some(2_000)),
+        })
     }
 
     /// Capture a verified exact-session resume proof while the provider store
@@ -2011,9 +2067,14 @@ fn fresh_agent_replay_settings(
     agent: &freshell_runtime_protocol::FreshAgentLaunchSpec,
 ) -> freshell_runtime_protocol::FreshAgentTurnSettings {
     freshell_runtime_protocol::FreshAgentTurnSettings {
+        collaboration_mode: agent.collaboration_mode.clone(),
         cwd: Some(agent.cwd.clone()),
         model: agent.model.clone(),
-        effort: agent.effort.clone(),
+        effort: if agent.provider == freshell_runtime_protocol::FreshProvider::Codex {
+            Some(agent.effort.clone())
+        } else {
+            agent.effort.clone().map(Some)
+        },
         permission_mode: agent.permission_mode.clone(),
         sandbox: agent.sandbox.clone(),
     }
@@ -2413,12 +2474,15 @@ fn map_registry(error: RegistryError) -> RuntimeError {
 mod tests {
     include!("shell_recovery_tests.rs");
     include!("retained_output_tests.rs");
+    include!("host_restart_recovery_tests.rs");
     use super::*;
     use freshell_runtime_protocol::{FreshAgentLaunchSpec, FreshProvider, IncarnationId};
 
     #[test]
     fn queued_fresh_prompt_replays_with_the_exact_persisted_turn_profile() {
         let agent = FreshAgentLaunchSpec {
+            naming_handle: None,
+            collaboration_mode: None,
             session_id: "presentation".into(),
             provider: FreshProvider::Codex,
             session_type: "freshcodex".into(),
@@ -2446,7 +2510,7 @@ mod tests {
         let settings = fresh_agent_replay_settings(&agent);
         assert_eq!(settings.cwd.as_deref(), Some("/workspace/nested"));
         assert_eq!(settings.model.as_deref(), Some("model-exact"));
-        assert_eq!(settings.effort.as_deref(), Some("high"));
+        assert_eq!(settings.effort, Some(Some("high".into())));
         assert_eq!(settings.permission_mode.as_deref(), Some("ask"));
         assert_eq!(settings.sandbox.as_deref(), Some("workspace-write"));
     }

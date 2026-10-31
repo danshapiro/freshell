@@ -38,6 +38,7 @@ impl ClaudeRestLane {
             .state
             .handle_create(
                 FreshAgentCreate {
+                    collaboration_mode: None,
                     request_id: request.request_id,
                     provider: Some(AgentProvider::Claude),
                     session_type,
@@ -69,6 +70,8 @@ impl ClaudeRestLane {
                 session_id,
                 session_ref,
                 cleanup_token: cleanup_ownership_id,
+                effective_settings: None,
+                name_ref: None,
             }),
             ClaudeCreateOutcome::Failed {
                 code,
