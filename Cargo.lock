@@ -1524,6 +1524,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "freshell-platform",
+ "freshell-protocol",
  "libc",
  "notify",
  "regex",

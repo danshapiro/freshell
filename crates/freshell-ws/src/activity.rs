@@ -339,10 +339,13 @@ struct AntigravityLane {
     /// hub task's FIFO order guarantees no live drain can precede it).
     baseline_pending: bool,
     /// The submit-anchored BASELINE BOUNDARY (whole-delta review round 2,
-    /// Major 2): the located submit's Enter `at`, consumed by the first
-    /// drain — records on disk whose `at` predates it are history
-    /// (silent), records at/after it are live turn events (a quick turn
-    /// that settled during the locator's 2 s window rings). `None` = no
+    /// Major 2; floor aligned with the locator's recency tolerance in
+    /// round 4, Minor 1): the located submit's Enter `at`, consumed by
+    /// the first drain — records on disk whose `at` predates the
+    /// tolerance-widened floor are history (silent), records at/after
+    /// it are live turn events (a quick turn that settled during the
+    /// locator's window rings, including one stamped within the
+    /// backward tolerance BEFORE the captured submit). `None` = no
     /// captured submit; the tracker derives that boundary honestly (see
     /// its module header).
     baseline_submit_at: Option<i64>,
@@ -916,9 +919,17 @@ impl ActivityHub {
     /// Major 1: the first drain classifies the whole existing file as
     /// the tracker's BASELINE, so a young conversation and a months-old
     /// resume take the same path; the baseline itself is anchored to
-    /// the located SUBMIT — round 2, Major 2 — so historical settles
-    /// never ring while a settle written after the submit does), watch
-    /// it via inotify, and run the initial (baseline) drain.
+    /// the located SUBMIT — round 2, Major 2, its floor aligned with
+    /// the locator's recency tolerance in round 4, Minor 1 — so
+    /// historical settles never ring while a settle written within the
+    /// tolerance of the submit does), watch it via inotify, and run the
+    /// initial (baseline) drain. ANY install failure (tailer attach,
+    /// watcher construction, watch registration) drops the lane and
+    /// transitions the tracker to the honest no-identity state (round
+    /// 4, Minor 2: the stale session binding clears and busy resolves
+    /// with crash semantics) — the pane's next submit re-opens the
+    /// locator window and the sweep's successful attach re-establishes
+    /// everything.
     fn attach_antigravity_lane(
         &self,
         terminal_id: &str,
@@ -954,13 +965,16 @@ impl ActivityHub {
         let mut tailer = AntigravityTranscriptTailer::new(transcript_path);
         if let Err((reason, message)) = tailer.attach(AttachAt::Start) {
             // Attach failure = the lane's truth source is unreadable —
-            // crash semantics (owner ruling: probe failure = crash; a
-            // provisional busy reverts silently). A superseded lane must
-            // not survive the failed rebind: the abandoned conversation's
-            // records would keep feeding this terminal (phantom busy /
-            // phantom turn-complete for a foreign turn) — drop it first,
-            // mirroring the drain-degrade path. The pane's next submit
-            // re-opens the locator window and the sweep re-attaches.
+            // crash semantics (owner ruling: probe failure = crash). A
+            // superseded lane must not survive the failed rebind: the
+            // abandoned conversation's records would keep feeding this
+            // terminal (phantom busy / phantom turn-complete for a
+            // foreign turn) — drop it first, mirroring the
+            // drain-degrade path, and transition the tracker to the
+            // honest no-identity state (round 4, Minor 2): the stale
+            // session binding clears and busy resolves with the same
+            // crash semantics. The pane's next submit re-opens the
+            // locator window and the sweep re-attaches.
             tracing::warn!(
                 terminal_id = %terminal_id,
                 session_id = %session_id,
@@ -973,7 +987,7 @@ impl ActivityHub {
                 inner.antigravity_lanes.remove(terminal_id);
                 let effects = inner
                     .antigravity_tracker
-                    .note_verify_failed(terminal_id, now_ms());
+                    .note_lane_attach_failed(terminal_id, now_ms());
                 let (frames, _) = antigravity_frames(&mut inner.idle, effects);
                 frames
             };
@@ -1005,12 +1019,24 @@ impl ActivityHub {
                 );
                 // The failed rebind must also drop a superseded lane —
                 // same rule as the attach-failure arm above (the abandoned
-                // conversation's records must stop feeding this terminal).
-                self.inner
-                    .lock()
-                    .expect("activity hub lock")
-                    .antigravity_lanes
-                    .remove(terminal_id);
+                // conversation's records must stop feeding this terminal)
+                // — AND transition the tracker to the honest no-identity
+                // state (round 4, Minor 2): without this, a rebind whose
+                // watcher could not install left the activity record
+                // claiming the OLD session id with a busy that could
+                // never clear (the deadman's force-reads had no lane).
+                // The pane's next submit re-opens the locator window and
+                // the sweep's successful attach re-establishes identity.
+                let frames = {
+                    let mut inner = self.inner.lock().expect("activity hub lock");
+                    inner.antigravity_lanes.remove(terminal_id);
+                    let effects = inner
+                        .antigravity_tracker
+                        .note_lane_attach_failed(terminal_id, now_ms());
+                    let (frames, _) = antigravity_frames(&mut inner.idle, effects);
+                    frames
+                };
+                self.emit(frames);
                 return;
             }
         };
@@ -1020,14 +1046,23 @@ impl ActivityHub {
                 error = %err,
                 "antigravity transcript watch failed; PTY-only lane continues"
             );
-            // The failed rebind must also drop a superseded lane —
-            // same rule as the attach-failure arm above (the abandoned
-            // conversation's records must stop feeding this terminal).
-            self.inner
-                .lock()
-                .expect("activity hub lock")
-                .antigravity_lanes
-                .remove(terminal_id);
+            // The failed rebind must also drop a superseded lane — same
+            // rule as the arms above (the abandoned conversation's
+            // records must stop feeding this terminal) — AND transition
+            // the tracker to the honest no-identity state (round 4,
+            // Minor 2). The pane's next submit re-opens the locator
+            // window and the sweep's successful attach re-establishes
+            // identity.
+            let frames = {
+                let mut inner = self.inner.lock().expect("activity hub lock");
+                inner.antigravity_lanes.remove(terminal_id);
+                let effects = inner
+                    .antigravity_tracker
+                    .note_lane_attach_failed(terminal_id, now_ms());
+                let (frames, _) = antigravity_frames(&mut inner.idle, effects);
+                frames
+            };
+            self.emit(frames);
             return;
         }
 
@@ -1073,18 +1108,20 @@ impl ActivityHub {
     /// force-reads, and once at attach. The FIRST drain after attach (the
     /// lane's `baseline_pending` flag) classifies its records as the
     /// tracker's BASELINE — anchored to the lane's `baseline_submit_at`
-    /// (whole-delta review round 2, Major 2): records whose `at`
-    /// predates the submit seed the watermark + busy state without
-    /// effects (old settles never ring — round 1's property), while
-    /// records at/after the submit replay through `note_record` as the
-    /// LIVE turn events they are (a quick turn that settled during the
-    /// locator's 2 s window rings exactly once; the per-settle dedupe
-    /// covers re-drains); every later drain streams live. A degrade
-    /// drops the lane and applies crash semantics (the tracker's
-    /// `note_verify_failed`: a CONFIRMED busy clears and rings the
-    /// attention boundary; a provisional busy reverts silently) — the
-    /// pane's next submit re-opens the locator window and the sweep
-    /// re-attaches.
+    /// (whole-delta review round 2, Major 2; floor aligned with the
+    /// locator's recency tolerance in round 4, Minor 1): records whose
+    /// `at` predates the tolerance-widened floor seed the watermark +
+    /// busy state without effects (old settles never ring — round 1's
+    /// property), while records at/after the floor replay through
+    /// `note_record` as the LIVE turn events they are (a quick turn
+    /// that settled during the locator's window rings exactly once,
+    /// including one stamped within the backward tolerance before the
+    /// captured submit; the per-settle dedupe covers re-drains); every
+    /// later drain streams live. A degrade drops the lane and applies
+    /// crash semantics (the tracker's `note_verify_failed`: a CONFIRMED
+    /// busy clears and rings the attention boundary; a provisional busy
+    /// reverts silently) — the pane's next submit re-opens the locator
+    /// window and the sweep re-attaches.
     fn drain_antigravity_lane(&self, terminal_id: &str) {
         self.stats.tail_reads.fetch_add(1, Ordering::SeqCst);
         let frames = {
@@ -4328,6 +4365,143 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// Whole-delta review round 4, Minor 1: the baseline's live floor is
+    /// the locator's recency TOLERANCE, not the bare submit. The registry
+    /// writes the PTY bytes BEFORE stamping the Input event and the CLI's
+    /// clock can lag ours, so a QUICK turn can write BOTH its records —
+    /// the user message the locator matches AND its settle — stamped
+    /// within the tolerance BEFORE the captured submit. Identity binds
+    /// (the locator's tolerance admits the record); the settle must ring
+    /// EXACTLY ONCE at the hub seam (terminal.turn.complete + one
+    /// terminal.idle{grace}), or the turn's completion alert is silently
+    /// lost. The pre-window history (an old settled turn ≫ the tolerance
+    /// before the submit) stays silent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn antigravity_attach_baseline_rings_a_settle_landed_within_the_backward_tolerance() {
+        let (hub, mut rx) = hub();
+        let home = unique_temp_dir("agy-baseline-tolerance-settle");
+        hub.set_antigravity_association(Arc::new(
+            crate::antigravity_association::AntigravityAssociation::new(home.clone()),
+        ));
+
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "antigravity".into(),
+                resume_session_id: None,
+                at: now_ms(),
+            },
+        );
+        let t0 = now_ms();
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t1".into(),
+                data: "skewed settle prompt\r".into(),
+                at: t0,
+            },
+        );
+        next_frame_matching(&mut rx, "antigravity.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "busy" && v["upsert"][0]["terminalId"] == "t1"
+        })
+        .await
+        .expect("the flushed submit arms provisional busy");
+
+        // On disk at attach: an OLD settled turn (outside the tolerance
+        // window — history), then the pane's own QUICK turn — the user
+        // record the locator matched and its settle, both stamped within
+        // the 5 s backward tolerance BEFORE the captured submit (the
+        // write→stamp skew the tolerance exists for).
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        let line = |kind: &str, extra: &str, at: i64| {
+            format!("{{\"type\":\"{kind}\",\"conversationId\":\"conv-1\",\"at\":{at}{extra}}}\n")
+        };
+        std::fs::write(
+            &transcript,
+            [
+                line("session_start", "", t0 - 120_000),
+                line(
+                    "user_message",
+                    ",\"text\":\"old history prompt\"",
+                    t0 - 80_000,
+                ),
+                line(
+                    "turn_settled",
+                    ",\"outcome\":\"completed\",\"fullyIdle\":true",
+                    t0 - 79_000,
+                ),
+                line(
+                    "user_message",
+                    ",\"text\":\"skewed settle prompt\"",
+                    t0 - 3_000,
+                ),
+                line(
+                    "turn_settled",
+                    ",\"outcome\":\"completed\",\"fullyIdle\":true",
+                    t0 - 2_500,
+                ),
+            ]
+            .concat(),
+        )
+        .unwrap();
+
+        // Attach carrying the pane's captured submit as the baseline
+        // boundary; the pane's own turn's records sit within the
+        // tolerance BEFORE it.
+        hub.attach_antigravity_association("t1", "conv-1", &transcript, Some(t0));
+        next_frame_matching(&mut rx, "antigravity.activity.updated", 3_000, |v| {
+            v["upsert"][0]["sessionId"] == "conv-1"
+        })
+        .await
+        .expect("bind upsert");
+        wait_for_antigravity_drain(&hub, "t1").await;
+
+        // The in-tolerance settle RINGS: exactly one completion (seq 1)
+        // and exactly one terminal.idle{grace} — the pre-window history
+        // rang nothing.
+        let complete = next_frame_of_type(&mut rx, "terminal.turn.complete", 5_000)
+            .await
+            .expect("a settle stamped within the backward tolerance before the submit rings");
+        assert_eq!(complete["terminalId"], "t1");
+        assert_eq!(complete["sessionId"], "conv-1");
+        assert_eq!(complete["completionSeq"], 1);
+        let idle = next_frame_of_type(&mut rx, "terminal.idle", 5_000)
+            .await
+            .expect("terminal.idle after the in-tolerance settle");
+        assert_eq!(idle["terminalId"], "t1");
+        assert_eq!(idle["reason"], "grace");
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.turn.complete", 2_000)
+                .await
+                .is_none(),
+            "exactly one completion — the pre-window history stayed silent"
+        );
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 2_000)
+                .await
+                .is_none(),
+            "exactly one terminal.idle for the in-tolerance settle"
+        );
+        {
+            let (records, completions) = hub.antigravity_list();
+            assert_eq!(records.len(), 1);
+            assert_eq!(
+                records[0].phase,
+                freshell_protocol::AntigravityPhase::Idle,
+                "the pane resolved to the transcript's settled truth"
+            );
+            assert_eq!(
+                completions.len(),
+                1,
+                "the pre-window settle consumed none of the sequence"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// Antigravity plan Task 8: exit while busy rings the hub death bell
     /// exactly once (the tracker's provisional busy arms the gate engagement).
     #[tokio::test(flavor = "multi_thread")]
@@ -4384,14 +4558,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// Review follow-up (Task 8 Minor 1): a rebind whose new-transcript
-    /// attach fails must not leave the SUPERSEDED conversation's lane
-    /// feeding the pane — a settle written by the old conversation (e.g. a
-    /// second pane that resumed it) would mint a phantom turn-complete +
-    /// attention ring for a foreign turn. Drives the deterministic failure
-    /// arm (watch registration on a not-yet-created transcript); the
-    /// attach-failure and watcher-construction arms carry the same
-    /// superseded-lane drop.
+    /// Review follow-up (Task 8 Minor 1) + whole-delta review round 4,
+    /// Minor 2: a rebind whose new-transcript lane cannot be installed
+    /// must not leave the SUPERSEDED conversation's lane feeding the pane
+    /// — a settle written by the old conversation (e.g. a second pane
+    /// that resumed it) would mint a phantom turn-complete + attention
+    /// ring for a foreign turn — AND must leave the tracker's honest
+    /// no-identity state: the stale session binding clears (the UI must
+    /// not retain the old conversation id), the confirmed busy clears
+    /// with exactly ONE crash-attention idle (a confirmed turn became
+    /// unverifiable — no lane can ever observe its settle), and a
+    /// subsequent successful attach re-establishes identity so the next
+    /// turn completes under the NEW conversation id. Drives the
+    /// deterministic failure arm (watch registration on a
+    /// not-yet-created transcript); the attach-failure and
+    /// watcher-construction arms carry the same transition.
     #[tokio::test(flavor = "multi_thread")]
     async fn antigravity_failed_rebind_attach_drops_the_superseded_lane() {
         let dir = tempfile::tempdir().unwrap();
@@ -4453,11 +4634,11 @@ mod tests {
         .expect("bind upsert for conversation A");
         wait_for_antigravity_drain(&hub, "t1").await;
 
-        // Rebind A→B whose attach fails: conv-b's transcript does not
-        // exist yet, so the tailer attaches at Start fine but the inotify
-        // watch registration fails. The channel's FIFO order guarantees
-        // the hub processes this failed attach before any event the old
-        // lane's watcher could forward for the append below.
+        // Rebind A→B whose lane cannot be installed: conv-b's transcript
+        // does not exist yet, so the tailer attaches at Start fine but the
+        // inotify watch registration fails. The channel's FIFO order
+        // guarantees the hub processes this failed attach before any event
+        // the old lane's watcher could forward for the append below.
         hub.attach_antigravity_association(
             "t1",
             "conv-b",
@@ -4465,8 +4646,28 @@ mod tests {
             Some(submit_at),
         );
 
+        // Round 4, Minor 2 — the honest no-identity state: the stale
+        // conv-a binding clears (sessionId null) and the pane resolves to
+        // idle (the confirmed busy became unverifiable — no lane can ever
+        // read the turn's settle).
+        next_frame_matching(&mut rx, "antigravity.activity.updated", 3_000, |v| {
+            v["upsert"][0]["terminalId"] == "t1"
+                && v["upsert"][0]["sessionId"].is_null()
+                && v["upsert"][0]["phase"] == "idle"
+        })
+        .await
+        .expect("the failed rebind clears the stale session binding and the busy state");
+        // Exactly ONE crash-attention idle for the pane's own confirmed
+        // turn (the gate arm), and no turn.complete was ever minted.
+        let crash_idle = next_frame_of_type(&mut rx, "terminal.idle", 3_000)
+            .await
+            .expect("the confirmed turn became unverifiable — one crash-attention idle");
+        assert_eq!(crash_idle["terminalId"], "t1");
+        assert_eq!(crash_idle["reason"], "grace");
+
         // Conversation A settles elsewhere (a second pane resumed it): the
-        // superseded lane must no longer feed this terminal.
+        // superseded lane must no longer feed this terminal — no phantom
+        // turn-complete, no second attention idle.
         let mut f = std::fs::OpenOptions::new()
             .append(true)
             .open(&transcript_a)
@@ -4500,11 +4701,69 @@ mod tests {
                 "a failed rebind attach must drop the superseded lane"
             );
         }
-        let (_, completions) = hub.antigravity_list();
-        assert!(
-            completions.is_empty(),
-            "no completion may be minted for a foreign turn"
-        );
+        {
+            let (records, completions) = hub.antigravity_list();
+            assert_eq!(records.len(), 1);
+            assert_eq!(
+                records[0].session_id, None,
+                "no stale conversation id survives the failed rebind"
+            );
+            assert_eq!(
+                records[0].phase,
+                freshell_protocol::AntigravityPhase::Idle,
+                "no busy assertion leaks from the lane-less pane"
+            );
+            assert!(
+                completions.is_empty(),
+                "no completion may be minted for a foreign turn"
+            );
+        }
+
+        // A subsequent successful attach RE-ESTABLISHES everything: the
+        // transcript now exists, so the watch installs — the pane binds
+        // conv-b, and a turn appended to conv-b completes under the NEW
+        // conversation id.
+        let transcript_b = dir.path().join("transcript-b.jsonl");
+        std::fs::write(
+            &transcript_b,
+            format!(
+                "{{\"type\":\"session_start\",\"conversationId\":\"conv-b\",\"at\":{}}}\n",
+                now_ms()
+            ),
+        )
+        .unwrap();
+        hub.attach_antigravity_association("t1", "conv-b", &transcript_b, Some(submit_at));
+        next_frame_matching(&mut rx, "antigravity.activity.updated", 3_000, |v| {
+            v["upsert"][0]["sessionId"] == "conv-b"
+        })
+        .await
+        .expect("the successful re-attach re-binds the new conversation");
+        wait_for_antigravity_drain(&hub, "t1").await;
+
+        let at_b = now_ms();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript_b)
+            .unwrap();
+        f.write_all(
+            format!(
+                concat!(
+                    "{{\"type\":\"user_message\",\"conversationId\":\"conv-b\",\"text\":\"re-established prompt\",\"at\":{}}}\n",
+                    "{{\"type\":\"turn_settled\",\"conversationId\":\"conv-b\",\"outcome\":\"completed\",\"fullyIdle\":true,\"at\":{}}}\n",
+                ),
+                at_b + 10,
+                at_b + 50,
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        drop(f);
+        let complete = next_frame_of_type(&mut rx, "terminal.turn.complete", 5_000)
+            .await
+            .expect("the re-established lane completes the new conversation's turn");
+        assert_eq!(complete["terminalId"], "t1");
+        assert_eq!(complete["sessionId"], "conv-b");
+        assert_eq!(complete["completionSeq"], 1);
 
         let _ = std::fs::remove_dir_all(&home);
     }

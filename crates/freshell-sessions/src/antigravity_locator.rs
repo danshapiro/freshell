@@ -147,7 +147,10 @@ pub const ANTIGRAVITY_WINDOW_MS: i64 = 2_000;
 pub const ANTIGRAVITY_PENDING_SUBMIT_LIFETIME_MS: i64 = 60_000;
 
 /// Bounded BACKWARD tolerance for the recency rule (whole-delta review
-/// round 3, Major 1): a matching user record whose own `at` is within this
+/// round 3, Major 1; whole-delta review round 4, Minor 1 moved the
+/// CANONICAL constant to `freshell_protocol` so the activity tracker's
+/// attach-baseline classification references the SAME number instead of
+/// forking it): a matching user record whose own `at` is within this
 /// window BEFORE the captured submit timestamp still counts as
 /// at/after-that-submit. The registry writes input to the PTY BEFORE
 /// timestamping the `ActivityEvent::Input` (registry.rs:3890,3931), so the
@@ -156,11 +159,12 @@ pub const ANTIGRAVITY_PENDING_SUBMIT_LIFETIME_MS: i64 = 60_000;
 /// The bound covers cross-process/cross-clock skew (the CLI's own `at`
 /// granularity is a Stage-1 unknown; NTP slew adds seconds), NOT history:
 /// it is 12× below the 60 s pending lifetime, so minutes-old conversations
-/// stay rejected. Full rationale in the module header. The mtime prefilter
-/// uses the SAME constant — a prefilter tighter than the tolerance would
-/// veto matches the recency rule itself accepts (never authoritative in
-/// the wrong direction).
-pub const ANTIGRAVITY_RECENCY_BACKWARD_TOLERANCE_MS: i64 = 5_000;
+/// stay rejected. Full rationale in the module header and at the canonical
+/// definition (`freshell_protocol::ANTIGRAVITY_RECENCY_BACKWARD_TOLERANCE_MS`).
+/// The mtime prefilter uses the SAME constant — a prefilter tighter than
+/// the tolerance would veto matches the recency rule itself accepts (never
+/// authoritative in the wrong direction).
+pub use freshell_protocol::ANTIGRAVITY_RECENCY_BACKWARD_TOLERANCE_MS;
 
 /// Bounded submit-text comparison cap (chars, on both the captured line
 /// and the record text) — prompts are bounded, never whole-paste dumps.

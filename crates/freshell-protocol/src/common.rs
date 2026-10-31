@@ -454,6 +454,28 @@ pub struct AntigravityActivityRecord {
     pub session_id: Option<String>,
 }
 
+/// Bounded BACKWARD tolerance for the antigravity recency rule (whole-delta
+/// review round 3, Major 1; shared by round 4, Minor 1): a matching user
+/// record whose own `at` is within this window BEFORE the captured submit
+/// timestamp still counts as at/after-that-submit. The registry writes input
+/// to the PTY BEFORE timestamping the `ActivityEvent::Input`
+/// (registry.rs:3890,3931), so the CLI child — on another core — can append
+/// its `user_message` record between the write and our stamp, with an `at`
+/// that precedes the submit. The bound covers cross-process/cross-clock
+/// skew (the CLI's own `at` granularity is a Stage-1 unknown; NTP slew adds
+/// seconds), NOT history: it is 12× below the 60 s pending lifetime, so
+/// minutes-old conversations stay rejected.
+///
+/// Canonical home (round 4, Minor 1 — one number, never forked):
+/// `freshell-sessions`' locator recency rule AND `freshell-activity`'s
+/// attach-baseline live/history classification must accept the SAME
+/// window, and this crate is the shared leaf both depend on. NOT a wire
+/// type (the crate's serialization charter is about message shapes; this
+/// is the cross-crate timing contract those two rules share).
+/// `freshell_sessions::antigravity_locator` re-exports it under its
+/// original path.
+pub const ANTIGRAVITY_RECENCY_BACKWARD_TOLERANCE_MS: i64 = 5_000;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpencodeActivityRecord {
