@@ -57,6 +57,7 @@ import { appReducers } from '@/store/appReducers'
 import antigravityActivityReducer, {
   removeAntigravityActivity,
   resetAntigravityActivity,
+  setAntigravityActivitySnapshot,
   upsertAntigravityActivity,
 } from '@/store/antigravityActivitySlice'
 import type { PaneNode } from '@/store/paneTypes'
@@ -568,6 +569,106 @@ describe('turnCompletionSlice', () => {
 
       store.dispatch(resetAntigravityActivity())
       expect(store.getState().antigravityActivity.lastSnapshotSeq).toBe(0)
+    })
+
+    // Whole-delta review round 5, Major 1: the antigravity wire's
+    // `updatedAt` is TWO-CLOCK by design — provisional busy carries the
+    // registry's submit stamp (the tracker's `note_submit`), settled idle
+    // carries the CLI record's own `at` (`note_record`), and the
+    // locator's 5 s backward tolerance lets that record legitimately land
+    // BEFORE the submit stamp. A later mutation can therefore carry an
+    // EARLIER timestamp; `mutationSeq` (the frame-ingestion counter, one
+    // shared strictly-increasing sequence with snapshot request seqs) is
+    // the only safe ordering key.
+    it('orders upserts by mutationSeq, not updatedAt (a later-seq idle with an earlier CLI-record timestamp ingests)', () => {
+      let state = antigravityActivityReducer(undefined, upsertAntigravityActivity({
+        terminals: [{ terminalId: 't-agy', phase: 'busy', updatedAt: 10_000, sessionId: 'conv-1' }],
+        mutationSeq: 1,
+      }))
+      expect(state.byTerminalId['t-agy']).toMatchObject({ phase: 'busy', updatedAt: 10_000 })
+
+      // The settled idle: a LATER frame (mutationSeq 2) whose timestamp
+      // is 2 s BEFORE the registry submit stamp — inside the locator's
+      // backward tolerance. It must ingest and clear the false busy.
+      state = antigravityActivityReducer(state, upsertAntigravityActivity({
+        terminals: [{ terminalId: 't-agy', phase: 'idle', updatedAt: 8_000, sessionId: 'conv-1' }],
+        mutationSeq: 2,
+      }))
+      expect(state.byTerminalId['t-agy']).toMatchObject({ phase: 'idle', updatedAt: 8_000 })
+      expect(state.liveMutationSeqByTerminalId['t-agy']).toBe(2)
+    })
+
+    it('ignores an older-seq upsert after a newer one even with a later timestamp (the seq gate guards both directions)', () => {
+      let state = antigravityActivityReducer(undefined, upsertAntigravityActivity({
+        terminals: [{ terminalId: 't-agy', phase: 'busy', updatedAt: 10_000, sessionId: 'conv-1' }],
+        mutationSeq: 1,
+      }))
+      state = antigravityActivityReducer(state, upsertAntigravityActivity({
+        terminals: [{ terminalId: 't-agy', phase: 'idle', updatedAt: 8_000, sessionId: 'conv-1' }],
+        mutationSeq: 2,
+      }))
+
+      // A stale re-delivery of the busy frame (older seq) must NOT
+      // resurrect busy even though its updatedAt is LATER than the idle
+      // record's — the gate must not become a timestamp gate again.
+      state = antigravityActivityReducer(state, upsertAntigravityActivity({
+        terminals: [{ terminalId: 't-agy', phase: 'busy', updatedAt: 12_000, sessionId: 'conv-1' }],
+        mutationSeq: 1,
+      }))
+      expect(state.byTerminalId['t-agy']).toMatchObject({ phase: 'idle', updatedAt: 8_000 })
+      expect(state.liveMutationSeqByTerminalId['t-agy']).toBe(2)
+    })
+
+    it('extends the seq ordering to snapshot-sourced records (older-seq live mutations stay out; newer ones still ingest)', () => {
+      // A snapshot-ingested record's effective seq is the snapshot's
+      // requestSeq (the same counter the live frames use) — the seq
+      // discipline must hold across the snapshot/live boundary too.
+      let state = antigravityActivityReducer(undefined, setAntigravityActivitySnapshot({
+        terminals: [{ terminalId: 't-agy', phase: 'busy', updatedAt: 5_000, sessionId: 'conv-1' }],
+        requestSeq: 10,
+      }))
+      expect(state.byTerminalId['t-agy']).toMatchObject({ phase: 'busy', updatedAt: 5_000 })
+
+      // Older than the snapshot: ignored even with a later timestamp.
+      state = antigravityActivityReducer(state, upsertAntigravityActivity({
+        terminals: [{ terminalId: 't-agy', phase: 'idle', updatedAt: 99_000, sessionId: 'conv-1' }],
+        mutationSeq: 8,
+      }))
+      expect(state.byTerminalId['t-agy']?.phase).toBe('busy')
+
+      // Newer than the snapshot: ingests even with an earlier timestamp.
+      state = antigravityActivityReducer(state, upsertAntigravityActivity({
+        terminals: [{ terminalId: 't-agy', phase: 'idle', updatedAt: 4_000, sessionId: 'conv-1' }],
+        mutationSeq: 12,
+      }))
+      expect(state.byTerminalId['t-agy']).toMatchObject({ phase: 'idle', updatedAt: 4_000 })
+      expect(state.liveMutationSeqByTerminalId['t-agy']).toBe(12)
+    })
+
+    it('keeps the removal seq authoritative (an older-seq upsert never crosses a newer tombstone)', () => {
+      let state = antigravityActivityReducer(undefined, upsertAntigravityActivity({
+        terminals: [{ terminalId: 't-agy', phase: 'busy', updatedAt: 10_000, sessionId: 'conv-1' }],
+        mutationSeq: 5,
+      }))
+      state = antigravityActivityReducer(state, removeAntigravityActivity({ terminalIds: ['t-agy'], mutationSeq: 6 }))
+      expect(state.byTerminalId['t-agy']).toBeUndefined()
+
+      // An older-seq upsert (a stale frame) must not resurrect the
+      // record regardless of its timestamp.
+      state = antigravityActivityReducer(state, upsertAntigravityActivity({
+        terminals: [{ terminalId: 't-agy', phase: 'busy', updatedAt: 50_000, sessionId: 'conv-1' }],
+        mutationSeq: 5,
+      }))
+      expect(state.byTerminalId['t-agy']).toBeUndefined()
+      expect(state.removedMutationSeqByTerminalId['t-agy']).toBe(6)
+
+      // A newer-seq upsert resurrects and clears the tombstone.
+      state = antigravityActivityReducer(state, upsertAntigravityActivity({
+        terminals: [{ terminalId: 't-agy', phase: 'idle', updatedAt: 3_000, sessionId: 'conv-1' }],
+        mutationSeq: 7,
+      }))
+      expect(state.byTerminalId['t-agy']).toMatchObject({ phase: 'idle', updatedAt: 3_000 })
+      expect(state.removedMutationSeqByTerminalId['t-agy']).toBeUndefined()
     })
 
     it('applies the server-idle edge to an antigravity pane (the terminal.idle path is mode-agnostic)', () => {

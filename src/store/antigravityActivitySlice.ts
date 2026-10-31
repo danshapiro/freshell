@@ -5,6 +5,18 @@ import type { AntigravityActivityRecord } from '@shared/ws-protocol'
 // same snapshot/upsert/removal seq discipline (a late list snapshot must
 // never resurrect a record a newer live mutation removed, and a newer live
 // mutation must never be clobbered by a stale snapshot).
+//
+// Whole-delta review round 5, Major 1: unlike the amplifier twin, the
+// antigravity upsert gate orders by `mutationSeq`, never `updatedAt`. The
+// antigravity wire's `updatedAt` is TWO-CLOCK by design — provisional
+// busy carries the registry's submit stamp while settled idle carries
+// the CLI record's own `at`, which the locator's backward tolerance
+// (ANTIGRAVITY_RECENCY_BACKWARD_TOLERANCE_MS) lets land BEFORE the
+// submit stamp — so a later mutation can legitimately carry an EARLIER
+// timestamp. `mutationSeq` is the ingestion counter (one shared
+// strictly-increasing sequence with snapshot request seqs, minted at
+// frame arrival in App.tsx) and is the only safe ordering key;
+// `updatedAt` stays on the record for display/derived purposes only.
 export type AntigravityActivityState = {
   byTerminalId: Record<string, AntigravityActivityRecord>
   lastSnapshotSeq: number
@@ -95,7 +107,15 @@ const antigravityActivitySlice = createSlice({
         if (removedMutationSeq > mutationSeq) continue
 
         const existing = state.byTerminalId[record.terminalId]
-        if (!existing || record.updatedAt >= existing.updatedAt) {
+        // The current record's ingestion seq: the live mutation that last
+        // ingested it, or — for a snapshot-sourced record — the seq of
+        // the snapshot it came from (the same counter). mutationSeq is
+        // authoritative: later seq always ingests, older seq is ignored
+        // (see the slice header for why updatedAt can move backwards on
+        // a newer mutation and must never gate ingestion).
+        const existingSeq =
+          state.liveMutationSeqByTerminalId[record.terminalId] ?? state.lastSnapshotSeq
+        if (!existing || mutationSeq >= existingSeq) {
           state.byTerminalId[record.terminalId] = record
           state.liveMutationSeqByTerminalId[record.terminalId] = mutationSeq
           delete state.removedMutationSeqByTerminalId[record.terminalId]
