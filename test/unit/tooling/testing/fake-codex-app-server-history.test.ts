@@ -1,10 +1,12 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import fs from 'node:fs/promises'
+import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import WebSocket from 'ws'
 import { describe, expect, it } from 'vitest'
+import { launchProviderFixture } from '../../../e2e-browser/helpers/provider-fixture-launcher.js'
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../..')
 const fakeAppServer = path.join(repoRoot, 'test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs')
@@ -89,6 +91,62 @@ async function stop(child: ChildProcess | undefined): Promise<void> {
 }
 
 describe('fake Codex app-server history transcript', () => {
+  it('answers the naming fixture deferred zero-turn page before a real first turn materializes it', async () => {
+    const port = await new Promise<number>((resolve, reject) => {
+      const server = net.createServer()
+      server.once('error', reject)
+      server.listen(0, '127.0.0.1', () => {
+        const address = server.address()
+        server.close(error => {
+          if (error) reject(error)
+          else if (typeof address === 'object' && address) resolve(address.port)
+          else reject(new Error('could not allocate a fixture port'))
+        })
+      })
+    })
+    const fixture = await launchProviderFixture({
+      fixture: 'fake-codex-app-server.mjs',
+      args: ['--listen', `ws://127.0.0.1:${port}`],
+      program: { sessionId: 'thread-naming-deferred-history' },
+      env: { FAKE_CODEX_DEFER_ROLLOUT: '1' },
+      scrub: true,
+    })
+    let socket: WebSocket | undefined
+    try {
+      await fixture.waitOutput('fake codex app-server listening on')
+      socket = await connectWebSocket(`ws://127.0.0.1:${port}`)
+      await rpc(socket, 'initialize', 'initialize', {})
+      const started = await rpc(socket, 'thread-start', 'thread/start', { cwd: fixture.cwd })
+      const threadId = started.result?.thread?.id
+      const rolloutPath = started.result?.thread?.path
+      expect(threadId).toBe('thread-naming-deferred-history')
+      expect(rolloutPath).toEqual(expect.any(String))
+      await expect(fs.stat(rolloutPath)).rejects.toMatchObject({ code: 'ENOENT' })
+
+      const recentPageParams = {
+        threadId, sortDirection: 'desc', itemsView: 'full', limit: 1,
+      }
+      const recent = await rpc(socket, 'recent-zero-turn', 'thread/turns/list', recentPageParams)
+      expect(recent.result).toEqual({ data: [], nextCursor: null })
+      await expect(fs.stat(rolloutPath)).rejects.toMatchObject({ code: 'ENOENT' })
+
+      const accepted = await rpc(socket, 'first-turn', 'turn/start', {
+        threadId, input: [{ type: 'text', text: 'Materialize the naming fixture' }],
+      })
+      expect(accepted.result?.turn?.id).toEqual(expect.any(String))
+      await fixture.waitEvent('completion')
+      const records = (await fs.readFile(rolloutPath, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+      expect(records[0]).toMatchObject({ type: 'session_meta', payload: { id: threadId } })
+      expect(records.filter(record => record.type === 'event_msg' && record.payload?.type === 'user_message')
+        .map(record => record.payload.message)).toEqual(['Materialize the naming fixture'])
+      await expect(rpc(socket, 'recent-committed-turn', 'thread/turns/list', recentPageParams))
+        .rejects.toThrow('turn history paging is unavailable for a materialized fixture rollout')
+    } finally {
+      socket?.close()
+      await fixture.stop()
+    }
+  }, 15_000)
+
   it('keeps recorded current turns and accepted native input available while completion is wedged and after resume', async () => {
     const owned = await fs.mkdtemp(path.join(os.tmpdir(), 'fake-codex-wedged-history-'))
     const workspace = path.join(owned, 'workspace')
