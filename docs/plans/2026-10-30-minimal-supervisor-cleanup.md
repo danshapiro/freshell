@@ -7,12 +7,13 @@
 ## User Request
 
 ### Requested result
-Apply the smallest reliable fixes for the flaky supervisor lock timeout (`arnn`) and Claude permission-contract harness cleanup race (`bczx`): pause Tokio test time while checking the lock timeout; for the harness, stop and await only the child processes it directly starts, then retry temporary-directory removal a few times and report any cleanup failure. Run a properly scoped Fresh Eyes review of the complete branch delta using Claude and report its result.
+Apply the smallest reliable fixes for the flaky supervisor lock timeout (`arnn`) and Claude permission-contract harness cleanup race (`bczx`): pause Tokio test time while checking the lock timeout; for the harness, stop and await only the child processes it directly starts, then retry temporary-directory removal a few times and report any cleanup failure. Run a properly scoped Fresh Eyes review of the complete branch delta using Claude and report its result. Land the work on main through a PR after required checks pass.
 
 ### Explicit constraints
 - Use the “usual” workflow, including an isolated worktree, focused tests, and independent review.
 - Keep fixture cleanup limited to direct child processes; do not add cross-platform descendant or process-tree tracking.
 - Use Claude for the requested Fresh Eyes review.
+- Push the feature branch and create its PR; merge only after required checks pass.
 
 ### Accepted tradeoffs and residuals
 - If a directly started process cannot be confirmed stopped or the temp directory still cannot be removed after bounded retries, report cleanup failure and retain the directory for diagnosis.
@@ -25,12 +26,12 @@ Apply the smallest reliable fixes for the flaky supervisor lock timeout (`arnn`)
 
 ## Global Constraints
 
-- Work in `/home/dan/code/freshell/.worktrees/minimal-supervisor-cleanup` on `the-usual/minimal-supervisor-cleanup`, based on `7c3fd19511237be62485d03dda585eaf47d86eff`.
+- Work in `/home/dan/code/freshell/.worktrees/minimal-supervisor-cleanup` on `the-usual/minimal-supervisor-cleanup`, originally based on `7c3fd19511237be62485d03dda585eaf47d86eff` and now rebased onto `origin/main` at `5e6398d7b659b725b2ff969ebf863d2e2e187174`.
 - Use pnpm `10.34.5` and frozen-lockfile installs. Use repo-owned test runners rather than raw Vitest or Cargo.
 - Route Rust tests through `FRESHELL_RUST_TEST_SANDBOX=1 pnpm run test:rust ...`; run process-kill test suites through `scripts/sandbox-test.sh`.
 - Keep the configured cloud Vitest backend. Do not substitute a local backend if the cloud path fails.
 - Keep production behavior unchanged. Preserve the existing structured cleanup log and the shared fixture's `fs.rm(..., { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })` behavior.
-- Do not create a PR, push, deploy, restart a service, or change the live server.
+- Do not deploy, restart a service, or change the live server. The user has authorized pushing this feature branch, creating its PR, and merging after required checks pass.
 
 ---
 
