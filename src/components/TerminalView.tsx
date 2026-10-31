@@ -6332,6 +6332,26 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           // Ledger A2: remember the acquired tid so the terminal.input.blocked
           // backstop still matches after a recovery path clears terminalIdRef.
           lastKnownTerminalIdRef.current = newId
+          // Fresh-recovery breadcrumb resolution (delta-loop round 5): the
+          // codex dead-live-handle fresh-recovery arm persists
+          // durable_artifact_missing as a breadcrumb for the recovery it
+          // minted; this create anchoring is the recovery SUCCEEDING, which
+          // resolves it. A live pane must not carry the dead latch — a
+          // later INVALID_TERMINAL_ID on this new terminal must take the
+          // ordinary auto-recovery lane, not the stand-down gate. The latch
+          // only survives a FAILED recovery (no terminal.created ever
+          // lands), where standing down is the intended behavior. Both
+          // signal shapes answer here: under active reconciliation the
+          // registry entry survives the gated consume (the non-consuming
+          // peek answers), under inactive reconciliation the consumed
+          // intent lives on the launch attempt that sent this create. Only
+          // the breadcrumb's own reason is cleared — a verdict-dead latch
+          // never registers a fresh-recovery intent, so it stands — and a
+          // server-folded msg.restoreError below still wins (spread order).
+          const resolvesFreshRecoveryBreadcrumb =
+            contentRef.current?.restoreError?.reason === 'durable_artifact_missing'
+            && (hasTerminalFreshRecoveryRequest(reqId)
+              || (pendingLaunch?.requestId === reqId && pendingLaunch.recoveryIntent !== undefined))
           updateContent({
             terminalId: newId,
             serverInstanceId: serverInstanceIdRef.current,
@@ -6349,6 +6369,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             ...(createdNotice ? { sessionRef: undefined, resumeSessionId: undefined } : {}),
             ...(createdSessionUpdates ?? {}),
             ...(msg.clearCodexDurability ? { codexDurability: undefined } : {}),
+            ...(resolvesFreshRecoveryBreadcrumb ? { restoreError: undefined } : {}),
             ...(msg.restoreError ? { restoreError: msg.restoreError } : {}),
           })
           // Wedge-backstop clear-on-adoption (LB-8): the pane just adopted a

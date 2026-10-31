@@ -550,6 +550,174 @@ describe('TerminalView reconcile adoption: verdict-driven create + bounded re-dr
     expect(freshCreates[0].restore).toBeUndefined()
   })
 
+  it('a SUCCESSFUL fresh recovery resolves its breadcrumb: a second INVALID_TERMINAL_ID still auto-recovers (delta-loop round 5)', async () => {
+    // The codex dead-live-handle collapse latches durable_artifact_missing
+    // as a BREADCRUMB for the recovery it minted. The recovery SUCCEEDING
+    // (terminal.created for the recovery create anchoring) must resolve
+    // that breadcrumb: a live pane must not carry the dead latch, or a
+    // later INVALID_TERMINAL_ID on the SAME connection hits the
+    // dead-session stand-down gate instead of the ordinary auto-recovery
+    // lane — the pane stalls until an unrelated reconnect or user action.
+    // The latch only survives a FAILED recovery (no terminal.created ever
+    // lands), where standing down is the intended behavior. Reconcile
+    // INACTIVE here: the consumed intent lives on the launch attempt that
+    // sent the create.
+    const { store } = await mountPane({
+      mode: 'codex',
+      status: 'running',
+      createRequestId: 'cr-codex-breadcrumb-live',
+      terminalId: 'term-codex-breadcrumb-live',
+      serverInstanceId: 'srv-local',
+      // No sessionRef, no codexDurability: genuinely no durable identity.
+    })
+
+    // (a) First loss: the dead-live-handle collapse — breadcrumb latched,
+    // fresh-recovery create minted and sent.
+    act(() => {
+      wsHarness.emit({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        message: 'terminal not found',
+        terminalId: 'term-codex-breadcrumb-live',
+      })
+    })
+    await flushEffects()
+    const mintedId = paneContent(store).createRequestId
+    expect(mintedId).not.toBe('cr-codex-breadcrumb-live')
+    expect(paneContent(store).restoreError?.reason).toBe('durable_artifact_missing')
+    expect(sentOfType('terminal.create').filter((msg) => msg?.requestId === mintedId)).toHaveLength(1)
+
+    // (b) The recovery SUCCEEDS: terminal.created for the recovery create
+    // anchors (identity-less fresh terminal — no sessionRef on the frame).
+    act(() => {
+      wsHarness.emit({
+        type: 'terminal.created',
+        requestId: mintedId,
+        terminalId: 'term-codex-breadcrumb-live-2',
+      })
+    })
+    await flushEffects()
+    expect(paneContent(store).terminalId).toBe('term-codex-breadcrumb-live-2')
+    // THE FIX: the breadcrumb is resolved with the recovery — the live
+    // pane carries no dead latch (today the stale breadcrumb survives the
+    // successful create).
+    expect(paneContent(store).restoreError).toBeUndefined()
+
+    // Settle the queued attach so the next INVALID_TERMINAL_ID takes the
+    // branch-5 reconnect lane (attachReady), not the launch-failure lane.
+    const attach = lastSentOfType('terminal.attach')
+    expect(attach?.attachRequestId).toBeTruthy()
+    act(() => {
+      wsHarness.emit({
+        type: 'terminal.attach.ready',
+        terminalId: 'term-codex-breadcrumb-live-2',
+        attachRequestId: attach.attachRequestId,
+        headSeq: 0,
+        replayFromSeq: 0,
+        replayToSeq: 0,
+      })
+    })
+    await flushEffects()
+
+    // (c) Second loss on the SAME connection: the pane is live with no
+    // durable identity — the fresh-recovery auto lane must fire AGAIN.
+    // Today the stale breadcrumb latches the stand-down gate and the pane
+    // stalls (no create, no recovery).
+    act(() => {
+      wsHarness.emit({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        message: 'terminal not found',
+        terminalId: 'term-codex-breadcrumb-live-2',
+      })
+    })
+    await flushEffects()
+    await flushEffects()
+    const secondMintedId = paneContent(store).createRequestId
+    expect(secondMintedId).not.toBe(mintedId)
+    expect(paneContent(store).status).toBe('creating')
+    expect(paneContent(store).terminalId).toBeUndefined()
+    const secondCreates = sentOfType('terminal.create')
+      .filter((msg) => msg?.requestId === secondMintedId)
+    expect(secondCreates).toHaveLength(1)
+    expect(secondCreates[0]).not.toHaveProperty('sessionRef')
+    expect(secondCreates[0].restore).toBeUndefined()
+  })
+
+  it('a SUCCESSFUL fresh recovery resolves its breadcrumb under ACTIVE pane reconcile too (the registry-peek shape)', async () => {
+    // Companion pin for the other reconcile state: under ACTIVE
+    // reconciliation the create frame stays plain-fresh (the consume is
+    // gated), so the resolution signal is the surviving registry entry —
+    // the same recovery succeeding must still clear the breadcrumb and
+    // re-arm auto-recovery for a later INVALID_TERMINAL_ID.
+    setPaneReconcileActive(true)
+    const { store } = await mountPane({
+      mode: 'codex',
+      status: 'running',
+      createRequestId: 'cr-codex-breadcrumb-active',
+      terminalId: 'term-codex-breadcrumb-active',
+      serverInstanceId: 'srv-local',
+    })
+
+    // (a) The collapse: breadcrumb latched, fresh-recovery create minted
+    // (plain-fresh frame under active reconciliation).
+    act(() => {
+      wsHarness.emit({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        message: 'terminal not found',
+        terminalId: 'term-codex-breadcrumb-active',
+      })
+    })
+    await flushEffects()
+    const mintedId = paneContent(store).createRequestId
+    expect(mintedId).not.toBe('cr-codex-breadcrumb-active')
+    expect(paneContent(store).restoreError?.reason).toBe('durable_artifact_missing')
+    expect(sentOfType('terminal.create').filter((msg) => msg?.requestId === mintedId)).toHaveLength(1)
+
+    // (b) The recovery SUCCEEDS.
+    act(() => {
+      wsHarness.emit({
+        type: 'terminal.created',
+        requestId: mintedId,
+        terminalId: 'term-codex-breadcrumb-active-2',
+      })
+    })
+    await flushEffects()
+    expect(paneContent(store).terminalId).toBe('term-codex-breadcrumb-active-2')
+    expect(paneContent(store).restoreError).toBeUndefined()
+
+    const attach = lastSentOfType('terminal.attach')
+    expect(attach?.attachRequestId).toBeTruthy()
+    act(() => {
+      wsHarness.emit({
+        type: 'terminal.attach.ready',
+        terminalId: 'term-codex-breadcrumb-active-2',
+        attachRequestId: attach.attachRequestId,
+        headSeq: 0,
+        replayFromSeq: 0,
+        replayToSeq: 0,
+      })
+    })
+    await flushEffects()
+
+    // (c) A later INVALID_TERMINAL_ID still auto-recovers.
+    act(() => {
+      wsHarness.emit({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        message: 'terminal not found',
+        terminalId: 'term-codex-breadcrumb-active-2',
+      })
+    })
+    await flushEffects()
+    await flushEffects()
+    const secondMintedId = paneContent(store).createRequestId
+    expect(secondMintedId).not.toBe(mintedId)
+    expect(paneContent(store).status).toBe('creating')
+    expect(sentOfType('terminal.create').filter((msg) => msg?.requestId === secondMintedId)).toHaveLength(1)
+  })
+
   it('the dead-latch exemption holds under ACTIVE pane reconcile too (the negotiated-connection shape)', async () => {
     // Focused episode 1, round 2 (the fresheyes finding): the exemption
     // used the consume-based intent read, which reports not-armed whenever
