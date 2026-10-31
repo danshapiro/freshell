@@ -50,6 +50,51 @@ export function reclassifyPtyNotificationTurns(turns: FreshAgentTurn[]): FreshAg
   return changed ? mapped : turns
 }
 
+function isSyntheticToolResultTurn(turn: FreshAgentTurn): boolean {
+  return turn.role === 'user'
+    && turn.items.length > 0
+    && turn.items.every((item) => item.kind === 'tool_result')
+}
+
+function appendTurnItems(previous: FreshAgentTurn, next: FreshAgentTurn): FreshAgentTurn {
+  return {
+    ...previous,
+    id: `${previous.id}:${next.id}`,
+    summary: [previous.summary, next.summary].filter(Boolean).join('\n\n'),
+    // Echo only when BOTH sides are echo: an authored segment must never be
+    // laundered into a foldable caption, and an untagged side is conservative.
+    summaryKind: previous.summaryKind === 'echo' && next.summaryKind === 'echo' ? 'echo' : 'authored',
+    items: [...previous.items, ...next.items],
+    model: next.model ?? previous.model,
+    timestamp: next.timestamp ?? previous.timestamp,
+  }
+}
+
+/**
+ * Display-only: a synthetic tool-result turn (a machine-injected user-role
+ * message whose items are ALL tool_result) folds into the preceding assistant
+ * turn, or stands alone as a tool turn. The second stage of the transcript's
+ * display pipeline (applied after [`reclassifyPtyNotificationTurns`], in that
+ * order); exported so the view can derive the DISPLAYED user rows from the
+ * same transformed list the transcript renders.
+ */
+export function coalesceSyntheticToolResultTurns(turns: FreshAgentTurn[]): FreshAgentTurn[] {
+  const coalesced: FreshAgentTurn[] = []
+  for (const turn of turns) {
+    const previous = coalesced[coalesced.length - 1]
+    if (isSyntheticToolResultTurn(turn)) {
+      if (previous?.role === 'assistant') {
+        coalesced[coalesced.length - 1] = appendTurnItems(previous, turn)
+      } else {
+        coalesced.push({ ...turn, role: 'tool' })
+      }
+      continue
+    }
+    coalesced.push(turn)
+  }
+  return coalesced
+}
+
 function normalizeTurnRole(role: unknown): string | undefined {
   return typeof role === 'string' ? role.trim().toLowerCase() : undefined
 }

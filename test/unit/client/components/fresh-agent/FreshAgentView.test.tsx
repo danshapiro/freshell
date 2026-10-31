@@ -6167,6 +6167,222 @@ describe('FreshAgentView', () => {
       expect(assistantItems.find((item) => item.label.startsWith('Rewind unavailable:'))).toBeUndefined()
       expect(assistantItems.find((item) => item.label === 'Saving code rewind checkpoint…')).toBeUndefined()
     })
+
+    // Round-3 delta review defect 1: the transcript DISPLAYS opencode-pty
+    // notification rows (raw role user) as agent text through
+    // reclassifyPtyNotificationTurns, so the newest-USER-row derivation must
+    // follow the DISPLAYED roles — a notification landing after a prompt must
+    // never steal the newest-user slot from the real prompt (the raw-role
+    // calculation handed the prompt the unearned mid-turn unavailable verdict
+    // while its capture identity was still unbound).
+    const PTY_NOTIFICATION_BLOCK = '<pty_exited>\nID: pty_d75e6fa9\nExit Code: 0\nTimed Out: no\nOutput Lines: 5\nLast Line: SYNC_EXIT=0\n</pty_exited>\n\nUse pty_read to check the full output.'
+    const ptyNotificationTurn = (id: string) => ({
+      id,
+      turnId: id,
+      source: 'durable' as const,
+      role: 'user' as const,
+      summary: PTY_NOTIFICATION_BLOCK,
+      items: [{ id: `${id}-text`, kind: 'text' as const, text: PTY_NOTIFICATION_BLOCK }],
+    })
+    const emitOpencodeSessionSnapshotStatus = (
+      store: ReturnType<typeof createStore>,
+      onMessage: ((message: Record<string, unknown>) => void) | undefined,
+      sessionId: string,
+      status: string,
+    ) => {
+      const message = {
+        type: 'freshAgent.event',
+        sessionId,
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: {
+          type: 'freshAgent.session.snapshot',
+          sessionId,
+          latestTurnId: null,
+          timelineSessionId: sessionId,
+          status,
+        },
+      }
+      act(() => {
+        handleFreshAgentMessage(store.dispatch, message)
+        onMessage?.(message)
+      })
+    }
+
+    it('a PTY notification row landing after the prompt never steals the newest-user slot: the displayed prompt keeps the mid-turn no-claim treatment', async () => {
+      const sessionId = 'ses-pty-notification-newest'
+      const store = createStore()
+      let onMessage: ((message: Record<string, unknown>) => void) | undefined
+      wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+        onMessage = handler
+        return () => {}
+      })
+      // An MCP/CLI-driven turn: this pane sent nothing, so no capture is in
+      // flight; the opencode-pty plugin injected its notification row AFTER the
+      // real prompt while the turn runs (raw role user — displayed as agent
+      // text).
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+        status: 'idle',
+        summary: 'a prompt followed by a machine-injected pty notification',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [
+          unboundModernUserTurn('msg_real_prompt', 'Real prompt the agent is running'),
+          ptyNotificationTurn('msg_pty_notification'),
+        ],
+      })
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          createRequestId: 'req-pty-notification-newest',
+          sessionId,
+          sessionRef: { provider: 'opencode', sessionId },
+          resumeSessionId: sessionId,
+          status: 'idle',
+        },
+      }))
+
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+
+      // Display reality: the notification renders as an agent row — the prompt
+      // is the ONLY user article, so it is the newest (and only) DISPLAYED
+      // user row.
+      expect(await screen.findAllByRole('article', { name: 'You transcript turn' })).toHaveLength(1)
+      expect(onMessage).toBeTypeOf('function')
+
+      emitOpencodeSessionSnapshotStatus(store, onMessage, sessionId, 'running')
+      expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+
+      const [promptRow] = screen.getAllByRole('article', { name: 'You transcript turn' })
+      // The prompt KEEPS the newest-user treatment: this pane can evidence no
+      // in-flight capture (nothing was sent from here), so the uncertain
+      // mid-turn window makes NO rewind claim at all — never the unavailable
+      // verdict the raw-role calculation handed it when the notification's
+      // raw user role stole the newest slot. RED today.
+      expect(within(promptRow!).queryByRole('button', { name: 'Saving code rewind checkpoint' })).not.toBeInTheDocument()
+      expect(within(promptRow!).queryByRole('button', { name: 'Rewind unavailable for this message' })).not.toBeInTheDocument()
+      expect(within(promptRow!).queryByRole('button', { name: 'Rewind code to here' })).not.toBeInTheDocument()
+      // The notification row keeps its assistant display: no rewind
+      // affordance on it either (the hover's role gate).
+      const ptyArticle = screen.getByText('SYNC_EXIT=0', { exact: false }).closest('article')
+      expect(ptyArticle?.getAttribute('data-turn-role')).toBe('assistant')
+      expect(within(ptyArticle as HTMLElement).queryByRole('button', { name: 'Rewind code to here' })).not.toBeInTheDocument()
+      expect(within(ptyArticle as HTMLElement).queryByRole('button', { name: 'Rewind unavailable for this message' })).not.toBeInTheDocument()
+
+      // The honest unavailable verdict returns when the turn settles.
+      emitOpencodeSessionSnapshotStatus(store, onMessage, sessionId, 'idle')
+      const rewindButton = await within(promptRow!).findByRole('button', { name: 'Rewind unavailable for this message' })
+      expect(rewindButton).toBeDisabled()
+      expect(rewindButton).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
+    })
+
+    it('a PTY notification row landing mid-turn never steals the saving prompt\'s newest-user slot', async () => {
+      const sessionId = 'ses-pty-notification-saving'
+      const store = createStore()
+      let onMessage: ((message: Record<string, unknown>) => void) | undefined
+      wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+        onMessage = handler
+        return () => {}
+      })
+      let snapshotTurns = [unboundModernUserTurn('msg_older', 'Older MCP-driven prompt')]
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => ({
+        status: 'idle',
+        summary: 'older row, the running send\'s landed row, then a pty notification',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: snapshotTurns,
+      }))
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          createRequestId: 'req-pty-notification-saving',
+          sessionId,
+          sessionRef: { provider: 'opencode', sessionId },
+          resumeSessionId: sessionId,
+          status: 'idle',
+        },
+      }))
+
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+
+      expect(await screen.findAllByRole('article', { name: 'You transcript turn' })).toHaveLength(1)
+      await waitFor(() => {
+        expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+      })
+      expect(onMessage).toBeTypeOf('function')
+
+      // A genuine in-flight composer send: its pending metadata and its
+      // un-enriched barrier-time capture outcome keep the capture genuinely
+      // in flight for the whole mid-turn window (the :4406 idiom, opencode
+      // flavor).
+      wsMock.send.mockClear()
+      fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+        target: { value: 'Newest prompt while the agent runs' },
+      })
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      const sendFrame = sentFreshAgentMessages('freshAgent.send')[0]
+      const requestId = String(sendFrame?.requestId)
+      const logicalAttemptId = String((sendFrame?.checkpointIntent as Record<string, unknown>)?.logicalAttemptId)
+      expect(requestId).not.toBe('undefined')
+      expect(logicalAttemptId).not.toBe('undefined')
+      act(() => {
+        onMessage?.({
+          type: 'freshAgent.checkpoint.outcome',
+          requestId,
+          logicalAttemptId,
+          sessionId,
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          status: 'available',
+          checkpointId: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        })
+      })
+      // The send is accepted, its row lands in the refreshed snapshot, and
+      // the opencode-pty plugin's notification lands after it — the turn is
+      // still running.
+      act(() => {
+        snapshotTurns = [
+          ...snapshotTurns,
+          unboundModernUserTurn('msg_new', 'Newest prompt while the agent runs'),
+          ptyNotificationTurn('msg_pty_midturn'),
+        ]
+        onMessage?.({
+          type: 'freshAgent.send.accepted',
+          requestId,
+          submittedTurnId: 'msg_new',
+        })
+      })
+      expect(await screen.findAllByRole('article', { name: 'You transcript turn' })).toHaveLength(2)
+      emitOpencodeSessionSnapshotStatus(store, onMessage, sessionId, 'running')
+      expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+
+      const [olderRow, newestRow] = screen.getAllByRole('article', { name: 'You transcript turn' })
+      // The landed send row KEEPS the newest-user treatment: its capture is
+      // genuinely in flight, so the honest still-saving hover stays on THE
+      // PROMPT — the notification (displayed as assistant) must not steal the
+      // slot and downgrade the prompt to the unearned unavailable verdict.
+      // RED today.
+      const savingButton = await within(newestRow!).findByRole('button', { name: 'Saving code rewind checkpoint' })
+      expect(savingButton).toBeDisabled()
+      expect(savingButton).toHaveAttribute('title', 'Saving the code state from before this message')
+      const olderButton = within(olderRow!).getByRole('button', { name: 'Rewind unavailable for this message' })
+      expect(olderButton).toBeDisabled()
+      expect(olderButton).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
+    })
   })
 
   it('restores saved rewind availability when the same durable session opens with a new pane request', async () => {

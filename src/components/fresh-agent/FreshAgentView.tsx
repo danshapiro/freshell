@@ -72,11 +72,13 @@ import type { RuntimeOwnerRecord } from '@/store/freshAgentTypes'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
 import {
+  coalesceSyntheticToolResultTurns,
   freshAgentSnapshotHasUserTurn,
   freshAgentTurnText,
   getFreshAgentDisplayTurnKey,
   isModernCheckpointTurn,
   LOCAL_ECHO_TURN_ID_PREFIX,
+  reclassifyPtyNotificationTurns,
 } from '@shared/fresh-agent-turns'
 import {
   buildFreshAgentSlashCommandMenu,
@@ -4208,8 +4210,21 @@ export function FreshAgentView({
   // the memoized transcript re-renders when the flag flips.
   const captureInFlight = paneCaptureInFlight(pendingSendMetadataRef.current, paneContent.checkpointOutcomes, busyEpochRef.current)
   const newestUserTurnKey = useMemo(() => {
-    const userTurns = transcriptTurns.filter((turn) => turn.role === 'user')
-    const lastLandedUserKey = userTurns.length > 0 ? getFreshAgentDisplayTurnKey(userTurns[userTurns.length - 1]) : undefined
+    // The transcript renders turns through its display pipeline — opencode-pty
+    // notification rows reclassify to agent text, synthetic tool-result rows
+    // coalesce away — so the newest USER row must be derived from the SAME
+    // displayed roles (round-3 delta review defect 1): a machine-injected
+    // notification row (raw role user, displayed as assistant) landing after
+    // a prompt must never steal the newest-user slot from the real prompt,
+    // which would hand the prompt the unearned mid-turn unavailable verdict
+    // while its capture identity was still unbound. Both transforms are pure
+    // display derivations over the snapshot turns (the wire and store turns
+    // are never mutated), and neither retypes a REAL prompt row, so the
+    // send-boundary key comparison below stays consistent: the boundary holds
+    // raw send-time keys and displayed user rows keep theirs.
+    const displayedUserTurns = coalesceSyntheticToolResultTurns(reclassifyPtyNotificationTurns(transcriptTurns))
+      .filter((turn) => turn.role === 'user')
+    const lastLandedUserKey = displayedUserTurns.length > 0 ? getFreshAgentDisplayTurnKey(displayedUserTurns[displayedUserTurns.length - 1]) : undefined
     if (!localEchoTurn) return lastLandedUserKey
     // The echo holds the newest user row only while no user row landed
     // AFTER its send — otherwise it is a stale echo (a delayed transcript
@@ -4234,8 +4249,8 @@ export function FreshAgentView({
       : undefined)
       ?? (localEcho?.previousTurnKeys ? new Set(localEcho.previousTurnKeys) : undefined)
     const echoOutdated = sendTimeTurnKeys
-      ? userTurns.some((turn) => !sendTimeTurnKeys.has(getTurnKey(turn)))
-      : userTurns.length > 0
+      ? displayedUserTurns.some((turn) => !sendTimeTurnKeys.has(getTurnKey(turn)))
+      : displayedUserTurns.length > 0
     return echoOutdated ? lastLandedUserKey : getFreshAgentDisplayTurnKey(localEchoTurn)
   }, [localEcho, localEchoTurn, transcriptTurns])
   const getRewindAvailability = useCallback((turn: FreshAgentTurn): FreshAgentTurnRewindAvailability | undefined => {

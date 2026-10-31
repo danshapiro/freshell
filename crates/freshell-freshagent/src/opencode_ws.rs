@@ -857,7 +857,14 @@ type OpencodeSessions = Arc<TokioMutex<HashMap<String, Arc<TokioMutex<OpencodeSe
 /// [`OpencodeSession::turn_derived_status`]. `None` when this lane holds no
 /// record for the id: the snapshot route then keeps its honest idle instead
 /// of guessing. Lock order follows the lane's discipline (the sessions-map
-/// guard is never held across the per-session lock).
+/// guard is never held across the per-session lock). The per-session lock is
+/// a TRY-lock (round-3 delta review defect 3): a first send's materialization
+/// holds that mutex while awaiting the OpenCode session creation, and a probe
+/// that BLOCKED on it would stall the placeholder snapshot request (up to the
+/// route's timeout) exactly when the pane needs its refetch answered. On
+/// contention the probe returns `None` -- the route falls back to its
+/// pre-probe shape for exactly that request (liveness over truthfulness in
+/// the contended window; outside it, full truthfulness is preserved).
 fn turn_status_probe(sessions: &OpencodeSessions) -> crate::OpencodeTurnStatusProbe {
     let sessions = sessions.clone();
     Arc::new(move |session_id: &str| {
@@ -869,7 +876,7 @@ fn turn_status_probe(sessions: &OpencodeSessions) -> crate::OpencodeTurnStatusPr
                 guard.get(&session_id).cloned()
             };
             let session_arc = session_arc?;
-            let session = session_arc.lock().await;
+            let session = session_arc.try_lock().ok()?;
             Some(session.turn_derived_status())
         })
     })
@@ -13547,6 +13554,84 @@ mod tests {
             json!("idle"),
             "no WS record keeps the honest idle -- the route never guesses"
         );
+    }
+
+    /// Round-3 delta review defect 3: the snapshot route's turn-status probe
+    /// must never BLOCK on the per-session mutex. A first send's
+    /// materialization holds that mutex while awaiting the OpenCode session
+    /// creation, so a placeholder snapshot request issued during a slow
+    /// first send parks on the probe (up to the route's timeout) where the
+    /// pre-probe route answered immediately -- delaying snapshot refresh and
+    /// rehydration for exactly the window that needs it most. The probe
+    /// TRY-LOCKS the session record; on contention it returns None, and the
+    /// route falls back to the pre-probe shape for exactly that request
+    /// (liveness over truthfulness in the contended window; outside it,
+    /// full truthfulness is preserved). The success path is unchanged.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn placeholder_snapshot_answers_promptly_while_a_first_send_holds_the_session_mutex() {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (arrived_tx, mut arrived_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: Arc::new(GatedCreateHttp {
+                arrived_tx,
+                release: Arc::clone(&release),
+            }),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        // The WS lane over the SHARED FreshAgentState -- its construction wires
+        // the lane's turn-status probe into the REST state the route reads.
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-probe-liveness"), None)
+            .await;
+        let placeholder = "freshopencode-req-probe-liveness";
+
+        // The first send parks inside its cold-start session creation, HOLDING
+        // the per-session mutex the probe reads.
+        let st2 = st.clone();
+        let send =
+            tokio::spawn(async move { st2.handle_send(send_msg(placeholder, "hello")).await });
+        arrived_rx
+            .recv()
+            .await
+            .expect("the first send reaches its session creation");
+
+        // The placeholder snapshot request answers PROMPTLY -- the probe skips
+        // the status overlay on contention instead of parking on the held
+        // mutex -- and the answer falls back to the pre-probe shape (the
+        // built placeholder snapshot's honest idle).
+        let snapshot = tokio::time::timeout(
+            Duration::from_millis(750),
+            st.fresh_agent.get_opencode_snapshot(placeholder, None),
+        )
+        .await
+        .expect(
+            "the placeholder snapshot answers while materialization holds \
+             the session mutex -- the probe must not block on the record lock",
+        )
+        .expect("placeholder snapshot builds");
+        assert_eq!(
+            snapshot["status"],
+            json!("idle"),
+            "the contended probe falls back to the pre-probe honest idle shape"
+        );
+
+        // Release the gated create so the parked send finishes and the test
+        // tears down cleanly.
+        release.notify_one();
+        let _ = send.await;
     }
 
     #[tokio::test]

@@ -46,88 +46,102 @@ Fix four fresh-agent "code rewind" defects:
 
 ### Task 1: Rewind availability is role-gated and pending-while-busy (defects 2 and 4)
 
+> **Amended by review findings (round-3 delta review):** Task 1 as originally
+> drafted specified a 3-arg `unboundRewindAvailability(turn, agentBusy,
+> isNewestUserTurn)` whose busy-newest cell was a BLANKET pending — any busy
+> newest modern user row claimed "Saving", including MCP/CLI-driven turns
+> with no capture in play at all. That design was superseded during
+> implementation (rounds E1R4/round-3, and the round-3 delta review): the
+> SHIPPED helper is the 4-arg
+> `unboundRewindAvailability(turn, agentBusy, isNewestUserTurn, captureInFlight)`
+> — pending ONLY while this pane's own composer send has a checkpoint capture
+> genuinely in flight; the uncertain mid-turn window (busy, newest, no
+> evidencable capture) makes NO claim at all; and the newest-user-row
+> derivation follows the transcript's DISPLAYED roles (the round-3 delta
+> defect-1 fix). The body below describes the shipped semantics; the source
+> of truth is `src/components/fresh-agent/FreshAgentView.tsx`
+> (`unboundRewindAvailability`, `paneCaptureInFlight`, `newestUserTurnKey`,
+> `getRewindAvailability`).
+
 **Files:**
 - Modify: `src/components/fresh-agent/FreshAgentView.tsx` — extract the fallback policy as a pure exported helper directly below `isModernCheckpointTurn` (:381-390), and move `getRewindAvailability` from :1333-1342 down to just after `isBusy`/`sessionEnded` (:3973-3974), rewritten per Step 3 (the move avoids a temporal-dead-zone `ReferenceError` on `isBusy`)
 - Test: `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`, plus a NEW focused policy file `test/unit/client/components/fresh-agent/rewind-availability-policy.test.tsx`
 
 **Interfaces:**
 - Consumes: `getCheckpointAvailability(turn): CheckpointTurnAvailability | undefined` (FreshAgentView.tsx:1311, unchanged), `isModernCheckpointTurn(turn)` (:381), `isBusy` (derived at :3973, `BUSY_STATES.has(effectiveStatus)`), and the pane's transcript turn order (to identify the newest user row).
-- Produces: `export function unboundRewindAvailability(turn: FreshAgentTurn, agentBusy: boolean, isNewestUserTurn: boolean): FreshAgentTurnRewindAvailability | undefined` — the pure fallback policy: non-user turns → `undefined`; non-modern turns → `undefined`; modern user turns that are NOT the newest user row → `{ status: 'unavailable', reason: MODERN_TURN_CHECKPOINT_UNAVAILABLE }` (honest for older MCP/CLI-driven rows: nothing is being saved for them, even while a later turn runs — round-3 review finding 1); the NEWEST modern user row while the agent is busy → `{ status: 'pending' }`; the newest modern user row while idle → `{ status: 'unavailable', reason: MODERN_TURN_CHECKPOINT_UNAVAILABLE }`. `getRewindAvailability` becomes: role/bound lookup first (unchanged), then `unboundRewindAvailability(turn, isBusy, turnIsNewestUserRow)`, with `isBusy` added to its `useCallback` deps; the component computes the newest-user-row comparison once from the pane's transcript order (the last user turn's display key — mid-turn the newest user row IS the running send's row, since the assistant has not yet replied; the exact key derivation follows the transcript's existing ordering, `getFreshAgentDisplayTurnKey`).
-- Semantics decisions (round-2 finding 1 + round-3 finding 1): a BOUND availability always wins over the busy fallback, and that is honest — the capture completes at the barrier BEFORE the turn runs, so a row that has bound an `available` capture outcome genuinely has a snapshot while the agent works (the existing e2e `fresh-agent-checkpoint-unavailable-rust.spec.ts:123` already asserts the mid-turn available state as a pinned journey, and the snapshot-refreshed `msg_`-id rows cannot bind the request-keyed capture frame — :1329-1331 requires `turn.requestId`, which schema rows do not carry — so the NEWEST unbound modern row is exactly the mid-turn surface the pending state serves). The pending state therefore applies ONLY to the newest unbound modern user row while busy; older unbound rows (e.g. historical MCP/CLI-driven turns) keep the honest unavailable verdict at all times, per the User Request's "MCP/CLI-driven turns stay honestly rewind-unavailable" constraint. Round-4 (E1R4) adds the nothing-branch: the uncertain mid-turn window — newest unbound modern user row, busy, but with nothing this pane can evidence as in flight — shows NOTHING at all for that row (no rewind hover, per the request's explicit "(or nothing)" acceptance), and the honest unavailable verdict returns when the turn settles.
+- Produces (shipped): `export function unboundRewindAvailability(turn: FreshAgentTurn, agentBusy: boolean, isNewestUserTurn: boolean, captureInFlight: boolean): FreshAgentTurnRewindAvailability | undefined` — the pure fallback policy: non-user turns → `undefined`; non-modern turns → `undefined`; the NEWEST modern user row while the agent is busy AND a capture this pane can evidence is in flight → `{ status: 'pending' }`; the newest modern user row while busy but with NOTHING evidencable in flight (the uncertain window: an MCP/CLI-driven turn, a mid-turn reload with no send metadata, a capture that already settled) → `undefined` (no claim at all — the request's "(or nothing)" acceptance); every other modern user row (newest while idle; older rows at all times) → `{ status: 'unavailable', reason: MODERN_TURN_CHECKPOINT_UNAVAILABLE }`. `getRewindAvailability` (as shipped) is: role/bound lookup first (a BOUND availability always wins — a bound `available` capture stays available even mid-turn), then a dedicated ECHO branch for the pane's pending local echo row (a busy newest echo shows `pending`, a busy non-newest (uncertain) echo shows nothing, an idle echo shows the honest unavailable — reloaded echoes never fall to the legacy enabled path), then `unboundRewindAvailability(turn, isBusy, turnIsNewestUserRow, captureInFlight)`, with `isBusy`, `newestUserTurnKey`, `captureInFlight` and `localEchoTurn` in its `useCallback` deps. The `captureInFlight` input is derived per render by `paneCaptureInFlight(pendingSendMetadataRef.current, paneContent.checkpointOutcomes, busyEpochRef.current)` — true only while one of this pane's own sends has an `available` outcome whose identity observation is still pending (no nativeTurnId) AND whose dispatch busy window is still the pane's current busy epoch (the epoch advances at every turn-settling busy→idle edge, so a settled turn's lingering metadata never mislabels a later window). The newest-user-row key (`newestUserTurnKey`) is computed from the pane's transcript order through the transcript's OWN display pipeline — `coalesceSyntheticToolResultTurns(reclassifyPtyNotificationTurns(transcriptTurns))`, the same two transforms `FreshAgentTranscript` applies in that order — so machine-injected rows that DISPLAY as non-user (opencode-pty `<pty_exited>` notification rows, raw role user; synthetic tool-result rows) never steal the newest-user slot from the real prompt (round-3 delta review defect 1); the echo branch of that derivation keeps the send-boundary comparison (`localEchoSendBoundaryRef` / the persisted `previousTurnKeys`) over the same displayed user rows, and display keys derive through `getFreshAgentDisplayTurnKey`.
+- Semantics decisions (round-2 finding 1 + round-3 finding 1): a BOUND availability always wins over the busy fallback, and that is honest — the capture completes at the barrier BEFORE the turn runs, so a row that has bound an `available` capture outcome genuinely has a snapshot while the agent works (the existing e2e `fresh-agent-checkpoint-unavailable-rust.spec.ts:123` already asserts the mid-turn available state as a pinned journey, and the snapshot-refreshed `msg_`-id rows cannot bind the request-keyed capture frame — :1329-1331 requires `turn.requestId`, which schema rows do not carry — so the NEWEST unbound modern row is exactly the mid-turn surface the pending state serves). The pending state therefore applies ONLY to the newest unbound modern user row while busy AND with a capture this pane can evidence as in flight; older unbound rows (e.g. historical MCP/CLI-driven turns) keep the honest unavailable verdict at all times, per the User Request's "MCP/CLI-driven turns stay honestly rewind-unavailable" constraint. Round-4 (E1R4) adds the nothing-branch: the uncertain mid-turn window — newest unbound modern user row, busy, but with nothing this pane can evidence as in flight — shows NOTHING at all for that row (no rewind hover, per the request's explicit "(or nothing)" acceptance), and the honest unavailable verdict returns when the turn settles.
 
 - [ ] **Step 1: Write the failing behavioral tests (no new module imports in the existing file)**
 
-In `FreshAgentView.test.tsx`, add one `describe('fresh-agent rewind availability honesty', ...)` with the tests below, using the file's existing harness idioms (frame-driven `onMessage`, snapshot turns via the outcome/snapshot frames — see the test at :3492 for the accepted-turn flow and the `isBusyEvent` frame kinds `freshAgent.status` / `freshAgent.session.snapshot` at :3144 for driving busy). IMPORTANT (round-2 review finding 6): this file's batch must NOT import `unboundRewindAvailability` — an import of a not-yet-existing export breaks the whole file's module load and the red step never runs. The helper-level assertions live in a SEPARATE new test file (Test A below), whose import failure is its own isolated red and cannot break Test B's red (round-3 review finding 2).
+As shipped, `FreshAgentView.test.tsx` gains one `describe('fresh-agent rewind availability honesty', ...)` (frame-driven `onMessage`, snapshot turns via the outcome/snapshot frames) whose file batch does NOT import `unboundRewindAvailability` — an import of a not-yet-existing export breaks the whole file's module load and the red step never runs. The helper-level assertions live in a SEPARATE new test file (Test A below), whose import failure is its own isolated red. The shipped suite:
 
-Test B (the red test) — `shows the honest still-saving state on the newest user row while the agent turn is running, and keeps older unbound rows honestly unavailable`:
-1. Render the pane with TWO modern user snapshot turns (turnIds `msg_a…` older, `msg_b…` newest, both `source: 'durable'`, NEITHER with a bound checkpoint outcome), and drive the pane busy with a `freshAgent.session.snapshot` frame carrying a busy status (idiom per :3144).
-2. Hover the NEWEST user turn's article; assert the rewind button is disabled with `aria-label="Saving code rewind checkpoint"` and `title="Saving the code state from before this message"`. RED today: it says `aria-label="Rewind unavailable for this message"`.
-3. Hover the OLDER user turn's article; assert the disabled `aria-label="Rewind unavailable for this message"` button with `title` containing `No exact code checkpoint is available for this message.` — pinning that older MCP/CLI-shaped rows never claim "saving" (round-3 finding 1; green today, must stay green).
+Test B (the red test, as shipped) — `shows the honest still-saving state on the newest user row while a genuine composer send's capture is in flight, and keeps older unbound rows honestly unavailable`: the still-saving verdict is earned by driving a REAL composer send through the pane (capture the `freshAgent.send` frame's `requestId`/`checkpointIntent.logicalAttemptId`, feed the un-enriched barrier-time `freshAgent.checkpoint.outcome` (status `available`, NO native ids), let `freshAgent.send.accepted` land the send's row in the refreshed snapshot, then drive the pane busy with a `freshAgent.session.snapshot` status frame):
+1. Hover the NEWEST user turn's article; assert the rewind button is disabled with `aria-label="Saving code rewind checkpoint"` and `title="Saving the code state from before this message"`. RED against pre-Task-1 code: it said `aria-label="Rewind unavailable for this message"`.
+2. Hover the OLDER user turn's article; assert the disabled `aria-label="Rewind unavailable for this message"` button with `title` containing `No exact code checkpoint is available for this message.` — pinning that older MCP/CLI-shaped rows never claim "saving".
 
-Test C (green pin, keeps passing) — `keeps a settled unbound modern turn unavailable when the agent is idle`: the idle case still shows the disabled `Rewind unavailable for this message` button (existing pinned behavior at :4103; assert through the hover surface so it survives Task 2).
+Test B2 (the nothing-branch, as shipped) — `an active MCP/CLI-driven turn shows no rewind claim at all mid-turn, and the honest unavailable verdict at settle`: the newest user row is modern and unbound but this pane sent NOTHING (no composer send, no pending send metadata, no capture in play); while busy the row shows NO rewind claim at all (no still-saving hover, no unavailable hover, no enabled hover — the request's "(or nothing)" acceptance), and the honest unavailable verdict returns at the busy→idle settle.
 
-Test D (green pin, keeps passing) — `a bound available capture keeps showing available while the agent is busy` (round-2 review finding 1): render a pane busy per Test B, with a user turn that HAS a bound `available` checkpoint outcome (bind it through the request-key frame path exactly as the :3492 test does); assert the hover button is ENABLED `Rewind code to here` — never downgraded to pending. This pin protects the bound-wins semantics against a future "fix" that turns mid-turn available into pending.
+Test C (green pin, keeps passing) — `keeps a settled unbound modern turn unavailable when the agent is idle`: the idle case still shows the disabled `Rewind unavailable for this message` button (asserted through the hover surface).
 
-Test A (policy unit, in a NEW file `test/unit/client/components/fresh-agent/rewind-availability-policy.test.ts(x)`, own red = the missing-export import failure, isolated from Test B's red) — `does not consider agent response turns for rewind status at all`:
-1. Import `unboundRewindAvailability` from `../../../../src/components/fresh-agent/FreshAgentView.js` (or via the `@/` alias per test-config convention); assert `unboundRewindAvailability(assistantTurn, false, false)`, `unboundRewindAvailability(assistantTurn, true, true)`, and `unboundRewindAvailability(assistantTurn, true, false)` are ALL `undefined` — the role gate holds for agent turns regardless of busy/newest inputs.
-2. Also pin the user-row matrix at the policy level: newest+busy → pending; newest+idle → unavailable; older+busy → unavailable; older+idle → unavailable; non-modern user row → undefined.
-3. NOTE on scope: this file tests the POLICY helper. The view-level wiring (the fallback actually running for user rows) is proven by Test B; the hover surface's own assistant-row role gate (canRewind) is a pre-existing, separately-tested behavior — no assertion here protects that gate, and none needs to (round-3 finding 2's observation about the toolbar gate is precisely why this file asserts the policy, not the toolbar).
+Test D (green pin, keeps passing) — `a bound available capture keeps showing available while the agent is busy`: a user turn that HAS a bound `available` checkpoint outcome (bound through the request-key frame path) keeps the ENABLED `Rewind code to here` hover while the pane is busy — never downgraded to pending.
+
+Round-3 delta review defect 1 pins (as shipped, added by the delta fix): two PTY-notification tests — `a PTY notification row landing after the prompt never steals the newest-user slot` (a busy MCP/CLI-driven pane whose snapshot has a real prompt followed by an opencode-pty `<pty_exited>` row, raw role user, displayed as assistant: the prompt keeps the mid-turn NO-claim treatment, never the unavailable verdict; the notification row keeps its assistant display with no rewind affordance; the honest unavailable returns at settle) and `a PTY notification row landing mid-turn never steals the saving prompt's newest-user slot` (a genuine composer send whose capture is in flight, with the notification landing after the send's landed row: the PROMPT keeps the Saving hover, the older row keeps the honest unavailable).
+
+The same describe also carries the shipped busy-epoch retirement, settled-unavailable, first-send materialization, slow-materialization, reload-in-echo-window, echo-boundary and stale-echo tests (see the Residuals section for their semantics).
+
+Test A (policy unit, as shipped, in the NEW file `test/unit/client/components/fresh-agent/rewind-availability-policy.test.tsx`) — `does not consider agent response turns for rewind status at all` and `pins the user-row matrix`:
+1. Import `unboundRewindAvailability` from the view module; assert `unboundRewindAvailability(assistantTurn, …)` is `undefined` for ALL four `(busy, newest, captureInFlight)` input combinations — the role gate holds for agent turns regardless of the other inputs.
+2. Pin the user-row matrix at the 4-arg policy level: newest+busy+captureInFlight → `{ status: 'pending' }`; newest+busy+NO captureInFlight → `undefined` (the uncertain window makes no claim); newest+idle (either capture input) → unavailable; older rows at all inputs → unavailable; a non-modern user row → `undefined`.
+3. NOTE on scope: this file tests the POLICY helper. The view-level wiring (the fallback actually running for user rows, the `captureInFlight` derivation, the echo branch) is proven by the view tests above.
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
 Run: `pnpm run test:vitest run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/components/fresh-agent/rewind-availability-policy.test.tsx --config config/vitest/vitest.config.ts`
 
-Expected: FAIL — `FreshAgentView.test.tsx` loads (no new imports there) and Test B fails on the newest row with the button showing "Rewind unavailable for this message" instead of "Saving code rewind checkpoint" (Test B's older-row half, Test C, and Test D pass — they pin current behavior); the new policy file fails on the missing-export import (its own isolated red).
+Expected (against pre-Task-1 code): FAIL — `FreshAgentView.test.tsx` loads (no new imports there) and Test B fails on the newest row with the button showing "Rewind unavailable for this message" instead of "Saving code rewind checkpoint" (Test B's older-row half, Test C, and Test D pass — they pin current behavior); the new policy file fails on the missing-export import (its own isolated red).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-In `FreshAgentView.tsx`, directly below `isModernCheckpointTurn` (:381-390):
+In `FreshAgentView.tsx`, directly below `isModernCheckpointTurn` — the 4-arg helper as committed (copied verbatim from the current source; the comment documents the captureInFlight gate and the nothing-branch):
 
 ```ts
 // The fallback for a modern turn with no bound checkpoint outcome. Agent
 // response turns are never rewindable and never even considered (defect 2).
 // "Still saving" (defect 4) belongs to the NEWEST user row only, while this
-// pane's agent turn is running: mid-turn the newest user row IS the running
-// send's row (the assistant has not replied yet), so its capture/identity is
-// legitimately in flight. Older unbound rows (historical MCP/CLI-driven
-// turns) keep the honest unavailable verdict — nothing is being saved for
-// them even while a later turn runs. The state is computed, never stored: it
-// dies at the busy→idle edge, so it can never wedge as an immortal "saving".
+// pane's agent turn is running AND this pane's own composer send has a
+// checkpoint capture genuinely in flight: an MCP/CLI-driven turn sends
+// through the REST lane with no capture at all, so its row must never claim
+// a save is underway even while the pane is busy. The UNCERTAIN window —
+// newest user row, busy, but nothing this pane can evidence as in flight
+// (an MCP/CLI-driven turn; a mid-turn reload whose fresh mount has no send
+// metadata; a capture that already settled) makes NO claim at all: undefined,
+// the User Request's explicit "(or nothing)" acceptance. Older unbound rows
+// (historical MCP/CLI-driven turns) keep the honest unavailable verdict —
+// nothing is being saved for them even while a later turn runs — and the
+// newest row's honest unavailable verdict returns at the busy→idle settle.
+// Every state here is computed, never stored: each dies at the busy→idle
+// edge and at the capture-enrichment edge, so none can wedge.
 export function unboundRewindAvailability(
   turn: FreshAgentTurn,
   agentBusy: boolean,
   isNewestUserTurn: boolean,
+  captureInFlight: boolean,
 ): FreshAgentTurnRewindAvailability | undefined {
   if (turn.role !== 'user') return undefined
   if (!isModernCheckpointTurn(turn)) return undefined
+  if (agentBusy && isNewestUserTurn && !captureInFlight) return undefined
   return agentBusy && isNewestUserTurn
     ? { status: 'pending' }
     : { status: 'unavailable', reason: MODERN_TURN_CHECKPOINT_UNAVAILABLE }
 }
 ```
 
-And REPLACE the `getRewindAvailability` definition by MOVING it from :1333-1342 down to immediately after `sessionEnded` (:3974), rewriting it as:
+The `getRewindAvailability` wiring, as shipped (all in the component body below the `isBusy`/`sessionEnded` derivations, so no temporal-dead-zone on `isBusy`):
 
-```ts
-const newestUserTurnKey = useMemo(() => {
-  const userTurns = transcriptTurns.filter((turn) => turn.role === 'user')
-  return userTurns.length > 0 ? getFreshAgentDisplayTurnKey(userTurns[userTurns.length - 1]) : undefined
-}, [transcriptTurns])
-const getRewindAvailability = useCallback((turn: FreshAgentTurn): FreshAgentTurnRewindAvailability | undefined => {
-  const availability = getCheckpointAvailability(turn)
-  if (!availability) {
-    return unboundRewindAvailability(
-      turn,
-      isBusy,
-      newestUserTurnKey !== undefined && getFreshAgentDisplayTurnKey(turn) === newestUserTurnKey,
-    )
-  }
-  if (availability.status === 'unavailable') return { status: 'unavailable', reason: availability.reason }
-  return { status: availability.status }
-}, [getCheckpointAvailability, isBusy, newestUserTurnKey])
-```
-
-(`transcriptTurns` names whatever state already feeds the pane's rendered transcript rows — the snapshot turns list the component renders articles from; reuse the existing source of truth rather than adding a parallel one, and follow its existing display-key derivation. The move is required, not cosmetic: `isBusy` is declared at :3973, and its first mention inside a `useCallback` dependency array evaluated at :1333 would be a temporal-dead-zone `ReferenceError` at render time. Both consumers (:4861 JSX prop, :5013 dependency list) sit after :3973, and nothing between the current definition and `isBusy` references `getRewindAvailability` (verified by `rg -n 'getRewindAvailability' src/components/fresh-agent/FreshAgentView.tsx`), so the definition must simply live below its new dependency.)
+1. `captureInFlight` is derived each render: `paneCaptureInFlight(pendingSendMetadataRef.current, paneContent.checkpointOutcomes, busyEpochRef.current)` — an own-send `available` outcome with no `nativeTurnId` counts as in flight only while the pane is still inside the busy window (epoch) the send was dispatched in; a settled non-`available` outcome never counts.
+2. `newestUserTurnKey` is a `useMemo` over `transcriptTurns` that first applies the transcript's own display pipeline — `coalesceSyntheticToolResultTurns(reclassifyPtyNotificationTurns(transcriptTurns))`, both exported from `shared/fresh-agent-turns.ts` and applied in the same order `FreshAgentTranscript` applies them — then filters the DISPLAYED user rows for the last landed key; when a local echo is displayed, the echo holds the newest-user slot only while no DISPLAYED user row landed after its send (the send-boundary key comparison, `localEchoSendBoundaryRef` or the echo record's persisted `previousTurnKeys`, over the same displayed user rows), and a stale echo yields to the last landed displayed user key.
+3. `getRewindAvailability` is a `useCallback` (deps include `getCheckpointAvailability`, `isBusy`, `newestUserTurnKey`, `captureInFlight`, `localEchoTurn`): the bound lookup first (an `unavailable` bound verdict keeps its reason; anything else keeps its status — a bound `available` capture is never downgraded by the busy fallback); then the ECHO branch (the pane's pending local echo row with no bound availability: busy+newest → `{ status: 'pending' }`, busy+non-newest (uncertain) → `undefined`, idle → the honest unavailable — so a reloaded echo can never fall to the legacy enabled rewind path); then `unboundRewindAvailability(turn, isBusy, newestUserTurnKey !== undefined && getFreshAgentDisplayTurnKey(turn) === newestUserTurnKey, captureInFlight)`.
 
 (Keep the `FreshAgentTurnRewindAvailability` import; the hover button, context-menu builder and action sheet consume the result unchanged.)
 
