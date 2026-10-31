@@ -5406,6 +5406,83 @@ describe('FreshAgentView', () => {
       expect(rewindButton).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
     })
 
+    it('a reload in the echo window never offers rewind before the outcome is known', async () => {
+      const sessionId = 'thread-rewind-reloaded-echo-window'
+      const store = createStore()
+      let onMessage: ((message: Record<string, unknown>) => void) | undefined
+      wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+        onMessage = handler
+        return () => {}
+      })
+      // A mid-turn reload INSIDE the echo window: the sent message's row has
+      // NOT landed in the provider snapshot (that is why the optimistic echo
+      // is still the displayed copy), so the fresh mount hydrates the echo
+      // row from persisted pane content alone — the restored row carries no
+      // modern identity (no source, no nativeTurnId) and the transient
+      // send-time request-keyed pending availability plus the pending send
+      // metadata do NOT survive the remount. No persisted checkpoint outcome
+      // is bound under the send's request either: the checkpoint outcome is
+      // genuinely unknown on this surface.
+      let snapshotStatus = 'running'
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => ({
+        status: snapshotStatus,
+        summary: 'the reloaded pane keeps the optimistic echo mid-turn',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [],
+      }))
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-reloaded-echo-pane',
+          sessionId,
+          status: 'idle',
+          pendingLocalEcho: {
+            requestId: 'req-reloaded-echo-send',
+            text: 'Prompt still echoing after the reload',
+          },
+        },
+      }))
+
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+
+      // The restored optimistic echo row is the displayed copy of the
+      // in-flight send — no snapshot row exists for it yet.
+      expect(await screen.findAllByRole('article', { name: 'You transcript turn' })).toHaveLength(1)
+      expect(onMessage).toBeTypeOf('function')
+      // The provider's busy status frame re-asserts the still-running turn on
+      // the reloaded pane (truthful since the snapshot-status fix).
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'running')
+      // Pin that the busy drive actually engaged: the still-saving verdict
+      // below is only honest while the pane is truly busy.
+      expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+
+      const [echoRow] = screen.getAllByRole('article', { name: 'You transcript turn' })
+      // RED today: the unbound restored echo row falls to the LEGACY path —
+      // an ENABLED 'Rewind code to here' hover offered for a message whose
+      // checkpoint outcome is unknown.
+      expect(within(echoRow!).queryByRole('button', { name: 'Rewind code to here' })).not.toBeInTheDocument()
+      const savingButton = await within(echoRow!).findByRole('button', { name: 'Saving code rewind checkpoint' })
+      expect(savingButton).toBeDisabled()
+      expect(savingButton).toHaveAttribute('title', 'Saving the code state from before this message')
+
+      // The turn settles: no checkpoint outcome ever reached this pane, so
+      // the honest verdict is the disabled unavailable hover (the stale clear
+      // retires the echo row on its own schedule).
+      snapshotStatus = 'idle'
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'idle')
+      const rewindButton = await within(echoRow!).findByRole('button', { name: 'Rewind unavailable for this message' })
+      expect(rewindButton).toBeDisabled()
+      expect(rewindButton).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
+    })
+
     it('keeps the older snapshot user row honestly unavailable while a pending local echo holds the newest user row', async () => {
       const sessionId = 'thread-rewind-echo-window'
       const store = createStore()

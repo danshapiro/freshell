@@ -4182,6 +4182,25 @@ export function FreshAgentView({
   const getRewindAvailability = useCallback((turn: FreshAgentTurn): FreshAgentTurnRewindAvailability | undefined => {
     const availability = getCheckpointAvailability(turn)
     if (!availability) {
+      // The pane's pending local echo with NO bound availability. A fresh
+      // echo normally holds the send-time request-keyed pending publication
+      // (the bound path above), but a reload inside the echo window restores
+      // the echo row from persisted pane content alone: that transient
+      // publication and the pending send metadata do not survive the
+      // remount, and the restored row carries no modern identity (no source,
+      // no nativeTurnId), so without this branch it would fall to the LEGACY
+      // enabled rewind path — an unearned rewind offer for a message whose
+      // checkpoint outcome this pane cannot know. While the pane is busy the
+      // send's turn is genuinely in flight: still saving. When idle the
+      // outcome is honestly unknown here — no checkpoint this pane can
+      // evidence — and the stale clear retires the echo row on its own.
+      // Identified by the echo row's `__local-echo:` id, the marker both the
+      // fresh send and the restored pendingLocalEcho build their row with.
+      if (localEchoTurn && turn.id === localEchoTurn.id) {
+        return isBusy
+          ? { status: 'pending' }
+          : { status: 'unavailable', reason: MODERN_TURN_CHECKPOINT_UNAVAILABLE }
+      }
       return unboundRewindAvailability(
         turn,
         isBusy,
@@ -4191,7 +4210,7 @@ export function FreshAgentView({
     }
     if (availability.status === 'unavailable') return { status: 'unavailable', reason: availability.reason }
     return { status: availability.status }
-  }, [getCheckpointAvailability, isBusy, newestUserTurnKey, captureInFlight])
+  }, [getCheckpointAvailability, isBusy, newestUserTurnKey, captureInFlight, localEchoTurn])
   // The live tail (transcript-live plan §4.4): what the running turn shows
   // before its transcript lines land. This view never subscribes to the
   // tail's text — only to whether it shows anything, so the transcript's own
