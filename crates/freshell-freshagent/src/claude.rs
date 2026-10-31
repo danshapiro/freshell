@@ -5962,10 +5962,64 @@ async fn spawn_sidecar(
 mod provider_exec_tests {
     use super::*;
 
+    const CASE: &str = "FRESHELL_EXEC_PROFILE_FIXTURE_CHILD";
+    const TEST: &str = "claude::provider_exec_tests::provider_exec_profile_checks_actual_managed_claude_sidecar_spawn";
+
+    fn process_observation(pid: u32) -> Result<Value, String> {
+        let start = crate::session_lease::proc_starttime(pid as i32)
+            .ok_or_else(|| format!("process {pid} has no live start time"))?;
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .map_err(|error| error.to_string())?;
+        let parent = status
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:")?.trim().parse::<u32>().ok())
+            .ok_or_else(|| format!("process {pid} has no parent observation"))?;
+        Ok(json!({"pid":pid,"start":start,"ppid":parent}))
+    }
+
+    fn assert_joined_cases(outputs: Vec<std::process::Output>) {
+        assert_eq!(outputs.len(), 2);
+        for (case, output) in ["large", "small"].into_iter().zip(outputs) {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                eprintln!("[provider-exec-child stdout] {line}");
+            }
+            assert!(stdout.lines().any(|line| line == "running 1 test"));
+            assert!(stdout
+                .lines()
+                .any(|line| line == format!("test {TEST} ... ok")));
+            assert!(stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"));
+            let observations: Vec<Value> = String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|value| value["event"] == "provider_exec_fixture_closed")
+                .collect();
+            assert_eq!(observations.len(), 1, "{observations:?}");
+            let observation = &observations[0];
+            assert_eq!(observation["test"], TEST);
+            assert_eq!(observation["case"], case);
+            let supervisor = &observation["supervisor"];
+            let native = observation["native"].as_array().unwrap();
+            assert_eq!(native.len(), usize::from(case == "small"));
+            for process in std::iter::once(supervisor).chain(native) {
+                let pid = u32::try_from(process["pid"].as_u64().unwrap()).unwrap();
+                let start = process["start"].as_u64().unwrap();
+                assert_eq!(
+                    crate::session_lease::recorded_process_evidence(pid, Some(start)),
+                    crate::session_lease::RecordedProcessEvidence::Gone
+                );
+            }
+            for process in native {
+                assert_eq!(process["ppid"], supervisor["pid"]);
+            }
+            eprintln!("{observation}");
+        }
+    }
+
     #[tokio::test]
     async fn provider_exec_profile_checks_actual_managed_claude_sidecar_spawn() {
-        const CASE: &str = "FRESHELL_EXEC_PROFILE_FIXTURE_CHILD";
         if let Ok(case) = std::env::var(CASE) {
+            let supervisor = process_observation(std::process::id());
             let owned = tempfile::tempdir().unwrap();
             let script = owned.path().join("synthetic-sidecar.mjs");
             std::fs::write(&script, "setInterval(()=>{},1000)\n").unwrap();
@@ -5978,30 +6032,87 @@ mod provider_exec_tests {
             )
             .unwrap();
             let mut result = spawn_sidecar(None, None, "freshclaude").await;
-            if let Ok(SpawnedSidecar { child, .. }) = &mut result {
-                let pid = child.id().unwrap();
-                child.kill().await.unwrap();
-                child.wait().await.unwrap();
-                eprintln!("synthetic owned sidecar pid {pid} stopped in fixture namespace");
-            }
+            let mut native = Vec::new();
+            let cleanup = if let Ok(SpawnedSidecar { child, .. }) = &mut result {
+                native.push(
+                    child
+                        .id()
+                        .ok_or_else(|| "native child has no pid".to_string())
+                        .and_then(process_observation),
+                );
+                Some((child.kill().await, child.wait().await))
+            } else {
+                None
+            };
             if case == "large" {
                 assert!(matches!(result,Err(ref cause) if cause.contains("provider exec profile")),"managed fresh sidecar must reject oversized actual inherited+selected environment before spawn");
             } else {
                 assert!(result.is_ok(),"valid finite selected environment must still launch the actual sidecar command");
             }
+            drop(result);
+            drop(owned);
+            if let Some((killed, waited)) = cleanup {
+                killed.unwrap();
+                waited.unwrap();
+            }
+            let native: Vec<Value> = native
+                .into_iter()
+                .collect::<Result<_, _>>()
+                .expect("observe actual spawned Claude identity");
+            let observation = json!({"severity":"info","event":"provider_exec_fixture_closed",
+                "test":TEST,"case":case,"supervisor":supervisor.expect("observe child libtest identity"),
+                "native":native});
+            use std::io::Write;
+            writeln!(std::io::stderr(), "{observation}").expect("report joined fixture identities");
             return;
         }
+        assert_joined_cases(run_profile_cases().await);
+    }
+
+    // The original exact test and the guard regression share this physical path.
+    async fn run_profile_cases() -> Vec<std::process::Output> {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
+        let mut outputs = Vec::new();
         for case in ["large", "small"] {
-            let output=std::process::Command::new(std::env::current_exe().unwrap()).env_clear()
-                .env("PATH","/usr/local/bin:/usr/bin:/bin").env(CASE,case)
-                .args(["--exact","claude::provider_exec_tests::provider_exec_profile_checks_actual_managed_claude_sidecar_spawn","--nocapture"])
-                .output().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .env_clear()
+                .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                .env(CASE, case)
+                .args(["--exact", TEST, "--nocapture"])
+                .output()
+                .unwrap();
             assert!(
                 output.status.success(),
                 "actual sidecar fixture case {case} failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
+            outputs.push(output);
         }
+        outputs
+    }
+
+    #[tokio::test]
+    async fn provider_exec_parent_waits_for_process_fixture() {
+        let held = crate::session_lease::process_fixture::lock().await;
+        let mut parent = Box::pin(run_profile_cases());
+        // Synchronous output either joins real children or waits at the parent guard.
+        let first_poll = futures_util::poll!(&mut parent);
+        let waited = first_poll.is_pending();
+        drop(held);
+        let outputs = match first_poll {
+            std::task::Poll::Ready(outputs) => outputs,
+            std::task::Poll::Pending => parent.await,
+        };
+        assert_joined_cases(outputs);
+        eprintln!(
+            "{}",
+            json!({"severity":"info","event":"provider_exec_parent_polled",
+            "test":TEST,"firstPollPending":waited})
+        );
+        assert!(
+            waited,
+            "actual Claude provider fixture spawned while the canonical process guard was held"
+        );
     }
 }
 
