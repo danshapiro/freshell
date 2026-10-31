@@ -52,6 +52,7 @@ import reducer, {
 import panesReducer from '@/store/panesSlice'
 import tabsReducer, { closePaneWithCleanup, closeTab } from '@/store/tabsSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
+import terminalLifecycleReducer from '@/store/terminalLifecycleSlice'
 import { appReducers } from '@/store/appReducers'
 import antigravityActivityReducer, {
   removeAntigravityActivity,
@@ -402,6 +403,93 @@ describe('turnCompletionSlice', () => {
 
       expect(store.getState().turnCompletion.pendingEvents).toEqual([])
       expect(store.getState().turnCompletion.lastIdleAtByTerminalId?.['term-missing']).toBeUndefined()
+    })
+
+    it('folds the DEATH idle through the lifecycle bridge after terminal.exit cleared the pane terminalId', () => {
+      // The crash death-bell wire order: the pane's terminal.exit handler
+      // records the exit into terminalLifecycle and CLEARS
+      // paneContent.terminalId, and only THEN the hub's death
+      // `terminal.idle` arrives (exit push → hub exit event → bell). The
+      // direct layout lookup therefore misses exactly the attached-pane
+      // crash — the bridge through the lifecycle slice's lastTerminalId
+      // (the terminal.replaced handler's precedent) must resolve the pane
+      // so the unified attention edge rings.
+      const now = Date.now()
+      const store = configureStore({
+        reducer: {
+          tabs: tabsReducer,
+          panes: panesReducer,
+          settings: settingsReducer,
+          terminalLifecycle: terminalLifecycleReducer,
+          turnCompletion: reducer,
+        },
+        preloadedState: {
+          tabs: {
+            tabs: [{ id: 'tab-1', createRequestId: 'req-1', title: 'Tab 1', status: 'exited' as const, mode: 'opencode' as const, shell: 'system' as const, createdAt: now }],
+            activeTabId: 'tab-1',
+            renameRequestTabId: null,
+          },
+          panes: {
+            layouts: {
+              'tab-1': {
+                type: 'leaf' as const,
+                id: 'pane-1',
+                content: {
+                  kind: 'terminal' as const,
+                  createRequestId: 'cr-1',
+                  status: 'exited' as const,
+                  mode: 'opencode' as const,
+                  shell: 'system' as const,
+                  // CLEARED by the exit handler before the death idle lands.
+                  terminalId: undefined,
+                },
+              },
+            },
+            activePane: { 'tab-1': 'pane-1' },
+            paneTitles: {},
+            paneTitleSetByUser: {},
+            renameRequestTabId: null,
+            renameRequestPaneId: null,
+            zoomedPane: {},
+            refreshRequestsByPane: {},
+          },
+          settings: { settings: defaultSettings, loaded: true },
+          terminalLifecycle: {
+            byPaneId: {
+              'pane-1': {
+                lastTerminalId: 'term-dying',
+                exit: { exitCode: 3, at: now },
+              },
+            },
+            stuckAtByPaneId: {},
+          },
+          turnCompletion: {
+            seq: 0,
+            lastAtByTerminalId: {},
+            lastIdleAtByTerminalId: {},
+            pendingEvents: [],
+            attentionByTab: {},
+            attentionByPane: {},
+          },
+        },
+      })
+
+      store.dispatch(applyServerIdle({
+        terminalId: 'term-dying',
+        at: now,
+        reason: 'grace',
+      }) as any)
+
+      expect(store.getState().turnCompletion.pendingEvents).toEqual([{
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        terminalId: 'term-dying',
+        at: now,
+        seq: 1,
+        source: 'terminal',
+        watched: false,
+      }])
+      expect(store.getState().turnCompletion.lastIdleAtByTerminalId?.['term-dying']).toBe(now)
     })
   })
 
