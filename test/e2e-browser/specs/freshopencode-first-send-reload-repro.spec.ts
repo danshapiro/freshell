@@ -371,6 +371,249 @@ test.describe('Freshopencode first-message code checkpoint', () => {
   })
 })
 
+test.describe('Freshopencode reservation-refusal survival', () => {
+  test('a SESSION_RESERVED reservation refusal during the running turn never clears the still-saving state', async ({ page }) => {
+    test.setTimeout(180_000)
+    const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-freshopencode-reserved-'))
+    const binDir = path.join(sharedRoot, 'bin')
+    const logsDir = path.join(sharedRoot, 'logs')
+    const auditLogPath = path.join(sharedRoot, 'fake-opencode-audit.jsonl')
+    const sharedOpencodeDataDir = path.join(sharedRoot, 'opencode-data')
+    const cwd = path.join(sharedRoot, 'project')
+    const promptGatePath = path.join(sharedRoot, 'prompt-gate')
+    const prompt = `playwright reserved refusal prompt ${Date.now()}`
+    await fsp.mkdir(cwd, { recursive: true })
+    // A Git workspace cwd so the code checkpoint capture succeeds (the
+    // journey's enabled-rewind ending requires an available capture).
+    await fsp.writeFile(path.join(cwd, 'tracked.txt'), 'fixture workspace file\n')
+    execFileSync('git', ['init', cwd], { stdio: 'ignore' })
+    execFileSync('git', ['-C', cwd, 'config', 'user.email', 'fixture@example.invalid'], { stdio: 'ignore' })
+    execFileSync('git', ['-C', cwd, 'config', 'user.name', 'Freshell fixture'], { stdio: 'ignore' })
+    execFileSync('git', ['-C', cwd, 'add', '--', 'tracked.txt'], { stdio: 'ignore' })
+    execFileSync('git', ['-C', cwd, 'commit', '-m', 'fixture'], { stdio: 'ignore' })
+    await installFakeOpencode(binDir)
+
+    // The flag-less harness (the durable ses_* id must materialize) with the
+    // prompt gate parking the turn in flight — the same harness as the
+    // live-binding leg: the reservation refusal must be forced DURING a
+    // genuinely running turn, and the parked gate makes "running" a stable
+    // steady state to assert survival against.
+    const server = new RustServer(createServerOptions({
+      binDir,
+      auditLogPath,
+      logsDir,
+      sharedOpencodeDataDir,
+      hangSessionCreate: false,
+      extraEnv: { FAKE_OPENCODE_HOLD_PROMPT_GATE_PATH: promptGatePath },
+    }))
+
+    try {
+      const info = await server.start()
+      await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+      const harness = new TestHarness(page)
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+      await enableFreshOpencode(page)
+      await createFreshopencodePane(page, cwd)
+
+      await expect.poll(async () => getFreshOpencodePaneState(page), { timeout: 15_000 }).toMatchObject({
+        sessionId: expect.stringMatching(/^freshopencode-/),
+      })
+
+      await sendFreshAgentPrompt(page, prompt)
+      await expect.poll(async () => {
+        const events = await readAuditEvents(auditLogPath)
+        return events.some((event) => event.event === 'prompt_async' && event.prompt === prompt)
+      }, { timeout: 30_000 }).toBe(true)
+
+      // The pane re-keys onto the durable ses_* id (materialization fired at
+      // request receipt). The forced attach below must name THIS id — the id
+      // the ownership coordinator's record holds.
+      await expect.poll(async () => {
+        const state = await getFreshOpencodePaneState(page)
+        return typeof state.sessionId === 'string' && /^ses_/.test(state.sessionId) ? state.sessionId : ''
+      }, { timeout: 30_000 }).toMatch(/^ses_/)
+      const durableSessionId = (await getFreshOpencodePaneState(page)).sessionId!
+      expect(durableSessionId).toMatch(/^ses_/)
+
+      const idleAfterPrompt = async (whichPrompt: string) => {
+        const events = await readAuditEvents(auditLogPath)
+        const promptIndex = events.findLastIndex((event) => event.event === 'prompt_async' && event.prompt === whichPrompt)
+        return promptIndex >= 0
+          && events.slice(promptIndex + 1).some((event) => event.event === 'session_idle_emitted')
+      }
+
+      const paneRoot = page.locator('[data-context="fresh-agent"]').last()
+      const userTurn = paneRoot.locator('[data-turn-role="user"]', { hasText: prompt })
+      await expect(userTurn).toHaveCount(1, { timeout: 20_000 })
+      // Parked-ness: the gate file does not exist yet, so the turn is
+      // deterministically still in flight (the live legs' discipline).
+      await expect(await idleAfterPrompt(prompt)).toBe(false)
+
+      // BASELINE mid-turn: the newest user row's hover shows the disabled
+      // still-saving state — the state the reservation refusal must NOT
+      // clear (the live-binding leg's pin).
+      await userTurn.hover()
+      const saving = userTurn.getByRole('button', { name: 'Saving code rewind checkpoint' })
+      await expect(saving).toBeVisible()
+      await expect(saving).toBeDisabled()
+      await expect(saving).toHaveAttribute('title', 'Saving the code state from before this message')
+
+      // BUSY pin: the pane content really reports the running turn — the
+      // pane-content status the survival assertions below keep pinned.
+      await expect.poll(async () => getFreshOpencodePaneState(page), { timeout: 10_000 }).toMatchObject({
+        sessionId: durableSessionId,
+        status: 'running',
+      })
+
+      // THE FORCED REFUSAL. A fence-less `freshAgent.attach` for the pane's
+      // own materialized session — the exact wire shape the pane's
+      // mount-rebind attach produces before it has observed the owner pair
+      // (legacy-unfenced; the schema's observedEpoch/observedGeneration are
+      // optional) — sent through the harness's raw-WS escape hatch while
+      // the turn is parked. Against the coordinator-wired lane the server's
+      // FENCE_REQUIRED contract (opencode_ws.rs: "the bridge restart must
+      // adopt the observed owner specifically") refuses it typed:
+      // freshAgent.error{SESSION_RESERVED, "The attach carried no observed
+      // ownership pair; re-observe the session's owner record and retry"}
+      // addressed to THIS session. That is the same typed transient refusal
+      // the slice's SESSION_RESERVED branch exists to survive: the pane
+      // re-observes and redrives (Task 14, ~1s floor) while the turn keeps
+      // running throughout.
+      const reservedRefusalFrames = async () => (await harness.getReceivedWsMessages())
+        .filter((frame) => {
+          const message = frame as { type?: string; sessionId?: string; event?: { type?: string; code?: string } }
+          return message?.type === 'freshAgent.event'
+            && message?.sessionId === durableSessionId
+            && message?.event?.type === 'freshAgent.error'
+            && message?.event?.code === 'SESSION_RESERVED'
+        }).length
+      const reservedFramesBefore = await reservedRefusalFrames()
+      await page.evaluate((sid: string) => {
+        window.__FRESHELL_TEST_HARNESS__?.sendWsMessage({
+          type: 'freshAgent.attach',
+          sessionId: sid,
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+        })
+      }, durableSessionId)
+
+      // Observe the refusal reaching the pane's error surface: the session
+      // record folds lastErrorCode = SESSION_RESERVED (the pane's banner
+      // filter reads exactly this field). The raf-cadence wait resolves
+      // within a frame of the fold, so the atomic sample below reads the
+      // store BEFORE the pane's Task-14 redrive (+1s floor) can re-assert
+      // anything — with the branch present nothing needs re-asserting, and
+      // without it the cleared status is caught before any heal.
+      await page.waitForFunction((sid: string) => {
+        const state = window.__FRESHELL_TEST_HARNESS__?.getState() as
+          { freshAgent?: { sessions?: Record<string, { lastErrorCode?: string }> } } | undefined
+        return state?.freshAgent?.sessions?.[`freshopencode:opencode:${sid}`]?.lastErrorCode === 'SESSION_RESERVED'
+      }, durableSessionId, { timeout: 15_000 })
+
+      // THE SURVIVAL SAMPLE — one synchronous Redux snapshot the instant the
+      // refusal is folded. The sessionError reducer decided in THIS dispatch
+      // whether the running record/pane status survives the refusal: with the
+      // SESSION_RESERVED branch both stay 'running'; without it the generic
+      // hard-error busy-clear drops the record status to 'idle' right here.
+      const refusalSample = await page.evaluate((sid: string) => {
+        const state = window.__FRESHELL_TEST_HARNESS__?.getState() as any
+        const record = state?.freshAgent?.sessions?.[`freshopencode:opencode:${sid}`]
+        const findFreshOpencode = (node: any): any => {
+          if (!node) return undefined
+          if (node.type === 'leaf' && node.content?.kind === 'fresh-agent' && node.content.provider === 'opencode') {
+            return node.content
+          }
+          if (node.type === 'split') return findFreshOpencode(node.children?.[0]) ?? findFreshOpencode(node.children?.[1])
+          return undefined
+        }
+        const content = findFreshOpencode(state?.panes?.layouts?.[state?.tabs?.activeTabId])
+        return {
+          recordStatus: typeof record?.status === 'string' ? record.status : null,
+          lastErrorCode: typeof record?.lastErrorCode === 'string' ? record.lastErrorCode : null,
+          lastError: typeof record?.lastError === 'string' ? record.lastError : null,
+          paneContentStatus: typeof content?.status === 'string' ? content.status : null,
+        }
+      }, durableSessionId)
+      expect(refusalSample, 'the running turn survives the reservation refusal').toEqual({
+        recordStatus: 'running',
+        lastErrorCode: 'SESSION_RESERVED',
+        lastError: expect.stringContaining('observed ownership pair'),
+        paneContentStatus: 'running',
+      })
+
+      // The hover still shows the disabled still-saving state: a one-shot
+      // read (no retries) right after the refusal — the refusal itself must
+      // never flip the newest user row's verdict mid-turn.
+      await userTurn.hover()
+      const savingVisible = await saving.isVisible()
+      const unavailableVisible = await userTurn.getByRole('button', { name: 'Rewind unavailable for this message' }).isVisible()
+      expect(savingVisible, 'the still-saving hover survives the refusal').toBe(true)
+      expect(unavailableVisible, 'no unavailable verdict may replace the still-saving hover mid-turn').toBe(false)
+
+      // The refusal genuinely came from the coordinator's FENCE_REQUIRED
+      // door: the typed frame reached this page's socket (count strictly
+      // increased beyond any earlier natural refusal) and the server logged
+      // the typed refusal for THIS session. The server's JSONL lands in
+      // THIS spec's logsDir (createServerOptions points FRESHELL_LOG_DIR
+      // here, overriding the RustServer helper's own logs dir).
+      await expect.poll(reservedRefusalFrames, { timeout: 15_000 }).toBeGreaterThan(reservedFramesBefore)
+      await expect.poll(async () => {
+        try {
+          const text = await fsp.readFile(path.join(logsDir, 'rust-server.jsonl'), 'utf8')
+          return text.split('\n').filter(Boolean).some((line) => {
+            try {
+              const row = JSON.parse(line) as { msg?: string; session_id?: string; code?: string }
+              return typeof row.msg === 'string'
+                && row.msg.includes('fresh_agent_attach_refused')
+                && row.session_id === durableSessionId
+                && row.code === 'FENCE_REQUIRED'
+            } catch {
+              return false
+            }
+          })
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+          throw error
+        }
+      }, { timeout: 15_000 }).toBe(true)
+
+      // The task-required survival assertions, through the same hover
+      // surface as the other legs: the pane still shows the running status
+      // and the user row's hover still shows the disabled Saving state.
+      await expect.poll(async () => getFreshOpencodePaneState(page), { timeout: 10_000 }).toMatchObject({
+        sessionId: durableSessionId,
+        status: 'running',
+      })
+      await userTurn.hover()
+      await expect(saving).toBeVisible()
+      await expect(saving).toBeDisabled()
+      await expect(saving).toHaveAttribute('title', 'Saving the code state from before this message')
+      // The transient reservation is never surfaced as a pane error banner
+      // (the Task-14 filter reads lastErrorCode) — the refusal is recorded,
+      // not shown.
+      await expect(paneRoot.getByText(/^Agent error:/)).toHaveCount(0)
+
+      // Parked-ness after the refusal: no idle can have been emitted since
+      // the prompt receipt — the reservation refusal never ended the turn.
+      await expect(await idleAfterPrompt(prompt)).toBe(false)
+
+      // Release the gate: the parked response answers, the idle settles the
+      // turn, the identity observation enriches the capture, and the landed
+      // row's hover flips to the enabled rewind — the journey's end matches
+      // the other legs, proving the refusal cost nothing downstream.
+      await fsp.writeFile(promptGatePath, 'release\n')
+      await expect.poll(() => idleAfterPrompt(prompt), { timeout: 30_000 }).toBe(true)
+      await userTurn.hover()
+      const rewind = userTurn.getByRole('button', { name: 'Rewind code to here' })
+      await expect(rewind).toBeEnabled({ timeout: 30_000 })
+    } finally {
+      await server.stop().catch(() => {})
+      await fsp.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+})
+
 test.describe('Freshopencode restored-echo rewind honesty', () => {
   test('a reload inside the echo window shows the restored echo still saving, then the enriched row enabled after the settle', async ({ page }) => {
     // The journey boots a server, creates a pane, sends, reloads inside the
