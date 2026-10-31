@@ -460,7 +460,7 @@ export default function Sidebar({
       codexActivityByTerminalId: state.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID,
       claudeActivityByTerminalId: state.claudeActivity?.byTerminalId ?? EMPTY_CLAUDE_ACTIVITY_BY_ID,
       amplifierActivityByTerminalId: state.amplifierActivity?.byTerminalId ?? EMPTY_AMPLIFIER_ACTIVITY_BY_ID,
-    antigravityActivityByTerminalId: state.antigravityActivity?.byTerminalId ?? EMPTY_ANTIGRAVITY_ACTIVITY_BY_ID,
+      antigravityActivityByTerminalId: state.antigravityActivity?.byTerminalId ?? EMPTY_ANTIGRAVITY_ACTIVITY_BY_ID,
       opencodeActivityByTerminalId: state.opencodeActivity?.byTerminalId ?? EMPTY_OPENCODE_ACTIVITY_BY_ID,
       paneRuntimeActivityByPaneId: state.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID,
       freshAgentSessions: state.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS,

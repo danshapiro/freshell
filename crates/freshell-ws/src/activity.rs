@@ -924,7 +924,11 @@ impl ActivityHub {
         if let Err((reason, message)) = tailer.attach(attach_at) {
             // Attach failure = the lane's truth source is unreadable —
             // crash semantics (owner ruling: probe failure = crash; a
-            // provisional busy reverts silently). The pane's next submit
+            // provisional busy reverts silently). A superseded lane must
+            // not survive the failed rebind: the abandoned conversation's
+            // records would keep feeding this terminal (phantom busy /
+            // phantom turn-complete for a foreign turn) — drop it first,
+            // mirroring the drain-degrade path. The pane's next submit
             // re-opens the locator window and the sweep re-attaches.
             tracing::warn!(
                 terminal_id = %terminal_id,
@@ -935,6 +939,7 @@ impl ActivityHub {
             );
             let frames = {
                 let mut inner = self.inner.lock().expect("activity hub lock");
+                inner.antigravity_lanes.remove(terminal_id);
                 let effects = inner
                     .antigravity_tracker
                     .note_verify_failed(terminal_id, now_ms());
@@ -967,6 +972,14 @@ impl ActivityHub {
                     error = %err,
                     "antigravity transcript watcher construction failed; PTY-only lane continues"
                 );
+                // The failed rebind must also drop a superseded lane —
+                // same rule as the attach-failure arm above (the abandoned
+                // conversation's records must stop feeding this terminal).
+                self.inner
+                    .lock()
+                    .expect("activity hub lock")
+                    .antigravity_lanes
+                    .remove(terminal_id);
                 return;
             }
         };
@@ -976,6 +989,14 @@ impl ActivityHub {
                 error = %err,
                 "antigravity transcript watch failed; PTY-only lane continues"
             );
+            // The failed rebind must also drop a superseded lane —
+            // same rule as the attach-failure arm above (the abandoned
+            // conversation's records must stop feeding this terminal).
+            self.inner
+                .lock()
+                .expect("activity hub lock")
+                .antigravity_lanes
+                .remove(terminal_id);
             return;
         }
 
@@ -1571,14 +1592,18 @@ impl ActivityHub {
                 at,
             } => {
                 let submit = freshell_activity::signal::is_submit_input(&data);
-                // Antigravity plan Task 6: the association's line capture
-                // runs BEFORE the modes lookup (antigravity panes are not
-                // tracker-modes yet — Task 8 adds the tracker). A flushed
-                // submit ALSO arms the idle gate's provisional Busy phase,
-                // which is what makes a mid-turn crash ENGAGED for the
-                // death bell below (the unified attention edge); the tag
-                // half drives the #612 quit-intent gate inside the lock —
-                // a deliberate user quit must suppress that bell too.
+                // Antigravity plan Task 8: the association's line capture
+                // still runs BEFORE the modes lookup (a pane's capture can
+                // outlive its modes entry — see the tag-check note below).
+                // A flushed submit arms the TRACKER's provisional Busy
+                // (`note_submit` in the antigravity Input arm below), and
+                // the frames mapper forwards that Busy phase to the idle
+                // gate — the Task 6 direct gate-arm moved into the tracker
+                // lane — which is what makes a mid-turn crash ENGAGED for
+                // the death bell below (the unified attention edge); the
+                // tag half drives the #612 quit-intent gate inside the
+                // lock — a deliberate user quit must suppress that bell
+                // too.
                 let (antigravity_flushed, antigravity_tagged) = self
                     .inner
                     .lock()
@@ -1887,11 +1912,13 @@ impl ActivityHub {
                         };
                         frames.extend(tracker_frames);
                     }
-                    // Antigravity plan Task 6: the association's pane
-                    // capture + locator arm go with the pane, and so does
-                    // the idle-gate state (antigravity panes are not
-                    // tracker-modes, so the modes-map teardown above never
-                    // ran for them). Runs AFTER the engagement read above,
+                    // Antigravity plan Task 8: the association's pane
+                    // capture + locator arm go with the pane. Post-Task-8
+                    // the modes-map teardown above ALSO runs for a tracked
+                    // antigravity pane (tracker record, transcript lane,
+                    // gate state) — the `idle.note_exit` here is idempotent
+                    // and still covers a pane whose capture outlived its
+                    // modes entry. Runs AFTER the engagement read above,
                     // per the "read engagement BEFORE any teardown"
                     // invariant. `note_exit`'s answer says whether the hub
                     // had the pane tagged at all.
@@ -2857,6 +2884,32 @@ mod tests {
         timeout_ms: u64,
     ) -> Option<serde_json::Value> {
         next_frame_matching(rx, wanted, timeout_ms, |_| true).await
+    }
+
+    /// Wait until the pane's antigravity lane has consumed its transcript's
+    /// current bytes (the attach worker's initial drain finished — its
+    /// records are already folded into the tracker). The amplifier
+    /// re-attach test's offset-polling shape.
+    async fn wait_for_antigravity_drain(hub: &ActivityHub, terminal_id: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let inner = hub.inner.lock().unwrap();
+                if inner
+                    .antigravity_lanes
+                    .get(terminal_id)
+                    .map(|lane| lane.tailer.offset() > 0)
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "antigravity lane for {terminal_id} never consumed its transcript"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     /// KATA namg: notify's inotify backend reports kernel IN_Q_OVERFLOW as
@@ -3912,6 +3965,295 @@ mod tests {
                 .await
                 .is_none(),
             "exactly one terminal.idle for the death, never a duplicate"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Review follow-up (Task 8 Minor 1): a rebind whose new-transcript
+    /// attach fails must not leave the SUPERSEDED conversation's lane
+    /// feeding the pane — a settle written by the old conversation (e.g. a
+    /// second pane that resumed it) would mint a phantom turn-complete +
+    /// attention ring for a foreign turn. Drives the deterministic failure
+    /// arm (watch registration on a not-yet-created transcript); the
+    /// attach-failure and watcher-construction arms carry the same
+    /// superseded-lane drop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn antigravity_failed_rebind_attach_drops_the_superseded_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript_a = dir.path().join("transcript-a.jsonl");
+        let line = |kind: &str, extra: &str| {
+            format!(
+                "{{\"type\":\"{kind}\",\"conversationId\":\"conv-a\",\"at\":\"{ts}\"{extra}}}\n",
+                ts = crate::now_iso(),
+            )
+        };
+        std::fs::write(
+            &transcript_a,
+            [
+                line("session_start", ""),
+                line("user_message", ",\"text\":\"first prompt\""),
+            ]
+            .concat(),
+        )
+        .unwrap();
+
+        let (hub, mut rx) = hub();
+        let home = unique_temp_dir("agy-rebind-attach-failure");
+        hub.set_antigravity_association(Arc::new(
+            crate::antigravity_association::AntigravityAssociation::new(home.clone()),
+        ));
+
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "antigravity".into(),
+                resume_session_id: None,
+                at: now_ms(),
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t1".into(),
+                data: "first prompt\r".into(),
+                at: now_ms(),
+            },
+        );
+        next_frame_matching(&mut rx, "antigravity.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "busy" && v["upsert"][0]["terminalId"] == "t1"
+        })
+        .await
+        .expect("the flushed submit arms the tracker's provisional busy");
+
+        // Conversation A binds: the lane replays the young transcript and
+        // the user_message record CONFIRMS the busy.
+        hub.attach_antigravity_association("t1", "conv-a", &transcript_a);
+        next_frame_matching(&mut rx, "antigravity.activity.updated", 3_000, |v| {
+            v["upsert"][0]["sessionId"] == "conv-a"
+        })
+        .await
+        .expect("bind upsert for conversation A");
+        wait_for_antigravity_drain(&hub, "t1").await;
+
+        // Rebind A→B whose attach fails: conv-b's transcript does not
+        // exist yet, so the tailer attaches at Start fine but the inotify
+        // watch registration fails. The channel's FIFO order guarantees
+        // the hub processes this failed attach before any event the old
+        // lane's watcher could forward for the append below.
+        hub.attach_antigravity_association(
+            "t1",
+            "conv-b",
+            &dir.path().join("not-created-yet.jsonl"),
+        );
+
+        // Conversation A settles elsewhere (a second pane resumed it): the
+        // superseded lane must no longer feed this terminal.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript_a)
+            .unwrap();
+        f.write_all(
+            line(
+                "turn_settled",
+                ",\"outcome\":\"completed\",\"fullyIdle\":true",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        drop(f);
+
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.turn.complete", 3_000)
+                .await
+                .is_none(),
+            "the superseded conversation's settle must not mint a phantom turn-complete for the rebound pane"
+        );
+        assert!(
+            next_frame_matching(&mut rx, "terminal.idle", 2_500, |v| v["terminalId"] == "t1")
+                .await
+                .is_none(),
+            "the superseded conversation's settle must not ring the rebound pane's attention"
+        );
+        {
+            let inner = hub.inner.lock().unwrap();
+            assert!(
+                !inner.antigravity_lanes.contains_key("t1"),
+                "a failed rebind attach must drop the superseded lane"
+            );
+        }
+        let (_, completions) = hub.antigravity_list();
+        assert!(
+            completions.is_empty(),
+            "no completion may be minted for a foreign turn"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Review follow-up (Task 8 Minor 2): pin the lane-degrade →
+    /// crash-attention seam at the level it runs at. Truncating a
+    /// confirmed-busy pane's bound transcript (FileReset degrade) drops
+    /// the lane, applies `note_verify_failed` crash semantics, and the
+    /// mapper's AttentionBoundary arm drives gate grace: exactly ONE
+    /// `terminal.idle{reason:"grace"}` and NO `terminal.turn.complete`.
+    /// The provisional (unconfirmed-busy) variant reverts silently.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn antigravity_transcript_degrade_rings_confirmed_once_and_reverts_provisional_silently()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let confirmed_transcript = dir.path().join("confirmed.jsonl");
+        let provisional_transcript = dir.path().join("provisional.jsonl");
+        let line = |kind: &str, extra: &str| {
+            format!(
+                "{{\"type\":\"{kind}\",\"conversationId\":\"conv\",\"at\":\"{ts}\"{extra}}}\n",
+                ts = crate::now_iso(),
+            )
+        };
+        std::fs::write(
+            &confirmed_transcript,
+            [
+                line("session_start", ""),
+                line("user_message", ",\"text\":\"confirmed pane prompt\""),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        // No user_message record: the lane attaches and drains, but this
+        // pane's busy stays PROVISIONAL (submit-grace only).
+        std::fs::write(&provisional_transcript, line("session_start", "")).unwrap();
+
+        let (hub, mut rx) = hub();
+        let home = unique_temp_dir("agy-degrade-seam");
+        hub.set_antigravity_association(Arc::new(
+            crate::antigravity_association::AntigravityAssociation::new(home.clone()),
+        ));
+
+        // t1 → CONFIRMED busy: submit + the transcript's user_message.
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "antigravity".into(),
+                resume_session_id: None,
+                at: now_ms(),
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t1".into(),
+                data: "confirmed pane prompt\r".into(),
+                at: now_ms(),
+            },
+        );
+        next_frame_matching(&mut rx, "antigravity.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "busy" && v["upsert"][0]["terminalId"] == "t1"
+        })
+        .await
+        .expect("t1: the flushed submit arms provisional busy");
+        hub.attach_antigravity_association("t1", "conv-c", &confirmed_transcript);
+        next_frame_matching(&mut rx, "antigravity.activity.updated", 3_000, |v| {
+            v["upsert"][0]["sessionId"] == "conv-c"
+        })
+        .await
+        .expect("t1: bind upsert");
+        wait_for_antigravity_drain(&hub, "t1").await;
+
+        // t2 → PROVISIONAL busy: submit only; its transcript never confirms.
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t2".into(),
+                mode: "antigravity".into(),
+                resume_session_id: None,
+                at: now_ms(),
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t2".into(),
+                data: "provisional pane prompt\r".into(),
+                at: now_ms(),
+            },
+        );
+        next_frame_matching(&mut rx, "antigravity.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "busy" && v["upsert"][0]["terminalId"] == "t2"
+        })
+        .await
+        .expect("t2: the flushed submit arms provisional busy");
+        hub.attach_antigravity_association("t2", "conv-p", &provisional_transcript);
+        next_frame_matching(&mut rx, "antigravity.activity.updated", 3_000, |v| {
+            v["upsert"][0]["sessionId"] == "conv-p"
+        })
+        .await
+        .expect("t2: bind upsert");
+        wait_for_antigravity_drain(&hub, "t2").await;
+
+        // Truncate both transcripts below the tailers' offsets → FileReset
+        // degrade on the next (inotify-driven) read.
+        std::fs::write(&confirmed_transcript, "").unwrap();
+        std::fs::write(&provisional_transcript, "").unwrap();
+
+        // PROVISIONAL first (it lands at drain time; the confirmed pane's
+        // attention arrives only after the 2 s gate grace): the revert is
+        // SILENT — a busy→idle upsert, never an attention ring.
+        let reverted = next_frame_matching(&mut rx, "antigravity.activity.updated", 5_000, |v| {
+            v["upsert"][0]["terminalId"] == "t2" && v["upsert"][0]["phase"] == "idle"
+        })
+        .await
+        .expect("t2: the degrade reverts the provisional busy (silent upsert)");
+        assert_eq!(reverted["upsert"][0]["sessionId"], "conv-p");
+
+        // CONFIRMED: crash semantics — the AttentionBoundary arms the
+        // gate, exactly one terminal.idle{grace}, never a turn.complete.
+        let idle =
+            next_frame_matching(&mut rx, "terminal.idle", 5_000, |v| v["terminalId"] == "t1")
+                .await
+                .expect("t1: a confirmed-busy degrade rings the crash-attention boundary");
+        assert_eq!(idle["reason"], "grace");
+        assert!(
+            next_frame_matching(&mut rx, "terminal.idle", 1_500, |v| v["terminalId"] == "t1")
+                .await
+                .is_none(),
+            "t1: exactly one terminal.idle for the degrade"
+        );
+        assert!(
+            next_frame_matching(&mut rx, "terminal.idle", 2_500, |v| v["terminalId"] == "t2")
+                .await
+                .is_none(),
+            "t2: a provisional-busy degrade must stay silent"
+        );
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.turn.complete", 1_000)
+                .await
+                .is_none(),
+            "a degrade is crash semantics, never a fabricated turn completion"
+        );
+
+        // Both lanes dropped on degrade; both records read idle and no
+        // completion was minted.
+        {
+            let inner = hub.inner.lock().unwrap();
+            assert!(
+                !inner.antigravity_lanes.contains_key("t1"),
+                "t1: the lane must drop on degrade"
+            );
+            assert!(
+                !inner.antigravity_lanes.contains_key("t2"),
+                "t2: the lane must drop on degrade"
+            );
+        }
+        let (records, completions) = hub.antigravity_list();
+        assert_eq!(completions.len(), 0, "no completion was minted");
+        assert_eq!(records.len(), 2);
+        assert!(
+            records
+                .iter()
+                .all(|r| r.phase == freshell_protocol::AntigravityPhase::Idle),
+            "both panes read idle after the degrade"
         );
 
         let _ = std::fs::remove_dir_all(&home);
