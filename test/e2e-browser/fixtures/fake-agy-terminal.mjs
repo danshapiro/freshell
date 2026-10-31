@@ -32,6 +32,16 @@
 //   the first user prompt, keeping the fixture on the safe side of the
 //   server's first-submit locator window); a bare Enter mints NOTHING (the
 //   zero-turn restore scenario stays robust).
+//   Submit delimiters mirror the ws association's byte discipline
+//   (crates/freshell-ws/src/antigravity_association.rs, whole-delta review
+//   round 3, Major 3): CR (Enter, 0x0D) is the ONLY submit delimiter; LF
+//   (Ctrl+J, 0x0A) inserts a newline INTO the accumulating prompt — the
+//   CLI's documented multiline form — so `line one`, Ctrl+J, `line two`,
+//   Enter submits ONE turn whose user_message text carries BOTH lines
+//   ("line one\nline two"), matching the ws capture's single full
+//   multi-line flush. (Pre-fix this fake treated LF as a delimiter too and
+//   ran two turns against one captured submit, so multi-line prompts never
+//   bound — the round-3 review finding.)
 // - resume (`--conversation <id>` anywhere in argv — the server's adjacent
 //   resumeArgs pair): missing brain/<id>/ ⇒ non-zero exit with a greppable
 //   error; else `agy: resumed conversation <id>` and the existing transcript
@@ -410,14 +420,31 @@ if (conversationIdx !== -1) {
 }
 
 // Line-buffered stdin, serialized per line (multi-line chunks and split
-// writes both stay in order); empty lines are no-ops.
+// writes both stay in order); empty lines are no-ops. CR (0x0D) is the
+// ONLY submit delimiter — an LF stays embedded in the accumulating prompt
+// as a newline (Ctrl+J, the CLI's documented multiline form), so ONE
+// Enter on a multi-line prompt submits ONE line carrying the embedded
+// newline and `handleLine` writes ONE user record with the full text.
+//
+// RAW MODE (the load-bearing part): a real interactive CLI puts its tty in
+// raw mode, and the byte discipline above is only observable there —
+// under the PTY's default COOKED mode the line discipline's ICRNL
+// translates the Enter key's CR into LF before this process ever reads
+// it (and a bare Ctrl+J is already LF), so the two bytes would be
+// indistinguishable and the CR-only delimiter could never fire. (The
+// pre-round-3 fake's `/[\r\n]/` delimiter worked only BY ACCIDENT of
+// that translation: it submitted at the ICRNL-translated Enter.) The
+// fake therefore sets its stdin to raw mode when it owns a tty — the
+// e2e PTY always provides one — and falls back to passthrough when
+// driven through a pipe (no line discipline, bytes arrive verbatim).
 let carry = ''
 let queue = Promise.resolve()
+if (process.stdin.isTTY) process.stdin.setRawMode(true)
 process.stdin.setEncoding('utf8')
 process.stdin.on('data', (chunk) => {
   carry += String(chunk)
   let idx
-  while ((idx = carry.search(/[\r\n]/)) !== -1) {
+  while ((idx = carry.indexOf('\r')) !== -1) {
     const line = carry.slice(0, idx)
     carry = carry.slice(idx + 1)
     if (line.length > 0) queue = queue.then(() => handleLine(line))

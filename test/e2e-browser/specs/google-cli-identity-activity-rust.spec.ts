@@ -31,7 +31,7 @@ import type { Page } from '@playwright/test'
  * resolves through the server's own seam (the PTY child inherits the
  * isolated HOME, so both read `<isolated HOME>/.gemini/antigravity-cli`).
  *
- * The TEN binding scenarios, mapped onto six per-test owned servers (the
+ * The ELEVEN binding scenarios, mapped onto seven per-test owned servers (the
  * google-cli-launch / google-cli-history per-test model — each test needs
  * its own env overrides, its own isolated HOME, and its own fixture
  * child):
@@ -108,6 +108,18 @@ import type { Page } from '@playwright/test'
  *   the Tabs view's remote card resolves the session's SAVED name on this
  *   device (the canonical-cache overlay), never the record's stale
  *   captured `tabName`.
+ *
+ * TEST 7 — multiline identity (scenario 11, whole-delta review round 3,
+ *   Major 3): a pane types a two-line prompt via Ctrl+J (`line one`,
+ *   Ctrl+J, `line two`, Enter). The capture joins the Ctrl+J as inline
+ *   newline content and flushes ONE full multi-line submit at the Enter
+ *   (round 1), the fake CLI submits ONE turn whose user record carries
+ *   both lines (the round-3 fake fix — pre-fix the fake treated the LF as
+ *   a submit delimiter and ran two turns against one captured submit, so
+ *   nothing bound), and the scenario pins the bind + EXACT identity: one
+ *   association frame, the leaf sessionRef, one completion + one idle for
+ *   the one turn, and the history surface (the session-directory row)
+ *   showing the multi-line prompt bound to the pane.
  *
  * Cloud legality: deterministic fakes, generous polls (5-45 s, 120 s for
  * the naming materialization tail), no wall-clock-sensitive waits (the
@@ -411,6 +423,35 @@ function closeWs(ws: WebSocket | null): void {
  * resolves through the PTY child's inherited env. */
 function brainRootOf(info: { homeDir: string }): string {
   return path.join(info.homeDir, '.gemini', 'antigravity-cli', 'brain')
+}
+
+/** One `DirItem` row of the History read model (the serialized
+ * `SessionDirectoryItem` shape, session_directory.rs `DirItem::to_value` —
+ * the google-cli-history spec's copy). */
+interface DirectoryItem {
+  sessionId: string
+  provider: string
+  cwd?: string
+  title?: string
+  summary?: string
+  firstUserMessage?: string
+  matchedIn?: string
+  snippet?: string
+  isRunning?: boolean
+}
+
+/** `GET /api/session-directory?priority=visible&limit=50` — the History
+ * read model (the google-cli-history spec's fetch shape). */
+async function fetchDirectory(
+  info: { baseUrl: string; token: string },
+): Promise<DirectoryItem[]> {
+  const response = await fetch(
+    `${info.baseUrl}/api/session-directory?priority=visible&limit=50`,
+    { headers: { 'x-auth-token': info.token } },
+  )
+  expect(response.ok, `GET /api/session-directory: ${response.status}`).toBe(true)
+  const payload = await response.json() as { items?: DirectoryItem[] }
+  return payload?.items ?? []
 }
 
 /** The fixture bundle every test owns: a fake `agy` binary, its argv log,
@@ -1107,6 +1148,97 @@ test.describe('Google CLI identity + activity + attention + naming (Rust)', () =
           'association #3 (the /resume: rebind to the existing conversation)',
         )
         expect(associated3.previousSessionId, 'the resume rebind names the superseded identity').toBe(convTwo)
+      } finally {
+        capture.close()
+        await server.stop().catch(() => {})
+      }
+    } finally {
+      await fs.rm(fixture.sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  test('scenario 11: a two-line Ctrl+J prompt binds exact identity — one multi-line submit, one turn, and the history surface carries the multi-line prompt', async ({ page }) => {
+    const fixture = await makeFixture('freshell-google-cli-multiline-')
+    try {
+      const server = await startOwnedServer(fixture)
+      const info = await server.start()
+      const capture = new WsCapture(info.wsUrl, info.token)
+      try {
+        await capture.ready()
+        const harness = await bootAndConnect(page, info)
+        await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+        const tabId = await harness.getActiveTabId()
+        expect(tabId).toBeTruthy()
+
+        const leaf = await openAntigravityPaneAndGetLeaf(page, harness, tabId!, fixture.cwdDir)
+        const paneId: string = leaf.id
+        const terminalId: string = leaf.content.terminalId
+        await expect.poll(async () => (await leafBufferUnwrapped(harness, terminalId)).includes('agy> '), { timeout: 20_000 }).toBe(true)
+
+        // The two-line prompt: `line one`, Ctrl+J — the CLI's documented
+        // "insert a newline into the prompt" (the ws capture joins the LF
+        // as inline content and flushes ONE full multi-line submit at the
+        // Enter; whole-delta review rounds 1+3) — then `line two`, Enter.
+        // The fake must submit ONE turn carrying the full two-line text:
+        // pre-fix it treated the LF as a submit delimiter and ran TWO
+        // turns (`line one`, then `line two`), while the capture flushed
+        // ONE submit (`line one\nline two`) — the locator's exact-text
+        // match could never bind, and this wait times out.
+        const xterm = paneXterm(page, paneId)
+        await xterm.click()
+        await page.keyboard.type('line one')
+        await page.keyboard.press('Control+j')
+        await page.keyboard.type('line two')
+        await page.keyboard.press('Enter')
+
+        // ONE bind: the associated frame names the conversation the
+        // multi-line submit armed (the store write precedes it).
+        const associated = await capture.waitFor(
+          (f) => f.type === 'terminal.session.associated'
+            && f.terminalId === terminalId
+            && f.sessionRef?.provider === 'antigravity',
+          30_000,
+          'terminal.session.associated (the two-line Ctrl+J prompt binds)',
+        )
+        const boundId: string = associated.sessionRef.sessionId
+        expect(boundId).toMatch(UUID_RE)
+        await expect.poll(async () => {
+          const leafNow = await findLeafById(harness, tabId!, paneId)
+          return leafNow?.content?.sessionRef ?? null
+        }, { timeout: 20_000 }).toMatchObject({ provider: 'antigravity', sessionId: boundId })
+
+        // The turn completes EXACTLY ONCE (seq 1 + one idle) — one fake
+        // turn for the one Enter, the pane's first live-settled turn
+        // under the submit-anchored baseline.
+        await capture.waitFor(
+          (f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId && f.completionSeq === 1,
+          20_000,
+          'terminal.turn.complete #1 (the multi-line turn settles)',
+        )
+        await capture.waitFor(
+          (f) => f.type === 'terminal.idle' && f.terminalId === terminalId,
+          15_000,
+          'terminal.idle #1 (the multi-line turn)',
+        )
+        await settleWindow(page, 2_000)
+        expect(capture.count((f) => f.type === 'terminal.session.associated' && f.terminalId === terminalId),
+          'exactly one bind for the whole two-line prompt').toBe(1)
+        expect(capture.count((f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId),
+          'the multi-line turn rings exactly one completion').toBe(1)
+        expect(capture.count((f) => f.type === 'terminal.idle' && f.terminalId === terminalId),
+          'the multi-line turn rings exactly one idle').toBe(1)
+
+        // The resume/history surface shows the multi-line prompt bound to
+        // the pane: the session-directory row for the bound conversation
+        // carries the FULL two-line text as its first user message (the
+        // message fields populate on the watcher's re-parse — the
+        // google-cli-history poll shape; a poll settles when the data
+        // arrives, the budget is pure headroom).
+        await expect.poll(async () => {
+          const rows = await fetchDirectory(info)
+          const row = rows.find((r) => r.provider === 'antigravity' && r.sessionId === boundId)
+          return row?.firstUserMessage === 'line one\nline two' ? row.firstUserMessage : null
+        }, { timeout: 100_000, message: 'the directory row carries the multi-line prompt' }).toBe('line one\nline two')
       } finally {
         capture.close()
         await server.stop().catch(() => {})
