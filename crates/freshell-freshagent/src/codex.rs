@@ -9230,7 +9230,7 @@ impl FreshCodexState {
                     }
                     // DIAG-01: the positive turn-complete chime only -- session_id
                     // alone, never the turn's text/response content.
-                    if let CodexAdapterEvent::TurnComplete { session_id, at } = &event {
+                    if let CodexAdapterEvent::TurnComplete { session_id, at, .. } = &event {
                         state
                             .attention
                             .record_turn_complete(session_id, SESSION_TYPE, *at);

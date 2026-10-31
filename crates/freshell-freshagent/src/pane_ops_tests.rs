@@ -313,7 +313,7 @@ async fn split_agent_routes_to_durable_gateway_and_attaches_fresh_content() {
             );
             assert_eq!(created.cwd.as_deref(), Some("/workspace"));
             assert_eq!(created.model.as_deref(), Some("route-model"));
-            assert_eq!(created.effort.as_deref(), Some("high"));
+            assert_eq!(created.effort, Some(Some("high".into())));
             assert_eq!(created.plugins, Some(vec!["/workspace/plugin".into()]));
             assert_eq!(created.model_selection, Some(None));
             assert_eq!(created.permission_mode.as_deref(), Some("default"));
