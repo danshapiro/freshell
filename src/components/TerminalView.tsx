@@ -4311,16 +4311,29 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       // The reset write's completion is the exact wipe moment: bump the
       // surface epoch (ref + state mirror) so the level-triggered
       // dead-notice invariant re-fires — a wiped surface always gets its
-      // line re-issued at the next effect run (even when the
-      // reconstruction ticket is later abandoned, the reset bytes were
-      // already applied and the old line is gone; a dropped reset never
-      // completes and never bumps — no wipe, no re-issue).
+      // line re-issued at the next effect run. The wipe is a SURFACE fact,
+      // not attach state: the bytes were already submitted to xterm when
+      // the write went in flight, so they still flush when a
+      // disconnect/reconnect abandons this generation before the
+      // completion lands — alwaysComplete exempts this callback from the
+      // queue's stale-generation suppression (which exists to stop stale
+      // ATTACH payloads, not to hide surface wipes), so the epoch advances
+      // on every FLUSHED reset and never on a dropped one (a dropped reset
+      // never completes at all). The surface-identity gate (the notice
+      // write's round-5 rule, mirrored) keeps the epoch claim honest: only
+      // the surface whose queue received the bytes may record the wipe —
+      // a retired (recreated) surface's late completion must not stamp the
+      // NEW surface's epoch (its own birth bump already re-issued the
+      // line; a false bump here would force a duplicate re-issue onto a
+      // surface that already holds it).
       writeQueue.enqueue('\x18\x1bc\x1b[?25h', () => {
         ticket.succeeded = true
+        if (writeQueueRef.current !== writeQueue) return
         deadSessionNoticeSurfaceEpochRef.current += 1
         setDeadSessionNoticeSurfaceEpoch(deadSessionNoticeSurfaceEpochRef.current)
       }, {
         generation: ticket.generation, mode: 'replay', coalesce: false,
+        alwaysComplete: true,
       })
       writeQueue.enqueueTask(() => {
         if (

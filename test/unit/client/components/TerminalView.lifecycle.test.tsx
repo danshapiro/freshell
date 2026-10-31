@@ -17276,4 +17276,198 @@ describe('dead-session notice line (no-modal contract)', () => {
     expect(sentCreates()).toHaveLength(0)
     expect(leafContent(store).terminalId).toBe(TERMINAL_ID)
   })
+
+  it('a flushed reset whose generation was abandoned still advances the notice epoch — the re-folded mint buys a re-issued line, never a stale record (delta-loop remediation)', async () => {
+    // The reviewer's exact order (the IN-FLIGHT reset): the dead notice
+    // APPLIES (record current at its epoch); a later admitted round's
+    // mounted reconstruction SUBMITS its reset (bytes in flight to xterm,
+    // completion held); a DISCONNECT abandons that generation; the reset
+    // bytes still FLUSH (the surface is wiped) but the write queue
+    // suppresses the abandoned generation's completion callback — the
+    // surface-epoch increment that lives in it never runs, so the applied
+    // record still LOOKS current; a later dead verdict re-fold mints and
+    // the level check consumes the mint against the stale record WITHOUT
+    // writing; with the recovery bound exhausted no further
+    // reconstruction can repair the buffer — the pane stays open with no
+    // notice. The fix: the reset's completion bookkeeping is exempt from
+    // the stale-generation suppression (a surface fact, not attach
+    // state), so every FLUSHED reset advances the epoch and the invariant
+    // re-issues the line exactly once.
+    const { store } = await renderDeadSessionNoticePane(
+      {},
+      { reconcilePendingPanes: { [PANE_KEY]: Date.now() } },
+    )
+
+    // The dead verdict folds (latch + mint): the invariant issues the line
+    // (issue #1), the fold's own attach round reconstructs the dirty surface
+    // (its reset wipes #1; the wipe's epoch bump re-issues #2), and its wire
+    // attach goes out from the reconstruction's queued task. The at-apply
+    // record is current on the post-reset surface — "dead notice applied".
+    foldDeadVerdict(store)
+    await waitFor(() => {
+      expect(sentAttaches().length).toBe(2)
+    })
+    expect(noticeWriteCount()).toBe(2)
+    expect(modeledFinalBuffer().split(NOTICE_LINE).length - 1).toBe(1)
+
+    // Honest-async test mode + a held queue flush: the next admitted round's
+    // reset will be SUBMITTED (bytes in flight) with its completion held.
+    const liveTerm = term()
+    liveTerm.deferWrites = true
+    const pump = captureWriteFrames()
+
+    // Flap 1 -> round B (attempt 2): admitted, reconstructs, and its
+    // reset+task stay QUEUED (the flush is held).
+    act(() => { reconnectHandler!() })
+    expect(sentAttaches().length).toBe(2)
+
+    // Flap 2 -> round C (attempt 3): admitted, supersedes B (round C's
+    // takeover drops B's queued reset+task), and its own reset is
+    // SUBMITTED to xterm — in flight, completion held.
+    act(() => { reconnectHandler!() })
+    expect(sentAttaches().length).toBe(2)
+    act(() => { pump() })
+    expect(reconstructionWrites(liveTerm).length).toBe(2) // round A's applied + round C's submitted
+    expect(liveTerm.pendingWriteCallbacks.length).toBe(1)
+
+    // THE DISCONNECT abandons round C's generation: the eligibility layout
+    // effect marks the ticket abandoned and moves the queue's active
+    // generation, which also drops round C's queued task (its wire attach
+    // never goes out).
+    act(() => {
+      store.dispatch(setConnectionStatus('disconnected'))
+    })
+
+    // The in-flight reset's bytes FLUSH — the surface was wiped — and its
+    // completion lands on the abandoned generation.
+    act(() => { liveTerm.releasePendingWrites() })
+
+    // A LATER dead verdict re-fold mints. Pre-fix: the epoch never advanced
+    // at the wipe, the record still matches it, and the level check CONSUMES
+    // the mint against the stale record without writing.
+    foldDeadVerdict(store)
+    await act(async () => {})
+    expect(leafContent(store).reconcileNotice).toBeUndefined()
+
+    // The recovery bound is exhausted (the mount attach was the free initial
+    // hydration; rounds A/B/C were attempts 1-3): the next transport flap's
+    // attach is REFUSED before sending — no further reconstruction can
+    // repair the buffer, and the visible retry state owns the pane's
+    // recovery.
+    act(() => { reconnectHandler!() })
+    await waitFor(() => {
+      expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
+    })
+    expect(sentAttaches().length).toBe(2)
+
+    // Flush anything the fix queued (the post-wipe re-issue) and settle
+    // every held completion.
+    act(() => { pump() })
+    act(() => { liveTerm.releasePendingWrites() })
+    await act(async () => {})
+
+    // FINAL SURVIVING BUFFER STATE: the wiped surface got its line back —
+    // exactly one, never zero (the suppressed completion loses the pane's
+    // only requested explanation) and never two (the at-apply record per
+    // epoch is the loop guard).
+    const buffer = modeledFinalBuffer()
+    expect(buffer.split(NOTICE_LINE).length - 1).toBe(1)
+    // Exactly-once accounting: issue #1 (the fold), re-issue #2 (round A's
+    // wipe), re-issue #3 (round C's flushed-but-abandoned wipe).
+    expect(noticeWriteCount()).toBe(3)
+    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    expect(sentCreates()).toHaveLength(0)
+    expect(leafContent(store).terminalId).toBe(TERMINAL_ID)
+  })
+
+  it('retired-surface reset completion: a late flushed reset from the OLD surface never stamps the NEW surface’s notice epoch — no duplicate re-issue', async () => {
+    // The always-complete exemption is a SURFACE fact gated on surface
+    // identity (the notice write's round-5 rule, mirrored for the reset): a
+    // reset SUBMITTED to the old xterm can COMPLETE after a renderer
+    // recreation — those bytes wiped the RETIRED surface only, and the new
+    // surface already re-issued its own line at its birth bump. A late
+    // completion that stamped the new surface's epoch would force ONE MORE
+    // re-issue onto a surface that already holds the line — a duplicate.
+    const opencodeEntry = (preferredRenderer?: 'canvas'): ClientExtensionEntry => ({
+      name: 'opencode',
+      version: '1.0.0',
+      label: 'OpenCode',
+      description: 'OpenCode CLI',
+      category: 'cli',
+      cli: {
+        terminalBehavior: {
+          ...(preferredRenderer ? { preferredRenderer } : {}),
+          scrollInputPolicy: 'native',
+        },
+      },
+    })
+    const { store } = await renderDeadSessionNoticePane(
+      {
+        mode: 'opencode',
+        sessionRef: { provider: 'opencode', sessionId: 'sess-opencode-dead' },
+      },
+      { reconcilePendingPanes: { [PANE_KEY]: Date.now() } },
+      [opencodeEntry('canvas')],
+    )
+
+    // The dead fold's round (attempt 1) writes and re-issues the line on
+    // surface A (the at-apply record is current at its epoch); its wire
+    // attach goes out from the reconstruction's queued task.
+    foldDeadVerdict(store)
+    await waitFor(() => {
+      expect(sentAttaches().length).toBe(2)
+    })
+    expect(noticeWriteCount()).toBe(2)
+    const firstTerm = term()
+
+    // Honest-async + held flush: the next admitted round's reconstruction
+    // SUBMITS its reset to surface A with the completion held.
+    firstTerm.deferWrites = true
+    const pump = captureWriteFrames()
+    act(() => { reconnectHandler!() }) // round B (attempt 2): reset queued
+    act(() => { pump() }) // the reset is SUBMITTED, completion held
+    expect(reconstructionWrites(firstTerm).length).toBe(2)
+    expect(firstTerm.pendingWriteCallbacks.length).toBe(1)
+
+    // Renderer preference change (canvas -> unset): surface B is born (the
+    // birth bump re-fires the invariant, which re-issues the recorded line
+    // onto B's fresh queue); surface A's queue is cleared and its terminal
+    // disposed — but the in-flight reset's completion is still held by the
+    // OLD surface.
+    act(() => {
+      store.dispatch(setRegistry([opencodeEntry(undefined)]))
+    })
+    await waitFor(() => {
+      expect(terminalInstances).toHaveLength(2)
+    })
+    const recreatedTerm = terminalInstances[terminalInstances.length - 1]
+    expect(recreatedTerm).not.toBe(firstTerm)
+
+    // Surface B's own line applies (its fresh term completes synchronously).
+    act(() => { pump() })
+    await waitFor(() => {
+      expect(terminalWriteStrings(recreatedTerm).filter((data) => data === FRAMED_NOTICE)).toHaveLength(1)
+    })
+
+    // THE MIRROR ORDER (round 5's, for the reset): the OLD surface's held
+    // reset completion arrives NOW — after the recreation, while B already
+    // holds its line. Its bytes wiped the retired surface only.
+    act(() => { firstTerm.releasePendingWrites() })
+    act(() => { pump() })
+    await act(async () => {})
+
+    // FINAL SURVIVING BUFFER STATE on the NEW surface: exactly one line —
+    // the late retired-surface completion must not stamp B's epoch (a false
+    // bump would re-issue a SECOND line onto a surface that already holds
+    // one).
+    const buffer = modeledFinalBuffer(recreatedTerm)
+    expect(buffer.split(NOTICE_LINE).length - 1).toBe(1)
+    expect(terminalWriteStrings(recreatedTerm).filter((data) => data === FRAMED_NOTICE)).toHaveLength(1)
+    // The retired surface's buffer was wiped by its own reset; nothing wrote
+    // to it again after the recreation.
+    expect(modeledFinalBuffer(firstTerm).split(NOTICE_LINE).length - 1).toBe(0)
+    expect(terminalWriteStrings(firstTerm).filter((data) => data === FRAMED_NOTICE)).toHaveLength(2)
+    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    expect(sentCreates()).toHaveLength(0)
+  })
 })

@@ -730,3 +730,110 @@ describe('onDrain (paced-replay credit flush tick)', () => {
     expect(observed).toEqual(['attach-one', 'attach-two'])
   })
 })
+
+describe('alwaysComplete (surface-mutation completion exemption)', () => {
+  it("runs an alwaysComplete write's callbacks even when its generation went stale before completion — onItemApplied stays suppressed", () => {
+    // Delta-loop remediation (the in-flight reset): bytes already
+    // SUBMITTED to the surface apply even when a takeover abandons the
+    // generation before the completion lands — the item's own callbacks
+    // record that SURFACE fact and must run; the generation-scoped
+    // onItemApplied hook (attach-scoped one-shot markers) stays
+    // suppressed for the stale generation, and the mutation ledger
+    // (onWriteCompleted) already counts every completion.
+    const callbacks: string[] = []
+    const applied: string[] = []
+    const completed: string[] = []
+    const rafCallbacks: FrameRequestCallback[] = []
+    let pendingWritten: (() => void) | undefined
+    const queue = createTerminalWriteQueue({
+      terminalInstanceId: 'surface-always-complete-stale',
+      write: (_chunk, onWritten) => {
+        pendingWritten = onWritten
+      },
+      onItemApplied: (item) => applied.push(`${item.mode}:${item.generation}`),
+      onWriteCompleted: (item) => completed.push(`${item.mode}:${item.generation}`),
+      requestFrame: (cb) => {
+        rafCallbacks.push(cb)
+        return rafCallbacks.length
+      },
+      cancelFrame: () => {},
+    })
+
+    queue.setActiveGeneration('gen-1')
+    queue.enqueue('\x18\x1bc\x1b[?25h', () => callbacks.push('reset'), {
+      mode: 'replay', generation: 'gen-1', coalesce: false, alwaysComplete: true,
+    })
+    rafCallbacks.shift()?.(0) // the reset is SUBMITTED, completion held
+    expect(queue.hasInFlightWrites()).toBe(true)
+
+    // A disconnect abandons the generation before the bytes' completion.
+    queue.setActiveGeneration('gen-1:abandoned', { dropQueuedStaleWrites: true })
+    pendingWritten?.() // the bytes flushed; the completion lands stale
+
+    expect(callbacks).toEqual(['reset'])
+    expect(applied).toEqual([])
+    expect(completed).toEqual(['replay:gen-1'])
+    expect(queue.hasInFlightWrites()).toBe(false)
+  })
+
+  it('still drops a QUEUED alwaysComplete write at a generation takeover — the exemption never resurrects drops', () => {
+    // The exemption licenses only a completion for bytes that actually
+    // reached the surface: a queued item removed by a takeover never
+    // applies, so its callbacks never run either.
+    const writes: string[] = []
+    const callbacks: string[] = []
+    const rafCallbacks: FrameRequestCallback[] = []
+    const queue = createTerminalWriteQueue({
+      terminalInstanceId: 'surface-always-complete-dropped',
+      write: (chunk, onWritten) => {
+        writes.push(chunk)
+        onWritten?.()
+      },
+      requestFrame: (cb) => {
+        rafCallbacks.push(cb)
+        return rafCallbacks.length
+      },
+      cancelFrame: () => {},
+    })
+
+    queue.setActiveGeneration('gen-1')
+    queue.enqueue('reset', () => callbacks.push('reset'), {
+      mode: 'replay', generation: 'gen-1', coalesce: false, alwaysComplete: true,
+    })
+    queue.setActiveGeneration('gen-2', { dropQueuedStaleWrites: true })
+    while (rafCallbacks.length) rafCallbacks.shift()!(0)
+
+    expect(writes).toEqual([])
+    expect(callbacks).toEqual([])
+  })
+
+  it('never coalesces an alwaysComplete write — its completion is a hard boundary', () => {
+    // An alwaysComplete item's callbacks are surface-fact bookkeeping tied
+    // to THIS item's bytes; merging them into a neighbor would let them
+    // ride (or be dropped with) a different item's completion.
+    const writes: string[] = []
+    const callbacks: string[] = []
+    const rafCallbacks: FrameRequestCallback[] = []
+    const queue = createTerminalWriteQueue({
+      terminalInstanceId: 'surface-always-complete-boundary',
+      write: (chunk, onWritten) => {
+        writes.push(chunk)
+        onWritten?.()
+      },
+      requestFrame: (cb) => {
+        rafCallbacks.push(cb)
+        return rafCallbacks.length
+      },
+      cancelFrame: () => {},
+    })
+
+    queue.enqueue('A', () => callbacks.push('A'), { mode: 'live' })
+    queue.enqueue('\x18\x1bc', () => callbacks.push('reset'), { mode: 'live', alwaysComplete: true })
+    queue.enqueue('B', () => callbacks.push('B'), { mode: 'live' })
+
+    rafCallbacks.shift()?.(16)
+
+    expect(writes).toEqual(['A', '\x18\x1bc', 'B'])
+    expect(callbacks).toEqual(['A', 'reset', 'B'])
+  })
+})
