@@ -322,6 +322,14 @@ struct AntigravityLane {
     tailer: AntigravityTranscriptTailer,
     session_id: String,
     transcript_path: PathBuf,
+    /// Whole-delta review Major 1: the FIRST drain after attach classifies
+    /// its records as the tracker's BASELINE (history seeds the dedupe
+    /// watermark + busy state without effects); every later drain streams
+    /// live. Cleared by the first `Ok` drain — the attach worker's initial
+    /// drain runs to the attach-time file size, so exactly the on-disk
+    /// records baseline and everything appended after streams live (the
+    /// hub task's FIFO order guarantees no live drain can precede it).
+    baseline_pending: bool,
     /// Keeps the inotify watcher alive for the lane's lifetime.
     _watcher: notify::RecommendedWatcher,
 }
@@ -730,17 +738,15 @@ impl ActivityHub {
     /// Antigravity plan Task 8: bind the pane's transcript lane to its
     /// located conversation (the Task 6 association's adopt/rebind/continue
     /// tails are the producers; hub-level tests inject directly). The
-    /// requested attach point is `Start` — the worker applies the SAME
-    /// `effective_attach_at` catch-up cap as the amplifier lane: a YOUNG
-    /// conversation (adoption — the CLI minted it at this pane's submit)
-    /// replays from byte 0, which is exactly the `user_message` that
-    /// confirms the provisional busy; an OVER-CAP file (a rebind/continue
-    /// of an older conversation) attaches at Eof and the worker
-    /// confirms busy directly (the locator's recency rule guarantees the
-    /// pane's own prompt is the transcript's LATEST user record — foreign
-    /// history is never replayed). Channel-deferred (mirror of
-    /// `attach_codex_rollout`): the tailer attach (file I/O), watcher
-    /// registration, and ALL frame emission run on the single hub task.
+    /// worker attaches at `Start` for EVERY transcript size and the
+    /// first drain classifies the existing records as the tracker's
+    /// BASELINE (whole-delta review Major 1): historical settles never
+    /// ring, an in-flight turn seeds confirmed busy, a settle written
+    /// during the locator's window resolves the pane to idle without
+    /// ringing, and only records appended after attach stream live.
+    /// Channel-deferred (mirror of `attach_codex_rollout`): the tailer
+    /// attach (file I/O), watcher registration, and ALL frame emission
+    /// run on the single hub task.
     pub fn attach_antigravity_association(
         &self,
         terminal_id: &str,
@@ -884,14 +890,14 @@ impl ActivityHub {
 
     /// Antigravity plan Task 8: hub-task worker for
     /// `HubEvent::AntigravityAttach` — bind identity (idempotent), attach
-    /// the transcript tailer (requested `Start` under the SAME
-    /// `effective_attach_at` catch-up cap as the amplifier lane: a young
-    /// conversation replays — its history is the pane's own, minted at this
-    /// pane's submit; an over-cap file attaches at Eof and the worker
-    /// confirms busy directly, because the locator's recency rule
-    /// guarantees the pane's prompt is the transcript's LATEST user record
-    /// — foreign history is never replayed), watch it via inotify, and run
-    /// the initial drain.
+    /// the transcript tailer (ALWAYS at `Start` — whole-delta review
+    /// Major 1: the first drain classifies the whole existing file as the
+    /// tracker's BASELINE, so a young conversation and a months-old
+    /// resume take the same path — historical settles never ring, the
+    /// in-flight turn seeds busy, and a settle written during the
+    /// locator's window is covered by the scan instead of being skipped
+    /// by an over-cap Eof attach), watch it via inotify, and run the
+    /// initial (baseline) drain.
     fn attach_antigravity_lane(&self, terminal_id: &str, session_id: &str, transcript_path: &Path) {
         use notify::Watcher;
         // Deferred-attach guard (mirror of `attach_codex_lane`): an Exit
@@ -919,9 +925,7 @@ impl ActivityHub {
             }
         }
         let mut tailer = AntigravityTranscriptTailer::new(transcript_path);
-        let file_len = std::fs::metadata(transcript_path).ok().map(|m| m.len());
-        let attach_at = effective_attach_at(AttachAt::Start, file_len);
-        if let Err((reason, message)) = tailer.attach(attach_at) {
+        if let Err((reason, message)) = tailer.attach(AttachAt::Start) {
             // Attach failure = the lane's truth source is unreadable —
             // crash semantics (owner ruling: probe failure = crash; a
             // provisional busy reverts silently). A superseded lane must
@@ -1003,47 +1007,43 @@ impl ActivityHub {
         let frames = {
             let mut inner = self.inner.lock().expect("activity hub lock");
             let mut frames = Vec::new();
-            // Bind identity first so completions minted by the initial
-            // drain carry the conversation id.
+            // Bind identity first so completions minted after the attach
+            // carry the conversation id. (The busy state is NOT armed
+            // here — the initial drain's BASELINE seeds it from the
+            // transcript's own records: an in-flight turn arms confirmed
+            // busy, a settled transcript resolves the provisional busy.)
             let bind = inner
                 .antigravity_tracker
                 .bind_session(terminal_id, session_id);
             let (mut f, _) = antigravity_frames(&mut inner.idle, bind);
             frames.append(&mut f);
-            // Eof attach of a just-matched conversation: the pane's own
-            // prompt is the transcript's latest user record — a turn is in
-            // flight. Confirm busy without a public flap when already
-            // provisionally busy.
-            if attach_at == AttachAt::Eof {
-                let confirm = inner
-                    .antigravity_tracker
-                    .note_confirm_busy(terminal_id, now_ms());
-                let (mut f, _) = antigravity_frames(&mut inner.idle, confirm);
-                frames.append(&mut f);
-            }
             inner.antigravity_lanes.insert(
                 terminal_id.to_string(),
                 AntigravityLane {
                     tailer,
                     session_id: session_id.to_string(),
                     transcript_path: transcript_path.to_path_buf(),
+                    baseline_pending: true,
                     _watcher: watcher,
                 },
             );
             frames
         };
         self.emit(frames);
-        // Initial drain: at Start this replays the young file (the
-        // user_message that confirms the provisional busy — and a settle
-        // that already landed completes the pane's own turn exactly once);
-        // at Eof it is a cheap size==offset no-op that validates
-        // readability.
+        // Initial drain: the BASELINE pass over everything on disk at
+        // attach (whole-delta review Major 1) — historical records seed
+        // the dedupe watermark + busy state WITHOUT effects, so only
+        // records appended after this point stream as live events.
         self.drain_antigravity_lane(terminal_id);
     }
 
     /// Antigravity plan Task 8: incremental read + classify for one
     /// transcript lane. Called on inotify change events, deadman/grace
-    /// force-reads, and once at attach. A degrade drops the lane and
+    /// force-reads, and once at attach. The FIRST drain after attach (the
+    /// lane's `baseline_pending` flag) classifies its records as the
+    /// tracker's BASELINE (whole-delta review Major 1: history seeds the
+    /// dedupe watermark + busy state without effects — old settles never
+    /// ring); every later drain streams live. A degrade drops the lane and
     /// applies crash semantics (the tracker's `note_verify_failed`: a
     /// CONFIRMED busy clears and rings the attention boundary; a
     /// provisional busy reverts silently) — the pane's next submit
@@ -1061,26 +1061,43 @@ impl ActivityHub {
                     bytes_consumed,
                     ..
                 } => {
-                    if records.is_empty() && bytes_consumed == 0 {
-                        return;
+                    if lane.baseline_pending {
+                        // The attach-time baseline: everything on disk at
+                        // attach, classified WITHOUT live effects. The
+                        // flag clears in the same lock scope — the read
+                        // consumed exactly the attach-time file size, so
+                        // any later drain (inotify-driven, FIFO-ordered
+                        // behind this one on the hub task) is live.
+                        lane.baseline_pending = false;
+                        let effects = inner.antigravity_tracker.note_attach_baseline(
+                            terminal_id,
+                            &records,
+                            now_ms(),
+                        );
+                        let (frames, _) = antigravity_frames(&mut inner.idle, effects);
+                        frames
+                    } else {
+                        if records.is_empty() && bytes_consumed == 0 {
+                            return;
+                        }
+                        let mut frames = Vec::new();
+                        if bytes_consumed > 0 {
+                            // File activity: the conversation is still doing
+                            // something — extend any pending truly-idle window
+                            // (the amplifier lane's rule).
+                            inner.idle.note_activity(terminal_id, now_ms());
+                        }
+                        let now = now_ms();
+                        for record in records {
+                            let effects =
+                                inner
+                                    .antigravity_tracker
+                                    .note_record(terminal_id, &record, now);
+                            let (mut f, _) = antigravity_frames(&mut inner.idle, effects);
+                            frames.append(&mut f);
+                        }
+                        frames
                     }
-                    let mut frames = Vec::new();
-                    if bytes_consumed > 0 {
-                        // File activity: the conversation is still doing
-                        // something — extend any pending truly-idle window
-                        // (the amplifier lane's rule).
-                        inner.idle.note_activity(terminal_id, now_ms());
-                    }
-                    let now = now_ms();
-                    for record in records {
-                        let effects =
-                            inner
-                                .antigravity_tracker
-                                .note_record(terminal_id, &record, now);
-                        let (mut f, _) = antigravity_frames(&mut inner.idle, effects);
-                        frames.append(&mut f);
-                    }
-                    frames
                 }
                 AntigravityTailerReadOutcome::Degraded { reason, message } => {
                     tracing::warn!(
@@ -3910,6 +3927,326 @@ mod tests {
         assert_eq!(records[0].phase, freshell_protocol::AntigravityPhase::Idle);
         assert_eq!(completions.len(), 1);
         assert_eq!(completions[0].completion_seq, 1);
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Whole-delta review Major 1: attaching a lane to a transcript that
+    /// already carries HISTORY (exact resume, rebind, restart-restore)
+    /// must seed the tracker from a BASELINE, never replay history as
+    /// live attention. The pre-fix Start-attach fed every historical
+    /// `user_message`/`turn_settled` record to a FRESH per-terminal
+    /// tracker: each old settle minted a phantom `terminal.turn.complete`
+    /// — old turns ringing as live attention after resume/rebind. The
+    /// baseline seeds the per-settle dedupe watermark and the busy state
+    /// from disk WITHOUT effects; records appended after attach stream
+    /// live exactly as before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn antigravity_attach_baseline_never_replays_history_as_live_attention() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        let t0 = now_ms();
+        let line = |kind: &str, extra: &str, at: i64| {
+            format!("{{\"type\":\"{kind}\",\"conversationId\":\"conv-1\",\"at\":{at}{extra}}}\n")
+        };
+        // Two settled historical turns, then the pane's own prompt as the
+        // LATEST record: a turn is in flight.
+        std::fs::write(
+            &transcript,
+            [
+                line("session_start", "", t0 - 120_000),
+                line(
+                    "user_message",
+                    ",\"text\":\"historical prompt one\"",
+                    t0 - 60_000,
+                ),
+                line(
+                    "turn_settled",
+                    ",\"outcome\":\"completed\",\"fullyIdle\":true",
+                    t0 - 59_000,
+                ),
+                line(
+                    "user_message",
+                    ",\"text\":\"historical prompt two\"",
+                    t0 - 30_000,
+                ),
+                line(
+                    "turn_settled",
+                    ",\"outcome\":\"completed\",\"fullyIdle\":true",
+                    t0 - 29_000,
+                ),
+                line(
+                    "user_message",
+                    ",\"text\":\"baseline in-flight prompt\"",
+                    t0,
+                ),
+            ]
+            .concat(),
+        )
+        .unwrap();
+
+        let (hub, mut rx) = hub();
+        let home = unique_temp_dir("agy-baseline-history");
+        hub.set_antigravity_association(Arc::new(
+            crate::antigravity_association::AntigravityAssociation::new(home.clone()),
+        ));
+
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "antigravity".into(),
+                resume_session_id: None,
+                at: now_ms(),
+            },
+        );
+        // The pane's own submit (the prompt that minted this conversation):
+        // provisional busy, as in production.
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t1".into(),
+                data: "baseline in-flight prompt\r".into(),
+                at: now_ms(),
+            },
+        );
+        next_frame_matching(&mut rx, "antigravity.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "busy" && v["upsert"][0]["terminalId"] == "t1"
+        })
+        .await
+        .expect("the flushed submit arms provisional busy");
+
+        // Attach to the EXISTING conversation (the resume/rebind shape:
+        // history + the pane's in-flight prompt on disk).
+        hub.attach_antigravity_association("t1", "conv-1", &transcript);
+        next_frame_matching(&mut rx, "antigravity.activity.updated", 3_000, |v| {
+            v["upsert"][0]["sessionId"] == "conv-1"
+        })
+        .await
+        .expect("bind upsert");
+        wait_for_antigravity_drain(&hub, "t1").await;
+
+        // NO historical completion and NO attention: the two settles on
+        // disk are BASELINE — old turns must never ring as live ones.
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.turn.complete", 2_500)
+                .await
+                .is_none(),
+            "historical settles must never replay as live turn completions"
+        );
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 2_500)
+                .await
+                .is_none(),
+            "the attach baseline must not arm the attention gate"
+        );
+
+        // Busy is SEEDED from the in-flight state: the transcript's
+        // latest record is the pane's own prompt — the current turn is
+        // recognized as busy (not idle, not completed).
+        {
+            let (records, completions) = hub.antigravity_list();
+            assert_eq!(records.len(), 1);
+            assert_eq!(
+                records[0].phase,
+                freshell_protocol::AntigravityPhase::Busy,
+                "the in-flight turn arms busy from the baseline"
+            );
+            assert!(
+                completions.is_empty(),
+                "no completion may be minted for historical turns"
+            );
+        }
+
+        // Records appended AFTER attach stream live exactly as before:
+        // the in-flight turn's settle completes EXACTLY once, with seq 1
+        // (the historical settles consumed none of the sequence).
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        f.write_all(
+            line(
+                "turn_settled",
+                ",\"outcome\":\"completed\",\"fullyIdle\":true",
+                now_ms(),
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        drop(f);
+        let complete = next_frame_of_type(&mut rx, "terminal.turn.complete", 5_000)
+            .await
+            .expect("the in-flight turn's settle completes once");
+        assert_eq!(complete["terminalId"], "t1");
+        assert_eq!(complete["sessionId"], "conv-1");
+        assert_eq!(complete["completionSeq"], 1);
+        let idle = next_frame_of_type(&mut rx, "terminal.idle", 5_000)
+            .await
+            .expect("terminal.idle after the live settle");
+        assert_eq!(idle["terminalId"], "t1");
+        assert_eq!(idle["reason"], "grace");
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 1_500)
+                .await
+                .is_none(),
+            "exactly one terminal.idle"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Whole-delta review Major 1, second half: the pane's own turn can
+    /// SETTLE while the locator's 2 s window is still running (the CLI
+    /// writes the user record and the settle right after the prompt). A
+    /// settle already on disk at attach is BASELINE by definition — it
+    /// must not ring, the pane resolves to idle, and the FOLLOW-UP turn
+    /// completes exactly once. (This also covers the >4 MiB EOF-attach
+    /// shape the review flagged: the baseline scan reads the whole file,
+    /// so a settle written before attach is never skipped.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn antigravity_attach_baseline_covers_a_settle_landed_before_attach() {
+        let (hub, mut rx) = hub();
+        let home = unique_temp_dir("agy-baseline-delayed-settle");
+        hub.set_antigravity_association(Arc::new(
+            crate::antigravity_association::AntigravityAssociation::new(home.clone()),
+        ));
+
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "antigravity".into(),
+                resume_session_id: None,
+                at: now_ms(),
+            },
+        );
+        let t0 = now_ms();
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t1".into(),
+                data: "delayed settle prompt\r".into(),
+                at: t0,
+            },
+        );
+        next_frame_matching(&mut rx, "antigravity.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "busy" && v["upsert"][0]["terminalId"] == "t1"
+        })
+        .await
+        .expect("the flushed submit arms provisional busy");
+
+        // The CLI writes the user record AND the settle immediately —
+        // both land on disk DURING the locator's 2 s window, before the
+        // sweep ever attaches the lane.
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        let line = |kind: &str, extra: &str, at: i64| {
+            format!("{{\"type\":\"{kind}\",\"conversationId\":\"conv-1\",\"at\":{at}{extra}}}\n")
+        };
+        std::fs::write(
+            &transcript,
+            [
+                line("session_start", "", t0 - 1_000),
+                line(
+                    "user_message",
+                    ",\"text\":\"delayed settle prompt\"",
+                    t0 + 10,
+                ),
+                line(
+                    "turn_settled",
+                    ",\"outcome\":\"completed\",\"fullyIdle\":true",
+                    t0 + 50,
+                ),
+            ]
+            .concat(),
+        )
+        .unwrap();
+
+        hub.attach_antigravity_association("t1", "conv-1", &transcript);
+        next_frame_matching(&mut rx, "antigravity.activity.updated", 3_000, |v| {
+            v["upsert"][0]["sessionId"] == "conv-1"
+        })
+        .await
+        .expect("bind upsert");
+        wait_for_antigravity_drain(&hub, "t1").await;
+
+        // The settle that landed during the window is BASELINE: no
+        // completion, no attention ring, no gate arm.
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.turn.complete", 2_500)
+                .await
+                .is_none(),
+            "a settle already on disk at attach must not ring"
+        );
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 2_500)
+                .await
+                .is_none(),
+            "the baseline settle must not arm the attention gate"
+        );
+        // The provisional busy resolved to the transcript's truth: IDLE.
+        {
+            let (records, completions) = hub.antigravity_list();
+            assert_eq!(records.len(), 1);
+            assert_eq!(
+                records[0].phase,
+                freshell_protocol::AntigravityPhase::Idle,
+                "the pane resolved to the transcript's settled truth"
+            );
+            assert!(completions.is_empty());
+        }
+
+        // The FOLLOW-UP turn completes exactly once.
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t1".into(),
+                data: "follow up prompt\r".into(),
+                at: now_ms(),
+            },
+        );
+        next_frame_matching(&mut rx, "antigravity.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "busy" && v["upsert"][0]["terminalId"] == "t1"
+        })
+        .await
+        .expect("the follow-up submit arms busy");
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        f.write_all(
+            [
+                line("user_message", ",\"text\":\"follow up prompt\"", now_ms()),
+                line(
+                    "turn_settled",
+                    ",\"outcome\":\"completed\",\"fullyIdle\":true",
+                    now_ms(),
+                ),
+            ]
+            .concat()
+            .as_bytes(),
+        )
+        .unwrap();
+        drop(f);
+        let complete = next_frame_of_type(&mut rx, "terminal.turn.complete", 5_000)
+            .await
+            .expect("the follow-up turn completes exactly once");
+        assert_eq!(complete["terminalId"], "t1");
+        assert_eq!(complete["completionSeq"], 1);
+        assert!(
+            next_frame_matching(&mut rx, "terminal.turn.complete", 1_500, |v| {
+                v["terminalId"] == "t1"
+            })
+            .await
+            .is_none(),
+            "never a duplicate completion for the follow-up turn"
+        );
+        let idle = next_frame_of_type(&mut rx, "terminal.idle", 5_000)
+            .await
+            .expect("terminal.idle after the follow-up settle");
+        assert_eq!(idle["terminalId"], "t1");
+        assert_eq!(idle["reason"], "grace");
 
         let _ = std::fs::remove_dir_all(&home);
     }

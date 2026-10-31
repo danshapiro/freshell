@@ -46,9 +46,13 @@ import type { Page } from '@playwright/test'
  *      `antigravity.activity.updated` busy upsert on the wire (the
  *      provisional-busy Enter capture), and the async window below holds
  *      the tab's blue chrome stably.
- *   3. Exactly ONE `terminal.turn.complete` + ONE
- *      `terminal.idle{reason:'grace'}` per settled turn: two plain turns
- *      mint completionSeq 1 then 2, one idle each, never a duplicate.
+ *   3. The attach BASELINE (whole-delta review Major 1): the bind turn's
+ *      settle lands on disk during the locator's 2 s window — it is
+ *      BASELINE and rings NOTHING (no completion, no terminal.idle, the
+ *      pane resolves to idle). Every LIVE-settled turn then rings exactly
+ *      ONE `terminal.turn.complete` + ONE `terminal.idle{reason:'grace'}`:
+ *      turn 2 mints completionSeq 1, the follow-up seq 2, one idle each,
+ *      never a duplicate.
  *   4. `/async:` settles WITHOUT full idle: NO completion arrives, the
  *      busy light PERSISTS (the tab stays blue), and the follow-up settle
  *      completes exactly once.
@@ -64,18 +68,19 @@ import type { Page } from '@playwright/test'
  *      report, not faked away). A later turn settles the pending one and
  *      completes once.
  *   7. The fake's `/dup:` verb replays a byte-faithful copy of the
- *      last completed settle (same `at`): no double completion, one bell
- *      — the per-settle `at` dedupe (fixed in this task's focused
- *      product-gap commit; before it, the dup's own Enter armed the
- *      provisional busy and the replay minted a phantom second
- *      completion + bell).
+ *      bind turn's BASELINE settle (same `at` — at/below the seeded
+ *      baseline watermark): no completion, no bell — the per-settle `at`
+ *      dedupe extended to pre-attach settles (whole-delta review
+ *      Major 1).
  *
  * TEST 3 — crash parity (scenario 8): `/explode:` mid-turn crash → the
  *   unified attention edge rings ONCE (exactly one death `terminal.idle`,
  *   one bell-pipeline event, the full emerald attention marks on the
  *   backgrounded tab) AND the pane auto-respawns with the ADJACENT
  *   `--conversation <bound id>` argv (Task 6's crash parity — both halves
- *   asserted).
+ *   asserted). The bind turn before the crash is baseline-silent (its
+ *   settle landed during the locator's window), so the crash's edge is
+ *   the flow's FIRST bell.
  *
  * TEST 4 — rebind (scenario 6): `/switch:` to a new conversation and
  *   `/resume:<id>` to an EXISTING one both rebind (sessionRef updates to
@@ -527,49 +532,48 @@ test.describe('Google CLI identity + activity + attention + naming (Rust)', () =
           'antigravity busy upsert',
         )
 
-        // ── Scenario 3: exactly one completion + one idle per settled turn.
-        // Turn 1 (the bind turn) settles: ONE completion (provider
-        // antigravity, the bound conversation, seq 1) + ONE
-        // terminal.idle{reason:'grace'}.
-        const complete1 = await capture.waitFor(
-          (f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId,
-          15_000,
-          'terminal.turn.complete #1',
-        )
-        expect(complete1.provider).toBe('antigravity')
-        expect(complete1.completionSeq).toBe(1)
-        expect(complete1.sessionId).toBe(boundId)
-        const idle1 = await capture.waitFor(
-          (f) => f.type === 'terminal.idle' && f.terminalId === terminalId,
-          15_000,
-          'terminal.idle #1',
-        )
-        expect(idle1.reason).toBe('grace')
+        // ── Scenario 3: the baseline contract + one completion per
+        // LIVE-settled turn. Turn 1 (the bind turn) settled while the
+        // locator's 2 s window was still open — its settle was ON DISK
+        // when the sweep attached the lane, so it is BASELINE
+        // (whole-delta review Major 1): it must NOT ring, and the pane
+        // resolves to idle without arming the attention gate.
+        await settleWindow(page, 3_000)
+        expect(capture.count((f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId),
+          'a settle already on disk at attach never rings (baseline)').toBe(0)
+        expect(capture.count((f) => f.type === 'terminal.idle' && f.terminalId === terminalId),
+          'the baseline resolve never arms the attention gate').toBe(0)
 
-        // Turn 2: a second plain turn mints seq 2, one more idle.
+        // Turn 2 (the lane is attached — its records stream LIVE): ONE
+        // completion (provider antigravity, the bound conversation,
+        // seq 1 — the baseline turn consumed none of the sequence) + ONE
+        // terminal.idle{reason:'grace'}.
         await submitLine(page, paneId, 'a second settled turn')
         const complete2 = await capture.waitFor(
-          (f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId && f.completionSeq === 2,
+          (f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId && f.completionSeq === 1,
           20_000,
-          'terminal.turn.complete #2 (seq 2)',
+          'terminal.turn.complete #1 (the first LIVE settled turn)',
         )
+        expect(complete2.provider).toBe('antigravity')
+        expect(complete2.completionSeq).toBe(1)
         expect(complete2.sessionId).toBe(boundId)
         const idleBaselineAfterTurn2 = lastIdleAtFor(capture, terminalId)
         await capture.waitFor(
           (f) => f.type === 'terminal.idle' && f.terminalId === terminalId && f.at > idleBaselineAfterTurn2,
           15_000,
-          'terminal.idle #2',
+          'terminal.idle #1',
         )
 
-        // Exactly TWO of each after both turns — never a duplicate.
+        // Exactly ONE of each so far — never a duplicate, and the
+        // baseline turn rang nothing.
         await settleWindow(page, 2_000)
-        expect(capture.count((f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId)).toBe(2)
-        expect(capture.count((f) => f.type === 'terminal.idle' && f.terminalId === terminalId)).toBe(2)
+        expect(capture.count((f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId)).toBe(1)
+        expect(capture.count((f) => f.type === 'terminal.idle' && f.terminalId === terminalId)).toBe(1)
 
         // ── Scenario 4: /async: settles WITHOUT full idle ────────────────
         // No completion for the async turn, busy PERSISTS (the blue chrome
         // holds — the stable busy window scenario 2's DOM side rides), and
-        // the follow-up settle completes exactly ONCE (seq 3).
+        // the follow-up settle completes exactly ONCE (seq 2).
         await submitLine(page, paneId, 'async: outstanding work remains')
         await capture.waitFor(
           (f) => f.type === 'antigravity.activity.updated'
@@ -583,28 +587,28 @@ test.describe('Google CLI identity + activity + attention + naming (Rust)', () =
         await expect(tabBlueIcons(page, tabId!)).not.toHaveCount(0, { timeout: 10_000 })
         await settleWindow(page, 4_000)
         expect(capture.count((f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId),
-          'the async settle (fullyIdle:false) never completes').toBe(2)
+          'the async settle (fullyIdle:false) never completes').toBe(1)
         expect(capture.count((f) => f.type === 'terminal.idle' && f.terminalId === terminalId),
-          'no terminal.idle while async work is outstanding').toBe(2)
+          'no terminal.idle while async work is outstanding').toBe(1)
         await expect(tabBlueIcons(page, tabId!), 'busy persists while the async work is outstanding').not.toHaveCount(0)
 
         // The follow-up settle completes once and clears the blue.
         await submitLine(page, paneId, 'the follow-up that settles')
         await capture.waitFor(
-          (f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId && f.completionSeq === 3,
+          (f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId && f.completionSeq === 2,
           20_000,
-          'terminal.turn.complete #3 (the follow-up settles)',
+          'terminal.turn.complete #2 (the follow-up settles)',
         )
         const idleBaselineAfterAsync = lastIdleAtFor(capture, terminalId)
         await capture.waitFor(
           (f) => f.type === 'terminal.idle' && f.terminalId === terminalId && f.at > idleBaselineAfterAsync,
           15_000,
-          'terminal.idle #3',
+          'terminal.idle #2',
         )
         await expect(tabBlueIcons(page, tabId!)).toHaveCount(0, { timeout: 10_000 })
         await settleWindow(page, 1_000)
-        expect(capture.count((f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId)).toBe(3)
-        expect(capture.count((f) => f.type === 'terminal.idle' && f.terminalId === terminalId)).toBe(3)
+        expect(capture.count((f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId)).toBe(2)
+        expect(capture.count((f) => f.type === 'terminal.idle' && f.terminalId === terminalId)).toBe(2)
       } finally {
         capture.close()
         await server.stop().catch(() => {})
@@ -632,20 +636,27 @@ test.describe('Google CLI identity + activity + attention + naming (Rust)', () =
         const terminalId: string = leaf.content.terminalId
         await expect.poll(async () => (await leafBufferUnwrapped(harness, terminalId)).includes('agy> '), { timeout: 20_000 }).toBe(true)
 
-        // The bind turn settles (completion #1 — the settle the /dup: verb
-        // will replay byte-faithfully below).
+        // The bind turn's settle lands on disk during the locator's 2 s
+        // window, so it is BASELINE (whole-delta review Major 1): it rings
+        // nothing — and its settle record is exactly what the /dup: verb
+        // will replay byte-faithfully below (the seeded baseline watermark
+        // must swallow that replay). The associated frame proves the sweep
+        // matched and attached the lane, so the absence windows below are
+        // not vacuous.
         await submitLine(page, paneId, 'remember: approval-dup-nonce')
-        const complete1 = await capture.waitFor(
-          (f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId,
-          20_000,
-          'terminal.turn.complete #1 (the bind turn)',
+        const associated = await capture.waitFor(
+          (f) => f.type === 'terminal.session.associated'
+            && f.terminalId === terminalId
+            && f.sessionRef?.provider === 'antigravity',
+          30_000,
+          'terminal.session.associated (the bind turn attaches the lane)',
         )
-        expect(complete1.completionSeq).toBe(1)
-        await capture.waitFor(
-          (f) => f.type === 'terminal.idle' && f.terminalId === terminalId,
-          15_000,
-          'terminal.idle #1',
-        )
+        const boundId: string = associated.sessionRef.sessionId
+        await settleWindow(page, 3_000)
+        expect(capture.count((f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId),
+          'the baseline bind turn rings no completion').toBe(0)
+        expect(capture.count((f) => f.type === 'terminal.idle' && f.terminalId === terminalId),
+          'the baseline bind turn rings no attention').toBe(0)
         await settleWindow(page, 1_500)
         const seqAfterBind = (await harness.getState()).turnCompletion?.seq ?? 0
         const completionsAfterBind = capture.count((f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId)
@@ -680,39 +691,42 @@ test.describe('Google CLI identity + activity + attention + naming (Rust)', () =
         // ── Scenario 7: the /dup: duplicate-settle replay ────────────────
         // The dup Enter is mid-turn typing against the CONFIRMED approval
         // busy (it re-arms nothing), and the byte-faithful copy of the
-        // ALREADY-COMPLETED settle (same `at`) is a replay: inert — no
-        // second completion, no second idle, no second bell.
+        // BASELINE settle (the bind turn's already-on-disk record, same
+        // `at` — at/below the seeded watermark) is a replay: inert — no
+        // completion, no idle, no bell.
         await submitLine(page, paneId, 'dup:')
         await expect.poll(async () => (await leafBufferUnwrapped(harness, terminalId)).includes('agy: duplicated settle'), { timeout: 15_000 }).toBe(true)
         await settleWindow(page, 5_000)
         expect(capture.count((f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId),
-          'the replayed settle never double-completes').toBe(completionsAfterBind)
+          'the replayed baseline settle never double-completes').toBe(completionsAfterBind)
         expect(capture.count((f) => f.type === 'terminal.idle' && f.terminalId === terminalId),
-          'the replayed settle never rings a second bell').toBe(idlesAfterBind)
+          'the replayed settle never rings a bell').toBe(idlesAfterBind)
         expect((await harness.getState()).turnCompletion?.seq ?? 0,
-          'one bell total so far — the dup minted no bell-pipeline event').toBe(seqAfterBind)
+          'the dup minted no bell-pipeline event').toBe(seqAfterBind)
         await expect(tabBlueIcons(page, tabId!), 'the running turn keeps the busy light through the replay').not.toHaveCount(0)
 
-        // A later turn settles the pending one: completes ONCE (seq 2),
-        // rings the SECOND bell of the flow, and clears the blue.
+        // A later turn settles the pending one (the lane is attached — the
+        // records stream LIVE): completes ONCE (seq 1), rings the FIRST
+        // bell of the flow, and clears the blue.
         await submitLine(page, paneId, 'answer the approval and finish')
         await capture.waitFor(
-          (f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId && f.completionSeq === 2,
+          (f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId && f.completionSeq === 1,
           20_000,
-          'terminal.turn.complete #2 (the pending turn settles)',
+          'terminal.turn.complete #1 (the pending turn settles)',
         )
         const idleBaselineAfterDup = lastIdleAtFor(capture, terminalId)
         await capture.waitFor(
           (f) => f.type === 'terminal.idle' && f.terminalId === terminalId && f.at > idleBaselineAfterDup,
           15_000,
-          'terminal.idle #2',
+          'terminal.idle #1',
         )
         await expect(tabBlueIcons(page, tabId!)).toHaveCount(0, { timeout: 10_000 })
         await settleWindow(page, 1_000)
         expect(capture.count((f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId)).toBe(completionsAfterBind + 1)
         expect(capture.count((f) => f.type === 'terminal.idle' && f.terminalId === terminalId)).toBe(idlesAfterBind + 1)
-        // Exactly TWO bell-pipeline events across the whole flow (the bind
-        // turn + the settled approval turn): the dup replay rang none.
+        // Exactly ONE bell-pipeline event across the whole flow (the
+        // settled approval turn — the baseline bind turn and the dup
+        // replay rang none).
         expect((await harness.getState()).turnCompletion?.seq ?? 0).toBe(seqAfterBind + 1)
       } finally {
         capture.close()
@@ -746,6 +760,10 @@ test.describe('Google CLI identity + activity + attention + naming (Rust)', () =
         await expect.poll(async () => (await leafBufferUnwrapped(harness, terminalId)).includes('agy> '), { timeout: 20_000 }).toBe(true)
 
         // Bind the pane (its identity is what the crash respawn must carry).
+        // The bind turn's settle lands on disk during the locator's 2 s
+        // window — BASELINE (whole-delta review Major 1): it rings nothing;
+        // the associated frame proves the sweep matched and attached the
+        // lane, so the crash's exactly-one edge below starts from zero.
         await submitLine(page, paneId, 'remember: crash-parity-nonce')
         const associated = await capture.waitFor(
           (f) => f.type === 'terminal.session.associated'
@@ -756,20 +774,14 @@ test.describe('Google CLI identity + activity + attention + naming (Rust)', () =
         )
         const boundId: string = associated.sessionRef.sessionId
         expect(boundId).toMatch(UUID_RE)
-        await capture.waitFor(
-          (f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId,
-          20_000,
-          'the bind turn completes',
-        )
-        await capture.waitFor(
-          (f) => f.type === 'terminal.idle' && f.terminalId === terminalId,
-          15_000,
-          'the bind turn goes truly idle',
-        )
-        await settleWindow(page, 1_000)
+        await settleWindow(page, 3_000)
+        expect(capture.count((f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId),
+          'the baseline bind turn rings no completion').toBe(0)
+        expect(capture.count((f) => f.type === 'terminal.idle' && f.terminalId === terminalId),
+          'the baseline bind turn rings no attention').toBe(0)
 
-        // Baselines: the bind turn minted its one completion + one idle +
-        // one bell. The crash must add EXACTLY one more of each.
+        // Baselines: all zero — the bind turn is baseline-silent. The
+        // crash must add EXACTLY one idle + one bell and NO completion.
         const completionsBefore = capture.count((f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId)
         const idlesBefore = capture.count((f) => f.type === 'terminal.idle' && f.terminalId === terminalId)
         const seqBefore = (await harness.getState()).turnCompletion?.seq ?? 0
