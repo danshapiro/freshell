@@ -19,13 +19,39 @@
 //!   captured submit payload (normalized, bounded comparison — the FULL
 //!   multi-line buffer a Ctrl+J prompt flushed at Enter, never just its
 //!   last line), and whose
-//! - MATCHING user record was written AT/AFTER that submit (recency is
-//!   proven by the matching record's OWN `at` — a later record of
-//!   another type, e.g. an assistant record still streaming after the
-//!   submit, never vouches for a user record written before it; a
-//!   transcript whose matching record predates the submit can never
+//! - MATCHING user record was written AT/AFTER that submit within a
+//!   bounded BACKWARD tolerance (recency is proven by the matching
+//!   record's OWN `at` — a later record of another type, e.g. an
+//!   assistant record still streaming after the submit, never vouches
+//!   for a user record written before it; a transcript whose matching
+//!   record predates the submit by more than the tolerance can never
 //!   match, which is what rejects re-typed old prompts and dead-launch
 //!   late writes alike; unprovable timestamps fail toward refusal).
+//!
+//!   // Stage-1 candidate contract (the backward tolerance,
+//!   // `ANTIGRAVITY_RECENCY_BACKWARD_TOLERANCE_MS` = 5 s — whole-delta
+//!   // review round 3, Major 1): the registry writes input to the PTY
+//!   // BEFORE timestamping the `ActivityEvent::Input` it feeds the
+//!   // association (registry.rs writes, then stamps `at`), so the CLI
+//!   // child — scheduled on another core — can process the prompt and
+//!   // append its `user_message` record between those two operations,
+//!   // with an `at` that legitimately PRECEDES our captured submit
+//!   // timestamp. The strict `at >= submit` rule rejected the pane's
+//!   // own conversation on every retry (the record can never get newer).
+//!   // The tolerance is sized for the CROSS-PROCESS/CROSS-CLOCK skew
+//!   // between the CLI's own timestamps and ours, not for the race
+//!   // alone (which is µs–ms of write→stamp latency):
+//!   //   - the same-host clock is shared, but the CLI's `at` granularity
+//!   //     is a Stage-1 UNKNOWN (A2): a second-granularity stamp can
+//!   //     predate the true write instant by up to ~1 s;
+//!   //   - NTP slew/step adjustments between the two stamping instants
+//!   //     add up to seconds in pathological cases;
+//!   //   - 5 s covers both with wide margin (~50× the observed race
+//!   //     scale) while staying 12× BELOW the 60 s pending-submit
+//!   //     lifetime, so "awaiting the first record" ends long before
+//!   //     the retry bound, and minutes/hours-old conversations remain
+//!   //     decisively rejected — the tolerance covers skew, never
+//!   //     history.
 //!
 //! Outcomes per tick per pane: exactly one matching candidate == current id
 //! ⇒ no-op (the ws association decides; the locator has no current-id
@@ -70,9 +96,10 @@
 //!   first Enter's window. With content matching, holding an older
 //!   captured line could only ever mismatch.
 //! - mtime PREFILTER (never authoritative): a transcript whose file mtime
-//!   is older than `submit_at - 2 s` cannot have a record written at/after
-//!   the submit, so its head/tail probe is skipped; an mtime error or a
-//!   coarse-grained clock falls through to the probe (conservative).
+//!   is older than `submit_at - ANTIGRAVITY_RECENCY_BACKWARD_TOLERANCE_MS`
+//!   cannot carry a record the recency rule would accept, so its
+//!   head/tail probe is skipped; an mtime error or a coarse-grained clock
+//!   falls through to the probe (conservative).
 //! - Bounded reads: the ownership record is read from a 64 KiB head window
 //!   (it is the first line in practice); the latest user record + newest
 //!   record timestamp are read from a 256 KiB tail window. Residual: a
@@ -118,6 +145,22 @@ pub const ANTIGRAVITY_WINDOW_MS: i64 = 2_000;
 /// the user re-submitting (the next Enter re-opens the window — the pane
 /// self-heals on its next prompt).
 pub const ANTIGRAVITY_PENDING_SUBMIT_LIFETIME_MS: i64 = 60_000;
+
+/// Bounded BACKWARD tolerance for the recency rule (whole-delta review
+/// round 3, Major 1): a matching user record whose own `at` is within this
+/// window BEFORE the captured submit timestamp still counts as
+/// at/after-that-submit. The registry writes input to the PTY BEFORE
+/// timestamping the `ActivityEvent::Input` (registry.rs:3890,3931), so the
+/// CLI child — on another core — can append its `user_message` record
+/// between the write and our stamp, with an `at` that precedes the submit.
+/// The bound covers cross-process/cross-clock skew (the CLI's own `at`
+/// granularity is a Stage-1 unknown; NTP slew adds seconds), NOT history:
+/// it is 12× below the 60 s pending lifetime, so minutes-old conversations
+/// stay rejected. Full rationale in the module header. The mtime prefilter
+/// uses the SAME constant — a prefilter tighter than the tolerance would
+/// veto matches the recency rule itself accepts (never authoritative in
+/// the wrong direction).
+pub const ANTIGRAVITY_RECENCY_BACKWARD_TOLERANCE_MS: i64 = 5_000;
 
 /// Bounded submit-text comparison cap (chars, on both the captured line
 /// and the record text) — prompts are bounded, never whole-paste dumps.
@@ -326,15 +369,22 @@ impl AntigravityLocator {
                     continue;
                 }
                 // Recency is proven by the MATCHING user record's own
-                // timestamp: a transcript whose matching record predates
-                // the submit can never match (re-typed old prompts,
+                // timestamp, with a bounded BACKWARD tolerance (round 3,
+                // Major 1): the registry writes the PTY bytes BEFORE
+                // stamping the Input event, so the CLI child can record
+                // the prompt between those operations — its `at` then
+                // precedes the captured submit by the write→stamp latency
+                // (plus CLI-stamp granularity and clock slew — the module
+                // header's tolerance rationale). A transcript whose
+                // matching record predates the submit by MORE than the
+                // tolerance still never matches (re-typed old prompts,
                 // dead-launch late writes), and a later record of another
                 // type (an assistant record still streaming after the
                 // submit) never vouches for it. Unprovable timestamps
                 // (the matching record's own `at` unparseable) fail
                 // toward refusal.
                 match summary.latest_user_at {
-                    Some(at) if at >= submit.at_ms => {}
+                    Some(at) if at >= submit.at_ms - ANTIGRAVITY_RECENCY_BACKWARD_TOLERANCE_MS => {}
                     _ => continue,
                 }
                 matches.push(AntigravityLocated {
@@ -419,7 +469,10 @@ impl AntigravityLocator {
 }
 
 /// mtime prefilter (never authoritative): a transcript not written since
-/// `submit_at - 2 s` cannot carry a record written at/after the submit.
+/// `submit_at - ANTIGRAVITY_RECENCY_BACKWARD_TOLERANCE_MS` cannot carry a
+/// record the recency rule would accept (the tolerance admits records
+/// stamped slightly BEFORE the submit — the round 3 race — so the prefilter
+/// must be at least as wide, or it would veto matches the rule accepts).
 /// An mtime error or a coarse clock falls through to the probe.
 fn mtime_could_be_recent(path: &Path, submit_at_ms: i64) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
@@ -432,7 +485,7 @@ fn mtime_could_be_recent(path: &Path, submit_at_ms: i64) -> bool {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    mtime_ms >= submit_at_ms - 2_000
+    mtime_ms >= submit_at_ms - ANTIGRAVITY_RECENCY_BACKWARD_TOLERANCE_MS
 }
 
 /// The facts a candidate transcript must present (all extracted with
@@ -670,11 +723,22 @@ mod tests {
         assert_eq!(located[0].conversation_id, "conv-multi");
         // Edge-trimming symmetry: leading/trailing newlines on either
         // side normalize away — a capture that picked up a stray edge
-        // newline binds the same record text (the record must postdate
-        // this second submit, per the recency rule).
-        write_transcript(&root, "conv-multi-edge", cwd, &[("line1\\nline2", T0 + 20)]);
-        assert!(locator.note_submit("t1", "\nline1\nline2\n", T0 + 10));
-        let located = locator.tick(T0 + 10 + ANTIGRAVITY_WINDOW_MS + 1);
+        // newline binds the same record text. The second match must be
+        // tolerance-legal while the FIRST conversation's identical text
+        // is NOT (its record predates the new submit by more than
+        // ANTIGRAVITY_RECENCY_BACKWARD_TOLERANCE_MS — under the round-3
+        // tolerance, two same-text records 10 ms apart would BOTH be
+        // legitimate candidates and the pane must refuse them as
+        // ambiguous, which the dedicated ambiguity test pins instead).
+        let second_submit = T0 + 20_000;
+        write_transcript(
+            &root,
+            "conv-multi-edge",
+            cwd,
+            &[("line1\\nline2", second_submit + 10)],
+        );
+        assert!(locator.note_submit("t1", "\nline1\nline2\n", second_submit));
+        let located = locator.tick(second_submit + ANTIGRAVITY_WINDOW_MS + 1);
         assert_eq!(
             located.len(),
             1,
@@ -1048,6 +1112,104 @@ mod tests {
         let located = locator.tick(submit_b + ANTIGRAVITY_WINDOW_MS + 2);
         assert_eq!(located.len(), 1, "the newest submit's window binds");
         assert_eq!(located[0].conversation_id, "conv-b");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Whole-delta review round 3, Major 1 — the flush-before-timestamp
+    /// race: the registry writes input to the PTY BEFORE timestamping the
+    /// `ActivityEvent::Input` (registry.rs writes, then stamps `at`), so
+    /// the CLI child — scheduled on another core — can process the prompt
+    /// and record its `user_message` between those two operations. The
+    /// transcript's matching record then carries an `at` that PRECEDES the
+    /// captured submit timestamp by the write→stamp latency, and the old
+    /// strict `at >= submit` rule rejected the pane's own conversation on
+    /// every retry. The backward tolerance accepts that race: a matching
+    /// record stamped within the tolerance BEFORE the submit binds.
+    #[test]
+    fn a_record_stamped_slightly_before_the_submit_binds_within_the_tolerance() {
+        let (locator, root) = locator_for("race-tolerance");
+        let cwd = "/tmp/agy-race-tolerance";
+        std::fs::create_dir_all(cwd).unwrap();
+        locator.arm("t1", cwd);
+        // The race shape: the child recorded the prompt 500 ms BEFORE the
+        // server's Input-event timestamp landed (the PTY write → child
+        // write → server stamp ordering the review described).
+        let submit_at = T0;
+        write_transcript(
+            &root,
+            "conv-raced",
+            cwd,
+            &[("race prompt", submit_at - 500)],
+        );
+        assert!(locator.note_submit("t1", "race prompt", submit_at));
+        let located = locator.tick(submit_at + ANTIGRAVITY_WINDOW_MS + 1);
+        assert_eq!(
+            located.len(),
+            1,
+            "a matching record stamped within the backward tolerance before \
+             the submit is the pane's own conversation: {located:?}"
+        );
+        assert_eq!(located[0].conversation_id, "conv-raced");
+        assert_eq!(located[0].submit_at_ms, submit_at);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The mtime prefilter must honor the FULL backward tolerance: a
+    /// transcript whose matching record landed inside the tolerance (but
+    /// before the prefilter's old 2 s cushion) has an mtime that predates
+    /// `submit - 2 s`, and a prefilter tighter than the tolerance would
+    /// veto a match the recency rule itself accepts.
+    #[test]
+    fn the_mtime_prefilter_honors_the_full_backward_tolerance() {
+        let (locator, root) = locator_for("race-prefilter");
+        let cwd = "/tmp/agy-race-prefilter";
+        std::fs::create_dir_all(cwd).unwrap();
+        locator.arm("t1", cwd);
+        let submit_at = T0;
+        // 3 s before the submit: inside the 5 s tolerance, OUTSIDE the old
+        // 2 s mtime cushion — only a prefilter widened to the tolerance
+        // lets this probe through.
+        write_transcript(
+            &root,
+            "conv-prefilter",
+            cwd,
+            &[("prefilter prompt", submit_at - 3_000)],
+        );
+        assert!(locator.note_submit("t1", "prefilter prompt", submit_at));
+        let located = locator.tick(submit_at + ANTIGRAVITY_WINDOW_MS + 1);
+        assert_eq!(
+            located.len(),
+            1,
+            "the prefilter never vetoes a match the tolerance accepts: {located:?}"
+        );
+        assert_eq!(located[0].conversation_id, "conv-prefilter");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The tolerance is BOUNDED: an old conversation (minutes old) whose
+    /// latest user record happens to equal the pane's re-typed prompt is
+    /// still rejected — the backward tolerance covers cross-process skew,
+    /// not history (the forward pin guarding the other direction).
+    #[test]
+    fn a_transcript_from_minutes_before_the_submit_still_never_binds() {
+        let (locator, root) = locator_for("race-old-still-rejected");
+        let cwd = "/tmp/agy-race-old";
+        std::fs::create_dir_all(cwd).unwrap();
+        locator.arm("t1", cwd);
+        // The old conversation: its matching record predates the submit by
+        // far more than the tolerance.
+        write_transcript(
+            &root,
+            "conv-old",
+            cwd,
+            &[("minutes old prompt", T0 - 300_000)],
+        );
+        assert!(locator.note_submit("t1", "minutes old prompt", T0));
+        let located = locator.tick(T0 + ANTIGRAVITY_WINDOW_MS + 1);
+        assert!(
+            located.is_empty(),
+            "a transcript from minutes before the submit is still rejected: {located:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
