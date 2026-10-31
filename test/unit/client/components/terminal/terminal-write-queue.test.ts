@@ -693,4 +693,40 @@ describe('onDrain (paced-replay credit flush tick)', () => {
     while (rafCallbacks.length) rafCallbacks.shift()!(0)
     expect(applied).toEqual([])
   })
+
+  it('fires onActiveGenerationChange on every takeover — never on same-value re-sets (the level-triggered notice signal)', () => {
+    // Level-triggered dead-notice invariant (focused review 3, round 4):
+    // the drop of a queued copy produces no store change and no render, so
+    // the queue must surface every generation CHANGE as a callback the
+    // TerminalView can mirror into state — an effect dep that re-fires the
+    // invariant exactly when a takeover could have invalidated a queued
+    // delivery. Same-value re-sets stay inert (a re-asserted regime changes
+    // nothing the invariant observes).
+    const rafCallbacks: FrameRequestCallback[] = []
+    const observed: Array<string | undefined> = []
+    const queue = createTerminalWriteQueue({
+      terminalInstanceId: 'surface-generation-change',
+      write: (_chunk, onWritten) => {
+        onWritten?.()
+      },
+      requestFrame: (cb) => {
+        rafCallbacks.push(cb)
+        return rafCallbacks.length
+      },
+      cancelFrame: () => {},
+      onActiveGenerationChange: (generation) => {
+        observed.push(generation)
+      },
+    })
+
+    queue.setActiveGeneration('attach-one', { dropQueuedStaleWrites: true })
+    queue.setActiveGeneration('attach-one', { dropQueuedStaleWrites: true })
+    expect(observed).toEqual(['attach-one'])
+
+    queue.setActiveGeneration('attach-two', { dropQueuedStaleWrites: true })
+    expect(observed).toEqual(['attach-one', 'attach-two'])
+
+    while (rafCallbacks.length) rafCallbacks.shift()!(0)
+    expect(observed).toEqual(['attach-one', 'attach-two'])
+  })
 })

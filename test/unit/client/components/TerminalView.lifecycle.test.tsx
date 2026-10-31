@@ -15887,21 +15887,17 @@ describe('replay phantom focus report silencing (kata 9gy8)', () => {
 // A terminal pane whose saved session was deleted explains itself with ONE
 // notice line written directly into its own stale xterm buffer — never a
 // modal. The fold mints a one-shot dead-copy reconcileNotice beside the
-// persisted restoreError latch; the write timing follows the
-// SETTLED-SURFACE rule — the line is written whenever the dead pane's
-// surface is settled (no attach attempt is in flight and none will be
-// auto-sent, so no reconstruction wipe can occur before the next user
-// action), whichever settle event comes last:
-// - no terminalId (reload shape): the effect writes (no attach can start);
-// - retained terminalId (live reconnect): the INVALID_TERMINAL_ID
-//   stand-down gate writes, AFTER the round's attach attempt (including
-//   any beginMountedReconstruction wipe) has settled and been rejected;
-// - attach machinery exhausted (delta review round 3, finding 1): the
-//   refused round leaves no rejection to write it — the effect is the
-//   fallback writer (the limiter state attachTerminal consults, read-only);
-// - surface recreated while the pane stays dead (round 3, finding 2): the
-//   epoch-keyed rewrite restores the consumed line onto the new buffer from
-//   the recorded identity + mint copy.
+// persisted restoreError latch. The write trigger is LEVEL-TRIGGERED
+// (focused review 3, round 4): the INVARIANT — whenever the pane is
+// dead-adjudicated and its CURRENT surface epoch has no APPLIED notice
+// record, the line is (re-)issued, queue-ordered, generation-adopting —
+// is continuously asserted by an effect keyed on every state that can
+// invalidate it (the latch, the mint, the surface epoch, the write
+// queue's active generation, the attach-limiter state, the renderer
+// preference, the provider-wait gate). The at-apply record per epoch is
+// the loop guard; the INVALID_TERMINAL_ID gate keeps a
+// belt-and-suspenders writer call at its natural settle moment. Every
+// test asserts FINAL SURVIVING BUFFER STATE wherever a wipe is in play.
 describe('dead-session notice line (no-modal contract)', () => {
   let messageHandler: ((msg: any) => void) | null = null
   let reconnectHandler: (() => void) | null = null
@@ -16228,7 +16224,15 @@ describe('dead-session notice line (no-modal contract)', () => {
     expect(leafContent(store).restoreError).toBeUndefined()
   })
 
-  it('retained-terminalId shape: the line is written at the stand-down gate AFTER the rejection settles — never before, never twice, never the raw copy', async () => {
+  it('retained-terminalId shape: the invariant writes the line at the fold and re-issues it after the round’s reconstruction wipe — exactly one line survives, never the raw copy', async () => {
+    // Level-triggered regime (focused review 3, round 4): the write trigger
+    // is the INVARIANT (dead latch + no at-apply record for the current
+    // surface epoch), not a settle-event enumeration — so the line is
+    // issued the moment the verdict folds, and every later wipe (the
+    // round's own reconstruction, which the notice itself dirties the
+    // surface into) re-issues it at its epoch bump. The exactly-once
+    // contract moves to the FINAL SURVIVING BUFFER: one line, never zero,
+    // never two, never the raw store copy.
     const { store } = await renderDeadSessionNoticePane(
       {},
       { reconcilePendingPanes: { [PANE_KEY]: Date.now() } },
@@ -16252,15 +16256,19 @@ describe('dead-session notice line (no-modal contract)', () => {
     expect(leafContent(store).createRequestId).toBe('req-dead-notice')
     expect(sentCreates()).toHaveLength(0)
 
-    // Fold the dead verdict (latch + mint). The fold clears the pending
-    // mark, the lifecycle effect re-fires, and the round's attach attempt
-    // goes out.
+    // Fold the dead verdict (latch + mint): the invariant fires IMMEDIATELY
+    // (issue #1). The write dirties the surface, so the lifecycle effect's
+    // round attach runs a mounted reconstruction: its reset WIPES issue #1,
+    // and the wipe's epoch bump re-fires the invariant (issue #2 lands on
+    // the post-reset surface). The round's wire attach goes out from the
+    // reconstruction's queued task.
     foldDeadVerdict(store)
     await waitFor(() => {
       expect(sentAttaches().length).toBe(2)
     })
-    // NEVER BEFORE the round's attach settles:
-    expect(noticeWriteCount()).toBe(0)
+    expect(noticeWriteCount()).toBe(2)
+    // The round's reconstruction reset really applied (it wiped issue #1).
+    expect(reconstructionWrites(term()).length).toBeGreaterThanOrEqual(1)
 
     const roundAttachId = sentAttaches().at(-1)!.attachRequestId
     act(() => {
@@ -16273,13 +16281,15 @@ describe('dead-session notice line (no-modal contract)', () => {
       })
     })
 
-    // NOW the gate ran (stand-down) and the writer fired.
-    await waitFor(() => {
-      expect(noticeWriteCount()).toBe(1)
-    })
+    // The gate's post-rejection writer call is the belt-and-suspenders pass:
+    // the record matches the post-wipe epoch, so it must NOT write again.
+    await act(async () => {})
+    expect(noticeWriteCount()).toBe(2)
 
     // FINAL SURVIVING BUFFER STATE (modeled from the write sequence +
-    // reset events), not merely captured writes: the line is in the buffer.
+    // reset events), not merely captured writes: exactly one line — not
+    // zero (the wipe is absorbed) and not two (the level check is
+    // idempotent per surface epoch).
     const buffer = modeledFinalBuffer()
     expect(buffer.split(NOTICE_LINE).length - 1).toBe(1)
     expect(leafContent(store).reconcileNotice).toBeUndefined()
@@ -16289,7 +16299,7 @@ describe('dead-session notice line (no-modal contract)', () => {
     expect(leafContent(store).terminalId).toBe(TERMINAL_ID)
     expect(sentCreates()).toHaveLength(0)
 
-    // Re-adjudication without an intervening wipe must NOT write twice —
+    // Re-adjudication without an intervening wipe must NOT write again —
     // and the idempotent skip must still CONSUME the re-folded mint: the
     // line is already on this surface epoch, so the dead copy may not
     // linger resident in the store (the next re-fold re-mints).
@@ -16302,7 +16312,7 @@ describe('dead-session notice line (no-modal contract)', () => {
         terminalId: TERMINAL_ID,
       })
     })
-    expect(noticeWriteCount()).toBe(1)
+    expect(noticeWriteCount()).toBe(2)
     expect(leafContent(store).reconcileNotice).toBeUndefined()
   })
 
@@ -16355,8 +16365,11 @@ describe('dead-session notice line (no-modal contract)', () => {
         terminalId: TERMINAL_ID,
       })
     })
+    // Level-triggered regime: the invariant issued at the fold, the round's
+    // reconstruction wiped that copy, and the wipe's epoch bump re-issued
+    // the line on the post-reset surface — two writes, one survivor.
     await waitFor(() => {
-      expect(noticeWriteCount()).toBe(1)
+      expect(noticeWriteCount()).toBe(2)
     })
     // The round-1 attach's reconstruction wiped the stale content BEFORE
     // the rejection — the notice landed on the final surface.
@@ -16366,8 +16379,12 @@ describe('dead-session notice line (no-modal contract)', () => {
     // the still-dead verdict (App re-sends the reconcile request), so the
     // mint arrives again — and the pane's surface is now dirty from the
     // earlier notice, so the new attach attempt reconstructs again: the
-    // wipe must RE-ARM the write.
+    // wipe must RE-ISSUE the line.
     foldDeadVerdict(store)
+    await act(async () => {})
+    // The re-folded mint was consumed by the idempotent skip (the line was
+    // on the current epoch at the fold) — no write from the re-fold alone.
+    expect(noticeWriteCount()).toBe(2)
     act(() => {
       reconnectHandler!()
     })
@@ -16385,9 +16402,10 @@ describe('dead-session notice line (no-modal contract)', () => {
       })
     })
 
-    // BINDING idempotency contract: the gate re-wrote the wiped line.
+    // BINDING idempotency contract: the round-2 reconstruction wiped the
+    // round-1 line and the invariant re-issued it at the wipe's epoch bump.
     await waitFor(() => {
-      expect(noticeWriteCount()).toBe(2)
+      expect(noticeWriteCount()).toBe(3)
     })
     // The reconstruction wipe happened in both rounds.
     expect(reconstructionWrites(term()).length).toBeGreaterThanOrEqual(2)
@@ -16433,10 +16451,15 @@ describe('dead-session notice line (no-modal contract)', () => {
     expect(leafContent(store).sessionRef).toEqual({ provider: 'claude', sessionId: 'sess-dead-1' })
 
     // Re-latch + re-mint the SAME identity (the file was deleted again).
+    // Level-triggered regime: the invariant writes the line AT THE RE-FOLD
+    // (dead latch + no record for the current epoch) — the line is on the
+    // surface before the live attach's rejection settles; the gate's
+    // post-rejection pass is the belt-and-suspenders skip.
     foldDeadVerdict(store)
-    expect(noticeWriteCount()).toBe(1) // the retained-terminalId shape never writes from the effect
+    expect(noticeWriteCount()).toBe(2)
 
-    // The re-death round's attach is rejected; the gate writes AGAIN.
+    // The live attach round (admitted at the terminalId change) is
+    // rejected; the gate's writer call must NOT duplicate the line.
     const liveAttaches = () => wsMocks.send.mock.calls
       .map(([msg]) => msg)
       .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === 'term-live-again')
@@ -16453,9 +16476,11 @@ describe('dead-session notice line (no-modal contract)', () => {
         terminalId: 'term-live-again',
       })
     })
-    await waitFor(() => {
-      expect(noticeWriteCount()).toBe(2)
-    })
+    await act(async () => {})
+    expect(noticeWriteCount()).toBe(2)
+    // The re-death line is in the FINAL buffer exactly once (the first
+    // death's copy was wiped by the live round's reconstruction).
+    expect(modeledFinalBuffer().split(NOTICE_LINE).length - 1).toBe(1)
     expect(leafContent(store).reconcileNotice).toBeUndefined()
   })
 
@@ -16669,6 +16694,110 @@ describe('dead-session notice line (no-modal contract)', () => {
     expect(leafContent(store).terminalId).toBe(TERMINAL_ID)
   })
 
+  it('attach-exhaustion fallback vs a pending reconstruction reset on a READY socket: the task-driven sendAttach drops the queued notice — the invariant re-issues it and the final buffer keeps the line', async () => {
+    // Focused review 3, round 4 — the reviewer's race: the queue-ordered
+    // write is only safe while the queued regime SURVIVES until the copy
+    // applies. With the socket READY, the pending round's queued task runs
+    // right after the reset and calls sendAttach — an attach-generation
+    // takeover that DROPS the queued notice before it ever reaches xterm.
+    // The one-shot mint was consumed at enqueue, and when the last admitted
+    // attach never gets a response, no rejection gate runs and no
+    // settle-conditioned fallback re-fires: the pane is left WITHOUT its
+    // notice unless the write trigger is LEVEL-TRIGGERED — the invariant
+    // (dead latch + no at-apply record for the current surface epoch)
+    // re-issues the line at the very state change that revealed the drop
+    // (the reset's epoch bump, observable through its state mirror).
+    const { store } = await renderDeadSessionNoticePane(
+      {},
+      { reconcilePendingPanes: { [PANE_KEY]: Date.now() } },
+    )
+    const mountAttachId = sentAttaches()[0].attachRequestId
+
+    // The pane rendered pre-death content on its mount attach: the surface
+    // is dirty, so every later admitted attach degrades to a mounted
+    // reconstruction (the pane has no checkpoint stream identity).
+    act(() => {
+      messageHandler!({
+        type: 'terminal.attach.ready',
+        terminalId: TERMINAL_ID,
+        attachRequestId: mountAttachId,
+        seq: 0,
+        headSeq: 1,
+        replayFromSeq: 1,
+        replayToSeq: 1,
+      })
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId: TERMINAL_ID,
+        seqStart: 1,
+        seqEnd: 1,
+        data: 'stale pre-restart output\r\n',
+      })
+    })
+    expect(modeledFinalBuffer()).toContain('stale pre-restart output')
+
+    // Defer the write queue's flush: the next reconstruction reset is
+    // ENQUEUED but stays UNFLUSHED (the pending reset of the finding).
+    const pump = captureWriteFrames()
+
+    // Three progressless transport flaps exhaust the recovery bound (the
+    // mount attach was the pane's free initial hydration). Each admitted
+    // attach reconstructs the dirty surface and supersedes the previous
+    // round's queued reset+task, so the LAST flap's reset is still queued
+    // when the bound trips — and its wire attach (queued behind the reset)
+    // never even went out: no response can ever arrive.
+    act(() => { reconnectHandler!() })
+    act(() => { reconnectHandler!() })
+    act(() => { reconnectHandler!() })
+    expect(sentAttaches()).toHaveLength(1)
+    expect(noticeWriteCount()).toBe(0)
+
+    // THE SOCKET STAYS READY (the path the pending-reset pin above misses:
+    // there the task abandoned on a dead socket). The dead verdict folds
+    // (latch + mint). The lifecycle effect re-fires the round's attach —
+    // which the exhausted limiter REFUSES before sending — so the notice
+    // writer is the exhaustion fallback: the notice is enqueued FIFO behind
+    // the pending reset AND its queued task.
+    foldDeadVerdict(store)
+    await waitFor(() => {
+      expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
+    })
+    expect(sentAttaches()).toHaveLength(1)
+    expect(noticeWriteCount()).toBe(0)
+
+    // Flush: the reset applies (wiping the surface), then the task runs —
+    // socket READY — and its sendAttach takes the queue over (generation
+    // change) and DROPS the queued notice before it applies; the wire attach
+    // goes out. It is the LAST admitted attach: no response is ever
+    // delivered for it.
+    act(() => { pump() })
+    expect(sentAttaches()).toHaveLength(2)
+
+    // The invariant re-issued the dropped copy on the new regime (fired by
+    // the reset's epoch bump); flush its frame.
+    act(() => { pump() })
+
+    // FINAL SURVIVING BUFFER STATE: the notice is present exactly once, on
+    // the post-reset surface (the dropped first copy never landed; a
+    // missing re-issue leaves the dead pane with NO notice — the finding).
+    const buffer = modeledFinalBuffer()
+    expect(buffer.split(NOTICE_LINE).length - 1).toBe(1)
+    expect(buffer).not.toContain('stale pre-restart output')
+    // FIFO order: the surviving notice write ran AFTER the reconstruction
+    // reset.
+    const writes = terminalWriteStrings(term())
+    const resetIndex = writes.indexOf(MOUNTED_RECONSTRUCTION)
+    expect(resetIndex).toBeGreaterThanOrEqual(0)
+    expect(writes.indexOf(FRAMED_NOTICE)).toBeGreaterThan(resetIndex)
+    // Exactly one notice line was ever applied.
+    expect(noticeWriteCount()).toBe(1)
+    // The mint was consumed at the first (dropped) enqueue and no re-mint
+    // ever arrived; the create-lane stand-down held throughout.
+    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    expect(sentCreates()).toHaveLength(0)
+    expect(leafContent(store).terminalId).toBe(TERMINAL_ID)
+  })
+
   it('gate write survives an attach-generation takeover: a queued copy dropped by a later admitted attach is re-written at that round’s rejection — exactly once', async () => {
     // Queue-ordered writes are droppable: every attach takeover calls
     // setActiveGeneration(+dropQueuedStaleWrites). A queued dead notice
@@ -16849,9 +16978,14 @@ describe('dead-session notice line (no-modal contract)', () => {
       [opencodeEntry('canvas')],
     )
 
-    // The retained-terminalId gate write: mount attach rejected inside the
-    // pending window, dead fold, round attach rejected — the line lands on
-    // the FIRST surface and the mint is consumed.
+    // The retained-terminalId write path (level-triggered regime): mount
+    // attach rejected inside the pending window, dead fold — the invariant
+    // issues the line at the fold, the round attach's own reconstruction
+    // wipes it, and the wipe's epoch bump re-issues it on the post-reset
+    // surface — then the round attach is rejected and the gate's writer
+    // call is the belt-and-suspenders skip. The FIRST surface received TWO
+    // framed writes (the wiped fold issue + the re-issue) and its FINAL
+    // buffer holds the line exactly once; the mint is consumed.
     const mountAttachId = sentAttaches()[0].attachRequestId
     act(() => {
       messageHandler!({
@@ -16877,8 +17011,11 @@ describe('dead-session notice line (no-modal contract)', () => {
       })
     })
     await waitFor(() => {
-      expect(terminalWriteStrings(term()).filter((data) => data === FRAMED_NOTICE)).toHaveLength(1)
+      expect(terminalWriteStrings(term()).filter((data) => data === FRAMED_NOTICE)).toHaveLength(2)
     })
+    // The fold issue was wiped by the round's reconstruction: the first
+    // surface's FINAL SURVIVING BUFFER holds the line exactly once.
+    expect(modeledFinalBuffer().split(NOTICE_LINE).length - 1).toBe(1)
     const firstTerm = term()
     expect(leafContent(store).reconcileNotice).toBeUndefined()
 
@@ -16893,31 +17030,31 @@ describe('dead-session notice line (no-modal contract)', () => {
     })
     const recreatedTerm = terminalInstances[terminalInstances.length - 1]
 
-    // The recreated buffer gets the notice line EXACTLY ONCE (the record's
-    // epoch keyed the rewrite), and the FIRST surface was not touched
-    // again.
+    // The recreated buffer gets the notice line EXACTLY ONCE (the epoch
+    // bump re-fired the invariant, which re-issued from the record — no
+    // mint existed to consume and none was minted: the record IS the
+    // surviving truth), and the FIRST surface was not touched again.
     await waitFor(() => {
       expect(terminalWriteStrings(recreatedTerm).filter((data) => data === FRAMED_NOTICE)).toHaveLength(1)
     })
-    expect(terminalWriteStrings(firstTerm).filter((data) => data === FRAMED_NOTICE)).toHaveLength(1)
-    // No mint existed to consume and none was minted: the record IS the
-    // surviving truth, and the store keeps no resident dead copy.
+    expect(terminalWriteStrings(firstTerm).filter((data) => data === FRAMED_NOTICE)).toHaveLength(2)
+    // The store keeps no resident dead copy.
     expect(leafContent(store).reconcileNotice).toBeUndefined()
     expect(sentCreates()).toHaveLength(0)
   })
 
   it('surface-recreation window: a consumed-but-UNAPPLIED queued notice is re-issued onto the new surface — exactly once', async () => {
-    // Focused review 3, round 3, finding 1: the recreation coverage above
-    // changes the renderer only AFTER the first notice APPLIED. The window
-    // it missed: the gate write is ENQUEUED (queue-ordered) but the queue
-    // has not flushed when the renderer preference changes — surface
-    // recreation disposes the old surface's queue, the UNAPPLIED copy dies
-    // with it, and the one-shot mint is already consumed, so the queued
-    // write tracker is the only surviving record of the owed line. Surface
-    // birth must PRESERVE the tracker (a copy that APPLIED clears it at
-    // apply time, so a surviving tracker is always an unapplied one) and
-    // the notice effect must treat it as a recreation settle event,
-    // re-issuing the line onto the new surface — otherwise the dead pane
+    // Focused review 3, round 3, finding 1, carried into the
+    // level-triggered regime: an issued copy can still be QUEUED but
+    // UNAPPLIED (the write queue's flush deferred) when the renderer
+    // preference changes — surface recreation disposes the old surface's
+    // queue, the UNAPPLIED copy dies with it, and the one-shot mint is
+    // already consumed, so the outstanding-issue record is the only
+    // surviving record of the owed line. Surface birth must PRESERVE the
+    // record (a copy that APPLIED clears it at apply time, so a surviving
+    // record is always an unapplied one) and the invariant effect must
+    // re-issue the line onto the new surface at the epoch bump (or the
+    // generation signal that revealed the drop) — otherwise the dead pane
     // is left WITHOUT its notice on every surface it will ever show.
     const opencodeEntry = (preferredRenderer?: 'canvas'): ClientExtensionEntry => ({
       name: 'opencode',
@@ -16941,10 +17078,13 @@ describe('dead-session notice line (no-modal contract)', () => {
       [opencodeEntry('canvas')],
     )
 
-    // The retained-terminalId gate write: mount attach rejected inside the
-    // pending window, dead fold, round attach — but this time the write
-    // queue's flush is DEFERRED before the round's rejection arrives, so
-    // the gate write stays ENQUEUED and UNAPPLIED.
+    // The retained-terminalId write path — but this time the write queue's
+    // flush is DEFERRED BEFORE the dead fold, so the invariant's issue stays
+    // ENQUEUED and UNAPPLIED through the whole round. The mount attach was
+    // rejected inside the pending window (absorbed, nothing applied — the
+    // surface is still constructor-fresh), so the round attach goes out
+    // DIRECT (no reconstruction): its sendAttach generation takeover DROPS
+    // the queued copy before it ever applies.
     const mountAttachId = sentAttaches()[0].attachRequestId
     act(() => {
       messageHandler!({
@@ -16955,13 +17095,14 @@ describe('dead-session notice line (no-modal contract)', () => {
         terminalId: TERMINAL_ID,
       })
     })
+
+    const pump = captureWriteFrames()
     foldDeadVerdict(store)
     await waitFor(() => {
       expect(sentAttaches().length).toBe(2)
     })
     const roundAttachId = sentAttaches().at(-1)!.attachRequestId
 
-    const pump = captureWriteFrames()
     act(() => {
       messageHandler!({
         type: 'error',
@@ -16971,8 +17112,10 @@ describe('dead-session notice line (no-modal contract)', () => {
         terminalId: TERMINAL_ID,
       })
     })
-    // The gate ENQUEUED the notice and consumed the mint — no bytes have
-    // reached the first surface (the unapplied copy of the finding).
+    // The invariant issued at the fold, the round's sendAttach dropped that
+    // copy (revealed by the generation signal), and the re-issue rode the
+    // queue — no bytes have reached the first surface (the unapplied copy
+    // of the finding).
     expect(noticeWriteCount()).toBe(0)
     expect(leafContent(store).reconcileNotice).toBeUndefined()
     const firstTerm = term()
@@ -16989,9 +17132,9 @@ describe('dead-session notice line (no-modal contract)', () => {
     const recreatedTerm = terminalInstances[terminalInstances.length - 1]
     expect(recreatedTerm).not.toBe(firstTerm)
 
-    // The new surface must still get its line: the preserved tracker
-    // re-issues it queue-ordered on the new surface's queue. Flush the
-    // deferred frames and read the FINAL SURVIVING BUFFER STATE.
+    // The new surface must still get its line: the preserved outstanding
+    // issue record re-issues it queue-ordered on the new surface's queue.
+    // Flush the deferred frames and read the FINAL SURVIVING BUFFER STATE.
     act(() => { pump() })
     await waitFor(() => {
       expect(terminalWriteStrings(recreatedTerm).filter((data) => data === FRAMED_NOTICE)).toHaveLength(1)

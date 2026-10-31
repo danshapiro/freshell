@@ -959,44 +959,51 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   const deadSessionLatchRef = useRef(false)
   deadSessionLatchRef.current =
     terminalContent?.restoreError?.reason === 'durable_artifact_missing'
-  // ── Dead-session notice line (no-modal contract) ──
-  // Idempotency keys on the REJECTION ROUND, not identity alone: the state
-  // records the identity key (`createRequestId|sessionId`), the surface
-  // epoch of the buffer the line was written to, AND the mint copy that
-  // produced the line. The epoch bumps at every xterm surface birth (init)
-  // and at every beginMountedReconstruction reset completion — i.e. at
-  // every event that can WIPE the buffer — so a wiped surface always gets
-  // the line re-written at the next settle event, while a re-adjudication
-  // of an un-wiped surface never duplicates it. The recorded mint copy lets
-  // a wiped surface be re-written even when the one-shot mint was already
-  // consumed and no re-fold re-minted it (the settled-surface rewrite).
-  // Cleared when the latch clears (user resolved the pane), re-arming a
-  // later re-death of the same identity.
+  // ── Dead-session notice line (no-modal contract, LEVEL-TRIGGERED —
+  // focused review 3, round 4) ──
+  // INVARIANT: whenever this pane is dead-adjudicated (restoreError reason
+  // durable_artifact_missing) and its CURRENT surface epoch has no APPLIED
+  // dead-notice record, the notice line is (re-)issued — queue-ordered,
+  // generation-adopting — into that surface. The at-apply record below
+  // (identity key `createRequestId|sessionId` + surface epoch + mint copy)
+  // is the loop guard: it only ever claims an epoch the line actually landed
+  // on, so the skip branch is honest (skip ⟺ the line is on the current
+  // surface). The epoch bumps at every xterm surface birth (init) and at
+  // every beginMountedReconstruction reset completion — i.e. at every event
+  // that can WIPE the buffer — and is MIRRORED INTO STATE
+  // (deadSessionNoticeSurfaceEpoch) so the invariant effect re-runs on each
+  // bump; the ref remains the source of truth for immediate (non-render)
+  // readers. The record's mint copy keeps re-issues reason-honest after the
+  // one-shot mint is consumed. Cleared when the latch clears (user resolved
+  // the pane), re-arming a later re-death of the same identity.
   const deadSessionNoticeSurfaceEpochRef = useRef(0)
+  const [deadSessionNoticeSurfaceEpoch, setDeadSessionNoticeSurfaceEpoch] = useState(0)
+  // Write-queue generation signal: the queue fires onActiveGenerationChange
+  // on every attach takeover; mirroring it into state lets the invariant
+  // effect OBSERVE a takeover that dropped a queued notice copy — a drop is
+  // otherwise invisible (no store change, no render).
+  const [writeQueueActiveGeneration, setWriteQueueActiveGeneration] = useState<string | undefined>(undefined)
   const deadSessionNoticeStateRef = useRef<{ key: string; surfaceEpoch: number; notice: string } | null>(null)
-  // Pending marker for a mint that arrived while the xterm surface was not
-  // mounted (provider-wait window): the mint is NOT consumed until the
-  // deferred surface mounts and the write completes.
-  const deadSessionNoticePendingRef = useRef<string | null>(null)
-  // Queue-ordered write tracker (focused review 3, round 2): a dead-notice
-  // line ENQUEUED but not yet applied. The queue drops queued writes at
-  // every attach-generation takeover (`setActiveGeneration` +
-  // `dropQueuedStaleWrites`), so the tracker records the queue object and
-  // the ACTIVE GENERATION the copy was enqueued under; a writer call that
-  // finds the tracker's generation no longer the queue's active generation
-  // knows its copy was dropped and re-writes the recorded line instead of
-  // trusting delivery. The tracker clears when the copy applies (its
-  // callback records the write at the surface epoch READ AT APPLY — FIFO
-  // puts the line after any pending reconstruction reset, whose completion
-  // already bumped that epoch) and when the latch clears. At SURFACE BIRTH
-  // (focused review 3, round 3) it is deliberately NOT cleared: the
-  // previous surface's queue died with that surface, so a still-pending
-  // copy died unapplied while its one-shot mint is already consumed — the
-  // surviving tracker is the consumed-pending-at-dispose record, the only
-  // surviving copy of the owed line. The dead-queue fields make
-  // `deadSessionNoticeQueuedWriteIsLive` false on the new regime, and the
-  // notice effect's recreation settle event re-issues the recorded line
-  // onto the new surface exactly once.
+  // Outstanding-issue record (focused review 3, round 4): a dead-notice line
+  // ENQUEUED but not yet applied. The queue drops queued writes at every
+  // attach-generation takeover (`setActiveGeneration` +
+  // `dropQueuedStaleWrites`), so the record captures the queue object and
+  // the ACTIVE GENERATION the copy was enqueued under. Two roles in the
+  // invariant regime: (1) LIVENESS — while the record's queue is the
+  // current queue and its generation the current active generation, the
+  // copy is still the current regime's write and FIFO delivery is owed (the
+  // level check trusts it and never double-issues); (2) OWED COPY — once
+  // the copy is dropped (a takeover moved the generation) or its queue
+  // died (surface recreation disposed it), the record is the only
+  // surviving copy of the owed line (its one-shot mint was consumed at
+  // enqueue), and the invariant effect re-issues `record.data` at the very
+  // state change that revealed the drop (the epoch bump or the generation
+  // signal). At SURFACE BIRTH it is deliberately NOT cleared: the previous
+  // surface's queue died with that surface, so a still-pending copy died
+  // unapplied while its mint is already consumed — the surviving record is
+  // the consumed-pending-at-dispose copy. It clears when the copy applies
+  // (the apply callback then writes the at-apply record), when the latch
+  // clears, and when a later issue replaces it.
   const deadSessionNoticeQueuedWriteRef = useRef<{
     key: string
     generation: string | undefined
@@ -1831,21 +1838,23 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // Dead-notice surface writer (no-modal contract, queue-ordered — focused
   // review 3, round 2): the line rides the TERMINAL WRITE QUEUE whenever it
   // exists, so FIFO ordering puts it AFTER any pending mounted-reconstruction
-  // reset — the exhaustion fallback can fire while a previously admitted
-  // attach still has its wipe queued, and a direct write would land the line
-  // BEFORE that reset only to be erased by it, with no rejection left to
-  // re-write it (the limiter blocks further automatic attaches). The write
-  // adopts the queue's ACTIVE generation (never a stale attach id), so it is
-  // only dropped by a LATER generation takeover; the tracker
-  // (deadSessionNoticeQueuedWriteRef) records the adopted generation and the
-  // writers re-write on detecting a takeover. The apply callback records the
-  // write at the surface epoch READ THEN — the idempotency record only ever
-  // claims an epoch the line actually landed on, so the skip branch stays
-  // honest (skip ⟺ the line is on the current surface). The queue item is
-  // 'live'-mode: the queue's own onItemApplied hook counts it toward surface
-  // mutation (surfaceWritesSinceFresh), so a later full-hydrate attach treats
-  // the surface as dirty and reconstructs it. The direct path remains ONLY
-  // as the no-queue fallback.
+  // reset — an issue can fire while a previously admitted attach still has
+  // its wipe queued, and a direct write would land the line BEFORE that
+  // reset only to be erased by it. The write adopts the queue's ACTIVE
+  // generation (never a stale attach id), so it is only dropped by a LATER
+  // generation takeover; the outstanding-issue record
+  // (deadSessionNoticeQueuedWriteRef) captures the adopted generation, and
+  // the level-triggered invariant effect re-issues the recorded line at the
+  // state change that reveals the drop (the queue's onActiveGenerationChange
+  // signal, or the epoch bump of a later reset). The apply callback records
+  // the write at the surface epoch READ THEN — the idempotency record only
+  // ever claims an epoch the line actually landed on, so the skip branch
+  // stays honest (skip ⟺ the line is on the current surface). The queue
+  // item is 'live'-mode: the queue's own onItemApplied hook counts it
+  // toward surface mutation (surfaceWritesSinceFresh), so a later
+  // full-hydrate attach treats the surface as dirty and reconstructs it
+  // (and the invariant re-issues the line after that wipe). The direct path
+  // remains ONLY as the no-queue fallback.
   const writeDeadSessionNoticeToSurface = useCallback((
     term: Terminal,
     data: string,
@@ -1897,10 +1906,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   }, [resetParserAppliedSurface, writeLocalXtermNoticeDirect])
 
   // A queued dead-notice copy that is STILL the current queue regime's write:
-  // FIFO delivery is owed for this identity — later writer calls consume
-  // their mint and trust it. A mismatch (different queue object — surface
-  // recreation — or a moved active generation — an attach takeover dropped
-  // the copy) means the line is NOT coming from that copy.
+  // FIFO delivery is owed for this identity — the level check below trusts it
+  // and consumes any re-folded mint without writing. A mismatch (a different
+  // queue object — surface recreation — or a moved active generation — an
+  // attach takeover dropped the copy) means the line is NOT coming from that
+  // copy: the invariant effect re-issues it from the outstanding-issue record
+  // at the state change that revealed the drop (the epoch bump or the
+  // generation signal).
   const deadSessionNoticeQueuedWriteIsLive = useCallback((key: string) => {
     const queue = writeQueueRef.current
     if (!queue) return false
@@ -1911,108 +1923,91 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       && queued.generation === queue.getActiveGeneration()
   }, [])
 
-  // Settled-surface rewrite for an already-consumed dead notice (delta
-  // review round 3, finding 2): surface recreation (a provider renderer
-  // preference change re-runs the init effect) bumps the notice epoch at
-  // surface birth and leaves a BLANK buffer while the one-shot mint was
-  // consumed at the first write — no verdict re-fold and no attach
-  // rejection will ever re-write the line. When the dead latch still
-  // stands and the recorded identity matches the current pane, restore
-  // the recorded line onto the current surface (identity-keyed and
-  // latch-gated, so a resolved or re-keyed pane never resurrects it).
-  // No store dispatch: the mint is gone and the record IS the surviving
-  // truth. A queued copy dropped by a generation takeover — or one whose
-  // queue died with a recreated surface while the copy was still pending
-  // (the preserved consumed-pending-at-dispose record, focused review 3
-  // round 3) — is re-written from the tracker (the record never claimed a
-  // write that did not land, so nothing else would re-deliver it).
-  const rewriteDeadSessionNoticeAfterSurfaceRecreation = useCallback(() => {
+  // Dead-session notice writer (no-modal contract, LEVEL-TRIGGERED — focused
+  // review 3, round 4): ONE level check shared by the invariant effect and
+  // the INVALID_TERMINAL_ID stand-down gate. The observation is the
+  // INVARIANT itself — a dead-adjudicated pane whose CURRENT surface epoch
+  // holds no APPLIED notice record is owed the line — and this writer issues
+  // whenever the observation says the line is missing, never on an edge. The
+  // copy is resolved in order: a live dead-copy mint (the FIRST write; the
+  // mint is consumed at enqueue — the queued copy owns the delivery), an
+  // ISSUED copy that never applied (a generation takeover dropped it, or its
+  // queue died with a recreated surface — the outstanding-issue record is
+  // the only surviving copy of the owed line once the one-shot mint is
+  // gone), or the last APPLIED record's copy (re-issues stay reason-honest
+  // without a fresh mint). A queued copy that is still the current regime's
+  // write is TRUSTED (FIFO); a record matching the current surface epoch
+  // SATISFIES the invariant (a re-folded mint is still consumed — the dead
+  // copy may not linger resident in the store — and its copy adopted into
+  // the record so a later re-issue stays reason-honest). With no mint, no
+  // issued copy, and no record, nothing explains a write: the persisted
+  // latch alone is not a copy source (the reload shape waits for the boot
+  // re-fold's mint). While the xterm surface is not mounted (provider-wait
+  // window) the mint stays unconsumed — the invariant effect completes the
+  // write when the deferred surface mounts.
+  const writeDeadSessionNoticeIfPending = useCallback(() => {
     const content = contentRef.current
-    if (content?.restoreError?.reason !== 'durable_artifact_missing') return
+    const notice = content?.reconcileNotice
+    const mint = notice !== undefined && isDeadSessionReconcileNotice(notice) ? notice : null
     const term = termRef.current
-    if (!term) return
+    if (!term) {
+      // Surface not mounted (provider-wait window): the mint stays
+      // unconsumed in the store.
+      return
+    }
     const key = deadSessionNoticeIdentityKey(content)
-    if (deadSessionNoticeQueuedWriteIsLive(key)) return
+    if (deadSessionNoticeQueuedWriteIsLive(key)) {
+      // A queued copy of this identity is still the current queue regime's
+      // write: FIFO delivery is owed. Consume a re-folded mint exactly like
+      // the applied-record skip below.
+      if (mint) dispatch(clearPaneReconcileNotice({ tabId, paneId: paneIdRef.current }))
+      return
+    }
     const written = deadSessionNoticeStateRef.current
     if (written && written.key === key && written.surfaceEpoch === deadSessionNoticeSurfaceEpochRef.current) {
-      // The line is on the current surface: a stale tracker is leftover
-      // garbage (its copy was dropped or belongs to a dead queue).
+      // The line is on the current surface epoch: the invariant is
+      // satisfied. Consume a re-folded mint so the dead copy cannot linger
+      // resident in the store, and adopt its copy into the record so a later
+      // re-issue stays reason-honest. A surviving issue record here is stale
+      // garbage (its copy was dropped or died with an old queue).
       deadSessionNoticeQueuedWriteRef.current = null
+      if (mint) {
+        deadSessionNoticeStateRef.current = { key, surfaceEpoch: written.surfaceEpoch, notice: mint }
+        dispatch(clearPaneReconcileNotice({ tabId, paneId: paneIdRef.current }))
+      }
+      return
+    }
+    if (mint) {
+      writeDeadSessionNoticeToSurface(term, `\r\n${deadSessionBufferNoticeForMint(mint)}\r\n`, key, mint)
+      dispatch(clearPaneReconcileNotice({ tabId, paneId: paneIdRef.current }))
+      return
+    }
+    const issued = deadSessionNoticeQueuedWriteRef.current
+    if (issued && issued.key === key) {
+      // A previously issued copy never applied — a generation takeover
+      // dropped it, or its queue died with a recreated surface — and its
+      // one-shot mint is gone: the outstanding-issue record IS the owed
+      // line. Re-issue it queue-ordered on the current regime.
+      writeDeadSessionNoticeToSurface(term, issued.data, key, issued.notice)
       return
     }
     if (written && written.key === key) {
+      // The line APPLIED on an earlier epoch of this surface history (a
+      // reconstruction reset or surface birth wiped it): re-issue the
+      // recorded reason-honest copy.
       writeDeadSessionNoticeToSurface(
         term,
         `\r\n${deadSessionBufferNoticeForMint(written.notice)}\r\n`,
         key,
         written.notice,
       )
-      return
     }
-    const queued = deadSessionNoticeQueuedWriteRef.current
-    if (queued && queued.key === key) {
-      // The queued copy was dropped by a takeover (or its queue was
-      // replaced by surface recreation) before it ever applied: the line
-      // is still owed — re-write the recorded line on the current regime.
-      writeDeadSessionNoticeToSurface(term, queued.data, key, queued.notice)
-    }
-  }, [deadSessionNoticeQueuedWriteIsLive, writeDeadSessionNoticeToSurface])
-
-  // Dead-session notice writer (no-modal contract): no-op unless the pane's
-  // store content holds the fold-minted dead-copy reconcileNotice. When the
-  // xterm surface is not mounted yet (provider-wait window) it records a
-  // pending marker and does NOT consume the mint — the notice effect below
-  // completes the write when the deferred surface mounts. On write it
-  // consumes the mint one-shot (synchronously, at enqueue: the queued copy
-  // owns the delivery) and the apply callback latches the idempotency key
-  // against the surface epoch AT APPLY (see writeDeadSessionNoticeToSurface).
-  // On an idempotent skip — a copy APPLIED at the current surface epoch (a
-  // re-adjudication round without an intervening wipe) or a copy still QUEUED
-  // on the current queue regime — it consumes the re-folded mint as well:
-  // the line's delivery is already owned, so the mint's job is done and the
-  // next re-fold re-mints (the record still adopts the re-folded copy,
-  // keeping a later wiped-surface rewrite reason-honest). With NO live mint,
-  // the only remaining owner is the settled-surface rewrite above.
-  const writeDeadSessionNoticeIfPending = useCallback(() => {
-    const content = contentRef.current
-    const notice = content?.reconcileNotice
-    if (!notice || !isDeadSessionReconcileNotice(notice)) {
-      rewriteDeadSessionNoticeAfterSurfaceRecreation()
-      return
-    }
-    const term = termRef.current
-    if (!term) {
-      // Surface not mounted: the mint stays pending and unconsumed.
-      deadSessionNoticePendingRef.current = notice
-      return
-    }
-    const key = deadSessionNoticeIdentityKey(content)
-    if (deadSessionNoticeQueuedWriteIsLive(key)) {
-      // A queued copy of this identity will deliver the line (FIFO, after
-      // any pending reset): consume the re-folded mint exactly like the
-      // applied-write skip below.
-      deadSessionNoticePendingRef.current = null
-      dispatch(clearPaneReconcileNotice({ tabId, paneId: paneIdRef.current }))
-      return
-    }
-    const written = deadSessionNoticeStateRef.current
-    if (written && written.key === key && written.surfaceEpoch === deadSessionNoticeSurfaceEpochRef.current) {
-      // The line is already on this surface epoch: consume the re-folded
-      // mint so the dead copy cannot linger resident in the store. The
-      // pending-marker and latch semantics are untouched.
-      deadSessionNoticeStateRef.current = { key, surfaceEpoch: written.surfaceEpoch, notice }
-      deadSessionNoticeQueuedWriteRef.current = null
-      dispatch(clearPaneReconcileNotice({ tabId, paneId: paneIdRef.current }))
-      return
-    }
-    writeDeadSessionNoticeToSurface(term, `\r\n${deadSessionBufferNoticeForMint(notice)}\r\n`, key, notice)
-    deadSessionNoticePendingRef.current = null
-    dispatch(clearPaneReconcileNotice({ tabId, paneId: paneIdRef.current }))
+    // No mint, no issued copy, no record: nothing is owed that this writer
+    // can explain — the persisted latch alone is not a copy source.
   }, [
     dispatch,
     tabId,
     deadSessionNoticeQueuedWriteIsLive,
-    rewriteDeadSessionNoticeAfterSurfaceRecreation,
     writeDeadSessionNoticeToSurface,
   ])
 
@@ -3068,30 +3063,35 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     surfaceFreshRef.current = true
     surfaceFreshMarkerRef.current = null
     surfaceWritesSinceFreshRef.current = 0
-    // New xterm surface identity (dead-session notice idempotency): a
-    // renderer-recreated surface starts blank, so a previously written
-    // notice line must be re-armed — the next settle event (a rejection
-    // round's gate write, or the notice effect's settled-surface rewrite)
-    // restores the line onto the new buffer.
+    // New xterm surface identity (dead-session notice invariant): a
+    // renderer-recreated surface starts blank, so a previously applied
+    // notice line no longer matches the current epoch — the state-mirrored
+    // bump re-fires the level-triggered invariant effect, which re-issues
+    // the recorded line onto this new buffer exactly once (from the
+    // at-apply record, or from the preserved outstanding-issue record when
+    // the owed copy never applied on the previous surface).
     deadSessionNoticeSurfaceEpochRef.current += 1
-    // The queued-write tracker's copy can never APPLY here — the previous
-    // surface's queue was cleared with that surface, so a copy still
-    // pending on it died unapplied. But a tracker that still EXISTS is
-    // exactly that unapplied copy (an applied copy clears the tracker at
-    // apply time), and its one-shot mint was consumed at enqueue — the
-    // tracker is the only surviving record of the owed line. It is
-    // deliberately NOT cleared at this birth: it survives as the
-    // consumed-pending-at-dispose record, and the notice effect's
-    // recreation settle event re-issues the line onto THIS surface,
-    // exactly once (identity-keyed, so a re-keyed pane's stale copy never
-    // lands; the record clears at apply, when the latch clears, or when a
-    // later write replaces it).
+    setDeadSessionNoticeSurfaceEpoch(deadSessionNoticeSurfaceEpochRef.current)
+    // The outstanding-issue record is deliberately NOT cleared here: an
+    // applied copy clears it at apply time, so a surviving record is always
+    // an unapplied one whose one-shot mint was consumed at enqueue — the
+    // consumed-pending-at-dispose copy, the only surviving record of the
+    // owed line. Its dead-queue fields make
+    // deadSessionNoticeQueuedWriteIsLive false on the new regime, and the
+    // epoch bump above re-fires the invariant effect, which re-issues it
+    // identity-keyed onto THIS surface exactly once.
     // A brand-new surface has no covered stream position.
     surfaceCoverageSeqRef.current = 0
     unsafeSurfaceCheckpointRef.current = false
     failedConsumptionGenerationRef.current = null
     const writeQueue = createTerminalWriteQueue({
       terminalInstanceId,
+      // Attach-takeover signal (dead-session notice invariant, focused
+      // review 3, round 4): every generation change is mirrored into state
+      // so the level-triggered notice effect re-runs its level check when a
+      // takeover could have dropped a queued notice copy — the drop itself
+      // is invisible (no store change, no render).
+      onActiveGenerationChange: setWriteQueueActiveGeneration,
       // One paced-replay credit per drain tick (Workstream 1): the flush is
       // idempotent (lastSentCreditSeq guard), so non-paced panes and drains
       // with no frontier movement are no-ops.
@@ -3494,39 +3494,38 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isTerminal, providerBehavior.preferredRenderer, shouldWaitForProviderBehavior])
 
-  // Dead-session notice line (no-modal contract), the no-terminalId trigger
-  // site. Write timing follows the SETTLED-SURFACE rule: the line is
-  // written whenever the dead pane's surface is settled — no attach
-  // attempt is in flight and none will be auto-sent, so no reconstruction
-  // wipe can run before the next user action — whichever settle event
-  // comes last:
-  // - no terminalId (reload/boot shape): no attach can ever start, the
-  //   empty surface is stable — this effect invokes the writer directly;
-  // - retained terminalId (live-reconnect shape): an attach can still start
-  //   (and its beginMountedReconstruction wipe the buffer) before the
-  //   server rejects it — the INVALID_TERMINAL_ID stand-down gate owns the
-  //   write there, post-rejection — EXCEPT when the surface is ALREADY
-  //   settled by a later event (delta review round 3):
-  //   - attach machinery exhausted (recovery bound reached): every LATER
-  //     automatic attach is refused BEFORE sending (attachTerminal's
-  //     beginRecoveryAttempt), so no rejection response will ever arrive
-  //     and no NEW wipe can be enqueued — this effect is the fallback
-  //     writer. A PREVIOUSLY admitted attach can still have its
-  //     reconstruction reset QUEUED at that moment (focused review 3,
-  //     round 2), so the write is QUEUE-ORDERED
-  //     (writeDeadSessionNoticeToSurface): FIFO lands the line AFTER that
-  //     pending reset instead of letting a direct write be erased by it;
-  //   - surface recreated since the last write (provider renderer
-  //     preference change re-ran the init effect): the new buffer is
-  //     blank and the recreation itself happened with no attach cycle
-  //     pending — the epoch-keyed rewrite restores the recorded line for
-  //     a copy that APPLIED on the old surface, and for a copy that was
-  //     consumed-but-STILL-PENDING there (the old surface's queue died
-  //     holding it), the preserved tracker record re-issues the line —
-  //     in both cases exactly once, queue-ordered on the new surface.
-  // The effect also completes a pending write recorded while the xterm
-  // surface was deferred (provider-wait window): the
-  // shouldWaitForProviderBehavior dep re-fires it when the surface mounts.
+  // ── Dead-notice invariant effect (no-modal contract, LEVEL-TRIGGERED —
+  // focused review 3, round 4) ──
+  // INVARIANT: whenever this pane is dead-adjudicated (restoreError reason
+  // durable_artifact_missing) and its CURRENT surface epoch has no APPLIED
+  // dead-notice record, the notice line is (re-)issued — queue-ordered,
+  // generation-adopting — into that surface. The writer's level check
+  // (writeDeadSessionNoticeIfPending) IS the invariant observation; the
+  // at-apply record per epoch is the loop guard. This effect REPLACES the
+  // edge-triggered settle-event enumeration of the prior rounds (rejection
+  // ordering; pending reconstruction resets; surface recreation;
+  // queued-task sendAttach drops; abandoned attaches) — three review rounds
+  // each closed one edge while the next stayed un-pinned. Instead, every
+  // state that can INVALIDATE the observation is a dependency, and each
+  // change re-runs the level check (re-issuing the line only when it is
+  // missing):
+  // - the latch (restoreError): a dead verdict folds (turn on) or the pane
+  //   resolves (clear — re-arm);
+  // - a dead-copy mint (reconcileNotice): the FIRST write's copy source;
+  // - the surface epoch (state mirror): surface birth and every
+  //   reconstruction reset completion — a wipe invalidates the record;
+  // - the write queue's active generation (the queue's
+  //   onActiveGenerationChange signal): an attach takeover can DROP a
+  //   queued copy before it applies, invisibly to every other dep;
+  // - the attach-limiter state (recoveryExhausted) and the provider
+  //   renderer preference (surface recreation);
+  // - the provider-wait gate: the deferred surface mounting.
+  // A queued-live copy of the identity is TRUSTED (FIFO delivery is owed),
+  // so a re-run never duplicates an in-flight delivery, and spurious
+  // re-runs are inert by construction (the record check is the loop
+  // guard). The INVALID_TERMINAL_ID stand-down gate keeps its own writer
+  // call — the natural settle moment's belt-and-suspenders pass; the level
+  // check makes it a no-op whenever the line is already delivered.
   // Declared AFTER the init-xterm effect so a mount-time run already sees
   // termRef.current set (declaration-order effect execution).
   useEffect(() => {
@@ -3535,52 +3534,18 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       // Latch cleared (or a non-dead reason): re-arm the idempotency state
       // so a later re-death of the SAME identity writes again.
       deadSessionNoticeStateRef.current = null
-      deadSessionNoticePendingRef.current = null
       deadSessionNoticeQueuedWriteRef.current = null
-      return
-    }
-    if (deadSessionNoticePendingRef.current && termRef.current) {
-      // The deferred surface mounted: complete the pending write.
-      deadSessionNoticePendingRef.current = null
-      writeDeadSessionNoticeIfPending()
-      return
-    }
-    if (content?.terminalId) {
-      const written = deadSessionNoticeStateRef.current
-      const surfaceRecreatedSinceWrite = written !== null
-        && written.surfaceEpoch !== deadSessionNoticeSurfaceEpochRef.current
-      // A copy CONSUMED on a previous surface but never applied there (the
-      // renderer change disposed that surface's queue while the copy was
-      // still pending on it) is still owed HERE: its preserved tracker
-      // record — pointing at the dead queue — is the only surviving copy
-      // of the line, and the recreation is its settle event. Re-issue it
-      // through the same settled-surface rewrite, exactly once.
-      const owedCopy = deadSessionNoticeQueuedWriteRef.current
-      const undeliveredCopyDiedWithPreviousSurface = owedCopy !== null
-        && owedCopy.queue !== writeQueueRef.current
-        && owedCopy.key === deadSessionNoticeIdentityKey(content)
-      if (
-        !recoveryAccountingRef.current.exhausted
-        && !surfaceRecreatedSinceWrite
-        && !undeliveredCopyDiedWithPreviousSurface
-      ) return
-      writeDeadSessionNoticeIfPending()
       return
     }
     writeDeadSessionNoticeIfPending()
   }, [
     terminalContent?.restoreError,
     terminalContent?.reconcileNotice,
-    terminalContent?.terminalId,
-    shouldWaitForProviderBehavior,
-    // Settle-event triggers (delta review round 3): re-run when the
-    // recovery bound trips (recoveryExhausted mirrors the limiter state
-    // attachTerminal consults — consulted read-only in the branch above)
-    // and when a provider renderer preference change recreates the surface
-    // (the init effect bumps the notice epoch synchronously before this
-    // effect runs).
+    deadSessionNoticeSurfaceEpoch,
+    writeQueueActiveGeneration,
     recoveryExhausted,
     providerBehavior.preferredRenderer,
+    shouldWaitForProviderBehavior,
     writeDeadSessionNoticeIfPending,
   ])
 
@@ -4310,14 +4275,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         scheduleQuarantineRepair(tid, ticket.generation)
       }
       // The reset write's completion is the exact wipe moment: bump the
-      // surface epoch so the dead-session notice idempotency re-arms — a
-      // wiped surface always gets its line re-written at the next rejection
-      // (even when the reconstruction ticket is later abandoned, the reset
-      // bytes were already applied and the old line is gone; a dropped reset
-      // never completes and never bumps — no wipe, no re-arm).
+      // surface epoch (ref + state mirror) so the level-triggered
+      // dead-notice invariant re-fires — a wiped surface always gets its
+      // line re-issued at the next effect run (even when the
+      // reconstruction ticket is later abandoned, the reset bytes were
+      // already applied and the old line is gone; a dropped reset never
+      // completes and never bumps — no wipe, no re-issue).
       writeQueue.enqueue('\x18\x1bc\x1b[?25h', () => {
         ticket.succeeded = true
         deadSessionNoticeSurfaceEpochRef.current += 1
+        setDeadSessionNoticeSurfaceEpoch(deadSessionNoticeSurfaceEpochRef.current)
       }, {
         generation: ticket.generation, mode: 'replay', coalesce: false,
       })
@@ -7201,18 +7168,17 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             //   the next attach-error round takes the recovery below -- the
             //   ensure() re-fire re-attaches, so this can never wedge.
             if (deadSessionLatchRef.current) {
-              // Post-rejection moment (no-modal contract): the round's
-              // attach attempt -- including any beginMountedReconstruction
-              // wipe -- has settled and been rejected, so no further wipe
-              // of this round can be pending and the write QUEUE is the
-              // line's own settled regime. Write the one notice line now,
-              // QUEUE-ORDERED (it flushes behind anything still queued from
-              // the round; the retained-terminalId shape's primary writer;
-              // idempotent per surface epoch, re-armed after a wipe; a
-              // queued copy dropped by a LATER attach takeover is re-written
-              // by this same gate at that round's rejection). The notice
-              // effect is the fallback writer for the settles that draw no
-              // response -- attach exhaustion and surface recreation.
+              // Post-rejection moment (no-modal contract): the round's attach
+              // attempt — including any beginMountedReconstruction wipe — has
+              // settled and been rejected. The LEVEL-TRIGGERED notice
+              // invariant (the effect) already re-issues the line on every
+              // state change that can invalidate it (the fold, every wipe's
+              // epoch bump, every queue-generation takeover, exhaustion);
+              // this gate call is the natural settle moment's
+              // belt-and-suspenders pass — the writer's level check makes it
+              // a no-op whenever the line is already on the current surface
+              // (or a queued copy owns the delivery), and it consumes a
+              // re-folded mint either way.
               writeDeadSessionNoticeIfPending()
               return
             }

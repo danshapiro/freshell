@@ -57,6 +57,16 @@ type TerminalWriteQueueArgs = {
    * the surface still matches its last checkpoint.
    */
   onWriteCompleted?: (item: { mode: TerminalWriteQueueMode; generation: string | undefined }) => void
+  /**
+   * Fired whenever the queue's active generation CHANGES (a
+   * `setActiveGeneration` call with a value different from the current one;
+   * same-value re-sets stay inert). Lets a caller observe attach takeovers —
+   * including the drop of a queued write enqueued under the previous
+   * generation — as a reactive signal (e.g. a state bump an effect can key
+   * on): the drop itself is otherwise invisible, producing no store change
+   * and no render.
+   */
+  onActiveGenerationChange?: (generation: string | undefined) => void
   /** A surface write failed before completion; no success hooks ran. */
   onWriteFailed?: (item: { mode: TerminalWriteQueueMode; generation: string | undefined; error: unknown }) => void
   budgetMs?: number
@@ -296,7 +306,10 @@ export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): Terminal
       scheduleFlush()
     },
     setActiveGeneration(generation, options) {
-      activeGeneration = generation
+      if (activeGeneration !== generation) {
+        activeGeneration = generation
+        args.onActiveGenerationChange?.(generation)
+      }
       if (options?.dropQueuedStaleWrites) {
         dropQueuedWritesOutsideGeneration(generation)
       }
