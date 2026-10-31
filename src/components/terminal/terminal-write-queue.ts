@@ -7,6 +7,15 @@ export type TerminalWriteQueue = {
     generation: string,
     options?: { dropQueuedStaleWrites?: boolean },
   ) => void
+  /**
+   * The queue's current active generation (undefined until an attach
+   * generation takes the queue over). Read-only introspection for callers
+   * that must detect a takeover between enqueue and flush — a queued write
+   * enqueued under a generation this no longer returns was dropped by
+   * `setActiveGeneration(_, { dropQueuedStaleWrites: true })` and will
+   * never apply.
+   */
+  getActiveGeneration: () => string | undefined
   hasInFlightWrites: (generation?: string) => boolean
   clear: () => void
 }
@@ -291,6 +300,9 @@ export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): Terminal
       if (options?.dropQueuedStaleWrites) {
         dropQueuedWritesOutsideGeneration(generation)
       }
+    },
+    getActiveGeneration() {
+      return activeGeneration
     },
     hasInFlightWrites(generation) {
       if (generation === undefined) {

@@ -654,4 +654,43 @@ describe('onDrain (paced-replay credit flush tick)', () => {
     expect(pendingWritten).toEqual([])
     expect(drains).toEqual([2])
   })
+
+  it('exposes the active generation so a queued write can detect a takeover drop', () => {
+    // Queue-ordered dead-notice writes (focused review 3, round 2): a caller
+    // that enqueues a line under the queue's CURRENT generation must be able
+    // to detect, later, that a generation takeover dropped it — the only
+    // reliable signal is comparing the enqueue-time generation against the
+    // queue's still-active one.
+    const rafCallbacks: FrameRequestCallback[] = []
+    const applied: string[] = []
+    const queue = createTerminalWriteQueue({
+      terminalInstanceId: 'surface-active-generation',
+      write: (chunk, onWritten) => {
+        applied.push(chunk)
+        onWritten?.()
+      },
+      requestFrame: (cb) => {
+        rafCallbacks.push(cb)
+        return rafCallbacks.length
+      },
+      cancelFrame: () => {},
+    })
+
+    // A fresh queue has no attach generation: a queued write adopted it and
+    // is never stale.
+    expect(queue.getActiveGeneration()).toBeUndefined()
+    queue.setActiveGeneration('attach-one')
+    expect(queue.getActiveGeneration()).toBe('attach-one')
+
+    const enqueuedGeneration = queue.getActiveGeneration()
+    queue.enqueue('line', undefined, { mode: 'live', generation: enqueuedGeneration })
+    // A takeover with dropQueuedStaleWrites removes the queued copy...
+    queue.setActiveGeneration('attach-two', { dropQueuedStaleWrites: true })
+    expect(queue.getActiveGeneration()).toBe('attach-two')
+    // ...so the enqueue-time generation no longer matches: the caller can
+    // see the drop WITHOUT flushing.
+    expect(enqueuedGeneration === queue.getActiveGeneration()).toBe(false)
+    while (rafCallbacks.length) rafCallbacks.shift()!(0)
+    expect(applied).toEqual([])
+  })
 })

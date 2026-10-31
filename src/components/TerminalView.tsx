@@ -978,6 +978,25 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // mounted (provider-wait window): the mint is NOT consumed until the
   // deferred surface mounts and the write completes.
   const deadSessionNoticePendingRef = useRef<string | null>(null)
+  // Queue-ordered write tracker (focused review 3, round 2): a dead-notice
+  // line ENQUEUED but not yet applied. The queue drops queued writes at
+  // every attach-generation takeover (`setActiveGeneration` +
+  // `dropQueuedStaleWrites`), so the tracker records the queue object and
+  // the ACTIVE GENERATION the copy was enqueued under; a writer call that
+  // finds the tracker's generation no longer the queue's active generation
+  // knows its copy was dropped and re-writes the recorded line instead of
+  // trusting delivery. The tracker clears when the copy applies (its
+  // callback records the write at the surface epoch READ AT APPLY — FIFO
+  // puts the line after any pending reconstruction reset, whose completion
+  // already bumped that epoch), at surface birth (a new queue owns the new
+  // surface), and when the latch clears.
+  const deadSessionNoticeQueuedWriteRef = useRef<{
+    key: string
+    generation: string | undefined
+    queue: TerminalWriteQueue
+    data: string
+    notice: string
+  } | null>(null)
   const managedReplayAvailable = canReplayManagedTerminal(terminalContent)
 
   // kata b8ke (round-1 review: convergence is bidirectional): a TERMINAL
@@ -1717,17 +1736,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     persistSurfaceCheckpointForAttach(terminalId, attach, parserAppliedSeq)
   }, [getTerminalCheckpointStreamId, persistSurfaceCheckpointForAttach, recordTerminalPerfAuditEvent])
 
-  // No-queue local-notice core: the existing writeLocalXtermNotice fallback
-  // path, extracted so the dead-session writer can call it directly. The
-  // dead pane's line must not be generation-dropped or reordered by the
-  // write queue — it is written after the round's attach already settled and
-  // was rejected, so the queue's generation discipline is moot and the write
-  // goes straight to the term inside its own output-write scope. The write
-  // still counts toward surface mutation (surfaceWritesSinceFresh): the
-  // line is real bytes on the surface, so a later full-hydrate attach must
+  // No-queue local-notice core: the writeLocalXtermNotice fallback path,
+  // extracted so the dead-session writer can call it directly for its own
+  // no-queue fallback (its ONLY role for the dead line — with a queue the
+  // dead notice rides the write queue, see writeDeadSessionNoticeToSurface).
+  // The write still counts toward surface mutation (surfaceWritesSinceFresh):
+  // the line is real bytes on the surface, so a later full-hydrate attach must
   // treat the surface as dirty and reconstruct it (the stand-down gate then
   // re-writes the line post-rejection).
-  const writeLocalXtermNoticeDirect = useCallback((term: Terminal, data: string) => {
+  const writeLocalXtermNoticeDirect = useCallback((term: Terminal, data: string, onApplied?: () => void) => {
     const terminalInstanceId = terminalInstanceIdRef.current
     if (!shouldAllowTerminalOutputSideEffect({
       terminalInstanceId,
@@ -1765,6 +1782,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         try {
           invalidateAppliedSurface()
           surfaceWritesSinceFreshRef.current += 1
+          onApplied?.()
         } finally {
           complete()
         }
@@ -1803,6 +1821,89 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     writeLocalXtermNoticeDirect(term, data)
   }, [resetParserAppliedSurface, writeLocalXtermNoticeDirect])
 
+  // Dead-notice surface writer (no-modal contract, queue-ordered — focused
+  // review 3, round 2): the line rides the TERMINAL WRITE QUEUE whenever it
+  // exists, so FIFO ordering puts it AFTER any pending mounted-reconstruction
+  // reset — the exhaustion fallback can fire while a previously admitted
+  // attach still has its wipe queued, and a direct write would land the line
+  // BEFORE that reset only to be erased by it, with no rejection left to
+  // re-write it (the limiter blocks further automatic attaches). The write
+  // adopts the queue's ACTIVE generation (never a stale attach id), so it is
+  // only dropped by a LATER generation takeover; the tracker
+  // (deadSessionNoticeQueuedWriteRef) records the adopted generation and the
+  // writers re-write on detecting a takeover. The apply callback records the
+  // write at the surface epoch READ THEN — the idempotency record only ever
+  // claims an epoch the line actually landed on, so the skip branch stays
+  // honest (skip ⟺ the line is on the current surface). The queue item is
+  // 'live'-mode: the queue's own onItemApplied hook counts it toward surface
+  // mutation (surfaceWritesSinceFresh), so a later full-hydrate attach treats
+  // the surface as dirty and reconstructs it. The direct path remains ONLY
+  // as the no-queue fallback.
+  const writeDeadSessionNoticeToSurface = useCallback((
+    term: Terminal,
+    data: string,
+    key: string,
+    notice: string,
+  ) => {
+    const terminalInstanceId = terminalInstanceIdRef.current
+    if (!shouldAllowTerminalOutputSideEffect({
+      terminalInstanceId,
+      source: 'live',
+      effect: 'local_xterm_notice',
+      mode: contentRef.current?.mode,
+    })) {
+      return
+    }
+    const recordAppliedWrite = () => {
+      deadSessionNoticeQueuedWriteRef.current = null
+      deadSessionNoticeStateRef.current = {
+        key,
+        surfaceEpoch: deadSessionNoticeSurfaceEpochRef.current,
+        notice,
+      }
+    }
+    const queue = writeQueueRef.current
+    if (queue) {
+      deadSessionNoticeQueuedWriteRef.current = {
+        key,
+        generation: queue.getActiveGeneration(),
+        queue,
+        data,
+        notice,
+      }
+      const invalidateAppliedSurface = () => {
+        // Keep the applied position (the notice does not unapply stream
+        // bytes), bump the epoch (stream-unpure surface state), and preserve
+        // the coverage cursor — the notice appends non-stream bytes but
+        // never un-accounts stream coverage.
+        resetParserAppliedSurface(parserAppliedSeqRef.current, {
+          surfaceCoverageSeq: surfaceCoverageSeqRef.current,
+        })
+      }
+      queue.enqueue(data, () => {
+        invalidateAppliedSurface()
+        recordAppliedWrite()
+      }, { mode: 'live', generation: undefined })
+      return
+    }
+    writeLocalXtermNoticeDirect(term, data, recordAppliedWrite)
+  }, [resetParserAppliedSurface, writeLocalXtermNoticeDirect])
+
+  // A queued dead-notice copy that is STILL the current queue regime's write:
+  // FIFO delivery is owed for this identity — later writer calls consume
+  // their mint and trust it. A mismatch (different queue object — surface
+  // recreation — or a moved active generation — an attach takeover dropped
+  // the copy) means the line is NOT coming from that copy.
+  const deadSessionNoticeQueuedWriteIsLive = useCallback((key: string) => {
+    const queue = writeQueueRef.current
+    if (!queue) return false
+    const queued = deadSessionNoticeQueuedWriteRef.current
+    return queued !== null
+      && queued.queue === queue
+      && queued.key === key
+      && queued.generation === queue.getActiveGeneration()
+  }, [])
+
   // Settled-surface rewrite for an already-consumed dead notice (delta
   // review round 3, finding 2): surface recreation (a provider renderer
   // preference change re-runs the init effect) bumps the notice epoch at
@@ -1813,32 +1914,56 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // the recorded line onto the current surface (identity-keyed and
   // latch-gated, so a resolved or re-keyed pane never resurrects it).
   // No store dispatch: the mint is gone and the record IS the surviving
-  // truth.
+  // truth. A queued copy dropped by a generation takeover is re-written
+  // from the tracker (the record never claimed a write that did not land,
+  // so nothing else would re-deliver it).
   const rewriteDeadSessionNoticeAfterSurfaceRecreation = useCallback(() => {
     const content = contentRef.current
     if (content?.restoreError?.reason !== 'durable_artifact_missing') return
     const term = termRef.current
+    if (!term) return
+    const key = deadSessionNoticeIdentityKey(content)
+    if (deadSessionNoticeQueuedWriteIsLive(key)) return
     const written = deadSessionNoticeStateRef.current
-    if (!term || !written) return
-    if (written.key !== deadSessionNoticeIdentityKey(content)) return
-    if (written.surfaceEpoch === deadSessionNoticeSurfaceEpochRef.current) return
-    writeLocalXtermNoticeDirect(term, `\r\n${deadSessionBufferNoticeForMint(written.notice)}\r\n`)
-    deadSessionNoticeStateRef.current = { ...written, surfaceEpoch: deadSessionNoticeSurfaceEpochRef.current }
-  }, [writeLocalXtermNoticeDirect])
+    if (written && written.key === key && written.surfaceEpoch === deadSessionNoticeSurfaceEpochRef.current) {
+      // The line is on the current surface: a stale tracker is leftover
+      // garbage (its copy was dropped or belongs to a dead queue).
+      deadSessionNoticeQueuedWriteRef.current = null
+      return
+    }
+    if (written && written.key === key) {
+      writeDeadSessionNoticeToSurface(
+        term,
+        `\r\n${deadSessionBufferNoticeForMint(written.notice)}\r\n`,
+        key,
+        written.notice,
+      )
+      return
+    }
+    const queued = deadSessionNoticeQueuedWriteRef.current
+    if (queued && queued.key === key) {
+      // The queued copy was dropped by a takeover (or its queue was
+      // replaced by surface recreation) before it ever applied: the line
+      // is still owed — re-write the recorded line on the current regime.
+      writeDeadSessionNoticeToSurface(term, queued.data, key, queued.notice)
+    }
+  }, [deadSessionNoticeQueuedWriteIsLive, writeDeadSessionNoticeToSurface])
 
   // Dead-session notice writer (no-modal contract): no-op unless the pane's
   // store content holds the fold-minted dead-copy reconcileNotice. When the
   // xterm surface is not mounted yet (provider-wait window) it records a
   // pending marker and does NOT consume the mint — the notice effect below
   // completes the write when the deferred surface mounts. On write it
-  // consumes the mint one-shot and latches the idempotency key against the
-  // current surface epoch (see deadSessionNoticeStateRef). On an idempotent
-  // skip (same key + same surface epoch — a re-adjudication round without
-  // an intervening wipe) it consumes the re-folded mint as well: the line is
-  // already on the surface, so the mint's job is done and the next re-fold
-  // re-mints (the record still adopts the re-folded copy, keeping a later
-  // wiped-surface rewrite reason-honest). With NO live mint, the only
-  // remaining owner is the settled-surface rewrite above.
+  // consumes the mint one-shot (synchronously, at enqueue: the queued copy
+  // owns the delivery) and the apply callback latches the idempotency key
+  // against the surface epoch AT APPLY (see writeDeadSessionNoticeToSurface).
+  // On an idempotent skip — a copy APPLIED at the current surface epoch (a
+  // re-adjudication round without an intervening wipe) or a copy still QUEUED
+  // on the current queue regime — it consumes the re-folded mint as well:
+  // the line's delivery is already owned, so the mint's job is done and the
+  // next re-fold re-mints (the record still adopts the re-folded copy,
+  // keeping a later wiped-surface rewrite reason-honest). With NO live mint,
+  // the only remaining owner is the settled-surface rewrite above.
   const writeDeadSessionNoticeIfPending = useCallback(() => {
     const content = contentRef.current
     const notice = content?.reconcileNotice
@@ -1853,20 +1978,34 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       return
     }
     const key = deadSessionNoticeIdentityKey(content)
+    if (deadSessionNoticeQueuedWriteIsLive(key)) {
+      // A queued copy of this identity will deliver the line (FIFO, after
+      // any pending reset): consume the re-folded mint exactly like the
+      // applied-write skip below.
+      deadSessionNoticePendingRef.current = null
+      dispatch(clearPaneReconcileNotice({ tabId, paneId: paneIdRef.current }))
+      return
+    }
     const written = deadSessionNoticeStateRef.current
     if (written && written.key === key && written.surfaceEpoch === deadSessionNoticeSurfaceEpochRef.current) {
       // The line is already on this surface epoch: consume the re-folded
       // mint so the dead copy cannot linger resident in the store. The
       // pending-marker and latch semantics are untouched.
       deadSessionNoticeStateRef.current = { key, surfaceEpoch: written.surfaceEpoch, notice }
+      deadSessionNoticeQueuedWriteRef.current = null
       dispatch(clearPaneReconcileNotice({ tabId, paneId: paneIdRef.current }))
       return
     }
-    writeLocalXtermNoticeDirect(term, `\r\n${deadSessionBufferNoticeForMint(notice)}\r\n`)
+    writeDeadSessionNoticeToSurface(term, `\r\n${deadSessionBufferNoticeForMint(notice)}\r\n`, key, notice)
     deadSessionNoticePendingRef.current = null
-    deadSessionNoticeStateRef.current = { key, surfaceEpoch: deadSessionNoticeSurfaceEpochRef.current, notice }
     dispatch(clearPaneReconcileNotice({ tabId, paneId: paneIdRef.current }))
-  }, [dispatch, tabId, writeLocalXtermNoticeDirect, rewriteDeadSessionNoticeAfterSurfaceRecreation])
+  }, [
+    dispatch,
+    tabId,
+    deadSessionNoticeQueuedWriteIsLive,
+    rewriteDeadSessionNoticeAfterSurfaceRecreation,
+    writeDeadSessionNoticeToSurface,
+  ])
 
   useEffect(() => () => {
     clearQuarantineRepair()
@@ -2926,6 +3065,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     // round's gate write, or the notice effect's settled-surface rewrite)
     // restores the line onto the new buffer.
     deadSessionNoticeSurfaceEpochRef.current += 1
+    // The queued-write tracker belongs to the PREVIOUS surface's queue (a
+    // new queue object owns this surface): its copy can never apply here.
+    deadSessionNoticeQueuedWriteRef.current = null
     // A brand-new surface has no covered stream position.
     surfaceCoverageSeqRef.current = 0
     unsafeSurfaceCheckpointRef.current = false
@@ -3338,7 +3480,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // site. Write timing follows the SETTLED-SURFACE rule: the line is
   // written whenever the dead pane's surface is settled — no attach
   // attempt is in flight and none will be auto-sent, so no reconstruction
-  // wipe can occur before the next user action — whichever settle event
+  // wipe can run before the next user action — whichever settle event
   // comes last:
   // - no terminalId (reload/boot shape): no attach can ever start, the
   //   empty surface is stable — this effect invokes the writer directly;
@@ -3347,10 +3489,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   //   server rejects it — the INVALID_TERMINAL_ID stand-down gate owns the
   //   write there, post-rejection — EXCEPT when the surface is ALREADY
   //   settled by a later event (delta review round 3):
-  //   - attach machinery exhausted (recovery bound reached): every
+  //   - attach machinery exhausted (recovery bound reached): every LATER
   //     automatic attach is refused BEFORE sending (attachTerminal's
   //     beginRecoveryAttempt), so no rejection response will ever arrive
-  //     and no wipe can be enqueued — this effect is the fallback writer;
+  //     and no NEW wipe can be enqueued — this effect is the fallback
+  //     writer. A PREVIOUSLY admitted attach can still have its
+  //     reconstruction reset QUEUED at that moment (focused review 3,
+  //     round 2), so the write is QUEUE-ORDERED
+  //     (writeDeadSessionNoticeToSurface): FIFO lands the line AFTER that
+  //     pending reset instead of letting a direct write be erased by it;
   //   - surface recreated since the last write (provider renderer
   //     preference change re-ran the init effect): the new buffer is
   //     blank and the recreation itself happened with no attach cycle
@@ -3367,6 +3514,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       // so a later re-death of the SAME identity writes again.
       deadSessionNoticeStateRef.current = null
       deadSessionNoticePendingRef.current = null
+      deadSessionNoticeQueuedWriteRef.current = null
       return
     }
     if (deadSessionNoticePendingRef.current && termRef.current) {
@@ -7019,12 +7167,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             if (deadSessionLatchRef.current) {
               // Post-rejection moment (no-modal contract): the round's
               // attach attempt -- including any beginMountedReconstruction
-              // wipe -- has settled and been rejected, so the surface is
-              // final for the round. Write the one notice line now (the
-              // retained-terminalId shape's primary writer; idempotent per
-              // surface epoch, re-armed after a wipe. The notice effect is
-              // the fallback writer for the settles that draw no response
-              // -- attach exhaustion and surface recreation).
+              // wipe -- has settled and been rejected, so no further wipe
+              // of this round can be pending and the write QUEUE is the
+              // line's own settled regime. Write the one notice line now,
+              // QUEUE-ORDERED (it flushes behind anything still queued from
+              // the round; the retained-terminalId shape's primary writer;
+              // idempotent per surface epoch, re-armed after a wipe; a
+              // queued copy dropped by a LATER attach takeover is re-written
+              // by this same gate at that round's rejection). The notice
+              // effect is the fallback writer for the settles that draw no
+              // response -- attach exhaustion and surface recreation.
               writeDeadSessionNoticeIfPending()
               return
             }

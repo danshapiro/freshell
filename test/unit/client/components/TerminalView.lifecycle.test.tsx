@@ -16579,6 +16579,185 @@ describe('dead-session notice line (no-modal contract)', () => {
     expect(leafContent(store).reconcileNotice).toBe('Reconcile rejected this pane (invalid_pane_shape).')
   })
 
+  it('attach-exhaustion fallback vs a PENDING reconstruction reset: the notice is queue-ordered after the unflushed reset and survives it', async () => {
+    // Focused review 3, round 2 — the reviewer's race: reaching the recovery
+    // bound does not prove the surface is settled. The LAST ADMITTED attach
+    // can still have a mounted-reconstruction reset QUEUED (unflushed) when
+    // the limiter exhausts — writing the notice DIRECTLY lands it BEFORE
+    // that reset, the reset then wipes it, the abandoned attach never yields
+    // a rejection, and the exhausted limiter blocks every later automatic
+    // attach: the pane is left WITHOUT its notice. The write must be
+    // QUEUE-ORDERED: FIFO lands the line AFTER the pending reset.
+    const { store } = await renderDeadSessionNoticePane(
+      {},
+      { reconcilePendingPanes: { [PANE_KEY]: Date.now() } },
+    )
+    const mountAttachId = sentAttaches()[0].attachRequestId
+
+    // The pane rendered pre-death content on its mount attach: the surface
+    // is dirty, so every later admitted attach degrades to a mounted
+    // reconstruction (the pane has no checkpoint stream identity).
+    act(() => {
+      messageHandler!({
+        type: 'terminal.attach.ready',
+        terminalId: TERMINAL_ID,
+        attachRequestId: mountAttachId,
+        seq: 0,
+        headSeq: 1,
+        replayFromSeq: 1,
+        replayToSeq: 1,
+      })
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId: TERMINAL_ID,
+        seqStart: 1,
+        seqEnd: 1,
+        data: 'stale pre-restart output\r\n',
+      })
+    })
+    expect(modeledFinalBuffer()).toContain('stale pre-restart output')
+
+    // Defer the write queue's flush: the next reconstruction reset is
+    // ENQUEUED but stays UNFLUSHED (the pending reset of the finding).
+    const pump = captureWriteFrames()
+
+    // Three progressless transport flaps exhaust the recovery bound (the
+    // mount attach was the pane's free initial hydration). Each admitted
+    // attach reconstructs the dirty surface and supersedes the previous
+    // round's queued reset+task, so the LAST flap's reset is still queued
+    // when the bound trips — and its wire attach (queued behind the reset)
+    // never even went out: no response can ever arrive.
+    act(() => { reconnectHandler!() })
+    act(() => { reconnectHandler!() })
+    act(() => { reconnectHandler!() })
+    expect(sentAttaches()).toHaveLength(1)
+    expect(noticeWriteCount()).toBe(0)
+
+    // The connection drops before the pending round can settle.
+    wsMocks.isReady = false
+
+    // The dead verdict folds (latch + mint). The lifecycle effect re-fires
+    // the round's attach — which the exhausted limiter REFUSES before
+    // sending: no response will ever arrive, so the gate can never run and
+    // the notice effect's exhaustion fallback is the ONLY writer.
+    foldDeadVerdict(store)
+    await waitFor(() => {
+      expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
+    })
+    expect(sentAttaches()).toHaveLength(1)
+
+    // The fallback fired while the reconstruction reset was still queued:
+    // the notice must ride BEHIND it. Flush the deferred queue frames —
+    // the reset applies (wiping the surface), then the notice lands.
+    act(() => { pump() })
+
+    // FINAL SURVIVING BUFFER STATE: the notice is present exactly once, on
+    // the post-reset surface (a direct write here would have been wiped).
+    const buffer = modeledFinalBuffer()
+    expect(buffer.split(NOTICE_LINE).length - 1).toBe(1)
+    // FIFO order: the notice write ran AFTER the reconstruction reset.
+    const writes = terminalWriteStrings(term())
+    const resetIndex = writes.indexOf(MOUNTED_RECONSTRUCTION)
+    expect(resetIndex).toBeGreaterThanOrEqual(0)
+    expect(writes.indexOf(FRAMED_NOTICE)).toBeGreaterThan(resetIndex)
+    // Exactly one notice line was ever written.
+    expect(noticeWriteCount()).toBe(1)
+    // The pending reset really wiped the pre-death content.
+    expect(buffer).not.toContain('stale pre-restart output')
+    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    expect(sentCreates()).toHaveLength(0)
+    expect(leafContent(store).terminalId).toBe(TERMINAL_ID)
+  })
+
+  it('gate write survives an attach-generation takeover: a queued copy dropped by a later admitted attach is re-written at that round’s rejection — exactly once', async () => {
+    // Queue-ordered writes are droppable: every attach takeover calls
+    // setActiveGeneration(+dropQueuedStaleWrites). A queued dead notice
+    // caught by a takeover is re-delivered by the tracker — the copy's
+    // enqueue-time generation no longer matches the queue's active one, so
+    // the next writer call (this round's own rejection gate) re-writes the
+    // recorded line instead of trusting the dropped copy. Without the
+    // tracker this scenario loses the line permanently: the mint was
+    // consumed at the first enqueue and no re-fold re-mints.
+    const { store } = await renderDeadSessionNoticePane(
+      {},
+      { reconcilePendingPanes: { [PANE_KEY]: Date.now() } },
+    )
+    const mountAttachId = sentAttaches()[0].attachRequestId
+    act(() => {
+      messageHandler!({
+        type: 'terminal.attach.ready',
+        terminalId: TERMINAL_ID,
+        attachRequestId: mountAttachId,
+        seq: 0,
+        headSeq: 1,
+        replayFromSeq: 1,
+        replayToSeq: 1,
+      })
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId: TERMINAL_ID,
+        seqStart: 1,
+        seqEnd: 1,
+        data: 'stale pre-restart output\r\n',
+      })
+    })
+
+    // Round 1: fold the dead verdict, let the round's (admitted) attach
+    // reconstruct and reach the wire, then reject it — the gate enqueues
+    // the notice while the flush is deferred.
+    const pump = captureWriteFrames()
+    foldDeadVerdict(store)
+    act(() => { pump() }) // the reconstruction reset applies; the wire attach goes out
+    await waitFor(() => {
+      expect(sentAttaches().length).toBe(2)
+    })
+    const roundOneAttachId = sentAttaches().at(-1)!.attachRequestId
+    act(() => {
+      messageHandler!({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        message: 'Unknown terminalId',
+        requestId: roundOneAttachId,
+        terminalId: TERMINAL_ID,
+      })
+    })
+    // The gate write is QUEUED (unflushed) under round one's generation.
+    expect(noticeWriteCount()).toBe(0)
+
+    // A transport flap admits a NEW attach (the limiter is not exhausted):
+    // its reconstruction takeover bumps the generation and DROPS the queued
+    // notice before it ever applies.
+    act(() => { reconnectHandler!() })
+    await waitFor(() => {
+      expect(sentAttaches().length).toBe(3)
+    })
+    act(() => { pump() }) // the flap's reset applies; its wire attach goes out
+    const flapAttachId = sentAttaches().at(-1)!.attachRequestId
+    expect(flapAttachId).not.toBe(roundOneAttachId)
+
+    // The flap round is rejected too: the gate re-runs and must re-write
+    // the dropped line (the tracker saw the generation move).
+    act(() => {
+      messageHandler!({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        message: 'Unknown terminalId',
+        requestId: flapAttachId,
+        terminalId: TERMINAL_ID,
+      })
+    })
+    act(() => { pump() })
+
+    // The dropped copy never reached the surface; the re-written copy did —
+    // exactly one line, in the final buffer.
+    const writes = terminalWriteStrings(term())
+    expect(writes.filter((data) => data === FRAMED_NOTICE)).toHaveLength(1)
+    const buffer = modeledFinalBuffer()
+    expect(buffer.split(NOTICE_LINE).length - 1).toBe(1)
+    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    expect(sentCreates()).toHaveLength(0)
+  })
+
   it('attach-exhaustion fallback: at the recovery bound a dead pane still gets its notice — the refused round leaves no rejection to write it', async () => {
     // Delta review round 3, finding 1 (combined state): a dead pane with a
     // retained terminalId whose attach machinery is EXHAUSTED can never
