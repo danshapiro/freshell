@@ -138,6 +138,10 @@ export function unsupportedInvocationResult(
     && !freshAgentFamilies.some(agent => agent === invocation.agent)) {
     return { error: 'Unsupported fresh-agent family with the Rust Freshell server.', hint: 'Use agent: claude, kilroy, codex, or opencode.' }
   }
+  if (canonical === 'split-pane' && invocation?.agent === undefined
+    && ['model', 'effort'].some(key => invocation?.[key] !== undefined)) {
+    return { error: 'Fresh-agent splits with model or effort require an agent.', hint: 'Choose agent claude, kilroy, codex, or opencode.' }
+  }
   const waitPattern = canonical === 'wait-for' ? invocation?.pattern : undefined
   if (canonical === 'wait-for' && (
     typeof waitPattern !== 'string' || waitPattern.length === 0 || ['stable', 'exit', 'prompt'].some((key) => invocation?.[key] !== undefined)
