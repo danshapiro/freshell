@@ -538,13 +538,18 @@ export function foldVerdicts(
         break
       }
       case 'dead_session': {
-        // Loud, non-destructive per-pane breadcrumb: the saved session
-        // artifact is gone. RestoreError reasons are a closed enum, so the
-        // verdict's machine reason travels on the dead-copy notice below.
+        // Stale-verdict identity guard (delta round 4, finding 2): both
+        // dispatches carry the createRequestId the REQUEST observed on
+        // this pane. Replace pane keeps the paneId but re-keys the content
+        // (a NEW createRequestId); a verdict for the replaced-away content
+        // then NO-OPs in the reducers instead of latching the replacement
+        // dead (which would arm the new-create stand-down against it and
+        // break the requested resolution through existing pane chrome).
         dispatch(setPaneRestoreError({
           tabId,
           paneId,
           restoreError: buildRestoreError('durable_artifact_missing'),
+          expectedCreateRequestId: pane.createRequestId,
         }))
         // No-modal contract (Task 2): the terminal dead arm also mints the
         // dead-copy reconcileNotice beside the latch — the signal no other
@@ -563,6 +568,7 @@ export function foldVerdicts(
           tabId,
           paneId,
           notice: deadSessionReconcileNoticeFor(verdict.reason),
+          expectedCreateRequestId: pane.createRequestId,
         }))
         break
       }

@@ -2864,10 +2864,31 @@ export const panesSlice = createSlice({
 
     setPaneReconcileNotice: (
       state,
-      action: PayloadAction<{ tabId: string; paneId: string; notice: string }>
+      action: PayloadAction<{
+        tabId: string
+        paneId: string
+        notice: string
+        /** Stale-verdict identity guard (delta round 4, finding 2): the
+         * createRequestId the verdict's REQUEST observed on this pane. When
+         * present and the CURRENT content's createRequestId differs, the pane
+         * was replaced since the request (Replace pane keeps the paneId but
+         * re-keys the content) — the verdict describes the old content, and
+         * this fold no-ops. */
+        expectedCreateRequestId?: string
+      }>
     ) => {
+      const { expectedCreateRequestId } = action.payload
       const content = findReconcilePaneContent(state, action.payload.tabId, action.payload.paneId)
       if (!content) return
+      if (expectedCreateRequestId !== undefined && content.createRequestId !== expectedCreateRequestId) {
+        log.warn('ignoring a stale-verdict reconcile notice for replaced pane content', {
+          tabId: action.payload.tabId,
+          paneId: action.payload.paneId,
+          expectedCreateRequestId,
+          currentCreateRequestId: content.createRequestId ?? null,
+        })
+        return
+      }
       content.reconcileNotice = action.payload.notice
     },
 
@@ -2951,13 +2972,35 @@ export const panesSlice = createSlice({
      * Loud, non-destructive per-pane breadcrumb for reconcile
      * dead_session/invalid/error verdicts. Sets only restoreError —
      * never touches identity, handles, or createRequestId.
+     * The optional `expectedCreateRequestId` is the stale-verdict identity
+     * guard (delta round 4, finding 2): when present and the CURRENT
+     * content's createRequestId differs, the pane was replaced since the
+     * request that carried the verdict (Replace pane keeps the paneId but
+     * re-keys the content) — the verdict describes the old content, and the
+     * fold no-ops (no latch, no dead-copy mint, no pre-verdict pending
+     * release: the replacement's own verdict/window owns those).
      */
     setPaneRestoreError: (
       state,
-      action: PayloadAction<{ tabId: string; paneId: string; restoreError: RestoreError }>
+      action: PayloadAction<{
+        tabId: string
+        paneId: string
+        restoreError: RestoreError
+        expectedCreateRequestId?: string
+      }>
     ) => {
+      const { expectedCreateRequestId } = action.payload
       const content = findReconcilePaneContent(state, action.payload.tabId, action.payload.paneId)
       if (!content) return
+      if (expectedCreateRequestId !== undefined && content.createRequestId !== expectedCreateRequestId) {
+        log.warn('ignoring a stale-verdict restoreError for replaced pane content', {
+          tabId: action.payload.tabId,
+          paneId: action.payload.paneId,
+          expectedCreateRequestId,
+          currentCreateRequestId: content.createRequestId ?? null,
+        })
+        return
+      }
       content.restoreError = action.payload.restoreError
       // dead/invalid/error verdicts resolve the pre-verdict wait too
       clearReconcilePendingForPane(state, action.payload.tabId, action.payload.paneId)

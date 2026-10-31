@@ -12,13 +12,16 @@ const localStorageMock = (() => {
 })()
 Object.defineProperty(globalThis, 'localStorage', { value: localStorageMock, writable: true })
 
+import { configureStore } from '@reduxjs/toolkit'
 import panesReducer, {
   initLayout,
   applyReconcileAttach,
+  replacePane,
   resetPaneForReconcileCreate,
   setReconcileWarming,
   setPaneReconcileNotice,
   setPaneRestoreError,
+  updatePaneContent,
 } from '@/store/panesSlice'
 import type { PanesState } from '@/store/panesSlice'
 import type { TerminalPaneContent, PaneNode } from '@/store/paneTypes'
@@ -478,6 +481,90 @@ describe('foldVerdicts', () => {
     const outcome = foldVerdicts(dispatch, req, resultFor(req, dispatched.verdicts))
     expect(outcome.invalid).toBe(1)
     expect(dispatched.countOf(setPaneRestoreError.type)).toBe(1)
+  })
+})
+
+describe('foldVerdicts stale-verdict identity guard (delta round 4, finding 2)', () => {
+  // The guard lives in the REDUCERS the fold dispatches to, so these pins
+  // drive a REAL store (the recording harness above cannot see reducer
+  // behavior).
+  function realStorePanes() {
+    return configureStore({ reducer: { panes: panesReducer } })
+  }
+
+  function seedDeadAdjudicablePane(store: ReturnType<typeof realStorePanes>) {
+    store.dispatch(initLayout({
+      tabId: 'tab1',
+      paneId: 'p1',
+      content: {
+        kind: 'terminal',
+        mode: 'claude',
+        shell: 'system',
+        createRequestId: 'cr-old',
+        status: 'running',
+        terminalId: 't-old',
+        sessionRef: { provider: 'claude', sessionId: 'sess-gone' },
+      },
+    }))
+  }
+
+  function leafTerminalContent(store: ReturnType<typeof realStorePanes>): TerminalPaneContent {
+    const layout = store.getState().panes.layouts['tab1'] as { type: 'leaf'; content: TerminalPaneContent }
+    return layout.content
+  }
+
+  it('a dead verdict for replaced content cannot latch the replacement (Replace pane keeps the paneId, re-keys createRequestId)', () => {
+    const store = realStorePanes()
+    seedDeadAdjudicablePane(store)
+
+    // A reconcile request goes out, carrying the OLD content's identity.
+    const req = buildReconcileRequest(asRootState(store.getState().panes))!
+    expect(req.panes[0].createRequestId).toBe('cr-old')
+
+    // While the verdict is in flight, the user resolves the dead-looking
+    // pane through existing chrome: Replace pane keeps the paneId, swaps
+    // in the type picker, and the user's selection lands NEW terminal
+    // content with a NEW createRequestId (the PaneContainer flow).
+    store.dispatch(replacePane({ tabId: 'tab1', paneId: 'p1' }))
+    store.dispatch(updatePaneContent({
+      tabId: 'tab1',
+      paneId: 'p1',
+      content: {
+        kind: 'terminal',
+        mode: 'claude',
+        shell: 'system',
+        createRequestId: 'cr-new',
+        status: 'creating',
+      },
+    }))
+
+    // The OLD request's dead verdict arrives. RED today: the verdict keys
+    // only on (tabId, paneId), so the latch + dead-copy mint land on the
+    // NEW content — and the new-create stand-down (keyed on the latch)
+    // blocks the replacement from ever starting, breaking the requested
+    // resolution through existing pane chrome.
+    foldVerdicts(store.dispatch, req, deadResultFor(req))
+
+    const content = leafTerminalContent(store)
+    expect(content.createRequestId).toBe('cr-new')
+    expect(content.restoreError).toBeUndefined()
+    expect(content.reconcileNotice).toBeUndefined()
+    expect(content.status).toBe('creating')
+    expect(content.terminalId).toBeUndefined()
+  })
+
+  it('the same fold still latches + mints the pane the verdict describes (the guard is an exact-identity check)', () => {
+    const store = realStorePanes()
+    seedDeadAdjudicablePane(store)
+    const req = buildReconcileRequest(asRootState(store.getState().panes))!
+    foldVerdicts(store.dispatch, req, deadResultFor(req))
+    const content = leafTerminalContent(store)
+    expect(content.createRequestId).toBe('cr-old')
+    expect(content.restoreError).toMatchObject({
+      code: 'RESTORE_UNAVAILABLE',
+      reason: 'durable_artifact_missing',
+    })
+    expect(isDeadSessionReconcileNotice(content.reconcileNotice)).toBe(true)
   })
 })
 
