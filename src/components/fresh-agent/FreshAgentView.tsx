@@ -1217,6 +1217,17 @@ export function FreshAgentView({
   const [localEcho, setLocalEchoState] = useState<LocalEcho | null>(() => paneContent.pendingLocalEcho ?? null)
   const localEchoRef = useRef<LocalEcho | null>(null)
   localEchoRef.current = localEcho
+  // The send-time turn-key boundary of THIS mount's composer send: which
+  // turns already existed when the CURRENT optimistic echo was dispatched.
+  // It must ride a ref, not the echo state: the pane-content sync effect
+  // below adopts the normalized (runtime-field-stripped) store copy of a
+  // fresh echo in the store-driven render that precedes the send's own
+  // state update, so a boundary carried on the state echo is reliably
+  // stripped before any render can read it. Keyed by the echo's requestId
+  // and consulted only while it describes the CURRENT echo (a restored
+  // echo — a reload inside the echo window remounts the pane with no
+  // boundary at all — and a foreign re-keyed echo read as no boundary).
+  const localEchoSendBoundaryRef = useRef<{ requestId: string; turnKeys: ReadonlySet<string> } | null>(null)
   const pendingSendMetadataRef = useRef<Map<string, PendingSendMetadata>>(new Map())
   // The pane's busy-epoch: advanced at every busy→idle edge of effectiveStatus
   // that SETTLES a turn. A composer send records the current epoch into its
@@ -2040,6 +2051,12 @@ export function FreshAgentView({
     const echo = localEchoRef.current
     if (echo && echo.text === text) {
       setLocalEcho({ ...echo, requestId: retryRequestId })
+      // The retry re-keys the SAME message's echo: its send-time boundary
+      // (which turns existed before this message) carries over unchanged.
+      const boundary = localEchoSendBoundaryRef.current
+      if (boundary && boundary.requestId === echo.requestId) {
+        localEchoSendBoundaryRef.current = { requestId: retryRequestId, turnKeys: boundary.turnKeys }
+      }
     }
   }, [recordPendingSendMetadata, sendFreshAgentSendFrame, setLocalEcho])
 
@@ -4151,9 +4168,10 @@ export function FreshAgentView({
   // The user's just-sent message as an optimistic echo row, displayed after
   // the turns until the send's turn lands in the snapshot (the transcript
   // appends it as the newest turn). While it is displayed it holds the
-  // newest user row for the rewind fallback: no snapshot row can claim the
-  // busy-pending state during the echo window, so older rows keep the
-  // honest unavailable verdict until the send's own row lands.
+  // newest user row for the rewind fallback ONLY while no user row landed
+  // after its send (the newestUserTurnKey memo below decides that): older
+  // rows keep the honest unavailable verdict, and a LATER landed row both
+  // takes over the newest-user-row slot and retires the echo's claim.
   const localEchoTurn = useMemo<FreshAgentTurn | undefined>(() => (localEcho ? {
     id: `__local-echo:${localEcho.requestId}`,
     turnId: localEcho.submittedTurnId ?? `__local-echo:${localEcho.requestId}`,
@@ -4175,10 +4193,31 @@ export function FreshAgentView({
   // the memoized transcript re-renders when the flag flips.
   const captureInFlight = paneCaptureInFlight(pendingSendMetadataRef.current, paneContent.checkpointOutcomes, busyEpochRef.current)
   const newestUserTurnKey = useMemo(() => {
-    if (localEchoTurn) return getFreshAgentDisplayTurnKey(localEchoTurn)
     const userTurns = transcriptTurns.filter((turn) => turn.role === 'user')
-    return userTurns.length > 0 ? getFreshAgentDisplayTurnKey(userTurns[userTurns.length - 1]) : undefined
-  }, [localEchoTurn, transcriptTurns])
+    const lastLandedUserKey = userTurns.length > 0 ? getFreshAgentDisplayTurnKey(userTurns[userTurns.length - 1]) : undefined
+    if (!localEchoTurn) return lastLandedUserKey
+    // The echo holds the newest user row only while no user row landed
+    // AFTER its send — otherwise it is a stale echo (a delayed transcript
+    // can leave an old echo visible while a later turn runs) and the
+    // landed row takes over the newest-user-row slot. This mount's own
+    // composer send stamps its send-time turn keys in
+    // localEchoSendBoundaryRef, so any landed user row OUTSIDE that set
+    // appeared after the send and outdates the echo. A restored echo (a
+    // reload inside the echo window remounts the pane without the send
+    // metadata) has no send-time boundary at all: every landed user row
+    // beside it may belong to a later turn, so it holds the newest user
+    // row only while the transcript holds no user row. The echo's own
+    // row landing never fights this rule — that clear retires the echo in
+    // the same snapshot application.
+    const boundary = localEchoSendBoundaryRef.current
+    const sendTimeTurnKeys = boundary && localEcho && boundary.requestId === localEcho.requestId
+      ? boundary.turnKeys
+      : undefined
+    const echoOutdated = sendTimeTurnKeys
+      ? userTurns.some((turn) => !sendTimeTurnKeys.has(getTurnKey(turn)))
+      : userTurns.length > 0
+    return echoOutdated ? lastLandedUserKey : getFreshAgentDisplayTurnKey(localEchoTurn)
+  }, [localEcho, localEchoTurn, transcriptTurns])
   const getRewindAvailability = useCallback((turn: FreshAgentTurn): FreshAgentTurnRewindAvailability | undefined => {
     const availability = getCheckpointAvailability(turn)
     if (!availability) {
@@ -4190,14 +4229,22 @@ export function FreshAgentView({
       // remount, and the restored row carries no modern identity (no source,
       // no nativeTurnId), so without this branch it would fall to the LEGACY
       // enabled rewind path — an unearned rewind offer for a message whose
-      // checkpoint outcome this pane cannot know. While the pane is busy the
-      // send's turn is genuinely in flight: still saving. When idle the
-      // outcome is honestly unknown here — no checkpoint this pane can
-      // evidence — and the stale clear retires the echo row on its own.
-      // Identified by the echo row's `__local-echo:` id, the marker both the
-      // fresh send and the restored pendingLocalEcho build their row with.
+      // checkpoint outcome this pane cannot know. The same newest-user-row
+      // discipline as the modern fallback applies (defect fix: a stale echo
+      // beside a later landed row is never the newest user row): while the
+      // pane is busy AND the echo is still the pane's newest user row, the
+      // send's turn is genuinely in flight — still saving. Otherwise — the
+      // pane idle, or a later turn's row landed and outranks the echo — the
+      // outcome is honestly unknown on this surface, and the stale clear
+      // retires the echo row on its own schedule. Identified by the echo
+      // row's `__local-echo:` id, the marker both the fresh send and the
+      // restored pendingLocalEcho build their row with (the display key
+      // compares consistently: both sides derive through
+      // getFreshAgentDisplayTurnKey over the same memoized echo turn).
       if (localEchoTurn && turn.id === localEchoTurn.id) {
-        return isBusy
+        const echoIsNewestUserRow = newestUserTurnKey !== undefined
+          && getFreshAgentDisplayTurnKey(turn) === newestUserTurnKey
+        return isBusy && echoIsNewestUserRow
           ? { status: 'pending' }
           : { status: 'unavailable', reason: MODERN_TURN_CHECKPOINT_UNAVAILABLE }
       }
@@ -4436,6 +4483,10 @@ export function FreshAgentView({
       text,
       requestId,
       previousTurnKeys: (snapshotRef.current?.turns ?? []).map(getTurnKey),
+    }
+    localEchoSendBoundaryRef.current = {
+      requestId,
+      turnKeys: new Set(nextLocalEcho.previousTurnKeys),
     }
     setLocalEchoState(nextLocalEcho)
     dispatch(mergePaneContent({

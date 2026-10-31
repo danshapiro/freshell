@@ -371,6 +371,191 @@ test.describe('Freshopencode first-message code checkpoint', () => {
   })
 })
 
+test.describe('Freshopencode restored-echo rewind honesty', () => {
+  test('a reload inside the echo window shows the restored echo still saving, then the enriched row enabled after the settle', async ({ page }) => {
+    test.setTimeout(240_000)
+    const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-freshopencode-restored-echo-'))
+    const binDir = path.join(sharedRoot, 'bin')
+    const logsDir = path.join(sharedRoot, 'logs')
+    const auditLogPath = path.join(sharedRoot, 'fake-opencode-audit.jsonl')
+    const sharedOpencodeDataDir = path.join(sharedRoot, 'opencode-data')
+    const cwd = path.join(sharedRoot, 'project')
+    const promptGatePath = path.join(sharedRoot, 'prompt-gate')
+    const prompt = `playwright restored echo reload prompt ${Date.now()}`
+    await fsp.mkdir(cwd, { recursive: true })
+    // A Git workspace cwd so the code checkpoint capture succeeds (the
+    // enabled rewind at the journey's end requires an available capture).
+    await fsp.writeFile(path.join(cwd, 'tracked.txt'), 'fixture workspace file\n')
+    execFileSync('git', ['init', cwd], { stdio: 'ignore' })
+    execFileSync('git', ['-C', cwd, 'config', 'user.email', 'fixture@example.invalid'], { stdio: 'ignore' })
+    execFileSync('git', ['-C', cwd, 'config', 'user.name', 'Freshell fixture'], { stdio: 'ignore' })
+    execFileSync('git', ['-C', cwd, 'add', '--', 'tracked.txt'], { stdio: 'ignore' })
+    execFileSync('git', ['-C', cwd, 'commit', '-m', 'fixture'], { stdio: 'ignore' })
+    await installFakeOpencode(binDir)
+
+    // The flag-less harness (the durable ses_* id must materialize for the
+    // journey's end) with the prompt gate holding the turn in flight.
+    const server = new RustServer(createServerOptions({
+      binDir,
+      auditLogPath,
+      logsDir,
+      sharedOpencodeDataDir,
+      hangSessionCreate: false,
+      extraEnv: { FAKE_OPENCODE_HOLD_PROMPT_GATE_PATH: promptGatePath },
+    }))
+
+    try {
+      const info = await server.start()
+      // Frame-level pin for the whole journey, installed BEFORE the page's
+      // first WebSocket so it owns both the original page's socket and the
+      // reloaded page's socket (the message-holding idiom of
+      // fresh-agent-hidden-approval-reveal.spec.ts). Server->client frames
+      // pass through until the send flips the hold; from then until the
+      // release below they are buffered undelivered — so the dying page's
+      // pagehide persist cannot write the send's follow-up frames (the
+      // checkpoint outcome, the materialization re-key, the refetch's
+      // status adoption) into the persisted pane content, and the reloaded
+      // page boots on persisted content alone (no frames, so no snapshot
+      // fetch, no outcome history, no status overwrite). The
+      // client->server direction always passes — the composer send itself
+      // rides it, so the server really runs the capture, forwards the
+      // prompt to the fake, and parks the turn at the gate.
+      let holdServerFrames = false
+      const heldFrames: Array<() => void> = []
+      await page.routeWebSocket('**/ws', (route) => {
+        const upstream = route.connectToServer()
+        upstream.onMessage((message) => {
+          const deliver = () => {
+            try {
+              route.send(message)
+            } catch {
+              // The owning page died with its socket (the reload); the
+              // buffered frame dies with it.
+            }
+          }
+          if (holdServerFrames) {
+            heldFrames.push(deliver)
+            return
+          }
+          deliver()
+        })
+      })
+      await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+      const harness = new TestHarness(page)
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+      await enableFreshOpencode(page)
+      await createFreshopencodePane(page, cwd)
+
+      await expect.poll(async () => getFreshOpencodePaneState(page), { timeout: 15_000 }).toMatchObject({
+        sessionId: expect.stringMatching(/^freshopencode-/),
+      })
+      // Flush the pane's placeholder identity so the reloaded page
+      // rehydrates this pane at all.
+      await page.evaluate(() => {
+        window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
+      })
+
+      await sendFreshAgentPrompt(page, prompt)
+      // From the send on, no server frame may update the store: the
+      // optimistic echo row is the displayed copy of the in-flight first
+      // send — the echo window the reload must land inside. Wait for the
+      // pane store to hold the echo (raf-cadence polling, so the flush
+      // below runs before any debounced persist could), then persist
+      // EXACTLY this state: the optimistic echo plus the optimistic
+      // running status, with no checkpoint outcome bound under the send's
+      // request.
+      holdServerFrames = true
+      await page.waitForFunction(() => {
+        const state = window.__FRESHELL_TEST_HARNESS__?.getState() as any
+        const findFreshOpencode = (node: any): any => {
+          if (!node) return undefined
+          if (node.type === 'leaf' && node.content?.kind === 'fresh-agent' && node.content.provider === 'opencode') {
+            return node.content
+          }
+          if (node.type === 'split') return findFreshOpencode(node.children?.[0]) ?? findFreshOpencode(node.children?.[1])
+          return undefined
+        }
+        const activeTabId = state?.tabs?.activeTabId
+        const content = findFreshOpencode(state?.panes?.layouts?.[activeTabId])
+        return Boolean(content?.pendingLocalEcho && content?.status === 'running')
+      })
+      await page.evaluate(() => {
+        window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
+      })
+      await page.reload()
+      await harness.waitForHarness()
+
+      // The rehydrated pane boots from persisted content alone: the
+      // restored echo row renders with the persisted running status, no
+      // snapshot can land the durable row (the frames that trigger the
+      // refetch are held, and the fetch itself is gated on the connection
+      // the held ready frame never establishes), and no outcome is bound
+      // under the send's request. Mid-turn, the restored echo is the
+      // pane's newest user row whose checkpoint outcome is genuinely in
+      // flight — so its hover shows the DISABLED still-saving state, never
+      // the legacy enabled rewind offer an unbound restored echo used to
+      // fall to.
+      const paneRoot = page.locator('[data-context="fresh-agent"]').last()
+      const echoRow = paneRoot.locator('[data-turn-role="user"]', { hasText: prompt })
+      await expect(echoRow).toBeVisible({ timeout: 10_000 })
+      // Pin that the pane really reports busy: the held-frame boot has no
+      // server-seen session record and no snapshot, so the pane's status IS
+      // the persisted running status the send stamped — the still-saving
+      // verdict below is only honest mid-turn. (The composer's Stop button
+      // is not usable as this pin: it needs a snapshot's interrupt
+      // capability, which the held-frame boot has not fetched.)
+      await expect.poll(async () => getFreshOpencodePaneState(page), { timeout: 10_000 }).toMatchObject({
+        status: 'running',
+      })
+      await echoRow.hover()
+      const saving = echoRow.getByRole('button', { name: 'Saving code rewind checkpoint' })
+      await expect(saving).toBeVisible()
+      await expect(saving).toBeDisabled()
+      await expect(saving).toHaveAttribute('title', 'Saving the code state from before this message')
+      await expect(echoRow.getByRole('button', { name: 'Rewind code to here' })).toHaveCount(0)
+
+      // Reconnect the page: the held frames deliver (the original page's
+      // die with its socket; the reloaded page's ready frame and everything
+      // after it flow), and the server's truth reaches the pane — the
+      // record's current status, the capture's outcome, the
+      // materialization, and the parked turn's busy window.
+      holdServerFrames = false
+      for (const deliver of heldFrames.splice(0)) deliver()
+      await harness.waitForConnection()
+      // Parked-ness (the live legs' discipline): the fake received the
+      // prompt and never emitted the turn's idle — the still-saving
+      // verdict above was made while the turn was genuinely in flight.
+      await expect.poll(async () => {
+        const events = await readAuditEvents(auditLogPath)
+        return events.some((event) => event.event === 'prompt_async' && event.prompt === prompt)
+      }, { timeout: 60_000 }).toBe(true)
+      const idleEmitted = async () => (await readAuditEvents(auditLogPath))
+        .some((event) => event.event === 'session_idle_emitted')
+      await expect(await idleEmitted()).toBe(false)
+
+      // Release the gate: the parked response answers, the idle settles the
+      // turn, the identity observation binds the enriched outcome (the
+      // per-alias broadcast reaches this pane whichever session id the
+      // reload persisted), and the durable row lands — the echo clears at
+      // its landing.
+      await fsp.writeFile(promptGatePath, 'release\n')
+      await expect.poll(idleEmitted, { timeout: 30_000 }).toBe(true)
+
+      // The enriched row shows the enabled rewind hover: the journey's end
+      // matches the live-binding leg, reached through the reload.
+      const userTurn = paneRoot.locator('[data-turn-role="user"]', { hasText: prompt })
+      await expect(userTurn).toHaveCount(1, { timeout: 30_000 })
+      await userTurn.hover()
+      const rewind = userTurn.getByRole('button', { name: 'Rewind code to here' })
+      await expect(rewind).toBeEnabled({ timeout: 30_000 })
+    } finally {
+      await server.stop().catch(() => {})
+      await fsp.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+})
+
 test.describe('Freshopencode MCP/CLI rewind honesty', () => {
   test('an MCP/CLI-driven turn through the REST lane makes no rewind claim mid-turn, and the honest unavailable verdict returns at settle', async ({ page }) => {
     test.setTimeout(180_000)
