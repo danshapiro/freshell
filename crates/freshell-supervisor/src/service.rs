@@ -88,6 +88,7 @@ fn backend_failure_category(error: &BackendError) -> (&'static str, Option<u16>)
         BackendError::DockerHttp { status, .. } => ("docker_http", Some(*status)),
         BackendError::Malformed(_) => ("malformed_response", None),
         BackendError::InvalidConfig(_) => ("invalid_config", None),
+        BackendError::CodexIncompatible(_) => ("codex_configuration_incompatible", None),
         BackendError::StoppedRepair(_) => ("stopped_repair", None),
     }
 }
@@ -2880,6 +2881,7 @@ impl Supervisor {
                 state,
                 native_session_id,
                 claude_fork,
+                ..
             } => {
                 self.commit_fresh_native_operation(&context, &host, native_session_id, claude_fork)
                     .await?;
@@ -9077,6 +9079,7 @@ mod opencode_transfer_restart_tests {
                     effort: None,
                     permission_mode: None,
                     sandbox: None,
+                    collaboration_mode: None,
                 }),
                 None,
             )
@@ -10354,6 +10357,7 @@ mod interrupted_transaction_tests {
             incarnation_id: None,
             grant_id: None,
             provider: Some("claude"),
+            codex_source_runtime: None,
             tui_source: None,
             workspace: Some("/workspace"),
             auth_lookup_authority: None,
@@ -10650,6 +10654,7 @@ mod interrupted_transaction_tests {
                 incarnation_id: None,
                 grant_id: None,
                 provider: Some("claude"),
+                codex_source_runtime: None,
                 tui_source: None,
                 workspace: Some(&terminal.workspace_path),
                 auth_lookup_authority: Some(&scope.key),

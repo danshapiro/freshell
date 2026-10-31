@@ -3932,6 +3932,7 @@ pub(crate) mod tests {
             OwnedRuntimeHandle::from_registry(
                 original.installation_id().clone(),
                 original.soul_id().clone(),
+                original.provider_store_id().into(),
                 original.incarnation_id().clone(),
                 original.launch_nonce().clone(),
                 original.daemon_id().clone(),

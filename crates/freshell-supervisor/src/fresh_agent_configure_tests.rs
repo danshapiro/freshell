@@ -61,12 +61,13 @@ async fn running_fresh_claude() -> RunningFreshAgent {
     running_fresh_provider(FreshProvider::Claude).await
 }
 async fn running_fresh_provider(provider: FreshProvider) -> RunningFreshAgent {
-    running_fresh_provider_with_name(provider, None).await
+    running_fresh_provider_with_name(provider, None, "native-claude").await
 }
 
 async fn running_fresh_provider_with_name(
     provider: FreshProvider,
     naming_handle: Option<String>,
+    initial_native_session_id: &str,
 ) -> RunningFreshAgent {
     let root = tempfile::tempdir().unwrap();
     let workspace = std::fs::canonicalize(root.path()).unwrap();
@@ -160,7 +161,7 @@ async fn running_fresh_provider_with_name(
             launch_nonce: prepared.launch_nonce.as_str().into(),
             evidence_revision: current.evidence_revision,
             execution_generation: grant.execution_generation,
-            requested_native_session_id: Some("native-claude".into()),
+            requested_native_session_id: Some(initial_native_session_id.into()),
         })
         .await
         .unwrap();
@@ -168,7 +169,7 @@ async fn running_fresh_provider_with_name(
         .record_native_session(
             soul.clone(),
             prepared.incarnation_id.clone(),
-            "native-claude".into(),
+            initial_native_session_id.into(),
         )
         .await
         .unwrap();
@@ -177,7 +178,7 @@ async fn running_fresh_provider_with_name(
         .record_native_identity_observation(
             soul.clone(),
             NativeIdentityObservation {
-                native_session_id: "native-claude".into(),
+                native_session_id: initial_native_session_id.into(),
                 incarnation_id: prepared.incarnation_id.clone(),
                 launch_nonce: launch.launch_nonce.clone(),
                 evidence_revision: launch.evidence_revision,
@@ -218,6 +219,7 @@ async fn running_fresh_provider_with_name(
 
 fn native_send_reply(previous: &str, native: &str, pending: Option<String>) -> HostResult {
     HostResult::FreshAgentCommand {
+        claude_fork: None,
         state: CommandState::ProviderAcked,
         native_session_id: Some(native.into()),
         native_identity: Some(NativeDispatchIdentity {
@@ -228,7 +230,7 @@ fn native_send_reply(previous: &str, native: &str, pending: Option<String>) -> H
     }
 }
 
-fn native_send_host(
+async fn native_send_host(
     fixture: &RunningFreshAgent,
     replies: Vec<HostResult>,
     gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
@@ -241,24 +243,78 @@ fn native_send_host(
     let listener = UnixListener::bind(fixture.runtime_dir.join("host.sock")).unwrap();
     let boot = HostBootId::new();
     let incarnation = fixture.incarnation.clone();
+    let context = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    let mut launch = context.native_identity_launch.unwrap();
+    let mut observation = fixture
+        .supervisor
+        .registry
+        .inventory()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|view| view.incarnation_id == fixture.incarnation)
+        .unwrap()
+        .native_identity_observation
+        .expect("the current producer observation was published during fixture startup");
+    let control_epoch = fixture.supervisor.registry.control_epoch();
     let (shutdown, mut stop) = tokio::sync::oneshot::channel();
     let host = tokio::spawn(async move {
         let mut replies = replies.into_iter();
         let mut sends = 0;
+        let mut ready_for_send = false;
         loop {
             let mut socket =
                 tokio::select! {_=&mut stop=>break,result=listener.accept()=>result.unwrap().0};
             let envelope: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
             let result = match envelope.body {
                 HostCommand::Hello {incarnation_id,challenge} => HostResult::Hello {
-                    host_boot_id:boot.clone(),proof:host_proof(secret,&challenge,&boot,&incarnation_id),capabilities:vec![],effective_limits:crate::checkpoints::tests::limits()
+                    host_boot_id:boot.clone(),proof:host_proof(secret,&challenge,&boot,&incarnation_id),capabilities:vec!["native-identity-observation-v1".into()],effective_limits:crate::checkpoints::tests::limits()
+                },
+                HostCommand::Status { incarnation_id } => {
+                    assert_eq!(incarnation_id, incarnation);
+                    assert_eq!(envelope.auth, Some(host_proof(secret, "command-auth", &boot, &incarnation)));
+                    assert!(!ready_for_send, "only one readiness read may precede each original input");
+                    assert!(observation.matches_launch(&launch));
+                    ready_for_send = true;
+                    HostResult::Status {
+                        host_boot_id: boot.clone(),
+                        worker_pid: Some(123),
+                        worker_launch_count: 1,
+                        max_control_epoch: control_epoch,
+                        max_execution_generation: launch.execution_generation,
+                        fixture_evidence: serde_json::Value::Null,
+                        exited: false,
+                        native_session_id: Some(observation.native_session_id.clone()),
+                        native_identity_observation: Some(observation.clone()),
+                        opencode_transfer_receipt: None,
+                        opencode_adoption: Default::default(),
+                    }
                 },
                 HostCommand::FreshAgentSend {incarnation_id,..} => {
                     assert_eq!(incarnation_id,incarnation);
                     assert_eq!(envelope.auth,Some(host_proof(secret,"command-auth",&boot,&incarnation)));
+                    assert!(ready_for_send, "current native readiness must precede the original input");
+                    ready_for_send = false;
                     sends+=1;
                     if let Some((entered,release))=&gate {entered.notify_one();release.notified().await;}
-                    replies.next().expect("no input may be automatically resent")
+                    let reply = replies.next().expect("no input may be automatically resent");
+                    if let HostResult::FreshAgentCommand {
+                        state: CommandState::ProviderAcked | CommandState::Completed,
+                        native_session_id: Some(native), ..
+                    } = &reply {
+                        if native != &observation.native_session_id {
+                            launch.evidence_revision += 1;
+                            launch.requested_native_session_id = Some(native.clone());
+                            observation.native_session_id = native.clone();
+                            observation.evidence_revision = launch.evidence_revision;
+                        }
+                    }
+                    reply
                 },
                 other=>panic!("native acknowledgement must not create/start/configure/probe a provider: {other:?}")
             };
@@ -272,6 +328,10 @@ fn native_send_host(
             .await
             .unwrap();
         }
+        assert!(
+            !ready_for_send,
+            "an acknowledgement must not trigger a trailing native probe"
+        );
         sends
     });
     (shutdown, host)
@@ -280,9 +340,12 @@ fn native_send_host(
 #[tokio::test]
 async fn accepted_native_recovery_preserves_presentation_and_pending_name_policy() {
     for pending in [false, true] {
-        let fixture =
-            running_fresh_provider_with_name(FreshProvider::Codex, Some("pending-original".into()))
-                .await;
+        let fixture = running_fresh_provider_with_name(
+            FreshProvider::Codex,
+            Some("pending-original".into()),
+            "native-original",
+        )
+        .await;
         fixture
             .supervisor
             .registry
@@ -320,7 +383,7 @@ async fn accepted_native_recovery_preserves_presentation_and_pending_name_policy
             handle.clone(),
         ));
         let expected_sends = replies.len();
-        let (shutdown, host) = native_send_host(&fixture, replies, None);
+        let (shutdown, host) = native_send_host(&fixture, replies, None).await;
         let mut results = Vec::new();
         let mut same_native = None;
         for index in 0..expected_sends {
@@ -415,6 +478,7 @@ async fn native_dispatch_rejects_stale_invalid_and_nonaccepted_identity_authorit
                 FreshProvider::Codex
             },
             Some("pending-original".into()),
+            "native-original",
         )
         .await;
         fixture
@@ -456,6 +520,7 @@ async fn native_dispatch_rejects_stale_invalid_and_nonaccepted_identity_authorit
             state,
             native_session_id,
             native_identity,
+            ..
         } = &mut reply
         {
             match scenario {
@@ -473,7 +538,8 @@ async fn native_dispatch_rejects_stale_invalid_and_nonaccepted_identity_authorit
             &fixture,
             vec![reply],
             (scenario == "stop-intent").then(|| (entered.clone(), release.clone())),
-        );
+        )
+        .await;
         let work = tokio::spawn({
             let supervisor = fixture.supervisor.clone();
             let soul = fixture.soul.clone();

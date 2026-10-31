@@ -44,6 +44,7 @@ async fn unconfirmed_codex_supervisor(
         .commit_created(
             prepared.incarnation_id.clone(),
             BackendCreatedRecord {
+                launch_policy: Default::default(),
                 daemon_id: DockerDaemonId::new(),
                 container_id: "a".repeat(64),
                 image_ref: format!("sha256:{}", "b".repeat(64)),
