@@ -76,6 +76,7 @@ import {
   freshAgentTurnText,
   getFreshAgentDisplayTurnKey,
   isModernCheckpointTurn,
+  LOCAL_ECHO_TURN_ID_PREFIX,
 } from '@shared/fresh-agent-turns'
 import {
   buildFreshAgentSlashCommandMenu,
@@ -4187,8 +4188,8 @@ export function FreshAgentView({
   // rows keep the honest unavailable verdict, and a LATER landed row both
   // takes over the newest-user-row slot and retires the echo's claim.
   const localEchoTurn = useMemo<FreshAgentTurn | undefined>(() => (localEcho ? {
-    id: `__local-echo:${localEcho.requestId}`,
-    turnId: localEcho.submittedTurnId ?? `__local-echo:${localEcho.requestId}`,
+    id: `${LOCAL_ECHO_TURN_ID_PREFIX}${localEcho.requestId}`,
+    turnId: localEcho.submittedTurnId ?? `${LOCAL_ECHO_TURN_ID_PREFIX}${localEcho.requestId}`,
     requestId: localEcho.requestId,
     role: 'user',
     summary: localEcho.text,
@@ -4250,22 +4251,33 @@ export function FreshAgentView({
       // enabled rewind path — an unearned rewind offer for a message whose
       // checkpoint outcome this pane cannot know. The same newest-user-row
       // discipline as the modern fallback applies (defect fix: a stale echo
-      // beside a later landed row is never the newest user row): while the
-      // pane is busy AND the echo is still the pane's newest user row, the
-      // send's turn is genuinely in flight — still saving. Otherwise — the
-      // pane idle, or a later turn's row landed and outranks the echo — the
-      // outcome is honestly unknown on this surface, and the stale clear
-      // retires the echo row on its own schedule. Identified by the echo
-      // row's `__local-echo:` id, the marker both the fresh send and the
-      // restored pendingLocalEcho build their row with (the display key
-      // compares consistently: both sides derive through
+      // beside a later landed row is never the newest user row), with one
+      // honesty rule stricter than the modern fallback: while the pane is
+      // busy AND the echo is still the pane's newest user row (the send
+      // boundary proves every landed row predates the send), the send's
+      // turn is genuinely in flight — still saving. While the pane is busy
+      // but some landed row sits OUTSIDE the boundary, the echo is
+      // UNCERTAIN: that row may be a later turn's row OR a late-landing
+      // OLDER row (a queued second message can dispatch before the first
+      // row reaches the snapshot, and that row then lands during the
+      // second turn) — the client cannot tell, so mid-turn the echo makes
+      // NO claim at all (undefined; the hover hides the rewind affordance
+      // for the echo row, never an unearned settled verdict). At the
+      // busy→idle settle the honest unavailable verdict returns, and the
+      // stale clear retires the echo row on its own schedule. Identified
+      // by the echo row's `__local-echo:` id, the marker both the fresh
+      // send and the restored pendingLocalEcho build their row with (the
+      // display key compares consistently: both sides derive through
       // getFreshAgentDisplayTurnKey over the same memoized echo turn).
       if (localEchoTurn && turn.id === localEchoTurn.id) {
         const echoIsNewestUserRow = newestUserTurnKey !== undefined
           && getFreshAgentDisplayTurnKey(turn) === newestUserTurnKey
-        return isBusy && echoIsNewestUserRow
-          ? { status: 'pending' }
-          : { status: 'unavailable', reason: MODERN_TURN_CHECKPOINT_UNAVAILABLE }
+        if (isBusy) {
+          return echoIsNewestUserRow
+            ? { status: 'pending' }
+            : undefined
+        }
+        return { status: 'unavailable', reason: MODERN_TURN_CHECKPOINT_UNAVAILABLE }
       }
       return unboundRewindAvailability(
         turn,

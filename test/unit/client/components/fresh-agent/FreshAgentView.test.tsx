@@ -5496,7 +5496,11 @@ describe('FreshAgentView', () => {
       // rehydrated pane shows the restored echo BESIDE a newer user row.
       // The reload destroyed the send metadata that would attribute the
       // busy window, so the restored echo can prove nothing about the
-      // LATER turn — it may never claim a save is underway for it.
+      // LATER turn — it may never claim a save is underway for it. Nor can
+      // it earn the settled unavailable verdict mid-turn: a landed row the
+      // boundary cannot place may be a later row OR a late-landing older
+      // one, so the uncertain echo makes NO claim at all while the turn
+      // runs, and the honest unavailable returns at the settle.
       let snapshotStatus = 'running'
       apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => ({
         status: snapshotStatus,
@@ -5541,14 +5545,14 @@ describe('FreshAgentView', () => {
 
       const [laterRow, echoRow] = screen.getAllByRole('article', { name: 'You transcript turn' })
       // The ECHO row is NOT the pane's newest user row (the later turn's
-      // row landed), so it keeps the honest unavailable verdict for the
-      // whole busy window — never a "Saving code rewind checkpoint" claim
-      // for the later turn it cannot speak for. RED today: the restored
-      // echo claims Saving whenever the pane is busy.
+      // row landed), so mid-turn it makes NO rewind claim at all — never a
+      // "Saving code rewind checkpoint" claim for the later turn it
+      // cannot speak for, and never the settled unavailable verdict the
+      // uncertain window cannot evidence either: the request's "(or
+      // nothing)" acceptance.
       expect(within(echoRow!).queryByRole('button', { name: 'Saving code rewind checkpoint' })).not.toBeInTheDocument()
-      const echoRewind = await within(echoRow!).findByRole('button', { name: 'Rewind unavailable for this message' })
-      expect(echoRewind).toBeDisabled()
-      expect(echoRewind).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
+      expect(within(echoRow!).queryByRole('button', { name: 'Rewind unavailable for this message' })).not.toBeInTheDocument()
+      expect(within(echoRow!).queryByRole('button', { name: 'Rewind code to here' })).not.toBeInTheDocument()
       // The LATER row keeps its own honest state: it is the newest user
       // row and the pane is busy, but the reload left no send metadata, so
       // no capture this pane can evidence is in flight — the nothing-branch
@@ -5559,13 +5563,16 @@ describe('FreshAgentView', () => {
       expect(within(laterRow!).queryByRole('button', { name: 'Rewind code to here' })).not.toBeInTheDocument()
 
       // The later turn settles: its row returns to the honest unavailable
-      // verdict, and the stale echo keeps the same verdict it held mid-turn.
+      // verdict, and the echo's own honest unavailable verdict returns
+      // with it (no checkpoint outcome ever reached this pane).
       snapshotStatus = 'idle'
       emitSessionSnapshotStatus(store, onMessage, sessionId, 'idle')
       const laterRewind = await within(laterRow!).findByRole('button', { name: 'Rewind unavailable for this message' })
       expect(laterRewind).toBeDisabled()
       expect(laterRewind).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
-      expect(within(echoRow!).queryByRole('button', { name: 'Saving code rewind checkpoint' })).not.toBeInTheDocument()
+      const echoRewind = await within(echoRow!).findByRole('button', { name: 'Rewind unavailable for this message' })
+      expect(echoRewind).toBeDisabled()
+      expect(echoRewind).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
     })
 
     it('a reloaded second message still shows still-saving beside earlier turns', async () => {
@@ -5658,7 +5665,96 @@ describe('FreshAgentView', () => {
       expect(echoRewind).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
     })
 
-    it('a restored echo whose persisted boundary excludes a later-landed row keeps the honest unavailable', async () => {
+    it('a late-landing older row never earns an unavailable verdict for the queued message mid-turn', async () => {
+      const sessionId = 'thread-rewind-reloaded-queued-late-row'
+      const store = createStore()
+      let onMessage: ((message: Record<string, unknown>) => void) | undefined
+      wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+        onMessage = handler
+        return () => {}
+      })
+      // The queued-second-message reload: the second message was
+      // dispatched after the first turn ended but BEFORE the first row
+      // reached the client snapshot, so the send boundary persisted with
+      // the echo is EMPTY — the positive claim that nothing predated the
+      // send on this pane's evidence. The first row then lands DURING the
+      // second turn: it is OLDER than the echo, but its key is outside
+      // the boundary, and the reloaded pane cannot tell a late-landing
+      // older row from a later one. Mid-turn that uncertainty must show
+      // NOTHING — never the settled unavailable verdict the
+      // outside-the-boundary classification used to mint for a row the
+      // pane cannot place in time; the honest unavailable returns at the
+      // settle.
+      let snapshotStatus = 'running'
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => ({
+        status: snapshotStatus,
+        summary: 'the first row landed beside the queued second send\'s echo',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [unboundModernUserTurn('msg_first_late', 'Prompt whose row landed after the queued send')],
+      }))
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-reloaded-queued-late-row',
+          sessionId,
+          status: 'idle',
+          pendingLocalEcho: {
+            requestId: 'req-reloaded-queued-late-row-send',
+            text: 'Prompt queued as the second message before the first row landed',
+            // EMPTY boundary: the first row had not reached the snapshot
+            // at dispatch time, so the send claimed nothing preceded it.
+            previousTurnKeys: [],
+          },
+        },
+      }))
+
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+
+      expect(await screen.findByText('Prompt whose row landed after the queued send')).toBeInTheDocument()
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(2)
+      expect(onMessage).toBeTypeOf('function')
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'running')
+      // Pin that the busy drive actually engaged: the nothing verdict
+      // below is only honest while the pane is truly busy.
+      expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+
+      const [firstRow, echoRow] = screen.getAllByRole('article', { name: 'You transcript turn' })
+      // NOTHING mid-turn on the echo — the request's "(or nothing)"
+      // acceptance: the boundary cannot prove the echo current (the
+      // landed row is outside it), but that row may be a late-landing
+      // OLDER row, so no settled verdict is earned either way — no
+      // still-saving hover, no unavailable hover, no enabled hover. RED
+      // today: the echo shows the unearned unavailable hover while the
+      // turn runs.
+      expect(within(echoRow!).queryByRole('button', { name: 'Saving code rewind checkpoint' })).not.toBeInTheDocument()
+      expect(within(echoRow!).queryByRole('button', { name: 'Rewind unavailable for this message' })).not.toBeInTheDocument()
+      expect(within(echoRow!).queryByRole('button', { name: 'Rewind code to here' })).not.toBeInTheDocument()
+      // The landed first row keeps its own honest state: it holds the
+      // newest user row while the echo is outranked, the pane is busy,
+      // and the reload left no send metadata — nothing this pane can
+      // evidence as in flight, so the nothing-branch makes no claim.
+      expect(within(firstRow!).queryByRole('button', { name: 'Saving code rewind checkpoint' })).not.toBeInTheDocument()
+      expect(within(firstRow!).queryByRole('button', { name: 'Rewind unavailable for this message' })).not.toBeInTheDocument()
+      expect(within(firstRow!).queryByRole('button', { name: 'Rewind code to here' })).not.toBeInTheDocument()
+
+      // The turn settles: the honest unavailable verdict returns on the
+      // echo (no checkpoint outcome ever reached this pane).
+      snapshotStatus = 'idle'
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'idle')
+      const echoRewind = await within(echoRow!).findByRole('button', { name: 'Rewind unavailable for this message' })
+      expect(echoRewind).toBeDisabled()
+      expect(echoRewind).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
+    })
+
+    it('a restored echo whose persisted boundary excludes a later-landed row makes no rewind claim mid-turn, and the honest unavailable returns at settle', async () => {
       const sessionId = 'thread-rewind-reloaded-echo-boundary-later-row'
       const store = createStore()
       let onMessage: ((message: Record<string, unknown>) => void) | undefined
@@ -5668,10 +5764,13 @@ describe('FreshAgentView', () => {
       })
       // The persisted boundary names the row that existed at send time
       // (msg_first); the later row (msg_later) landed AFTER the send —
-      // outside the boundary — so it outdates the restored echo exactly
-      // the way a landed row outside the in-memory boundary outdates a
-      // fresh echo's window. The boundary never licenses a save claim for
-      // a later turn the echo cannot speak for.
+      // outside the boundary. The boundary never licenses a save claim
+      // for a later turn the echo cannot speak for, but it cannot CONDEMN
+      // the echo either: a row outside the boundary may be a later row OR
+      // a late-landing older one (the client cannot tell), so mid-turn
+      // the uncertain echo makes NO claim at all — never the settled
+      // unavailable verdict it cannot evidence while the turn runs — and
+      // the honest unavailable returns at the settle.
       let snapshotStatus = 'running'
       apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => ({
         status: snapshotStatus,
@@ -5714,13 +5813,14 @@ describe('FreshAgentView', () => {
 
       const [firstRow, laterRow, echoRow] = screen.getAllByRole('article', { name: 'You transcript turn' })
       // The ECHO row is NOT the pane's newest user row — the later row
-      // landed outside the persisted boundary — so it keeps the honest
-      // unavailable verdict for the whole busy window, never a
-      // "Saving code rewind checkpoint" claim for the later turn.
+      // landed outside the persisted boundary — so mid-turn it makes NO
+      // rewind claim at all: never a "Saving code rewind checkpoint"
+      // claim for the later turn, and never the settled unavailable
+      // verdict the uncertain window cannot evidence — the request's
+      // "(or nothing)" acceptance.
       expect(within(echoRow!).queryByRole('button', { name: 'Saving code rewind checkpoint' })).not.toBeInTheDocument()
-      const echoRewind = await within(echoRow!).findByRole('button', { name: 'Rewind unavailable for this message' })
-      expect(echoRewind).toBeDisabled()
-      expect(echoRewind).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
+      expect(within(echoRow!).queryByRole('button', { name: 'Rewind unavailable for this message' })).not.toBeInTheDocument()
+      expect(within(echoRow!).queryByRole('button', { name: 'Rewind code to here' })).not.toBeInTheDocument()
       // The LATER row keeps its own honest state: it is the newest user
       // row and the pane is busy, but the reload left no send metadata, so
       // nothing this pane can evidence is in flight — the nothing-branch
@@ -5733,9 +5833,17 @@ describe('FreshAgentView', () => {
       const firstRewind = await within(firstRow!).findByRole('button', { name: 'Rewind unavailable for this message' })
       expect(firstRewind).toBeDisabled()
       expect(firstRewind).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
+
+      // The turn settles: the honest unavailable verdict returns on the
+      // echo (no checkpoint outcome ever reached this pane).
+      snapshotStatus = 'idle'
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'idle')
+      const echoRewind = await within(echoRow!).findByRole('button', { name: 'Rewind unavailable for this message' })
+      expect(echoRewind).toBeDisabled()
+      expect(echoRewind).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
     })
 
-    it('a restored echo persisted without a boundary falls back to the conservative verdict beside earlier rows', async () => {
+    it('a restored echo persisted without a boundary makes no rewind claim mid-turn and keeps the conservative unavailable at settle', async () => {
       const sessionId = 'thread-rewind-reloaded-echo-legacy-record'
       const store = createStore()
       let onMessage: ((message: Record<string, unknown>) => void) | undefined
@@ -5746,8 +5854,11 @@ describe('FreshAgentView', () => {
       // Legacy records (persisted before the send boundary rode the echo
       // record): the rehydrated pane cannot tell earlier rows from later
       // ones — every landed row may belong to a later turn — so the
-      // restored echo keeps the conservative verdict: unavailable even
-      // while the pane is busy. Only an empty transcript (the first leg's
+      // restored echo is UNCERTAIN beside any landed row: mid-turn it
+      // makes no rewind claim at all (never a save claim it cannot
+      // evidence, and never the settled unavailable verdict the uncertain
+      // window cannot earn), and the conservative unavailable verdict
+      // returns at the settle. Only an empty transcript (the first leg's
       // journey) can earn the still-saving verdict without a boundary.
       let snapshotStatus = 'running'
       apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => ({
@@ -5786,12 +5897,12 @@ describe('FreshAgentView', () => {
       expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
 
       const [earlierRow, echoRow] = screen.getAllByRole('article', { name: 'You transcript turn' })
-      // No boundary evidence → the conservative fallback: the echo never
-      // claims a save is underway beside a row it cannot place in time.
+      // No boundary evidence → the uncertain window: the echo makes no
+      // rewind claim at all beside a row it cannot place in time — no
+      // save claim, no settled verdict, no enabled offer.
       expect(within(echoRow!).queryByRole('button', { name: 'Saving code rewind checkpoint' })).not.toBeInTheDocument()
-      const echoRewind = await within(echoRow!).findByRole('button', { name: 'Rewind unavailable for this message' })
-      expect(echoRewind).toBeDisabled()
-      expect(echoRewind).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
+      expect(within(echoRow!).queryByRole('button', { name: 'Rewind unavailable for this message' })).not.toBeInTheDocument()
+      expect(within(echoRow!).queryByRole('button', { name: 'Rewind code to here' })).not.toBeInTheDocument()
       // The earlier row takes over the newest-user-row slot while the
       // echo is outdated, so mid-turn it holds the same uncertain state
       // the stale test's later row holds: busy, newest, but nothing this
@@ -5802,13 +5913,16 @@ describe('FreshAgentView', () => {
 
       // The turn settles: both rows return to the honest unavailable
       // verdict (the landed row's nothing-branch dies at the busy→idle
-      // edge; the echo keeps the conservative verdict it held mid-turn).
+      // edge; the echo's conservative unavailable verdict returns with
+      // it — no checkpoint outcome ever reached this pane).
       snapshotStatus = 'idle'
       emitSessionSnapshotStatus(store, onMessage, sessionId, 'idle')
       const earlierRewind = await within(earlierRow!).findByRole('button', { name: 'Rewind unavailable for this message' })
       expect(earlierRewind).toBeDisabled()
       expect(earlierRewind).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
-      expect(within(echoRow!).queryByRole('button', { name: 'Saving code rewind checkpoint' })).not.toBeInTheDocument()
+      const echoRewind = await within(echoRow!).findByRole('button', { name: 'Rewind unavailable for this message' })
+      expect(echoRewind).toBeDisabled()
+      expect(echoRewind).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
     })
 
     it('keeps the older snapshot user row honestly unavailable while a pending local echo holds the newest user row', async () => {

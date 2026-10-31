@@ -76,6 +76,19 @@ export function isModernCheckpointTurn(turn: Pick<FreshAgentTurn, 'nativeTurnId'
 }
 
 /**
+ * The id marker of the pending local echo row — the optimistic display copy
+ * of a composer send whose turn has not landed in the provider snapshot yet.
+ * Both a fresh send and a restored pendingLocalEcho record build their row
+ * with it, so action surfaces can identify the echo row without a wire
+ * contract.
+ */
+export const LOCAL_ECHO_TURN_ID_PREFIX = '__local-echo:'
+
+export function isPendingLocalEchoTurn(turn: Pick<FreshAgentTurn, 'id'>): boolean {
+  return typeof turn.id === 'string' && turn.id.startsWith(LOCAL_ECHO_TURN_ID_PREFIX)
+}
+
+/**
  * A turn summary is "authored" — provider-written prose that must remain a
  * permanent transcript boundary — unless the server explicitly tagged it as an
  * 'echo' of the turn's own items. A missing tag is conservative (authored):
