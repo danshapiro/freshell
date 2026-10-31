@@ -313,13 +313,22 @@ mod tests {
                         );
                         continue;
                     }
+                    let mut raw = if params["threadId"] == parent["thread"]["id"] {
+                        parent.clone()
+                    } else {
+                        child.clone()
+                    };
+                    if params["includeTurns"] == false {
+                        raw["thread"]["turns"] = json!([]);
+                    }
+                    peer.respond(&id, raw);
+                } else if method == "thread/turns/list" {
+                    assert_eq!(params["threadId"], parent["thread"]["id"]);
+                    assert_eq!(params["limit"], 1);
+                    assert_eq!(params["itemsView"], "full");
                     peer.respond(
                         &id,
-                        if params["threadId"] == parent["thread"]["id"] {
-                            parent.clone()
-                        } else {
-                            child.clone()
-                        },
+                        json!({"data": parent["thread"]["turns"], "nextCursor": null, "backwardsCursor": null}),
                     );
                 } else {
                     panic!("observer dispatched a writer operation: {method}");
@@ -355,11 +364,10 @@ mod tests {
                     .contains("Exact child final answer."));
             }
             state.shutdown().await;
-            assert!(driver
-                .await
-                .unwrap()
-                .iter()
-                .all(|(method, _)| matches!(method.as_str(), "initialize" | "thread/read")));
+            assert!(driver.await.unwrap().iter().all(|(method, _)| matches!(
+                method.as_str(),
+                "initialize" | "thread/read" | "thread/turns/list"
+            )));
         }
     }
 
@@ -389,9 +397,10 @@ mod tests {
         ] {
             assert_eq!(observed["snapshot"]["capabilities"][flag], false);
         }
-        assert!(reads
-            .iter()
-            .all(|(method, _)| matches!(method.as_str(), "initialize" | "thread/read")));
+        assert!(reads.iter().all(|(method, _)| matches!(
+            method.as_str(),
+            "initialize" | "thread/read" | "thread/turns/list"
+        )));
         assert!(reads
             .iter()
             .any(|(_, params)| params["threadId"] == "child" && params["includeTurns"] == true));
@@ -431,11 +440,10 @@ mod tests {
                 }
             }
             state.shutdown().await;
-            assert!(driver
-                .await
-                .unwrap()
-                .iter()
-                .all(|(method, _)| matches!(method.as_str(), "initialize" | "thread/read")));
+            assert!(driver.await.unwrap().iter().all(|(method, _)| matches!(
+                method.as_str(),
+                "initialize" | "thread/read" | "thread/turns/list"
+            )));
         }
     }
 
@@ -533,7 +541,22 @@ mod tests {
                 .expect("parent history read");
         assert_eq!(method, "thread/read");
         assert_eq!(params["threadId"], "parent");
-        peer.respond(&id, parent());
+        assert_eq!(params["includeTurns"], false);
+        let mut metadata = parent();
+        metadata["thread"]["turns"] = json!([]);
+        peer.respond(&id, metadata);
+        let (id, method, params) =
+            tokio::time::timeout(Duration::from_secs(3), peer.expect_request())
+                .await
+                .expect("parent recent-turn membership read");
+        assert_eq!(method, "thread/turns/list");
+        assert_eq!(params["threadId"], "parent");
+        assert_eq!(params["limit"], 1);
+        assert_eq!(params["itemsView"], "full");
+        peer.respond(
+            &id,
+            json!({"data": parent()["thread"]["turns"], "nextCursor": null, "backwardsCursor": null}),
+        );
         let (id, method, params) =
             tokio::time::timeout(Duration::from_secs(3), peer.expect_request())
                 .await

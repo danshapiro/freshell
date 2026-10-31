@@ -60,9 +60,21 @@ async fn capture_from_peer(
     let mut capturing = Box::pin(lane.capture(request));
     tokio::select! {
         result = &mut capturing => result,
-        (id, method, _) = peer.expect_request() => {
+        (id, method, params) = peer.expect_request() => {
             assert_eq!(method, "thread/read");
-            peer.respond(&id, raw.clone());
+            assert_eq!(params["includeTurns"], false);
+            let mut metadata = raw.clone();
+            metadata["thread"]["turns"] = json!([]);
+            peer.respond(&id, metadata);
+            let (id, method, params) = tokio::select! {
+                result = &mut capturing => panic!("capture settled without its native recent-turn page: {result:?}"),
+                request = peer.expect_request() => request,
+            };
+            assert_eq!(method, "thread/turns/list");
+            assert_eq!(params["threadId"], raw["thread"]["id"]);
+            assert_eq!(params["limit"], 1);
+            assert_eq!(params["itemsView"], "full");
+            peer.respond(&id, json!({"data":raw["thread"]["turns"],"nextCursor":null,"backwardsCursor":null}));
             capturing.await
         }
     }
@@ -453,10 +465,22 @@ async fn task009_rest_lane_capture_preserves_native_output_and_bounds_utf8_separ
         let state = state.clone();
         tokio::spawn(async move { state.get_snapshot("task009-capture", None).await })
     };
-    let (id, method, _) = peer.expect_request().await;
+    let (id, method, params) = peer.expect_request().await;
     assert_eq!(method, "thread/read");
+    assert_eq!(params["includeTurns"], false);
     let raw = json!({"thread":{"id":"task009-capture","status":{"type":"idle"},"turns":[{"id":"captured-turn","status":"completed","items":[{"type":"userMessage","id":"u","content":[{"type":"text","text":"éé"}]},{"type":"agentMessage","id":"a","text":"actual retained answer"}]}]}});
-    peer.respond(&id, raw.clone());
+    let mut metadata = raw.clone();
+    metadata["thread"]["turns"] = json!([]);
+    peer.respond(&id, metadata);
+    let (id, method, params) = peer.expect_request().await;
+    assert_eq!(method, "thread/turns/list");
+    assert_eq!(params["threadId"], "task009-capture");
+    assert_eq!(params["limit"], 1);
+    assert_eq!(params["itemsView"], "full");
+    peer.respond(
+        &id,
+        json!({"data":raw["thread"]["turns"],"nextCursor":null,"backwardsCursor":null}),
+    );
     let ready = reading.await.unwrap().unwrap();
     let evidence = tokio::time::timeout(Duration::from_secs(1), events.recv())
         .await
