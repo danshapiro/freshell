@@ -208,7 +208,7 @@ pub struct FreshOpencodeState {
     /// close BEFORE its durable retire and wedging every other opencode map
     /// reader. Pinned by `handle_kill_never_holds_the_sessions_map_across_
     /// its_session_lock_wait` and its teardown/refusal-teardown twins.)
-    sessions: Arc<TokioMutex<HashMap<String, Arc<TokioMutex<OpencodeSession>>>>>,
+    sessions: Arc<TokioMutex<HashMap<String, Arc<OpencodeSessionCell>>>>,
     /// `freshAgent.create` requestId dedup (parity gap fix -- see the module doc on
     /// [`crate::FreshAgentCreateDedup`]): single-flight + replay cache so a client
     /// resending the SAME `requestId` on every reconnect while a pane is
@@ -848,7 +848,123 @@ enum IdleVerdict {
 /// The WS lane's session map ([`FreshOpencodeState::sessions`]): keyed by
 /// BOTH the placeholder id and (once materialized) the durable `ses_*` id —
 /// both aliases of the SAME record.
-type OpencodeSessions = Arc<TokioMutex<HashMap<String, Arc<TokioMutex<OpencodeSession>>>>>;
+type OpencodeSessions = Arc<TokioMutex<HashMap<String, Arc<OpencodeSessionCell>>>>;
+
+/// The per-session LOCK-FREE running mirror the snapshot route's probe reads
+/// when the session mutex is contended (focused E3R2 review defect 1).
+/// [`OpencodeSession::turn_derived_status`] — the probe's uncontended truth —
+/// lives behind the per-session mutex, and during a first send's
+/// materialization that mutex is HELD (the create parks under it) while the
+/// send has ALREADY broadcast `running`; there is no other lock-free source
+/// of the busy truth (no task registry outside the mutex, no broadcast
+/// ledger, and the daemon does not know a not-yet-created session). The
+/// mirror is the bounded lock-free claim that broadcast implies: armed at
+/// the send path's running-broadcast site and held by the spawned turn drive,
+/// so it clears at the drive's end (settle, error, or abort) with NO
+/// enumerated clear sites to drift. `mint` hands out strictly monotonic
+/// claim tokens (never reset), `current` holds the newest live claim's
+/// token — 0 means no running claim (idle). Arming runs under the session
+/// mutex (all arm sites do), so the fetch_add→store pair never interleaves;
+/// a claim's drop clears `current` only when it is STILL the newest claim,
+/// so an overlapping drive's older guard can never clear a newer send's
+/// claim (the unserialized-overlapping-sends corner the record documents).
+#[derive(Default)]
+struct RunningMirror {
+    mint: std::sync::atomic::AtomicU64,
+    current: std::sync::atomic::AtomicU64,
+}
+
+impl RunningMirror {
+    const fn new() -> Self {
+        Self {
+            mint: std::sync::atomic::AtomicU64::new(0),
+            current: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        self.current.load(Ordering::SeqCst) != 0
+    }
+}
+
+/// One map value in [`OpencodeSessions`]: the session record under the
+/// lane's per-session mutex, plus the record's lock-free running mirror.
+/// `Deref` to the inner mutex keeps every existing `arc.lock().await` /
+/// `arc.try_lock()` call site working unchanged; the mirror sits BESIDE the
+/// mutex so the probe's contended arm can read it without the lock.
+struct OpencodeSessionCell {
+    session: TokioMutex<OpencodeSession>,
+    running: RunningMirror,
+}
+
+impl std::ops::Deref for OpencodeSessionCell {
+    type Target = TokioMutex<OpencodeSession>;
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
+}
+
+impl OpencodeSessionCell {
+    fn wrapping(session: OpencodeSession) -> Self {
+        Self {
+            session: TokioMutex::new(session),
+            running: RunningMirror::new(),
+        }
+    }
+
+    /// The probe's contended-arm answer: the mirror's status — running while
+    /// a lane send is genuinely in flight, idle when no live claim exists.
+    fn mirror_turn_status(&self) -> &'static str {
+        if self.running.is_running() {
+            "running"
+        } else {
+            "idle"
+        }
+    }
+}
+
+/// Wrap a session record into its map cell (both aliases of one record share
+/// ONE cell, so the mirror is shared across the placeholder and durable ids).
+fn session_cell(session: OpencodeSession) -> Arc<OpencodeSessionCell> {
+    Arc::new(OpencodeSessionCell::wrapping(session))
+}
+
+/// The RAII running claim [`RunningMirror`] arming: created at the send
+/// path's running-broadcast site (under the session mutex), moved into the
+/// spawned turn drive so the claim lives EXACTLY as long as the drive —
+/// its `Drop` clears the mirror at the drive's end (natural settle, error,
+/// or abort) and every pre-spawn error return clears it when `send_locked`
+/// unwinds. A claim's drop only clears the mirror while it is still the
+/// NEWEST claim, so an overlapping older drive's drop is inert.
+struct RunningClaimGuard {
+    cell: Arc<OpencodeSessionCell>,
+    token: u64,
+}
+
+impl RunningClaimGuard {
+    fn arm(cell: &Arc<OpencodeSessionCell>) -> Self {
+        let token = cell.running.mint.fetch_add(1, Ordering::SeqCst) + 1;
+        cell.running.current.store(token, Ordering::SeqCst);
+        Self {
+            cell: Arc::clone(cell),
+            token,
+        }
+    }
+}
+
+impl Drop for RunningClaimGuard {
+    fn drop(&mut self) {
+        // Clear only OUR claim and only while it is still the current one —
+        // a newer send's claim has already overwritten `current`, and an
+        // overlapping older drive's drop must not clear it.
+        let _ = self.cell.running.current.compare_exchange(
+            self.token,
+            0,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+}
 
 /// The WS lane's turn-status probe handed to the shared
 /// [`crate::FreshAgentState`] (registered by [`FreshOpencodeState::new`]):
@@ -862,9 +978,12 @@ type OpencodeSessions = Arc<TokioMutex<HashMap<String, Arc<TokioMutex<OpencodeSe
 /// holds that mutex while awaiting the OpenCode session creation, and a probe
 /// that BLOCKED on it would stall the placeholder snapshot request (up to the
 /// route's timeout) exactly when the pane needs its refetch answered. On
-/// contention the probe returns `None` -- the route falls back to its
-/// pre-probe shape for exactly that request (liveness over truthfulness in
-/// the contended window; outside it, full truthfulness is preserved).
+/// contention the probe reads the session's LOCK-FREE running mirror instead
+/// (focused E3R2 review defect 1): the running broadcast has already fired
+/// for exactly this window, so the mirror answers running while the send is
+/// genuinely in flight — never a blanket idle — and idle only when no live
+/// running claim exists. The uncontended arm is unchanged: full truthfulness
+/// from the record itself whenever the lock is free.
 fn turn_status_probe(sessions: &OpencodeSessions) -> crate::OpencodeTurnStatusProbe {
     let sessions = sessions.clone();
     Arc::new(move |session_id: &str| {
@@ -876,7 +995,11 @@ fn turn_status_probe(sessions: &OpencodeSessions) -> crate::OpencodeTurnStatusPr
                 guard.get(&session_id).cloned()
             };
             let session_arc = session_arc?;
-            let session = session_arc.try_lock().ok()?;
+            let Ok(session) = session_arc.try_lock() else {
+                // The record lock is held (a send's materialization, a
+                // compact's preflight, ...): answer from the lock-free mirror.
+                return Some(session_arc.mirror_turn_status());
+            };
             Some(session.turn_derived_status())
         })
     })
@@ -1599,7 +1722,7 @@ impl FreshOpencodeState {
         self.sessions
             .lock()
             .await
-            .insert(placeholder.clone(), Arc::new(TokioMutex::new(session)));
+            .insert(placeholder.clone(), session_cell(session));
 
         // Cache the completed create for requestId dedup BEFORE responding (mirrors
         // codex/claude: a duplicate `create` arriving right after this point must see the
@@ -2343,7 +2466,7 @@ impl FreshOpencodeState {
     #[allow(clippy::too_many_arguments)] // the send field set + the drain's armed guard (the compact precedent)
     async fn send_locked(
         &self,
-        session_arc: &Arc<TokioMutex<OpencodeSession>>,
+        session_arc: &Arc<OpencodeSessionCell>,
         session: &mut tokio::sync::MutexGuard<'_, OpencodeSession>,
         msg: FreshAgentSend,
         session_id: String,
@@ -2424,6 +2547,18 @@ impl FreshOpencodeState {
             &busy_session_id,
             snapshot_event(&busy_session_id, "running"),
         ));
+        // The lock-free running claim for exactly this busy window (focused
+        // E3R2 review defect 1): the snapshot route's turn-status probe
+        // TRY-LOCKS this session's mutex, and the materialization below
+        // parks holding it — the pane that reloaded mid-send and missed the
+        // broadcast above would otherwise read a blanket idle from its
+        // refetch. Armed here (under the session mutex, so arming never
+        // interleaves), then moved into the spawned turn drive so the claim
+        // lives exactly as long as the drive: cleared at its natural settle,
+        // on any pre-spawn error return when this frame unwinds, and on
+        // every abort path (kill/interrupt join the aborted handle, so the
+        // guard's Drop has run before they answer).
+        let running_claim = RunningClaimGuard::arm(session_arc);
 
         let acked_session_id = if let Some(real_id) = session.real_session_id.clone() {
             // Already materialized: THE continuity fix — reuse it, no new session.
@@ -2907,6 +3042,12 @@ impl FreshOpencodeState {
         let prompt_dispatched = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let turn_task = tokio::spawn(async move {
+            // The drive owns the send's lock-free running claim (armed at the
+            // running broadcast above): held for the drive's whole life, so
+            // the probe's contended arm answers running exactly while this
+            // turn is in flight, and the claim clears at the drive's end —
+            // the settle tail's trailing idle broadcast — or on any abort.
+            let _running_claim = running_claim;
             // `run_turn` (freshell-opencode/serve.rs) prompts + awaits idle against the
             // REAL opencode serve session (adapter.ts materializeOrSend:363-368). The
             // accepted witness (b8ke focused FR1 + round-2 R2-4) arms the session's
@@ -3351,13 +3492,27 @@ impl FreshOpencodeState {
     pub async fn insert_live_session_for_test(&self, session_id: &str) {
         self.sessions.lock().await.insert(
             session_id.to_string(),
-            Arc::new(TokioMutex::new(OpencodeSession::new(
+            session_cell(OpencodeSession::new(
                 session_id.to_string(),
                 None,
                 None,
                 None,
-            ))),
+            )),
         );
+    }
+
+    /// Test-only seam (focused E3R2 review defect 1): read the session's
+    /// LOCK-FREE running mirror directly — the same cell the probe's
+    /// contended arm reads — WITHOUT taking the per-session mutex, so a
+    /// test can assert the claim's arm and clear around a held lock.
+    /// Production code must never call this.
+    #[doc(hidden)]
+    pub async fn opencode_running_claim_active_for_test(&self, session_id: &str) -> bool {
+        let cell = {
+            let guard = self.sessions.lock().await;
+            guard.get(session_id).cloned()
+        };
+        cell.is_some_and(|cell| cell.running.is_running())
     }
 
     /// Test-only seam for the b8ke focused FR1 red/green: settle the
@@ -6105,7 +6260,7 @@ impl FreshOpencodeState {
         // ep2-r5: bind the child's session INSTANCE — the fork's rescue
         // verifies this exact `Arc` against the map (a same-key
         // replacement for the child can never satisfy it).
-        let child_session_arc = Arc::new(TokioMutex::new(child_session));
+        let child_session_arc = session_cell(child_session);
         self.sessions
             .lock()
             .await
@@ -7349,7 +7504,7 @@ impl FreshOpencodeState {
         // performs the ONE `commit_live`, so this lane skips both its own
         // claim and its own commit (under-ticket mode).
         handoff: Option<(&str, u64)>,
-    ) -> Result<Arc<TokioMutex<OpencodeSession>>, ResumeOpencodeError> {
+    ) -> Result<Arc<OpencodeSessionCell>, ResumeOpencodeError> {
         // A `freshopencode-*` placeholder is minted by Freshell for a pane
         // that has not materialized yet. Opencode has never seen it, so no
         // daemon can resume it: answer NotFound before ANY side effect — no
@@ -7564,7 +7719,7 @@ impl FreshOpencodeState {
         });
         self.install_serve_bridge(&manager, &mut session, session_id)
             .await;
-        let session_arc = Arc::new(TokioMutex::new(session));
+        let session_arc = session_cell(session);
 
         self.sessions
             .lock()
@@ -8353,7 +8508,7 @@ impl FreshOpencodeState {
     /// deadlocked production) — the session `Arc`s are cloned out under ONE
     /// short map lock, the guard drops, and each session is read outside it.
     async fn materialized_session_ids(&self) -> Vec<String> {
-        let arcs: Vec<Arc<TokioMutex<OpencodeSession>>> = {
+        let arcs: Vec<Arc<OpencodeSessionCell>> = {
             let map = self.sessions.lock().await;
             map.values().cloned().collect()
         };
@@ -8890,18 +9045,18 @@ pub(crate) enum TransitionalBridgeRescue {
 /// current entry. The wrapped [`OpencodeSession`] stays private to this
 /// module; the runner only ever passes the handle through.
 #[derive(Clone)]
-pub(crate) struct OpencodeSessionHandle(Arc<TokioMutex<OpencodeSession>>);
+pub(crate) struct OpencodeSessionHandle(Arc<OpencodeSessionCell>);
 
 impl OpencodeSessionHandle {
     /// Wrap the session instance a caller is committing (or has just
     /// committed) under its durable id.
-    fn new(instance: Arc<TokioMutex<OpencodeSession>>) -> Self {
+    fn new(instance: Arc<OpencodeSessionCell>) -> Self {
         Self(instance)
     }
 
     /// The committed-instance binding (ep2-r5): true iff `current` IS the
     /// session instance this handle was minted from.
-    fn ptr_eq(&self, current: &Arc<TokioMutex<OpencodeSession>>) -> bool {
+    fn ptr_eq(&self, current: &Arc<OpencodeSessionCell>) -> bool {
         Arc::ptr_eq(&self.0, current)
     }
 }
@@ -13556,17 +13711,22 @@ mod tests {
         );
     }
 
-    /// Round-3 delta review defect 3: the snapshot route's turn-status probe
-    /// must never BLOCK on the per-session mutex. A first send's
-    /// materialization holds that mutex while awaiting the OpenCode session
-    /// creation, so a placeholder snapshot request issued during a slow
-    /// first send parks on the probe (up to the route's timeout) where the
-    /// pre-probe route answered immediately -- delaying snapshot refresh and
-    /// rehydration for exactly the window that needs it most. The probe
-    /// TRY-LOCKS the session record; on contention it returns None, and the
-    /// route falls back to the pre-probe shape for exactly that request
-    /// (liveness over truthfulness in the contended window; outside it,
-    /// full truthfulness is preserved). The success path is unchanged.
+    /// Focused E3R2 review defect 1 (superseding the round-3 delta defect-3
+    /// fix's contended-window contract): the snapshot route's turn-status
+    /// probe must never BLOCK on the per-session mutex, AND its contended
+    /// arm must never answer a blanket idle. A first send's materialization
+    /// holds that mutex while awaiting the OpenCode session creation, and
+    /// the send has ALREADY broadcast `running` (send_locked's status
+    /// broadcast fires before any materialization) — so a pane that reloads
+    /// in exactly that window missed the broadcast, and a placeholder
+    /// snapshot refetch answering the pre-probe honest idle flips the pane
+    /// idle mid-send (the in-flight message's row then shows the unearned
+    /// "Rewind unavailable" verdict). The probe TRY-LOCKS the session
+    /// record; on contention it reads the session's LOCK-FREE running
+    /// mirror (armed at the running-broadcast site, cleared when the send's
+    /// drive ends) and reports the mirror's status: running while the send
+    /// is genuinely in flight, idle only when no running claim is live.
+    /// The uncontended success path is unchanged.
     #[tokio::test(flavor = "multi_thread")]
     async fn placeholder_snapshot_answers_promptly_while_a_first_send_holds_the_session_mutex() {
         let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
@@ -13609,9 +13769,11 @@ mod tests {
             .expect("the first send reaches its session creation");
 
         // The placeholder snapshot request answers PROMPTLY -- the probe skips
-        // the status overlay on contention instead of parking on the held
-        // mutex -- and the answer falls back to the pre-probe shape (the
-        // built placeholder snapshot's honest idle).
+        // parking on the held mutex -- and the answer is the LOCK-FREE
+        // mirror's HONEST running: the send has already broadcast running and
+        // is genuinely in flight inside the held critical section, so the
+        // pane that reloaded mid-send and missed the broadcast must NOT be
+        // flipped idle by its refetch.
         let snapshot = tokio::time::timeout(
             Duration::from_millis(750),
             st.fresh_agent.get_opencode_snapshot(placeholder, None),
@@ -13624,14 +13786,41 @@ mod tests {
         .expect("placeholder snapshot builds");
         assert_eq!(
             snapshot["status"],
-            json!("idle"),
-            "the contended probe falls back to the pre-probe honest idle shape"
+            json!("running"),
+            "the contended probe reports the session's lock-free running mirror \
+             while the first send is genuinely in flight -- never a blanket idle"
+        );
+        // The mirror's claim is armed for exactly this window (read lock-free
+        // while the mutex stays held).
+        assert!(
+            st.opencode_running_claim_active_for_test(placeholder).await,
+            "the running claim is armed while the first send holds the session mutex"
         );
 
-        // Release the gated create so the parked send finishes and the test
-        // tears down cleanly.
+        // Release the gated create so the parked send finishes: the send
+        // spawns its turn drive (the claim moves into the drive), then the
+        // drive is settled — the abort path kill/interrupt use — so the
+        // claim must clear: the mirror never wedges running past the end of
+        // the drive it was armed for, and a fresh snapshot answers idle.
         release.notify_one();
         let _ = send.await;
+        st.settle_local_turn_task_for_test(placeholder).await;
+        assert!(
+            !st.opencode_running_claim_active_for_test(placeholder).await,
+            "the running claim clears when the send's drive ends"
+        );
+        let settled = tokio::time::timeout(
+            Duration::from_millis(750),
+            st.fresh_agent.get_opencode_snapshot(placeholder, None),
+        )
+        .await
+        .expect("the settled placeholder snapshot still answers promptly")
+        .expect("settled placeholder snapshot builds");
+        assert_eq!(
+            settled["status"],
+            json!("idle"),
+            "once no running claim is live the probe reports the honest idle"
+        );
     }
 
     #[tokio::test]
@@ -14322,7 +14511,7 @@ mod tests {
         let mut session =
             OpencodeSession::new("freshopencode-req-live".to_string(), None, None, None);
         session.real_session_id = Some("ses_live".to_string());
-        let session_arc = Arc::new(TokioMutex::new(session));
+        let session_arc = session_cell(session);
         {
             let mut guard = st.sessions.lock().await;
             guard.insert("freshopencode-req-live".to_string(), session_arc.clone());
@@ -15617,7 +15806,7 @@ mod tests {
         st.sessions
             .lock()
             .await
-            .insert(durable_id.to_string(), Arc::new(TokioMutex::new(session)));
+            .insert(durable_id.to_string(), session_cell(session));
         (st, rx, registry)
     }
 
@@ -18660,7 +18849,7 @@ mod tests {
         st.sessions
             .lock()
             .await
-            .insert(id.to_string(), Arc::new(TokioMutex::new(session)));
+            .insert(id.to_string(), session_cell(session));
     }
 
     /// Drain every buffered bus frame in arrival order (full parsed payloads).
@@ -21207,7 +21396,7 @@ mod tests {
         st.sessions
             .lock()
             .await
-            .insert(id.to_string(), Arc::new(TokioMutex::new(session)));
+            .insert(id.to_string(), session_cell(session));
     }
 
     /// b8ke ext r26 F3: the fork's PRE-MUTATION claim — the request-scoped
@@ -22310,7 +22499,7 @@ mod tests {
         st.sessions
             .lock()
             .await
-            .insert("ses_real".to_string(), Arc::new(TokioMutex::new(session)));
+            .insert("ses_real".to_string(), session_cell(session));
         let sink = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         st.set_identity_sink(sink.clone());
         if let Some(pointer) = pointer {
@@ -22801,12 +22990,12 @@ mod tests {
         // Register an UNMATERIALIZED placeholder (no durable ses_* id yet).
         st.sessions.lock().await.insert(
             "freshopencode-placeholder-1".to_string(),
-            Arc::new(TokioMutex::new(OpencodeSession::new(
+            session_cell(OpencodeSession::new(
                 "freshopencode-placeholder-1".to_string(),
                 None,
                 None,
                 None,
-            ))),
+            )),
         );
         let (sink, captured) = capturing_sink();
         st.handle_rollback(undo_op("freshopencode-placeholder-1", "rb-7"), sink)

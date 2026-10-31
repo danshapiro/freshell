@@ -113,4 +113,104 @@ test.describe('fresh-agent PTY notification display role', () => {
     await expect(ticks).toHaveCount(1)
     await expect(freshPane.getByRole('button', { name: 'Jump to prompt: Run the backup sync now', exact: true })).toBeVisible()
   })
+
+  /** Focused E3R2 review defect 2(b): the mid-turn rewind-decision leg of the
+   * PTY-notification journey. A PTY notification row (raw role user,
+   * displayed as agent text) lands AFTER the prompt while the turn is parked
+   * (the pane driven busy through the server-status snapshot event — the
+   * opencode busy truth is event-driven), and the prompt is a MODERN durable
+   * row with no bound capture: the newest-DISPLAYED-user-row derivation must
+   * keep the prompt's mid-turn rewind state honest — the uncertain busy
+   * window makes NO rewind claim at all (never the unearned "Rewind
+   * unavailable" verdict) — and the honest verdict returns when the turn
+   * settles. This spec has no fake-fixture pty emission: the journey drives
+   * PTY notifications through the routed REST snapshot (the harness idiom
+   * above), so the leg drives the busy window through the WS injection
+   * seam the same harness exposes. */
+  test('keeps the mid-turn rewind decision honest when a PTY notification lands after the parked prompt', async ({ freshellPage: _freshellPage, page, terminal }) => {
+    await terminal.waitForTerminal()
+    const sessionId = '63333000-0000-4333-8333-0000000bb202'
+    const PROMPT_TEXT = 'Run the backup sync now'
+    await seedOpencodePane(page, sessionId, [
+      {
+        id: 'turn-parked-u1',
+        turnId: 'turn-parked-u1',
+        role: 'user',
+        source: 'durable',
+        summary: PROMPT_TEXT,
+        items: [{ id: 'item-parked-u1', kind: 'text', text: PROMPT_TEXT }],
+      },
+      {
+        id: 'turn-parked-a1',
+        turnId: 'turn-parked-a1',
+        role: 'assistant',
+        summary: 'Starting it in a background session',
+        items: [{ id: 'item-parked-a1', kind: 'text', text: 'Starting it in a background session.' }],
+      },
+      {
+        id: 'turn-parked-n1',
+        turnId: 'turn-parked-n1',
+        role: 'user',
+        summary: PTY_EXITED_BLOCK,
+        items: [{ id: 'item-parked-n1', kind: 'text', text: PTY_EXITED_BLOCK }],
+      },
+    ])
+
+    const freshPane = page.locator('[data-context="fresh-agent"]')
+    await expect(freshPane).toBeVisible({ timeout: 10_000 })
+    await expect(freshPane.locator('[data-context="fresh-agent-transcript"]')).toBeVisible({ timeout: 10_000 })
+
+    // Display reality first: the notification renders as agent text, the
+    // prompt is the ONLY user article — so the prompt is the newest
+    // DISPLAYED user row once the turn parks.
+    const promptArticle = freshPane.locator('article[data-turn-role="user"]', { hasText: PROMPT_TEXT })
+    const ptyArticle = freshPane.locator('article[data-turn-role="assistant"]', { hasText: 'SYNC_EXIT=0' })
+    await expect(promptArticle).toBeVisible()
+    await expect(ptyArticle).toBeVisible()
+    await expect(freshPane.locator('article[data-turn-role="user"]')).toHaveCount(1)
+
+    // Park the turn mid-flight: the server-status snapshot event drives the
+    // pane busy exactly the way the real server does.
+    const injectSessionStatus = (status: string) => page.evaluate((msg) => {
+      window.__FRESHELL_TEST_HARNESS__?.receiveWsMessage?.(msg)
+    }, {
+      type: 'freshAgent.event',
+      sessionId,
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      event: {
+        type: 'freshAgent.session.snapshot',
+        sessionId,
+        latestTurnId: null,
+        timelineSessionId: sessionId,
+        status,
+      },
+    })
+    await injectSessionStatus('running')
+    await expect(freshPane.getByRole('button', { name: 'Stop' })).toBeVisible({ timeout: 10_000 })
+
+    // Mid-turn honesty (the nothing-branch): the prompt is the newest
+    // DISPLAYED user row — the notification's raw user role must not steal
+    // the slot — and this pane can evidence no in-flight capture, so the
+    // busy newest row makes NO rewind claim at all: hover the prompt and
+    // assert NO rewind affordance renders — never the unearned unavailable
+    // verdict for the in-flight message.
+    await promptArticle.hover()
+    await expect(promptArticle.getByRole('button', { name: 'Rewind unavailable for this message' })).toHaveCount(0)
+    await expect(promptArticle.getByRole('button', { name: 'Saving code rewind checkpoint' })).toHaveCount(0)
+    await expect(promptArticle.getByRole('button', { name: 'Rewind code to here' })).toHaveCount(0)
+    // The notification row keeps its agent display with no rewind affordance.
+    await expect(ptyArticle.getByRole('button', { name: 'Rewind code to here' })).toHaveCount(0)
+    await expect(ptyArticle.getByRole('button', { name: 'Rewind unavailable for this message' })).toHaveCount(0)
+
+    // The turn settles: the honest unavailable verdict returns on the prompt
+    // (disabled, with its reason) — the row was mid-flight-hidden, not
+    // rewind-usable.
+    await injectSessionStatus('idle')
+    await promptArticle.hover()
+    const settledRewind = promptArticle.getByRole('button', { name: 'Rewind unavailable for this message' })
+    await expect(settledRewind).toBeVisible({ timeout: 10_000 })
+    await expect(settledRewind).toBeDisabled()
+    await expect(settledRewind).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
+  })
 })

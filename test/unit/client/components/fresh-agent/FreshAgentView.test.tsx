@@ -6383,6 +6383,155 @@ describe('FreshAgentView', () => {
       expect(olderButton).toBeDisabled()
       expect(olderButton).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
     })
+
+    // Focused E3R2 review defect 2(a): the OTHER display-pipeline arm of the
+    // newest-user derivation — a synthetic tool_result row (raw role user,
+    // coalesced into the preceding ASSISTANT turn by
+    // coalesceSyntheticToolResultTurns) landing after the prompt mid-turn
+    // must not steal the newest-user slot either. The row shapes mirror the
+    // coalesce fixtures in FreshAgentTranscript.test.tsx
+    // ('coalesces adjacent Claude tool-use/result exchanges').
+    const assistantToolUseTurn = (id: string, toolUseId: string) => ({
+      id,
+      turnId: id,
+      source: 'durable' as const,
+      role: 'assistant' as const,
+      summary: 'Read',
+      summaryKind: 'echo' as const,
+      items: [{
+        id: `${id}-item`,
+        kind: 'tool_use' as const,
+        toolUseId,
+        name: 'Read',
+        input: { file_path: 'src/one.ts' },
+      }],
+    })
+    const syntheticToolResultTurn = (id: string, toolUseId: string) => ({
+      id,
+      turnId: id,
+      source: 'durable' as const,
+      role: 'user' as const,
+      summary: 'Tool result',
+      summaryKind: 'echo' as const,
+      items: [{
+        id: `${id}-item`,
+        kind: 'tool_result' as const,
+        toolUseId,
+        content: 'the tool ran fine',
+        isError: false,
+      }],
+    })
+
+    it('a synthetic tool-result row landing mid-turn never steals the saving prompt\'s newest-user slot', async () => {
+      const sessionId = 'ses-tool-result-newest'
+      const store = createStore()
+      let onMessage: ((message: Record<string, unknown>) => void) | undefined
+      wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+        onMessage = handler
+        return () => {}
+      })
+      let snapshotTurns = [unboundModernUserTurn('msg_older_tool', 'Older MCP-driven prompt')]
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => ({
+        status: 'idle',
+        summary: 'older row, the running send\'s landed row, then a synthetic tool result',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: snapshotTurns,
+      }))
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          createRequestId: 'req-tool-result-newest',
+          sessionId,
+          sessionRef: { provider: 'opencode', sessionId },
+          resumeSessionId: sessionId,
+          status: 'idle',
+        },
+      }))
+
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+
+      expect(await screen.findAllByRole('article', { name: 'You transcript turn' })).toHaveLength(1)
+      await waitFor(() => {
+        expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+      })
+      expect(onMessage).toBeTypeOf('function')
+
+      // A genuine in-flight composer send (the honesty block's :4406 idiom,
+      // opencode flavor): its pending metadata and un-enriched barrier-time
+      // capture outcome keep the capture genuinely in flight mid-turn.
+      wsMock.send.mockClear()
+      fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+        target: { value: 'Newest prompt while the agent runs' },
+      })
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      const sendFrame = sentFreshAgentMessages('freshAgent.send')[0]
+      const requestId = String(sendFrame?.requestId)
+      const logicalAttemptId = String((sendFrame?.checkpointIntent as Record<string, unknown>)?.logicalAttemptId)
+      expect(requestId).not.toBe('undefined')
+      expect(logicalAttemptId).not.toBe('undefined')
+      act(() => {
+        onMessage?.({
+          type: 'freshAgent.checkpoint.outcome',
+          requestId,
+          logicalAttemptId,
+          sessionId,
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          status: 'available',
+          checkpointId: 'cccccccccccccccccccccccccccccccccccc',
+        })
+      })
+      // The send is accepted, its row lands in the refreshed snapshot, and
+      // the agent's tool exchange lands after it: an assistant tool_use turn
+      // followed by its synthetic tool_result row (raw role user, coalesced
+      // into the assistant turn by the display pipeline) — the turn is still
+      // running.
+      act(() => {
+        snapshotTurns = [
+          ...snapshotTurns,
+          unboundModernUserTurn('msg_tool_new', 'Newest prompt while the agent runs'),
+          assistantToolUseTurn('msg_tool_use', 'call_tool_midturn'),
+          syntheticToolResultTurn('msg_tool_result', 'call_tool_midturn'),
+        ]
+        onMessage?.({
+          type: 'freshAgent.send.accepted',
+          requestId,
+          submittedTurnId: 'msg_tool_new',
+        })
+      })
+      expect(await screen.findAllByRole('article', { name: 'You transcript turn' })).toHaveLength(2)
+      emitOpencodeSessionSnapshotStatus(store, onMessage, sessionId, 'running')
+      expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+
+      // The tool_result row coalesced into the assistant turn's article: it
+      // renders there (the activity strip), never as a third user row.
+      // The tool_result row coalesced into the preceding assistant tool turn
+      // (the exchange's strip rendering is FreshAgentTranscript's own,
+      // pinned in its coalesce tests): it never renders as a THIRD user row.
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(2)
+
+      const [olderRow, newestRow] = screen.getAllByRole('article', { name: 'You transcript turn' })
+      // The landed send row KEEPS the newest-user treatment: its capture is
+      // genuinely in flight, so the honest still-saving hover stays on THE
+      // PROMPT — the coalesced tool-result row (raw role user) must not steal
+      // the slot and downgrade the prompt to the unearned mid-turn
+      // unavailable verdict.
+      const savingButton = await within(newestRow!).findByRole('button', { name: 'Saving code rewind checkpoint' })
+      expect(savingButton).toBeDisabled()
+      expect(savingButton).toHaveAttribute('title', 'Saving the code state from before this message')
+      expect(within(newestRow!).queryByRole('button', { name: 'Rewind unavailable for this message' })).not.toBeInTheDocument()
+      const olderButton = within(olderRow!).getByRole('button', { name: 'Rewind unavailable for this message' })
+      expect(olderButton).toBeDisabled()
+      expect(olderButton).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
+    })
   })
 
   it('restores saved rewind availability when the same durable session opens with a new pane request', async () => {
