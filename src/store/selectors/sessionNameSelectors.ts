@@ -108,7 +108,7 @@ export function resolvePaneNameRef(content: PaneContent): SessionNameRef | undef
   return undefined
 }
 
-/** Is this pane content one of the six unified naming modes? (Kilroy — a
+/** Is this pane content one of the seven unified naming modes? (Kilroy — a
  * claude runtime with sessionType `kilroy` — is never scoped.) */
 export function isScopedPaneContent(content: PaneContent): boolean {
   if (content.kind === 'terminal') {

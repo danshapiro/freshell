@@ -478,6 +478,61 @@ async fn every_surface_renames_the_same_durable_record_across_all_six_modes() {
     }
 }
 
+/// Google-CLI plan Task 9 follow-up: antigravity (the seventh scoped
+/// provider) renames through the CANONICAL route directly —
+/// `PATCH /api/session-names` accepts an antigravity session target and the
+/// record persists across a store reopen. The create lane is the same
+/// verified bind the other scoped providers use (the Task 6 helper arm);
+/// antigravity has no fresh pane type, so the pane/tab route surfaces do
+/// not apply.
+#[tokio::test]
+async fn antigravity_rename_through_the_canonical_route_persists() {
+    let home = temp_home();
+    let state = names_state(&home);
+    let names = state.names.clone();
+    let session_id = "agys-0000-4000-8000-0000000000a1";
+    admit_pending(&names, "handle-agy", NamedProvider::Antigravity, Some("/w")).await;
+    let bound = bind_verified(&names, "handle-agy", NamedProvider::Antigravity, session_id).await;
+    assert_eq!(
+        bound.record.name, "w",
+        "the directory-basename fallback names the pending record"
+    );
+
+    // The canonical route accepts the antigravity session target.
+    let (status, body) = patch(
+        super::router(state.clone()),
+        "/api/session-names",
+        json!({
+            "target": { "kind": "session", "provider": "antigravity", "sessionId": session_id },
+            "name": "Antigravity Route Name",
+            "nameIntent": "user",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let update: SessionNameUpdate = serde_json::from_value(body).expect("SessionNameUpdate shape");
+    assert_eq!(update.record.name, "Antigravity Route Name");
+    assert_eq!(update.record.name_ref, bound.record.name_ref);
+
+    // Persists: a store REOPEN (fresh process semantics) reads the
+    // identical record.
+    let reopened = SessionNames::open(home.join(".freshell")).expect("reopen");
+    let reopened_update = reopened
+        .get(vec![SessionNameRef::Session {
+            provider: NamedProvider::Antigravity,
+            session_id: session_id.to_string(),
+        }])
+        .await
+        .expect("reopen get")[0]
+        .clone();
+    assert_eq!(
+        reopened_update.record, update.record,
+        "reopen reads identically"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// Name-reliability Task 4: an automation rename reports whether it
 /// applied, at each route's own nesting — the canonical route answers the
 /// update itself (`outcome`), the session and terminal routes nest it under
