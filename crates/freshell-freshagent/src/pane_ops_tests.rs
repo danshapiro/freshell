@@ -237,6 +237,11 @@ async fn split_agent_without_durable_gateway_is_503_and_rolls_back_layout() {
 #[tokio::test]
 async fn split_agent_routes_to_durable_gateway_and_attaches_fresh_content() {
     for (agent, provider, session_type) in FRESH_SPLIT_MODES {
+        let permission_mode = if provider == "codex" {
+            "on-request"
+        } else {
+            "default"
+        };
         for resume in [false, true] {
             let native_id = format!("native-split-{session_type}");
             // The real gateway allocates a presentation ID for a new session,
@@ -259,7 +264,7 @@ async fn split_agent_routes_to_durable_gateway_and_attaches_fresh_content() {
                 "agent": agent, "cwd": "/workspace", "direction": "vertical",
                 "model": "route-model", "effort": "high",
                 "plugins": ["/workspace/plugin"], "modelSelection": null,
-                "permissionMode": "default", "sandbox": "workspace-write"
+                "permissionMode": permission_mode, "sandbox": "workspace-write"
             });
             if resume {
                 request["sessionRef"] = json!({"provider":provider,"sessionId":native_id});
@@ -316,7 +321,7 @@ async fn split_agent_routes_to_durable_gateway_and_attaches_fresh_content() {
             assert_eq!(created.effort, Some(Some("high".into())));
             assert_eq!(created.plugins, Some(vec!["/workspace/plugin".into()]));
             assert_eq!(created.model_selection, Some(None));
-            assert_eq!(created.permission_mode.as_deref(), Some("default"));
+            assert_eq!(created.permission_mode.as_deref(), Some(permission_mode));
             assert_eq!(
                 created.sandbox,
                 Some(freshell_protocol::Sandbox::WorkspaceWrite)
