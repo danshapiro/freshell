@@ -4554,6 +4554,318 @@ describe('FreshAgentView', () => {
       expect(rewindButton).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
     })
 
+    it('retires a settled composer send\'s in-flight capture at the busy window\'s end, so a later MCP/CLI busy window shows the honest unavailable verdict', async () => {
+      const sessionId = 'thread-rewind-retained-unenriched'
+      const store = createStore()
+      let onMessage: ((message: Record<string, unknown>) => void) | undefined
+      wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+        onMessage = handler
+        return () => {}
+      })
+      let snapshotTurns = [unboundModernUserTurn('msg_a', 'Older MCP-driven prompt')]
+      // The snapshot mock answers the CURRENT busy state: a mid-window
+      // refetch must not "report idle" and clear the busy drive the frame
+      // just armed (the refetch the frame itself triggers re-enters the
+      // pane with this status).
+      let snapshotStatus = 'idle'
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => ({
+        status: snapshotStatus,
+        summary: 'the composer send\'s landed row plus a later MCP/CLI-shaped row',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: snapshotTurns,
+      }))
+      apiMock.post.mockResolvedValue({ ok: true })
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-rewind-retained-unenriched',
+          sessionId,
+          status: 'idle',
+        },
+      }))
+
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+
+      expect(await screen.findAllByRole('article', { name: 'You transcript turn' })).toHaveLength(1)
+      await waitFor(() => {
+        expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+      })
+      expect(onMessage).toBeTypeOf('function')
+
+      // A composer send dispatched with capture intent: its pending send
+      // metadata (requestId + logicalAttemptId) is recorded at dispatch.
+      wsMock.send.mockClear()
+      fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+        target: { value: 'Composer prompt whose capture never enriches' },
+      })
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      const sendFrame = sentFreshAgentMessages('freshAgent.send')[0]
+      const requestId = String(sendFrame?.requestId)
+      const logicalAttemptId = String((sendFrame?.checkpointIntent as Record<string, unknown>)?.logicalAttemptId)
+      expect(requestId).not.toBe('undefined')
+      expect(logicalAttemptId).not.toBe('undefined')
+
+      // The barrier-time capture outcome arrives WITHOUT native row ids:
+      // the attempt stays un-enriched (its identity observation never
+      // happened — the exact shape that used to wedge the flag).
+      act(() => {
+        onMessage?.({
+          type: 'freshAgent.checkpoint.outcome',
+          requestId,
+          logicalAttemptId,
+          sessionId,
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          status: 'available',
+          checkpointId: 'dddddddddddddddddddddddddddddddddddddddd',
+        })
+      })
+
+      // The send is accepted and its own row lands in the refreshed
+      // snapshot; the optimistic echo clears.
+      act(() => {
+        snapshotTurns = [
+          ...snapshotTurns,
+          unboundModernUserTurn('msg_new', 'Composer prompt whose capture never enriches'),
+        ]
+        onMessage?.({
+          type: 'freshAgent.send.accepted',
+          requestId,
+          submittedTurnId: 'msg_new',
+        })
+      })
+      expect(await screen.findAllByRole('article', { name: 'You transcript turn' })).toHaveLength(2)
+
+      // The composer turn runs: mid-window its landed row (the newest
+      // unbound modern row) shows the honest still-saving state — the
+      // capture for THIS window's dispatch is genuinely in flight.
+      snapshotStatus = 'running'
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'running')
+      expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+      const [, composerRow] = screen.getAllByRole('article', { name: 'You transcript turn' })
+      const savingButton = await within(composerRow!).findByRole('button', { name: 'Saving code rewind checkpoint' })
+      expect(savingButton).toBeDisabled()
+      expect(savingButton).toHaveAttribute('title', 'Saving the code state from before this message')
+
+      // The turn settles WITHOUT enrichment — the busy→idle edge must
+      // retire the in-flight flag. The un-enriched metadata lingers (only
+      // a send-failure frame would delete it).
+      snapshotStatus = 'idle'
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'idle')
+
+      // A LATER busy window with NO new composer send: a NEWEST modern
+      // user row lands (an MCP/CLI-shaped turn's row) while the pane is
+      // busy again.
+      act(() => {
+        snapshotTurns = [
+          ...snapshotTurns,
+          unboundModernUserTurn('msg_mcp_cli', 'Prompt sent through the REST lane'),
+        ]
+      })
+      snapshotStatus = 'running'
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'running')
+      expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+      await waitFor(() => {
+        expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(3)
+      })
+      const [, , mcpRow] = screen.getAllByRole('article', { name: 'You transcript turn' })
+
+      // The retained un-enriched metadata must NOT survive the busy window
+      // it was dispatched in: the MCP/CLI-shaped newest row honestly reads
+      // rewind-unavailable while its turn runs — never "Saving".
+      expect(within(mcpRow).queryByRole('button', { name: 'Saving code rewind checkpoint' })).not.toBeInTheDocument()
+      const rewindButton = await within(mcpRow).findByRole('button', { name: 'Rewind unavailable for this message' })
+      expect(rewindButton).toBeDisabled()
+      expect(rewindButton).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
+    })
+
+    it('keeps still-saving through the first-send materialization transient (the live-journey pin)', async () => {
+      const store = createStore()
+      let onMessage: ((message: Record<string, unknown>) => void) | undefined
+      wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+        onMessage = handler
+        return () => {}
+      })
+      const promptText = 'First live-journey prompt'
+      // The real first-send journey: the placeholder snapshot is empty; the
+      // materialization refetch answers BEFORE the provider persisted any
+      // rows (and the durable snapshot route hardcodes status 'idle'); the
+      // busy status frame then drives the row-landing refetch.
+      let durableTurns: Array<Record<string, unknown>> = []
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => ({
+        status: 'idle',
+        summary: durableTurns.length > 0 ? 'first turn in flight' : 'empty',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: durableTurns,
+      }))
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          createRequestId: 'req-live-journey',
+          status: 'creating',
+        },
+      }))
+
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+
+      expect(sentFreshAgentMessages('freshAgent.create').at(-1)).toMatchObject({
+        type: 'freshAgent.create',
+        requestId: 'req-live-journey',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+      })
+      act(() => {
+        onMessage?.({
+          type: 'freshAgent.created',
+          requestId: 'req-live-journey',
+          sessionId: 'freshopencode-req-live-journey',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          runtimeProvider: 'opencode',
+          sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-live-journey' },
+        })
+      })
+      await waitFor(() => {
+        expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+      })
+      wsMock.send.mockClear()
+
+      fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+        target: { value: promptText },
+      })
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      const sendFrame = sentFreshAgentMessages('freshAgent.send')[0]
+      const requestId = String(sendFrame?.requestId)
+      const logicalAttemptId = String((sendFrame?.checkpointIntent as Record<string, unknown>)?.logicalAttemptId)
+      expect(requestId).not.toBe('undefined')
+      expect(logicalAttemptId).not.toBe('undefined')
+
+      // Server order, frame 1: the barrier-time capture outcome (no native
+      // ids yet) addressed to the placeholder the pane still holds.
+      act(() => {
+        onMessage?.({
+          type: 'freshAgent.checkpoint.outcome',
+          requestId,
+          logicalAttemptId,
+          sessionId: 'freshopencode-req-live-journey',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          status: 'available',
+          checkpointId: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+        })
+      })
+      // Frame 2: OpenCode accepts the send without a submittedTurnId.
+      act(() => {
+        onMessage?.({
+          type: 'freshAgent.send.accepted',
+          requestId,
+        })
+      })
+      // Frame 3: the first send materializes the durable session and re-keys
+      // the pane; the materialization refetch answers an EMPTY idle snapshot
+      // (the provider has not persisted the turn's rows yet) — the journey's
+      // transient non-busy window between the optimistic running and the
+      // provider's busy status.
+      act(() => {
+        onMessage?.({
+          type: 'freshAgent.session.materialized',
+          previousSessionId: 'freshopencode-req-live-journey',
+          sessionId: 'ses_live_journey',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          sessionRef: { provider: 'opencode', sessionId: 'ses_live_journey' },
+        })
+      })
+      await waitFor(() => {
+        expect(getFreshAgentPaneContent(store).sessionId).toBe('ses_live_journey')
+      })
+      // Frame 4: the provider's busy status (the serve-SSE bridge's running
+      // snapshot) addresses the durable session and starts the turn's REAL
+      // busy window; the refetch it triggers lands the persisted rows (the
+      // durable snapshot route answers status 'idle' — the session-record
+      // busy gate must keep the pane busy through it).
+      const nativeTurnId = 'msg_livejourneyuserrow000000000000000000'
+      durableTurns = [
+        {
+          id: nativeTurnId,
+          turnId: nativeTurnId,
+          role: 'user',
+          source: 'durable',
+          summary: promptText,
+          items: [{ id: 'live-user-text', kind: 'text', text: promptText }],
+        },
+        {
+          id: 'msg_live_journey_assistant',
+          turnId: 'msg_live_journey_assistant',
+          role: 'assistant',
+          summary: 'Fake OpenCode response',
+          items: [{ id: 'live-assistant-text', kind: 'text', text: 'Fake OpenCode response' }],
+        },
+      ]
+      act(() => {
+        handleFreshAgentMessage(store.dispatch, {
+          type: 'freshAgent.event',
+          sessionId: 'ses_live_journey',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          event: {
+            type: 'freshAgent.session.snapshot',
+            sessionId: 'ses_live_journey',
+            latestTurnId: null,
+            timelineSessionId: 'ses_live_journey',
+            status: 'running',
+          },
+        })
+        onMessage?.({
+          type: 'freshAgent.event',
+          sessionId: 'ses_live_journey',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          event: {
+            type: 'freshAgent.session.snapshot',
+            sessionId: 'ses_live_journey',
+            latestTurnId: null,
+            timelineSessionId: 'ses_live_journey',
+            status: 'running',
+          },
+        })
+      })
+      expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+      // The refetch the busy frame triggers lands the persisted rows and
+      // clears the optimistic echo (the live e2e's toHaveCount(1) pin: the
+      // echo row also renders as a user transcript article, so length 1
+      // proves BOTH the landing and the clear). The assistant row text is
+      // the landing marker — the echo can never produce it.
+      await waitFor(() => {
+        expect(screen.getByText('Fake OpenCode response')).toBeInTheDocument()
+        expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(1)
+      })
+      const userRow = screen.getByRole('article', { name: 'You transcript turn' })
+      // MID-TURN (the pinned live e2e behavior): the landed durable row is
+      // the newest unbound modern row while its capture's identity is still
+      // un-enriched, so the hover honestly shows the still-saving state —
+      // the transient materialization window must NOT have retired it.
+      const savingButton = await within(userRow).findByRole('button', { name: 'Saving code rewind checkpoint' })
+      expect(savingButton).toBeDisabled()
+      expect(savingButton).toHaveAttribute('title', 'Saving the code state from before this message')
+    })
+
     it('keeps the older snapshot user row honestly unavailable while a pending local echo holds the newest user row', async () => {
       const sessionId = 'thread-rewind-echo-window'
       const store = createStore()

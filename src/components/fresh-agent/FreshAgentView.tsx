@@ -227,6 +227,12 @@ type PendingSendMetadata = {
   checkpointAvailabilityScope?: string
   checkpointWorkspace?: NonNullable<FreshAgentPaneContent['checkpointWorkspace']>
   logicalAttemptId?: string
+  /** The pane's busy-epoch at dispatch time (see `busyEpochRef`). The send's
+   * capture is "in flight" only while the pane is still in THIS busy
+   * window: every busy→idle edge bumps the epoch, so a retained
+   * un-enriched entry goes stale the moment its turn settles and can never
+   * mark a LATER busy window (e.g. an MCP/CLI-driven turn) as saving. */
+  busyEpoch?: number
   checkpointOutcome?: CheckpointTurnAvailability
   submittedTurnId?: string
   legacyAccepted?: boolean
@@ -418,28 +424,40 @@ export function unboundRewindAvailability(
 }
 
 // True while this pane has a composer send whose checkpoint capture has not
-// yet been identity-enriched. The barrier-time outcome frame carries the
+// yet been identity-enriched AND whose dispatch busy window is still the
+// pane's CURRENT busy window. The barrier-time outcome frame carries the
 // send's logicalAttemptId but no native row ids; the identity-enriched
 // outcome adds nativeTurnId. An attempt whose outcome record still has no
 // nativeTurnId is therefore "capture in flight" — covering BOTH the
 // pre-barrier window (no outcome yet) and the post-barrier pre-identity
-// window. The attempt's outcome record is looked up where the pane keeps it:
-// the pending send metadata's own checkpointOutcome (the same record the
-// availability map and paneContent.checkpointOutcomes persist from) plus the
-// persisted pane outcome entry for the send's request — the pane-local stand
-// in for the logicalAttemptId join, since the durable outcome records key by
-// the send's requestId (minted 1:1 with the attempt's logicalAttemptId) and
-// carry no logicalAttemptId of their own. A settled previous composer send
-// (enriched outcome present) reads false even though its metadata lingers —
-// metadata is only deleted on this pane's send-failure frames. MCP/CLI-driven
-// turns mint no send metadata and produce no capture outcome, so they read
-// false throughout.
+// window — but only for as long as the pane stays in the busy window the
+// send's turn runs in: `currentBusyEpoch` is the pane's busy-epoch (bumped
+// at every turn-settling busy→idle edge of effectiveStatus and at the
+// stale-echo clear) and each metadata entry records the epoch it was
+// dispatched at, so the moment the pane settles the send's turn the
+// retained entry goes stale. Without that gate an un-enriched send's
+// lingering metadata (deleted only on send-failure frames) would mislabel a
+// LATER busy window — e.g. an MCP/CLI-driven turn, which mints no send
+// metadata and produces no capture at all — as still-saving. The attempt's
+// outcome record is looked up where the pane keeps it: the pending send
+// metadata's own checkpointOutcome (the same record the availability map
+// and paneContent.checkpointOutcomes persist from) plus the persisted pane
+// outcome entry for the send's request — the pane-local stand-in for the
+// logicalAttemptId join, since the durable outcome records key by the send's
+// requestId (minted 1:1 with the attempt's logicalAttemptId) and carry no
+// logicalAttemptId of their own. A metadata entry with no recorded epoch
+// predates the mechanism and can assert nothing about its busy window: it
+// reads false (never claims an in-flight capture that cannot be evidenced).
+// MCP/CLI-driven turns mint no send metadata and produce no capture
+// outcome, so they read false throughout.
 function paneCaptureInFlight(
   pendingSends: ReadonlyMap<string, PendingSendMetadata>,
   paneOutcomes: readonly FreshAgentCheckpointOutcome[] | undefined,
+  currentBusyEpoch: number,
 ): boolean {
   for (const [requestId, metadata] of pendingSends) {
     if (!metadata.logicalAttemptId) continue
+    if (metadata.busyEpoch !== currentBusyEpoch) continue
     if (metadata.checkpointOutcome?.nativeTurnId) continue
     if (paneOutcomes?.some((outcome) => outcome.requestId === requestId && outcome.nativeTurnId)) continue
     return true
@@ -1193,6 +1211,17 @@ export function FreshAgentView({
   const localEchoRef = useRef<LocalEcho | null>(null)
   localEchoRef.current = localEcho
   const pendingSendMetadataRef = useRef<Map<string, PendingSendMetadata>>(new Map())
+  // The pane's busy-epoch: bumped at every busy→idle edge of effectiveStatus
+  // that SETTLES a turn (no pending local echo at the edge — see the
+  // render-phase adjustment just below `isBusy` — plus the stale-echo clear
+  // in applySnapshot for a send whose row never landed). A composer send
+  // records the current epoch into its pending send metadata at dispatch
+  // time, and `paneCaptureInFlight` only counts the entry while the pane is
+  // still in that SAME busy window — so an un-enriched send's retained
+  // metadata can never survive its own turn's settle to mislabel a later
+  // busy window (e.g. an MCP/CLI-driven turn) as still-saving.
+  const busyEpochRef = useRef(0)
+  const wasPaneBusyRef = useRef(false)
   const [checkpointAvailabilityByTurn, setCheckpointAvailabilityByTurn] = useState<Map<string, CheckpointTurnAvailability>>(
     () => checkpointAvailabilityMap(paneContent),
   )
@@ -1955,6 +1984,7 @@ export function FreshAgentView({
     recordPendingSendMetadata(retryRequestId, {
       text,
       logicalAttemptId: nanoid(),
+      busyEpoch: busyEpochRef.current,
       checkpointAvailabilityScope: checkpointAvailabilityScope(current),
       ...(current.checkpointWorkspace ? { checkpointWorkspace: current.checkpointWorkspace } : {}),
     })
@@ -3510,7 +3540,18 @@ export function FreshAgentView({
           && shouldClearStaleLocalEcho(displaySnapshot, echo, echoPendingMetadata)
         : false
       if (echo) {
-        if (landedEcho || staleEcho) setLocalEcho(null)
+        if (landedEcho || staleEcho) {
+          setLocalEcho(null)
+          if (staleEcho && !landedEcho) {
+            // The stale-echo clear is the definitive end of a send whose row
+            // never landed: the turn settled without its transcript row, so
+            // no later busy→idle edge will ever name it. Retire the past
+            // dispatch windows' capture-in-flight claims here (the busy-epoch
+            // bump) — the retained un-enriched metadata must not outlive the
+            // send's journey into a later busy window.
+            busyEpochRef.current += 1
+          }
+        }
       }
       // Task 16 (zrrj): an idle snapshot that does not yet contain the
       // just-sent turn means the durable transcript is lagging -- schedule a
@@ -4020,6 +4061,24 @@ export function FreshAgentView({
     : (agentSession?.status ?? paneContent.status)
   const isBusy = BUSY_STATES.has(effectiveStatus)
   const sessionEnded = effectiveStatus === 'exited' || effectiveStatus === 'create-failed'
+  // Render-phase busy-epoch adjustment (the lastCreateArmKeyRef pattern):
+  // a busy→idle transition retires the capture window once per edge — the
+  // ref pair makes re-renders of an unchanged isBusy no-ops, so a
+  // double-render of the same transition (StrictMode) cannot double-count.
+  // The `!localEcho` gate keeps the FIRST-SEND MATERIALIZATION JOURNEY
+  // honest: between the pane's optimistic running and the provider's busy
+  // status the materialization refetch answers an idle snapshot before the
+  // provider persisted any row, so the pane transiently observes non-busy
+  // while the send's echo is still pending — that edge belongs to the same
+  // turn, not to a settle, and must NOT advance the epoch. An edge observed
+  // with no pending echo is the turn's real settle (the row landed long
+  // before). Every epoch bump rides an isBusy change, so the
+  // captureInFlight recompute below always sees the bumped epoch in the
+  // same render that observes the edge; the stale-echo clear path in
+  // applySnapshot is the complementary bump for a send whose row never
+  // landed.
+  if (wasPaneBusyRef.current && !isBusy && !localEcho) busyEpochRef.current += 1
+  wasPaneBusyRef.current = isBusy
   // The user's just-sent message as an optimistic echo row, displayed after
   // the turns until the send's turn lands in the snapshot (the transcript
   // appends it as the newest turn). While it is displayed it holds the
@@ -4035,14 +4094,17 @@ export function FreshAgentView({
     items: [{ id: `__local-echo-item:${localEcho.requestId}`, kind: 'text', text: localEcho.text }],
   } as FreshAgentTurn : undefined), [localEcho])
   const transcriptTurns = snapshot?.turns ?? EMPTY_TRANSCRIPT_TURNS
-  // Render-phase read of a ref: every pendingSendMetadataRef mutation rides a
-  // state transition that re-renders (a send creates the local echo; an
+  // Render-phase reads of refs: every pendingSendMetadataRef mutation rides
+  // a state transition that re-renders (a send creates the local echo; an
   // outcome arrival publishes checkpoint availability and persists the pane
-  // outcome; a send failure clears the echo/status), so recomputing on each
-  // render always reflects the last transition — the enriched outcome's
-  // arrival flips it. Fed through getRewindAvailability's deps so the
-  // memoized transcript re-renders when the flag flips.
-  const captureInFlight = paneCaptureInFlight(pendingSendMetadataRef.current, paneContent.checkpointOutcomes)
+  // outcome; a send failure clears the echo/status), and every busyEpochRef
+  // bump rides the isBusy flip of the busy→idle edge's own render — so
+  // recomputing on each render always reflects the last transition: the
+  // enriched outcome's arrival flips the flag false, and the pane leaving
+  // busy retires it (the epoch moves past every entry dispatched in the
+  // window that just ended). Fed through getRewindAvailability's deps so
+  // the memoized transcript re-renders when the flag flips.
+  const captureInFlight = paneCaptureInFlight(pendingSendMetadataRef.current, paneContent.checkpointOutcomes, busyEpochRef.current)
   const newestUserTurnKey = useMemo(() => {
     if (localEchoTurn) return getFreshAgentDisplayTurnKey(localEchoTurn)
     const userTurns = transcriptTurns.filter((turn) => turn.role === 'user')
@@ -4251,6 +4313,7 @@ export function FreshAgentView({
     recordPendingSendMetadata(requestId, {
       text,
       logicalAttemptId,
+      busyEpoch: busyEpochRef.current,
       checkpointAvailabilityScope: checkpointScope,
       ...(current.checkpointWorkspace ? { checkpointWorkspace: current.checkpointWorkspace } : {}),
     })

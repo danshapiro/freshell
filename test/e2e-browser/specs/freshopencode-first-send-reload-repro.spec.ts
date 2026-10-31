@@ -131,6 +131,27 @@ async function getFreshOpencodePaneState(page: Page): Promise<FreshOpencodePaneS
   })
 }
 
+/** The active tab's freshopencode pane id plus its content — for scoping
+ * locators to THIS pane when other fresh-agent panes exist in background
+ * tabs (an MCP-created tab folds focus-neutrally). */
+async function getFreshOpencodePaneIdentity(
+  page: Page,
+): Promise<{ paneId?: string; content: FreshOpencodePaneState } | undefined> {
+  return page.evaluate(() => {
+    const state = window.__FRESHELL_TEST_HARNESS__?.getState()
+    const activeTabId = state?.tabs?.activeTabId
+    const findFreshOpencode = (node: any): any => {
+      if (!node) return undefined
+      if (node.type === 'leaf' && node.content?.kind === 'fresh-agent' && node.content.provider === 'opencode') {
+        return { paneId: node.id, content: node.content }
+      }
+      if (node.type === 'split') return findFreshOpencode(node.children?.[0]) ?? findFreshOpencode(node.children?.[1])
+      return undefined
+    }
+    return findFreshOpencode(state?.panes?.layouts?.[activeTabId])
+  })
+}
+
 async function sendFreshAgentPrompt(page: Page, prompt: string): Promise<void> {
   const textbox = page.getByRole('textbox', { name: 'Chat message input' })
   await expect(textbox).toBeVisible({ timeout: 15_000 })
@@ -343,6 +364,175 @@ test.describe('Freshopencode first-message code checkpoint', () => {
       await userTurn.hover()
       const rewind = userTurn.getByRole('button', { name: 'Rewind code to here' })
       await expect(rewind).toBeEnabled({ timeout: 30_000 })
+    } finally {
+      await server.stop().catch(() => {})
+      await fsp.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+})
+
+test.describe('Freshopencode MCP/CLI rewind honesty', () => {
+  test('an MCP/CLI-driven turn through the REST lane never claims a still-saving rewind state', async ({ page }) => {
+    test.setTimeout(180_000)
+    const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-freshopencode-mcp-honesty-'))
+    const binDir = path.join(sharedRoot, 'bin')
+    const logsDir = path.join(sharedRoot, 'logs')
+    const auditLogPath = path.join(sharedRoot, 'fake-opencode-audit.jsonl')
+    const sharedOpencodeDataDir = path.join(sharedRoot, 'opencode-data')
+    const cwd = path.join(sharedRoot, 'project')
+    const promptGatePath = path.join(sharedRoot, 'prompt-gate')
+    const setupPrompt = `playwright composer setup prompt ${Date.now()}`
+    const mcpPrompt = `playwright mcp honesty prompt ${Date.now()}`
+    await fsp.mkdir(cwd, { recursive: true })
+    // A Git workspace so the cwd is capture-CAPABLE: the unavailable verdict
+    // pinned below can then only come from the REST lane performing no
+    // checkpoint capture at all — never from a capture that would have
+    // failed on a non-Git scope anyway. If REST-lane capture is ever
+    // added, this assertion must flip consciously, not silently.
+    await fsp.writeFile(path.join(cwd, 'tracked.txt'), 'fixture workspace file\n')
+    execFileSync('git', ['init', cwd], { stdio: 'ignore' })
+    execFileSync('git', ['-C', cwd, 'config', 'user.email', 'fixture@example.invalid'], { stdio: 'ignore' })
+    execFileSync('git', ['-C', cwd, 'config', 'user.name', 'Freshell fixture'], { stdio: 'ignore' })
+    execFileSync('git', ['-C', cwd, 'add', '--', 'tracked.txt'], { stdio: 'ignore' })
+    execFileSync('git', ['-C', cwd, 'commit', '-m', 'fixture'], { stdio: 'ignore' })
+    await installFakeOpencode(binDir)
+
+    const server = new RustServer(createServerOptions({
+      binDir,
+      auditLogPath,
+      logsDir,
+      sharedOpencodeDataDir,
+      hangSessionCreate: false,
+      extraEnv: { FAKE_OPENCODE_HOLD_PROMPT_GATE_PATH: promptGatePath },
+    }))
+
+    try {
+      const info = await server.start()
+      const authed = { 'content-type': 'application/json', 'x-auth-token': info.token }
+      await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+      const harness = new TestHarness(page)
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+      await enableFreshOpencode(page)
+
+      // The browser pane comes from the picker (this file's existing
+      // harness): the user's pane, whose conversation the MCP client below
+      // drives a turn on.
+      await createFreshopencodePane(page, cwd)
+      await expect.poll(async () => getFreshOpencodePaneState(page), { timeout: 15_000 }).toMatchObject({
+        sessionId: expect.stringMatching(/^freshopencode-/),
+      })
+
+      // SETUP TURN (the composer, the pane's own lane): the pre-armed gate
+      // releases this turn at the fixture's first gate poll, so it
+      // materializes the durable ses_* session through the WS lane — which
+      // bridges the session's serve-SSE — and settles immediately. The
+      // bridge is what makes the MCP turn below observable live in this
+      // pane.
+      await fsp.writeFile(promptGatePath, 'release\n')
+      await sendFreshAgentPrompt(page, setupPrompt)
+      // The pane re-keys onto the durable session once the turn
+      // materializes it.
+      await expect.poll(async () => getFreshOpencodePaneState(page), { timeout: 30_000 }).toMatchObject({
+        sessionId: expect.stringMatching(/^ses_/),
+      })
+      const pane = await getFreshOpencodePaneIdentity(page)
+      expect(pane?.paneId).toBeTruthy()
+      const paneRoot = page.locator(
+        `[data-pane-id="${pane!.paneId}"] [data-context="fresh-agent"], [data-pane-id="${pane!.paneId}"][data-context="fresh-agent"]`,
+      ).first()
+      const durableSessionId = pane?.content.sessionId
+      expect(durableSessionId).toMatch(/^ses_/)
+      const idleAfterPrompt = async (prompt: string) => {
+        const events = await readAuditEvents(auditLogPath)
+        const promptIndex = events.findLastIndex((event) => event.event === 'prompt_async' && event.prompt === prompt)
+        return promptIndex >= 0
+          && events.slice(promptIndex + 1).some((event) => event.event === 'session_idle_emitted')
+      }
+      await expect.poll(() => idleAfterPrompt(setupPrompt), { timeout: 30_000 }).toBe(true)
+
+      // THE HONESTY TURN: an MCP/CLI client opens the SAME conversation
+      // through the REST tab lane (POST /api/tabs with sessionRef — the
+      // documented MCP new-tab resume route) and drives one turn through
+      // the REST send lane — which performs no checkpoint capture. The
+      // turn parks behind the gate file the fixture consumed on the setup
+      // turn's release.
+      const createRes = await fetch(`${info.baseUrl}/api/tabs`, {
+        method: 'POST',
+        headers: authed,
+        body: JSON.stringify({
+          agent: 'opencode',
+          sessionRef: { provider: 'opencode', sessionId: durableSessionId },
+          cwd,
+        }),
+      })
+      const createText = await createRes.text()
+      expect(createRes.ok, createText).toBe(true)
+      const created = (JSON.parse(createText) as { data?: { tabId?: string; paneId?: string } }).data
+      expect(created?.paneId, `POST /api/tabs envelope: ${createText}`).toBeTruthy()
+      // The MCP pane folds into the browser as a background tab (focus-neutral
+      // create). Its mount attach broadcasts the session's CURRENT status —
+      // computed from the WS session record, which knows nothing about the
+      // REST turn below — so wait for that mount trail to go QUIESCENT before
+      // firing the turn: the attach's idle broadcast must never clobber the
+      // turn's busy status mid-flight.
+      const paneBRoot = page.locator(`[data-pane-id="${created!.paneId!}"]`).first()
+      await expect(
+        paneBRoot.locator('[data-turn-role="user"]', { hasText: setupPrompt }),
+      ).toHaveCount(1, { timeout: 15_000 })
+      const readRecordStatusVersion = () => page.evaluate((sid: string) => {
+        const state = window.__FRESHELL_TEST_HARNESS__?.getState() as any
+        const record = state?.freshAgent?.sessions?.[`freshopencode:opencode:${sid}`]
+        return typeof record?.statusVersion === 'number' ? record.statusVersion : -1
+      }, durableSessionId as string)
+      await expect.poll(async () => {
+        const before = await readRecordStatusVersion()
+        if (before < 0) return null
+        await page.waitForTimeout(400)
+        const after = await readRecordStatusVersion()
+        return before === after ? after : null
+      }, { timeout: 15_000 }).toBeGreaterThanOrEqual(0)
+      const mcpSendPromise = fetch(`${info.baseUrl}/api/panes/${encodeURIComponent(created!.paneId!)}/send-keys`, {
+        method: 'POST',
+        headers: authed,
+        body: JSON.stringify({ data: mcpPrompt }),
+      })
+      await expect.poll(async () => {
+        const events = await readAuditEvents(auditLogPath)
+        return events.some((event) => event.event === 'prompt_async' && event.prompt === mcpPrompt)
+      }, { timeout: 30_000 }).toBe(true)
+
+      // The user's pane observes the MCP turn live through its bridge: the
+      // turn's user row lands on the open transcript.
+      const userTurn = paneRoot.locator('[data-turn-role="user"]', { hasText: mcpPrompt })
+      await expect(userTurn).toHaveCount(1, { timeout: 20_000 })
+
+      // Parked-ness (the live test's discipline): no idle can have been
+      // emitted after the MCP turn's prompt_async receipt — the turn is
+      // deterministically still in flight at the assertions below.
+      await expect(await idleAfterPrompt(mcpPrompt)).toBe(false)
+
+      // BUSY pin: the user's pane observes the MCP turn running — the
+      // pane's busy window is genuinely open, which is the state a
+      // dishonest "Saving code rewind checkpoint" claim would ride.
+      await expect(paneRoot.getByRole('button', { name: 'Stop' })).toBeVisible({ timeout: 15_000 })
+
+      // The honesty verdict: while the MCP turn is parked the row's hover
+      // shows the disabled unavailable rewind with its reason — never a
+      // still-saving claim for a turn nothing is being saved for.
+      await userTurn.hover()
+      await expect(userTurn.getByRole('button', { name: 'Saving code rewind checkpoint' })).toHaveCount(0)
+      const rewind = userTurn.getByRole('button', { name: 'Rewind unavailable for this message' })
+      await expect(rewind).toBeVisible()
+      await expect(rewind).toBeDisabled()
+      await expect(rewind).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
+
+      // Release the gate and let the turn settle; the REST drive resolves.
+      await fsp.writeFile(promptGatePath, 'release\n')
+      await expect.poll(() => idleAfterPrompt(mcpPrompt), { timeout: 30_000 }).toBe(true)
+      const mcpSend = await mcpSendPromise
+      const mcpText = await mcpSend.text()
+      expect(mcpSend.ok, mcpText).toBe(true)
     } finally {
       await server.stop().catch(() => {})
       await fsp.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
