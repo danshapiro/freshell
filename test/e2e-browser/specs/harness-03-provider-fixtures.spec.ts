@@ -542,7 +542,7 @@ test.describe('opencode server fixture', () => {
 // decoy-secret control proves the ledger can never exfiltrate credentials.
 
 test.describe('provider fixtures are hermetic', () => {
-  for (const provider of ['claude', 'gemini', 'kimi', 'amplifier'] as const) {
+  for (const provider of ['claude', 'gemini', 'kimi', 'agy', 'amplifier'] as const) {
     test(`${provider}: full turn contract with scrubbed PATH, no children`, async () => {
       const fixture = await launchProviderFixture({
         fixture: provider === 'amplifier' ? 'fake-amplifier.mjs' : `fake-${provider}.mjs`,

@@ -68,6 +68,13 @@
 //   /^async:/       settles turn_settled{fullyIdle:false} with NO completion
 //                    (outstanding async work — the pane stays busy until a
 //                    later turn settles fullyIdle:true).
+//   /^dup:/         appends a byte-faithful COPY of the ACTIVE transcript's
+//                    last turn_settled record (same `at`) — the scripted
+//                    duplicate-settle replay the tracker's dedupe must
+//                    swallow: no double completion, one bell (plan Task
+//                    13's scenario). No user record; with no active
+//                    conversation or no settle yet there is nothing to
+//                    duplicate and the honest marker says so.
 //
 // FAKE_AGY_STORE_GATE_PATH (the fake-codex rollout-gate copy): when set, the
 // process's FIRST conversation mint blocks on a 50 ms poll until the gate
@@ -271,6 +278,27 @@ function appendTurnSettled(fullyIdle) {
   })
 }
 
+// Copy source for the /^dup:/ verb: the ACTIVE transcript's last
+// turn_settled RAW line — byte-faithful, same `at`, a true duplicate — or
+// '' when there is no settle to duplicate.
+function lastSettledLine(conversationId) {
+  let raw
+  try {
+    raw = fs.readFileSync(transcriptPath(conversationId), 'utf8')
+  } catch {
+    return ''
+  }
+  for (const line of raw.split('\n').reverse()) {
+    if (line.trim().length === 0) continue
+    try {
+      if (JSON.parse(line).type === 'turn_settled') return line
+    } catch {
+      continue // malformed tail — skip
+    }
+  }
+  return ''
+}
+
 function assistantReply() {
   return state.remembered.length > 0
     ? `done; remembered: ${state.remembered.join(', ')}`
@@ -312,6 +340,17 @@ async function handleLine(line) {
   if (/^switch:/.test(line)) {
     const id = await mintConversationGated()
     process.stdout.write(`agy: switched to conversation ${id}\r\n`)
+    return
+  }
+  // Duplicate-settle replay: append a byte-faithful copy of the ACTIVE
+  // transcript's last turn_settled record (same `at`) — the scripted
+  // duplicate the tracker's dedupe must swallow (no double completion, one
+  // bell; plan Task 13's scenario). Not a turn line: no user record, no
+  // mint — nothing to duplicate ⇒ the honest marker.
+  if (/^dup:/.test(line)) {
+    const last = state.conversationId ? lastSettledLine(state.conversationId) : ''
+    if (last) fs.appendFileSync(transcriptPath(state.conversationId), `${last}\n`)
+    process.stdout.write(last ? 'agy: duplicated settle\r\n' : 'agy: no settle to duplicate\r\n')
     return
   }
   // A TURN line needs an active conversation — the first submit mints one.
