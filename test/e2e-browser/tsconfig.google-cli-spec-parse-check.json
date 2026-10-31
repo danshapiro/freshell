@@ -8,6 +8,7 @@
   },
   "include": [
     "specs/google-cli-launch-rust.spec.ts",
-    "specs/google-cli-history-resume-rust.spec.ts"
+    "specs/google-cli-history-resume-rust.spec.ts",
+    "specs/google-cli-identity-activity-rust.spec.ts"
   ]
 }
