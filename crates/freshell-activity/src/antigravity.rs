@@ -10,8 +10,9 @@
 //!
 //! * `user_message` ⇒ Busy (a new submit — the pane's prompt landed).
 //! * `turn_settled{fullyIdle:true}` ⇒ exactly ONE TurnComplete, deduped per
-//!   settle (a settle while not Busy is a no-op — replayed/duplicate settles
-//!   never ring twice).
+//!   settle (a settle while not Busy is a no-op, and a settle whose `at` is
+//!   at/before the last COMPLETED settle's `at` is a replayed record —
+//!   inert in every phase; replayed/duplicate settles never ring twice).
 //! * `turn_settled{fullyIdle:false}` ⇒ stay Busy (outstanding async work —
 //!   invocation completion is NOT turn completion).
 //! * `turn_settled{outcome:"errored"}` ⇒ TurnComplete (attention is
@@ -607,6 +608,21 @@ impl AntigravityActivityTracker {
                     state.last_observed_at = at;
                     return Vec::new();
                 }
+                // Per-settle dedupe (plan Task 13's `/dup:` scenario): a
+                // settle whose `at` is at/before the last COMPLETED settle's
+                // `at` for this terminal is a REPLAY of that settle record
+                // (a byte-faithful duplicate the CLI re-appended — the
+                // same `at` by construction), not a new turn end. The
+                // replay is inert even while Busy (the `/dup:` line's own
+                // Enter arms the provisional busy before the record lands,
+                // so the phase no-op above cannot catch it): no second
+                // completion, no phase flap, no liveness feed — a stale
+                // record is not evidence the running turn is alive.
+                if let Some(last_completed_at) = self.ledger.last_completion_at(terminal_id) {
+                    if at <= last_completed_at {
+                        return Vec::new();
+                    }
+                }
                 state.last_observed_at = at;
                 if state.phase != AntigravityPhase::Busy {
                     return Vec::new();
@@ -862,9 +878,78 @@ mod tests {
         tracker.note_submit("t1", 1_000);
         let effects = tracker.note_record("t1", &user_message(Some(1_010)), 1_010);
         assert!(effects.is_empty());
+
         let effects = tracker.note_record("t1", &settled(true, false, Some(2_000)), 2_000);
         assert_eq!(completions(&effects), vec![2]);
         assert_eq!(tracker.list_latest_completions()[0].completion_seq, 2);
+    }
+
+    /// Plan Task 13's duplicate-settle scenario (the fake's `/dup:` verb):
+    /// a byte-faithful replay of an ALREADY-COMPLETED settle record (same
+    /// `at`) must be inert even when it arrives while the pane is Busy —
+    /// the replay is submitted through a fresh Enter, so the provisional
+    /// busy is armed BEFORE the record lands and the "settle while not
+    /// Busy" no-op cannot catch it. The per-settle identity (`at`) is the
+    /// dedupe: a settle at/before the last COMPLETED settle's `at` is the
+    /// same settle — no second completion, no phase flap, and the next
+    /// genuine settle still completes with the next monotonic seq.
+    #[test]
+    fn duplicate_settle_replayed_while_busy_never_completes_again() {
+        let mut tracker = AntigravityActivityTracker::new();
+        tracker.track_terminal("t1", Some("conv-1"), 0);
+        tracker.note_submit("t1", 10);
+        tracker.note_record("t1", &user_message(Some(20)), 20);
+        let effects = tracker.note_record("t1", &settled(true, false, Some(900)), 900);
+        assert_eq!(completions(&effects), vec![1]);
+
+        // The `/dup:` shape: a fresh submit arms the provisional busy, then
+        // the byte-faithful copy of the SAME settle (same `at`) lands.
+        let effects = tracker.note_submit("t1", 5_000);
+        assert_eq!(phases(&effects), vec![AntigravityPhase::Busy]);
+        let effects = tracker.note_record("t1", &settled(true, false, Some(900)), 5_000);
+        assert!(
+            effects.is_empty(),
+            "the replayed settle is inert: no completion, no phase flap — got {effects:?}"
+        );
+        assert_eq!(
+            tracker.list()[0].phase,
+            AntigravityPhase::Busy,
+            "the provisional busy stays armed for the submit-grace to revert"
+        );
+
+        // The next GENUINE settle (a fresh `at` past the last completed one)
+        // still completes exactly once, with the next monotonic seq.
+        tracker.note_record("t1", &user_message(Some(5_010)), 5_010);
+        let effects = tracker.note_record("t1", &settled(true, false, Some(6_000)), 6_000);
+        assert_eq!(completions(&effects), vec![2]);
+        assert_eq!(phases(&effects), vec![AntigravityPhase::Idle]);
+    }
+
+    /// The same guard protects a CONFIRMED turn in flight: a stale replay of
+    /// a previous turn's settle must never complete (or clear) the running
+    /// turn — the phantom-completion hazard the plan's scenario rules out.
+    #[test]
+    fn duplicate_settle_replayed_mid_turn_keeps_the_running_turn_busy() {
+        let mut tracker = AntigravityActivityTracker::new();
+        tracker.track_terminal("t1", Some("conv-1"), 0);
+        tracker.note_submit("t1", 10);
+        tracker.note_record("t1", &user_message(Some(20)), 20);
+        tracker.note_record("t1", &settled(true, false, Some(900)), 900);
+
+        // A new CONFIRMED turn starts (submit + user_message)…
+        tracker.note_submit("t1", 5_000);
+        tracker.note_record("t1", &user_message(Some(5_010)), 5_010);
+        // …and the dead launch's stale settle copy lands mid-turn.
+        let effects = tracker.note_record("t1", &settled(true, false, Some(900)), 5_050);
+        assert!(
+            effects.is_empty(),
+            "a stale replay never completes or clears the running turn — got {effects:?}"
+        );
+        assert_eq!(tracker.list()[0].phase, AntigravityPhase::Busy);
+
+        // The running turn's OWN settle completes exactly once.
+        let effects = tracker.note_record("t1", &settled(true, false, Some(7_000)), 7_000);
+        assert_eq!(completions(&effects), vec![2]);
     }
 
     #[test]
