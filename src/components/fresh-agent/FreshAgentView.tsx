@@ -427,21 +427,26 @@ export function unboundRewindAvailability(
 // yet been identity-enriched AND whose dispatch busy window is still the
 // pane's CURRENT busy window. The barrier-time outcome frame carries the
 // send's logicalAttemptId but no native row ids; the identity-enriched
-// outcome adds nativeTurnId. An attempt whose outcome record still has no
-// nativeTurnId is therefore "capture in flight" — covering BOTH the
-// pre-barrier window (no outcome yet) and the post-barrier pre-identity
-// window — but only for as long as the pane stays in the busy window the
-// send's turn runs in: `currentBusyEpoch` is the pane's busy-epoch (bumped
-// at every turn-settling busy→idle edge of effectiveStatus and at the
-// stale-echo clear) and each metadata entry records the epoch it was
-// dispatched at, so the moment the pane settles the send's turn the
-// retained entry goes stale. Without that gate an un-enriched send's
-// lingering metadata (deleted only on send-failure frames) would mislabel a
-// LATER busy window — e.g. an MCP/CLI-driven turn, which mints no send
-// metadata and produces no capture at all — as still-saving. The attempt's
-// outcome record is looked up where the pane keeps it: the pending send
-// metadata's own checkpointOutcome (the same record the availability map
-// and paneContent.checkpointOutcomes persist from) plus the persisted pane
+// outcome adds nativeTurnId. An attempt's outcome counts as "capture in
+// flight" ONLY while the capture SUCCEEDED (status exactly 'available') and
+// its identity observation is still pending (no nativeTurnId) — covering
+// BOTH the pre-barrier window (no outcome yet) and the post-barrier
+// pre-identity window — but only for as long as the pane stays in the busy
+// window the send's turn runs in: `currentBusyEpoch` is the pane's busy-epoch
+// (bumped at every turn-settling busy→idle edge of effectiveStatus) and each
+// metadata entry records the epoch it was dispatched at, so the moment the
+// pane settles the send's turn the retained entry goes stale. A SETTLED
+// non-available outcome (unavailable/failed/etc.) is never in flight,
+// regardless of native ids: the server settles some captures as unavailable
+// (e.g. a non-Git directory) BEFORE forwarding the message, and that outcome
+// arriving must not leave the row claiming a save is underway for the whole
+// running turn. Without the epoch gate an un-enriched send's lingering
+// metadata (deleted only on send-failure frames) would mislabel a LATER
+// busy window — e.g. an MCP/CLI-driven turn, which mints no send metadata
+// and produces no capture at all — as still-saving. The attempt's outcome
+// record is looked up where the pane keeps it: the pending send metadata's
+// own checkpointOutcome (the same record the availability map and
+// paneContent.checkpointOutcomes persist from) plus the persisted pane
 // outcome entry for the send's request — the pane-local stand-in for the
 // logicalAttemptId join, since the durable outcome records key by the send's
 // requestId (minted 1:1 with the attempt's logicalAttemptId) and carry no
@@ -458,8 +463,10 @@ function paneCaptureInFlight(
   for (const [requestId, metadata] of pendingSends) {
     if (!metadata.logicalAttemptId) continue
     if (metadata.busyEpoch !== currentBusyEpoch) continue
-    if (metadata.checkpointOutcome?.nativeTurnId) continue
-    if (paneOutcomes?.some((outcome) => outcome.requestId === requestId && outcome.nativeTurnId)) continue
+    const metadataOutcome = metadata.checkpointOutcome
+    if (metadataOutcome && (metadataOutcome.status !== 'available' || metadataOutcome.nativeTurnId)) continue
+    const persistedOutcome = paneOutcomes?.find((outcome) => outcome.requestId === requestId)
+    if (persistedOutcome && (persistedOutcome.status !== 'available' || persistedOutcome.nativeTurnId)) continue
     return true
   }
   return false
@@ -1213,13 +1220,17 @@ export function FreshAgentView({
   const pendingSendMetadataRef = useRef<Map<string, PendingSendMetadata>>(new Map())
   // The pane's busy-epoch: bumped at every busy→idle edge of effectiveStatus
   // that SETTLES a turn (no pending local echo at the edge — see the
-  // render-phase adjustment just below `isBusy` — plus the stale-echo clear
-  // in applySnapshot for a send whose row never landed). A composer send
-  // records the current epoch into its pending send metadata at dispatch
-  // time, and `paneCaptureInFlight` only counts the entry while the pane is
-  // still in that SAME busy window — so an un-enriched send's retained
-  // metadata can never survive its own turn's settle to mislabel a later
-  // busy window (e.g. an MCP/CLI-driven turn) as still-saving.
+  // render-phase adjustment just below `isBusy`). A composer send records
+  // the current epoch into its pending send metadata at dispatch time, and
+  // `paneCaptureInFlight` only counts the entry while the pane is still in
+  // that SAME busy window — so an un-enriched send's retained metadata can
+  // never survive its own turn's settle to mislabel a later busy window
+  // (e.g. an MCP/CLI-driven turn) as still-saving. Only a real busy→idle
+  // edge bumps the epoch: a send whose row never lands keeps its echo until
+  // the bounded stale-echo clear, and that clear is NOT a settle signal
+  // (empty idle snapshots can answer while the turn still runs), so the
+  // retained window survives until the next un-gated busy→idle edge —
+  // the accepted bounded residual.
   const busyEpochRef = useRef(0)
   const wasPaneBusyRef = useRef(false)
   const [checkpointAvailabilityByTurn, setCheckpointAvailabilityByTurn] = useState<Map<string, CheckpointTurnAvailability>>(
@@ -3539,19 +3550,14 @@ export function FreshAgentView({
           && idleIncompleteRetryCountRef.current >= IDLE_INCOMPLETE_MAX_RETRIES
           && shouldClearStaleLocalEcho(displaySnapshot, echo, echoPendingMetadata)
         : false
-      if (echo) {
-        if (landedEcho || staleEcho) {
-          setLocalEcho(null)
-          if (staleEcho && !landedEcho) {
-            // The stale-echo clear is the definitive end of a send whose row
-            // never landed: the turn settled without its transcript row, so
-            // no later busy→idle edge will ever name it. Retire the past
-            // dispatch windows' capture-in-flight claims here (the busy-epoch
-            // bump) — the retained un-enriched metadata must not outlive the
-            // send's journey into a later busy window.
-            busyEpochRef.current += 1
-          }
-        }
+      if (echo && (landedEcho || staleEcho)) {
+        // The stale-echo clear is NOT a turn-settle signal: OpenCode can
+        // answer empty idle snapshots while the accepted first send is
+        // still materializing (first-message startup may exceed the retry
+        // budget), so the clear must never retire the send's dispatch busy
+        // window — only a real busy→idle edge of effectiveStatus bumps the
+        // busy-epoch (see the render-phase adjustment below `isBusy`).
+        setLocalEcho(null)
       }
       // Task 16 (zrrj): an idle snapshot that does not yet contain the
       // just-sent turn means the durable transcript is lagging -- schedule a
@@ -4074,9 +4080,11 @@ export function FreshAgentView({
   // with no pending echo is the turn's real settle (the row landed long
   // before). Every epoch bump rides an isBusy change, so the
   // captureInFlight recompute below always sees the bumped epoch in the
-  // same render that observes the edge; the stale-echo clear path in
-  // applySnapshot is the complementary bump for a send whose row never
-  // landed.
+  // same render that observes the edge. The stale-echo clear in
+  // applySnapshot deliberately does NOT bump: it is not a settle signal
+  // (an accepted first send can still be materializing when its echo goes
+  // stale), so a send whose row never lands keeps its dispatch window
+  // until the next un-gated busy→idle edge — the accepted bounded residual.
   if (wasPaneBusyRef.current && !isBusy && !localEcho) busyEpochRef.current += 1
   wasPaneBusyRef.current = isBusy
   // The user's just-sent message as an optimistic echo row, displayed after
