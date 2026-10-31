@@ -371,7 +371,7 @@ export type TerminalPaneContent = {
   restoreError?: RestoreError
   /** Initial working directory */
   initialCwd?: string
-  /** One-shot user-visible reconcile notice (corrected identity, fresh-by-reason, duplicate ignored). Rendered then cleared by TerminalView. */
+  /** User-visible reconcile notice. NON-DEAD copies (corrected identity, fresh-by-reason, duplicate ignored, invalid reason) are one-shot: rendered by TerminalView's create/attach anchors, then cleared. A DEAD-SESSION copy (the fold's dead arm, matched by category in `lib/dead-session-notice.ts`) is the RESIDENT durable copy source for the pane's in-buffer death explanation: it survives TerminalView unmounts, is never consumed at a write, and is cleared with the dead latch by the recovery folds (applyReconcileAttach / resetPaneForReconcileCreate). Never persisted (stripped in persistMiddleware). */
   reconcileNotice?: string
   /** The pane-close failure surface (delta-r7-r3 / focused-episode-7 round 2
    * Finding F2): set by the close gate when the server does NOT confirm the

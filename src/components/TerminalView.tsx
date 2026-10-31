@@ -418,9 +418,9 @@ const PENDING_INPUT_LOSS_NOTICE: Record<PendingInputLossReason, string> = {
  * (close button; +/split, Replace pane, Reopen pane as for a fresh start).
  * REASON-HONEST (delta review round 1, finding 3): the server also returns
  * dead_session with reason respawn_exhausted while the session file is
- * PRESENT, so the buffer line is selected from the store mint the writer
- * consumed — the same reason-honesty rule the store copy follows
- * (DEAD_SESSION_RECONCILE_NOTICES in pane-reconcile.ts).
+ * PRESENT, so the buffer line is selected from the resident store mint the
+ * writer read — the same reason-honesty rule the store copy follows
+ * (DEAD_SESSION_RECONCILE_NOTICES, dead-session-notice.ts).
  */
 const DEAD_SESSION_BUFFER_NOTICES = {
   missing:
@@ -429,7 +429,7 @@ const DEAD_SESSION_BUFFER_NOTICES = {
     "[This pane's saved session could not be resumed - close this pane or start a new one]",
 } as const
 
-/** Buffer-line variant for a consumed dead-copy mint (category match). */
+/** Buffer-line variant for a dead-copy mint (category match). */
 function deadSessionBufferNoticeForMint(notice: string): string {
   return notice === DEAD_SESSION_RECONCILE_NOTICES.respawnExhausted
     ? DEAD_SESSION_BUFFER_NOTICES.respawnExhausted
@@ -973,9 +973,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // that can WIPE the buffer — and is MIRRORED INTO STATE
   // (deadSessionNoticeSurfaceEpoch) so the invariant effect re-runs on each
   // bump; the ref remains the source of truth for immediate (non-render)
-  // readers. The record's mint copy keeps re-issues reason-honest after the
-  // one-shot mint is consumed. Cleared when the latch clears (user resolved
-  // the pane), re-arming a later re-death of the same identity.
+  // readers. The record's mint copy keeps re-issues reason-honest. The
+  // component-side records clear when the latch clears (user resolved the
+  // pane), re-arming a later re-death of the same identity; the STORE-side
+  // dead-copy mint (reconcileNotice) is the DURABLE copy source that
+  // survives this component's unmount and is cleared with the latch by
+  // the recovery folds (delta review round 4, finding 1).
   const deadSessionNoticeSurfaceEpochRef = useRef(0)
   const [deadSessionNoticeSurfaceEpoch, setDeadSessionNoticeSurfaceEpoch] = useState(0)
   // Write-queue generation signal: the queue fires onActiveGenerationChange
@@ -994,16 +997,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // copy is still the current regime's write and FIFO delivery is owed (the
   // level check trusts it and never double-issues); (2) OWED COPY — once
   // the copy is dropped (a takeover moved the generation) or its queue
-  // died (surface recreation disposed it), the record is the only
-  // surviving copy of the owed line (its one-shot mint was consumed at
-  // enqueue), and the invariant effect re-issues `record.data` at the very
-  // state change that revealed the drop (the epoch bump or the generation
-  // signal). At SURFACE BIRTH it is deliberately NOT cleared: the previous
-  // surface's queue died with that surface, so a still-pending copy died
-  // unapplied while its mint is already consumed — the surviving record is
-  // the consumed-pending-at-dispose copy. It clears when the copy applies
-  // (the apply callback then writes the at-apply record), when the latch
-  // clears, and when a later issue replaces it.
+  // died (surface recreation disposed it), the record re-issues
+  // `record.data` at the very state change that revealed the drop (the
+  // epoch bump or the generation signal). At SURFACE BIRTH it is
+  // deliberately NOT cleared: the previous surface's queue died with that
+  // surface, so a still-pending copy died unapplied — the surviving record
+  // is the consumed-pending-at-dispose copy. It clears when the copy
+  // applies (the apply callback then writes the at-apply record), when the
+  // latch clears, and when a later issue replaces it. (The RESIDENT store
+  // mint is the primary copy source for every fresh surface; this record
+  // keeps the re-issue queue-ordered through takeover reveals.)
   const deadSessionNoticeQueuedWriteRef = useRef<{
     key: string
     generation: string | undefined
@@ -1941,12 +1944,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
 
   // A queued dead-notice copy that is STILL the current queue regime's write:
   // FIFO delivery is owed for this identity — the level check below trusts it
-  // and consumes any re-folded mint without writing. A mismatch (a different
-  // queue object — surface recreation — or a moved active generation — an
-  // attach takeover dropped the copy) means the line is NOT coming from that
-  // copy: the invariant effect re-issues it from the outstanding-issue record
-  // at the state change that revealed the drop (the epoch bump or the
-  // generation signal).
+  // and never double-issues. A mismatch (a different queue object — surface
+  // recreation — or a moved active generation — an attach takeover dropped
+  // the copy) means the line is NOT coming from that copy: the invariant
+  // effect re-issues it from the outstanding-issue record (or the resident
+  // store mint) at the state change that revealed the drop (the epoch bump or
+  // the generation signal).
   const deadSessionNoticeQueuedWriteIsLive = useCallback((key: string) => {
     const queue = writeQueueRef.current
     if (!queue) return false
@@ -1963,65 +1966,65 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // INVARIANT itself — a dead-adjudicated pane whose CURRENT surface epoch
   // holds no APPLIED notice record is owed the line — and this writer issues
   // whenever the observation says the line is missing, never on an edge. The
-  // copy is resolved in order: a live dead-copy mint (the FIRST write; the
-  // mint is consumed at enqueue — the queued copy owns the delivery), an
-  // ISSUED copy that never applied (a generation takeover dropped it, or its
-  // queue died with a recreated surface — the outstanding-issue record is
-  // the only surviving copy of the owed line once the one-shot mint is
-  // gone), or the last APPLIED record's copy (re-issues stay reason-honest
-  // without a fresh mint). A queued copy that is still the current regime's
-  // write is TRUSTED (FIFO); a record matching the current surface epoch
-  // SATISFIES the invariant (a re-folded mint is still consumed — the dead
-  // copy may not linger resident in the store — and its copy adopted into
-  // the record so a later re-issue stays reason-honest). With no mint, no
-  // issued copy, and no record, nothing explains a write: the persisted
-  // latch alone is not a copy source (the reload shape waits for the boot
-  // re-fold's mint). While the xterm surface is not mounted (provider-wait
-  // window) the mint stays unconsumed — the invariant effect completes the
-  // write when the deferred surface mounts.
+  // copy is resolved in order: a live dead-copy mint (the RESIDENT store
+  // copy — the durable copy source that survives TerminalView unmounts and
+  // re-writes the line on every fresh surface; delta review round 4,
+  // finding 1 — it stays in the pane content while the dead latch holds
+  // and is never consumed at a write), an ISSUED copy that never applied
+  // (a generation takeover dropped it, or its queue died with a recreated
+  // surface — the outstanding-issue record re-issues the owed line), or
+  // the last APPLIED record's copy (re-issues stay reason-honest without a
+  // fresh mint). A queued copy that is still the current regime's write is
+  // TRUSTED (FIFO); a record matching the current surface epoch SATISFIES
+  // the invariant (the at-apply record per epoch is the loop guard, so a
+  // retained mint never causes repeat writes on one surface). With no
+  // mint, no issued copy, and no record, nothing explains a write: the
+  // persisted latch alone is not a copy source (the reload shape waits
+  // for the boot re-fold's mint). While the xterm surface is not mounted
+  // (provider-wait window) nothing can be written — the resident mint
+  // simply waits; the invariant effect completes the write when the
+  // deferred surface mounts.
   const writeDeadSessionNoticeIfPending = useCallback(() => {
     const content = contentRef.current
     const notice = content?.reconcileNotice
     const mint = notice !== undefined && isDeadSessionReconcileNotice(notice) ? notice : null
     const term = termRef.current
     if (!term) {
-      // Surface not mounted (provider-wait window): the mint stays
-      // unconsumed in the store.
+      // Surface not mounted (provider-wait window): the resident mint
+      // stays in the store until a surface exists to write it.
       return
     }
     const key = deadSessionNoticeIdentityKey(content)
     if (deadSessionNoticeQueuedWriteIsLive(key)) {
       // A queued copy of this identity is still the current queue regime's
-      // write: FIFO delivery is owed. Consume a re-folded mint exactly like
-      // the applied-record skip below.
-      if (mint) dispatch(clearPaneReconcileNotice({ tabId, paneId: paneIdRef.current }))
+      // write: FIFO delivery is owed. The resident mint needs no action.
       return
     }
     const written = deadSessionNoticeStateRef.current
     if (written && written.key === key && written.surfaceEpoch === deadSessionNoticeSurfaceEpochRef.current) {
       // The line is on the current surface epoch: the invariant is
-      // satisfied. Consume a re-folded mint so the dead copy cannot linger
-      // resident in the store, and adopt its copy into the record so a later
-      // re-issue stays reason-honest. A surviving issue record here is stale
-      // garbage (its copy was dropped or died with an old queue).
+      // satisfied. A re-folded mint stays resident (the durable copy
+      // source), and its copy is adopted into the record so a later
+      // re-issue stays reason-honest. A surviving issue record here is
+      // stale garbage (its copy was dropped or died with an old queue).
       deadSessionNoticeQueuedWriteRef.current = null
       if (mint) {
         deadSessionNoticeStateRef.current = { key, surfaceEpoch: written.surfaceEpoch, notice: mint }
-        dispatch(clearPaneReconcileNotice({ tabId, paneId: paneIdRef.current }))
       }
       return
     }
     if (mint) {
       writeDeadSessionNoticeToSurface(term, `\r\n${deadSessionBufferNoticeForMint(mint)}\r\n`, key, mint)
-      dispatch(clearPaneReconcileNotice({ tabId, paneId: paneIdRef.current }))
       return
     }
     const issued = deadSessionNoticeQueuedWriteRef.current
     if (issued && issued.key === key) {
       // A previously issued copy never applied — a generation takeover
-      // dropped it, or its queue died with a recreated surface — and its
-      // one-shot mint is gone: the outstanding-issue record IS the owed
-      // line. Re-issue it queue-ordered on the current regime.
+      // dropped it, or its queue died with a recreated surface. Re-issue
+      // it queue-ordered on the current regime. (Unreachable while a
+      // resident mint exists — the mint branch above owns that shape —
+      // but the reload window folds verdicts late, so the fallback
+      // stays.)
       writeDeadSessionNoticeToSurface(term, issued.data, key, issued.notice)
       return
     }
@@ -2039,8 +2042,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     // No mint, no issued copy, no record: nothing is owed that this writer
     // can explain — the persisted latch alone is not a copy source.
   }, [
-    dispatch,
-    tabId,
     deadSessionNoticeQueuedWriteIsLive,
     writeDeadSessionNoticeToSurface,
   ])
@@ -3101,16 +3102,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     // renderer-recreated surface starts blank, so a previously applied
     // notice line no longer matches the current epoch — the state-mirrored
     // bump re-fires the level-triggered invariant effect, which re-issues
-    // the recorded line onto this new buffer exactly once (from the
-    // at-apply record, or from the preserved outstanding-issue record when
-    // the owed copy never applied on the previous surface).
+    // the line onto this new buffer exactly once (from the resident store
+    // mint — the durable copy source — or from the preserved
+    // outstanding-issue record when the owed copy never applied on the
+    // previous surface).
     deadSessionNoticeSurfaceEpochRef.current += 1
     setDeadSessionNoticeSurfaceEpoch(deadSessionNoticeSurfaceEpochRef.current)
     // The outstanding-issue record is deliberately NOT cleared here: an
     // applied copy clears it at apply time, so a surviving record is always
-    // an unapplied one whose one-shot mint was consumed at enqueue — the
-    // consumed-pending-at-dispose copy, the only surviving record of the
-    // owed line. Its dead-queue fields make
+    // an unapplied one — the pending-at-dispose copy, a queue-ordered
+    // record of the owed line. Its dead-queue fields make
     // deadSessionNoticeQueuedWriteIsLive false on the new regime, and the
     // epoch bump above re-fires the invariant effect, which re-issues it
     // identity-keyed onto THIS surface exactly once.
@@ -3545,7 +3546,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // missing):
   // - the latch (restoreError): a dead verdict folds (turn on) or the pane
   //   resolves (clear — re-arm);
-  // - a dead-copy mint (reconcileNotice): the FIRST write's copy source;
+  // - a dead-copy mint (reconcileNotice): the RESIDENT store copy — the
+  //   durable copy source that survives this component's unmount and
+  //   re-writes the line onto every fresh surface (delta review round 4,
+  //   finding 1);
   // - the surface epoch (state mirror): surface birth and every
   //   reconstruction reset completion — a wipe invalidates the record;
   // - the write queue's active generation (the queue's
@@ -6453,11 +6457,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           if (createdNotice) {
             writeLocalXtermNotice(term, `\r\n${createdNotice}\r\n`)
           }
-          // One-shot reconcile notice (respawn/fresh verdicts): render it now
-          // that the pane anchored, then clear it from the store. The
-          // dead-session mint has exactly TWO owners (the INVALID_TERMINAL_ID
-          // stand-down gate and the notice effect's settled-surface writers)
-          // — this anchor neither writes nor clears it.
+          // One-shot reconcile notice (respawn/fresh verdicts — corrected,
+          // fresh-by-reason, duplicate copies): render it now that the pane
+          // anchored, then clear it from the store. The dead-session mint is
+          // the RESIDENT durable copy source with exactly TWO writers (the
+          // INVALID_TERMINAL_ID stand-down gate and the notice effect's
+          // settled-surface writers) and is cleared with the dead latch by
+          // the store folds — this anchor neither writes nor clears it.
           const createdReconcileNotice = contentRef.current?.reconcileNotice
           if (createdReconcileNotice && !isDeadSessionReconcileNotice(createdReconcileNotice)) {
             writeLocalXtermNotice(term, `\r\n${createdReconcileNotice}\r\n`)
@@ -7224,8 +7230,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               // this gate call is the natural settle moment's
               // belt-and-suspenders pass — the writer's level check makes it
               // a no-op whenever the line is already on the current surface
-              // (or a queued copy owns the delivery), and it consumes a
-              // re-folded mint either way.
+              // (or a queued copy owns the delivery).
               writeDeadSessionNoticeIfPending()
               return
             }
@@ -7551,10 +7556,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           })
           // One-shot reconcile notice (attach/corrected/duplicate verdicts):
           // render it on the attach that the verdict fold re-fired, then
-          // clear it from the store. The dead-session mint has exactly TWO
-          // owners (the INVALID_TERMINAL_ID stand-down gate and the
-          // no-terminalId notice effect) — this anchor neither writes nor
-          // clears it.
+          // clear it from the store. The dead-session mint is the RESIDENT
+          // durable copy source with exactly TWO writers (the
+          // INVALID_TERMINAL_ID stand-down gate and the no-terminalId notice
+          // effect) and is cleared with the dead latch by the store folds —
+          // this anchor neither writes nor clears it.
           const attachReconcileNotice = contentRef.current?.reconcileNotice
           if (attachReconcileNotice && !isDeadSessionReconcileNotice(attachReconcileNotice)) {
             writeLocalXtermNotice(term, `\r\n${attachReconcileNotice}\r\n`)

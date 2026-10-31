@@ -15886,8 +15886,11 @@ describe('replay phantom focus report silencing (kata 9gy8)', () => {
 //
 // A terminal pane whose saved session was deleted explains itself with ONE
 // notice line written directly into its own stale xterm buffer — never a
-// modal. The fold mints a one-shot dead-copy reconcileNotice beside the
-// persisted restoreError latch. The write trigger is LEVEL-TRIGGERED
+// modal. The fold mints a dead-copy reconcileNotice beside the persisted
+// restoreError latch; the mint is the RESIDENT durable copy source (delta
+// review round 4, finding 1): it stays in the pane content while the dead
+// latch holds — surviving TerminalView unmounts — and is cleared with the
+// latch by the recovery folds. The write trigger is LEVEL-TRIGGERED
 // (focused review 3, round 4): the INVARIANT — whenever the pane is
 // dead-adjudicated and its CURRENT surface epoch has no APPLIED notice
 // record, the line is (re-)issued, queue-ordered, generation-adopting —
@@ -16134,8 +16137,9 @@ describe('dead-session notice line (no-modal contract)', () => {
       expect(noticeWriteCount()).toBe(1)
     })
     expect(terminalWriteStrings(term()).filter((data) => data === FRAMED_NOTICE)).toHaveLength(1)
-    // Consumed one-shot.
-    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    // The mint stays RESIDENT (the durable copy source) while the latch
+    // holds — never consumed at the write.
+    expect(leafContent(store).reconcileNotice).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
     // The fold's STORE copy is never the buffer line.
     expect(terminalWriteStrings(term()).some((data) => data.includes('Saved session no longer exists on disk.'))).toBe(false)
 
@@ -16292,7 +16296,7 @@ describe('dead-session notice line (no-modal contract)', () => {
     // idempotent per surface epoch).
     const buffer = modeledFinalBuffer()
     expect(buffer.split(NOTICE_LINE).length - 1).toBe(1)
-    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    expect(leafContent(store).reconcileNotice).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
     expect(terminalWriteStrings(term()).some((data) => data.includes('Saved session no longer exists on disk.'))).toBe(false)
     // The stand-down held: no duplicate resume create was minted.
     expect(leafContent(store).createRequestId).toBe('req-dead-notice')
@@ -16300,9 +16304,9 @@ describe('dead-session notice line (no-modal contract)', () => {
     expect(sentCreates()).toHaveLength(0)
 
     // Re-adjudication without an intervening wipe must NOT write again —
-    // and the idempotent skip must still CONSUME the re-folded mint: the
-    // line is already on this surface epoch, so the dead copy may not
-    // linger resident in the store (the next re-fold re-mints).
+    // the line is already on this surface epoch, so the idempotent skip
+    // trusts the at-apply record; the re-folded mint stays RESIDENT (the
+    // durable copy source, delta round 4 finding 1).
     foldDeadVerdict(store)
     act(() => {
       messageHandler!({
@@ -16313,7 +16317,7 @@ describe('dead-session notice line (no-modal contract)', () => {
       })
     })
     expect(noticeWriteCount()).toBe(2)
-    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    expect(leafContent(store).reconcileNotice).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
   })
 
   it('survives a SECOND reconnect round: a reconstruction wipe re-arms the write and the line is present exactly once afterwards', async () => {
@@ -16382,8 +16386,9 @@ describe('dead-session notice line (no-modal contract)', () => {
     // wipe must RE-ISSUE the line.
     foldDeadVerdict(store)
     await act(async () => {})
-    // The re-folded mint was consumed by the idempotent skip (the line was
-    // on the current epoch at the fold) — no write from the re-fold alone.
+    // The re-fold refreshed the resident mint; the idempotent skip trusted
+    // the at-apply record (the line was on the current epoch at the fold)
+    // — no write from the re-fold alone.
     expect(noticeWriteCount()).toBe(2)
     act(() => {
       reconnectHandler!()
@@ -16413,7 +16418,7 @@ describe('dead-session notice line (no-modal contract)', () => {
     // wipe is absorbed) and not two (the write is idempotent per surface).
     const buffer = modeledFinalBuffer()
     expect(buffer.split(NOTICE_LINE).length - 1).toBe(1)
-    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    expect(leafContent(store).reconcileNotice).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
     expect(sentCreates()).toHaveLength(0)
   })
 
@@ -16481,10 +16486,10 @@ describe('dead-session notice line (no-modal contract)', () => {
     // The re-death line is in the FINAL buffer exactly once (the first
     // death's copy was wiped by the live round's reconstruction).
     expect(modeledFinalBuffer().split(NOTICE_LINE).length - 1).toBe(1)
-    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    expect(leafContent(store).reconcileNotice).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
   })
 
-  it('provider-wait window: the mint stays pending (not consumed) until the deferred surface mounts, then the line writes once', async () => {
+  it('provider-wait window: nothing writes until the deferred surface mounts, then the line writes once (the resident mint waits)', async () => {
     // OpenCode panes defer their xterm surface until the extension registry
     // resolves (shouldWaitForProviderBehavior, terminal-behavior.ts:15-19).
     // During the wait the lifecycle effect is stood down entirely (no
@@ -16519,8 +16524,8 @@ describe('dead-session notice line (no-modal contract)', () => {
     // No xterm surface yet — the registry fetch is still pending.
     expect(terminalInstances).toHaveLength(0)
 
-    // The dead verdict folds while the surface does not exist: the mint
-    // stays PENDING (unconsumed) and nothing can be written.
+    // The dead verdict folds while the surface does not exist: nothing can
+    // be written; the mint just waits, resident.
     foldDeadVerdict(store)
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalled()
@@ -16528,8 +16533,8 @@ describe('dead-session notice line (no-modal contract)', () => {
     expect(terminalInstances).toHaveLength(0)
     expect(leafContent(store).reconcileNotice).toBeTruthy()
 
-    // The registry resolves; the deferred surface mounts and the pending
-    // write completes — exactly one line, mint consumed.
+    // The registry resolves; the deferred surface mounts and the resident
+    // mint writes — exactly one line, mint still resident.
     await act(async () => {
       resolveExtensionsFetch(new Response(JSON.stringify([]), { status: 200 }))
     })
@@ -16537,7 +16542,7 @@ describe('dead-session notice line (no-modal contract)', () => {
       expect(terminalInstances.length).toBeGreaterThan(0)
       expect(noticeWriteCount()).toBe(1)
     })
-    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    expect(leafContent(store).reconcileNotice).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
   })
 
   it('copy honesty: a respawn_exhausted mint writes the could-not-be-resumed buffer line — the file is PRESENT', async () => {
@@ -16552,10 +16557,9 @@ describe('dead-session notice line (no-modal contract)', () => {
 
     // The server also returns dead_session with reason respawn_exhausted
     // while the session file is PRESENT (reconcile.rs) — the fold mints the
-    // honest could-not-be-resumed STORE copy. The one-shot machinery
-    // consumes the mint inside the fold's act() flush, so capture the
-    // TRANSIENT store state per dispatch to pin WHICH copy was minted
-    // (never the missing copy this path must not produce).
+    // honest could-not-be-resumed STORE copy. Capture the store state per
+    // dispatch to pin WHICH copy was minted (never the missing copy this
+    // path must not produce).
     const mints: string[] = []
     store.subscribe(() => {
       const notice = leafContent(store).reconcileNotice
@@ -16568,14 +16572,16 @@ describe('dead-session notice line (no-modal contract)', () => {
       expect(terminalWriteStrings(term()).filter((data) => data === FRAMED_RESPAWN_NOTICE)).toHaveLength(1)
     })
     // Reason honesty (delta review round 1, finding 3): the buffer line
-    // derives from the consumed mint — the respawn_exhausted variant says
+    // derives from the resident mint — the respawn_exhausted variant says
     // "could not be resumed" and NEVER the false "no longer exists on
     // disk" (the session file is present; only the resume failed). The
     // STORE copy still never reaches the buffer.
     expect(terminalWriteStrings(term()).some((data) => data === FRAMED_NOTICE)).toBe(false)
     expect(terminalWriteStrings(term()).some((data) => data.includes('Saved session could not be resumed.'))).toBe(false)
     expect(terminalWriteStrings(term()).some((data) => data.includes('Saved session no longer exists on disk.'))).toBe(false)
-    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    // The mint stays resident (retention is copy-honest: the respawn copy
+    // is retained, never the missing copy).
+    expect(leafContent(store).reconcileNotice).toBe(DEAD_SESSION_RECONCILE_NOTICES.respawnExhausted)
   })
 
   it('ignores non-dead reconcileNotice copies (invalid verdict): no buffer write, mint left to its anchor owners', async () => {
@@ -16689,7 +16695,7 @@ describe('dead-session notice line (no-modal contract)', () => {
     expect(noticeWriteCount()).toBe(1)
     // The pending reset really wiped the pre-death content.
     expect(buffer).not.toContain('stale pre-restart output')
-    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    expect(leafContent(store).reconcileNotice).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
     expect(sentCreates()).toHaveLength(0)
     expect(leafContent(store).terminalId).toBe(TERMINAL_ID)
   })
@@ -16700,13 +16706,14 @@ describe('dead-session notice line (no-modal contract)', () => {
     // applies. With the socket READY, the pending round's queued task runs
     // right after the reset and calls sendAttach — an attach-generation
     // takeover that DROPS the queued notice before it ever reaches xterm.
-    // The one-shot mint was consumed at enqueue, and when the last admitted
-    // attach never gets a response, no rejection gate runs and no
-    // settle-conditioned fallback re-fires: the pane is left WITHOUT its
-    // notice unless the write trigger is LEVEL-TRIGGERED — the invariant
-    // (dead latch + no at-apply record for the current surface epoch)
-    // re-issues the line at the very state change that revealed the drop
-    // (the reset's epoch bump, observable through its state mirror).
+    // When the last admitted attach never gets a response, no rejection
+    // gate runs and no settle-conditioned fallback re-fires: the pane is
+    // left WITHOUT its notice unless the write trigger is
+    // LEVEL-TRIGGERED — the invariant (dead latch + no at-apply record for
+    // the current surface epoch, with the resident store mint as the copy
+    // source) re-issues the line at the very state change that revealed
+    // the drop (the reset's epoch bump, observable through its state
+    // mirror).
     const { store } = await renderDeadSessionNoticePane(
       {},
       { reconcilePendingPanes: { [PANE_KEY]: Date.now() } },
@@ -16791,9 +16798,9 @@ describe('dead-session notice line (no-modal contract)', () => {
     expect(writes.indexOf(FRAMED_NOTICE)).toBeGreaterThan(resetIndex)
     // Exactly one notice line was ever applied.
     expect(noticeWriteCount()).toBe(1)
-    // The mint was consumed at the first (dropped) enqueue and no re-mint
-    // ever arrived; the create-lane stand-down held throughout.
-    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    // The mint is still resident (the re-issue's copy source); the
+    // create-lane stand-down held throughout.
+    expect(leafContent(store).reconcileNotice).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
     expect(sentCreates()).toHaveLength(0)
     expect(leafContent(store).terminalId).toBe(TERMINAL_ID)
   })
@@ -16805,8 +16812,8 @@ describe('dead-session notice line (no-modal contract)', () => {
     // enqueue-time generation no longer matches the queue's active one, so
     // the next writer call (this round's own rejection gate) re-writes the
     // recorded line instead of trusting the dropped copy. Without the
-    // tracker this scenario loses the line permanently: the mint was
-    // consumed at the first enqueue and no re-fold re-mints.
+    // tracker this scenario loses the line on every takeover: the queued
+    // copy's generation goes stale and no writer call ever re-issues it.
     const { store } = await renderDeadSessionNoticePane(
       {},
       { reconcilePendingPanes: { [PANE_KEY]: Date.now() } },
@@ -16883,7 +16890,7 @@ describe('dead-session notice line (no-modal contract)', () => {
     expect(writes.filter((data) => data === FRAMED_NOTICE)).toHaveLength(1)
     const buffer = modeledFinalBuffer()
     expect(buffer.split(NOTICE_LINE).length - 1).toBe(1)
-    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    expect(leafContent(store).reconcileNotice).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
     expect(sentCreates()).toHaveLength(0)
   })
 
@@ -16941,7 +16948,7 @@ describe('dead-session notice line (no-modal contract)', () => {
     })
     const buffer = modeledFinalBuffer()
     expect(buffer.split(NOTICE_LINE).length - 1).toBe(1)
-    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    expect(leafContent(store).reconcileNotice).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
     // The create-lane stand-down held: no duplicate resume was minted.
     expect(sentCreates()).toHaveLength(0)
     expect(leafContent(store).terminalId).toBe(TERMINAL_ID)
@@ -16950,12 +16957,14 @@ describe('dead-session notice line (no-modal contract)', () => {
   it('surface-recreation fallback: a provider renderer preference change re-writes the consumed notice into the new buffer exactly once', async () => {
     // Delta review round 3, finding 2: recreating the xterm surface while
     // the pane stays dead (the opencode extension's preferred renderer
-    // changes) bumps the notice epoch at surface birth — but the one-shot
-    // mint was consumed at the first write, and with no new verdict and no
-    // attach rejection neither writer ran (the line was LOST from the
-    // recreated buffer). The recreation is itself a settle event (renderer
-    // changes happen with no attach cycle pending): the effect re-writes
-    // the recorded line onto the settled new surface.
+    // changes) bumps the notice epoch at surface birth — but with no new
+    // verdict and no attach rejection no edge existed to run a writer
+    // (the line was LOST from the recreated buffer in the consumed-mint
+    // regime of that round). The recreation is itself a settle event
+    // (renderer changes happen with no attach cycle pending): the level
+    // check re-writes the line onto the settled new surface (today from
+    // the resident mint; the at-apply record is the same-surface loop
+    // guard).
     const opencodeEntry = (preferredRenderer?: 'canvas'): ClientExtensionEntry => ({
       name: 'opencode',
       version: '1.0.0',
@@ -17017,7 +17026,7 @@ describe('dead-session notice line (no-modal contract)', () => {
     // surface's FINAL SURVIVING BUFFER holds the line exactly once.
     expect(modeledFinalBuffer().split(NOTICE_LINE).length - 1).toBe(1)
     const firstTerm = term()
-    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    expect(leafContent(store).reconcileNotice).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
 
     // The provider's preferred renderer changes (canvas -> unset): the init
     // effect re-runs and recreates the xterm surface (a NEW terminal
@@ -17031,15 +17040,15 @@ describe('dead-session notice line (no-modal contract)', () => {
     const recreatedTerm = terminalInstances[terminalInstances.length - 1]
 
     // The recreated buffer gets the notice line EXACTLY ONCE (the epoch
-    // bump re-fired the invariant, which re-issued from the record — no
-    // mint existed to consume and none was minted: the record IS the
-    // surviving truth), and the FIRST surface was not touched again.
+    // bump re-fired the invariant, which re-issued from the resident
+    // mint; the at-apply record stamps the new surface so the level
+    // check settles), and the FIRST surface was not touched again.
     await waitFor(() => {
       expect(terminalWriteStrings(recreatedTerm).filter((data) => data === FRAMED_NOTICE)).toHaveLength(1)
     })
     expect(terminalWriteStrings(firstTerm).filter((data) => data === FRAMED_NOTICE)).toHaveLength(2)
-    // The store keeps no resident dead copy.
-    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    // The store keeps the resident dead copy (the durable copy source).
+    expect(leafContent(store).reconcileNotice).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
     expect(sentCreates()).toHaveLength(0)
   })
 
@@ -17117,7 +17126,7 @@ describe('dead-session notice line (no-modal contract)', () => {
     // queue — no bytes have reached the first surface (the unapplied copy
     // of the finding).
     expect(noticeWriteCount()).toBe(0)
-    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    expect(leafContent(store).reconcileNotice).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
     const firstTerm = term()
 
     // The provider's preferred renderer changes BEFORE the copy applies:
@@ -17144,9 +17153,9 @@ describe('dead-session notice line (no-modal contract)', () => {
     // The died-with-the-old-queue copy never landed anywhere: the first
     // surface never applied its notice bytes.
     expect(terminalWriteStrings(firstTerm).filter((data) => data === FRAMED_NOTICE)).toHaveLength(0)
-    // No re-mint ever arrived and none is resident; the create-lane
+    // The mint is resident (the durable copy source); the create-lane
     // stand-down held throughout.
-    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    expect(leafContent(store).reconcileNotice).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
     expect(sentCreates()).toHaveLength(0)
   })
 
@@ -17221,7 +17230,7 @@ describe('dead-session notice line (no-modal contract)', () => {
     })
     expect(sentAttaches()).toHaveLength(4)
     expect(terminalWriteStrings(firstTerm).filter((data) => data === FRAMED_NOTICE)).toHaveLength(1)
-    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    expect(leafContent(store).reconcileNotice).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
 
     // Hold the NEW surface's queue flushes: its re-issued copy must stay
     // QUEUED (unapplied) when the old surface's completion arrives.
@@ -17270,9 +17279,9 @@ describe('dead-session notice line (no-modal contract)', () => {
     // No double-write anywhere: the retired surface was never touched
     // again, and the new surface received exactly one line.
     expect(terminalWriteStrings(firstTerm).filter((data) => data === FRAMED_NOTICE)).toHaveLength(1)
-    // The mint stays consumed; no re-mint ever arrived; the create-lane
+    // The mint stays resident (the durable copy source); the create-lane
     // stand-down held throughout.
-    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    expect(leafContent(store).reconcileNotice).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
     expect(sentCreates()).toHaveLength(0)
     expect(leafContent(store).terminalId).toBe(TERMINAL_ID)
   })
@@ -17347,7 +17356,7 @@ describe('dead-session notice line (no-modal contract)', () => {
     // the mint against the stale record without writing.
     foldDeadVerdict(store)
     await act(async () => {})
-    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    expect(leafContent(store).reconcileNotice).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
 
     // The recovery bound is exhausted (the mount attach was the free initial
     // hydration; rounds A/B/C were attempts 1-3): the next transport flap's
@@ -17375,7 +17384,7 @@ describe('dead-session notice line (no-modal contract)', () => {
     // Exactly-once accounting: issue #1 (the fold), re-issue #2 (round A's
     // wipe), re-issue #3 (round C's flushed-but-abandoned wipe).
     expect(noticeWriteCount()).toBe(3)
-    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    expect(leafContent(store).reconcileNotice).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
     expect(sentCreates()).toHaveLength(0)
     expect(leafContent(store).terminalId).toBe(TERMINAL_ID)
   })
@@ -17467,7 +17476,75 @@ describe('dead-session notice line (no-modal contract)', () => {
     // to it again after the recreation.
     expect(modeledFinalBuffer(firstTerm).split(NOTICE_LINE).length - 1).toBe(0)
     expect(terminalWriteStrings(firstTerm).filter((data) => data === FRAMED_NOTICE)).toHaveLength(2)
-    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    expect(leafContent(store).reconcileNotice).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
+    expect(sentCreates()).toHaveLength(0)
+  })
+
+  it('survives terminal-area unmount/remount (App view navigation): the retained store mint re-writes the line onto the fresh surface', async () => {
+    // Delta round 4, finding 1: App.tsx renders OverviewView/TabsView
+    // INSTEAD of the terminal work area (App.tsx view switch), so ordinary
+    // navigation UNMOUNTS TerminalView. The remounted pane starts with a
+    // blank xterm buffer and FRESH refs — the at-apply record and the
+    // outstanding-issue record died with the old component instance. The
+    // pane content's dead-copy mint is the ONLY copy source that survives
+    // the unmount (the Redux store outlives the component): while the dead
+    // latch holds, the mint must stay RESIDENT in the store and re-write
+    // the line onto the fresh surface — a consumed one-shot mint left the
+    // remounted dead pane with NO in-pane explanation (the reload path
+    // never covered this: a reload triggers a fresh verdict and re-mint).
+    const harness = setupDeadSessionNoticePane(
+      {
+        terminalId: undefined,
+        status: 'creating',
+        restoreError: buildRestoreError('durable_artifact_missing'),
+      },
+      { reconcilePendingPanes: { [PANE_KEY]: Date.now() } },
+    )
+    const { store } = harness
+    const first = render(
+      <Provider store={store}>
+        <TerminalViewFromStore tabId={TAB_ID} paneId={PANE_ID} />
+      </Provider>,
+    )
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    // The boot re-fold mints and the invariant writes the line (issue #1
+    // applies; the mint was consumed at the write pre-fix).
+    foldDeadVerdict(store)
+    await waitFor(() => {
+      expect(noticeWriteCount()).toBe(1)
+    })
+    const firstSurface = term()
+
+    // Navigate away and back: the terminal work area unmounts exactly as
+    // App's view switch does, then a fresh TerminalView mounts on the SAME
+    // store (which persists across component unmounts).
+    first.unmount()
+    render(
+      <Provider store={store}>
+        <TerminalViewFromStore tabId={TAB_ID} paneId={PANE_ID} />
+      </Provider>,
+    )
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+    const remountedSurface = terminalInstances[terminalInstances.length - 1]
+    expect(remountedSurface).not.toBe(firstSurface)
+
+    // The retained mint is the durable copy source: the fresh surface —
+    // blank buffer, no ref memory — gets its explanation line.
+    await waitFor(() => {
+      expect(terminalWriteStrings(remountedSurface).filter((data) => data === FRAMED_NOTICE)).toHaveLength(1)
+    })
+    // The mint stays RESIDENT while the dead latch holds (never
+    // re-consumed at a write; cleared with the latch; persistence-stripped
+    // so a reload re-folds and re-mints).
+    expect(leafContent(store).reconcileNotice).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
+    // The retired surface was never touched again, and the create-lane
+    // stand-down held across the whole navigation.
+    expect(terminalWriteStrings(firstSurface).filter((data) => data === FRAMED_NOTICE)).toHaveLength(1)
     expect(sentCreates()).toHaveLength(0)
   })
 })

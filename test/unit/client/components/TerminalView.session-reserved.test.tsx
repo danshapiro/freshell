@@ -15,7 +15,7 @@ import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import { buildRestoreError } from '@shared/session-contract'
-import { deadSessionReconcileNoticeFor } from '@/lib/pane-reconcile'
+import { DEAD_SESSION_RECONCILE_NOTICES, deadSessionReconcileNoticeFor } from '@/lib/pane-reconcile'
 // This suite deliberately does NOT mock terminal-restore (see the codex
 // breadcrumb exemption pin below): the real registry carries the
 // registration -> consume round trip, and the real setPaneReconcileActive
@@ -437,11 +437,12 @@ describe('TerminalView reconcile adoption: verdict-driven create + bounded re-dr
     // No-modal contract (Task 2): the dead verdict explains itself with
     // exactly ONE notice line written directly into the pane's own stale
     // buffer (CRLF-framed) — never a modal. The fold's dead-copy mint is
-    // consumed one-shot, and the STORE copy never reaches the buffer.
+    // the RESIDENT durable copy source (delta round 4, finding 1) and the
+    // STORE copy never reaches the buffer.
     const deadNoticeLine = '\r\n[This pane\'s saved session no longer exists on disk - close this pane or start a new one]\r\n'
     expect(xtermWrites().filter((data) => data === deadNoticeLine)).toHaveLength(1)
     expect(xtermWrites().some((data) => data.includes('Saved session no longer exists on disk.'))).toBe(false)
-    expect(paneContent(store).reconcileNotice).toBeUndefined()
+    expect(paneContent(store).reconcileNotice).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
 
     // Create-lane stand-down (delta review round 1, finding 1): after the
     // dead verdict fold NO further terminal.create may be sent — the pane
@@ -868,11 +869,11 @@ describe('TerminalView reconcile adoption: verdict-driven create + bounded re-dr
     expect(sentOfType('terminal.create').filter((msg) => msg?.requestId === mintedId)).toHaveLength(1)
     expect(sentOfType('terminal.create').some((msg) => msg?.sessionRef?.sessionId === 'sess-stale-exempt')).toBe(false)
 
-    // The notice still writes (exactly one buffer line, the dead-copy
-    // category mint consumed one-shot).
+    // The notice still writes (exactly one buffer line; the dead-copy
+    // category mint stays resident as the durable copy source).
     const deadNoticeLine = '\r\n[This pane\'s saved session no longer exists on disk - close this pane or start a new one]\r\n'
     expect(xtermWrites().filter((data) => data === deadNoticeLine)).toHaveLength(1)
-    expect(paneContent(store).reconcileNotice).toBeUndefined()
+    expect(paneContent(store).reconcileNotice).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
   })
 
   it('INVALID_TERMINAL_ID at launch is retried bounded (F9), not a permanent error', async () => {

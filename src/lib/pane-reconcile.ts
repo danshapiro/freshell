@@ -38,51 +38,28 @@ import {
 import { retainedManagedPreparationFailure } from '@/store/paneTypes'
 import { clearSessionLost } from '@/store/freshAgentSlice'
 import type { PaneOwnerDivergence } from '@/store/selectors/runtimeOwner'
+import {
+  DEAD_SESSION_RECONCILE_NOTICES,
+  deadSessionReconcileNoticeFor,
+  isDeadSessionReconcileNotice,
+} from '@/lib/dead-session-notice'
+
+// The dead-copy mint vocabulary lives in its own leaf module
+// (dead-session-notice.ts) so the STORE folds that clear the dead latch
+// can observe the category without importing this module (which depends
+// on the slice). Re-exported here: TerminalView and the tests import the
+// mint vocabulary from the reconcile fold's module.
+export {
+  DEAD_SESSION_RECONCILE_NOTICES,
+  deadSessionReconcileNoticeFor,
+  isDeadSessionReconcileNotice,
+}
 
 /** Protocol cap on request size (mirrors PaneReconcileRequestSchema). */
 const MAX_RECONCILE_PANES = 200
 
 /** Bounded wait for a boot `pane.reconcile.result`: > the server's single 2s warming deferral + round-trip margin. */
 export const RECONCILE_RESULT_WAIT_MS = 10_000
-
-/**
- * Dead-session store-copy mints for the one-shot `reconcileNotice` field
- * (no-modal contract). REASON-HONEST: the server also returns `dead_session`
- * with reason `respawn_exhausted` while the session file is PRESENT, so the
- * fold selects the copy from `verdict.reason`. Consumers match the mint by
- * CATEGORY through `isDeadSessionReconcileNotice` — never one string — so the
- * `invalid`-arm and reset notices can never trigger them. The xterm
- * buffer line is a SEPARATE shared const in TerminalView; these copies stay
- * store-side.
- */
-export const DEAD_SESSION_RECONCILE_NOTICES = {
-  missing: 'Saved session no longer exists on disk.',
-  respawnExhausted: 'Saved session could not be resumed.',
-} as const
-
-/**
- * The known-missing reason family — the only dead reasons that may claim
- * the session file is gone from disk. Everything else (respawn_exhausted,
- * an absent reason, or a future server's unknown code) maps to the
- * generic "could not be resumed" copy: an unknown reason must never make
- * a disk-loss claim it cannot back (plan Task 2 keying; delta review
- * round 2, finding 2).
- */
-const DEAD_SESSION_DISK_LOSS_REASONS: ReadonlySet<string> = new Set([
-  'session_not_on_disk',
-  'session_file_missing',
-])
-
-export function deadSessionReconcileNoticeFor(reason: string | undefined): string {
-  return reason !== undefined && DEAD_SESSION_DISK_LOSS_REASONS.has(reason)
-    ? DEAD_SESSION_RECONCILE_NOTICES.missing
-    : DEAD_SESSION_RECONCILE_NOTICES.respawnExhausted
-}
-
-export function isDeadSessionReconcileNotice(notice: string | undefined): boolean {
-  return notice === DEAD_SESSION_RECONCILE_NOTICES.missing
-    || notice === DEAD_SESSION_RECONCILE_NOTICES.respawnExhausted
-}
 
 export function paneKeyFor(tabId: string, paneId: string): string {
   return `${tabId}:${paneId}`
@@ -570,13 +547,18 @@ export function foldVerdicts(
           restoreError: buildRestoreError('durable_artifact_missing'),
         }))
         // No-modal contract (Task 2): the terminal dead arm also mints the
-        // one-shot dead-copy reconcileNotice — the signal no other producer
-        // can mint (the latch alone is also set on LIVE panes by the codex
-        // dead-live-handle recovery breadcrumb). TerminalView's notice
-        // machinery consumes it into ONE xterm buffer line. Reason-honest
-        // copy selection; the fresh-agent arm above does NOT mint
-        // (FreshAgentView renders reconcileNotice as a transient status —
-        // its restoreError banner already explains the death).
+        // dead-copy reconcileNotice beside the latch — the signal no other
+        // producer can mint (the latch alone is also set on LIVE panes by
+        // the codex dead-live-handle recovery breadcrumb). TerminalView's
+        // notice machinery writes it into ONE xterm buffer line per
+        // surface epoch; the mint itself STAYS RESIDENT in the pane
+        // content as the durable copy source while the dead latch holds
+        // (it survives TerminalView unmounts — delta review round 4,
+        // finding 1 — and is cleared with the latch by the recovery
+        // folds). Reason-honest copy selection; the fresh-agent arm above
+        // does NOT mint (FreshAgentView renders reconcileNotice as a
+        // transient status — its restoreError banner already explains
+        // the death).
         dispatch(setPaneReconcileNotice({
           tabId,
           paneId,

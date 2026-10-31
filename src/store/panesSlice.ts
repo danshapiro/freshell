@@ -33,6 +33,7 @@ import { loadPersistedPanes, loadPersistedTabs } from './persistMiddleware.js'
 import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
 import { mergeHydratedPaneMetadata, mergeCrossWindowPaneTitles, paneTitleMetadataEquals, type HydratePanesMeta } from './hydrate-pane-metadata-merge.js'
 import { createLogger } from '@/lib/client-logger'
+import { isDeadSessionReconcileNotice } from '@/lib/dead-session-notice'
 import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
 import { sanitizeRestoreError, sanitizeCrashTrace, sanitizeSessionRef, type RestoreError } from '@shared/session-contract'
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
@@ -703,6 +704,14 @@ function foldLiveTerminalAttach(content: TerminalPaneContent, terminalId: string
   if (!sameTerminal) content.streamId = undefined
   content.status = 'running'
   content.restoreError = undefined
+  // No-modal contract (delta review round 4, finding 1): the dead-copy
+  // mint is the DURABLE notice copy source — it lives exactly as long as
+  // the dead latch it explains. This fold clears the latch, so a resident
+  // dead mint goes with it; a NON-dead notice (corrected/duplicate/
+  // invalid copies) keeps its own one-shot lifecycle at the anchors.
+  if (isDeadSessionReconcileNotice(content.reconcileNotice)) {
+    content.reconcileNotice = undefined
+  }
   // kata b8ke: anchoring onto a live terminal resolves any typed launch
   // failure — the recoverable card must not outlive its recovery.
   content.launchFailure = undefined
@@ -2744,6 +2753,12 @@ export const panesSlice = createSlice({
         content.reconcileNotice = RECONCILE_NOTICE_CORRECTED
       } else if (intent === 'fresh' && reason) {
         content.reconcileNotice = reconcileFreshNotice(reason)
+      } else if (isDeadSessionReconcileNotice(content.reconcileNotice)) {
+        // No-modal contract (delta review round 4, finding 1): the reset
+        // cleared the dead latch above, so the durable dead-copy mint —
+        // retained precisely while that latch holds — goes with it
+        // (unless this fold's own corrected/fresh copy replaced it).
+        content.reconcileNotice = undefined
       }
       clearRestoreFallbackAttemptForPane(state, tabId, paneId)
       clearReconcilePendingForPane(state, tabId, paneId)
