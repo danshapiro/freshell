@@ -17149,4 +17149,131 @@ describe('dead-session notice line (no-modal contract)', () => {
     expect(leafContent(store).reconcileNotice).toBeUndefined()
     expect(sentCreates()).toHaveLength(0)
   })
+
+  it('retired-surface completion: a late apply from the OLD surface’s in-flight write never records on the NEW surface — a takeover-dropped copy is re-issued and the new buffer keeps its line exactly once', async () => {
+    // Focused review 3, round 5: the at-apply completion callback does not
+    // verify WHICH surface received the write. A write SUBMITTED to the old
+    // xterm surface can COMPLETE after a renderer recreation — the callback
+    // then clears the NEW surface's outstanding-notice record and stamps the
+    // NEW surface's epoch: a FALSE applied record for bytes that never
+    // touched the new surface. When the new surface's own queued copy is
+    // subsequently dropped (a generation takeover), the invariant sees the
+    // false record and never re-issues — the dead pane loses its notice.
+    // The completion must record ONLY on the surface whose queue received
+    // the bytes. (The recreation-window pin above holds the write BEFORE
+    // submission; this test holds its COMPLETION — the reviewer's order.)
+    const opencodeEntry = (preferredRenderer?: 'canvas'): ClientExtensionEntry => ({
+      name: 'opencode',
+      version: '1.0.0',
+      label: 'OpenCode',
+      description: 'OpenCode CLI',
+      category: 'cli',
+      cli: {
+        terminalBehavior: {
+          ...(preferredRenderer ? { preferredRenderer } : {}),
+          scrollInputPolicy: 'native',
+        },
+      },
+    })
+    const { store } = await renderDeadSessionNoticePane(
+      {
+        mode: 'opencode',
+        sessionRef: { provider: 'opencode', sessionId: 'sess-opencode-dead' },
+      },
+      { reconcilePendingPanes: { [PANE_KEY]: Date.now() } },
+      [opencodeEntry('canvas')],
+    )
+
+    // The exhaustion shape keeps the OLD surface's queue generation STABLE
+    // through the fold: the mount attach is rejected inside the pending
+    // window (absorbed), three progressless flaps exhaust the recovery
+    // bound, and the fold's round attach is REFUSED before sending — no
+    // sendAttach ever moves the old queue's generation after the notice
+    // adopts it, so the in-flight write's completion still runs its
+    // per-item callbacks when the test releases it below.
+    const mountAttachId = sentAttaches()[0].attachRequestId
+    act(() => {
+      messageHandler!({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        message: 'Unknown terminalId',
+        requestId: mountAttachId,
+        terminalId: TERMINAL_ID,
+      })
+    })
+    act(() => { reconnectHandler!() })
+    act(() => { reconnectHandler!() })
+    act(() => { reconnectHandler!() })
+    expect(sentAttaches()).toHaveLength(4)
+
+    // Honest-async test mode: the notice's write is SUBMITTED to the old
+    // surface's xterm and its COMPLETION is held — the reviewer's order
+    // needs the write in flight, not queued.
+    const firstTerm = term()
+    firstTerm.deferWrites = true
+
+    // The dead verdict folds (latch + mint): the invariant issues the line
+    // onto the old surface (in flight, completion held), the exhausted
+    // limiter refuses the round attach, and the visible retry state shows.
+    foldDeadVerdict(store)
+    await waitFor(() => {
+      expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
+    })
+    expect(sentAttaches()).toHaveLength(4)
+    expect(terminalWriteStrings(firstTerm).filter((data) => data === FRAMED_NOTICE)).toHaveLength(1)
+    expect(leafContent(store).reconcileNotice).toBeUndefined()
+
+    // Hold the NEW surface's queue flushes: its re-issued copy must stay
+    // QUEUED (unapplied) when the old surface's completion arrives.
+    const pump = captureWriteFrames()
+
+    // Renderer recreation (canvas -> unset): a NEW xterm surface and queue;
+    // the epoch bump re-fires the invariant, which re-issues the line from
+    // the preserved outstanding-issue record onto the new queue.
+    act(() => {
+      store.dispatch(setRegistry([opencodeEntry(undefined)]))
+    })
+    await waitFor(() => {
+      expect(terminalInstances).toHaveLength(2)
+    })
+    const recreatedTerm = terminalInstances[terminalInstances.length - 1]
+    expect(recreatedTerm).not.toBe(firstTerm)
+
+    // THE REVIEWER'S ORDER: the OLD surface's held write completes NOW —
+    // after the recreation, while the new surface's own copy is still
+    // queued. These bytes never touched the new surface.
+    act(() => { firstTerm.releasePendingWrites() })
+
+    // A generation takeover drops the new surface's still-queued copy: the
+    // user's explicit retry (existing pane chrome) resets the recovery
+    // accounting, and its direct attach takes the new queue over with
+    // dropQueuedStaleWrites.
+    fireEvent.click(screen.getByRole('button', { name: 'Retry terminal restore' }))
+    await waitFor(() => {
+      expect(sentAttaches()).toHaveLength(5)
+    })
+
+    // Flush everything the test deferred.
+    act(() => { pump() })
+
+    // FINAL SURVIVING BUFFER STATE on the NEW surface: the notice is present
+    // EXACTLY ONCE. Pre-fix, the retired completion's FALSE record made the
+    // invariant believe the line applied, so the takeover's drop was never
+    // re-issued and the new buffer held ZERO lines — the dead pane lost its
+    // notice. With the surface-identity gate the retired completion records
+    // nothing, the drop re-fires the invariant, and the re-issue lands.
+    await waitFor(() => {
+      expect(terminalWriteStrings(recreatedTerm).filter((data) => data === FRAMED_NOTICE)).toHaveLength(1)
+    })
+    const buffer = modeledFinalBuffer(recreatedTerm)
+    expect(buffer.split(NOTICE_LINE).length - 1).toBe(1)
+    // No double-write anywhere: the retired surface was never touched
+    // again, and the new surface received exactly one line.
+    expect(terminalWriteStrings(firstTerm).filter((data) => data === FRAMED_NOTICE)).toHaveLength(1)
+    // The mint stays consumed; no re-mint ever arrived; the create-lane
+    // stand-down held throughout.
+    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    expect(sentCreates()).toHaveLength(0)
+    expect(leafContent(store).terminalId).toBe(TERMINAL_ID)
+  })
 })

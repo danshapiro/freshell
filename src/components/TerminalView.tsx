@@ -1794,6 +1794,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     try {
       term.write(data, () => {
         try {
+          // Surface-identity gate (focused review 3, round 5): this write's
+          // bytes went to the term captured at ENQUEUE time. A completion
+          // arriving after the surface was recreated (termRef moved on)
+          // belongs to the RETIRED surface — its bytes never touched the
+          // current one, so it must not mutate the current surface's
+          // stream-epoch accounting or run the applied hook.
+          if (termRef.current !== term) return
           invalidateAppliedSurface()
           surfaceWritesSinceFreshRef.current += 1
           onApplied?.()
@@ -1829,7 +1836,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     const generation = currentAttachRef.current?.requestId
     const queue = writeQueueRef.current
     if (queue) {
-      queue.enqueue(data, invalidateAppliedSurface, { mode: 'live', generation })
+      queue.enqueue(data, () => {
+        // Surface-identity gate (focused review 3, round 5): only the
+        // surface whose queue received the bytes may consume this
+        // completion — a retired surface's late completion must not bump
+        // the CURRENT surface's stream-epoch accounting.
+        if (writeQueueRef.current !== queue) return
+        invalidateAppliedSurface()
+      }, { mode: 'live', generation })
       return
     }
     writeLocalXtermNoticeDirect(term, data)
@@ -1847,10 +1861,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // the level-triggered invariant effect re-issues the recorded line at the
   // state change that reveals the drop (the queue's onActiveGenerationChange
   // signal, or the epoch bump of a later reset). The apply callback records
-  // the write at the surface epoch READ THEN — the idempotency record only
-  // ever claims an epoch the line actually landed on, so the skip branch
-  // stays honest (skip ⟺ the line is on the current surface). The queue
-  // item is 'live'-mode: the queue's own onItemApplied hook counts it
+  // the write at the surface epoch READ THEN, and ONLY when the surface that
+  // received the bytes is still the current one (the captured queue object —
+  // the same identity the liveness check below trusts): a completion from a
+  // retired surface records nothing, so the idempotency record only ever
+  // claims an epoch the line actually landed on and the skip branch stays
+  // honest (skip ⟺ the line is on the current surface). The queue item
+  // is 'live'-mode: the queue's own onItemApplied hook counts it
   // toward surface mutation (surfaceWritesSinceFresh), so a later
   // full-hydrate attach treats the surface as dirty and reconstructs it
   // (and the invariant re-issues the line after that wipe). The direct path
@@ -1897,11 +1914,28 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         })
       }
       queue.enqueue(data, () => {
+        // Surface-identity gate (focused review 3, round 5): the at-apply
+        // record may be written ONLY by the surface whose queue received
+        // the bytes. A write SUBMITTED to the old xterm surface can
+        // COMPLETE after a renderer recreation — that late completion must
+        // not clear the NEW surface's outstanding-issue record nor stamp
+        // the NEW surface's epoch (a FALSE applied record for bytes that
+        // never touched it); otherwise a later generation takeover that
+        // drops the new surface's own queued copy meets an invariant that
+        // believes the line applied, and the dead pane never gets its
+        // notice. The gate leaves the outstanding record intact, so the
+        // invariant re-issues at the drop's reveal; the at-apply record
+        // per epoch remains the loop breaker.
+        if (writeQueueRef.current !== queue) return
         invalidateAppliedSurface()
         recordAppliedWrite()
       }, { mode: 'live', generation: undefined })
       return
     }
+    // Direct no-queue fallback arm: the surface-identity gate lives in
+    // writeLocalXtermNoticeDirect's completion callback (focused review 3,
+    // round 5) — only the term that received the bytes may record the
+    // apply, exactly like the queue arm above.
     writeLocalXtermNoticeDirect(term, data, recordAppliedWrite)
   }, [resetParserAppliedSurface, writeLocalXtermNoticeDirect])
 
