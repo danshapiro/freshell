@@ -63,20 +63,25 @@ import type { Page } from '@playwright/test'
  *      sessionRef, no resume argv, and NO conversation was ever minted for
  *      it (the brain tree holds only the bound pane's conversation).
  *
- * TEST 3 — deleted store, honest restore:
- *   8. Delete `brain/<id>/` under the isolated HOME → the restart resume
- *      attempt still launches with `--conversation <id>` (the antigravity
- *      resume gate is deferred by design — Task 7's honest-restore: no
- *      SpawnFresh substitution), the fake's OWN missing-store error
- *      surfaces IN-PANE (`agy: conversation <id> not found`), NO
- *      replacement conversation is ever minted (no fresh-argv row, no new
- *      brain dir, the pane's sessionRef still names the deleted id), and
- *      `--continue` never appears. (The bounded auto-resume lane may
- *      re-attempt the SAME id a few times — every retry carries the same
- *      `--conversation <id>` pair, so the no-replacement invariants hold at
- *      every instant.)
- *
- * Cloud legality: deterministic fakes, generous polls (15-45 s), no
+  * TEST 3 — deleted store, honest restore (two-part shape):
+  *   8. Delete `brain/<id>/` under the isolated HOME. PART A: the restart
+  *      resume attempt spawns NOTHING — the reconcile door intercepts the
+  *      deleted store (`dead_session`/`session_not_on_disk`, no provider
+  *      carve-out) into the loud user-driven Dead-sessions dialog, so no
+  *      restore spawn ever happens on the restart path. PART B: a direct
+  *      create-door restore attempt (this spec's raw WS client) launches
+  *      with `--conversation <id>` (the antigravity resume gate is deferred
+  *      by design — Task 7's honest-restore: no SpawnFresh substitution),
+  *      the fake's OWN missing-store error surfaces in the captured output
+  *      stream (`agy: conversation <id> not found`) with a non-zero exit,
+  *      NO replacement conversation is ever minted (no fresh-argv row, no
+  *      new brain dir, the pane's sessionRef still names the deleted id),
+  *      and `--continue` never appears. (The bounded auto-resume lane may
+  *      re-attempt the SAME id a few times — every retry carries the same
+  *      `--conversation <id>` pair, so the no-replacement invariants hold
+  *      at every instant.)
+  *
+  * Cloud legality: deterministic fakes, generous polls (15-100 s), no
  * wall-clock-sensitive waits, and every selector is role/accessible-name
  * based except the a11y-gate-exempt `.xterm` widget root and value-carrying
  * attribute selectors (`[data-session-id=…]`, the session-directory-matrix
