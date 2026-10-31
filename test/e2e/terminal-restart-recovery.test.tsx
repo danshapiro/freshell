@@ -46,6 +46,9 @@ const wsHarness = vi.hoisted(() => {
       addedRestoreIds.delete(id)
       return intent
     },
+    hasFreshRecoveryRequestId(id: string) {
+      return addedFreshRecoveryIds.has(id)
+    },
     armRecoveredLiveTerminalTarget(tabId: string, paneId: string, terminalId: string) {
       recoveredLiveTerminalTargets.set(`${tabId}:${paneId}`, terminalId)
     },
@@ -79,6 +82,7 @@ vi.mock('@/lib/terminal-restore', () => ({
   clearTerminalRestoreRequestId: (id: string) => wsHarness.clearRestoreRequestId(id),
   addTerminalFreshRecoveryRequestId: (id: string, intent: string) => wsHarness.addFreshRecoveryRequestId(id, intent),
   consumeTerminalFreshRecoveryRequest: (id: string) => wsHarness.consumeFreshRecoveryRequest(id),
+  hasTerminalFreshRecoveryRequest: (id: string) => wsHarness.hasFreshRecoveryRequestId(id),
   armRecoveredLiveTerminalTarget: (tabId: string, paneId: string, terminalId: string) =>
     wsHarness.armRecoveredLiveTerminalTarget(tabId, paneId, terminalId),
   consumeRecoveredLiveTerminalTarget: (tabId: string, paneId: string) =>

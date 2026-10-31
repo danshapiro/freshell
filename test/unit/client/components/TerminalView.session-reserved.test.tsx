@@ -15,6 +15,12 @@ import connectionReducer from '@/store/connectionSlice'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import { buildRestoreError } from '@shared/session-contract'
 import { deadSessionReconcileNoticeFor } from '@/lib/pane-reconcile'
+// This suite deliberately does NOT mock terminal-restore (see the codex
+// breadcrumb exemption pin below): the real registry carries the
+// registration -> consume round trip, and the real setPaneReconcileActive
+// is the harness seam that arms the negotiated-connection shape
+// (paneReconcileV1 active) for the exemption tests.
+import { setPaneReconcileActive } from '@/lib/terminal-restore'
 
 // Task 12: verdict-driven create args, SESSION_RESERVED bounded re-drive,
 // launch-time INVALID_TERMINAL_ID bounded re-drive (F9), and exhaustion
@@ -24,13 +30,17 @@ import { deadSessionReconcileNoticeFor } from '@/lib/pane-reconcile'
 
 const wsHarness = vi.hoisted(() => {
   const messageHandlers = new Set<(msg: any) => void>()
+  const reconnectHandlers = new Set<() => void>()
   const send = vi.fn()
   const connect = vi.fn().mockResolvedValue(undefined)
   const onMessage = vi.fn((handler: (msg: any) => void) => {
     messageHandlers.add(handler)
     return () => messageHandlers.delete(handler)
   })
-  const onReconnect = vi.fn(() => () => {})
+  const onReconnect = vi.fn((handler: () => void) => {
+    reconnectHandlers.add(handler)
+    return () => reconnectHandlers.delete(handler)
+  })
   return {
     send,
     connect,
@@ -39,8 +49,12 @@ const wsHarness = vi.hoisted(() => {
     emit(msg: any) {
       for (const handler of [...messageHandlers]) handler(msg)
     },
+    fireReconnect() {
+      for (const handler of [...reconnectHandlers]) handler()
+    },
     reset() {
       messageHandlers.clear()
+      reconnectHandlers.clear()
       send.mockReset()
       connect.mockClear()
       onMessage.mockClear()
@@ -228,6 +242,11 @@ describe('TerminalView reconcile adoption: verdict-driven create + bounded re-dr
     vi.useRealTimers()
     vi.restoreAllMocks()
     vi.unstubAllGlobals()
+    // terminal-restore's reconcile-active flag is module state shared by
+    // every test in this file (the real registry). The exemption tests arm
+    // the negotiated-connection shape; every other test must run with it
+    // inactive, exactly like a legacy (non-negotiated) connection.
+    setPaneReconcileActive(false)
   })
 
   /// REQUIRED red test (A1 fix): folding a verdict into an ALREADY-MOUNTED pane
@@ -517,6 +536,213 @@ describe('TerminalView reconcile adoption: verdict-driven create + bounded re-dr
     expect(freshCreates).toHaveLength(1)
     expect(freshCreates[0]).not.toHaveProperty('sessionRef')
     expect(freshCreates[0].restore).toBeUndefined()
+  })
+
+  it('the dead-latch exemption holds under ACTIVE pane reconcile too (the negotiated-connection shape)', async () => {
+    // Focused episode 1, round 2 (the fresheyes finding): the exemption
+    // used the consume-based intent read, which reports not-armed whenever
+    // reconciliation is active -- and real connections negotiate
+    // paneReconcileV1 (App arms the registry flag on ready), so on a live
+    // connection the exemption was inert: the codex live-only collapse
+    // (breadcrumb latch + fresh-recovery registration) had its explicitly
+    // FRESH create suppressed and the pane wedged in 'creating'. The
+    // exemption must answer identically in both reconcile states.
+    setPaneReconcileActive(true)
+    const { store } = await mountPane({
+      mode: 'codex',
+      status: 'running',
+      createRequestId: 'cr-codex-live-active',
+      terminalId: 'term-codex-live-active',
+      serverInstanceId: 'srv-local',
+      // No sessionRef, no codexDurability: genuinely no durable identity.
+    })
+    expect(lastAttachedTerminalId()).toBe('term-codex-live-active')
+
+    act(() => {
+      wsHarness.emit({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        message: 'terminal not found',
+        terminalId: 'term-codex-live-active',
+      })
+    })
+
+    // The collapse keeps the codex breadcrumb and mints the fresh-recovery
+    // requestId (mirrors the inactive pin above).
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    const content = paneContent(store)
+    expect(content.terminalId).toBeUndefined()
+    expect(content.status).toBe('creating')
+    expect(content.restoreError?.reason).toBe('durable_artifact_missing')
+    expect(content.createRequestId).not.toBe('cr-codex-live-active')
+
+    // THE EXEMPTION HOLDS under active reconciliation: the latch stands and
+    // the create lane still fires the FRESH create. (The consume-based
+    // intent read keeps its gated semantics for the create frame -- under
+    // this state the frame stays plain-fresh, so pin the create by
+    // requestId and the absence of resume identity, not by recoveryIntent.)
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    const freshCreates = sentOfType('terminal.create')
+      .filter((msg) => msg?.requestId === content.createRequestId)
+    expect(freshCreates).toHaveLength(1)
+    expect(freshCreates[0]).not.toHaveProperty('sessionRef')
+    expect(freshCreates[0].restore).toBeUndefined()
+  })
+
+  it('WS-reconnect re-drive keeps the exemption under ACTIVE pane reconcile (the fresh create is re-sent, never a resume)', async () => {
+    // The reconnect re-drive is one of the three gated lanes: a transport
+    // flap on an un-anchored 'creating' pane must keep exempting the
+    // explicitly-fresh recovery create under the negotiated-connection
+    // shape -- re-sending the SAME requestId (idempotent), never a resume.
+    setPaneReconcileActive(true)
+    const { store } = await mountPane({
+      mode: 'codex',
+      status: 'running',
+      createRequestId: 'cr-codex-flap-active',
+      terminalId: 'term-codex-flap-active',
+      serverInstanceId: 'srv-local',
+    })
+    act(() => {
+      wsHarness.emit({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        message: 'terminal not found',
+        terminalId: 'term-codex-flap-active',
+      })
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    const mintedId = paneContent(store).createRequestId
+    expect(mintedId).not.toBe('cr-codex-flap-active')
+
+    // The fresh create went out before the flap...
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(sentOfType('terminal.create').filter((msg) => msg?.requestId === mintedId)).toHaveLength(1)
+
+    // ...and the flap re-drives the un-anchored pane: the exemption must
+    // survive the reconnect lane too.
+    act(() => {
+      wsHarness.fireReconnect()
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    const after = sentOfType('terminal.create').filter((msg) => msg?.requestId === mintedId)
+    expect(after).toHaveLength(2)
+    for (const create of after) {
+      expect(create).not.toHaveProperty('sessionRef')
+      expect(create.restore).toBeUndefined()
+    }
+  })
+
+  it('the armed SESSION_RESERVED re-drive keeps the exemption under ACTIVE pane reconcile (the timer re-sends the fresh create)', async () => {
+    // The armed reserve-redrive timer is the third gated lane: a
+    // SESSION_RESERVED standoff on the fresh-recovery create must keep
+    // exempting it under the negotiated-connection shape when the timer
+    // fires -- re-sending the SAME requestId, never a resume.
+    setPaneReconcileActive(true)
+    const { store } = await mountPane({
+      mode: 'codex',
+      status: 'running',
+      createRequestId: 'cr-codex-reserve-active',
+      terminalId: 'term-codex-reserve-active',
+      serverInstanceId: 'srv-local',
+    })
+    act(() => {
+      wsHarness.emit({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        message: 'terminal not found',
+        terminalId: 'term-codex-reserve-active',
+      })
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    const mintedId = paneContent(store).createRequestId
+    expect(mintedId).not.toBe('cr-codex-reserve-active')
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(sentOfType('terminal.create').filter((msg) => msg?.requestId === mintedId)).toHaveLength(1)
+
+    // The standoff arms the re-drive timer (no immediate resend).
+    act(() => {
+      wsHarness.emit({
+        type: 'error',
+        code: 'SESSION_RESERVED',
+        message: 'Session is reserved by another create',
+        requestId: mintedId,
+        retryAfterMs: 1000,
+      })
+    })
+    expect(sentOfType('terminal.create').filter((msg) => msg?.requestId === mintedId)).toHaveLength(1)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000)
+    })
+    // The timer fired and KEPT the exemption: the fresh create is re-sent.
+    const after = sentOfType('terminal.create').filter((msg) => msg?.requestId === mintedId)
+    expect(after).toHaveLength(2)
+    for (const create of after) {
+      expect(create).not.toHaveProperty('sessionRef')
+      expect(create.restore).toBeUndefined()
+    }
+  })
+
+  it('the exemption survives the consume: a reconnect re-drive re-sends the fresh create WITH its intent (reconcile inactive)', async () => {
+    // Delimiting pin for the gate's retry-stability (reconcile inactive):
+    // the intent is consumed by the first create's frame, and the
+    // re-drive lane must keep exempting (and re-stamping) the recovery
+    // create across retries -- the exemption may not go inert after the
+    // consume settles the registry entry.
+    const { store } = await mountPane({
+      mode: 'codex',
+      status: 'running',
+      createRequestId: 'cr-codex-flap-inactive',
+      terminalId: 'term-codex-flap-inactive',
+      serverInstanceId: 'srv-local',
+    })
+    act(() => {
+      wsHarness.emit({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        message: 'terminal not found',
+        terminalId: 'term-codex-flap-inactive',
+      })
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    const mintedId = paneContent(store).createRequestId
+    expect(mintedId).not.toBe('cr-codex-flap-inactive')
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(sentOfType('terminal.create').filter((msg) => msg?.requestId === mintedId)).toHaveLength(1)
+
+    act(() => {
+      wsHarness.fireReconnect()
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    const creates = sentOfType('terminal.create').filter((msg) => msg?.requestId === mintedId)
+    expect(creates).toHaveLength(2)
+    for (const create of creates) {
+      expect(create.recoveryIntent).toBe('fresh_after_restore_unavailable')
+      expect(create).not.toHaveProperty('sessionRef')
+      expect(create.restore).toBeUndefined()
+    }
   })
 
   it('INVALID_TERMINAL_ID at launch is retried bounded (F9), not a permanent error', async () => {

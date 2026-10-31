@@ -71,6 +71,10 @@ const restoreMocks = vi.hoisted(() => ({
   clearTerminalRestoreRequestId: vi.fn(),
   consumeTerminalFreshRecoveryRequest: vi.fn(() => undefined),
   addTerminalFreshRecoveryRequestId: vi.fn(),
+  // Non-consuming peek for the dead-create stand-down exemption (mirrors
+  // the suite's consume mock: nothing is ever registry-armed here, so the
+  // exemption stays inert exactly like the consume-based read it replaced).
+  hasTerminalFreshRecoveryRequest: vi.fn(() => false),
   armRecoveredLiveTerminalTarget: vi.fn(),
   consumeRecoveredLiveTerminalTarget: vi.fn((): string | undefined => undefined),
 }))
@@ -112,6 +116,7 @@ vi.mock('@/lib/terminal-restore', () => ({
   clearTerminalRestoreRequestId: restoreMocks.clearTerminalRestoreRequestId,
   consumeTerminalFreshRecoveryRequest: restoreMocks.consumeTerminalFreshRecoveryRequest,
   addTerminalFreshRecoveryRequestId: restoreMocks.addTerminalFreshRecoveryRequestId,
+  hasTerminalFreshRecoveryRequest: restoreMocks.hasTerminalFreshRecoveryRequest,
   armRecoveredLiveTerminalTarget: restoreMocks.armRecoveredLiveTerminalTarget,
   consumeRecoveredLiveTerminalTarget: restoreMocks.consumeRecoveredLiveTerminalTarget,
 }))

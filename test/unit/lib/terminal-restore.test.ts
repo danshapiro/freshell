@@ -122,6 +122,49 @@ describe('terminal-restore', () => {
     expect(consumeTerminalFreshRecoveryRequest('cr-y')).toBe('fresh_after_restore_unavailable')
   })
 
+  it('hasTerminalFreshRecoveryRequest peeks true for a registered intent under BOTH reconcile states', async () => {
+    const {
+      setPaneReconcileActive,
+      addTerminalFreshRecoveryRequestId,
+      hasTerminalFreshRecoveryRequest,
+    } = await import('@/lib/terminal-restore')
+
+    expect(hasTerminalFreshRecoveryRequest('cr-peek')).toBe(false)
+    addTerminalFreshRecoveryRequestId('cr-peek', 'fresh_after_restore_unavailable')
+    // The exemption's existence check must answer identically with
+    // reconciliation active (the negotiated paneReconcileV1 connection
+    // shape) and inactive: the consume-based readers are the ones gated
+    // by the reconcile bypass, never this peek.
+    setPaneReconcileActive(true)
+    expect(hasTerminalFreshRecoveryRequest('cr-peek')).toBe(true)
+    setPaneReconcileActive(false)
+    expect(hasTerminalFreshRecoveryRequest('cr-peek')).toBe(true)
+  })
+
+  it('hasTerminalFreshRecoveryRequest never consumes: the gated consume keeps its exact semantics', async () => {
+    const {
+      setPaneReconcileActive,
+      addTerminalFreshRecoveryRequestId,
+      hasTerminalFreshRecoveryRequest,
+      consumeTerminalFreshRecoveryRequest,
+    } = await import('@/lib/terminal-restore')
+
+    addTerminalFreshRecoveryRequestId('cr-peek-2', 'fresh_after_restore_unavailable')
+    // Repeated peeks do not settle anything.
+    expect(hasTerminalFreshRecoveryRequest('cr-peek-2')).toBe(true)
+    expect(hasTerminalFreshRecoveryRequest('cr-peek-2')).toBe(true)
+    // ...and the consume-based readers keep today's behavior exactly:
+    // gated to undefined while reconciliation is active...
+    setPaneReconcileActive(true)
+    expect(consumeTerminalFreshRecoveryRequest('cr-peek-2')).toBeUndefined()
+    expect(hasTerminalFreshRecoveryRequest('cr-peek-2')).toBe(true)
+    // ...one-shot under inactive reconciliation, after which the peek
+    // (like the consume) reports not-armed.
+    setPaneReconcileActive(false)
+    expect(consumeTerminalFreshRecoveryRequest('cr-peek-2')).toBe('fresh_after_restore_unavailable')
+    expect(hasTerminalFreshRecoveryRequest('cr-peek-2')).toBe(false)
+  })
+
   it('prefers explicit fresh recovery when a request id is mistakenly registered for both paths', async () => {
     const {
       addTerminalFreshRecoveryRequestId,

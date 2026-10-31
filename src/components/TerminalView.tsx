@@ -105,6 +105,7 @@ import {
   consumeRecoveredLiveTerminalTarget,
   consumeTerminalFreshRecoveryRequest,
   consumeTerminalRestoreRequestId,
+  hasTerminalFreshRecoveryRequest,
   type TerminalFreshRecoveryIntent,
 } from '@/lib/terminal-restore'
 import { isTerminalPasteShortcut } from '@/lib/terminal-input-policy'
@@ -845,6 +846,17 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   const exhaustionReconcileRef = useRef<PaneReconcileRequest | null>(null)
   const freshRecoveryRequestIdRef = useRef<string | null>(null)
   const freshRecoveryIntentRef = useRef<TerminalFreshRecoveryIntent | undefined>(undefined)
+  // The dead-create stand-down gate's exemption read (shouldStandDownDeadCreate):
+  // a per-requestId cache seeded by the NON-CONSUMING, NON-GATED peek
+  // (hasTerminalFreshRecoveryRequest) -- deliberately separate from the
+  // consume-based freshRecoveryIntentRef above. The gate always runs before
+  // sendCreate for a given requestId, so its seed sees the registered intent
+  // (the recovery arm registers before the minted id ever reaches pane
+  // content), and the cache keeps the exemption stable across every retry
+  // lane (WS-reconnect re-drive, armed SESSION_RESERVED timer) even after
+  // sendCreate's consume has settled the registry entry.
+  const freshRecoveryExemptRequestIdRef = useRef<string | null>(null)
+  const freshRecoveryExemptRef = useRef(false)
   const turnCompleteSignalStateRef = useRef(createTurnCompleteSignalParserState())
   const startupProbeStateRef = useRef(createTerminalStartupProbeState())
   const startupProbeReplayDiscardStateRef = useRef<StartupProbeReplayDiscardState>({
@@ -4394,13 +4406,29 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     // sessionRef (the dead adjudication requires one) and never carry a
     // fresh-recovery intent, while the breadcrumb pane never has one — so
     // keying the exemption on the fresh-recovery intent can never leak a
-    // verdict-dead resume through this gate. Recovery folds (attach/reset)
-    // clear the latch, re-arming auto-recovery the moment the pane
-    // legitimately moves on; user-driven retries and launch-failure retries
-    // (scheduleCreateRetry, retryLaunch) call sendCreate directly and are
-    // unaffected by this gate.
+    // verdict-dead resume through this gate. The exemption reads the
+    // NON-CONSUMING peek (hasTerminalFreshRecoveryRequest), which answers
+    // identically with pane reconciliation active or inactive (focused
+    // episode 1, round 2 — the fresheyes finding): the consume-based read
+    // is gated to not-armed on any real paneReconcileV1-negotiated
+    // connection, and an exemption that read through it went inert there,
+    // suppressing the fresh create and wedging the pane in 'creating'. The
+    // sendCreate frame keeps its consume-based semantics exactly as before
+    // (under active reconciliation it stays a plain-fresh create; the
+    // registry entry survives for this gate's peek).
+    // Recovery folds (attach/reset) clear the latch, re-arming
+    // auto-recovery the moment the pane legitimately moves on; user-driven
+    // retries and launch-failure retries (scheduleCreateRetry, retryLaunch)
+    // call sendCreate directly and are unaffected by this gate.
+    const isFreshRecoveryCreate = (requestId: string): boolean => {
+      if (freshRecoveryExemptRequestIdRef.current !== requestId) {
+        freshRecoveryExemptRequestIdRef.current = requestId
+        freshRecoveryExemptRef.current = hasTerminalFreshRecoveryRequest(requestId)
+      }
+      return freshRecoveryExemptRef.current
+    }
     const shouldStandDownDeadCreate = (requestId: string): boolean =>
-      deadSessionLatchRef.current && !getFreshRecoveryIntent(requestId)
+      deadSessionLatchRef.current && !isFreshRecoveryCreate(requestId)
 
     const sendCreate = (requestId: string) => {
       if (isManagedRuntimeRecoveryPending(contentRef.current?.recoverySummary)) return
