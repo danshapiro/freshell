@@ -1,0 +1,12 @@
+{
+  "//": "google-cli spec parse gate (antigravity plan Task 11). The repo-owned typecheck configs (tsconfig.json / tsconfig.server.json) deliberately exclude test/, so this config gives the google-cli e2e specs an EXECUTABLE, file-attributed parse gate: `pnpm exec tsc -p test/e2e-browser/tsconfig.google-cli-spec-parse-check.json`, then require zero error lines attributed to any included spec file. Mirrors the e3r1 convention (tsconfig.e3r1-spec-parse-check.json) and the TERM-04 convention (tsconfig.term04-check.json). Tasks 12/13 append their specs to this include list.",
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "incremental": false,
+    "types": ["node"]
+  },
+  "include": [
+    "specs/google-cli-launch-rust.spec.ts"
+  ]
+}
