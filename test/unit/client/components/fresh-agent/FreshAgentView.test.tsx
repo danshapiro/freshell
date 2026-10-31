@@ -4704,6 +4704,157 @@ describe('FreshAgentView', () => {
       expect(rewindButton).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
     })
 
+    it('a turn that settles while its row has not landed retires its capture at the idle echo clear', async () => {
+      const sessionId = 'thread-rewind-settle-with-echo'
+      const store = createStore()
+      let onMessage: ((message: Record<string, unknown>) => void) | undefined
+      wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+        onMessage = handler
+        return () => {}
+      })
+      let snapshotTurns = [unboundModernUserTurn('msg_a', 'Older MCP-driven prompt')]
+      // The snapshot mock answers the CURRENT busy state: a mid-window
+      // refetch must not "report idle" and clear the busy drive the frame
+      // just armed.
+      let snapshotStatus = 'idle'
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => ({
+        status: snapshotStatus,
+        summary: 'a composer send whose row lands only after its turn settles',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: snapshotTurns,
+      }))
+      apiMock.post.mockResolvedValue({ ok: true })
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-rewind-settle-with-echo',
+          sessionId,
+          status: 'idle',
+        },
+      }))
+
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+
+      expect(await screen.findAllByRole('article', { name: 'You transcript turn' })).toHaveLength(1)
+      await waitFor(() => {
+        expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+      })
+      expect(onMessage).toBeTypeOf('function')
+
+      // A composer send dispatched with capture intent: its pending send
+      // metadata (requestId + logicalAttemptId + busyEpoch) is recorded.
+      wsMock.send.mockClear()
+      fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+        target: { value: 'Composer prompt whose row lands after the settle' },
+      })
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      const sendFrame = sentFreshAgentMessages('freshAgent.send')[0]
+      const requestId = String(sendFrame?.requestId)
+      const logicalAttemptId = String((sendFrame?.checkpointIntent as Record<string, unknown>)?.logicalAttemptId)
+      expect(requestId).not.toBe('undefined')
+      expect(logicalAttemptId).not.toBe('undefined')
+
+      // The barrier-time capture outcome arrives WITHOUT native row ids: the
+      // attempt stays un-enriched for its whole turn.
+      act(() => {
+        onMessage?.({
+          type: 'freshAgent.checkpoint.outcome',
+          requestId,
+          logicalAttemptId,
+          sessionId,
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          status: 'available',
+          checkpointId: 'dddddddddddddddddddddddddddddddddddddddd',
+        })
+      })
+
+      // The send is accepted, but its row does NOT land yet — every snapshot
+      // still answers without it, so the optimistic echo stays pending.
+      act(() => {
+        onMessage?.({
+          type: 'freshAgent.send.accepted',
+          requestId,
+          submittedTurnId: 'msg_settled',
+        })
+      })
+      expect(await screen.findAllByRole('article', { name: 'You transcript turn' })).toHaveLength(2)
+
+      // The turn runs (busy window; the send's dispatch epoch is current).
+      snapshotStatus = 'running'
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'running')
+      expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+      // The row still has not landed: the optimistic echo row is the only
+      // in-flight user row (older snapshot row + echo).
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(2)
+
+      // REAL settle to idle while the echo is still present (no row in any
+      // snapshot): the busy→idle edge cannot bump the epoch itself (the
+      // `!localEcho` gate — the same edge shape as the first-send
+      // materialization blip), so the retirement must wait for the echo
+      // clear. The echo survives the settle (transcript history lag).
+      snapshotStatus = 'idle'
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'idle')
+      await waitFor(() => {
+        expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument()
+      })
+      expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeDefined()
+
+      // The row finally lands while the pane is idle: the echo clears at its
+      // row-landed arm — the recorded settle must retire the send's dispatch
+      // busy window HERE (the fix under test).
+      act(() => {
+        snapshotTurns = [
+          ...snapshotTurns,
+          unboundModernUserTurn('msg_settled', 'Composer prompt whose row lands after the settle'),
+        ]
+      })
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'idle')
+      await waitFor(() => {
+        expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
+      })
+      await waitFor(() => {
+        expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(2)
+      })
+
+      // A LATER busy window with NO new composer send (an MCP/CLI-shaped
+      // turn): its newest modern user row must make NO rewind claim
+      // mid-turn — the settled send's un-enriched capture cannot masquerade
+      // as this window's in-flight capture. RED today: the row shows the
+      // "Saving code rewind checkpoint" hover from stale confidence.
+      act(() => {
+        snapshotTurns = [
+          ...snapshotTurns,
+          unboundModernUserTurn('msg_mcp_cli', 'Prompt sent through the REST lane'),
+        ]
+      })
+      snapshotStatus = 'running'
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'running')
+      expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+      await waitFor(() => {
+        expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(3)
+      })
+      const [, , mcpRow] = screen.getAllByRole('article', { name: 'You transcript turn' })
+      expect(within(mcpRow).queryByRole('button', { name: 'Saving code rewind checkpoint' })).not.toBeInTheDocument()
+      expect(within(mcpRow).queryByRole('button', { name: 'Rewind unavailable for this message' })).not.toBeInTheDocument()
+      expect(within(mcpRow).queryByRole('button', { name: 'Rewind code to here' })).not.toBeInTheDocument()
+
+      // The honest unavailable verdict returns when this busy window settles.
+      snapshotStatus = 'idle'
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'idle')
+      const rewindButton = await within(mcpRow).findByRole('button', { name: 'Rewind unavailable for this message' })
+      expect(rewindButton).toBeDisabled()
+      expect(rewindButton).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
+    })
+
     it('a settled-unavailable capture makes no rewind claim mid-turn, and the honest unavailable verdict returns at settle', async () => {
       const sessionId = 'thread-rewind-settled-unavailable'
       const store = createStore()

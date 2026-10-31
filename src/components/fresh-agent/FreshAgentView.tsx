@@ -230,9 +230,11 @@ type PendingSendMetadata = {
   logicalAttemptId?: string
   /** The pane's busy-epoch at dispatch time (see `busyEpochRef`). The send's
    * capture is "in flight" only while the pane is still in THIS busy
-   * window: every busy→idle edge bumps the epoch, so a retained
-   * un-enriched entry goes stale the moment its turn settles and can never
-   * mark a LATER busy window (e.g. an MCP/CLI-driven turn) as saving. */
+   * window: every busy→idle edge advances the epoch — at the edge itself,
+   * or at the still-pending echo's clear when the edge passed before the
+   * row landed — so a retained un-enriched entry goes stale the moment its
+   * turn settles and can never mark a LATER busy window (e.g. an
+   * MCP/CLI-driven turn) as saving. */
   busyEpoch?: number
   checkpointOutcome?: CheckpointTurnAvailability
   submittedTurnId?: string
@@ -429,9 +431,11 @@ export function unboundRewindAvailability(
 // BOTH the pre-barrier window (no outcome yet) and the post-barrier
 // pre-identity window — but only for as long as the pane stays in the busy
 // window the send's turn runs in: `currentBusyEpoch` is the pane's busy-epoch
-// (bumped at every turn-settling busy→idle edge of effectiveStatus) and each
-// metadata entry records the epoch it was dispatched at, so the moment the
-// pane settles the send's turn the retained entry goes stale. A SETTLED
+// (advanced at every turn-settling busy→idle edge of effectiveStatus — at
+// the edge itself, or at the still-pending echo's clear when the edge
+// passed before the row landed) and each metadata entry records the epoch
+// it was dispatched at, so the moment the pane settles the send's turn the
+// retained entry goes stale. A SETTLED
 // non-available outcome (unavailable/failed/etc.) is never in flight,
 // regardless of native ids: the server settles some captures as unavailable
 // (e.g. a non-Git directory) BEFORE forwarding the message, and that outcome
@@ -1214,21 +1218,58 @@ export function FreshAgentView({
   const localEchoRef = useRef<LocalEcho | null>(null)
   localEchoRef.current = localEcho
   const pendingSendMetadataRef = useRef<Map<string, PendingSendMetadata>>(new Map())
-  // The pane's busy-epoch: bumped at every busy→idle edge of effectiveStatus
-  // that SETTLES a turn (no pending local echo at the edge — see the
-  // render-phase adjustment just below `isBusy`). A composer send records
-  // the current epoch into its pending send metadata at dispatch time, and
-  // `paneCaptureInFlight` only counts the entry while the pane is still in
-  // that SAME busy window — so an un-enriched send's retained metadata can
-  // never survive its own turn's settle to mislabel a later busy window
-  // (e.g. an MCP/CLI-driven turn) as still-saving. Only a real busy→idle
-  // edge bumps the epoch: a send whose row never lands keeps its echo until
-  // the bounded stale-echo clear, and that clear is NOT a settle signal
-  // (empty idle snapshots can answer while the turn still runs), so the
-  // retained window survives until the next un-gated busy→idle edge —
-  // the accepted bounded residual.
+  // The pane's busy-epoch: advanced at every busy→idle edge of effectiveStatus
+  // that SETTLES a turn. A composer send records the current epoch into its
+  // pending send metadata at dispatch time, and `paneCaptureInFlight` only
+  // counts the entry while the pane is still in that SAME busy window — so
+  // an un-enriched send's retained metadata can never survive its own turn's
+  // settle to mislabel a later busy window (e.g. an MCP/CLI-driven turn) as
+  // still-saving. A settle observed with NO pending echo bumps right at the
+  // edge; a settle observed while the send's echo is still pending (the row
+  // has not landed — transcript history lag) cannot bump at the edge (the
+  // first-send materialization blip is the same edge shape while the turn is
+  // still about to run) and is instead RECORDED and retired at the echo's
+  // clear: both echo-clear arms in applySnapshot — the row-landed clear and
+  // the stale clear — bump the epoch, gated on the pane not being busy at
+  // the clear moment (a live store read via isPaneBusyNow). A clear that
+  // fires mid-turn (slow materialization; the blip's resumed busy window)
+  // keeps the window, whose capture is genuinely in flight there. The only
+  // surviving corner is a history-lagged row landing DURING a later busy
+  // window, which retires at that window's own settle edge — the accepted
+  // bounded residual.
   const busyEpochRef = useRef(0)
   const wasPaneBusyRef = useRef(false)
+  // True from a busy→idle settle edge observed while the send's local echo
+  // was still pending, until that echo clears. Lives and dies with THIS
+  // echo: any render with no pending echo clears it (its clear already ran —
+  // bumped, or honestly blocked mid-turn — or the send failed), so a stale
+  // record can never retire a LATER send's dispatch window at that send's
+  // own confident-path echo clear.
+  const retireAtEchoClearRef = useRef(false)
+  // The pane's CURRENT effective busy state, read from the store at the
+  // moment of the call — not the last render. The echo-clear arms in
+  // applySnapshot can run inside the microtask window between a busy
+  // frame's dispatch and React's commit, where the render-mirrored refs
+  // still hold pre-busy state; Redux state is synchronous, so this read
+  // cannot miss a busy window that already opened. Mirrors the render's
+  // effectiveStatus derivation exactly: the session record's status wins
+  // over the pane content's status.
+  const isPaneBusyNow = useCallback((): boolean => {
+    const state = appStore.getState()
+    const paneRoot = state.panes.layouts[tabId]
+    const content = paneRoot ? findPaneContent(paneRoot, paneId) : null
+    if (!content || content.kind !== 'fresh-agent') return false
+    if (content.sessionId) {
+      const sessionKey = makeFreshAgentSessionKey({
+        sessionId: content.sessionId,
+        sessionType: content.sessionType,
+        provider: content.provider,
+      })
+      const sessionStatus = state.freshAgent.sessions[sessionKey]?.status
+      if (sessionStatus !== undefined) return BUSY_STATES.has(sessionStatus)
+    }
+    return BUSY_STATES.has(content.status)
+  }, [appStore, paneId, tabId])
   const [checkpointAvailabilityByTurn, setCheckpointAvailabilityByTurn] = useState<Map<string, CheckpointTurnAvailability>>(
     () => checkpointAvailabilityMap(paneContent),
   )
@@ -3547,12 +3588,26 @@ export function FreshAgentView({
           && shouldClearStaleLocalEcho(displaySnapshot, echo, echoPendingMetadata)
         : false
       if (echo && (landedEcho || staleEcho)) {
-        // The stale-echo clear is NOT a turn-settle signal: OpenCode can
+        // This echo clear is the retire point for a send whose turn ALREADY
+        // settled while the echo was still pending: the busy→idle edge
+        // recorded the settle in retireAtEchoClearRef instead of bumping
+        // (the row had not landed, so the edge could not distinguish a real
+        // settle from the first-send materialization blip), and the history
+        // confirmation this clear represents — the row landing, or the
+        // bounded stale budget giving up on a row that never lands — is
+        // what upgrades the recorded settle into the epoch bump. The
+        // stale-echo clear ALONE is still not a settle signal (OpenCode can
         // answer empty idle snapshots while the accepted first send is
-        // still materializing (first-message startup may exceed the retry
-        // budget), so the clear must never retire the send's dispatch busy
-        // window — only a real busy→idle edge of effectiveStatus bumps the
-        // busy-epoch (see the render-phase adjustment below `isBusy`).
+        // still materializing), so the bump only fires when the pane is NOT
+        // busy at this clear moment, read from the store at call time
+        // (isPaneBusyNow): mid-turn clears — slow materialization, the
+        // blip's resumed busy window — keep the window, whose capture is
+        // genuinely in flight. Consume-on-bump keeps a second clear of the
+        // same echo from double-bumping.
+        if (retireAtEchoClearRef.current && !isPaneBusyNow()) {
+          busyEpochRef.current += 1
+          retireAtEchoClearRef.current = false
+        }
         setLocalEcho(null)
       }
       // Task 16 (zrrj): an idle snapshot that does not yet contain the
@@ -3884,6 +3939,7 @@ export function FreshAgentView({
     captureFreshAgentAttachmentAttempt,
     claudeSession,
     isRestoring,
+    isPaneBusyNow,
     dispatch,
     paneContent.provider,
     paneContent.soulId,
@@ -4067,21 +4123,30 @@ export function FreshAgentView({
   // a busy→idle transition retires the capture window once per edge — the
   // ref pair makes re-renders of an unchanged isBusy no-ops, so a
   // double-render of the same transition (StrictMode) cannot double-count.
-  // The `!localEcho` gate keeps the FIRST-SEND MATERIALIZATION JOURNEY
-  // honest: between the pane's optimistic running and the provider's busy
-  // status the materialization refetch answers an idle snapshot before the
-  // provider persisted any row, so the pane transiently observes non-busy
-  // while the send's echo is still pending — that edge belongs to the same
-  // turn, not to a settle, and must NOT advance the epoch. An edge observed
-  // with no pending echo is the turn's real settle (the row landed long
-  // before). Every epoch bump rides an isBusy change, so the
-  // captureInFlight recompute below always sees the bumped epoch in the
-  // same render that observes the edge. The stale-echo clear in
-  // applySnapshot deliberately does NOT bump: it is not a settle signal
-  // (an accepted first send can still be materializing when its echo goes
-  // stale), so a send whose row never lands keeps its dispatch window
-  // until the next un-gated busy→idle edge — the accepted bounded residual.
-  if (wasPaneBusyRef.current && !isBusy && !localEcho) busyEpochRef.current += 1
+  // An edge observed with NO pending echo is the turn's real settle (the
+  // row landed long before): it bumps the epoch here. An edge observed WITH
+  // the send's echo still pending cannot bump — the FIRST-SEND
+  // MATERIALIZATION JOURNEY hits the same shape (between the pane's
+  // optimistic running and the provider's busy status the materialization
+  // refetch answers an idle snapshot before the provider persisted any
+  // row), and that edge belongs to the same turn, not to a settle. A REAL
+  // settle in that shape (the turn ended while transcript history lagged
+  // the row) is recorded in retireAtEchoClearRef and retired at the echo's
+  // clear by the echo-clear arms in applySnapshot, which confirm the
+  // history (the row landed, or the bounded stale give-up) and gate on the
+  // pane not being busy at the clear moment. Every epoch bump rides an
+  // isBusy change or an echo clear, so the captureInFlight recompute below
+  // always sees the bumped epoch in a render that observes the causing
+  // transition.
+  if (wasPaneBusyRef.current && !isBusy) {
+    if (localEcho) retireAtEchoClearRef.current = true
+    else busyEpochRef.current += 1
+  }
+  // The retire record lives and dies with THIS echo: once no echo is
+  // pending, its clear already ran (bumped, or honestly blocked mid-turn)
+  // or the send failed — a stale record must never retire a LATER send's
+  // window at that send's own confident-path echo clear.
+  if (!localEcho) retireAtEchoClearRef.current = false
   wasPaneBusyRef.current = isBusy
   // The user's just-sent message as an optimistic echo row, displayed after
   // the turns until the send's turn lands in the snapshot (the transcript
