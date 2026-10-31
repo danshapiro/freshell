@@ -79,6 +79,8 @@ describe('Rust capability rejection wall', () => {
     ['run', { command: 'echo blocked' }],
     ['fresh-send', { sessionId: 's', sessionType: 't', provider: 'codex', text: 'blocked' }],
     ['attach', { target: 'p', terminalId: 't' }],
+    ['split-pane', { model: 'model' }],
+    ['split-pane', { effort: 'high' }],
     ['new-tab', { agent: 'unknown' }],
     ['split-pane', { agent: 'unknown' }],
     ['wait-for', {}],

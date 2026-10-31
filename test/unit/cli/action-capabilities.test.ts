@@ -74,13 +74,15 @@ describe('standalone CLI capability contract', () => {
   })
 
   it.each([
-    ['new-tab', 'claude'],
-    ['new-tab', 'kilroy'],
-    ['new-tab', 'codex'],
-    ['split-pane', 'claude'],
-    ['split-pane', 'kilroy'],
-    ['split-pane', 'codex'],
-  ])('%s sends %s fresh-agent options and canonical resume identity', async (action, agent) => {
+    ['new-tab', 'claude', '--resume'],
+    ['new-tab', 'kilroy', '--resume'],
+    ['new-tab', 'codex', '--resume'],
+    ['split-pane', 'claude', '--resume'],
+    ['split-pane', 'kilroy', '--resume'],
+    ['split-pane', 'codex', '--resume'],
+    ['new-tab', 'codex', '--resumeSessionId'],
+    ['split-pane', 'codex', '--resumeSessionId'],
+  ])('%s sends %s fresh-agent options and canonical resume identity', async (action, agent, resumeFlag) => {
     const bodies: Array<{ url: string; body: Record<string, unknown> }> = []
     const server = createServer(async (request, response) => {
       response.setHeader('content-type', 'application/json')
@@ -100,7 +102,7 @@ describe('standalone CLI capability contract', () => {
     const address = server.address()
     if (!address || typeof address === 'string') throw new Error('test server did not listen')
     try {
-      const args = [action, '--agent', agent, '--model', 'catalog-model', '--effort', 'max', '--resume', '550e8400-e29b-41d4-a716-446655440000']
+      const args = [action, '--agent', agent, '--model', 'catalog-model', '--effort', 'max', resumeFlag, '550e8400-e29b-41d4-a716-446655440000']
       if (action === 'split-pane') args.push('--target', 'p1')
       const result = await runCli(args, `http://127.0.0.1:${address.port}`)
       expect(result.code, result.stderr).toBe(0)
@@ -123,6 +125,8 @@ describe('standalone CLI capability contract', () => {
     ['run', 'echo', 'blocked'],
     ['fresh-send', 'blocked'],
     ['attach', '--terminal', 'term-1'],
+    ['split-pane', '--model', 'model'],
+    ['split-pane', '--effort', 'high'],
     ['new-tab', '--agent', 'unknown'],
     ['split-pane', '--agent', 'unknown'],
     ['wait-for'],
@@ -157,10 +161,10 @@ describe('standalone CLI capability contract', () => {
   })
 
   it.each([
-    ['new-tab', '--agent', 'codex', '--resume', 'raw-thread'],
-    ['new-tab', '--agent', 'codex', '--resumeSessionId', 'raw-thread'],
-    ['split-pane', '--agent', 'codex', '--resume', 'raw-thread'],
-    ['split-pane', '--agent', 'codex', '--resumeSessionId', 'raw-thread'],
+    ['new-tab', '--mode', 'codex', '--resume', 'raw-thread'],
+    ['new-tab', '--mode', 'codex', '--resumeSessionId', 'raw-thread'],
+    ['split-pane', '--mode', 'codex', '--resume', 'raw-thread'],
+    ['split-pane', '--mode', 'codex', '--resumeSessionId', 'raw-thread'],
     ['new-tab', '--agent', 'kilroy', '--sessionRef', 'kilroy:wrong-provider'],
     ['split-pane', '--agent', 'kilroy', '--sessionRef', 'kilroy:wrong-provider'],
     ['new-tab', '--agent', 'claude', '--sessionRef', 'codex:wrong-provider'],
