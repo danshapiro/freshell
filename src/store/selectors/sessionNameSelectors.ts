@@ -1,8 +1,9 @@
 /**
  * Unified agent names (Task 5) — the ONLY scoped display rules.
  *
- * A scoped Claude/Codex/OpenCode pane (terminal modes claude/codex/opencode,
- * fresh types freshclaude/freshcodex/freshopencode) displays its session's
+ * A scoped Claude/Codex/OpenCode/Antigravity pane (terminal modes
+ * claude/codex/opencode/antigravity, fresh types
+ * freshclaude/freshcodex/freshopencode) displays its session's
  * canonical saved name from the `sessionNames` cache; every legacy field
  * (paneTitles, paneTitleSetByUser, Tab.title, titleSetByUser, terminal
  * inventory strings) is a FALLBACK only and can never override a cached
@@ -61,8 +62,15 @@ export function selectSessionNativeSync(
   return state.sessionNames?.nativeSync?.[resolveRefKey(state.sessionNames, ref)]?.sync
 }
 
-function isNamedProvider(provider: string): provider is 'claude' | 'codex' | 'opencode' {
-  return provider === 'claude' || provider === 'codex' || provider === 'opencode'
+function isNamedProvider(
+  provider: string,
+): provider is 'claude' | 'codex' | 'opencode' | 'antigravity' {
+  return (
+    provider === 'claude'
+    || provider === 'codex'
+    || provider === 'opencode'
+    || provider === 'antigravity'
+  )
 }
 
 /** The pane's naming identity: its explicit nameRef, its pre-durable naming

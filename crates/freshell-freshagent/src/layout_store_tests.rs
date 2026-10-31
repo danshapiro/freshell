@@ -532,6 +532,13 @@ fn derive_pane_title_full_matrix() {
         derive_pane_title(&json!({ "kind": "terminal", "mode": "kimi" })),
         "Kimi"
     );
+    // Antigravity joins the terminal CLI label map (antigravity plan Task 9):
+    // the bundled extension's label, so a stored title equal to it is a
+    // default label and the server-side derived title matches the client's.
+    assert_eq!(
+        derive_pane_title(&json!({ "kind": "terminal", "mode": "antigravity" })),
+        "Antigravity CLI"
+    );
 
     // ...else by shell (layout-store.ts:147-157)
     assert_eq!(

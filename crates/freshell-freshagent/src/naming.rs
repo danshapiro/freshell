@@ -261,17 +261,17 @@ impl std::error::Error for NameError {}
 // ── Task 2: scope predicate, runtime transition classification, sink holder ──
 
 /// The terminal modes in scope for unified naming.
-const TERMINAL_UNIFIED_MODES: [&str; 3] = ["claude", "codex", "opencode"];
+const TERMINAL_UNIFIED_MODES: [&str; 4] = ["claude", "codex", "opencode", "antigravity"];
 /// The fresh session types in scope for unified naming.
 const FRESH_UNIFIED_SESSION_TYPES: [&str; 3] = ["freshclaude", "freshcodex", "freshopencode"];
 
 /// Scope predicate — the Rust mirror of `isUnifiedAgentMode`
 /// (`shared/session-names.ts`): terminal scope is `mode in {claude, codex,
-/// opencode}`; fresh scope is `sessionType in {freshclaude, freshcodex,
-/// freshopencode}` (fresh types also match when passed as the mode, since
-/// fresh panes identify by session type). Kilroy is explicitly out of scope
-/// even though it shares the Claude runtime — a `kilroy` session type is never
-/// scoped, regardless of the mode it rides on.
+/// opencode, antigravity}`; fresh scope is `sessionType in {freshclaude,
+/// freshcodex, freshopencode}` (fresh types also match when passed as the
+/// mode, since fresh panes identify by session type). Kilroy is explicitly
+/// out of scope even though it shares the Claude runtime — a `kilroy`
+/// session type is never scoped, regardless of the mode it rides on.
 pub fn is_unified_agent_mode(mode: Option<&str>, session_type: Option<&str>) -> bool {
     if session_type == Some("kilroy") {
         return false;
@@ -286,9 +286,10 @@ pub fn is_unified_agent_mode(mode: Option<&str>, session_type: Option<&str>) -> 
     })
 }
 
-/// The scoped provider for a pane content classification: the three terminal
-/// CLI providers map to themselves; the three fresh session types map to their
-/// runtime provider. `None` for kilroy, shells, and every excluded mode.
+/// The scoped provider for a pane content classification: the four terminal
+/// CLI providers map to themselves; the three fresh session types map to
+/// their runtime provider. `None` for kilroy, shells, and every excluded
+/// mode.
 pub fn named_provider_for(mode: Option<&str>, session_type: Option<&str>) -> Option<NamedProvider> {
     if !is_unified_agent_mode(mode, session_type) {
         return None;
@@ -301,6 +302,7 @@ pub fn named_provider_for(mode: Option<&str>, session_type: Option<&str>) -> Opt
         "claude" | "freshclaude" => NamedProvider::Claude,
         "codex" | "freshcodex" => NamedProvider::Codex,
         "opencode" | "freshopencode" => NamedProvider::Opencode,
+        "antigravity" => NamedProvider::Antigravity,
         _ => return None,
     })
 }
@@ -1086,11 +1088,12 @@ mod tests {
 
     // ── the scope predicate (the Rust mirror of isUnifiedAgentMode) ──────────
 
-    /// The six unified modes scope; everything else — including kilroy, the
-    /// Claude-runtime twin — does not.
+    /// The seven unified modes scope (three terminal CLIs + the antigravity
+    /// terminal CLI + three fresh types); everything else — including kilroy,
+    /// the Claude-runtime twin, and the legacy gemini terminal mode — does not.
     #[test]
-    fn unified_agent_scope_matches_exactly_the_six_modes() {
-        for mode in ["claude", "codex", "opencode"] {
+    fn unified_agent_scope_matches_exactly_the_seven_modes() {
+        for mode in ["claude", "codex", "opencode", "antigravity"] {
             assert!(is_unified_agent_mode(Some(mode), None), "terminal {mode}");
         }
         for session_type in ["freshclaude", "freshcodex", "freshopencode"] {
@@ -1115,8 +1118,8 @@ mod tests {
         assert!(!is_unified_agent_mode(None, None));
     }
 
-    /// `named_provider_for` answers the provider enum for the six modes and
-    /// `None` for everything else (kilroy included).
+    /// `named_provider_for` answers the provider enum for the seven modes and
+    /// `None` for everything else (kilroy and gemini included).
     #[test]
     fn named_provider_answers_the_scoped_provider_only() {
         assert_eq!(
@@ -1130,6 +1133,10 @@ mod tests {
         assert_eq!(
             named_provider_for(None, Some("freshopencode")),
             Some(NamedProvider::Opencode)
+        );
+        assert_eq!(
+            named_provider_for(Some("antigravity"), None),
+            Some(NamedProvider::Antigravity)
         );
         assert_eq!(named_provider_for(None, Some("kilroy")), None);
         assert_eq!(named_provider_for(Some("gemini"), None), None);

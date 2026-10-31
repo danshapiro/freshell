@@ -13,8 +13,9 @@
 //!   so a caller without a folder recognizes only folder-free patterns);
 //! - a provider or mode label (`Claude`, `Claude CLI`, `Codex`, `Codex CLI`,
 //!   `OpenCode`, `Shell`, `Freshclaude`, `Freshcodex`, `Freshopencode`,
-//!   `Kilroy`, `Gemini`, `Kimi`, `Amplifier`), optionally prefixed with
-//!   `Recovered ` and/or suffixed with ` agent`, ASCII case-insensitive;
+//!   `Kilroy`, `Gemini`, `Kimi`, `Amplifier`, `Antigravity`, `Antigravity
+//!   CLI`), optionally prefixed with `Recovered ` and/or suffixed with
+//!   ` agent`, ASCII case-insensitive;
 //! - one of the bare words `Recovered`, `Untitled`, `Tab` (case-insensitive);
 //! - a provider placeholder title ([`is_provider_placeholder_title`]) for the
 //!   context's provider (else its mode); with neither known, any provider's;
@@ -57,6 +58,8 @@ const PROVIDER_OR_MODE_LABELS: &[&str] = &[
     "gemini",
     "kimi",
     "amplifier",
+    "antigravity",
+    "antigravity cli",
 ];
 
 /// Bare default words, lowercase.

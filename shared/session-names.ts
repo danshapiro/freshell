@@ -2,9 +2,10 @@
  * Canonical coding-agent session names — shared wire contract
  * (unified-agent-names plan, Task 1).
  *
- * One saved name per scoped Claude/Codex/OpenCode session (terminal modes
- * `claude`/`codex`/`opencode` and fresh types `freshclaude`/`freshcodex`/
- * `freshopencode`). The Rust server's `SessionNames` store is the authority;
+ * One saved name per scoped Claude/Codex/OpenCode/Antigravity session (terminal
+ * modes `claude`/`codex`/`opencode`/`antigravity` and fresh types
+ * `freshclaude`/`freshcodex`/`freshopencode`). The Rust server's
+ * `SessionNames` store is the authority;
  * these Zod schemas are the language-neutral wire shapes mirrored by
  * `crates/freshell-protocol/src/session_names.rs`.
  *
@@ -17,14 +18,15 @@
  */
 import { z } from 'zod'
 
-export const NamedProviderSchema = z.enum(['claude', 'codex', 'opencode'])
+export const NamedProviderSchema = z.enum(['claude', 'codex', 'opencode', 'antigravity'])
 export type NamedProvider = z.infer<typeof NamedProviderSchema>
 
-/** The six scoped coding-agent modes: three terminal CLIs + three fresh types. */
+/** The seven scoped coding-agent modes: four terminal CLIs + three fresh types. */
 export const UnifiedAgentModeSchema = z.enum([
   'claude',
   'codex',
   'opencode',
+  'antigravity',
   'freshclaude',
   'freshcodex',
   'freshopencode',
@@ -218,13 +220,13 @@ export const RenameSessionNameRequestSchema = z.object({
 })
 export type RenameSessionNameRequest = z.infer<typeof RenameSessionNameRequestSchema>
 
-const TERMINAL_UNIFIED_MODES = new Set(['claude', 'codex', 'opencode'])
+const TERMINAL_UNIFIED_MODES = new Set(['claude', 'codex', 'opencode', 'antigravity'])
 const FRESH_UNIFIED_SESSION_TYPES = new Set(['freshclaude', 'freshcodex', 'freshopencode'])
 
 /**
- * Scope predicate: is this pane content one of the six unified naming modes?
- * Terminal scope is `mode in {claude,codex,opencode}`; fresh scope is
- * `sessionType in {freshclaude,freshcodex,freshopencode}` (fresh types also
+ * Scope predicate: is this pane content one of the seven unified naming modes?
+ * Terminal scope is `mode in {claude,codex,opencode,antigravity}`; fresh scope
+ * is `sessionType in {freshclaude,freshcodex,freshopencode}` (fresh types also
  * match when passed as the mode, since fresh panes identify by session type).
  * Kilroy is explicitly out of scope even though it shares the Claude
  * runtime — a kilroy sessionType is never scoped, regardless of mode.
