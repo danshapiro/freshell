@@ -38,7 +38,7 @@ Worktree: `.worktrees/google-cli-plan`, branch `docs/google-cli-first-class-plan
 7. **Structured logging:** emit JSONL severity-tagged events (launch outcomes, identity bind/rebind/refusals, discovery/parse failures, resume decisions, activity transitions) correlating provider, terminal id, and native conversation id; omit prompt/transcript contents and credentials; rate-limit repeated failures per repo conventions.
 8. **Documentation:** `README.md` is the only end-user doc (env var row, provider row, limitations); `docs/index.html` mock updated only for the new visible provider experience; agent-facing notes link from `AGENTS.md`.
 9. **Preserve frozen provenance:** never edit `crates/freshell-extensions/fixtures/manifest-oracle.json` or `port/**`; the bundled-manifests test covers the real new file.
-10. **A11y:** new UI rows follow the repo's semantic-HTML/aria rules (`pnpm run lint` clean).
+10. **A11y:** new UI rows follow the repo's semantic-HTML/aria rules (`pnpm run lint` introduces no new findings on this plan's delta — the repo-wide gate's pre-existing red baseline is ledger-recorded; see Verification gate 4).
 
 ## Requirements → Tasks map
 
@@ -141,7 +141,7 @@ git commit -m "docs(plan): record antigravity contract-probe evidence"
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
-Run: `cargo test -p freshell-server --lib extensions && pnpm run test:vitest run test/unit/client/components/icons/provider-icons.test.tsx test/unit/client/components/SettingsView.agent-chat.test.tsx test/unit/client/components/panes/PanePicker.test.tsx --config config/vitest/vitest.config.ts`
+Run: `cargo test -p freshell-server --bin freshell-server extensions && pnpm run test:vitest run test/unit/client/components/icons/provider-icons.test.tsx test/unit/client/components/SettingsView.agent-chat.test.tsx test/unit/client/components/panes/PanePicker.test.tsx --config config/vitest/vitest.config.ts`
 
 Expected: FAIL — bundled list missing `antigravity`; icon undefined; no settings row; no picker tile.
 
@@ -180,9 +180,9 @@ Check for duplication only (icon pattern is already shared); none expected. Expl
 
 - [ ] **Step 6: Run impacted-test verification**
 
-Impacted set: extension scan/settings auto-discovery (`cargo test -p freshell-server --lib settings_store`), icon consumers (`test/unit/client/components/icons/PaneIcon.test.tsx`, `test/unit/client/deck/provider-icon-svg.test.ts`, `test/unit/client/deck/tile-renderer.test.ts`), settings hydration (`test/unit/shared/settings.test.ts`), launch goldens referencing bundled manifests (`cargo test -p freshell-platform --lib cli_launch`).
+Impacted set: extension scan/settings auto-discovery (`cargo test -p freshell-server --bin freshell-server settings_store`), icon consumers (`test/unit/client/components/icons/PaneIcon.test.tsx`, `test/unit/client/deck/provider-icon-svg.test.ts`, `test/unit/client/deck/tile-renderer.test.ts`), settings hydration (`test/unit/shared/settings.test.ts`), launch goldens referencing bundled manifests (`cargo test -p freshell-platform --lib cli_launch`).
 
-Run: `cargo test -p freshell-server --lib extensions && cargo test -p freshell-server --lib settings_store && cargo test -p freshell-platform --lib cli_launch && pnpm run test:vitest run test/unit/client/components/icons/ test/unit/client/deck/provider-icon-svg.test.ts test/unit/client/deck/tile-renderer.test.ts test/unit/shared/settings.test.ts test/unit/client/store/settingsSlice.test.ts --config config/vitest/vitest.config.ts`
+Run: `cargo test -p freshell-server --bin freshell-server extensions && cargo test -p freshell-server --bin freshell-server settings_store && cargo test -p freshell-platform --lib cli_launch && pnpm run test:vitest run test/unit/client/components/icons/ test/unit/client/deck/provider-icon-svg.test.ts test/unit/client/deck/tile-renderer.test.ts test/unit/shared/settings.test.ts test/unit/client/store/settingsSlice.test.ts --config config/vitest/vitest.config.ts`
 
 Expected: PASS (the new manifest must not break any golden — it has no templates yet).
 
@@ -282,9 +282,9 @@ None expected — manifest-only. Confirm `client_entry` now reports `supportsRes
 
 - [ ] **Step 6: Run impacted-test verification**
 
-Impacted: all launch goldens (`cargo test -p freshell-platform --lib`), extension scan (`cargo test -p freshell-server --lib extensions`), client resume-command rendering (`test/unit/client/lib/coding-cli-utils.test.ts` — add a case: antigravity registry entry renders `agy --conversation <id>`; registry entry wins, no builtin fallback).
+Impacted: all launch goldens (`cargo test -p freshell-platform --lib`), extension scan (`cargo test -p freshell-server --bin freshell-server extensions`), client resume-command rendering (`test/unit/client/lib/coding-cli-utils.test.ts` — add a case: antigravity registry entry renders `agy --conversation <id>`; registry entry wins, no builtin fallback).
 
-Run: `cargo test -p freshell-platform --lib && cargo test -p freshell-server --lib extensions && pnpm run test:vitest run test/unit/client/lib/coding-cli-utils.test.ts --config config/vitest/vitest.config.ts`
+Run: `cargo test -p freshell-platform --lib && cargo test -p freshell-server --bin freshell-server extensions && pnpm run test:vitest run test/unit/client/lib/coding-cli-utils.test.ts --config config/vitest/vitest.config.ts`
 
 Expected: PASS.
 
@@ -434,7 +434,7 @@ git commit -m "feat(antigravity): native transcript parser, layout, and candidat
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
-Run: `cargo test -p freshell-sessions antigravity && cargo test -p freshell-server --lib session_directory && cargo test -p freshell-server --lib resolve && cargo test -p freshell-server --lib existence`
+Run: `cargo test -p freshell-sessions antigravity && cargo test -p freshell-server --bin freshell-server session_directory && cargo test -p freshell-server --bin freshell-server resolve && cargo test -p freshell-server --bin freshell-server existence`
 
 Expected: FAIL — source unwired (no rows, no search arm, provider gate skips antigravity, existence unknown-provider).
 
@@ -479,9 +479,9 @@ Check `discover`/`discover_checked` duplication against codex's pair (directory_
 
 - [ ] **Step 6: Run impacted-test verification**
 
-Impacted: whole `freshell-sessions`, `freshell-server` route suites touched, watcher behavior, and the settings auto-discovery interplay (`cargo test -p freshell-server --lib settings_store`).
+Impacted: whole `freshell-sessions`, `freshell-server` route suites touched, watcher behavior, and the settings auto-discovery interplay (`cargo test -p freshell-server --bin freshell-server settings_store`).
 
-Run: `cargo test -p freshell-sessions && cargo test -p freshell-server --lib session_directory && cargo test -p freshell-server --lib resolve && cargo test -p freshell-server --lib existence && cargo test -p freshell-server --lib settings_store`
+Run: `cargo test -p freshell-sessions && cargo test -p freshell-server --bin freshell-server session_directory && cargo test -p freshell-server --bin freshell-server resolve && cargo test -p freshell-server --bin freshell-server existence && cargo test -p freshell-server --bin freshell-server settings_store`
 
 Expected: PASS.
 
@@ -599,7 +599,7 @@ Check the by-id locator against the amplifier/codex locators for a shareable "de
 
 Impacted: `resume_input` parity (fixture moved first), `existence`/`resolve` route tests, the REST create-path suites, and the launch e2e from Task 3.
 
-Run: `cargo test -p freshell-sessions resume_input && cargo test -p freshell-server --lib existence && cargo test -p freshell-server --lib resolve && cargo test -p freshell-freshagent --lib terminal_tabs && cargo test -p freshell-ws --test antigravity_launch_e2e && pnpm run test:vitest run test/unit/shared/resume-input-parser.test.ts --config config/vitest/vitest.config.ts`
+Run: `cargo test -p freshell-sessions resume_input && cargo test -p freshell-server --bin freshell-server existence && cargo test -p freshell-server --bin freshell-server resolve && cargo test -p freshell-freshagent --lib terminal_tabs && cargo test -p freshell-ws --test antigravity_launch_e2e && pnpm run test:vitest run test/unit/shared/resume-input-parser.test.ts --config config/vitest/vitest.config.ts`
 
 Expected: PASS.
 
@@ -704,7 +704,7 @@ None expected — list extension. Verify `src/lib/session-names.ts` needs no edi
 
 Impacted: all naming suites (shared + Rust twins + store/selector tests + the batched-read 400 guard) and the cross-mode gemini preservation pins.
 
-Run: `pnpm run test:vitest run test/unit/shared/session-names.test.ts test/unit/shared/name-evidence.test.ts test/unit/shared/session-flavor.test.ts test/unit/client/lib/session-names.test.ts test/unit/client/store/sessionNames.test.ts test/unit/client/store/sessionNameLifecycle.test.ts test/unit/client/store/savedNameTabTitleMirror.test.ts test/unit/client/store/storedTabTitleHeal.test.ts test/unit/client/components/UnifiedAgentRename.test.tsx --config config/vitest/vitest.config.ts && cargo test -p freshell-freshagent naming && cargo test -p freshell-server --lib session_name`
+Run: `pnpm run test:vitest run test/unit/shared/session-names.test.ts test/unit/shared/name-evidence.test.ts test/unit/shared/session-flavor.test.ts test/unit/client/lib/session-names.test.ts test/unit/client/store/sessionNames.test.ts test/unit/client/store/sessionNameLifecycle.test.ts test/unit/client/store/savedNameTabTitleMirror.test.ts test/unit/client/store/storedTabTitleHeal.test.ts test/unit/client/components/UnifiedAgentRename.test.tsx --config config/vitest/vitest.config.ts && cargo test -p freshell-freshagent naming && cargo test -p freshell-server --bin freshell-server session_name`
 
 Expected: PASS (gemini's legacy pins must stay green — gemini is NOT added to any unified list).
 
@@ -910,7 +910,7 @@ git commit -m "feat(antigravity): blocked managed row, real-provider smoke, docs
    `GCLOUD_ROBOT_REQUIRE=1 FRESHELL_RUST_TEST_SANDBOX=1 FRESHELL_VITEST_BACKEND=cloud FRESHELL_E2E_BACKEND=cloud FRESHELL_TEST_SUMMARY='the-usual google-cli plan full-suite gate' pnpm run check`
    Pass criterion: the suite is GREEN at the final HEAD. A failure that reproduces at base_ref with a ledger-recorded pre-existing receipt is first RETRIED after the run (flakes are load-sensitive and the receipt shows this one passing in isolation); if it recurs, the repo's flake policy applies — diagnose and fix the flaky test within the run rather than excusing it. Only if the flake fix is demonstrably out of this run's reach does the recap carry it as an explicit unresolved blocker with the reproduction evidence, instead of a pass.
 3. The three new browser specs must pass with nonzero case counts on the configured cloud backend — full stop; a `CLOUD_SKIP_SPECS` entry does not satisfy this gate and is NOT a fallback. They must be written cloud-legal (deterministic fakes, poll-based assertions, generous timeouts, no wall-clock-sensitive waits): unlike the existing provider-lifecycle skips (which time REAL CLI boot behavior), these specs drive deterministic fixtures, so timing fragility is a spec bug to fix in the spec, never a skip to record. If cloud infrastructure (not the spec) is the failure cause, rerun after the infra issue clears and record the attempt. The runtime qualification spec for antigravity is deliberately NOT created (managed adapter blocked) — this deviation from the first draft's Stage-7 file list is required by the honesty discipline (Global Constraints 4/5) and recorded in the Provider Contract Record.
-4. `pnpm run lint` clean (a11y rules for the new settings row).
+4. `pnpm run lint` clean ON THE DELTA (a11y rules for the new settings row): this plan's changes must introduce zero new lint findings, and the new `Antigravity CLI` settings row, picker tile, and icon introduce no a11y violations. The repo-WIDE `pnpm run lint` gate was already red at base_ref 4da47fd9a (exit 1: 10 errors + 19 warnings, byte-identical finding sets at base and at this plan's HEAD — verified by running lint at both trees; every finding is pre-existing and outside this plan's scope), so repo-wide exit 0 is not an honest completion criterion for this plan. The pre-existing set is ledger-recorded (progress ledger's baseline-ledger entry, with the per-finding classification evidence); fixing those out-of-scope files is deliberately NOT part of this plan.
 5. Commit focused changes per task; push the branch only when the user asks; PR creation requires explicit user approval. The live 3001 server is never restarted by this work (no deploy steps exist in this plan).
 
 ## Known limitations this plan deliberately ships (recorded, not hidden)
