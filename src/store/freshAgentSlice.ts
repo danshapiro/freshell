@@ -439,6 +439,17 @@ const freshAgentSlice = createSlice({
         session.historyLoading = false
         session.restoreFailureCode = action.payload.code
         session.restoreFailureMessage = action.payload.message
+      } else if (action.payload.code === 'SESSION_RESERVED') {
+        // A transient reservation does NOT end the turn. The fence-less
+        // mount-rebind attach for a just-materialized session answers this
+        // typed refusal (FENCE_REQUIRED server-side — "re-observe the owner
+        // record and retry with the pair") and the pane redrives the attach
+        // with the observed pair; the turn keeps running throughout, so the
+        // generic hard-error busy-clear must not fire — it would manufacture
+        // a false mid-turn idle (a busy→idle edge that retires the rewind
+        // epoch's in-flight capture window while the turn is genuinely
+        // running). The error fields stay recorded: the pane's banner filter
+        // reads lastErrorCode to keep the reservation unsurfaced (Task 14).
       } else {
         // A hard (non-restore) error ends the turn: clear streaming + drop an
         // active 'running'/'starting' status to idle so the pane does not stay blue.
