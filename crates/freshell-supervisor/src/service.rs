@@ -4209,7 +4209,14 @@ mod release_scope_tests {
     fn direct_terminal_launch_cannot_bypass_live_qualification_scope() {
         assert!(release_qualified_workload("shell", false, true, false));
         assert!(release_qualified_workload("opencode", false, true, false));
-        for provider in ["claude", "codex", "amplifier", "gemini", "kimi"] {
+        for provider in [
+            "claude",
+            "codex",
+            "amplifier",
+            "gemini",
+            "kimi",
+            "antigravity",
+        ] {
             assert!(
                 !release_qualified_workload(provider, false, true, false),
                 "{provider}"

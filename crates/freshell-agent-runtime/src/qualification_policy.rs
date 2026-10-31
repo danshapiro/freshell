@@ -98,6 +98,7 @@ mod tests {
             "opencode",
             "freshclaude",
             "gemini",
+            "antigravity",
             "claude,unknown",
             "claude,claude",
             "all",

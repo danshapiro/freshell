@@ -3810,6 +3810,18 @@ mod managed_runtime_id_tests {
                 "managed routing drifted from release qualification for {mode}"
             );
         }
+        // Task 14: the antigravity mirror row is fully blocked. The loop above
+        // only covers providers the manifest lists, so the row's presence and
+        // its blocked managed routing are pinned explicitly.
+        let antigravity = manifest["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["provider"] == "antigravity")
+            .expect("antigravity must publish a mirror capability row");
+        assert_eq!(antigravity["certificationState"], "not_applicable");
+        assert_eq!(antigravity["managedEnabled"], false);
+        assert!(!managed_runtime_mode("antigravity"));
     }
 
     #[test]

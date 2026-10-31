@@ -98,6 +98,24 @@ describe('checked-in provider certification manifest', () => {
     ])
   })
 
+  it('keeps the fully blocked antigravity row outside the managed certification scope', () => {
+    // Task 14: antigravity publishes a not_applicable capability row (fully
+    // blocked, BLOCKED_RECOVERY_IMPLEMENTATION). A not_applicable row makes no
+    // managed-or-deferred claim, so the PC gates must not demand a live
+    // receipt for it: it is absent from the certification case set and is
+    // classified NOT_APPLICABLE in both gate modes.
+    const manifest = loadCapabilityManifest(repoRoot)
+    const row = manifest.providers.find((candidate) => candidate.provider === 'antigravity')
+    expect(row?.certificationState).toBe('not_applicable')
+    expect(row?.managedEnabled).toBe(false)
+    expect(row?.durableRecoveryEnabled).toBe(false)
+    expect(row?.blockedReason).toBe('BLOCKED_RECOVERY_IMPLEMENTATION')
+    expect(providerCertificationCaseIds(manifest))
+      .not.toContain(providerCertificationCaseId('antigravity'))
+    expect(classifyProviderCertificationCase('landing', row!).status).toBe('NOT_APPLICABLE')
+    expect(classifyProviderCertificationCase('production', row!).status).toBe('NOT_APPLICABLE')
+  })
+
   it('puts the release-scope audit first in the full certification case set', () => {
     expect(certificationCaseIds(loadCapabilityManifest(repoRoot))).toEqual([
       RELEASE_SCOPE_CASE_ID, ...PROVIDER_PARITY_CASE_IDS,

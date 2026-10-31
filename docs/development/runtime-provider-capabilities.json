@@ -171,6 +171,27 @@
       "blockedReason": "BLOCKED_RECOVERY_IMPLEMENTATION",
       "recoveryPaths": [],
       "qualificationStatus": "not-enabled"
+    },
+    {
+      "provider": "antigravity",
+      "certificationState": "not_applicable",
+      "qualificationReady": false,
+      "managedEnabled": false,
+      "durableRecoveryEnabled": false,
+      "managedModes": [
+        "antigravity"
+      ],
+      "executionBoundary": "legacy-extension",
+      "identityCapture": "terminal locator (candidate contract; managed identity unimplemented)",
+      "stateStore": "$HOME/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl (candidate)",
+      "resumeCommand": null,
+      "zeroTurnPolicy": "no-continuity-claim",
+      "checkpointPolicy": "none",
+      "bootstrap": "extension-owned",
+      "liveGate": "not-enabled",
+      "blockedReason": "BLOCKED_RECOVERY_IMPLEMENTATION",
+      "recoveryPaths": [],
+      "qualificationStatus": "not-enabled"
     }
   ],
   "freshAgentModes": [

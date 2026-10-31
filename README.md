@@ -226,6 +226,7 @@ Freshell indexes local session history and can launch terminals for these coding
 | **Codex** | Yes | Yes | `~/.codex` |
 | **OpenCode** | Yes | Yes | `XDG_DATA_HOME/opencode` (or platform default) |
 | **Gemini** | — | Yes | — |
+| **Antigravity** | Yes | Yes | `~/.gemini/antigravity-cli` |
 | **Kimi** | — | Yes | — |
 | **Amplifier** | Yes | Yes | `~/.amplifier` |
 
@@ -241,6 +242,27 @@ plugins. If the provider needs a secret, give Freshell a private OneCLI grant
 through `FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENV_FILE` or
 `FRESHELL_MANAGED_AMPLIFIER_ONECLI_AUTH_FILE`. Freshell resolves the grant for
 the provider child when the session starts.
+
+Antigravity CLI support launches `agy` panes, indexes native conversation
+history, binds one conversation identity per pane, and shows busy and
+turn-completion state — with these recorded limitations. Freshell's view of
+Antigravity's on-disk conversation format follows Google's documented store,
+but it has not yet been validated against a pinned real `agy` binary, so the
+transcript record schema and the store's authority remain candidate contracts
+until that probe runs. Freshell installs no Antigravity hooks and writes no
+Antigravity configuration anywhere; identity and activity are read-only views
+over the CLI's own files. Managed execution, durable recovery, live
+qualification, and a pinned runtime image for Antigravity are not built — the
+runtime capability row is fully blocked and records why. Renaming a
+conversation works inside Freshell but is never written back to the
+Antigravity CLI itself (native rename is unsupported). An approval or
+question is only marked separately when the transcript tailer can prove it;
+today terminal Antigravity panes show only the broader busy/idle state and
+have no waiting-for-approval attention signal (the same treatment as other
+terminal CLI panes). Resuming passes the conversation
+id to `agy` verbatim without Freshell-side validation for now, so a stale
+resume id surfaces the CLI's own error in the pane; enabling the validated
+resume gate is deferred until real-binary transcript evidence exists.
 
 ### Standalone CLI and MCP client
 
