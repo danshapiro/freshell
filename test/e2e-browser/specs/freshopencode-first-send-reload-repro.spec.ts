@@ -372,7 +372,7 @@ test.describe('Freshopencode first-message code checkpoint', () => {
 })
 
 test.describe('Freshopencode MCP/CLI rewind honesty', () => {
-  test('an MCP/CLI-driven turn through the REST lane never claims a still-saving rewind state', async ({ page }) => {
+  test('an MCP/CLI-driven turn through the REST lane makes no rewind claim mid-turn, and the honest unavailable verdict returns at settle', async ({ page }) => {
     test.setTimeout(180_000)
     const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-freshopencode-mcp-honesty-'))
     const binDir = path.join(sharedRoot, 'bin')
@@ -517,15 +517,15 @@ test.describe('Freshopencode MCP/CLI rewind honesty', () => {
       // dishonest "Saving code rewind checkpoint" claim would ride.
       await expect(paneRoot.getByRole('button', { name: 'Stop' })).toBeVisible({ timeout: 15_000 })
 
-      // The honesty verdict: while the MCP turn is parked the row's hover
-      // shows the disabled unavailable rewind with its reason — never a
-      // still-saving claim for a turn nothing is being saved for.
+      // The honesty verdict: while the MCP turn is parked the row makes NO
+      // rewind claim at all — nothing is being saved for it (never a
+      // still-saving hover), and the uncertain mid-turn window supports no
+      // verdict this pane can evidence (no unavailable hover, no enabled
+      // hover either): the User Request's "(or nothing)" acceptance.
       await userTurn.hover()
       await expect(userTurn.getByRole('button', { name: 'Saving code rewind checkpoint' })).toHaveCount(0)
-      const rewind = userTurn.getByRole('button', { name: 'Rewind unavailable for this message' })
-      await expect(rewind).toBeVisible()
-      await expect(rewind).toBeDisabled()
-      await expect(rewind).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
+      await expect(userTurn.getByRole('button', { name: 'Rewind unavailable for this message' })).toHaveCount(0)
+      await expect(userTurn.getByRole('button', { name: 'Rewind code to here' })).toHaveCount(0)
 
       // Release the gate and let the turn settle; the REST drive resolves.
       await fsp.writeFile(promptGatePath, 'release\n')
@@ -533,6 +533,14 @@ test.describe('Freshopencode MCP/CLI rewind honesty', () => {
       const mcpSend = await mcpSendPromise
       const mcpText = await mcpSend.text()
       expect(mcpSend.ok, mcpText).toBe(true)
+
+      // The honest settled verdict: the turn's end returns the disabled
+      // unavailable rewind with its reason.
+      await userTurn.hover()
+      const rewind = userTurn.getByRole('button', { name: 'Rewind unavailable for this message' })
+      await expect(rewind).toBeVisible({ timeout: 15_000 })
+      await expect(rewind).toBeDisabled()
+      await expect(rewind).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
     } finally {
       await server.stop().catch(() => {})
       await fsp.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})

@@ -4503,7 +4503,7 @@ describe('FreshAgentView', () => {
       expect(olderButton).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
     })
 
-    it('an active MCP/CLI-driven turn never claims a still-saving state', async () => {
+    it('an active MCP/CLI-driven turn shows no rewind claim at all mid-turn, and the honest unavailable verdict at settle', async () => {
       const sessionId = 'thread-rewind-mcp-cli-busy'
       const store = createStore()
       let onMessage: ((message: Record<string, unknown>) => void) | undefined
@@ -4547,14 +4547,22 @@ describe('FreshAgentView', () => {
       expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
 
       const [newestRow] = screen.getAllByRole('article', { name: 'You transcript turn' })
-      // NOT the pending aria-label: nothing is being saved for this row.
+      // NOTHING mid-turn — the request's "(or nothing)" acceptance: nothing
+      // is being saved for this row and the pane can evidence no in-flight
+      // capture for its busy window, so the row makes no rewind claim at
+      // all — no still-saving hover, no unavailable hover, no enabled hover.
       expect(within(newestRow!).queryByRole('button', { name: 'Saving code rewind checkpoint' })).not.toBeInTheDocument()
+      expect(within(newestRow!).queryByRole('button', { name: 'Rewind unavailable for this message' })).not.toBeInTheDocument()
+      expect(within(newestRow!).queryByRole('button', { name: 'Rewind code to here' })).not.toBeInTheDocument()
+
+      // The honest unavailable verdict returns when the turn settles.
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'idle')
       const rewindButton = await within(newestRow!).findByRole('button', { name: 'Rewind unavailable for this message' })
       expect(rewindButton).toBeDisabled()
       expect(rewindButton).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
     })
 
-    it('retires a settled composer send\'s in-flight capture at the busy window\'s end, so a later MCP/CLI busy window shows the honest unavailable verdict', async () => {
+    it('retires a settled composer send\'s in-flight capture at the busy window\'s end, so a later MCP/CLI busy window makes no rewind claim mid-turn and the honest unavailable verdict returns at settle', async () => {
       const sessionId = 'thread-rewind-retained-unenriched'
       const store = createStore()
       let onMessage: ((message: Record<string, unknown>) => void) | undefined
@@ -4679,15 +4687,24 @@ describe('FreshAgentView', () => {
       const [, , mcpRow] = screen.getAllByRole('article', { name: 'You transcript turn' })
 
       // The retained un-enriched metadata must NOT survive the busy window
-      // it was dispatched in: the MCP/CLI-shaped newest row honestly reads
-      // rewind-unavailable while its turn runs — never "Saving".
+      // it was dispatched in: nothing this pane can evidence is in flight
+      // for the later window, so the MCP/CLI-shaped newest row makes NO
+      // rewind claim at all while its turn runs — neither a dishonest
+      // "Saving" hover nor an unavailable verdict the uncertain window
+      // cannot support.
       expect(within(mcpRow).queryByRole('button', { name: 'Saving code rewind checkpoint' })).not.toBeInTheDocument()
+      expect(within(mcpRow).queryByRole('button', { name: 'Rewind unavailable for this message' })).not.toBeInTheDocument()
+      expect(within(mcpRow).queryByRole('button', { name: 'Rewind code to here' })).not.toBeInTheDocument()
+
+      // The honest unavailable verdict returns when this busy window settles.
+      snapshotStatus = 'idle'
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'idle')
       const rewindButton = await within(mcpRow).findByRole('button', { name: 'Rewind unavailable for this message' })
       expect(rewindButton).toBeDisabled()
       expect(rewindButton).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
     })
 
-    it('a settled-unavailable capture never claims a still-saving state', async () => {
+    it('a settled-unavailable capture makes no rewind claim mid-turn, and the honest unavailable verdict returns at settle', async () => {
       const sessionId = 'thread-rewind-settled-unavailable'
       const store = createStore()
       let onMessage: ((message: Record<string, unknown>) => void) | undefined
@@ -4787,8 +4804,16 @@ describe('FreshAgentView', () => {
 
       const [userRow] = screen.getAllByRole('article', { name: 'You transcript turn' })
       // The capture already settled WITHOUT a snapshot — nothing is being
-      // saved for this row: the hover must never claim a still-saving state.
+      // saved for this row, so the uncertain mid-turn window makes NO rewind
+      // claim at all: no still-saving hover, no unavailable hover, no
+      // enabled hover either.
       expect(within(userRow!).queryByRole('button', { name: 'Saving code rewind checkpoint' })).not.toBeInTheDocument()
+      expect(within(userRow!).queryByRole('button', { name: 'Rewind unavailable for this message' })).not.toBeInTheDocument()
+      expect(within(userRow!).queryByRole('button', { name: 'Rewind code to here' })).not.toBeInTheDocument()
+
+      // The honest unavailable verdict returns when the turn settles.
+      snapshotStatus = 'idle'
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'idle')
       const rewindButton = await within(userRow!).findByRole('button', { name: 'Rewind unavailable for this message' })
       expect(rewindButton).toBeDisabled()
       expect(rewindButton).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
@@ -5151,6 +5176,80 @@ describe('FreshAgentView', () => {
       expect(savingButton).toBeDisabled()
       expect(savingButton).toHaveAttribute('title', 'Saving the code state from before this message')
     }, 25_000) // real timers: the 5 x 1s stale-echo retry budget needs a raised test timeout
+
+    it('a reloaded mid-turn row shows nothing rather than a verdict it cannot support', async () => {
+      const sessionId = 'thread-rewind-reloaded-mid-turn'
+      const store = createStore()
+      let onMessage: ((message: Record<string, unknown>) => void) | undefined
+      wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+        onMessage = handler
+        return () => {}
+      })
+      // A mid-turn RELOAD: the fresh mount hydrates from persisted pane
+      // content — the send's durable row has landed (modern and unbound:
+      // the request-keyed capture outcome cannot bind it) and its capture
+      // outcome is available-but-unenriched — but the reloaded pane has NO
+      // pending send metadata and NO busy-epoch history, so nothing it can
+      // observe is in flight. The provider's busy status frame re-asserts
+      // the still-running turn on the reloaded pane.
+      let snapshotStatus = 'running'
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => ({
+        status: snapshotStatus,
+        summary: 'the reloaded pane hydrates the landed row mid-turn',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [unboundModernUserTurn('msg_reloaded', 'Prompt whose turn was running at reload')],
+      }))
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-reloaded-pane',
+          sessionId,
+          status: 'idle',
+          checkpointOutcomes: [{
+            version: 1,
+            conversationRequestId: 'req-reloaded-pane',
+            conversationSessionKey: JSON.stringify(['codex', 'freshcodex', sessionId]),
+            requestId: 'req-reloaded-send',
+            status: 'available',
+            checkpointId: 'cccccccccccccccccccccccccccccccc',
+          }],
+        },
+      }))
+
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+
+      expect(await screen.findAllByRole('article', { name: 'You transcript turn' })).toHaveLength(1)
+      expect(onMessage).toBeTypeOf('function')
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'running')
+      // Pin that the busy drive actually engaged: the nothing-verdict below
+      // is only meaningful while the pane is truly busy.
+      expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+
+      const [newestRow] = screen.getAllByRole('article', { name: 'You transcript turn' })
+      // NOTHING mid-turn — the request's "(or nothing)" acceptance: the
+      // uncertain window supports no verdict this pane can evidence, so the
+      // row makes no rewind claim at all — no still-saving hover, no
+      // unavailable hover, and no enabled hover either. RED today: the row
+      // shows the unavailable hover it cannot support.
+      expect(within(newestRow!).queryByRole('button', { name: 'Saving code rewind checkpoint' })).not.toBeInTheDocument()
+      expect(within(newestRow!).queryByRole('button', { name: 'Rewind unavailable for this message' })).not.toBeInTheDocument()
+      expect(within(newestRow!).queryByRole('button', { name: 'Rewind code to here' })).not.toBeInTheDocument()
+
+      // The honest settled verdict returns when the turn ends.
+      snapshotStatus = 'idle'
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'idle')
+      const rewindButton = await within(newestRow!).findByRole('button', { name: 'Rewind unavailable for this message' })
+      expect(rewindButton).toBeDisabled()
+      expect(rewindButton).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
+    })
 
     it('keeps the older snapshot user row honestly unavailable while a pending local echo holds the newest user row', async () => {
       const sessionId = 'thread-rewind-echo-window'

@@ -42,13 +42,15 @@ describe('unboundRewindAvailability policy', () => {
     expect(unboundRewindAvailability(assistantTurn, true, true, false)).toBeUndefined()
   })
 
-  it('pins the user-row matrix: pending only for the newest user row while the agent is busy AND this pane\'s capture is genuinely in flight', () => {
+  it('pins the user-row matrix: pending only for the newest user row while the agent is busy AND this pane\'s capture is genuinely in flight; the uncertain mid-turn window makes no claim at all', () => {
     // The only pending cell: newest user row, busy, capture in flight.
     expect(unboundRewindAvailability(modernUserTurn, true, true, true)).toEqual({ status: 'pending' })
-    // An MCP/CLI-driven turn (busy, newest, but NO capture in flight for it)
-    // stays honestly rewind-unavailable — never a still-saving claim.
-    expect(unboundRewindAvailability(modernUserTurn, true, true, false))
-      .toEqual({ status: 'unavailable', reason: MODERN_UNAVAILABLE_REASON })
+    // The uncertain window (busy, newest, but NO capture this pane can
+    // evidence as in flight — an MCP/CLI-driven turn, a reloaded pane with
+    // no send metadata, a capture that already settled) makes NO claim:
+    // undefined, per the User Request's "(or nothing)" acceptance. The
+    // honest unavailable verdict returns at the turn's settle (idle cell).
+    expect(unboundRewindAvailability(modernUserTurn, true, true, false)).toBeUndefined()
     expect(unboundRewindAvailability(modernUserTurn, false, true, true))
       .toEqual({ status: 'unavailable', reason: MODERN_UNAVAILABLE_REASON })
     expect(unboundRewindAvailability(modernUserTurn, false, true, false))

@@ -2,6 +2,7 @@ import { useCallback, useState } from 'react'
 import { Check, Copy, GitFork, History, MoreHorizontal, Undo2 } from 'lucide-react'
 import { copyText } from '@/lib/clipboard'
 import type { FreshAgentTurn } from '@shared/fresh-agent-contract'
+import { isModernCheckpointTurn } from '@shared/fresh-agent-turns'
 import { stripSystemReminders } from './FreshAgentItemCard'
 import type { ActionSheetItem } from './FreshAgentActionSheet'
 
@@ -34,6 +35,25 @@ export type TurnActionCallbacks = {
 }
 
 /**
+ * A modern turn whose rewind verdict the availability policy cannot support.
+ * `getRewindAvailability` returning undefined means the provider wired no
+ * verdict for this row: for a LEGACY turn that is the label-based path (the
+ * enabled affordance whose click resolves the checkpoint by label), but for
+ * a modern turn it is the uncertain mid-turn window — the row must make no
+ * claim at all, never an unearned enabled affordance. Only an actually
+ * provided callback can say this; without one the surface keeps its shape.
+ */
+function rewindUnsupportedByPolicy(
+  callbacks: Pick<TurnActionCallbacks, 'getRewindAvailability'>,
+  turn: FreshAgentTurn,
+  rewindAvailability: FreshAgentTurnRewindAvailability | undefined,
+): boolean {
+  return callbacks.getRewindAvailability !== undefined
+    && rewindAvailability === undefined
+    && isModernCheckpointTurn(turn)
+}
+
+/**
  * One source of truth for what you can do to a turn — consumed by the mobile
  * action sheet directly and by the desktop unified context menu through the
  * transcript's pane-registered FreshAgentTurnItemsBuilder, so the two
@@ -43,6 +63,9 @@ export function buildTurnActionItems(turn: FreshAgentTurn, callbacks: TurnAction
   const rewindAvailability = callbacks.getRewindAvailability?.(turn)
   const rewindPending = rewindAvailability?.status === 'pending'
   const rewindUnavailable = rewindAvailability?.status === 'unavailable'
+  // The uncertain mid-turn window on a modern row keeps the plain label but
+  // reads disabled — the same no-verdict treatment assistant rows get.
+  const rewindUnsupported = rewindUnsupportedByPolicy(callbacks, turn, rewindAvailability)
   return [
     {
       label: 'Copy turn text',
@@ -66,7 +89,11 @@ export function buildTurnActionItems(turn: FreshAgentTurn, callbacks: TurnAction
       label: rewindUnavailable
         ? `Rewind unavailable: ${rewindAvailability.reason}`
         : rewindPending ? 'Saving code rewind checkpoint…' : 'Rewind code to here',
-      disabled: callbacks.onRewindToTurn === undefined || turn.role !== 'user' || rewindPending || rewindUnavailable,
+      disabled: callbacks.onRewindToTurn === undefined
+        || turn.role !== 'user'
+        || rewindPending
+        || rewindUnavailable
+        || rewindUnsupported,
       destructive: true,
       run: () => callbacks.onRewindToTurn?.(turn),
     },
@@ -98,10 +125,15 @@ export function FreshAgentTurnActions({
   onOpenActions?: (turn: FreshAgentTurn) => void
 }) {
   const [copied, setCopied] = useState(false)
-  const canRewind = onRewindToTurn !== undefined && turn.role === 'user'
   const rewindAvailability = getRewindAvailability?.(turn)
   const rewindPending = rewindAvailability?.status === 'pending'
   const rewindUnavailable = rewindAvailability?.status === 'unavailable'
+  // The uncertain mid-turn window on a modern row shows NO rewind hover at
+  // all — no claim the row cannot support (the request's "(or nothing)"
+  // acceptance); the honest verdict returns when the turn settles. Legacy
+  // turns keep the enabled label-based affordance.
+  const rewindUnsupported = rewindUnsupportedByPolicy({ getRewindAvailability }, turn, rewindAvailability)
+  const canRewind = onRewindToTurn !== undefined && turn.role === 'user' && !rewindUnsupported
 
   const handleCopy = useCallback(async () => {
     const ok = await copyText(turnPlainText(turn))

@@ -61,6 +61,21 @@ export function freshAgentSnapshotHasUserTurn(
 }
 
 /**
+ * A turn that participates in the modern checkpoint contract: current
+ * provider snapshots mark materialized/live turns with their source, and a
+ * turn that exposes an exact native identity is modern even when an older
+ * server omitted the source field. Turns with neither keep the legacy
+ * label-based rewind path (an enabled rewind affordance whose click resolves
+ * the checkpoint by label lookup, never a per-message verdict).
+ */
+export function isModernCheckpointTurn(turn: Pick<FreshAgentTurn, 'nativeTurnId' | 'source'>): boolean {
+  return Boolean(turn.nativeTurnId)
+    || turn.source === 'durable'
+    || turn.source === 'live'
+    || turn.source === 'server'
+}
+
+/**
  * A turn summary is "authored" — provider-written prose that must remain a
  * permanent transcript boundary — unless the server explicitly tagged it as an
  * 'echo' of the turn's own items. A missing tag is conservative (authored):

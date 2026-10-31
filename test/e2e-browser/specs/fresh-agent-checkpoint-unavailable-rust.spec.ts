@@ -252,12 +252,12 @@ test.describe('fresh-agent checkpoint availability', () => {
 
       const userTurn = paneRoot.locator('[data-turn-role="user"]', { hasText: marker })
       await expect(userTurn).toBeVisible({ timeout: 20_000 })
-      // The unavailable verdict lives on the hover button: disabled with the
-      // exact reason in its title, and no status note renders.
-      await userTurn.hover()
-      const unavailable = userTurn.getByRole('button', { name: 'Rewind unavailable for this message' })
-      await expect(unavailable).toBeDisabled()
-      await expect(unavailable).toHaveAttribute('title', /A selected project file could not be read/)
+      // Mid-turn the pane is still running its provider turn: the capture
+      // already settled unavailable, so the uncertain window makes NO
+      // rewind claim at all on the landed row (the freshopencode MCP/CLI
+      // honesty spec pins the nothing-state deterministically behind its
+      // prompt gate, and the unit tests pin it too). What still holds
+      // mid-turn: no per-turn rewind status text renders anywhere.
       await expectNoRewindStatusText(paneRoot)
       await expect(paneRoot.getByText('Fixture turn')).toBeVisible({ timeout: 30_000 })
 
@@ -288,6 +288,14 @@ test.describe('fresh-agent checkpoint availability', () => {
           ?.find((entry: any) => entry.status === 'unavailable' && entry.code === 'checkpoint_path_unreadable')
         return unavailableOutcome?.nativeTurnId
       }, { timeout: 30_000 }).toEqual(expect.any(String))
+
+      // The honest settled verdict: the turn's end returns it — the row
+      // binds the identity-enriched unavailable outcome, so the hover shows
+      // the disabled unavailable rewind with the exact server reason.
+      await userTurn.hover()
+      const unavailable = userTurn.getByRole('button', { name: 'Rewind unavailable for this message' })
+      await expect(unavailable).toBeDisabled()
+      await expect(unavailable).toHaveAttribute('title', /A selected project file could not be read/)
 
       await page.evaluate(() => {
         window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })

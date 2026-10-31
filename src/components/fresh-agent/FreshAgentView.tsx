@@ -75,6 +75,7 @@ import {
   freshAgentSnapshotHasUserTurn,
   freshAgentTurnText,
   getFreshAgentDisplayTurnKey,
+  isModernCheckpointTurn,
 } from '@shared/fresh-agent-turns'
 import {
   buildFreshAgentSlashCommandMenu,
@@ -388,28 +389,22 @@ function checkpointAvailabilityMatchesTurn(
 
 const MODERN_TURN_CHECKPOINT_UNAVAILABLE = 'No exact code checkpoint is available for this message.'
 
-function isModernCheckpointTurn(turn: FreshAgentTurn): boolean {
-  // Current provider snapshots mark materialized/live turns with their source;
-  // providers that expose an exact native identity are modern even when an
-  // older server omitted that source field. Older snapshots with neither keep
-  // the legacy label-based rewind path.
-  return Boolean(turn.nativeTurnId)
-    || turn.source === 'durable'
-    || turn.source === 'live'
-    || turn.source === 'server'
-}
-
 // The fallback for a modern turn with no bound checkpoint outcome. Agent
 // response turns are never rewindable and never even considered (defect 2).
 // "Still saving" (defect 4) belongs to the NEWEST user row only, while this
 // pane's agent turn is running AND this pane's own composer send has a
 // checkpoint capture genuinely in flight: an MCP/CLI-driven turn sends
 // through the REST lane with no capture at all, so its row must never claim
-// a save is underway even while the pane is busy. Older unbound rows
+// a save is underway even while the pane is busy. The UNCERTAIN window —
+// newest user row, busy, but nothing this pane can evidence as in flight
+// (an MCP/CLI-driven turn; a mid-turn reload whose fresh mount has no send
+// metadata; a capture that already settled) makes NO claim at all: undefined,
+// the User Request's explicit "(or nothing)" acceptance. Older unbound rows
 // (historical MCP/CLI-driven turns) keep the honest unavailable verdict —
-// nothing is being saved for them even while a later turn runs. The state
-// is computed, never stored: it dies at the busy→idle edge and at the
-// capture-enrichment edge, so it can never wedge as an immortal "saving".
+// nothing is being saved for them even while a later turn runs — and the
+// newest row's honest unavailable verdict returns at the busy→idle settle.
+// Every state here is computed, never stored: each dies at the busy→idle
+// edge and at the capture-enrichment edge, so none can wedge.
 export function unboundRewindAvailability(
   turn: FreshAgentTurn,
   agentBusy: boolean,
@@ -418,7 +413,8 @@ export function unboundRewindAvailability(
 ): FreshAgentTurnRewindAvailability | undefined {
   if (turn.role !== 'user') return undefined
   if (!isModernCheckpointTurn(turn)) return undefined
-  return agentBusy && isNewestUserTurn && captureInFlight
+  if (agentBusy && isNewestUserTurn && !captureInFlight) return undefined
+  return agentBusy && isNewestUserTurn
     ? { status: 'pending' }
     : { status: 'unavailable', reason: MODERN_TURN_CHECKPOINT_UNAVAILABLE }
 }
