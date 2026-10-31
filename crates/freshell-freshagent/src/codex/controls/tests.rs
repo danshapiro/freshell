@@ -1898,7 +1898,31 @@ async fn runtime_with_native_home(
     ChannelPeer,
     tokio::sync::broadcast::Receiver<String>,
 ) {
-    let (state, peer, events) = runtime().await;
+    let (transport, peer) = freshell_codex::new_channel_transport();
+    let (client, notifications) = CodexAppServerClient::connect(transport);
+    let (state, events) = state_with_bus();
+    // Parsing a large saved rollout must not expire the test's live provider.
+    // The exit watcher owns this child until shutdown (or runtime-drop cleanup).
+    let ownership_id = mint_ownership_id();
+    let child = tokio::process::Command::new("node")
+        .args(["-e", "setInterval(() => {}, 1000)"])
+        .env(CODEX_SIDECAR_OWNERSHIP_ENV, &ownership_id)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn owned live native fixture");
+    insert_fake_session_with_real_consumer(
+        &state,
+        "thread-1",
+        Arc::new(client),
+        Arc::new(StdMutex::new(Some("active-turn".into()))),
+        notifications,
+        child,
+        &ownership_id,
+    )
+    .await;
     let client = state.sessions.lock().await["thread-1"].client.clone();
     let initialize = tokio::spawn(async move { client.initialize().await.unwrap() });
     let (id, method, _) = peer.expect_request().await;
@@ -1991,9 +2015,10 @@ async fn live_codex_large_native_snapshot_preserves_partial_output_and_original_
         peer.respond(&page_id,json!({"data":[{"id":"active-turn","status":"inProgress","itemsView":page_params["itemsView"],"items":items}],"nextCursor":null,"backwardsCursor":null}));
     }
     let result = task.await.unwrap();
+    let mut approval_accepted = false;
     let native_reply = if result.is_ok() {
-        state
-            .handle_approval_respond(
+        approval_accepted = state
+            .try_handle_approval_respond(
                 serde_json::from_value(
                     json!({"provider":"codex","sessionType":"freshcodex","sessionId":"thread-1",
             "requestId":pending["requestId"],"decision":{"behavior":"allow"}}),
@@ -2001,9 +2026,9 @@ async fn live_codex_large_native_snapshot_preserves_partial_output_and_original_
                 .unwrap(),
             )
             .await;
-        Some(peer.next_raw_frame().await.unwrap())
+        tokio::time::timeout(Duration::from_secs(3), peer.next_raw_frame()).await
     } else {
-        None
+        Ok(None)
     };
     peer.disconnect();
     state.shutdown().await;
@@ -2012,6 +2037,11 @@ async fn live_codex_large_native_snapshot_preserves_partial_output_and_original_
         "a known large native history must never be requested as one WebSocket message: {result:?}"
     );
     let snapshot = result.unwrap();
+    assert!(
+        approval_accepted,
+        "the original live approval must remain answerable after reading large history"
+    );
+    let native_reply = native_reply.expect("accepted approval writes its native reply promptly");
     assert!(
         serde_json::to_vec(&snapshot).unwrap().len()
             < crate::native_history::MAX_HISTORY_BYTES as usize

@@ -124,9 +124,10 @@ async fn live_codex_native_controls_survive_older_display_worker_failure() {
             query.await.unwrap()
         }
     };
+    let mut approval_accepted = false;
     let native_reply = if snapshot.is_ok() {
-        state
-            .handle_approval_respond(
+        approval_accepted = state
+            .try_handle_approval_respond(
                 serde_json::from_value(json!({
                     "provider":"codex","sessionType":"freshcodex","sessionId":"thread-1",
                     "requestId":pending["requestId"],"decision":{"behavior":"allow"}
@@ -134,15 +135,20 @@ async fn live_codex_native_controls_survive_older_display_worker_failure() {
                 .unwrap(),
             )
             .await;
-        peer.next_raw_frame().await
+        tokio::time::timeout(Duration::from_secs(3), peer.next_raw_frame()).await
     } else {
-        None
+        Ok(None)
     };
     peer.disconnect();
     state.shutdown().await;
 
     let snapshot =
         snapshot.expect("unavailable older display must preserve the same-root live owner");
+    assert!(
+        approval_accepted,
+        "the original live approval remains answerable"
+    );
+    let native_reply = native_reply.expect("accepted approval writes its native reply promptly");
     assert_eq!(snapshot["threadId"], "thread-1");
     assert_eq!(snapshot["status"], "running");
     assert_eq!(snapshot["capabilities"]["interrupt"], true);
@@ -225,9 +231,10 @@ async fn assert_absent_older_display(native_turn_not_materialized: bool) {
         }
     }
     let snapshot = query.await.unwrap();
+    let mut approval_accepted = false;
     let native_reply = if snapshot.is_ok() {
-        state
-            .handle_approval_respond(
+        approval_accepted = state
+            .try_handle_approval_respond(
                 serde_json::from_value(json!({
                     "provider":"codex","sessionType":"freshcodex","sessionId":"thread-1",
                     "requestId":pending["requestId"],"decision":{"behavior":"allow"}
@@ -235,9 +242,9 @@ async fn assert_absent_older_display(native_turn_not_materialized: bool) {
                 .unwrap(),
             )
             .await;
-        peer.next_raw_frame().await
+        tokio::time::timeout(Duration::from_secs(3), peer.next_raw_frame()).await
     } else {
-        None
+        Ok(None)
     };
     peer.disconnect();
     state.shutdown().await;
@@ -248,6 +255,11 @@ async fn assert_absent_older_display(native_turn_not_materialized: bool) {
     );
     let snapshot =
         snapshot.expect("a loaded native thread remains usable without older disk display");
+    assert!(
+        approval_accepted,
+        "the original live approval remains answerable"
+    );
+    let native_reply = native_reply.expect("accepted approval writes its native reply promptly");
     assert_eq!(snapshot["threadId"], "thread-1");
     assert_eq!(snapshot["status"], "running");
     assert_eq!(snapshot["capabilities"]["interrupt"], true);
