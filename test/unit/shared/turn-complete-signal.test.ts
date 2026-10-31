@@ -102,9 +102,9 @@ describe('countTrackerTurnCompleteSignals', () => {
 
 describe('turn-complete side-effect gating', () => {
   it('allows client-minted live turn completion only for non-server-authoritative modes', () => {
-    // Truly-idle alerting: all four terminal CLIs are server-authoritative
+    // Truly-idle alerting: all five terminal CLIs are server-authoritative
     // (terminal.idle broadcast) — the client must not mint completions for them.
-    for (const mode of ['claude', 'codex', 'opencode', 'amplifier'] as const) {
+    for (const mode of ['claude', 'codex', 'opencode', 'amplifier', 'antigravity'] as const) {
       expect(shouldAllowTerminalOutputSideEffect({
         source: 'live',
         effect: 'turn_complete',
@@ -121,5 +121,18 @@ describe('turn-complete side-effect gating', () => {
       effect: 'turn_complete',
       mode: 'shell',
     })).toBe(false)
+  })
+
+  it('does NOT support the turn-complete BEL signal for antigravity (server-authoritative transcript lane)', () => {
+    // Antigravity plan Task 8: antigravity is NOT a BEL mode. The shared
+    // `supportsTurnSignal` gate recognizes only claude/codex, so a BEL in
+    // antigravity output is never counted or stripped (the gemini/kimi
+    // status-inert rule, mirrored for the fifth terminal CLI). Attention
+    // flows exclusively from the server's transcript-driven
+    // terminal.turn.complete / terminal.idle edges.
+    const input = `x${TURN_COMPLETE_SIGNAL}y`
+    const out = extractTurnCompleteSignals(input, 'antigravity')
+    expect(out.count).toBe(0)
+    expect(out.cleaned).toBe(input)
   })
 })

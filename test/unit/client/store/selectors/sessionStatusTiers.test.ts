@@ -104,6 +104,7 @@ const EMPTY_BY_ID: Record<string, never> = {}
 
 function makeState(options: {
   localSessions?: Array<{ sessionId: string; busy?: boolean }>
+  localAntigravity?: Array<{ sessionId: string; busy?: boolean }>
   restoreGap?: { staleSessionId: string; liveSessionId: string; busy?: boolean }
   remoteOpen?: RegistryTabRecord[]
   sameDeviceOpen?: RegistryTabRecord[]
@@ -111,6 +112,7 @@ function makeState(options: {
   const tabs: unknown[] = []
   const layouts: Record<string, unknown> = {}
   const busyClaude: Record<string, unknown> = {}
+  const busyAntigravity: Record<string, unknown> = {}
   let freshAgentSessions: Record<string, unknown> = EMPTY_BY_ID
 
   for (const local of options.localSessions ?? []) {
@@ -119,6 +121,34 @@ function makeState(options: {
     layouts[`tab-${local.sessionId}`] = makeLayout(local.sessionId, terminalId)
     if (local.busy) {
       busyClaude[terminalId] = { terminalId, phase: 'busy', updatedAt: 1 }
+    }
+  }
+
+  // Antigravity plan Task 8: an antigravity busy record tiers the row
+  // local-busy exactly the way a claude/codex one does.
+  for (const local of options.localAntigravity ?? []) {
+    const terminalId = `term-${local.sessionId}`
+    tabs.push({
+      id: `tab-${local.sessionId}`,
+      mode: 'antigravity',
+      resumeSessionId: local.sessionId,
+      sessionRef: { provider: 'antigravity', sessionId: local.sessionId },
+      createdAt: 1,
+    })
+    layouts[`tab-${local.sessionId}`] = {
+      type: 'leaf',
+      id: `pane-${local.sessionId}`,
+      content: {
+        kind: 'terminal',
+        mode: 'antigravity',
+        status: 'running',
+        terminalId,
+        createRequestId: `req-${local.sessionId}`,
+        sessionRef: { provider: 'antigravity', sessionId: local.sessionId },
+      },
+    }
+    if (local.busy) {
+      busyAntigravity[terminalId] = { terminalId, phase: 'busy', updatedAt: 1 }
     }
   }
 
@@ -138,6 +168,7 @@ function makeState(options: {
     claudeActivity: { byTerminalId: busyClaude },
     amplifierActivity: { byTerminalId: EMPTY_BY_ID },
     opencodeActivity: { byTerminalId: EMPTY_BY_ID },
+    antigravityActivity: { byTerminalId: busyAntigravity },
     paneRuntimeActivity: { byPaneId: EMPTY_BY_ID },
     freshAgent: { sessions: freshAgentSessions },
     tabRegistry: {
@@ -153,6 +184,15 @@ describe('makeSelectSessionStatusTiers', () => {
     const tiers = select(makeState({ localSessions: [{ sessionId: 's-busy', busy: true }] }))
 
     expect(tiers).toEqual({ 'claude:s-busy': 'local-busy' })
+  })
+
+  it('marks an antigravity session whose local pane is busy as local-busy (like a claude/codex one)', () => {
+    const select = makeSelectSessionStatusTiers()
+    const tiers = select(makeState({
+      localAntigravity: [{ sessionId: 'conv-agy', busy: true }],
+    }))
+
+    expect(tiers).toEqual({ 'antigravity:conv-agy': 'local-busy' })
   })
 
   it('marks an idle locally-open session as local-open', () => {

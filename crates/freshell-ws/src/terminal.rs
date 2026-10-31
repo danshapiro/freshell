@@ -2013,6 +2013,10 @@ async fn handle_client_text(
                             Box::pin(async move { fresh_opencode.handle_send(send).await })
                         }
                         freshell_protocol::AgentProvider::Amplifier => Box::pin(async {}),
+                        // Antigravity plan Task 8: no fresh-agent runtime
+                        // (the amplifier shape) — a (contract-invalid)
+                        // freshAgent.send naming it is dropped.
+                        freshell_protocol::AgentProvider::Antigravity => Box::pin(async {}),
                     };
                     tokio::spawn(
                         Arc::clone(&service)
@@ -2051,6 +2055,10 @@ async fn handle_client_text(
                 // freshAgent.send naming it is dropped, same as legacy's
                 // zod parse rejecting it.
                 freshell_protocol::AgentProvider::Amplifier => {}
+                // Antigravity plan Task 8: the amplifier shape — the enum
+                // member exists for the terminal.turn.complete broadcast
+                // only; a freshAgent.send naming it is dropped.
+                freshell_protocol::AgentProvider::Antigravity => {}
             }
             true
         }
@@ -2656,6 +2664,26 @@ async fn handle_client_text(
                 ws_tx,
                 &ServerMessage::AmplifierActivityListResponse(
                     freshell_protocol::AmplifierActivityListResponse {
+                        request_id: list.request_id.clone(),
+                        terminals,
+                        latest_turn_completions: Some(latest),
+                    },
+                ),
+            )
+            .await
+        }
+        // Antigravity plan Task 8: the amplifier list's additive twin —
+        // reconnect seeding from the live tracker (same per-terminal
+        // `completionSeq` contract as the other families).
+        ClientMessage::AntigravityActivityList(list) => {
+            let (terminals, latest) = match &state.activity {
+                Some(hub) => hub.antigravity_list(),
+                None => (Vec::new(), Vec::new()),
+            };
+            send(
+                ws_tx,
+                &ServerMessage::AntigravityActivityListResponse(
+                    freshell_protocol::AntigravityActivityListResponse {
                         request_id: list.request_id.clone(),
                         terminals,
                         latest_turn_completions: Some(latest),
@@ -9489,6 +9517,8 @@ fn agent_provider_wire(provider: AgentProvider) -> &'static str {
         AgentProvider::Codex => "codex",
         AgentProvider::Opencode => "opencode",
         AgentProvider::Amplifier => "amplifier",
+        // Antigravity plan Task 8: the additive enum member's wire name.
+        AgentProvider::Antigravity => "antigravity",
     }
 }
 

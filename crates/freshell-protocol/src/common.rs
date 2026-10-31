@@ -133,7 +133,10 @@ pub const FRESH_AGENT_DISABLED_REFUSAL: &str =
 /// The coding-agent providers (`claude | codex | opencode | amplifier`).
 /// `amplifier` matches the legacy `TerminalTurnCompleteSchema.provider` enum
 /// (`shared/ws-protocol.ts:192`) — required by the TERM-16 turn-complete
-/// broadcast for amplifier terminal panes.
+/// broadcast for amplifier terminal panes. `antigravity` (antigravity plan
+/// Task 8) extends the same enum in BOTH twins so the frame can be minted
+/// for antigravity terminal panes; it has NO fresh-agent runtime (the
+/// fresh-agent dispatch arms treat it like `amplifier`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentProvider {
@@ -141,6 +144,7 @@ pub enum AgentProvider {
     Codex,
     Opencode,
     Amplifier,
+    Antigravity,
 }
 
 /// fresh-agent session flavour.
@@ -423,6 +427,28 @@ pub enum AmplifierPhase {
 pub struct AmplifierActivityRecord {
     pub terminal_id: String,
     pub phase: AmplifierPhase,
+    pub updated_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+/// `AntigravityActivityRecordSchema` (`shared/ws-protocol.ts`) — the
+/// amplifier record's additive twin (antigravity plan Task 8): same wire
+/// shape, `antigravity.*` discriminants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AntigravityPhase {
+    Idle,
+    Busy,
+}
+
+/// `AntigravityActivityRecordSchema` — the amplifier record's additive twin
+/// (antigravity plan Task 8).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AntigravityActivityRecord {
+    pub terminal_id: String,
+    pub phase: AntigravityPhase,
     pub updated_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,

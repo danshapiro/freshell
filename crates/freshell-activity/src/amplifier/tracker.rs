@@ -441,7 +441,9 @@ fn parse_effect_at(at: Option<&str>, now: i64) -> i64 {
 
 /// Minimal ISO-8601 → epoch-ms parse without a chrono dependency. Returns
 /// `None` for anything it can't parse (falls back to `now`).
-fn chrono_free_parse_iso_ms(s: &str) -> Option<i64> {
+/// `pub(crate)`: the antigravity tracker's `record_at_ms` reuses this exact
+/// parser (the two providers' transcripts carry the same ISO shapes).
+pub(crate) fn chrono_free_parse_iso_ms(s: &str) -> Option<i64> {
     // Format: YYYY-MM-DDTHH:MM:SS(.fff...)(Z|±HH:MM)
     let bytes = s.as_bytes();
     if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {

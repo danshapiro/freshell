@@ -78,6 +78,11 @@ pub enum ClientMessage {
     // on connect (`src/App.tsx:696-701`), mirroring the legacy zod schema.
     #[serde(rename = "amplifier.activity.list")]
     AmplifierActivityList(ActivityList),
+    // Antigravity plan Task 8: the reconnect-seeding list request for the
+    // antigravity tracker (the amplifier request's additive twin; the client
+    // sends it on every (re)connect beside the other four).
+    #[serde(rename = "antigravity.activity.list")]
+    AntigravityActivityList(ActivityList),
     #[serde(rename = "ui.layout.sync")]
     UiLayoutSync(UiLayoutSync),
     #[serde(rename = "ui.screenshot.result")]
@@ -180,8 +185,11 @@ pub const CLIENT_MESSAGE_TYPES: [&str; 42] = [
 
 /// Extension client→server discriminants declared beyond the generated
 /// inventory. The process-only Codex recovery stop is an additive extension;
-/// the generated frozen inventory remains unchanged.
-pub const EXTENSION_CLIENT_MESSAGE_TYPES: [&str; 1] = ["freshAgent.recovery.stop"];
+/// the generated frozen inventory remains unchanged. The antigravity
+/// activity list request (plan Task 8) joins it — same additive pattern as
+/// the amplifier family's promotion path.
+pub const EXTENSION_CLIENT_MESSAGE_TYPES: [&str; 2] =
+    ["freshAgent.recovery.stop", "antigravity.activity.list"];
 
 // --- hello ------------------------------------------------------------------
 

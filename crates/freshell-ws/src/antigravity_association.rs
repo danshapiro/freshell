@@ -343,7 +343,19 @@ pub async fn drain_and_associate(state: &WsState) {
         match current {
             Some(current_id) if current_id == hit.conversation_id => {
                 // No-op: the pane's own conversation continuing (the
-                // locator stays armed for the switch forms).
+                // locator stays armed for the switch forms). Task 8: the
+                // attach is idempotent at the hub — it no-ops a lane
+                // already tracking this conversation and RE-ATTACHES one
+                // that has none (a resume/restart-created pane's first
+                // submit lands here with identity already bound, so this
+                // re-assert is the ONLY thing that ever binds its lane).
+                if let Some(hub) = &state.activity {
+                    hub.attach_antigravity_association(
+                        &hit.terminal_id,
+                        &hit.conversation_id,
+                        &hit.transcript_path,
+                    );
+                }
                 tracing::debug!(
                     target: "freshell_ws::antigravity_association",
                     terminal_id = %hit.terminal_id,
@@ -642,9 +654,9 @@ pub(crate) async fn rebind_antigravity_identity(
 /// announces NOTHING) -> identity.upsert -> naming bind -> name-reliability
 /// follow -> registry set_meta -> structured JSONL -> broadcast
 /// `terminal.session.associated` (the ONE shared provider-parameterized
-/// broadcaster) — then the caller's coordinator commit. The activity
-/// hub's tracker bind is Task 8's wiring (no antigravity tracker exists
-/// yet; the idle-gate arming lives in the hub's Input arm).
+/// broadcaster) -> the activity hub's transcript-lane bind (plan Task 8:
+/// the tracker bind + lane attach ride the same channel-deferred hub
+/// event) — then the caller's coordinator commit.
 async fn apply_antigravity_identity(
     state: &WsState,
     terminal_id: &str,
@@ -754,6 +766,13 @@ async fn apply_antigravity_identity(
         cwd.map(str::to_string),
         previous_conversation_id.map(str::to_string),
     );
+    // Antigravity plan Task 8: bind the activity lane to the pane's now-
+    // durable conversation (adopt AND rebind land here). Channel-deferred
+    // by the hub — the lane attach, watcher, and every frame it mints run
+    // on the hub task.
+    if let (Some(hub), Some(transcript)) = (&state.activity, transcript_path) {
+        hub.attach_antigravity_association(terminal_id, conversation_id, transcript);
+    }
     true
 }
 

@@ -13,6 +13,7 @@
 //! | [`claude`]        | `server/coding-cli/claude-activity-tracker.ts`       |
 //! | [`codex`]         | `server/coding-cli/codex-activity-tracker.ts` (PTY lane) |
 //! | [`amplifier`]     | `server/coding-cli/amplifier-{events-reducer,events-tailer,activity-tracker}.ts` |
+//! | [`antigravity`]   | NEW capability (no legacy counterpart — the antigravity plan's transcript-record lane) |
 //! | [`idle`]          | NEW capability (no legacy counterpart)               |
 //!
 //! ## Zero-polling design
@@ -25,6 +26,7 @@
 //! events or expiries. A provider with no busy/pending terminals reports
 //! `None` and carries **zero armed timers and zero wakes**.
 pub mod amplifier;
+pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod idle;

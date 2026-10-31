@@ -17,6 +17,18 @@ describe('normalizeTurnCompleteSignalMode', () => {
     expect(normalizeTurnCompleteSignalMode('gemini')).toBe('shell')
     expect(normalizeTurnCompleteSignalMode('kimi')).toBe('shell')
   })
+
+  it('maps antigravity to shell (NOT a BEL mode — plan Task 8 negative pin)', () => {
+    // Antigravity is server-authoritative: its turn-completion attention
+    // flows from the transcript lane (terminal.turn.complete +
+    // terminal.idle), never from a BEL byte. The shared
+    // `supportsTurnSignal` gate stays claude|codex only.
+    expect(normalizeTurnCompleteSignalMode('antigravity')).toBe('shell')
+    expect(extractTurnCompleteSignals(`x${TURN_COMPLETE_SIGNAL}y`, 'antigravity')).toEqual({
+      cleaned: `x${TURN_COMPLETE_SIGNAL}y`,
+      count: 0,
+    })
+  })
 })
 
 describe('extractTurnCompleteSignals', () => {

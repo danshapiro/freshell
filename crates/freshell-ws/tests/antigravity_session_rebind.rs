@@ -56,6 +56,12 @@
 //!      suppression must hold for antigravity panes exactly as it does
 //!      for tracker modes (scenario 7 pins the crash side of the same
 //!      engagement).
+//!   9. Activity phases (plan Task 8): the transcript lane drives busy →
+//!      exactly one `terminal.turn.complete` (provider `antigravity`,
+//!      sessionId bound) → exactly one `terminal.idle{reason:"grace"}` per
+//!      settled turn; a `turn_settled{fullyIdle:false}` record (outstanding
+//!      async work) keeps the pane busy with NO completion until a later
+//!      full settle completes the turn exactly once.
 //!
 //! Process-kill suite: the fakes this suite spawns are its own PTY children
 //! (killed via `registry.kill` of the created ids, which reaps the fake
@@ -116,6 +122,12 @@ fn transcript_path(home: &std::path::Path, conv: &str) -> std::path::PathBuf {
 /// - `/resume <id>` (the documented in-CLI conversation switch) makes the
 ///   EXISTING conversation active without re-initializing it — the NEXT
 ///   stdin line is appended as that transcript's LATEST user record.
+/// - `settle:<text>` (Task 8's activity phase) appends the user record AND
+///   a `turn_settled{outcome:"completed",fullyIdle:true}` record — a turn
+///   that fully settles.
+/// - `async:<text>` (Task 8's activity phase) appends the user record AND a
+///   `turn_settled{fullyIdle:false}` record — invocation completion with
+///   outstanding async work (NOT turn completion).
 /// - `/crash` exits 1 (a real spontaneous non-zero death for the
 ///   auto-resume phase).
 /// - `/quit` or `/exit` exits 0 (a deliberate user quit: a spontaneous
@@ -166,6 +178,21 @@ while IFS= read -r line; do
     "/resume "*)
       CONV="${line#/resume }"
       TRANSCRIPT="$(transcript_of)"
+      ;;
+    "settle:"*)
+      # The user record's text is the FULL input line (the locator
+      # content-matches the pane's captured submit line — a stripped prefix
+      # could never associate); the settle record follows it.
+      printf '{"type":"user_message","conversationId":"%s","text":"%s","at":"%s"}\n' \
+        "$CONV" "$line" "$(now)" >> "$TRANSCRIPT"
+      printf '{"type":"turn_settled","conversationId":"%s","at":"%s","outcome":"completed","fullyIdle":true}\n' \
+        "$CONV" "$(now)" >> "$TRANSCRIPT"
+      ;;
+    "async:"*)
+      printf '{"type":"user_message","conversationId":"%s","text":"%s","at":"%s"}\n' \
+        "$CONV" "$line" "$(now)" >> "$TRANSCRIPT"
+      printf '{"type":"turn_settled","conversationId":"%s","at":"%s","outcome":"completed","fullyIdle":false}\n' \
+        "$CONV" "$(now)" >> "$TRANSCRIPT"
       ;;
     "/crash")
       exit 1
@@ -1072,6 +1099,90 @@ async fn antigravity_exact_live_identity_rebind_suite() {
         .await,
         "a deliberate user quit (quit-intent input + spontaneous exit) rings \
          NO death bell (#612 parity)"
+    );
+
+    // ── Scenario 9: activity phases (plan Task 8) ────────────────────────
+    // The transcript lane's full attention contract, end to end through the
+    // real sweep + adoption: busy on submit, exactly one completion + one
+    // terminal.idle per settled turn, and a partial settle (fullyIdle:false
+    // — outstanding async work) that NEVER completes.
+    let tid9 = create_pane(&mut ws, &cwd, "req-agy-sc9").await;
+    to_kill.push(tid9.clone());
+    let conv9 = conv_of(&tid9);
+
+    // A settled turn: busy → exactly one terminal.turn.complete (provider
+    // antigravity, the bound conversation as sessionId) → exactly one
+    // terminal.idle{grace}.
+    submit_prompt(&mut ws, &tid9, "settle:activity phase prompt kilo").await;
+    assert!(
+        frame_seen_within(&mut ws, Duration::from_secs(10), |v| {
+            v["type"] == "antigravity.activity.updated"
+                && v["upsert"][0]["terminalId"] == tid9.as_str()
+                && v["upsert"][0]["phase"] == "busy"
+        })
+        .await,
+        "the flushed submit arms the antigravity tracker's busy record"
+    );
+    let settle_complete = loop {
+        let frame = next_frame_of_type(&mut ws, "terminal.turn.complete").await;
+        if frame["terminalId"] == tid9.as_str() {
+            break frame;
+        }
+    };
+    assert_eq!(settle_complete["provider"], "antigravity");
+    assert_eq!(settle_complete["sessionId"], conv9.as_str());
+    assert_eq!(settle_complete["completionSeq"], 1);
+    assert!(
+        frame_seen_within(&mut ws, Duration::from_secs(10), |v| {
+            v["type"] == "terminal.idle" && v["terminalId"] == tid9.as_str()
+        })
+        .await,
+        "the settled turn rings exactly one terminal.idle (grace)"
+    );
+    assert!(
+        !frame_seen_within(&mut ws, Duration::from_secs(3), |v| {
+            v["type"] == "terminal.idle" && v["terminalId"] == tid9.as_str()
+        })
+        .await,
+        "never a second terminal.idle for the settled turn"
+    );
+
+    // A partial settle (fullyIdle:false — outstanding async work): the pane
+    // stays busy and NO completion may arrive.
+    submit_prompt(&mut ws, &tid9, "async:outstanding work prompt lima").await;
+    assert!(
+        frame_seen_within(&mut ws, Duration::from_secs(10), |v| {
+            v["type"] == "antigravity.activity.updated"
+                && v["upsert"][0]["terminalId"] == tid9.as_str()
+                && v["upsert"][0]["phase"] == "busy"
+        })
+        .await,
+        "the async turn re-arms busy"
+    );
+    assert!(
+        !frame_seen_within(&mut ws, Duration::from_secs(3), |v| {
+            v["type"] == "terminal.turn.complete" && v["terminalId"] == tid9.as_str()
+        })
+        .await,
+        "invocation completion is NOT turn completion — no completion for a \
+         fullyIdle:false settle"
+    );
+
+    // The follow-up full settle completes the outstanding turn exactly once.
+    submit_prompt(&mut ws, &tid9, "settle:final settle prompt mike").await;
+    let settle_complete2 = loop {
+        let frame = next_frame_of_type(&mut ws, "terminal.turn.complete").await;
+        if frame["terminalId"] == tid9.as_str() {
+            break frame;
+        }
+    };
+    assert_eq!(settle_complete2["completionSeq"], 2);
+    assert!(
+        !frame_seen_within(&mut ws, Duration::from_secs(3), |v| {
+            v["type"] == "terminal.turn.complete" && v["terminalId"] == tid9.as_str()
+        })
+        .await,
+        "never a duplicate completion for the same settled turn"
     );
 
     // ── cleanup: only the terminals this suite created (never a broad kill) ──

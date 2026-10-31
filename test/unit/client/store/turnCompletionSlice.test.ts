@@ -52,6 +52,12 @@ import reducer, {
 import panesReducer from '@/store/panesSlice'
 import tabsReducer, { closePaneWithCleanup, closeTab } from '@/store/tabsSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
+import { appReducers } from '@/store/appReducers'
+import antigravityActivityReducer, {
+  removeAntigravityActivity,
+  resetAntigravityActivity,
+  upsertAntigravityActivity,
+} from '@/store/antigravityActivitySlice'
 import type { PaneNode } from '@/store/paneTypes'
 import { applyServerIdle } from '@/store/turnCompletionThunks'
 
@@ -440,6 +446,115 @@ describe('turnCompletionSlice', () => {
       state = reducer(state, resetCompletionDedupeBaselines())
       state = reducer(state, recordTerminalIdle({ tabId: 'tab-1', paneId: 'p1', terminalId: 't1', at: 1_000, reason: 'grace' }))
       expect(state.pendingEvents).toHaveLength(2)
+    })
+  })
+
+  describe('antigravity activity ingestion (plan Task 8)', () => {
+    it('registers the antigravityActivity slice in the app store and ingests records', () => {
+      // The registration trap the plan review flagged: an UNREGISTERED slice
+      // silently discards every dispatch, so busy never reaches the UI. Build
+      // the store from the app's exact reducer map and prove the slice is
+      // both present and fed. (The serializable-check exemption mirrors the
+      // repo's App-level store pattern — the sessions slice's
+      // expandedProjects Set is a pre-existing known non-serializable.)
+      const store = configureStore({
+        reducer: appReducers,
+        middleware: (getDefault) => getDefault({
+          serializableCheck: { ignoredPaths: ['sessions.expandedProjects'] },
+        }),
+      })
+
+      expect(store.getState().antigravityActivity).toBeDefined()
+
+      store.dispatch(upsertAntigravityActivity({
+        terminals: [{ terminalId: 't-agy', phase: 'busy', updatedAt: 1_000, sessionId: 'conv-1' }],
+        mutationSeq: 1,
+      }))
+      expect(store.getState().antigravityActivity.byTerminalId['t-agy']).toMatchObject({
+        terminalId: 't-agy',
+        phase: 'busy',
+      })
+
+      store.dispatch(removeAntigravityActivity({ terminalIds: ['t-agy'], mutationSeq: 2 }))
+      expect(store.getState().antigravityActivity.byTerminalId['t-agy']).toBeUndefined()
+
+      store.dispatch(resetAntigravityActivity())
+      expect(store.getState().antigravityActivity.lastSnapshotSeq).toBe(0)
+    })
+
+    it('applies the server-idle edge to an antigravity pane (the terminal.idle path is mode-agnostic)', () => {
+      const now = Date.now()
+      const store = configureStore({
+        reducer: {
+          tabs: tabsReducer,
+          panes: panesReducer,
+          settings: settingsReducer,
+          antigravityActivity: antigravityActivityReducer,
+          turnCompletion: reducer,
+        },
+        preloadedState: {
+          tabs: {
+            tabs: [{ id: 'tab-1', createRequestId: 'req-1', title: 'Tab 1', status: 'running' as const, mode: 'antigravity' as const, shell: 'system' as const, createdAt: now }],
+            activeTabId: 'tab-1',
+            renameRequestTabId: null,
+          },
+          panes: {
+            layouts: {
+              'tab-1': {
+                type: 'leaf' as const,
+                id: 'pane-1',
+                content: {
+                  kind: 'terminal' as const,
+                  createRequestId: 'cr-1',
+                  status: 'running' as const,
+                  mode: 'antigravity' as const,
+                  shell: 'system' as const,
+                  terminalId: 'term-agy',
+                },
+              },
+            },
+            activePane: { 'tab-1': 'pane-1' },
+            paneTitles: {},
+            paneTitleSetByUser: {},
+            renameRequestTabId: null,
+            renameRequestPaneId: null,
+            zoomedPane: {},
+            refreshRequestsByPane: {},
+          },
+          settings: { settings: defaultSettings, loaded: true },
+          antigravityActivity: {
+            byTerminalId: { 'term-agy': { terminalId: 'term-agy', phase: 'busy', updatedAt: 1 } },
+            lastSnapshotSeq: 0,
+            liveMutationSeqByTerminalId: {},
+            removedMutationSeqByTerminalId: {},
+          },
+          turnCompletion: {
+            seq: 0,
+            lastAtByTerminalId: {},
+            lastIdleAtByTerminalId: {},
+            pendingEvents: [],
+            attentionByTab: {},
+            attentionByPane: {},
+          },
+        },
+      })
+
+      store.dispatch(applyServerIdle({
+        terminalId: 'term-agy',
+        at: 1_000,
+        reason: 'grace',
+      }) as any)
+
+      expect(store.getState().turnCompletion.pendingEvents).toEqual([{
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        terminalId: 'term-agy',
+        at: 1_000,
+        seq: 1,
+        source: 'terminal',
+        watched: false,
+      }])
+      expect(store.getState().turnCompletion.lastIdleAtByTerminalId?.['term-agy']).toBe(1_000)
     })
   })
 })

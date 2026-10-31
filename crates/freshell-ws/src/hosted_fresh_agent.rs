@@ -83,6 +83,7 @@ pub(crate) fn hosted_route(message: &ClientMessage) -> HostedRoute {
         | ClientMessage::OpencodeActivityList(_)
         | ClientMessage::ClaudeActivityList(_)
         | ClientMessage::AmplifierActivityList(_)
+        | ClientMessage::AntigravityActivityList(_)
         | ClientMessage::UiLayoutSync(_)
         | ClientMessage::UiScreenshotResult(_)
         | ClientMessage::CodingCliCreate(_)

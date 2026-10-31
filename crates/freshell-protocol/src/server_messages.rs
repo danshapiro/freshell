@@ -9,9 +9,10 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::common::{
-    AgentProvider, AmplifierActivityRecord, ClaudeActivityRecord, CodexActivityRecord,
-    CodexDurability, ErrorCode, FreshAgentCheckpointWorkspace, OpencodeActivityRecord,
-    SessionLocator, SessionType, TerminalMetaRecord, TurnCompletionSnapshot,
+    AgentProvider, AmplifierActivityRecord, AntigravityActivityRecord, ClaudeActivityRecord,
+    CodexActivityRecord, CodexDurability, ErrorCode, FreshAgentCheckpointWorkspace,
+    OpencodeActivityRecord, SessionLocator, SessionType, TerminalMetaRecord,
+    TurnCompletionSnapshot,
 };
 use crate::session_names::{SessionNameRecord, SessionNameRef, SessionNameUpdated};
 use crate::settings::ServerSettings;
@@ -27,6 +28,12 @@ pub enum ServerMessage {
     AmplifierActivityListResponse(AmplifierActivityListResponse),
     #[serde(rename = "amplifier.activity.updated")]
     AmplifierActivityUpdated(AmplifierActivityUpdated),
+    // Antigravity plan Task 8: the antigravity activity family — the
+    // amplifier family's additive twin (see EXTENSION_SERVER_MESSAGE_TYPES).
+    #[serde(rename = "antigravity.activity.list.response")]
+    AntigravityActivityListResponse(AntigravityActivityListResponse),
+    #[serde(rename = "antigravity.activity.updated")]
+    AntigravityActivityUpdated(AntigravityActivityUpdated),
     #[serde(rename = "claude.activity.list.response")]
     ClaudeActivityListResponse(ClaudeActivityListResponse),
     #[serde(rename = "claude.activity.updated")]
@@ -415,8 +422,15 @@ pub struct RuntimeViewChanged {
 /// consumer, add the Zod schema to `shared/ws-protocol.ts`, run
 /// `pnpm run contract:generate`, and promote this into
 /// [`SERVER_MESSAGE_TYPES`]. Shape pinned by `tests/activity_extension.rs`.
-pub const EXTENSION_SERVER_MESSAGE_TYPES: [&str; 2] =
-    ["durability.degraded", "freshAgent.recovery.stopped"];
+pub const EXTENSION_SERVER_MESSAGE_TYPES: [&str; 4] = [
+    "durability.degraded",
+    "freshAgent.recovery.stopped",
+    // Antigravity plan Task 8: the antigravity activity family (the
+    // amplifier family's additive twin — the generated frozen inventory is
+    // not regenerated in this task; promote on the next contract reconcile).
+    "antigravity.activity.list.response",
+    "antigravity.activity.updated",
+];
 
 // ---------------------------------------------------------------------------
 // Server-only enums.
@@ -710,6 +724,27 @@ pub struct AmplifierActivityListResponse {
 pub struct AmplifierActivityUpdated {
     pub remove: Vec<String>,
     pub upsert: Vec<AmplifierActivityRecord>,
+}
+
+/// `AntigravityActivityListResponseSchema` — the amplifier list response's
+/// additive twin (antigravity plan Task 8), served from the hub's live
+/// tracker state (reconnect seeding, per-terminal `completionSeq`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AntigravityActivityListResponse {
+    pub request_id: String,
+    pub terminals: Vec<AntigravityActivityRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_turn_completions: Option<Vec<TurnCompletionSnapshot>>,
+}
+
+/// `AntigravityActivityUpdatedSchema` — the amplifier updated frame's
+/// additive twin (antigravity plan Task 8).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AntigravityActivityUpdated {
+    pub remove: Vec<String>,
+    pub upsert: Vec<AntigravityActivityRecord>,
 }
 
 /// `terminal.idle.reason` — why the server believes the terminal is truly
