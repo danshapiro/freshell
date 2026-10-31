@@ -426,8 +426,10 @@ describe('foldVerdicts', () => {
     expect(noticePayloads.map((p) => p.notice)).toEqual([
       DEAD_SESSION_RECONCILE_NOTICES.missing,
       DEAD_SESSION_RECONCILE_NOTICES.respawnExhausted,
-      // An unknown reason is honest about the general case, not the disk.
-      DEAD_SESSION_RECONCILE_NOTICES.missing,
+      // An unknown reason is honest about the general case, never a
+      // disk-loss claim (plan prose: only the known-missing family says
+      // "no longer exists on disk").
+      DEAD_SESSION_RECONCILE_NOTICES.respawnExhausted,
     ])
     expect(noticePayloads.map((p) => `${p.tabId}:${p.paneId}`)).toEqual(['tab1:p1', 'tab2:p2', 'tab3:p3'])
   })
@@ -476,6 +478,23 @@ describe('foldVerdicts', () => {
     const outcome = foldVerdicts(dispatch, req, resultFor(req, dispatched.verdicts))
     expect(outcome.invalid).toBe(1)
     expect(dispatched.countOf(setPaneRestoreError.type)).toBe(1)
+  })
+})
+
+describe('deadSessionReconcileNoticeFor', () => {
+  it('maps ONLY the known-missing reason family to the disk-loss copy; everything else gets the generic copy', async () => {
+    const { deadSessionReconcileNoticeFor } = await import('@/lib/pane-reconcile')
+    // The server's deleted-file reasons (and the legacy TS spelling) claim
+    // the disk loss.
+    expect(deadSessionReconcileNoticeFor('session_not_on_disk')).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
+    expect(deadSessionReconcileNoticeFor('session_file_missing')).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
+    // The present-but-unresumable reason...
+    expect(deadSessionReconcileNoticeFor('respawn_exhausted')).toBe(DEAD_SESSION_RECONCILE_NOTICES.respawnExhausted)
+    // ...and any UNKNOWN reason (a future server's new code, a missing
+    // reason field) must not claim the file is gone — honesty is the
+    // generic "could not be resumed" copy.
+    expect(deadSessionReconcileNoticeFor(undefined)).toBe(DEAD_SESSION_RECONCILE_NOTICES.respawnExhausted)
+    expect(deadSessionReconcileNoticeFor('some_future_dead_reason')).toBe(DEAD_SESSION_RECONCILE_NOTICES.respawnExhausted)
   })
 })
 

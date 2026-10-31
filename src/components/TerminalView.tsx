@@ -93,6 +93,7 @@ import {
   buildTerminalResizeMessage,
   getCreateSessionStateFromRef,
   isStaleSessionIdentityMismatch,
+  paneHasResumableDurableIdentity,
 } from '@/components/terminal-view-utils'
 import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
 import { copyText, readText } from '@/lib/clipboard'
@@ -4402,20 +4403,34 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     // (fresh_after_restore_unavailable): that pane was never verdict-dead,
     // lost its live handle with no durable identity, and its create is an
     // explicitly FRESH one — not a resume attempt, so it may proceed. The
-    // exemption is exact by construction: verdict-dead panes always hold a
-    // sessionRef (the dead adjudication requires one) and never carry a
-    // fresh-recovery intent, while the breadcrumb pane never has one — so
-    // keying the exemption on the fresh-recovery intent can never leak a
-    // verdict-dead resume through this gate. The exemption reads the
-    // NON-CONSUMING peek (hasTerminalFreshRecoveryRequest), which answers
-    // identically with pane reconciliation active or inactive (focused
-    // episode 1, round 2 — the fresheyes finding): the consume-based read
-    // is gated to not-armed on any real paneReconcileV1-negotiated
-    // connection, and an exemption that read through it went inert there,
-    // suppressing the fresh create and wedging the pane in 'creating'. The
-    // sendCreate frame keeps its consume-based semantics exactly as before
-    // (under active reconciliation it stays a plain-fresh create; the
-    // registry entry survives for this gate's peek).
+    // exemption reads the NON-CONSUMING peek
+    // (hasTerminalFreshRecoveryRequest), which answers identically with
+    // pane reconciliation active or inactive (focused episode 1, round 2
+    // — the fresheyes finding): the consume-based read is gated to
+    // not-armed on any real paneReconcileV1-negotiated connection, and an
+    // exemption that read through it went inert there, suppressing the
+    // fresh create and wedging the pane in 'creating'. The sendCreate
+    // frame keeps its consume-based semantics exactly as before (under
+    // active reconciliation it stays a plain-fresh create; the registry
+    // entry survives for this gate's peek).
+    //
+    // THE EXEMPTION REQUIRES THE CURRENT NO-IDENTITY SHAPE (delta review
+    // round 2, finding 1): the registry entry describes the identity-less
+    // recovery the dead-live-handle arm decided, and it can outlive that
+    // shape — under active reconciliation the entry is never consumed, so
+    // a pane that recovered fresh, later anchored a durable sessionRef,
+    // exited, and was then adjudicated dead_session would still hold the
+    // STALE entry, and an exemption keyed on history alone would let the
+    // create lane resume the deleted session. The exemption therefore
+    // holds only while paneHasResumableDurableIdentity is FALSE — the
+    // exact guard the dead-live-handle arm consults to decide a fresh
+    // recovery (same shared predicate): a pane WITH a resumable identity
+    // stands down on the dead latch regardless of registry history,
+    // because the only thing the exemption ever licenses is a FRESH
+    // (identity-less) create. All three gated lanes (this effect's create
+    // path, the WS-reconnect re-drive, the armed SESSION_RESERVED re-drive
+    // timer) call this one gate, so the condition covers them at once.
+    //
     // Recovery folds (attach/reset) clear the latch, re-arming
     // auto-recovery the moment the pane legitimately moves on; user-driven
     // retries and launch-failure retries (scheduleCreateRetry, retryLaunch)
@@ -4428,7 +4443,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       return freshRecoveryExemptRef.current
     }
     const shouldStandDownDeadCreate = (requestId: string): boolean =>
-      deadSessionLatchRef.current && !isFreshRecoveryCreate(requestId)
+      deadSessionLatchRef.current
+      && (!isFreshRecoveryCreate(requestId)
+        || paneHasResumableDurableIdentity(contentRef.current, tabRef.current?.sessionRef, mode))
 
     const sendCreate = (requestId: string) => {
       if (isManagedRuntimeRecoveryPending(contentRef.current?.recoverySummary)) return
@@ -6954,18 +6971,22 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               return
             }
             const restoreMode = current?.mode || (paneContent.kind === 'terminal' ? paneContent.mode : 'shell')
-            const isCodingCliMode = restoreMode !== 'shell'
-            const hasCodexCapturedRestoreState = current?.mode === 'codex' && Boolean(current.codexDurability?.candidate)
             // Last-known-durable-identity fallback: the pane's own sessionRef may
             // be missing (e.g. it never arrived before the live terminal died),
             // but a single-pane tab keeps its own sessionRef in sync (see
             // terminal-session-association.ts). Recovering from it here avoids
             // permanently abandoning a coding-CLI session that a moment's race
             // condition made the pane briefly forget.
-            const tabSessionRefFallback = !current?.sessionRef && isCodingCliMode
+            const tabSessionRefFallback = !current?.sessionRef && restoreMode !== 'shell'
               ? tabRef.current?.sessionRef
               : undefined
-            if (!current?.sessionRef && !hasCodexCapturedRestoreState && !tabSessionRefFallback) {
+            // The fresh-vs-resume decision runs through the ONE shared
+            // resumable-identity predicate
+            // (paneHasResumableDurableIdentity, terminal-view-utils.ts) —
+            // the dead-latch create stand-down gate's exemption requires
+            // the same no-identity shape, so the two sites cannot drift
+            // (delta review round 2, finding 1).
+            if (!paneHasResumableDurableIdentity(current, tabRef.current?.sessionRef, mode)) {
               const restoreDiagnostic = {
                 event: 'restore_unavailable' as const,
                 reason: 'dead_live_handle' as const,

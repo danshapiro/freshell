@@ -50,8 +50,8 @@ export const RECONCILE_RESULT_WAIT_MS = 10_000
  * (no-modal contract). REASON-HONEST: the server also returns `dead_session`
  * with reason `respawn_exhausted` while the session file is PRESENT, so the
  * fold selects the copy from `verdict.reason`. Consumers match the mint by
- * CATEGORY through `isDeadSessionReconcileNotice` — never one string — so
- * the `invalid`-arm and reset notices can never trigger them. The xterm
+ * CATEGORY through `isDeadSessionReconcileNotice` — never one string — so the
+ * `invalid`-arm and reset notices can never trigger them. The xterm
  * buffer line is a SEPARATE shared const in TerminalView; these copies stay
  * store-side.
  */
@@ -60,10 +60,23 @@ export const DEAD_SESSION_RECONCILE_NOTICES = {
   respawnExhausted: 'Saved session could not be resumed.',
 } as const
 
+/**
+ * The known-missing reason family — the only dead reasons that may claim
+ * the session file is gone from disk. Everything else (respawn_exhausted,
+ * an absent reason, or a future server's unknown code) maps to the
+ * generic "could not be resumed" copy: an unknown reason must never make
+ * a disk-loss claim it cannot back (plan Task 2 keying; delta review
+ * round 2, finding 2).
+ */
+const DEAD_SESSION_DISK_LOSS_REASONS: ReadonlySet<string> = new Set([
+  'session_not_on_disk',
+  'session_file_missing',
+])
+
 export function deadSessionReconcileNoticeFor(reason: string | undefined): string {
-  return reason === 'respawn_exhausted'
-    ? DEAD_SESSION_RECONCILE_NOTICES.respawnExhausted
-    : DEAD_SESSION_RECONCILE_NOTICES.missing
+  return reason !== undefined && DEAD_SESSION_DISK_LOSS_REASONS.has(reason)
+    ? DEAD_SESSION_RECONCILE_NOTICES.missing
+    : DEAD_SESSION_RECONCILE_NOTICES.respawnExhausted
 }
 
 export function isDeadSessionReconcileNotice(notice: string | undefined): boolean {

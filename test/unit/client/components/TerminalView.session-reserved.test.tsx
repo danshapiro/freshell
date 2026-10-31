@@ -8,6 +8,7 @@ import panesReducer, {
   resetPaneForReconcileCreate,
   setPaneReconcileNotice,
   setPaneRestoreError,
+  setReconcilePendingPanes,
   RECONCILE_NOTICE_CORRECTED,
 } from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
@@ -63,14 +64,24 @@ const wsHarness = vi.hoisted(() => {
   }
 })
 
-vi.mock('@/lib/ws-client', () => ({
-  getWsClient: () => ({
-    send: wsHarness.send,
-    connect: wsHarness.connect,
-    onMessage: wsHarness.onMessage,
-    onReconnect: wsHarness.onReconnect,
-  }),
-}))
+vi.mock('@/lib/ws-client', async (importOriginal) => {
+  // Keep the real module's exports (TerminalView imports
+  // RECONCILE_VERDICT_WAIT_MS from it); replace only the client instance.
+  const actual = await importOriginal<typeof import('@/lib/ws-client')>()
+  return {
+    ...actual,
+    getWsClient: () => ({
+      send: wsHarness.send,
+      connect: wsHarness.connect,
+      onMessage: wsHarness.onMessage,
+      onReconnect: wsHarness.onReconnect,
+      // Production clients always expose the ready getter (ws-client.ts);
+      // the mounted-reconstruction completion gate reads it, and without it
+      // the post-terminal.created attach silently abandons in a harness.
+      isReady: true,
+    }),
+  }
+})
 
 vi.mock('@/lib/terminal-themes', () => ({
   getTerminalTheme: () => ({}),
@@ -743,6 +754,125 @@ describe('TerminalView reconcile adoption: verdict-driven create + bounded re-dr
       expect(create).not.toHaveProperty('sessionRef')
       expect(create.restore).toBeUndefined()
     }
+  })
+
+  it('a stale fresh-recovery exemption cannot unlock a resume once the pane holds a durable identity (delta round 2, finding 1)', async () => {
+    // The reviewer's exact end-to-end sequence: a live-only codex pane
+    // collapses into the explicitly-fresh recovery (breadcrumb latch +
+    // registry entry, reconciliation ACTIVE so the entry is never
+    // consumed), the fresh create anchors AND acquires a durable
+    // sessionRef, the terminal exits (terminalId cleared, identity
+    // retained), and a later boot-reconcile round adjudicates the session
+    // dead after its file was deleted. The registry entry is STALE -- the
+    // identity-less recovery shape it describes is gone -- so the
+    // exemption must not hold: the create lane may not auto-send
+    // terminal.create carrying the deleted sessionRef (the forbidden
+    // duplicate resume attempt). The pane waits for the user's existing
+    // chrome; the notice still writes.
+    setPaneReconcileActive(true)
+    const { store } = await mountPane({
+      mode: 'codex',
+      status: 'running',
+      createRequestId: 'cr-codex-stale-exempt',
+      terminalId: 'term-codex-stale-exempt',
+      serverInstanceId: 'srv-local',
+      // No sessionRef, no codexDurability: genuinely no durable identity.
+    })
+
+    // (a) The dead-live-handle collapse: fresh-recovery createRequestId
+    // minted, breadcrumb latch set, registry entry registered (and never
+    // consumed under ACTIVE reconciliation).
+    act(() => {
+      wsHarness.emit({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        message: 'terminal not found',
+        terminalId: 'term-codex-stale-exempt',
+      })
+    })
+    await flushEffects()
+    const mintedId = paneContent(store).createRequestId
+    expect(mintedId).not.toBe('cr-codex-stale-exempt')
+    expect(paneContent(store).restoreError?.reason).toBe('durable_artifact_missing')
+    const freshCreates = sentOfType('terminal.create').filter((msg) => msg?.requestId === mintedId)
+    expect(freshCreates).toHaveLength(1)
+    expect(freshCreates[0]).not.toHaveProperty('sessionRef')
+
+    // (b) The fresh session anchors AND acquires a durable identity
+    // (terminal.created folds the server-named sessionRef).
+    act(() => {
+      wsHarness.emit({
+        type: 'terminal.created',
+        requestId: mintedId,
+        terminalId: 'term-codex-stale-exempt-2',
+        sessionRef: { provider: 'codex', sessionId: 'sess-stale-exempt' },
+      })
+    })
+    await flushEffects()
+    expect(paneContent(store).terminalId).toBe('term-codex-stale-exempt-2')
+    expect(paneContent(store).sessionRef).toMatchObject({ provider: 'codex', sessionId: 'sess-stale-exempt' })
+
+    // Settle the queued attach so the exit below takes the ordinary exit
+    // branch (attachReady), not the launch-failure branch.
+    const attach = lastSentOfType('terminal.attach')
+    expect(attach?.attachRequestId).toBeTruthy()
+    act(() => {
+      wsHarness.emit({
+        type: 'terminal.attach.ready',
+        terminalId: 'term-codex-stale-exempt-2',
+        attachRequestId: attach.attachRequestId,
+        headSeq: 0,
+        replayFromSeq: 0,
+        replayToSeq: 0,
+      })
+    })
+    await flushEffects()
+
+    // (c) Exit: terminalId cleared, durable identity retained.
+    act(() => {
+      wsHarness.emit({ type: 'terminal.exit', terminalId: 'term-codex-stale-exempt-2', exitCode: 0 })
+    })
+    await flushEffects()
+    expect(paneContent(store).terminalId).toBeUndefined()
+    expect(paneContent(store).status).toBe('exited')
+    expect(paneContent(store).sessionRef).toMatchObject({ provider: 'codex', sessionId: 'sess-stale-exempt' })
+
+    // (d) The next boot-reconcile round holds the pane in its pre-verdict
+    // wait, then folds the dead verdict for the deleted session file
+    // (exactly the fold's terminal dead_session arm dispatches).
+    act(() => {
+      store.dispatch(setReconcilePendingPanes({
+        paneKeys: [`${TAB_ID}:${PANE_ID}`],
+        startedAt: Date.now(),
+      }))
+    })
+    await flushEffects()
+    act(() => {
+      store.dispatch(setPaneRestoreError({
+        tabId: TAB_ID,
+        paneId: PANE_ID,
+        restoreError: buildRestoreError('durable_artifact_missing'),
+      }))
+      store.dispatch(setPaneReconcileNotice({
+        tabId: TAB_ID,
+        paneId: PANE_ID,
+        notice: deadSessionReconcileNoticeFor('session_not_on_disk'),
+      }))
+    })
+    await flushEffects()
+
+    // THE STALE EXEMPTION MUST NOT HOLD: the pane now HAS a resumable
+    // durable identity, so the create lane stands down -- no
+    // terminal.create carrying the deleted sessionRef is auto-sent (no
+    // create at all beyond the one fresh create from (a)).
+    expect(sentOfType('terminal.create').filter((msg) => msg?.requestId === mintedId)).toHaveLength(1)
+    expect(sentOfType('terminal.create').some((msg) => msg?.sessionRef?.sessionId === 'sess-stale-exempt')).toBe(false)
+
+    // The notice still writes (exactly one buffer line, the dead-copy
+    // category mint consumed one-shot).
+    const deadNoticeLine = '\r\n[This pane\'s saved session no longer exists on disk - close this pane or start a new one]\r\n'
+    expect(xtermWrites().filter((data) => data === deadNoticeLine)).toHaveLength(1)
+    expect(paneContent(store).reconcileNotice).toBeUndefined()
   })
 
   it('INVALID_TERMINAL_ID at launch is retried bounded (F9), not a permanent error', async () => {

@@ -8,6 +8,7 @@ import {
   getCreateSessionStateFromRef,
   getExpectedSessionRefForTerminalOperation,
   getResumeSessionIdFromRef,
+  paneHasResumableDurableIdentity,
 } from '@/components/terminal-view-utils'
 
 describe('terminal-view-utils', () => {
@@ -126,6 +127,60 @@ describe('terminal-view-utils', () => {
       provider: 'codex',
       sessionId: 'thread-1',
     })
+  })
+
+  it('paneHasResumableDurableIdentity: truth table over the three identity sources (the shared fresh-vs-resume guard)', () => {
+    // The dead-live-handle recovery arm's fresh decision and the dead-latch
+    // create stand-down exemption share this ONE predicate (delta review
+    // round 2, finding 1): the exemption may hold ONLY while every
+    // identity source is absent.
+    const codexCandidate = {
+      schemaVersion: 1 as const,
+      state: 'captured_pre_turn' as const,
+      candidate: {
+        provider: 'codex' as const,
+        candidateThreadId: 'cand-1',
+        rolloutPath: '/tmp/rollout.jsonl',
+        source: 'thread_started_notification' as const,
+        capturedAt: 1,
+      },
+    }
+    const noIdentity: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-identity',
+      status: 'running',
+      mode: 'codex',
+      shell: 'system',
+    }
+
+    // No identity anywhere: the fresh-recovery shape the exemption licenses.
+    expect(paneHasResumableDurableIdentity(noIdentity, undefined, 'codex')).toBe(false)
+    // A shell pane never falls back to the tab's sessionRef (a stateless
+    // shell has no durable identity).
+    expect(paneHasResumableDurableIdentity({ ...noIdentity, mode: 'shell' }, { provider: 'codex', sessionId: 'tab-sess' }, 'shell')).toBe(false)
+
+    // The pane's own canonical sessionRef is identity...
+    expect(paneHasResumableDurableIdentity(
+      { ...noIdentity, sessionRef: { provider: 'codex', sessionId: 'own-sess' } },
+      undefined,
+      'codex',
+    )).toBe(true)
+    // ...a captured codex durability candidate is identity...
+    expect(paneHasResumableDurableIdentity(
+      { ...noIdentity, codexDurability: codexCandidate },
+      undefined,
+      'codex',
+    )).toBe(true)
+    // ...and the single-pane-tab sessionRef fallback is identity for a
+    // coding-CLI pane without its own sessionRef.
+    expect(paneHasResumableDurableIdentity(noIdentity, { provider: 'codex', sessionId: 'tab-sess' }, 'codex')).toBe(true)
+    // A captured candidate that is NOT codex-mode is not a resumable
+    // codex capture (mode gates the capture source).
+    expect(paneHasResumableDurableIdentity(
+      { ...noIdentity, mode: 'claude', codexDurability: { ...codexCandidate } },
+      undefined,
+      'claude',
+    )).toBe(false)
   })
 
   it('carries the paced replayPageBytes request on the attach when provided (and omits it otherwise)', () => {
