@@ -7,11 +7,12 @@
 ## User Request
 
 ### Requested result
-Apply the smallest reliable fixes for the flaky supervisor lock timeout (`arnn`) and Claude permission-contract harness cleanup race (`bczx`): pause Tokio test time while checking the lock timeout; for the harness, stop and await only the child processes it directly starts, then retry temporary-directory removal a few times and report any cleanup failure.
+Apply the smallest reliable fixes for the flaky supervisor lock timeout (`arnn`) and Claude permission-contract harness cleanup race (`bczx`): pause Tokio test time while checking the lock timeout; for the harness, stop and await only the child processes it directly starts, then retry temporary-directory removal a few times and report any cleanup failure. Run a properly scoped Fresh Eyes review of the complete branch delta using Claude and report its result.
 
 ### Explicit constraints
 - Use the “usual” workflow, including an isolated worktree, focused tests, and independent review.
 - Keep fixture cleanup limited to direct child processes; do not add cross-platform descendant or process-tree tracking.
+- Use Claude for the requested Fresh Eyes review.
 
 ### Accepted tradeoffs and residuals
 - If a directly started process cannot be confirmed stopped or the temp directory still cannot be removed after bounded retries, report cleanup failure and retain the directory for diagnosis.
