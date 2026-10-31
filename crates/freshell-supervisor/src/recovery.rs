@@ -160,6 +160,7 @@ fn log_stopped_repair_import_failure(
         }
         BackendError::Malformed(_) => "malformed",
         BackendError::InvalidConfig(_) => "invalid_config",
+        BackendError::CodexIncompatible(_) => "codex_configuration_incompatible",
     }
     .into();
     crate::service::append_event(
@@ -7441,6 +7442,7 @@ pub(crate) mod tests {
                             .resume_pending_native_permissions()
                             .await
                             .map(|()| HostResult::FreshAgentCommand {
+                                native_identity: None,
                                 state: freshell_runtime_protocol::CommandState::ProviderAcked,
                                 native_session_id: Some(native.into()),
                                 claude_fork: None,
@@ -9364,6 +9366,9 @@ pub(crate) mod automatic_retry_tests {
                     "ownership" => BackendError::OwnershipMismatch("temporary dependency".into()),
                     "policy" => BackendError::PolicyMismatch("temporary dependency".into()),
                     "malformed" => BackendError::Malformed("temporary dependency".into()),
+                    "codex_incompatible" => {
+                        BackendError::CodexIncompatible("temporary dependency".into())
+                    }
                     _ => BackendError::InvalidConfig("temporary dependency".into()),
                 });
             }
@@ -11647,12 +11652,30 @@ pub(crate) mod automatic_retry_tests {
             ("policy", false),
             ("malformed", false),
             ("config", false),
+            ("codex_incompatible", false),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let (supervisor, backend, clock) = open(dir.path(), 0);
             let soul = seed(&supervisor).await;
             std::fs::write(dir.path().join("create-failure"), kind).unwrap();
             supervisor.reconcile_startup().await.unwrap();
+            if kind == "codex_incompatible" {
+                let events: Vec<serde_json::Value> =
+                    std::fs::read_to_string(&supervisor.config.lifecycle_log)
+                        .unwrap()
+                        .lines()
+                        .map(|line| serde_json::from_str(line).unwrap())
+                        .collect();
+                let failure = events
+                    .iter()
+                    .find(|event| {
+                        event["event"] == "supervisor.activation_failed"
+                            && event["data"]["soulId"] == soul.as_str()
+                            && event["data"]["stage"] == "create_stopped_runtime"
+                    })
+                    .expect("the actual incompatible backend must refuse activation");
+                assert_eq!(failure["data"]["errorCode"], "INVALID_REQUEST");
+            }
             assert_eq!(due(dir.path()), retryable.then_some(2_000), "{kind}");
             let count = backend.count("inspects");
             clock.store(20_000, Ordering::SeqCst);
@@ -11825,6 +11848,7 @@ pub(crate) mod automatic_retry_tests {
             };
             let prior = freshell_runtime_protocol::ProviderLaunchContext {
                 preparation: freshell_runtime_protocol::ProviderPreparation::Codex {
+                    approval_default: None,
                     tui_args: vec![],
                     sidecar_args: vec![],
                 },

@@ -120,6 +120,7 @@ impl Fixture {
                     HostCommand::FreshAgentReadEvents { .. } => {
                         let state = current.lock().unwrap();
                         Ok(HostResult::FreshAgentEvents(AgentEventBatch {
+                            retained_state: None,
                             retained_from: 1,
                             head: 1,
                             reset_required: false,
@@ -148,6 +149,7 @@ impl Fixture {
                             evidence_digest: "b".repeat(64),
                         });
                         Ok(HostResult::FreshAgentCommand {
+                            native_identity: None,
                             state: CommandState::ProviderAcked,
                             native_session_id: Some(CHILD.into()),
                             claude_fork: None,
@@ -180,6 +182,7 @@ impl Fixture {
                             conn.execute("UPDATE souls SET desired_state='stopped',intent_revision=intent_revision+1", []).unwrap();
                         }
                         Ok(HostResult::FreshAgentCommand {
+                            native_identity: None,
                             state: CommandState::Completed,
                             native_session_id: Some(root.into()),
                             claude_fork: None,
@@ -190,6 +193,7 @@ impl Fixture {
                         assert!(!state.ended);
                         state.inputs.push(text);
                         Ok(HostResult::FreshAgentCommand {
+                            native_identity: None,
                             state: CommandState::ProviderAcked,
                             native_session_id: Some(state.root.clone()),
                             claude_fork: None,

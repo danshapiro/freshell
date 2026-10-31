@@ -19,6 +19,7 @@ fn kilroy_actor_accepts_its_typed_claude_native_context() {
         .preparation = freshell_runtime_protocol::ProviderPreparation::Codex {
         tui_args: Vec::new(),
         sidecar_args: Vec::new(),
+        approval_default: None,
     };
     assert!(profile.validate().is_err());
 }
