@@ -3381,6 +3381,7 @@ impl FreshAgentState {
                 return self.opencode_disk_state_response(thread_id);
             }
         };
+        let snapshot_owner = self.local_snapshot_owner(thread_id).await;
         let route: freshell_opencode::Route = cwd.map(str::to_string);
 
         let info = match manager.get_session_at(thread_id, &route, &base).await {
@@ -3421,6 +3422,48 @@ impl FreshAgentState {
         // replay.
         self.ensure_child_watchers(&manager, thread_id, &snapshot);
         attach_child_activity(&manager, &route, &mut snapshot).await;
+        if let Some(owner) = snapshot_owner {
+            let status_result = manager
+                .get_session_status_at(thread_id, &route, &base)
+                .await
+                .and_then(|status| {
+                    let status_type = status.as_ref().and_then(|status| status.get("type"));
+                    if freshell_opencode::is_running_status_type(status_type) {
+                        Ok("running")
+                    } else if status.is_none()
+                        || status_type.and_then(Value::as_str) == Some("idle")
+                    {
+                        Ok("idle")
+                    } else {
+                        Err(ServeError::Decode(
+                            "OpenCode returned an unknown session status".into(),
+                        ))
+                    }
+                });
+            let status = match status_result {
+                Ok(status) => status,
+                Err(error) => {
+                    tracing::warn!(
+                        provider = PROVIDER,
+                        session_id = thread_id,
+                        error = %error,
+                        "freshagent.opencode.snapshot_status_unavailable"
+                    );
+                    return self.opencode_disk_state_response(thread_id);
+                }
+            };
+            // The history read may race a handoff or daemon replacement. Only
+            // the same local owner and captured daemon can supply live authority.
+            if manager.base_url().await.as_deref() == Some(base.as_str())
+                && self.local_snapshot_owner(thread_id).await.as_ref() == Some(&owner)
+            {
+                snapshot["status"] = json!(status);
+                snapshot["extensions"]["opencode"]["statusFromLiveState"] = json!(true);
+                snapshot["extensions"]["opencode"]["ownerKind"] = json!("fresh-agent");
+                snapshot["extensions"]["opencode"]["ownerEpoch"] = json!(owner.epoch);
+                snapshot["extensions"]["opencode"]["ownerGeneration"] = json!(owner.generation);
+            }
+        }
         Ok(snapshot)
     }
 
@@ -4590,12 +4633,9 @@ pub(crate) fn opencode_message_turn_json(message: &Value, ordinal: usize) -> Opt
     Some(Value::Object(turn))
 }
 
-/// `normalizeOpencodeSnapshot` (`normalize.ts:357-405`): map the session's own info + its
-/// message page into the `FreshAgentSnapshotSchema` shape. `status` always reports `idle`
-/// here -- this REST read has no live busy/idle bit to consult (that lives in the WS
-/// session's in-memory turn task, not the serve's own session record) -- an honest
-/// approximation the task report calls out; the client's WS-driven busy chrome already
-/// covers the live case, this endpoint's job is the committed transcript.
+/// Map saved session information and messages into the snapshot contract. Saved
+/// history defaults to idle; `get_opencode_snapshot` overlays current daemon status
+/// for a locally owned session after verifying its ownership is still current.
 fn build_opencode_snapshot_json(
     thread_id: &str,
     info: &Value,
@@ -9141,6 +9181,7 @@ mod tests {
         messages: HashMap<String, Value>,
         status_map: Value,
         fail_substring: Option<String>,
+        before_status: Option<Arc<dyn Fn() + Send + Sync>>,
     }
 
     impl RoutedSessionHttp {
@@ -9150,6 +9191,7 @@ mod tests {
                 messages,
                 status_map: json!({}),
                 fail_substring: None,
+                before_status: None,
             }
         }
     }
@@ -9188,6 +9230,9 @@ mod tests {
                 // Before the bare `/session/` arm: `/session/status` is the
                 // status map, not a session.
                 if req.url.contains("/session/status") {
+                    if let Some(before_status) = &self.before_status {
+                        before_status();
+                    }
                     return Ok(ServeHttpResponse::new(
                         200,
                         serde_json::to_vec(&self.status_map).unwrap(),
@@ -9234,6 +9279,212 @@ mod tests {
             .expect("healthy fake serve starts");
         st.set_manager_for_test(manager).await;
         st
+    }
+
+    fn live_opencode_snapshot_http(status_map: Value) -> RoutedSessionHttp {
+        let mut http = RoutedSessionHttp::new(
+            HashMap::from([(
+                "ses_live".into(),
+                json!({"id":"ses_live","time":{"updated":7}}),
+            )]),
+            HashMap::from([(
+                "ses_live".into(),
+                json!([
+                    {"info":{"id":"msg-running","role":"assistant"},"parts":[
+                        {"type":"tool","tool":"bash","state":{"status":"running","input":{"command":"long-running test"}}}
+                    ]}
+                ]),
+            )]),
+        );
+        http.status_map = status_map;
+        http
+    }
+
+    fn claim_opencode_snapshot_session(state: &FreshAgentState) {
+        let mut ticket = match ownership_lane::begin_lane_claim(
+            &state.ownership,
+            "opencode",
+            "ses_live",
+            "snapshot-live-status",
+            None,
+            "test",
+            0,
+        ) {
+            ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+            _ => panic!("expected local claim"),
+        };
+        ownership_lane::commit_lane_claim(
+            &state.ownership,
+            &state.ownership_stamps,
+            None,
+            "opencode",
+            "ses_live",
+            &mut ticket,
+            "ses_live",
+            None,
+        )
+        .unwrap();
+    }
+
+    async fn owned_opencode_snapshot_state(status_map: Value) -> FreshAgentState {
+        let state = state_with_routed_http(live_opencode_snapshot_http(status_map))
+            .await
+            .with_ownership(Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new()));
+        claim_opencode_snapshot_session(&state);
+        state
+    }
+
+    #[tokio::test]
+    async fn get_opencode_snapshot_uses_live_busy_and_retry_status_without_history_changes() {
+        for status in ["busy", "retry"] {
+            let state = owned_opencode_snapshot_state(json!({"ses_live":{"type":status}})).await;
+            let snapshot = state
+                .get_opencode_snapshot("ses_live", Some("/workspace"))
+                .await
+                .unwrap();
+            assert_eq!(snapshot["status"], "running", "native {status}: {snapshot}");
+            assert_eq!(
+                snapshot["revision"], 7,
+                "status recovery does not invent history revisions"
+            );
+            assert_eq!(
+                snapshot["extensions"]["opencode"]["statusFromLiveState"],
+                true
+            );
+            assert_eq!(
+                snapshot["extensions"]["opencode"]["ownerKind"],
+                "fresh-agent"
+            );
+            assert_eq!(snapshot["turns"][0]["items"][0]["status"], "running");
+        }
+    }
+
+    #[tokio::test]
+    async fn get_opencode_snapshot_uses_live_idle_even_when_last_tool_is_still_running_in_history()
+    {
+        for status_map in [json!({}), json!({"ses_live":{"type":"idle"}})] {
+            let state = owned_opencode_snapshot_state(status_map).await;
+            let snapshot = state.get_opencode_snapshot("ses_live", None).await.unwrap();
+            assert_eq!(snapshot["status"], "idle");
+            assert_eq!(
+                snapshot["extensions"]["opencode"]["statusFromLiveState"],
+                true
+            );
+            assert_eq!(snapshot["turns"][0]["items"][0]["status"], "running");
+        }
+    }
+
+    #[tokio::test]
+    async fn get_opencode_snapshot_never_promotes_unknown_live_status_to_idle() {
+        for status in [
+            json!(null),
+            json!({}),
+            json!({"type":"unknown"}),
+            json!("busy"),
+        ] {
+            let state = owned_opencode_snapshot_state(json!({"ses_live":status})).await;
+            assert!(
+                matches!(
+                    state.get_opencode_snapshot("ses_live", None).await,
+                    Err(OpencodeSnapshotError::ReservedByOwner { .. })
+                ),
+                "native status: {status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_opencode_snapshot_does_not_claim_live_authority_for_saved_history() {
+        let state = state_with_routed_http(RoutedSessionHttp::new(
+            HashMap::from([(
+                "ses_saved".into(),
+                json!({"id":"ses_saved","time":{"updated":7}}),
+            )]),
+            HashMap::from([("ses_saved".into(), json!([]))]),
+        ))
+        .await
+        .with_ownership(Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new()));
+        let snapshot = state
+            .get_opencode_snapshot("ses_saved", None)
+            .await
+            .unwrap();
+        assert_ne!(
+            snapshot["extensions"]["opencode"]["statusFromLiveState"],
+            true
+        );
+        assert_ne!(
+            snapshot["extensions"]["opencode"]["ownerKind"],
+            "fresh-agent"
+        );
+        assert!(state.local_snapshot_owner("ses_saved").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_opencode_snapshot_status_failure_does_not_report_idle_or_mutate_the_daemon() {
+        let mut http = live_opencode_snapshot_http(json!({}));
+        http.fail_substring = Some("/session/status".into());
+        let spawner = Arc::new(CountingSpawner::default());
+        let manager = OpencodeServeManager::new(
+            ServeDeps {
+                spawner: spawner.clone(),
+                http: Arc::new(http),
+                ports: Arc::new(FakeAllocator),
+                events: Arc::new(NoopEventSource),
+            },
+            ServeConfig::default(),
+        );
+        manager.ensure_started().await.unwrap();
+        let state =
+            state().with_ownership(Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new()));
+        state.set_manager_for_test(manager.clone()).await;
+        claim_opencode_snapshot_session(&state);
+        let error = state
+            .get_opencode_snapshot("ses_live", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            OpencodeSnapshotError::ReservedByOwner { .. }
+        ));
+        assert_eq!(spawner.spawns(), 1);
+        assert!(!spawner.last_spawn_killed());
+        assert!(manager.base_url().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn get_opencode_snapshot_does_not_stamp_live_status_after_ownership_changes() {
+        let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let mut http = live_opencode_snapshot_http(json!({"ses_live":{"type":"busy"}}));
+        let changed_owner = ownership.clone();
+        http.before_status = Some(Arc::new(move || {
+            let outcome = changed_owner.begin_handoff(
+                "opencode",
+                "ses_live",
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "snapshot-racing-handoff",
+                None,
+                "test",
+                freshell_ownership::now_epoch_ms(),
+            );
+            assert!(matches!(
+                outcome,
+                freshell_ownership::BeginOutcome::Granted { .. }
+            ));
+        }));
+        let state = state_with_routed_http(http)
+            .await
+            .with_ownership(ownership.clone());
+        claim_opencode_snapshot_session(&state);
+        let snapshot = state.get_opencode_snapshot("ses_live", None).await.unwrap();
+        assert!(matches!(
+            ownership.observe("opencode", "ses_live").state,
+            freshell_ownership::OwnershipState::Handoff { .. }
+        ));
+        assert_ne!(
+            snapshot["extensions"]["opencode"]["statusFromLiveState"],
+            true
+        );
+        assert_ne!(snapshot["status"], "running");
     }
 
     /// The parent fixture every join test shares: an assistant turn carrying the
