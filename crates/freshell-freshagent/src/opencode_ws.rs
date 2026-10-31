@@ -5566,6 +5566,21 @@ impl FreshOpencodeState {
 
         // adapter.ts:362 `emitStatus(state, 'running')` — BEFORE the upstream request.
         self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "running")));
+        // The lock-free running claim for exactly this busy window (focused
+        // E3R3 review defect 2 — the compact lane's arm site): the preflight
+        // below parks the session mutex across ensure_manager, the /config
+        // model resolution and the redo-destroy ledger write, and the
+        // snapshot route's turn-status probe TRY-LOCKS this session's
+        // mutex — a pane that reloaded mid-compact and missed the
+        // broadcast above would otherwise read a blanket idle from its
+        // refetch. Armed here (under the session mutex, so arming never
+        // interleaves), then moved into the spawned compact drive below so
+        // the claim lives exactly as long as the drive: cleared at its
+        // natural settle tail, on the pre-spawn failure legs below (no
+        // model pair, the redo-destroy refusal) when this frame unwinds,
+        // and on every abort path (kill/interrupt join the aborted handle,
+        // so the guard's Drop has run before they answer).
+        let running_claim = RunningClaimGuard::arm(&session_arc);
 
         let manager = self.fresh_agent.ensure_manager().await;
         // Subscribe BEFORE the POST so the compact's idle edge cannot be missed (the
@@ -5679,6 +5694,13 @@ impl FreshOpencodeState {
         let collected_witness = summarize_dispatched.clone();
         let compact_accepted_witness = daemon_turn_accepted.clone();
         let compact_task = tokio::spawn(async move {
+            // The drive owns the compact's lock-free running claim (armed at
+            // the running broadcast above): held for the drive's whole life,
+            // so the probe's contended arm answers running exactly while
+            // this compact is in flight, and the claim clears at the drive's
+            // end — the settle tail's trailing idle broadcast — or on any
+            // abort.
+            let _running_claim = running_claim;
             // b8ke focused ep5 r1 F1: the op guard moved INTO the drive
             // (the same constructed-outside-moved-in discipline as
             // `undo_guard`): a never-started future still drops it, and
@@ -13837,6 +13859,109 @@ mod tests {
         .await
         .expect("the settled placeholder snapshot still answers promptly")
         .expect("settled placeholder snapshot builds");
+        assert_eq!(
+            settled["status"],
+            json!("idle"),
+            "once no running claim is live the probe reports the honest idle"
+        );
+    }
+
+    /// Focused E3R3 review defect 2: the compact lane broadcasts `running`
+    /// BEFORE its preflight (the model-pair resolution, the redo-destroy
+    /// ledger write) and parks the session mutex across that preflight —
+    /// the same contended window a first send's materialization has. A
+    /// snapshot probe contending there must read the session's LOCK-FREE
+    /// running mirror (armed at the compact's running-broadcast site, held
+    /// by the spawned compact drive) and answer the honest `running` —
+    /// never the blanket idle that would flip a reloaded pane idle
+    /// mid-compact.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_preflight_arms_the_running_mirror_for_a_concurrent_snapshot() {
+        // A config-gated compact preflight: the session carries NO model, so
+        // the handler must resolve the pair through GET /config — the gate
+        // parks that GET while the session mutex is held, AFTER the running
+        // broadcast fired (the parked window is observable through the
+        // fake's request record, the ep5-r1-F1 idiom).
+        let config_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, mut rx) = compact_state_gated(
+            r#"{"model":"prov-c/mdl-c"}"#,
+            SummarizeOutcome::OkAnswered,
+            None,
+            Some(Arc::clone(&config_gate)),
+        )
+        .await;
+        insert_compact_session(&st, "ses_e3r3_compact", None).await;
+
+        let driven = st.clone();
+        let task =
+            tokio::spawn(
+                async move { driven.handle_compact(compact_msg("ses_e3r3_compact")).await },
+            );
+        // Park proof: the model-resolution GET /config is recorded (request
+        // arrival) while the compact holds the session mutex.
+        {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if http.get_config_count() > 0 {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the compact never reached its config resolution"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        // THE CONTENDED SNAPSHOT: the probe must not block on the held
+        // mutex (the 750 ms promptness bound) and must answer the mirror's
+        // honest running — the compact broadcast running and is genuinely
+        // in flight inside the held critical section.
+        let snapshot = tokio::time::timeout(
+            Duration::from_millis(750),
+            st.fresh_agent
+                .get_opencode_snapshot("ses_e3r3_compact", None),
+        )
+        .await
+        .expect(
+            "the snapshot answers while the compact preflight holds the \
+             session mutex -- the probe must not block on the record lock",
+        )
+        .expect("contended snapshot builds");
+        assert_eq!(
+            snapshot["status"],
+            json!("running"),
+            "the contended probe reports the session's lock-free running mirror \
+             while the compact is genuinely in flight -- never a blanket idle"
+        );
+        assert!(
+            st.opencode_running_claim_active_for_test("ses_e3r3_compact")
+                .await,
+            "the compact's running broadcast armed the running claim"
+        );
+
+        // Release the gate: the preflight completes, the detached compact
+        // drive runs and settles (its terminal chime bounds the wait), and
+        // the claim the drive held clears at the drive's end — the mirror
+        // never wedges running past the compact it was armed for, and a
+        // fresh snapshot answers the honest idle.
+        config_gate.notify_one();
+        let _ = task.await;
+        frames_until(&mut rx, |f| is_event(f, "freshAgent.turn.complete", None)).await;
+        st.settle_local_turn_task_for_test("ses_e3r3_compact").await;
+        assert!(
+            !st.opencode_running_claim_active_for_test("ses_e3r3_compact")
+                .await,
+            "the running claim clears when the compact's drive ends"
+        );
+        let settled = tokio::time::timeout(
+            Duration::from_millis(750),
+            st.fresh_agent
+                .get_opencode_snapshot("ses_e3r3_compact", None),
+        )
+        .await
+        .expect("the settled snapshot still answers promptly")
+        .expect("settled snapshot builds");
         assert_eq!(
             settled["status"],
             json!("idle"),

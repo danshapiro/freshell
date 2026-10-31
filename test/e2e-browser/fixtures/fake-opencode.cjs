@@ -815,6 +815,22 @@ function currentSessionStatus(sessionId) {
   return sessionStatuses.get(sessionId) || 'idle'
 }
 
+// Focused E3R3 review defect 1: FAKE_OPENCODE_DELAY_SESSION_CREATE_MS
+// delays the fake's POST /session RESPONSE by a bounded, configurable
+// amount (the FAKE_OPENCODE_TITLE_SEQUENCE_DELAY_MS delay-knob pattern).
+// The `session_create_requested` audit row still fires at REQUEST RECEIPT
+// exactly as in the ungated arm; only the response (and the session row
+// persist + the `session_created` audit row behind it) park behind the
+// delay — so a spec can hold a freshopencode first send's materialization
+// (the Rust side's per-session mutex parks awaiting the creation)
+// deterministically in flight, then let the turn proceed when the delay
+// elapses. Off by default (unset or 0): byte-identical behavior for every
+// other spec.
+const sessionCreateDelayMs = Math.max(
+  0,
+  Number(process.env.FAKE_OPENCODE_DELAY_SESSION_CREATE_MS || 0),
+)
+
 // Name-reliability Task 4: FAKE_OPENCODE_TITLE_SEQUENCE (pipe-separated
 // titles) mimics opencode naming a session after its first exchange: after
 // a session's FIRST prompt, each title is written to the session row and
@@ -1773,6 +1789,14 @@ const server = http.createServer(async (req, res) => {
           })
         })
         return
+      }
+      // The bounded creation-delay window (the E3R3 knob documented at its
+      // declaration): the request is audited above at receipt, and only the
+      // response parks here — the turn's materialization on the Rust side
+      // holds its per-session mutex awaiting this answer for exactly the
+      // delay's duration.
+      if (sessionCreateDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, sessionCreateDelayMs))
       }
       try {
         const input = parseJsonText(await readRequestBody(req)) || {}
