@@ -27,19 +27,57 @@
 //! rejected submit can never wedge the pane busy), confirmed by the
 //! transcript's own `user_message`.
 //!
-//! ATTACH BASELINE (whole-delta review Major 1): the records already on a
+//! ATTACH BASELINE, SUBMIT-ANCHORED (whole-delta review round 2, Major 2;
+//! round 1 established the baseline itself): the records already on a
 //! transcript at lane attach (resume, rebind, restart-restore — the
 //! transcript can carry the conversation's whole history) are fed to
-//! [`AntigravityActivityTracker::note_attach_baseline`], which seeds the
-//! per-settle dedupe watermark and the busy state from disk WITHOUT
-//! emitting effects — historical settles never mint completions, and the
-//! current in-flight turn (a user record after the last settle) is
-//! recognized as busy. Only records appended AFTER the attach point
-//! stream as live events. This is why the hub attaches the tailer at
-//! `Start` for EVERY transcript size (the amplifier's catch-up cap does
-//! not apply here: replayed history classifies as baseline, never as
-//! live attention, and a settle written during the locator's window is
-//! covered by the scan instead of being skipped by an Eof attach).
+//! [`AntigravityActivityTracker::note_attach_baseline`] together with
+//! the SUBMIT that armed the pane (the located Enter's `at` — the
+//! locator's match proved that submit is the pane's own). The baseline
+//! boundary is that submit's `at`:
+//!
+//! * a record whose own `at` PREDATES the submit is HISTORY: it seeds
+//!   the per-settle dedupe watermark and the busy state WITHOUT
+//!   emitting effects — historical settles never mint completions, and
+//!   the current in-flight turn (a user record after the last settle)
+//!   is recognized as busy (round 1's property, unchanged);
+//! * a record whose own `at` is AT/AFTER the submit is a LIVE turn
+//!   event even though the first drain reads it from disk: the pane's
+//!   prompt and — the round-2 case — a QUICK turn's settle can land on
+//!   disk during the locator's 2 s window, before the tailer ever
+//!   attaches. That settle is a turn end the user may not have
+//!   witnessed; it rings EXACTLY ONCE through the same `note_record`
+//!   path a streamed record takes (the ledger + seeded watermark
+//!   dedupe makes re-drains of it inert). The `>=` comparison matches
+//!   the locator's recency rule exactly — the same operator that
+//!   proved the record is the pane's own classifies it live.
+//! * a record with an UNPARSEABLE `at` cannot PROVE it postdates the
+//!   submit — it fails toward history/silence (unlike a live-streamed
+//!   record, whose ARRIVAL after attach proves recency and which folds
+//!   `now` in).
+//!
+//! A pane attached with NO captured submit (the `None` boundary — e.g.
+//! a future restart-resume arming purely from on-disk state) has its
+//! boundary defined honestly from what the records themselves prove:
+//! the LATEST user record's `at` stands in as the effective submit
+//! (the newest deliberate user action the transcript shows). The last
+//! turn's settle therefore rings — the attention contract's
+//! tiebreaker (a turn end the user may not have witnessed must ring;
+//! the settle may have landed while the pane was disconnected);
+//! everything before the latest user record is history and stays
+//! silent. Residual: if the user DID witness that last turn end (the
+//! restart happened long after it settled), this rings one false bell
+//! per restored pane — accepted because the pane owes exactly the turn
+//! ends it cannot prove were witnessed, and every current attach path
+//! (locator-driven) carries a real captured submit anyway. A
+//! transcript with NO user record proves no user action at all:
+//! everything is history.
+//!
+//! This is why the hub attaches the tailer at `Start` for EVERY
+//! transcript size (the amplifier's catch-up cap does not apply here:
+//! replayed history classifies as baseline, never as live attention,
+//! and a settle written during the locator's window is classified by
+//! the submit boundary instead of being skipped by an Eof attach).
 //!
 //! The tailer ([`AntigravityTranscriptTailer`]) is the amplifier
 //! `AmplifierEventsTailer` pattern: an offset-based incremental reader that
@@ -421,12 +459,13 @@ struct TerminalActivity {
     submit_grace_retried: bool,
     force_read_logged: bool,
     next_force_read_at: Option<i64>,
-    /// The attach-time BASELINE watermark (whole-delta review Major 1):
-    /// the `at` of the last COMPLETING settle already on disk when the
-    /// lane attached. Consulted beside the ledger's
+    /// The attach-time BASELINE watermark (whole-delta review Major 1,
+    /// submit-anchored in round 2): the `at` of the last COMPLETING
+    /// settle among the records that PREDATE the boundary submit when
+    /// the lane attached. Consulted beside the ledger's
     /// `last_completion_at` by the per-settle dedupe, so replays of
-    /// pre-attach settles are inert and the FIRST live settle after
-    /// attach must postdate every historical one. Resides on the
+    /// pre-submit settles are inert and the FIRST live settle after the
+    /// boundary must postdate every historical one. Resides on the
     /// per-track state (a respawn re-seeds it), unlike the ledger's
     /// deliberately-surviving snapshots.
     attach_baseline_completed_at: Option<i64>,
@@ -592,39 +631,78 @@ impl AntigravityActivityTracker {
         changed(Some(&previous), next)
     }
 
-    /// The attach-time BASELINE (whole-delta review Major 1): seed the
-    /// tracker from the transcript's records that are ALREADY on disk at
-    /// lane attach WITHOUT emitting effects — historical settles never
-    /// mint completions. What the baseline seeds:
+    /// The attach-time BASELINE, anchored to the SUBMIT (whole-delta
+    /// review round 1 established the baseline; round 2, Major 2 anchored
+    /// it): seed the tracker from the transcript's records that are
+    /// ALREADY on disk at lane attach, classified at the baseline
+    /// boundary — the captured submit's `at` (`submit_at`). What the
+    /// baseline seeds:
     ///
-    /// * the per-settle dedupe watermark: the `at` of the last COMPLETING
-    ///   settle in the records (replays of pre-attach settles are inert
-    ///   forever after);
-    /// * the busy state, judged from the record sequence: a user record
-    ///   after the last completing settle means the current turn is IN
-    ///   FLIGHT — the pane arms confirmed busy (the [`Self::note_confirm_busy`]
-    ///   transition, flap-free when the pane is already provisionally
-    ///   busy); otherwise the transcript is fully settled and the pane
-    ///   seeds idle — a provisionally-busy pane whose turn already
-    ///   settled during the locator's window resolves with a public
-    ///   Busy→Idle upsert but NO completion and NO attention boundary
-    ///   (the gate treats an idle phase report as inert, so this rings
-    ///   nothing).
+    /// * HISTORICAL records (own `at` < the submit, or `at` unparseable
+    ///   — unprovable recency fails toward silence): the per-settle
+    ///   dedupe watermark (the `at` of the last completing settle among
+    ///   them; replays of pre-submit settles are inert forever after)
+    ///   and the busy state, judged from their sequence: a user record
+    ///   after the last completing settle means the turn was in flight
+    ///   at the submit — the pane arms confirmed busy (the
+    ///   [`Self::note_confirm_busy`] transition, flap-free when the pane
+    ///   is already provisionally busy); otherwise the pre-submit
+    ///   history ended settled and the pane seeds idle — a
+    ///   provisionally-busy pane whose pre-submit history ended settled
+    ///   resolves with a public Busy→Idle upsert but NO completion and
+    ///   NO attention boundary (the gate treats an idle phase report as
+    ///   inert, so this rings nothing).
+    /// * LIVE records (own `at` >= the submit): replayed through
+    ///   [`Self::note_record`] exactly as if the tailer had streamed
+    ///   them — the pane's own prompt confirms busy, and a settle that
+    ///   landed during the locator's 2 s window (the round-2 case)
+    ///   mints its completion ONCE (the ledger dedupe makes re-drains of
+    ///   the same record inert).
     ///
-    /// Records appended after the baseline stream live through
-    /// [`Self::note_record`] exactly as before. A partial settle
-    /// (`fullyIdle:false`) in the baseline does not end a turn — the turn
-    /// stays in flight. Untracked terminal: a no-op, like every note.
+    /// `submit_at == None` (no captured submit — e.g. a future
+    /// restart-resume arming from on-disk state): the boundary is
+    /// derived honestly from the records (the module header's contract):
+    /// the LATEST user record's `at` stands in as the effective submit;
+    /// with no user record at all, everything is history. When live
+    /// records exist they alone drive the phase (the pane's own
+    /// post-submit turn); the historical in-flight fold then only
+    /// applies to an all-historical baseline. Records appended after
+    /// the baseline stream live through [`Self::note_record`] exactly as
+    /// before. Untracked terminal: a no-op, like every note.
     pub fn note_attach_baseline(
         &mut self,
         terminal_id: &str,
         records: &[AntigravityTranscriptRecord],
         now: i64,
+        submit_at: Option<i64>,
     ) -> Vec<AntigravityEffect> {
-        // Derive the baseline from the record sequence (file order).
+        // The boundary: the captured submit's `at`, or — with none — the
+        // latest user record's `at` (the module header's None contract);
+        // a transcript with no user record (or an unparseable one) proves
+        // no provable user action: everything is history (`now`).
+        let boundary = match submit_at {
+            Some(at) => at,
+            None => records
+                .iter()
+                .rev()
+                .find(|record| matches!(record.kind, AntigravityRecordKind::UserMessage))
+                .and_then(|record| record.at)
+                .unwrap_or(now),
+        };
+        // Historical fold (file order): records whose own `at` predates
+        // the boundary — plus unparseable-`at` records (unprovable
+        // recency fails toward silence). Live records (own `at` >= the
+        // boundary — the same comparison as the locator's recency rule)
+        // are collected for the replay below.
         let mut baseline_completed_at: Option<i64> = None;
         let mut in_flight = false;
+        let mut live: Vec<AntigravityTranscriptRecord> = Vec::new();
         for record in records {
+            let is_live = record.at.map(|at| at >= boundary).unwrap_or(false);
+            if is_live {
+                live.push(*record);
+                continue;
+            }
             let at = record.at.unwrap_or(now);
             match record.kind {
                 AntigravityRecordKind::UserMessage => in_flight = true,
@@ -648,33 +726,48 @@ impl AntigravityActivityTracker {
             };
             state.attach_baseline_completed_at = baseline_completed_at;
         }
+        // LIVE replay: records at/after the submit flow through
+        // `note_record` exactly as a streamed record would — minting the
+        // pane's own prompt (busy) and a window-settle's completion
+        // (exactly once; the ledger records it, so re-drains of the same
+        // record are inert). When live records exist, they alone drive
+        // the phase: the pane's own post-submit turn is the current
+        // truth.
+        let mut effects = Vec::new();
+        for record in &live {
+            effects.extend(self.note_record(terminal_id, record, now));
+        }
+        if !live.is_empty() {
+            return effects;
+        }
+        // All-historical baseline: resolve the phase from the fold.
         if in_flight {
-            // The transcript's latest records show a turn in flight: the
-            // pane arms (confirmed) busy through the exact rebind-attach
-            // confirm transition.
-            return self.note_confirm_busy(terminal_id, now);
+            // The transcript's pre-submit records show a turn in flight:
+            // the pane arms (confirmed) busy through the exact
+            // rebind-attach confirm transition.
+            effects.extend(self.note_confirm_busy(terminal_id, now));
+            return effects;
         }
         // Fully settled on disk: seed idle-with-baseline. A provisional
         // busy resolves here (the transcript already proved the turn's
         // fate); a confirmed stale busy (a rebind away from a conversation
         // whose records ended settled) clears too — the baseline is the
         // pane's CURRENT truth.
-        let Some(state) = self.states.get_mut(terminal_id) else {
-            return Vec::new();
-        };
-        state.busy_confirmed = false;
-        state.submit_grace_deadline = None;
-        state.force_read_logged = false;
-        state.next_force_read_at = None;
-        state.last_observed_at = now;
-        if state.phase != AntigravityPhase::Idle {
-            let previous = state.to_record();
-            state.phase = AntigravityPhase::Idle;
-            state.updated_at = now;
-            let next = state.to_record();
-            return changed(Some(&previous), next);
+        if let Some(state) = self.states.get_mut(terminal_id) {
+            state.busy_confirmed = false;
+            state.submit_grace_deadline = None;
+            state.force_read_logged = false;
+            state.next_force_read_at = None;
+            state.last_observed_at = now;
+            if state.phase != AntigravityPhase::Idle {
+                let previous = state.to_record();
+                state.phase = AntigravityPhase::Idle;
+                state.updated_at = now;
+                let next = state.to_record();
+                effects.extend(changed(Some(&previous), next));
+            }
         }
-        Vec::new()
+        effects
     }
 
     /// Consume one classified transcript record (the Stage-1 candidate
@@ -732,8 +825,8 @@ impl AntigravityActivityTracker {
                 // completion, no phase flap, no liveness feed — a stale
                 // record is not evidence the running turn is alive.
                 // The watermark is the LEDGER's last completion OR the
-                // attach-time baseline (whole-delta review Major 1) — a
-                // replay of a pre-attach settle is the same settle.
+                // attach baseline (whole-delta review Major 1, round 2)
+                // — a replay of a pre-submit settle is the same settle.
                 let last_completed_at = self
                     .ledger
                     .last_completion_at(terminal_id)
@@ -1309,7 +1402,11 @@ mod tests {
             settled(true, false, Some(400)),
             user_message(Some(1_050)),
         ];
-        let effects = tracker.note_attach_baseline("t1", &records, 1_100);
+        // The boundary is the pane's submit (1_000): everything on disk
+        // predates it — history (round 1's property: pre-submit settles
+        // never ring; the boundary classification replaces round 1's
+        // attach-instant classification).
+        let effects = tracker.note_attach_baseline("t1", &records, 1_100, Some(1_000));
         assert!(
             effects.is_empty(),
             "no completion, no attention, no public flap — the pane is already \
@@ -1337,14 +1434,14 @@ mod tests {
         assert_eq!(phases(&effects), vec![AntigravityPhase::Idle]);
     }
 
-    /// Whole-delta review Major 1, second half: a settle already on disk
-    /// at attach (the pane's turn settled during the locator's 2 s
-    /// window) is BASELINE — it never rings. The provisional busy
-    /// resolves to the transcript's settled truth (a public Busy→Idle
-    /// upsert, but never a completion or attention boundary — the gate
-    /// treats an idle phase report as inert), the seeded watermark
-    /// swallows a replay of that same settle, and the FOLLOW-UP turn
-    /// completes exactly once.
+    /// A fully-settled PRE-SUBMIT history (the resumed pane whose fresh
+    /// submit is still awaiting its user record): everything on disk
+    /// predates the submit, so it is all history — the provisional busy
+    /// resolves to the transcript's settled truth silently (a public
+    /// Busy→Idle upsert, but never a completion or attention boundary —
+    /// the gate treats an idle phase report as inert), the seeded
+    /// watermark swallows a replay of the same settle, and the
+    /// FOLLOW-UP turn completes exactly once.
     #[test]
     fn seed_attach_baseline_fully_settled_resolves_the_provisional_busy_silently() {
         let mut tracker = AntigravityActivityTracker::new();
@@ -1352,7 +1449,7 @@ mod tests {
         tracker.note_submit("t1", 1_000);
 
         let records = vec![user_message(Some(100)), settled(true, false, Some(500))];
-        let effects = tracker.note_attach_baseline("t1", &records, 1_100);
+        let effects = tracker.note_attach_baseline("t1", &records, 1_100, Some(1_000));
         assert_eq!(
             phases(&effects),
             vec![AntigravityPhase::Idle],
@@ -1384,6 +1481,61 @@ mod tests {
         assert_eq!(completions(&effects), vec![1]);
     }
 
+    /// Whole-delta review round 2, Major 2: the baseline is anchored to
+    /// the pane's SUBMIT — a settle already on disk at attach is
+    /// HISTORICAL only when its own `at` predates the submit that armed
+    /// the pane. A quick first turn can settle during the locator's 2 s
+    /// window (before the tailer attaches): that settle's `at` is AFTER
+    /// the submit, so it is a LIVE turn end the user may not have
+    /// witnessed — it must ring EXACTLY ONCE (the per-settle dedupe
+    /// covers re-drains of the same record).
+    #[test]
+    fn seed_attach_baseline_rings_a_settle_landed_after_the_submit() {
+        let mut tracker = AntigravityActivityTracker::new();
+        tracker.track_terminal("t1", Some("conv-1"), 0);
+        // The pane's captured submit (the hub's Enter capture) armed the
+        // provisional busy, as in production.
+        tracker.note_submit("t1", 1_000);
+
+        // On disk at attach: an older settled turn (its settle predates
+        // the submit — historical), then the pane's own prompt + its
+        // QUICK settle, both written during the locator's window (their
+        // `at`s postdate the submit — live).
+        let records = vec![
+            user_message(Some(100)),
+            settled(true, false, Some(200)),
+            user_message(Some(1_010)),
+            settled(true, false, Some(1_050)),
+        ];
+        let effects = tracker.note_attach_baseline("t1", &records, 1_200, Some(1_000));
+        assert_eq!(
+            completions(&effects),
+            vec![1],
+            "a settle whose `at` is AFTER the submit rings as a live completion \
+             even though it was already on disk at attach: {effects:?}"
+        );
+        assert_eq!(phases(&effects), vec![AntigravityPhase::Idle]);
+        assert_eq!(tracker.list()[0].phase, AntigravityPhase::Idle);
+
+        // Exactly once: a byte-faithful replay of the rung settle (same
+        // `at`) is inert against the ledger's recorded completion.
+        assert!(tracker
+            .note_record("t1", &settled(true, false, Some(1_050)), 2_000)
+            .is_empty());
+        // The pre-submit settle rang nothing either — a replay of it is
+        // inert too (the seeded historical watermark).
+        assert!(tracker
+            .note_record("t1", &settled(true, false, Some(200)), 2_100)
+            .is_empty());
+
+        // The FOLLOW-UP turn completes exactly once, with seq 2 (the
+        // window settle consumed seq 1).
+        tracker.note_submit("t1", 3_000);
+        tracker.note_record("t1", &user_message(Some(3_050)), 3_050);
+        let effects = tracker.note_record("t1", &settled(true, false, Some(4_000)), 4_000);
+        assert_eq!(completions(&effects), vec![2]);
+    }
+
     /// Baseline edge shapes: an empty baseline seeds idle-with-baseline;
     /// a baseline ending in a PARTIAL settle (fullyIdle:false — async
     /// work outstanding) seeds busy; an untracked terminal is a no-op.
@@ -1393,7 +1545,9 @@ mod tests {
         // idle, no effects; the pane's first live turn behaves normally.
         let mut tracker = AntigravityActivityTracker::new();
         tracker.track_terminal("t1", Some("conv-1"), 0);
-        assert!(tracker.note_attach_baseline("t1", &[], 100).is_empty());
+        assert!(tracker
+            .note_attach_baseline("t1", &[], 100, None)
+            .is_empty());
         assert_eq!(tracker.list()[0].phase, AntigravityPhase::Idle);
         tracker.note_submit("t1", 1_000);
         tracker.note_record("t1", &user_message(Some(1_050)), 1_050);
@@ -1401,10 +1555,13 @@ mod tests {
         assert_eq!(completions(&effects), vec![1]);
 
         // Partial settle outstanding: the turn has NOT ended — busy seeds.
+        // No captured submit (`None`): the boundary derives to the latest
+        // user record (100), so the user record + its partial settle
+        // replay LIVE and arm busy on the previously-idle pane.
         let mut tracker = AntigravityActivityTracker::new();
         tracker.track_terminal("t2", Some("conv-2"), 0);
         let records = vec![user_message(Some(100)), settled(false, false, Some(200))];
-        let effects = tracker.note_attach_baseline("t2", &records, 300);
+        let effects = tracker.note_attach_baseline("t2", &records, 300, None);
         assert_eq!(phases(&effects), vec![AntigravityPhase::Busy]);
         assert!(completions(&effects).is_empty());
         // No completing settle was on disk: the watermark stays unset and
@@ -1412,14 +1569,15 @@ mod tests {
         let effects = tracker.note_record("t2", &settled(true, false, Some(1_000)), 1_000);
         assert_eq!(completions(&effects), vec![1]);
 
-        // An errored settle in the baseline ENDS the turn (attention is
-        // outcome-uniform): the pane seeds idle (no public change — it
-        // was already idle) and the watermark seeds from the errored
-        // settle's `at`, so a replay of it is inert.
+        // An errored HISTORICAL settle (at/before an explicit submit
+        // boundary) ENDS the turn (attention is outcome-uniform): the
+        // pane seeds idle (no public change — it was already idle) and
+        // the watermark seeds from the errored settle's `at`, so a
+        // replay of it is inert.
         let mut tracker = AntigravityActivityTracker::new();
         tracker.track_terminal("t3", Some("conv-3"), 0);
         let records = vec![user_message(Some(100)), settled(false, true, Some(600))];
-        let effects = tracker.note_attach_baseline("t3", &records, 700);
+        let effects = tracker.note_attach_baseline("t3", &records, 700, Some(700));
         assert!(effects.is_empty());
         assert_eq!(tracker.list()[0].phase, AntigravityPhase::Idle);
         assert!(tracker
@@ -1429,9 +1587,78 @@ mod tests {
         // Untracked terminal: a no-op like every other note.
         let mut tracker = AntigravityActivityTracker::new();
         assert!(tracker
-            .note_attach_baseline("t-unknown", &[user_message(Some(10))], 20)
+            .note_attach_baseline("t-unknown", &[user_message(Some(10))], 20, None)
             .is_empty());
         assert!(tracker.list().is_empty());
+    }
+
+    /// The NO-CAPTURED-SUBMIT boundary (the module header's None
+    /// contract): the latest user record's `at` stands in as the
+    /// effective submit — settles before it are history (silent), the
+    /// LAST turn's settle is a live (potentially unwitnessed) turn end
+    /// and rings exactly once; a transcript with no user record at all
+    /// proves no user action and stays entirely silent.
+    #[test]
+    fn seed_attach_baseline_without_a_captured_submit_uses_the_latest_user_record() {
+        // Two settled turns; the second (latest) turn's settle postdates
+        // the derived boundary (its own user record) and rings.
+        let mut tracker = AntigravityActivityTracker::new();
+        tracker.track_terminal("t1", Some("conv-1"), 0);
+        let records = vec![
+            user_message(Some(100)),
+            settled(true, false, Some(200)),
+            user_message(Some(300)),
+            settled(true, false, Some(400)),
+        ];
+        let effects = tracker.note_attach_baseline("t1", &records, 500, None);
+        assert_eq!(
+            completions(&effects),
+            vec![1],
+            "the latest turn's settle rings once (the effective-submit \
+             boundary is the latest user record): {effects:?}"
+        );
+        // The live replay mints the turn's own phase arc: the replayed
+        // prompt flips the fresh pane Busy, the settle flips it Idle.
+        assert_eq!(
+            phases(&effects),
+            vec![AntigravityPhase::Busy, AntigravityPhase::Idle]
+        );
+        assert_eq!(tracker.list()[0].phase, AntigravityPhase::Idle);
+        // Replays are inert: the rung settle via the LEDGER, the older
+        // settle via the seeded historical watermark.
+        assert!(tracker
+            .note_record("t1", &settled(true, false, Some(400)), 600)
+            .is_empty());
+        assert!(tracker
+            .note_record("t1", &settled(true, false, Some(200)), 700)
+            .is_empty());
+
+        // No user record at all: no provable user action, everything is
+        // history — silent, and the pane seeds from the settled fold.
+        let mut tracker = AntigravityActivityTracker::new();
+        tracker.track_terminal("t2", Some("conv-2"), 0);
+        let records = vec![settled(true, false, Some(150))];
+        let effects = tracker.note_attach_baseline("t2", &records, 300, None);
+        assert!(
+            effects.is_empty(),
+            "a transcript with no user record owes no bell: {effects:?}"
+        );
+        assert_eq!(tracker.list()[0].phase, AntigravityPhase::Idle);
+
+        // An in-flight tail with no captured submit: the latest user
+        // record IS the boundary, so it replays live and arms busy (the
+        // restored pane shows the turn still running).
+        let mut tracker = AntigravityActivityTracker::new();
+        tracker.track_terminal("t3", Some("conv-3"), 0);
+        let records = vec![
+            user_message(Some(100)),
+            settled(true, false, Some(200)),
+            user_message(Some(250)),
+        ];
+        let effects = tracker.note_attach_baseline("t3", &records, 300, None);
+        assert_eq!(phases(&effects), vec![AntigravityPhase::Busy]);
+        assert!(completions(&effects).is_empty());
+        assert_eq!(tracker.list()[0].phase, AntigravityPhase::Busy);
     }
 
     #[test]

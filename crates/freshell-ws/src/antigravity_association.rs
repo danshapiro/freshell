@@ -389,6 +389,7 @@ pub async fn drain_and_associate(state: &WsState) {
                         &hit.terminal_id,
                         &hit.conversation_id,
                         &hit.transcript_path,
+                        Some(hit.submit_at_ms),
                     );
                 }
                 tracing::debug!(
@@ -406,6 +407,7 @@ pub async fn drain_and_associate(state: &WsState) {
                     &hit.conversation_id,
                     &hit.transcript_path,
                     entry.cwd.as_deref(),
+                    hit.submit_at_ms,
                 )
                 .await;
                 if !rebound {
@@ -424,6 +426,7 @@ pub async fn drain_and_associate(state: &WsState) {
                     &hit.conversation_id,
                     &hit.transcript_path,
                     entry.cwd.as_deref(),
+                    hit.submit_at_ms,
                 )
                 .await;
                 if !adopted {
@@ -514,6 +517,7 @@ pub(crate) async fn adopt_antigravity_identity(
     conversation_id: &str,
     transcript_path: &std::path::Path,
     cwd: Option<&str>,
+    submit_at_ms: i64,
 ) -> bool {
     if antigravity_claim_refused(state, terminal_id, conversation_id).await {
         return false;
@@ -536,6 +540,7 @@ pub(crate) async fn adopt_antigravity_identity(
         Some(transcript_path),
         cwd,
         None,
+        submit_at_ms,
     )
     .await;
     if !applied {
@@ -593,6 +598,7 @@ pub(crate) async fn rebind_antigravity_identity(
     new_conversation_id: &str,
     transcript_path: &std::path::Path,
     cwd: Option<&str>,
+    submit_at_ms: i64,
 ) -> bool {
     // Guard 1: the pane is the LIVE owner of the superseded id.
     if state
@@ -639,6 +645,7 @@ pub(crate) async fn rebind_antigravity_identity(
         Some(transcript_path),
         cwd,
         Some(old_conversation_id),
+        submit_at_ms,
     )
     .await;
     if !applied {
@@ -691,7 +698,9 @@ pub(crate) async fn rebind_antigravity_identity(
 /// `terminal.session.associated` (the ONE shared provider-parameterized
 /// broadcaster) -> the activity hub's transcript-lane bind (plan Task 8:
 /// the tracker bind + lane attach ride the same channel-deferred hub
-/// event) — then the caller's coordinator commit.
+/// event, carrying the located submit's `at` as the lane baseline's
+/// boundary — whole-delta review round 2, Major 2) — then the caller's
+/// coordinator commit.
 async fn apply_antigravity_identity(
     state: &WsState,
     terminal_id: &str,
@@ -699,6 +708,7 @@ async fn apply_antigravity_identity(
     transcript_path: Option<&std::path::Path>,
     cwd: Option<&str>,
     previous_conversation_id: Option<&str>,
+    submit_at_ms: i64,
 ) -> bool {
     if !crate::pane_ledger::ledger_resolve_identity(
         state,
@@ -804,9 +814,17 @@ async fn apply_antigravity_identity(
     // Antigravity plan Task 8: bind the activity lane to the pane's now-
     // durable conversation (adopt AND rebind land here). Channel-deferred
     // by the hub — the lane attach, watcher, and every frame it mints run
-    // on the hub task.
+    // on the hub task. The located submit's `at` rides along as the
+    // lane's BASELINE BOUNDARY (round 2, Major 2): settles on disk that
+    // predate the submit are historical and silent; a settle after it
+    // (a quick turn that landed during the locator's window) rings.
     if let (Some(hub), Some(transcript)) = (&state.activity, transcript_path) {
-        hub.attach_antigravity_association(terminal_id, conversation_id, transcript);
+        hub.attach_antigravity_association(
+            terminal_id,
+            conversation_id,
+            transcript,
+            Some(submit_at_ms),
+        );
     }
     true
 }

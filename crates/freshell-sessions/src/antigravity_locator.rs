@@ -140,6 +140,14 @@ pub struct AntigravityLocated {
     pub terminal_id: String,
     pub conversation_id: String,
     pub transcript_path: PathBuf,
+    /// The captured submit's Enter `at` — the SUBMIT-ANCHORED baseline
+    /// boundary for the activity lane's attach (whole-delta review round
+    /// 2, Major 2): a settle already on disk when the lane attaches is
+    /// HISTORICAL only when its own `at` predates this submit; a settle
+    /// after it is a live turn end and rings. The match itself proved
+    /// this submit armed the pane (content + recency), so it is the
+    /// exact boundary the tracker needs.
+    pub submit_at_ms: i64,
 }
 
 /// The pane's captured submit (the flushed line at the Enter byte).
@@ -333,6 +341,7 @@ impl AntigravityLocator {
                     terminal_id: terminal_id.clone(),
                     conversation_id: summary.conversation_id,
                     transcript_path: path.clone(),
+                    submit_at_ms: submit.at_ms,
                 });
             }
             match matches.len() {

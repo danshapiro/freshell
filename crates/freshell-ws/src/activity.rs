@@ -214,10 +214,18 @@ enum HubEvent {
     /// (every locator hit re-asserts the attach; the worker no-ops a lane
     /// that already tracks the same conversation and REPLACES one that
     /// tracks a superseded one — the codex re-attach replacement rule).
+    /// `submit_at_ms` is the located submit's Enter `at` — the SUBMIT-
+    /// ANCHORED baseline boundary (whole-delta review round 2, Major 2):
+    /// records already on disk whose `at` predates the submit classify
+    /// as history (silent); records at/after it classify as live turn
+    /// events even though the first drain reads them from disk. `None`
+    /// when the caller has no captured submit (see the tracker's module
+    /// header for that boundary's honest derivation).
     AntigravityAttach {
         terminal_id: String,
         session_id: String,
         transcript_path: PathBuf,
+        submit_at_ms: Option<i64>,
     },
     /// The inotify watcher saw a change on an antigravity lane's bound
     /// transcript (mirror of `AmplifierFsChange`; the notify thread never
@@ -330,6 +338,14 @@ struct AntigravityLane {
     /// records baseline and everything appended after streams live (the
     /// hub task's FIFO order guarantees no live drain can precede it).
     baseline_pending: bool,
+    /// The submit-anchored BASELINE BOUNDARY (whole-delta review round 2,
+    /// Major 2): the located submit's Enter `at`, consumed by the first
+    /// drain — records on disk whose `at` predates it are history
+    /// (silent), records at/after it are live turn events (a quick turn
+    /// that settled during the locator's 2 s window rings). `None` = no
+    /// captured submit; the tracker derives that boundary honestly (see
+    /// its module header).
+    baseline_submit_at: Option<i64>,
     /// Keeps the inotify watcher alive for the lane's lifetime.
     _watcher: notify::RecommendedWatcher,
 }
@@ -740,23 +756,29 @@ impl ActivityHub {
     /// tails are the producers; hub-level tests inject directly). The
     /// worker attaches at `Start` for EVERY transcript size and the
     /// first drain classifies the existing records as the tracker's
-    /// BASELINE (whole-delta review Major 1): historical settles never
-    /// ring, an in-flight turn seeds confirmed busy, a settle written
-    /// during the locator's window resolves the pane to idle without
-    /// ringing, and only records appended after attach stream live.
-    /// Channel-deferred (mirror of `attach_codex_rollout`): the tailer
-    /// attach (file I/O), watcher registration, and ALL frame emission
-    /// run on the single hub task.
+    /// BASELINE — anchored to the SUBMIT (`submit_at_ms`, whole-delta
+    /// review round 2, Major 2): records whose `at` predates the submit
+    /// seed the dedupe watermark and busy state without ringing, an
+    /// in-flight turn seeds confirmed busy, and a settle written after
+    /// the submit (a quick turn that landed during the locator's 2 s
+    /// window) rings as the live turn end it is; only records appended
+    /// after attach stream live beyond that. `None` = no captured
+    /// submit (the tracker's module header defines that boundary
+    /// honestly). Channel-deferred (mirror of `attach_codex_rollout`):
+    /// the tailer attach (file I/O), watcher registration, and ALL frame
+    /// emission run on the single hub task.
     pub fn attach_antigravity_association(
         &self,
         terminal_id: &str,
         session_id: &str,
         transcript_path: &Path,
+        submit_at_ms: Option<i64>,
     ) {
         let _ = self.tx.send(HubEvent::AntigravityAttach {
             terminal_id: terminal_id.to_string(),
             session_id: session_id.to_string(),
             transcript_path: transcript_path.to_path_buf(),
+            submit_at_ms,
         });
     }
 
@@ -891,14 +913,19 @@ impl ActivityHub {
     /// Antigravity plan Task 8: hub-task worker for
     /// `HubEvent::AntigravityAttach` — bind identity (idempotent), attach
     /// the transcript tailer (ALWAYS at `Start` — whole-delta review
-    /// Major 1: the first drain classifies the whole existing file as the
-    /// tracker's BASELINE, so a young conversation and a months-old
-    /// resume take the same path — historical settles never ring, the
-    /// in-flight turn seeds busy, and a settle written during the
-    /// locator's window is covered by the scan instead of being skipped
-    /// by an over-cap Eof attach), watch it via inotify, and run the
-    /// initial (baseline) drain.
-    fn attach_antigravity_lane(&self, terminal_id: &str, session_id: &str, transcript_path: &Path) {
+    /// Major 1: the first drain classifies the whole existing file as
+    /// the tracker's BASELINE, so a young conversation and a months-old
+    /// resume take the same path; the baseline itself is anchored to
+    /// the located SUBMIT — round 2, Major 2 — so historical settles
+    /// never ring while a settle written after the submit does), watch
+    /// it via inotify, and run the initial (baseline) drain.
+    fn attach_antigravity_lane(
+        &self,
+        terminal_id: &str,
+        session_id: &str,
+        transcript_path: &Path,
+        submit_at_ms: Option<i64>,
+    ) {
         use notify::Watcher;
         // Deferred-attach guard (mirror of `attach_codex_lane`): an Exit
         // processed before this attach already tore the terminal down —
@@ -1024,6 +1051,7 @@ impl ActivityHub {
                     session_id: session_id.to_string(),
                     transcript_path: transcript_path.to_path_buf(),
                     baseline_pending: true,
+                    baseline_submit_at: submit_at_ms,
                     _watcher: watcher,
                 },
             );
@@ -1031,9 +1059,12 @@ impl ActivityHub {
         };
         self.emit(frames);
         // Initial drain: the BASELINE pass over everything on disk at
-        // attach (whole-delta review Major 1) — historical records seed
-        // the dedupe watermark + busy state WITHOUT effects, so only
-        // records appended after this point stream as live events.
+        // attach (whole-delta review Major 1) — records whose `at`
+        // predates the submit that armed the pane seed the dedupe
+        // watermark + busy state WITHOUT effects; records at/after it
+        // (round 2, Major 2 — e.g. a quick turn that settled during the
+        // locator's 2 s window) replay as LIVE turn events, so only
+        // genuinely appended-after records stream live beyond this.
         self.drain_antigravity_lane(terminal_id);
     }
 
@@ -1041,13 +1072,19 @@ impl ActivityHub {
     /// transcript lane. Called on inotify change events, deadman/grace
     /// force-reads, and once at attach. The FIRST drain after attach (the
     /// lane's `baseline_pending` flag) classifies its records as the
-    /// tracker's BASELINE (whole-delta review Major 1: history seeds the
-    /// dedupe watermark + busy state without effects — old settles never
-    /// ring); every later drain streams live. A degrade drops the lane and
-    /// applies crash semantics (the tracker's `note_verify_failed`: a
-    /// CONFIRMED busy clears and rings the attention boundary; a
-    /// provisional busy reverts silently) — the pane's next submit
-    /// re-opens the locator window and the sweep re-attaches.
+    /// tracker's BASELINE — anchored to the lane's `baseline_submit_at`
+    /// (whole-delta review round 2, Major 2): records whose `at`
+    /// predates the submit seed the watermark + busy state without
+    /// effects (old settles never ring — round 1's property), while
+    /// records at/after the submit replay through `note_record` as the
+    /// LIVE turn events they are (a quick turn that settled during the
+    /// locator's 2 s window rings exactly once; the per-settle dedupe
+    /// covers re-drains); every later drain streams live. A degrade
+    /// drops the lane and applies crash semantics (the tracker's
+    /// `note_verify_failed`: a CONFIRMED busy clears and rings the
+    /// attention boundary; a provisional busy reverts silently) — the
+    /// pane's next submit re-opens the locator window and the sweep
+    /// re-attaches.
     fn drain_antigravity_lane(&self, terminal_id: &str) {
         self.stats.tail_reads.fetch_add(1, Ordering::SeqCst);
         let frames = {
@@ -1063,16 +1100,18 @@ impl ActivityHub {
                 } => {
                     if lane.baseline_pending {
                         // The attach-time baseline: everything on disk at
-                        // attach, classified WITHOUT live effects. The
-                        // flag clears in the same lock scope — the read
+                        // attach, split at the submit boundary. The flag
+                        // clears in the same lock scope — the read
                         // consumed exactly the attach-time file size, so
                         // any later drain (inotify-driven, FIFO-ordered
                         // behind this one on the hub task) is live.
                         lane.baseline_pending = false;
+                        let submit_at = lane.baseline_submit_at.take();
                         let effects = inner.antigravity_tracker.note_attach_baseline(
                             terminal_id,
                             &records,
                             now_ms(),
+                            submit_at,
                         );
                         let (frames, _) = antigravity_frames(&mut inner.idle, effects);
                         frames
@@ -1448,8 +1487,14 @@ impl ActivityHub {
                 terminal_id,
                 session_id,
                 transcript_path,
+                submit_at_ms,
             } => {
-                self.attach_antigravity_lane(&terminal_id, &session_id, &transcript_path);
+                self.attach_antigravity_lane(
+                    &terminal_id,
+                    &session_id,
+                    &transcript_path,
+                    submit_at_ms,
+                );
             }
             HubEvent::AntigravityFsChange { terminal_id } => {
                 self.drain_antigravity_lane(&terminal_id);
@@ -3859,12 +3904,13 @@ mod tests {
         assert_eq!(initial["upsert"][0]["phase"], "idle");
 
         // A flushed non-empty submit line arms the provisional busy.
+        let submit_at = now_ms();
         observer_send(
             &hub,
             ActivityEvent::Input {
                 terminal_id: "t1".into(),
                 data: "unit flow prompt\r".into(),
-                at: now_ms(),
+                at: submit_at,
             },
         );
         let busy = next_frame_matching(&mut rx, "antigravity.activity.updated", 3_000, |v| {
@@ -3875,8 +3921,10 @@ mod tests {
         assert_eq!(busy["upsert"][0]["terminalId"], "t1");
 
         // Association resolves: the lane attaches at Start and replays the
-        // young transcript (the user_message confirms busy — no public flap).
-        hub.attach_antigravity_association("t1", "conv-1", &transcript);
+        // young transcript (the user_message — which predates the submit
+        // boundary — confirms busy via the historical in-flight fold: no
+        // public flap).
+        hub.attach_antigravity_association("t1", "conv-1", &transcript, Some(submit_at));
         let bound = next_frame_matching(&mut rx, "antigravity.activity.updated", 3_000, |v| {
             v["upsert"][0]["sessionId"] == "conv-1"
         })
@@ -3931,16 +3979,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// Whole-delta review Major 1: attaching a lane to a transcript that
-    /// already carries HISTORY (exact resume, rebind, restart-restore)
-    /// must seed the tracker from a BASELINE, never replay history as
-    /// live attention. The pre-fix Start-attach fed every historical
+    /// Whole-delta review Major 1 (round 2 keeps the property, now
+    /// submit-anchored): attaching a lane to a transcript that already
+    /// carries HISTORY (exact resume, rebind, restart-restore) must seed
+    /// the tracker from a BASELINE, never replay history as live
+    /// attention. The pre-fix Start-attach fed every historical
     /// `user_message`/`turn_settled` record to a FRESH per-terminal
     /// tracker: each old settle minted a phantom `terminal.turn.complete`
     /// — old turns ringing as live attention after resume/rebind. The
     /// baseline seeds the per-settle dedupe watermark and the busy state
-    /// from disk WITHOUT effects; records appended after attach stream
-    /// live exactly as before.
+    /// from the records that PREDATE the submit boundary, WITHOUT
+    /// effects; records appended after attach stream live exactly as
+    /// before. (The sibling test below flips the other direction: a
+    /// settle AFTER the submit rings.)
     #[tokio::test(flavor = "multi_thread")]
     async fn antigravity_attach_baseline_never_replays_history_as_live_attention() {
         let dir = tempfile::tempdir().unwrap();
@@ -4001,13 +4052,15 @@ mod tests {
             },
         );
         // The pane's own submit (the prompt that minted this conversation):
-        // provisional busy, as in production.
+        // provisional busy, as in production. Its `at` is the baseline
+        // BOUNDARY the locator hit would carry.
+        let submit_at = now_ms();
         observer_send(
             &hub,
             ActivityEvent::Input {
                 terminal_id: "t1".into(),
                 data: "baseline in-flight prompt\r".into(),
-                at: now_ms(),
+                at: submit_at,
             },
         );
         next_frame_matching(&mut rx, "antigravity.activity.updated", 3_000, |v| {
@@ -4017,8 +4070,10 @@ mod tests {
         .expect("the flushed submit arms provisional busy");
 
         // Attach to the EXISTING conversation (the resume/rebind shape:
-        // history + the pane's in-flight prompt on disk).
-        hub.attach_antigravity_association("t1", "conv-1", &transcript);
+        // history + the pane's in-flight prompt on disk), carrying the
+        // captured submit as the boundary — every record on disk predates
+        // that submit (a resumed pane's pre-submit history).
+        hub.attach_antigravity_association("t1", "conv-1", &transcript, Some(submit_at));
         next_frame_matching(&mut rx, "antigravity.activity.updated", 3_000, |v| {
             v["upsert"][0]["sessionId"] == "conv-1"
         })
@@ -4026,8 +4081,10 @@ mod tests {
         .expect("bind upsert");
         wait_for_antigravity_drain(&hub, "t1").await;
 
-        // NO historical completion and NO attention: the two settles on
-        // disk are BASELINE — old turns must never ring as live ones.
+        // NO historical completion and NO attention: both settles on disk
+        // PREDATE the submit boundary — history, and old turns must never
+        // ring as live ones (the resumed pane's pre-submit history stays
+        // silent — round 2's required direction).
         assert!(
             next_frame_of_type(&mut rx, "terminal.turn.complete", 2_500)
                 .await
@@ -4096,18 +4153,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// Whole-delta review Major 1, second half: the pane's own turn can
-    /// SETTLE while the locator's 2 s window is still running (the CLI
-    /// writes the user record and the settle right after the prompt). A
-    /// settle already on disk at attach is BASELINE by definition — it
-    /// must not ring, the pane resolves to idle, and the FOLLOW-UP turn
-    /// completes exactly once. (This also covers the >4 MiB EOF-attach
-    /// shape the review flagged: the baseline scan reads the whole file,
-    /// so a settle written before attach is never skipped.)
+    /// Whole-delta review round 2, Major 2: the baseline is anchored to
+    /// the pane's SUBMIT, not to the attach instant. A quick first turn
+    /// can settle during the locator's 2 s window — the CLI writes the
+    /// user record and the settle right after the prompt, both landing
+    /// on disk BEFORE the sweep attaches the lane. That settle's `at` is
+    /// AFTER the submit that armed the pane, so it is a LIVE turn end
+    /// the user may not have witnessed: it must ring EXACTLY ONCE
+    /// (terminal.turn.complete + one terminal.idle{grace}), and the
+    /// follow-up turn completes as seq 2. (The pre-round-2 contract —
+    /// "everything on disk at attach is baseline, the settle rings
+    /// nothing" — silenced a normal quick first turn; the round-2
+    /// review falsified it. Settles whose `at` is at/before the submit
+    /// stay historical and silent — the sibling test above.)
     #[tokio::test(flavor = "multi_thread")]
-    async fn antigravity_attach_baseline_covers_a_settle_landed_before_attach() {
+    async fn antigravity_attach_baseline_rings_a_settle_landed_after_the_submit() {
         let (hub, mut rx) = hub();
-        let home = unique_temp_dir("agy-baseline-delayed-settle");
+        let home = unique_temp_dir("agy-baseline-window-settle");
         hub.set_antigravity_association(Arc::new(
             crate::antigravity_association::AntigravityAssociation::new(home.clone()),
         ));
@@ -4138,7 +4200,7 @@ mod tests {
 
         // The CLI writes the user record AND the settle immediately —
         // both land on disk DURING the locator's 2 s window, before the
-        // sweep ever attaches the lane.
+        // sweep ever attaches the lane. Their `at`s are AFTER the submit.
         let dir = tempfile::tempdir().unwrap();
         let transcript = dir.path().join("transcript.jsonl");
         let line = |kind: &str, extra: &str, at: i64| {
@@ -4163,7 +4225,10 @@ mod tests {
         )
         .unwrap();
 
-        hub.attach_antigravity_association("t1", "conv-1", &transcript);
+        // Attach carrying the pane's captured submit as the baseline
+        // boundary (the user record and settle land AFTER it, during the
+        // window).
+        hub.attach_antigravity_association("t1", "conv-1", &transcript, Some(t0));
         next_frame_matching(&mut rx, "antigravity.activity.updated", 3_000, |v| {
             v["upsert"][0]["sessionId"] == "conv-1"
         })
@@ -4171,21 +4236,33 @@ mod tests {
         .expect("bind upsert");
         wait_for_antigravity_drain(&hub, "t1").await;
 
-        // The settle that landed during the window is BASELINE: no
-        // completion, no attention ring, no gate arm.
+        // The settle that landed during the window RINGS: exactly one
+        // completion (seq 1 — the window turn is the pane's first) and
+        // exactly one terminal.idle{grace}.
+        let complete = next_frame_of_type(&mut rx, "terminal.turn.complete", 5_000)
+            .await
+            .expect("a settle after the submit rings even if already on disk at attach");
+        assert_eq!(complete["terminalId"], "t1");
+        assert_eq!(complete["sessionId"], "conv-1");
+        assert_eq!(complete["completionSeq"], 1);
+        let idle = next_frame_of_type(&mut rx, "terminal.idle", 5_000)
+            .await
+            .expect("terminal.idle after the window settle");
+        assert_eq!(idle["terminalId"], "t1");
+        assert_eq!(idle["reason"], "grace");
         assert!(
-            next_frame_of_type(&mut rx, "terminal.turn.complete", 2_500)
+            next_frame_of_type(&mut rx, "terminal.turn.complete", 2_000)
                 .await
                 .is_none(),
-            "a settle already on disk at attach must not ring"
+            "exactly one completion for the window settle"
         );
         assert!(
-            next_frame_of_type(&mut rx, "terminal.idle", 2_500)
+            next_frame_of_type(&mut rx, "terminal.idle", 2_000)
                 .await
                 .is_none(),
-            "the baseline settle must not arm the attention gate"
+            "exactly one terminal.idle for the window settle"
         );
-        // The provisional busy resolved to the transcript's truth: IDLE.
+        // The pane resolved to the transcript's settled truth: IDLE.
         {
             let (records, completions) = hub.antigravity_list();
             assert_eq!(records.len(), 1);
@@ -4194,10 +4271,10 @@ mod tests {
                 freshell_protocol::AntigravityPhase::Idle,
                 "the pane resolved to the transcript's settled truth"
             );
-            assert!(completions.is_empty());
+            assert_eq!(completions.len(), 1);
         }
 
-        // The FOLLOW-UP turn completes exactly once.
+        // The FOLLOW-UP turn completes exactly once, as seq 2.
         observer_send(
             &hub,
             ActivityEvent::Input {
@@ -4233,7 +4310,7 @@ mod tests {
             .await
             .expect("the follow-up turn completes exactly once");
         assert_eq!(complete["terminalId"], "t1");
-        assert_eq!(complete["completionSeq"], 1);
+        assert_eq!(complete["completionSeq"], 2);
         assert!(
             next_frame_matching(&mut rx, "terminal.turn.complete", 1_500, |v| {
                 v["terminalId"] == "t1"
@@ -4350,12 +4427,13 @@ mod tests {
                 at: now_ms(),
             },
         );
+        let submit_at = now_ms();
         observer_send(
             &hub,
             ActivityEvent::Input {
                 terminal_id: "t1".into(),
                 data: "first prompt\r".into(),
-                at: now_ms(),
+                at: submit_at,
             },
         );
         next_frame_matching(&mut rx, "antigravity.activity.updated", 3_000, |v| {
@@ -4364,9 +4442,10 @@ mod tests {
         .await
         .expect("the flushed submit arms the tracker's provisional busy");
 
-        // Conversation A binds: the lane replays the young transcript and
-        // the user_message record CONFIRMS the busy.
-        hub.attach_antigravity_association("t1", "conv-a", &transcript_a);
+        // Conversation A binds: the lane replays the young transcript (the
+        // user_message — written before the submit — confirms the busy
+        // through the historical in-flight fold).
+        hub.attach_antigravity_association("t1", "conv-a", &transcript_a, Some(submit_at));
         next_frame_matching(&mut rx, "antigravity.activity.updated", 3_000, |v| {
             v["upsert"][0]["sessionId"] == "conv-a"
         })
@@ -4383,6 +4462,7 @@ mod tests {
             "t1",
             "conv-b",
             &dir.path().join("not-created-yet.jsonl"),
+            Some(submit_at),
         );
 
         // Conversation A settles elsewhere (a second pane resumed it): the
@@ -4477,12 +4557,13 @@ mod tests {
                 at: now_ms(),
             },
         );
+        let submit_at_t1 = now_ms();
         observer_send(
             &hub,
             ActivityEvent::Input {
                 terminal_id: "t1".into(),
                 data: "confirmed pane prompt\r".into(),
-                at: now_ms(),
+                at: submit_at_t1,
             },
         );
         next_frame_matching(&mut rx, "antigravity.activity.updated", 3_000, |v| {
@@ -4490,7 +4571,12 @@ mod tests {
         })
         .await
         .expect("t1: the flushed submit arms provisional busy");
-        hub.attach_antigravity_association("t1", "conv-c", &confirmed_transcript);
+        hub.attach_antigravity_association(
+            "t1",
+            "conv-c",
+            &confirmed_transcript,
+            Some(submit_at_t1),
+        );
         next_frame_matching(&mut rx, "antigravity.activity.updated", 3_000, |v| {
             v["upsert"][0]["sessionId"] == "conv-c"
         })
@@ -4508,12 +4594,13 @@ mod tests {
                 at: now_ms(),
             },
         );
+        let submit_at_t2 = now_ms();
         observer_send(
             &hub,
             ActivityEvent::Input {
                 terminal_id: "t2".into(),
                 data: "provisional pane prompt\r".into(),
-                at: now_ms(),
+                at: submit_at_t2,
             },
         );
         next_frame_matching(&mut rx, "antigravity.activity.updated", 3_000, |v| {
@@ -4521,7 +4608,12 @@ mod tests {
         })
         .await
         .expect("t2: the flushed submit arms provisional busy");
-        hub.attach_antigravity_association("t2", "conv-p", &provisional_transcript);
+        hub.attach_antigravity_association(
+            "t2",
+            "conv-p",
+            &provisional_transcript,
+            Some(submit_at_t2),
+        );
         next_frame_matching(&mut rx, "antigravity.activity.updated", 3_000, |v| {
             v["upsert"][0]["sessionId"] == "conv-p"
         })

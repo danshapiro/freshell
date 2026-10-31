@@ -58,12 +58,16 @@
 //!      engagement).
 //!   9. Activity phases (plan Task 8): the transcript lane drives busy on
 //!      every submit; a settle already ON DISK at the lane attach (the fake
-//!      writes it during the locator's 2 s window) is BASELINE — it never
-//!      rings (whole-delta review Major 1); later turns stream live: a
+//!      writes it during the locator's 2 s window) is classified at the
+//!      SUBMIT that armed the pane — its `at` is AFTER the submit, so it is
+//!      a LIVE turn end and rings exactly one completion + one
+//!      `terminal.idle{reason:"grace"}` (whole-delta review round 2,
+//!      Major 2; settles that PREDATE the submit stay historical and
+//!      silent); later turns stream live: a
 //!      `turn_settled{fullyIdle:false}` record (outstanding async work)
 //!      keeps the pane busy with NO completion until a later full settle
-//!      completes the turn exactly once and rings exactly one
-//!      `terminal.idle{reason:"grace"}`.
+//!      completes the turn exactly once (seq 2 — the window turn consumed
+//!      seq 1).
 //!
 //! Process-kill suite: the fakes this suite spawns are its own PTY children
 //! (killed via `registry.kill` of the created ids, which reaps the fake
@@ -1105,20 +1109,24 @@ async fn antigravity_exact_live_identity_rebind_suite() {
 
     // ── Scenario 9: activity phases (plan Task 8) ────────────────────────
     // The transcript lane's full attention contract, end to end through the
-    // real sweep + adoption. Whole-delta review Major 1 reshaped the first
-    // phase: the fake writes the user record AND the settle immediately,
-    // so both are ON DISK when the locator's 2 s window closes and the
-    // sweep attaches — the settle is BASELINE and must NOT ring (the
-    // pre-fix replay rang every on-disk settle as a live completion).
-    // Later turns stream live through the attached lane: a partial settle
+    // real sweep + adoption. Whole-delta review round 2, Major 2 shapes the
+    // first phase: the fake writes the user record AND the settle
+    // immediately, so both are ON DISK when the locator's 2 s window closes
+    // and the sweep attaches — but their `at`s are AFTER the submit that
+    // armed the pane, so the settle is a LIVE turn end and must ring
+    // EXACTLY ONCE (the round-1 attach-instant baseline silenced a normal
+    // quick first turn; the round-2 review falsified that contract). Later
+    // turns stream live through the attached lane: a partial settle
     // (fullyIdle:false — outstanding async work) NEVER completes, and the
-    // follow-up full settle completes exactly once.
+    // follow-up full settle completes exactly once (seq 2).
     let tid9 = create_pane(&mut ws, &cwd, "req-agy-sc9").await;
     to_kill.push(tid9.clone());
     let conv9 = conv_of(&tid9);
 
     // Phase 1 — a settle that landed during the locator's 2 s window: the
-    // pane arms busy on the submit, then the baseline resolve (no ring).
+    // pane arms busy on the submit, the sweep attaches the lane with the
+    // captured submit as the baseline boundary, and the settle (whose `at`
+    // postdates that submit) rings as the live turn end it is.
     submit_prompt(&mut ws, &tid9, "settle:activity phase prompt kilo").await;
     assert!(
         frame_seen_within(&mut ws, Duration::from_secs(10), |v| {
@@ -1129,21 +1137,44 @@ async fn antigravity_exact_live_identity_rebind_suite() {
         .await,
         "the flushed submit arms the antigravity tracker's busy record"
     );
-    // The 5 s window covers the attach (submit + the 2 s locator window +
-    // the sweep cadence): a baseline settle never mints a completion.
-    assert!(
-        !frame_seen_within(&mut ws, Duration::from_secs(5), |v| {
-            v["type"] == "terminal.turn.complete" && v["terminalId"] == tid9.as_str()
-        })
-        .await,
-        "a settle already on disk at attach never rings a completion (baseline)"
+    // The window settle rings EXACTLY ONE completion (seq 1 — the pane's
+    // first) — the sweep attach + baseline drain land within the 10 s
+    // window (submit + the 2 s locator window + the sweep cadence).
+    let window_complete = loop {
+        let frame = next_frame_of_type(&mut ws, "terminal.turn.complete").await;
+        if frame["terminalId"] == tid9.as_str() {
+            break frame;
+        }
+    };
+    assert_eq!(window_complete["provider"], "antigravity");
+    assert_eq!(window_complete["sessionId"], conv9.as_str());
+    assert_eq!(
+        window_complete["completionSeq"], 1,
+        "the window settle is the pane's first turn end — it rings as seq 1"
     );
+    // The idle wait runs BEFORE the absence windows: the idle frame fires
+    // at the boundary + 2 s grace, which a scan-first absence window would
+    // swallow (the round-1 suite-ordering lesson, kept).
     assert!(
-        !frame_seen_within(&mut ws, Duration::from_secs(2), |v| {
+        frame_seen_within(&mut ws, Duration::from_secs(10), |v| {
             v["type"] == "terminal.idle" && v["terminalId"] == tid9.as_str()
         })
         .await,
-        "a baseline settle never rings attention (terminal.idle)"
+        "the window settle rings exactly one terminal.idle (grace)"
+    );
+    assert!(
+        !frame_seen_within(&mut ws, Duration::from_secs(3), |v| {
+            v["type"] == "terminal.turn.complete" && v["terminalId"] == tid9.as_str()
+        })
+        .await,
+        "exactly one completion for the window settle — never a duplicate"
+    );
+    assert!(
+        !frame_seen_within(&mut ws, Duration::from_secs(3), |v| {
+            v["type"] == "terminal.idle" && v["terminalId"] == tid9.as_str()
+        })
+        .await,
+        "never a second terminal.idle for the window settle"
     );
 
     // Phase 2 — a partial settle (fullyIdle:false — outstanding async
@@ -1169,8 +1200,8 @@ async fn antigravity_exact_live_identity_rebind_suite() {
     );
 
     // Phase 3 — the follow-up full settle completes the outstanding turn
-    // exactly once (completionSeq 1: the phase-1 baseline consumed none of
-    // the sequence) and rings exactly one terminal.idle (grace).
+    // exactly once (completionSeq 2: the window settle consumed seq 1) and
+    // rings exactly one terminal.idle (grace).
     submit_prompt(&mut ws, &tid9, "settle:final settle prompt mike").await;
     let settle_complete = loop {
         let frame = next_frame_of_type(&mut ws, "terminal.turn.complete").await;
@@ -1181,8 +1212,8 @@ async fn antigravity_exact_live_identity_rebind_suite() {
     assert_eq!(settle_complete["provider"], "antigravity");
     assert_eq!(settle_complete["sessionId"], conv9.as_str());
     assert_eq!(
-        settle_complete["completionSeq"], 1,
-        "the baseline settle rang nothing, so this is the pane's first completion"
+        settle_complete["completionSeq"], 2,
+        "the window settle rang seq 1, so the follow-up settles as seq 2"
     );
     // Truly idle after the grace window — the idle wait runs BEFORE the
     // absence windows: the idle frame fires at the boundary + 2 s, which
