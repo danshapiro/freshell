@@ -4403,7 +4403,7 @@ describe('FreshAgentView', () => {
       })
     }
 
-    it('shows the honest still-saving state on the newest user row while the agent turn is running, and keeps older unbound rows honestly unavailable', async () => {
+    it('shows the honest still-saving state on the newest user row while a genuine composer send\'s capture is in flight, and keeps older unbound rows honestly unavailable', async () => {
       const sessionId = 'thread-rewind-busy-honesty'
       const store = createStore()
       let onMessage: ((message: Record<string, unknown>) => void) | undefined
@@ -4411,15 +4411,18 @@ describe('FreshAgentView', () => {
         onMessage = handler
         return () => {}
       })
-      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      // The snapshot grows when the composer send's own row lands mid-turn
+      // (the real journey the busy-pending fallback serves): the request-keyed
+      // capture outcome cannot bind the landed durable row, so the row is
+      // unbound and honest only while its capture/identity is still in flight.
+      let snapshotTurns = [unboundModernUserTurn('msg_a', 'Older MCP-driven prompt')]
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => ({
         status: 'idle',
-        summary: 'two unbound modern user turns',
+        summary: 'older MCP-driven row plus the running send\'s landed row',
         capabilities: { send: true, interrupt: true, fork: true },
-        turns: [
-          unboundModernUserTurn('msg_a', 'Older MCP-driven prompt'),
-          unboundModernUserTurn('msg_b', 'Newest prompt while the agent runs'),
-        ],
-      })
+        turns: snapshotTurns,
+      }))
+      apiMock.post.mockResolvedValue({ ok: true })
       store.dispatch(initLayout({
         tabId: 'tab-1',
         paneId: 'pane-1',
@@ -4439,9 +4442,57 @@ describe('FreshAgentView', () => {
         </Provider>,
       )
 
-      expect(await screen.findAllByRole('article', { name: 'You transcript turn' })).toHaveLength(2)
+      expect(await screen.findAllByRole('article', { name: 'You transcript turn' })).toHaveLength(1)
+      await waitFor(() => {
+        expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+      })
       expect(onMessage).toBeTypeOf('function')
+
+      // A genuine in-flight composer send through the real send path: its
+      // pending metadata (requestId + logicalAttemptId) and its un-enriched
+      // barrier-time capture outcome (logicalAttemptId, NO native row ids)
+      // keep the capture genuinely in flight for the whole mid-turn window.
+      wsMock.send.mockClear()
+      fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+        target: { value: 'Newest prompt while the agent runs' },
+      })
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      const sendFrame = sentFreshAgentMessages('freshAgent.send')[0]
+      const requestId = String(sendFrame?.requestId)
+      const logicalAttemptId = String((sendFrame?.checkpointIntent as Record<string, unknown>)?.logicalAttemptId)
+      expect(requestId).not.toBe('undefined')
+      expect(logicalAttemptId).not.toBe('undefined')
+      act(() => {
+        onMessage?.({
+          type: 'freshAgent.checkpoint.outcome',
+          requestId,
+          logicalAttemptId,
+          sessionId,
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          status: 'available',
+          checkpointId: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        })
+      })
+      // The send is accepted and its row lands in the refreshed snapshot; the
+      // optimistic echo clears, so the landed durable row IS the newest user
+      // row the busy-pending fallback must serve.
+      act(() => {
+        snapshotTurns = [
+          ...snapshotTurns,
+          unboundModernUserTurn('msg_new', 'Newest prompt while the agent runs'),
+        ]
+        onMessage?.({
+          type: 'freshAgent.send.accepted',
+          requestId,
+          submittedTurnId: 'msg_new',
+        })
+      })
+      expect(await screen.findAllByRole('article', { name: 'You transcript turn' })).toHaveLength(2)
       emitSessionSnapshotStatus(store, onMessage, sessionId, 'running')
+      // Pin that the busy drive actually engaged: the pending verdict below
+      // is only meaningful while the pane is truly busy.
+      expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
 
       const [olderRow, newestRow] = screen.getAllByRole('article', { name: 'You transcript turn' })
       const savingButton = await within(newestRow!).findByRole('button', { name: 'Saving code rewind checkpoint' })
@@ -4450,6 +4501,57 @@ describe('FreshAgentView', () => {
       const olderButton = within(olderRow!).getByRole('button', { name: 'Rewind unavailable for this message' })
       expect(olderButton).toBeDisabled()
       expect(olderButton).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
+    })
+
+    it('an active MCP/CLI-driven turn never claims a still-saving state', async () => {
+      const sessionId = 'thread-rewind-mcp-cli-busy'
+      const store = createStore()
+      let onMessage: ((message: Record<string, unknown>) => void) | undefined
+      wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+        onMessage = handler
+        return () => {}
+      })
+      // An MCP/CLI-driven turn: the newest user row is modern and unbound,
+      // but this pane sent nothing — no composer send, no pending send
+      // metadata, no checkpoint capture in play at all.
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+        status: 'idle',
+        summary: 'one unbound modern user turn sent through the REST lane',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [unboundModernUserTurn('msg_mcp_cli', 'Prompt sent through the REST lane')],
+      })
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-rewind-mcp-cli-busy',
+          sessionId,
+          status: 'idle',
+        },
+      }))
+
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+
+      expect(await screen.findAllByRole('article', { name: 'You transcript turn' })).toHaveLength(1)
+      expect(onMessage).toBeTypeOf('function')
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'running')
+      // Pin that the busy drive actually engaged: the honesty verdict below
+      // is only meaningful while the pane is truly busy.
+      expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+
+      const [newestRow] = screen.getAllByRole('article', { name: 'You transcript turn' })
+      // NOT the pending aria-label: nothing is being saved for this row.
+      expect(within(newestRow!).queryByRole('button', { name: 'Saving code rewind checkpoint' })).not.toBeInTheDocument()
+      const rewindButton = await within(newestRow!).findByRole('button', { name: 'Rewind unavailable for this message' })
+      expect(rewindButton).toBeDisabled()
+      expect(rewindButton).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
     })
 
     it('keeps the older snapshot user row honestly unavailable while a pending local echo holds the newest user row', async () => {

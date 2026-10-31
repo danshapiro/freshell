@@ -396,22 +396,55 @@ function isModernCheckpointTurn(turn: FreshAgentTurn): boolean {
 // The fallback for a modern turn with no bound checkpoint outcome. Agent
 // response turns are never rewindable and never even considered (defect 2).
 // "Still saving" (defect 4) belongs to the NEWEST user row only, while this
-// pane's agent turn is running: mid-turn the newest user row IS the running
-// send's row (the assistant has not replied yet), so its capture/identity is
-// legitimately in flight. Older unbound rows (historical MCP/CLI-driven
-// turns) keep the honest unavailable verdict — nothing is being saved for
-// them even while a later turn runs. The state is computed, never stored: it
-// dies at the busy→idle edge, so it can never wedge as an immortal "saving".
+// pane's agent turn is running AND this pane's own composer send has a
+// checkpoint capture genuinely in flight: an MCP/CLI-driven turn sends
+// through the REST lane with no capture at all, so its row must never claim
+// a save is underway even while the pane is busy. Older unbound rows
+// (historical MCP/CLI-driven turns) keep the honest unavailable verdict —
+// nothing is being saved for them even while a later turn runs. The state
+// is computed, never stored: it dies at the busy→idle edge and at the
+// capture-enrichment edge, so it can never wedge as an immortal "saving".
 export function unboundRewindAvailability(
   turn: FreshAgentTurn,
   agentBusy: boolean,
   isNewestUserTurn: boolean,
+  captureInFlight: boolean,
 ): FreshAgentTurnRewindAvailability | undefined {
   if (turn.role !== 'user') return undefined
   if (!isModernCheckpointTurn(turn)) return undefined
-  return agentBusy && isNewestUserTurn
+  return agentBusy && isNewestUserTurn && captureInFlight
     ? { status: 'pending' }
     : { status: 'unavailable', reason: MODERN_TURN_CHECKPOINT_UNAVAILABLE }
+}
+
+// True while this pane has a composer send whose checkpoint capture has not
+// yet been identity-enriched. The barrier-time outcome frame carries the
+// send's logicalAttemptId but no native row ids; the identity-enriched
+// outcome adds nativeTurnId. An attempt whose outcome record still has no
+// nativeTurnId is therefore "capture in flight" — covering BOTH the
+// pre-barrier window (no outcome yet) and the post-barrier pre-identity
+// window. The attempt's outcome record is looked up where the pane keeps it:
+// the pending send metadata's own checkpointOutcome (the same record the
+// availability map and paneContent.checkpointOutcomes persist from) plus the
+// persisted pane outcome entry for the send's request — the pane-local stand
+// in for the logicalAttemptId join, since the durable outcome records key by
+// the send's requestId (minted 1:1 with the attempt's logicalAttemptId) and
+// carry no logicalAttemptId of their own. A settled previous composer send
+// (enriched outcome present) reads false even though its metadata lingers —
+// metadata is only deleted on this pane's send-failure frames. MCP/CLI-driven
+// turns mint no send metadata and produce no capture outcome, so they read
+// false throughout.
+function paneCaptureInFlight(
+  pendingSends: ReadonlyMap<string, PendingSendMetadata>,
+  paneOutcomes: readonly FreshAgentCheckpointOutcome[] | undefined,
+): boolean {
+  for (const [requestId, metadata] of pendingSends) {
+    if (!metadata.logicalAttemptId) continue
+    if (metadata.checkpointOutcome?.nativeTurnId) continue
+    if (paneOutcomes?.some((outcome) => outcome.requestId === requestId && outcome.nativeTurnId)) continue
+    return true
+  }
+  return false
 }
 
 function localEchoLanded(
@@ -4002,6 +4035,14 @@ export function FreshAgentView({
     items: [{ id: `__local-echo-item:${localEcho.requestId}`, kind: 'text', text: localEcho.text }],
   } as FreshAgentTurn : undefined), [localEcho])
   const transcriptTurns = snapshot?.turns ?? EMPTY_TRANSCRIPT_TURNS
+  // Render-phase read of a ref: every pendingSendMetadataRef mutation rides a
+  // state transition that re-renders (a send creates the local echo; an
+  // outcome arrival publishes checkpoint availability and persists the pane
+  // outcome; a send failure clears the echo/status), so recomputing on each
+  // render always reflects the last transition — the enriched outcome's
+  // arrival flips it. Fed through getRewindAvailability's deps so the
+  // memoized transcript re-renders when the flag flips.
+  const captureInFlight = paneCaptureInFlight(pendingSendMetadataRef.current, paneContent.checkpointOutcomes)
   const newestUserTurnKey = useMemo(() => {
     if (localEchoTurn) return getFreshAgentDisplayTurnKey(localEchoTurn)
     const userTurns = transcriptTurns.filter((turn) => turn.role === 'user')
@@ -4014,11 +4055,12 @@ export function FreshAgentView({
         turn,
         isBusy,
         newestUserTurnKey !== undefined && getFreshAgentDisplayTurnKey(turn) === newestUserTurnKey,
+        captureInFlight,
       )
     }
     if (availability.status === 'unavailable') return { status: 'unavailable', reason: availability.reason }
     return { status: availability.status }
-  }, [getCheckpointAvailability, isBusy, newestUserTurnKey])
+  }, [getCheckpointAvailability, isBusy, newestUserTurnKey, captureInFlight])
   // The live tail (transcript-live plan §4.4): what the running turn shows
   // before its transcript lines land. This view never subscribes to the
   // tail's text — only to whether it shows anything, so the transcript's own

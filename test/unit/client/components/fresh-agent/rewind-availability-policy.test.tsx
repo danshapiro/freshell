@@ -35,19 +35,30 @@ const legacyUserTurn: FreshAgentTurn = {
 
 describe('unboundRewindAvailability policy', () => {
   it('does not consider agent response turns for rewind status at all', () => {
-    expect(unboundRewindAvailability(assistantTurn, false, false)).toBeUndefined()
-    expect(unboundRewindAvailability(assistantTurn, true, true)).toBeUndefined()
-    expect(unboundRewindAvailability(assistantTurn, true, false)).toBeUndefined()
+    expect(unboundRewindAvailability(assistantTurn, false, false, false)).toBeUndefined()
+    expect(unboundRewindAvailability(assistantTurn, true, true, true)).toBeUndefined()
+    expect(unboundRewindAvailability(assistantTurn, true, false, true)).toBeUndefined()
+    // The capture-in-flight input can never resurrect an agent row either.
+    expect(unboundRewindAvailability(assistantTurn, true, true, false)).toBeUndefined()
   })
 
-  it('pins the user-row matrix: pending only for the newest user row while the agent is busy', () => {
-    expect(unboundRewindAvailability(modernUserTurn, true, true)).toEqual({ status: 'pending' })
-    expect(unboundRewindAvailability(modernUserTurn, false, true))
+  it('pins the user-row matrix: pending only for the newest user row while the agent is busy AND this pane\'s capture is genuinely in flight', () => {
+    // The only pending cell: newest user row, busy, capture in flight.
+    expect(unboundRewindAvailability(modernUserTurn, true, true, true)).toEqual({ status: 'pending' })
+    // An MCP/CLI-driven turn (busy, newest, but NO capture in flight for it)
+    // stays honestly rewind-unavailable — never a still-saving claim.
+    expect(unboundRewindAvailability(modernUserTurn, true, true, false))
       .toEqual({ status: 'unavailable', reason: MODERN_UNAVAILABLE_REASON })
-    expect(unboundRewindAvailability(modernUserTurn, true, false))
+    expect(unboundRewindAvailability(modernUserTurn, false, true, true))
       .toEqual({ status: 'unavailable', reason: MODERN_UNAVAILABLE_REASON })
-    expect(unboundRewindAvailability(modernUserTurn, false, false))
+    expect(unboundRewindAvailability(modernUserTurn, false, true, false))
       .toEqual({ status: 'unavailable', reason: MODERN_UNAVAILABLE_REASON })
-    expect(unboundRewindAvailability(legacyUserTurn, true, true)).toBeUndefined()
+    expect(unboundRewindAvailability(modernUserTurn, true, false, true))
+      .toEqual({ status: 'unavailable', reason: MODERN_UNAVAILABLE_REASON })
+    expect(unboundRewindAvailability(modernUserTurn, true, false, false))
+      .toEqual({ status: 'unavailable', reason: MODERN_UNAVAILABLE_REASON })
+    expect(unboundRewindAvailability(modernUserTurn, false, false, false))
+      .toEqual({ status: 'unavailable', reason: MODERN_UNAVAILABLE_REASON })
+    expect(unboundRewindAvailability(legacyUserTurn, true, true, true)).toBeUndefined()
   })
 })
