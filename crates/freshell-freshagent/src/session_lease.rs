@@ -266,12 +266,15 @@ fn capture_runtime_identity(
     if let Some(start) = child_start {
         capture_complete &= capture_linked_descendants(pid as i32, start, ownership_id, &mut tree);
     }
+    // Reuse exact descendant membership from this walk as well as the old
+    // record. A fresh root is added only after the scan: its unavailable
+    // ownership evidence must still make the capture incomplete.
     let scan = scan_tagged_pids_observing(
         ownership_env,
         ownership_id,
         Some(pid as i32),
         child_start,
-        previous.map_or(&[], |recorded| recorded.tree.as_slice()),
+        &tree,
         before_read,
     );
     capture_complete &= scan.complete;
@@ -1505,6 +1508,294 @@ mod tests {
             .unwrap();
         assert_eq!(ready, "ready\n");
         (child, tag)
+    }
+
+    /// The dumpable root owns the opaque child's readiness/release pipes and
+    /// reaps it on either our explicit exit or the production SIGTERM path.
+    #[cfg(target_os = "linux")]
+    struct LinkedOpaqueFixture {
+        root: std::process::Child,
+        replies: std::io::BufReader<std::process::ChildStdout>,
+        tag: String,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl LinkedOpaqueFixture {
+        fn new() -> Self {
+            let tag = format!("capture-{}", uuid::Uuid::new_v4());
+            let mut root = std::process::Command::new("python3")
+                .args(["-c", r#"
+import ctypes, json, os, signal, sys
+libc = ctypes.CDLL(None)
+child = None
+release = None
+def close(*_):
+    if child is not None:
+        os.write(release, b'X')
+        assert os.waitpid(child, 0)[1] == 0
+    sys.exit(0)
+signal.signal(signal.SIGTERM, close)
+print(json.dumps({'pid':os.getpid(), 'uid':os.geteuid(), 'dumpable':libc.prctl(3,0,0,0,0)}), flush=True)
+for command in sys.stdin:
+    if command == 'exit\n':
+        close()
+    if command in ('hide\n', 'show\n'):
+        dumpable = int(command == 'show\n')
+        assert libc.prctl(4,dumpable,0,0,0) == 0
+        assert libc.prctl(3,0,0,0,0) == dumpable
+        print(json.dumps({'dumpable':dumpable}), flush=True)
+        continue
+    assert command == 'spawn\n' and child is None
+    reader, release = os.pipe()
+    ready, ack = os.pipe()
+    child = os.fork()
+    if child == 0:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        assert libc.prctl(4,0,0,0,0) == 0
+        assert libc.prctl(3,0,0,0,0) == 0
+        os.write(ack, json.dumps({'pid':os.getpid(), 'parent':os.getppid(), 'uid':os.geteuid(), 'dumpable':0}).encode() + b'\n')
+        assert os.read(reader,1) == b'X'
+        os._exit(0)
+    with os.fdopen(ready) as replies:
+        print(replies.readline(), end='', flush=True)
+close()
+"#])
+                .env("CAPTURE_TEST_OWNERSHIP", &tag)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn().unwrap();
+            let replies = std::io::BufReader::new(root.stdout.take().unwrap());
+            let mut fixture = Self { root, replies, tag };
+            let ready = fixture.read_reply();
+            assert_eq!(ready["pid"], fixture.root.id());
+            assert_eq!(ready["uid"], unsafe { libc::geteuid() });
+            assert_eq!(ready["dumpable"], 1);
+            fixture
+        }
+
+        fn read_reply(&mut self) -> serde_json::Value {
+            use std::io::BufRead;
+            let mut line = String::new();
+            self.replies.read_line(&mut line).unwrap();
+            serde_json::from_str(&line).unwrap()
+        }
+
+        fn command(&mut self, command: &[u8]) -> serde_json::Value {
+            use std::io::Write;
+            self.root
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(command)
+                .unwrap();
+            self.read_reply()
+        }
+
+        fn spawn_opaque_member(&mut self) -> (i32, u64) {
+            let ready = self.command(b"spawn\n");
+            let pid = ready["pid"].as_i64().unwrap() as i32;
+            assert_eq!(ready["parent"], self.root.id());
+            assert_eq!(ready["uid"], unsafe { libc::geteuid() });
+            assert_eq!(ready["dumpable"], 0);
+            assert_eq!(
+                std::fs::read(format!("/proc/{pid}/environ"))
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            let start = proc_starttime(pid).unwrap();
+            assert_eq!(
+                process_is_descendant_of(pid, self.root.id() as i32),
+                Ok(true)
+            );
+            (pid, start)
+        }
+
+        fn set_root_dumpable(&mut self, dumpable: bool) {
+            let ready = self.command(if dumpable { b"show\n" } else { b"hide\n" });
+            assert_eq!(ready["dumpable"], u8::from(dumpable));
+        }
+
+        fn close(&mut self) {
+            use std::io::Write;
+            if self.root.try_wait().unwrap().is_none() {
+                let _ = self.root.stdin.as_mut().unwrap().write_all(b"exit\n");
+            }
+            assert!(self.root.wait().unwrap().success());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for LinkedOpaqueFixture {
+        fn drop(&mut self) {
+            self.close();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn assert_linked_opaque_capture(late_member: bool) {
+        let mut fixture = LinkedOpaqueFixture::new();
+        let pid = fixture.root.id();
+        let root_start = proc_starttime(pid as i32).unwrap();
+        let original = late_member.then(|| {
+            record_condemned_runtime_identity(pid, "CAPTURE_TEST_OWNERSHIP", &fixture.tag)
+        });
+        let member = fixture.spawn_opaque_member();
+        let mut linked = Vec::new();
+        let link_complete =
+            capture_linked_descendants(pid as i32, root_start, &fixture.tag, &mut linked);
+        let without_membership = scan_tagged_pids_observing(
+            "CAPTURE_TEST_OWNERSHIP",
+            &fixture.tag,
+            Some(pid as i32),
+            Some(root_start),
+            &[],
+            &mut |_, _| {},
+        );
+        let with_membership = scan_tagged_pids_observing(
+            "CAPTURE_TEST_OWNERSHIP",
+            &fixture.tag,
+            Some(pid as i32),
+            Some(root_start),
+            &linked,
+            &mut |_, _| {},
+        );
+        let recorded = original.unwrap_or_else(|| {
+            record_condemned_runtime_identity(pid, "CAPTURE_TEST_OWNERSHIP", &fixture.tag)
+        });
+        let original_bytes = serde_json::to_vec(&recorded).unwrap();
+        let refreshed = refresh_condemned_runtime_identity(&recorded, "CAPTURE_TEST_OWNERSHIP");
+        let confirmed =
+            kill_and_confirm_recorded_tree_dead(&recorded, "CAPTURE_TEST_OWNERSHIP").await;
+        let root_survived_cleanup = proc_starttime(pid as i32) == Some(root_start);
+        let member_survived_cleanup = proc_starttime(member.0) == Some(member.1);
+        // Close and reap before the intended Red assertions, even when the
+        // production consumer correctly refuses genuinely missing coverage.
+        fixture.close();
+        let root_reaped = !std::path::Path::new(&format!("/proc/{pid}")).exists();
+        let member_reaped = !std::path::Path::new(&format!("/proc/{}", member.0)).exists();
+        eprintln!(
+            "{}",
+            serde_json::json!({"severity":"info","event":"session_lease.linked_opaque_fixture","lateMember":late_member,"rootPid":pid,"rootStart":root_start,"member":member,"uid":unsafe {libc::geteuid()},"dumpable":0,"environPermissionDenied":true,"linkComplete":link_complete,"linked":linked,"scanWithoutMembership":without_membership.complete,"scanWithMembership":with_membership.complete,"originalComplete":recorded.capture_complete,"refreshedComplete":refreshed.capture_complete,"confirmed":confirmed,"rootSurvivedCleanup":root_survived_cleanup,"memberSurvivedCleanup":member_survived_cleanup,"rootReaped":root_reaped,"memberReaped":member_reaped})
+        );
+        assert!(root_reaped && member_reaped);
+        assert!(
+            link_complete,
+            "missing descendant coverage is not an ownership-only defect"
+        );
+        assert!(linked.contains(&member));
+        assert!(!without_membership.complete);
+        assert!(
+            with_membership.complete,
+            "positive exact membership resolves only the duplicate ownership lookup"
+        );
+        assert!(
+            with_membership.pids.contains(&(pid as i32)),
+            "the original root's ownership tag remains readable and matching"
+        );
+        assert_eq!(serde_json::to_vec(&recorded).unwrap(), original_bytes);
+        assert_eq!(recorded.start_time, Some(root_start));
+        assert!(recorded
+            .tree
+            .iter()
+            .all(|member| refreshed.tree.contains(member)));
+        if late_member {
+            assert!(
+                recorded.capture_complete,
+                "the original root-only record was complete"
+            );
+            assert!(!recorded.tree.contains(&member));
+        } else {
+            assert!(recorded.tree.contains(&member));
+            assert!(
+                recorded.capture_complete,
+                "complete positive links must suffice for an opaque descendant"
+            );
+        }
+        assert!(refreshed.tree.contains(&member));
+        assert!(
+            refreshed.capture_complete,
+            "refresh must reuse complete positive links for the new member"
+        );
+        assert!(
+            confirmed,
+            "the unchanged original record must drive physical cleanup"
+        );
+        assert!(
+            !root_survived_cleanup && !member_survived_cleanup,
+            "confirmation must stop the actual root and writer"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linked_opaque_member_is_complete_at_initial_capture() {
+        let _process_fixture = process_fixture::lock().await;
+        assert_linked_opaque_capture(false).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linked_opaque_member_first_seen_at_refresh_is_killed_from_original_record() {
+        let _process_fixture = process_fixture::lock().await;
+        assert_linked_opaque_capture(true).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linked_opaque_member_cannot_confirm_an_unavailable_root_or_incomplete_original() {
+        let _process_fixture = process_fixture::lock().await;
+        let mut fixture = LinkedOpaqueFixture::new();
+        let member = fixture.spawn_opaque_member();
+        fixture.set_root_dumpable(false);
+        assert_eq!(
+            std::fs::read(format!("/proc/{}/environ", fixture.root.id()))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let original = record_condemned_runtime_identity(
+            fixture.root.id(),
+            "CAPTURE_TEST_OWNERSHIP",
+            &fixture.tag,
+        );
+        let original_bytes = serde_json::to_vec(&original).unwrap();
+        let unavailable_confirmed =
+            kill_and_confirm_recorded_tree_dead(&original, "CAPTURE_TEST_OWNERSHIP").await;
+        fixture.set_root_dumpable(true);
+        let fresh = record_condemned_runtime_identity(
+            fixture.root.id(),
+            "CAPTURE_TEST_OWNERSHIP",
+            &fixture.tag,
+        );
+        let refreshed = refresh_condemned_runtime_identity(&original, "CAPTURE_TEST_OWNERSHIP");
+        let incomplete_confirmed =
+            kill_and_confirm_recorded_tree_dead(&original, "CAPTURE_TEST_OWNERSHIP").await;
+        let root_survived = proc_starttime(fixture.root.id() as i32) == original.start_time;
+        let member_survived = proc_starttime(member.0) == Some(member.1);
+        fixture.close();
+        assert!(original.tree.contains(&member));
+        assert!(!original.capture_complete);
+        assert!(!unavailable_confirmed);
+        assert!(
+            fresh.capture_complete,
+            "restored root evidence permits only a new complete capture"
+        );
+        assert!(
+            !refreshed.capture_complete,
+            "refresh cannot upgrade original unavailable coverage"
+        );
+        assert!(original
+            .tree
+            .iter()
+            .all(|member| refreshed.tree.contains(member)));
+        assert!(!incomplete_confirmed);
+        assert!(
+            root_survived && member_survived,
+            "incomplete original evidence cannot authorize a signal"
+        );
+        assert_eq!(serde_json::to_vec(&original).unwrap(), original_bytes);
+        assert!(!std::path::Path::new(&format!("/proc/{}", member.0)).exists());
     }
 
     #[cfg(target_os = "linux")]
