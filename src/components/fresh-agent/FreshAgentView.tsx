@@ -1480,13 +1480,13 @@ export function FreshAgentView({
   // stamp → catalog probe). A pane with NO model set at all gets no chip
   // either — the pane-type label is not a model display name, and model
   // selection stays reachable from the settings gear and /model.
-  const stripModelLabel = stripModelId
+  const stripModelName = stripModelId
     ? (stripStaticModelLabel ?? stripStampedModelLabel ?? stripProbedModelLabel)
     : null
   // ≤520px collapse favors the short form: drop a trailing "(1M context)"-style
   // parenthetical (raw ids carry none and pass through unchanged).
-  const stripModelLabelShort = stripModelLabel?.replace(/\s*\([^)]*\)\s*$/, '') || stripModelLabel
-  // Tooltip carries the live session's effort when the runtime reports one:
+  const stripModelNameShort = stripModelName?.replace(/\s*\([^)]*\)\s*$/, '') || stripModelName
+  // The model button and tooltip carry the live session's effort when reported:
   // the session-metadata event's fold first (fresher than any REST snapshot by
   // construction — it lands the instant a configure/turn changes the live
   // pair, with null meaning an explicit clear), else the REST snapshot's
@@ -1495,9 +1495,12 @@ export function FreshAgentView({
   const stripEffort = agentSession?.effort !== undefined
     ? agentSession.effort
     : snapshot?.settings?.effort ?? getEffectiveFreshAgentEffort(paneContent, providerDefaults)
+  const stripEffortLabel = stripEffort ?? 'Default'
+  const stripModelLabel = stripModelName ? `${stripModelName} ${stripEffortLabel}` : null
+  const stripModelLabelShort = stripModelNameShort ? `${stripModelNameShort} ${stripEffortLabel}` : undefined
   const stripModelTooltip = !stripModelId
     ? 'model not set'
-    : `${stripModelId} · effort ${stripEffort ?? 'Default'}`
+    : `${stripModelId} · effort ${stripEffortLabel}`
   const contextSessionId = freshAgentContextSessionId(paneContent, agentSession)
   const [usageTick, forceUsageTick] = useReducer((tick: number) => tick + 1, 0)
   const usageRefreshDispatchedRef = useRef(false)

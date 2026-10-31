@@ -12503,6 +12503,52 @@ describe('/undo + /redo dispatch (kata 1wxv)', () => {
 })
 
 describe('FreshAgentView session status strip', () => {
+  it.each([
+    ['freshclaude', 'claude'],
+    ['freshcodex', 'codex'],
+    ['freshopencode', 'opencode'],
+    ['kilroy', 'claude'],
+  ] as const)('shows the current thinking level in full and compact %s model labels', async (sessionType, provider) => {
+    const snapshotRead = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValue(snapshotRead.promise)
+    const store = createStore()
+    const sessionId = provider === 'opencode' ? 'ses_thinking_label' : CLAUDE_THREAD_ID
+    const model = 'thinking-label-model'
+    const modelName = 'Thinking Model (1M context)'
+    const locator = { sessionType, provider, sessionId }
+    store.dispatch(sessionInit(locator))
+    render(
+      <Provider store={store}>
+        <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={{
+          kind: 'fresh-agent', ...locator, resumeSessionId: sessionId,
+          createRequestId: `thinking-label-${sessionType}`, status: 'connected',
+          model, modelLabel: { modelId: model, label: modelName },
+          modelEffortLevels: ['low', 'high', 'max'], effort: 'max',
+        }} />
+      </Provider>,
+    )
+    const expectLabel = (effort: string) => {
+      const chip = screen.getByRole('button', { name: `Model: ${modelName} ${effort} — change model` })
+      expect(within(chip).getByText(`${modelName} ${effort}`, { exact: true })).toBeInTheDocument()
+      expect(within(chip).getByText(`Thinking Model ${effort}`, { exact: true })).toBeInTheDocument()
+      expect(chip).toHaveAttribute('title', `${model} · effort ${effort}`)
+    }
+
+    expectLabel('max')
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+    await act(async () => snapshotRead.resolve({
+      status: 'idle', summary: 'summary', turns: [],
+      capabilities: { send: true, interrupt: true, fork: true },
+      settings: { model, effort: 'low' },
+    }))
+    await waitFor(() => expectLabel('low'))
+
+    act(() => store.dispatch(sessionMetadataReceived({ ...locator, model, effort: 'high' })))
+    expectLabel('high')
+    act(() => store.dispatch(sessionMetadataReceived({ ...locator, model, effort: null })))
+    expectLabel('Default')
+  })
+
   describe('bound Codex catalog strip', () => {
     const model = 'catalog-only-model'
     const catalog = (label: string) => ({ ok: true, sessionType: 'freshcodex', runtimeProvider: 'codex',
@@ -12532,14 +12578,14 @@ describe('FreshAgentView session status strip', () => {
         store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: bound }))
         store.dispatch(sessionInit({ sessionType: 'freshcodex', provider: 'codex', sessionId: nativeId, model, effort: 'ultra' }))
       })
-      await waitFor(() => expect(screen.getByRole('button', { name: 'Model: Owning runtime model — change model' })).toBeInTheDocument())
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Model: Owning runtime model ultra — change model' })).toBeInTheDocument())
       expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenCalledExactlyOnceWith('freshcodex', {
         cwd: content.initialCwd, codexContext: { sessionId: nativeId, sessionRef: bound.sessionRef,
           cwd: content.initialCwd, observedEpoch: 7, observedGeneration: 3 },
       })
-      expect(screen.getByRole('button', { name: 'Model: Owning runtime model — change model' }))
+      expect(screen.getByRole('button', { name: 'Model: Owning runtime model ultra — change model' }))
         .toHaveAttribute('title', 'catalog-only-model · effort ultra')
-      expect(screen.queryByRole('button', { name: `Model: ${model} — change model` })).toBeNull()
+      expect(screen.queryByRole('button', { name: `Model: ${model} ultra — change model` })).toBeNull()
       expect(sentFreshAgentMessages('freshAgent.create')).toEqual(createsBefore)
     })
 
@@ -12583,10 +12629,10 @@ describe('FreshAgentView session status strip', () => {
           codexContext: expect.objectContaining({ sessionId: nativeId, observedEpoch: 7, observedGeneration: 4 }),
         }))
         await act(async () => { current.resolve(catalog('Current source model')) })
-        expect(screen.getByRole('button', { name: 'Model: Current source model — change model' })).toBeInTheDocument()
+        expect(screen.getByRole('button', { name: 'Model: Current source model ultra — change model' })).toBeInTheDocument()
         await act(async () => { old.resolve(catalog('Stale source model')) })
-        expect(screen.queryByRole('button', { name: 'Model: Stale source model — change model' })).toBeNull()
-        expect(screen.getByRole('button', { name: 'Model: Current source model — change model' })).toBeInTheDocument()
+        expect(screen.queryByRole('button', { name: 'Model: Stale source model ultra — change model' })).toBeNull()
+        expect(screen.getByRole('button', { name: 'Model: Current source model ultra — change model' })).toBeInTheDocument()
       } finally { now.mockRestore() }
     })
   })
@@ -12620,7 +12666,7 @@ describe('FreshAgentView session status strip', () => {
       </Provider>,
     )
 
-    const chip = screen.getByRole('button', { name: 'Model: Claude Opus 5 (1M context) — change model' })
+    const chip = screen.getByRole('button', { name: 'Model: Claude Opus 5 (1M context) high — change model' })
     expect(chip).toHaveAttribute('title', 'opus[1m] · effort high')
   })
 
@@ -12655,7 +12701,7 @@ describe('FreshAgentView session status strip', () => {
     })
     // Probe resolved without a match: still no raw id on the chip.
     expect(screen.queryByRole('button', { name: /custom-blend-x/ })).toBeNull()
-    expect(screen.queryByRole('button', { name: 'Model: Claude Opus 5 (1M context) — change model' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Model: Claude Opus 5 (1M context) high — change model' })).toBeNull()
   })
 
   it('shows the live session model ahead of the staged pane model on the chip', async () => {
@@ -12703,13 +12749,13 @@ describe('FreshAgentView session status strip', () => {
     // name wins over the staged pane model's static label.
     expect(screen.queryByRole('button', { name: /claude-live-99/ })).toBeNull()
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Model: Live Ninety Nine — change model' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Model: Live Ninety Nine high — change model' })).toBeInTheDocument()
     })
-    expect(screen.queryByRole('button', { name: 'Model: Claude Opus 5 (1M context) — change model' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Model: Claude Opus 5 (1M context) high — change model' })).toBeNull()
     expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenCalledWith('freshclaude', expect.anything())
   })
 
-  it('pairs the chip tooltip effort with the displayed live model — never the staged model\'s effort under a live id', async () => {
+  it('pairs the chip label and tooltip effort with the displayed live model — never the staged model\'s effort under a live id', async () => {
     apiMock.getFreshAgentModelCapabilities.mockResolvedValue({
       ok: true,
       sessionType: 'freshclaude',
@@ -12752,11 +12798,11 @@ describe('FreshAgentView session status strip', () => {
     )
 
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Model: Live Ninety Nine — change model' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Model: Live Ninety Nine high — change model' })).toBeInTheDocument()
     })
     // The chip's raw-id+effort tooltip must describe the DISPLAYED (live)
     // model; the staged opus[1m]/'high' pairing must not leak under it.
-    const chip = screen.getByRole('button', { name: 'Model: Live Ninety Nine — change model' })
+    const chip = screen.getByRole('button', { name: 'Model: Live Ninety Nine high — change model' })
     // The tooltip carries the LIVE model id and its session effort — the pane
     // was created with 'high', and no live snapshot effort overrides it.
     expect(chip).toHaveAttribute('title', 'claude-live-99 · effort high')
@@ -12815,7 +12861,7 @@ describe('FreshAgentView session status strip', () => {
 
     // The chip starts on the live (init) model.
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Model: Live Ninety Nine — change model' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Model: Live Ninety Nine low — change model' })).toBeInTheDocument()
     })
 
     // The live pair changed server-side (a configure or a settings-carrying
@@ -12829,16 +12875,16 @@ describe('FreshAgentView session status strip', () => {
       effort: 'high',
     }))
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Model: Claude Opus 5 (1M context) — change model' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Model: Claude Opus 5 (1M context) high — change model' })).toBeInTheDocument()
     })
-    expect(screen.queryByRole('button', { name: 'Model: Live Ninety Nine — change model' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Model: Live Ninety Nine low — change model' })).toBeNull()
     // The tooltip effort follows the metadata fold (not the snapshot's stale
     // 'low').
-    expect(screen.getByRole('button', { name: 'Model: Claude Opus 5 (1M context) — change model' }))
+    expect(screen.getByRole('button', { name: 'Model: Claude Opus 5 (1M context) high — change model' }))
       .toHaveAttribute('title', 'opus[1m] · effort high')
   })
 
-  it('an explicit-null metadata effort clears the chip tooltip back to Default', async () => {
+  it('an explicit-null metadata effort clears the chip label and tooltip back to Default', async () => {
     apiMock.getFreshAgentModelCapabilities.mockResolvedValue({
       ok: true,
       sessionType: 'freshopencode',
@@ -12883,9 +12929,9 @@ describe('FreshAgentView session status strip', () => {
     )
 
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Model: GLM 5.2 — change model' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Model: GLM 5.2 high — change model' })).toBeInTheDocument()
     })
-    expect(screen.getByRole('button', { name: 'Model: GLM 5.2 — change model' }))
+    expect(screen.getByRole('button', { name: 'Model: GLM 5.2 high — change model' }))
       .toHaveAttribute('title', 'opencode-go/glm-5.2 · effort high')
 
     // The Default-row commit clears the variant: metadata states effort null
@@ -12898,7 +12944,7 @@ describe('FreshAgentView session status strip', () => {
       effort: null,
     }))
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Model: GLM 5.2 — change model' }))
+      expect(screen.getByRole('button', { name: 'Model: GLM 5.2 Default — change model' }))
         .toHaveAttribute('title', 'opencode-go/glm-5.2 · effort Default')
     })
   })
@@ -12949,15 +12995,15 @@ describe('FreshAgentView session status strip', () => {
     )
 
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Model: Live Ninety Nine — change model' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Model: Live Ninety Nine low — change model' })).toBeInTheDocument()
     })
     expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenCalled()
     // Tooltip pairs the live id with the live effort (not the pane's 'high').
-    expect(screen.getByRole('button', { name: 'Model: Live Ninety Nine — change model' }))
+    expect(screen.getByRole('button', { name: 'Model: Live Ninety Nine low — change model' }))
       .toHaveAttribute('title', 'claude-live-99 · effort low')
   })
 
-  it('a live-reported snapshot effort wins the chip tooltip', async () => {
+  it('a live-reported snapshot effort wins the chip label and tooltip', async () => {
     apiMock.getFreshAgentModelCapabilities.mockResolvedValue({
       ok: true,
       sessionType: 'freshclaude',
@@ -13008,8 +13054,8 @@ describe('FreshAgentView session status strip', () => {
     )
 
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Model: Live Ninety Nine — change model' })).toBeInTheDocument()
-      expect(screen.getByRole('button', { name: 'Model: Live Ninety Nine — change model' }))
+      expect(screen.getByRole('button', { name: 'Model: Live Ninety Nine low — change model' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Model: Live Ninety Nine low — change model' }))
         .toHaveAttribute('title', 'claude-live-99 · effort low')
     })
   })
@@ -13084,7 +13130,7 @@ describe('FreshAgentView session status strip', () => {
       </Provider>,
     )
 
-    fireEvent.click(screen.getByRole('button', { name: 'Model: Claude Opus 5 (1M context) — change model' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Model: Claude Opus 5 (1M context) high — change model' }))
 
     const dialog = await screen.findByRole('dialog', { name: 'Model and thinking level' })
     expect(within(dialog).getByText('Claude Opus 5 (1M context)')).toBeInTheDocument()
@@ -13301,10 +13347,10 @@ describe('FreshAgentView session status strip', () => {
       </Provider>,
     )
 
-    expect(screen.getByRole('button', { name: 'Model: Sonnet Future — change model' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Model: Sonnet Future high — change model' })).toBeInTheDocument()
     // Raw id never appears, and the stamp answers before (and instead of) the
     // catalog probe.
-    expect(screen.queryByRole('button', { name: 'Model: claude-ish/sonnet-future — change model' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Model: claude-ish/sonnet-future high — change model' })).toBeNull()
     await act(async () => { await Promise.resolve() })
     expect(apiMock.getFreshAgentModelCapabilities).not.toHaveBeenCalled()
   })
@@ -13347,10 +13393,10 @@ describe('FreshAgentView session status strip', () => {
 
     // Mismatched stamp must not render (a model change that skipped restamping
     // can never mislabel the chip).
-    expect(screen.queryByRole('button', { name: 'Model: Sonnet Future — change model' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Model: Sonnet Future high — change model' })).toBeNull()
     await waitFor(() => {
       expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenCalledWith('freshclaude', expect.anything())
-      expect(screen.getByRole('button', { name: 'Model: Opus Future — change model' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Model: Opus Future high — change model' })).toBeInTheDocument()
     })
   })
 
@@ -13397,9 +13443,9 @@ describe('FreshAgentView session status strip', () => {
     expect(screen.queryByRole('button', { name: /^Model: / })).toBeNull()
 
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: `Model: ${displayName} — change model` })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: `Model: ${displayName} high — change model` })).toBeInTheDocument()
     })
-    expect(screen.queryByRole('button', { name: `Model: ${modelId} — change model` })).toBeNull()
+    expect(screen.queryByRole('button', { name: `Model: ${modelId} high — change model` })).toBeNull()
     expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenCalledWith(sessionType, expect.anything())
   })
 
@@ -13442,9 +13488,9 @@ describe('FreshAgentView session status strip', () => {
     expect(screen.queryByRole('button', { name: /^Model: / })).toBeNull()
 
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Model: GLM 5.2 — change model' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Model: GLM 5.2 Default — change model' })).toBeInTheDocument()
     })
-    expect(screen.queryByRole('button', { name: 'Model: opencode-go/glm-5.2 — change model' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Model: opencode-go/glm-5.2 Default — change model' })).toBeNull()
   })
 
   it('keeps the chip hidden when the freshopencode catalog probe fails — raw ids never render', async () => {
@@ -13568,7 +13614,7 @@ describe('FreshAgentView session status strip', () => {
       </Provider>,
     )
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Model: Alpha Claude — change model' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Model: Alpha Claude Default — change model' })).toBeInTheDocument()
     })
 
     // Live session model switches to a new catalog-only id; the previous
@@ -13581,7 +13627,7 @@ describe('FreshAgentView session status strip', () => {
         model: 'opencode-go/beta-y',
       }))
     })
-    expect(screen.queryByRole('button', { name: 'Model: Alpha Claude — change model' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Model: Alpha Claude Default — change model' })).toBeNull()
     expect(screen.queryByRole('button', { name: /opencode-go\/beta-y/ })).toBeNull()
 
     resolveSecondProbe!({
@@ -13593,7 +13639,7 @@ describe('FreshAgentView session status strip', () => {
       models: [{ id: 'opencode-go/beta-y', displayName: 'Beta Claude', provider: 'opencode', supportsEffort: true, supportedEffortLevels: ['low'], supportsAdaptiveThinking: true }],
     })
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Model: Beta Claude — change model' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Model: Beta Claude Default — change model' })).toBeInTheDocument()
     })
   })
 })
