@@ -66,6 +66,10 @@ describe('managed builders copy the actual Cargo target artifacts', () => {
     fs.writeFileSync(mise, `#!${process.execPath}\n
         const fs = require('node:fs'); const path = require('node:path');
         const args = process.argv.slice(2);
+        if (args.join(' ') === 'exec rust@1.96.0 -- rustc --version') {
+          process.stdout.write('rustc fixture-host-version\\n');
+          process.exit(0);
+        }
         const target = path.resolve(process.cwd(), process.env.CARGO_TARGET_DIR || 'target');
         const profile = args.includes('--release') ? 'release' : 'debug';
         const bins = args.flatMap((arg, i) => arg === '-p' ? [args[i+1]] : []);
