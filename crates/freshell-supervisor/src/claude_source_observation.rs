@@ -289,8 +289,7 @@ mod tests {
             _: &str,
             until: Instant,
         ) -> Result<ObservationReply, BackendError> {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             *self.until.lock().unwrap() = Some(until);
             if !self.delay.is_zero() {
                 let delay = self.delay;
