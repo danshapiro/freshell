@@ -1166,6 +1166,20 @@ wss.on('connection', (socket) => {
         exitProcessAfterMethodsOnce.delete(method)
         && claimCrossProcessOnce(behavior.exitProcessAfterMethodsOnceMarkerPath, `exit-process:${method}`)
       ) {
+        if (behavior.processExitGate) {
+          const { readyPath, releasePath } = behavior.processExitGate
+          fs.writeFileSync(`${readyPath}.tmp`, JSON.stringify({
+            pid: process.pid,
+            ownershipId: process.env.FRESHELL_CODEX_SIDECAR_ID ?? null,
+            method,
+            threadId: result?.thread?.id ?? message.params?.threadId ?? null,
+            rolloutPath: result?.thread?.path ?? null,
+          }) + '\n', { encoding: 'utf8', flag: 'wx' })
+          fs.renameSync(`${readyPath}.tmp`, readyPath)
+          while (!fs.existsSync(releasePath)) {
+            await new Promise((resolve) => setTimeout(resolve, 25))
+          }
+        }
         setTimeout(() => {
           if (behavior.stdoutBeforeExit) {
             process.stdout.write(String(behavior.stdoutBeforeExit))

@@ -2120,7 +2120,13 @@ mod tests {
         std::fs::write(
             &wrapper,
             format!(
-                "#!/usr/bin/env node\nimport {};\n",
+                r#"#!/usr/bin/env node
+import fs from 'node:fs'
+const stat = fs.readFileSync('/proc/self/stat', 'utf8').split(') ').pop().split(' ')
+fs.appendFileSync({}, JSON.stringify({{pid:process.pid,startTime:Number(stat[19]),ownershipId:process.env.FRESHELL_CODEX_SIDECAR_ID}})+'\n')
+await import({});
+"#,
+                serde_json::to_string(&dir.path().join("native-boots.jsonl")).unwrap(),
                 serde_json::to_string(&fixture).unwrap()
             ),
         )
@@ -2157,6 +2163,158 @@ mod tests {
             _environment,
             _lock,
         }
+    }
+
+    fn native_boots(fixture: &NativeCodexFixture) -> Vec<Value> {
+        std::fs::read_to_string(fixture.dir.path().join("native-boots.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn native_boot_is_live(boot: &Value) -> bool {
+        freshell_codex::sidecar_store::proc_starttime(boot["pid"].as_i64().unwrap() as i32)
+            == boot["startTime"].as_u64()
+    }
+
+    async fn wait_for_native_exit(
+        fixture: &NativeCodexFixture,
+        boot: &Value,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), tokio::time::error::Elapsed> {
+        tokio::time::timeout_at(deadline, async {
+            while native_boot_is_live(boot) || fixture.transport.is_live().await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+    }
+
+    async fn read_native_thread(
+        fixture: &NativeCodexFixture,
+        original: &str,
+        deadline: tokio::time::Instant,
+    ) -> Value {
+        let ProviderState::Codex(state) = &fixture.transport.state else {
+            unreachable!()
+        };
+        let client = state
+            .management_client_for_root(fixture.dir.path().join("codex-home").to_str().unwrap())
+            .await
+            .unwrap();
+        tokio::time::timeout_at(deadline, client.read_thread(original, true))
+            .await
+            .unwrap()
+            .expect("armed native must answer a real read_thread RPC")
+    }
+
+    struct NativeExitGate {
+        ready: std::path::PathBuf,
+        release: std::path::PathBuf,
+    }
+
+    impl NativeExitGate {
+        fn new(directory: &std::path::Path) -> Self {
+            Self {
+                ready: directory.join("native-exit-ready"),
+                release: directory.join("native-exit-release"),
+            }
+        }
+
+        fn behavior(&self) -> Value {
+            json!({"readyPath":self.ready,"releasePath":self.release})
+        }
+
+        async fn armed(&self, boot: &Value, deadline: tokio::time::Instant) -> Value {
+            tokio::time::timeout_at(deadline, async {
+                loop {
+                    assert!(native_boot_is_live(boot),
+                        "native process physically exited while its exit release was absent: {boot}");
+                    if let Ok(bytes) = std::fs::read(&self.ready) {
+                        let ready: Value = serde_json::from_slice(&bytes).unwrap();
+                        assert_eq!(ready["pid"], boot["pid"]);
+                        assert_eq!(ready["ownershipId"], boot["ownershipId"]);
+                        assert!(!self.release.exists());
+                        return ready;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.expect("native exit must arm within the existing lifecycle budget")
+        }
+
+        fn release(&self) {
+            std::fs::write(&self.release, b"release").unwrap();
+        }
+    }
+
+    impl Drop for NativeExitGate {
+        fn drop(&mut self) {
+            // Failure cleanup releases only this fixture's waiting executable.
+            let _ = std::fs::write(&self.release, b"release");
+        }
+    }
+
+    #[tokio::test]
+    async fn task010_native_thread_start_exit_gate_holds_until_release() {
+        assert_native_exit_gate(true).await;
+    }
+
+    #[tokio::test]
+    async fn task010_native_turn_start_exit_gate_holds_until_release() {
+        assert_native_exit_gate(false).await;
+    }
+
+    async fn assert_native_exit_gate(pending: bool) {
+        let logs = tempfile::tempdir().unwrap();
+        let gate = NativeExitGate::new(logs.path());
+        let method = if pending {
+            "thread/start"
+        } else {
+            "turn/start"
+        };
+        let fixture = native_codex_fixture(json!({"recordTurns":true,
+            "exitProcessAfterMethodsOnce":[method],"processExitGate":gate.behavior()}))
+        .await;
+        let actor = FreshAgentHostActor::open(
+            fixture.dir.path().join("physical-exit-gate-actor"),
+            fixture.profile.clone(),
+            fixture.transport.clone(),
+        )
+        .await
+        .unwrap();
+        let original = actor.profile().await.native_session_id.unwrap();
+        if !pending {
+            actor
+                .dispatch(
+                    RequestId::parse("gate-first-input").unwrap(),
+                    "first native input".into(),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let boots = native_boots(&fixture);
+        assert_eq!(boots.len(), 1, "the real native executable boots once");
+        let boot = &boots[0];
+        let ready = gate.armed(boot, deadline).await;
+        assert_eq!(ready["method"], method);
+        assert_eq!(ready["threadId"], original);
+        let native = read_native_thread(&fixture, &original, deadline).await;
+        assert_eq!(native["thread"]["id"], original);
+        assert_eq!(
+            native["thread"]["turns"].as_array().unwrap().len(),
+            usize::from(!pending)
+        );
+        assert!(native_boot_is_live(boot));
+        assert!(fixture.transport.is_live().await);
+        assert!(!gate.release.exists());
+        gate.release();
+        wait_for_native_exit(&fixture, boot, deadline)
+            .await
+            .expect("released native incarnation must physically exit");
+        actor.stop().await.unwrap();
     }
 
     #[tokio::test]
@@ -2411,13 +2569,13 @@ await import(parameters.source)
     struct NativeCodexCleanupReadiness {
         available: Arc<std::sync::atomic::AtomicBool>,
         original: Arc<std::sync::Mutex<Option<CondemnedRuntimeIdentity>>>,
+        capture: oneshot::Receiver<(String, CondemnedRuntimeIdentity)>,
+        callbacks: Arc<std::sync::Mutex<Vec<Value>>>,
         ready: watch::Receiver<Option<CondemnedRuntimeIdentity>>,
     }
 
     fn native_cleanup_evidence(recorded: &CondemnedRuntimeIdentity) -> Value {
-        json!({"pid":recorded.pid,"startTime":recorded.start_time,
-            "ownershipId":recorded.ownership_id,"tree":recorded.tree,
-            "captureComplete":recorded.capture_complete})
+        serde_json::to_value(recorded).unwrap()
     }
 
     impl NativeCodexCleanupReadiness {
@@ -2428,21 +2586,42 @@ await import(parameters.source)
             };
             let available = Arc::new(AtomicBool::new(false));
             let original = Arc::new(std::sync::Mutex::new(None::<CondemnedRuntimeIdentity>));
+            let callbacks = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (capture_tx, capture) = oneshot::channel();
+            let capture_tx = std::sync::Mutex::new(Some(capture_tx));
+            state.set_sidecar_capture_observer_for_tests(Arc::new(move |thread_id, recorded| {
+                if let Some(sender) = capture_tx.lock().unwrap().take() {
+                    let _ = sender.send((thread_id.to_owned(), recorded.clone()));
+                }
+            }));
             let (ready_tx, ready) = watch::channel(None);
             state.set_sidecar_cleanup_probe(Arc::new({
                 let available = available.clone();
                 let original = original.clone();
+                let callbacks = callbacks.clone();
                 move |recorded| {
                     let available = available.clone();
                     let original = original.clone();
+                    let callbacks = callbacks.clone();
                     let ready_tx = ready_tx.clone();
                     Box::pin(async move {
+                        callbacks
+                            .lock()
+                            .unwrap()
+                            .push(native_cleanup_evidence(&recorded));
                         let is_original = {
-                            let mut first = original.lock().expect("original owned identity");
-                            let first = first.get_or_insert_with(|| recorded.clone());
-                            first.pid == recorded.pid
-                                && first.start_time == recorded.start_time
-                                && first.ownership_id == recorded.ownership_id
+                            let first = original.lock().expect("original owned identity");
+                            let same = first.as_ref().is_some_and(|first| {
+                                native_cleanup_evidence(first) == native_cleanup_evidence(&recorded)
+                            });
+                            if first
+                                .as_ref()
+                                .is_some_and(|first| first.ownership_id == recorded.ownership_id)
+                                && !same
+                            {
+                                return Err("the original watcher record changed".into());
+                            }
+                            same
                         };
                         let withheld = !available.load(Ordering::SeqCst);
                         let confirmed = if withheld {
@@ -2475,14 +2654,81 @@ await import(parameters.source)
             Self {
                 available,
                 original,
+                capture,
+                callbacks,
                 ready,
             }
+        }
+
+        async fn observe_original(
+            &mut self,
+            session_id: &str,
+            boot: &Value,
+            require_complete: bool,
+            deadline: tokio::time::Instant,
+        ) -> CondemnedRuntimeIdentity {
+            // Receive once, never filter or recapture an incomplete original.
+            let (thread_id, recorded) = tokio::time::timeout_at(deadline, &mut self.capture)
+                .await
+                .unwrap()
+                .expect("exact watcher capture notification");
+            assert_eq!(thread_id, session_id);
+            assert_eq!(json!(recorded.pid), boot["pid"]);
+            assert_eq!(json!(recorded.ownership_id), boot["ownershipId"]);
+            if let Some(start) = recorded.start_time {
+                assert_eq!(json!(start), boot["startTime"]);
+            }
+            if require_complete {
+                assert!(
+                    recorded.capture_complete,
+                    "first original capture must be complete before exit release: {}",
+                    native_cleanup_evidence(&recorded)
+                );
+                let start = recorded.start_time.expect("live original start time");
+                assert!(recorded.tree.contains(&(recorded.pid as i32, start)));
+                assert!(native_boot_is_live(boot));
+            }
+            let mut original = self.original.lock().unwrap();
+            assert!(original.is_none());
+            *original = Some(recorded.clone());
+            recorded
         }
 
         fn evidence(&self) -> Value {
             let original = self.original.lock().expect("original owned identity");
             json!({"original":original.as_ref().map(native_cleanup_evidence),
+                "callbacks":*self.callbacks.lock().unwrap(),
                 "confirmed":self.ready.borrow().as_ref().map(native_cleanup_evidence)})
+        }
+
+        async fn assert_original_remains_unconfirmed(
+            &self,
+            state: &FreshCodexState,
+            session_id: &str,
+            deadline: tokio::time::Instant,
+        ) {
+            let before = self.callbacks.lock().unwrap().len();
+            assert!(!tokio::time::timeout_at(
+                deadline,
+                state.confirm_fenced_prior_dead(session_id)
+            )
+            .await
+            .unwrap());
+            let callbacks = self.callbacks.lock().unwrap();
+            assert!(
+                callbacks.len() > before,
+                "false must come from actual original cleanup, not a missing prior"
+            );
+            let original = self.original.lock().unwrap();
+            let original = native_cleanup_evidence(original.as_ref().unwrap());
+            assert!(callbacks[before..]
+                .iter()
+                .all(|recorded| *recorded == original));
+            eprintln!(
+                "{}",
+                json!({"event":"freshcodex.test.original_remains_unconfirmed",
+                "severity":"info","identity":original,"callbackDelta":callbacks.len()-before})
+            );
         }
 
         async fn allow_and_wait(
@@ -2532,6 +2778,114 @@ await import(parameters.source)
         }
     }
 
+    #[tokio::test]
+    async fn task010_ungated_initial_native_exit_retains_claim_and_never_replays_input() {
+        let logs = tempfile::tempdir().unwrap();
+        let requests = logs.path().join("ungated-requests.jsonl");
+        let original = uuid::Uuid::new_v4().to_string();
+        // Deliberately no exit gate: this is the genuine initial-capture race.
+        let fixture = native_codex_fixture(json!({"threadStartThreadId":original,
+            "recordTurns":true,"appendRequestLogPath":requests,
+            "exitProcessAfterMethodsOnce":["thread/start"]}))
+        .await;
+        let mut cleanup = NativeCodexCleanupReadiness::withheld(&fixture, true);
+        let mut profile = fixture.profile.clone();
+        profile.naming_handle = Some("pending-ungated-recovery".into());
+        let actor = FreshAgentHostActor::open(
+            fixture.dir.path().join("ungated-actor"),
+            profile,
+            fixture.transport.clone(),
+        )
+        .await
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let before = actor.profile().await;
+        assert_eq!(before.native_session_id.as_deref(), Some(original.as_str()));
+        let boots = native_boots(&fixture);
+        assert_eq!(boots.len(), 1);
+        let boot = &boots[0];
+        let captured = cleanup
+            .observe_original(&original, boot, false, deadline)
+            .await;
+        wait_for_native_exit(&fixture, boot, deadline)
+            .await
+            .expect("ungated original incarnation must physically exit");
+        let ProviderState::Codex(state) = &fixture.transport.state else {
+            unreachable!()
+        };
+        // Fresh create has no in-flight resume/watchdog lease. Its actual
+        // unconfirmed ownership is the exact condemned record, not a new lease.
+        let initial_handle = state.leases().peek_kill_handle("codex", &original);
+        assert!(initial_handle.is_none());
+        cleanup
+            .assert_original_remains_unconfirmed(state, &original, deadline)
+            .await;
+        let refused = tokio::time::timeout_at(
+            deadline,
+            actor.dispatch(
+                RequestId::parse("ungated-explicit-refused-input").unwrap(),
+                "ungated input must never reach native work".into(),
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(refused,
+            Err(freshell_agent_runtime::host_actor::ActorError::Transport(ref message))
+                if message.starts_with("SESSION_RESERVED:")),
+            "{refused:?}"
+        );
+        assert_eq!(actor.profile().await, before);
+        assert_eq!(
+            state.leases().peek_kill_handle("codex", &original),
+            initial_handle
+        );
+        cleanup
+            .assert_original_remains_unconfirmed(state, &original, deadline)
+            .await;
+        assert!(!cleanup.available.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(cleanup.ready.borrow().is_none());
+        let callbacks = cleanup.callbacks.lock().unwrap().clone();
+        assert!(
+            !callbacks.is_empty(),
+            "the unavailable original proof must actually run"
+        );
+        assert!(callbacks
+            .iter()
+            .all(|recorded| *recorded == native_cleanup_evidence(&captured)));
+        assert_eq!(
+            native_boots(&fixture),
+            boots,
+            "refusal must not boot a replacement executable"
+        );
+        let rows = std::fs::read_to_string(&requests).unwrap();
+        let requests = rows
+            .lines()
+            .map(|row| serde_json::from_str::<Value>(row).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|row| row["method"] == "thread/start")
+                .count(),
+            1
+        );
+        assert!(!requests
+            .iter()
+            .any(|row| row["method"] == "thread/resume" || row["method"] == "turn/start"));
+        assert!(!rows.contains("ungated input must never reach native work"));
+        assert!(!fixture.dir.path().join("codex-home/sessions").exists());
+        assert!(!fixture.dir.path().join("codex-home/fake-turns").exists());
+        eprintln!(
+            "{}",
+            json!({"event":"freshcodex.test.ungated_initial_exit_refused",
+            "severity":"info","identity":native_cleanup_evidence(&captured),
+            "boot":boot,"physicalExit":true,"nativeBoots":boots.len(),"nativeTurns":0})
+        );
+        actor.stop().await.unwrap();
+    }
+
     async fn assert_native_mint_ack(pending: bool) {
         eprintln!(
             "{}",
@@ -2539,12 +2893,14 @@ await import(parameters.source)
             "severity":"info","pending":pending,"phase":"start"})
         );
         let logs = tempfile::tempdir().unwrap();
+        let gate = NativeExitGate::new(logs.path());
         let log = logs.path().join("recovery-requests.jsonl");
         let original_id = uuid::Uuid::new_v4().to_string();
         let replacement_id = uuid::Uuid::new_v4().to_string();
         let behavior = json!({
             "threadStartThreadId":original_id,"recordTurns":true,"echoRequestedModel":true,"appendRequestLogPath":log,
             "exitProcessAfterMethodsOnce":[if pending {"thread/start"} else {"turn/start"}],
+            "processExitGate":gate.behavior(),
             "exitProcessAfterMethodsOnceMarkerPath":logs.path().join("first-native-exit"),
             "overrides":{"thread/resume":{"error":{"code":-32600,"message":"no rollout found for thread id original-native"}}}
         });
@@ -2592,12 +2948,81 @@ await import(parameters.source)
         // Keep the original five-second lifecycle budget for both exit
         // and readiness; no accepted recovery dispatch is retried.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let exited = tokio::time::timeout_at(deadline, async {
-            while fixture.transport.is_live().await {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await;
+        let boots = native_boots(&fixture);
+        assert_eq!(boots.len(), 1);
+        let boot = &boots[0];
+        let captured = cleanup
+            .observe_original(&original, boot, true, deadline)
+            .await;
+        let armed = gate.armed(boot, deadline).await;
+        assert_eq!(armed["threadId"], original);
+        let ProviderState::Codex(state) = &fixture.transport.state else {
+            unreachable!()
+        };
+        let native = read_native_thread(&fixture, &original, deadline).await;
+        let turns = native["thread"]["turns"].as_array().unwrap();
+        let configured_rollout = fixture
+            .dir
+            .path()
+            .join("codex-home/sessions")
+            .join(format!("rollout-{original}.jsonl"));
+        let prospective_rollout = std::path::Path::new(native["thread"]["path"].as_str().unwrap());
+        let turn_store = fixture
+            .dir
+            .path()
+            .join("codex-home/fake-turns")
+            .join(format!("{original}.json"));
+        let before_exit = std::fs::read_to_string(&log).unwrap();
+        let rows = before_exit
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["method"] == "thread/start")
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["method"] == "turn/start")
+                .count(),
+            usize::from(!pending)
+        );
+        assert_eq!(turns.len(), usize::from(!pending));
+        assert_eq!(actor.profile().await.naming_handle, profile.naming_handle);
+        if pending {
+            assert!(!configured_rollout.exists());
+            assert!(!prospective_rollout.exists());
+            assert!(!turn_store.exists());
+            let retained = state.retained_state(&original).await.unwrap();
+            assert_eq!(retained["snapshot"]["threadId"], original);
+            assert!(
+                retained["snapshot"]["extensions"]["codex"]["hostedNamingFacts"]
+                    .as_array()
+                    .is_none_or(|facts| !facts
+                        .iter()
+                        .any(|fact| fact["kind"] == "acquisition" || fact["kind"] == "transition"))
+            );
+        } else {
+            assert!(configured_rollout.exists());
+            assert!(prospective_rollout.exists());
+            let persisted: Value =
+                serde_json::from_slice(&std::fs::read(&turn_store).unwrap()).unwrap();
+            assert_eq!(persisted.as_array().unwrap().len(), 1);
+            assert!(persisted.to_string().contains("first native input"));
+        }
+        assert!(native_boot_is_live(boot));
+        assert!(!gate.release.exists());
+        eprintln!(
+            "{}",
+            json!({"event":"freshcodex.test.original_before_exit_release",
+            "severity":"info","pending":pending,"identity":native_cleanup_evidence(&captured),
+            "nativeTurns":turns.len(),"configuredHeader":configured_rollout.exists(),
+            "prospectiveHeader":prospective_rollout.exists(),"turnStore":turn_store.exists()})
+        );
+        gate.release();
+        let exited = wait_for_native_exit(&fixture, boot, deadline).await;
         eprintln!(
             "{}",
             json!({"event":"freshcodex.test.native_exit",
@@ -2775,6 +3200,20 @@ await import(parameters.source)
                 .count(),
             2,
             "only the initial thread and explicit native missing-history fallback may create"
+        );
+        let resume = rows
+            .iter()
+            .position(|row| {
+                row["method"] == "thread/resume" && row["params"]["threadId"] == original
+            })
+            .expect("old native id must actually attempt resume");
+        let replacement = rows
+            .iter()
+            .rposition(|row| row["method"] == "thread/start")
+            .unwrap();
+        assert!(
+            resume < replacement,
+            "native missing-history refusal must precede mint-new"
         );
         let starts = rows
             .iter()

@@ -545,6 +545,8 @@ pub struct FreshCodexState {
     hosted_naming_events: bool,
     naming_rollout_probe: Arc<std::sync::OnceLock<CodexNamingRolloutProbe>>,
     sidecar_cleanup_probe: Arc<std::sync::OnceLock<CodexSidecarCleanupProbe>>,
+    #[cfg(any(test, feature = "test-support"))]
+    sidecar_capture_observer: Arc<std::sync::OnceLock<CodexSidecarCaptureObserver>>,
     /// Unified agent names: thread id → the pre-durable naming handle
     /// admitted at create. A `thread/start` id/path is PROSPECTIVE (the
     /// rollout hasn't materialized), so the handle stays pending and the
@@ -599,6 +601,11 @@ pub type CodexSidecarCleanupProbe = Arc<
         + Send
         + Sync,
 >;
+
+/// Observe the exact one-time watcher capture without changing its evidence.
+#[cfg(any(test, feature = "test-support"))]
+pub type CodexSidecarCaptureObserver =
+    Arc<dyn Fn(&str, &crate::session_lease::CondemnedRuntimeIdentity) + Send + Sync>;
 
 /// The cached result of a completed codex `freshAgent.create`, keyed by `requestId` in
 /// [`FreshCodexState::create_dedup`]. Only `session_id` is needed: every other field of
@@ -951,6 +958,8 @@ impl FreshCodexState {
             hosted_naming_events: false,
             naming_rollout_probe: Arc::new(std::sync::OnceLock::new()),
             sidecar_cleanup_probe: Arc::new(std::sync::OnceLock::new()),
+            #[cfg(any(test, feature = "test-support"))]
+            sidecar_capture_observer: Arc::new(std::sync::OnceLock::new()),
             naming_handles: Arc::new(TokioMutex::new(HashMap::new())),
             snapshot_pause: Arc::new(StdMutex::new(None)),
             snapshot_pause_after_capture: Arc::new(StdMutex::new(None)),
@@ -974,6 +983,14 @@ impl FreshCodexState {
 
     pub fn set_sidecar_cleanup_probe(&self, probe: CodexSidecarCleanupProbe) {
         let _ = self.sidecar_cleanup_probe.set(probe);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_sidecar_capture_observer_for_tests(&self, observer: CodexSidecarCaptureObserver) {
+        assert!(
+            self.sidecar_capture_observer.set(observer).is_ok(),
+            "sidecar capture observer is already installed"
+        );
     }
 
     async fn report_hosted_naming_fact(
@@ -11684,6 +11701,15 @@ fn spawn_exit_watcher_tracking_turns(
             &ownership_id,
         )
     });
+    #[cfg(any(test, feature = "test-support"))]
+    if let (Some(observer), Some(recorded)) = (
+        retained_state
+            .as_ref()
+            .and_then(|state| state.sidecar_capture_observer.get()),
+        recorded.as_ref(),
+    ) {
+        observer(&thread_id, recorded);
+    }
     let ownership = ownership.map(|watch| watch.for_runtime(&thread_id, child.id()));
     let cleanup_probe = retained_state
         .as_ref()
