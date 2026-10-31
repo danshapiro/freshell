@@ -1,6 +1,6 @@
 {
   "clientToServer": {
-    "count": 42,
+    "count": 43,
     "types": [
       "amplifier.activity.list",
       "claude.activity.list",
@@ -14,6 +14,7 @@
       "freshAgent.compact",
       "freshAgent.configure",
       "freshAgent.create",
+      "freshAgent.elicitation.respond",
       "freshAgent.fork",
       "freshAgent.interrupt",
       "freshAgent.kill",

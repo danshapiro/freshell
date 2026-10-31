@@ -439,9 +439,9 @@ export function capFreshAgentModelSourceRows(
 /**
  * Map a provider's baked-in model menu into the live-catalog capability shape
  * so the shared model+thinking dialog treats baked-in and probed catalogs as
- * data-only differences. freshcodex and the claude providers
- * (freshclaude/kilroy) have baked-in static tables; freshopencode models come
- * from the probed catalog alone. The claude arm carries no `source`, so
+ * data-only differences. Claude providers (freshclaude/kilroy) retain their
+ * static aliases. Codex requires a bound native catalog and OpenCode uses its
+ * probed catalog. The claude arm carries no `source`, so
  * statics and probed rows group together under the provider fallback exactly
  * as the probed claude catalog does.
  */
@@ -466,22 +466,5 @@ export function getFreshAgentStaticModelCapabilities(
       models,
     }
   }
-  if (sessionType !== 'freshcodex') return undefined
-  const models: FreshAgentModelCapability[] = FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE.freshcodex
-    .map((option) => ({
-      id: option.value,
-      displayName: option.label,
-      provider: 'codex' as const,
-      source: { id: 'openai', displayName: 'openai' },
-      supportsEffort: (option.thinkingEfforts?.length ?? 0) > 0,
-      supportedEffortLevels: [...(option.thinkingEfforts ?? [])],
-      supportsAdaptiveThinking: false,
-    }))
-  return {
-    sessionType: 'freshcodex',
-    runtimeProvider: 'codex',
-    status: 'fresh',
-    fetchedAt: 0,
-    models,
-  }
+  return undefined
 }

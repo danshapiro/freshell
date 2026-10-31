@@ -422,7 +422,7 @@ async function sendComposerText(page: Page, text: string): Promise<void> {
   const paneRoot = page.locator('[data-context="fresh-agent"]').last()
   const composer = paneRoot.getByRole('textbox', { name: 'Chat message input' })
   await composer.fill(text)
-  await paneRoot.getByRole('button', { name: 'Send' }).click()
+  await paneRoot.getByRole('button', { name: 'Send', exact: true }).click()
 }
 
 /** Capture the pane's durable sessionRef id once it exists. */
@@ -1289,6 +1289,7 @@ async function bootCodexLane(
   projectDir: string
   opLogPath: string
   responseLogPath: string
+  requestLogPath: string
   tabId: string
 }> {
   const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-agentctl-codex-'))
@@ -1297,6 +1298,7 @@ async function bootCodexLane(
     await fs.mkdir(projectDir, { recursive: true })
     const opLogPath = path.join(sharedRoot, 'codex-ops.jsonl')
     const responseLogPath = path.join(sharedRoot, 'codex-responses.jsonl')
+    const requestLogPath = path.join(sharedRoot, 'codex-requests.jsonl')
     const { server, info, harness } = await bootWall(page, {
       env: {
         // Whitespace-split by spawn_sidecar (codex.rs): interpreter + script.
@@ -1307,6 +1309,8 @@ async function bootCodexLane(
           // answers the recorded history, so forks provably diverge at the pin.
           recordTurns: true,
           appendClientResponseLogPath: responseLogPath,
+          appendRequestLogPath: requestLogPath,
+          echoRequestedModel: true,
           ...behavior,
         }),
         ...extraEnv,
@@ -1319,7 +1323,7 @@ async function bootCodexLane(
     const tabId = (await harness.getActiveTabId())!
     expect(tabId).toBeTruthy()
     await createFreshAgentPane(page, /^Freshcodex$/, 'Freshcodex', projectDir)
-    return { server, info, harness, sharedRoot, projectDir, opLogPath, responseLogPath, tabId }
+    return { server, info, harness, sharedRoot, projectDir, opLogPath, responseLogPath, requestLogPath, tabId }
   } catch (error) {
     await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
     throw error
@@ -1328,6 +1332,66 @@ async function bootCodexLane(
 
 function readCodexOps(opLogPath: string): any[] {
   return readJsonl(opLogPath)
+}
+
+/** Bounded fixture-only diagnostics; never include control bodies or answers. */
+async function captureCodexLaneDiagnostics(
+  page: Page,
+  lane: Awaited<ReturnType<typeof bootCodexLane>>,
+): Promise<void> {
+  const rows = (turns: any[] = []) => turns.map((turn) => ({
+    id: turn.turnId, nativeTurnId: turn.nativeTurnId, role: turn.role,
+    items: (turn.items ?? []).map((item: any) => ({ id: item.id, kind: item.kind, textBytes: typeof item.text === 'string' ? item.text.length : undefined })),
+  }))
+  const summarizeMetadata = (metadata: any) => metadata && ({
+    ...metadata,
+    turnOutputStates: Object.fromEntries(Object.entries(metadata.turnOutputStates ?? {}).map(([id, output]: [string, any]) => [id, {
+      provenance: output.provenance, diagnostic: output.diagnostic, refreshPending: output.refreshPending,
+      savedTurns: rows(output.savedTurns), retainedTurns: rows(output.retainedTurns),
+    }])),
+  })
+  const summarizeSnapshot = (snapshot: any) => snapshot && ({
+    threadId: snapshot.threadId, status: snapshot.status, revision: snapshot.revision,
+    turns: rows(snapshot.turns),
+    projection: summarizeMetadata(snapshot.extensions?.codex?.projection),
+  })
+  const result = await Promise.allSettled([
+    fetchSnapshot(lane.info, 'freshcodex', 'codex', 'thread-new-1'),
+    lane.harness.getReceivedWsMessages(),
+    lane.harness.getState(),
+    page.locator('[data-context="fresh-agent"]').last().getByRole('button').allTextContents(),
+  ])
+  const value = (index: number): any => {
+    const item = result[index]
+    return item.status === 'fulfilled' ? item.value : { diagnosticError: String(item.reason) }
+  }
+  const state = value(2)
+  const live = Object.values(state?.freshAgentLive?.bySession ?? {}).map((session: any) => ({
+    sessionId: session.sessionId,
+    retainedSourceKey: session.retainedSourceKey,
+    retainedSnapshot: summarizeSnapshot(session.retainedSnapshot),
+    projection: session.projection && {
+      id: session.projection.id, historyGeneration: session.projection.historyGeneration,
+      eventRevision: session.projection.eventRevision, needsResnapshot: session.projection.needsResnapshot,
+      turns: rows(session.projection.turns), turnRows: session.projection.turnRows,
+    },
+  }))
+  const frames = Array.isArray(value(1)) ? value(1).slice(-100).map((frame: any) => ({
+    type: frame.type, sessionId: frame.sessionId, provider: frame.provider,
+    event: frame.event && {
+      type: frame.event.type, status: frame.event.status,
+      projectionId: frame.event.projectionId, historyGeneration: frame.event.historyGeneration,
+      afterRevision: frame.event.afterRevision,
+      ops: frame.event.ops?.map((op: any) => ({ op: op.op, revision: op.revision, nativeTurnId: op.nativeTurnId })),
+      source: frame.event.retainedState?.source,
+      snapshot: summarizeSnapshot(frame.event.retainedState?.snapshot),
+    },
+  })) : value(1)
+  console.log('TASK006_CODEX_STATE_DIAGNOSTIC', JSON.stringify({
+    test: test.info().title, nativeOperations: readCodexOps(lane.opLogPath).slice(-100),
+    restSnapshot: summarizeSnapshot(value(0)), forwardedFrames: frames,
+    live, sessions: Object.values(state?.freshAgent?.sessions ?? {}).map((session: any) => ({ sessionId: session.sessionId, status: session.status })), visibleButtonLabels: value(3),
+  }))
 }
 
 /** Read a freshAgent session's status from the harness store — the exact
@@ -1371,12 +1435,13 @@ async function sendCodexTurnAndWaitRows(
   harness: TestHarness,
   expectedRowCount: number,
   text: string,
+  threadId = 'thread-new-1',
 ): Promise<void> {
   const sentBefore = await harness.getSentWsMessages()
   const matchingSendsBefore = (sentBefore as any[]).filter(
     (message) => message?.type === 'freshAgent.send'
       && message?.provider === 'codex'
-      && message?.sessionId === 'thread-new-1'
+      && message?.sessionId === threadId
       && message?.text === text,
   ).length
   await sendComposerText(page, text)
@@ -1385,7 +1450,7 @@ async function sendCodexTurnAndWaitRows(
       async () => (await harness.getSentWsMessages() as any[]).filter(
         (message) => message?.type === 'freshAgent.send'
           && message?.provider === 'codex'
-          && message?.sessionId === 'thread-new-1'
+          && message?.sessionId === threadId
           && message?.text === text,
       ).length,
       {
@@ -1406,7 +1471,7 @@ async function sendCodexTurnAndWaitRows(
   await expect
     .poll(
       async () => {
-        const snapshot = await fetchSnapshot(info, 'freshcodex', 'codex', 'thread-new-1')
+        const snapshot = await fetchSnapshot(info, 'freshcodex', 'codex', threadId)
         return {
           rows: snapshot?.turns?.length ?? 0,
           status: snapshot?.status ?? null,
@@ -1423,7 +1488,7 @@ async function sendCodexTurnAndWaitRows(
   // provider snapshot alone.
   await expect
     .poll(
-      () => readFreshAgentSessionStatus(harness, 'thread-new-1'),
+      () => readFreshAgentSessionStatus(harness, threadId),
       {
         timeout: 30_000,
         message: `the browser did not settle its Codex session after "${text}"`,
@@ -1461,6 +1526,185 @@ async function readRollout(homeDir: string, threadId: string): Promise<string | 
 test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
   test.setTimeout(240_000)
 
+  test('Freshcodex preserves pre-ack Default and typed exact effort through native sends', async ({ page }) => {
+    const gateRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-create-gate-'))
+    const releasePath = path.join(gateRoot, 'release')
+    await fs.writeFile(releasePath, '')
+    const lane = await bootCodexLane(page, { uniqueThreadIds: true, waitForThreadStartReleasePath: releasePath })
+    try {
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      const controlId = (await paneLeaf(lane.harness, lane.tabId)).content.sessionId as string
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 2, 'Pre-ack readiness control', controlId)
+      const settings = page.getByRole('dialog', { name: 'Agent settings' })
+      const modelDialog = page.getByRole('dialog', { name: 'Model and thinking level' })
+      await page.getByRole('button', { name: 'Agent settings' }).click()
+      await settings.getByRole('button', { name: /Change/ }).click()
+      await modelDialog.getByRole('option', { name: 'Provider Current', exact: true }).click()
+      await modelDialog.getByRole('listbox', { name: 'Thinking levels for Provider Current' }).getByRole('option', { name: /^ultra\b/ }).click()
+      await modelDialog.getByRole('button', { name: 'Use Provider Current · ultra' }).click()
+      await page.keyboard.press('Escape')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 4, 'Pre-ack explicit ultra control', controlId)
+      const starts = () => readJsonl(lane.requestLogPath).filter((row) => row.method === 'turn/start')
+      expect(starts()[1].params).toMatchObject({ model: 'provider-current', effort: 'ultra' })
+      console.log('TASK008_PREACK_NATIVE_READY', JSON.stringify({ controlId, completedControl: true, explicitEffort: 'ultra' }))
+
+      await fs.unlink(releasePath)
+      await page.getByRole('button', { name: 'New shell tab', exact: true }).click()
+      await selectShellIfPickerShowing(page)
+      await expect(page.locator('.xterm:visible').first()).toBeVisible({ timeout: 30_000 })
+      const tabId = (await lane.harness.getActiveTabId())!
+      await createFreshAgentPane(page, /^Freshcodex$/, 'Freshcodex', lane.projectDir)
+      await expect.poll(() => readJsonl(lane.requestLogPath).filter((row) => row.method === 'thread/start').length).toBe(2)
+      const create = (await lane.harness.getSentWsMessages() as any[]).filter((row) => row.type === 'freshAgent.create').at(-1)
+      expect(create.effort).toBe('ultra')
+      expect((await paneLeaf(lane.harness, tabId)).content.sessionId).toBeUndefined()
+      await page.getByRole('button', { name: 'Agent settings' }).click()
+      await settings.getByRole('button', { name: /Change/ }).click()
+      await modelDialog.getByRole('option', { name: 'Default', exact: true }).click()
+      await modelDialog.getByRole('button', { name: /^Use .* · Default$/ }).click()
+      expect((await paneLeaf(lane.harness, tabId)).content).toMatchObject({ effortIsNativeDefault: true })
+      expect((await paneLeaf(lane.harness, tabId)).content.effort).toBeUndefined()
+      await page.keyboard.press('Escape')
+      await fs.writeFile(releasePath, '')
+      await expect.poll(async () => (await paneLeaf(lane.harness, tabId))?.content?.sessionId ?? null).not.toBe(null)
+      const threadId = (await paneLeaf(lane.harness, tabId)).content.sessionId as string
+      await expect.poll(async () => (await fetchSnapshot(lane.info, 'freshcodex', 'codex', threadId))?.settings?.effort).toBe('ultra')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 2, 'Pre-ack Default next send', threadId)
+      const afterAck = (await paneLeaf(lane.harness, tabId)).content
+      const defaultStart = starts().at(-1).params
+
+      await page.getByRole('button', { name: 'Agent settings' }).click()
+      await settings.getByRole('button', { name: /Change/ }).click()
+      await expect(modelDialog.getByRole('listbox', { name: 'Thinking levels for Provider Current' })).toBeVisible()
+      await modelDialog.getByRole('textbox', { name: 'Reasoning effort', exact: true }).fill('future-effort')
+      const commitButton = modelDialog.getByRole('button', { name: /^Use / })
+      const typedLabel = await commitButton.textContent()
+      await commitButton.click()
+      await page.keyboard.press('Escape')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 4, 'Typed exact effort next send', threadId)
+      expect({
+        afterAck: { effort: afterAck.effort ?? null, nativeDefault: afterAck.effortIsNativeDefault },
+        defaultNative: defaultStart.effort ?? null,
+        defaultCollaboration: defaultStart.collaborationMode.settings.reasoning_effort,
+        typedLabel, typedNative: starts().at(-1).params.effort ?? null,
+      }).toEqual({
+        afterAck: { effort: null, nativeDefault: true }, defaultNative: null, defaultCollaboration: null,
+        typedLabel: 'Use Provider Current · future-effort', typedNative: 'future-effort',
+      })
+    } finally {
+      await fs.writeFile(releasePath, '')
+      await lane.server.stop()
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true })
+      await fs.rm(gateRoot, { recursive: true, force: true })
+    }
+  })
+
+  test('Freshcodex explicitly clears effort with Default and keeps native settings after reload', async ({ page }) => {
+    const lane = await bootCodexLane(page, { uniqueThreadIds: true })
+    try {
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      const threadId = (await paneLeaf(lane.harness, lane.tabId)).content.sessionId as string
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 2, 'Default readiness control', threadId)
+      const starts = () => readJsonl(lane.requestLogPath).filter((row) => row.method === 'turn/start')
+      const settings = page.getByRole('dialog', { name: 'Agent settings' })
+      const modelDialog = page.getByRole('dialog', { name: 'Model and thinking level' })
+      await page.getByRole('button', { name: 'Agent settings' }).click()
+      await settings.getByRole('button', { name: /Change/ }).click()
+      await modelDialog.getByRole('option', { name: 'Provider Current', exact: true }).click()
+      await modelDialog.getByRole('listbox', { name: 'Thinking levels for Provider Current' }).getByRole('option', { name: /^ultra\b/ }).click()
+      await modelDialog.getByRole('button', { name: 'Use Provider Current · ultra' }).click()
+      await settings.getByRole('combobox', { name: 'File access', exact: true }).selectOption('read-only')
+      await settings.getByRole('combobox', { name: 'Work mode', exact: true }).selectOption('plan')
+      await page.keyboard.press('Escape')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 4, 'Explicit effort before Default', threadId)
+      expect(starts()[1].params).toMatchObject({ model: 'provider-current', effort: 'ultra', sandboxPolicy: { type: 'readOnly' }, collaborationMode: { mode: 'plan', settings: { reasoning_effort: 'ultra' } } })
+      const providerDefaults = async () => {
+        const response = await page.request.get(`${lane.info.baseUrl}/api/settings`, { headers: { 'x-auth-token': lane.info.token } })
+        expect(response.ok()).toBe(true)
+        return (await response.json()).freshAgent?.providers?.freshcodex
+      }
+      await expect.poll(async () => (await providerDefaults())?.effort).toBe('ultra')
+      console.log('TASK008_DEFAULT_NATIVE_READY', JSON.stringify({ threadId, completedControl: true, explicitEffort: 'ultra', savedEffort: 'ultra' }))
+      await page.getByRole('button', { name: 'Agent settings' }).click()
+      await settings.getByRole('button', { name: /Change/ }).click()
+      const levels = modelDialog.getByRole('listbox', { name: 'Thinking levels for Provider Current' })
+      await expect(levels.getByRole('option', { name: /^ultra\b/ })).toBeVisible()
+      await expect(levels.getByRole('option', { name: 'Default', exact: true })).toBeVisible({ timeout: 10_000 })
+      await levels.getByRole('option', { name: 'Default', exact: true }).click()
+      await modelDialog.getByRole('button', { name: 'Use Provider Current · Default' }).click()
+      await page.keyboard.press('Escape')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 6, 'Native Default next send', threadId)
+      expect(starts()[2].params).not.toHaveProperty('effort')
+      expect(starts()[2].params).toMatchObject({ cwd: lane.projectDir, sandboxPolicy: { type: 'readOnly' }, approvalPolicy: 'on-request', collaborationMode: { mode: 'plan', settings: { model: 'provider-current', reasoning_effort: null, developer_instructions: null } } })
+      expect((await lane.harness.getSentWsMessages() as any[]).some((frame) => frame.type === 'freshAgent.configure' && frame.settings?.effort === null)).toBe(true)
+      await expect.poll(async () => (await providerDefaults())?.effort ?? null).toBe(null)
+      await page.reload()
+      await lane.harness.waitForHarness()
+      await lane.harness.waitForConnection()
+      await expect.poll(async () => (await paneLeaf(lane.harness, lane.tabId))?.content?.effortIsNativeDefault).toBe(true)
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 8, 'Native Default after reload', threadId)
+      expect(starts()[3].params).not.toHaveProperty('effort')
+      expect(starts()[3].params).toMatchObject({ model: 'provider-current', sandboxPolicy: { type: 'readOnly' }, collaborationMode: { mode: 'plan', settings: { reasoning_effort: null } } })
+    } finally {
+      await lane.server.stop()
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true })
+    }
+  })
+
+  test('Freshcodex file access and Plan settings reach native turns and survive reload', async ({ page }) => {
+    const lane = await bootCodexLane(page, { serverRequestsByPrompt: {
+      'Plan the change': { id: 'plan-question', method: 'item/tool/requestUserInput', params: {
+        isBlocking: true, questions: [{ id: 'approach', header: 'Approach', question: 'Choose an approach', options: [{ label: 'Small change', description: 'Keep the change focused' }] }],
+      } },
+    } })
+    try {
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 2, 'Settings readiness control')
+      expect(readJsonl(lane.requestLogPath).filter((row) => row.method === 'turn/start')).toHaveLength(1)
+      console.log('TASK008_SETTINGS_NATIVE_READY', JSON.stringify({ threadId: 'thread-new-1', status: 'idle', completedControl: true }))
+
+      await page.getByRole('button', { name: 'Agent settings' }).click()
+      const settings = page.getByRole('dialog', { name: 'Agent settings' })
+      await settings.getByRole('combobox', { name: 'File access', exact: true }).selectOption('read-only')
+      await settings.getByRole('combobox', { name: 'Work mode', exact: true }).selectOption('plan')
+      await page.keyboard.press('Escape')
+      await sendComposerText(page, 'Plan the change')
+      const question = page.getByRole('region', { name: 'Question from Codex' })
+      await expect(question).toBeVisible()
+      const starts = () => readJsonl(lane.requestLogPath).filter((row) => row.method === 'turn/start')
+      await expect.poll(() => starts().length).toBe(2)
+      const plan = starts()[1].params
+      expect(plan).toMatchObject({ cwd: lane.projectDir, sandboxPolicy: { type: 'readOnly' }, approvalPolicy: 'on-request', collaborationMode: {
+        mode: 'plan', settings: { model: plan.model, reasoning_effort: plan.effort ?? null, developer_instructions: null },
+      } })
+      await question.getByRole('button', { name: 'Small change', exact: true }).click()
+      await expect.poll(() => readJsonl(lane.responseLogPath)).toContainEqual({ id: 'plan-question', result: { answers: { approach: { answers: ['Small change'] } } } })
+      await expect.poll(async () => (await fetchSnapshot(lane.info, 'freshcodex', 'codex', 'thread-new-1'))?.status).toBe('idle')
+      await expect.poll(() => readFreshAgentSessionStatus(lane.harness, 'thread-new-1')).toBe('idle')
+
+      await page.getByRole('button', { name: 'Agent settings' }).click()
+      await settings.getByRole('combobox', { name: 'Work mode', exact: true }).selectOption('default')
+      await page.keyboard.press('Escape')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 6, 'Build the change')
+      expect(starts()[2].params).toMatchObject({ cwd: lane.projectDir, sandboxPolicy: { type: 'readOnly' }, approvalPolicy: 'on-request', collaborationMode: {
+        mode: 'default', settings: { model: plan.model, reasoning_effort: plan.effort ?? null, developer_instructions: null },
+      } })
+
+      await page.reload()
+      await lane.harness.waitForHarness()
+      await lane.harness.waitForConnection()
+      await page.getByRole('button', { name: 'Agent settings' }).click()
+      await expect(settings.getByRole('combobox', { name: 'File access', exact: true })).toHaveValue('read-only')
+      await expect(settings.getByRole('combobox', { name: 'Work mode', exact: true })).toHaveValue('default')
+      await page.keyboard.press('Escape')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 8, 'After settings reload')
+      expect(starts()[3].params).toMatchObject({ cwd: lane.projectDir, sandboxPolicy: { type: 'readOnly' }, collaborationMode: { mode: 'default' } })
+    } finally {
+      await lane.server.stop()
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true })
+    }
+  })
+
   test('Codex approvals and questions survive reload and send user decisions to the provider', async ({ page }) => {
     const lane = await bootCodexLane(page, { serverRequestsByPrompt: {
       'Approve tests': { id: 501, method: 'item/commandExecution/requestApproval', params: { command: 'npm test', reason: 'Run project tests' } },
@@ -1476,7 +1720,8 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       await page.reload()
       await expect(approval).toHaveCount(1)
       await expect(approval).toBeVisible()
-      await approval.getByRole('button', { name: 'Allow tool use', exact: true }).click()
+      expect(readJsonl(lane.responseLogPath)).toHaveLength(0)
+      await approval.getByRole('button', { name: 'Allow', exact: true }).click()
       await expect.poll(() => readJsonl(lane.responseLogPath)).toContainEqual({ id: 501, result: { decision: 'accept' } })
       await expect(approval).toBeHidden()
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -1490,43 +1735,76 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       await sendComposerText(page, 'Deny an edit')
       const edit = page.getByRole('alert', { name: 'Permission request for Edit' })
       await expect(edit).toBeVisible()
-      await edit.getByRole('button', { name: 'Deny tool use', exact: true }).click()
+      await edit.getByRole('button', { name: 'Decline', exact: true }).click()
       await expect.poll(() => readJsonl(lane.responseLogPath)).toContainEqual({ id: 502, result: { decision: 'decline' } })
       await expect(edit).toBeHidden()
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      console.log('TASK006_NATIVE_APPROVAL_CONTRACT', JSON.stringify({ test: test.info().title, normalizedNativeResponses: readJsonl(lane.responseLogPath) }))
+    } catch (error) {
+      await captureCodexLaneDiagnostics(page, lane).catch((diagnosticError) => console.log('TASK006_CODEX_DIAGNOSTIC_FAILED', String(diagnosticError)))
+      throw error
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
     }
   })
 
-  // Decision D3 (client-alerts G20): codex keeps its client-only bypass,
-  // labelled for what it is. (The claude lane's former "Always Allow" case is
-  // replaced by Claude's own "Allow and don't ask again", pinned with no
-  // client auto-answer in freshclaude-approvals-rust.spec.ts.)
-  test('Always allow (pane) auto-answers the second raise for that tool', async ({ page }) => {
+  // Native grants belong to Codex's offered decision, rather than a generic
+  // pane-local tool bypass. A subsequent native request still needs a choice.
+  test('Codex native session approval forwards an offered decision and keeps later requests user-gated', async ({ page }) => {
     const lane = await bootCodexLane(page, { serverRequestsByPrompt: {
-      'Approve tests': { id: 601, method: 'item/commandExecution/requestApproval', params: { command: 'npm test', reason: 'Run project tests' } },
-      'Approve a build': { id: 602, method: 'item/commandExecution/requestApproval', params: { command: 'npm run build', reason: 'Build the project' } },
+      'Approve tests': { id: 601, method: 'item/commandExecution/requestApproval', params: { command: 'npm test', reason: 'Run project tests', availableDecisions: ['accept', 'acceptForSession', 'decline', 'cancel'] } },
+      'Approve a build': { id: 602, method: 'item/commandExecution/requestApproval', params: { command: 'npm run build', reason: 'Build the project', availableDecisions: ['decline', 'cancel'] } },
     } })
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
       await sendComposerText(page, 'Approve tests')
       const approval = page.getByRole('alert', { name: 'Permission request for Bash' })
       await expect(approval).toBeVisible()
-      const always = approval.getByRole('button', { name: 'Always allow Bash in this pane', exact: true })
-      await expect(always).toHaveAttribute('title', 'Until this pane reloads')
-      await always.click()
-      await expect.poll(() => readJsonl(lane.responseLogPath)).toContainEqual({ id: 601, result: { decision: 'accept' } })
+      const beforeReload = (await fetchSnapshot(lane.info, 'freshcodex', 'codex', 'thread-new-1')).pendingApprovals[0]
+      expect(beforeReload).toMatchObject({ providerRequest: { id: 601, method: 'item/commandExecution/requestApproval' }, native: { availableDecisions: ['accept', 'acceptForSession', 'decline', 'cancel'] } })
+      expect(readJsonl(lane.responseLogPath)).toEqual([])
+      await expect(approval.getByRole('button', { name: 'Always allow Bash in this pane', exact: true })).toHaveCount(0)
+      expect((await lane.harness.getSentWsMessages() as any[]).filter((frame) => frame.type === 'freshAgent.send' && frame.text === 'Approve tests')).toHaveLength(1)
+      await page.reload()
+      await expect(approval).toHaveCount(1)
+      await expect(approval).toBeVisible()
+      const afterReload = (await fetchSnapshot(lane.info, 'freshcodex', 'codex', 'thread-new-1')).pendingApprovals[0]
+      expect(afterReload.requestId).toBe(beforeReload.requestId)
+      expect(afterReload.native.availableDecisions).toEqual(['accept', 'acceptForSession', 'decline', 'cancel'])
+      expect(readJsonl(lane.responseLogPath)).toEqual([])
+      await approval.getByRole('button', { name: 'Allow for this session', exact: true }).click()
+      await expect.poll(() => readJsonl(lane.responseLogPath)).toEqual([{ id: 601, result: { decision: 'acceptForSession' } }])
       await expect(approval).toBeHidden()
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
 
-      // The second request for Bash is answered by the pane, with no click.
+      // The provider raises a different command with a narrower offer. The
+      // first session choice does not authorize a client-side automatic reply.
       await sendComposerText(page, 'Approve a build')
-      await expect.poll(() => readJsonl(lane.responseLogPath), { timeout: 15_000, message: 'the second raise is answered without a click' })
-        .toContainEqual({ id: 602, result: { decision: 'accept' } })
+      await expect(approval).toHaveCount(1)
+      await expect(approval).toBeVisible()
+      const second = (await fetchSnapshot(lane.info, 'freshcodex', 'codex', 'thread-new-1')).pendingApprovals[0]
+      expect(second).toMatchObject({ providerRequest: { id: 602, method: 'item/commandExecution/requestApproval' }, native: { availableDecisions: ['decline', 'cancel'] } })
+      await expect(approval.getByRole('button', { name: 'Allow', exact: true })).toHaveCount(0)
+      await expect(approval.getByRole('button', { name: 'Allow for this session', exact: true })).toHaveCount(0)
+      await expect(approval.getByRole('button', { name: 'Always allow Bash in this pane', exact: true })).toHaveCount(0)
+      expect(readJsonl(lane.responseLogPath)).toEqual([{ id: 601, result: { decision: 'acceptForSession' } }])
+      expect((await lane.harness.getSentWsMessages() as any[]).filter((frame) => frame.type === 'freshAgent.approval.respond' && frame.requestId === second.requestId)).toEqual([])
+      await approval.getByRole('button', { name: 'Decline', exact: true }).click()
+      await expect.poll(() => readJsonl(lane.responseLogPath)).toEqual([{ id: 601, result: { decision: 'acceptForSession' } }, { id: 602, result: { decision: 'decline' } }])
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
       await expect(approval).toBeHidden()
+      expect((await lane.harness.getSentWsMessages() as any[]).filter((frame) => frame.type === 'freshAgent.send' && frame.text === 'Approve a build')).toHaveLength(1)
+      const recorded = JSON.parse(await fs.readFile(path.join(lane.info.homeDir, '.codex', 'fake-turns', 'thread-new-1.json'), 'utf8'))
+      expect(recorded).toHaveLength(2)
+      console.log('TASK006_NATIVE_APPROVAL_CONTRACT', JSON.stringify({
+        test: test.info().title,
+        normalizedRequests: [beforeReload, afterReload, second].map((request) => ({ requestId: request.requestId, providerRequest: request.providerRequest, availableDecisions: request.native.availableDecisions })),
+        normalizedNativeResponses: readJsonl(lane.responseLogPath), recordedTurns: recorded.length,
+      }))
+    } catch (error) {
+      await captureCodexLaneDiagnostics(page, lane).catch((diagnosticError) => console.log('TASK006_CODEX_DIAGNOSTIC_FAILED', String(diagnosticError)))
+      throw error
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
@@ -1659,6 +1937,9 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       await expect(pane).toContainText('review-1')
       await expect(pane).toContainText('pending')
       await expect(pane).toContainText('thread-parent-1')
+    } catch (error) {
+      await captureCodexLaneDiagnostics(page, lane).catch((diagnosticError) => console.log('TASK006_CODEX_DIAGNOSTIC_FAILED', String(diagnosticError)))
+      throw error
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
@@ -1666,12 +1947,16 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
   })
 
   test('compact: thread/compact/start, never a turn; pane returns usable', async ({ page }) => {
-    const lane = await bootCodexLane(page)
+    const compactRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-compact-'))
+    const notificationLogPath = path.join(compactRoot, 'native-notifications.jsonl')
+    const lane = await bootCodexLane(page, { appendNativeNotificationLogPath: notificationLogPath })
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
       await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 2, 'codex turn one')
 
       // Typed slash gesture → freshAgent.compact → thread/compact/start.
+      const notificationFrom = readJsonl(notificationLogPath).length
+      const receivedFrom = (await lane.harness.getReceivedWsMessages()).length
       const paneRoot = page.locator('[data-context="fresh-agent"]').last()
       await paneRoot.getByRole('textbox', { name: 'Chat message input' }).fill('/compact')
       await paneRoot.getByRole('textbox', { name: 'Chat message input' }).press('Enter')
@@ -1682,8 +1967,28 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
         'thread/compact/start op',
       )
       expect(compactOp.params.threadId).toBe('thread-new-1')
-      // Busy→idle ride the probed notification sequence; the pane settles.
+      // A prior idle snapshot can still be visible when the compact RPC lands.
+      // Join this native compaction turn's terminal and its owning Rust
+      // consumption before the next send is allowed to be an idle start.
+      let compactTurnId: string | undefined
+      await expect.poll(() => {
+        compactTurnId = readJsonl(notificationLogPath).slice(notificationFrom)
+          .find((row) => row.method === 'turn/started' && row.threadId === 'thread-new-1')?.turnId
+        return compactTurnId
+      }).toBeTruthy()
+      await expect.poll(async () => {
+        const nativeCompleted = readJsonl(notificationLogPath).slice(notificationFrom).some((row) =>
+          row.method === 'turn/completed' && row.threadId === 'thread-new-1' && row.turnId === compactTurnId)
+        const frames = (await lane.harness.getReceivedWsMessages() as any[]).slice(receivedFrom)
+        const settled = frames.findIndex((frame) => frame.type === 'freshAgent.event' && frame.sessionId === 'thread-new-1'
+          && frame.event?.type === 'freshAgent.transcript.patch'
+          && frame.event.ops?.some((op: any) => op.op === 'settleTurn' && op.nativeTurnId === compactTurnId))
+        const consumed = settled >= 0 && frames.slice(settled + 1).some((frame) =>
+          frame.type === 'freshAgent.event' && frame.sessionId === 'thread-new-1' && frame.event?.type === 'freshAgent.turn.complete')
+        return nativeCompleted && consumed
+      }).toBe(true)
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      expect(readJsonl(lane.requestLogPath).filter((row) => row.method === 'turn/start')).toHaveLength(1)
 
       // AGENT-04's crucial shape pin: compact minted NO turn. The fixture's
       // recorded-turns store is the ground truth — after the compact the
@@ -1696,9 +2001,15 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       // Usable after compact: a follow-up prompt mints exactly the next turn
       // (two recorded turns -> four display rows).
       await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 4, 'codex post-compact turn')
+      expect(readJsonl(lane.requestLogPath).filter((row) => row.method === 'turn/start')).toHaveLength(2)
+      expect(readJsonl(lane.requestLogPath).filter((row) => row.method === 'turn/steer')).toHaveLength(0)
+    } catch (error) {
+      await captureCodexLaneDiagnostics(page, lane).catch((diagnosticError) => console.log('TASK006_CODEX_DIAGNOSTIC_FAILED', String(diagnosticError)))
+      throw error
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+      await fs.rm(compactRoot, { recursive: true, force: true }).catch(() => {})
     }
   })
 
@@ -1770,6 +2081,9 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
         )
       expect(mutationsAgainstParent, 'no post-fork mutation against the source thread').toEqual([])
       expect(await readRollout(lane.info.homeDir, 'thread-new-1')).toBe(parentRolloutBefore)
+    } catch (error) {
+      await captureCodexLaneDiagnostics(page, lane).catch((diagnosticError) => console.log('TASK006_CODEX_DIAGNOSTIC_FAILED', String(diagnosticError)))
+      throw error
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
@@ -1939,6 +2253,9 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
         }, { timeout: 30_000, message: 'post-restart resume+read evidence for BOTH source and child' })
         .toBe(true)
       sourceRestartWs.close()
+    } catch (error) {
+      await captureCodexLaneDiagnostics(page, lane).catch((diagnosticError) => console.log('TASK006_CODEX_DIAGNOSTIC_FAILED', String(diagnosticError)))
+      throw error
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
@@ -2033,6 +2350,9 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       await expect.poll(async () =>
         (await fetchSnapshot(lane.info, 'freshcodex', 'codex', threadId))?.turns?.length,
       { timeout: 15_000 }).toBe(turnsAfter.length + 2)
+    } catch (error) {
+      await captureCodexLaneDiagnostics(page, lane).catch((diagnosticError) => console.log('TASK006_CODEX_DIAGNOSTIC_FAILED', String(diagnosticError)))
+      throw error
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
@@ -2067,6 +2387,9 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       // exactly the false positive the bound exists to prevent.
       await page.waitForTimeout(Math.max(0, 11_000 - (Date.now() - sentAt)))
       await expect(stuckAlert).toHaveCount(0)
+    } catch (error) {
+      await captureCodexLaneDiagnostics(page, lane).catch((diagnosticError) => console.log('TASK006_CODEX_DIAGNOSTIC_FAILED', String(diagnosticError)))
+      throw error
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
@@ -2074,10 +2397,24 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
   })
 
   test('per-send settings alter the turn payload against the Rust server (freshcodex)', async ({ page }) => {
-    const lane = await bootCodexLane(page)
+    const lane = await bootCodexLane(page, { modelCatalogPages: [{ data: [
+      { id: 'astra-record', model: 'gpt-6-astra', displayName: 'GPT-6 Astra',
+        supportedReasoningEfforts: [{ reasoningEffort: 'high' }, { reasoningEffort: 'xhigh' }], defaultReasoningEffort: 'xhigh' },
+      { id: 'sol-record', model: 'gpt-5.6-sol', displayName: 'GPT-5.6 Sol',
+        supportedReasoningEfforts: [{ reasoningEffort: 'low' }, { reasoningEffort: 'high' }], defaultReasoningEffort: 'high' },
+    ], nextCursor: null }] })
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
-      // Turn 1 rides the pane's untouched defaults.
+      // Omission is native no-override. Deliberately select legacy max so the
+      // original first-turn xhigh assertion exercises the advertised alias.
+      await page.getByRole('button', { name: 'Agent settings' }).click()
+      await page.getByRole('dialog', { name: 'Agent settings' }).getByRole('button', { name: /Change/ }).click()
+      const initialDialog = page.getByRole('dialog', { name: 'Model and thinking level' })
+      await expect(initialDialog.getByRole('listbox', { name: 'Thinking levels for GPT-6 Astra' })).toBeVisible()
+      await initialDialog.getByRole('textbox', { name: 'Reasoning effort', exact: true }).fill('max')
+      await initialDialog.getByRole('button', { name: 'Use GPT-6 Astra · max' }).click()
+      await page.keyboard.press('Escape')
+      expect((await paneLeaf(lane.harness, lane.tabId))?.content?.effort).toBe('max')
       await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 2, 'codex turn one')
       const threadId = (await paneLeaf(lane.harness, lane.tabId))?.content?.sessionId as string
       expect(threadId, 'the durable codex thread id must be known before turn two').toBeTruthy()
@@ -2114,9 +2451,8 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       // Ground truth: the fake's recorded-turns file under the lane's isolated
       // CODEX_HOME (<home>/.codex/fake-turns/<threadId>.json). Each recorded
       // turn carries its captured turn/start params additively under `start` —
-      // turn 2 carries the per-send selection while turn 1 kept the defaults
-      // (gpt-6-astra / the default 'max' effort, wire-mapped 'xhigh' by
-      // to_codex_reasoning_effort).
+      // Turn 1 keeps the explicit max intent, wire-mapped to xhigh only because
+      // this selected native model advertises xhigh and no distinct max.
       const turnsPath = path.join(lane.info.homeDir, '.codex', 'fake-turns', `${threadId}.json`)
       await expect(async () => {
         const turns = JSON.parse(await fs.readFile(turnsPath, 'utf8')) as any[]
@@ -2128,6 +2464,9 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
         expect(turns[0]?.start?.model).not.toBe(turns[1]?.start?.model)
         expect(turns[0]?.start?.effort).not.toBe(turns[1]?.start?.effort)
       }).toPass({ timeout: 15_000 })
+    } catch (error) {
+      await captureCodexLaneDiagnostics(page, lane).catch((diagnosticError) => console.log('TASK006_CODEX_DIAGNOSTIC_FAILED', String(diagnosticError)))
+      throw error
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})

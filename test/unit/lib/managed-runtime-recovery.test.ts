@@ -148,7 +148,6 @@ function baseState() {
       closingPanes: {},
       refreshRequests: {},
       restoreFallbackAttemptsByPane: {},
-      deadSessionAdjudication: [],
       reconcilePendingPanes: {},
     },
     managedRuntime: {

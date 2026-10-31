@@ -81,6 +81,10 @@ vi.mock('@/lib/terminal-restore', () => ({
   clearTerminalRestoreRequestId: (id: string) => wsHarness.clearRestoreRequestId(id),
   addTerminalFreshRecoveryRequestId: vi.fn(),
   consumeTerminalFreshRecoveryRequest: vi.fn(() => undefined),
+  // Non-consuming peek for the dead-create stand-down exemption (mirrors
+  // this suite's consume mock: nothing is ever registry-armed here, so the
+  // exemption stays inert exactly like the consume-based read it replaced).
+  hasTerminalFreshRecoveryRequest: vi.fn(() => false),
   armRecoveredLiveTerminalTarget: (tabId: string, paneId: string, terminalId: string) =>
     wsHarness.armRecoveredLiveTerminalTarget(tabId, paneId, terminalId),
   consumeRecoveredLiveTerminalTarget: (tabId: string, paneId: string) =>

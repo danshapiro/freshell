@@ -6,7 +6,8 @@
 use freshell_freshagent::naming::{admit_pending_projection, session_projection, SessionNaming};
 use freshell_freshagent::rest_lane::{
     FreshAgentRestLane, RestLaneCapture, RestLaneCaptureError, RestLaneCaptureResult,
-    RestLaneCreate, RestLaneCreated, RestLaneSend, RestLaneSendResult,
+    RestLaneCreate, RestLaneCreated, RestLaneError, RestLaneErrorKind, RestLaneSend,
+    RestLaneSendResult,
 };
 use freshell_protocol::session_names::NamedProvider;
 use freshell_protocol::{
@@ -80,15 +81,14 @@ impl HostedFreshAgentProxy {
             format!("{OPT_IN_ENV}=1 requires an available managed runtime controller")
         })?;
         let fixture_modes = configured_fixture_modes()?;
-        // Name reliability (Task 10, Residual 4): hosted fresh agents admit a
-        // pending name at create and read a resumed session's name, but no
-        // lane reports their first message or transfers the pending name onto
-        // the native session, so they never get a first-message or AI name.
-        // Said once at boot so enabling the flag cannot hide the gap.
+        // Codex reports authenticated accepted-input and verified acquisition
+        // facts to the shared authority. The other hosted provider lanes
+        // still have no first-message/materialization naming feed.
         tracing::warn!(
             target: "freshell_server::session_names",
             flag = OPT_IN_ENV,
-            "session_names.hosted_fresh_agent_naming_incomplete: hosted fresh-agent \
+            providers = "claude,opencode",
+            "session_names.hosted_fresh_agent_naming_incomplete: hosted Claude and OpenCode \
              sessions keep their create-time name only (no first-message or AI naming)"
         );
         Ok(Some(Arc::new(Self {
@@ -203,14 +203,19 @@ impl HostedFreshAgentProxy {
         match command {
             HostedFreshAgentCommand::Create(message) => {
                 let request_id = message.request_id.clone();
-                if self.create(message).await.is_err() {
-                    tracing::warn!(request_id, "fresh_agent.create.failed");
+                if let Err(mut error) = self.create(message).await {
+                    tracing::warn!(request_id, code=%error.code, "fresh_agent.create.failed");
+                    if error.code == "FRESH_AGENT_UNAVAILABLE" {
+                        error.code = "FRESH_AGENT_CREATE_FAILED".into();
+                        error.message = "managed fresh-agent host could not be created".into();
+                        error.retryable = Some(true);
+                    }
                     self.send(ServerMessage::FreshAgentCreateFailed(
                         FreshAgentCreateFailed {
-                            code: "FRESH_AGENT_CREATE_FAILED".into(),
-                            message: "managed fresh-agent host could not be created".into(),
+                            code: error.code,
+                            message: error.message,
                             request_id,
-                            retryable: Some(true),
+                            retryable: error.retryable,
                             owner_kind: None,
                             owner_generation: None,
                             owner_epoch: None,
@@ -363,6 +368,20 @@ impl HostedFreshAgentProxy {
                 )
                 .await;
             }
+            HostedFreshAgentCommand::Elicitation(message) => {
+                if message.provider != AgentProvider::Codex {
+                    self.error_event_code(
+                        &message.provider,
+                        &message.session_id,
+                        message.session_type,
+                        "UNSUPPORTED_CAPABILITY",
+                        "MCP elicitation is not supported for this provider.",
+                    );
+                    return;
+                }
+                self.resolve_decision(message.provider, message.session_id, message.session_type, decision_id(message.request_id),
+                    serde_json::json!({"elicitation":{"action":message.action,"content":message.content}})).await;
+            }
             HostedFreshAgentCommand::Question(message) => {
                 self.resolve_decision(
                     message.provider,
@@ -501,12 +520,12 @@ impl HostedFreshAgentProxy {
     async fn create(
         self: &Arc<Self>,
         message: freshell_protocol::FreshAgentCreate,
-    ) -> Result<Option<(SoulId, u64)>, ()> {
+    ) -> Result<Option<(SoulId, u64)>, RestLaneError> {
         let provider = fresh_provider(&message.provider, message.session_type).ok_or(())?;
         let public_provider = fresh_provider_wire(&provider);
         if let Some(session_ref) = message.session_ref.as_ref() {
             if session_ref.provider != public_provider {
-                return Err(());
+                return Err(().into());
             }
             let inventory = self.client.inventory().await.map_err(|_| ())?;
             let view = inventory
@@ -632,6 +651,8 @@ impl HostedFreshAgentProxy {
             let original = |name: &str| std::env::var(name).ok();
             let context = crate::managed_provider_references::codex::prepare_managed(
                 crate::managed_provider_references::codex::CodexPreparation {
+                    native_source_runtime:
+                        freshell_platform::codex_inputs::NativeSourceRuntime::AppServer,
                     client: &self.client,
                     soul: &soul,
                     creation_seed: &message.request_id,
@@ -645,7 +666,15 @@ impl HostedFreshAgentProxy {
             )
             .await
             .map_err(|error| {
-                tracing::warn!(event="fresh_agent.create.provider_inputs_failed",%error);
+                tracing::warn!(event="fresh_agent.create.provider_inputs_failed", provider="codex", request_id=%message.request_id, code=?error.code, message=%error.message);
+                let configuration = error.code == RuntimeErrorCode::InvalidRequest;
+                let mut refusal = RestLaneError::new(
+                    if configuration { RestLaneErrorKind::BadRequest } else { RestLaneErrorKind::Unavailable },
+                    if configuration { "INVALID_REQUEST" } else { "CODEX_PREPARATION_UNAVAILABLE" },
+                    error.message,
+                );
+                refusal.retryable = Some(!configuration);
+                refusal
             })?;
             (context.mcp_capability.clone().ok_or(())?, Some(context))
         } else if matches!(provider, FreshProvider::Claude | FreshProvider::Kilroy) {
@@ -704,6 +733,10 @@ impl HostedFreshAgentProxy {
         };
         provider_launch_context = context_for_fresh_provider(provider_launch_context);
         let launch = FreshAgentLaunchSpec {
+            naming_handle: (provider == FreshProvider::Codex)
+                .then(|| message.naming_handle.clone())
+                .flatten(),
+            collaboration_mode: message.collaboration_mode.clone(),
             session_id: public_session_id.clone(),
             provider: provider.clone(),
             session_type: session_type.clone(),
@@ -716,7 +749,7 @@ impl HostedFreshAgentProxy {
             run_as_uid: PROVIDER_UID,
             run_as_gid: PROVIDER_GID,
             model: message.model.clone(),
-            effort: message.effort.clone(),
+            effort: message.effort.clone().flatten(),
             permission_mode: message.permission_mode.clone(),
             sandbox: message
                 .sandbox
@@ -999,6 +1032,12 @@ impl HostedFreshAgentProxy {
         let proxy = Arc::clone(self);
         tokio::spawn(async move {
             let mut cursor = 0;
+            let mut retained_through = 0;
+            let mut source_before = if provider == "codex" {
+                proxy.current_source(&soul).await
+            } else {
+                None
+            };
             loop {
                 match proxy
                     .client
@@ -1006,7 +1045,47 @@ impl HostedFreshAgentProxy {
                     .await
                 {
                     Ok(batch) => {
-                        if batch.reset_required {
+                        if batch.retained_state.is_some() || cursor < retained_through {
+                            let after = proxy.current_source(&soul).await;
+                            let valid = retained_batch_matches_source(
+                                source_before.as_ref(),
+                                after.as_ref(),
+                                batch.retained_state.as_ref(),
+                            );
+                            source_before = after;
+                            if !valid {
+                                tracing::warn!(provider, soul_id=%soul, "freshagent.gateway.retained_source_changed");
+                                cursor = 0;
+                                retained_through = 0;
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                continue;
+                            }
+                        }
+                        if let Some(retained) = batch.retained_state {
+                            let presentation = proxy
+                                .presentation_ids
+                                .lock()
+                                .await
+                                .get(&soul)
+                                .cloned()
+                                .unwrap_or_else(|| presentation_session_id.clone());
+                            proxy
+                                .forward_retained(
+                                    retained,
+                                    &provider,
+                                    &presentation,
+                                    &session_type,
+                                    if batch.reset_required {
+                                        "freshAgent.host.journal.reset"
+                                    } else {
+                                        "freshAgent.host.backpressure"
+                                    },
+                                )
+                                .await;
+                            // Projection and controls are covered, but request receipts
+                            // still have to drain through every bounded journal page.
+                            retained_through = retained_through.max(batch.head);
+                        } else if batch.reset_required {
                             proxy.send(ServerMessage::FreshAgentEvent(FreshAgentEvent {
                                 event: serde_json::json!({
                                     "type":"freshAgent.host.journal.reset",
@@ -1017,8 +1096,16 @@ impl HostedFreshAgentProxy {
                                 session_type: session_type.clone(),
                             }));
                         }
+                        if batch.events.is_empty() {
+                            cursor = cursor.max(batch.head);
+                        }
                         for event in batch.events {
                             cursor = cursor.max(event.sequence);
+                            if event.sequence <= retained_through
+                                && !is_request_receipt(&event.event)
+                            {
+                                continue;
+                            }
                             // Provider-native identity is nested provider state. The public
                             // routing alias changes only through an explicit same-soul fork
                             // transition or durable inventory reconciliation, never merely
@@ -1030,12 +1117,14 @@ impl HostedFreshAgentProxy {
                                 .get(&soul)
                                 .cloned()
                                 .unwrap_or_else(|| presentation_session_id.clone());
-                            proxy.forward_host_event(
-                                event.event,
-                                &provider,
-                                &current_presentation,
-                                &session_type,
-                            );
+                            proxy
+                                .forward_host_event(
+                                    event.event,
+                                    &provider,
+                                    &current_presentation,
+                                    &session_type,
+                                )
+                                .await;
                         }
                     }
                     Err(_) => {
@@ -1060,6 +1149,92 @@ impl HostedFreshAgentProxy {
         true
     }
 
+    async fn current_source(
+        &self,
+        soul: &SoulId,
+    ) -> Option<freshell_runtime_protocol::RuntimeView> {
+        self.client
+            .inventory()
+            .await
+            .ok()?
+            .into_iter()
+            .rev()
+            .find(|view| {
+                &view.soul_id == soul
+                    && view.desired_state == DesiredState::Running
+                    && view.launch_state == freshell_runtime_protocol::LaunchState::Running
+            })
+    }
+
+    async fn forward_retained(
+        &self,
+        mut retained: serde_json::Value,
+        provider: &str,
+        presentation: &str,
+        session_type: &str,
+        event_type: &str,
+    ) {
+        let native = retained["snapshot"]["threadId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if provider == "codex" {
+            if let Some(facts) = retained["snapshot"]["extensions"]["codex"]
+                .as_object_mut()
+                .and_then(|extension| extension.remove("hostedNamingFacts"))
+            {
+                let facts = facts.as_array().into_iter().flatten();
+                // A retained accepted input may precede its admission fact.
+                // Bind/admit first, then fold that same idempotent input.
+                for fact in facts
+                    .clone()
+                    .filter(|fact| fact["kind"] != "activity")
+                    .chain(facts.filter(|fact| fact["kind"] == "activity"))
+                {
+                    self.fold_hosted_codex_naming(presentation, &native, fact.clone())
+                        .await;
+                }
+            }
+        }
+        retained["source"]["nativeSessionId"] = retained["snapshot"]["threadId"].clone();
+        if let Some(ownership) = self.ownership.get() {
+            let canonical = ownership.resolve_canonical(provider, presentation);
+            let owner = ownership.observe(provider, &canonical);
+            retained["source"]["ownerEpoch"] = serde_json::json!(owner.epoch);
+            retained["source"]["ownerGeneration"] = serde_json::json!(owner.generation);
+        }
+        freshell_agent_runtime::snapshot_projection::project_hosted_rest_snapshot(
+            &mut retained["snapshot"],
+            provider,
+            session_type,
+        );
+        for mark in retained["attentionMarks"]
+            .as_array_mut()
+            .into_iter()
+            .flatten()
+        {
+            mark["sessionId"] = serde_json::json!(presentation);
+        }
+        self.send(ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            provider: provider.into(),
+            session_type: session_type.into(),
+            session_id: presentation.into(),
+            event: serde_json::json!({"type":event_type,"retainedState":retained}),
+        }));
+        for payload in retained["pendingControls"].as_array().into_iter().flatten() {
+            self.forward_host_event(
+                AgentEvent::PermissionRequested {
+                    decision_id: payload["requestId"].as_str().unwrap_or_default().into(),
+                    payload: payload.clone(),
+                },
+                provider,
+                presentation,
+                session_type,
+            )
+            .await;
+        }
+    }
+
     async fn replay_once(
         &self,
         soul: SoulId,
@@ -1067,15 +1242,71 @@ impl HostedFreshAgentProxy {
         presentation_session_id: &str,
         session_type: &str,
     ) {
-        let Ok(batch) = self.client.fresh_agent_events(soul, 0, 4096).await else {
-            return;
+        let mut before = if provider == "codex" {
+            self.current_source(&soul).await
+        } else {
+            None
         };
-        for event in batch.events {
-            self.forward_host_event(event.event, provider, presentation_session_id, session_type);
+        let mut cursor = 0;
+        let mut replay_through = None;
+        let mut retained_through = 0;
+        loop {
+            let Ok(batch) = self
+                .client
+                .fresh_agent_events(soul.clone(), cursor, 4096)
+                .await
+            else {
+                return;
+            };
+            let replay_through = *replay_through.get_or_insert(batch.head);
+            if batch.retained_state.is_some() || cursor < retained_through {
+                let after = self.current_source(&soul).await;
+                let valid = retained_batch_matches_source(
+                    before.as_ref(),
+                    after.as_ref(),
+                    batch.retained_state.as_ref(),
+                );
+                before = after;
+                if !valid {
+                    return;
+                }
+            }
+            if let Some(retained) = batch.retained_state {
+                self.forward_retained(
+                    retained,
+                    provider,
+                    presentation_session_id,
+                    session_type,
+                    "freshAgent.host.backpressure",
+                )
+                .await;
+                retained_through = retained_through.max(batch.head);
+            }
+            if batch.events.is_empty() {
+                return;
+            }
+            for event in batch.events {
+                if event.sequence > replay_through {
+                    return;
+                }
+                cursor = cursor.max(event.sequence);
+                if event.sequence > retained_through || is_request_receipt(&event.event) {
+                    self.forward_host_event(
+                        event.event,
+                        provider,
+                        presentation_session_id,
+                        session_type,
+                    )
+                    .await;
+                }
+            }
+            if cursor >= replay_through {
+                return;
+            }
         }
     }
 
-    fn forward_host_event(
+    async fn forward_host_event(
         &self,
         event: AgentEvent,
         provider: &str,
@@ -1084,6 +1315,20 @@ impl HostedFreshAgentProxy {
     ) {
         match event {
             AgentEvent::Provider { mut payload } => {
+                if payload["event"]["type"]
+                    == freshell_freshagent::naming::HOSTED_CODEX_NAMING_EVENT
+                {
+                    if provider == "codex" {
+                        let native = payload["sessionId"].as_str().unwrap_or_default();
+                        self.fold_hosted_codex_naming(
+                            presentation_session_id,
+                            native,
+                            payload["event"]["fact"].clone(),
+                        )
+                        .await;
+                    }
+                    return;
+                }
                 if payload.get("type").and_then(serde_json::Value::as_str)
                     == Some("freshAgent.created")
                 {
@@ -1108,6 +1353,162 @@ impl HostedFreshAgentProxy {
                 }));
             }
             _ => {}
+        }
+    }
+
+    async fn fold_hosted_codex_naming(
+        &self,
+        presentation: &str,
+        native_id: &str,
+        value: serde_json::Value,
+    ) {
+        use freshell_freshagent::naming::{HostedCodexNamingFact, NameTransitionReason};
+        use freshell_protocol::native_location::{
+            NativeEvidenceKind, NativeLocation, NativePersistence,
+        };
+        use freshell_protocol::session_names::{NamedProvider, SessionNameRef};
+        if native_id.is_empty() {
+            return;
+        }
+        let Some(soul) = self
+            .resolve_soul(&AgentProvider::Codex, SessionType::Freshcodex, presentation)
+            .await
+        else {
+            return;
+        };
+        let current = self.current_source(&soul).await;
+        if current
+            .as_ref()
+            .and_then(|view| view.native_session_id.as_deref())
+            != Some(native_id)
+        {
+            tracing::warn!(
+                provider = "codex",
+                session_id = presentation,
+                native_session_id = native_id,
+                "freshagent.gateway.naming_source_changed"
+            );
+            return;
+        }
+        let fact = match serde_json::from_value::<HostedCodexNamingFact>(value) {
+            Ok(fact) => fact,
+            Err(error) => {
+                tracing::warn!(provider="codex", native_session_id=native_id, %error, "freshagent.gateway.invalid_naming_fact");
+                return;
+            }
+        };
+        let sink = self.naming.get().cloned();
+        match fact {
+            HostedCodexNamingFact::Acquisition {
+                target,
+                acquisition,
+                cwd,
+            } => {
+                let expected = SessionNameRef::Session {
+                    provider: NamedProvider::Codex,
+                    session_id: native_id.into(),
+                };
+                let location_matches = matches!(&acquisition.location,
+                    NativeLocation::Codex { codex_home, native_thread_id: Some(id), rollout_path: Some(path), .. }
+                    if !codex_home.is_empty() && id == native_id && !path.is_empty());
+                if target != expected
+                    || !location_matches
+                    || acquisition.persistence != NativePersistence::Verified
+                    || acquisition.evidence != NativeEvidenceKind::PersistedMetadata
+                {
+                    tracing::warn!(
+                        provider = "codex",
+                        native_session_id = native_id,
+                        "freshagent.gateway.naming_source_mismatch"
+                    );
+                    return;
+                }
+                if let Some(sink) = sink {
+                    if let Err(error) = sink.ensure_session(target.clone(), cwd).await {
+                        freshell_freshagent::naming::log_name_error(
+                            "ensure_session",
+                            &target,
+                            &error,
+                        );
+                        return;
+                    }
+                    let after_admission = self.current_source(&soul).await;
+                    if !current
+                        .as_ref()
+                        .zip(after_admission.as_ref())
+                        .is_some_and(|(before, after)| rest::same_snapshot_source(before, after))
+                    {
+                        tracing::warn!(
+                            provider = "codex",
+                            session_id = presentation,
+                            native_session_id = native_id,
+                            "freshagent.gateway.naming_source_changed"
+                        );
+                        return;
+                    }
+                    if let Err(error) = sink.record_acquisition(target.clone(), acquisition).await {
+                        freshell_freshagent::naming::log_name_error(
+                            "record_acquisition",
+                            &target,
+                            &error,
+                        );
+                    }
+                    let after_acquisition = self.current_source(&soul).await;
+                    if !current
+                        .as_ref()
+                        .zip(after_acquisition.as_ref())
+                        .is_some_and(|(before, after)| rest::same_snapshot_source(before, after))
+                    {
+                        tracing::warn!(
+                            provider = "codex",
+                            session_id = presentation,
+                            native_session_id = native_id,
+                            "freshagent.gateway.naming_source_changed"
+                        );
+                    }
+                }
+            }
+            HostedCodexNamingFact::Activity(input) => {
+                let valid_target = match &input.target {
+                    SessionNameRef::Pending { id } => !id.is_empty(),
+                    SessionNameRef::Session {
+                        provider,
+                        session_id,
+                    } => *provider == NamedProvider::Codex && session_id == native_id,
+                };
+                if valid_target && input.mode == "freshcodex" {
+                    if let Some(sink) = sink {
+                        if let Err(error) = sink.activity(input.clone()).await {
+                            freshell_freshagent::naming::log_name_error(
+                                "activity",
+                                &input.target,
+                                &error,
+                            );
+                        }
+                    }
+                }
+            }
+            HostedCodexNamingFact::Transition { target, transition } => {
+                let expected = SessionNameRef::Session {
+                    provider: NamedProvider::Codex,
+                    session_id: native_id.into(),
+                };
+                let location_matches = matches!(&transition.acquisition.location, NativeLocation::Codex { native_thread_id:Some(id), .. } if id == native_id);
+                if target != expected
+                    || !location_matches
+                    || transition.reason != NameTransitionReason::InitialMaterialization
+                    || transition.acquisition.persistence != NativePersistence::Verified
+                {
+                    tracing::warn!(
+                        provider = "codex",
+                        native_session_id = native_id,
+                        "freshagent.gateway.naming_source_mismatch"
+                    );
+                    return;
+                }
+                freshell_freshagent::naming::fold_identity_transition(&sink, &transition, target)
+                    .await;
+            }
         }
     }
 
@@ -1171,6 +1572,70 @@ fn named_provider(provider: &FreshProvider) -> NamedProvider {
 }
 
 impl HostedFreshAgentGateway for HostedFreshAgentProxy {
+    fn attention_marks(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Vec<freshell_protocol::FreshAgentAttentionMark>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let Ok(views) = self.client.inventory().await else {
+                return Vec::new();
+            };
+            let mut marks = Vec::new();
+            for before in views.into_iter().filter(|view| {
+                view.provider.as_deref() == Some("codex")
+                    && view.fresh_agent_session_type.as_deref() == Some("freshcodex")
+                    && view.desired_state == DesiredState::Running
+            }) {
+                let Ok(batch) = self
+                    .client
+                    .fresh_agent_events(before.soul_id.clone(), 0, 1)
+                    .await
+                else {
+                    continue;
+                };
+                let Some(retained) = batch.retained_state else {
+                    continue;
+                };
+                let Some(after) = self.current_source(&before.soul_id).await else {
+                    continue;
+                };
+                if !same_retained_host(&before, &after)
+                    || !retained_matches_view(&retained, &before)
+                    || !retained_matches_view(&retained, &after)
+                {
+                    continue;
+                }
+                let presentation = self
+                    .presentation_ids
+                    .lock()
+                    .await
+                    .get(&before.soul_id)
+                    .cloned()
+                    .or(before.fresh_agent_session_id.clone())
+                    .or(before.native_session_id.clone());
+                let Some(presentation) = presentation else {
+                    continue;
+                };
+                if let Ok(current) = serde_json::from_value::<
+                    Vec<freshell_protocol::FreshAgentAttentionMark>,
+                >(retained["attentionMarks"].clone())
+                {
+                    marks.extend(
+                        current
+                            .into_iter()
+                            .filter(|mark| {
+                                mark.provider == "codex" && mark.session_type == "freshcodex"
+                            })
+                            .map(|mut mark| {
+                                mark.session_id = presentation.clone();
+                                mark
+                            }),
+                    );
+                }
+            }
+            marks
+        })
+    }
     fn dispatch(
         self: Arc<Self>,
         command: HostedFreshAgentCommand,
@@ -1179,6 +1644,8 @@ impl HostedFreshAgentGateway for HostedFreshAgentProxy {
     }
 }
 
+#[path = "fresh_agent_proxy_naming.rs"]
+mod native_naming;
 #[path = "fresh_agent_proxy_rest.rs"]
 mod rest;
 #[cfg(test)]
@@ -1245,6 +1712,7 @@ fn turn_settings(
 ) -> Option<freshell_runtime_protocol::FreshAgentTurnSettings> {
     let mut settings = settings.map(
         |settings| freshell_runtime_protocol::FreshAgentTurnSettings {
+            collaboration_mode: settings.collaboration_mode,
             cwd: settings.cwd,
             model: settings.model,
             effort: settings.effort,
@@ -1364,6 +1832,74 @@ fn fresh_agent_error_payload(code: &str, message: &str) -> serde_json::Value {
         "code":code,
         "message":message,
     })
+}
+
+fn same_retained_host(
+    before: &freshell_runtime_protocol::RuntimeView,
+    after: &freshell_runtime_protocol::RuntimeView,
+) -> bool {
+    before.soul_id == after.soul_id
+        && before.incarnation_id == after.incarnation_id
+        && before.host_boot_id == after.host_boot_id
+}
+
+/// Retained projection/control state does not carry request acknowledgements.
+/// Keep only these receipts when superseding the journal's display prefix.
+fn is_request_receipt(event: &AgentEvent) -> bool {
+    let AgentEvent::Provider { payload } = event else {
+        return false;
+    };
+    let receipt = if payload["type"] == "freshAgent.event"
+        && matches!(
+            payload["event"]["type"].as_str(),
+            Some(
+                "checkpointTurnIdentity"
+                    | "freshAgent.rolledBack"
+                    | "freshAgent.redone"
+                    | "freshAgent.error"
+            )
+        ) {
+        &payload["event"]
+    } else if matches!(
+        payload["type"].as_str(),
+        Some("freshAgent.send.accepted" | "error" | "freshAgent.checkpoint.outcome")
+    ) {
+        payload
+    } else {
+        return false;
+    };
+    receipt["requestId"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty())
+}
+
+fn retained_batch_matches_source(
+    before: Option<&freshell_runtime_protocol::RuntimeView>,
+    after: Option<&freshell_runtime_protocol::RuntimeView>,
+    retained: Option<&serde_json::Value>,
+) -> bool {
+    before.zip(after).is_some_and(|(before, after)| {
+        same_retained_host(before, after)
+            && before.native_session_id == after.native_session_id
+            && retained.is_none_or(|retained| {
+                retained_matches_view(retained, before) && retained_matches_view(retained, after)
+            })
+    })
+}
+
+fn retained_matches_view(
+    retained: &serde_json::Value,
+    view: &freshell_runtime_protocol::RuntimeView,
+) -> bool {
+    retained["source"]["soulId"].as_str() == Some(view.soul_id.as_str())
+        && retained["source"]["incarnationId"].as_str() == Some(view.incarnation_id.as_str())
+        && view
+            .host_boot_id
+            .as_ref()
+            .is_some_and(|boot| retained["source"]["hostBootId"].as_str() == Some(boot.as_str()))
+        && retained["snapshot"]["provider"] == "codex"
+        && retained["snapshot"]["sessionType"] == "freshcodex"
+        && retained["snapshot"]["threadId"].as_str() == view.native_session_id.as_deref()
 }
 
 fn rewrite_presentation_id(payload: &mut serde_json::Value, presentation_id: &str) {

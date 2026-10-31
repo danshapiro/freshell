@@ -15,6 +15,10 @@ import TerminalView from '@/components/TerminalView'
 const wsHarness = vi.hoisted(() => {
   const messageHandlers = new Set<(msg: any) => void>()
   const restoreRequestIds = new Set<string>()
+  // Mirrors src/lib/terminal-restore.ts's fresh-recovery registry: the
+  // collapse arm registers an intent, the create frame consumes it, and
+  // the dead-create stand-down gate peeks it non-destructively.
+  const freshRecoveryRequestIds = new Map<string, string>()
   // Mirrors src/lib/terminal-restore.ts's recovered-live-terminal target arm
   // (focused-ep6 r5): one-shot tabId:paneId -> terminalId consult before create.
   const recoveredLiveTerminalTargets = new Map<string, string>()
@@ -42,6 +46,19 @@ const wsHarness = vi.hoisted(() => {
     clearRestoreRequestId(id: string) {
       restoreRequestIds.delete(id)
     },
+    addFreshRecoveryRequestId(id: string, intent: string) {
+      freshRecoveryRequestIds.set(id, intent)
+      restoreRequestIds.delete(id)
+    },
+    consumeFreshRecoveryRequest(id: string) {
+      const intent = freshRecoveryRequestIds.get(id)
+      if (!intent) return undefined
+      freshRecoveryRequestIds.delete(id)
+      return intent
+    },
+    hasFreshRecoveryRequestId(id: string) {
+      return freshRecoveryRequestIds.has(id)
+    },
     armRecoveredLiveTerminalTarget(tabId: string, paneId: string, terminalId: string) {
       recoveredLiveTerminalTargets.set(`${tabId}:${paneId}`, terminalId)
     },
@@ -54,6 +71,7 @@ const wsHarness = vi.hoisted(() => {
     reset() {
       messageHandlers.clear()
       restoreRequestIds.clear()
+      freshRecoveryRequestIds.clear()
       recoveredLiveTerminalTargets.clear()
       send.mockClear()
       connect.mockClear()
@@ -80,8 +98,9 @@ vi.mock('@/lib/terminal-restore', () => ({
   addTerminalRestoreRequestId: (id: string) => wsHarness.addRestoreRequestId(id),
   consumeTerminalRestoreRequestId: (id: string) => wsHarness.consumeRestoreRequestId(id),
   clearTerminalRestoreRequestId: (id: string) => wsHarness.clearRestoreRequestId(id),
-  addTerminalFreshRecoveryRequestId: vi.fn(),
-  consumeTerminalFreshRecoveryRequest: vi.fn(() => undefined),
+  addTerminalFreshRecoveryRequestId: (id: string, intent: string) => wsHarness.addFreshRecoveryRequestId(id, intent),
+  consumeTerminalFreshRecoveryRequest: (id: string) => wsHarness.consumeFreshRecoveryRequest(id),
+  hasTerminalFreshRecoveryRequest: (id: string) => wsHarness.hasFreshRecoveryRequestId(id),
   armRecoveredLiveTerminalTarget: (tabId: string, paneId: string, terminalId: string) =>
     wsHarness.armRecoveredLiveTerminalTarget(tabId, paneId, terminalId),
   consumeRecoveredLiveTerminalTarget: (tabId: string, paneId: string) =>

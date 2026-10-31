@@ -252,6 +252,7 @@ impl Drop for EndingSession {
 
 fn create_msg(request_id: &str) -> FreshAgentCreate {
     FreshAgentCreate {
+        collaboration_mode: None,
         pane_id: None,
         naming_handle: None,
         observed_epoch: None,

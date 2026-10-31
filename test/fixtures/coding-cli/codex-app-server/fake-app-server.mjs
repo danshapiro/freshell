@@ -2,6 +2,7 @@
 
 import { WebSocketServer } from 'ws'
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import net from 'node:net'
 import os from 'node:os'
@@ -330,6 +331,15 @@ function successResult(method, params) {
       platformOs: 'linux',
     }
   }
+  if (method === 'configRequirements/read') return { requirements: behavior.configRequirements ?? null }
+  if (method === 'model/list') {
+    const pages = behavior.modelCatalogPagesByCwd?.[process.cwd()] ?? behavior.modelCatalogPages ?? [{ data: [
+      { id: 'native-record', model: 'provider-current', displayName: 'Provider Current',
+        supportedReasoningEfforts: [{ reasoningEffort: 'none' }, { reasoningEffort: 'ultra' }],
+        defaultReasoningEffort: 'ultra', inputModalities: ['text', 'image'] },
+    ], nextCursor: null }]
+    return pages[params?.cursor ? Number(params.cursor) : 0]
+  }
   if (method === 'thread/start') {
     const threadId = behavior.threadStartThreadId
       || (behavior.uniqueThreadIds === true
@@ -344,12 +354,13 @@ function successResult(method, params) {
     return {
       thread,
       cwd: params?.cwd ?? process.cwd(),
-      model: 'fixture-model',
+      model: behavior.echoRequestedModel === true ? params?.model ?? 'fixture-model' : 'fixture-model',
       modelProvider: 'openai',
       instructionSources: [],
-      approvalPolicy: 'never',
+      approvalPolicy: behavior.effectiveApprovalPolicy ?? params?.approvalPolicy ?? 'never',
       approvalsReviewer: 'user',
       sandbox: params?.sandbox ?? 'danger-full-access',
+      ...behavior.effectiveThreadSettings,
     }
   }
   if (method === 'thread/resume') {
@@ -363,13 +374,19 @@ function successResult(method, params) {
     return {
       thread,
       cwd: params?.cwd ?? process.cwd(),
-      model: 'fixture-model',
+      model: behavior.echoRequestedModel === true ? params?.model ?? 'fixture-model' : 'fixture-model',
       modelProvider: 'openai',
       instructionSources: [],
-      approvalPolicy: 'never',
+      approvalPolicy: behavior.effectiveApprovalPolicy ?? params?.approvalPolicy ?? 'never',
       approvalsReviewer: 'user',
       sandbox: params?.sandbox ?? 'danger-full-access',
+      ...behavior.effectiveThreadSettings,
     }
+  }
+  if (method === 'turn/steer') {
+    // Native 0.164 active input adds to the expected turn; it does not
+    // manufacture a second turn or apply turn/start setting overrides.
+    return { turnId: params?.expectedTurnId }
   }
   if (method === 'turn/start') {
     if (behavior.recordTurns) {
@@ -379,6 +396,10 @@ function successResult(method, params) {
         ? params.input.map((part) => (part && typeof part.text === 'string' ? part.text : '')).filter(Boolean).join('\n')
         : ''
       const turn = makeRecordedTurn(`turn-${turns.length + 1}`, promptText, params)
+      if (behavior.liveTranscript) {
+        turn.status = 'inProgress'
+        turn.items = [turn.items[0]]
+      }
       turns.push(turn)
       recordedTurnsByThread.set(threadId, turns)
       persistRecordedTurns(threadId, turns)
@@ -414,7 +435,7 @@ function successResult(method, params) {
       model: params?.model ?? 'fixture-model',
       modelProvider: 'openai',
       instructionSources: [],
-      approvalPolicy: 'never',
+      approvalPolicy: behavior.effectiveApprovalPolicy ?? params?.approvalPolicy ?? 'never',
       approvalsReviewer: 'user',
       sandbox: params?.sandbox ?? 'danger-full-access',
     }
@@ -459,6 +480,8 @@ function successResult(method, params) {
     return {}
   }
   if (method === 'thread/read') {
+    const scriptedThread = behavior.threadReadResults?.[params?.threadId]
+    if (scriptedThread) return { thread: scriptedThread }
     const thread = makeThread(params?.threadId, {
       ...params,
       includeTurns: params?.includeTurns === true,
@@ -521,6 +544,22 @@ function maybeWriteRolloutForMethod(method, params) {
     fs.appendFileSync(spec.path, line, 'utf8')
   } else {
     fs.writeFileSync(spec.path, line, 'utf8')
+  }
+}
+
+function recordInputFileReads(method, params) {
+  if (method !== 'turn/start' || !behavior.appendInputFileReadLogPath) return
+  const text = (params?.input ?? []).filter(part => part.type === 'text').map(part => part.text).join('\n')
+  for (const match of text.matchAll(/^- (.+)$/gm)) {
+    const file = match[1]
+    if (!path.isAbsolute(file)) continue
+    const size = fs.statSync(file).size
+    if (size > 10 * 1024 * 1024) throw new Error(`Native fixture attachment exceeds its bounded read: ${file}`)
+    const bytes = fs.readFileSync(file)
+    fs.appendFileSync(behavior.appendInputFileReadLogPath, JSON.stringify({
+      threadId: params.threadId, pid: process.pid, uid: process.getuid?.(), gid: process.getgid?.(),
+      path: file, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex'),
+    }) + '\n')
   }
 }
 
@@ -619,6 +658,9 @@ const paginatedThreadIds = new Set()
 let forkCounter = 0
 
 function broadcastNotification(method, params) {
+  if (behavior.appendNativeNotificationLogPath) {
+    fs.appendFileSync(behavior.appendNativeNotificationLogPath, JSON.stringify({ method, threadId: params?.threadId, turnId: params?.turnId ?? params?.turn?.id }) + '\n')
+  }
   const payload = JSON.stringify({
     jsonrpc: '2.0',
     method,
@@ -669,7 +711,9 @@ function appendThreadOperation(method, params, result) {
     method,
     threadId,
     params,
-    listenUrl,
+    listenUrl: portFile ? `ws://${host}:${wss.address().port}` : listenUrl,
+    sidecarOwnershipId: process.env.FRESHELL_CODEX_SIDECAR_ID ?? null,
+    pid: process.pid,
     at: new Date().toISOString(),
   }) + '\n', 'utf8')
 }
@@ -791,6 +835,9 @@ wss.on('connection', (socket) => {
       return
     }
     const method = message.method
+    if (behavior.appendRequestLogPath) {
+      fs.appendFileSync(behavior.appendRequestLogPath, JSON.stringify({ method, params: message.params, codexHome: getCodexHome(), cwd: process.cwd(), ...(behavior.requestLogContext ? { context: behavior.requestLogContext } : {}) }) + '\n')
+    }
 
     if (
       behavior.requireInitializeBeforeOtherMethods
@@ -895,6 +942,13 @@ wss.on('connection', (socket) => {
       return
     }
 
+    // Opt-in native requirements refusal. Unrelated fixture consumers retain
+    // their normal resume behavior and effective defaults.
+    if (behavior.rejectResumeOverrides === true && method === 'thread/resume'
+      && (message.params?.sandbox != null || message.params?.approvalPolicy != null)) {
+      socket.send(JSON.stringify({ id: message.id, error: { code: -32600, message: 'Native test requirements refuse requested resume sandbox or approval overrides' } }))
+      return
+    }
     const override = behavior.overrides?.[method]
     const delayMs = Number(behavior.delayMethodsMs?.[method] || 0)
     const floodStdoutBytes = Number(behavior.floodStdoutBeforeMethodsBytes?.[method] || 0)
@@ -910,9 +964,20 @@ wss.on('connection', (socket) => {
     }
 
     setTimeout(async () => {
+      // Opt-in creation interleaving: the real browser may stage settings
+      // after its native thread/start request but before its acknowledgement.
+      if (method === 'thread/start' && behavior.waitForThreadStartReleasePath) {
+        const deadline = Date.now() + 120_000
+        while (!fs.existsSync(behavior.waitForThreadStartReleasePath)) {
+          if (Date.now() > deadline) throw new Error('Timed out waiting for test thread/start release')
+          await new Promise((resolve) => setTimeout(resolve, 25))
+        }
+      }
       await writeBytes(process.stdout, floodStdoutBytes)
       await writeBytes(process.stderr, floodStderrBytes)
-      const result = override?.result ?? successResult(method, message.params)
+      const result = method === 'thread/read' && behavior.threadReadResults?.[message.params?.threadId]
+        ? successResult(method, message.params)
+        : override?.result ?? successResult(method, message.params)
       // Durable witnesses land BEFORE the RPC response (kata rb5h). socket.send copies
       // the frame into the kernel synchronously, so on a loaded multi-core host a client
       // on another core can observe the response and assert the witness files while THIS
@@ -922,6 +987,7 @@ wss.on('connection', (socket) => {
       // response implies the witness entry is already on disk.
       appendThreadOperation(method, message.params, result)
       maybeWriteRolloutForMethod(method, message.params)
+      recordInputFileReads(method, message.params)
       socket.send(JSON.stringify({
         id: message.id,
         result,
@@ -958,6 +1024,45 @@ wss.on('connection', (socket) => {
           turn: { id: result.turn.id, status: 'inProgress' },
         })
         const prompt = (message.params?.input ?? []).filter((part) => part.type === 'text').map((part) => part.text).join('\n')
+        if (behavior.liveTranscript && (!behavior.liveTranscriptPrompts || behavior.liveTranscriptPrompts.some(marker => prompt.includes(marker)))) {
+          const threadId = message.params.threadId
+          const turnId = result.turn.id
+          const user = result.turn.items[0]
+          broadcastNotification('item/started', { threadId, turnId, item: user })
+          broadcastNotification('item/completed', { threadId, turnId, item: user })
+          const item = { type: 'agentMessage', id: `${turnId}:answer`, text: '' }
+          broadcastNotification('item/started', { threadId, turnId, item })
+          broadcastNotification('item/agentMessage/delta', { threadId, turnId, itemId: item.id, delta: 'Native streaming fragment' })
+          const command = { type: 'commandExecution', id: `${turnId}:command`, command: 'echo progress', status: 'inProgress', aggregatedOutput: '' }
+          broadcastNotification('item/started', { threadId, turnId, item: command })
+          broadcastNotification('item/commandExecution/outputDelta', { threadId, turnId, itemId: command.id, delta: 'command progress before completion' })
+          const reasoning = { type: 'reasoning', id: `${turnId}:reasoning`, summary: [], content: [] }
+          broadcastNotification('item/started', { threadId, turnId, item: reasoning })
+          broadcastNotification('item/reasoning/summaryTextDelta', { threadId, turnId, itemId: reasoning.id, summaryIndex: 0, delta: 'Native reasoning in progress' })
+          broadcastNotification('turn/plan/updated', { threadId, turnId, plan: [{ step: 'Old plan', status: 'pending' }] })
+          broadcastNotification('turn/plan/updated', { threadId, turnId, explanation: 'Latest native plan', plan: [{ step: 'Inspect progress', status: 'inProgress' }, { step: 'Verify saved result', status: 'pending' }] })
+          broadcastNotification('turn/diff/updated', { threadId, turnId, diff: '@@ -1 +1 @@\n-old\n+previous' })
+          broadcastNotification('turn/diff/updated', { threadId, turnId, diff: '@@ -1 +1 @@\n-old\n+replacement' })
+          broadcastNotification('thread/tokenUsage/updated', { threadId, turnId, tokenUsage: { last: { totalTokens: 20, inputTokens: 15, cachedInputTokens: 8, outputTokens: 5, reasoningOutputTokens: 3 }, total: { totalTokens: 200, inputTokens: 150, cachedInputTokens: 80, outputTokens: 50 }, modelContextWindow: 258400 } })
+          const release = behavior.waitForTurnReleasePath
+          const deadline = Date.now() + 120_000
+          while (release && !fs.existsSync(release)) {
+            if (Date.now() > deadline) throw new Error(`Timed out waiting for test release: ${threadId}/${turnId}`)
+            await new Promise((resolve) => setTimeout(resolve, 25))
+          }
+          item.text = 'Native streaming fragment and final answer'
+          command.status = 'completed'
+          command.aggregatedOutput = 'command progress before completion'
+          reasoning.summary = ['Native reasoning in progress']
+          broadcastNotification('item/completed', { threadId, turnId, item })
+          broadcastNotification('item/completed', { threadId, turnId, item: command })
+          broadcastNotification('item/completed', { threadId, turnId, item: reasoning })
+          const turns = loadRecordedTurns(threadId)
+          const turn = turns.find((candidate) => candidate.id === turnId)
+          turn.items.push(item, command, reasoning)
+          turn.status = 'completed'
+          persistRecordedTurns(threadId, turns)
+        }
         const userRequest = behavior.serverRequestsByPrompt?.[prompt]
         let interrupted = false
         if (userRequest) {
@@ -979,7 +1084,9 @@ wss.on('connection', (socket) => {
         })
         broadcastNotification('turn/completed', {
           threadId: message.params?.threadId,
-          turn: { id: result.turn.id, status: interrupted ? 'interrupted' : 'completed' },
+          turn: behavior.terminalItemsView
+            ? projectTurnItemsView({ ...loadRecordedTurns(message.params.threadId).find(turn => turn.id === result.turn.id), status: interrupted ? 'interrupted' : 'completed' }, behavior.terminalItemsView)
+            : { id: result.turn.id, status: interrupted ? 'interrupted' : 'completed' },
         })
       }
       if (method === 'initialize') {
@@ -1059,6 +1166,20 @@ wss.on('connection', (socket) => {
         exitProcessAfterMethodsOnce.delete(method)
         && claimCrossProcessOnce(behavior.exitProcessAfterMethodsOnceMarkerPath, `exit-process:${method}`)
       ) {
+        if (behavior.processExitGate) {
+          const { readyPath, releasePath } = behavior.processExitGate
+          fs.writeFileSync(`${readyPath}.tmp`, JSON.stringify({
+            pid: process.pid,
+            ownershipId: process.env.FRESHELL_CODEX_SIDECAR_ID ?? null,
+            method,
+            threadId: result?.thread?.id ?? message.params?.threadId ?? null,
+            rolloutPath: result?.thread?.path ?? null,
+          }) + '\n', { encoding: 'utf8', flag: 'wx' })
+          fs.renameSync(`${readyPath}.tmp`, readyPath)
+          while (!fs.existsSync(releasePath)) {
+            await new Promise((resolve) => setTimeout(resolve, 25))
+          }
+        }
         setTimeout(() => {
           if (behavior.stdoutBeforeExit) {
             process.stdout.write(String(behavior.stdoutBeforeExit))

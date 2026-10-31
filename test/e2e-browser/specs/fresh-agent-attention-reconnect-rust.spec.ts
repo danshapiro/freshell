@@ -42,7 +42,7 @@ async function sendFromAnotherConnection(baseUrl: string, token: string, session
       socket.on('message', (raw) => {
         const frame = JSON.parse(raw.toString())
         if (frame.type === 'ready') socket.send(JSON.stringify({
-          type: 'freshAgent.send', provider: 'claude', sessionType, sessionId,
+          type: 'freshAgent.send', provider: sessionType === 'freshcodex' ? 'codex' : 'claude', sessionType, sessionId,
           requestId: 'offline-turn', text: 'finish while the browser is offline',
         }))
         if (frame.type === 'error' && frame.requestId === 'offline-turn') finish(new Error(JSON.stringify(frame)))
@@ -57,14 +57,29 @@ async function sendFromAnotherConnection(baseUrl: string, token: string, session
   }
 }
 
-for (const flavour of ['freshclaude', 'kilroy'] as const) {
+for (const flavour of ['freshclaude', 'kilroy', 'freshcodex'] as const) {
   test(`${flavour}: reconnect replays missed attention once and reload seeds silently`, async ({ page }) => {
     test.setTimeout(120_000)
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-attention-reconnect-'))
     const project = path.join(root, 'project')
     await fs.mkdir(project)
+    const codex = path.join(root, 'codex.mjs')
+    const nativeLog = path.join(root, 'codex-native.jsonl')
+    if (flavour === 'freshcodex') {
+      const fixture = path.resolve(directory, '../../fixtures/coding-cli/codex-app-server/fake-app-server.mjs')
+      await fs.writeFile(codex, `#!/usr/bin/env node
+import {randomUUID} from 'node:crypto'
+import path from 'node:path'
+const threadId=randomUUID()
+process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR=JSON.stringify({recordTurns:true,appendNativeNotificationLogPath:${JSON.stringify(nativeLog)},threadStartThreadId:threadId,
+writeRolloutOnMethods:{'turn/start':{path:path.join(process.env.CODEX_HOME,'sessions','rollout-'+threadId+'.jsonl'),record:{type:'session_meta',payload:{id:threadId,cwd:process.cwd()}}}}})
+await import(${JSON.stringify(fixture)})
+`)
+      await fs.chmod(codex, 0o755)
+    }
     const server = new RustServer({
       env: {
+        ...(flavour === 'freshcodex' ? { CODEX_CMD: codex, FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES: '1' } : {}),
         FRESHELL_CLAUDE_SIDECAR: sidecar,
         FRESHELL_CLAUDE_NODE: process.execPath,
         FRESHELL_CLAUDE_SDK_QUERY_MODULE: simulator,
@@ -74,7 +89,7 @@ for (const flavour of ['freshclaude', 'kilroy'] as const) {
       setupHome: async (home) => {
         await fs.mkdir(path.join(home, '.freshell'), { recursive: true })
         await fs.writeFile(path.join(home, '.freshell', 'config.json'), JSON.stringify({
-          version: 1, settings: { codingCli: { enabledProviders: ['claude'] }, freshAgent: { enabled: true } },
+          version: 1, settings: { codingCli: { enabledProviders: [flavour === 'freshcodex' ? 'codex' : 'claude'] }, freshAgent: { enabled: true } },
         }))
       },
     })
@@ -112,11 +127,11 @@ for (const flavour of ['freshclaude', 'kilroy'] as const) {
       // picker, or it can return the fading boot picker and miss the click.
       await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
       await page.evaluate(() => (window as any).__FRESHELL_TEST_HARNESS__.dispatch({
-        type: 'connection/setAvailableClis', payload: { claude: true },
+        type: 'connection/setAvailableClis', payload: { claude: true, codex: true },
       }))
       const tabId = (await harness.getActiveTabId())!
       const picker = await openPanePicker(page)
-      const label = flavour === 'kilroy' ? 'Kilroy' : 'Freshclaude'
+      const label = flavour === 'kilroy' ? 'Kilroy' : flavour === 'freshcodex' ? 'Freshcodex' : 'Freshclaude'
       await picker.getByRole('button', { name: new RegExp(`^${label}$`) }).click({ force: true })
       const cwd = page.getByLabel(new RegExp(`^Starting directory for ${label}$`, 'i'))
       await cwd.fill(project)
@@ -151,7 +166,11 @@ for (const flavour of ['freshclaude', 'kilroy'] as const) {
       expect((await completion()).attentionByTab[tabId]).toBe(true)
       expect((await completion()).attentionByPane[leaf.id]).toBe(true)
       await expect(page.locator(`[data-context="tab"][data-tab-id="${tabId}"]`)).toHaveClass(/bg-emerald-100/)
-      await expect(page.getByTestId('sidebar-session-list').locator(`[data-session-id="${sessionRef.sessionId}"][data-provider="claude"]`)).toHaveClass(/bg-emerald-50|border-l-emerald-500/)
+      await expect(page.getByTestId('sidebar-session-list').locator(`[data-session-id="${sessionRef.sessionId}"][data-provider="${flavour === 'freshcodex' ? 'codex' : 'claude'}"]`)).toHaveClass(/bg-emerald-50|border-l-emerald-500/)
+      if (flavour === 'freshcodex') {
+        const notifications = (await fs.readFile(nativeLog, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+        expect(notifications.filter(frame => frame.method === 'turn/completed')).toHaveLength(2)
+      }
 
       await harness.forceDisconnect()
       await harness.waitForConnection()

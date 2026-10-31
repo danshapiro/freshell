@@ -83,7 +83,10 @@ pub trait WsTransport: Send + Sync {
 #[derive(Clone, Debug, PartialEq)]
 pub enum CodexAppServerError {
     /// A JSON-RPC error envelope for the request (`CodexAppServerRpcError`, `client.ts:68-78`).
-    Rpc { method: String, error: RpcError },
+    Rpc {
+        method: String,
+        error: Box<RpcError>,
+    },
     /// The request timed out (`client.ts:784-787`).
     Timeout { method: String, timeout_ms: u64 },
     /// The connection closed before the request completed (`client.ts:449,726`).
@@ -130,6 +133,30 @@ impl std::fmt::Display for CodexAppServerError {
 
 impl std::error::Error for CodexAppServerError {}
 
+impl CodexAppServerError {
+    /// Evidence-backed pre-admission refusals in the supported native protocol.
+    /// Internal errors, transport failures and lost replies can follow accepted
+    /// work, so callers must preserve their delivery receipt as ambiguous.
+    pub fn is_not_submitted(&self) -> bool {
+        match self {
+            Self::Rpc { method, error } => {
+                method == "initialize"
+                    || method == "configRequirements/read"
+                    || matches!(error.code, -32601 | -32602)
+                    || (error.code == -32600
+                        && (error.message.starts_with("no active turn to ")
+                            || error.message.starts_with("expected active turn id")))
+            }
+            Self::Timeout { method, .. }
+            | Self::Closed { method }
+            | Self::Transport { method, .. }
+            | Self::InvalidResponse { method, .. } => {
+                matches!(method.as_str(), "initialize" | "configRequirements/read")
+            }
+        }
+    }
+}
+
 /// `thread/start` params (`CodexThreadStartInput`, `client.ts:80-83`; adapter create,
 /// `adapter.ts:825-830`). The client adds `experimentalRawEvents:false` +
 /// `persistExtendedHistory:true` (`client.ts:170-174`).
@@ -154,6 +181,9 @@ pub struct StartThreadParams {
 pub struct StartedThread {
     pub thread_id: String,
     pub reasoning_effort: Option<String>,
+    /// Effective settings stated by native start/resume. Absent fields are
+    /// deliberately distinguishable from an explicit null native default.
+    pub effective_settings: Value,
 }
 
 /// `thread/fork` params (the 0.147.0 `ThreadForkParams` generated type): `{threadId,
@@ -187,6 +217,7 @@ pub struct StartTurnParams {
     pub effort: Option<String>,
     pub sandbox_policy: Option<Value>,
     pub approval_policy: Option<Value>,
+    pub collaboration_mode: Option<Value>,
 }
 
 /// The `turn/start` result (`CodexTurnStartResult`, `protocol.ts:318-320`): the provider turn id.
@@ -226,6 +257,18 @@ impl Drop for CodexAppServerClient {
 }
 
 impl CodexAppServerClient {
+    pub async fn is_initialized(&self) -> bool {
+        self.init.lock().await.is_some()
+    }
+
+    /// Read visible model metadata from this connection's own provider context.
+    pub async fn list_models(&self, cursor: Option<&str>) -> Result<Value, CodexAppServerError> {
+        let mut params = json!({"includeHidden":false,"limit":100});
+        if let Some(cursor) = cursor {
+            params["cursor"] = json!(cursor);
+        }
+        self.request("model/list", params).await
+    }
     /// Wire a client to a transport with the default request timeout and the
     /// [`SNAPSHOT_READ_TIMEOUT_MS`] read budget. Returns the client plus the
     /// [`CodexNotification`] stream the background consumer feeds (the adapter's
@@ -289,6 +332,7 @@ impl CodexAppServerClient {
             "clientInfo": { "name": "freshell", "version": "1.0.0" },
             "capabilities": {
                 "experimentalApi": true,
+                "extensions": {"openai/form": {}, "openai/elicitation": {"form": {}}, "openai/standard-form-input": {}},
                 "optOutNotificationMethods": ["thread/started"],
             },
         });
@@ -317,11 +361,78 @@ impl CodexAppServerClient {
         self.codex_home.lock().await.clone()
     }
 
+    /// 0.164 may warn and fall back when managed requirements constrain the
+    /// requested policy. Check before submitting work; never turn that fallback
+    /// into a silent replacement of prepared untrusted intent.
+    async fn check_untrusted_requirements(
+        &self,
+        policy: Option<&str>,
+    ) -> Result<(), CodexAppServerError> {
+        if policy != Some("untrusted") {
+            return Ok(());
+        }
+        let result = self.request("configRequirements/read", json!({})).await?;
+        let requirements =
+            result
+                .get("requirements")
+                .ok_or_else(|| CodexAppServerError::InvalidResponse {
+                    method: "configRequirements/read".into(),
+                    detail:
+                        "missing native requirements while preserving approval_policy untrusted"
+                            .into(),
+                })?;
+        let policies = requirements.get("allowedApprovalPolicies");
+        if policies.is_some_and(|policies| {
+            !policies.is_null()
+                && !policies.as_array().is_some_and(|allowed| {
+                    allowed
+                        .iter()
+                        .any(|policy| policy.as_str() == Some("untrusted"))
+                })
+        }) {
+            tracing::warn!(
+                event = "codex.approval_policy_incompatible",
+                setting = "approval_policy",
+                requested = "untrusted",
+                stage = "requirements"
+            );
+            return Err(CodexAppServerError::InvalidResponse {
+                method: "configRequirements/read".into(), detail: "Codex approval_policy untrusted is disallowed by native requirements; prepared approval intent was preserved and no work was submitted".into(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn check_effective_approval_policy(
+        result: &Value,
+        requested: Option<&str>,
+        method: &str,
+    ) -> Result<(), CodexAppServerError> {
+        if requested == Some("untrusted")
+            && result.get("approvalPolicy").and_then(Value::as_str) != requested
+        {
+            tracing::warn!(
+                event = "codex.approval_policy_incompatible",
+                setting = "approval_policy",
+                requested = "untrusted",
+                method,
+                stage = "effective_response"
+            );
+            return Err(CodexAppServerError::InvalidResponse {
+                method: method.into(), detail: "native response did not preserve requested approval_policy untrusted; refusing to submit work under a different policy".into(),
+            });
+        }
+        Ok(())
+    }
+
     /// `thread/start` (`client.ts:168-186`) — the stable-from-create codex thread.
     pub async fn start_thread(
         &self,
         params: StartThreadParams,
     ) -> Result<StartedThread, CodexAppServerError> {
+        self.check_untrusted_requirements(params.approval_policy.as_deref())
+            .await?;
+        let requested_policy = params.approval_policy.clone();
         let mut wire = Map::new();
         insert_opt_str(&mut wire, "cwd", params.cwd);
         insert_opt_str(&mut wire, "model", params.model);
@@ -337,6 +448,11 @@ impl CodexAppServerClient {
         wire.insert("persistExtendedHistory".to_string(), json!(true));
 
         let result = self.request("thread/start", Value::Object(wire)).await?;
+        Self::check_effective_approval_policy(
+            &result,
+            requested_policy.as_deref(),
+            "thread/start",
+        )?;
         let thread_id = result
             .get("thread")
             .and_then(|t| t.get("id"))
@@ -354,6 +470,7 @@ impl CodexAppServerClient {
         Ok(StartedThread {
             thread_id,
             reasoning_effort,
+            effective_settings: effective_thread_settings(&result),
         })
     }
 
@@ -368,6 +485,9 @@ impl CodexAppServerClient {
         thread_id: &str,
         params: StartThreadParams,
     ) -> Result<StartedThread, CodexAppServerError> {
+        self.check_untrusted_requirements(params.approval_policy.as_deref())
+            .await?;
+        let requested_policy = params.approval_policy.clone();
         let mut wire = Map::new();
         wire.insert("threadId".to_string(), json!(thread_id));
         insert_opt_str(&mut wire, "cwd", params.cwd);
@@ -384,6 +504,11 @@ impl CodexAppServerClient {
         let result = self
             .request_with_timeout("thread/resume", Value::Object(wire), self.read_timeout)
             .await?;
+        Self::check_effective_approval_policy(
+            &result,
+            requested_policy.as_deref(),
+            "thread/resume",
+        )?;
         let resumed_thread_id = result
             .get("thread")
             .and_then(|t| t.get("id"))
@@ -401,6 +526,7 @@ impl CodexAppServerClient {
         Ok(StartedThread {
             thread_id: resumed_thread_id,
             reasoning_effort,
+            effective_settings: effective_thread_settings(&result),
         })
     }
 
@@ -413,6 +539,8 @@ impl CodexAppServerClient {
         &self,
         params: ThreadForkParams,
     ) -> Result<Value, CodexAppServerError> {
+        self.check_untrusted_requirements(params.approval_policy.as_deref())
+            .await?;
         let mut wire = Map::new();
         wire.insert("threadId".to_string(), json!(params.thread_id));
         insert_opt_str(&mut wire, "lastTurnId", params.last_turn_id);
@@ -472,6 +600,8 @@ impl CodexAppServerClient {
         &self,
         params: StartTurnParams,
     ) -> Result<StartedTurn, CodexAppServerError> {
+        self.check_untrusted_requirements(params.approval_policy.as_ref().and_then(Value::as_str))
+            .await?;
         let mut wire = Map::new();
         wire.insert("threadId".to_string(), json!(params.thread_id));
         wire.insert("input".to_string(), Value::Array(params.input));
@@ -485,6 +615,9 @@ impl CodexAppServerClient {
         insert_opt_str(&mut wire, "model", params.model);
         // DEV-0003: the reasoning effort crosses the wire EXACTLY as given (no clamp/remap).
         insert_opt_str(&mut wire, "effort", params.effort);
+        if let Some(mode) = params.collaboration_mode {
+            wire.insert("collaborationMode".to_string(), mode);
+        }
 
         let result = self.request("turn/start", Value::Object(wire)).await?;
         let turn_id = result
@@ -500,7 +633,35 @@ impl CodexAppServerClient {
         Ok(StartedTurn { turn_id })
     }
 
-    /// `turn/interrupt` (`client.ts:433-439`).
+    /// Active input belongs to the exact native turn the caller observed.
+    /// Native steer accepts no setting overrides and returns that same turn ID.
+    pub async fn steer_turn(
+        &self,
+        thread_id: &str,
+        expected_turn_id: &str,
+        input: Vec<Value>,
+    ) -> Result<StartedTurn, CodexAppServerError> {
+        let result = self
+            .request(
+                "turn/steer",
+                json!({"threadId": thread_id, "expectedTurnId": expected_turn_id, "input": input}),
+            )
+            .await?;
+        let turn_id = result
+            .get("turnId")
+            .and_then(Value::as_str)
+            .filter(|id| *id == expected_turn_id)
+            .ok_or_else(|| CodexAppServerError::InvalidResponse {
+                method: "turn/steer".into(),
+                detail: "missing or mismatched turnId".into(),
+            })?;
+        Ok(StartedTurn {
+            turn_id: turn_id.into(),
+        })
+    }
+
+    /// `turn/interrupt` (`client.ts:433-439`). A successful reply acknowledges
+    /// submission only; it is never terminal-turn evidence.
     pub async fn interrupt_turn(
         &self,
         thread_id: &str,
@@ -717,7 +878,7 @@ impl CodexAppServerClient {
             Ok(Ok(Ok(result))) => Ok(result),
             Ok(Ok(Err(error))) => Err(CodexAppServerError::Rpc {
                 method: method.to_string(),
-                error,
+                error: Box::new(error),
             }),
             // The sender was dropped without a value → the connection closed.
             Ok(Err(_)) => Err(CodexAppServerError::Closed {
@@ -782,6 +943,23 @@ fn fail_all_pending(pending: &PendingMap, _reason: &str) {
         // Dropping the sender (via a closed Err) resolves the waiter's `Ok(Err(_))` → Closed.
         drop(tx);
     }
+}
+
+fn effective_thread_settings(response: &Value) -> Value {
+    let mut settings = Map::new();
+    for key in [
+        "model",
+        "reasoningEffort",
+        "cwd",
+        "sandbox",
+        "approvalPolicy",
+        "collaborationMode",
+    ] {
+        if let Some(value) = response.get(key) {
+            settings.insert(key.into(), value.clone());
+        }
+    }
+    Value::Object(settings)
 }
 
 fn insert_opt_str(map: &mut Map<String, Value>, key: &str, value: Option<String>) {
@@ -921,8 +1099,271 @@ pub fn new_channel_transport() -> (Arc<ChannelTransport>, ChannelPeer) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn only_native_pre_admission_errors_are_refusals() {
+        for message in [
+            "no active turn to steer",
+            "no active turn to interrupt",
+            "expected active turn id `old` but found `new`",
+        ] {
+            assert!(CodexAppServerError::Rpc {
+                method: "turn/steer".into(),
+                error: Box::new(RpcError {
+                    code: -32600,
+                    message: message.into(),
+                    data: None
+                })
+            }
+            .is_not_submitted());
+        }
+        for error in [
+            CodexAppServerError::Rpc {
+                method: "turn/start".into(),
+                error: Box::new(RpcError {
+                    code: -32603,
+                    message: "internal failure".into(),
+                    data: None,
+                }),
+            },
+            CodexAppServerError::Timeout {
+                method: "turn/start".into(),
+                timeout_ms: 100,
+            },
+            CodexAppServerError::Closed {
+                method: "turn/steer".into(),
+            },
+            CodexAppServerError::Transport {
+                method: "turn/interrupt".into(),
+                message: "lost transport reply".into(),
+            },
+            CodexAppServerError::InvalidResponse {
+                method: "turn/start".into(),
+                detail: "missing result".into(),
+            },
+        ] {
+            assert!(!error.is_not_submitted(), "{error}");
+        }
+        assert!(CodexAppServerError::Timeout {
+            method: "initialize".into(),
+            timeout_ms: 100
+        }
+        .is_not_submitted());
+    }
+
+    #[cfg(feature = "native-policy-qualification")]
+    #[tokio::test]
+    async fn native_requirements_refuse_untrusted_before_work() {
+        struct RecordingTransport {
+            native: crate::transport::TungsteniteTransport,
+            frames: Arc<StdMutex<Vec<Value>>>,
+        }
+        impl WsTransport for RecordingTransport {
+            fn send(&self, text: String) -> BoxFuture<'_, Result<(), String>> {
+                Box::pin(async move {
+                    self.frames.lock().unwrap().push(json!({"direction":"controller", "frame":serde_json::from_str::<Value>(&text).unwrap()}));
+                    self.native.send(text).await
+                })
+            }
+            fn recv(&self) -> BoxFuture<'_, Option<String>> {
+                Box::pin(async move {
+                    let text = self.native.recv().await?;
+                    self.frames.lock().unwrap().push(json!({"direction":"native", "frame":serde_json::from_str::<Value>(&text).unwrap()}));
+                    Some(text)
+                })
+            }
+            fn close(&self) -> BoxFuture<'_, ()> {
+                self.native.close()
+            }
+        }
+        let endpoint = std::env::var("FRESHELL_CODEX_POLICY_PROBE_URL")
+            .expect("explicit owned native endpoint required");
+        assert!(endpoint.starts_with("ws://127.0.0.1:"));
+        let receipt_path = std::env::var("FRESHELL_CODEX_POLICY_PROBE_RECEIPT")
+            .expect("explicit owned receipt required");
+        let frames = Arc::new(StdMutex::new(Vec::<Value>::new()));
+        let transport = RecordingTransport {
+            native: crate::transport::TungsteniteTransport::connect(&endpoint)
+                .await
+                .unwrap(),
+            frames: frames.clone(),
+        };
+        let (client, _notifications) = CodexAppServerClient::connect(Arc::new(transport));
+        let mut refused = Vec::new();
+        for route in ["create", "resume", "fork", "send"] {
+            let params = StartThreadParams {
+                approval_policy: Some("untrusted".into()),
+                ..Default::default()
+            };
+            let parent = "019810de-1e5f-7db3-9c47-1c2a3b4c5d6e";
+            let result = match route {
+                "create" => client.start_thread(params).await.map(|_| ()),
+                "resume" => client.resume_thread(parent, params).await.map(|_| ()),
+                "fork" => client
+                    .fork_thread(ThreadForkParams {
+                        thread_id: parent.into(),
+                        approval_policy: Some("untrusted".into()),
+                        ..Default::default()
+                    })
+                    .await
+                    .map(|_| ()),
+                _ => client
+                    .start_turn(StartTurnParams {
+                        thread_id: parent.into(),
+                        approval_policy: Some(json!("untrusted")),
+                        input: vec![json!({"type":"text","text":"must remain unsubmitted"})],
+                        ..Default::default()
+                    })
+                    .await
+                    .map(|_| ()),
+            };
+            let error = result.expect_err("native requirements must refuse before work");
+            assert!(
+                matches!(&error, CodexAppServerError::InvalidResponse { method, .. } if method == "configRequirements/read"),
+                "{route}: {error}"
+            );
+            assert!(error.to_string().contains("approval_policy untrusted"));
+            refused.push(route);
+        }
+        client.close().await;
+        let frames = frames.lock().unwrap();
+        let requests: Vec<_> = frames
+            .iter()
+            .filter(|entry| entry["direction"] == "controller")
+            .map(|entry| &entry["frame"])
+            .collect();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|frame| frame["method"] == "configRequirements/read")
+                .count(),
+            4
+        );
+        assert!(requests.iter().all(|frame| matches!(
+            frame["method"].as_str(),
+            Some("initialize" | "initialized" | "configRequirements/read")
+        )));
+        let replies: Vec<_> = frames
+            .iter()
+            .filter(|entry| {
+                entry["direction"] == "native"
+                    && entry["frame"]["result"]["requirements"]["allowedApprovalPolicies"]
+                        .is_array()
+            })
+            .collect();
+        assert_eq!(replies.len(), 4);
+        assert!(replies
+            .iter()
+            .all(
+                |entry| entry["frame"]["result"]["requirements"]["allowedApprovalPolicies"]
+                    == json!(["never"])
+            ));
+        let receipt = json!({"event":"codex_native_policy_client_proof", "severity":"info", "refusedRoutes":refused, "frames":*frames, "workRequests":0});
+        std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        println!(
+            "{}",
+            json!({"event":"codex_native_policy_client_proof", "severity":"info", "refusedRoutes":refused, "workRequests":0})
+        );
+    }
+
     fn started_thread_result() -> Value {
         json!({ "thread": { "id": "019810de-1e5f-7db3-9c47-1c2a3b4c5d6e" }, "reasoningEffort": "none" })
+    }
+
+    #[tokio::test]
+    async fn untrusted_requirements_refuse_before_native_work_on_every_typed_route() {
+        for route in ["create", "resume", "fork", "send"] {
+            let (transport, peer) = new_channel_transport();
+            let (client, _notifications) = CodexAppServerClient::connect(transport);
+            let task = tokio::spawn(async move {
+                let params = StartThreadParams {
+                    approval_policy: Some("untrusted".into()),
+                    ..Default::default()
+                };
+                match route {
+                    "create" => client.start_thread(params).await.map(|_| ()),
+                    "resume" => client.resume_thread("parent", params).await.map(|_| ()),
+                    "fork" => client
+                        .fork_thread(ThreadForkParams {
+                            thread_id: "parent".into(),
+                            approval_policy: Some("untrusted".into()),
+                            ..Default::default()
+                        })
+                        .await
+                        .map(|_| ()),
+                    _ => client
+                        .start_turn(StartTurnParams {
+                            thread_id: "parent".into(),
+                            approval_policy: Some(json!("untrusted")),
+                            input: vec![json!({"type":"text","text":"must remain unsubmitted"})],
+                            ..Default::default()
+                        })
+                        .await
+                        .map(|_| ()),
+                }
+            });
+            let (init, method, _) = peer.expect_request().await;
+            assert_eq!(method, "initialize");
+            peer.respond(&init, json!({"userAgent":"fixture", "codexHome":"/fixture", "platformFamily":"unix", "platformOs":"linux"}));
+            peer.expect_notification().await;
+            let (id, method, _) = peer.expect_request().await;
+            assert_eq!(
+                method, "configRequirements/read",
+                "{route} must check native requirements before work"
+            );
+            peer.respond(
+                &id,
+                json!({"requirements":{"allowedApprovalPolicies":["never"]}}),
+            );
+            let error = task
+                .await
+                .unwrap()
+                .expect_err("native requirement fallback must be refused");
+            assert!(error.to_string().contains("approval_policy"));
+            assert!(error.to_string().contains("untrusted"));
+        }
+    }
+
+    #[tokio::test]
+    async fn untrusted_native_effective_policy_mismatch_is_not_accepted() {
+        for route in ["create", "resume"] {
+            let (transport, peer) = new_channel_transport();
+            let (client, _notifications) = CodexAppServerClient::connect(transport);
+            let task = tokio::spawn(async move {
+                let params = StartThreadParams {
+                    approval_policy: Some("untrusted".into()),
+                    ..Default::default()
+                };
+                if route == "create" {
+                    client.start_thread(params).await
+                } else {
+                    client.resume_thread("parent", params).await
+                }
+            });
+            let (init, _, _) = peer.expect_request().await;
+            peer.respond(&init, json!({"userAgent":"fixture", "codexHome":"/fixture", "platformFamily":"unix", "platformOs":"linux"}));
+            peer.expect_notification().await;
+            let (mut id, mut method, _) = peer.expect_request().await;
+            if method == "configRequirements/read" {
+                peer.respond(&id, json!({"requirements":null}));
+                (id, method, _) = peer.expect_request().await;
+            }
+            assert_eq!(
+                method,
+                if route == "create" {
+                    "thread/start"
+                } else {
+                    "thread/resume"
+                }
+            );
+            peer.respond(
+                &id,
+                json!({"thread":{"id":"minted-or-resumed"}, "approvalPolicy":"never"}),
+            );
+            assert!(
+                task.await.unwrap().is_err(),
+                "returned native effective policy must not silently replace untrusted intent"
+            );
+        }
     }
 
     #[tokio::test]
@@ -985,6 +1426,7 @@ mod tests {
             let turn_effort = effort.to_string();
             let task = tokio::spawn(async move {
                 c.start_turn(StartTurnParams {
+                    collaboration_mode: None,
                     thread_id: "thread-1".to_string(),
                     input: vec![json!({ "type": "text", "text": "hi" })],
                     cwd: None,

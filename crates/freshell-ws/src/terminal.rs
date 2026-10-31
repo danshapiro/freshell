@@ -1998,7 +1998,9 @@ async fn handle_client_text(
                     let forward: futures::future::BoxFuture<'static, ()> = match send.provider {
                         freshell_protocol::AgentProvider::Codex => {
                             let fresh_codex = state.fresh_codex.clone();
-                            Box::pin(async move { fresh_codex.handle_send(send).await })
+                            Box::pin(async move {
+                                fresh_codex.handle_send(send).await;
+                            })
                         }
                         freshell_protocol::AgentProvider::Claude => {
                             let fresh_claude = state.fresh_claude.clone();
@@ -2176,6 +2178,14 @@ async fn handle_client_text(
                         .instrument(tracing::Span::current()),
                 );
             }
+            true
+        }
+        ClientMessage::FreshAgentElicitationRespond(respond) => {
+            let fresh_codex = state.fresh_codex.clone();
+            tokio::spawn(
+                async move { fresh_codex.handle_elicitation_respond(respond).await }
+                    .instrument(tracing::Span::current()),
+            );
             true
         }
         ClientMessage::FreshAgentQuestionRespond(respond) => {
@@ -9549,6 +9559,13 @@ pub(crate) fn fresh_agent_control_refusal(message: &ClientMessage) -> Option<Ser
         ClientMessage::FreshAgentApprovalRespond(m) => (
             !matches!(m.provider, AgentProvider::Claude | AgentProvider::Codex),
             "Approvals are",
+            m.provider,
+            m.session_id.as_str(),
+            m.session_type,
+        ),
+        ClientMessage::FreshAgentElicitationRespond(m) => (
+            m.provider != AgentProvider::Codex,
+            "MCP elicitation is",
             m.provider,
             m.session_id.as_str(),
             m.session_type,

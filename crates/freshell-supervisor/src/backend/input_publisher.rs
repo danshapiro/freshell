@@ -1820,11 +1820,10 @@ mod tests {
                         candidate.image_ref.clone(),
                         candidate.runtime_dir.clone(),
                         binary.clone(),
-                        digest_expected(&ExpectedConfig::new(
-                            candidate,
-                            &binary,
-                            &candidate.runtime_dir,
-                        ))
+                        digest_expected(
+                            &ExpectedConfig::new(candidate, &binary, &candidate.runtime_dir)
+                                .unwrap(),
+                        )
                         .unwrap(),
                         candidate.limits,
                         None,

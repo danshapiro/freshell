@@ -585,3 +585,19 @@ async fn handled_control_frames_still_reach_their_dispatch_arms() {
     let frame = next_frame_of_type(&mut ws, "pong").await;
     assert!(frame["timestamp"].is_string(), "pong carries a timestamp");
 }
+
+#[tokio::test]
+async fn task5_elicitation_typed_ingress_dispatches_codex_and_refuses_other_providers() {
+    let (url, _registry) = spawn_server().await;
+    let (mut ws, _) = connect_and_capture_inventory(&url).await;
+    for (provider, session_type, expected) in [
+        ("codex", "freshcodex", "INVALID_SESSION_ID"),
+        ("claude", "freshclaude", "UNSUPPORTED_CAPABILITY"),
+        ("opencode", "freshopencode", "UNSUPPORTED_CAPABILITY"),
+    ] {
+        send_json(&mut ws,serde_json::json!({"type":"freshAgent.elicitation.respond","provider":provider,"sessionType":session_type,"sessionId":"absent-native-thread","requestId":"41","action":"decline","content":null})).await;
+        let frame = next_frame_of_type(&mut ws, "freshAgent.event").await;
+        assert_eq!(frame["provider"], provider);
+        assert_eq!(frame["event"]["code"], expected);
+    }
+}

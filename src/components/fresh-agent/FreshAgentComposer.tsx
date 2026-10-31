@@ -70,6 +70,8 @@ export type FreshAgentComposerHandle = {
    * typed since (never overwriting it), focus, caret to end.
    */
   restoreText: (text: string) => void
+  /** Replace one contextual answer line, preserving every unrelated draft line. */
+  upsertTextLine: (prefix: string, text: string) => void
 }
 
 /**
@@ -223,6 +225,7 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
     if (!storageKey || typeof window === 'undefined') return ''
     return window.sessionStorage.getItem(storageKey) ?? ''
   })
+  const draftStorageKeyRef = useRef(storageKey)
   const [menuMode, setMenuMode] = useState<MenuMode | null>(null)
   const [filter, setFilter] = useState('')
   const [highlightedIndex, setHighlightedIndex] = useState(0)
@@ -272,6 +275,16 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
       setText((current) => (current.trim() ? `${value}\n${current}` : value))
       focusAtEnd()
     },
+    upsertTextLine: (prefix: string, value: string) => {
+      if (disabled) return
+      setText((current) => {
+        const lines = current.split('\n')
+        const index = lines.findIndex((line) => line.startsWith(prefix))
+        if (index < 0) return current.trim() ? `${value}\n${current}` : value
+        return lines.flatMap((line, i) => i === index ? [value] : line.startsWith(prefix) ? [] : [line]).join('\n')
+      })
+      focusAtEnd()
+    },
   }), [disabled, focusAtEnd])
 
   const chatPrefix = getCommandPrefix(text)
@@ -296,7 +309,18 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
   const menuLength = menuMode === 'files' ? fileSuggestions.length : visibleRows.length
 
   useEffect(() => {
+    const keyChanged = draftStorageKeyRef.current !== storageKey
+    draftStorageKeyRef.current = storageKey
     if (!storageKey || typeof window === 'undefined') return
+    if (keyChanged && !text) {
+      const saved = window.sessionStorage.getItem(storageKey)
+      if (saved) {
+        // Restores can bind the native session after this composer mounts.
+        // Hydrate its existing ordinary draft before an empty value can erase it.
+        setText((current) => current || saved)
+        return
+      }
+    }
     if (text) {
       window.sessionStorage.setItem(storageKey, text)
     } else {

@@ -542,6 +542,36 @@ process.stdout.write(JSON.stringify({rootExists:fs.existsSync(root),fileExists:f
     }
   }, 180_000)
 
+  it('managed Claude prepares its complete installed environment before dispatch', async () => {
+    const wire = await TerminalWire.connect(rig.info, true)
+    sockets.push(wire)
+    await wire.create('claude', workspace, authorizeManagedRequest)
+    const launch = await waitFor('managed Claude installed environment consumer', () => (
+      wire.recordRows().find(row => row.provider === 'claude' && row.kind === 'launch')
+    ))
+    // The real child executes the selected command, imports the last installed
+    // dependency and reads its resource after candidate preparation completes.
+    expect(launch.selectedEnvironment).toEqual({
+      dependency: 'installed-dependency-nonce', resource: 'selected-resource-nonce', entries: 4201,
+    })
+    expect(launch.providerConfig['settings.json']).toMatchObject({ paritySetting: true })
+    expect(launch.providerPlugin).toBe('claude parity plugin\n')
+    expect(launch.childIdentity).toEqual({ uid: 65534, gid: 0 })
+    expect(launch.privateTopology).toEqual({ uid: 0, gid: 0, mode: 0o710 })
+    expect(launch.onecliChildDigest).toBe(onecli.childDigests.claude)
+    expect(launch.onecliControlPresent).toBe(false)
+    const mcp = await waitFor('managed Claude prepared MCP probe', () => (
+      wire.recordRows().find(row => row.provider === 'claude' && row.kind === 'mcp')
+    ))
+    expect(mcp.error).toBeUndefined()
+    expect(mcp.tools).toContain('freshell')
+    expect(mcp.call?.ok).toBe(true)
+    expect(mcp.authenticatedCall).toMatchObject({ isError: false, count: 0, truncated: false })
+    for (const marker of [nestedSecretMarker, 'fixture-secret-byte']) {
+      expect(JSON.stringify({ launch, mcp })).not.toContain(marker)
+    }
+  }, 180_000)
+
   it.each(providers)('%s preserves provider-visible launch and MCP behavior', async provider => {
     const observed: RecordRow[] = []
     const mcpResults: RecordRow[] = []

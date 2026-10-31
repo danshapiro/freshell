@@ -522,10 +522,9 @@ export class ManagedRuntimeBrowserRig {
     const features = this.fixtureFreshAgentModes.length > 0
       ? 'managed-fresh-agent-fixtures'
       : qualification.length ? 'managed-provider-qualification' : 'managed-runtime-v1'
-    const prepared = features === 'managed-runtime-v1' ? undefined
-      : preparedRuntimeBinary(this.repoRoot, `server-${features}`)
+    const prepared = preparedRuntimeBinary(this.repoRoot, `server-${features}`)
     if (!prepared) execFileSync(mise, [
-      'exec', 'rust@1.96', '--', 'cargo', 'build', '--release', '-p', 'freshell-server',
+      'exec', 'rust@1.96.0', '--', 'cargo', 'build', '--locked', '--release', '-p', 'freshell-server',
       '--features', features,
     ], { cwd: this.repoRoot, stdio: 'inherit' })
     const source = prepared ?? path.join(this.repoRoot, 'target', 'release', 'freshell-server')
@@ -540,7 +539,7 @@ export class ManagedRuntimeBrowserRig {
     const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
     const prepared = preparedRuntimeBinary(this.repoRoot, 'supervisor-qualification')
     if (!prepared) execFileSync(mise, [
-      'exec', 'rust@1.96', '--', 'cargo', 'build', '--release', '-p', 'freshell-supervisor',
+      'exec', 'rust@1.96.0', '--', 'cargo', 'build', '--locked', '--release', '-p', 'freshell-supervisor',
       '--features', 'provider-qualification',
     ], { cwd: this.repoRoot, stdio: 'inherit' })
     const target = path.join(this.runtime.buildDir, 'freshell-supervisor-qualification')

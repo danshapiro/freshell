@@ -10,6 +10,7 @@ import { createApiClient, resolveConfig, type ApiClient } from './http-client.js
 import { translateKeys } from '../node-client-runtime/keys.js'
 import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../node-client-runtime/codex-restore-contract.js'
 import { renameNotAppliedMessage } from '../node-client-runtime/rename-outcome.js'
+import { automationErrorReceipt } from '../node-client-runtime/automation-errors.js'
 import {
   ACTION_ALIASES,
   freshAgentResumeProvider,
@@ -59,7 +60,7 @@ FRESHELL_URL and FRESHELL_TOKEN are already set in your environment.
 
 ## Fresh agents (in-app)
 
-- Use new-tab with agent="claude", "kilroy", or "opencode", optional model=, effort=, cwd=. Use split-pane with agent="claude" or "kilroy" for a fresh pane beside an existing one. For direct Claude or Codex terminals, use mode="claude" or mode="codex". Drive fresh panes with send-keys and read them with capture-pane. Example:
+- Use new-tab with agent="claude", "kilroy", "codex", or "opencode", optional model=, effort=, cwd=. Use split-pane with agent="claude", "kilroy", or "codex" for a fresh pane beside an existing one. Fresh Codex resume uses sessionRef: { provider: "codex", sessionId }; the resume shorthand promotes to that identity. For direct Claude or Codex terminals, use mode="claude" or mode="codex". Drive fresh panes with send-keys and read them with capture-pane. Example:
   new-tab { agent: "opencode", model: "umans-ai-coding-plan/umans-kimi-k2.7", prompt: "Summarize README.md" }
 
 ## Choosing the right action
@@ -450,9 +451,13 @@ export async function executeAction(
     if (err instanceof MissingParamError) {
       return { error: err.message, hint: `Run action 'help' to see required parameters for '${action}'.` }
     }
+    const receipt = automationErrorReceipt(err)
     return {
       error: `Action '${action}' failed: ${err.message || err}`,
-      hint: 'Check that the Freshell server is running and FRESHELL_URL/FRESHELL_TOKEN are set correctly.',
+      hint: receipt?.code === 'CODEX_DELIVERY_AMBIGUOUS'
+        ? 'Delivery is uncertain; inspect the conversation before sending again.'
+        : 'Check that the Freshell server is running and FRESHELL_URL/FRESHELL_TOKEN are set correctly.',
+      ...receipt,
     }
   }
 }
@@ -475,11 +480,11 @@ async function routeAction(
       const legacyResume = typeof resume === 'string' ? resume : resumeSessionId
       // Provider the resume sugar keys on: an explicit mode wins; otherwise the
       // fresh-agent shorthand maps Claude/Kilroy to Claude identity and keeps
-      // the existing OpenCode promotion and raw-Codex refusal.
+      // the provider's canonical identity. Raw terminal Codex ids remain refused.
       const resumeProvider = mode ?? freshAgentResumeProvider(rest.agent)
-      const codexResumeError = rejectRawCodexResume(resumeProvider, legacyResume, explicitSessionRef)
+      const codexResumeError = rejectRawCodexResume(mode, legacyResume, explicitSessionRef)
       if (codexResumeError) return codexResumeError
-      const sessionRef = explicitSessionRef ?? (typeof resumeProvider === 'string' && resumeProvider !== 'codex' && typeof legacyResume === 'string'
+      const sessionRef = explicitSessionRef ?? (typeof resumeProvider === 'string' && typeof legacyResume === 'string'
         ? { provider: resumeProvider, sessionId: legacyResume }
         : undefined)
       const nameIntent = resolveNameIntent(params)
@@ -548,9 +553,9 @@ async function routeAction(
       const paneId = resolved.pane.id
       const { direction, browser, editor, mode, shell, cwd, target: _t, resume, sessionRef, ...rest } = params || {}
       const resumeProvider = mode ?? freshAgentResumeProvider(rest.agent)
-      const codexResumeError = rejectRawCodexResume(resumeProvider, resume, sessionRef)
+      const codexResumeError = rejectRawCodexResume(mode, resume, sessionRef)
       if (codexResumeError) return codexResumeError
-      const effectiveSessionRef = sessionRef ?? (typeof resumeProvider === 'string' && resumeProvider !== 'codex' && typeof resume === 'string'
+      const effectiveSessionRef = sessionRef ?? (typeof resumeProvider === 'string' && typeof resume === 'string'
         ? { provider: resumeProvider, sessionId: resume }
         : undefined)
       return c.post(`/api/panes/${encodeURIComponent(paneId)}/split`, {

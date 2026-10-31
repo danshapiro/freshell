@@ -7,7 +7,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { configuredAmplifierOnecliGrantFiles } from './runtime-amplifier-onecli.js'
-import { preparedRuntimeBinary } from './runtime-build-preflight.js'
+import { preparedRuntimeBinary, preparedRuntimeBuildProvenance } from './runtime-build-preflight.js'
 import { parseHelperCreateDelay, RestrictedDockerBroker, type BrokerEvent, type BrokerReceipt } from './runtime-test-broker.js'
 
 export const PHASE1_RUNTIME_IMAGE_TAG = 'ubuntu:24.04'
@@ -228,6 +228,7 @@ export class RuntimeHarness {
   private readonly assertions: AssertionRecord[] = []
   private ownedRuntimeImage: OwnedRuntimeImage | undefined
   private brokerStarted = false
+  private buildProvenance: ReturnType<typeof preparedRuntimeBuildProvenance> | { source: 'mise'; command: { program: string; args: string[] }; hostMiseRustc: string }
   private readonly fixtureInputs: RuntimeFixtureInputs | undefined
 
   constructor(repoRoot: string, runId = randomUUID(), phase: 1 | 2 | 3 | 4 | 5 = 1,
@@ -254,6 +255,13 @@ export class RuntimeHarness {
     this.browserDir = path.join(this.evidenceDir, 'browser')
   }
 
+  private codexRuntimeVersion(): string {
+    const inventory = JSON.parse(fs.readFileSync(path.join(this.repoRoot, 'docker/runtime/provider-versions.json'), 'utf8'))
+    const version: unknown = inventory?.providers?.codex?.version
+    if (typeof version !== 'string' || version.length === 0) throw new Error('Managed Codex runtime inventory has no version')
+    return version
+  }
+
   async prepare(options: { operatorHome?: string } = {}): Promise<void> {
     fs.rmSync(this.testRoot, { recursive: true, force: true })
     fs.mkdirSync(this.testRoot, { recursive: true, mode: 0o700 })
@@ -277,7 +285,7 @@ export class RuntimeHarness {
               providers: {
                 claude: { status: 'pending-receipt', requiredModel: 'haiku', reasoning: 'lowest' },
                 opencode: { status: 'pending-receipt', version: '1.18.21', modelProvider: 'openai', model: 'openai/gpt-5.6-luna', freeTier: false },
-                codex: { status: 'pending-receipt', version: '0.147.0', requiredModel: 'gpt-5.6-luna', reasoning: 'lowest' },
+                codex: { status: 'pending-receipt', version: this.codexRuntimeVersion(), requiredModel: 'gpt-5.6-luna', reasoning: 'lowest' },
                 amplifier: { status: 'pending-receipt', version: '0.1.1', commit: '1873aa980535c99a743b17172e4231833f6c8741' },
               },
             }
@@ -1285,6 +1293,7 @@ export class RuntimeHarness {
     this.releaseHostBinary = path.join(this.buildDir, 'freshell-session-host-release')
     const prepared = preparedRuntimeBinary(this.repoRoot, 'supervisor-test')
     if (prepared) {
+      this.buildProvenance = preparedRuntimeBuildProvenance(this.repoRoot)
       for (const [source, destination] of [
         [prepared, this.testSupervisorBinary],
         [preparedRuntimeBinary(this.repoRoot, 'host-test')!, this.testHostBinary],
@@ -1294,17 +1303,20 @@ export class RuntimeHarness {
       return
     }
     const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
-    execFileSync(mise, ['exec', 'rust@1.96', '--', 'cargo', 'build', '-p', 'freshell-supervisor', '-p', 'freshell-session-host', '--features', 'freshell-supervisor/runtime-test-faults,freshell-session-host/fresh-agent-fixtures'], { cwd: this.repoRoot, stdio: 'inherit' })
+    const command = { program: mise, args: ['exec', 'rust@1.96.0', '--', 'cargo'] }
+    const hostMiseRustc = execFileSync(mise, ['exec', 'rust@1.96.0', '--', 'rustc', '--version'], { encoding: 'utf8' }).trim()
+    execFileSync(mise, [...command.args, 'build', '--locked', '-p', 'freshell-supervisor', '-p', 'freshell-session-host', '--features', 'freshell-supervisor/runtime-test-faults,freshell-session-host/fresh-agent-fixtures'], { cwd: this.repoRoot, stdio: 'inherit' })
     fs.copyFileSync(path.join(this.repoRoot, 'target/debug/freshell-supervisor'), this.testSupervisorBinary)
     fs.copyFileSync(path.join(this.repoRoot, 'target/debug/freshell-session-host'), this.testHostBinary)
     fs.chmodSync(this.testSupervisorBinary, 0o755)
     fs.chmodSync(this.testHostBinary, 0o755)
 
-    execFileSync(mise, ['exec', 'rust@1.96', '--', 'cargo', 'build', '--release', '-p', 'freshell-supervisor', '-p', 'freshell-session-host'], { cwd: this.repoRoot, stdio: 'inherit' })
+    execFileSync(mise, [...command.args, 'build', '--locked', '--release', '-p', 'freshell-supervisor', '-p', 'freshell-session-host'], { cwd: this.repoRoot, stdio: 'inherit' })
     fs.copyFileSync(path.join(this.repoRoot, 'target/release/freshell-supervisor'), this.releaseSupervisorBinary)
     fs.copyFileSync(path.join(this.repoRoot, 'target/release/freshell-session-host'), this.releaseHostBinary)
     fs.chmodSync(this.releaseSupervisorBinary, 0o755)
     fs.chmodSync(this.releaseHostBinary, 0o755)
+    this.buildProvenance = { source: 'mise', command, hostMiseRustc }
   }
 
   private collectCapabilities(): unknown {
@@ -1327,12 +1339,10 @@ export class RuntimeHarness {
   }
 
   private collectBuildInfo(): unknown {
-    const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
-    const rustc = execFileSync(mise, ['exec', 'rust@1.96', '--', 'rustc', '--version'], { encoding: 'utf8' }).trim()
     return {
       candidateSha: this.candidateSha,
       runtimeImage: this.imageRef,
-      rustc,
+      build: this.buildProvenance,
       node: process.version,
       docker: docker(['version', '--format', 'client={{.Client.Version}} server={{.Server.Version}}']).trim(),
       binaries: {

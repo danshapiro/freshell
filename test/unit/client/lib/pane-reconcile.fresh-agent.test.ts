@@ -18,12 +18,11 @@ import panesReducer, {
   applyReconcileAttach,
   applyFreshAgentReconcileAttach,
   resetFreshAgentPaneForReconcileCreate,
-  setDeadSessionAdjudication,
+  setPaneReconcileNotice,
   setPaneRestoreError,
 } from '@/store/panesSlice'
 import type { PanesState } from '@/store/panesSlice'
 import type {
-  DeadSessionEntry,
   FreshAgentPaneContent,
   TerminalPaneContent,
 } from '@/store/paneTypes'
@@ -355,20 +354,27 @@ describe('foldVerdicts fresh-agent routing', () => {
     })
   })
 
-  it('dead_session joins ONE batched adjudication with kind fresh-agent and sets per-pane restoreError', () => {
+  it('dead_session sets exactly one per-pane restoreError per pane — no batched dispatch, no dead-copy notice', () => {
+    // No-modal contract (Task 4): the fresh-agent dead arm keeps ONLY the
+    // per-pane restoreError latch (FreshAgentView's banner reads it). No
+    // batched adjudication dispatch, and NO dead-copy reconcileNotice mint —
+    // FreshAgentView renders reconcileNotice as a transient status, so the
+    // notice is a terminal-arm signal only. RED while the batch dispatch
+    // still exists (it is the 3rd dispatch for 2 dead panes).
     const { req, dispatch, dispatched } = freshAgentFoldHarness([
       ['dead_session', { sessionRef: { provider: 'claude', sessionId: 'gone-0' }, reason: 'session_missing' }],
       ['dead_session', { sessionRef: { provider: 'claude', sessionId: 'gone-1' }, reason: 'session_missing' }],
     ])
     const outcome = foldVerdicts(dispatch, req, resultFor(req, dispatched.verdicts))
-    const batched = dispatched.actions.filter((a) => a.type === setDeadSessionAdjudication.type)
-    expect(batched).toHaveLength(1)
-    const entries = (batched[0] as { payload: DeadSessionEntry[] }).payload
-    expect(entries).toHaveLength(2)
-    expect(entries.every((e) => e.kind === 'fresh-agent')).toBe(true)
-    expect(entries.every((e) => e.title.length > 0)).toBe(true)
-    expect(outcome.dead).toBe(2)
-    expect(dispatched.countOf(setPaneRestoreError.type)).toBe(2)
+    expect(outcome.cardinalityViolation).toBe(false)
+    expect(dispatched.actions).toHaveLength(2)
+    expect(new Set(dispatched.actions.map((a) => a.type))).toEqual(new Set([setPaneRestoreError.type]))
+    expect(dispatched.countOf(setPaneReconcileNotice.type)).toBe(0)
+    const restoreErrors = dispatched.actions
+      .filter((a) => a.type === setPaneRestoreError.type)
+      .map((a) => (a as unknown as { payload: { restoreError: { code: string; reason: string } } }).payload.restoreError)
+    expect(restoreErrors).toHaveLength(2)
+    expect(restoreErrors.every((r) => r.code === 'RESTORE_UNAVAILABLE' && r.reason === 'durable_artifact_missing')).toBe(true)
     expect(dispatched.lastPayloadOf(setPaneRestoreError.type)).toMatchObject({
       restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'durable_artifact_missing' },
     })

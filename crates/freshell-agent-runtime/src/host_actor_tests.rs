@@ -125,6 +125,211 @@ impl FreshAgentTransport for SnapshotTransport {
         }
         Ok(self.value.clone())
     }
+    async fn retained_state(&self) -> Result<Option<Value>, String> {
+        let retained = self.value.get("retainedState").cloned();
+        if retained.is_some() {
+            if let Some((entered, release)) = &self.pause {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
+        Ok(retained)
+    }
+    async fn read_child(&self, _: &str) -> Result<Value, String> {
+        self.snapshot().await
+    }
+    async fn model_catalog(&self, _: Option<&str>) -> Result<Value, String> {
+        self.snapshot().await
+    }
+    async fn native_name(
+        &self,
+        native: &str,
+        _: &str,
+        _: &FreshAgentNativeNameOperation,
+    ) -> FreshAgentNativeNameReply {
+        assert_eq!(
+            Some(native),
+            self.initial_native.as_deref(),
+            "a stale target must never reach the transport"
+        );
+        assert!(
+            self.live.load(Ordering::SeqCst),
+            "a dead transport must not receive metadata work"
+        );
+        let value = self.snapshot().await.unwrap();
+        FreshAgentNativeNameReply::Title(value["title"].as_str().map(str::to_string))
+    }
+}
+
+#[tokio::test]
+async fn native_name_preserves_actor_state_and_rejects_stale_targets_and_source_loss() {
+    for scenario in [
+        "live",
+        "wrong-native",
+        "dead-before",
+        "exit-during",
+        "replaced",
+        "oversized",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let transport = Arc::new(SnapshotTransport {
+            value: serde_json::json!({"title": if scenario=="oversized" { "x".repeat(freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES) } else { "Saved title".into() }}),
+            live: std::sync::atomic::AtomicBool::new(scenario != "dead-before"),
+            exit_during_read: scenario == "exit-during",
+            initial_native: Some("name-native".into()),
+            registered: None,
+            pause: (scenario == "replaced").then(|| (entered.clone(), release.clone())),
+        });
+        let actor = FreshAgentHostActor::open(
+            dir.path(),
+            profile(FreshProvider::Codex, "name-store", None),
+            transport,
+        )
+        .await
+        .unwrap();
+        let before = fs::read(dir.path().join("fresh-agent-state.json")).unwrap();
+        let operation = tokio::spawn({
+            let actor = actor.clone();
+            async move {
+                actor
+                    .native_name(
+                        if scenario == "wrong-native" {
+                            "stale-native"
+                        } else {
+                            "name-native"
+                        },
+                        "/owned/codex",
+                        &FreshAgentNativeNameOperation::Read,
+                    )
+                    .await
+            }
+        });
+        if scenario == "replaced" {
+            entered.notified().await;
+            // Controlled source replacement while the actual actor read is held.
+            actor.state.lock().await.profile.native_session_id = Some("replacement".into());
+            release.notify_one();
+        }
+        let reply = operation.await.unwrap();
+        match scenario {
+            "live" => assert_eq!(
+                reply,
+                FreshAgentNativeNameReply::Title(Some("Saved title".into()))
+            ),
+            "wrong-native" | "dead-before" => assert!(matches!(
+                reply,
+                FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Unavailable { .. })
+            )),
+            "oversized" => assert!(matches!(
+                reply,
+                FreshAgentNativeNameReply::Failed(
+                    FreshAgentNativeNameError::InvalidResponse { .. }
+                )
+            )),
+            _ => assert_eq!(
+                reply,
+                FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Closed)
+            ),
+        }
+        assert_eq!(
+            fs::read(dir.path().join("fresh-agent-state.json")).unwrap(),
+            before,
+            "native naming is not a conversation command or writer transition"
+        );
+    }
+}
+
+#[tokio::test]
+async fn model_catalog_preserves_actor_state_and_fences_liveness_size_and_replaced_native_source() {
+    for scenario in ["live", "exited", "oversized", "replaced"] {
+        let dir = tempfile::tempdir().unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let transport = Arc::new(SnapshotTransport {
+            value: serde_json::json!([{"id":"provider-current","displayName":if scenario=="oversized" {"x".repeat(freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES)} else {"Provider Current".into()}}]),
+            live: std::sync::atomic::AtomicBool::new(true),
+            exit_during_read: scenario == "exited",
+            initial_native: Some("catalog-native".into()),
+            registered: None,
+            pause: if scenario == "replaced" {
+                Some((entered.clone(), release.clone()))
+            } else {
+                None
+            },
+        });
+        let actor = FreshAgentHostActor::open(
+            dir.path(),
+            profile(FreshProvider::Codex, "catalog-store", None),
+            transport,
+        )
+        .await
+        .unwrap();
+        let before = fs::read(dir.path().join("fresh-agent-state.json")).unwrap();
+        let read = tokio::spawn({
+            let actor = actor.clone();
+            async move { actor.model_catalog(Some("/workspace")).await }
+        });
+        if scenario == "replaced" {
+            entered.notified().await;
+            // Fixture-only replacement while the read is held; this does not
+            // grant native identity mutation or claim crash recovery coverage.
+            actor.state.lock().await.profile.native_session_id = Some("replacement-native".into());
+            release.notify_one();
+        }
+        let result = read.await.unwrap();
+        assert_eq!(result.is_ok(), scenario == "live", "{scenario}: {result:?}");
+        assert_eq!(
+            fs::read(dir.path().join("fresh-agent-state.json")).unwrap(),
+            before,
+            "a catalog is not a durable command or writer transition"
+        );
+    }
+}
+
+#[tokio::test]
+async fn child_observation_preserves_actor_state_and_rejects_cross_parent_child_and_liveness() {
+    for scenario in [
+        "saved",
+        "live",
+        "wrong-parent",
+        "wrong-child",
+        "exit-during-read",
+        "oversized",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = Arc::new(SnapshotTransport {
+            value: serde_json::json!({"parentThreadId":if scenario == "wrong-parent" {"foreign"} else {"parent-native"},"childThreadId":if scenario == "wrong-child" {"foreign"} else {"child-native"},"status":if scenario == "live" {"live"} else {"saved"},"snapshot":{"threadId":"child-native","provider":"codex","turns":if scenario == "oversized" {"x".repeat(freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES)} else {"Exact observed body".into()}}}),
+            live: std::sync::atomic::AtomicBool::new(true),
+            exit_during_read: scenario == "exit-during-read",
+            initial_native: Some("parent-native".into()),
+            registered: None,
+            pause: None,
+        });
+        let actor = FreshAgentHostActor::open(
+            dir.path(),
+            profile(FreshProvider::Codex, "child-store", None),
+            transport,
+        )
+        .await
+        .unwrap();
+        let before = fs::read(dir.path().join("fresh-agent-state.json")).unwrap();
+        let result = actor.read_child("child-native").await;
+        assert_eq!(
+            result.is_ok(),
+            matches!(scenario, "saved" | "live"),
+            "{scenario}"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("fresh-agent-state.json")).unwrap(),
+            before
+        );
+        assert_eq!(
+            actor.profile().await.native_session_id.as_deref(),
+            Some("parent-native")
+        );
+    }
 }
 
 #[tokio::test]
@@ -337,6 +542,9 @@ struct FakeTransport {
     dispatches: AtomicUsize,
     checkpoint_attempts: std::sync::Mutex<Vec<Option<String>>>,
     decisions: AtomicUsize,
+    retained: std::sync::Mutex<Option<Value>>,
+    dispatch_identity: std::sync::Mutex<Option<NativeDispatchIdentity>>,
+    dispatch_gate: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     stops: AtomicUsize,
     ambiguous_dispatch: bool,
     live: std::sync::atomic::AtomicBool,
@@ -369,6 +577,7 @@ impl FreshAgentTransport for SerialTransport {
         tokio::time::sleep(std::time::Duration::from_millis(15)).await;
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
         Ok(DispatchAck {
+            native_identity: None,
             provider_ack_id: None,
         })
     }
@@ -437,6 +646,9 @@ impl FakeTransport {
             dispatches: AtomicUsize::new(0),
             checkpoint_attempts: std::sync::Mutex::new(Vec::new()),
             decisions: AtomicUsize::new(0),
+            retained: std::sync::Mutex::new(None),
+            dispatch_identity: std::sync::Mutex::new(None),
+            dispatch_gate: std::sync::Mutex::new(None),
             stops: AtomicUsize::new(0),
             ambiguous_dispatch: false,
             live: std::sync::atomic::AtomicBool::new(true),
@@ -452,6 +664,9 @@ impl FakeTransport {
                 dispatches: AtomicUsize::new(0),
                 checkpoint_attempts: std::sync::Mutex::new(Vec::new()),
                 decisions: AtomicUsize::new(0),
+                retained: std::sync::Mutex::new(None),
+                dispatch_identity: std::sync::Mutex::new(None),
+                dispatch_gate: std::sync::Mutex::new(None),
                 stops: AtomicUsize::new(0),
                 ambiguous_dispatch: false,
                 live: std::sync::atomic::AtomicBool::new(true),
@@ -476,6 +691,11 @@ impl FreshAgentTransport for FakeTransport {
         _profile: &FreshAgentProfile,
     ) -> Result<DispatchAck, DispatchFailure> {
         self.dispatches.fetch_add(1, Ordering::SeqCst);
+        let gate = self.dispatch_gate.lock().unwrap().clone();
+        if let Some((entered, release)) = gate {
+            entered.notify_one();
+            release.notified().await;
+        }
         if self.ambiguous_dispatch {
             Err(DispatchFailure {
                 message: "reply lost".into(),
@@ -483,6 +703,7 @@ impl FreshAgentTransport for FakeTransport {
             })
         } else {
             Ok(DispatchAck {
+                native_identity: self.dispatch_identity.lock().unwrap().clone(),
                 provider_ack_id: Some("ack-1".into()),
             })
         }
@@ -514,6 +735,9 @@ impl FreshAgentTransport for FakeTransport {
     async fn is_live(&self) -> bool {
         self.live.load(Ordering::SeqCst)
     }
+    async fn retained_state(&self) -> Result<Option<Value>, String> {
+        Ok(self.retained.lock().unwrap().clone())
+    }
     async fn stop(self: Arc<Self>) -> Result<(), String> {
         self.stops.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -525,6 +749,8 @@ impl FreshAgentTransport for FakeTransport {
 
 fn profile(provider: FreshProvider, store: &str, native: Option<&str>) -> FreshAgentProfile {
     FreshAgentProfile {
+        naming_handle: None,
+        collaboration_mode: None,
         runtime_variant: provider.as_str().into(),
         provider,
         cwd: "/workspace".into(),
@@ -831,6 +1057,123 @@ async fn transport_liveness_is_observed_without_transferring_ownership() {
 }
 
 #[tokio::test]
+async fn accepted_dispatch_native_identity_requires_current_source_and_existing_pending_authority()
+{
+    for scenario in [
+        "wrong-pending",
+        "initial-recovery",
+        "new-conversation",
+        "wrong-parent",
+        "empty-native",
+        "control-native",
+        "stale-native",
+        "stale-store",
+        "stale-provider",
+        "ambiguous",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = if scenario == "ambiguous" {
+            FakeTransport::ambiguous("native-old")
+        } else {
+            FakeTransport::new("native-old")
+        };
+        let mut launch = profile(FreshProvider::Codex, "native-store", None);
+        launch.naming_handle = Some("pending-original".into());
+        *transport.dispatch_identity.lock().unwrap() = Some(NativeDispatchIdentity {
+            previous_native_session_id: if scenario == "wrong-parent" {
+                "foreign-native"
+            } else {
+                "native-old"
+            }
+            .into(),
+            native_session_id: match scenario {
+                "empty-native" => "",
+                "control-native" => "native\nnew",
+                _ => "native-new",
+            }
+            .into(),
+            pending_naming_handle: match scenario {
+                "wrong-pending" => Some("foreign-pending".into()),
+                "initial-recovery" => launch.naming_handle.clone(),
+                _ => None,
+            },
+        });
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        if scenario.starts_with("stale-") {
+            *transport.dispatch_gate.lock().unwrap() = Some((entered.clone(), release.clone()));
+        }
+        let actor = FreshAgentHostActor::open(dir.path(), launch, transport.clone())
+            .await
+            .unwrap();
+        let request = RequestId::parse("native-identity-request").unwrap();
+        let work = tokio::spawn({
+            let actor = actor.clone();
+            let request = request.clone();
+            async move {
+                actor
+                    .dispatch(request, "controlled native input".into(), None)
+                    .await
+            }
+        });
+        if scenario.starts_with("stale-") {
+            tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified())
+                .await
+                .unwrap();
+            let mut state = actor.state.lock().await;
+            match scenario {
+                "stale-native" => {
+                    state.profile.native_session_id = Some("replacement-native".into())
+                }
+                "stale-store" => state.profile.provider_store_id = "replacement-store".into(),
+                "stale-provider" => state.profile.provider = FreshProvider::Claude,
+                _ => unreachable!(),
+            }
+            drop(state);
+            release.notify_one();
+        }
+        let result = work.await.unwrap();
+        let current = actor.profile().await;
+        if matches!(scenario, "initial-recovery" | "new-conversation") {
+            assert_eq!(result, Ok(CommandState::ProviderAcked), "{scenario}");
+            assert_eq!(current.native_session_id.as_deref(), Some("native-new"));
+            assert_eq!(
+                current.naming_handle,
+                if scenario == "initial-recovery" {
+                    Some("pending-original".into())
+                } else {
+                    None
+                }
+            );
+        } else {
+            assert!(
+                matches!(result, Err(ActorError::AmbiguousDispatch)),
+                "{scenario}: {result:?}"
+            );
+            assert_ne!(
+                current.native_session_id.as_deref(),
+                Some("native-new"),
+                "{scenario}"
+            );
+            assert_eq!(
+                current.naming_handle.as_deref(),
+                Some("pending-original"),
+                "{scenario}"
+            );
+            assert_eq!(
+                actor
+                    .dispatch(request, "controlled native input".into(), None)
+                    .await,
+                Err(ActorError::AmbiguousDispatch),
+                "an uncertain native result cannot be replayed: {scenario}"
+            );
+            assert_eq!(transport.dispatches.load(Ordering::SeqCst), 1, "{scenario}");
+        }
+        actor.stop().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn pending_permission_persists_and_is_answered_exactly_once_after_gateway_restart() {
     let dir = tempfile::tempdir().unwrap();
     let transport = FakeTransport::new("thread-7");
@@ -871,6 +1214,137 @@ async fn pending_permission_persists_and_is_answered_exactly_once_after_gateway_
         .await
         .unwrap();
     assert_eq!(transport.decisions.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn snapshot_control_can_be_answered_before_its_delayed_journal_event() {
+    for (scenario, event_type) in [
+        ("current", "freshAgent.permission.request"),
+        ("current", "freshAgent.question.request"),
+        ("current", "freshAgent.elicitation.request"),
+        ("unknown", "freshAgent.permission.request"),
+        ("foreign-native", "freshAgent.permission.request"),
+        ("foreign-provider", "freshAgent.permission.request"),
+        ("foreign-type", "freshAgent.permission.request"),
+        ("foreign-parent", "freshAgent.permission.request"),
+        ("invalid-kind", "freshAgent.status"),
+        ("dead", "freshAgent.permission.request"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = FakeTransport::new("parent-native");
+        let payload = serde_json::json!({
+            "type":event_type, "sessionId":if scenario=="foreign-parent" {"another-parent"} else {"parent-native"},
+            "requestId":"child-request", "providerRequest":{"id":15,"threadId":"registered-child","turnId":"child-turn"},
+            "native":{"availableDecisions":["accept","cancel"]}
+        });
+        *transport.retained.lock().unwrap() = Some(serde_json::json!({
+            "source":{"projectionId":"current-source","ownerEpoch":1,"ownerGeneration":2},
+            "snapshot":{"provider":if scenario=="foreign-provider" {"claude"} else {"codex"},"sessionType":if scenario=="foreign-type" {"freshclaude"} else {"freshcodex"},"threadId":if scenario=="foreign-native" {"old-native"} else {"parent-native"},"pendingApprovals":[payload.clone()]},
+            "pendingControls":[payload.clone()]
+        }));
+        let actor = FreshAgentHostActor::open(
+            dir.path(),
+            profile(FreshProvider::Codex, "retained-control", None),
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+        if scenario == "dead" {
+            transport.live.store(false, Ordering::SeqCst);
+        }
+        // The authoritative retained snapshot is visible while the event pump
+        // has not delivered PermissionRequested. A response must reconcile that
+        // exact current control, without turning snapshot reads into writes.
+        assert!(actor.state.lock().await.decisions.is_empty());
+        let id = if scenario == "unknown" {
+            "invented-request"
+        } else {
+            "child-request"
+        };
+        let decision = serde_json::json!({"nativeDecision":"accept"});
+        let result = actor.resolve_permission(id, decision.clone()).await;
+        if scenario != "current" {
+            assert!(result.is_err(), "{scenario} must not admit a decision");
+            assert!(
+                actor.state.lock().await.decisions.is_empty(),
+                "{scenario} must not persist an unproved control"
+            );
+            assert_eq!(transport.decisions.load(Ordering::SeqCst), 0, "{scenario}");
+            continue;
+        }
+        result.expect("a current snapshot control must be immediately answerable");
+        // The delayed event and duplicate user click must not send twice.
+        actor.record_permission(id.into(), payload).await.unwrap();
+        actor.resolve_permission(id, decision).await.unwrap();
+        assert_eq!(transport.decisions.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.dispatches.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            actor
+                .resolve_permission(id, serde_json::json!({"nativeDecision":"cancel"}))
+                .await,
+            Err(ActorError::DecisionAlreadyResolved)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn retained_control_admission_rejects_source_change_during_read() {
+    for changed in ["native", "store", "dead"] {
+        let dir = tempfile::tempdir().unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let transport = Arc::new(SnapshotTransport {
+            value: serde_json::json!({"retainedState":{
+                "snapshot":{"provider":"codex","sessionType":"freshcodex","threadId":"native-held"},
+                "pendingControls":[{"type":"freshAgent.permission.request","sessionId":"native-held","requestId":"held-request"}]
+            }}),
+            live: std::sync::atomic::AtomicBool::new(true),
+            exit_during_read: false,
+            initial_native: Some("native-held".into()),
+            registered: None,
+            pause: Some((entered.clone(), release.clone())),
+        });
+        let actor = FreshAgentHostActor::open(
+            dir.path(),
+            profile(FreshProvider::Codex, "held-store", None),
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+        let response = tokio::spawn({
+            let actor = actor.clone();
+            async move {
+                actor
+                    .resolve_permission(
+                        "held-request",
+                        serde_json::json!({"nativeDecision":"accept"}),
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified())
+            .await
+            .unwrap();
+        match changed {
+            "native" => {
+                actor.state.lock().await.profile.native_session_id =
+                    Some("replacement-native".into())
+            }
+            "store" => {
+                actor.state.lock().await.profile.provider_store_id = "replacement-store".into()
+            }
+            "dead" => transport.live.store(false, Ordering::SeqCst),
+            _ => unreachable!(),
+        }
+        release.notify_one();
+        assert_eq!(
+            response.await.unwrap(),
+            Err(ActorError::UnknownDecision),
+            "{changed}"
+        );
+        assert!(actor.state.lock().await.decisions.is_empty(), "{changed}");
+    }
 }
 
 #[tokio::test]
@@ -1006,9 +1480,10 @@ async fn exact_native_identity_and_profile_are_reused_on_host_actor_recovery() {
             RequestId::parse("settings-update").unwrap(),
             "continue".into(),
             Some(FreshAgentTurnSettings {
+                collaboration_mode: None,
                 cwd: None,
                 model: Some("updated-model".into()),
-                effort: Some("high".into()),
+                effort: Some(Some("high".into())),
                 permission_mode: None,
                 sandbox: None,
             }),
@@ -1063,6 +1538,7 @@ async fn current_provider_preparation_reopens_the_same_fresh_conversation() {
                 mcp_args: Vec::new(),
             },
             FreshProvider::Codex => ProviderPreparation::Codex {
+                approval_default: None,
                 tui_args: Vec::new(),
                 sidecar_args: Vec::new(),
             },
@@ -1431,13 +1907,11 @@ async fn provider_native_fork_transitions_the_same_actor_without_a_second_writer
     let transport = Arc::new(ForkingTransport {
         forks: AtomicUsize::new(0),
     });
-    let actor = FreshAgentHostActor::open(
-        dir.path(),
-        profile(FreshProvider::Codex, "same-store", Some("native-parent")),
-        transport.clone(),
-    )
-    .await
-    .unwrap();
+    let mut parent = profile(FreshProvider::Codex, "same-store", Some("native-parent"));
+    parent.naming_handle = Some("parent-only-pending-name".into());
+    let actor = FreshAgentHostActor::open(dir.path(), parent, transport.clone())
+        .await
+        .unwrap();
     let request = RequestId::parse("fork-same-soul-1").unwrap();
     let input = Some(serde_json::json!({"atTurnId":"turn-7"}));
     let transition = actor
@@ -1446,6 +1920,10 @@ async fn provider_native_fork_transitions_the_same_actor_without_a_second_writer
         .unwrap();
     assert_eq!(transition.child_session_id, "native-child");
     assert!(transition.parent_retired_by_runtime);
+    assert!(
+        actor.profile().await.naming_handle.is_none(),
+        "an ordinary native fork must not reuse its parent's pending name on reopen"
+    );
     assert_eq!(
         actor.profile().await.native_session_id.as_deref(),
         Some("native-child")
@@ -1621,6 +2099,7 @@ impl FreshAgentTransport for ConfigureTransport {
     ) -> Result<DispatchAck, DispatchFailure> {
         self.sent_profiles.lock().unwrap().push(profile.clone());
         Ok(DispatchAck {
+            native_identity: None,
             provider_ack_id: Some(request_id.as_str().into()),
         })
     }
@@ -1668,9 +2147,10 @@ impl FreshAgentTransport for ConfigureTransport {
 
 fn opus_high() -> FreshAgentTurnSettings {
     FreshAgentTurnSettings {
+        collaboration_mode: None,
         cwd: None,
         model: Some("opus".into()),
-        effort: Some("high".into()),
+        effort: Some(Some("high".into())),
         permission_mode: None,
         sandbox: None,
     }
@@ -1958,4 +2438,107 @@ async fn configure_without_an_effort_keeps_the_profile_on_the_providers_effort()
             case.provider
         );
     }
+}
+
+#[tokio::test]
+async fn task6_covered_head_precedes_retained_await_so_a_final_event_remains_readable() {
+    let dir = tempfile::tempdir().unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let transport = Arc::new(SnapshotTransport {
+        value: serde_json::json!({"retainedState":{"snapshot":{"turns":[]}}}),
+        live: std::sync::atomic::AtomicBool::new(true),
+        exit_during_read: false,
+        initial_native: Some("native-held".into()),
+        registered: None,
+        pause: Some((entered.clone(), release.clone())),
+    });
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Codex, "held-source", None),
+        transport,
+    )
+    .await
+    .unwrap();
+    actor.record_event(AgentEvent::Provider{payload:serde_json::json!({"type":"freshAgent.event","event":{"type":"freshAgent.status","status":"running"}})}).await.unwrap();
+    let read = tokio::spawn({
+        let actor = actor.clone();
+        async move { actor.read_events(0, 64).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified())
+        .await
+        .unwrap();
+    let final_sequence=actor.record_event(AgentEvent::Provider{payload:serde_json::json!({"type":"freshAgent.event","event":{"type":"freshAgent.turn.complete","at":200}})}).await.unwrap();
+    release.notify_one();
+    let first = read.await.unwrap();
+    assert!(
+        first.head < final_sequence,
+        "the covered head must be captured before the held provider read"
+    );
+    assert_eq!(
+        first.retained_state.as_ref().unwrap()["snapshot"]["turns"],
+        serde_json::json!([])
+    );
+    let next = actor.read_events(first.head, 64).await;
+    assert!(next.events.iter().any(|entry|entry.sequence==final_sequence && matches!(&entry.event,AgentEvent::Provider{payload} if payload["event"]["type"]=="freshAgent.turn.complete")),"advancing through the retained prefix must not skip the final concurrent event");
+    actor.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn task6_default_unsupported_provider_keeps_the_existing_event_wire_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = FakeTransport::new("legacy-native");
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Claude, "legacy", None),
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let batch = actor.read_events(0, 64).await;
+    assert!(batch.retained_state.is_none());
+    assert!(serde_json::to_value(batch)
+        .unwrap()
+        .get("retainedState")
+        .is_none());
+    assert_eq!(transport.dispatches.load(Ordering::SeqCst), 0);
+    actor.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn task6_large_retained_body_stays_out_of_the_small_durable_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = "retained body ".repeat(200_000);
+    let retained = serde_json::json!({"snapshot":{"turns":[{"text":body}]}});
+    let transport = Arc::new(SnapshotTransport {
+        value: serde_json::json!({"retainedState":retained}),
+        live: std::sync::atomic::AtomicBool::new(true),
+        exit_during_read: false,
+        initial_native: Some("body-native".into()),
+        registered: None,
+        pause: None,
+    });
+    let actor = FreshAgentHostActor::open_with_bounds(
+        dir.path(),
+        profile(FreshProvider::Codex, "body-store", None),
+        transport,
+        1024,
+        8,
+    )
+    .await
+    .unwrap();
+    actor.record_event(AgentEvent::Provider{payload:serde_json::json!({"type":"freshAgent.event","event":{"type":"freshAgent.host.backpressure","retainedState":retained}})}).await.expect("a multi-MiB retained body must not consume the 1KiB event journal budget");
+    let batch = actor.read_events(0, 8).await;
+    assert!(
+        batch.retained_state == Some(retained),
+        "the same body is reconstructed from the provider source on read"
+    );
+    assert!(
+        std::fs::metadata(dir.path().join("fresh-agent-state.json"))
+            .unwrap()
+            .len()
+            < 64 * 1024,
+        "only the small recovery edge belongs in durable actor state"
+    );
+    actor.stop().await.unwrap();
 }

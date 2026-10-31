@@ -225,14 +225,11 @@ test.describe('freshclaude zero-turn restart (kata 09v1)', () => {
       }, { timeout: 30_000, message: 'the restarted connection observes the fresh-agent owner' }).toBe('fresh-agent')
 
       // Negative proof (the pre-fix failure shape must be gone): the
-      // zero-turn session must NOT be adjudicated dead.
-      await expect(page.getByRole('dialog', { name: 'Dead sessions' })).toHaveCount(0)
-      const state = await harness.getState()
-      const deadEntries = state?.panes?.deadSessionAdjudication ?? []
-      expect(
-        deadEntries.some((e: any) => e?.sessionRef?.sessionId === originalDurable),
-        'zero-turn session must not appear in dead-session adjudication',
-      ).toBe(false)
+      // zero-turn session must NOT be adjudicated dead. With the
+      // dead-session modal gone there is no dialog surface to count and no
+      // deadSessionAdjudication state to read -- the must-NOT-be-dead
+      // negative is pinned by the restoreError check after the send below,
+      // on top of the freshAgent.attach resume evidence above.
       const paneRoot = page.locator('[data-context="fresh-agent"]').last()
       const composer = paneRoot.getByRole('textbox', { name: 'Chat message input' })
       await composer.fill('zero-turn post-restart send')

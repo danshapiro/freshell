@@ -918,3 +918,47 @@ fn fresh_agent_create_and_attach_carry_the_pane_they_run_for() {
         other => panic!("expected FreshAgentAttach, got {other:?}"),
     }
 }
+
+#[test]
+fn combined_codex_controls_and_naming_fields_roundtrip_against_generated_contracts() {
+    for request_id in [json!(41), json!("41")] {
+        let wire = json!({
+            "type": "freshAgent.elicitation.respond", "provider": "codex",
+            "sessionType": "freshcodex", "sessionId": "native-thread",
+            "requestId": request_id, "action": "accept",
+            "content": { "approved": true, "count": 3, "label": "chosen", "tags": ["one"] }
+        });
+        assert!(matches!(
+            client_roundtrip(&wire.to_string(), "freshAgent.elicitation.respond"),
+            ClientMessage::FreshAgentElicitationRespond(_)
+        ));
+    }
+    let reconcile = json!({
+        "type": "pane.reconcile.request", "reconcileId": "rec-combined",
+        "panes": [{ "paneKey": "tab:pane", "kind": "terminal", "mode": "codex",
+            "createRequestId": "create", "namingHandle": "pending-name" }]
+    });
+    match client_roundtrip(&reconcile.to_string(), "pane.reconcile.request") {
+        ClientMessage::PaneReconcileRequest(request) => {
+            assert_eq!(
+                request.panes[0].naming_handle.as_deref(),
+                Some("pending-name")
+            );
+        }
+        other => panic!("expected reconcile request, got {other:?}"),
+    }
+    let associated = json!({
+        "type": "terminal.session.associated", "terminalId": "terminal",
+        "sessionRef": { "provider": "codex", "sessionId": "native-thread" },
+        "nameRef": { "kind": "session", "provider": "codex", "sessionId": "native-thread" }
+    });
+    server_roundtrip(&associated.to_string(), "terminal.session.associated");
+    let ready = json!({
+        "type": "ready", "timestamp": "now",
+        "freshAgentAttention": [{
+            "provider": "codex", "sessionId": "native-thread", "sessionType": "freshcodex",
+            "lastQuestionAvailableAt": 1234
+        }]
+    });
+    server_roundtrip(&ready.to_string(), "ready");
+}

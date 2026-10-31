@@ -29,6 +29,8 @@ describe('classifyHiddenPaneEvent', () => {
     ['permission.cancelled', { type: 'freshAgent.permission.cancelled' }, 'surface'],
     ['question.request', { type: 'freshAgent.question.request' }, 'surface'],
     ['question.cancelled', { type: 'freshAgent.question.cancelled' }, 'surface'],
+    ['elicitation.request', { type: 'freshAgent.elicitation.request' }, 'surface'],
+    ['elicitation.cancelled', { type: 'freshAgent.elicitation.cancelled' }, 'surface'],
     // None: status-only frames never stale a hidden pane.
     ['idle snapshot', { type: 'freshAgent.session.snapshot', status: 'idle' }, 'none'],
     ['status', { type: 'freshAgent.status', status: 'running' }, 'none'],
@@ -66,6 +68,8 @@ describe('isSnapshotInvalidatingFreshAgentEvent', () => {
     'freshAgent.permission.cancelled',
     'freshAgent.question.request',
     'freshAgent.question.cancelled',
+    'freshAgent.elicitation.request',
+    'freshAgent.elicitation.cancelled',
     'freshAgent.session.rolledBack',
     'freshAgent.session.redone',
     'freshAgent.rolledBack',

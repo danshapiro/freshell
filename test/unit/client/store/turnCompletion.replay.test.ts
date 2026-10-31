@@ -124,7 +124,7 @@ describe('fresh-agent reconnect attention', () => {
     dispatch(foldReadyFreshAgentAttention(mark(100, 200)))
     dispatch(observeFreshAgentSession({ provider: 'claude', sessionId: 'session-1' }))
     expect(store.getState().turnCompletion.lastAtByTerminalId).toEqual({
-      'claude:session-1': 100, 'claude:session-1#waiting': 200,
+      'claude:session-1': 100, 'claude:session-1#waiting': 200, 'claude:session-1#question': 0,
     })
   })
 
@@ -239,7 +239,7 @@ describe('fresh-agent reconnect attention', () => {
     dispatch(foldReadyFreshAgentAttention([{ ...mark(100, 110)[0], sessionId: 'remote-only' }]))
     expect(store.getState().turnCompletion.seq).toBe(0)
     expect(store.getState().turnCompletion.lastAtByTerminalId).toEqual({
-      'claude:remote-only': 100, 'claude:remote-only#waiting': 110,
+      'claude:remote-only': 100, 'claude:remote-only#waiting': 110, 'claude:remote-only#question': 0,
     })
   })
 
@@ -252,5 +252,20 @@ describe('fresh-agent reconnect attention', () => {
     dispatch(foldReadyFreshAgentAttention(parsed.freshAgentAttention))
     expect(store.getState().turnCompletion.seq).toBe(0)
     expect(ReadyMessageSchema.parse({ ...valid, freshAgentAttention: mark(100) }).freshAgentAttention).toEqual(mark(100))
+  })
+})
+
+
+describe('nonblocking question attention replay', () => {
+  it('passes the ready parser, seeds reload silently, and replays a newer question once in its own bucket', () => {
+    const { store, dispatch } = createStore()
+    const ready = (at: number) => ReadyMessageSchema.parse({ type: 'ready', timestamp: 'now', serverInstanceId: 'server', freshAgentAttention: [{ provider: 'claude', sessionId: 'session-1', lastQuestionAvailableAt: at }] })
+    dispatch(foldReadyFreshAgentAttention(ready(100).freshAgentAttention))
+    expect(store.getState().turnCompletion.seq).toBe(0)
+    expect(store.getState().turnCompletion.lastAtByTerminalId['claude:session-1#question']).toBe(100)
+    dispatch(foldReadyFreshAgentAttention(ready(101).freshAgentAttention))
+    dispatch(foldReadyFreshAgentAttention(ready(101).freshAgentAttention))
+    expect(store.getState().turnCompletion.pendingEvents).toEqual([expect.objectContaining({ terminalId: 'claude:session-1#question', at: 101 })])
+    expect(store.getState().turnCompletion.lastAtByTerminalId['claude:session-1#waiting']).toBe(0)
   })
 })

@@ -123,11 +123,19 @@ The service is standalone and independent of Electron.
 
 ### Fresh agents
 
-Freshclaude, Freshcodex, and Freshopencode share a chat interface with tool output, questions, and approval controls. Use `/model` or click the model name to choose a model and thinking level. Changes apply to your next message; the picker remembers recent choices for each project.
+Freshclaude, Freshcodex, and Freshopencode share a chat interface with live tool output, attachments, questions, and approval controls. Use `/model` or click the model name to choose a model and thinking level. Freshcodex lists models offered by its running Codex installation and also accepts an exact custom model ID. Changes apply to your next message; the picker remembers recent choices for each project. **Default** removes Freshell’s thinking-level override; Codex may still use its own configuration or a choice retained from earlier turns.
 
-In Freshclaude, “Allow and don't ask again” saves the rule Claude suggests, listed on the card before you click (project rules go to `.claude/settings.local.json` in the project), and when Claude finishes planning it shows the plan with choices to approve it, approve and auto-accept edits, approve and stop asking for permission, or keep planning. In Freshcodex, “Always allow” lasts until the pane reloads.
+In Freshclaude, “Allow and don't ask again” saves the rule Claude suggests, listed on the card before you click (project rules go to `.claude/settings.local.json` in the project), and when Claude finishes planning it shows the plan with choices to approve it, approve and auto-accept edits, approve and stop asking for permission, or keep planning. Freshcodex shows the decisions offered by Codex for each request, including “Allow for this session” when available.
 
-You can queue follow-up messages while an agent works. They run one at a time, and the queue stays available if the session disconnects or ends. Expand the queue to read or cancel individual messages. Codex permission settings control when it asks for approval; “Never ask” does not change the session’s file or network access limits.
+Freshcodex settings separate **Build or Plan**, **File access**, and approval policy. “Never ask” does not expand file or network access. Incompatible model, effort, or provider settings produce a diagnostic instead of silently broadening access.
+
+Questions that await an answer pause the requested work. Async questions let Codex continue; replying sends an ordinary contextual message, and its status confirms delivery rather than completion of the requested work. MCP prompts offer explicit accept, decline, and cancel actions. Opening a linked page does not accept its prompt. Secret answers stay masked.
+
+You can queue follow-up messages while an agent works. They run one at a time, and the queue stays available if the session disconnects or ends. Expand the queue to read or cancel individual messages.
+
+Codex child conversations open read-only inside their parent. Available history can include live or saved output; ephemeral child history can be unavailable. Output labels distinguish retained, saved, interrupted, and truncated content, so a reload does not imply that every streamed byte was saved.
+
+Use `/undo` to roll back Codex conversation turns without changing files; Codex has no `/redo`. **Rewind code to here** restores a message’s code checkpoint separately. `!command` runs a shell command in the conversation’s working directory and sends its output to the agent.
 
 ### Session switching and recovery
 
@@ -269,12 +277,13 @@ turning it off removes the server from Freshclaude and Kilroy agents started or
 resumed after the change, with no restart. Terminal panes do not follow the
 switch yet.
 
-With fresh agents enabled, the CLI and MCP client can create Freshclaude or
-Kilroy tabs, split them into panes, send prompts, and capture their conversation
-as plain text. These operations also work without an open browser. Use
-`agent: "claude"` or `agent: "kilroy"` with MCP `new-tab` and `split-pane`, or
-`--agent claude` / `--agent kilroy` with the CLI. Both support resuming a saved
-Claude conversation through `resume`.
+With fresh agents enabled, the CLI and MCP client can create Freshclaude,
+Kilroy, or Freshcodex tabs, split them into panes, send prompts, capture their
+conversation as plain text, and wait for an output pattern. These operations
+also work without an open browser. Use `agent: "claude"`, `agent: "kilroy"`, or
+`agent: "codex"` with MCP `new-tab` and `split-pane`, or `--agent claude`,
+`--agent kilroy`, or `--agent codex` with the CLI. Both support resuming a saved
+conversation through `resume`; Freshcodex uses its canonical Codex session ID.
 
 ### Rust server scope
 

@@ -478,10 +478,18 @@ test('legacy provider fixture: injected managed projection preserves the convers
       rollout = path.join(sessions, `rollout-${SESSION_ID}.jsonl`)
       transcript = (await fs.readFile('test/fixtures/coding-cli/codex/task-events.sanitized.jsonl', 'utf8'))
         .replace('session-activity', SESSION_ID).replace('Sanitized completion', 'Fixture turn')
+        .split('\n').map((line) => {
+          if (!line) return line
+          const record = JSON.parse(line)
+          if (record.type !== 'session_meta') return line
+          return JSON.stringify({ ...record, payload: { ...record.payload, cwd: homeDir } })
+        }).join('\n')
       await fs.writeFile(rollout, transcript)
       operations = path.join(homeDir, 'codex-operations.jsonl')
       // This is the existing provider protocol fixture, reached through the real Rust backend.
+      // Native cold resume restores the saved cwd even when its request omits cwd.
       fixtureEnv.FAKE_CODEX_APP_SERVER_BEHAVIOR = JSON.stringify({ threadStartThreadId: SESSION_ID,
+        effectiveThreadSettings: { cwd: homeDir },
         appendThreadOperationLogPath: operations })
     },
   })
@@ -494,6 +502,12 @@ test('legacy provider fixture: injected managed projection preserves the convers
     client.sendJson({ type: 'freshAgent.create', requestId: CREATE_REQUEST_ID,
       sessionType: 'freshcodex', provider: 'codex', cwd: info.homeDir })
     const created = await client.nextJsonMessage<{ sessionId: string; sessionRef?: { provider: string; sessionId: string } }>('freshAgent.created', 20_000)
+    const snapshot = await page.request.get(
+      `${info.baseUrl}/api/fresh-agent/threads/freshcodex/codex/${created.sessionRef?.sessionId ?? created.sessionId}`,
+      { headers: { 'x-auth-token': info.token } },
+    )
+    expect(snapshot.ok()).toBe(true)
+    expect((await snapshot.json()).settings).toMatchObject({ cwd: info.homeDir })
     const sent: Array<Record<string, any>> = []
     const received: Array<Record<string, any>> = []
     const held: Array<string | Buffer> = []

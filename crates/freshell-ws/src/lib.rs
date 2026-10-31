@@ -658,9 +658,14 @@ pub async fn build_handshake_with_capabilities(
         fresh_agent_attention_replay_v1,
     } = capabilities;
     let boot_id = state.boot_id.as_ref().clone();
-    let fresh_agent_attention = fresh_agent_attention_replay_v1
-        .then(|| state.fresh_claude.attention_marks())
-        .filter(|marks| !marks.is_empty());
+    let fresh_agent_attention = if fresh_agent_attention_replay_v1 {
+        let mut marks = state.fresh_claude.attention_marks();
+        marks.extend(state.fresh_codex.attention_marks().await);
+        marks.extend(hosted_fresh_agent::retained_attention_marks().await);
+        (!marks.is_empty()).then_some(marks)
+    } else {
+        None
+    };
     if let Some(marks) = fresh_agent_attention.as_ref() {
         tracing::debug!(count = marks.len(), "ws.handshake.attention_marks");
     }

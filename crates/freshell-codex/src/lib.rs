@@ -28,16 +28,16 @@
 //! production wiring behind the default-off `real-transport` feature (verified to compile;
 //! wired live in the next step, T2-over-rust).
 //!
-//! ## DEV-0003 (REJECTED — `port/oracle/DEVIATIONS.md`)
+//! ## Native selections
 //!
-//! Codex reasoning-effort `none`/`minimal` are VALID codex efforts (`protocol.ts:26`) and are
-//! **forwarded VERBATIM** on `turn/start` (`adapter.ts:130-131`). The proposed "clamp
-//! none/minimal" fix was rejected with ZERO differ tolerance: any old-vs-new divergence in
-//! codex effort handling is a port defect. The seam is [`model::to_codex_reasoning_effort`]
-//! and [`app_server::CodexAppServerClient::start_turn`], both pinned by tests here and in
-//! `tests/`.
+//! The installed initialized client supplies the model catalog. Explicit model
+//! and effort IDs remain opaque native values, including none/minimal. Native
+//! validation decides whether custom values are usable; catalog omission never
+//! substitutes a default. A legacy max alias applies only when the selected
+//! installed model advertises xhigh without a distinct max.
 
 pub mod app_server;
+pub mod catalog;
 pub mod durability;
 pub mod events;
 mod json_scan;
@@ -49,6 +49,8 @@ pub mod remote_proxy_side_effects;
 
 #[cfg(feature = "real-transport")]
 pub mod launch_lifecycle;
+#[cfg(all(feature = "real-transport", target_os = "linux"))]
+pub mod managed_launch;
 #[cfg(feature = "real-transport")]
 pub mod remote_proxy;
 #[cfg(feature = "real-transport")]

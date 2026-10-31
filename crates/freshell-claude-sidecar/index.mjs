@@ -177,7 +177,7 @@ function emit(msg) {
   process.stdout.write(`${JSON.stringify(msg)}\n`)
 }
 
-/** Set once the sidecar is exiting on its own (a refused boot, or an unrequested stream end). */
+/** Set once an exit path owns shutdown and the final exit code. */
 let exiting = false
 /** How long an exiting sidecar waits for stdout and stderr to flush. */
 const EXIT_FLUSH_BUDGET_MS = 2000
@@ -516,7 +516,10 @@ function handleCreate(req) {
         // the server's turn accounting reads it (sdk.session.state).
         env: withFreshellContext({ ...createClaudeSdkCleanEnv(process.env), CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' }, req.freshellContext),
         settingSources: ['user', 'project', 'local'],
-        spawnClaudeCodeProcess: managedSdkSpawn(sdkStderr),
+        spawnClaudeCodeProcess: managedSdkSpawn(sdkStderr, process.env, (child) => {
+          state.nativeProcess = child
+          state.nativeClosed = new Promise(resolve => child.once('close', resolve))
+        }),
         stderr: sdkStderr,
         canUseTool: async (toolName, input, options) => {
           const s = sessions.get(sessionId)
@@ -682,14 +685,34 @@ function handleInterrupt(req) {
     })
 }
 
-function shutdown() {
+async function shutdown() {
+  if (exiting) return
+  exiting = true
+  const closed = []
   for (const [sessionId, st] of sessions) {
     // Teardown: emit the card-clearing frames but NEVER resolve parked promises
     // (LB-04 — transport closing; a late resolve is an unhandled rejection).
     cancelPending(st, emit, sessionId, { resolveDeny: false })
+    // close():void only starts SDK cleanup. Signal while we still own the
+    // CLI's pipes, and retain its reader until the real child has closed.
+    // Exiting Node first races native EPIPE against the SDK's exit signal.
+    if (st.nativeProcess) {
+      const child = st.nativeProcess
+      child.stdout.resume()
+      if (child.exitCode === null && child.signalCode === null) {
+        try {
+          if (!child.kill('SIGTERM')) log('warn', 'shutdown.signal_failed', { sessionId, cliPid: child.pid })
+        } catch (error) {
+          log('warn', 'shutdown.signal_failed', { sessionId, cliPid: child.pid, error: errorText(error) })
+        }
+      }
+      closed.push(st.nativeClosed)
+    }
     try { st.abort.abort(); st.query?.close?.() } catch { /* ignore */ }
   }
   sessions.clear()
+  await Promise.all(closed)
+  process.exit(0)
 }
 
 // ── stdin dispatch loop (newline-JSON) ───────────────────────────────────────
@@ -739,13 +762,13 @@ rl.on('line', (line) => {
       }
       break
     }
-    case 'shutdown': shutdown(); process.exit(0); break
+    case 'shutdown': void shutdown(); break
     default: log('warn', 'request.unknown_type', { requestType: String(req?.type) })
   }
 })
 // stdin closed (Rust reaped us): abort every query and exit so no claude CLI
 // grandchild is left mid-stream.
-rl.on('close', () => { if (!exiting) { shutdown(); process.exit(0) } })
+rl.on('close', () => { if (!exiting) void shutdown() })
 // stdout lost (Rust dropped our reader, e.g. a kill aborted its consumer before
 // it wrote the shutdown line): nobody hears us any more, the same request as
 // stdin EOF. Unhandled, the next emit's EPIPE kills node with exit 1 before
@@ -757,10 +780,9 @@ rl.on('close', () => { if (!exiting) { shutdown(); process.exit(0) } })
 process.stdout.on('error', (err) => {
   log('warn', 'stdout.closed', { code: err?.code ?? null, error: errorText(err) })
   if (exiting) return
-  shutdown()
-  process.exit(0)
+  void shutdown()
 })
-process.on('SIGTERM', () => { shutdown(); process.exit(0) })
-process.on('SIGINT', () => { shutdown(); process.exit(0) })
+process.on('SIGTERM', () => { void shutdown() })
+process.on('SIGINT', () => { void shutdown() })
 
 log('info', 'sidecar.ready', { pid: process.pid })

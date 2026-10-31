@@ -132,12 +132,12 @@ export function unsupportedInvocationResult(
   const unsupported = unsupportedActionResult(action)
   if (unsupported) return unsupported
   const canonical = resolveCanonicalAction(action)
-  if (canonical === 'new-tab' && invocation?.agent !== undefined && !['claude', 'kilroy', 'opencode'].includes(String(invocation.agent))) {
-    return { error: 'This fresh-agent provider is unavailable with the Rust Freshell server.', hint: 'Use agent claude, kilroy, or opencode; use mode codex for a Codex terminal.' }
+  if (canonical === 'new-tab' && invocation?.agent !== undefined && !['claude', 'kilroy', 'codex', 'opencode'].includes(String(invocation.agent))) {
+    return { error: 'This fresh-agent provider is unavailable with the Rust Freshell server.', hint: 'Use agent claude, kilroy, codex, or opencode.' }
   }
   if (canonical === 'split-pane' && ['agent', 'model', 'effort'].some((key) => invocation?.[key] !== undefined)
-    && !['claude', 'kilroy'].includes(String(invocation?.agent))) {
-    return { error: 'Fresh-agent splits require agent claude or kilroy.', hint: 'Choose a supported fresh agent or use mode for a terminal pane.' }
+    && !['claude', 'kilroy', 'codex'].includes(String(invocation?.agent))) {
+    return { error: 'Fresh-agent splits require agent claude, kilroy, or codex.', hint: 'Choose a supported fresh agent or use mode for a terminal pane.' }
   }
   const waitPattern = canonical === 'wait-for' ? invocation?.pattern : undefined
   if (canonical === 'wait-for' && (

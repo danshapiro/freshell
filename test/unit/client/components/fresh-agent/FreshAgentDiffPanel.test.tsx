@@ -35,6 +35,20 @@ describe('FreshAgentDiffPanel', () => {
     expect(screen.getByRole('button', { name: 'Diff: src/app.tsx' })).toBeInTheDocument()
   })
 
+  it('shows supplied native diff and later replacement without a cwd/path fetch', async () => {
+    const { rerender } = render(<FreshAgentDiffPanel diffs={[{ id: 'turn:t', title: 'Turn changes', diff: 'diff --git a/one.ts b/one.ts\n@@ -1 +1 @@\n-one\n+two\ndiff --git a/two.ts b/two.ts\n@@ -1 +1 @@\n-old\n+updated' }]} />)
+    await userEvent.click(screen.getByRole('button', { name: 'Diff: Turn changes' }))
+    expect(await screen.findByText('+two')).toBeVisible()
+    expect(screen.getByText('diff --git a/one.ts b/one.ts')).toBeVisible()
+    expect(screen.getByText('diff --git a/two.ts b/two.ts')).toBeVisible()
+    expect(screen.queryByText(/Diff unavailable/)).toBeNull()
+    rerender(<FreshAgentDiffPanel diffs={[{ id: 'turn:t', title: 'Turn changes', diff: '@@ -1 +1 @@\n-one\n+three' }]} cwd="/different" />)
+    expect(screen.getByText('+three')).toBeVisible()
+    expect(screen.queryByText('+two')).toBeNull()
+    expect(screen.queryByText('diff --git a/one.ts b/one.ts')).toBeNull()
+    expect(apiGet).not.toHaveBeenCalled()
+  })
+
   it('renders the shared diff view with data-file-path copy target metadata', () => {
     const { container } = render(
       <DiffView oldStr="const value = 1\n" newStr="const value = 2\n" filePath="src/app.tsx" />,

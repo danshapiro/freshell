@@ -347,10 +347,17 @@ mod tests {
     #[test]
     fn advance_moves_live_time_forward_by_exactly_the_delta() {
         let (_lock, _guard) = OverrideGuard::locked(true);
+        let real_before = system_now_ms();
         let before = snapshot();
+        // Live time keeps moving during advance; exercise that movement rather
+        // than requiring both snapshots to land in the same millisecond.
+        std::thread::sleep(std::time::Duration::from_millis(2));
         advance_ms(90_000).unwrap();
         let after = snapshot();
-        assert_eq!(after.now_ms - before.now_ms, 90_000);
+        let real_after = system_now_ms();
+        let delta = after.now_ms - before.now_ms;
+        assert!(delta >= 90_000 && delta <= 90_000 + real_after - real_before);
+        assert_eq!(after.offset_ms - before.offset_ms, 90_000);
         assert_eq!(after.offset_ms, 90_000);
         assert_eq!(after.mode, ClockMode::Live);
     }

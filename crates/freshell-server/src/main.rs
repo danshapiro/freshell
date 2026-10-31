@@ -1174,7 +1174,13 @@ async fn main() -> ExitCode {
     fresh_agent_state
         .set_rest_create_settings_reader(Arc::new(move || {
             let settings = Arc::clone(&rest_create_settings);
-            Box::pin(async move { settings.read().await.fresh_agent.clone() })
+            Box::pin(async move {
+                let settings = settings.read().await;
+                freshell_freshagent::rest_lane::RestCreateSettings {
+                    fresh_agent: settings.fresh_agent.clone(),
+                    coding_cli: Some(settings.coding_cli.clone()),
+                }
+            })
         }))
         .expect("REST create settings reader is installed once");
     // The freshopencode WS fresh-agent slice: the post-handshake loop dispatches
@@ -1463,6 +1469,12 @@ async fn main() -> ExitCode {
                         >
                 },
             ));
+            #[cfg(feature = "managed-runtime-v1")]
+            let codex_adapter = codex_adapter.with_hosted_backend(
+                hosted_fresh_gateway
+                    .as_ref()
+                    .map(|gateway| gateway.native_name_backend()),
+            );
             let opencode_adapter = Some(session_name_native::OpencodeNativeNameAdapter::new(
                 agent_state.opencode_shared_handle(),
             ));
@@ -1560,6 +1572,9 @@ async fn main() -> ExitCode {
     fresh_opencode_state.set_terminal_liveness(terminal_liveness);
     let fresh_claude_state = fresh_claude_state;
     let fresh_codex_state = fresh_codex_state;
+    fresh_agent_state
+        .set_codex_catalog_state(fresh_codex_state.clone())
+        .expect("one shared registered Codex state");
     let fresh_opencode_state = fresh_opencode_state;
 
     // kata b8ke Task 3: the bounded Starting-state timeout watchdog (5s
@@ -2044,6 +2059,15 @@ async fn main() -> ExitCode {
             ),
         ))
         .expect("local Claude REST lane is installed once");
+    let codex_rest_enabled = fresh_codex_state.clone();
+    fresh_agent_state
+        .set_codex_rest_lane(Arc::new(
+            freshell_freshagent::codex_rest_lane::CodexRestLane::new(
+                fresh_codex_state.clone(),
+                Arc::new(move || codex_rest_enabled.is_enabled()),
+            ),
+        ))
+        .expect("local Codex REST lane is installed once");
     // Lane D1: the crash-event channel for terminal auto-resume. The receiver
     // is consumed by `auto_resume::spawn_auto_resume_hub`, spawned right
     // after `ws_state` is assembled (the hub needs the full state).

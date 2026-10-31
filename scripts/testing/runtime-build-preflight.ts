@@ -6,8 +6,8 @@ import path from 'node:path'
 
 export const RUNTIME_BUILD_MANIFEST_ENV = 'FRESHELL_RUNTIME_TEST_BUILD_MANIFEST'
 export type RuntimeBinary = 'supervisor-test' | 'host-test' | 'supervisor-release' | 'host-release'
-  | 'supervisor-qualification' | 'server-managed-provider-qualification' | 'server-managed-fresh-agent-fixtures'
-export type RuntimeBuildRecipe = 'test-hosts' | 'release-hosts' | 'qualification-supervisor' | 'qualification-server' | 'fresh-fixture-server'
+  | 'supervisor-qualification' | 'server-managed-provider-qualification' | 'server-managed-fresh-agent-fixtures' | 'server-managed-runtime-v1'
+export type RuntimeBuildRecipe = 'test-hosts' | 'release-hosts' | 'qualification-supervisor' | 'qualification-server' | 'fresh-fixture-server' | 'managed-server'
 export type RuntimeBuildCommand = { program: string; args: string[] }
 
 type BuildManifest = {
@@ -15,9 +15,14 @@ type BuildManifest = {
   repoRoot: string
   revision: string
   binaries: Partial<Record<RuntimeBinary, string>>
+  command?: RuntimeBuildCommand
 }
 
 const recipes: Record<RuntimeBuildRecipe, { args: string[]; profile: string; outputs: Partial<Record<RuntimeBinary, string>> }> = {
+  'managed-server': {
+    args: ['--release', '-p', 'freshell-server', '--features', 'managed-runtime-v1'],
+    profile: 'release', outputs: { 'server-managed-runtime-v1': 'freshell-server' },
+  },
   'test-hosts': {
     args: ['-p', 'freshell-supervisor', '-p', 'freshell-session-host', '--features', 'freshell-supervisor/runtime-test-faults,freshell-session-host/fresh-agent-fixtures'],
     profile: 'debug', outputs: { 'supervisor-test': 'freshell-supervisor', 'host-test': 'freshell-session-host' },
@@ -52,7 +57,7 @@ export function runtimeBuildRecipesForFiles(repoRoot: string, files: string[], e
   return [
     'test-hosts', 'release-hosts',
     ...(terminal ? ['qualification-supervisor', 'qualification-server'] as const : []),
-    ...(fresh ? ['fresh-fixture-server'] as const : []),
+    ...(fresh ? ['fresh-fixture-server', 'managed-server'] as const : []),
   ]
 }
 
@@ -80,6 +85,12 @@ export function preparedRuntimeBinary(repoRoot: string, binary: RuntimeBinary, e
   return file
 }
 
+/** Older manifests have no command provenance; never infer it from the host. */
+export function preparedRuntimeBuildProvenance(repoRoot: string, env: NodeJS.ProcessEnv = process.env) {
+  const manifest = readManifest(repoRoot, env)
+  return manifest ? { source: 'prepared' as const, manifestPath: env[RUNTIME_BUILD_MANIFEST_ENV]!, command: manifest.command ?? null } : undefined
+}
+
 export function hasPreparedRuntimeBuilds(repoRoot: string, selected: RuntimeBuildRecipe[], env: NodeJS.ProcessEnv): boolean {
   if (!readManifest(repoRoot, env)) return false
   for (const recipe of selected) for (const binary of Object.keys(recipes[recipe].outputs) as RuntimeBinary[]) {
@@ -92,7 +103,7 @@ export function hasPreparedRuntimeBuilds(repoRoot: string, selected: RuntimeBuil
 export function prepareRuntimeBuilds(
   repoRoot: string,
   selected: RuntimeBuildRecipe[],
-  { env = process.env, command = { program: path.join(os.homedir(), '.local/bin/mise'), args: ['exec', 'rust@1.96', '--', 'cargo'] } }: {
+  { env = process.env, command = { program: path.join(os.homedir(), '.local/bin/mise'), args: ['exec', 'rust@1.96.0', '--', 'cargo'] } }: {
     env?: NodeJS.ProcessEnv
     command?: RuntimeBuildCommand
   } = {},
@@ -100,7 +111,7 @@ export function prepareRuntimeBuilds(
   const root = fs.realpathSync(repoRoot)
   const directory = path.join(root, '.runtime-build', `preflight-${randomUUID()}`)
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 })
-  const manifest: BuildManifest = { version: 1, repoRoot: root, revision: revision(root), binaries: {} }
+  const manifest: BuildManifest = { version: 1, repoRoot: root, revision: revision(root), binaries: {}, command }
   const target = path.resolve(root, env.CARGO_TARGET_DIR || 'target')
   const jobs = Math.max(1, Math.min(3, Number.parseInt(env.CARGO_BUILD_JOBS || '3', 10) || 3))
   const cleanup = () => fs.rmSync(directory, { recursive: true, force: true })

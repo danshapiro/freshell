@@ -114,7 +114,15 @@ impl HostedPty {
             }
         });
         let mut provider_args = crate::provider_identity_args(launch.run_as_uid, launch.run_as_gid);
-        provider_args.push(launch.program.clone());
+        #[cfg(target_os = "linux")]
+        let provider_program = if launch.mode == "codex" {
+            freshell_codex::managed_launch::managed_program(&launch.program)?
+        } else {
+            launch.program.clone()
+        };
+        #[cfg(not(target_os = "linux"))]
+        let provider_program = launch.program.clone();
+        provider_args.push(provider_program);
         for (index, argument) in launch.args.iter().enumerate() {
             provider_args.push(if launch.mode == "claude" && index > 0 && launch.args[index - 1] == "--settings" && argument == freshell_platform::claude_inputs::MANAGED_SETTINGS_ARGUMENT {
                 claude_settings.as_ref().ok_or("selected Claude settings origin is unavailable; retain inputs and reprepare before dispatch")?.clone()
@@ -139,15 +147,23 @@ impl HostedPty {
         provider_env.insert("GIT_CONFIG_VALUE_0".into(), launch.workspace_path.clone());
         let spawn = (|| {
             #[cfg(target_os = "linux")]
-            freshell_platform::provider_exec::check_final_exec(
-                &spec.program,
-                &spec.args,
-                &provider_env,
-                &[&launch.program],
-                freshell_platform::provider_exec::process_profile()
-                    .map_err(|error| error.to_string())?,
-            )
-            .map_err(|error| error.to_string())?;
+            if launch.mode == "codex" {
+                freshell_codex::managed_launch::check_launch(
+                    &spec.program,
+                    &spec.args,
+                    &provider_env,
+                )?;
+            } else {
+                freshell_platform::provider_exec::check_final_exec(
+                    &spec.program,
+                    &spec.args,
+                    &provider_env,
+                    &[&launch.program],
+                    freshell_platform::provider_exec::process_profile()
+                        .map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
+            }
             PtyTerminal::spawn_with_sink(
                 &spec,
                 &provider_env,

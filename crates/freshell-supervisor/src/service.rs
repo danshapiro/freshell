@@ -62,6 +62,7 @@ struct McpCapabilityRequest<'a> {
     workspace: Option<&'a str>,
     auth_lookup_authority: Option<&'a str>,
     claude_recovery_source: Option<&'a freshell_runtime_protocol::ClaudeRecoverySourceBinding>,
+    codex_source_runtime: Option<freshell_platform::codex_inputs::NativeSourceRuntime>,
     cwd: Option<&'a str>,
     prior_context: Option<&'a freshell_runtime_protocol::ProviderLaunchContext>,
     provider_secret_references: Option<&'a [freshell_runtime_protocol::ProviderSecretReference]>,
@@ -577,12 +578,38 @@ impl Supervisor {
                         .await?,
                 ))
             }
+            AdminCommand::FreshAgentModelCatalog(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::FreshAgentModelCatalog(
+                    self.fresh_agent_model_catalog(request.soul_id, request.cwd)
+                        .await?,
+                ))
+            }
+            AdminCommand::FreshAgentNativeName(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::FreshAgentNativeName(
+                    self.fresh_agent_native_name(request).await?,
+                ))
+            }
             AdminCommand::FreshAgentReadSnapshot(request) => {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
                 Ok(AdminResult::FreshAgentSnapshot(
                     self.fresh_agent_snapshot(request.soul_id).await?,
+                ))
+            }
+            AdminCommand::FreshAgentReadChild(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::FreshAgentChildSnapshot(
+                    self.fresh_agent_read_child(request.soul_id, request.child_thread_id)
+                        .await?,
                 ))
             }
             AdminCommand::FreshAgentResolve(request) => {
@@ -1604,8 +1631,36 @@ impl Supervisor {
             Ok(HostResult::FreshAgentCommand {
                 state: CommandState::ProviderAcked | CommandState::Completed,
                 native_session_id,
+                native_identity,
             }) => {
-                if let Some(native_session_id) = native_session_id {
+                if let Some(identity) = native_identity {
+                    let prior_native = active
+                        .fresh_agent()
+                        .and_then(|spec| spec.native_session_id.as_deref());
+                    if active.fresh_agent().is_none_or(|spec| {
+                        spec.provider != freshell_runtime_protocol::FreshProvider::Codex
+                    }) || prior_native != Some(identity.previous_native_session_id.as_str())
+                        || native_session_id.as_deref() != Some(identity.native_session_id.as_str())
+                    {
+                        return Err(RuntimeError::new(
+                            RuntimeErrorCode::OwnershipMismatch,
+                            "accepted native identity does not match its captured command source",
+                        ));
+                    }
+                    let update = classify_fresh_agent_operation_identity(
+                        prior_native,
+                        native_session_id.as_deref(),
+                    )?;
+                    self.registry
+                        .record_fresh_agent_dispatch_identity(
+                            soul_id.clone(),
+                            handle.incarnation_id().clone(),
+                            identity,
+                        )
+                        .await
+                        .map_err(map_registry)?;
+                    tracing::info!(soul_id=%soul_id,incarnation_id=%handle.incarnation_id(),previous_native_session_id=prior_native,native_session_id=native_session_id.as_deref(),native_identity_update=?update,"freshagent.native_dispatch_identity_committed");
+                } else if let Some(native_session_id) = native_session_id {
                     self.registry
                         .record_native_session(
                             soul_id.clone(),
@@ -1866,6 +1921,7 @@ impl Supervisor {
             HostResult::FreshAgentCommand {
                 state,
                 native_session_id,
+                ..
             } => {
                 let identity_update = classify_fresh_agent_operation_identity(
                     prior_native.as_deref(),
@@ -1958,6 +2014,148 @@ impl Supervisor {
         }
     }
 
+    async fn fresh_agent_native_name(
+        &self,
+        request: freshell_runtime_protocol::FreshAgentNativeNameRequest,
+    ) -> Result<freshell_runtime_protocol::FreshAgentNativeNameReply, RuntimeError> {
+        use freshell_runtime_protocol::{FreshAgentNativeNameError, FreshAgentNativeNameReply};
+        let unavailable = || {
+            FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Unavailable {
+                message: "native naming source is no longer current".into(),
+            })
+        };
+        let lifecycle_lock = self.lifecycle_lock(&request.soul_id).await;
+        // Metadata discovery must not queue behind lifecycle work and then
+        // dispatch after the name worker's existing request budget expired.
+        let Ok(_guard) = lifecycle_lock.try_lock() else {
+            return Ok(unavailable());
+        };
+        let handle = self
+            .registry
+            .active_handle_for_soul(request.soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let before = find_view(&self.registry, handle.incarnation_id()).await?;
+        let matches_source = |view: &RuntimeView| {
+            view.incarnation_id == request.source.incarnation_id
+                && view.host_boot_id.as_ref() == Some(&request.source.host_boot_id)
+                && view.execution_generation == request.source.execution_generation
+                && view.intent_revision == request.source.intent_revision
+                && view.native_session_id.as_deref()
+                    == Some(request.source.native_session_id.as_str())
+                && view.launch_state == LaunchState::Running
+                && view.recovery_state == freshell_runtime_protocol::RecoveryState::Live
+                && view.desired_state == freshell_runtime_protocol::DesiredState::Running
+        };
+        if !matches_source(&before)
+            || !handle.fresh_agent().is_some_and(|agent| {
+                agent.provider == freshell_runtime_protocol::FreshProvider::Codex
+            })
+            || request.codex_home.is_empty()
+        {
+            return Ok(unavailable());
+        }
+        let host = self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await?;
+        if host.host_boot_id != request.source.host_boot_id {
+            return Ok(unavailable());
+        }
+        let reply = self
+            .send_authenticated_host_command(
+                handle.incarnation_id().clone(),
+                handle.runtime_dir(),
+                &host,
+                HostCommand::FreshAgentNativeName {
+                    incarnation_id: handle.incarnation_id().clone(),
+                    native_session_id: request.source.native_session_id.clone(),
+                    codex_home: request.codex_home.clone(),
+                    operation: request.operation.clone(),
+                },
+            )
+            .await?;
+        let HostResult::FreshAgentNativeName(value) = reply else {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::HostAuthenticationFailed,
+                "unexpected native naming reply",
+            ));
+        };
+        let after = find_view(&self.registry, handle.incarnation_id()).await?;
+        let after_host = self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await?;
+        if !matches_source(&after) || after_host.host_boot_id != host.host_boot_id {
+            return Ok(FreshAgentNativeNameReply::Failed(
+                FreshAgentNativeNameError::Closed,
+            ));
+        }
+        Ok(value)
+    }
+
+    async fn fresh_agent_model_catalog(
+        &self,
+        soul_id: SoulId,
+        cwd: Option<String>,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
+        let _guard = lifecycle_lock.lock().await;
+        let handle = self
+            .registry
+            .active_handle_for_soul(soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let agent = handle.fresh_agent().ok_or_else(|| {
+            RuntimeError::new(
+                RuntimeErrorCode::UnsupportedWorkload,
+                "soul is not a hosted fresh-agent",
+            )
+        })?;
+        if agent.provider != freshell_runtime_protocol::FreshProvider::Codex {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::UnsupportedOperation,
+                "model catalog requires a bound Codex runtime",
+            ));
+        }
+        let host = self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await?;
+        let reply = self
+            .send_authenticated_host_command(
+                handle.incarnation_id().clone(),
+                handle.runtime_dir(),
+                &host,
+                HostCommand::FreshAgentModelCatalog {
+                    incarnation_id: handle.incarnation_id().clone(),
+                    cwd,
+                },
+            )
+            .await?;
+        let HostResult::FreshAgentModelCatalog(value) = reply else {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::HostAuthenticationFailed,
+                "unexpected model catalog reply",
+            ));
+        };
+        let current = self
+            .registry
+            .active_handle_for_soul(soul_id)
+            .await
+            .map_err(map_registry)?;
+        let after = self
+            .authenticate_host(current.incarnation_id(), current.runtime_dir())
+            .await?;
+        if current.incarnation_id() != handle.incarnation_id()
+            || current.fresh_agent() != handle.fresh_agent()
+            || host.host_boot_id != after.host_boot_id
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::OwnershipMismatch,
+                "model catalog source changed",
+            ));
+        }
+        Ok(value)
+    }
+
     async fn fresh_agent_snapshot(
         &self,
         soul_id: SoulId,
@@ -2014,6 +2212,71 @@ impl Supervisor {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::OwnershipMismatch,
                 "fresh-agent snapshot provider mismatch",
+            ));
+        }
+        Ok(snapshot)
+    }
+
+    async fn fresh_agent_read_child(
+        &self,
+        soul_id: SoulId,
+        child_thread_id: String,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
+        let _guard = lifecycle_lock.lock().await;
+        let handle = self
+            .registry
+            .active_handle_for_soul(soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let agent = handle.fresh_agent().ok_or_else(|| {
+            RuntimeError::new(
+                RuntimeErrorCode::UnsupportedWorkload,
+                "soul is not a hosted fresh-agent",
+            )
+        })?;
+        let provider = if agent.provider == freshell_runtime_protocol::FreshProvider::Kilroy {
+            "claude"
+        } else {
+            agent.provider.as_str()
+        };
+        let host = self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await?;
+        let result = self
+            .send_authenticated_host_command(
+                handle.incarnation_id().clone(),
+                handle.runtime_dir(),
+                &host,
+                HostCommand::FreshAgentReadChild {
+                    child_thread_id: child_thread_id.clone(),
+                    incarnation_id: handle.incarnation_id().clone(),
+                },
+            )
+            .await?;
+        let HostResult::FreshAgentChildSnapshot(snapshot) = result else {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::HostAuthenticationFailed,
+                "unexpected fresh-agent snapshot reply",
+            ));
+        };
+        let current = self
+            .registry
+            .active_handle_for_soul(soul_id)
+            .await
+            .map_err(map_registry)?;
+        if current.incarnation_id() != handle.incarnation_id() {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::OwnershipMismatch,
+                "fresh-agent snapshot owner changed",
+            ));
+        }
+        if provider != "codex"
+            || snapshot["childThreadId"].as_str() != Some(child_thread_id.as_str())
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::OwnershipMismatch,
+                "fresh-agent child snapshot identity mismatch",
             ));
         }
         Ok(snapshot)
@@ -2113,7 +2376,33 @@ impl Supervisor {
             )
             .await?
         {
-            HostResult::FreshAgentEvents(events) => {
+            HostResult::FreshAgentEvents(mut events) => {
+                let current = self
+                    .registry
+                    .active_handle_for_soul(soul_id.clone())
+                    .await
+                    .map_err(map_registry)?;
+                if current.incarnation_id() != handle.incarnation_id() {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::OwnershipMismatch,
+                        "fresh-agent events owner changed",
+                    ));
+                }
+                if let Some(retained) = &mut events.retained_state {
+                    let after = self
+                        .authenticate_host(current.incarnation_id(), current.runtime_dir())
+                        .await?;
+                    if after.host_boot_id != host.host_boot_id {
+                        return Err(RuntimeError::new(
+                            RuntimeErrorCode::OwnershipMismatch,
+                            "fresh-agent retained source boot changed",
+                        ));
+                    }
+                    retained["source"]["soulId"] = serde_json::json!(soul_id);
+                    retained["source"]["incarnationId"] =
+                        serde_json::json!(handle.incarnation_id());
+                    retained["source"]["hostBootId"] = serde_json::json!(host.host_boot_id);
+                }
                 for event in &events.events {
                     if let freshell_runtime_protocol::AgentEvent::Started { native_session_id } =
                         &event.event
@@ -2328,6 +2617,7 @@ impl Supervisor {
                 workspace: None,
                 auth_lookup_authority: None,
                 claude_recovery_source: None,
+                codex_source_runtime: None,
                 cwd: None,
                 prior_context: None,
                 provider_secret_references: None,
@@ -2551,6 +2841,37 @@ impl Supervisor {
         cwd: &str,
         workspace: &str,
     ) -> Result<freshell_runtime_protocol::PreparedProviderContext, RuntimeError> {
+        let codex_source_runtime = if provider == "codex" {
+            use freshell_platform::codex_inputs::NativeSourceRuntime;
+            let incompatible =
+                || {
+                    RuntimeError::new(RuntimeErrorCode::InvalidRequest,
+                "Codex replacement current consumer is invalid; retain inputs and reconcile")
+                };
+            if start.context.provider != "codex" {
+                return Err(incompatible());
+            }
+            Some(
+                match (
+                    start.context.prior_handle.fresh_agent(),
+                    start.context.prior_handle.terminal(),
+                ) {
+                    (Some(spec), None)
+                        if spec.provider == freshell_runtime_protocol::FreshProvider::Codex =>
+                    {
+                        spec.validate()?;
+                        NativeSourceRuntime::AppServer
+                    }
+                    (None, Some(spec)) if spec.mode == "codex" => {
+                        spec.validate()?;
+                        NativeSourceRuntime::Tui
+                    }
+                    _ => return Err(incompatible()),
+                },
+            )
+        } else {
+            None
+        };
         let tui_source = match &context.preparation {
             freshell_runtime_protocol::ProviderPreparation::Opencode { tui_source, .. } => {
                 tui_source.as_ref()
@@ -2586,6 +2907,7 @@ impl Supervisor {
                 workspace: Some(workspace),
                 auth_lookup_authority: Some(&scope.key),
                 claude_recovery_source: claude_recovery_source.as_ref(),
+                codex_source_runtime,
                 cwd: Some(cwd),
                 prior_context: Some(context),
                 provider_secret_references: Some(references),
@@ -2625,6 +2947,7 @@ impl Supervisor {
                 "workspace": request.workspace,
                 "authLookupAuthority": request.auth_lookup_authority,
                 "claudeRecoverySource": request.claude_recovery_source,
+                "codexSourceRuntime": request.codex_source_runtime,
                 "cwd":request.cwd,
                 "priorContext":request.prior_context,
                 "providerSecretReferences":request.provider_secret_references,
@@ -3207,7 +3530,11 @@ where
     drop(supervisor);
     let limit = if matches!(
         reply.result,
-        Ok(AdminResult::FreshAgentHistory(_) | AdminResult::FreshAgentSnapshot(_))
+        Ok(AdminResult::FreshAgentHistory(_)
+            | AdminResult::FreshAgentSnapshot(_)
+            | AdminResult::FreshAgentModelCatalog(_)
+            | AdminResult::FreshAgentChildSnapshot(_)
+            | AdminResult::FreshAgentEvents(_))
     ) {
         freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES
     } else {
@@ -3439,7 +3766,12 @@ pub(crate) async fn request_host_reply(
         write_frame(&mut stream, envelope)
             .await
             .map_err(|error| unreachable(error.to_string()))?;
-        let reply_limit = if matches!(envelope.body, HostCommand::FreshAgentReadSnapshot { .. }) {
+        let reply_limit = if matches!(
+            envelope.body,
+            HostCommand::FreshAgentReadSnapshot { .. }
+                | HostCommand::FreshAgentReadChild { .. }
+                | HostCommand::FreshAgentReadEvents { .. }
+        ) {
             freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES
         } else {
             freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES
@@ -3562,6 +3894,7 @@ pub(crate) fn uses_fresh_agent_command_budget(command: &HostCommand) -> bool {
     matches!(
         command,
         HostCommand::FreshAgentSend { .. }
+            | HostCommand::FreshAgentNativeName { .. }
             | HostCommand::FreshAgentCompact { .. }
             | HostCommand::FreshAgentConfigure { .. }
             | HostCommand::FreshAgentRollback { .. }
@@ -3646,8 +3979,8 @@ mod host_ipc_timeout_tests {
     use tokio::net::UnixListener;
 
     #[tokio::test]
-    async fn snapshot_host_reply_preserves_large_history_and_controls_stay_bounded() {
-        for snapshot_read in [true, false] {
+    async fn snapshot_and_child_host_replies_preserve_large_history_and_controls_stay_bounded() {
+        for (snapshot_read, child_read) in [(true, false), (true, true), (false, false)] {
             let dir = tempfile::tempdir().unwrap();
             let socket = dir.path().join("host.sock");
             let listener = UnixListener::bind(&socket).unwrap();
@@ -3663,16 +3996,23 @@ mod host_ipc_timeout_tests {
                     &mut stream,
                     &freshell_runtime_protocol::HostReply {
                         request_id: envelope.request_id,
-                        result: Ok(freshell_runtime_protocol::HostResult::FreshAgentSnapshot(
-                            sent,
-                        )),
+                        result: Ok(if child_read {
+                            freshell_runtime_protocol::HostResult::FreshAgentChildSnapshot(sent)
+                        } else {
+                            freshell_runtime_protocol::HostResult::FreshAgentSnapshot(sent)
+                        }),
                     },
                     freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES,
                 )
                 .await
             });
             let id = IncarnationId::parse("large-incarnation").unwrap();
-            let command = if snapshot_read {
+            let command = if child_read {
+                HostCommand::FreshAgentReadChild {
+                    incarnation_id: id,
+                    child_thread_id: "native-child".into(),
+                }
+            } else if snapshot_read {
                 HostCommand::FreshAgentReadSnapshot { incarnation_id: id }
             } else {
                 HostCommand::Status { incarnation_id: id }
@@ -3684,7 +4024,11 @@ mod host_ipc_timeout_tests {
             )
             .await;
             let _ = server.await.unwrap();
-            if snapshot_read {
+            if child_read {
+                assert!(
+                    matches!(reply.unwrap().result.unwrap(), freshell_runtime_protocol::HostResult::FreshAgentChildSnapshot(value) if value == expected)
+                );
+            } else if snapshot_read {
                 assert!(
                     matches!(reply.unwrap().result.unwrap(), freshell_runtime_protocol::HostResult::FreshAgentSnapshot(value) if value == expected)
                 );
@@ -4427,6 +4771,7 @@ fn map_registry(error: RegistryError) -> RuntimeError {
 fn map_backend(error: BackendError) -> RuntimeError {
     let code = match &error {
         BackendError::OwnershipMismatch(_) => RuntimeErrorCode::OwnershipMismatch,
+        BackendError::CodexIncompatible(_) => RuntimeErrorCode::InvalidRequest,
         BackendError::Unavailable(_) | BackendError::DockerHttp { .. } => {
             RuntimeErrorCode::BackendUnavailable
         }
@@ -4442,6 +4787,9 @@ fn backend_failure_diagnostic(error: &BackendError) -> serde_json::Value {
         BackendError::DockerHttp { status, body } => ("docker_http", Some(*status), body.as_str()),
         BackendError::Malformed(detail) => ("malformed", None, detail.as_str()),
         BackendError::InvalidConfig(detail) => ("invalid_config", None, detail.as_str()),
+        BackendError::CodexIncompatible(detail) => {
+            ("codex_configuration_incompatible", None, detail.as_str())
+        }
     };
     const MAX_DETAIL_CHARS: usize = 512;
     let redacted = freshell_runtime_observability::scrub(detail, "");

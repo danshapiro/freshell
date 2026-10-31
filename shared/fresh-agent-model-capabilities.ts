@@ -1,4 +1,13 @@
 import { z } from 'zod'
+import type { SessionLocator } from './ws-protocol.js'
+
+export type FreshAgentCodexCatalogContext = {
+  sessionId: string
+  sessionRef?: SessionLocator
+  cwd?: string
+  observedEpoch?: number
+  observedGeneration?: number
+}
 
 export const FRESH_AGENT_MODEL_CAPABILITY_CACHE_TTL_MS = 5 * 60 * 1000
 
@@ -45,6 +54,8 @@ export const FreshAgentModelCapabilitySchema = z.object({
   supportsEffort: z.boolean(),
   supportedEffortLevels: z.array(FreshAgentModelCapabilitiesOpaqueStringSchema),
   supportsAdaptiveThinking: z.boolean(),
+  defaultEffort: FreshAgentModelCapabilitiesOpaqueStringSchema.optional(),
+  inputModalities: z.array(FreshAgentModelCapabilitiesOpaqueStringSchema).optional(),
 }).strict()
 
 export const FreshAgentModelCapabilitiesSchema = z.object({

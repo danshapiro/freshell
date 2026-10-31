@@ -24,7 +24,7 @@
     },
     "codex": {
       "package": "@openai/codex",
-      "version": "0.147.0"
+      "version": "0.164.0"
     },
     "opencode": {
       "package": "opencode-ai",

@@ -1214,13 +1214,7 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
 
             #[cfg(target_os = "linux")]
             if self.sidecar_context.provider_exec_profile {
-                let additional = if program == "/usr/bin/setpriv" {
-                    &["codex"][..]
-                } else {
-                    &[]
-                };
-                freshell_platform::provider_exec::check_command(cmd.as_std(), true, additional)
-                    .map_err(|error| error.to_string())?;
+                crate::managed_launch::check_command(cmd.as_std())?;
             }
             let mut child = cmd
                 .spawn()

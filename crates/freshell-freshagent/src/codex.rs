@@ -62,11 +62,10 @@ use freshell_codex::launch_lifecycle::{
 use freshell_codex::launch_plan::{codex_sidecar_spawn_spec, CodexSidecarLaunchContext};
 use freshell_codex::transport::{reap_owned_codex_sidecars, TungsteniteTransport};
 use freshell_codex::{
-    mint_ownership_id, normalize_codex_thread_status, normalize_freshcodex_effort,
-    normalize_freshcodex_model, read_rollout_history_mode, to_codex_reasoning_effort,
-    CodexAdapterEvent, CodexAppServerClient, CodexAppServerError, CodexNotification, CodexStatus,
-    CodexSubscription, HistoryMode, StartThreadParams, StartTurnParams, ThreadForkParams,
-    CODEX_SIDECAR_OWNERSHIP_ENV,
+    mint_ownership_id, normalize_codex_thread_status, read_rollout_history_mode,
+    to_codex_reasoning_effort, CodexAdapterEvent, CodexAppServerClient, CodexAppServerError,
+    CodexNotification, CodexStatus, CodexSubscription, HistoryMode, StartThreadParams,
+    StartTurnParams, ThreadForkParams, CODEX_SIDECAR_OWNERSHIP_ENV,
 };
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCompact, FreshAgentConfigure,
@@ -82,9 +81,75 @@ use crate::summary::{
 };
 use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
 
+pub mod children;
+pub mod settings;
+use settings::{CodexEffectiveSettings, CodexWorkMode};
 mod controls;
+mod elicitation;
 mod metadata;
 pub(crate) mod native_history;
+mod projection;
+pub(crate) mod turn_state;
+use turn_state::{CodexTurnState, DispatchToken, NativeSettlement, StopDisposition};
+type SharedCodexTurnState = Arc<StdMutex<CodexTurnState>>;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum CodexCreateOutcome {
+    Created {
+        session_id: String,
+        session_ref: Option<SessionLocator>,
+        cleanup_ownership_id: Option<String>,
+        name_ref: Option<freshell_protocol::session_names::SessionNameRef>,
+    },
+    Failed {
+        code: String,
+        message: String,
+        retryable: Option<bool>,
+        owner: Option<crate::ownership_lane::TerminalOwnerFields>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CodexSendOutcome {
+    Accepted {
+        session_id: String,
+        submitted_turn_id: String,
+        incarnation_id: String,
+        pending_naming_handle: Option<String>,
+    },
+    Refused {
+        code: String,
+        message: String,
+        retryable: Option<bool>,
+        owner: Option<crate::ownership_lane::TerminalOwnerFields>,
+    },
+    Ambiguous {
+        session_id: String,
+        request_id: String,
+        incarnation_id: String,
+        code: String,
+        message: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CodexSettlementSource {
+    NativeNotification,
+    NativeThreadRead,
+    ConfirmedOwnedExit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CodexTurnEvent {
+    Settled {
+        session_id: String,
+        turn_id: Option<String>,
+        incarnation_id: String,
+        request_ids: Vec<String>,
+        outcome: NativeSettlement,
+        source: CodexSettlementSource,
+    },
+}
 
 /// Unified agent names (Task 2): the ambient `CODEX_HOME` fallback for the
 /// durability-driven pending bind when the app-server's own initialize
@@ -247,7 +312,9 @@ const STATUS_RANG_TURN_IDS_CAP: usize = 8;
 /// explicit: every lifecycle path must give the reducer, quiet-deadman, compact
 /// guard, and emission barrier for the same thread to the same task.
 struct CodexConsumerRuntime {
+    turn_state: SharedCodexTurnState,
     thread_id: String,
+    projection: Arc<StdMutex<projection::CodexProjection>>,
     active_turn: Arc<StdMutex<Option<String>>>,
     /// The session's USER-interrupt marker: the interrupt control lane arms it,
     /// the consumer's subscription consumes it at the `interrupted` completion,
@@ -299,6 +366,46 @@ struct CodexConsumerRuntime {
     event_emission_gate: Arc<TokioMutex<()>>,
 }
 
+async fn wait_for_codex_stop_resolution(turns: &SharedCodexTurnState) {
+    loop {
+        let changed = turns.lock().expect("codex turn state").changed.clone();
+        let notified = changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !turns
+            .lock()
+            .expect("codex turn state")
+            .has_unresolved_stop()
+        {
+            return;
+        }
+        #[cfg(test)]
+        turns
+            .lock()
+            .expect("codex turn state")
+            .waiting_for_stop
+            .notify_one();
+        notified.await;
+    }
+}
+
+fn publish_codex_interrupt_refusal(
+    turns: &SharedCodexTurnState,
+    dispatch: DispatchToken,
+    turn_id: &str,
+    publish: impl FnOnce(),
+) -> bool {
+    let mut state = turns.lock().expect("codex turn state");
+    if !state.interrupt_refused(dispatch, turn_id) {
+        return false;
+    }
+    // Gate waiters may wake during the transition, but cannot acquire state
+    // and admit a newer Stop until its compatibility publication is complete.
+    // Production publication only writes the atomic attention marker.
+    publish();
+    true
+}
+
 /// Seed the quiet window from `FRESHELL_FRESHCODEX_QUIET_WINDOW_MS` (positive integer
 /// milliseconds; missing or unparseable falls back to [`DEFAULT_CODEX_QUIET_WINDOW_MS`]).
 fn codex_quiet_window_ms_from_env() -> u64 {
@@ -308,6 +415,8 @@ fn codex_quiet_window_ms_from_env() -> u64 {
     )
 }
 
+type ChildReadAttempts = HashMap<(String, String, String), u8>;
+
 /// Shared, cheaply-cloneable freshcodex WS state (mergeable into the server app + WsState).
 #[derive(Clone)]
 pub struct FreshCodexState {
@@ -316,8 +425,12 @@ pub struct FreshCodexState {
     /// `freshell-ws` connection. `freshAgent.created` / `freshAgent.send.accepted` /
     /// `freshAgent.event` are pushed here so the oracle's capture socket records them.
     broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+    turn_events: tokio::sync::broadcast::Sender<CodexTurnEvent>,
     /// threadId → live codex session (client + settings + owned sidecar).
     sessions: Arc<TokioMutex<HashMap<String, CodexSession>>>,
+    child_reads: Arc<TokioMutex<ChildReadAttempts>>,
+    retained_changed: Arc<tokio::sync::watch::Sender<u64>>,
+    attention: Arc<crate::attention_ledger::AttentionLedger>,
     /// The `settings.freshAgent.enabled` gate the WS `freshAgent.create` requires
     /// (default off; flipped true by `PATCH /api/settings`, as a real freshcodex user does).
     fresh_agent_enabled: Arc<AtomicBool>,
@@ -429,6 +542,11 @@ pub struct FreshCodexState {
     /// set-once/shared model as [`Self::identity_sink`]. Wired by
     /// `freshell-server::main`; unwired = scoped naming fails unavailable.
     naming: crate::naming::NamingSink,
+    hosted_naming_events: bool,
+    naming_rollout_probe: Arc<std::sync::OnceLock<CodexNamingRolloutProbe>>,
+    sidecar_cleanup_probe: Arc<std::sync::OnceLock<CodexSidecarCleanupProbe>>,
+    #[cfg(any(test, feature = "test-support"))]
+    sidecar_capture_observer: Arc<std::sync::OnceLock<CodexSidecarCaptureObserver>>,
     /// Unified agent names: thread id → the pre-durable naming handle
     /// admitted at create. A `thread/start` id/path is PROSPECTIVE (the
     /// rollout hasn't materialized), so the handle stays pending and the
@@ -462,6 +580,33 @@ pub struct FreshCodexState {
 pub type SnapshotPauseHook =
     std::sync::Arc<dyn Fn(&str) -> futures_util::future::BoxFuture<'static, ()> + Send + Sync>;
 
+/// A hosted runtime reads private native metadata as the provider identity.
+/// The initialized root and exact thread ID remain the proof inputs.
+pub type CodexNamingRolloutProbe = Arc<
+    dyn Fn(
+            String,
+            String,
+        )
+            -> futures_util::future::BoxFuture<'static, Result<Option<std::path::PathBuf>, String>>
+        + Send
+        + Sync,
+>;
+
+/// Hosted cleanup runs under the same identity as the exact owned sidecar.
+/// A positive answer must confirm the recorded incarnation and whole tree gone.
+pub type CodexSidecarCleanupProbe = Arc<
+    dyn Fn(
+            crate::session_lease::CondemnedRuntimeIdentity,
+        ) -> futures_util::future::BoxFuture<'static, Result<bool, String>>
+        + Send
+        + Sync,
+>;
+
+/// Observe the exact one-time watcher capture without changing its evidence.
+#[cfg(any(test, feature = "test-support"))]
+pub type CodexSidecarCaptureObserver =
+    Arc<dyn Fn(&str, &crate::session_lease::CondemnedRuntimeIdentity) + Send + Sync>;
+
 /// The cached result of a completed codex `freshAgent.create`, keyed by `requestId` in
 /// [`FreshCodexState::create_dedup`]. Only `session_id` is needed: every other field of
 /// the `freshAgent.created` replay frame ([`FreshCodexState::handle_create`]'s replay
@@ -475,6 +620,11 @@ struct CodexCreateRecord {
 /// One live freshcodex session: the app-server client, its owned sidecar, and the
 /// normalized create-time settings a later `send` re-uses.
 struct CodexSession {
+    collaboration_mode: Option<CodexWorkMode>,
+    native_turn_settings: Option<CodexEffectiveSettings>,
+    native_thread_settings: Option<Value>,
+    turn_state: SharedCodexTurnState,
+    projection: Arc<StdMutex<projection::CodexProjection>>,
     client: Arc<CodexAppServerClient>,
     /// Normalized model (`normalizeFreshcodexModel`), reused verbatim on `send`.
     model: String,
@@ -485,21 +635,11 @@ struct CodexSession {
     sandbox: Option<String>,
     /// Raw create permissionMode (e.g. `never`) → the turn's `approvalPolicy`.
     permission_mode: Option<String>,
-    /// Legacy `activeTurnByThread.get(sessionId)` mirror (adapter.ts:295,980,1009,1027): set
-    /// immediately after `turn/start` resolves (`handle_send`), cleared on a successful
-    /// `handle_interrupt` and whenever the notification consumer observes the turn/thread end
-    /// (`reduce_notification`). Lets `freshAgent.interrupt` target the in-flight turn.
+    /// Compatibility target for native/compact lifecycle consumers. Owed work
+    /// and Stop ownership live in `turn_state`; an interrupt ACK never clears it.
     active_turn: Arc<StdMutex<Option<String>>>,
-    /// The per-session USER-interrupt marker (opencode's `turn_aborted`
-    /// precedent): `handle_interrupt` arms it BEFORE issuing `turn/interrupt`
-    /// (and disarms it again when the RPC fails — the interrupt never landed),
-    /// the consumer's subscription consumes it at the `interrupted`
-    /// completion, and the consumer's `turn/started` fold CLEARS it (the
-    /// full opencode dispatch-clear discipline — a stale armed marker never
-    /// crosses a turn boundary). ONE `Arc` shared by this session record (the
-    /// interrupt lane) and the consumer's [`CodexSubscription`] (the guard),
-    /// so a user interrupt is silent while an automation/rollback-forced
-    /// `interrupted` still rings the unified attention edge.
+    /// Compatibility attention marker. Arm before native Stop; disarm only on
+    /// a proven pre-submission refusal or the matching terminal/new-turn fold.
     user_interrupt_pending: Arc<AtomicBool>,
     /// Delta-r1 F2: the compact-window busy truth. `thread/compact/start`'s answer
     /// carries no turn id, and the REAL 0.147.0 sequence returns the RPC BEFORE
@@ -586,24 +726,11 @@ struct CodexSession {
     /// into the consumer ([`reduce_notification`]), the exit watcher
     /// ([`spawn_exit_watcher`]), and the snapshot path ([`FreshCodexState::get_snapshot`]).
     quiet_deadman: Arc<StdMutex<QuietDeadman>>,
-    /// The lane's turn-in-flight AUTHORITY (the round-2 review finding): armed at
-    /// `start_turn` DISPATCH -- BEFORE awaiting the response -- so the
-    /// independently-running exit watcher and quiet deadman classify the turn as
-    /// in flight even while the response is still outstanding (a post-response
-    /// arm would miss a crash in that window). Mirrored at every `active_turn`
-    /// mutation, so it is a superset of `active_turn` between dispatch and the
-    /// crash/kill retirement points: SET alongside the consumer's
-    /// `turn/started` adoption and the snapshot's mid-flight seed, CLEARED at
-    /// every turn-end observation (the thread leaving running/starting, the
-    /// active turn's completion, `thread_closed`, a successful user
-    /// interrupt) and on a failed dispatch the sidecar survived (the
-    /// kill/crash arms retire the latch WITHOUT clearing `active_turn`, so a
-    /// post-kill/post-crash `active_turn` can outlive the latch; an
-    /// exit-induced dispatch failure instead leaves the latch armed for the
-    /// crash arm's swap-and-mint — a bare Err-arm retirement would land
-    /// before the crash arm and swallow the crash edge). The crash self-heal
-    /// arm reads and retires it (the crash IS the turn end it observes); a
-    /// requested kill retires it silently (the user initiated that turn end).
+    /// Compatibility in-flight/attention latch for existing crash, compact and
+    /// quiet-deadman consumers. Dispatch and matching native terminal evidence
+    /// mirror the identity-owned `turn_state`; interrupt acknowledgement does
+    /// not retire work. Existing lifecycle-loss attention dedup remains separate
+    /// from proving terminal delivery/owned-process settlement.
     turn_in_flight: Arc<AtomicBool>,
     /// The-usual SDD focused-r1 FR1-1: the per-session RETIRED-TURN slot.
     /// A terminal thread status retires the active-turn TRACKER while the
@@ -653,6 +780,37 @@ struct CodexSession {
     /// site filters hollow `Some`s away (focused-ep1-r5 Finding 2): a
     /// partially initialized client's hello never lands here.
     provenance: Option<crate::BindProvenance>,
+}
+
+impl CodexSession {
+    fn effective_settings(&self) -> CodexEffectiveSettings {
+        let mut settings = CodexEffectiveSettings {
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+            cwd: self.cwd.clone(),
+            sandbox: self.sandbox.clone(),
+            permission_mode: self.permission_mode.clone(),
+            collaboration_mode: self.collaboration_mode,
+        };
+        // Historical lineage-only resumes have no recorded next-turn intent.
+        // Their native observations still supply working/display defaults;
+        // provenance-only refreshes keep the raw blank sentinel untouched.
+        if self.model.is_empty() {
+            if let Some(native) = &self.native_thread_settings {
+                settings.adopt_native(native);
+            }
+        }
+        settings
+    }
+
+    fn apply_settings(&mut self, settings: &CodexEffectiveSettings) {
+        self.model = settings.model.clone();
+        self.effort = settings.effort.clone();
+        self.cwd = settings.cwd.clone();
+        self.sandbox = settings.sandbox.clone();
+        self.permission_mode = settings.permission_mode.clone();
+        self.collaboration_mode = settings.collaboration_mode;
+    }
 }
 
 struct CodexCheckpointIdentityProbe {
@@ -774,7 +932,11 @@ impl FreshCodexState {
         Self {
             sidecar_launch_context: CodexSidecarLaunchContext::default(),
             broadcast_tx,
+            turn_events: tokio::sync::broadcast::channel(256).0,
             sessions: Arc::new(TokioMutex::new(HashMap::new())),
+            child_reads: Arc::new(TokioMutex::new(HashMap::new())),
+            retained_changed: Arc::new(tokio::sync::watch::channel(0).0),
+            attention: Arc::new(crate::attention_ledger::AttentionLedger::default()),
             fresh_agent_enabled: Arc::new(AtomicBool::new(enabled)),
             settings: Arc::new(TokioMutex::new(settings)),
             auth_token,
@@ -793,6 +955,11 @@ impl FreshCodexState {
             codex_quiet_window_ms: Arc::new(AtomicU64::new(codex_quiet_window_ms_from_env())),
             rollback_in_flight: crate::InFlightRegistry::new(),
             naming: crate::naming::NamingSink::default(),
+            hosted_naming_events: false,
+            naming_rollout_probe: Arc::new(std::sync::OnceLock::new()),
+            sidecar_cleanup_probe: Arc::new(std::sync::OnceLock::new()),
+            #[cfg(any(test, feature = "test-support"))]
+            sidecar_capture_observer: Arc::new(std::sync::OnceLock::new()),
             naming_handles: Arc::new(TokioMutex::new(HashMap::new())),
             snapshot_pause: Arc::new(StdMutex::new(None)),
             snapshot_pause_after_capture: Arc::new(StdMutex::new(None)),
@@ -803,6 +970,60 @@ impl FreshCodexState {
     pub fn with_sidecar_launch_context(mut self, context: CodexSidecarLaunchContext) -> Self {
         self.sidecar_launch_context = context;
         self
+    }
+
+    pub fn with_hosted_naming_events(mut self) -> Self {
+        self.hosted_naming_events = true;
+        self
+    }
+
+    pub fn set_naming_rollout_probe(&self, probe: CodexNamingRolloutProbe) {
+        let _ = self.naming_rollout_probe.set(probe);
+    }
+
+    pub fn set_sidecar_cleanup_probe(&self, probe: CodexSidecarCleanupProbe) {
+        let _ = self.sidecar_cleanup_probe.set(probe);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_sidecar_capture_observer_for_tests(&self, observer: CodexSidecarCaptureObserver) {
+        assert!(
+            self.sidecar_capture_observer.set(observer).is_ok(),
+            "sidecar capture observer is already installed"
+        );
+    }
+
+    async fn report_hosted_naming_fact(
+        &self,
+        thread_id: &str,
+        fact: crate::naming::HostedCodexNamingFact,
+    ) {
+        if !self.hosted_naming_events {
+            return;
+        }
+        let Ok(fact) = serde_json::to_value(fact) else {
+            return;
+        };
+        let projection = self
+            .sessions
+            .lock()
+            .await
+            .get(thread_id)
+            .map(|session| Arc::clone(&session.projection));
+        let Some(projection) = projection else {
+            return;
+        };
+        if !projection
+            .lock()
+            .expect("codex projection lock")
+            .retain_hosted_naming_fact(fact.clone())
+        {
+            return;
+        }
+        self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            provider: PROVIDER.into(), session_type: SESSION_TYPE.into(), session_id: thread_id.into(),
+            event: json!({"type":crate::naming::HOSTED_CODEX_NAMING_EVENT,"sessionId":thread_id,"fact":fact}),
+        }));
     }
 
     /// Wire the server-owned durable checkpoint-event path before this state is
@@ -1052,11 +1273,9 @@ impl FreshCodexState {
             .get(session_id)
             .cloned();
         if let Some(condemned) = condemned {
-            let confirmed = crate::session_lease::kill_and_confirm_recorded_tree_dead(
-                &condemned,
-                CODEX_SIDECAR_OWNERSHIP_ENV,
-            )
-            .await;
+            let confirmed =
+                confirm_codex_tree_dead(&condemned, self.sidecar_cleanup_probe.get().cloned())
+                    .await;
             if confirmed {
                 let ownership = self
                     .ownership_watch()
@@ -1394,6 +1613,12 @@ impl FreshCodexState {
             return None;
         }
         let handle = handle.to_string();
+        if self.hosted_naming_events {
+            self.naming_handles
+                .lock()
+                .await
+                .insert(thread_id.into(), handle.clone());
+        }
         let sink = self.naming();
         let projection = crate::naming::admit_pending_projection(
             &sink,
@@ -1477,7 +1702,8 @@ impl FreshCodexState {
         None
     }
 
-    /// Unified agent names (Task 2): the durability-driven pending bind. A
+    /// Durability-driven naming: bind a pending handle, or admit a hosted
+    /// session's own name when it has no handle. A
     /// freshcodex thread is verified ONLY once its rollout exists under the
     /// initialized `codexHome` sessions tree (the first line a
     /// `session_meta` naming the thread — the same proof
@@ -1488,17 +1714,44 @@ impl FreshCodexState {
     /// store answers the already-bound handle with a Read, and the stash is
     /// consumed on success). `codex_home` comes from the app-server's own
     /// initialize result when known.
-    pub(crate) async fn try_bind_pending_naming(
+    pub(crate) async fn try_materialize_naming(
         &self,
         thread_id: &str,
         codex_home: Option<&str>,
     ) -> Option<crate::naming::NameTransition> {
-        let handle = self.naming_handles.lock().await.get(thread_id).cloned()?;
+        let handle = self.naming_handles.lock().await.get(thread_id).cloned();
+        if handle.is_none() && !self.hosted_naming_events {
+            return None;
+        }
+        let (source_projection, cwd) = {
+            let sessions = self.sessions.lock().await;
+            let session = sessions.get(thread_id)?;
+            (session.projection.clone(), session.cwd.clone())
+        };
+        if handle.is_none()
+            && source_projection
+                .lock()
+                .expect("codex projection lock")
+                .has_hosted_naming_proof()
+        {
+            return None;
+        }
         let home = codex_home
             .map(str::to_string)
             .or_else(codex_home_from_env)?;
-        let sessions_root = std::path::Path::new(&home).join("sessions");
-        let Some(rollout) = locate_thread_rollout(&sessions_root, thread_id) else {
+        let rollout = if let Some(probe) = self.naming_rollout_probe.get() {
+            match probe(home.clone(), thread_id.to_string()).await {
+                Ok(path) => path,
+                Err(error) => {
+                    tracing::warn!(provider = "codex", session_id = thread_id, %error,
+                        "freshagent.codex.naming_proof_unavailable");
+                    None
+                }
+            }
+        } else {
+            locate_thread_rollout(&std::path::Path::new(&home).join("sessions"), thread_id)
+        };
+        let Some(rollout) = rollout else {
             return None; // still prospective: the next turn-completed edge retries
         };
         let target = freshell_protocol::session_names::SessionNameRef::Session {
@@ -1515,6 +1768,40 @@ impl FreshCodexState {
             evidence: freshell_protocol::native_location::NativeEvidenceKind::PersistedMetadata,
             persistence: freshell_protocol::native_location::NativePersistence::Verified,
         };
+        if !self
+            .sessions
+            .lock()
+            .await
+            .get(thread_id)
+            .is_some_and(|session| Arc::ptr_eq(&session.projection, &source_projection))
+        {
+            return None;
+        }
+        let Some(handle) = handle else {
+            // Established mint-new recovery has no pending name to transfer.
+            // The same verified-header boundary admits its own durable name,
+            // and also repairs an unnamed restored session without relabeling
+            // the identity transition or starting another provider.
+            self.report_hosted_naming_fact(
+                thread_id,
+                crate::naming::HostedCodexNamingFact::Acquisition {
+                    target,
+                    acquisition,
+                    cwd,
+                },
+            )
+            .await;
+            let activity = source_projection
+                .lock()
+                .expect("codex projection lock")
+                .hosted_naming_activity();
+            if let Some(activity) = activity {
+                if let Ok(activity) = serde_json::from_value(activity) {
+                    self.report_hosted_naming_fact(thread_id, activity).await;
+                }
+            }
+            return None;
+        };
         // Unified agent names (Task 4, T2-M5): the rollout-verified
         // pending→durable transition is an InitialMaterialization — the
         // shared classification-driven fold owns the policy, and the
@@ -1524,6 +1811,20 @@ impl FreshCodexState {
             acquisition,
             pending: Some(handle),
         };
+        if self.hosted_naming_events {
+            self.report_hosted_naming_fact(
+                thread_id,
+                crate::naming::HostedCodexNamingFact::Transition {
+                    target: target.clone(),
+                    transition: transition.clone(),
+                },
+            )
+            .await;
+            // This is the provider's verified materialization fact. Canonical
+            // acceptance remains in the gateway; the retained source keeps
+            // this fact available even if its final notification was dropped.
+            self.naming_handles.lock().await.remove(thread_id);
+        }
         match crate::naming::fold_identity_transition(&self.naming(), &transition, target.clone())
             .await
         {
@@ -1665,6 +1966,7 @@ impl FreshCodexState {
         permission_mode: Option<&str>,
         effort: Option<&str>,
         cwd: Option<&str>,
+        collaboration_mode: Option<CodexWorkMode>,
         supersedes: Option<&str>,
         // D8 provenance stamps — `Some` from connection-scoped creates and
         // from the fork lane (the RESOLVED fork provenance: forking
@@ -1693,6 +1995,7 @@ impl FreshCodexState {
             return Ok(());
         };
         let settings = crate::identity_sink::FreshAgentSettings {
+            collaboration_mode: collaboration_mode.map(|mode| mode.as_str().into()),
             model: if model.is_empty() {
                 None
             } else {
@@ -1819,7 +2122,241 @@ impl FreshCodexState {
         }
     }
 
+    async fn retain_native_exit(&self, session_id: &str, ownership_id: &str) {
+        let projection = self
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .filter(|session| session.sidecar_ownership_id == ownership_id)
+            .map(|session| session.projection.clone());
+        if let Some(projection) = projection {
+            projection
+                .lock()
+                .expect("codex projection lock")
+                .retire_source();
+            self.clear_source_controls(session_id, &projection).await;
+        }
+    }
+
+    fn notify_retained(&self) {
+        self.retained_changed
+            .send_modify(|version| *version = version.wrapping_add(1));
+    }
+
+    /// A coalesced wakeup, never a history cursor or a provider RPC.
+    pub fn subscribe_retained_state(&self, _session_id: &str) -> tokio::sync::watch::Receiver<u64> {
+        self.retained_changed.subscribe()
+    }
+
+    /// Current native facts, including unfinished event-owned output. Reading
+    /// this source cannot create/resume a runtime or wait for native history.
+    pub async fn retained_state(&self, session_id: &str) -> Result<Value, RetainedStateError> {
+        let resolved = {
+            let sessions = self.sessions.lock().await;
+            if sessions.contains_key(session_id) {
+                session_id.to_owned()
+            } else {
+                let mut aliases = self
+                    .attention
+                    .aliases_for(session_id)
+                    .into_iter()
+                    .filter(|id| sessions.contains_key(id));
+                let resolved = aliases.next().ok_or(CodexSnapshotError::NotFound)?;
+                if aliases.next().is_some() {
+                    return Err(CodexSnapshotError::NotFound);
+                }
+                resolved
+            }
+        };
+        let session_id = resolved.as_str();
+        let (projection, turns, exited, history_mode, quiet) = self
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .map(|s| {
+                (
+                    s.projection.clone(),
+                    s.turn_state.clone(),
+                    s.exited.clone(),
+                    s.history_mode,
+                    s.quiet_deadman.clone(),
+                )
+            })
+            .ok_or(CodexSnapshotError::NotFound)?;
+        let owner = self.ownership_snapshot(PROVIDER, session_id);
+        let stuck = quiet.lock().expect("quiet deadman lock").is_stuck();
+        let mut snapshot = {
+            let p = projection.lock().expect("codex projection lock");
+            let mut retained = p
+                .retained_snapshot(exited.load(Ordering::SeqCst))
+                .map_err(|_| CodexSnapshotError::NotFound)?;
+            if let Some(status) = p.live_status() {
+                if matches!(status, "idle" | "running" | "stuck") {
+                    retained.raw["thread"]["status"] =
+                        json!({"type":if status == "idle" {"idle"} else {"active"}});
+                }
+            }
+            let mut snapshot = build_codex_snapshot_json(
+                session_id,
+                &retained.raw,
+                false,
+                history_mode,
+                None,
+                stuck,
+            )
+            .map_err(CodexSnapshotError::Protocol)?;
+            p.overlay(&mut snapshot, retained.metadata);
+            snapshot
+        };
+        if turns.lock().expect("codex turn state").has_owed_work() && !exited.load(Ordering::SeqCst)
+        {
+            snapshot["status"] = json!(if stuck { "stuck" } else { "running" });
+            snapshot["capabilities"]["send"] = json!(false);
+            snapshot["capabilities"]["interrupt"] = json!(true);
+        }
+        if exited.load(Ordering::SeqCst) {
+            snapshot["status"] = json!("exited");
+        }
+        self.overlay_controls(session_id, &mut snapshot).await;
+        self.overlay_settings_snapshot(session_id, &mut snapshot)
+            .await;
+        let pending = self.retained_control_events(session_id).await;
+        let marks = self
+            .attention_marks()
+            .await
+            .into_iter()
+            .filter(|m| m.session_id == session_id)
+            .collect::<Vec<_>>();
+        let after = self.ownership_snapshot(PROVIDER, session_id);
+        if owner.epoch != after.epoch
+            || owner.generation != after.generation
+            || !self
+                .sessions
+                .lock()
+                .await
+                .get(session_id)
+                .is_some_and(|s| Arc::ptr_eq(&s.projection, &projection))
+        {
+            return Err(CodexSnapshotError::HandoffInProgress {
+                generation: after.generation,
+            });
+        }
+        Ok(
+            json!({"source":{"projectionId":snapshot["extensions"]["codex"]["projection"]["id"],"ownerEpoch":owner.epoch,"ownerGeneration":owner.generation},"snapshot":snapshot,"attentionMarks":marks,"pendingControls":pending}),
+        )
+    }
+
+    async fn catalog_binding(
+        &self,
+        context: &crate::model_capabilities::CodexCatalogContext,
+    ) -> Result<(String, Arc<CodexAppServerClient>), crate::model_capabilities::CapabilityError>
+    {
+        use crate::model_capabilities::{runtime_pending, source_changed};
+        let requested = context.native_reference()?;
+        let id = self
+            .ownership
+            .as_ref()
+            .map(|registry| registry.resolve_canonical(PROVIDER, requested))
+            .unwrap_or_else(|| requested.to_string());
+        let owner = self.ownership_snapshot(PROVIDER, &id);
+        if self.ownership.is_some()
+            && !matches!(&owner.state, freshell_ownership::OwnershipState::Live {owner,..} if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent)
+        {
+            return Err(runtime_pending());
+        }
+        if context.observed_epoch.is_some_and(|v| v != owner.epoch)
+            || context
+                .observed_generation
+                .is_some_and(|v| v != owner.generation)
+        {
+            return Err(source_changed());
+        }
+        let (key, client, exited) = {
+            let sessions = self.sessions.lock().await;
+            let session = sessions.get(&id).ok_or_else(runtime_pending)?;
+            (
+                json!([
+                    "codex",
+                    id,
+                    session.sidecar_ownership_id,
+                    format!("{:p}", Arc::as_ptr(&session.client)),
+                    format!("{:p}", Arc::as_ptr(&session.projection)),
+                    session.cwd,
+                    owner.epoch,
+                    owner.generation,
+                    format!("{:?}", owner.state)
+                ])
+                .to_string(),
+                session.client.clone(),
+                session.exited.load(Ordering::SeqCst),
+            )
+        };
+        if exited || !client.is_initialized().await {
+            return Err(runtime_pending());
+        }
+        Ok((key, client))
+    }
+
+    /// Registered-client discovery only: never spawn, resume, read saved history,
+    /// or search attention aliases to manufacture a catalog authority.
+    pub async fn model_catalog_source(
+        &self,
+        context: crate::model_capabilities::CodexCatalogContext,
+    ) -> Result<
+        crate::model_capabilities::CodexCatalogSource,
+        crate::model_capabilities::CapabilityError,
+    > {
+        let (key, _) = self.catalog_binding(&context).await?;
+        Ok(crate::model_capabilities::CodexCatalogSource {
+            key: key.clone(),
+            probe: Arc::new(LocalCodexCatalogProbe {
+                state: self.clone(),
+                context,
+                expected_source: key,
+            }),
+        })
+    }
+
+    pub async fn model_catalog(
+        &self,
+        context: crate::model_capabilities::CodexCatalogContext,
+    ) -> Result<Value, crate::model_capabilities::CapabilityError> {
+        use crate::model_capabilities::{codex_probe_error, source_changed};
+        let (key, client) = self.catalog_binding(&context).await?;
+        let models = freshell_codex::catalog::read_models(&client).await.map_err(|error| {
+            tracing::warn!(provider=PROVIDER,session_id=%context.session_id,cause=%error,"freshagent.codex.catalog_unavailable");
+            codex_probe_error(error)
+        })?;
+        if self.catalog_binding(&context).await?.0 != key {
+            return Err(source_changed());
+        }
+        Ok(serde_json::to_value(models).expect("native catalog rows serialize"))
+    }
+
     fn broadcast(&self, msg: &ServerMessage) {
+        match msg {
+            ServerMessage::FreshAgentCreated(created) => {
+                self.attention.observe(&created.session_id, SESSION_TYPE)
+            }
+            ServerMessage::FreshAgentSessionMaterialized(materialized) => {
+                self.attention
+                    .alias(&materialized.previous_session_id, &materialized.session_id);
+                let mut controls = self.controls.lock().expect("codex controls registry");
+                if let Some(retained) = controls.get(&materialized.previous_session_id).cloned() {
+                    controls.insert(materialized.session_id.clone(), retained);
+                }
+            }
+            ServerMessage::FreshAgentKilled(killed) if killed.success => {
+                self.attention.forget(&killed.session_id)
+            }
+            ServerMessage::FreshAgentRecoveryStopped(stopped) if stopped.success => {
+                self.attention.forget(&stopped.session_id)
+            }
+            _ => {}
+        }
+        self.notify_retained();
         if let Ok(frame) = serde_json::to_string(msg) {
             let _ = self.broadcast_tx.send(frame);
         }
@@ -1863,7 +2400,7 @@ impl FreshCodexState {
         &self,
         msg: FreshAgentCreate,
         provenance: Option<crate::BindProvenance>,
-    ) {
+    ) -> CodexCreateOutcome {
         let request_id = msg.request_id.clone();
         // Unified agent names (Task 2): the pane's pre-durable naming handle
         // (threaded to both create lanes; `None` = an unnamed pane).
@@ -1890,12 +2427,20 @@ impl FreshCodexState {
                     session_type: SESSION_TYPE.to_string(),
                     session_ref: Some(SessionLocator {
                         provider: PROVIDER.to_string(),
-                        session_id: cached.session_id,
+                        session_id: cached.session_id.clone(),
                     }),
-                    name_ref,
+                    name_ref: name_ref.clone(),
                     session_name,
                 }));
-                return;
+                return CodexCreateOutcome::Created {
+                    session_id: cached.session_id.clone(),
+                    session_ref: Some(SessionLocator {
+                        provider: PROVIDER.into(),
+                        session_id: cached.session_id,
+                    }),
+                    cleanup_ownership_id: None,
+                    name_ref,
+                };
             }
             FreshAgentCreateOutcome::Proceed(guard) => guard,
         };
@@ -1953,24 +2498,42 @@ impl FreshCodexState {
                 .unwrap_or_default(),
             None => crate::identity_sink::FreshAgentSettings::default(),
         };
-        let cwd = msg.cwd.clone().or(rec.cwd);
-        let raw_model = msg.model.clone().or(rec.model);
-        let model = normalize_freshcodex_model(raw_model.as_deref());
-        let raw_effort = msg.effort.clone().or(rec.effort);
-        let effort = normalize_freshcodex_effort(Some(&model), raw_effort.as_deref());
-        let mut sandbox = msg.sandbox.map(sandbox_wire_value).or(rec.sandbox);
-        let mut permission_mode = msg.permission_mode.clone().or(rec.permission_mode);
-        if let Err(error) = normalize_codex_permission(&mut permission_mode, &mut sandbox) {
-            self.fail_create(&request_id, "FRESH_AGENT_CREATE_FAILED", error);
-            return;
-        }
-
-        // Validate the effort maps to the codex wire vocabulary (adapter create calls
-        // toCodexReasoningEffort purely to reject unsupported efforts before spawning).
-        if let Err(err) = to_codex_reasoning_effort(effort.as_deref()) {
-            self.fail_create(&request_id, "FRESH_AGENT_CREATE_FAILED", &err.to_string());
-            return;
-        }
+        let raw_model = msg
+            .model
+            .clone()
+            .or_else(|| {
+                msg.model_selection
+                    .as_ref()
+                    .and_then(|selection| selection.as_ref())
+                    .map(|selection| selection.model_id.clone())
+            })
+            .or(rec.model);
+        let base = CodexEffectiveSettings {
+            model: raw_model.unwrap_or_default(),
+            effort: msg.effort.clone().unwrap_or(rec.effort),
+            cwd: msg.cwd.clone().or(rec.cwd),
+            sandbox: msg.sandbox.map(sandbox_wire_value).or(rec.sandbox),
+            permission_mode: msg.permission_mode.clone().or(rec.permission_mode),
+            collaboration_mode: None,
+        };
+        let patch = freshell_protocol::FreshAgentSendSettings {
+            collaboration_mode: msg.collaboration_mode.clone().or(rec.collaboration_mode),
+            ..Default::default()
+        };
+        let effective = match CodexEffectiveSettings::resolve(&base, &patch) {
+            Ok(settings) => settings,
+            Err(error) => {
+                return self.fail_create(&request_id, error.code, &error.message);
+            }
+        };
+        let CodexEffectiveSettings {
+            model,
+            effort,
+            cwd,
+            sandbox,
+            permission_mode,
+            collaboration_mode,
+        } = effective;
 
         // FIX (CODEX-FIRST triage Finding 1): a `freshAgent.create` carrying
         // `resumeSessionId` must RESUME the existing thread -- mirroring the reference's
@@ -1990,8 +2553,7 @@ impl FreshCodexState {
                 tracing::warn!(target: "freshell_freshagent::codex",
                     session_id = %resume_session_id, request_id = %request_id,
                     "fresh_agent_create_refused: a live terminal PTY owns this session (Task 13b cross-kind live-guard)");
-                self.fail_create_session_reserved(&request_id);
-                return;
+                return self.fail_create_session_reserved(&request_id);
             }
             // Task 12 (D8 for fresh agents): claim the per-sessionRef lease BEFORE any
             // spawn -- exactly one in-flight resume (and one live rollout writer) per
@@ -2024,8 +2586,7 @@ impl FreshCodexState {
                         session_id = %resume_session_id, request_id = %request_id,
                         code = err.code(),
                         "fresh_agent_create_refused: the observed fence is half-sent (invalid)");
-                    self.fail_create(&request_id, err.code(), err.message());
-                    return;
+                    return self.fail_create(&request_id, err.code(), err.message());
                 }
             };
             let own_ticket = match self.begin_lane_claim_at(
@@ -2096,21 +2657,20 @@ impl FreshCodexState {
                                      moved on while the live-runtime adopt committed — the \
                                      create is refused (never a live writer left unowned)"
                                 );
-                                self.fail_create(
+                                return self.fail_create(
                                     &request_id,
                                     "STALE_CLAIM",
                                     "ownership moved on while adopting the live session; refresh and retry",
                                 );
-                                return;
                             }
                         }
                         // D8 (focused-ep1-r4 Finding 1): the adopt re-parks/re-stamps
                         // the CURRENT connection's provenance — recovery plans mint
                         // NEW tabIds, so the incumbent must not keep the old tab's
                         // attribution.
-                        self.adopt_live_create(&request_id, &resume_session_id, provenance.clone())
+                        return self
+                            .adopt_live_create(&request_id, &resume_session_id, provenance.clone())
                             .await;
-                        return;
                     }
                     Some(ticket)
                 }
@@ -2119,9 +2679,9 @@ impl FreshCodexState {
                     // session adopts, spawn nothing. With no coordinator
                     // there is no fence to consult.
                     if self.has_live_session(&resume_session_id).await {
-                        self.adopt_live_create(&request_id, &resume_session_id, provenance.clone())
+                        return self
+                            .adopt_live_create(&request_id, &resume_session_id, provenance.clone())
                             .await;
-                        return;
                     }
                     None
                 }
@@ -2129,9 +2689,9 @@ impl FreshCodexState {
                     // A same-kind live runtime the coordinator names —
                     // adopt it, spawn nothing (the COORDINATED map-hit:
                     // the claim already verified the key's state).
-                    self.adopt_live_create(&request_id, &resume_session_id, provenance.clone())
+                    return self
+                        .adopt_live_create(&request_id, &resume_session_id, provenance.clone())
                         .await;
-                    return;
                 }
                 crate::ownership_lane::LaneClaim::Refused(outcome) => {
                     tracing::warn!(target: "freshell_freshagent::codex",
@@ -2140,8 +2700,15 @@ impl FreshCodexState {
                         "fresh_agent_create_refused: the ownership coordinator refused the \
                          claim (kata b8ke cross-kind authority)"
                     );
-                    self.fail_create_session_reserved(&request_id);
-                    return;
+                    return self.fail_create_with_owner(
+                        &request_id,
+                        "SESSION_RESERVED",
+                        "Another resume for this session is in flight",
+                        crate::ownership_lane::fresh_agent_owner_fields_from_outcome(
+                            &self.ownership,
+                            &outcome,
+                        ),
+                    );
                 }
             };
             let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
@@ -2165,13 +2732,12 @@ impl FreshCodexState {
                         // Under-lock ADOPT (the V5 TOCTOU window). D8
                         // (focused-ep1-r4 Finding 1): re-parks/re-stamps the
                         // CURRENT connection's provenance on the incumbent.
-                        self.adopt_live_create(&request_id, &resume_session_id, provenance.clone())
+                        return self
+                            .adopt_live_create(&request_id, &resume_session_id, provenance.clone())
                             .await;
-                        return;
                     }
                     crate::session_lease::FreshSessionClaim::Held { .. } => {
-                        self.fail_create_session_reserved(&request_id);
-                        return;
+                        return self.fail_create_session_reserved(&request_id);
                     }
                     crate::session_lease::FreshSessionClaim::ExpiredNeedsKill {
                         pid,
@@ -2191,26 +2757,26 @@ impl FreshCodexState {
                         }
                         tracing::error!(target: "invariant", pid, session_id = %resume_session_id,
                             "fresh_agent_lease_expired_kill_unconfirmed: holding closed");
-                        self.fail_create_session_reserved(&request_id);
-                        return;
+                        return self.fail_create_session_reserved(&request_id);
                     }
                 }
             }
-            self.handle_create_resume(
-                request_id,
-                resume_session_id,
-                cwd,
-                model,
-                effort,
-                sandbox,
-                permission_mode,
-                lease_guard,
-                own_ticket,
-                provenance,
-                naming_handle,
-            )
-            .await;
-            return;
+            return self
+                .handle_create_resume(
+                    request_id,
+                    resume_session_id,
+                    cwd,
+                    model,
+                    effort,
+                    sandbox,
+                    permission_mode,
+                    collaboration_mode,
+                    lease_guard,
+                    own_ticket,
+                    provenance,
+                    naming_handle,
+                )
+                .await;
         }
 
         // b8ke ext r22 F1: the fresh create is coordinator-owned from BEFORE
@@ -2256,9 +2822,9 @@ impl FreshCodexState {
                 // an earlier create for this pane completed (the key is
                 // Aliased{to: canonical}); the idempotent re-drive ADOPTS
                 // the live session, never a second spawn.
-                self.adopt_live_create(&request_id, &claim_key, provenance.clone())
+                return self
+                    .adopt_live_create(&request_id, &claim_key, provenance.clone())
                     .await;
-                return;
             }
             crate::ownership_lane::LaneClaim::Refused(outcome) => {
                 tracing::warn!(target: "freshell_freshagent::codex",
@@ -2267,8 +2833,15 @@ impl FreshCodexState {
                     "fresh_agent_create_refused: the ownership coordinator refused the \
                      fresh create's provisional claim (kata b8ke ext r22 F1)"
                 );
-                self.fail_create_session_reserved(&request_id);
-                return;
+                return self.fail_create_with_owner(
+                    &request_id,
+                    "SESSION_RESERVED",
+                    "Another resume for this session is in flight",
+                    crate::ownership_lane::fresh_agent_owner_fields_from_outcome(
+                        &self.ownership,
+                        &outcome,
+                    ),
+                );
             }
         }
 
@@ -2276,8 +2849,7 @@ impl FreshCodexState {
         let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd.as_deref()).await {
             Ok(parts) => parts,
             Err(err) => {
-                self.fail_create(&request_id, "CODEX_APP_SERVER_START_FAILED", &err);
-                return;
+                return self.fail_create(&request_id, "CODEX_APP_SERVER_START_FAILED", &err);
             }
         };
 
@@ -2309,18 +2881,40 @@ impl FreshCodexState {
                 history_mode: Some(HistoryMode::Paginated),
             })
             .await;
-        let thread_id = match started {
-            Ok(started) => started.thread_id,
+        let started = match started {
+            Ok(started) => started,
             Err(err) => {
                 client.close().await;
                 let mut child = child;
                 let _ = child.start_kill();
                 reap_owned_codex_sidecars(&ownership_id);
                 crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
-                self.fail_create(&request_id, "CODEX_THREAD_START_FAILED", &err.to_string());
-                return;
+                return self.fail_create(
+                    &request_id,
+                    "CODEX_THREAD_START_FAILED",
+                    &err.to_string(),
+                );
             }
         };
+
+        let thread_id = started.thread_id.clone();
+        let mut effective = CodexEffectiveSettings {
+            model,
+            effort,
+            cwd,
+            sandbox,
+            permission_mode,
+            collaboration_mode,
+        };
+        effective.adopt_native(&started.effective_settings);
+        let CodexEffectiveSettings {
+            model,
+            effort,
+            cwd,
+            sandbox,
+            permission_mode,
+            collaboration_mode,
+        } = effective;
 
         // b8ke ext r22 F1: the MINT-TIME REKEY — the SAME ticket's
         // in-flight record moves from the pane-scoped provisional key to
@@ -2368,12 +2962,11 @@ impl FreshCodexState {
                     let _ = child.start_kill();
                     reap_owned_codex_sidecars(&ownership_id);
                     crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
-                    self.fail_create(
+                    return self.fail_create(
                         &request_id,
                         "FRESH_AGENT_CREATE_FAILED",
                         "the minted thread id was claimed by another owner during the create; torn down",
                     );
-                    return;
                 }
             }
         }
@@ -2390,6 +2983,8 @@ impl FreshCodexState {
             cwd,
             sandbox,
             permission_mode,
+            collaboration_mode,
+            started.effective_settings.clone(),
             None,
             // Threads freshell starts are paginated (we SET the mode at start).
             Some(HistoryMode::Paginated),
@@ -2399,7 +2994,7 @@ impl FreshCodexState {
             None,
             naming_handle,
         )
-        .await;
+        .await
     }
 
     /// The resume branch of `handle_create` (FINDING 1 -- CODEX-FIRST triage): spawn a
@@ -2434,6 +3029,7 @@ impl FreshCodexState {
         effort: Option<String>,
         sandbox: Option<String>,
         permission_mode: Option<String>,
+        collaboration_mode: Option<CodexWorkMode>,
         mut lease_guard: Option<crate::FreshSessionLeaseGuard>,
         // kata b8ke Task 3: the coordinator claim ticket from
         // `handle_create`'s resume lane — every failure return below drops
@@ -2444,7 +3040,7 @@ impl FreshCodexState {
         provenance: Option<crate::BindProvenance>,
         // Unified agent names (Task 2): the pane's pre-durable naming handle.
         naming_handle: Option<String>,
-    ) {
+    ) -> CodexCreateOutcome {
         let _ = &mut own_ticket; // moved to finish_create below on the success path
                                  // b8ke focused episode-2 round-2 F4: the claim exists — register the
                                  // watchdog machinery NOW, before the spawn + thread/resume awaits (up
@@ -2474,12 +3070,11 @@ impl FreshCodexState {
             if let Some(mut g) = lease_guard.take() {
                 g.fail();
             }
-            self.fail_create(
+            return self.fail_create(
                 &request_id,
                 "FRESH_AGENT_CREATE_FAILED",
                 &format!("codex thread {resume_session_id} not found"),
             );
-            return;
         }
 
         // Round 4 (focused-ep5-r3 Finding 1): the claim's dead-state
@@ -2521,8 +3116,7 @@ impl FreshCodexState {
                 if let Some(mut g) = lease_guard.take() {
                     g.fail();
                 }
-                self.fail_create(&request_id, "CODEX_APP_SERVER_START_FAILED", &err);
-                return;
+                return self.fail_create(&request_id, "CODEX_APP_SERVER_START_FAILED", &err);
             }
         };
         // Task 12: arm the TTL tree-kill path now that the child + its tag exist.
@@ -2561,8 +3155,11 @@ impl FreshCodexState {
                 if is_codex_thread_not_found(&err) {
                     self.mark_thread_dead(&resume_session_id).await;
                 }
-                self.fail_create(&request_id, "FRESH_AGENT_CREATE_FAILED", &err.to_string());
-                return;
+                return self.fail_create(
+                    &request_id,
+                    "FRESH_AGENT_CREATE_FAILED",
+                    &err.to_string(),
+                );
             }
         };
         // TERM-25: never silently proceed against the wrong thread. `thread/resume`
@@ -2583,7 +3180,7 @@ impl FreshCodexState {
                 returned = %started.thread_id,
                 "freshagent.codex.wrong_thread_resume_rejected"
             );
-            self.fail_create(
+            return self.fail_create(
                 &request_id,
                 "FRESH_AGENT_CREATE_FAILED",
                 &format!(
@@ -2592,9 +3189,25 @@ impl FreshCodexState {
                     started.thread_id, resume_session_id
                 ),
             );
-            return;
         }
         let thread_id = resume_session_id;
+        let mut effective = CodexEffectiveSettings {
+            model,
+            effort,
+            cwd,
+            sandbox,
+            permission_mode,
+            collaboration_mode,
+        };
+        effective.adopt_native(&started.effective_settings);
+        let CodexEffectiveSettings {
+            model,
+            effort,
+            cwd,
+            sandbox,
+            permission_mode,
+            collaboration_mode,
+        } = effective;
         self.clear_dead_thread(&thread_id).await;
 
         // Retire-on-kill round 2/3 (focused-ep5-r1 Finding 2, -r2 Finding
@@ -2626,14 +3239,13 @@ impl FreshCodexState {
             if let Some(mut g) = lease_guard.take() {
                 g.fail();
             }
-            self.fail_create(
+            return self.fail_create(
                 &request_id,
                 "FRESH_AGENT_CREATE_FAILED",
                 &format!(
                     "codex thread {thread_id} closed while the resume was in flight; torn down"
                 ),
             );
-            return;
         }
 
         // Kata 1wxv Task 2 (r3): the durable rollout meta is the ONE source of
@@ -2665,6 +3277,8 @@ impl FreshCodexState {
             cwd,
             sandbox,
             permission_mode,
+            collaboration_mode,
+            started.effective_settings.clone(),
             lease_guard,
             history_mode,
             own_ticket,
@@ -2676,7 +3290,7 @@ impl FreshCodexState {
             Some((thread_id.as_str(), claim_dead_state)),
             naming_handle,
         )
-        .await;
+        .await
     }
 
     /// Shared tail of `handle_create` and `handle_create_resume`: register the session
@@ -2699,6 +3313,8 @@ impl FreshCodexState {
         cwd: Option<String>,
         sandbox: Option<String>,
         permission_mode: Option<String>,
+        collaboration_mode: Option<CodexWorkMode>,
+        native_thread_settings: Value,
         mut lease_guard: Option<crate::FreshSessionLeaseGuard>,
         // Kata 1wxv Task 2: the thread's durable history mode — `Some(Paginated)`
         // for threads freshell started, the rollout-meta parse for resumes.
@@ -2725,7 +3341,7 @@ impl FreshCodexState {
         // (None = an unnamed pane; the frame then carries the durable
         // session's own projection when a record exists).
         naming_handle: Option<String>,
-    ) {
+    ) -> CodexCreateOutcome {
         let _ = &mut own_ticket; // consumed at the commit below on the success path
                                  // D8 (focused-ep1-r5 Finding 2): a HOLLOW `Some` (a partially
                                  // initialized client's hello — all fields absent) behaves like `None`
@@ -2735,6 +3351,7 @@ impl FreshCodexState {
         // kata b8ke Task 3: the sidecar pid for the commit's owner identity
         // (captured before `child` moves into the exit watcher).
         let sidecar_pid = child.id();
+        let cleanup_ownership_id = Some(ownership_id.clone());
 
         // Unified agent names (Task 2): capture the app-server's initialized
         // `codexHome` BEFORE `client` moves into the session registration
@@ -2769,9 +3386,9 @@ impl FreshCodexState {
             // re-parks/re-stamps the CURRENT connection's provenance on the
             // incumbent (this arm returns immediately, so moving `provenance`
             // in is safe).
-            self.adopt_live_create(&request_id, &thread_id, provenance)
+            return self
+                .adopt_live_create(&request_id, &thread_id, provenance)
                 .await;
-            return;
         }
 
         // Legacy `activeTurnByThread` mirror for THIS session (adapter.ts:295) -- set on
@@ -2809,10 +3426,16 @@ impl FreshCodexState {
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
         let event_emission_gate = Arc::new(TokioMutex::new(()));
+        let turn_state = Arc::new(StdMutex::new(CodexTurnState::default()));
+        let projection = Arc::new(StdMutex::new(projection::CodexProjection::new(
+            mint_ownership_id(),
+            thread_id.to_string(),
+        )));
         let (created_tx, created_rx) = oneshot::channel();
         let consumer = self.spawn_consumer_after(
             notifs,
             CodexConsumerRuntime {
+                turn_state: turn_state.clone(),
                 thread_id: thread_id.clone(),
                 active_turn: active_turn.clone(),
                 user_interrupt_pending: user_interrupt_pending.clone(),
@@ -2824,6 +3447,7 @@ impl FreshCodexState {
                 compact_in_flight: compact_in_flight.clone(),
                 compact_turn_id: compact_turn_id.clone(),
                 event_emission_gate: event_emission_gate.clone(),
+                projection: projection.clone(),
             },
             Some(created_rx),
         );
@@ -2836,7 +3460,7 @@ impl FreshCodexState {
         // b8ke focused round-2 R2-1: the condemned-prior tag (the pid was
         // captured above for the coordinator commit).
         let sidecar_ownership_id = ownership_id.clone();
-        let watcher = spawn_exit_watcher(
+        let watcher = spawn_exit_watcher_tracking_turns(
             child,
             ownership_id,
             thread_id.clone(),
@@ -2850,11 +3474,17 @@ impl FreshCodexState {
             last_turn_complete_at.clone(),
             Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
+            Some(turn_state.clone()),
+            Some(self.clone()),
         );
 
         self.sessions.lock().await.insert(
             thread_id.clone(),
             CodexSession {
+                collaboration_mode,
+                native_turn_settings: None,
+                native_thread_settings: Some(native_thread_settings),
+                turn_state: turn_state.clone(),
                 client,
                 model: model.clone(),
                 effort: effort.clone(),
@@ -2868,6 +3498,7 @@ impl FreshCodexState {
                 history_mode,
                 turn_lock: Arc::new(TokioMutex::new(())),
                 event_emission_gate,
+                projection,
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -2914,14 +3545,13 @@ impl FreshCodexState {
                 if let Some(mut g) = lease_guard.take() {
                     g.fail();
                 }
-                self.fail_create(
+                return self.fail_create(
                     &request_id,
                     "FRESH_AGENT_CREATE_FAILED",
                     &format!(
                         "codex thread {thread_id} closed while the resume was in flight; torn down"
                     ),
                 );
-                return;
             }
         }
 
@@ -2945,12 +3575,11 @@ impl FreshCodexState {
                 if let Some((claim_id, _)) = claim {
                     self.rollback_session_claim(claim_id).await;
                 }
-                self.fail_create(
+                return self.fail_create(
                     &request_id,
                     "FRESH_AGENT_CREATE_FAILED",
                     "session lease revoked during create; torn down",
                 );
-                return;
             }
         }
 
@@ -2994,6 +3623,7 @@ impl FreshCodexState {
                 permission_mode.as_deref(),
                 effort.as_deref(),
                 cwd.as_deref(),
+                collaboration_mode,
                 None,
                 provenance.as_ref(),
                 // Unified agent names (Task 4, T2-M5): the naming classification
@@ -3025,12 +3655,11 @@ impl FreshCodexState {
             if let Some(mut g) = lease_guard.take() {
                 g.fail();
             }
-            self.fail_create(
+            return self.fail_create(
                 &request_id,
                 "FRESH_AGENT_CREATE_FAILED",
                 "the session's resume record could not be persisted; torn down",
             );
-            return;
         }
         if let Err(outcome) =
             self.commit_lane_claim_at(&mut own_ticket, &thread_id, &thread_id, sidecar_pid)
@@ -3049,12 +3678,11 @@ impl FreshCodexState {
             if let Some(mut g) = lease_guard.take() {
                 g.fail();
             }
-            self.fail_create(
+            return self.fail_create(
                 &request_id,
                 "FRESH_AGENT_CREATE_FAILED",
                 "session ownership changed during create; torn down",
             );
-            return;
         }
 
         // DIAG-01: fresh-agent session lifecycle -- provider/session_id/cwd,
@@ -3116,7 +3744,7 @@ impl FreshCodexState {
         // bind, so the classification is not yet verified at upsert time).
         if claim.is_some() {
             if let Some(transition) = self
-                .try_bind_pending_naming(&thread_id, codex_home.as_deref())
+                .try_materialize_naming(&thread_id, codex_home.as_deref())
                 .await
             {
                 tracing::debug!(
@@ -3139,9 +3767,9 @@ impl FreshCodexState {
             session_type: SESSION_TYPE.to_string(),
             session_ref: Some(SessionLocator {
                 provider: PROVIDER.to_string(),
-                session_id: thread_id,
+                session_id: thread_id.clone(),
             }),
-            name_ref,
+            name_ref: name_ref.clone(),
             session_name,
         }));
 
@@ -3150,6 +3778,27 @@ impl FreshCodexState {
         // notification already buffered on `notifs` is only delivered to the consumer
         // (and thus only broadcast) from this point on.
         let _ = created_tx.send(());
+        self.publish_codex_settings(
+            &thread_id,
+            &CodexEffectiveSettings {
+                model,
+                effort,
+                cwd,
+                sandbox,
+                permission_mode,
+                collaboration_mode,
+            },
+            None,
+        );
+        CodexCreateOutcome::Created {
+            session_id: thread_id.clone(),
+            session_ref: Some(SessionLocator {
+                provider: PROVIDER.into(),
+                session_id: thread_id,
+            }),
+            cleanup_ownership_id,
+            name_ref,
+        }
     }
 
     /// REVIEW FIX (item 3): legacy's `freshAgent.create.failed` sends `retryable: true` on
@@ -3163,28 +3812,53 @@ impl FreshCodexState {
     /// so this was a real, user-visible gap: every Rust `fail_create` call previously sent
     /// no `retryable` field at all (serde omits `None`), silently hiding the retry button
     /// legacy always offers.
-    fn fail_create(&self, request_id: &str, code: &str, message: &str) {
-        self.broadcast(&ServerMessage::FreshAgentCreateFailed(
-            FreshAgentCreateFailed {
-                owner_kind: None,
-                owner_generation: None,
-                owner_epoch: None,
-                code: code.to_string(),
-                message: message.to_string(),
-                request_id: request_id.to_string(),
-                retryable: Some(true),
-            },
-        ));
+    fn fail_create(&self, request_id: &str, code: &str, message: &str) -> CodexCreateOutcome {
+        self.fail_create_with_owner(request_id, code, message, None)
+    }
+
+    fn fail_create_with_owner(
+        &self,
+        request_id: &str,
+        code: &str,
+        message: &str,
+        owner: Option<crate::ownership_lane::TerminalOwnerFields>,
+    ) -> CodexCreateOutcome {
+        let outcome = CodexCreateOutcome::Failed {
+            code: code.into(),
+            message: message.into(),
+            retryable: Some(true),
+            owner,
+        };
+        if let CodexCreateOutcome::Failed {
+            code,
+            message,
+            retryable,
+            owner,
+        } = &outcome
+        {
+            self.broadcast(&ServerMessage::FreshAgentCreateFailed(
+                FreshAgentCreateFailed {
+                    owner_kind: owner.as_ref().map(|owner| owner.owner_kind.into()),
+                    owner_generation: owner.as_ref().map(|owner| owner.owner_generation),
+                    owner_epoch: owner.as_ref().map(|owner| owner.owner_epoch),
+                    code: code.clone(),
+                    message: message.clone(),
+                    request_id: request_id.into(),
+                    retryable: *retryable,
+                },
+            ));
+        }
+        outcome
     }
 
     /// The D8 loser answer (Task 12): reuses the existing create-failed frame with the
     /// fixed reservation code — NO new protocol fields.
-    fn fail_create_session_reserved(&self, request_id: &str) {
+    fn fail_create_session_reserved(&self, request_id: &str) -> CodexCreateOutcome {
         self.fail_create(
             request_id,
             "SESSION_RESERVED",
             "Another resume for this session is in flight",
-        );
+        )
     }
 
     /// The HAS-LIVE→ADOPT arm (Task 12, V1): answer a loser's create-with-resume with a
@@ -3209,7 +3883,7 @@ impl FreshCodexState {
         request_id: &str,
         thread_id: &str,
         provenance: Option<crate::BindProvenance>,
-    ) {
+    ) -> CodexCreateOutcome {
         if let Some(p) = provenance.filter(|p| p.is_meaningful()) {
             // Re-park + snapshot the incumbent's settings in one lock scope
             // (the refresh write below asserts the parked identity together
@@ -3227,10 +3901,12 @@ impl FreshCodexState {
                         s.cwd.clone(),
                         s.sandbox.clone(),
                         s.permission_mode.clone(),
+                        s.collaboration_mode,
                     )
                 })
             };
-            if let Some((model, effort, cwd, sandbox, permission_mode)) = parked {
+            if let Some((model, effort, cwd, sandbox, permission_mode, collaboration_mode)) = parked
+            {
                 let _ = self
                     .record_codex_binding(
                         thread_id,
@@ -3240,6 +3916,7 @@ impl FreshCodexState {
                         permission_mode.as_deref(),
                         effort.as_deref(),
                         cwd.as_deref(),
+                        collaboration_mode,
                         None,
                         Some(&p),
                         // Unified agent names: a refresh carries no naming fact.
@@ -3286,9 +3963,18 @@ impl FreshCodexState {
                 provider: PROVIDER.to_string(),
                 session_id: thread_id.to_string(),
             }),
-            name_ref,
+            name_ref: name_ref.clone(),
             session_name,
         }));
+        CodexCreateOutcome::Created {
+            session_id: thread_id.into(),
+            session_ref: Some(SessionLocator {
+                provider: PROVIDER.into(),
+                session_id: thread_id.into(),
+            }),
+            cleanup_ownership_id: None,
+            name_ref,
+        }
     }
 
     // ── freshAgent.send (WS) ─────────────────────────────────────────────────
@@ -3301,7 +3987,11 @@ impl FreshCodexState {
     /// `ensureRuntime` lazy-restart invariant, adapter.ts:935-946) -- the ONLY visible effect
     /// is added latency on this one send; there is no user-facing error frame for a
     /// self-healed crash.
-    pub async fn handle_send(&self, msg: FreshAgentSend) {
+    pub(crate) fn subscribe_turn_events(&self) -> tokio::sync::broadcast::Receiver<CodexTurnEvent> {
+        self.turn_events.subscribe()
+    }
+
+    pub async fn handle_send(&self, msg: FreshAgentSend) -> CodexSendOutcome {
         let request_id = msg.request_id.clone();
         let checkpoint_identity_request = msg.checkpoint_intent.as_ref().and_then(|intent| {
             request_id
@@ -3322,8 +4012,7 @@ impl FreshCodexState {
                     tracing::warn!(target: "freshell_freshagent::codex",
                         session_id = %msg.session_id, code = err.code(),
                         "fresh_agent_send_refused: the observed fence is half-sent (invalid)");
-                    self.send_error(&request_id, err.code(), err.message());
-                    return;
+                    return self.refuse_send(&request_id, err.code(), err.message());
                 }
             };
 
@@ -3336,22 +4025,29 @@ impl FreshCodexState {
                 session_id = new_session_id;
             }
             Err(EnsureAliveError::NotFound) => {
-                self.send_error(&request_id, "SESSION_NOT_FOUND", "codex session not found");
-                return;
+                return self.refuse_send(
+                    &request_id,
+                    "SESSION_NOT_FOUND",
+                    "codex session not found",
+                );
             }
             Err(EnsureAliveError::RespawnFailed(err)) => {
-                self.send_error(&request_id, "CODEX_RESPAWN_FAILED", &err);
-                return;
+                return self.refuse_send(&request_id, "CODEX_RESPAWN_FAILED", &err);
             }
             Err(EnsureAliveError::Reserved) => {
                 // Task 13 (D8): another create/attach holds this sessionRef -- the
                 // retryable non-lost error channel; the client re-drive converges.
+                let outcome = self.refuse_send(
+                    &request_id,
+                    "SESSION_RESERVED",
+                    "Another resume for this session is in flight",
+                );
                 self.emit_fresh_agent_error(
                     &session_id,
                     "SESSION_RESERVED",
                     "Another resume for this session is in flight",
                 );
-                return;
+                return outcome;
             }
         }
 
@@ -3389,6 +4085,7 @@ impl FreshCodexState {
             guard.get(&session_id).map(|s| {
                 (
                     s.client.clone(),
+                    s.turn_state.clone(),
                     s.active_turn.clone(),
                     s.turn_in_flight.clone(),
                     // FR1-1: the install-site void of the retired-turn slot.
@@ -3401,11 +4098,13 @@ impl FreshCodexState {
                     s.quiet_deadman.clone(),
                     s.exited.clone(),
                     s.checkpoint_probe_cancelled.clone(),
+                    s.sidecar_ownership_id.clone(),
                 )
             })
         };
         let Some((
             client,
+            turn_state,
             active_turn,
             turn_in_flight,
             retired_turn_id,
@@ -3414,10 +4113,10 @@ impl FreshCodexState {
             quiet_deadman,
             exited,
             checkpoint_probe_cancelled,
+            incarnation_id,
         )) = looked_up
         else {
-            self.send_error(&request_id, "SESSION_NOT_FOUND", "codex session not found");
-            return;
+            return self.refuse_send(&request_id, "SESSION_NOT_FOUND", "codex session not found");
         };
 
         // Kata 1wxv Task 2 (r2 serialization discipline): take the session's
@@ -3430,7 +4129,104 @@ impl FreshCodexState {
         // this lock, the send simply waits, then proceeds and destroys redo
         // ("send waits, rollback wins, then destroys").
         let _turn = turn_lock.lock().await;
+        wait_for_codex_stop_resolution(&turn_state).await;
 
+        // Read defaults after acquiring the turn lock: a queued send inherits the
+        // last accepted settings, while this message's explicit choices win.
+        let stored = self
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .map(CodexSession::effective_settings);
+        let Some(stored) = stored else {
+            return self.refuse_send(&request_id, "SESSION_NOT_FOUND", "codex session not found");
+        };
+        let mut patch = msg.settings.clone().unwrap_or_default();
+        if patch.cwd.is_none() && stored.cwd.is_none() {
+            patch.cwd = cwd;
+        }
+        let effective = match CodexEffectiveSettings::resolve(&stored, &patch) {
+            Ok(settings) => settings,
+            Err(error) => {
+                return self.refuse_send(&request_id, error.code, &error.message);
+            }
+        };
+        let model = effective.model.clone();
+        let effort = effective.effort.clone();
+        let turn_cwd = effective.cwd.clone();
+        let sandbox = effective.sandbox.clone();
+        let permission_mode = effective.permission_mode.clone();
+        let wire_choice = if effort.as_deref() == Some("max") {
+            match freshell_codex::catalog::read_models(&client).await {
+                Ok(catalog) => Some(freshell_codex::catalog::resolve_legacy_effort(
+                    &model, "max", &catalog,
+                )),
+                Err(error) => {
+                    tracing::warn!(provider=PROVIDER, session_id=%session_id, request_id=?request_id, cause=%error, "freshagent.codex.effort_catalog_unavailable");
+                    effort.clone()
+                }
+            }
+        } else {
+            effort.clone()
+        };
+        let wire_effort = match to_codex_reasoning_effort(wire_choice.as_deref()) {
+            Ok(value) => value,
+            Err(error) => {
+                return self.refuse_send(&request_id, "INVALID_EFFORT", &error.to_string());
+            }
+        };
+        let native_settings = CodexEffectiveSettings {
+            effort: wire_effort.clone(),
+            ..effective.clone()
+        };
+
+        let params = StartTurnParams {
+            collaboration_mode: native_settings.native_collaboration_mode(),
+            thread_id: session_id.clone(),
+            input: codex_user_input(&msg.text, msg.images.as_deref()),
+            cwd: turn_cwd.clone(),
+            model: Some(model.clone()),
+            // Preserve exact native intent, with only the advertised legacy alias above.
+            effort: wire_effort,
+            sandbox_policy: sandbox.as_deref().map(sandbox_policy_value),
+            approval_policy: permission_mode.as_deref().map(|p| json!(p)),
+        };
+
+        // The emission barrier keeps acceptance before terminal publication.
+        // Recheck Stop while atomically recording dispatch ownership: a Stop
+        // arriving after the first wait must either block issuance or latch on
+        // this exact new dispatch. No consumer lock is held across the wait.
+        let (_event_emission, expected_turn_id, dispatch) = loop {
+            let emission = event_emission_gate.lock().await;
+            let active = active_turn.lock().expect("active_turn mutex").clone();
+            let selected = {
+                let mut turns = turn_state.lock().expect("codex turn state");
+                if let Some(active) = active.as_deref() {
+                    turns.observe_started(active);
+                }
+                if turns.has_unresolved_stop() {
+                    None
+                } else {
+                    if turns.has_owned_exit() {
+                        return self.refuse_send(&request_id, "SESSION_RESERVED", "The owned Codex runtime exited while this input waited; refresh before sending again");
+                    }
+                    let expected = turns.active_turn_id().map(str::to_owned);
+                    if expected.is_none() && turns.has_unknown_delivery() {
+                        return self.refuse_send(&request_id, "CODEX_DELIVERY_AMBIGUOUS", "Earlier input has unresolved native delivery; recover or inspect the conversation before sending again");
+                    }
+                    Some((
+                        expected,
+                        turns.begin_dispatch(request_id.as_deref().unwrap_or_default()),
+                    ))
+                }
+            };
+            if let Some((expected, dispatch)) = selected {
+                break (emission, expected, dispatch);
+            }
+            drop(emission);
+            wait_for_codex_stop_resolution(&turn_state).await;
+        };
         // The checkpoint workspace barrier can park a send outside this
         // handler while ownership changes. Recheck the captured wire fence
         // after the turn lock so a delayed send cannot reach a replacement
@@ -3453,51 +4249,16 @@ impl FreshCodexState {
                     tracing::warn!(target: "freshell_freshagent::codex",
                         session_id = %session_id, request_id = ?request_id,
                         "fresh_agent_send_refused: ownership guard refused");
-                    self.send_error(&request_id, "SESSION_RESERVED", &message);
-                    return;
+                    turn_state
+                        .lock()
+                        .expect("codex turn state")
+                        .reject(dispatch);
+                    return self.refuse_send(&request_id, "SESSION_RESERVED", &message);
                 }
             }
         } else {
             None
         };
-
-        // Read defaults after acquiring the turn lock: a queued send inherits the
-        // last accepted settings, while this message's explicit choices win.
-        let stored = {
-            let sessions = self.sessions.lock().await;
-            sessions.get(&session_id).map(|s| {
-                (
-                    s.model.clone(),
-                    s.effort.clone(),
-                    s.cwd.clone(),
-                    s.sandbox.clone(),
-                    s.permission_mode.clone(),
-                )
-            })
-        };
-        let Some((stored_model, stored_effort, stored_cwd, stored_sandbox, stored_permission)) =
-            stored
-        else {
-            self.send_error(&request_id, "SESSION_NOT_FOUND", "codex session not found");
-            return;
-        };
-        let settings = msg.settings.as_ref();
-        let model = settings
-            .and_then(|s| s.model.clone())
-            .unwrap_or(stored_model);
-        let effort = settings.and_then(|s| s.effort.clone()).or(stored_effort);
-        let turn_cwd = settings.and_then(|s| s.cwd.clone()).or(stored_cwd).or(cwd);
-        let mut sandbox = settings
-            .and_then(|s| s.sandbox)
-            .map(sandbox_wire_value)
-            .or(stored_sandbox);
-        let mut permission_mode = settings
-            .and_then(|s| s.permission_mode.clone())
-            .or(stored_permission);
-        if let Err(error) = normalize_codex_permission(&mut permission_mode, &mut sandbox) {
-            self.send_error(&request_id, "INVALID_PERMISSION_MODE", error);
-            return;
-        }
 
         // Decision 5 (codex/opencode/claude share this helper): any new
         // submission permanently destroys redo. AWAITED before the turn goes
@@ -3513,111 +4274,87 @@ impl FreshCodexState {
             tracing::warn!(error = %err, session = %session_id, "freshagent.codex.destroy_redo_on_submit_failed");
         }
 
-        // Re-normalize model/effort on send (adapter.ts:961-963) — idempotent for stored values.
-        let model = normalize_freshcodex_model(Some(&model));
-        let effort = normalize_freshcodex_effort(Some(&model), effort.as_deref());
-        let wire_effort = match to_codex_reasoning_effort(effort.as_deref()) {
-            Ok(value) => value,
-            Err(err) => {
-                self.send_error(&request_id, "INVALID_EFFORT", &err.to_string());
-                return;
-            }
-        };
-
-        let params = StartTurnParams {
-            thread_id: session_id.clone(),
-            input: codex_user_input(&msg.text, msg.images.as_deref()),
-            cwd: turn_cwd.clone(),
-            model: Some(model.clone()),
-            // DEV-0003: none/minimal/low/medium/high forwarded VERBATIM; max/xhigh → xhigh.
-            effort: wire_effort,
-            sandbox_policy: sandbox.as_deref().map(sandbox_policy_value),
-            approval_policy: permission_mode.as_deref().map(|p| json!(p)),
-        };
-
-        // The app-server can write a terminal notification immediately after its
-        // turn/start response. Hold the session-local emission gate from before that
-        // RPC through the accepted broadcast below, so the client first receives the
-        // request-correlated submittedTurnId and then the completion-derived frames.
-        let _event_emission = event_emission_gate.lock().await;
-
-        // The turn-in-flight latch + quiet window arm at DISPATCH time -- BEFORE
-        // awaiting the response: the independently-running exit watcher and the
-        // quiet-deadman waiter must classify this turn as in flight even while
-        // the response is still outstanding (a crash in that window ends a real
-        // dispatched turn; a post-response arm would classify it idle and miss
-        // the crash edge, or arm the deadman after the sidecar is already
-        // gone). The response-failure arm below disarms both ONLY when the
-        // sidecar is not known-dead.
+        let contextual_answers = self.contextual_answer_targets(&session_id, &msg.text).await;
         turn_in_flight.store(true, Ordering::SeqCst);
         note_codex_activity(self, &session_id, &turn_in_flight, &quiet_deadman);
-
-        let submitted_turn_id = match client.start_turn(params).await {
+        let result = if let Some(expected) = expected_turn_id.as_deref() {
+            client.steer_turn(&session_id, expected, params.input).await
+        } else {
+            client.start_turn(params).await
+        };
+        let (submitted_turn_id, latched_stop) = match result {
             Ok(started) => {
-                // adapter.ts:980 -- track the active turn immediately (before any
-                // turn/started notification), so a fast-follow interrupt has a target.
-                *active_turn.lock().expect("active_turn mutex") = Some(started.turn_id.clone());
-                // FR1-1 (stale-slot protection): the new turn's install VOIDS
-                // the retired-turn slot a PREVIOUS turn's idle retirement may
-                // have left — a late completion for that older turn must never
-                // retire THIS turn's crash latch. The emission gate (held above
-                // across the RPC) keeps the consumer from folding any
-                // completion in this window, so the two writes are serialized
-                // against the reducer. The slot guard is sequenced with (never
-                // nested inside) the tracker guard.
+                let mut turns = turn_state.lock().expect("codex turn state");
+                let latched_stop = turns.accept(dispatch, &started.turn_id);
+                let active = turns.active_turn_id().map(str::to_owned);
+                let owed = turns.has_owed_work();
+                drop(turns);
+                *active_turn.lock().expect("active_turn mutex") = active;
+                turn_in_flight.store(owed, Ordering::SeqCst);
                 *retired_turn_id.lock().expect("retired_turn_id mutex") = None;
-                // E3R1 (durable already-rang set): the install deliberately
-                // does NOT touch the set. The pre-fix install VOID reopened
-                // the gate for a PRIOR turn's late completion after a
-                // lifecycle-loss mint — a double bell. A stale set entry is
-                // safe: the gate matches turn ids, so it can never gate THIS
-                // new turn's own completion.
-                // A turn is now in flight: refresh the quiet window off the
-                // response (the sidecar has provably accepted the turn; the
-                // deadline resets from this lane-visible proof).
                 note_codex_activity(self, &session_id, &turn_in_flight, &quiet_deadman);
-                started.turn_id
+                (started.turn_id, latched_stop)
             }
             Err(err) => {
-                // The dispatch/response failed. Retire the latch + disarm the
-                // dispatch-time window ONLY when the sidecar is NOT known-dead:
-                // an exit-induced failure (the production crash shape — the
-                // sidecar dies mid-dispatch and the transport's read loop fails
-                // the pending request with a connection-closed error) must
-                // LEAVE the latch armed so the exit watcher's crash arm owns
-                // the turn-end classification. This arm has no awaits, so a
-                // bare retirement would land before the crash arm's swap
-                // (which sits behind disarm + the `exited` broadcast + an
-                // awaited kill-and-confirm) and swallow the crash edge with
-                // near-certainty. The crash arm is guaranteed to run for a
-                // dead child; if it already ran, its swap minted the edge and
-                // leaving the now-false latch untouched is harmless. A
-                // requested kill also retires the latch silently and
-                // unconditionally, so a close-induced failure can never
-                // out-live it. Ordinary rejections (a live sidecar's RPC
-                // error, a timeout) still retire promptly.
-                let exit_induced = exited.load(Ordering::SeqCst)
-                    || matches!(err, CodexAppServerError::Closed { .. });
-                if !exit_induced {
-                    turn_in_flight.store(false, Ordering::SeqCst);
+                let (refused, fact, owed) = {
+                    let mut turns = turn_state.lock().expect("codex turn state");
+                    let refused = err.is_not_submitted() && turns.reject(dispatch);
+                    if !refused {
+                        turns.mark_ambiguous(dispatch);
+                    }
+                    (
+                        refused,
+                        turns
+                            .facts()
+                            .iter()
+                            .find(|fact| fact.token == dispatch)
+                            .cloned(),
+                        turns.has_owed_work(),
+                    )
+                };
+                if !exited.load(Ordering::SeqCst) {
+                    turn_in_flight.store(owed, Ordering::SeqCst);
                     note_codex_activity(self, &session_id, &turn_in_flight, &quiet_deadman);
                 }
-                self.send_error(&request_id, "CODEX_TURN_START_FAILED", &err.to_string());
-                return;
+                tracing::warn!(provider=PROVIDER, session_id=%session_id, request_id=?request_id, incarnation_id=%incarnation_id, dispatch=?dispatch, expected_turn_id=?expected_turn_id, refused, error=%err, "freshagent.codex.send_failed");
+                if let Some(turn_id) = fact
+                    .as_ref()
+                    .filter(|fact| fact.delivery == turn_state::Delivery::Accepted)
+                    .and_then(|fact| fact.turn_id.clone())
+                {
+                    // Observed native admission outweighs a contradictory RPC reply.
+                    (turn_id, StopDisposition::None)
+                } else if refused {
+                    return self.refuse_send(
+                        &request_id,
+                        "CODEX_TURN_START_FAILED",
+                        &err.to_string(),
+                    );
+                } else {
+                    self.send_error(&request_id, "CODEX_DELIVERY_AMBIGUOUS", &err.to_string());
+                    return CodexSendOutcome::Ambiguous {
+                        session_id,
+                        request_id: request_id.unwrap_or_default(),
+                        incarnation_id,
+                        code: "CODEX_DELIVERY_AMBIGUOUS".into(),
+                        message: err.to_string(),
+                    };
+                }
             }
         };
+        self.acknowledge_contextual_answers(&session_id, contextual_answers)
+            .await;
         drop(ownership_guard);
 
         // Only persist choices once the provider has accepted them. Failed sends
         // keep the previous working settings for resume and retry.
         let mut settings_changed = false;
         if let Some(session) = self.sessions.lock().await.get_mut(&session_id) {
-            settings_changed = session.model != model || session.effort != effort;
-            session.model = model.clone();
-            session.effort = effort.clone();
-            session.cwd = turn_cwd.clone();
-            session.sandbox = sandbox.clone();
-            session.permission_mode = permission_mode.clone();
+            settings_changed = session.effective_settings() != effective;
+            session.apply_settings(&effective);
+            if expected_turn_id.is_none() {
+                session.native_turn_settings = Some(native_settings);
+            }
         }
         // b8ke ext r29 F3: the post-send binding refresh carries the
         // operation's CLAIM pair (captured above, right after ensure-alive)
@@ -3643,6 +4380,7 @@ impl FreshCodexState {
                 permission_mode.as_deref(),
                 effort.as_deref(),
                 turn_cwd.as_deref(),
+                effective.collaboration_mode,
                 None,
                 // Send/settings mutation is not a new browser assertion — conn-less
                 // (merge keeps prior stamps, ep4 writer rules).
@@ -3674,14 +4412,7 @@ impl FreshCodexState {
         // a device that missed the configure still lands here). Keyed at the
         // client-addressed id, the same stamp the accepted frame below uses.
         if settings_changed {
-            self.broadcast(&crate::session_metadata::session_metadata_frame(
-                PROVIDER,
-                SESSION_TYPE,
-                &session_id,
-                Some(model.as_str()),
-                effort.as_deref(),
-                None,
-            ));
+            self.publish_codex_settings(&session_id, &effective, request_id.as_deref());
         }
 
         // Unified agent names (Task 4): the shared accepted-input callback —
@@ -3689,12 +4420,9 @@ impl FreshCodexState {
         // target is the stashed pre-durable handle (it redirects once the
         // rollout bind lands), else the durable thread itself. A failed feed
         // never blocks the turn.
-        let naming_target = self
-            .naming_handles
-            .lock()
-            .await
-            .get(&session_id)
-            .cloned()
+        let pending_naming_handle = self.naming_handles.lock().await.get(&session_id).cloned();
+        let naming_target = pending_naming_handle
+            .clone()
             .map(|handle| freshell_protocol::session_names::SessionNameRef::Pending { id: handle })
             .unwrap_or_else(
                 || freshell_protocol::session_names::SessionNameRef::Session {
@@ -3702,6 +4430,20 @@ impl FreshCodexState {
                     session_id: session_id.clone(),
                 },
             );
+        if !msg.text.trim().is_empty() {
+            self.report_hosted_naming_fact(
+                &session_id,
+                crate::naming::HostedCodexNamingFact::Activity(crate::naming::NameActivity {
+                    target: naming_target.clone(),
+                    mode: SESSION_TYPE.into(),
+                    event_id: submitted_turn_id.to_string(),
+                    reason: crate::naming::NameActivityReason::AcceptedUserMessage,
+                    first_user_message: Some(msg.text.trim().to_string()),
+                    cwd: turn_cwd.clone(),
+                }),
+            )
+            .await;
+        }
         crate::naming::report_accepted_input(
             &self.naming(),
             &naming_target,
@@ -3752,6 +4494,33 @@ impl FreshCodexState {
             self.broadcast(&accepted);
         }
 
+        if expected_turn_id.is_some() && msg.settings.is_some() {
+            broadcast_codex_event(
+                &session_id,
+                json!({"type":"freshAgent.notice", "level":"info", "code":"CODEX_SETTINGS_STAGED", "message":"Settings are saved for the next turn; active input keeps this turn's settings."}),
+                &self.broadcast_tx,
+            );
+        }
+        let outcome = CodexSendOutcome::Accepted {
+            session_id: session_id.clone(),
+            submitted_turn_id: submitted_turn_id.clone(),
+            incarnation_id,
+            pending_naming_handle,
+        };
+        // Release both serialization locks before Stop RPC work. The consumer
+        // must remain free to observe terminal evidence while Stop is pending.
+        drop(_event_emission);
+        drop(_turn);
+        if let StopDisposition::Interrupt { dispatch, turn_id } = latched_stop {
+            self.issue_codex_interrupt(
+                &session_id,
+                client.clone(),
+                turn_state.clone(),
+                dispatch,
+                turn_id,
+            )
+            .await;
+        }
         if let Some((request_id, logical_attempt_id)) = checkpoint_identity_request {
             drop(
                 self.spawn_checkpoint_identity_probe(CodexCheckpointIdentityProbe {
@@ -3766,6 +4535,7 @@ impl FreshCodexState {
                 }),
             );
         }
+        outcome
     }
 
     fn spawn_checkpoint_identity_probe(
@@ -3886,6 +4656,21 @@ impl FreshCodexState {
         })
     }
 
+    fn refuse_send(
+        &self,
+        request_id: &Option<String>,
+        code: &str,
+        message: &str,
+    ) -> CodexSendOutcome {
+        self.send_error(request_id, code, message);
+        CodexSendOutcome::Refused {
+            code: code.into(),
+            message: message.into(),
+            retryable: None,
+            owner: None,
+        }
+    }
+
     fn send_error(&self, request_id: &Option<String>, code: &str, message: &str) {
         self.broadcast(&ServerMessage::Error(ErrorMsg {
             provider_preparation_failure: None,
@@ -3913,8 +4698,8 @@ impl FreshCodexState {
     /// re-snapshot the durable binding row, and broadcast
     /// `freshAgent.session.metadata` so every device's model surfaces converge
     /// immediately. Explicit choices win over the stored values, exactly like
-    /// `handle_send`'s settings merge; the effort is wire-validated up front
-    /// so the record never holds a value the next turn could not send.
+    /// `handle_send`'s settings merge. Nonempty effort strings stay exact for
+    /// native validation on the next turn.
     ///
     /// No busy refusal: recording mid-turn is safe — the in-flight turn keeps
     /// the parameters it already started with, and the next turn picks up the
@@ -3922,179 +4707,255 @@ impl FreshCodexState {
     /// unknown session surfaces on the pane's error banner.
     pub async fn handle_configure(&self, msg: FreshAgentConfigure) {
         let session_id = msg.session_id.clone();
-        let stored = {
-            let sessions = self.sessions.lock().await;
-            sessions.get(&session_id).map(|s| {
-                (
-                    s.model.clone(),
-                    s.effort.clone(),
-                    s.sandbox.clone(),
-                    s.permission_mode.clone(),
-                    s.cwd.clone(),
-                )
-            })
-        };
-        let Some((stored_model, stored_effort, stored_sandbox, stored_permission, stored_cwd)) =
-            stored
-        else {
-            self.emit_fresh_agent_error(
+        let target = self
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .map(|session| (session.turn_lock.clone(), session.client.clone()));
+        let Some((turn_lock, client)) = target else {
+            self.configure_error(
                 &session_id,
+                msg.request_id.as_deref(),
                 "INVALID_SESSION_ID",
                 "codex session not found",
             );
             return;
         };
-
-        let settings = &msg.settings;
-        let mut model = settings
-            .model
-            .clone()
-            .unwrap_or_else(|| stored_model.clone());
-        let effort = settings.effort.clone().or_else(|| stored_effort.clone());
-        let mut sandbox = settings
-            .sandbox
-            .map(sandbox_wire_value)
-            .or_else(|| stored_sandbox.clone());
-        let mut permission_mode = settings
-            .permission_mode
-            .clone()
-            .or_else(|| stored_permission.clone());
-        if let Err(error) = normalize_codex_permission(&mut permission_mode, &mut sandbox) {
-            self.emit_fresh_agent_error(&session_id, "INVALID_PERMISSION_MODE", error);
+        // Keep the operation's retained owner fence across both the turn wait
+        // and durable write. Never sample a replacement owner's generation.
+        let (epoch, generation) = self
+            .ownership_stamps
+            .lock()
+            .expect("ownership stamps lock")
+            .get(&session_id)
+            .map(|stamp| (Some(stamp.epoch), Some(stamp.generation)))
+            .unwrap_or((None, None));
+        let _turn = turn_lock.lock().await;
+        let stored = self
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .filter(|session| {
+                Arc::ptr_eq(&client, &session.client) && !session.exited.load(Ordering::SeqCst)
+            })
+            .map(CodexSession::effective_settings);
+        let Some(stored) = stored else {
+            self.configure_error(
+                &session_id,
+                msg.request_id.as_deref(),
+                "SESSION_RESERVED",
+                "The Codex runtime changed while settings waited; refresh before changing them.",
+            );
+            return;
+        };
+        let mut patch = msg.settings;
+        patch.cwd = patch.cwd.or(msg.cwd);
+        let effective = match CodexEffectiveSettings::resolve(&stored, &patch) {
+            Ok(settings) => settings,
+            Err(error) => {
+                self.configure_error(
+                    &session_id,
+                    msg.request_id.as_deref(),
+                    error.code,
+                    &error.message,
+                );
+                return;
+            }
+        };
+        if effective == stored {
             return;
         }
-        // Re-normalize on configure (the same idempotent pass send applies).
-        model = normalize_freshcodex_model(Some(&model));
-        let effort = normalize_freshcodex_effort(Some(&model), effort.as_deref());
-        if let Err(err) = to_codex_reasoning_effort(effort.as_deref()) {
-            self.emit_fresh_agent_error(&session_id, "INVALID_EFFORT", &err.to_string());
-            return;
-        }
-
-        let settings_changed = stored_model != model
-            || stored_effort != effort
-            || stored_sandbox != sandbox
-            || stored_permission != permission_mode;
-        if !settings_changed {
-            // Idempotent configure: nothing to converge.
-            return;
-        }
-        if let Some(session) = self.sessions.lock().await.get_mut(&session_id) {
-            session.model = model.clone();
-            session.effort = effort.clone();
-            session.sandbox = sandbox.clone();
-            session.permission_mode = permission_mode.clone();
-        }
-        let _ = self
+        if let Err(error) = self
             .record_codex_binding(
                 &session_id,
                 None,
-                &model,
-                sandbox.as_deref(),
-                permission_mode.as_deref(),
-                effort.as_deref(),
-                stored_cwd.as_deref(),
-                None,
-                // A settings record is not a new browser assertion — conn-less
-                // (the ledger merge keeps the row's prior stamps).
-                None,
-                // Unified agent names: a settings refresh carries no naming fact.
+                &effective.model,
+                effective.sandbox.as_deref(),
+                effective.permission_mode.as_deref(),
+                effective.effort.as_deref(),
+                effective.cwd.as_deref(),
+                effective.collaboration_mode,
                 None,
                 None,
                 None,
+                epoch,
+                generation,
                 false,
             )
-            .await;
+            .await
+        {
+            tracing::warn!(provider=PROVIDER, session_id=%session_id, request_id=?msg.request_id, error=%error, "freshagent.codex.configure_persist_failed");
+            self.configure_error(
+                &session_id,
+                msg.request_id.as_deref(),
+                "CODEX_SETTINGS_PERSIST_FAILED",
+                "Could not save Codex settings. The previous settings remain active; try again.",
+            );
+            return;
+        }
+        let applied = {
+            let mut sessions = self.sessions.lock().await;
+            match sessions
+                .get_mut(&session_id)
+                .filter(|session| Arc::ptr_eq(&client, &session.client))
+            {
+                Some(session) => {
+                    session.apply_settings(&effective);
+                    true
+                }
+                None => false,
+            }
+        };
+        if !applied {
+            self.configure_error(
+                &session_id,
+                msg.request_id.as_deref(),
+                "SESSION_RESERVED",
+                "The Codex runtime changed while saving settings; refresh before changing them.",
+            );
+            return;
+        }
+        self.publish_codex_settings(&session_id, &effective, msg.request_id.as_deref());
+    }
 
-        // Broadcast keyed at the CLIENT-ADDRESSED id: the client's fold
-        // resolves the sessions-map entry by it.
-        self.broadcast(&crate::session_metadata::session_metadata_frame(
-            PROVIDER,
-            SESSION_TYPE,
-            &session_id,
-            Some(model.as_str()),
-            effort.as_deref(),
-            None,
-        ));
+    fn configure_error(
+        &self,
+        session_id: &str,
+        request_id: Option<&str>,
+        code: &str,
+        message: &str,
+    ) {
+        self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            event: json!({"type":"freshAgent.error","sessionId":session_id,"requestId":request_id,"code":code,"message":message}),
+            provider: PROVIDER.into(), session_type: SESSION_TYPE.into(), session_id: session_id.into(),
+        }));
+    }
+
+    fn publish_codex_settings(
+        &self,
+        session_id: &str,
+        settings: &CodexEffectiveSettings,
+        request_id: Option<&str>,
+    ) {
+        let mut event = settings.as_json();
+        event["type"] = json!("freshAgent.session.metadata");
+        event["sessionId"] = json!(session_id);
+        event["effort"] = json!(settings.effort);
+        event["settingsScope"] = json!("next-turn");
+        if let Some(request_id) = request_id {
+            event["requestId"] = json!(request_id);
+        }
+        self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            event,
+            provider: PROVIDER.into(),
+            session_type: SESSION_TYPE.into(),
+            session_id: session_id.into(),
+        }));
     }
 
     // ── freshAgent.interrupt (WS) ────────────────────────────────────────────
 
-    /// Handle a `freshAgent.interrupt` for codex: issue `turn/interrupt` for the tracked
-    /// active turn (`activeTurnByThread.get(sessionId)`, adapter.ts:1009) and clear it on
-    /// success (adapter.ts:1027). There is NO wire ack on success — the app-server's
-    /// resulting `turn/completed{interrupted}` notification flows through the existing
-    /// STATUS-GUARDED consumer (`reduce_notification` -> `CodexSubscription::on_turn_completed`),
-    /// which emits the idle `freshAgent.session.snapshot` with NO `freshAgent.turn.complete`
-    /// edge: the interrupt is USER-initiated, so this lane arms the per-session
-    /// `user_interrupt_pending` marker BEFORE the RPC (opencode's `turn_aborted`
-    /// precedent) and disarms it again when the RPC fails (the interrupt never
-    /// landed — a later NON-user `interrupted` must still ring the unified edge).
-    /// A completion the marker did not cover (automation/rollback-forced) rings. The
-    /// marker is bounded to the CURRENT turn: the consumer clears it at the next
-    /// `turn/started` on the thread (the full opencode dispatch-clear discipline),
-    /// so an armed marker whose `interrupted` completion never arrived cannot
-    /// cross a turn boundary and silence a later turn's non-user `interrupted`.
-    /// Mirrors `ws-handler.ts:3503-3516` (fire-and-forget; `INTERNAL_ERROR` on failure).
+    /// Stop the exact owned dispatch/native turn, or latch Stop until its
+    /// native ID is known. An RPC acknowledgement resolves issuance only;
+    /// matching native terminal evidence settles work. An ambiguous response
+    /// retains both the intent and the new-start gate until proven recovery.
     pub async fn handle_interrupt(&self, msg: FreshAgentInterrupt) {
-        let session_id = msg.session_id.clone();
-
-        let looked_up = {
-            let guard = self.sessions.lock().await;
-            guard.get(&session_id).map(|s| {
-                (
-                    s.client.clone(),
-                    s.active_turn.clone(),
-                    s.turn_in_flight.clone(),
-                    s.user_interrupt_pending.clone(),
-                    // FR1-1: the retire helper clears the retired-turn slot
-                    // with the tracker + latch (a user-initiated interrupt
-                    // leaves no idle→completed gap to bridge). (E3R1: the
-                    // durable already-rang set is deliberately NOT cleared
-                    // — a stale entry can only gate its own turn's late
-                    // duplicate.)
-                    s.retired_turn_id.clone(),
-                )
-            })
-        };
-        let Some((client, active_turn, turn_in_flight, user_interrupt_pending, retired_turn_id)) =
-            looked_up
-        else {
-            self.send_error(&None, "SESSION_NOT_FOUND", "codex session not found");
-            return;
-        };
-
-        let turn_id = active_turn.lock().expect("active_turn mutex").clone();
-        let Some(turn_id) = turn_id else {
-            // adapter.ts:1017-1019 — no tracked active turn to target.
+        let session_id = msg.session_id;
+        let handles = self.sessions.lock().await.get(&session_id).map(|s| {
+            (
+                s.client.clone(),
+                s.turn_state.clone(),
+                s.active_turn.clone(),
+                s.user_interrupt_pending.clone(),
+            )
+        });
+        let Some((client, turns, active, marker)) = handles else {
             self.send_error(
-                &None,
-                "CODEX_INTERRUPT_FAILED",
-                &format!("No active Codex turn is tracked for {session_id}."),
+                &msg.request_id,
+                "SESSION_NOT_FOUND",
+                "codex session not found",
             );
             return;
         };
+        let disposition = {
+            let active = active.lock().expect("active_turn mutex").clone();
+            let mut state = turns.lock().expect("codex turn state");
+            if let Some(id) = active.as_deref() {
+                state.observe_started(id);
+            }
+            state.request_stop()
+        };
+        match disposition {
+            StopDisposition::Interrupt { dispatch, turn_id } => {
+                marker.store(true, Ordering::SeqCst);
+                self.issue_codex_interrupt(&session_id, client, turns, dispatch, turn_id)
+                    .await;
+            }
+            StopDisposition::Latched => {
+                tracing::info!(provider=PROVIDER, session_id=%session_id, "freshagent.codex.stop_latched");
+            }
+            StopDisposition::None => {
+                if !turns.lock().expect("codex turn state").has_owed_work() {
+                    self.send_error(
+                        &msg.request_id,
+                        "CODEX_INTERRUPT_FAILED",
+                        &format!("No active Codex turn is tracked for {session_id}."),
+                    );
+                }
+            }
+        }
+    }
 
-        // Arm the USER-interrupt marker BEFORE the RPC: the resulting
-        // `turn/completed{interrupted}` consumes it in the guard and stays
-        // silent. Set-first closes the race with a completion the app-server
-        // pushes immediately after processing the interrupt.
-        user_interrupt_pending.store(true, Ordering::SeqCst);
-        match client.interrupt_turn(&session_id, &turn_id).await {
+    async fn issue_codex_interrupt(
+        &self,
+        session_id: &str,
+        client: Arc<CodexAppServerClient>,
+        turns: SharedCodexTurnState,
+        dispatch: DispatchToken,
+        turn_id: String,
+    ) {
+        // Native validates the ID then queues an unqualified core interrupt.
+        // Keep new-start issuance closed until THIS operation is resolved, even
+        // if natural completion wins while its reply is held or lost.
+        let marker = self
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .filter(|s| Arc::ptr_eq(&s.client, &client))
+            .map(|s| s.user_interrupt_pending.clone());
+        if let Some(marker) = &marker {
+            marker.store(true, Ordering::SeqCst);
+        }
+        match client.interrupt_turn(session_id, &turn_id).await {
             Ok(()) => {
-                // adapter.ts:1027 — the turn is over from this call's perspective; the
-                // resulting turn/completed notification also clears it (redundant, harmless).
-                // The user-initiated interrupt ends the turn SILENTLY: retire the
-                // in-flight latch too, so a later idle crash cannot ring for a turn
-                // that already ended at the user's own hand.
-                retire_observed_turn_end(&active_turn, &turn_in_flight, &retired_turn_id);
+                turns
+                    .lock()
+                    .expect("codex turn state")
+                    .interrupt_ack(dispatch, &turn_id);
+                tracing::info!(provider=PROVIDER, session_id, native_turn_id=%turn_id, dispatch=?dispatch, "freshagent.codex.interrupt_acknowledged");
             }
             Err(err) => {
-                // The interrupt never landed — disarm so a later NON-user
-                // `interrupted` completion is not silently swallowed (the
-                // opencode abort-failure discipline).
-                user_interrupt_pending.store(false, Ordering::SeqCst);
-                self.send_error(&None, "CODEX_INTERRUPT_FAILED", &err.to_string());
+                let refused = err.is_not_submitted();
+                if refused {
+                    publish_codex_interrupt_refusal(&turns, dispatch, &turn_id, || {
+                        if let Some(marker) = marker {
+                            marker.store(false, Ordering::SeqCst);
+                        }
+                    });
+                }
+                tracing::warn!(provider=PROVIDER, session_id, native_turn_id=%turn_id, dispatch=?dispatch, refused, error=%err, "freshagent.codex.interrupt_failed");
+                self.emit_fresh_agent_error(
+                    session_id,
+                    if refused {
+                        "CODEX_INTERRUPT_FAILED"
+                    } else {
+                        "CODEX_INTERRUPT_AMBIGUOUS"
+                    },
+                    &err.to_string(),
+                );
             }
         }
     }
@@ -4289,6 +5150,11 @@ impl FreshCodexState {
                 *compact_turn_id.lock().expect("compact_turn_id mutex") = None;
             }
             self.emit_fresh_agent_error(&session_id, "CODEX_COMPACT_FAILED", &err.to_string());
+        } else if let Some(session) = self.sessions.lock().await.get(&session_id) {
+            let mut p = session.projection.lock().expect("codex projection lock");
+            let ops = p.invalidate_history(&[]);
+            broadcast_codex_event(&session_id, p.patch(ops), &self.broadcast_tx);
+            broadcast_codex_event(&session_id, p.metadata_event(), &self.broadcast_tx);
         }
     }
 
@@ -4647,6 +5513,18 @@ impl FreshCodexState {
             return;
         }
 
+        if let Some(session) = self.sessions.lock().await.get(&thread_id) {
+            let mut p = session.projection.lock().expect("codex projection lock");
+            let removed_native_ids: Vec<String> = raw_turns
+                .iter()
+                .skip_while(|turn| turn["id"] != before_turn_id)
+                .filter_map(|turn| turn["id"].as_str().map(str::to_owned))
+                .collect();
+            let ops = p.invalidate_history(&removed_native_ids);
+            broadcast_codex_event(&thread_id, p.patch(ops), &self.broadcast_tx);
+            broadcast_codex_event(&thread_id, p.metadata_event(), &self.broadcast_tx);
+        }
+
         // Converge siblings + revoke attention (decisions 6/10). The broadcast
         // carries NO prompt text (other devices' composers are untouched), and
         // a rollback NEVER chimes (no freshAgent.turn.complete).
@@ -4847,6 +5725,7 @@ impl FreshCodexState {
                     s.cwd.clone(),
                     s.sandbox.clone(),
                     s.permission_mode.clone(),
+                    s.collaboration_mode,
                     // Fork precedence source (2) (focused-ep1-r3/r5): the
                     // parent's PARKED provenance (the child pane continues
                     // the parent's lineage in the same client context).
@@ -4861,6 +5740,7 @@ impl FreshCodexState {
             parent_cwd,
             parent_sandbox,
             parent_permission_mode,
+            parent_collaboration_mode,
             parent_provenance,
         )) = looked_up
         else {
@@ -5027,6 +5907,26 @@ impl FreshCodexState {
             None,
         );
 
+        // The minted child identity and its existing ownership/cancellation
+        // guards are now armed. Refuse a changed policy through the same
+        // post-archive containment as every later startup failure, before spawn.
+        if let Err(error) = CodexAppServerClient::check_effective_approval_policy(
+            &fork_result,
+            parent_permission_mode.as_deref(),
+            "thread/fork",
+        ) {
+            tracing::warn!(event="freshagent.codex.fork_policy_refused", parent_session_id=%parent_id, session_id=%child_id, error=%error);
+            self.fail_fork_after_archive(
+                &parent_client,
+                &child_id,
+                &parent_id,
+                &reply_sink,
+                &error.to_string(),
+            )
+            .await;
+            return;
+        }
+
         // ── post-archive (failure containment applies to every step below) ──
         let fork_spawn_slot = Arc::clone(&fork_start_pid_slot);
         let fork_spawn_state = self.clone();
@@ -5131,6 +6031,24 @@ impl FreshCodexState {
             return;
         }
 
+        let mut effective = CodexEffectiveSettings {
+            model: eff_model,
+            effort: parent_effort,
+            cwd: eff_cwd,
+            sandbox: parent_sandbox,
+            permission_mode: parent_permission_mode,
+            collaboration_mode: parent_collaboration_mode,
+        };
+        effective.adopt_native(&resumed.effective_settings);
+        let CodexEffectiveSettings {
+            model: eff_model,
+            effort: parent_effort,
+            cwd: eff_cwd,
+            sandbox: parent_sandbox,
+            permission_mode: parent_permission_mode,
+            collaboration_mode: parent_collaboration_mode,
+        } = effective;
+
         // Register the child on its OWN sidecar (the shared registration tail, the
         // ensure_session_resumable shape), inheriting the parent's settings. The
         // child rollout's durable session_meta is the history-mode SoT (kata 1wxv
@@ -5148,6 +6066,8 @@ impl FreshCodexState {
             eff_cwd.clone(),
             parent_sandbox.clone(),
             parent_permission_mode.clone(),
+            parent_collaboration_mode,
+            resumed.effective_settings.clone(),
             read_rollout_history_mode(&child_id),
             fork_provenance.clone(),
         )
@@ -5169,6 +6089,7 @@ impl FreshCodexState {
                 parent_permission_mode.as_deref(),
                 parent_effort.as_deref(),
                 eff_cwd.as_deref(),
+                parent_collaboration_mode,
                 None,
                 fork_provenance.as_ref(),
                 // Unified agent names (Task 4): the fork's naming classification
@@ -5262,7 +6183,39 @@ impl FreshCodexState {
     /// unconditional `return true`, adapter.ts:1211-1215) — `ws-handler.ts:3607-3626` always
     /// sends `success:true`. Never touches a process this session did not itself spawn.
     pub async fn handle_kill(&self, msg: FreshAgentKill) {
-        self.handle_stop(msg, CodexStopMode::Close).await;
+        let _ = self.handle_stop(msg, CodexStopMode::Close, None).await;
+    }
+
+    pub(crate) async fn abandon_created_runtime(
+        &self,
+        session_id: &str,
+        ownership_id: &str,
+    ) -> Result<(), crate::rest_lane::RestLaneError> {
+        let result = self
+            .handle_stop(
+                FreshAgentKill {
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    session_id: session_id.into(),
+                    cwd: None,
+                    observed_epoch: None,
+                    observed_generation: None,
+                },
+                CodexStopMode::Close,
+                Some(ownership_id),
+            )
+            .await;
+        match &result {
+            Ok(()) => tracing::info!(
+                event = "freshagent.codex.rest_lane.create_abandoned",
+                session_id,
+                ownership_id
+            ),
+            Err(error) => {
+                tracing::warn!(event="freshagent.codex.rest_lane.create_abandon_failed", session_id, ownership_id, code=%error.code)
+            }
+        }
+        result
     }
 
     /// Stop only the owned writer so the persisted Codex thread can be resumed.
@@ -5286,18 +6239,20 @@ impl FreshCodexState {
         let mode = CodexStopMode::Recovery {
             request_id: msg.request_id,
         };
-        self.handle_stop(
-            FreshAgentKill {
-                provider: msg.provider,
-                session_id: msg.session_id,
-                session_type: msg.session_type,
-                cwd: None,
-                observed_epoch: msg.observed_epoch,
-                observed_generation: msg.observed_generation,
-            },
-            mode,
-        )
-        .await;
+        let _ = self
+            .handle_stop(
+                FreshAgentKill {
+                    provider: msg.provider,
+                    session_id: msg.session_id,
+                    session_type: msg.session_type,
+                    cwd: None,
+                    observed_epoch: msg.observed_epoch,
+                    observed_generation: msg.observed_generation,
+                },
+                mode,
+                None,
+            )
+            .await;
     }
 
     fn broadcast_stop_result(&self, mode: &CodexStopMode, frame: &ServerMessage) {
@@ -5331,8 +6286,41 @@ impl FreshCodexState {
         }
     }
 
-    async fn handle_stop(&self, msg: FreshAgentKill, mode: CodexStopMode) {
+    async fn handle_stop(
+        &self,
+        msg: FreshAgentKill,
+        mode: CodexStopMode,
+        expected_owner: Option<&str>,
+    ) -> Result<(), crate::rest_lane::RestLaneError> {
         let session_id = msg.session_id.clone();
+
+        // A create receipt identifies only the incarnation it established. Capture
+        // its retained authority before any stop claim or awaited durable work.
+        let expected_stamp = if let Some(expected) = expected_owner {
+            let sessions = self.sessions.lock().await;
+            let Some(session) = sessions
+                .get(&session_id)
+                .filter(|session| session.sidecar_ownership_id == expected)
+            else {
+                return Ok(());
+            };
+            if self.ownership.is_some() {
+                let stamp =
+                    crate::ownership_lane::peek_retained_stamp(&self.ownership_stamps, &session_id)
+                        .filter(|stamp| {
+                            stamp.owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                                && stamp.owner.live_session_key.as_deref()
+                                    == Some(session_id.as_str())
+                                && stamp.owner.pid == session.sidecar_pid
+                        })
+                        .ok_or_else(codex_cleanup_error)?;
+                Some(stamp)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // b8ke delta review F7: a half-sent observed pair (exactly one of
         // epoch/generation) is the typed invalid-fence refusal — BEFORE the
@@ -5356,7 +6344,7 @@ impl FreshCodexState {
                             message: Some(err.message().to_string()),
                         }),
                     );
-                    return;
+                    return Err(codex_cleanup_error());
                 }
             };
 
@@ -5381,9 +6369,12 @@ impl FreshCodexState {
         // b8ke e3r3 F7: the granted stop's settlement guard.
         let mut _stop_settlement: Option<crate::ownership_lane::StopSettlementGuard> = None;
         if let Some(registry) = self.ownership.as_ref() {
-            if let Some(stamp) =
+            let stamp = if expected_owner.is_some() {
+                expected_stamp
+            } else {
                 crate::ownership_lane::peek_retained_stamp(&self.ownership_stamps, &session_id)
-            {
+            };
+            if let Some(stamp) = stamp {
                 let claim = crate::ownership_lane::stop_claim_from_stamp(&stamp, stop_fence);
                 let kill_op_id = format!("kill-{}", uuid::Uuid::new_v4());
                 let stop_outcome = crate::ownership_lane::begin_fresh_agent_stop(
@@ -5473,7 +6464,7 @@ impl FreshCodexState {
                             message: Some(refusal_message),
                         }),
                     );
-                    return;
+                    return Err(codex_cleanup_error());
                 }
             } else {
                 // b8ke delta round-3 F1: NO retained stamp — the kill STILL
@@ -5513,7 +6504,7 @@ impl FreshCodexState {
                                     ),
                                 }),
                             );
-                            return;
+                            return Err(codex_cleanup_error());
                         }
                         let claim = freshell_ownership::StopClaim {
                             expected_kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
@@ -5613,7 +6604,7 @@ impl FreshCodexState {
                                         message: Some(refusal_message),
                                     }),
                                 );
-                                return;
+                                return Err(codex_cleanup_error());
                             }
                         }
                     }
@@ -5638,7 +6629,7 @@ impl FreshCodexState {
                                     .to_string(),
                             ),
                         }));
-                        return;
+                        return Err(codex_cleanup_error());
                     }
                     freshell_ownership::OwnershipState::Starting { .. }
                     | freshell_ownership::OwnershipState::Stopping { .. } => {
@@ -5661,7 +6652,7 @@ impl FreshCodexState {
                                 ),
                             }),
                         );
-                        return;
+                        return Err(codex_cleanup_error());
                     }
                     freshell_ownership::OwnershipState::Fenced { .. } => {
                         tracing::warn!(target: "freshell_freshagent::codex",
@@ -5684,7 +6675,7 @@ impl FreshCodexState {
                                 ),
                             }),
                         );
-                        return;
+                        return Err(codex_cleanup_error());
                     }
                     _ => {
                         // Genuinely Vacant (or residue): lane-local cleanup
@@ -5697,16 +6688,46 @@ impl FreshCodexState {
         // Record the sidecar identity before the first teardown await. If the
         // bounded watcher window cannot prove the complete writer tree dead,
         // the deferred confirmation keeps this exact identity fenced.
-        let condemned_ownership_id = self.record_condemned_prior(&session_id).await;
+        let cleanup_removed = if let Some(expected) = expected_owner {
+            let mut sessions = self.sessions.lock().await;
+            if sessions
+                .get(&session_id)
+                .is_none_or(|session| session.sidecar_ownership_id != expected)
+            {
+                return Err(codex_cleanup_error());
+            }
+            sessions.remove(&session_id)
+        } else {
+            None
+        };
+        let condemned_ownership_id = if let Some(session) = &cleanup_removed {
+            if let Some(pid) = session.sidecar_pid {
+                let recorded = crate::session_lease::record_condemned_runtime_identity(
+                    pid,
+                    CODEX_SIDECAR_OWNERSHIP_ENV,
+                    &session.sidecar_ownership_id,
+                );
+                self.condemned_priors
+                    .lock()
+                    .expect("condemned priors lock")
+                    .insert(session_id.clone(), recorded);
+                Some(session.sidecar_ownership_id.clone())
+            } else {
+                None
+            }
+        } else {
+            self.record_condemned_prior(&session_id).await
+        };
 
         // Ordinary close retires the pane-ledger row before teardown. Recovery
         // keeps that durable binding so a new writer can resume this thread.
         // A failed ordinary close stops before touching the live process.
-        let close_answer = if matches!(mode, CodexStopMode::Recovery { .. }) {
-            crate::identity_sink::CloseAnswer::Recorded
-        } else {
-            self.retire_closed_row(&session_id).await
-        };
+        let close_answer =
+            if expected_owner.is_some() || matches!(mode, CodexStopMode::Recovery { .. }) {
+                crate::identity_sink::CloseAnswer::Recorded
+            } else {
+                self.retire_closed_row(&session_id).await
+            };
         if close_answer == crate::identity_sink::CloseAnswer::Failed {
             // b8ke e3r2 F4 + e3r3 F2/F8: THE LIVENESS VERDICT COMES FIRST —
             // exactly ONE mutation path follows from it (pre-e3r3 the
@@ -5785,13 +6806,22 @@ impl FreshCodexState {
                     ),
                 }),
             );
-            return;
+            return Err(codex_cleanup_error());
         }
         let close_reported_failure = close_answer == crate::identity_sink::CloseAnswer::Persisted;
 
-        self.clear_controls(&session_id).await;
+        if let Some(session) = &cleanup_removed {
+            self.clear_source_controls(&session_id, &session.projection)
+                .await;
+        } else {
+            self.clear_controls(&session_id).await;
+        }
 
-        let removed = self.sessions.lock().await.remove(&session_id);
+        let removed = if expected_owner.is_some() {
+            cleanup_removed
+        } else {
+            self.sessions.lock().await.remove(&session_id)
+        };
         if let Some(session) = removed.as_ref() {
             // Requested teardown ends the probe's wait even when the provider never
             // emits turn/completed. Signal before closing the client so an in-flight
@@ -5953,6 +6983,27 @@ impl FreshCodexState {
                     ));
                 }
             }
+        } else if expected_owner.is_some() {
+            match teardown {
+                crate::session_handoff::StopResult::Reaped
+                | crate::session_handoff::StopResult::AlreadyGone => {}
+                crate::session_handoff::StopResult::NotConfirmed { confirmation } => {
+                    tokio::spawn(async move {
+                        let _ = confirmation.await;
+                    });
+                    kill_failure = Some((
+                        "TEARDOWN_NOT_CONFIRMED",
+                        "the owned Codex process tree is not yet confirmed stopped".into(),
+                    ));
+                }
+                crate::session_handoff::StopResult::PlatformLimited => {
+                    kill_failure = Some((
+                        "TEARDOWN_PLATFORM_LIMITED",
+                        "the complete owned Codex process tree could not be verified stopped"
+                            .into(),
+                    ));
+                }
+            }
         }
 
         // Explicit kill evicts this session's requestId dedup cache entries (mirrors
@@ -5965,6 +7016,7 @@ impl FreshCodexState {
             .clear_for_session(|record| record.session_id == session_id)
             .await;
 
+        let success = !close_reported_failure && kill_failure.is_none();
         self.broadcast_stop_result(
             &mode,
             &ServerMessage::FreshAgentKilled(FreshAgentKilled {
@@ -5974,11 +7026,16 @@ impl FreshCodexState {
                 // A persisted-despite-error close ends the session (consistent
                 // with the durable close) but the kill visibly fails
                 // (delta-r6-r4, focused-episode-6 round 3 Finding 3).
-                success: !close_reported_failure && kill_failure.is_none(),
+                success,
                 code: kill_failure.as_ref().map(|(code, _)| code.to_string()),
                 message: kill_failure.map(|(_, message)| message),
             }),
         );
+        if success {
+            Ok(())
+        } else {
+            Err(codex_cleanup_error())
+        }
     }
 
     /// The kill-side lane of `retire_closed` (delta-review round 5):
@@ -6020,6 +7077,29 @@ impl FreshCodexState {
         guard
             .get(session_id)
             .is_some_and(|s| !s.exited.load(Ordering::SeqCst))
+    }
+
+    pub(crate) async fn created_rest_settings(
+        &self,
+        session_id: &str,
+        expected_owner: Option<&str>,
+    ) -> Option<Value> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(session_id)?;
+        if session.exited.load(Ordering::SeqCst)
+            || expected_owner.is_some_and(|owner| owner != session.sidecar_ownership_id)
+        {
+            return None;
+        }
+        crate::ownership_lane::current_local_snapshot_owner(
+            &self.ownership,
+            &self.ownership_stamps,
+            PROVIDER,
+            session_id,
+            session_id,
+            session.sidecar_pid,
+        )?;
+        Some(session.effective_settings().as_json())
     }
 
     pub(crate) async fn local_snapshot_owner(
@@ -6343,10 +7423,9 @@ impl FreshCodexState {
     /// the OLD mint-new path silently discarded the model's memory of the conversation).
     ///
     /// If the app-server rejects the resume WITH those settings for any reason other than a
-    /// genuine "thread not found" (a stale/invalid model or sandbox value, say), one retry is
-    /// made with NO settings at all -- `handle_send`'s own "re-normalize on send" already
-    /// re-applies the real settings on the next turn, so a resume succeeding with defaults is
-    /// strictly better than failing over a value we can't currently validate.
+    /// genuine "thread not found", one retry may omit a stale model. File access
+    /// and approval remain exact on that retry. Untrusted policy refusal returns
+    /// directly, preserving its prepared-source diagnostic before any work.
     ///
     /// Only a genuine `threadNotFound` on resume ([`is_codex_thread_not_found`]) falls back to
     /// the ORIGINAL mint-new-thread behavior ([`Self::respawn_as_new_thread_after_crash`]):
@@ -6400,6 +7479,7 @@ impl FreshCodexState {
             session_effort,
             session_sandbox,
             session_permission_mode,
+            session_collaboration_mode,
             session_provenance,
         ) = {
             let guard = self.sessions.lock().await;
@@ -6413,6 +7493,7 @@ impl FreshCodexState {
                 session.effort.clone(),
                 session.sandbox.clone(),
                 session.permission_mode.clone(),
+                session.collaboration_mode,
                 // D8 (focused-ep1-r3): the parked provenance rides ACROSS the
                 // recovery rebuild below (and into the mint-new fallback) — the
                 // same logical session continues; nothing new is invented (the
@@ -6425,25 +7506,30 @@ impl FreshCodexState {
         // P1.13 (Task 5, R2): a blank stored model means this registration came from a
         // settings-less resume (a record miss at R3 time) -- fall back to the ledger
         // record so crash recovery doesn't silently respawn onto defaults.
-        let (model, sandbox, permission_mode, effort) = if session_model.is_empty() {
-            let rec = self
-                .identity_sink()
-                .and_then(|s| s.load_settings("codex", session_id))
-                .unwrap_or_default();
-            (
-                rec.model.unwrap_or_default(),
-                rec.sandbox,
-                rec.permission_mode,
-                rec.effort,
-            )
-        } else {
-            (
-                session_model,
-                session_sandbox,
-                session_permission_mode,
-                session_effort,
-            )
-        };
+        let (model, sandbox, permission_mode, effort, collaboration_mode) =
+            if session_model.is_empty() {
+                let rec = self
+                    .identity_sink()
+                    .and_then(|s| s.load_settings("codex", session_id))
+                    .unwrap_or_default();
+                (
+                    rec.model.unwrap_or_default(),
+                    rec.sandbox,
+                    rec.permission_mode,
+                    rec.effort,
+                    rec.collaboration_mode
+                        .as_deref()
+                        .and_then(CodexWorkMode::parse),
+                )
+            } else {
+                (
+                    session_model,
+                    session_sandbox,
+                    session_permission_mode,
+                    session_effort,
+                    session_collaboration_mode,
+                )
+            };
 
         // Single-flight: acquire (and possibly create) this session id's per-thread lock,
         // shared with `ensure_session_resumable`'s map so a concurrent historical-thread
@@ -6612,6 +7698,7 @@ impl FreshCodexState {
                     effort,
                     sandbox,
                     permission_mode,
+                    collaboration_mode,
                     lease_guard,
                     session_provenance,
                 )
@@ -6685,18 +7772,22 @@ impl FreshCodexState {
         let resume_result = match first_attempt {
             Ok(started) => Ok(started),
             Err(err) if is_codex_thread_not_found(&err) => Err(err),
-            // Not a "thread not found" -- retry once with no settings at all in case the
-            // app-server rejected one of them; `handle_send` re-applies the real settings
-            // on the next turn regardless.
-            Err(_) => {
+            // A retry without settings would drop prepared/explicit untrusted
+            // intent. Preserve the original typed refusal before any work.
+            Err(error) if permission_mode.as_deref() == Some("untrusted") => Err(error),
+            // A stale model may be unavailable after a provider update. Keep
+            // file access and approval intent on this retry: native defaults
+            // must never turn a settings refusal into broader access.
+            Err(error) => {
+                tracing::warn!(provider=PROVIDER, session_id=%session_id, cause=%error, "freshagent.codex.resume_retry_without_model");
                 client
                     .resume_thread(
                         session_id,
                         StartThreadParams {
                             cwd: cwd.clone(),
                             model: None,
-                            sandbox: None,
-                            approval_policy: None,
+                            sandbox: sandbox.clone(),
+                            approval_policy: permission_mode.clone(),
                             history_mode: None, // resume carries no mode param
                         },
                     )
@@ -6712,8 +7803,53 @@ impl FreshCodexState {
                 // and fall back to the ORIGINAL mint-new-thread recovery on a fresh sidecar.
                 client.close().await;
                 let mut dead_child = child;
-                let _ = dead_child.start_kill();
-                reap_owned_codex_sidecars(&ownership_id);
+                let recorded = crate::session_lease::record_condemned_runtime_identity(
+                    dead_child.id().unwrap_or(0),
+                    CODEX_SIDECAR_OWNERSHIP_ENV,
+                    &ownership_id,
+                );
+                if !confirm_codex_tree_dead(&recorded, self.sidecar_cleanup_probe.get().cloned())
+                    .await
+                {
+                    // No user input was dispatched. Retain exact cleanup
+                    // evidence and claims until the owned tree is confirmed.
+                    self.condemned_priors
+                        .lock()
+                        .expect("condemned priors lock")
+                        .insert(session_id.to_string(), recorded.clone());
+                    let confirmation = codex_tree_death_escalation(
+                        recorded,
+                        ownership_id.clone(),
+                        session_id.to_string(),
+                        self.sidecar_cleanup_probe.get().cloned(),
+                    );
+                    let state = self.clone();
+                    let key = session_id.to_string();
+                    tokio::spawn(async move {
+                        if confirmation.await {
+                            let _ = dead_child.wait().await;
+                            crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
+                            state.clear_condemned_prior_if_matching(&key, &ownership_id);
+                            if let Some(mut guard) = lease_guard {
+                                guard.fail();
+                            }
+                            drop(own_ticket);
+                        } else {
+                            std::future::pending::<()>().await;
+                            drop((dead_child, lease_guard, own_ticket));
+                        }
+                    });
+                    tracing::warn!(
+                        provider = PROVIDER,
+                        session_id,
+                        "freshagent.codex.failed_resume_cleanup_unconfirmed"
+                    );
+                    return Err(EnsureAliveError::RespawnFailed(
+                        "the failed Codex resume's owned process tree is not yet confirmed stopped"
+                            .into(),
+                    ));
+                }
+                let _ = dead_child.wait().await;
                 crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                 // FIX (CODEX-FIRST triage Finding 2): remember this id as genuinely gone so
                 // a later attach/create against it fails fast instead of repeating this same
@@ -6731,6 +7867,7 @@ impl FreshCodexState {
                         effort,
                         sandbox,
                         permission_mode,
+                        collaboration_mode,
                         lease_guard,
                         session_provenance,
                     )
@@ -6774,6 +7911,24 @@ impl FreshCodexState {
             )));
         }
 
+        let mut effective = CodexEffectiveSettings {
+            model,
+            effort,
+            cwd,
+            sandbox,
+            permission_mode,
+            collaboration_mode,
+        };
+        effective.adopt_native(&started.effective_settings);
+        let CodexEffectiveSettings {
+            model,
+            effort,
+            cwd,
+            sandbox,
+            permission_mode,
+            collaboration_mode,
+        } = effective;
+
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let user_interrupt_pending: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         let quiet_deadman = QuietDeadman::new_shared();
@@ -6790,10 +7945,29 @@ impl FreshCodexState {
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
         let event_emission_gate = Arc::new(TokioMutex::new(()));
+        let turn_state = Arc::new(StdMutex::new(CodexTurnState::default()));
+        let projection = Arc::new(StdMutex::new(projection::CodexProjection::new(
+            mint_ownership_id(),
+            session_id.to_string(),
+        )));
+        let prior_projection = self
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .map(|session| session.projection.clone());
+        if let Some(prior) = prior_projection {
+            projection
+                .lock()
+                .expect("codex projection lock")
+                .inherit_finite_history(&prior.lock().expect("prior codex projection lock"));
+        }
+
         let exited = Arc::new(AtomicBool::new(false));
         let consumer = self.spawn_consumer(
             notifs,
             CodexConsumerRuntime {
+                turn_state: turn_state.clone(),
                 thread_id: session_id.to_string(),
                 active_turn: active_turn.clone(),
                 user_interrupt_pending: user_interrupt_pending.clone(),
@@ -6805,13 +7979,14 @@ impl FreshCodexState {
                 compact_in_flight: compact_in_flight.clone(),
                 compact_turn_id: compact_turn_id.clone(),
                 event_emission_gate: event_emission_gate.clone(),
+                projection: projection.clone(),
             },
         );
         let (kill_tx, kill_rx) = oneshot::channel();
         // b8ke focused round-2 R2-1: the condemned-prior identity (pid + tag).
         let sidecar_pid = child.id();
         let sidecar_ownership_id = ownership_id.clone();
-        let watcher = spawn_exit_watcher(
+        let watcher = spawn_exit_watcher_tracking_turns(
             child,
             ownership_id,
             session_id.to_string(),
@@ -6825,6 +8000,8 @@ impl FreshCodexState {
             last_turn_complete_at.clone(),
             Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
+            Some(turn_state.clone()),
+            Some(self.clone()),
         );
 
         // `HashMap::insert` on an existing key overwrites in place, dropping the old (dead
@@ -6838,6 +8015,10 @@ impl FreshCodexState {
             guard.insert(
                 session_id.to_string(),
                 CodexSession {
+                    collaboration_mode,
+                    native_turn_settings: None,
+                    native_thread_settings: Some(started.effective_settings.clone()),
+                    turn_state: turn_state.clone(),
                     client,
                     model: model.clone(),
                     effort: effort.clone(),
@@ -6855,6 +8036,7 @@ impl FreshCodexState {
                     history_mode: read_rollout_history_mode(session_id),
                     turn_lock: Arc::new(TokioMutex::new(())),
                     event_emission_gate,
+                    projection,
                     consumer,
                     kill_tx: Some(kill_tx),
                     watcher,
@@ -6889,6 +8071,7 @@ impl FreshCodexState {
                 permission_mode.as_deref(),
                 effort.as_deref(),
                 cwd.as_deref(),
+                collaboration_mode,
                 None,
                 None,
                 // Unified agent names: a refresh carries no naming fact.
@@ -6963,6 +8146,7 @@ impl FreshCodexState {
         effort: Option<String>,
         sandbox: Option<String>,
         permission_mode: Option<String>,
+        collaboration_mode: Option<CodexWorkMode>,
         mut lease_guard: Option<crate::FreshSessionLeaseGuard>,
         // D8 (focused-ep1-r3): the crashed session's parked provenance, CARRIED
         // onto the mint-new record below (the identity moved; the same logical
@@ -6998,8 +8182,8 @@ impl FreshCodexState {
                 history_mode: Some(HistoryMode::Paginated),
             })
             .await;
-        let new_thread_id = match started {
-            Ok(started) => started.thread_id,
+        let started = match started {
+            Ok(started) => started,
             Err(err) => {
                 client.close().await;
                 let mut child = child;
@@ -7013,6 +8197,25 @@ impl FreshCodexState {
                 return Err(EnsureAliveError::RespawnFailed(err.to_string()));
             }
         };
+
+        let new_thread_id = started.thread_id.clone();
+        let mut effective = CodexEffectiveSettings {
+            model,
+            effort,
+            cwd,
+            sandbox,
+            permission_mode,
+            collaboration_mode,
+        };
+        effective.adopt_native(&started.effective_settings);
+        let CodexEffectiveSettings {
+            model,
+            effort,
+            cwd,
+            sandbox,
+            permission_mode,
+            collaboration_mode,
+        } = effective;
 
         // kata b8ke Task 3: the mint-new fallback MINTS the canonical thread
         // id — claim it under the NEW key (no fence: a minted id was never
@@ -7100,10 +8303,16 @@ impl FreshCodexState {
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
         let event_emission_gate = Arc::new(TokioMutex::new(()));
+        let turn_state = Arc::new(StdMutex::new(CodexTurnState::default()));
         let exited = Arc::new(AtomicBool::new(false));
+        let projection = Arc::new(StdMutex::new(projection::CodexProjection::new(
+            mint_ownership_id(),
+            new_thread_id.to_string(),
+        )));
         let consumer = self.spawn_consumer(
             notifs,
             CodexConsumerRuntime {
+                turn_state: turn_state.clone(),
                 thread_id: new_thread_id.clone(),
                 active_turn: active_turn.clone(),
                 user_interrupt_pending: user_interrupt_pending.clone(),
@@ -7115,13 +8324,14 @@ impl FreshCodexState {
                 compact_in_flight: compact_in_flight.clone(),
                 compact_turn_id: compact_turn_id.clone(),
                 event_emission_gate: event_emission_gate.clone(),
+                projection: projection.clone(),
             },
         );
         let (kill_tx, kill_rx) = oneshot::channel();
         // b8ke focused round-2 R2-1: the condemned-prior identity (pid + tag).
         let sidecar_pid = child.id();
         let sidecar_ownership_id = ownership_id.clone();
-        let watcher = spawn_exit_watcher(
+        let watcher = spawn_exit_watcher_tracking_turns(
             child,
             ownership_id,
             new_thread_id.clone(),
@@ -7135,6 +8345,8 @@ impl FreshCodexState {
             last_turn_complete_at.clone(),
             Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
+            Some(turn_state.clone()),
+            Some(self.clone()),
         );
 
         {
@@ -7143,6 +8355,10 @@ impl FreshCodexState {
             guard.insert(
                 new_thread_id.clone(),
                 CodexSession {
+                    collaboration_mode,
+                    native_turn_settings: None,
+                    native_thread_settings: Some(started.effective_settings.clone()),
+                    turn_state: turn_state.clone(),
                     client,
                     model: model.clone(),
                     effort: effort.clone(),
@@ -7156,6 +8372,7 @@ impl FreshCodexState {
                     history_mode: Some(HistoryMode::Paginated),
                     turn_lock: Arc::new(TokioMutex::new(())),
                     event_emission_gate,
+                    projection,
                     consumer,
                     kill_tx: Some(kill_tx),
                     watcher,
@@ -7221,6 +8438,7 @@ impl FreshCodexState {
                 permission_mode.as_deref(),
                 effort.as_deref(),
                 cwd.as_deref(),
+                collaboration_mode,
                 Some(old_session_id),
                 // D8: conn-less crash-respawn — provenance `None`; the ledger
                 // inherits the superseded parent's stamps (fork-chain rule).
@@ -7422,13 +8640,7 @@ impl FreshCodexState {
 
         #[cfg(target_os = "linux")]
         if self.sidecar_launch_context.provider_exec_profile {
-            let additional = if codex_program == "/usr/bin/setpriv" {
-                &["codex"][..]
-            } else {
-                &[]
-            };
-            freshell_platform::provider_exec::check_command(cmd.as_std(), true, additional)
-                .map_err(|error| error.to_string())?;
+            freshell_codex::managed_launch::check_command(cmd.as_std())?;
         }
         let mut child = cmd
             .spawn()
@@ -7536,6 +8748,7 @@ impl FreshCodexState {
         created_gate: Option<oneshot::Receiver<()>>,
     ) -> tokio::task::JoinHandle<()> {
         let CodexConsumerRuntime {
+            turn_state,
             thread_id,
             active_turn,
             user_interrupt_pending,
@@ -7547,11 +8760,32 @@ impl FreshCodexState {
             compact_in_flight,
             compact_turn_id,
             event_emission_gate,
+            projection,
         } = runtime;
+        let seeded = active_turn.lock().expect("active_turn mutex").clone();
+        if let Some(id) = seeded.as_deref() {
+            turn_state
+                .lock()
+                .expect("codex turn state")
+                .observe_started(id);
+        }
         let broadcast_tx = self.broadcast_tx.clone();
         // The deadman feed needs the state handle (window config + waiter spawn); a
         // clone is all-Arc, cheap, and adds no lifecycle coupling (the state is the
         // server-global `FreshCodexState`, alive for the process's whole life anyway).
+        let retained_floor = self
+            .attention
+            .snapshot()
+            .into_iter()
+            .find(|mark| mark.session_id == thread_id)
+            .and_then(|mark| mark.last_turn_complete_at);
+        {
+            let mut clock = last_turn_complete_at
+                .lock()
+                .expect("attention complete clock");
+            *clock = (*clock).max(retained_floor);
+        }
+        self.attention.observe(&thread_id, SESSION_TYPE);
         let state = self.clone();
         tokio::spawn(async move {
             if let Some(gate) = created_gate {
@@ -7568,7 +8802,28 @@ impl FreshCodexState {
             let mut subscription = CodexSubscription::new(thread_id.clone())
                 .with_user_interrupt_pending(user_interrupt_pending)
                 .with_last_turn_complete_at(last_turn_complete_at.clone());
-            while let Some(notification) = notifs.recv().await {
+            let mut projection_announced = false;
+            let mut patch_tick = tokio::time::interval(Duration::from_millis(33));
+            patch_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                let notification = tokio::select! {
+                    notification = notifs.recv() => match notification { Some(n) => n, None => break },
+                    _ = patch_tick.tick() => {
+                        let _emission = event_emission_gate.lock().await;
+                        flush_codex_projection(&projection, &thread_id, &broadcast_tx);
+                        continue;
+                    }
+                };
+                if projection
+                    .lock()
+                    .expect("codex projection lock")
+                    .source_retired()
+                {
+                    continue;
+                }
+                state
+                    .observe_child_control_turn(&thread_id, &projection, &notification)
+                    .await;
                 // Unified agent names (Task 3): an upstream `thread/name/updated`
                 // is a NATIVE title observation — automatic provider metadata,
                 // folded at the store's current location revision. It emits no
@@ -7621,9 +8876,11 @@ impl FreshCodexState {
                 // turn. Every notification capable of emitting a wire frame stays
                 // behind the barrier below.
                 if matches!(&notification, CodexNotification::TurnStarted(_)) {
+                    project_codex_notification(&projection, &notification);
                     let events = reduce_notification(
                         &mut subscription,
                         notification,
+                        &turn_state,
                         &active_turn,
                         &turn_in_flight,
                         &quiet_deadman,
@@ -7644,8 +8901,58 @@ impl FreshCodexState {
                 // also ensures an immediate completion cannot retire a just-started
                 // turn before handle_send has recorded its returned turn id.
                 let _emission = event_emission_gate.lock().await;
+                // A native item is projected before lifecycle/control emission.
+                // Appends wait at most 33 ms; every boundary flushes in order.
+                let append = matches!(&notification, CodexNotification::Other { method, .. } if method.ends_with("Delta") || method.ends_with("/delta"));
+                if !append {
+                    flush_codex_projection(&projection, &thread_id, &broadcast_tx);
+                }
+                let has_patch = project_codex_notification(&projection, &notification);
+                state.notify_retained();
+                if has_patch {
+                    if !projection_announced {
+                        let p = projection.lock().expect("codex projection lock");
+                        broadcast_codex_event(
+                            &thread_id,
+                            json!({"type":"freshAgent.session.init","sessionId":thread_id,"projectionId":p.id,"historyGeneration":p.history_generation}),
+                            &broadcast_tx,
+                        );
+                        projection_announced = true;
+                    }
+                    if !append {
+                        flush_codex_projection(&projection, &thread_id, &broadcast_tx);
+                    }
+                }
+                if let CodexNotification::Other {
+                    method,
+                    params: Some(params),
+                } = &notification
+                {
+                    if params["threadId"] == thread_id
+                        && matches!(
+                            method.as_str(),
+                            "thread/tokenUsage/updated" | "turn/plan/updated" | "turn/diff/updated"
+                        )
+                    {
+                        let p = projection.lock().expect("codex projection lock");
+                        broadcast_codex_event(&thread_id, p.metadata_event(), &broadcast_tx);
+                    }
+                    if params["threadId"] == thread_id && method == "error" {
+                        // Retry notices never replace the lifecycle's failed-turn
+                        // result. Only native diagnostics are shown, never payloads.
+                        let message = params["error"]["message"]
+                            .as_str()
+                            .unwrap_or("Codex reported a provider error");
+                        let event = if params["willRetry"] == true {
+                            json!({"type":"freshAgent.retry","attempt":params["retryAttempt"].as_u64().unwrap_or(1),"error":message})
+                        } else {
+                            json!({"type":"freshAgent.notice","level":"error","code":"CODEX_PROVIDER_ERROR","message":message})
+                        };
+                        broadcast_codex_event(&thread_id, event, &broadcast_tx);
+                    }
+                }
                 if state
-                    .consume_control_notification(&thread_id, &notification)
+                    .consume_control_notification(&thread_id, &notification, &projection)
                     .await
                 {
                     // A control-consumed notification (an approval/question
@@ -7659,6 +8966,7 @@ impl FreshCodexState {
                 let events = reduce_notification(
                     &mut subscription,
                     notification,
+                    &turn_state,
                     &active_turn,
                     &turn_in_flight,
                     &quiet_deadman,
@@ -7670,10 +8978,24 @@ impl FreshCodexState {
                     &last_turn_complete_at,
                     &broadcast_tx,
                 );
-                for event in events {
+                for mut event in events {
+                    if turn_state
+                        .lock()
+                        .expect("codex turn state")
+                        .has_stopping_work()
+                    {
+                        if let CodexAdapterEvent::StatusSnapshot { status, .. } = &mut event {
+                            if *status == CodexStatus::Idle {
+                                *status = CodexStatus::Running;
+                            }
+                        }
+                    }
                     // DIAG-01: the positive turn-complete chime only -- session_id
                     // alone, never the turn's text/response content.
-                    if let CodexAdapterEvent::TurnComplete { session_id, .. } = &event {
+                    if let CodexAdapterEvent::TurnComplete { session_id, at } = &event {
+                        state
+                            .attention
+                            .record_turn_complete(session_id, SESSION_TYPE, *at);
                         tracing::info!(provider = PROVIDER, session_id = %session_id, "freshagent.turn.complete");
                         // Unified agent names (Task 2): a completed turn wrote
                         // history, so the thread's rollout has materialized —
@@ -7696,7 +9018,7 @@ impl FreshCodexState {
                             None => None,
                         };
                         if let Some(transition) = state
-                            .try_bind_pending_naming(session_id, codex_home.as_deref())
+                            .try_materialize_naming(session_id, codex_home.as_deref())
                             .await
                         {
                             tracing::debug!(
@@ -7707,13 +9029,23 @@ impl FreshCodexState {
                             );
                         }
                     }
+                    if let CodexAdapterEvent::StatusSnapshot { status, .. }
+                    | CodexAdapterEvent::Status { status, .. } = &event
+                    {
+                        projection
+                            .lock()
+                            .expect("codex projection lock")
+                            .observe_status(status.as_str());
+                    }
                     let frame = adapter_event_to_frame(&event, &thread_id);
                     if let Some(frame) = frame {
+                        state.notify_retained();
                         let _ = broadcast_tx.send(frame);
                     }
                 }
             }
-            state.clear_controls(&thread_id).await;
+            flush_codex_projection(&projection, &thread_id, &broadcast_tx);
+            state.clear_source_controls(&thread_id, &projection).await;
         })
     }
 
@@ -7750,6 +9082,9 @@ impl FreshCodexState {
     /// armed window) and the epoch hasn't already fired. Used by [`Self::get_snapshot`]
     /// after it seeds an observed mid-flight turn (the U-1 repair).
     fn arm_codex_quiet_if_absent(&self, thread_id: &str, quiet: &Arc<StdMutex<QuietDeadman>>) {
+        if self.awaited_control_count(thread_id) != 0 {
+            return;
+        }
         let window_ms = self.codex_quiet_window_ms();
         let Some(generation) = quiet
             .lock()
@@ -7790,7 +9125,7 @@ impl FreshCodexState {
         // "Turn still in flight" reads the dispatch-time latch — the lane's
         // turn-in-flight authority — at the deadline.
         let fired = crate::quiet_deadman::wait_for_quiet_deadline(&quiet, generation, || {
-            turn_in_flight.load(Ordering::SeqCst)
+            turn_in_flight.load(Ordering::SeqCst) && self.awaited_control_count(&thread_id) == 0
         })
         .await;
         if !fired {
@@ -7814,6 +9149,7 @@ impl FreshCodexState {
             &thread_id,
             &self.broadcast_tx,
             "quiet_deadman",
+            Some(&self),
         );
     }
 
@@ -7866,14 +9202,105 @@ impl FreshCodexState {
         // this port previously had no fallback at all, so ANY such rejection became an
         // unconditional 500. Retry once with `includeTurns:false`, matching the reference
         // exactly (still a valid, if turn-less, snapshot).
-        let raw = match client.read_thread(thread_id, true).await {
-            Ok(raw) => raw,
-            Err(err) if is_codex_include_turns_unavailable(&err) => client
-                .read_thread(thread_id, false)
-                .await
-                .map_err(CodexSnapshotError::AppServer)?,
-            Err(err) => return Err(CodexSnapshotError::AppServer(err)),
-        };
+        let (projection, turn_state) = self
+            .sessions
+            .lock()
+            .await
+            .get(thread_id)
+            .filter(|session| Arc::ptr_eq(&session.client, &client))
+            .map(|session| (session.projection.clone(), session.turn_state.clone()))
+            .ok_or(CodexSnapshotError::NotFound)?;
+        let mut selected = None;
+        for _ in 0..3 {
+            let owner = self.ownership_snapshot(PROVIDER, thread_id);
+            let fence = {
+                let mut p = projection.lock().expect("codex projection lock");
+                p.bind_owner(owner.epoch, owner.generation);
+                // A read cannot cut through a coalesced append. Publish the
+                // entire pending batch before capturing its consumed prefix;
+                // future batches then contain only events after this fence.
+                if let Some(patch) = p.take_patch() {
+                    broadcast_codex_event(thread_id, patch, &self.broadcast_tx);
+                }
+                p.begin_history_read()
+            };
+            let read = match client.read_thread(thread_id, true).await {
+                Ok(raw) => Ok(raw),
+                Err(err) if is_codex_include_turns_unavailable(&err) => {
+                    client.read_thread(thread_id, false).await
+                }
+                Err(err) => Err(err),
+            };
+            let current = self.sessions.lock().await.get(thread_id).map(|session| {
+                (
+                    Arc::ptr_eq(&session.client, &client)
+                        && Arc::ptr_eq(&session.projection, &projection),
+                    session.exited.load(Ordering::SeqCst),
+                )
+            });
+            if !current.is_some_and(|(same, _)| same) {
+                return Err(CodexSnapshotError::HandoffInProgress {
+                    generation: self.ownership_snapshot(PROVIDER, thread_id).generation,
+                });
+            }
+            let owner_after = self.ownership_snapshot(PROVIDER, thread_id);
+            let mut p = projection.lock().expect("codex projection lock");
+            p.bind_owner(owner_after.epoch, owner_after.generation);
+            if !p.matches_fence(&fence) {
+                continue;
+            }
+            let projected = match read {
+                Ok(raw) => p.accept_native_history(&raw, &fence),
+                Err(err) => {
+                    if !p.has_usable_history() {
+                        return Err(CodexSnapshotError::AppServer(err));
+                    }
+                    if current.is_some_and(|(_, exited)| exited) {
+                        p.freeze_active("interrupted");
+                    }
+                    tracing::warn!(provider=PROVIDER, session_id=thread_id, projection_id=%p.id, "freshagent.codex.history_unavailable");
+                    if let Some(patch) = p.take_patch() {
+                        broadcast_codex_event(thread_id, patch, &self.broadcast_tx);
+                    }
+                    let retained_fence = p.begin_history_read();
+                    p.unavailable_history(&retained_fence)
+                }
+            };
+            match projected {
+                Ok(snapshot) => {
+                    selected = Some(snapshot);
+                    break;
+                }
+                Err(_) => {
+                    tracing::debug!(provider=PROVIDER, session_id=thread_id, projection_id=%p.id, "freshagent.codex.stale_history_reread")
+                }
+            }
+        }
+        let projected = selected.ok_or_else(|| CodexSnapshotError::HandoffInProgress {
+            generation: self.ownership_snapshot(PROVIDER, thread_id).generation,
+        })?;
+        let raw = projected.raw;
+        {
+            let mut turns = turn_state.lock().expect("codex turn state");
+            for turn in raw["thread"]["turns"].as_array().into_iter().flatten() {
+                let Some(id) = turn["id"].as_str() else {
+                    continue;
+                };
+                let terminal = match turn["status"].as_str() {
+                    Some("completed") => Some(NativeSettlement::Completed),
+                    Some("interrupted") => Some(NativeSettlement::Interrupted),
+                    Some("failed") => Some(NativeSettlement::Failed),
+                    Some("inProgress") => {
+                        turns.observe_started(id);
+                        None
+                    }
+                    _ => None,
+                };
+                if let Some(terminal) = terminal {
+                    turns.settle_native_read(id, terminal);
+                }
+            }
+        }
         // U-1 repair (wedged-sidecar deadman): a thread restored MID-TURN has no
         // adapter-observed `turn/started` (this process never saw one), so
         // `active_turn` is empty and the quiet deadman would never arm. When the FRESH
@@ -7960,21 +9387,31 @@ impl FreshCodexState {
             stuck,
         )
         .map_err(CodexSnapshotError::Protocol)?;
-        self.overlay_controls(thread_id, &mut snapshot).await;
-        if let Some(session) = self.sessions.lock().await.get(thread_id) {
-            let mut settings = Map::new();
-            if !session.model.is_empty() {
-                settings.insert("model".into(), json!(session.model));
-            }
-            if let Some(effort) = &session.effort {
-                settings.insert("effort".into(), json!(effort));
-            }
-            if let Some(permission) = &session.permission_mode {
-                settings.insert("permissionMode".into(), json!(permission));
-            }
-            snapshot["settings"] = Value::Object(settings);
+        projection
+            .lock()
+            .expect("codex projection lock")
+            .overlay(&mut snapshot, projected.metadata);
+        if snapshot["status"] == "idle"
+            && turn_state.lock().expect("codex turn state").has_owed_work()
+        {
+            snapshot["status"] = json!("running");
+            snapshot["capabilities"]["send"] = json!(false);
+            snapshot["capabilities"]["interrupt"] = json!(true);
         }
+        self.overlay_controls(thread_id, &mut snapshot).await;
+        self.overlay_settings_snapshot(thread_id, &mut snapshot)
+            .await;
         Ok(snapshot)
+    }
+
+    async fn overlay_settings_snapshot(&self, thread_id: &str, snapshot: &mut Value) {
+        if let Some(session) = self.sessions.lock().await.get(thread_id) {
+            snapshot["settings"] = session.effective_settings().as_json();
+            snapshot["extensions"]["codex"]["settings"] = json!({
+                "scope":"next-turn", "currentTurn":session.native_turn_settings.as_ref().map(CodexEffectiveSettings::as_json),
+                "lastThreadResponse":session.native_thread_settings.as_ref(),
+            });
+        }
     }
 
     /// Resolve the live client + active-turn bit for `thread_id` — FULLY
@@ -8482,7 +9919,7 @@ impl FreshCodexState {
                  running with default model and permissions. Reconfirm your settings.",
             );
         }
-        let rec = recovered.clone().unwrap_or_default();
+        let mut rec = recovered.clone().unwrap_or_default();
 
         // D8 (focused-ep1-r4 Finding 2 — the parking invariant's durable
         // half): this construction lane is CONN-LESS (attach / snapshot reads
@@ -8558,6 +9995,26 @@ impl FreshCodexState {
             )));
         }
 
+        if recovered.is_some() {
+            let mut effective = CodexEffectiveSettings {
+                model: rec.model.clone().unwrap_or_default(),
+                effort: rec.effort.clone(),
+                cwd: cwd.map(str::to_owned).or_else(|| rec.cwd.clone()),
+                sandbox: rec.sandbox.clone(),
+                permission_mode: rec.permission_mode.clone(),
+                collaboration_mode: rec
+                    .collaboration_mode
+                    .as_deref()
+                    .and_then(CodexWorkMode::parse),
+            };
+            effective.adopt_native(&started.effective_settings);
+            rec.model = (!effective.model.is_empty()).then_some(effective.model);
+            rec.effort = effective.effort;
+            rec.cwd = effective.cwd;
+            rec.sandbox = effective.sandbox;
+            rec.permission_mode = effective.permission_mode;
+        }
+
         // FIX (CODEX-FIRST triage Finding 2): the app-server just proved this id alive --
         // clear any stale "recently gone" marking so it doesn't linger.
         self.clear_dead_thread(thread_id).await;
@@ -8605,9 +10062,13 @@ impl FreshCodexState {
                 child,
                 rec.model.clone().unwrap_or_default(),
                 rec.effort.clone(),
-                cwd.map(str::to_string).or_else(|| rec.cwd.clone()),
+                rec.cwd.clone().or_else(|| cwd.map(str::to_string)),
                 rec.sandbox.clone(),
                 rec.permission_mode.clone(),
+                rec.collaboration_mode
+                    .as_deref()
+                    .and_then(CodexWorkMode::parse),
+                started.effective_settings.clone(),
                 // Kata 1wxv Task 2 (r3): the durable rollout meta carries the
                 // mode across resume (only a missing/unparseable meta ⇒ legacy).
                 read_rollout_history_mode(thread_id),
@@ -8714,7 +10175,10 @@ impl FreshCodexState {
                     rec.sandbox.as_deref(),
                     rec.permission_mode.as_deref(),
                     rec.effort.as_deref(),
-                    cwd.or(rec.cwd.as_deref()),
+                    rec.cwd.as_deref().or(cwd),
+                    rec.collaboration_mode
+                        .as_deref()
+                        .and_then(CodexWorkMode::parse),
                     None,
                     // D8: conn-less attach-resume refresh — provenance `None`
                     // keeps the row's existing stamps.
@@ -8834,6 +10298,8 @@ impl FreshCodexState {
         cwd: Option<String>,
         sandbox: Option<String>,
         permission_mode: Option<String>,
+        collaboration_mode: Option<CodexWorkMode>,
+        native_thread_settings: Value,
         // Kata 1wxv Task 2: the thread's durable history mode (the rollout-meta
         // parse the resume/fork callers perform post-RPC).
         history_mode: Option<HistoryMode>,
@@ -8853,10 +10319,16 @@ impl FreshCodexState {
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
         let event_emission_gate = Arc::new(TokioMutex::new(()));
+        let turn_state = Arc::new(StdMutex::new(CodexTurnState::default()));
         let exited = Arc::new(AtomicBool::new(false));
+        let projection = Arc::new(StdMutex::new(projection::CodexProjection::new(
+            mint_ownership_id(),
+            thread_id.to_string(),
+        )));
         let consumer = self.spawn_consumer(
             notifs,
             CodexConsumerRuntime {
+                turn_state: turn_state.clone(),
                 thread_id: thread_id.to_string(),
                 active_turn: active_turn.clone(),
                 user_interrupt_pending: user_interrupt_pending.clone(),
@@ -8868,13 +10340,14 @@ impl FreshCodexState {
                 compact_in_flight: compact_in_flight.clone(),
                 compact_turn_id: compact_turn_id.clone(),
                 event_emission_gate: event_emission_gate.clone(),
+                projection: projection.clone(),
             },
         );
         let (kill_tx, kill_rx) = oneshot::channel();
         // b8ke focused round-2 R2-1: the condemned-prior identity (pid + tag).
         let sidecar_pid = child.id();
         let sidecar_ownership_id = ownership_id.clone();
-        let watcher = spawn_exit_watcher(
+        let watcher = spawn_exit_watcher_tracking_turns(
             child,
             ownership_id,
             thread_id.to_string(),
@@ -8888,10 +10361,16 @@ impl FreshCodexState {
             last_turn_complete_at.clone(),
             Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
+            Some(turn_state.clone()),
+            Some(self.clone()),
         );
         self.sessions.lock().await.insert(
             thread_id.to_string(),
             CodexSession {
+                collaboration_mode,
+                native_turn_settings: None,
+                native_thread_settings: Some(native_thread_settings),
+                turn_state: turn_state.clone(),
                 client,
                 model,
                 effort,
@@ -8905,6 +10384,7 @@ impl FreshCodexState {
                 history_mode,
                 turn_lock: Arc::new(TokioMutex::new(())),
                 event_emission_gate,
+                projection,
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -8951,6 +10431,7 @@ impl FreshCodexState {
         cmd.kill_on_drop(true);
         let child = cmd.spawn().expect("spawn sleep fixture");
 
+        let turn_state = Arc::new(StdMutex::new(CodexTurnState::default()));
         let consumer = tokio::spawn(async {});
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
@@ -8967,7 +10448,7 @@ impl FreshCodexState {
         // b8ke focused round-2 R2-1: the condemned-prior identity (pid + tag).
         let sidecar_pid = child.id();
         let sidecar_ownership_id = format!("codex-sidecar-test-snapshot-router-{thread_id}");
-        let watcher = spawn_exit_watcher(
+        let watcher = spawn_exit_watcher_tracking_turns(
             child,
             format!("codex-sidecar-test-snapshot-router-{thread_id}"),
             thread_id.to_string(),
@@ -8981,10 +10462,16 @@ impl FreshCodexState {
             last_turn_complete_at.clone(),
             Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
+            Some(turn_state.clone()),
+            Some(self.clone()),
         );
         self.sessions.lock().await.insert(
             thread_id.to_string(),
             CodexSession {
+                collaboration_mode: None,
+                native_turn_settings: None,
+                native_thread_settings: None,
+                turn_state: turn_state.clone(),
                 client,
                 model: "gpt-5.3-codex-spark".to_string(),
                 effort: None,
@@ -8999,6 +10486,10 @@ impl FreshCodexState {
                 history_mode: Some(HistoryMode::Paginated),
                 turn_lock: Arc::new(TokioMutex::new(())),
                 event_emission_gate: Arc::new(TokioMutex::new(())),
+                projection: Arc::new(StdMutex::new(projection::CodexProjection::new(
+                    mint_ownership_id(),
+                    thread_id.to_string(),
+                ))),
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -9062,6 +10553,9 @@ pub enum CodexSnapshotError {
     HandoffInProgress { generation: u64 },
 }
 
+/// Retained reads share the existing source/ownership/protocol refusal contract.
+pub type RetainedStateError = CodexSnapshotError;
+
 impl std::fmt::Display for CodexSnapshotError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -9108,6 +10602,16 @@ fn is_codex_include_turns_unavailable(err: &CodexAppServerError) -> bool {
 /// app-server's own error text says so, so a garbage/expired thread id (as opposed to a
 /// real spawn/RPC failure) doesn't masquerade as a server error.
 fn is_codex_thread_not_found(err: &CodexAppServerError) -> bool {
+    // The qualified native resume rejection uses "no rollout found", which
+    // does not contain "not found". The same fork text can mean an empty
+    // parent; only the actual resume RPC and its native error code qualify.
+    if matches!(err, CodexAppServerError::Rpc { method, error }
+        if method == "thread/resume" && error.code == -32600
+            && (error.message == "no rollout found for thread id"
+                || error.message.starts_with("no rollout found for thread id ")))
+    {
+        return true;
+    }
     let message = err.to_string().to_lowercase();
     message.contains("not found")
         || message.contains("no such thread")
@@ -9120,7 +10624,8 @@ fn codex_normalize_command_status(status: Option<&str>) -> &'static str {
         Some("inProgress") => "running",
         Some("declined") => "declined",
         Some("failed") => "failed",
-        _ => "completed",
+        Some("completed") => "completed",
+        _ => "running",
     }
 }
 
@@ -9129,7 +10634,8 @@ fn codex_normalize_tool_status(status: Option<&str>) -> &'static str {
     match status {
         Some("inProgress") => "running",
         Some("failed") => "failed",
-        _ => "completed",
+        Some("completed") => "completed",
+        _ => "running",
     }
 }
 
@@ -9171,6 +10677,18 @@ fn codex_user_message_text_parts(item: &Value) -> Vec<(usize, String)> {
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_string()
+                    } else if matches!(part_type, Some("image" | "localImage" | "input_image")) {
+                        let reference = part["path"]
+                            .as_str()
+                            .or(part["url"].as_str())
+                            .or(part["image_url"].as_str())
+                            .unwrap_or("");
+                        // Never place inline image bytes in a transcript string.
+                        if reference.is_empty() || reference.starts_with("data:") {
+                            "Image attachment".to_string()
+                        } else {
+                            format!("Image: {reference}")
+                        }
                     } else {
                         format!("[{}]", part_type.unwrap_or("input"))
                     };
@@ -9188,29 +10706,10 @@ fn codex_user_message_text_parts(item: &Value) -> Vec<(usize, String)> {
     vec![(0, String::new())]
 }
 
-/// `normalizeCodexItem` (`normalize.ts:238-473`): map ONE raw codex thread item into its
-/// `FreshAgentTranscriptItemSchema`-shaped item(s). Every `CodexThreadItemTypeSchema` variant
-/// (`protocol.ts:113-129`) is covered.
-///
-/// DELIBERATE DEVIATION from legacy for an unrecognized `type`: the reference's
-/// `readCodexThreadItemType`/`assertNever` both throw `Unsupported Codex thread item type:
-/// ${value}` (`normalize.ts:141-147,123-125`), which `router.ts`'s catch-all turns into a bare
-/// 500 for the ENTIRE thread (`router.ts:165-166`) -- legacy would 500 here too, so this is not
-/// a port regression, but it is a real bug either way. The real codex CLI (observed: 0.144.5)
-/// emits `subAgentActivity`, an item type absent from BOTH the frozen legacy protocol
-/// (`protocol.ts:113-129`, 16 variants) and current `origin/main`. Hard-failing an entire
-/// historical thread over one item type neither codebase has caught up to yet makes the
-/// snapshot endpoint unusable for real transcripts -- proven against real staging data (a
-/// genuinely readable thread 500'd solely because of one `subAgentActivity` item). So an
-/// unrecognized item type returns `Ok(vec![])` (the item is silently omitted; every other item
-/// in the thread still renders) instead of `Err`. This mirrors the opencode side's existing
-/// precedent: an unrecognized opencode part also degrades to `[]`, not a hard error (see
-/// `opencode_item_from_part`).
-///
-/// Unlike the reference, a missing `item.id` does NOT throw (`readCodexItemId`,
-/// `normalize.ts:149-156`) -- the caller ([`build_codex_turn_json`]) already falls back to a
-/// synthetic `{turnId}:item-{index}` id, matching this module's existing tolerant-read
-/// convention elsewhere (documented divergence, not a silent one).
+/// Normalize the visible Codex 0.164 thread items into the shared transcript.
+/// Unknown future items emit a structured diagnostic and are omitted before
+/// role bookkeeping, so they cannot make a blank conversation row or fail
+/// otherwise readable history. Missing IDs use the caller's stable synthetic ID.
 fn map_codex_item(item_id: &str, item: &Value, item_type: &str) -> Result<Vec<Value>, String> {
     match item_type {
         "userMessage" => Ok(codex_user_message_text_parts(item)
@@ -9225,7 +10724,11 @@ fn map_codex_item(item_id: &str, item: &Value, item_type: &str) -> Result<Vec<Va
                 .and_then(Value::as_str)
                 .or_else(|| item.get("summary").and_then(Value::as_str))
                 .unwrap_or("");
-            Ok(vec![json!({ "id": item_id, "kind": "text", "text": text })])
+            let mut mapped = json!({ "id": item_id, "kind": "text", "text": text });
+            if item_type == "agentMessage" && (item["phase"].is_string() || item["questions"].is_array()) {
+                mapped["extensions"] = json!({"codex": {"phase": item["phase"], "questions": item["questions"], "delivery":item["delivery"], "itemId":item_id}});
+            }
+            Ok(vec![mapped])
         }
         "reasoning" => {
             let summary = codex_string_array(item.get("summary"));
@@ -9258,15 +10761,18 @@ fn map_codex_item(item_id: &str, item: &Value, item_type: &str) -> Result<Vec<Va
                 .and_then(Value::as_array)
                 .map(|arr| arr.iter().filter(|change| change.is_object()).cloned().collect())
                 .unwrap_or_default();
-            Ok(vec![json!({
+            let mut mapped = json!({
                 "id": item_id,
                 "kind": "file_change",
                 "status": codex_normalize_command_status(item.get("status").and_then(Value::as_str)),
                 "changes": changes,
                 "extensions": { "codex": item },
-            })])
+            });
+            if let Some(output) = item["aggregatedOutput"].as_str() { mapped["output"] = json!(output); }
+            Ok(vec![mapped])
         }
-        "mcpToolCall" => Ok(vec![json!({
+        "mcpToolCall" => {
+            let mut mapped = json!({
             "id": item_id,
             "kind": "mcp_tool",
             "server": item.get("server").and_then(Value::as_str).unwrap_or(""),
@@ -9275,7 +10781,10 @@ fn map_codex_item(item_id: &str, item: &Value, item_type: &str) -> Result<Vec<Va
             "arguments": item.get("arguments").cloned().unwrap_or(Value::Null),
             "result": item.get("result").cloned().unwrap_or(Value::Null),
             "error": item.get("error").cloned().unwrap_or(Value::Null),
-        })]),
+            });
+            if let Some(progress) = item["progress"].as_str() { mapped["progress"] = json!(progress); }
+            Ok(vec![mapped])
+        },
         "dynamicToolCall" => Ok(vec![json!({
             "id": item_id,
             "kind": "dynamic_tool",
@@ -9310,6 +10819,24 @@ fn map_codex_item(item_id: &str, item: &Value, item_type: &str) -> Result<Vec<Va
                 "agentsStates": agents_states,
             })])
         }
+        "subAgentActivity" => {
+            let Some(child) = item["agentThreadId"].as_str().filter(|id| !id.is_empty()) else {
+                tracing::warn!(provider=PROVIDER, native_item_id=item_id, item_type, reason="missing_child_identity", "freshagent.codex.item_unavailable");
+                return Ok(vec![]);
+            };
+            let status = match item["kind"].as_str() {
+                Some("completed") => "completed",
+                Some("interrupted") => "interrupted",
+                _ => "running",
+            };
+            let mut mapped = json!({"id":item_id, "kind":"task_delegation", "status":status, "title":format!("Child agent {}", item["agentPath"].as_str().unwrap_or(child)), "childSessionId":child, "provider":"codex", "nativeStatus":item["kind"]});
+            for field in ["model", "reasoningEffort"] {
+                if let Some(value) = item[field].as_str() { mapped[field] = json!(value); }
+            }
+            Ok(vec![mapped])
+        }
+        "functionCallOutput" => Ok(vec![json!({"id":item_id, "kind":"tool_result", "toolUseId":item_id, "content":item.get("output").cloned().unwrap_or_else(|| json!("Function output unavailable")), "isError":false})]),
+        "sleep" => Ok(vec![json!({"id":item_id, "kind":"dynamic_tool", "tool":"Sleep", "status":"completed", "arguments":{"durationMs":item["durationMs"]}})]),
         "webSearch" => Ok(vec![json!({
             "id": item_id,
             "kind": "web_search",
@@ -9350,16 +10877,14 @@ fn map_codex_item(item_id: &str, item: &Value, item_type: &str) -> Result<Vec<Va
         // DELIBERATE DEVIATION: unrecognized item type -> skip, don't error the whole thread.
         // See the doc comment above for the full rationale (real codex 0.144.5's
         // `subAgentActivity`, unknown to both frozen legacy and current `origin/main`).
-        _ => Ok(vec![]),
+        _ => {
+            tracing::warn!(provider=PROVIDER, native_item_id=item_id, item_type, reason="unsupported_native_item", "freshagent.codex.item_unavailable");
+            Ok(vec![])
+        },
     }
 }
 
-/// `classifyCodexItemRole(item)` (`normalize.ts:475-501`): every `CodexThreadItemTypeSchema`
-/// variant maps to exactly one display role. The caller ([`build_codex_turn_json`]) classifies
-/// EVERY raw item, INCLUDING ones [`map_codex_item`] mapped to an empty item list
-/// (unrecognized types) -- the catch-all arm IS reachable there and decides whether that item
-/// pushes a zero-item display row -- so the catch-all is a runtime path, not just a
-/// compile-time safety net (it still matches the reference's `assertNever` default in spirit).
+/// Select the display role of a successfully mapped native item.
 fn classify_codex_item_role(item_type: &str) -> &'static str {
     match item_type {
         "userMessage" => "user",
@@ -9369,6 +10894,9 @@ fn classify_codex_item_role(item_type: &str) -> &'static str {
         | "mcpToolCall"
         | "dynamicToolCall"
         | "collabAgentToolCall"
+        | "subAgentActivity"
+        | "functionCallOutput"
+        | "sleep"
         | "webSearch"
         | "imageView"
         | "imageGeneration" => "tool",
@@ -9517,13 +11045,9 @@ fn summarize_codex_items(items: &[Value]) -> (String, &'static str) {
 /// `normalizeCodexThreadSnapshot` (`normalize.ts:748-787`): map a raw `thread/read` result
 /// into the `FreshAgentSnapshotSchema` shape.
 ///
-/// `tokenUsage` is always the zero-fallback (`normalize.ts:774-779`'s `?? {...zeros}` branch):
-/// `CodexThreadReadResultSchema` (`protocol.ts:258-259`) is `{ thread: CodexThreadSchema }`, and
-/// neither `CodexThreadSchema` (`protocol.ts:148-167`) nor anywhere else in the codex app-server
-/// RPC surface exposes a `tokenUsage` field -- confirmed by inspection of the full protocol
-/// schema, not by omission. The reference's `rawSnapshot.tokenUsage` is therefore ALWAYS
-/// `undefined` on this path too; this is not a Rust-side gap, it is the reference's own honest
-/// zero, faithfully reproduced.
+/// `thread/read` carries no measured usage. The base snapshot stays explicitly
+/// unobserved; a tracked session overlays the actual native usage notification
+/// (total counters plus its separate latest sample) from its projection.
 fn build_codex_snapshot_json(
     thread_id: &str,
     raw: &Value,
@@ -9592,7 +11116,11 @@ fn build_codex_snapshot_json(
     // NOT per-raw-turn, it is the display row's position in the final transcript.
     let turns: Vec<Value> = raw_turns
         .iter()
-        .map(|raw_turn| build_codex_turn_json(raw_turn, 0))
+        .map(|raw_turn| {
+            let mut rows = build_codex_turn_json(raw_turn, 0)?;
+            projection::stamp_saved_output_state(raw_turn, &mut rows);
+            Ok(rows)
+        })
         .collect::<Result<Vec<Vec<Value>>, String>>()?
         .into_iter()
         .flatten()
@@ -9637,9 +11165,12 @@ fn build_codex_snapshot_json(
                 "effort": "per-send",
                 "sandbox": "per-send",
                 "permissionMode": "per-send",
+                "cwd": "per-send",
+                "collaborationMode": "per-send",
             },
         },
         "tokenUsage": {
+            "observed": false,
             "inputTokens": 0,
             "outputTokens": 0,
             "cachedTokens": 0,
@@ -9681,21 +11212,9 @@ struct CodexPendingRow {
     items: Vec<Value>,
 }
 
-/// `normalizeCodexDisplayTurns` (`normalize.ts:600-684`), restricted to this committed-turns
-/// REST READ path (`getSnapshot`, `adapter.ts:1082-1122`): SPLIT one raw codex `turn` record
-/// (`makeThread`/real app-server shape: `{id, status, error?, items:[{type,id,...}], ...}`)
-/// into MULTIPLE `FreshAgentTurnSchema`-shaped display turns, one per maximal run of
-/// contiguous-same-role raw items (`classifyCodexItemRole`, `normalize.ts:475-501` --
-/// ported as [`classify_codex_item_role`]). Every raw item is mapped via [`map_codex_item`]
-/// (the full `normalizeCodexItem` switch, `normalize.ts:238-473`) before being folded into its
-/// row. DELIBERATE DEVIATION: an unrecognized item type no longer fails the turn -- per
-/// [`map_codex_item`]'s doc comment, it maps to an empty item list. The loop does NOT skip it:
-/// its role is still classified (the catch-all arm of [`classify_codex_item_role`] yields
-/// `assistant`) and folded into `has_assistant_output`/`has_user_output`/`all_items_are_user`,
-/// and when that role differs from the previous row's a new row is pushed whose `items` is the
-/// empty list -- a ZERO-ITEM display row with a BLANK summary (`summarize_codex_items(&[])`
-/// returns `""`). When the role matches the previous row, `row.items.extend(mapped)` extends by
-/// nothing and no empty row appears. Every other item in the turn still renders normally.
+/// Split each raw native turn into maximal runs of contiguous display roles.
+/// Unknown or unsupported items are omitted before role bookkeeping; they
+/// never manufacture an empty assistant or user row.
 ///
 /// A turn-level `error` (`normalize.ts:509-519,640-641`) or a completed turn whose only items
 /// are `user`-role with no `assistant` output (`normalize.ts:642-652`) each APPEND A NEW
@@ -9746,6 +11265,9 @@ fn build_codex_turn_json(raw_turn: &Value, ordinal: usize) -> Result<Vec<Value>,
             .map(str::to_string)
             .unwrap_or_else(|| format!("{turn_id}:item-{index}"));
         let mapped = map_codex_item(&item_id, item, item_type)?;
+        if mapped.is_empty() {
+            continue;
+        }
         let role = classify_codex_item_role(item_type);
         match role {
             "assistant" => has_assistant_output = true,
@@ -9861,6 +11383,16 @@ fn checkpoint_codex_turn_identity(
     Some((native_turn_id.to_string(), display_turn_id.to_string()))
 }
 
+fn codex_cleanup_error() -> crate::rest_lane::RestLaneError {
+    let mut error = crate::rest_lane::RestLaneError::new(
+        crate::rest_lane::RestLaneErrorKind::Unavailable,
+        "CODEX_CREATE_CLEANUP_UNCONFIRMED",
+        "the exact created Codex runtime could not be confirmed stopped",
+    );
+    error.retryable = Some(true);
+    error
+}
+
 /// Watch an owned sidecar child to completion. Two ways out:
 ///
 /// - The child exits ON ITS OWN (crash / unexpected disconnect, never requested): self-heal
@@ -9878,17 +11410,61 @@ fn watcher_stop_not_confirmed() -> crate::session_handoff::StopResult {
     }
 }
 
-/// Continue an incomplete Codex tree reap after the bounded watcher window. The first
-/// watcher pass has already stopped the direct child; this continuation keeps probing the
-/// recorded incarnation and tagged descendants until the complete writer tree is confirmed
-/// gone. An incomplete identity capture cannot be repaired safely, so it stays fail-closed.
+fn with_codex_turn_exit_confirmation(
+    confirmation: std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'static>>,
+    turns: Option<SharedCodexTurnState>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'static>> {
+    Box::pin(async move {
+        let confirmed = confirmation.await;
+        if confirmed {
+            if let Some(turns) = turns {
+                turns
+                    .lock()
+                    .expect("codex turn state")
+                    .settle_native("", NativeSettlement::OwnedExit);
+            }
+        }
+        confirmed
+    })
+}
+
+/// Keep the same recorded process identity when a hosted provider needs its
+/// own uid to inspect and terminate the tree. Local lanes use the same primitive.
+async fn confirm_codex_tree_dead(
+    recorded: &crate::session_lease::CondemnedRuntimeIdentity,
+    probe: Option<CodexSidecarCleanupProbe>,
+) -> bool {
+    match probe {
+        Some(probe) => match probe(recorded.clone()).await {
+            Ok(confirmed) => confirmed,
+            Err(error) => {
+                tracing::warn!(provider=PROVIDER, pid=recorded.pid, ownership_id=%recorded.ownership_id, %error,
+                    "freshagent.codex.owned_cleanup_unavailable");
+                false
+            }
+        },
+        None => {
+            crate::session_lease::kill_and_confirm_recorded_tree_dead(
+                recorded,
+                CODEX_SIDECAR_OWNERSHIP_ENV,
+            )
+            .await
+        }
+    }
+}
+
+/// Continue the existing exact-owned teardown until confirmed. A hosted
+/// identity helper may complete a capture its unprivileged host could not read.
 fn codex_tree_death_escalation(
     recorded: crate::session_lease::CondemnedRuntimeIdentity,
     ownership_id: String,
     thread_id: String,
+    cleanup_probe: Option<CodexSidecarCleanupProbe>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'static>> {
     Box::pin(async move {
-        if !recorded.capture_complete {
+        if (!recorded.capture_complete && cleanup_probe.is_none())
+            || (recorded.start_time.is_none() && cleanup_probe.is_some())
+        {
             tracing::error!(target: "freshell_freshagent::codex",
                 session_id = %thread_id,
                 ownership_id = %ownership_id,
@@ -9896,12 +11472,7 @@ fn codex_tree_death_escalation(
             return false;
         }
         loop {
-            if crate::session_lease::kill_and_confirm_recorded_tree_dead(
-                &recorded,
-                CODEX_SIDECAR_OWNERSHIP_ENV,
-            )
-            .await
-            {
+            if confirm_codex_tree_dead(&recorded, cleanup_probe.clone()).await {
                 return true;
             }
             tracing::warn!(target: "freshell_freshagent::codex",
@@ -10020,9 +11591,10 @@ fn detach_codex_confirmation(
     Box::pin(async move { settled_rx.await.unwrap_or(false) })
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_exit_watcher(
-    mut child: tokio::process::Child,
+    child: tokio::process::Child,
     ownership_id: String,
     thread_id: String,
     broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
@@ -10053,6 +11625,70 @@ pub(crate) fn spawn_exit_watcher(
     // its fenced claim (None when the lane is unwired — pre-existing tests).
     ownership: Option<crate::ownership_lane::OwnershipWatch>,
 ) -> tokio::task::JoinHandle<crate::session_handoff::StopResult> {
+    spawn_exit_watcher_tracking_turns(
+        child,
+        ownership_id,
+        thread_id,
+        broadcast_tx,
+        kill_rx,
+        exited,
+        leases,
+        quiet_deadman,
+        turn_in_flight,
+        retired_turn_id,
+        last_turn_complete_at,
+        condemned_priors,
+        ownership,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_exit_watcher_tracking_turns(
+    mut child: tokio::process::Child,
+    ownership_id: String,
+    thread_id: String,
+    broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+    kill_rx: oneshot::Receiver<()>,
+    exited: Arc<AtomicBool>,
+    leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
+    quiet_deadman: Arc<StdMutex<QuietDeadman>>,
+    // The session's turn-in-flight latch (the dispatch-time authority) + its
+    // shared turn-complete clock: the crash self-heal arm mints the unified
+    // attention edge for a turn in flight at crash time on the session's ONE
+    // clock; a requested kill retires the latch silently.
+    turn_in_flight: Arc<AtomicBool>,
+    // FR1-1: the session's retired-turn slot — both terminal arms (the
+    // requested kill, the crash self-heal) end the turn, so the slot's
+    // idle→completed bridge dies with the latch: a respawned incarnation's
+    // fresh notifications must never consult a pre-teardown slot.
+    // (E3R1: the durable already-rang set is deliberately NOT threaded
+    // into the watcher — teardown voids would reopen the gate for a
+    // buffered late completion folding after the exit, and a respawned
+    // incarnation never consults the pre-teardown set anyway: every
+    // respawn site constructs FRESH Arcs.)
+    retired_turn_id: Arc<StdMutex<Option<String>>>,
+    last_turn_complete_at: Arc<StdMutex<Option<i64>>>,
+    condemned_priors: Arc<
+        StdMutex<HashMap<String, crate::session_lease::CondemnedRuntimeIdentity>>,
+    >,
+    // kata b8ke Task 3: release the retained coordinator stamp on exit with
+    // its fenced claim (None when the lane is unwired — pre-existing tests).
+    ownership: Option<crate::ownership_lane::OwnershipWatch>,
+    turn_state: Option<SharedCodexTurnState>,
+    retained_state: Option<FreshCodexState>,
+) -> tokio::task::JoinHandle<crate::session_handoff::StopResult> {
+    if let (Some(turns), Some(state)) = (&turn_state, &retained_state) {
+        turns
+            .lock()
+            .expect("codex turn state")
+            .bind_settlement_stream(
+                thread_id.clone(),
+                ownership_id.clone(),
+                state.turn_events.clone(),
+            );
+    }
     // wfah: the thread id is fixed by the time the watcher is constructed at
     // every successful spawn site; enrich the durable record once, here.
     crate::codex_sidecar_tracking::enrich_record_session_id(&ownership_id, &thread_id);
@@ -10065,7 +11701,19 @@ pub(crate) fn spawn_exit_watcher(
             &ownership_id,
         )
     });
+    #[cfg(any(test, feature = "test-support"))]
+    if let (Some(observer), Some(recorded)) = (
+        retained_state
+            .as_ref()
+            .and_then(|state| state.sidecar_capture_observer.get()),
+        recorded.as_ref(),
+    ) {
+        observer(&thread_id, recorded);
+    }
     let ownership = ownership.map(|watch| watch.for_runtime(&thread_id, child.id()));
+    let cleanup_probe = retained_state
+        .as_ref()
+        .and_then(|state| state.sidecar_cleanup_probe.get().cloned());
     tokio::spawn(async move {
         // `biased` + the REQUESTED-kill arm listed FIRST: a `freshAgent.kill` signals
         // `kill_tx` right before `start_kill()`s the child, so `child.wait()` can become
@@ -10094,23 +11742,32 @@ pub(crate) fn spawn_exit_watcher(
                 // Arcs at its rebuild, and a teardown void would reopen
                 // the gate for a buffered late completion of the
                 // already-rang turn.
-                let _ = child.start_kill();
-                let wait_result = child.wait().await;
-                let confirmed = if cfg!(target_os = "linux") {
-                    match recorded.as_ref() {
-                        Some(recorded) => {
-                            crate::session_lease::kill_and_confirm_recorded_tree_dead(
-                                recorded,
-                                CODEX_SIDECAR_OWNERSHIP_ENV,
-                            )
-                            .await
-                        }
+                let (wait_result, confirmed) = if cleanup_probe.is_some() {
+                    let confirmed = match recorded.as_ref() {
+                        Some(recorded) => confirm_codex_tree_dead(recorded, cleanup_probe.clone()).await,
                         None => false,
-                    }
+                    };
+                    let waited = if confirmed {
+                        child.wait().await
+                    } else {
+                        Err(std::io::Error::other("owned provider exit remains unconfirmed"))
+                    };
+                    (waited, confirmed)
                 } else {
-                    false
+                    let _ = child.start_kill();
+                    let waited = child.wait().await;
+                    let confirmed = if cfg!(target_os = "linux") {
+                        match recorded.as_ref() {
+                            Some(recorded) => confirm_codex_tree_dead(recorded, None).await,
+                            None => false,
+                        }
+                    } else {
+                        false
+                    };
+                    (waited, confirmed)
                 };
                 if confirmed {
+                    if let Some(turns) = &turn_state { turns.lock().expect("codex turn state").settle_native("", NativeSettlement::OwnedExit); }
                     cleanup_confirmed_codex_teardown(
                         &leases,
                         ownership.as_ref(),
@@ -10155,9 +11812,11 @@ pub(crate) fn spawn_exit_watcher(
                                 recorded,
                                 ownership_id.clone(),
                                 thread_id.clone(),
+                                cleanup_probe.clone(),
                             )
                         })
                         .unwrap_or_else(|| Box::pin(async { false }));
+                    let confirmation = with_codex_turn_exit_confirmation(confirmation, turn_state.clone());
                     crate::session_handoff::StopResult::NotConfirmed {
                         confirmation: wrap_codex_confirmation_with_cleanup(
                             confirmation,
@@ -10179,11 +11838,7 @@ pub(crate) fn spawn_exit_watcher(
                 let confirmed = if cfg!(target_os = "linux") {
                     match recorded.as_ref() {
                         Some(recorded) => {
-                            crate::session_lease::kill_and_confirm_recorded_tree_dead(
-                                recorded,
-                                CODEX_SIDECAR_OWNERSHIP_ENV,
-                            )
-                            .await
+                            confirm_codex_tree_dead(recorded, cleanup_probe.clone()).await
                         }
                         None => false,
                     }
@@ -10191,6 +11846,7 @@ pub(crate) fn spawn_exit_watcher(
                     false
                 };
                 let stop_result = if confirmed {
+                    if let Some(turns) = &turn_state { turns.lock().expect("codex turn state").settle_native("", NativeSettlement::OwnedExit); }
                     cleanup_confirmed_codex_teardown(
                         &leases,
                         ownership.as_ref(),
@@ -10239,9 +11895,11 @@ pub(crate) fn spawn_exit_watcher(
                                 recorded,
                                 ownership_id.clone(),
                                 thread_id.clone(),
+                                cleanup_probe.clone(),
                             )
                         })
                         .unwrap_or_else(|| Box::pin(async { false }));
+                    let confirmation = with_codex_turn_exit_confirmation(confirmation, turn_state.clone());
                     let confirmation = wrap_codex_confirmation_with_cleanup(
                         confirmation,
                         ownership_id.clone(),
@@ -10262,6 +11920,9 @@ pub(crate) fn spawn_exit_watcher(
                 // PR-4: flip the lazy-restart flag BEFORE broadcasting, so a client that
                 // reacts to the `exited` status by immediately sending/attaching never
                 // races ahead of `ensure_session_alive` observing a stale `false`.
+                if let Some(state) = &retained_state {
+                    state.retain_native_exit(&thread_id, &ownership_id).await;
+                }
                 exited.store(true, Ordering::SeqCst);
                 let event = CodexAdapterEvent::Status {
                     session_id: thread_id.clone(),
@@ -10295,6 +11956,7 @@ pub(crate) fn spawn_exit_watcher(
                         &thread_id,
                         &broadcast_tx,
                         "crash_self_heal",
+                        retained_state.as_ref(),
                     );
                 }
                 stop_result
@@ -10436,7 +12098,10 @@ fn note_codex_activity(
     let window = Duration::from_millis(window_ms);
     let feed = {
         let mut q = quiet.lock().expect("quiet deadman lock");
-        q.feed(turn_in_flight.load(Ordering::SeqCst), window)
+        q.feed(
+            turn_in_flight.load(Ordering::SeqCst) && state.awaited_control_count(thread_id) == 0,
+            window,
+        )
     };
     if feed.resolved {
         tracing::info!(provider = PROVIDER, session_id = %thread_id, phase = "resolved", "freshagent.codex.quiet_deadman");
@@ -10526,6 +12191,7 @@ fn disarm_codex_quiet(
 fn reduce_notification(
     subscription: &mut CodexSubscription,
     notification: CodexNotification,
+    turn_state: &SharedCodexTurnState,
     active_turn: &Arc<StdMutex<Option<String>>>,
     turn_in_flight: &Arc<AtomicBool>,
     quiet_deadman: &Arc<StdMutex<QuietDeadman>>,
@@ -10618,6 +12284,7 @@ fn reduce_notification(
                             subscription.session_id(),
                             broadcast_tx,
                             "system_error_status",
+                            Some(state),
                         );
                         let rang_turn_id = active_turn
                             .lock()
@@ -10662,6 +12329,7 @@ fn reduce_notification(
                         // `active_turn` guard, and dropped before the
                         // `quiet_deadman` lock below (the file-wide order is
                         // `quiet_deadman` outer / `active_turn`-tier inner).
+                        turn_state.lock().expect("codex turn state").observe_idle();
                         let retired_tracker_id =
                             active_turn.lock().expect("active_turn mutex").take();
                         if let Some(id) = retired_tracker_id {
@@ -10693,6 +12361,19 @@ fn reduce_notification(
             // the retired-turn latch each have their narrower FIFO-safe
             // ownership exceptions below.
             if event.thread_id == subscription.session_id() {
+                let terminal = match freshell_codex::turn_status(&event.params).as_deref() {
+                    Some("completed") => Some(NativeSettlement::Completed),
+                    Some("interrupted") => Some(NativeSettlement::Interrupted),
+                    Some("failed") => Some(NativeSettlement::Failed),
+                    Some("inProgress") => return subscription.on_turn_completed(&event, now_ms()),
+                    _ => None,
+                };
+                if let (Some(turn_id), Some(terminal)) = (event.turn_id.as_deref(), terminal) {
+                    turn_state
+                        .lock()
+                        .expect("codex turn state")
+                        .settle_native(turn_id, terminal);
+                }
                 // Scoped: the `active_turn` guard must be dropped BEFORE the
                 // quiet-deadman disarm below (the file-wide lock order is
                 // `quiet_deadman` outer / `active_turn` inner — never lock
@@ -10940,7 +12621,43 @@ fn reduce_notification(
                     // `interrupted` (e.g. the app-server completed the turn
                     // as `completed`) must never cross the turn boundary and
                     // silence a later NON-user `interrupted` (a missed bell).
-                    subscription.clear_user_interrupt();
+                    let disposition = turn_state
+                        .lock()
+                        .expect("codex turn state")
+                        .observe_started(turn_id);
+                    let user_stopped = turn_state
+                        .lock()
+                        .expect("codex turn state")
+                        .user_stop_turn_id()
+                        == Some(turn_id.as_str());
+                    if !user_stopped {
+                        subscription.clear_user_interrupt();
+                    }
+                    if let StopDisposition::Interrupt { dispatch, turn_id } = disposition {
+                        let state = state.clone();
+                        let turns = turn_state.clone();
+                        let session_id = event.thread_id.clone();
+                        tokio::spawn(async move {
+                            let client = state
+                                .sessions
+                                .lock()
+                                .await
+                                .get(&session_id)
+                                .filter(|session| Arc::ptr_eq(&session.turn_state, &turns))
+                                .map(|session| session.client.clone());
+                            if let Some(client) = client {
+                                state
+                                    .issue_codex_interrupt(
+                                        &session_id,
+                                        client,
+                                        turns,
+                                        dispatch,
+                                        turn_id,
+                                    )
+                                    .await;
+                            }
+                        });
+                    }
                     // `handle_send` records the provider-returned turn id before its
                     // matching `turn/started` notification necessarily reaches this
                     // consumer. Treat that direct record as authoritative over a
@@ -11022,6 +12739,7 @@ fn reduce_notification(
                         subscription.session_id(),
                         broadcast_tx,
                         "thread_closed",
+                        Some(state),
                     );
                 }
                 let rang_turn_id = active_turn
@@ -11060,6 +12778,82 @@ fn reduce_notification(
 
 /// Map an adapter event to a `freshAgent.event` wire frame (sdk-events.ts normalization:
 /// `sdk.*` → `freshAgent.*`). Returns the pre-serialized JSON, or `None` on a serialize error.
+fn project_codex_notification(
+    projection: &Arc<StdMutex<projection::CodexProjection>>,
+    notification: &CodexNotification,
+) -> bool {
+    let (method, params) = match notification {
+        CodexNotification::Other { method, params } => {
+            (method.as_str(), params.clone().unwrap_or(Value::Null))
+        }
+        CodexNotification::TurnStarted(event) => {
+            ("turn/started", Value::Object(event.params.clone()))
+        }
+        CodexNotification::TurnCompleted(event) => {
+            ("turn/completed", Value::Object(event.params.clone()))
+        }
+        CodexNotification::ThreadClosed { thread_id } => {
+            let mut p = projection.lock().expect("codex projection lock");
+            if p.owns_thread(thread_id) {
+                p.freeze_active("interrupted");
+            }
+            return false;
+        }
+        CodexNotification::ThreadStatusChanged { thread_id, status } => {
+            let mut p = projection.lock().expect("codex projection lock");
+            if p.owns_thread(thread_id)
+                && normalize_codex_thread_status(status) == CodexStatus::Exited
+            {
+                p.freeze_active("interrupted");
+            }
+            return false;
+        }
+        _ => return false,
+    };
+    let mut p = projection.lock().expect("codex projection lock");
+    match p.apply(method, &params) {
+        Ok(ops) => {
+            let has_ops = !ops.is_empty();
+            p.enqueue(ops);
+            has_ops
+        }
+        Err(error) => {
+            tracing::warn!(provider=PROVIDER, projection_id=%p.id, method=%error.method, native_turn_id=?error.turn_id, native_item_id=?error.item_id, reason=error.reason, "freshagent.codex.projection_refused");
+            false
+        }
+    }
+}
+
+fn broadcast_codex_event(
+    thread_id: &str,
+    event: Value,
+    tx: &tokio::sync::broadcast::Sender<String>,
+) {
+    let msg = ServerMessage::FreshAgentEvent(FreshAgentEvent {
+        provider: PROVIDER.to_owned(),
+        session_type: SESSION_TYPE.to_owned(),
+        session_id: thread_id.to_owned(),
+        event,
+    });
+    if let Ok(frame) = serde_json::to_string(&msg) {
+        let _ = tx.send(frame);
+    }
+}
+
+fn flush_codex_projection(
+    projection: &Arc<StdMutex<projection::CodexProjection>>,
+    thread_id: &str,
+    tx: &tokio::sync::broadcast::Sender<String>,
+) {
+    let patch = projection
+        .lock()
+        .expect("codex projection lock")
+        .take_patch();
+    if let Some(patch) = patch {
+        broadcast_codex_event(thread_id, patch, tx);
+    }
+}
+
 fn adapter_event_to_frame(event: &CodexAdapterEvent, thread_id: &str) -> Option<String> {
     let inner = match event {
         CodexAdapterEvent::StatusSnapshot {
@@ -11111,9 +12905,16 @@ fn mint_synthesized_attention_edge(
     thread_id: &str,
     broadcast_tx: &tokio::sync::broadcast::Sender<String>,
     source: &'static str,
+    state: Option<&FreshCodexState>,
 ) {
     let clock = crate::attention::AttentionClock::from(Arc::clone(last_turn_complete_at));
     let at = crate::attention::mint_synthesized_edge(&clock, PROVIDER, thread_id, source);
+    if let Some(state) = state {
+        state
+            .attention
+            .record_turn_complete(thread_id, SESSION_TYPE, at);
+        state.notify_retained();
+    }
     let event = CodexAdapterEvent::TurnComplete {
         session_id: thread_id.to_string(),
         at,
@@ -11469,6 +13270,31 @@ fn now_iso() -> String {
     let year = if month <= 2 { year + 1 } else { year };
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}.{millis:03}Z")
 }
+
+struct LocalCodexCatalogProbe {
+    state: FreshCodexState,
+    context: crate::model_capabilities::CodexCatalogContext,
+    expected_source: String,
+}
+impl crate::model_capabilities::ModelCatalogProbe for LocalCodexCatalogProbe {
+    fn probe<'a>(
+        &'a self,
+        _cwd: Option<&'a str>,
+    ) -> freshell_opencode::serve::BoxFuture<'a, crate::model_capabilities::CatalogOut> {
+        Box::pin(async move {
+            if self.state.catalog_binding(&self.context).await?.0 != self.expected_source {
+                return Err(crate::model_capabilities::source_changed());
+            }
+            let rows = self.state.model_catalog(self.context.clone()).await?;
+            let models = serde_json::from_value(rows).expect("typed native catalog rows");
+            Ok(crate::model_capabilities::codex_capabilities(models))
+        })
+    }
+}
+
+#[cfg(test)]
+#[path = "codex_rest_lane_tests.rs"]
+mod rest_lane_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -11983,6 +13809,7 @@ pub(crate) mod tests {
         ownership_id: &str,
     ) -> tokio::sync::broadcast::Receiver<String> {
         // no-op consumer: these tests drive the reducer/RPC surfaces directly.
+        let turn_state = Arc::new(StdMutex::new(CodexTurnState::default()));
         let consumer = tokio::spawn(async {});
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
@@ -12001,7 +13828,7 @@ pub(crate) mod tests {
         let last_turn_complete_at: Arc<StdMutex<Option<i64>>> = Arc::new(StdMutex::new(None));
         let sidecar_pid = child.id();
         let sidecar_ownership_id = ownership_id.to_string();
-        let watcher = spawn_exit_watcher(
+        let watcher = spawn_exit_watcher_tracking_turns(
             child,
             ownership_id.to_string(),
             thread_id.to_string(),
@@ -12015,10 +13842,16 @@ pub(crate) mod tests {
             last_turn_complete_at.clone(),
             Arc::clone(&state.condemned_priors),
             None,
+            Some(turn_state.clone()),
+            Some(state.clone()),
         );
         state.sessions.lock().await.insert(
             thread_id.to_string(),
             CodexSession {
+                collaboration_mode: None,
+                native_turn_settings: None,
+                native_thread_settings: None,
+                turn_state: turn_state.clone(),
                 client,
                 model: "gpt-5.3-codex-spark".to_string(),
                 effort: None,
@@ -12033,6 +13866,10 @@ pub(crate) mod tests {
                 history_mode: Some(HistoryMode::Paginated),
                 turn_lock: Arc::new(TokioMutex::new(())),
                 event_emission_gate: Arc::new(TokioMutex::new(())),
+                projection: Arc::new(StdMutex::new(projection::CodexProjection::new(
+                    mint_ownership_id(),
+                    thread_id.to_string(),
+                ))),
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -12090,9 +13927,15 @@ pub(crate) mod tests {
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
         let event_emission_gate = Arc::new(TokioMutex::new(()));
+        let turn_state = Arc::new(StdMutex::new(CodexTurnState::default()));
+        let projection = Arc::new(StdMutex::new(projection::CodexProjection::new(
+            mint_ownership_id(),
+            thread_id.to_string(),
+        )));
         let consumer = state.spawn_consumer(
             notifs,
             CodexConsumerRuntime {
+                turn_state: turn_state.clone(),
                 thread_id: thread_id.to_string(),
                 active_turn: active_turn.clone(),
                 user_interrupt_pending: user_interrupt_pending.clone(),
@@ -12104,13 +13947,14 @@ pub(crate) mod tests {
                 compact_in_flight: compact_in_flight.clone(),
                 compact_turn_id: compact_turn_id.clone(),
                 event_emission_gate: event_emission_gate.clone(),
+                projection: projection.clone(),
             },
         );
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
         let sidecar_pid = child.id();
         let sidecar_ownership_id = ownership_id.to_string();
-        let watcher = spawn_exit_watcher(
+        let watcher = spawn_exit_watcher_tracking_turns(
             child,
             ownership_id.to_string(),
             thread_id.to_string(),
@@ -12124,10 +13968,16 @@ pub(crate) mod tests {
             last_turn_complete_at.clone(),
             Arc::clone(&state.condemned_priors),
             None,
+            Some(turn_state.clone()),
+            Some(state.clone()),
         );
         state.sessions.lock().await.insert(
             thread_id.to_string(),
             CodexSession {
+                collaboration_mode: None,
+                native_turn_settings: None,
+                native_thread_settings: None,
+                turn_state: turn_state.clone(),
                 client,
                 model: "gpt-5.3-codex-spark".to_string(),
                 effort: None,
@@ -12142,6 +13992,7 @@ pub(crate) mod tests {
                 history_mode: Some(HistoryMode::Paginated),
                 turn_lock: Arc::new(TokioMutex::new(())),
                 event_emission_gate,
+                projection,
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -12511,6 +14362,7 @@ pub(crate) mod tests {
         let sink = crate::naming::test_support::RecordingSink::new();
         st.set_session_naming(sink.clone());
         let create = FreshAgentCreate {
+            collaboration_mode: None,
             pane_id: None,
             observed_epoch: None,
             observed_generation: None,
@@ -13297,6 +15149,600 @@ pub(crate) mod tests {
         );
     }
 
+    async fn task008_settings_fixture() -> (
+        FreshCodexState,
+        freshell_codex::ChannelPeer,
+        tokio::sync::broadcast::Receiver<String>,
+        Arc<crate::identity_sink::FakeIdentitySink>,
+    ) {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifications) = CodexAppServerClient::connect(transport);
+        let (st, _) = state_with_bus();
+        let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(sink.clone());
+        let wire = insert_fake_session_with_real_consumer(
+            &st,
+            "thread-settings",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            notifications,
+            spawn_sleeper(),
+            &format!("task008-settings-{}", uuid::Uuid::new_v4()),
+        )
+        .await;
+        (st, peer, wire, sink)
+    }
+
+    async fn task008_settings_send(
+        st: &FreshCodexState,
+        peer: &freshell_codex::ChannelPeer,
+        settings: Value,
+    ) -> Value {
+        task008_settings_send_named(st, peer, settings, "turn-settings").await
+    }
+
+    async fn task008_settings_send_named(
+        st: &FreshCodexState,
+        peer: &freshell_codex::ChannelPeer,
+        settings: Value,
+        turn_id: &str,
+    ) -> Value {
+        let task = tokio::spawn({
+            let st = st.clone();
+            async move {
+                st.handle_send(serde_json::from_value(json!({
+                "provider":"codex", "sessionType":"freshcodex", "sessionId":"thread-settings",
+                "requestId":"settings-send", "text":"settings probe", "settings":settings,
+            })).unwrap()).await;
+            }
+        });
+        let (mut id, mut method, mut params) = peer.expect_request().await;
+        if method == "initialize" {
+            peer.respond(&id, json!({}));
+            peer.expect_notification().await;
+            (id, method, params) = peer.expect_request().await;
+        }
+        assert_eq!(method, "turn/start");
+        peer.respond(&id, json!({"turn":{"id":turn_id}}));
+        task.await.unwrap();
+        params
+    }
+
+    async fn task008_settings_snapshot(
+        st: &FreshCodexState,
+        peer: &freshell_codex::ChannelPeer,
+    ) -> Value {
+        let task = tokio::spawn({
+            let st = st.clone();
+            async move { st.get_snapshot("thread-settings", None).await.unwrap() }
+        });
+        let (id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "thread/read");
+        peer.respond(
+            &id,
+            json!({"thread":{"id":"thread-settings","status":{"type":"idle"},"turns":[]}}),
+        );
+        task.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn task008_settings_configure_cwd_reaches_the_next_native_start() {
+        let (st, peer, _, sink) = task008_settings_fixture().await;
+        st.handle_configure(serde_json::from_value(json!({"provider":"codex","sessionType":"freshcodex","sessionId":"thread-settings","settings":{"cwd":"/next","sandbox":"read-only","permissionMode":"never","model":"provider-current","effort":"ultra"}})).unwrap()).await;
+        let params = task008_settings_send(&st, &peer, Value::Null).await;
+        let saved = sink.load_settings("codex", "thread-settings");
+        peer.disconnect();
+        st.shutdown().await;
+        assert_eq!(params["cwd"], "/next");
+        assert_eq!(params["sandboxPolicy"]["type"], "readOnly");
+        assert_eq!(params["approvalPolicy"], "never");
+        assert_eq!(saved.unwrap().cwd.as_deref(), Some("/next"));
+    }
+
+    #[tokio::test]
+    async fn task008_settings_snapshot_exposes_complete_next_turn_defaults() {
+        let (st, peer, _, _) = task008_settings_fixture().await;
+        task008_settings_send(&st, &peer, json!({"cwd":"/next","sandbox":"read-only","permissionMode":"never","model":"provider-current","effort":"ultra"})).await;
+        let snapshot = task008_settings_snapshot(&st, &peer).await;
+        peer.disconnect();
+        st.shutdown().await;
+        assert_eq!(
+            snapshot["settings"],
+            json!({"cwd":"/next","sandbox":"read-only","permissionMode":"never","model":"provider-current","effort":"ultra","collaborationMode":"default"})
+        );
+        assert_eq!(snapshot["capabilities"]["settingScopes"]["cwd"], "per-send");
+    }
+
+    #[tokio::test]
+    async fn task008_settings_plan_and_explicit_build_use_native_collaboration_mode() {
+        let mut observed = Vec::new();
+        for mode in ["plan", "default"] {
+            let (st, peer, _, _) = task008_settings_fixture().await;
+            let params = task008_settings_send(&st, &peer, json!({"model":"provider-current","effort":"ultra","cwd":"/next","sandbox":"read-only","permissionMode":"never","collaborationMode":mode})).await;
+            peer.disconnect();
+            st.shutdown().await;
+            assert_eq!(params["sandboxPolicy"]["type"], "readOnly");
+            assert_eq!(params["approvalPolicy"], "never");
+            observed.push(params["collaborationMode"].clone());
+        }
+        assert_eq!(observed, ["plan", "default"].map(|mode| json!({"mode":mode,"settings":{"model":"provider-current","reasoning_effort":"ultra","developer_instructions":null}})));
+    }
+
+    #[tokio::test]
+    async fn task008_settings_newer_configure_survives_a_held_older_send_response() {
+        let (st, peer, mut wire, sink) = task008_settings_fixture().await;
+        let send = tokio::spawn({
+            let st = st.clone();
+            async move {
+                st.handle_send(serde_json::from_value(json!({"provider":"codex","sessionType":"freshcodex","sessionId":"thread-settings","text":"old settings","settings":{"model":"old-model","effort":"low","cwd":"/old","sandbox":"read-only","permissionMode":"on-request"}})).unwrap()).await;
+            }
+        });
+        let (id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "initialize");
+        peer.respond(&id, json!({}));
+        peer.expect_notification().await;
+        let (id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        let configure = st.handle_configure(serde_json::from_value(json!({"provider":"codex","sessionType":"freshcodex","sessionId":"thread-settings","requestId":"new-settings","settings":{"model":"new-model","effort":"ultra","cwd":"/new","sandbox":"workspace-write","permissionMode":"never","collaborationMode":"plan"}})).unwrap());
+        tokio::pin!(configure);
+        // Give the public configure an actual admission opportunity. It may
+        // finish now or serialize behind the held send; either ordering is valid.
+        let admitted = futures_util::poll!(&mut configure).is_ready();
+        peer.respond(&id, json!({"turn":{"id":"turn-old"}}));
+        send.await.unwrap();
+        if !admitted {
+            configure.await;
+        }
+        drain_wire(&mut wire);
+        peer.emit_notification(
+            "turn/completed",
+            json!({"threadId":"thread-settings","turn":{"id":"turn-old","status":"completed"}}),
+        );
+        await_next_idle_snapshot(&mut wire, "thread-settings").await;
+        let params = task008_settings_send(&st, &peer, Value::Null).await;
+        let saved = sink.load_settings("codex", "thread-settings").unwrap();
+        peer.disconnect();
+        st.shutdown().await;
+        assert_eq!(params["model"], "new-model");
+        assert_eq!(params["effort"], "ultra");
+        assert_eq!(params["cwd"], "/new");
+        assert_eq!(params["sandboxPolicy"]["type"], "workspaceWrite");
+        assert_eq!(params["approvalPolicy"], "never");
+        assert_eq!(saved.model.as_deref(), Some("new-model"));
+        assert_eq!(saved.cwd.as_deref(), Some("/new"));
+    }
+
+    #[tokio::test]
+    async fn task008_settings_durable_configure_failure_refuses_without_false_success() {
+        let (events, _capture) = tracing_capture::capture();
+        let (st, peer, mut wire, sink) = task008_settings_fixture().await;
+        task008_settings_send(&st, &peer, json!({"model":"saved-model","effort":"low"})).await;
+        drain_wire(&mut wire);
+        sink.set_fail_writes(true);
+        st.handle_configure(serde_json::from_value(json!({"provider":"codex","sessionType":"freshcodex","sessionId":"thread-settings","requestId":"refused-settings","settings":{"model":"unsaved-model","effort":"ultra"}})).unwrap()).await;
+        let frames = drain(&mut wire).await;
+        let snapshot = task008_settings_snapshot(&st, &peer).await;
+        let saved = sink.load_settings("codex", "thread-settings").unwrap();
+        peer.disconnect();
+        st.shutdown().await;
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame["event"]["type"] == "freshAgent.error"
+                    && frame["event"]["code"] == "CODEX_SETTINGS_PERSIST_FAILED"
+                    && frame["event"]["requestId"] == "refused-settings"),
+            "typed correlated refusal missing: {frames:?}"
+        );
+        assert!(!frames
+            .iter()
+            .any(|frame| frame["event"]["type"] == "freshAgent.session.metadata"));
+        assert_eq!(snapshot["settings"]["model"], "saved-model");
+        assert_eq!(saved.model.as_deref(), Some("saved-model"));
+        assert!(events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.message.contains("configure_persist_failed")));
+    }
+
+    #[tokio::test]
+    async fn task008_settings_configure_carries_its_retained_owner_fence() {
+        let (mut st, peer, _, sink) = task008_settings_fixture().await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        let mut ticket =
+            match st.begin_lane_claim_at("thread-settings", "settings-owner", None, "test") {
+                crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+                _ => panic!("settings ownership claim must grant"),
+            };
+        let expected = (
+            Some(registry.boot_epoch()),
+            Some(ticket.as_ref().unwrap().generation()),
+        );
+        assert!(st
+            .commit_lane_claim_at(&mut ticket, "thread-settings", "thread-settings", None)
+            .is_ok());
+        st.handle_configure(configure_msg(
+            "thread-settings",
+            Some("provider-current"),
+            Some("ultra"),
+        ))
+        .await;
+        let observed = sink
+            .binding_pairs
+            .lock()
+            .unwrap()
+            .get(&("codex".into(), "thread-settings".into()))
+            .cloned();
+        peer.disconnect();
+        st.shutdown().await;
+        assert_eq!(observed, Some(expected));
+    }
+
+    #[tokio::test]
+    async fn task008_settings_refinement_retained_snapshot_keeps_complete_staged_defaults() {
+        let (st, peer, _, _) = task008_settings_fixture().await;
+        task008_settings_send(&st, &peer, json!({"model":"provider-current","effort":"ultra","cwd":"/first","sandbox":"read-only","permissionMode":"never"})).await;
+        task008_settings_snapshot(&st, &peer).await;
+        st.handle_configure(serde_json::from_value(json!({"provider":"codex","sessionType":"freshcodex","sessionId":"thread-settings","settings":{"cwd":"/next","collaborationMode":"plan"}})).unwrap()).await;
+        let retained = st.retained_state("thread-settings").await.unwrap();
+        peer.disconnect();
+        st.shutdown().await;
+        assert_eq!(
+            retained["snapshot"]["settings"],
+            json!({"model":"provider-current","effort":"ultra","cwd":"/next","sandbox":"read-only","permissionMode":"never","collaborationMode":"plan"})
+        );
+        assert_eq!(
+            retained["snapshot"]["extensions"]["codex"]["settings"]["currentTurn"]["cwd"],
+            "/first"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn task008_settings_recovery_refusal_keeps_file_access_and_approval_on_retry() {
+        let _guard = ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("restricted-recovery.jsonl");
+        configure_fake_codex_cmd(&json!({"appendRequestLogPath":log}).to_string());
+        let (st, mut wire) = state_with_bus();
+        let mut create = create_msg("restricted-settings-recovery");
+        create.cwd = Some(temp.path().to_string_lossy().into());
+        create.sandbox = Some(freshell_protocol::Sandbox::ReadOnly);
+        create.permission_mode = Some("on-request".into());
+        st.handle_create(create, None).await;
+        let created = collect_frames_until(&mut wire, Duration::from_secs(10), |frame| {
+            frame["type"] == "freshAgent.created"
+        })
+        .await;
+        assert!(created
+            .frames
+            .iter()
+            .any(|frame| frame["type"] == "freshAgent.created"));
+        simulate_unrequested_crash(&st, "thread-new-1").await;
+        configure_fake_codex_cmd(
+            &json!({"appendRequestLogPath":log,"rejectResumeOverrides":true}).to_string(),
+        );
+        drain_wire(&mut wire);
+        st.handle_send(send_msg(
+            "thread-new-1",
+            "restricted recovery must not run with native full access",
+        ))
+        .await;
+        let frames = drain(&mut wire).await;
+        st.shutdown().await;
+        let requests: Vec<Value> = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let observed = json!({
+            "resumes":requests.iter().filter(|row| row["method"] == "thread/resume").map(|row| json!({"sandbox":row["params"]["sandbox"],"approval":row["params"]["approvalPolicy"]})).collect::<Vec<_>>(),
+            "work":requests.iter().filter(|row| row["method"] == "turn/start").map(|row| json!({"sandbox":row["params"]["sandboxPolicy"]["type"],"approval":row["params"]["approvalPolicy"]})).collect::<Vec<_>>(),
+            "refused":frames.iter().any(|frame| frame["type"] == "error" && frame["message"].as_str().is_some_and(|message| message.starts_with("CODEX_RESPAWN_FAILED:") && message.contains("resume sandbox or approval")))
+        });
+        assert_eq!(
+            observed,
+            json!({"resumes":[{"sandbox":"read-only","approval":"on-request"},{"sandbox":"read-only","approval":"on-request"}],"work":[],"refused":true}),
+            "native refusal cannot become a no-policy full-access recovery"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn task008_settings_refinement_untrusted_recovery_refuses_without_dropping_policy() {
+        let _guard = ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("untrusted-recovery.jsonl");
+        configure_fake_codex_cmd(&json!({"appendRequestLogPath":log}).to_string());
+        let (st, mut wire) = state_with_bus();
+        let mut create = create_msg("untrusted-settings-recovery");
+        create.model = Some("provider-current".into());
+        create.effort = Some(Some("ultra".into()));
+        create.cwd = Some(temp.path().to_string_lossy().into());
+        create.permission_mode = Some("untrusted".into());
+        create.collaboration_mode = Some("plan".into());
+        st.handle_create(create, None).await;
+        let created = collect_frames_until(&mut wire, Duration::from_secs(10), |frame| {
+            frame["type"] == "freshAgent.created"
+        })
+        .await;
+        assert!(
+            created
+                .frames
+                .iter()
+                .any(|frame| frame["type"] == "freshAgent.created"),
+            "native untrusted creation is ready"
+        );
+        simulate_unrequested_crash(&st, "thread-new-1").await;
+        configure_fake_codex_cmd(&json!({"appendRequestLogPath":log,"configRequirements":{"allowedApprovalPolicies":["never"]}}).to_string());
+        drain_wire(&mut wire);
+        st.handle_send(send_msg("thread-new-1", "must be refused before work"))
+            .await;
+        let frames = drain(&mut wire).await;
+        st.shutdown().await;
+        let requests: Vec<Value> = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            !requests
+                .iter()
+                .any(|row| row["method"] == "thread/resume" || row["method"] == "turn/start"),
+            "requirements refusal must not retry without untrusted approval: {requests:?}"
+        );
+        assert!(frames.iter().any(|frame| frame["type"] == "error"
+            && frame["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("approval_policy untrusted"))));
+        assert!(!frames
+            .iter()
+            .any(|frame| frame["type"] == "freshAgent.send.accepted"));
+    }
+
+    #[tokio::test]
+    async fn task008_settings_active_steer_keeps_the_native_turn_and_stages_the_next_start() {
+        let (st, peer, mut wire, sink) = task008_settings_fixture().await;
+        let first = task008_settings_send(&st, &peer, json!({"model":"first-model","effort":"low","cwd":"/first","sandbox":"read-only","permissionMode":"on-request"})).await;
+        st.handle_configure(serde_json::from_value(json!({"provider":"codex","sessionType":"freshcodex","sessionId":"thread-settings","settings":{"model":"next-model","effort":"ultra","cwd":"/next","sandbox":"workspace-write","permissionMode":"never","collaborationMode":"plan"}})).unwrap()).await;
+        let steer = tokio::spawn({
+            let st = st.clone();
+            async move {
+                st.handle_send(send_msg("thread-settings", "add context"))
+                    .await;
+            }
+        });
+        let (id, method, params) = peer.expect_request().await;
+        peer.respond(&id, json!({"turnId":"turn-settings"}));
+        steer.await.unwrap();
+        let snapshot = task008_settings_snapshot(&st, &peer).await;
+        drain_wire(&mut wire);
+        peer.emit_notification("turn/completed", json!({"threadId":"thread-settings","turn":{"id":"turn-settings","status":"completed"}}));
+        await_next_idle_snapshot(&mut wire, "thread-settings").await;
+        let next = task008_settings_send_named(&st, &peer, Value::Null, "turn-next").await;
+        let saved = sink.load_settings("codex", "thread-settings").unwrap();
+        peer.disconnect();
+        st.shutdown().await;
+        // Existing steering is an honest baseline: these assertions precede
+        // the newly missing staged/current-settings assertions.
+        assert_eq!(method, "turn/steer");
+        assert_eq!(
+            params,
+            json!({"threadId":"thread-settings","expectedTurnId":"turn-settings","input":[{"type":"text","text":"add context","text_elements":[]}]})
+        );
+        assert_eq!(first["model"], "first-model");
+        assert_eq!(first["effort"], "low");
+        assert_eq!(next["cwd"], "/next");
+        assert_eq!(next["model"], "next-model");
+        assert_eq!(next["effort"], "ultra");
+        assert_eq!(next["approvalPolicy"], "never");
+        assert_eq!(next["sandboxPolicy"]["type"], "workspaceWrite");
+        assert_eq!(next["collaborationMode"]["mode"], "plan");
+        assert_eq!(
+            snapshot["extensions"]["codex"]["settings"]["scope"],
+            "next-turn"
+        );
+        assert_eq!(
+            snapshot["extensions"]["codex"]["settings"]["currentTurn"]["model"],
+            "first-model"
+        );
+        assert_eq!(snapshot["settings"]["model"], "next-model");
+        assert_eq!(saved.model.as_deref(), Some("next-model"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn task008_settings_refinement_thread_effort_echo_preserves_next_turn_selection_and_native_default(
+    ) {
+        let _guard = ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("effort-scopes.jsonl");
+        configure_fake_codex_cmd(&json!({"appendRequestLogPath":log,"effectiveThreadSettings":{"reasoningEffort":"low","collaborationMode":{"mode":"default","settings":{"model":"provider-current","reasoning_effort":"low","developer_instructions":null}}}}).to_string());
+        for (index, effort) in [None, Some("ultra"), Some("max"), Some("future-effort")]
+            .into_iter()
+            .enumerate()
+        {
+            let (st, _) = state_with_bus();
+            let mut create = create_msg(&format!("effort-scope-{index}"));
+            create.model = Some("provider-current".into());
+            create.effort = effort.map(str::to_owned).map(Some);
+            create.collaboration_mode = Some("plan".into());
+            st.handle_create(create, None).await;
+            st.handle_send(send_msg("thread-new-1", "selected next-turn effort"))
+                .await;
+            st.shutdown().await;
+        }
+        let requests: Vec<Value> = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let turns: Vec<_> = requests
+            .iter()
+            .filter(|row| row["method"] == "turn/start")
+            .collect();
+        let actual: Vec<_> = turns.iter().map(|row| json!({"effort":row["params"]["effort"],"mode":row["params"]["collaborationMode"]["mode"],"modeEffort":row["params"]["collaborationMode"]["settings"]["reasoning_effort"]})).collect();
+        let expected: Vec<_> = [
+            Value::Null,
+            json!("ultra"),
+            json!("max"),
+            json!("future-effort"),
+        ]
+        .into_iter()
+        .map(|effort| json!({"effort":effort,"mode":"plan","modeEffort":effort}))
+        .collect();
+        assert_eq!(actual, expected, "thread/start has no effort override input; its current/default echo cannot replace next-turn intent");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn task008_settings_clear_effort_configure_preserves_cwd_only_changes_and_survives_resume(
+    ) {
+        let _guard = ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let next_cwd = temp.path().join("next");
+        std::fs::create_dir(&next_cwd).unwrap();
+        let log = temp.path().join("clear-effort.jsonl");
+        configure_fake_codex_cmd(&json!({"appendRequestLogPath":log,"recordTurns":true,"effectiveThreadSettings":{"reasoningEffort":"low"}}).to_string());
+        let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        let (st, mut wire) = state_with_bus();
+        st.set_identity_sink(sink.clone());
+        let mut create = create_msg("clear-effort-create");
+        create.cwd = Some(temp.path().to_string_lossy().into());
+        create.model = Some("provider-current".into());
+        create.effort = Some(Some("ultra".into()));
+        create.sandbox = Some(freshell_protocol::Sandbox::ReadOnly);
+        create.permission_mode = Some("never".into());
+        create.collaboration_mode = Some("plan".into());
+        st.handle_create(create, None).await;
+        for (index, patch) in [
+            None,
+            Some(json!({"cwd":next_cwd})),
+            Some(json!({"effort":null})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if let Some(settings) = patch {
+                st.handle_configure(serde_json::from_value(json!({"provider":"codex","sessionType":"freshcodex","sessionId":"thread-new-1","requestId":format!("clear-settings-{index}"),"settings":settings})).unwrap()).await;
+            }
+            drain_wire(&mut wire);
+            st.handle_send(send_msg("thread-new-1", &format!("effort stage {index}")))
+                .await;
+            collect_frames_until(&mut wire, Duration::from_secs(10), |frame| {
+                frame["event"]["type"] == "freshAgent.turn.complete"
+            })
+            .await;
+        }
+        let saved = sink.load_settings("codex", "thread-new-1").unwrap();
+        st.shutdown().await;
+        let (resumed, _) = state_with_bus();
+        resumed.set_identity_sink(sink);
+        resumed.handle_create(serde_json::from_value(json!({"requestId":"clear-effort-resume","provider":"codex","sessionType":"freshcodex","sessionRef":{"provider":"codex","sessionId":"thread-new-1"}})).unwrap(), None).await;
+        resumed
+            .handle_send(send_msg("thread-new-1", "after clearing and resume"))
+            .await;
+        resumed.shutdown().await;
+        let requests: Vec<Value> = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let turns: Vec<_> = requests
+            .iter()
+            .filter(|row| row["method"] == "turn/start")
+            .collect();
+        assert_eq!(
+            turns
+                .iter()
+                .map(|row| row["params"]["effort"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!("ultra"), json!("ultra"), Value::Null, Value::Null]
+        );
+        assert!(saved.effort.is_none());
+        for row in &turns[1..] {
+            assert_eq!(row["params"]["cwd"], json!(next_cwd));
+            assert_eq!(row["params"]["collaborationMode"]["mode"], "plan");
+            assert_eq!(row["params"]["sandboxPolicy"]["type"], "readOnly");
+            assert_eq!(row["params"]["approvalPolicy"], "never");
+        }
+        assert_eq!(
+            turns[2]["params"]["collaborationMode"]["settings"]["reasoning_effort"],
+            Value::Null
+        );
+        assert_eq!(
+            turns[3]["params"]["collaborationMode"]["settings"]["reasoning_effort"],
+            Value::Null
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn task008_settings_native_effective_values_win_on_create_resume_and_fork() {
+        let _environment_lock = ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("effective");
+        std::fs::create_dir(&cwd).unwrap();
+        let log = temp.path().join("settings-native-echo.jsonl");
+        configure_fake_codex_cmd(&json!({"appendRequestLogPath":log,"recordTurns":true,"effectiveThreadSettings":{"model":"native-effective","reasoningEffort":"ultra","cwd":cwd,"sandbox":"read-only","approvalPolicy":"on-request"}}).to_string());
+        let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        let (st, mut rx) = state_with_bus();
+        st.set_identity_sink(sink.clone());
+        st.handle_create(serde_json::from_value(json!({"requestId":"settings-echo-create","provider":"codex","sessionType":"freshcodex","model":"stale-create","effort":"low","cwd":temp.path(),"sandbox":"danger-full-access","permissionMode":"never","collaborationMode":"plan"})).unwrap(), None).await;
+        st.handle_send(send_msg("thread-new-1", "after effective create"))
+            .await;
+        collect_frames_until(&mut rx, Duration::from_secs(10), |frame| {
+            frame["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        let (reply, frames) = capturing_sink();
+        st.handle_fork(
+            fork_msg(
+                "thread-new-1",
+                "settings-echo-fork",
+                Some(json!({"model":"stale-fork","cwd":temp.path()})),
+            ),
+            None,
+            reply,
+        )
+        .await;
+        let child = captured_frames(&frames)
+            .iter()
+            .find(|frame| frame["type"] == "freshAgent.forked")
+            .expect("native fork completes")["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        st.handle_send(send_msg(&child, "after effective fork"))
+            .await;
+        collect_frames_until(&mut rx, Duration::from_secs(10), |frame| {
+            frame["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        st.shutdown().await;
+        let (resumed, _) = state_with_bus();
+        resumed.set_identity_sink(sink.clone());
+        resumed.handle_create(serde_json::from_value(json!({"requestId":"settings-echo-resume","provider":"codex","sessionType":"freshcodex","sessionRef":{"provider":"codex","sessionId":"thread-new-1"},"model":"stale-resume","effort":"low","cwd":temp.path(),"sandbox":"danger-full-access","permissionMode":"never"})).unwrap(), None).await;
+        resumed
+            .handle_send(send_msg("thread-new-1", "after effective resume"))
+            .await;
+        let snapshot = resumed.get_snapshot("thread-new-1", None).await.unwrap();
+        resumed.shutdown().await;
+        std::env::remove_var("CODEX_CMD");
+        std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
+        let requests: Vec<Value> = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let starts: Vec<_> = requests.iter().filter(|row| row["method"] == "turn/start").map(|row| json!({"model":row["params"]["model"],"effort":row["params"]["effort"],"cwd":row["params"]["cwd"],"sandbox":row["params"]["sandboxPolicy"],"approval":row["params"]["approvalPolicy"],"mode":row["params"]["collaborationMode"]})).collect();
+        let expected = json!({"model":"native-effective","effort":"low","cwd":cwd,"sandbox":{"type":"readOnly"},"approval":"on-request","mode":{"mode":"plan","settings":{"model":"native-effective","reasoning_effort":"low","developer_instructions":null}}});
+        assert_eq!(starts, vec![expected; 3]);
+        assert_eq!(snapshot["settings"]["effort"], "low");
+        assert_eq!(
+            snapshot["extensions"]["codex"]["settings"]["lastThreadResponse"]["reasoningEffort"],
+            "ultra"
+        );
+        let saved = sink.load_settings("codex", "thread-new-1").unwrap();
+        assert_eq!(saved.model.as_deref(), Some("native-effective"));
+    }
+
     /// b8ke ext r29 F3 + focused ep5 r1 F2: the post-send binding refresh
     /// carries the operation's OWN claim pair — the lane's retained
     /// OwnershipStamp for the session (written only by this lane's claim
@@ -13585,7 +16031,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn handle_interrupt_issues_rpc_for_tracked_turn_and_clears_it() {
+    async fn handle_interrupt_issues_rpc_for_tracked_turn_and_retains_it_until_terminal_evidence() {
         let (transport, peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
         let client = Arc::new(client);
@@ -13634,9 +16080,9 @@ pub(crate) mod tests {
 
         driver.await.expect("handle_interrupt task");
         assert_eq!(
-            *active_turn.lock().unwrap(),
-            None,
-            "active turn cleared on a successful interrupt (adapter.ts:1027)"
+            active_turn.lock().unwrap().as_deref(),
+            Some("turn-1"),
+            "successful interrupt acknowledgement cannot settle a native turn"
         );
     }
 
@@ -13696,6 +16142,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn handle_kill_removes_session_kills_owned_child_and_broadcasts_killed() {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
         let (transport, _peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
         let client = Arc::new(client);
@@ -13743,6 +16190,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn recovery_stop_reaps_the_writer_without_retiring_the_durable_thread() {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
         let (transport, _peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
         let (st, mut rx, sink) = state_with_sink();
@@ -13783,6 +16231,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn requested_exit_watcher_reports_confirmed_reap() {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
         let (broadcast_tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
         let (kill_tx, kill_rx) = oneshot::channel();
         let child = spawn_sleeper();
@@ -14138,12 +16587,17 @@ pub(crate) mod tests {
         // A session whose watcher never resolves (the stalled teardown) and
         // whose kill_tx is absent — the teardown block parks on the watcher
         // join forever.
+        let turn_state = Arc::new(StdMutex::new(CodexTurnState::default()));
         let consumer = tokio::spawn(async {});
         let watcher = tokio::spawn(std::future::pending::<crate::session_handoff::StopResult>());
         let exited = Arc::new(AtomicBool::new(false));
         st.sessions.lock().await.insert(
             "thread-stall".to_string(),
             CodexSession {
+                collaboration_mode: None,
+                native_turn_settings: None,
+                native_thread_settings: None,
+                turn_state: turn_state.clone(),
                 client,
                 sidecar_pid: None,
                 sidecar_ownership_id: String::new(),
@@ -14159,6 +16613,10 @@ pub(crate) mod tests {
                 history_mode: Some(HistoryMode::Paginated),
                 turn_lock: Arc::new(TokioMutex::new(())),
                 event_emission_gate: Arc::new(TokioMutex::new(())),
+                projection: Arc::new(StdMutex::new(projection::CodexProjection::new(
+                    mint_ownership_id(),
+                    "thread-stall".to_string(),
+                ))),
                 consumer,
                 kill_tx: None,
                 watcher,
@@ -14495,6 +16953,7 @@ pub(crate) mod tests {
         let create = tokio::spawn(async move {
             st2.handle_create(
                 FreshAgentCreate {
+                    collaboration_mode: None,
                     pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
@@ -14671,6 +17130,7 @@ pub(crate) mod tests {
         configure_fake_codex_cmd("{}");
         st.handle_create(
             FreshAgentCreate {
+                collaboration_mode: None,
                 pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
@@ -14832,6 +17292,7 @@ pub(crate) mod tests {
         let create_task = tokio::spawn(async move {
             st2.handle_create(
                 FreshAgentCreate {
+                    collaboration_mode: None,
                     pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
@@ -15235,6 +17696,15 @@ pub(crate) mod tests {
         // window, with the busy truth carried by compact-1's window bit alone.
         peer.respond(&compact_id, json!({}));
         compact_1.await.expect("compact-1 task");
+
+        // Accepted compaction advances the transcript history fence before
+        // another request can observe this window. Consume those additive
+        // projection frames; the refusal below must still beat every RPC.
+        let projection: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(projection["event"]["type"], "freshAgent.transcript.patch");
+        assert_eq!(projection["event"]["historyGeneration"], 1);
+        let metadata: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(metadata["event"]["type"], "freshAgent.session.metadata");
 
         // Compact-2 in the window: REFUSED BUSY_TURN with ZERO RPCs reaching
         // the app-server (the red shape instead issues a second
@@ -16709,6 +19179,150 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn handle_fork_policy_mismatch_refuses_before_child_spawn_and_settles_cleanup() {
+        // Existing ENV_LOCK/configure_fake_codex_cmd make accidental RED-path
+        // spawns hermetic; this test does not need to launch a parent app-server.
+        let _env = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+
+        let (mut st, _rx, fake) = state_with_sink();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+
+        const PARENT: &str = "parent-untrusted-fork";
+        const CHILD: &str = "child-policy-mismatch";
+        let mut ticket = match st.begin_lane_claim_at(PARENT, "seed-parent", None, "test") {
+            crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+            _ => panic!("parent seed must grant"),
+        };
+        assert!(st
+            .commit_lane_claim_at(&mut ticket, PARENT, PARENT, None)
+            .is_ok());
+
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let parent_client = Arc::new(client);
+        insert_fake_session(
+            &st,
+            PARENT,
+            parent_client.clone(),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-policy-fork-parent",
+        )
+        .await;
+        {
+            let mut sessions = st.sessions.lock().await;
+            sessions.get_mut(PARENT).unwrap().permission_mode = Some("untrusted".into());
+        }
+        let parent_before = registry.observe(PROVIDER, PARENT);
+        let capture = tracing_capture::capture_by_session("fork-policy-test-unused");
+        let (sink, captured) = capturing_sink();
+        let driver = tokio::spawn({
+            let st = st.clone();
+            async move {
+                st.handle_fork(fork_msg(PARENT, "fork-policy", None), None, sink)
+                    .await;
+            }
+        });
+
+        answer_initialize(&peer).await;
+        let (requirements_id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "configRequirements/read");
+        peer.respond(&requirements_id, json!({"requirements": null}));
+
+        let (fork_id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/fork");
+        assert_eq!(params["threadId"], PARENT);
+        assert_eq!(params["approvalPolicy"], "untrusted");
+        peer.respond(
+            &fork_id,
+            json!({
+                "thread": {"id": CHILD},
+                "approvalPolicy": "never"
+            }),
+        );
+
+        let (archive_id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/archive");
+        assert_eq!(params["threadId"], CHILD);
+        peer.respond(&archive_id, json!({}));
+
+        // The established post-archive containment must now run. Keep its
+        // response pending so guard ordering is observable without a sleep.
+        let (cleanup_id, method, params) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), peer.expect_request())
+                .await
+                .expect("mismatched fork must enter guarded post-archive cleanup");
+        assert_eq!(method, "thread/unarchive");
+        assert_eq!(params["threadId"], CHILD);
+        let child_during_cleanup = registry.observe(PROVIDER, CHILD);
+        assert!(child_during_cleanup.generation > 0);
+        assert!(matches!(
+            child_during_cleanup.state,
+            freshell_ownership::OwnershipState::Starting { .. }
+        ));
+
+        // A witnessed, still-running cleanup must survive the normal stale
+        // start sweep; this fails if cancellation/settle was armed too late.
+        let recovered = registry.recover_stale_starts(0, 0);
+        assert!(!recovered.iter().any(|entry| entry.session_id == CHILD));
+        assert!(matches!(
+            registry.observe(PROVIDER, CHILD).state,
+            freshell_ownership::OwnershipState::Starting { .. }
+        ));
+
+        peer.respond(&cleanup_id, json!({}));
+        tokio::time::timeout(std::time::Duration::from_secs(2), driver)
+            .await
+            .expect("fork refusal settles")
+            .expect("fork task");
+
+        assert_single_fork_error_frame(
+            &captured_frames(&captured),
+            PARENT,
+            "INTERNAL_ERROR",
+            "approval_policy untrusted",
+        );
+        let child_after = registry.observe(PROVIDER, CHILD);
+        assert_eq!(child_after.generation, child_during_cleanup.generation);
+        assert!(matches!(
+            child_after.state,
+            freshell_ownership::OwnershipState::Vacant
+        ));
+
+        let parent_after = registry.observe(PROVIDER, PARENT);
+        assert_eq!(parent_after.epoch, parent_before.epoch);
+        assert_eq!(parent_after.generation, parent_before.generation);
+        assert_eq!(parent_after.state, parent_before.state);
+        {
+            let sessions = st.sessions.lock().await;
+            assert_eq!(sessions.len(), 1);
+            let parent = sessions.get(PARENT).unwrap();
+            assert!(Arc::ptr_eq(&parent.client, &parent_client));
+            assert_eq!(parent.permission_mode.as_deref(), Some("untrusted"));
+            assert!(!parent.exited.load(Ordering::SeqCst));
+            assert!(!sessions.contains_key(CHILD));
+        }
+        assert_eq!(spawn_count(&capture), 0);
+        assert!(st.fork_in_flight.try_acquire(PARENT).is_some());
+        assert!(!fake
+            .bindings
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|row| row.session_id == CHILD));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.next_frame())
+                .await
+                .is_err()
+        );
+
+        peer.disconnect();
+        st.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn handle_fork_rpc_error_replies_on_the_sink_without_archiving_or_spawning() {
         let (st, _rx_boot) = state_with_bus();
         let (transport, peer) = freshell_codex::new_channel_transport();
@@ -17928,6 +20542,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            None, // no work-mode override in this lease fixture
             // kata b8ke Task 3: no coordinator claim in this direct-drive
             // test path (the lease-claim skip mirrors handle_create's
             // pre-claim fast paths).
@@ -18407,6 +21022,12 @@ pub(crate) mod tests {
         // Conn-less attach reconstructs the session (all-blank settings),
         // seeding the OLD row's stamps (focused-ep1-r4 Finding 2).
         st.handle_attach(attach_msg("thread-lineage-adopt")).await;
+        let observed = st.get_snapshot("thread-lineage-adopt", None).await.unwrap();
+        assert_eq!(observed["settings"]["model"], "fixture-model");
+        assert_eq!(
+            observed["extensions"]["codex"]["settings"]["lastThreadResponse"]["model"],
+            "fixture-model"
+        );
 
         // A NEW connection's recovery-create adopts the live incumbent.
         let mut resume = create_msg("req-adopt-lineage");
@@ -18427,27 +21048,50 @@ pub(crate) mod tests {
             "the adopt answers created: {created}"
         );
 
-        let bindings = fake.bindings.lock().expect("bindings mutex");
-        let b = bindings
-            .iter()
-            .rev()
-            .find(|b| b.session_id == "thread-lineage-adopt")
-            .expect("the adopt's refresh write must NOT be eaten by the no-laundering guard");
+        {
+            let bindings = fake.bindings.lock().expect("bindings mutex");
+            let b = bindings
+                .iter()
+                .rev()
+                .find(|b| b.session_id == "thread-lineage-adopt")
+                .expect("the adopt's refresh write must NOT be eaten by the no-laundering guard");
+            assert_eq!(
+                b.asserted_stamps().client_instance_id.as_deref(),
+                Some("client-new"),
+                "the provenance refresh must not be gated on settings presence"
+            );
+            assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-new"));
+            assert_eq!(
+                b.asserted_stamps().tab_key.as_deref(),
+                Some("device-new:tab-new")
+            );
+            assert_eq!(
+                b.settings,
+                crate::identity_sink::FreshAgentSettings::default(),
+                "the settings payload is untouched by the provenance refresh (stays lineage-only)"
+            );
+        }
+        // Accepted work materializes the observed defaults as durable intent;
+        // it must use that exact native model, not a fabricated fallback.
+        st.handle_send(send_msg(
+            "thread-lineage-adopt",
+            "first accepted lineage work",
+        ))
+        .await;
+        let accepted = collect_frames_until(&mut rx, Duration::from_secs(10), |frame| {
+            frame["type"] == "freshAgent.send.accepted"
+                && frame["sessionId"] == "thread-lineage-adopt"
+        })
+        .await;
+        assert!(accepted.matched, "{:?}", accepted.frames);
         assert_eq!(
-            b.asserted_stamps().client_instance_id.as_deref(),
-            Some("client-new"),
-            "the provenance refresh must not be gated on settings presence"
+            fake.load_settings("codex", "thread-lineage-adopt")
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("fixture-model")
         );
-        assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-new"));
-        assert_eq!(
-            b.asserted_stamps().tab_key.as_deref(),
-            Some("device-new:tab-new")
-        );
-        assert_eq!(
-            b.settings,
-            crate::identity_sink::FreshAgentSettings::default(),
-            "the settings payload is untouched by the provenance refresh (stays lineage-only)"
-        );
+        st.shutdown().await;
     }
 
     /// Focused-ep1-r4 Finding 2 (codex): the CONN-LESS cold attach
@@ -18492,6 +21136,7 @@ pub(crate) mod tests {
 
             authoritative: false,
             settings: crate::identity_sink::FreshAgentSettings {
+                collaboration_mode: None,
                 model: Some("gpt-5.3-codex-spark".into()),
                 sandbox: None,
                 permission_mode: None,
@@ -18597,6 +21242,7 @@ pub(crate) mod tests {
 
             authoritative: false,
             settings: crate::identity_sink::FreshAgentSettings {
+                collaboration_mode: None,
                 model: Some("gpt-5.3-codex-spark".into()),
                 sandbox: None,
                 permission_mode: None,
@@ -18767,6 +21413,552 @@ pub(crate) mod tests {
             st.sessions.lock().await.contains_key("thread-1"),
             "the session stays mapped after an unrequested exit"
         );
+    }
+
+    #[test]
+    fn task4_refusal_marker_publication_cannot_clear_a_newer_stop() {
+        let turns = Arc::new(StdMutex::new(CodexTurnState::default()));
+        let marker = Arc::new(AtomicBool::new(true));
+        let old = {
+            let mut state = turns.lock().unwrap();
+            let old = state.begin_dispatch("old");
+            state.accept(old, "old");
+            state.request_stop();
+            state.settle_native("old", NativeSettlement::Completed);
+            old
+        };
+        let (entered, at_publication) = std::sync::mpsc::channel();
+        let (release, may_publish) = std::sync::mpsc::channel();
+        let publisher = {
+            let turns = turns.clone();
+            let marker = marker.clone();
+            std::thread::spawn(move || {
+                publish_codex_interrupt_refusal(&turns, old, "old", || {
+                    // This is the actual compatibility publication boundary, held
+                    // with deterministic barriers, not a delayed native ACK model.
+                    entered.send(()).unwrap();
+                    may_publish.recv_timeout(Duration::from_secs(5)).unwrap();
+                    marker.store(false, Ordering::SeqCst);
+                })
+            })
+        };
+        at_publication.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut admitted_new = false;
+        let blocked = match turns.try_lock() {
+            Ok(mut state) => {
+                let new = state.begin_dispatch("new");
+                state.accept(new, "new");
+                state.request_stop();
+                marker.store(true, Ordering::SeqCst);
+                admitted_new = true;
+                false
+            }
+            Err(std::sync::TryLockError::WouldBlock) => true,
+            Err(error) => panic!("unexpected state-lock failure: {error}"),
+        };
+        release.send(()).unwrap();
+        assert!(publisher.join().unwrap());
+        if !admitted_new {
+            let mut state = turns.lock().unwrap();
+            let new = state.begin_dispatch("new");
+            state.accept(new, "new");
+            state.request_stop();
+            marker.store(true, Ordering::SeqCst);
+        }
+        assert!(
+            marker.load(Ordering::SeqCst),
+            "an old refusal publication must never clear the newer Stop marker"
+        );
+        assert!(blocked, "new dispatch/Stop cannot acquire ownership before the old compatibility publication completes");
+        assert_eq!(turns.lock().unwrap().user_stop_turn_id(), Some("new"));
+    }
+
+    fn task4_stop(session_id: &str) -> FreshAgentInterrupt {
+        FreshAgentInterrupt {
+            session_id: session_id.into(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            provider: freshell_protocol::AgentProvider::Codex,
+            request_id: None,
+            cwd: None,
+        }
+    }
+
+    async fn task4_no_native_frame(peer: &freshell_codex::ChannelPeer) {
+        let mut next = Box::pin(peer.next_raw_frame());
+        let pending = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(next.as_mut(), cx).is_pending())
+        })
+        .await;
+        assert!(
+            pending,
+            "the native issuance gate must have issued no frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn task4_held_stop_allows_terminal_consumption_but_blocks_new_start_until_its_reply() {
+        let (st, mut rx) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-held",
+            Arc::new(client),
+            Arc::new(StdMutex::new(Some("old".into()))),
+            notifs,
+            spawn_sleeper(),
+            "task4-held",
+        )
+        .await;
+        let stop = {
+            let st = st.clone();
+            tokio::spawn(async move { st.handle_interrupt(task4_stop("thread-held")).await })
+        };
+        answer_initialize(&peer).await;
+        let (stop_id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "turn/interrupt");
+        // Hold the exact dispatch serialization lock while terminal evidence
+        // is consumed. A consumer that waits for this lock cannot release the
+        // issuance gate, and this deterministic barrier would fail.
+        let dispatch_lock = st
+            .sessions
+            .lock()
+            .await
+            .get("thread-held")
+            .unwrap()
+            .turn_lock
+            .clone();
+        let dispatch_guard = dispatch_lock.lock().await;
+        peer.emit_notification(
+            "turn/completed",
+            json!({"threadId":"thread-held", "turn":{"id":"old","status":"completed"}}),
+        );
+        let terminal = collect_frames_until(&mut rx, Duration::from_secs(2), |w| {
+            w["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        assert!(
+            terminal.matched,
+            "consumer must progress with Stop RPC held"
+        );
+        drop(dispatch_guard);
+        let turns = st
+            .sessions
+            .lock()
+            .await
+            .get("thread-held")
+            .unwrap()
+            .turn_state
+            .clone();
+        assert!(!turns.lock().unwrap().has_owed_work());
+        assert!(turns.lock().unwrap().has_unresolved_stop());
+        let waiting = turns.lock().unwrap().waiting_for_stop.clone();
+        let next = {
+            let st = st.clone();
+            tokio::spawn(async move { st.handle_send(send_msg("thread-held", "new input")).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), waiting.notified())
+            .await
+            .unwrap();
+        task4_no_native_frame(&peer).await;
+        peer.respond(&stop_id, json!({}));
+        stop.await.unwrap();
+        let (start_id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        peer.respond(&start_id, json!({"turn":{"id":"new"}}));
+        next.await.unwrap();
+        // Adversarial old replies after a supported resolved rollover; this is
+        // deliberately not described as normal native ACK ordering.
+        peer.respond(&stop_id, json!({}));
+        peer.emit_notification(
+            "turn/completed",
+            json!({"threadId":"thread-held", "turn":{"id":"old","status":"interrupted"}}),
+        );
+        peer.emit_notification(
+            "thread/name/updated",
+            json!({"threadId":"thread-held","name":"consumer barrier"}),
+        );
+        let stop_new = {
+            let st = st.clone();
+            tokio::spawn(async move { st.handle_interrupt(task4_stop("thread-held")).await })
+        };
+        let (new_stop, method, params) = peer.expect_request().await;
+        assert_eq!(method, "turn/interrupt");
+        assert_eq!(params["turnId"], "new");
+        assert!(turns.lock().unwrap().has_owed_work());
+        peer.respond(&new_stop, json!({}));
+        stop_new.await.unwrap();
+        assert!(turns.lock().unwrap().has_owed_work());
+        drop(peer);
+        st.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn task4_stop_before_start_acceptance_interrupts_once_and_preserves_acceptance_order() {
+        let (st, mut rx) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-pending",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            notifs,
+            spawn_sleeper(),
+            "task4-pending",
+        )
+        .await;
+        let send = {
+            let st = st.clone();
+            tokio::spawn(async move { st.handle_send(send_msg("thread-pending", "first")).await })
+        };
+        answer_initialize(&peer).await;
+        let (start_id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        st.handle_interrupt(task4_stop("thread-pending")).await;
+        task4_no_native_frame(&peer).await;
+        peer.respond(&start_id, json!({"turn":{"id":"accepted"}}));
+        let (stop_id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "turn/interrupt");
+        assert_eq!(params["turnId"], "accepted");
+        peer.emit_notification(
+            "turn/completed",
+            json!({"threadId":"thread-pending","turn":{"id":"accepted","status":"interrupted"}}),
+        );
+        peer.respond(&stop_id, json!({}));
+        send.await.unwrap();
+        let frames = collect_frames_until(&mut rx, Duration::from_secs(2), |w| {
+            w["event"]["type"] == "freshAgent.session.snapshot" && w["event"]["status"] == "idle"
+        })
+        .await;
+        assert!(frames.matched);
+        let accepted = frames
+            .frames
+            .iter()
+            .position(|w| w["type"] == "freshAgent.send.accepted")
+            .unwrap();
+        let terminal = frames
+            .frames
+            .iter()
+            .position(|w| w["event"]["type"] == "freshAgent.session.snapshot")
+            .unwrap();
+        assert!(accepted < terminal);
+        task4_no_native_frame(&peer).await;
+        assert!(!st
+            .sessions
+            .lock()
+            .await
+            .get("thread-pending")
+            .unwrap()
+            .turn_state
+            .lock()
+            .unwrap()
+            .has_owed_work());
+        drop(peer);
+        st.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn task4_unknown_start_delivery_is_not_replayed_and_native_evidence_can_recover_it() {
+        let (st, mut rx) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-unknown",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            notifs,
+            spawn_sleeper(),
+            "task4-unknown",
+        )
+        .await;
+        let send = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                let mut msg = send_msg("thread-unknown", "original");
+                msg.request_id = Some("delivery-receipt".into());
+                st.handle_send(msg).await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        peer.respond_error(&id, -32603, "internal failure after possible admission");
+        send.await.unwrap();
+        let failed = collect_frames_until(&mut rx, Duration::from_secs(2), |w| {
+            w["type"] == "error" && w["requestId"] == "delivery-receipt"
+        })
+        .await;
+        assert!(failed.matched);
+        assert!(failed.frames.last().unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("CODEX_DELIVERY_AMBIGUOUS:"));
+        let turns = st
+            .sessions
+            .lock()
+            .await
+            .get("thread-unknown")
+            .unwrap()
+            .turn_state
+            .clone();
+        assert!(turns.lock().unwrap().has_owed_work());
+        st.handle_send(send_msg("thread-unknown", "later input"))
+            .await;
+        task4_no_native_frame(&peer).await;
+        peer.emit_notification(
+            "turn/started",
+            json!({"threadId":"thread-unknown","turn":{"id":"recovered","status":"inProgress"}}),
+        );
+        peer.emit_notification(
+            "turn/completed",
+            json!({"threadId":"thread-unknown","turn":{"id":"recovered","status":"completed"}}),
+        );
+        assert!(
+            collect_frames_until(&mut rx, Duration::from_secs(2), |w| w["event"]["type"]
+                == "freshAgent.turn.complete")
+            .await
+            .matched
+        );
+        assert!(!turns.lock().unwrap().has_owed_work());
+        assert_eq!(
+            turns.lock().unwrap().facts().front().unwrap().request_id,
+            "delivery-receipt"
+        );
+        drop(peer);
+        st.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn task4_ambiguous_stop_timeout_keeps_issuance_closed_after_terminal_evidence() {
+        let (st, mut rx) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) =
+            CodexAppServerClient::connect_with_timeout(transport, Duration::from_millis(100));
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-timeout",
+            Arc::new(client),
+            Arc::new(StdMutex::new(Some("old".into()))),
+            notifs,
+            spawn_sleeper(),
+            "task4-timeout",
+        )
+        .await;
+        let stop = {
+            let st = st.clone();
+            tokio::spawn(async move { st.handle_interrupt(task4_stop("thread-timeout")).await })
+        };
+        answer_initialize(&peer).await;
+        let (_id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "turn/interrupt");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_millis(200)).await;
+        stop.await.unwrap();
+        tokio::time::resume();
+        peer.emit_notification(
+            "turn/completed",
+            json!({"threadId":"thread-timeout","turn":{"id":"old","status":"interrupted"}}),
+        );
+        assert!(
+            collect_frames_until(&mut rx, Duration::from_secs(2), |w| w["event"]["type"]
+                == "freshAgent.session.snapshot"
+                && w["event"]["status"] == "idle")
+            .await
+            .matched
+        );
+        let turns = st
+            .sessions
+            .lock()
+            .await
+            .get("thread-timeout")
+            .unwrap()
+            .turn_state
+            .clone();
+        assert!(!turns.lock().unwrap().has_owed_work());
+        assert!(turns.lock().unwrap().has_unresolved_stop());
+        let waiting = turns.lock().unwrap().waiting_for_stop.clone();
+        let send = {
+            let st = st.clone();
+            tokio::spawn(async move { st.handle_send(send_msg("thread-timeout", "later")).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), waiting.notified())
+            .await
+            .unwrap();
+        task4_no_native_frame(&peer).await;
+        drop(peer);
+        st.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(2), send)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !turns.lock().unwrap().has_unresolved_stop(),
+            "confirmed owned exit resolves the outstanding operation"
+        );
+    }
+
+    #[tokio::test]
+    async fn task4_ack_and_idle_cannot_make_rest_sendable_before_matching_terminal_evidence() {
+        let (st, mut rx) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-rest",
+            Arc::new(client),
+            Arc::new(StdMutex::new(Some("old".into()))),
+            notifs,
+            spawn_sleeper(),
+            "task4-rest",
+        )
+        .await;
+        let stop = {
+            let st = st.clone();
+            tokio::spawn(async move { st.handle_interrupt(task4_stop("thread-rest")).await })
+        };
+        answer_initialize(&peer).await;
+        let (id, _, _) = peer.expect_request().await;
+        peer.respond(&id, json!({}));
+        stop.await.unwrap();
+        peer.emit_notification(
+            "thread/status/changed",
+            json!({"threadId":"thread-rest","status":{"type":"idle"}}),
+        );
+        let status = collect_frames_until(&mut rx, Duration::from_secs(2), |w| {
+            w["event"]["type"] == "freshAgent.session.snapshot"
+        })
+        .await;
+        assert_eq!(status.frames.last().unwrap()["event"]["status"], "running");
+        let snapshot = {
+            let st = st.clone();
+            tokio::spawn(async move { st.get_snapshot("thread-rest", None).await.unwrap() })
+        };
+        let (id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "thread/read");
+        peer.respond(
+            &id,
+            json!({"thread":{"id":"thread-rest","status":"idle","turns":[]}}),
+        );
+        let snapshot = snapshot.await.unwrap();
+        assert_eq!(snapshot["status"], "running");
+        assert_eq!(snapshot["capabilities"]["send"], false);
+        peer.emit_notification(
+            "turn/completed",
+            json!({"threadId":"thread-rest","turn":{"id":"old","status":"interrupted"}}),
+        );
+        assert!(
+            collect_frames_until(&mut rx, Duration::from_secs(2), |w| w["event"]["status"]
+                == "idle")
+            .await
+            .matched
+        );
+        let snapshot = {
+            let st = st.clone();
+            tokio::spawn(async move { st.get_snapshot("thread-rest", None).await.unwrap() })
+        };
+        let (id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "thread/read");
+        peer.respond(
+            &id,
+            json!({"thread":{"id":"thread-rest","status":"idle","turns":[]}}),
+        );
+        assert_eq!(snapshot.await.unwrap()["capabilities"]["send"], true);
+        drop(peer);
+        st.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn task4_interrupt_ack_does_not_settle_owed_work() {
+        let (st, _) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-ack",
+            Arc::new(client),
+            Arc::new(StdMutex::new(Some("old".into()))),
+            notifs,
+            spawn_sleeper(),
+            "task4-ack",
+        )
+        .await;
+        let interrupt = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_interrupt(FreshAgentInterrupt {
+                    session_id: "thread-ack".into(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    request_id: None,
+                    cwd: None,
+                })
+                .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "turn/interrupt");
+        assert_eq!(params["turnId"], "old");
+        peer.respond(&id, json!({}));
+        interrupt.await.unwrap();
+        let owed = st
+            .sessions
+            .lock()
+            .await
+            .get("thread-ack")
+            .unwrap()
+            .turn_in_flight
+            .load(Ordering::SeqCst);
+        assert!(
+            owed,
+            "interrupt ACK proves submission, never terminal settlement"
+        );
+        drop(peer);
+        st.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn task4_active_input_steers_expected_turn_and_rejection_preserves_it() {
+        let (st, _) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-steer",
+            Arc::new(client),
+            Arc::new(StdMutex::new(Some("old".into()))),
+            notifs,
+            spawn_sleeper(),
+            "task4-steer",
+        )
+        .await;
+        let send = {
+            let st = st.clone();
+            tokio::spawn(async move { st.handle_send(send_msg("thread-steer", "adjust")).await })
+        };
+        answer_initialize(&peer).await;
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "turn/steer");
+        assert_eq!(params["expectedTurnId"], "old");
+        assert!(
+            params.get("model").is_none(),
+            "steer cannot override turn settings"
+        );
+        peer.respond_error(
+            &id,
+            -32600,
+            "expected active turn id `old` but found `different`",
+        );
+        send.await.unwrap();
+        let guard = st.sessions.lock().await;
+        let session = guard.get("thread-steer").unwrap();
+        assert!(session.turn_in_flight.load(Ordering::SeqCst));
+        assert_eq!(session.active_turn.lock().unwrap().as_deref(), Some("old"));
+        drop(guard);
+        drop(peer);
+        st.shutdown().await;
     }
 
     #[tokio::test]
@@ -22014,6 +25206,7 @@ pub(crate) mod tests {
             let (st, mut rx) = state_with_bus();
             st.handle_create(
                 FreshAgentCreate {
+                    collaboration_mode: None,
                     pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
@@ -22566,6 +25759,7 @@ pub(crate) mod tests {
             "codex",
             "thread-9",
             crate::identity_sink::FreshAgentSettings {
+                collaboration_mode: None,
                 model: Some("gpt-5.3-codex-spark".into()),
                 sandbox: Some("workspace-write".into()),
                 permission_mode: Some("on-request".into()),
@@ -22710,6 +25904,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                collaboration_mode: None,
                 pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
@@ -22764,6 +25959,7 @@ pub(crate) mod tests {
     /// `request_id`.
     fn create_msg(request_id: &str) -> FreshAgentCreate {
         FreshAgentCreate {
+            collaboration_mode: None,
             pane_id: None,
             naming_handle: None,
             observed_epoch: None,
@@ -23110,6 +26306,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                collaboration_mode: None,
                 pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
@@ -23181,6 +26378,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                collaboration_mode: None,
                 pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
@@ -23263,6 +26461,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                collaboration_mode: None,
                 pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
@@ -23333,6 +26532,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                collaboration_mode: None,
                 pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
@@ -23998,7 +27198,16 @@ pub(crate) mod tests {
     /// to depending on a host-installed `codex` binary.
     pub(crate) fn configure_fake_codex_cmd(behavior_json: &str) {
         std::env::set_var("CODEX_CMD", format!("node {}", fake_codex_app_server_cmd()));
-        std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR", behavior_json);
+        let behavior = match serde_json::from_str::<Value>(behavior_json) {
+            Ok(Value::Object(mut behavior)) => {
+                behavior.entry("echoRequestedModel").or_insert(json!(true));
+                Value::Object(behavior).to_string()
+            }
+            // Existing fault cases deliberately pass malformed/non-object
+            // input. Let the native fake consume and refuse it as before.
+            _ => behavior_json.to_owned(),
+        };
+        std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR", behavior);
     }
 
     /// Create a session whose sidecar is a REAL fake-app-server-driven codex process (not
@@ -24021,6 +27230,7 @@ pub(crate) mod tests {
     ) -> String {
         st.handle_create(
             FreshAgentCreate {
+                collaboration_mode: None,
                 pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
@@ -24073,6 +27283,7 @@ pub(crate) mod tests {
     ) -> String {
         st.handle_create(
             FreshAgentCreate {
+                collaboration_mode: None,
                 pane_id: None,
                 observed_epoch: None,
                 observed_generation: None,
@@ -24270,6 +27481,7 @@ pub(crate) mod tests {
         state
             .handle_create(
                 FreshAgentCreate {
+                    collaboration_mode: None,
                     pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
@@ -24285,7 +27497,7 @@ pub(crate) mod tests {
                     model_selection: None,
                     permission_mode: Some("on-request".to_string()),
                     sandbox: Some(freshell_protocol::Sandbox::WorkspaceWrite),
-                    effort: Some("high".to_string()),
+                    effort: Some(Some("high".to_string())),
                     plugins: None,
                     tab_id: None,
                 },
@@ -24340,6 +27552,7 @@ pub(crate) mod tests {
         state
             .handle_create(
                 FreshAgentCreate {
+                    collaboration_mode: None,
                     pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
@@ -24423,6 +27636,7 @@ pub(crate) mod tests {
         state
             .handle_create(
                 FreshAgentCreate {
+                    collaboration_mode: None,
                     pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
@@ -24591,6 +27805,56 @@ pub(crate) mod tests {
     /// brand-new id, conversation memory for the old thread genuinely lost.
     #[tokio::test(flavor = "multi_thread")]
     async fn send_after_crash_falls_back_to_mint_new_thread_when_resume_reports_not_found() {
+        assert_crash_mints_new_thread(json!({"code":-32001,"message":"Thread not found"})).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_after_crash_falls_back_for_native_missing_rollout_rpc() {
+        assert_crash_mints_new_thread(
+            json!({"code":-32600,"message":"no rollout found for thread id thread-original"}),
+        )
+        .await;
+    }
+
+    #[test]
+    fn native_missing_rollout_requires_the_resume_rpc_and_known_error_code() {
+        for (method, code, expected) in [
+            ("thread/resume", -32600, true),
+            ("thread/fork", -32600, false),
+            ("thread/read", -32600, false),
+            ("thread/resume", -32000, false),
+        ] {
+            let error = CodexAppServerError::Rpc {
+                method: method.into(),
+                error: Box::new(freshell_codex::protocol::RpcError {
+                    code,
+                    message: "no rollout found for thread id thread-original".into(),
+                    data: None,
+                }),
+            };
+            assert_eq!(
+                is_codex_thread_not_found(&error),
+                expected,
+                "{method}/{code}"
+            );
+        }
+        assert!(!is_codex_thread_not_found(
+            &CodexAppServerError::Transport {
+                method: "thread/resume".into(),
+                message: "no rollout found for thread id thread-original".into()
+            }
+        ));
+        assert!(!is_codex_thread_not_found(&CodexAppServerError::Rpc {
+            method: "thread/resume".into(),
+            error: Box::new(freshell_codex::protocol::RpcError {
+                code: -32600,
+                message: "approval_policy untrusted is not supported".into(),
+                data: None
+            })
+        }));
+    }
+
+    async fn assert_crash_mints_new_thread(resume_error: Value) {
         let _guard = ENV_LOCK.lock().await;
         let (st, mut rx) = state_with_bus();
 
@@ -24608,7 +27872,7 @@ pub(crate) mod tests {
                 "threadStartThreadId": "thread-respawned",
                 "overrides": {
                     "thread/resume": {
-                        "error": { "code": -32001, "message": "Thread not found" }
+                        "error": resume_error
                     }
                 }
             })
@@ -24776,7 +28040,7 @@ pub(crate) mod tests {
         simulate_unrequested_crash(&st, &thread_id).await;
 
         // A transient failure (NOT a "not found"-shaped message) on EVERY `thread/resume`
-        // attempt -- the first (with settings) AND the retry (with settings dropped).
+        // attempt -- the first and the retry that omits only the model.
         configure_fake_codex_cmd(
             &json!({
                 "overrides": {
@@ -24950,6 +28214,7 @@ pub(crate) mod tests {
         let create_task = tokio::spawn(async move {
             st2.handle_create(
                 FreshAgentCreate {
+                    collaboration_mode: None,
                     pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
@@ -25280,6 +28545,246 @@ pub(crate) mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct SidecarIncarnation {
+        ownership_id: String,
+        pid: u32,
+    }
+
+    async fn snapshot_live_sidecars(
+        st: &FreshCodexState,
+        session_ids: &[&str],
+    ) -> Vec<SidecarIncarnation> {
+        let sessions = st.sessions.lock().await;
+        assert_eq!(
+            sessions.len(),
+            session_ids.len(),
+            "exact live registrations"
+        );
+        session_ids
+            .iter()
+            .map(|id| {
+                let session = sessions.get(*id).expect("the sidecar is registered");
+                assert!(
+                    !session.exited.load(Ordering::SeqCst),
+                    "the registered sidecar for {id} is live"
+                );
+                assert!(!session.sidecar_ownership_id.is_empty());
+                SidecarIncarnation {
+                    ownership_id: session.sidecar_ownership_id.clone(),
+                    pid: session.sidecar_pid.expect("a genuine sidecar child PID"),
+                }
+            })
+            .collect()
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct SidecarThreadOperation {
+        method: String,
+        thread_id: String,
+        params: Value,
+        listen_url: String,
+        sidecar_ownership_id: String,
+        pid: u32,
+    }
+
+    /// Join real RPC witnesses to the captured launch owners. Retired endpoints and
+    /// PIDs may be reused; the inherited ownership tag identifies each incarnation.
+    fn assert_sidecar_operation_sequences(
+        log_text: &str,
+        expected: &[(&SidecarIncarnation, &[(&str, &str)])],
+    ) -> Vec<String> {
+        let operations: Vec<SidecarThreadOperation> = log_text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("owned operation witness parses"))
+            .collect();
+        let owners: std::collections::HashSet<_> = expected
+            .iter()
+            .map(|(owner, _)| owner.ownership_id.as_str())
+            .collect();
+        assert_eq!(
+            owners.len(),
+            expected.len(),
+            "distinct launch ownership tags"
+        );
+        assert_eq!(
+            operations.len(),
+            expected
+                .iter()
+                .map(|(_, sequence)| sequence.len())
+                .sum::<usize>(),
+            "exactly the expected operations: {log_text}"
+        );
+        expected
+            .iter()
+            .map(|(owner, sequence)| {
+                assert!(!owner.ownership_id.is_empty());
+                let rows: Vec<_> = operations
+                    .iter()
+                    .filter(|row| row.sidecar_ownership_id == owner.ownership_id)
+                    .collect();
+                let actual: Vec<_> = rows
+                    .iter()
+                    .map(|row| (row.method.as_str(), row.thread_id.as_str()))
+                    .collect();
+                assert_eq!(actual, *sequence, "RPC sequence for {owner:?}: {log_text}");
+                let url = rows
+                    .first()
+                    .expect("each launch served an operation")
+                    .listen_url
+                    .clone();
+                assert!(!url.is_empty(), "the endpoint remains diagnostic evidence");
+                for row in rows {
+                    assert_eq!(row.pid, owner.pid, "RPC served by the owned child: {row:?}");
+                    assert_eq!(row.listen_url, url, "one endpoint per launch: {row:?}");
+                    if row.method != "thread/start" && row.method != "thread/fork" {
+                        assert_eq!(
+                            row.params["threadId"].as_str(),
+                            Some(row.thread_id.as_str()),
+                            "handoff targets the witnessed thread: {row:?}"
+                        );
+                    }
+                }
+                url
+            })
+            .collect()
+    }
+
+    /// Match PID occurrences from the same global event window as `spawn_count`.
+    /// The operation audit separately joins these real launches to ownership tags.
+    fn assert_spawn_pids_match_incarnations(
+        capture: &tracing_capture::GlobalCapture,
+        incarnations: &[SidecarIncarnation],
+    ) {
+        let mut spawned_pids: Vec<u32> = capture
+            .untagged_events_since_start()
+            .into_iter()
+            .filter(|event| event.message == "freshagent.sidecar.spawned")
+            .map(|event| event.fields["pid"].parse().expect("successful spawn PID"))
+            .collect();
+        let mut owned_pids: Vec<_> = incarnations.iter().map(|owner| owner.pid).collect();
+        spawned_pids.sort_unstable();
+        owned_pids.sort_unstable();
+        assert_eq!(
+            spawned_pids, owned_pids,
+            "one successful spawn per owned incarnation"
+        );
+    }
+
+    #[tokio::test]
+    async fn sidecar_operation_identity_survives_retired_endpoint_reuse() {
+        let _guard = ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("fixture evidence directory");
+        let log_path = dir.path().join("operations.jsonl");
+        let port_file = dir.path().join("port");
+        let mut endpoint = "ws://127.0.0.1:0".to_string();
+        let mut incarnations = Vec::new();
+        for thread_id in ["reuse-first", "reuse-second"] {
+            let ownership_id = mint_ownership_id();
+            let mut command = tokio::process::Command::new("node");
+            command
+                .arg(fake_codex_app_server_cmd())
+                .arg("--listen")
+                .arg(&endpoint)
+                .env(CODEX_SIDECAR_OWNERSHIP_ENV, &ownership_id)
+                .env(
+                    "FAKE_CODEX_APP_SERVER_BEHAVIOR",
+                    json!({
+                        "threadStartThreadId": thread_id,
+                        "appendThreadOperationLogPath": log_path,
+                    })
+                    .to_string(),
+                )
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::inherit())
+                .kill_on_drop(true);
+            if incarnations.is_empty() {
+                command.env("FAKE_CODEX_APP_SERVER_PORT_FILE", &port_file);
+            } else {
+                command.env_remove("FAKE_CODEX_APP_SERVER_PORT_FILE");
+            }
+            let mut child = command.spawn().expect("spawn this test's own fixture");
+            let owner = SidecarIncarnation {
+                ownership_id,
+                pid: child.id().expect("fixture child PID"),
+            };
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let transport = loop {
+                if incarnations.is_empty() {
+                    if let Ok(report) = std::fs::read_to_string(&port_file) {
+                        if let Ok(port) = report.trim().parse::<u16>() {
+                            endpoint = format!("ws://127.0.0.1:{port}");
+                        }
+                    }
+                }
+                if let Ok(Some(status)) = child.try_wait() {
+                    panic!("owned endpoint-reuse fixture exited before listening: {status}");
+                }
+                if let Ok(Ok(transport)) = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    TungsteniteTransport::connect(&endpoint),
+                )
+                .await
+                {
+                    break transport;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "owned fixture did not bind {endpoint}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            let (client, _notifications) = CodexAppServerClient::connect(Arc::new(transport));
+            let started = client
+                .start_thread(StartThreadParams::default())
+                .await
+                .expect("real RPC served by the owned fixture");
+            assert_eq!(started.thread_id, thread_id);
+            client.close().await;
+            tokio::time::timeout(Duration::from_secs(5), child.kill())
+                .await
+                .expect("owned child teardown completed")
+                .expect("kill and reap only this child");
+            incarnations.push(owner);
+        }
+        let log_text = read_op_log_when_complete(&log_path, 2).await;
+        let urls = assert_sidecar_operation_sequences(
+            &log_text,
+            &[
+                (&incarnations[0], &[("thread/start", "reuse-first")]),
+                (&incarnations[1], &[("thread/start", "reuse-second")]),
+            ],
+        );
+        assert_eq!(
+            urls[0], urls[1],
+            "the two genuine launches reused one endpoint"
+        );
+        assert_eq!(
+            urls.iter().collect::<std::collections::HashSet<_>>().len(),
+            1,
+            "historical URL grouping conflates two distinct launch owners"
+        );
+        let aliased_owner = SidecarIncarnation {
+            ownership_id: incarnations[1].ownership_id.clone(),
+            pid: incarnations[0].pid,
+        };
+        assert!(
+            std::panic::catch_unwind(|| {
+                assert_sidecar_operation_sequences(
+                    &log_text,
+                    &[
+                        (&aliased_owner, &[("thread/start", "reuse-first")]),
+                        (&incarnations[0], &[("thread/start", "reuse-second")]),
+                    ],
+                );
+            })
+            .is_err(),
+            "a wrong owner must fail despite two genuine launches"
+        );
+    }
+
     /// Whole-branch review M-2: a Compact click on a crash-stale session (sidecar
     /// hand-flagged exited-unrequested, see `simulate_unrequested_crash`; the
     /// self-heal design keeps the session MAPPED) must transparently
@@ -25409,6 +28914,7 @@ pub(crate) mod tests {
             .to_string(),
         );
         let parent_id = create_real_fake_session(&st, &mut rx).await;
+        let original_owner = snapshot_live_sidecars(&st, &[&parent_id]).await.remove(0);
         simulate_unrequested_crash(&st, &parent_id).await;
         assert_eq!(
             spawn_count(&capture),
@@ -25453,54 +28959,46 @@ pub(crate) mod tests {
             spawn_count(&capture)
         );
 
-        // Per-connection RPC order over THREE sidecars: first spawn (kept alive,
-        // hand-flagged crashed — D8) = thread/start; respawned parent =
-        // thread/resume → thread/fork → thread/archive; child =
-        // thread/unarchive → thread/resume.
+        let mut incarnations = vec![original_owner];
+        incarnations.extend(snapshot_live_sidecars(&st, &[&parent_id, "child-after-crash"]).await);
+        assert_spawn_pids_match_incarnations(&capture, &incarnations);
         let log_text = read_op_log_when_complete(&log_path, 6).await;
-        let mut by_url: HashMap<String, Vec<String>> = HashMap::new();
-        for line in log_text.lines() {
-            let entry: Value = serde_json::from_str(line).expect("op log line parses");
-            by_url
-                .entry(entry["listenUrl"].as_str().expect("listenUrl").to_string())
-                .or_default()
-                .push(entry["method"].as_str().expect("method").to_string());
-        }
+        let urls = assert_sidecar_operation_sequences(
+            &log_text,
+            &[
+                (&incarnations[0], &[("thread/start", &parent_id)]),
+                (
+                    &incarnations[1],
+                    &[
+                        ("thread/resume", &parent_id),
+                        ("thread/fork", "child-after-crash"),
+                        ("thread/archive", "child-after-crash"),
+                    ],
+                ),
+                (
+                    &incarnations[2],
+                    &[
+                        ("thread/unarchive", "child-after-crash"),
+                        ("thread/resume", "child-after-crash"),
+                    ],
+                ),
+            ],
+        );
+        assert_ne!(
+            urls[1], urls[2],
+            "the live parent and child have distinct endpoints"
+        );
+        let targets: Vec<Value> = log_text
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|row| row["method"] == "thread/fork")
+            .map(|row| row["params"]["threadId"].clone())
+            .collect();
         assert_eq!(
-            by_url.len(),
-            3,
-            "exactly three sidecar connections (first + respawned parent + child): {log_text}"
+            targets,
+            vec![json!(parent_id)],
+            "only the recovered parent is forked"
         );
-        let mut sequences: Vec<Vec<String>> = by_url.values().cloned().collect();
-        sequences.sort();
-        // Sorted order: ["thread/resume", ...] < ["thread/start"] < ["thread/unarchive", ...].
-        assert_eq!(
-            sequences[0],
-            vec!["thread/resume", "thread/fork", "thread/archive"],
-            "the respawned parent was forked, never the dead connection: {log_text}"
-        );
-        assert_eq!(
-            sequences[1],
-            vec!["thread/start"],
-            "the first spawn served only the create: {log_text}"
-        );
-        assert_eq!(
-            sequences[2],
-            vec!["thread/unarchive", "thread/resume"],
-            "the child sidecar completed the archive→unarchive→resume handoff: {log_text}"
-        );
-
-        // Both the respawned parent and the child are registered and live.
-        let guard = st.sessions.lock().await;
-        assert!(
-            guard.contains_key(&parent_id),
-            "the respawned parent stays registered under the SAME id"
-        );
-        assert!(
-            guard.contains_key("child-after-crash"),
-            "the forked child is registered on its own sidecar"
-        );
-        drop(guard);
 
         // The recovery was transparent: no user-facing error frame names the parent.
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
@@ -25564,6 +29062,7 @@ pub(crate) mod tests {
         );
         let old_id = create_real_fake_session(&st, &mut rx).await;
         assert_eq!(old_id, "parent-old-mint", "fixture sanity: the clicked id");
+        let original_owner = snapshot_live_sidecars(&st, &[&old_id]).await.remove(0);
         simulate_unrequested_crash(&st, &old_id).await;
         assert_eq!(
             spawn_count(&capture),
@@ -25619,68 +29118,51 @@ pub(crate) mod tests {
             spawn_count(&capture)
         );
 
-        // Per-connection RPC order over THREE sidecars: first spawn (kept alive,
-        // hand-flagged crashed — D8) = thread/start; respawned parent =
-        // thread/start (the mint) → thread/fork → thread/archive, with the fork
-        // RPC TARGETING the minted parent id; child = unarchive → resume.
+        let mut incarnations = vec![original_owner];
+        incarnations
+            .extend(snapshot_live_sidecars(&st, &["parent-new-mint", "child-after-mint"]).await);
+        assert!(
+            !st.sessions.lock().await.contains_key(&old_id),
+            "old record retired"
+        );
+        assert_spawn_pids_match_incarnations(&capture, &incarnations);
         let log_text = read_op_log_when_complete(&log_path, 6).await;
-        let mut by_url: HashMap<String, Vec<String>> = HashMap::new();
-        let mut fork_target: Option<String> = None;
-        for line in log_text.lines() {
-            let entry: Value = serde_json::from_str(line).expect("op log line parses");
-            by_url
-                .entry(entry["listenUrl"].as_str().expect("listenUrl").to_string())
-                .or_default()
-                .push(entry["method"].as_str().expect("method").to_string());
-            if entry["method"].as_str() == Some("thread/fork") {
-                fork_target = Some(
-                    entry["params"]["threadId"]
-                        .as_str()
-                        .expect("fork threadId")
-                        .to_string(),
-                );
-            }
-        }
-        assert_eq!(
-            fork_target.as_deref(),
-            Some("parent-new-mint"),
-            "thread/fork runs against the RESPAWNED parent thread: {log_text}"
+        let urls = assert_sidecar_operation_sequences(
+            &log_text,
+            &[
+                (&incarnations[0], &[("thread/start", &old_id)]),
+                (
+                    &incarnations[1],
+                    &[
+                        ("thread/start", "parent-new-mint"),
+                        ("thread/fork", "child-after-mint"),
+                        ("thread/archive", "child-after-mint"),
+                    ],
+                ),
+                (
+                    &incarnations[2],
+                    &[
+                        ("thread/unarchive", "child-after-mint"),
+                        ("thread/resume", "child-after-mint"),
+                    ],
+                ),
+            ],
         );
-        assert_eq!(
-            by_url.len(),
-            3,
-            "exactly three sidecar connections (first + respawned parent + child): {log_text}"
+        assert_ne!(
+            urls[1], urls[2],
+            "the live parent and child have distinct endpoints"
         );
-        let mut sequences: Vec<Vec<String>> = by_url.values().cloned().collect();
-        sequences.sort();
-        // Sorted order: ["thread/start"] < ["thread/start", "thread/fork", ...] < ["thread/unarchive", ...].
+        let targets: Vec<Value> = log_text
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|row| row["method"] == "thread/fork")
+            .map(|row| row["params"]["threadId"].clone())
+            .collect();
         assert_eq!(
-            sequences[0],
-            vec!["thread/start"],
-            "the first spawn served only the original create: {log_text}"
+            targets,
+            vec![json!("parent-new-mint")],
+            "only the resolved parent is forked"
         );
-        assert_eq!(
-            sequences[1],
-            vec!["thread/start", "thread/fork", "thread/archive"],
-            "the respawned parent minted its new thread, then ran fork + archive: {log_text}"
-        );
-        assert_eq!(
-            sequences[2],
-            vec!["thread/unarchive", "thread/resume"],
-            "the child sidecar completed the archive→unarchive→resume handoff: {log_text}"
-        );
-
-        // Registrations: the old id is GONE (the respawn re-keyed the session map), the
-        // minted parent and the child are live.
-        {
-            let guard = st.sessions.lock().await;
-            assert!(
-                !guard.contains_key(&old_id),
-                "the mint-new respawn removed the old parent id"
-            );
-            assert!(guard.contains_key("parent-new-mint"));
-            assert!(guard.contains_key("child-after-mint"));
-        }
 
         // Broadcast leg audit: the materialized OLD→NEW pair DID go out (the client re-key
         // this whole finding hinges on), and NO broadcast error frame is keyed to the old id
@@ -25881,6 +29363,7 @@ pub(crate) mod tests {
         );
         let old_id = create_real_fake_session(&st, &mut rx).await;
         assert_eq!(old_id, "parent-old-mint", "fixture sanity: the clicked id");
+        let original_owner = snapshot_live_sidecars(&st, &[&old_id]).await.remove(0);
         simulate_unrequested_crash(&st, &old_id).await;
         // Dead-thread negative cache: ensure-alive goes straight to the mint-new
         // respawn fallback (the F-1 route).
@@ -26040,7 +29523,7 @@ pub(crate) mod tests {
 
         // Wire audit: exactly TWO thread/fork RPCs crossed the wire (fork #1 and the
         // post-completion fork #3 — the refused duplicate produced NONE), both
-        // targeting the respawned parent, over exactly four sidecar connections
+        // targeting the respawned parent, across exactly four owned launches
         // (parent spawn + respawn + one sidecar per child).
         assert_eq!(
             spawn_count(&capture),
@@ -26065,19 +29548,45 @@ pub(crate) mod tests {
             vec!["parent-new-mint".to_string(), "parent-new-mint".to_string()],
             "exactly the two legitimate forks hit the wire — the refused duplicate none: {log_text}"
         );
-        let urls: std::collections::HashSet<String> = log_text
-            .lines()
-            .map(|line| {
-                serde_json::from_str::<Value>(line).unwrap()["listenUrl"]
-                    .as_str()
-                    .unwrap()
-                    .to_string()
-            })
-            .collect();
+        let mut incarnations = vec![original_owner];
+        incarnations
+            .extend(snapshot_live_sidecars(&st, &["parent-new-mint", &child1, &child2]).await);
+        assert!(
+            !st.sessions.lock().await.contains_key(&old_id),
+            "old record retired"
+        );
+        assert_spawn_pids_match_incarnations(&capture, &incarnations);
+        let urls = assert_sidecar_operation_sequences(
+            &log_text,
+            &[
+                (&incarnations[0], &[("thread/start", &old_id)]),
+                (
+                    &incarnations[1],
+                    &[
+                        ("thread/start", "parent-new-mint"),
+                        ("thread/fork", &child1),
+                        ("thread/archive", &child1),
+                        ("thread/fork", &child2),
+                        ("thread/archive", &child2),
+                    ],
+                ),
+                (
+                    &incarnations[2],
+                    &[("thread/unarchive", &child1), ("thread/resume", &child1)],
+                ),
+                (
+                    &incarnations[3],
+                    &[("thread/unarchive", &child2), ("thread/resume", &child2)],
+                ),
+            ],
+        );
         assert_eq!(
-            urls.len(),
-            4,
-            "crashed + respawned parent + two child sidecars: {log_text}"
+            urls[1..]
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3,
+            "the recovered parent and both live child sidecars have distinct endpoints: {log_text}"
         );
 
         let _ = std::fs::remove_file(&log_path);
@@ -26336,9 +29845,15 @@ pub(crate) mod tests {
         assert_eq!(snapshot["capabilities"]["interrupt"], json!(false));
         assert_eq!(snapshot["tokenUsage"]["inputTokens"], json!(0));
         assert_eq!(snapshot["pendingApprovals"], json!([]));
-        assert_eq!(snapshot["extensions"]["codex"], json!({}));
+        assert_eq!(snapshot["tokenUsage"]["observed"], false);
+        let projection = &snapshot["extensions"]["codex"]["projection"];
+        assert!(projection["id"].as_str().is_some_and(|id| !id.is_empty()));
+        assert_eq!(projection["eventRevision"], 0);
+        assert_eq!(projection["historyGeneration"], 0);
+        assert_eq!(projection["nativeFinalTurnIds"], json!(["turn-1"]));
+        assert_eq!(projection["turnRows"]["turn-1"], json!(["turn-1"]));
 
-        // kata z7j7: codex honors all four settings knobs per send (merged over
+        // Codex honors these settings per send (merged over
         // the session baseline before turn/start).
         assert_eq!(
             snapshot["capabilities"]["settingScopes"],
@@ -26347,6 +29862,8 @@ pub(crate) mod tests {
                 "effort": "per-send",
                 "sandbox": "per-send",
                 "permissionMode": "per-send",
+                "cwd": "per-send",
+                "collaborationMode": "per-send",
             })
         );
 
@@ -26468,6 +29985,67 @@ pub(crate) mod tests {
     }
 
     // -- Batch D PR-6: rich transcript items for the codex snapshot endpoint --
+
+    #[test]
+    fn native_child_activity_function_output_and_sleep_remain_visible() {
+        for (native, status) in [
+            ("started", "running"),
+            ("interacted", "running"),
+            ("interrupted", "interrupted"),
+            ("completed", "completed"),
+        ] {
+            let mapped = map_codex_item("activity", &json!({"type":"subAgentActivity", "id":"activity", "agentPath":"/reviewer", "agentThreadId":"exact-child", "kind":native, "model":"native-model"}), "subAgentActivity").unwrap();
+            assert_eq!(
+                mapped.len(),
+                1,
+                "native activity must remain visible: {native}"
+            );
+            assert_eq!(mapped[0]["childSessionId"], "exact-child");
+            assert_eq!(mapped[0]["status"], status);
+            assert_eq!(mapped[0]["model"], "native-model");
+        }
+        for output in [
+            json!("Exact function output"),
+            json!([{"type":"input_text","text":"Typed function output"},{"type":"input_image","image_url":"/tmp/output.png"},{"type":"future","result":"visible value"}]),
+        ] {
+            let mapped = map_codex_item(
+                "function-output",
+                &json!({"output":output}),
+                "functionCallOutput",
+            )
+            .unwrap();
+            assert_eq!(mapped[0]["kind"], "tool_result");
+            assert_eq!(mapped[0]["toolUseId"], "function-output");
+            assert_eq!(mapped[0]["content"], output);
+        }
+        let sleep = map_codex_item("sleep", &json!({"durationMs":1250}), "sleep").unwrap();
+        assert_eq!(sleep[0]["tool"], "Sleep");
+        assert_eq!(sleep[0]["arguments"]["durationMs"], 1250);
+    }
+
+    #[test]
+    fn native_images_keep_paths_and_unknown_items_never_create_blank_rows() {
+        let mapped = map_codex_item("image-user", &json!({"content":[{"type":"localImage","path":"/tmp/upload.png"},{"type":"image","url":"https://example.test/image.png"}]}), "userMessage").unwrap();
+        assert!(mapped[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("/tmp/upload.png"));
+        assert!(mapped[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("https://example.test/image.png"));
+        let turns = build_codex_turn_json(
+            &json!({"id":"unknown-turn","items":[{"type":"futureVariant","id":"future"}]}),
+            0,
+        )
+        .unwrap();
+        assert!(
+            turns.is_empty()
+                || turns
+                    .iter()
+                    .all(|turn| !turn["items"].as_array().unwrap().is_empty())
+        );
+    }
 
     #[test]
     fn map_codex_item_command_execution_renders_command_kind_with_exact_schema_keys() {
@@ -26593,7 +30171,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             mapped[1],
-            json!({ "id": "item-6:part:1", "kind": "text", "text": "[image]" })
+            json!({ "id": "item-6:part:1", "kind": "text", "text": "Image attachment" })
         );
     }
 
@@ -27551,6 +31129,241 @@ pub(crate) mod tests {
 
     // ── freshAgent.configure: live model convergence ─────────────────────────
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_catalog_only_maps_legacy_max_when_selected_model_advertises_xhigh_without_max() {
+        let _guard = ENV_LOCK.lock().await;
+        for (levels, expected) in [
+            (vec!["xhigh"], "xhigh"),
+            (vec!["xhigh", "max"], "max"),
+            (vec!["ultra"], "max"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let log = temp.path().join("native-requests.jsonl");
+            configure_fake_codex_cmd(&json!({"appendRequestLogPath": log,"modelCatalogPages":[{"data":[{
+                "id":"model-record","model":"gpt-6-astra","displayName":"Installed Astra",
+                "supportedReasoningEfforts":levels.iter().map(|effort|json!({"reasoningEffort":effort})).collect::<Vec<_>>(),
+                "defaultReasoningEffort":levels[0],"inputModalities":["text"]
+            }],"nextCursor":null}]}).to_string());
+            let (st, mut rx) = state_with_bus();
+            let mut create = create_msg("legacy-effort-create");
+            create.model = Some("gpt-6-astra".into());
+            create.effort = Some(Some("max".into()));
+            st.handle_create(create, None).await;
+            let created = collect_frames_until(&mut rx, Duration::from_secs(10), |f| {
+                f["type"] == "freshAgent.created"
+            })
+            .await;
+            let id = created
+                .frames
+                .iter()
+                .find(|f| f["type"] == "freshAgent.created")
+                .unwrap()["sessionId"]
+                .as_str()
+                .unwrap();
+            st.handle_send(send_msg(id, "legacy max selection")).await;
+            let _ = collect_frames_until(&mut rx, Duration::from_secs(5), |f| {
+                f["type"] == "freshAgent.send.accepted"
+            })
+            .await;
+            st.shutdown().await;
+            let requests: Vec<Value> = std::fs::read_to_string(log)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let turn = requests
+                .iter()
+                .find(|r| r["method"] == "turn/start")
+                .unwrap();
+            assert_eq!(
+                turn["params"]["effort"], expected,
+                "installed levels: {levels:?}"
+            );
+        }
+        std::env::remove_var("CODEX_CMD");
+        std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_catalog_omission_preserves_exact_choice_and_native_refusal_is_typed_without_retry(
+    ) {
+        let _guard = ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("native-requests.jsonl");
+        configure_fake_codex_cmd(&json!({"appendRequestLogPath":log,"modelCatalogPages":[{"data":[],"nextCursor":null}],"overrides":{"turn/start":{"error":{"code":-32602,"message":"Native provider rejected provider-current effort ultra"}}}}).to_string());
+        let (st, mut rx) = state_with_bus();
+        let mut create = create_msg("native-model-refusal-create");
+        create.model = Some("provider-current".into());
+        create.effort = Some(Some("ultra".into()));
+        st.handle_create(create, None).await;
+        let created = collect_frames_until(&mut rx, Duration::from_secs(10), |frame| {
+            frame["type"] == "freshAgent.created"
+        })
+        .await;
+        let id = created
+            .frames
+            .iter()
+            .find(|frame| frame["type"] == "freshAgent.created")
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let catalog = st
+            .model_catalog(crate::model_capabilities::CodexCatalogContext {
+                session_id: id.clone(),
+                session_ref: None,
+                cwd: None,
+                observed_epoch: None,
+                observed_generation: None,
+            })
+            .await
+            .unwrap();
+        let mut send = send_msg(&id, "Native must validate the exact choice");
+        send.request_id = Some("native-model-refusal-send".into());
+        st.handle_send(send).await;
+        let failed = collect_frames_until(&mut rx, Duration::from_secs(5), |frame| {
+            frame["type"] == "error" && frame["requestId"] == "native-model-refusal-send"
+        })
+        .await;
+        st.shutdown().await;
+        std::env::remove_var("CODEX_CMD");
+        std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
+        assert_eq!(catalog, json!([]));
+        assert!(failed.matched, "{:?}", failed.frames);
+        let error = failed
+            .frames
+            .iter()
+            .find(|frame| frame["requestId"] == "native-model-refusal-send")
+            .unwrap();
+        assert!(error["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("CODEX_TURN_START_FAILED:"));
+        assert!(error["message"]
+            .as_str()
+            .unwrap()
+            .contains("Native provider rejected provider-current effort ultra"));
+        assert!(!failed
+            .frames
+            .iter()
+            .any(|frame| frame["type"] == "freshAgent.send.accepted"));
+        let requests: Vec<Value> = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let turns: Vec<_> = requests
+            .iter()
+            .filter(|frame| frame["method"] == "turn/start")
+            .collect();
+        assert_eq!(turns.len(), 1, "no retry or replacement of exact intent");
+        assert_eq!(turns[0]["params"]["model"], "provider-current");
+        assert_eq!(turns[0]["params"]["effort"], "ultra");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|frame| frame["method"] == "thread/start")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_model_choices_reach_create_send_configure_resume_and_fork_requests() {
+        let _guard = ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("native-requests.jsonl");
+        configure_fake_codex_cmd(
+            &json!({"appendRequestLogPath": log, "recordTurns": true}).to_string(),
+        );
+        let (st, mut rx) = state_with_bus();
+        let mut create = create_msg("native-model-create");
+        create.model_selection = Some(Some(freshell_protocol::ModelSelection {
+            kind: "exact".into(),
+            model_id: "provider-current".into(),
+        }));
+        create.effort = Some(Some("ultra".into()));
+        st.handle_create(create, None).await;
+        let created = collect_frames_until(&mut rx, Duration::from_secs(10), |f| {
+            f["type"] == "freshAgent.created"
+        })
+        .await;
+        let session_id = created
+            .frames
+            .iter()
+            .find(|f| f["type"] == "freshAgent.created")
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        st.handle_send(send_msg(&session_id, "first native choice"))
+            .await;
+        let _ = collect_frames_until(&mut rx, Duration::from_secs(5), |f| {
+            f["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        st.handle_configure(configure_msg(
+            &session_id,
+            Some("provider-current"),
+            Some("ultra"),
+        ))
+        .await;
+        st.handle_send(send_msg(&session_id, "configured native choice"))
+            .await;
+        let _ = collect_frames_until(&mut rx, Duration::from_secs(5), |f| {
+            f["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        let (sink, fork_frames) = capturing_sink();
+        st.handle_fork(fork_msg(&session_id, "native-model-fork", None), None, sink)
+            .await;
+        let forked = captured_frames(&fork_frames);
+        let child = forked
+            .iter()
+            .find(|f| f["type"] == "freshAgent.forked")
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        st.handle_send(send_msg(&child, "forked native choice"))
+            .await;
+        let _ = collect_frames_until(&mut rx, Duration::from_secs(5), |f| {
+            f["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        simulate_unrequested_crash(&st, &session_id).await;
+        st.handle_send(send_msg(&session_id, "resumed native choice"))
+            .await;
+        let _ = collect_frames_until(&mut rx, Duration::from_secs(10), |f| {
+            f["type"] == "freshAgent.send.accepted"
+        })
+        .await;
+        st.shutdown().await;
+        std::env::remove_var("CODEX_CMD");
+        std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
+        let requests: Vec<Value> = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for method in ["thread/start", "thread/resume", "thread/fork", "turn/start"] {
+            let rows: Vec<_> = requests
+                .iter()
+                .filter(|row| row["method"] == method)
+                .collect();
+            assert!(
+                !rows.is_empty(),
+                "native method not exercised: {method}: {requests:?}"
+            );
+            for row in rows {
+                assert_eq!(row["params"]["model"], "provider-current", "{method}");
+                if method == "turn/start" {
+                    assert_eq!(row["params"]["effort"], "ultra");
+                }
+            }
+        }
+    }
+
     fn configure_msg(
         session_id: &str,
         model: Option<&str>,
@@ -27563,11 +31376,12 @@ pub(crate) mod tests {
             cwd: None,
             request_id: Some("req-configure".to_string()),
             settings: freshell_protocol::FreshAgentSendSettings {
+                collaboration_mode: None,
                 cwd: None,
                 model: model.map(|m| m.to_string()),
                 permission_mode: None,
                 sandbox: None,
-                effort: effort.map(|e| e.to_string()),
+                effort: effort.map(|e| e.to_string()).map(Some),
             },
         }
     }
@@ -27634,11 +31448,9 @@ pub(crate) mod tests {
         assert_eq!(metadata["event"]["effort"], json!("high"));
     }
 
-    /// An unknown-menu effort clamps to the model's menu default (the same
-    /// two-stage normalization `handle_send` applies), and the broadcast
-    /// carries the CLAMPED value — the record never holds a raw pick.
+    /// An opaque native effort is retained for the next turn and broadcast.
     #[tokio::test(flavor = "multi_thread")]
-    async fn configure_normalizes_the_effort_before_recording_it() {
+    async fn configure_preserves_native_effort_before_recording_it() {
         let (st, rx) = state_with_bus();
         let mut rx = rx;
         inserted_session(&st, "thread-cfg-clamp").await;
@@ -27656,8 +31468,8 @@ pub(crate) mod tests {
         };
         assert_eq!(
             effort.as_deref(),
-            Some("max"),
-            "an unknown-menu effort clamps to gpt-5.3-codex-spark's default"
+            Some("bogus"),
+            "native validation, not a static menu, decides support"
         );
         let frames = drain(&mut rx).await;
         let metadata = frames
@@ -27667,7 +31479,7 @@ pub(crate) mod tests {
                     && f["event"]["type"] == "freshAgent.session.metadata"
             })
             .expect("a metadata frame is broadcast");
-        assert_eq!(metadata["event"]["effort"], json!("max"));
+        assert_eq!(metadata["event"]["effort"], json!("bogus"));
     }
 
     /// An idempotent configure (same effective pair) stays silent on the bus.
@@ -27751,11 +31563,12 @@ pub(crate) mod tests {
             images: None,
             request_id: None,
             settings: Some(freshell_protocol::FreshAgentSendSettings {
+                collaboration_mode: None,
                 cwd: None,
                 model: Some(model.to_string()),
                 permission_mode: None,
                 sandbox: None,
-                effort: Some(effort.to_string()),
+                effort: Some(Some(effort.to_string())),
             }),
             observed_epoch: None,
             observed_generation: None,
@@ -28007,12 +31820,20 @@ pub(crate) mod tests {
         })
         .await;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut correlated_refusal = false;
         loop {
             let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
                 .await
                 .expect("a frame within budget")
                 .map(|raw| serde_json::from_str(&raw).expect("json frame"))
                 .expect("the bus stays open");
+            if frame["type"] == "error" && frame["requestId"] == "req-r8-stale-send" {
+                assert!(frame["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("SESSION_RESERVED:"));
+                correlated_refusal = true;
+            }
             if frame["type"] == "freshAgent.event"
                 && frame["event"]["type"] == json!("freshAgent.error")
                 && frame["event"]["code"] == json!("SESSION_RESERVED")
@@ -28028,16 +31849,33 @@ pub(crate) mod tests {
                 "the stale send never answered typed: {frame}"
             );
         }
+        assert!(
+            correlated_refusal,
+            "the pane refusal must also release its request-owned composer"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn checkpoint_send_with_stale_fence_is_refused_for_an_already_running_codex_session() {
         let _guard = ENV_LOCK.lock().await;
-        let (mut st, mut rx) = state_with_bus();
+        let (mut st, mut rx, sink) = state_with_sink();
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         st.set_ownership(Arc::clone(&registry));
         configure_fake_codex_cmd("{}");
         let thread_id = create_real_fake_session(&st, &mut rx).await;
+        let mut rollback = crate::rollback_record::RollbackRecord::empty(1);
+        rollback.push_entry(
+            crate::rollback_record::RollbackEntry {
+                removed_turns: vec![json!({"id":"owned-history"})],
+                prompt_text: "retained".into(),
+                at_ms: 2,
+                epoch: 0,
+            },
+            3,
+        );
+        sink.record_rollback(PROVIDER, &thread_id, rollback.clone())
+            .await
+            .unwrap();
         let before = registry.observe(PROVIDER, &thread_id);
         let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_handoff(
             PROVIDER,
@@ -28068,7 +31906,7 @@ pub(crate) mod tests {
         st.handle_send(FreshAgentSend {
             request_id: Some("req-stale-checkpoint-codex".into()),
             provider: freshell_protocol::AgentProvider::Codex,
-            session_id: thread_id,
+            session_id: thread_id.clone(),
             session_type: freshell_protocol::SessionType::Freshcodex,
             text: "delayed checkpoint prompt".into(),
             images: None,
@@ -28090,6 +31928,11 @@ pub(crate) mod tests {
             saw_reserved |= frame.to_string().contains("SESSION_RESERVED");
             saw_accepted |= frame.to_string().contains("freshAgent.send.accepted");
         }
+        assert_eq!(
+            sink.load_rollback(PROVIDER, &thread_id),
+            Some(rollback),
+            "a stale refused send cannot mutate saved rollback state before its ownership guard"
+        );
         assert!(saw_reserved, "the stale owner fence is refused typed");
         assert!(
             !saw_accepted,
@@ -28743,6 +32586,7 @@ pub(crate) mod tests {
             task_st
                 .handle_create(
                     FreshAgentCreate {
+                        collaboration_mode: None,
                         pane_id: None,
                         naming_handle: None,
                         observed_epoch: None,
@@ -28854,6 +32698,7 @@ pub(crate) mod tests {
             task_st
                 .handle_create(
                     FreshAgentCreate {
+                        collaboration_mode: None,
                         pane_id: None,
                         naming_handle: None,
                         observed_epoch: None,
@@ -28970,6 +32815,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                collaboration_mode: None,
                 pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
@@ -29384,6 +33230,7 @@ pub(crate) mod tests {
         // adopted without consulting the coordinator.
         st.handle_create(
             FreshAgentCreate {
+                collaboration_mode: None,
                 pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
@@ -29475,6 +33322,7 @@ pub(crate) mod tests {
         // observed generation — the fence discipline refuses typed.
         st.handle_create(
             FreshAgentCreate {
+                collaboration_mode: None,
                 pane_id: None,
                 naming_handle: None,
                 observed_epoch: Some(registry.boot_epoch()),
@@ -29543,10 +33391,67 @@ pub(crate) mod tests {
 #[cfg(all(test, target_os = "linux"))]
 mod provider_exec_tests {
     use super::*;
+
+    const CASE: &str = "FRESHELL_CODEX_EXEC_PROFILE_CHILD";
+    const TEST: &str = "codex::provider_exec_tests::provider_exec_profile_rejects_actual_managed_fresh_codex_spawn";
+
+    fn process_observation(pid: u32) -> Result<Value, String> {
+        let start = crate::session_lease::proc_starttime(pid as i32)
+            .ok_or_else(|| format!("process {pid} has no live start time"))?;
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .map_err(|error| error.to_string())?;
+        let parent = status
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:")?.trim().parse::<u32>().ok())
+            .ok_or_else(|| format!("process {pid} has no parent observation"))?;
+        Ok(json!({"pid":pid,"start":start,"ppid":parent}))
+    }
+
+    fn assert_joined_cases(outputs: Vec<std::process::Output>) {
+        assert_eq!(outputs.len(), 2);
+        for (case, output) in ["large", "small"].into_iter().zip(outputs) {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                eprintln!("[provider-exec-child stdout] {line}");
+            }
+            assert!(stdout.lines().any(|line| line == "running 1 test"));
+            assert!(stdout
+                .lines()
+                .any(|line| line == format!("test {TEST} ... ok")));
+            assert!(stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"));
+            let observations: Vec<Value> = String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|value| value["event"] == "provider_exec_fixture_closed")
+                .collect();
+            assert_eq!(observations.len(), 1, "{observations:?}");
+            let observation = &observations[0];
+            assert_eq!(observation["test"], TEST);
+            assert_eq!(observation["case"], case);
+            let supervisor = &observation["supervisor"];
+            let native = observation["native"].as_array().unwrap();
+            assert_eq!(native.len(), usize::from(case == "small"));
+            for process in std::iter::once(supervisor).chain(native) {
+                let pid = u32::try_from(process["pid"].as_u64().unwrap()).unwrap();
+                let start = process["start"].as_u64().unwrap();
+                assert_eq!(
+                    crate::session_lease::recorded_process_evidence(pid, Some(start)),
+                    crate::session_lease::RecordedProcessEvidence::Gone
+                );
+            }
+            for process in native {
+                assert_eq!(process["ppid"], supervisor["pid"]);
+            }
+            eprintln!("{observation}");
+        }
+    }
+
     #[tokio::test]
     async fn provider_exec_profile_rejects_actual_managed_fresh_codex_spawn() {
-        const CASE: &str = "FRESHELL_CODEX_EXEC_PROFILE_CHILD";
         if let Ok(case) = std::env::var(CASE) {
+            let supervisor = process_observation(std::process::id());
+            let spawned = std::sync::Mutex::new(Vec::new());
+            let on_spawned = |pid| spawned.lock().unwrap().push(process_observation(pid));
             let count = if case == "large" { 17 } else { 1 };
             let (tx, _rx) = tokio::sync::broadcast::channel(16);
             let state = FreshCodexState::new(
@@ -29570,11 +33475,12 @@ mod provider_exec_tests {
                     env!("CARGO_MANIFEST_DIR")
                 ),
             );
-            let mut result = state.spawn_sidecar_notifying(None, None).await;
-            if let Ok((_, _, _, child)) = &mut result {
-                child.kill().await.unwrap();
-                child.wait().await.unwrap();
-            }
+            let mut result = state.spawn_sidecar_notifying(None, Some(&on_spawned)).await;
+            let cleanup = if let Ok((_, _, _, child)) = &mut result {
+                Some((child.kill().await, child.wait().await))
+            } else {
+                None
+            };
             if case == "large" {
                 assert!(
                     matches!(result,Err(ref cause) if cause.contains("provider exec profile")),
@@ -29586,18 +33492,71 @@ mod provider_exec_tests {
                     "valid selected fresh Codex inputs must execute the actual app-server handshake"
                 );
             }
+            drop(result);
+            if let Some((killed, waited)) = cleanup {
+                killed.unwrap();
+                waited.unwrap();
+            }
+            let native: Vec<Value> = spawned
+                .into_inner()
+                .unwrap()
+                .into_iter()
+                .collect::<Result<_, _>>()
+                .expect("observe actual spawned Codex identity");
+            assert_eq!(native.len(), usize::from(case == "small"));
+            let observation = json!({"severity":"info","event":"provider_exec_fixture_closed",
+                "test":TEST,"case":case,"supervisor":supervisor.expect("observe child libtest identity"),
+                "native":native});
+            use std::io::Write;
+            writeln!(std::io::stderr(), "{observation}").expect("report joined fixture identities");
             return;
         }
+        assert_joined_cases(run_profile_cases().await);
+    }
+
+    // The original exact test and the guard regression share this physical path.
+    async fn run_profile_cases() -> Vec<std::process::Output> {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
+        let mut outputs = Vec::new();
         for case in ["large", "small"] {
-            let output=std::process::Command::new(std::env::current_exe().unwrap()).env_clear()
-            .env("PATH","/usr/local/bin:/usr/bin:/bin").env(CASE,case)
-            .args(["--exact","codex::provider_exec_tests::provider_exec_profile_rejects_actual_managed_fresh_codex_spawn","--nocapture"])
-            .output().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .env_clear()
+                .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                .env(CASE, case)
+                .args(["--exact", TEST, "--nocapture"])
+                .output()
+                .unwrap();
             assert!(
                 output.status.success(),
                 "actual fresh Codex exec fixture failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
+            outputs.push(output);
         }
+        outputs
+    }
+
+    #[tokio::test]
+    async fn provider_exec_parent_waits_for_process_fixture() {
+        let held = crate::session_lease::process_fixture::lock().await;
+        let mut parent = Box::pin(run_profile_cases());
+        // Synchronous output either joins real children or waits at the parent guard.
+        let first_poll = futures_util::poll!(&mut parent);
+        let waited = first_poll.is_pending();
+        drop(held);
+        let outputs = match first_poll {
+            std::task::Poll::Ready(outputs) => outputs,
+            std::task::Poll::Pending => parent.await,
+        };
+        assert_joined_cases(outputs);
+        eprintln!(
+            "{}",
+            json!({"severity":"info","event":"provider_exec_parent_polled",
+            "test":TEST,"firstPollPending":waited})
+        );
+        assert!(
+            waited,
+            "actual Codex provider fixture spawned while the canonical process guard was held"
+        );
     }
 }

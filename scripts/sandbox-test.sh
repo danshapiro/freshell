@@ -30,7 +30,7 @@
 # 1 contract failure, 2 missing prerequisite before any Docker mutation).
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 IMAGE_TAG="freshell-sandbox:latest"
 
 if [ "${1:-}" = "--provider-mountpoints" ]; then
@@ -133,7 +133,124 @@ else
   fi
   CMD="$1"
 
+  # Only the closed native Codex contract entrypoint receives its declared
+  # sandbox construction policy. Every other runtime suite keeps Docker's
+  # existing default. Verify before the install-capable entrypoint can run.
+  CODEX_NATIVE_CONTRACT=0
+  if [ "${RUNTIME_SUITE}" -eq 1 ]; then
+    case "${CMD}" in
+      'node test/integration/providers/codex-cli-contract.mjs --scenario all' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario model-effort-usage' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario text-history --missing-policy-client-probe' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario mcp-form-url' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario parent-child-read --child-approval' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario mcp-form-url --history-mode paginated --large-output' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario mcp-form-url --history-mode legacy --large-output' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario active-input-stop' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario active-input-stop --startup-cancellation' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario approval-policy-restricted-exec --requirements-guard' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario approval-policy-restricted-exec --approval-control stdin' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario approval-policy-restricted-exec --approval-control network' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario text-history --history-mode paginated --persistence-mode delayed' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario text-history --history-mode legacy --persistence-mode delayed' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario text-history --history-mode legacy --persistence-mode missing' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario text-history --history-mode paginated --persistence-mode missing' | \
+      'node test/integration/providers/codex-cli-contract.mjs --scenario approval-policy-restricted-exec')
+        node "${REPO_ROOT}/scripts/testing/prepare-codex-contract.mjs" --verify-sandbox >/dev/null
+        CODEX_NATIVE_CONTRACT=1
+        IMAGE_TAG="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).image)' "${REPO_ROOT}/.runtime-build/codex-contract/staged.json")"
+        ;;
+    esac
+  fi
+
+  # Keep Cargo targets reusable within one canonical working copy while
+  # isolating concurrent checkouts. Labels are attached by Docker in the same
+  # --mount request that creates and references a fresh volume; there is no
+  # create-then-mount window for another cleanup process to observe.
+  target_cache_hash() {
+    local hash_output
+    if command -v sha256sum >/dev/null 2>&1; then
+      hash_output="$(printf '%s' "${REPO_ROOT}" | sha256sum)" || return 1
+    elif command -v shasum >/dev/null 2>&1; then
+      hash_output="$(printf '%s' "${REPO_ROOT}" | shasum -a 256)" || return 1
+    else
+      return 1
+    fi
+    TARGET_CACHE_WORKTREE_SHA256="${hash_output%% *}"
+    [[ "${TARGET_CACHE_WORKTREE_SHA256}" =~ ^[a-f0-9]{64}$ ]]
+  }
+
+  if ! target_cache_hash; then
+    printf '{"severity":"error","event":"sandbox_target_cache_identity_failed"}\n' >&2
+    exit 2
+  fi
+  TARGET_CACHE_VOLUME="freshell-sandbox-rust-target-v1-${TARGET_CACHE_WORKTREE_SHA256:0:24}"
+  TARGET_CACHE_OWNER_LABEL="com.freshell.cache.owner=freshell"
+  TARGET_CACHE_PURPOSE_LABEL="com.freshell.cache.purpose=rust-target"
+  TARGET_CACHE_SCHEMA_LABEL="com.freshell.cache.schema=1"
+  TARGET_CACHE_WORKTREE_LABEL="com.freshell.cache.worktree-sha256=${TARGET_CACHE_WORKTREE_SHA256}"
+  TARGET_CACHE_LABEL_OPTIONS="volume-label=${TARGET_CACHE_OWNER_LABEL},volume-label=${TARGET_CACHE_PURPOSE_LABEL},volume-label=${TARGET_CACHE_SCHEMA_LABEL},volume-label=${TARGET_CACHE_WORKTREE_LABEL}"
+
+  target_cache_labels_match() {
+    local labels_json="$1"
+    python3 - "${labels_json}" "${TARGET_CACHE_WORKTREE_SHA256}" <<'PY'
+import json
+import sys
+
+try:
+    labels = json.loads(sys.argv[1])
+except (TypeError, json.JSONDecodeError):
+    raise SystemExit(1)
+
+expected = {
+    "com.freshell.cache.owner": "freshell",
+    "com.freshell.cache.purpose": "rust-target",
+    "com.freshell.cache.schema": "1",
+    "com.freshell.cache.worktree-sha256": sys.argv[2],
+}
+raise SystemExit(0 if isinstance(labels, dict) and all(labels.get(key) == value for key, value in expected.items()) else 1)
+PY
+  }
+
+  # A deterministic name can already exist from an earlier run. Refuse to
+  # mount a volume whose immutable ownership labels do not match this copy.
+  # An absent volume is created and labeled atomically by the run --mount
+  # below. Docker's own diagnostic remains authoritative for unsupported
+  # volume-label mount capability; this wrapper never falls back to a shared
+  # target cache.
+  if existing_target_volumes="$(docker volume ls --format '{{.Name}}' --filter "name=${TARGET_CACHE_VOLUME}")"; then
+    if printf '%s\n' "${existing_target_volumes}" | grep -Fxq -- "${TARGET_CACHE_VOLUME}"; then
+      if existing_target_labels="$(docker volume inspect --format '{{json .Labels}}' "${TARGET_CACHE_VOLUME}" 2>/dev/null)"; then
+        if ! target_cache_labels_match "${existing_target_labels}"; then
+          printf '{"severity":"error","event":"sandbox_target_cache_labels_mismatch","volume":"%s"}\n' \
+            "${TARGET_CACHE_VOLUME}" >&2
+          exit 1
+        fi
+      elif rechecked_target_volumes="$(docker volume ls --format '{{.Name}}' --filter "name=${TARGET_CACHE_VOLUME}")"; then
+        if printf '%s\n' "${rechecked_target_volumes}" | grep -Fxq -- "${TARGET_CACHE_VOLUME}"; then
+          printf '{"severity":"error","event":"sandbox_target_cache_inspect_failed","volume":"%s"}\n' \
+            "${TARGET_CACHE_VOLUME}" >&2
+          exit 1
+        fi
+        # A concurrent cleanup removed the previously inspected volume.
+        # Continue to the atomic labeled --mount path below.
+      else
+        printf '{"severity":"error","event":"sandbox_target_cache_recheck_failed","volume":"%s"}\n' \
+          "${TARGET_CACHE_VOLUME}" >&2
+        exit 1
+      fi
+    fi
+  else
+    printf '{"severity":"error","event":"sandbox_target_cache_list_failed","volume":"%s"}\n' \
+      "${TARGET_CACHE_VOLUME}" >&2
+    exit 1
+  fi
+
   if ! docker image inspect "${IMAGE_TAG}" >/dev/null 2>&1; then
+    if [ "${CODEX_NATIVE_CONTRACT}" -eq 1 ]; then
+      echo '[sandbox] prepared Codex contract image is unavailable; connected preparation is required' >&2
+      exit 2
+    fi
     echo "[sandbox] image ${IMAGE_TAG} not found, building it first..." >&2
     "${REPO_ROOT}/scripts/sandbox-build.sh"
   fi
@@ -345,7 +462,7 @@ DOCKER_ARGS=(
   -v freshell-sandbox-cargo-registry:/usr/local/cargo/registry
   -v freshell-sandbox-cargo-git:/usr/local/cargo/git
   -v freshell-sandbox-pnpm-store:/home/sandbox/.local/share/pnpm/store
-  -v freshell-sandbox-cargo-target:/workspace/target
+  --mount "type=volume,src=${TARGET_CACHE_VOLUME},dst=/workspace/target,${TARGET_CACHE_LABEL_OPTIONS}"
   -v freshell-sandbox-node-modules:/workspace/node_modules
   # pnpm workspace members with their own dependencies get their own
   # sandbox-owned node_modules (the entrypoint chowns and, on fingerprint
@@ -365,11 +482,17 @@ if [ "${RUNTIME_SUITE}" -eq 1 ]; then
     # Executable fixtures need a private package-lookup boundary. Reuse the
     # same sandbox-owned target volume outside /workspace, where native
     # ancestor lookup would otherwise select the repo's real node_modules.
-    -v freshell-sandbox-cargo-target:/freshell-test-artifacts
+    --mount "type=volume,src=${TARGET_CACHE_VOLUME},dst=/freshell-test-artifacts,${TARGET_CACHE_LABEL_OPTIONS}"
     -e FRESHELL_TEST_EXECUTABLE_TMP_DIR=/freshell-test-artifacts
     --security-opt no-new-privileges
     -e FRESHELL_SANDBOX_MODE=runtime-suite
   )
+  if [ "${CODEX_NATIVE_CONTRACT:-0}" -eq 1 ]; then
+    DOCKER_ARGS+=(
+      --security-opt "seccomp=${REPO_ROOT}/.runtime-build/codex-contract/codex-policy.json"
+      -e FRESHELL_CODEX_CONTRACT_POLICY=prepared
+    )
+  fi
   if [ "${CHECKPOINT_FIXTURE}" -eq 1 ]; then
     DOCKER_ARGS+=(-e FRESHELL_SANDBOX_CHECKPOINT_FIXTURE=1)
   fi
@@ -387,7 +510,7 @@ fi
 # Docker creates any bind-mount point that doesn't yet exist on the host as
 # root (dockerd itself runs as root), before the container ever hands off to
 # its non-root user. A named volume layered under a path inside our
-# bind-mounted repo (e.g. -v ...:/workspace/target) needs a mount point at
+# bind-mounted repo (e.g. a volume mount at /workspace/target) needs a mount point at
 # ${REPO_ROOT}/target on the host side; in a freshly cloned/worktree'd repo
 # that path doesn't exist yet, so dockerd creates it — root-owned. That stub
 # then breaks host-side `cargo`/`pnpm` in this worktree with EACCES the next
@@ -401,6 +524,13 @@ for entry in "${DOCKER_ARGS[@]}"; do
   *:/workspace/*)
     subpath="${entry#*:/workspace/}"
     subpath="${subpath%%:*}" # strip a trailing :ro/:rw suffix, if present
+    if [ -n "${subpath}" ]; then
+      mkdir -p "${REPO_ROOT}/${subpath}"
+    fi
+    ;;
+  type=volume,*dst=/workspace/*)
+    subpath="${entry#*dst=/workspace/}"
+    subpath="${subpath%%,*}"
     if [ -n "${subpath}" ]; then
       mkdir -p "${REPO_ROOT}/${subpath}"
     fi

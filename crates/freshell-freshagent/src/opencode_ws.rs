@@ -1709,7 +1709,10 @@ impl FreshOpencodeState {
         }
 
         let model = normalize_opencode_model(msg.model.as_deref());
-        let effort = normalize_opencode_effort(model.as_deref(), msg.effort.as_deref());
+        let effort = normalize_opencode_effort(
+            model.as_deref(),
+            msg.effort.as_ref().and_then(|value| value.as_deref()),
+        );
         let placeholder = format!("freshopencode-{request_id}");
 
         let mut session = OpencodeSession::new(placeholder.clone(), msg.cwd.clone(), model, effort);
@@ -2012,6 +2015,7 @@ impl FreshOpencodeState {
             (
                 session.provenance.clone(),
                 crate::identity_sink::FreshAgentSettings {
+                    collaboration_mode: None,
                     model: session.model.clone(),
                     sandbox: None,
                     permission_mode: None,
@@ -2035,7 +2039,7 @@ impl FreshOpencodeState {
             }
             let raw_model = msg.model.clone().or_else(|| session.model.clone());
             let model = normalize_opencode_model(raw_model.as_deref());
-            let raw_effort = msg.effort.clone().or_else(|| session.effort.clone());
+            let raw_effort = msg.effort.clone().unwrap_or_else(|| session.effort.clone());
             let effort = normalize_opencode_effort(model.as_deref(), raw_effort.as_deref());
             session.model = model;
             session.effort = effort;
@@ -2178,6 +2182,7 @@ impl FreshOpencodeState {
                     // b8ke focused ep5 r2 F1: a lane write.
                     authoritative: false,
                     settings: crate::identity_sink::FreshAgentSettings {
+                        collaboration_mode: None,
                         model,
                         sandbox: None,
                         permission_mode: None,
@@ -2508,7 +2513,10 @@ impl FreshOpencodeState {
         // stored model/effort/cwd are reused verbatim.
         let (model, effort, cwd) = if let Some(settings) = msg.settings.as_ref() {
             let model = normalize_opencode_model(settings.model.as_deref());
-            let effort = normalize_opencode_effort(model.as_deref(), settings.effort.as_deref());
+            let effort = normalize_opencode_effort(
+                model.as_deref(),
+                settings.effort.as_ref().and_then(|value| value.as_deref()),
+            );
             let cwd = settings
                 .cwd
                 .clone()
@@ -2824,6 +2832,7 @@ impl FreshOpencodeState {
                     // b8ke focused ep5 r2 F1: a lane write.
                     authoritative: false,
                     settings: crate::identity_sink::FreshAgentSettings {
+                        collaboration_mode: None,
                         model: session.model.clone(),
                         sandbox: None,
                         permission_mode: None,
@@ -2956,6 +2965,7 @@ impl FreshOpencodeState {
                     // b8ke focused ep5 r2 F1: a lane write.
                     authoritative: false,
                     settings: crate::identity_sink::FreshAgentSettings {
+                        collaboration_mode: None,
                         model: session.model.clone(),
                         sandbox: None,
                         permission_mode: None,
@@ -3405,7 +3415,13 @@ impl FreshOpencodeState {
         }
 
         let model = normalize_opencode_model(msg.settings.model.as_deref());
-        let effort = normalize_opencode_effort(model.as_deref(), msg.settings.effort.as_deref());
+        let effort = normalize_opencode_effort(
+            model.as_deref(),
+            msg.settings
+                .effort
+                .as_ref()
+                .and_then(|value| value.as_deref()),
+        );
         let changed = session.model != model || session.effort != effort;
         if !changed {
             // Idempotent configure: nothing to converge.
@@ -3439,6 +3455,7 @@ impl FreshOpencodeState {
                     observed_generation: None,
                     authoritative: false,
                     settings: crate::identity_sink::FreshAgentSettings {
+                        collaboration_mode: None,
                         model: model.clone(),
                         sandbox: None,
                         permission_mode: None,
@@ -6298,6 +6315,7 @@ impl FreshOpencodeState {
                 // b8ke focused ep5 r2 F1: a lane write.
                 authoritative: false,
                 settings: crate::identity_sink::FreshAgentSettings {
+                    collaboration_mode: None,
                     model,
                     sandbox: None,
                     permission_mode: None,
@@ -7876,6 +7894,7 @@ impl FreshOpencodeState {
             // session gains provenance WITHOUT a laundered defaults snapshot).
             let settings = if recovered.is_some() {
                 crate::identity_sink::FreshAgentSettings {
+                    collaboration_mode: None,
                     model: rec.model.clone(),
                     sandbox: None,
                     permission_mode: None,
@@ -10034,6 +10053,7 @@ mod tests {
 
     fn create_msg(request_id: &str) -> FreshAgentCreate {
         FreshAgentCreate {
+            collaboration_mode: None,
             pane_id: None,
             naming_handle: None,
             observed_epoch: None,
@@ -10149,6 +10169,7 @@ mod tests {
         let placeholder = "freshopencode-req-ign";
         let mut msg = send_msg(placeholder, "ignored knobs should log");
         msg.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            collaboration_mode: None,
             cwd: None,
             effort: None,
             model: None,
@@ -14564,7 +14585,7 @@ mod tests {
         let mut create = create_msg("r1");
         create.cwd = Some("/w".to_string());
         create.model = Some("big-model".to_string());
-        create.effort = Some("high".to_string());
+        create.effort = Some(Some("high".to_string()));
         state.handle_create(create, None).await;
         state
             .handle_send(send_msg("freshopencode-r1", "hello"))
@@ -14910,15 +14931,16 @@ mod tests {
         let mut create = create_msg("r2");
         create.cwd = Some("/w".to_string());
         create.model = Some("big-model".to_string());
-        create.effort = Some("high".to_string());
+        create.effort = Some(Some("high".to_string()));
         state.handle_create(create, None).await;
         let placeholder = "freshopencode-r2";
         state.handle_send(send_msg(placeholder, "first")).await;
 
         let mut second = send_msg(placeholder, "second");
         second.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            collaboration_mode: None,
             cwd: None,
-            effort: Some("low".to_string()),
+            effort: Some(Some("low".to_string())),
             model: Some("small-model".to_string()),
             permission_mode: None,
             sandbox: None,
@@ -15036,6 +15058,7 @@ mod tests {
             "opencode",
             DURABLE_ID,
             crate::identity_sink::FreshAgentSettings {
+                collaboration_mode: None,
                 model: Some("big-model".into()),
                 sandbox: None,
                 permission_mode: None,
@@ -15079,6 +15102,7 @@ mod tests {
             "opencode",
             DURABLE_ID,
             crate::identity_sink::FreshAgentSettings {
+                collaboration_mode: None,
                 model: Some("big-model".into()),
                 sandbox: None,
                 permission_mode: None,
@@ -15544,6 +15568,7 @@ mod tests {
             "opencode",
             DURABLE_ID,
             crate::identity_sink::FreshAgentSettings {
+                collaboration_mode: None,
                 model: Some("big-model".into()),
                 sandbox: None,
                 permission_mode: None,
@@ -15619,6 +15644,7 @@ mod tests {
             "opencode",
             DURABLE_ID,
             crate::identity_sink::FreshAgentSettings {
+                collaboration_mode: None,
                 model: Some("big-model".into()),
                 sandbox: None,
                 permission_mode: None,
@@ -16148,6 +16174,7 @@ mod tests {
             "opencode",
             DURABLE_ID,
             crate::identity_sink::FreshAgentSettings {
+                collaboration_mode: None,
                 model: Some("big-model".into()),
                 sandbox: None,
                 permission_mode: None,
@@ -16356,6 +16383,7 @@ mod tests {
 
             authoritative: false,
             settings: crate::identity_sink::FreshAgentSettings {
+                collaboration_mode: None,
                 model: Some("big-model".into()),
                 sandbox: None,
                 permission_mode: None,
@@ -16459,6 +16487,7 @@ mod tests {
 
             authoritative: false,
             settings: crate::identity_sink::FreshAgentSettings {
+                collaboration_mode: None,
                 model: Some("big-model".into()),
                 sandbox: None,
                 permission_mode: None,
@@ -23530,11 +23559,12 @@ mod tests {
             cwd: None,
             request_id: Some("req-configure".to_string()),
             settings: freshell_protocol::FreshAgentSendSettings {
+                collaboration_mode: None,
                 cwd: None,
                 model: model.map(|m| m.to_string()),
                 permission_mode: None,
                 sandbox: None,
-                effort: effort.map(|e| e.to_string()),
+                effort: effort.map(|e| e.to_string()).map(Some),
             },
         }
     }
@@ -23554,11 +23584,12 @@ mod tests {
             images: None,
             request_id: Some(format!("req-{text}")),
             settings: Some(freshell_protocol::FreshAgentSendSettings {
+                collaboration_mode: None,
                 cwd: None,
                 model: model.map(|m| m.to_string()),
                 permission_mode: None,
                 sandbox: None,
-                effort: effort.map(|e| e.to_string()),
+                effort: effort.map(|e| e.to_string()).map(Some),
             }),
             observed_epoch: None,
             observed_generation: None,

@@ -3,7 +3,7 @@ import { ChevronRight, MessageSquarePlus } from 'lucide-react'
 import { api, ApiError } from '@/lib/api'
 import { cn } from '@/lib/utils'
 
-type DiffSummary = { id: string; path?: string; title?: string; status?: string }
+type DiffSummary = { id: string; path?: string; title?: string; status?: string; diff?: string }
 
 /**
  * A 404 from /api/fresh-agent/diff means the connected server predates the
@@ -58,7 +58,8 @@ function FreshAgentFileDiff({
   }, [diff, loading])
 
   const label = summary.title ?? summary.path ?? summary.id
-  const lines = diff !== null && diff.trim() ? diff.split('\n') : null
+  const shownDiff = summary.diff ?? diff
+  const lines = shownDiff !== null && shownDiff.trim() ? shownDiff.split('\n') : null
 
   return (
     <div className="fresh-agent-file-diff min-w-0 border-l-2 border-l-border text-xs">
@@ -69,7 +70,7 @@ function FreshAgentFileDiff({
         aria-label={`Diff: ${label}`}
         onClick={() => {
           setExpanded((value) => !value)
-          if (!expanded && cwd && summary.path) load(cwd, summary.path)
+          if (!expanded && summary.diff === undefined && cwd && summary.path) load(cwd, summary.path)
         }}
       >
         <ChevronRight className={cn('h-3 w-3 shrink-0 transition-transform', expanded && 'rotate-90')} />
@@ -78,8 +79,8 @@ function FreshAgentFileDiff({
       </button>
       {expanded ? (
         <div className="fresh-agent-file-diff-body mt-1 overflow-x-auto rounded border border-border/60 bg-background/70 font-mono text-[11px] leading-5">
-          {loading ? <div className="px-3 py-2 text-muted-foreground">Loading diff…</div> : null}
-          {error ? (
+          {summary.diff === undefined && loading ? <div className="px-3 py-2 text-muted-foreground">Loading diff…</div> : null}
+          {summary.diff === undefined && error ? (
             <div className="px-3 py-2 text-destructive">
               {error}{' '}
               {cwd && summary.path ? (
@@ -96,15 +97,15 @@ function FreshAgentFileDiff({
               ) : null}
             </div>
           ) : null}
-          {!cwd || !summary.path ? (
+          {summary.diff === undefined && (!cwd || !summary.path) ? (
             <div className="px-3 py-2 text-muted-foreground">Diff unavailable for this file.</div>
           ) : null}
-          {!loading && !error && lines === null && diff !== null ? (
-            <div className="px-3 py-2 text-muted-foreground">No uncommitted changes for this file.</div>
+          {(summary.diff !== undefined || (!loading && !error)) && lines === null && shownDiff !== null ? (
+            <div className="px-3 py-2 text-muted-foreground">{summary.diff !== undefined ? 'No changes in this turn.' : 'No uncommitted changes for this file.'}</div>
           ) : null}
           {lines?.map((line, index) => {
             const kind = classifyLine(line)
-            if (kind === 'meta') return null
+            if (kind === 'meta' && summary.diff === undefined) return null
             return (
               <div
                 key={index}
@@ -139,8 +140,8 @@ function FreshAgentFileDiff({
 }
 
 /**
- * Changed-files panel: summaries come from the thread snapshot; full content
- * loads on expand from /api/fresh-agent/diff (git diff in the session cwd).
+ * Provider-supplied diffs replace the displayed content directly. File-only
+ * summaries load git diff from the session cwd when expanded.
  * Line comments drop a prefilled mention into the composer via onComment.
  */
 export function FreshAgentDiffPanel({

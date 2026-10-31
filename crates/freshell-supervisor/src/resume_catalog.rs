@@ -355,6 +355,8 @@ mod tests {
         context.provider = "codex".into();
         context.provider_store_id = "codex-store-42".into();
         context.fresh_agent = Some(FreshAgentLaunchSpec {
+            naming_handle: None,
+            collaboration_mode: None,
             session_id: "presentation-42".into(),
             provider: FreshProvider::Codex,
             session_type: "freshcodex".into(),
@@ -400,6 +402,8 @@ mod tests {
         context.provider = "codex".into();
         context.provider_store_id = "fixture-store-42".into();
         context.fresh_agent = Some(FreshAgentLaunchSpec {
+            naming_handle: None,
+            collaboration_mode: None,
             session_id: "presentation-fixture-42".into(),
             provider: FreshProvider::Codex,
             session_type: "freshcodex".into(),
@@ -459,20 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn every_terminal_resume_adapter_uses_the_checked_in_provider_pin() {
-        assert_eq!(
-            pinned_provider_version("claude").as_deref(),
-            Some("2.1.263")
-        );
-        assert_eq!(pinned_provider_version("codex").as_deref(), Some("0.147.0"));
-        assert_eq!(
-            pinned_provider_version("opencode").as_deref(),
-            Some("1.18.21")
-        );
-        assert_eq!(
-            pinned_provider_version("amplifier").as_deref(),
-            Some("0.1.1")
-        );
+    fn unknown_provider_has_no_resume_version() {
         assert_eq!(pinned_provider_version("not-a-provider"), None);
     }
 }

@@ -67,7 +67,7 @@ try {
   })
 
   failureStage = 'sidecar start'
-  sidecar = spawn(process.execPath, [path.join(sidecarDir, 'index.mjs')], {
+  sidecar = fixture.ownProcess(spawn(process.execPath, [path.join(sidecarDir, 'index.mjs')], {
     cwd: sidecarDir,
     env: fixture.env(provider.url, {
       CLAUDE_CMD: pinned.nativeCli,
@@ -78,7 +78,7 @@ try {
       FRESHELL_TOKEN: token,
     }),
     stdio: ['pipe', 'pipe', 'pipe'],
-  })
+  }))
   let stderr = ''
   sidecar.stderr.setEncoding('utf8').on('data', (chunk) => { stderr = (stderr + chunk).slice(-4000) })
   sidecar.stdin.on('error', () => {})
@@ -111,6 +111,7 @@ try {
   const created = await waitFor(frame => frame.requestId === requestId && (frame.type === 'created' || frame.type === 'create.failed'), 45_000, 'created')
   if (created.type !== 'created') throw new Error(`the sidecar refused the create: ${created.message}`)
   if (created.sessionId !== nativeSessionId) throw new Error('the sidecar changed the requested native session identity')
+  await fixture.ownProcessId(created.cliPid)
 
   failureStage = 'cli argv'
   const argv = (await fs.readFile(`/proc/${created.cliPid}/cmdline`, 'utf8')).split('\0')
@@ -155,6 +156,7 @@ try {
   for (let waited = 0; waited < 10_000 && receipt.probe === null; waited += 50) {
     try { receipt.probe = JSON.parse(await fs.readFile(reportFile, 'utf8')) } catch { await sleep(50) }
   }
+  if (receipt.probe?.pid) await fixture.ownProcessId(receipt.probe.pid)
 
   const tokenDigest = createHash('sha256').update(token).digest('hex')
   const probeOk = receipt.probe !== null

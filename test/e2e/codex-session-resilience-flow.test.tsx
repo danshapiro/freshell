@@ -43,6 +43,10 @@ vi.mock('@/lib/terminal-restore', () => ({
   clearTerminalRestoreRequestId: vi.fn(),
   consumeTerminalFreshRecoveryRequest: vi.fn(() => undefined),
   addTerminalFreshRecoveryRequestId: vi.fn(),
+  // Non-consuming peek for the dead-create stand-down exemption (mirrors
+  // this suite's consume mock: nothing is ever registry-armed here, so the
+  // exemption stays inert exactly like the consume-based read it replaced).
+  hasTerminalFreshRecoveryRequest: vi.fn(() => false),
   // Batch-6 arm/consume pair (restore offer live-reattach): a full-module
   // mock must carry every export TerminalView imports, or the create path
   // throws inside the mock and vitest reports an unhandled rejection.

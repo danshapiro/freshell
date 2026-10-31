@@ -1132,6 +1132,7 @@ async fn rest_resume_durable_ses_is_born_durable_with_ledger_settings_and_route(
     sink.settings.lock().unwrap().insert(
         ("opencode".to_string(), "ses_resumed_1".to_string()),
         FreshAgentSettings {
+            collaboration_mode: None,
             model: Some("big-model".to_string()),
             sandbox: None,
             permission_mode: None,
@@ -1681,6 +1682,7 @@ async fn rest_resume_body_model_and_effort_beat_the_ledger_record() {
     sink.settings.lock().unwrap().insert(
         ("opencode".to_string(), "ses_override_1".to_string()),
         FreshAgentSettings {
+            collaboration_mode: None,
             model: Some("big-model".to_string()),
             sandbox: None,
             permission_mode: None,

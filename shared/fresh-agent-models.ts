@@ -26,38 +26,8 @@ export const FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE = {
       defaultEffort: FRESHCLAUDE_DEFAULT_EFFORT,
     },
   ],
-  freshcodex: [
-    {
-      value: FRESHCODEX_DEFAULT_MODEL,
-      label: 'GPT-6 Astra',
-      thinkingEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
-      defaultEffort: FRESHCODEX_DEFAULT_EFFORT,
-    },
-    {
-      value: 'gpt-5.6-sol',
-      label: 'GPT-5.6 Sol',
-      thinkingEfforts: ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
-      defaultEffort: FRESHCODEX_DEFAULT_EFFORT,
-    },
-    {
-      value: 'gpt-5.6-terra',
-      label: 'GPT-5.6 Terra',
-      thinkingEfforts: ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
-      defaultEffort: FRESHCODEX_DEFAULT_EFFORT,
-    },
-    {
-      value: 'gpt-5.6-luna',
-      label: 'GPT-5.6 Luna',
-      thinkingEfforts: ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
-      defaultEffort: FRESHCODEX_DEFAULT_EFFORT,
-    },
-    {
-      value: 'gpt-5.3-codex-spark',
-      label: 'GPT-5.3 Codex Spark',
-      thinkingEfforts: ['none', 'minimal', 'low', 'medium', 'high', 'max'],
-      defaultEffort: FRESHCODEX_DEFAULT_EFFORT,
-    },
-  ],
+  // A labeled input default, not an installed-model catalog.
+  freshcodex: [{ value:FRESHCODEX_DEFAULT_MODEL,label:'GPT-6 Astra',thinkingEfforts:[] as readonly string[],defaultEffort:FRESHCODEX_DEFAULT_EFFORT }],
   kilroy: [
     {
       value: 'opus[1m]',
@@ -85,8 +55,7 @@ export function resolveFreshAgentModelOption(
 }
 
 export function normalizeFreshcodexModel(model: string | undefined): string {
-  const option = FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE.freshcodex.find((candidate) => candidate.value === model)
-  return option?.value ?? FRESHCODEX_DEFAULT_MODEL
+  return model?.trim() || FRESHCODEX_DEFAULT_MODEL
 }
 
 export function normalizeFreshAgentModel(
@@ -120,6 +89,7 @@ export function normalizeFreshAgentEffort(
   model: string | undefined,
   effort: string | undefined,
 ): string | undefined {
+  if (provider === 'codex') return effort?.trim() || undefined
   const options = getFreshAgentThinkingOptions(sessionType, provider, model)
   if (provider === 'opencode') {
     const normalizedModel = normalizeFreshAgentModel(sessionType, provider, model)
@@ -139,7 +109,7 @@ export function normalizeFreshAgentEffort(
       return normalized.length > 0 ? normalized : undefined
     }
   }
-  const normalizedEffort = provider === 'codex' && effort === 'xhigh' ? 'max' : effort
+  const normalizedEffort = effort
   if (normalizedEffort && options.some((option) => option.value === normalizedEffort)) {
     return normalizedEffort
   }

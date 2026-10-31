@@ -16,10 +16,39 @@ const require = createRequire(import.meta.url)
 const cliPath = resolve(process.cwd(), 'tools/freshell-cli/index.ts')
 const tsxLoader = pathToFileURL(require.resolve('tsx')).href
 
+describe('Freshcodex creation through the real CLI', () => {
+  it('keeps an uncertain send receipt without replaying or exposing unrelated error payloads', async () => {
+    const receipt = { status: 'error', code: 'CODEX_DELIVERY_AMBIGUOUS', message: 'delivery is uncertain', retryable: false, requestId: 'uncertain-request', sessionId: 'native-session', incarnationId: 'owned-incarnation', answer: 'do-not-log-this-answer' }
+    const result = await invokeCli(['new-tab', '--agent', 'codex', '--prompt', 'recoverable prompt'], { sendError: receipt })
+    expect(result.code).toBe(1)
+    expect(result.stdout).toBe('')
+    expect(result.requests.map((request) => request.url)).toEqual(['/api/tabs', '/api/panes/p1/send-keys'])
+    const diagnostics = result.stderr.trim().split('\n').map((line) => JSON.parse(line))
+    expect(diagnostics).toContainEqual(expect.objectContaining({ code: 'CODEX_DELIVERY_AMBIGUOUS', retryable: false, requestId: 'uncertain-request', sessionId: 'native-session', incarnationId: 'owned-incarnation' }))
+    expect(result.stderr).not.toContain('do-not-log-this-answer')
+  })
+  it('promotes canonical resume identity and sends the initial prompt separately', async () => {
+    const result = await invokeCli(['new-tab', '--agent', 'codex', '--resume', '550e8400-e29b-41d4-a716-446655440000', '--model', 'provider-current', '--effort', 'xhigh', '--prompt', 'initial Codex prompt'])
+    expect(result.code, result.stderr).toBe(0)
+    expect(result.requests).toEqual([
+      { url: '/api/tabs', body: expect.objectContaining({ agent: 'codex', model: 'provider-current', effort: 'xhigh', sessionRef: { provider: 'codex', sessionId: '550e8400-e29b-41d4-a716-446655440000' } }) },
+      { url: '/api/panes/p1/send-keys', body: { data: 'initial Codex prompt\r' } },
+    ])
+    expect(result.requests[0].body).not.toHaveProperty('resumeSessionId')
+  })
+
+  it.each(['new-tab', 'split-pane'])('%s still refuses terminal-mode raw Codex resume before HTTP', async (action) => {
+    const result = await invokeCli([action, '--mode', 'codex', '--resume', 'raw-codex-id'])
+    expect(result.code).toBe(1)
+    expect(result.requests).toHaveLength(0)
+    expect(result.stderr).toContain('Restore requires sessionRef')
+  })
+})
+
 /** Spawns the real CLI (retained-flags.test.ts pattern) against a stub HTTP
  * server and records every resulting HTTP call. `outcome` (name-reliability
  * Task 4) is the rename outcome the stub's accepted update carries. */
-async function invokeCli(args: string[], opts: { outcome?: unknown } = {}) {
+async function invokeCli(args: string[], opts: { outcome?: unknown; sendError?: Record<string, unknown> } = {}) {
   const requests: Array<{ url: string; body: any }> = []
   const server = createServer(async (request, response) => {
     const chunks: Buffer[] = []
@@ -27,7 +56,10 @@ async function invokeCli(args: string[], opts: { outcome?: unknown } = {}) {
     const text = Buffer.concat(chunks).toString()
     requests.push({ url: request.url ?? '', body: text ? JSON.parse(text) : undefined })
     response.setHeader('content-type', 'application/json')
-    if (request.method === 'GET' && request.url === '/api/tabs') {
+    if (request.method === 'POST' && request.url?.endsWith('/send-keys') && opts.sendError) {
+      response.statusCode = 409
+      response.end(JSON.stringify(opts.sendError))
+    } else if (request.method === 'GET' && request.url === '/api/tabs') {
       response.end(JSON.stringify({ tabs: [{ id: 't1', activePaneId: 'p1' }], activeTabId: 't1' }))
     } else if (request.method === 'GET' && request.url === '/api/panes?tabId=t1') {
       response.end(JSON.stringify({ panes: [{ id: 'p1', index: 0, kind: 'terminal' }] }))

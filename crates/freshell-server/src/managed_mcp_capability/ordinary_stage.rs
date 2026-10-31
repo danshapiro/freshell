@@ -1,7 +1,7 @@
 //! Native-selected ordinary inputs use the shared resource copier and
 //! existing exact mounts. No configuration payload enters callback metadata.
 use super::{private_directory, write_private_bytes};
-use crate::managed_provider_references::codex::{discover, InputKind};
+use crate::managed_provider_references::codex::discover;
 use freshell_platform::{codex_inputs::CodexInputManifest, provider_environment::CopySelection};
 use freshell_runtime_protocol::*;
 use std::{
@@ -14,6 +14,7 @@ pub(super) struct Preparation {
     pub selections: Vec<CopySelection>,
     pub binds: Vec<ProviderConfigBind>,
     pub mounts: Vec<ProviderResourceMount>,
+    pub codex_approval: Option<crate::managed_provider_references::codex::ApprovalProjection>,
 }
 impl Preparation {
     pub(super) fn manifest_bytes(&self) -> &[u8] {
@@ -26,22 +27,26 @@ pub(super) fn prepare(
     accepted: Option<&CodexInputManifest>,
 ) -> Result<Preparation, String> {
     let manifest = accepted.cloned().unwrap_or_else(|| CodexInputManifest {
+        native_source_runtime: freshell_platform::codex_inputs::NativeSourceRuntime::Tui,
         version: 1,
         original_home: home.into(),
         cwd: cwd.into(),
         codex_home: home.join(".codex"),
         named_profile: None,
     });
-    let discovery = discover(manifest).map_err(str::to_string)?;
+    let source = manifest.codex_home.join("config.toml");
+    let discovery =
+        discover(manifest).map_err(|error| format!("{error}; source {}", source.display()))?;
+    let approval = crate::managed_provider_references::codex::approval_projection(&discovery)?;
     let configurations = discovery
         .inputs
         .iter()
-        .filter(|input| input.kind == InputKind::Configuration)
+        .filter(|input| input.kind.is_configuration())
         .map(|input| (input.logical_path.clone(), input.canonical_source.clone()))
         .collect();
     let mut ordinary = discovery.resource_roots.clone();
     for input in &discovery.inputs {
-        if input.kind != InputKind::Configuration
+        if !input.kind.is_configuration()
             && !ordinary
                 .iter()
                 .any(|root| input.logical_path.starts_with(root))
@@ -49,14 +54,16 @@ pub(super) fn prepare(
             ordinary.push(input.logical_path.clone());
         }
     }
-    prepare_selected(
+    let mut preparation = prepare_selected(
         "codex",
         &discovery.manifest.cwd,
         &discovery.manifest,
         configurations,
         ordinary,
         |logical| discovery.manifest.runtime_path(logical),
-    )
+    )?;
+    preparation.codex_approval = approval;
+    Ok(preparation)
 }
 
 pub(super) fn prepare_selected<M: serde::Serialize>(
@@ -73,6 +80,7 @@ pub(super) fn prepare_selected<M: serde::Serialize>(
         selections: Vec::new(),
         binds: Vec::new(),
         mounts: Vec::new(),
+        codex_approval: None,
     };
     let mut files = BTreeMap::<PathBuf, String>::new();
     for (logical_path, canonical_source) in configurations {
@@ -151,6 +159,63 @@ pub(super) fn prepare_selected<M: serde::Serialize>(
     }
     Ok(result)
 }
+pub(super) fn stage_codex_approval(root: &Path, preparation: &Preparation) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    let Some(projection) = &preparation.codex_approval else {
+        return Ok(());
+    };
+    for source in &projection.sources {
+        let selected = preparation
+            .selections
+            .iter()
+            .find(|selection| selection.source == source.canonical)
+            .ok_or("Codex approval_policy prepared source is unavailable")?;
+        let destination = root.join(&selected.destination_relative);
+        let bytes = std::fs::read(&destination).map_err(|_| {
+            format!(
+                "Codex approval_policy prepared source unreadable: {}",
+                source.canonical.display()
+            )
+        })?;
+        if bytes.len() as u64 > freshell_platform::provider_input_profiles::MAX_SOURCE_VIEW_BYTES
+            || format!("{:x}", Sha256::digest(&bytes)) != source.sha256
+        {
+            return Err(format!(
+                "Codex approval_policy source changed during preparation: {}",
+                source.canonical.display()
+            ));
+        }
+        if !source.strip_untrusted {
+            continue;
+        }
+        let mut value: toml::Value = toml::from_str(
+            std::str::from_utf8(&bytes).map_err(|_| "Codex approval_policy source is not UTF-8")?,
+        )
+        .map_err(|_| "Codex approval_policy source TOML is invalid")?;
+        let table = value
+            .as_table_mut()
+            .ok_or("Codex approval_policy source must be a TOML table")?;
+        if table.get("approval_policy").and_then(toml::Value::as_str) != Some("untrusted") {
+            return Err(format!(
+                "Codex approval_policy source no longer declares the accepted policy: {}",
+                source.canonical.display()
+            ));
+        }
+        table.remove("approval_policy");
+        let rewritten = toml::to_string(&value)
+            .map_err(|_| "Codex approval_policy prepared TOML could not be encoded")?;
+        super::replace_staged_private_bytes(&destination, rewritten.as_bytes())?;
+    }
+    write_private_bytes(
+        &root.join(".freshell/codex-approval.json"),
+        &bounded_json_bytes(&projection.default, 16 * 1024)
+            .map_err(|_| "Codex approval source metadata exceeds control budget")?,
+    )?;
+    tracing::info!(event="provider.codex.approval_projected", policy=%projection.default.policy,
+        source=%projection.default.logical_source, transformed_sources=projection.sources.len());
+    Ok(())
+}
+
 fn destinations(runtime_path: &impl Fn(&Path) -> PathBuf, logical: &Path) -> Vec<PathBuf> {
     let runtime = runtime_path(logical);
     if runtime == logical {

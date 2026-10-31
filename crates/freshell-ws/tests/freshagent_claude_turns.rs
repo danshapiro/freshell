@@ -441,14 +441,20 @@ fn session_events<'a>(
         .collect()
 }
 
-/// The first streamed text delta: the turn runs (its command started).
-async fn wait_for_streamed_text(conn: &mut RigConnection) {
-    conn.wait_for("the first streamed text", |v| {
-        v["type"] == "freshAgent.event"
-            && v["event"]["type"] == "freshAgent.stream"
-            && v["event"]["event"]["type"] == "content_block_delta"
+fn is_streamed_text(frame: &Value, session_id: &str) -> bool {
+    frame["type"] == "freshAgent.event"
+        && frame["sessionId"] == session_id
+        && frame["event"]["type"] == "freshAgent.stream"
+        && frame["event"]["event"]["type"] == "content_block_delta"
+        && frame["event"]["event"]["delta"]["type"] == "text_delta"
+}
+
+/// Text from this send's session after its pre-send frame boundary.
+async fn wait_for_streamed_text(conn: &mut RigConnection, start: usize, session_id: &str) -> Value {
+    conn.wait_for_since(start, "the first streamed text", |frame| {
+        is_streamed_text(frame, session_id)
     })
-    .await;
+    .await
 }
 
 /// The turn ended aborted (T11), with no edge and no banner: the user's own
@@ -510,8 +516,9 @@ async fn a_warm_stop_is_silent(kind: RigKind) {
     let rig = ClaudeRig::start(kind).await;
     let mut conn = rig.connect().await;
     let session_id = conn.create("create-1").await;
+    let start = conn.frames.len();
     conn.send_text(&session_id, "send-1", "SLOW stop me").await;
-    wait_for_streamed_text(&mut conn).await;
+    wait_for_streamed_text(&mut conn, start, &session_id).await;
     stop(&mut conn, &session_id).await;
     wait_for_results(&mut conn, 1, "the stopped turn").await;
     conn.read_for(Duration::from_millis(500)).await;
@@ -702,8 +709,9 @@ mod sim {
         let mut first = rig.connect().await;
         let mut second = rig.connect().await;
         let session_id = first.create("create-1").await;
+        let start = first.frames.len();
         first.send_text(&session_id, "send-1", "SLOW stop me").await;
-        wait_for_streamed_text(&mut first).await;
+        wait_for_streamed_text(&mut first, start, &session_id).await;
         second
             .send_text(&session_id, "send-queued", "the other device's message")
             .await;
@@ -893,9 +901,19 @@ mod sim {
     /// larger `at` (the client drops an edge whose `at` is not above the last).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_death_after_a_result_rings_with_a_strictly_larger_at() {
-        let program = json!({ "rules": [{
-            "on": "msg:prompt", "match": { "text": "die" }, "emit": [{ "kind": "crash" }],
-        }] })
+        let logs = log_capture::install();
+        let program = json!({ "rules": [
+            {
+                "on": "msg:prompt", "match": { "text": "hello" },
+                "emit": [
+                    { "kind": "approval", "data": { "tool": "Bash", "input": { "command": "ls" } } },
+                    { "kind": "completion", "data": { "subtype": "success" } },
+                ],
+            },
+            {
+                "on": "msg:prompt", "match": { "text": "die" }, "emit": [{ "kind": "crash" }],
+            },
+        ] })
         .to_string();
         let rig = ClaudeRig::start_with_env(
             RigKind::Sim,
@@ -906,14 +924,93 @@ mod sim {
         )
         .await;
         let mut conn = rig.connect().await;
-        let session_id = conn.create("create-1").await;
+        let created = conn
+            .request_create("create-1", json!({ "permissionMode": "default" }))
+            .await;
+        assert_eq!(created["type"], "freshAgent.created", "{created}");
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        let is_event = |v: &Value, event_type: &str| {
+            v["type"] == "freshAgent.event"
+                && v["sessionId"] == session_id
+                && v["event"]["type"] == event_type
+        };
+
+        // Acceptance orders the sends. The unanswered approval holds hello
+        // before completion and before the CLI can absorb another command.
         conn.send_text(&session_id, "send-1", "hello").await;
-        conn.send_text(&session_id, "send-2", "die").await;
-        conn.wait_for("the exit report", |v| {
-            v["event"]["code"] == "SIDECAR_EXITED"
+        let hello_uuid = accepted(&mut conn, "send-1").await["submittedTurnId"]
+            .as_str()
+            .expect("hello's submittedTurnId")
+            .to_string();
+        let request = conn
+            .wait_for("hello's approval", |v| {
+                is_event(v, "freshAgent.permission.request")
+            })
+            .await;
+        conn.wait_for("hello's waiting edge", |v| {
+            is_event(v, "freshAgent.turn.waiting")
         })
         .await;
-        conn.read_for(Duration::from_millis(500)).await;
+        let processes = rig.runtime_processes(&session_id);
+        conn.send_text(&session_id, "send-2", "die").await;
+        let die_uuid = accepted(&mut conn, "send-2").await["submittedTurnId"]
+            .as_str()
+            .expect("die's submittedTurnId")
+            .to_string();
+        logs.wait_for("die queued behind hello's unanswered approval", |event| {
+            event.message == "freshagent.claude.command"
+                && event.field("session_id") == Some(session_id.as_str())
+                && event.field("uuid") == Some(die_uuid.as_str())
+                && event.field("state") == Some("queued")
+        })
+        .await;
+        assert!(
+            rig.ledger_rows("result").is_empty(),
+            "hello cannot finish before its approval is answered"
+        );
+        assert!(
+            session_events(&conn, &session_id, "freshAgent.turn.complete").is_empty(),
+            "the held turn has not completed"
+        );
+
+        // Denial releases the explicit success completion without running a
+        // native tool; the already queued die then runs and crashes.
+        conn.send(json!({
+            "type": "freshAgent.approval.respond",
+            "provider": "claude",
+            "sessionType": "freshclaude",
+            "sessionId": session_id,
+            "requestId": request["event"]["requestId"],
+            "decision": { "behavior": "deny", "message": "Continue without the tool", "interrupt": false },
+        }))
+        .await;
+        conn.wait_for("the exit report", |v| {
+            is_event(v, "freshAgent.error") && v["event"]["code"] == "SIDECAR_EXITED"
+        })
+        .await;
+        let exit_at = index_of(&conn, "the exit report", |v| {
+            is_event(v, "freshAgent.error") && v["event"]["code"] == "SIDECAR_EXITED"
+        });
+        conn.wait_for_since(exit_at + 1, "the death's completion edge", |v| {
+            is_event(v, "freshAgent.turn.complete")
+        })
+        .await;
+        processes.wait_until_exited("the queued die crashed").await;
+
+        let result_frames = session_events(&conn, &session_id, "freshAgent.result");
+        assert_eq!(
+            result_frames.len(),
+            1,
+            "only hello returns a result: {:?}",
+            conn.frames
+        );
+        assert_eq!(result_frames[0]["event"]["subtype"], "success");
+        assert_eq!(result_frames[0]["event"]["isError"], false);
+        assert_eq!(
+            result_frames[0]["event"]["sessionBusy"], true,
+            "die is still owed"
+        );
+        assert_eq!(rig.ledger_rows("result")[0]["uuid"], hello_uuid);
         let rings: Vec<i64> = session_events(&conn, &session_id, "freshAgent.turn.complete")
             .iter()
             .map(|v| v["event"]["at"].as_i64().expect("a numeric at"))
@@ -925,6 +1022,33 @@ mod sim {
             conn.frames
         );
         assert!(rings[1] > rings[0], "{rings:?}");
+        let result_at = index_of(&conn, "hello's result", |v| {
+            is_event(v, "freshAgent.result")
+        });
+        let result_ring_at = index_of(&conn, "the result's edge", |v| {
+            is_event(v, "freshAgent.turn.complete") && v["event"]["at"] == rings[0]
+        });
+        assert!(result_at < result_ring_at && result_ring_at < exit_at);
+        let minted = logs.matching(|event| {
+            event.message == "freshagent.turn.complete"
+                && event.field("session_id") == Some(session_id.as_str())
+        });
+        assert_eq!(
+            minted
+                .iter()
+                .map(|event| event.field("source"))
+                .collect::<Vec<_>>(),
+            [Some("result"), Some("death")],
+            "{minted:?}"
+        );
+        assert_eq!(
+            minted
+                .iter()
+                .map(|event| event.field("at").unwrap().parse::<i64>().unwrap())
+                .collect::<Vec<_>>(),
+            rings,
+            "the logged sources mint the edges the client receives"
+        );
     }
 
     /// The waiting edge is the server's: on the 0 -> >=1 pending transition,
@@ -1057,7 +1181,23 @@ mod sim {
     /// registration, each edge and the close.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turn_events_and_attention_hooks_follow_every_settled_turn() {
-        let rig = ClaudeRig::start_with_options(RigKind::Sim, RigOptions::default()).await;
+        const SECOND_TEXT: &str = "the observer's second turn is ready for Stop";
+        let logs = log_capture::install();
+        let program = json!({"rules":[{
+            "on":"msg:prompt", "match":{"text":"SLOW stop me"}, "emit":[
+                {"kind":"text", "data":{"text":SECOND_TEXT}},
+                {"kind":"hang"},
+            ],
+        }]})
+        .to_string();
+        let rig = ClaudeRig::start_with_options(
+            RigKind::Sim,
+            RigOptions {
+                env: vec![("FRESHELL_CLAUDE_SIM_PROGRAM".into(), program)],
+                ..RigOptions::default()
+            },
+        )
+        .await;
         let observer = std::sync::Arc::new(RecordingObserver::default());
         let _ = rig
             .fresh_claude
@@ -1089,22 +1229,47 @@ mod sim {
             }
         );
 
+        let start = conn.frames.len();
         conn.send_text(&session_id, "send-2", "SLOW stop me").await;
-        wait_for_streamed_text(&mut conn).await;
+        let second_uuid = accepted(&mut conn, "send-2").await["submittedTurnId"]
+            .as_str()
+            .expect("second submittedTurnId")
+            .to_string();
+        let second_text = wait_for_streamed_text(&mut conn, start, &session_id).await;
+        let processes = rig.runtime_processes(&session_id);
+        let pids = rig.runtime_pids(&session_id);
         stop(&mut conn, &session_id).await;
         let silenced = tokio::time::timeout(RIG_FRAME_BUDGET, events.recv())
             .await
             .expect("a turn event")
             .expect("the channel is open");
-        assert!(
-            matches!(
-                &silenced,
-                ClaudeTurnEvent::Settled { retired_request_ids, outcome: TurnOutcome::Interrupted, at: None, .. }
-                    if retired_request_ids == &vec!["send-2".to_string()]
-            ),
-            "{silenced:?}"
-        );
+        let interrupts = sim_interrupts(&rig);
+        let stops = stop_logs(&logs, &session_id);
         conn.kill(&session_id).await;
+        processes.wait_until_exited("observer turn cleanup").await;
+        eprintln!(
+            "{}",
+            json!({"severity":"info","event":"claude_observer_stop_closed",
+            "sessionId":session_id,"secondUuid":second_uuid,"secondText":second_text,
+            "interrupts":interrupts,"settled":format!("{silenced:?}"),
+            "pids":pids,"ownedProcessesExited":true,"observerCalls":observer.calls()})
+        );
+        assert_eq!(second_text["event"]["event"]["delta"]["text"], SECOND_TEXT);
+        assert_eq!(
+            silenced,
+            ClaudeTurnEvent::Settled {
+                session_key: session_id.clone(),
+                retired_request_ids: vec!["send-2".into()],
+                retired_command_ids: vec![second_uuid],
+                outcome: TurnOutcome::Interrupted,
+                at: None,
+            }
+        );
+        assert_eq!(interrupts.len(), 1);
+        assert_eq!(interrupts[0]["running"], true);
+        assert_eq!(stops.len(), 1);
+        assert_eq!(stops[0].field("outcome"), Some("sent"));
+        assert_eq!(stops[0].field("target"), Some("running"));
         assert_eq!(
             observer.calls(),
             vec![
@@ -1113,6 +1278,150 @@ mod sim {
                 format!("forgotten {session_id}"),
             ]
         );
+    }
+
+    /// Retained text from an earlier completed command cannot establish that
+    /// another command, held before its text by an approval, is streaming.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_wait_does_not_reuse_a_previous_turn() {
+        const SECOND_TEXT: &str = "the second command reached its text";
+        let logs = log_capture::install();
+        let program = json!({"rules":[{
+            "on":"msg:prompt", "match":{"text":"held second command"}, "emit":[
+                {"kind":"approval", "data":{"tool":"Bash","input":{"command":"ls"}}},
+                {"kind":"text", "data":{"text":SECOND_TEXT}},
+                {"kind":"hang"},
+            ],
+        }]})
+        .to_string();
+        let rig =
+            ClaudeRig::start_with_env(RigKind::Sim, &[("FRESHELL_CLAUDE_SIM_PROGRAM", &program)])
+                .await;
+        let mut events = rig.fresh_claude.subscribe_turn_events();
+        let mut conn = rig.connect().await;
+        let mut control = rig.connect().await;
+        let created = conn
+            .request_create("create-1", json!({"permissionMode":"default"}))
+            .await;
+        let session_id = created["sessionId"]
+            .as_str()
+            .expect("created session")
+            .to_string();
+        let first_start = conn.frames.len();
+        conn.send_text(&session_id, "send-1", "hello").await;
+        let first_uuid = accepted(&mut conn, "send-1").await["submittedTurnId"]
+            .as_str()
+            .expect("first submitted UUID")
+            .to_string();
+        let first_text = wait_for_streamed_text(&mut conn, first_start, &session_id).await;
+        wait_for_results(&mut conn, 1, "hello").await;
+        let first_settled = tokio::time::timeout(RIG_FRAME_BUDGET, events.recv())
+            .await
+            .expect("hello settles")
+            .expect("turn event channel open");
+
+        let second_start = conn.frames.len();
+        conn.send_text(&session_id, "send-2", "held second command")
+            .await;
+        let second_uuid = accepted(&mut conn, "send-2").await["submittedTurnId"]
+            .as_str()
+            .expect("second submitted UUID")
+            .to_string();
+        let approval = conn
+            .wait_for_since(second_start, "second command's held approval", |frame| {
+                frame["type"] == "freshAgent.event"
+                    && frame["sessionId"] == session_id
+                    && frame["event"]["type"] == "freshAgent.permission.request"
+            })
+            .await;
+        let waiting = tokio::time::timeout(RIG_FRAME_BUDGET, events.recv())
+            .await
+            .expect("held approval publishes waiting")
+            .expect("turn event channel open");
+        let held_has_target_text = conn.frames[second_start..].iter().any(|frame| {
+            is_streamed_text(frame, &session_id)
+                && frame["event"]["event"]["delta"]["text"] == SECOND_TEXT
+        });
+        let held_has_second_result = rig
+            .ledger_rows("result")
+            .iter()
+            .any(|row| row["uuid"] == second_uuid);
+        let processes = rig.runtime_processes(&session_id);
+        let pids = rig.runtime_pids(&session_id);
+        let mut readiness = Box::pin(wait_for_streamed_text(&mut conn, second_start, &session_id));
+        let first_poll = futures_util::poll!(&mut readiness);
+        control.send(json!({
+            "type":"freshAgent.approval.respond", "provider":"claude", "sessionType":"freshclaude",
+            "sessionId":session_id, "requestId":approval["event"]["requestId"],
+            "decision":{"behavior":"deny","message":"Continue without running the tool","interrupt":false},
+        })).await;
+        let (premature, target_text) = match first_poll {
+            std::task::Poll::Ready(frame) => {
+                drop(readiness);
+                let target = conn
+                    .wait_for_since(second_start, "released second text", |frame| {
+                        is_streamed_text(frame, &session_id)
+                            && frame["event"]["event"]["delta"]["text"] == SECOND_TEXT
+                    })
+                    .await;
+                (Some(frame), target)
+            }
+            std::task::Poll::Pending => (None, readiness.await),
+        };
+        let premature_index = premature
+            .as_ref()
+            .and_then(|hit| conn.frames.iter().position(|frame| frame == hit));
+        stop(&mut conn, &session_id).await;
+        let silenced = tokio::time::timeout(RIG_FRAME_BUDGET, events.recv())
+            .await
+            .expect("held turn settles after Stop")
+            .expect("turn event channel open");
+        let interrupts = sim_interrupts(&rig);
+        let stops = stop_logs(&logs, &session_id);
+        conn.kill(&session_id).await;
+        processes
+            .wait_until_exited("stream-readiness regression cleanup")
+            .await;
+        eprintln!(
+            "{}",
+            json!({"severity":"info","event":"claude_stream_readiness_closed",
+            "sessionId":session_id,"firstUuid":first_uuid,"secondUuid":second_uuid,
+            "secondStart":second_start,"prematureIndex":premature_index,"prematureFrame":premature,
+            "heldHasTargetText":held_has_target_text,"heldHasSecondResult":held_has_second_result,
+            "targetText":target_text,"interrupts":interrupts,"settled":format!("{silenced:?}"),
+            "pids":pids,"ownedProcessesExited":true})
+        );
+        assert!(matches!(first_settled, ClaudeTurnEvent::Settled {
+            retired_request_ids, retired_command_ids, outcome:TurnOutcome::Completed, at:Some(_), ..
+        } if retired_request_ids == vec!["send-1"] && retired_command_ids == vec![first_uuid]));
+        assert!(!held_has_target_text && !held_has_second_result);
+        assert!(
+            matches!(waiting, ClaudeTurnEvent::Waiting { session_key, .. } if session_key == session_id)
+        );
+        assert_eq!(target_text["event"]["event"]["delta"]["text"], SECOND_TEXT);
+        assert_eq!(
+            silenced,
+            ClaudeTurnEvent::Settled {
+                session_key: session_id,
+                retired_request_ids: vec!["send-2".into()],
+                retired_command_ids: vec![second_uuid],
+                outcome: TurnOutcome::Interrupted,
+                at: None,
+            }
+        );
+        assert_eq!(interrupts.len(), 1);
+        assert_eq!(interrupts[0]["running"], true);
+        assert_eq!(stops.len(), 1);
+        assert_eq!(stops[0].field("outcome"), Some("sent"));
+        assert_eq!(stops[0].field("target"), Some("running"));
+        if let Some(frame) = &premature {
+            assert_eq!(
+                frame, &first_text,
+                "Red must observe the actual earlier turn's frame"
+            );
+            assert!(premature_index.is_some_and(|index| index < second_start));
+        }
+        assert!(premature.is_none(), "stream readiness reused a completed turn while the accepted second command was held at its approval");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

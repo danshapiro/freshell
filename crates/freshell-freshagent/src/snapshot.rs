@@ -189,7 +189,96 @@ pub fn router(state: SnapshotState) -> Router {
             "/api/fresh-agent/threads/{sessionType}/{provider}/{threadId}",
             get(get_snapshot),
         )
+        .route(
+            "/api/fresh-agent/threads/{sessionType}/{provider}/{threadId}/children/{childThreadId}",
+            get(get_child),
+        )
         .with_state(state)
+}
+
+async fn get_child(
+    State(state): State<SnapshotState>,
+    Path((session_type, provider, parent, child)): Path<(String, String, String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    use crate::codex::children::{observation, ChildReadError};
+    if !authorized(&headers, &state.auth_token) {
+        return fail(StatusCode::UNAUTHORIZED, "unauthorized".into());
+    }
+    if session_type != "freshcodex" || provider != "codex" {
+        return fail(
+            StatusCode::BAD_REQUEST,
+            "Child observation is supported for Freshcodex".into(),
+        );
+    }
+    let parse = |field: &str| {
+        query
+            .get(field)
+            .map(|value| value.parse::<u64>())
+            .transpose()
+    };
+    let (Ok(epoch), Ok(generation)) = (parse("observedEpoch"), parse("observedGeneration")) else {
+        return fail(StatusCode::BAD_REQUEST, "Invalid owner fence".into());
+    };
+    if crate::ownership_lane::wire_fence(epoch, generation).is_err() {
+        return fail(StatusCode::BAD_REQUEST, "Incomplete owner fence".into());
+    }
+    let result = if state
+        .local_owner(&session_type, &provider, &parent)
+        .await
+        .is_none()
+    {
+        if let Some(gateway) = state.opencode.hosted_rest_gateway() {
+            match gateway
+                .read_child(crate::rest_lane::RestLaneChildRead {
+                    parent_session_id: parent.clone(),
+                    child_thread_id: child.clone(),
+                    observed_epoch: epoch,
+                    observed_generation: generation,
+                })
+                .await
+            {
+                Ok(Some(value)) => return Json(value).into_response(),
+                Ok(None) => {
+                    state
+                        .codex
+                        .read_child(&parent, &child, epoch, generation)
+                        .await
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            state
+                .codex
+                .read_child(&parent, &child, epoch, generation)
+                .await
+        }
+    } else {
+        state
+            .codex
+            .read_child(&parent, &child, epoch, generation)
+            .await
+    };
+    match result {
+        Ok(value) => Json(value).into_response(),
+        Err(ChildReadError::UnrelatedChild) => fail_with_code(
+            StatusCode::NOT_FOUND,
+            "Child is not part of this parent conversation".into(),
+            "FRESH_AGENT_CHILD_NOT_FOUND",
+        ),
+        Err(ChildReadError::InvalidFence) => {
+            fail(StatusCode::BAD_REQUEST, "Invalid owner fence".into())
+        }
+        Err(ChildReadError::SourceUnavailable) => Json(observation(
+            &parent,
+            &child,
+            "unavailable",
+            "source_unavailable",
+            true,
+        ))
+        .into_response(),
+    }
 }
 
 async fn get_snapshot(

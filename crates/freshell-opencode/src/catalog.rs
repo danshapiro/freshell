@@ -54,6 +54,10 @@ pub struct ModelCapability {
     pub supports_effort: bool,
     #[serde(rename = "supportedEffortLevels")]
     pub supported_effort_levels: Vec<String>,
+    #[serde(rename = "defaultEffort", skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<String>,
+    #[serde(rename = "inputModalities", skip_serializing_if = "Option::is_none")]
+    pub input_modalities: Option<Vec<String>>,
     #[serde(rename = "supportsAdaptiveThinking")]
     pub supports_adaptive_thinking: bool,
     /// Raw `limit { context, input?, output }` block when the provider
@@ -259,6 +263,8 @@ pub fn normalize_enabled_model_catalog(raw: &Value) -> Vec<ModelCapability> {
             let has_levels = !supported_effort_levels.is_empty();
             let limit = read_model_limits(model.get("limit"));
             models.push(ModelCapability {
+                default_effort: None,
+                input_modalities: None,
                 id: format!("{provider_id}/{model_id}"),
                 display_name,
                 provider: "opencode",
@@ -828,6 +834,8 @@ mod tests {
         assert_eq!(
             models,
             vec![ModelCapability {
+                default_effort: None,
+                input_modalities: None,
                 id: "deepseek/deepseek-v4-pro".to_string(),
                 display_name: "DeepSeek V4 Pro".to_string(),
                 provider: "opencode",
@@ -1086,6 +1094,8 @@ mod tests {
         assert_eq!(
             models,
             vec![ModelCapability {
+                default_effort: None,
+                input_modalities: None,
                 id: "keyprovider/keymodel".to_string(),
                 display_name: "Keyed Name".to_string(),
                 provider: "opencode",
@@ -1203,6 +1213,8 @@ mod tests {
     #[test]
     fn model_limits_never_serialize_to_the_strict_wire_schema() {
         let cap = ModelCapability {
+            default_effort: None,
+            input_modalities: None,
             id: "lunaroute/glm-5.3".into(),
             display_name: "GLM 5.3".into(),
             provider: "opencode",

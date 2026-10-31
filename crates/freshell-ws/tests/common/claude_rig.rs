@@ -78,6 +78,8 @@ pub struct RigOptions {
     /// Hold the next shutdown interruption-marker write until the lifecycle
     /// test releases it, leaving the real sidecar alive during that window.
     pub turn_interrupted_marker_gate: Option<Arc<super::ledger_sink::TurnInterruptedMarkerGate>>,
+    /// Hold lazy genesis persistence to exercise a simulated upgrade boundary.
+    pub genesis_clear_gate: Option<Arc<super::ledger_sink::LedgerWriteGate>>,
     /// The claude lane runs the way the hosted session host runs it: the lane
     /// selects the hosted Freshell MCP (`with_hosted_mcp`) and its sidecars see
     /// `FRESHELL_HOSTED_FRESH_AGENT=claude`, so the sidecar offers the fixed MCP
@@ -476,6 +478,7 @@ impl ClaudeRig {
             .as_ref()
             .expect("seeding a binding row needs the rig's durable ledger")
             .record_fresh_agent_binding(&freshell_ws::pane_ledger::FreshAgentBindingWrite {
+                collaboration_mode: None,
                 provider: "claude",
                 session_id,
                 mode: "freshclaude",
@@ -1079,6 +1082,9 @@ async fn spawn_rig_server(
         if let Some(gate) = options.turn_interrupted_marker_gate.clone() {
             sink = sink.with_turn_interrupted_marker_gate(gate);
         }
+        if let Some(gate) = options.genesis_clear_gate.clone() {
+            sink = sink.with_genesis_clear_gate(gate);
+        }
         fresh_claude.set_identity_sink(Arc::new(sink));
     }
     let lane = fresh_claude.clone();
@@ -1167,7 +1173,7 @@ async fn spawn_rig_server(
         fresh_agent_state
             .set_rest_create_settings_reader(Arc::new(move || {
                 let defaults = defaults.clone();
-                Box::pin(async move { defaults.read().await.fresh_agent.clone() })
+                Box::pin(async move { defaults.read().await.fresh_agent.clone().into() })
             }))
             .expect("install the rig's REST defaults reader");
         router = router.merge(freshell_freshagent::router(fresh_agent_state.clone()));

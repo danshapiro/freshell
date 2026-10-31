@@ -854,6 +854,77 @@ impl RuntimeClient {
         }
     }
 
+    pub async fn fresh_agent_native_name(
+        &self,
+        mut request: freshell_runtime_protocol::FreshAgentNativeNameRequest,
+    ) -> Result<freshell_runtime_protocol::FreshAgentNativeNameReply, ClientError> {
+        request.expected_control_epoch = Some(self.current_epoch().await?);
+        // A stale epoch is a settled refusal before host/native dispatch. Keep
+        // the captured target unchanged if refreshing only that control stamp.
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::FreshAgentNativeName(request.clone()),
+            )
+            .await
+        {
+            Ok(AdminResult::FreshAgentNativeName(reply)) => Ok(reply),
+            Err(error) if error.runtime_code() == Some(RuntimeErrorCode::StaleControlEpoch) => {
+                request.expected_control_epoch = Some(self.health().await?.0);
+                match self
+                    .request(
+                        RequestId::new(),
+                        AdminCommand::FreshAgentNativeName(request),
+                    )
+                    .await?
+                {
+                    AdminResult::FreshAgentNativeName(reply) => Ok(reply),
+                    _ => Err(ClientError::UnexpectedResult),
+                }
+            }
+            Ok(_) => Err(ClientError::UnexpectedResult),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn fresh_agent_model_catalog(
+        &self,
+        soul_id: SoulId,
+        cwd: Option<String>,
+    ) -> Result<serde_json::Value, ClientError> {
+        let mut request = freshell_runtime_protocol::FreshAgentModelCatalogRequest {
+            soul_id,
+            cwd,
+            expected_control_epoch: Some(self.current_epoch().await?),
+        };
+        let original = request.clone();
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::FreshAgentModelCatalog(request),
+            )
+            .await
+        {
+            Ok(AdminResult::FreshAgentModelCatalog(snapshot)) => Ok(snapshot),
+            Err(error) if error.runtime_code() == Some(RuntimeErrorCode::StaleControlEpoch) => {
+                request = original;
+                request.expected_control_epoch = Some(self.health().await?.0);
+                match self
+                    .request(
+                        RequestId::new(),
+                        AdminCommand::FreshAgentModelCatalog(request),
+                    )
+                    .await?
+                {
+                    AdminResult::FreshAgentModelCatalog(snapshot) => Ok(snapshot),
+                    _ => Err(ClientError::UnexpectedResult),
+                }
+            }
+            Ok(_) => Err(ClientError::UnexpectedResult),
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn fresh_agent_snapshot(
         &self,
         soul_id: SoulId,
@@ -882,6 +953,38 @@ impl RuntimeClient {
                     .await?
                 {
                     AdminResult::FreshAgentSnapshot(snapshot) => Ok(snapshot),
+                    _ => Err(ClientError::UnexpectedResult),
+                }
+            }
+            Ok(_) => Err(ClientError::UnexpectedResult),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn fresh_agent_read_child(
+        &self,
+        soul_id: SoulId,
+        child_thread_id: String,
+    ) -> Result<serde_json::Value, ClientError> {
+        let mut request = freshell_runtime_protocol::FreshAgentReadChildRequest {
+            soul_id,
+            child_thread_id,
+            expected_control_epoch: Some(self.current_epoch().await?),
+        };
+        let original = request.clone();
+        match self
+            .request(RequestId::new(), AdminCommand::FreshAgentReadChild(request))
+            .await
+        {
+            Ok(AdminResult::FreshAgentChildSnapshot(snapshot)) => Ok(snapshot),
+            Err(error) if error.runtime_code() == Some(RuntimeErrorCode::StaleControlEpoch) => {
+                request = original;
+                request.expected_control_epoch = Some(self.health().await?.0);
+                match self
+                    .request(RequestId::new(), AdminCommand::FreshAgentReadChild(request))
+                    .await?
+                {
+                    AdminResult::FreshAgentChildSnapshot(snapshot) => Ok(snapshot),
                     _ => Err(ClientError::UnexpectedResult),
                 }
             }
@@ -1145,7 +1248,10 @@ impl RuntimeClient {
         let mut stream = UnixStream::connect(self.socket_path.as_ref()).await?;
         let reply_limit = if matches!(
             body,
-            AdminCommand::FreshAgentReadHistory(_) | AdminCommand::FreshAgentReadSnapshot(_)
+            AdminCommand::FreshAgentReadHistory(_)
+                | AdminCommand::FreshAgentReadSnapshot(_)
+                | AdminCommand::FreshAgentReadChild(_)
+                | AdminCommand::FreshAgentReadEvents(_)
         ) {
             freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES
         } else {
@@ -1185,6 +1291,8 @@ mod tests {
     enum FreshAgentReadKind {
         Snapshot,
         History,
+        Child,
+        Catalog,
     }
 
     impl FreshAgentReadKind {
@@ -1196,6 +1304,16 @@ mod tests {
             match self {
                 Self::Snapshot => client.fresh_agent_snapshot(soul).await,
                 Self::History => client.fresh_agent_history(soul).await,
+                Self::Catalog => {
+                    client
+                        .fresh_agent_model_catalog(soul, Some("/owned/project".into()))
+                        .await
+                }
+                Self::Child => {
+                    client
+                        .fresh_agent_read_child(soul, "native-child".into())
+                        .await
+                }
             }
         }
 
@@ -1203,6 +1321,8 @@ mod tests {
             match self {
                 Self::Snapshot => AdminResult::FreshAgentSnapshot(value),
                 Self::History => AdminResult::FreshAgentHistory(value),
+                Self::Catalog => AdminResult::FreshAgentModelCatalog(value),
+                Self::Child => AdminResult::FreshAgentChildSnapshot(value),
             }
         }
 
@@ -1212,6 +1332,14 @@ mod tests {
                     (&read.soul_id, read.expected_control_epoch)
                 }
                 (AdminCommand::FreshAgentReadHistory(read), Self::History) => {
+                    (&read.soul_id, read.expected_control_epoch)
+                }
+                (AdminCommand::FreshAgentReadChild(read), Self::Child) => {
+                    assert_eq!(read.child_thread_id, "native-child");
+                    (&read.soul_id, read.expected_control_epoch)
+                }
+                (AdminCommand::FreshAgentModelCatalog(read), Self::Catalog) => {
+                    assert_eq!(read.cwd.as_deref(), Some("/owned/project"));
                     (&read.soul_id, read.expected_control_epoch)
                 }
                 _ => panic!("expected the original exact read operation: {envelope:?}"),
@@ -1226,6 +1354,81 @@ mod tests {
             control_epoch: 2,
             installation_id: InstallationId::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn model_catalog_retries_only_stale_epoch_with_exact_soul_and_cwd() {
+        let kind = FreshAgentReadKind::Catalog;
+        let expected =
+            serde_json::json!([{"id":"provider-current","supportedEffortLevels":["ultra"]}]);
+        let (actual, requests, cached) = scripted_fresh_agent_read(
+            kind,
+            vec![
+                Err(RuntimeError::new(
+                    RuntimeErrorCode::StaleControlEpoch,
+                    "old",
+                )),
+                Ok(epoch_health()),
+                Ok(kind.reply(expected.clone())),
+            ],
+        )
+        .await;
+        assert_refreshed_read(kind, &requests);
+        assert_eq!(cached, Some(2));
+        assert_eq!(actual.unwrap(), expected);
+        let (actual, requests, cached) = scripted_fresh_agent_read(
+            kind,
+            vec![Ok(AdminResult::FreshAgentSnapshot(serde_json::json!({})))],
+        )
+        .await;
+        assert_cached_read(kind, &requests, cached);
+        assert!(matches!(actual, Err(ClientError::UnexpectedResult)));
+        let (actual, requests, cached) = scripted_fresh_agent_read(
+            kind,
+            vec![Err(RuntimeError::new(
+                RuntimeErrorCode::HostUnreachable,
+                "down",
+            ))],
+        )
+        .await;
+        assert_cached_read(kind, &requests, cached);
+        assert_eq!(
+            actual.unwrap_err().runtime_code(),
+            Some(RuntimeErrorCode::HostUnreachable)
+        );
+    }
+
+    #[tokio::test]
+    async fn model_catalog_reply_keeps_the_ordinary_control_frame_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("catalog.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            assert!(matches!(
+                request.body,
+                AdminCommand::FreshAgentModelCatalog(_)
+            ));
+            freshell_runtime_protocol::write_frame_with_limit(
+                &mut stream,
+                &AdminReply {
+                    request_id: request.request_id,
+                    result: Ok(AdminResult::FreshAgentModelCatalog(serde_json::json!([
+                        "x".repeat(2 * freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES)
+                    ]))),
+                },
+                freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES,
+            )
+            .await
+        });
+        let client = RuntimeClient::new(&socket, "0123456789abcdef");
+        *client.control_epoch.write().await = Some(1);
+        let actual = client
+            .fresh_agent_model_catalog(SoulId::parse("catalog-owned").unwrap(), None)
+            .await;
+        let _ = server.await.unwrap();
+        assert!(actual.is_err());
     }
 
     #[tokio::test]
@@ -1443,8 +1646,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_agent_child_read_refresh_preserves_exact_parent_and_child_and_large_body() {
+        assert_read_epoch_refresh_preserves_source(FreshAgentReadKind::Child).await;
+    }
+
+    #[tokio::test]
     async fn fresh_agent_reads_stop_after_second_stale_epoch() {
-        for kind in [FreshAgentReadKind::Snapshot, FreshAgentReadKind::History] {
+        for kind in [
+            FreshAgentReadKind::Snapshot,
+            FreshAgentReadKind::History,
+            FreshAgentReadKind::Child,
+        ] {
             let (actual, requests, cached) = scripted_fresh_agent_read(
                 kind,
                 vec![
@@ -1470,7 +1682,11 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_agent_reads_do_not_retry_other_runtime_errors() {
-        for kind in [FreshAgentReadKind::Snapshot, FreshAgentReadKind::History] {
+        for kind in [
+            FreshAgentReadKind::Snapshot,
+            FreshAgentReadKind::History,
+            FreshAgentReadKind::Child,
+        ] {
             for code in [
                 RuntimeErrorCode::HostUnreachable,
                 RuntimeErrorCode::OwnershipMismatch,
@@ -1490,7 +1706,11 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_agent_reads_propagate_health_error_without_retrying_the_read() {
-        for kind in [FreshAgentReadKind::Snapshot, FreshAgentReadKind::History] {
+        for kind in [
+            FreshAgentReadKind::Snapshot,
+            FreshAgentReadKind::History,
+            FreshAgentReadKind::Child,
+        ] {
             let (actual, requests, cached) = scripted_fresh_agent_read(
                 kind,
                 vec![
@@ -1517,7 +1737,11 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_agent_reads_reject_unexpected_initial_health_and_retry_results() {
-        for kind in [FreshAgentReadKind::Snapshot, FreshAgentReadKind::History] {
+        for kind in [
+            FreshAgentReadKind::Snapshot,
+            FreshAgentReadKind::History,
+            FreshAgentReadKind::Child,
+        ] {
             for stage in 0..3 {
                 let mut replies = Vec::new();
                 if stage > 0 {
@@ -1547,7 +1771,11 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_agent_reads_keep_healthy_live_and_history_provenance_without_refresh() {
-        for kind in [FreshAgentReadKind::Snapshot, FreshAgentReadKind::History] {
+        for kind in [
+            FreshAgentReadKind::Snapshot,
+            FreshAgentReadKind::History,
+            FreshAgentReadKind::Child,
+        ] {
             let expected = source_snapshot(kind);
             let (actual, requests, cached) =
                 scripted_fresh_agent_read(kind, vec![Ok(kind.reply(expected.clone()))]).await;
@@ -1587,6 +1815,85 @@ mod tests {
             .await;
         let _ = server.await.unwrap();
         assert_eq!(actual.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn task6_retained_event_reply_preserves_body_above_the_old_control_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("retained.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let expected = serde_json::json!({"retainedFrom":1,"head":1,"resetRequired":true,"events":[],"retainedState":{"snapshot":{"turns":[{"text":"x".repeat(2*freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES)}]}}});
+        let sent: freshell_runtime_protocol::AgentEventBatch =
+            serde_json::from_value(expected.clone()).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let envelope: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            assert!(matches!(
+                envelope.body,
+                AdminCommand::FreshAgentReadEvents(_)
+            ));
+            freshell_runtime_protocol::write_frame_with_limit(
+                &mut stream,
+                &AdminReply {
+                    request_id: envelope.request_id,
+                    result: Ok(AdminResult::FreshAgentEvents(sent)),
+                },
+                freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES,
+            )
+            .await
+            .unwrap();
+        });
+        let client = RuntimeClient::new(&socket, "0123456789abcdef");
+        *client.control_epoch.write().await = Some(1);
+        let actual = client
+            .fresh_agent_events(SoulId::parse("large-retained").unwrap(), 0, 1)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert!(
+            serde_json::to_value(actual).unwrap() == expected,
+            "the actual retained event caller must round-trip the entire 2MiB body"
+        );
+    }
+
+    #[tokio::test]
+    async fn task6_retained_reply_stays_bounded_and_ordinary_control_budget_stays_small() {
+        use tokio::io::AsyncWriteExt;
+        for retained in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("bounded.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let budget = if retained {
+                freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES
+            } else {
+                freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES
+            };
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let _: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+                stream
+                    .write_all(&((budget + 1) as u32).to_be_bytes())
+                    .await
+                    .unwrap();
+            });
+            let client = RuntimeClient::new(&socket, "0123456789abcdef");
+            *client.control_epoch.write().await = Some(1);
+            let body = if retained {
+                AdminCommand::FreshAgentReadEvents(
+                    freshell_runtime_protocol::FreshAgentReadEventsRequest {
+                        soul_id: SoulId::parse("bounded").unwrap(),
+                        after_sequence: 0,
+                        max_events: 1,
+                        expected_control_epoch: Some(1),
+                    },
+                )
+            } else {
+                AdminCommand::Inventory
+            };
+            let actual = client.request(RequestId::new(), body).await;
+            server.await.unwrap();
+            assert!(matches!(actual,Err(ClientError::Protocol(message)) if message==freshell_runtime_protocol::FrameError::TooLarge.to_string()),"oversized lengths must be rejected by the caller's exact budget before reading any body");
+        }
     }
 
     #[tokio::test]

@@ -6,9 +6,11 @@
 use async_trait::async_trait;
 pub use freshell_runtime_protocol::{
     AgentEvent, AgentEventBatch as EventBatch, AgentJournalEvent as JournalEvent, FreshProvider,
+    NativeDispatchIdentity,
 };
 use freshell_runtime_protocol::{
-    CommandState, FreshAgentCapture, FreshAgentRollbackDirection, FreshAgentRollbackMode,
+    CommandState, FreshAgentCapture, FreshAgentNativeNameError, FreshAgentNativeNameOperation,
+    FreshAgentNativeNameReply, FreshAgentRollbackDirection, FreshAgentRollbackMode,
     FreshAgentTurnSettings, ProviderLaunchContext, ProviderModelSelection, ProviderSecretReference,
     ProviderSessionReference, RequestId,
 };
@@ -50,6 +52,10 @@ mod double_optional {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub naming_handle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collaboration_mode: Option<String>,
     pub provider: FreshProvider,
     pub runtime_variant: String,
     pub cwd: String,
@@ -76,9 +82,28 @@ pub struct FreshAgentProfile {
 }
 
 impl FreshAgentProfile {
+    pub fn effective_permission_mode(&self) -> Option<&str> {
+        self.permission_mode.as_deref().or_else(|| {
+            if self.provider != FreshProvider::Codex {
+                return None;
+            }
+            match &self.provider_launch_context.as_ref()?.preparation {
+                freshell_runtime_protocol::ProviderPreparation::Codex {
+                    approval_default, ..
+                } => approval_default
+                    .as_ref()
+                    .map(|default| default.policy.as_str()),
+                _ => None,
+            }
+        })
+    }
+
     /// Folds per-turn settings into the durable launch profile: every
     /// provided field replaces the stored one, absent fields keep it.
     pub fn apply_turn_settings(&mut self, settings: &FreshAgentTurnSettings) {
+        if let Some(value) = &settings.collaboration_mode {
+            self.collaboration_mode = Some(value.clone());
+        }
         if let Some(value) = &settings.cwd {
             self.cwd = value.clone();
         }
@@ -86,7 +111,7 @@ impl FreshAgentProfile {
             self.model = Some(value.clone());
         }
         if let Some(value) = &settings.effort {
-            self.effort = Some(value.clone());
+            self.effort = value.clone();
         }
         if let Some(value) = &settings.permission_mode {
             self.permission_mode = Some(value.clone());
@@ -112,6 +137,10 @@ impl FreshAgentProfile {
 
     pub fn validate(&self) -> Result<(), ActorError> {
         if self.runtime_variant.is_empty()
+            || self
+                .collaboration_mode
+                .as_deref()
+                .is_some_and(|mode| !matches!(mode, "default" | "plan"))
             || self.cwd.is_empty()
             || self.provider_store_id.is_empty()
             || self.native_session_id.as_deref().is_some_and(str::is_empty)
@@ -168,6 +197,9 @@ pub struct TransportStart {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchAck {
     pub provider_ack_id: Option<String>,
+    /// Direct correlated provider acceptance, never an asynchronous Started
+    /// frame. The previous identity fences a recovery result to its caller.
+    pub native_identity: Option<NativeDispatchIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +281,20 @@ pub trait FreshAgentTransport: Send + Sync {
     ) -> Result<DispatchAck, DispatchFailure> {
         self.dispatch(request_id, text, profile).await
     }
+    /// Carries the caller's partial settings separately from durable launch
+    /// intent. Providers with native effective defaults must not restate an
+    /// unchanged launch profile as new overrides on every send.
+    async fn dispatch_with_turn_settings(
+        &self,
+        request_id: &RequestId,
+        text: &str,
+        profile: &FreshAgentProfile,
+        _settings: Option<&FreshAgentTurnSettings>,
+        logical_attempt_id: Option<&str>,
+    ) -> Result<DispatchAck, DispatchFailure> {
+        self.dispatch_with_checkpoint_identity(request_id, text, profile, logical_attempt_id)
+            .await
+    }
     async fn resolve_permission(
         &self,
         decision_id: &str,
@@ -285,8 +331,30 @@ pub trait FreshAgentTransport: Send + Sync {
     async fn capture(&self, _max_bytes: usize) -> Result<FreshAgentCapture, String> {
         Err("provider does not expose a hosted snapshot".into())
     }
+    /// Optional authoritative in-memory source. No native RPC or runtime creation.
+    async fn retained_state(&self) -> Result<Option<Value>, String> {
+        Ok(None)
+    }
     async fn snapshot(&self) -> Result<Value, String> {
         Err("provider does not expose a hosted snapshot".into())
+    }
+    async fn model_catalog(&self, _cwd: Option<&str>) -> Result<Value, String> {
+        Err("provider does not expose a model catalog".into())
+    }
+
+    async fn native_name(
+        &self,
+        _native_session_id: &str,
+        _codex_home: &str,
+        _operation: &FreshAgentNativeNameOperation,
+    ) -> FreshAgentNativeNameReply {
+        FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Unavailable {
+            message: "provider has no live native naming authority".into(),
+        })
+    }
+
+    async fn read_child(&self, _child_thread_id: &str) -> Result<Value, String> {
+        Err("provider does not expose child observation".into())
     }
 
     /// A registered zero-turn identity is transport-owned, not a durable native identity.
@@ -661,8 +729,8 @@ impl FreshAgentHostActor {
                     other => Ok(other),
                 };
             }
-            if let Some(settings) = settings {
-                state.profile.apply_turn_settings(&settings);
+            if let Some(settings) = settings.as_ref() {
+                state.profile.apply_turn_settings(settings);
                 state.profile.validate()?;
             }
             dispatch_profile = state.profile.clone();
@@ -687,14 +755,67 @@ impl FreshAgentHostActor {
 
         let result = self
             .transport
-            .dispatch_with_checkpoint_identity(
+            .dispatch_with_turn_settings(
                 &request_id,
                 &text,
                 &dispatch_profile,
+                settings.as_ref(),
                 logical_attempt_id.as_deref(),
             )
             .await;
         let mut state = self.state.lock().await;
+        if let Ok(ack) = &result {
+            if let Some(identity) = &ack.native_identity {
+                if identity.native_session_id.is_empty()
+                    || identity.native_session_id.chars().any(char::is_control)
+                    || dispatch_profile.native_session_id.as_deref()
+                        != Some(identity.previous_native_session_id.as_str())
+                    || state.profile.native_session_id != dispatch_profile.native_session_id
+                    || state.profile.provider_store_id != dispatch_profile.provider_store_id
+                    || state.profile.provider != dispatch_profile.provider
+                    || identity
+                        .pending_naming_handle
+                        .as_ref()
+                        .is_some_and(|handle| {
+                            dispatch_profile.naming_handle.as_ref() != Some(handle)
+                        })
+                {
+                    state
+                        .commands
+                        .get_mut(request_id.as_str())
+                        .expect("durable command")
+                        .state = CommandState::Ambiguous;
+                    push_event_bounded(
+                        &mut state,
+                        AgentEvent::CommandOutcome {
+                            request_id,
+                            state: CommandState::Ambiguous,
+                        },
+                        self.event_byte_cap,
+                        self.event_count_cap,
+                    )?;
+                    write_state(&self.state_dir, &state)?;
+                    return Err(ActorError::AmbiguousDispatch);
+                }
+                let changed = state.profile.native_session_id.as_deref()
+                    != Some(identity.native_session_id.as_str());
+                state.profile.native_session_id = Some(identity.native_session_id.clone());
+                state.profile.naming_handle = identity.pending_naming_handle.clone();
+                if changed {
+                    if let Some(reference) = state.profile.session_ref.as_mut() {
+                        reference.session_id = identity.native_session_id.clone();
+                    }
+                    push_event_bounded(
+                        &mut state,
+                        AgentEvent::Started {
+                            native_session_id: identity.native_session_id.clone(),
+                        },
+                        self.event_byte_cap,
+                        self.event_count_cap,
+                    )?;
+                }
+            }
+        }
         let command = state
             .commands
             .get_mut(request_id.as_str())
@@ -820,6 +941,7 @@ impl FreshAgentHostActor {
                     return Err(ActorError::AmbiguousDispatch);
                 }
                 state.profile.native_session_id = Some(transition.child_session_id.clone());
+                state.profile.naming_handle = None;
                 if let Some(reference) = state.profile.session_ref.as_mut() {
                     reference.session_id = transition.child_session_id.clone();
                 }
@@ -1018,6 +1140,7 @@ impl FreshAgentHostActor {
         if let Some(native_session_id) = native_session_id {
             if state.profile.native_session_id.as_deref() != Some(&native_session_id) {
                 state.profile.native_session_id = Some(native_session_id.clone());
+                state.profile.naming_handle = None;
                 if let Some(reference) = state.profile.session_ref.as_mut() {
                     reference.session_id = native_session_id.clone();
                 }
@@ -1113,7 +1236,124 @@ impl FreshAgentHostActor {
         Ok(snapshot)
     }
 
-    pub async fn record_event(&self, event: AgentEvent) -> Result<u64, ActorError> {
+    pub async fn model_catalog(&self, cwd: Option<&str>) -> Result<Value, ActorError> {
+        let before = self.profile().await;
+        if before.provider != FreshProvider::Codex
+            || before.native_session_id.is_none()
+            || !self.transport.is_live().await
+        {
+            return Err(ActorError::NativeIdentityMismatch);
+        }
+        let value = self
+            .transport
+            .model_catalog(cwd)
+            .await
+            .map_err(ActorError::Transport)?;
+        let after = self.profile().await;
+        if before.native_session_id != after.native_session_id
+            || before.provider_store_id != after.provider_store_id
+            || before.provider != after.provider
+            || before.cwd != after.cwd
+            || !self.transport.is_live().await
+        {
+            return Err(ActorError::NativeIdentityMismatch);
+        }
+        if serde_json::to_vec(&value)
+            .map_err(|e| ActorError::Transport(e.to_string()))?
+            .len()
+            > freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES - 4096
+        {
+            return Err(ActorError::Transport(
+                "model catalog exceeds control reply frame limit".into(),
+            ));
+        }
+        Ok(value)
+    }
+
+    pub async fn native_name(
+        &self,
+        native_session_id: &str,
+        codex_home: &str,
+        operation: &FreshAgentNativeNameOperation,
+    ) -> FreshAgentNativeNameReply {
+        let before = self.profile().await;
+        if before.provider != FreshProvider::Codex
+            || before.native_session_id.as_deref() != Some(native_session_id)
+            || codex_home.is_empty()
+            || !self.transport.is_live().await
+        {
+            return FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Unavailable {
+                message: "native naming target is no longer current".into(),
+            });
+        }
+        let reply = self
+            .transport
+            .native_name(native_session_id, codex_home, operation)
+            .await;
+        let after = self.profile().await;
+        if before.native_session_id != after.native_session_id
+            || before.provider_store_id != after.provider_store_id
+            || !self.transport.is_live().await
+        {
+            // A write may already have applied to the captured source.
+            return FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Closed);
+        }
+        if serde_json::to_vec(&reply).map_or(true, |bytes| {
+            bytes.len() > freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES - 4096
+        }) {
+            return FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::InvalidResponse {
+                detail: "native naming reply exceeds control frame limit".into(),
+            });
+        }
+        reply
+    }
+
+    pub async fn read_child(&self, child_thread_id: &str) -> Result<Value, ActorError> {
+        let before = self.profile().await;
+        if before.provider != FreshProvider::Codex
+            || before.native_session_id.is_none()
+            || !self.transport.is_live().await
+        {
+            return Err(ActorError::NativeIdentityMismatch);
+        }
+        let value = self
+            .transport
+            .read_child(child_thread_id)
+            .await
+            .map_err(ActorError::Transport)?;
+        let after = self.profile().await;
+        if before.native_session_id != after.native_session_id
+            || !self.transport.is_live().await
+            || value["parentThreadId"].as_str() != before.native_session_id.as_deref()
+            || value["childThreadId"].as_str() != Some(child_thread_id)
+            || (value.get("snapshot").is_some()
+                && (value["snapshot"]["threadId"].as_str() != Some(child_thread_id)
+                    || value["snapshot"]["provider"] != "codex"))
+        {
+            return Err(ActorError::NativeIdentityMismatch);
+        }
+        if serde_json::to_vec(&value)
+            .map_err(|error| ActorError::Transport(error.to_string()))?
+            .len()
+            > freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES - 4096
+        {
+            return Err(ActorError::Transport(
+                "child observation exceeds history reply frame limit".into(),
+            ));
+        }
+        Ok(value)
+    }
+
+    pub async fn record_event(&self, mut event: AgentEvent) -> Result<u64, ActorError> {
+        // The provider owns retained bodies. The bounded journal keeps only the
+        // invalidation edge; reads reconcile against the current source.
+        if let AgentEvent::Provider { payload } = &mut event {
+            if payload["event"]["type"] == "freshAgent.host.backpressure" {
+                if let Some(event) = payload["event"].as_object_mut() {
+                    event.remove("retainedState");
+                }
+            }
+        }
         let mut state = self.state.lock().await;
         let sequence =
             push_event_bounded(&mut state, event, self.event_byte_cap, self.event_count_cap)?;
@@ -1190,11 +1430,69 @@ impl FreshAgentHostActor {
         Ok(sequence)
     }
 
+    async fn record_retained_permission(&self, decision_id: &str) -> Result<(), ActorError> {
+        // A reconnect/snapshot can expose a native control before the
+        // asynchronous event pump journals it. Reconcile only on the user
+        // command, from the existing live source; reads stay side-effect free.
+        let before = self.profile().await;
+        if before.provider != FreshProvider::Codex || !self.transport.is_live().await {
+            return Ok(());
+        }
+        let Some(retained) = self
+            .transport
+            .retained_state()
+            .await
+            .map_err(ActorError::Transport)?
+        else {
+            return Ok(());
+        };
+        let after = self.profile().await;
+        if before.native_session_id.is_none()
+            || before.native_session_id != after.native_session_id
+            || before.provider_store_id != after.provider_store_id
+            || before.provider != after.provider
+            || !self.transport.is_live().await
+            || retained["snapshot"]["threadId"].as_str() != before.native_session_id.as_deref()
+            || retained["snapshot"]["provider"] != "codex"
+            || retained["snapshot"]["sessionType"] != "freshcodex"
+        {
+            return Ok(());
+        }
+        let Some(payload) = retained["pendingControls"].as_array().and_then(|pending| {
+            pending.iter().find(|payload| {
+                payload["requestId"].as_str() == Some(decision_id)
+                    && payload["sessionId"].as_str() == before.native_session_id.as_deref()
+                    && matches!(
+                        payload["type"].as_str(),
+                        Some(
+                            "freshAgent.permission.request"
+                                | "freshAgent.question.request"
+                                | "freshAgent.elicitation.request"
+                        )
+                    )
+            })
+        }) else {
+            return Ok(());
+        };
+        self.record_permission(decision_id.to_owned(), payload.clone())
+            .await?;
+        tracing::info!(
+            provider = "codex",
+            request_id = decision_id,
+            native_session_id = before.native_session_id.as_deref(),
+            "freshagent.host.control_admitted_from_retained"
+        );
+        Ok(())
+    }
+
     pub async fn resolve_permission(
         &self,
         decision_id: &str,
         decision: Value,
     ) -> Result<(), ActorError> {
+        if !self.state.lock().await.decisions.contains_key(decision_id) {
+            self.record_retained_permission(decision_id).await?;
+        }
         let response_digest = digest(&serde_json::to_vec(&decision).map_err(persist)?);
         {
             let mut state = self.state.lock().await;
@@ -1257,20 +1555,36 @@ impl FreshAgentHostActor {
     }
 
     pub async fn read_events(&self, after: u64, max_events: usize) -> EventBatch {
-        let state = self.state.lock().await;
-        let max_events = max_events.clamp(1, self.event_count_cap);
-        EventBatch {
-            retained_from: state.retained_from,
-            head: state.next_sequence.saturating_sub(1),
-            reset_required: after.saturating_add(1) < state.retained_from,
-            events: state
-                .events
-                .iter()
-                .filter(|event| event.sequence > after)
-                .take(max_events)
-                .cloned()
-                .collect(),
+        let mut batch = {
+            let state = self.state.lock().await;
+            let max_events = max_events.clamp(1, self.event_count_cap);
+            EventBatch {
+                retained_state: None,
+                retained_from: state.retained_from,
+                head: state.next_sequence.saturating_sub(1),
+                reset_required: after.saturating_add(1) < state.retained_from,
+                events: state
+                    .events
+                    .iter()
+                    .filter(|event| event.sequence > after)
+                    .filter(|event| !matches!(&event.event, AgentEvent::Started {native_session_id}
+                        if state.profile.native_session_id.as_deref() != Some(native_session_id.as_str())))
+                    .take(max_events)
+                    .cloned()
+                    .collect(),
+            }
+        };
+        if after == 0 || batch.reset_required || batch.events.iter().any(|entry|
+            matches!(&entry.event, AgentEvent::Provider { payload } if payload["event"]["type"] == "freshAgent.host.backpressure")) {
+            batch.retained_state = match self.transport.retained_state().await {
+                Ok(retained) => retained,
+                Err(error) => {
+                    tracing::warn!(%error, "freshagent.host.retained_read_failed");
+                    None
+                }
+            };
         }
+        batch
     }
 
     pub async fn interrupt(&self) -> Result<(), ActorError> {

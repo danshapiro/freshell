@@ -19,6 +19,7 @@ use crate::rollback_record::ROLLBACK_RECORD_VERSION;
 /// provider-native resume command needs.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FreshAgentSettings {
+    pub collaboration_mode: Option<String>,
     pub model: Option<String>,
     pub sandbox: Option<String>,
     pub permission_mode: Option<String>,
@@ -2260,6 +2261,7 @@ mod tests {
 
             authoritative: false,
             settings: FreshAgentSettings {
+                collaboration_mode: None,
                 model: Some("m".into()),
                 sandbox: None,
                 permission_mode: None,

@@ -5,6 +5,7 @@ import type {
 import type {
   FreshAgentPendingApproval,
   FreshAgentPendingQuestion,
+  FreshAgentPendingElicitation,
   FreshAgentRequestId,
   FreshAgentSnapshot,
   FreshAgentTurn,
@@ -112,6 +113,8 @@ export type FreshAgentSessionState = FreshAgentSessionLocator & {
    * changed it itself (an approved ExitPlanMode leaves plan mode). Absent
    * while no metadata ever stated it. */
   permissionMode?: string
+  sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'
+  collaborationMode?: 'default' | 'plan'
   tools?: Array<{ name: string }>
   turns: FreshAgentTurn[]
   historyItems: FreshAgentTurn[]
@@ -123,6 +126,7 @@ export type FreshAgentSessionState = FreshAgentSessionLocator & {
   streamingActive: boolean
   pendingPermissions: Record<string, FreshAgentPermissionRequest>
   pendingQuestions: Record<string, FreshAgentQuestionRequest>
+  pendingElicitations?: Record<string, FreshAgentPendingElicitation>
   totalCostUsd: number
   totalInputTokens: number
   totalOutputTokens: number

@@ -1,7 +1,8 @@
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { test, expect, type Browser } from '../helpers/fixtures.js'
+import { test, expect } from '../helpers/fixtures.js'
+import type { Browser } from '@playwright/test'
 import type { Page } from '@playwright/test'
 import type { SessionNameRef } from '../../../shared/session-names.js'
 import {
@@ -51,6 +52,17 @@ import { TestHarness } from '../helpers/test-harness.js'
  *   7. a deliberate user rename still converges both browsers.
  * The deliberate-new-conversation contrast lives in the freshclaude case
  * (a minted conversation gets its own name; the old session keeps it).
+ *
+ * PRODUCT RESIDUAL (no-modal contract, freshcodex case): with the blocking
+ * DeadSessionPanel modal removed, a dead freshcodex session's durable name
+ * no longer carries onto a remint through pane chrome. The modal's "Start
+ * fresh here" was the one remint verb that preserved the pane's naming
+ * identity (resetFreshAgentPaneForReconcileCreate); the only in-pane remint
+ * left is the composer's /new, which starts a NEW conversation with the
+ * name record STRANDED, and the pane's close button ends the session. The
+ * freshcodex case therefore ends at the recovered-name assertion (the pane
+ * keeps its manual name while the restoreError banner stands) and drops
+ * the materialization steps no honest existing-chrome route reaches.
  */
 
 const AI_NAME = 'Never fired AI name'
@@ -214,17 +226,29 @@ for (const mode of UNIFIED_AGENT_MODES) {
         await waitWsReady(a.page)
 
         // freshcodex: the REAL app-server's prospective-start semantics
-        // leave a zero-turn thread with NO rollout artifact on disk — the
+        // leave a zero-turn thread with NO rollout artifact on disk -- the
         // recovery inventory correctly reports it dead (session_not_on_
-        // disk) and the dead-sessions dialog offers the fresh-in-place
-        // remint. The pane's pre-durable naming identity (the persisted
-        // handle + the pending record) survives the remint: the pane that
-        // materializes next inherits the manual name on its NEW thread.
+        // disk). The blocking DeadSessionPanel modal is GONE (no-modal
+        // contract): the pane itself announces the death through its
+        // restoreError banner, and resolution stays with the existing pane
+        // chrome -- never a dialog.
         if (mode === 'freshcodex') {
-          const dialog = a.page.getByRole('dialog', { name: 'Dead sessions' })
-          await expect(dialog).toBeVisible({ timeout: 45_000 })
-          await dialog.getByRole('button', { name: 'Start fresh here' }).click()
-          await expect(dialog).not.toBeVisible({ timeout: 15_000 })
+          // Verdict sync (bounded): the dead verdict folds onto the pane
+          // as the durable restoreError latch.
+          await expect.poll(async () => {
+            const layout = await a.harness.getPaneLayout(handle.tabId)
+            const content = layout?.content ?? null
+            return content?.restoreError?.reason ?? null
+          }, { timeout: 45_000 }).toBe('durable_artifact_missing')
+          // The pane's own banner announces the death (FreshAgentView's
+          // durable_artifact_missing restoreError text, role="alert").
+          await expect(
+            a.page.getByRole('alert').filter({
+              hasText: 'This session cannot be resumed because the saved session artifact is no longer available.',
+            }),
+          ).toBeVisible({ timeout: 10_000 })
+          // NEVER a modal: zero Dead sessions dialogs.
+          await expect(a.page.getByRole('dialog', { name: 'Dead sessions' })).toHaveCount(0)
         }
 
         // (3) The recovered UI still shows the name...
@@ -237,124 +261,136 @@ for (const mode of UNIFIED_AGENT_MODES) {
         expect(afterRestart.record.name).toBe(PENDING_NAME)
         expect(afterRestart.record.revision).toBeGreaterThanOrEqual(before.record.revision)
 
-        // (4) Materialize on the recovered runtime: the first real input
-        // creates the durable identity and the store transfers the pending
-        // record in ONE atomic redirect.
-        await sendFirstMessage(a.page, a.harness, handle, mode, 'Materialize after the restart')
-        handle = await refreshHandle(a.harness, handle, mode)
-        let sessionId = ''
-        await expect.poll(async () => {
-          sessionId = (handle.sessionId
-            ?? (handle.nameRef?.kind === 'session' ? handle.nameRef.sessionId : ''))
-            || await resolveSessionId(journey, originalRef!)
-          return sessionId
-        }, { timeout: 90_000, intervals: [500, 1_000, 2_000] }).toBeTruthy()
-        const sessionRef: SessionNameRef = { kind: 'session', provider: fixture.provider, sessionId }
-        if (originalRef!.kind === 'pending') {
-          // The pane's CONTENT materializes (the runtime frame folds the
-          // durable sessionRef) BEFORE the naming bind redirects the
-          // pending record — wait for the redirect to land before the
-          // atomicity asserts.
-          const viaPending = await waitForMaterializationBind(journey, originalRef!)
-          // One atomic redirect: the pending ref resolves to the durable
-          // record, and the redirect is recorded on the same revision.
-          expect(viaPending.record.ref).toEqual(sessionRef)
-          expect(viaPending.record.name).toBe(PENDING_NAME)
-          expect(
-            viaPending.redirects?.some((r) => sameRef(r.from, originalRef!) && sameRef(r.to, sessionRef)),
-            'the pending→session redirect is present',
-          ).toBe(true)
-          const viaSession = await readUpdate(journey, sessionRef)
-          expect(viaSession.record.name).toBe(PENDING_NAME)
-          expect(viaSession.record.revision).toBe(viaPending.record.revision)
-        } else {
-          // An already-durable zero-turn identity (opencode's admitted
-          // pre-POST variant): the name carried across the restart.
-          const viaSession = await readUpdate(journey, sessionRef)
-          expect(viaSession.record.name).toBe(PENDING_NAME)
-        }
-
-        // (5) Close the tab, reopen the durable session from the sidebar —
-        // the reopened pane/tab have NEW (reminted) ids and the SAME name.
-        // A second turn first: the directory listing's parity filter hides
-        // a single-turn transcript (non-interactive), and the reopen's row
-        // comes from the directory once the pane is closed.
-        await sendFirstMessage(a.page, a.harness, handle, mode, 'A second turn makes the exchange real')
-        const originalTabId = handle.tabId
-        const originalPaneId = handle.paneId
-        await closeActiveTab(a.page, a.harness, originalTabId)
-        await reopenFromSidebar(a.page, sessionId)
-        const reopenedTabId = (await a.harness.getActiveTabId())!
-        expect(reopenedTabId).not.toBe(originalTabId)
-        await expect(
-          a.page.locator('[data-context="pane-header"]:visible').first(),
-        ).toContainText(PENDING_NAME, { timeout: 30_000 })
-        const reopenedPaneId = ((await a.harness.getPaneLayout(reopenedTabId))?.id ?? '') as string
-        expect(reopenedPaneId).toBeTruthy()
-        expect(reopenedPaneId).not.toBe(originalPaneId)
-        // The reopened tab is session-owned: its label follows the session.
-        await expect(
-          a.page.locator(`[data-context="tab"][data-tab-id="${reopenedTabId}"]`),
-        ).toContainText(PENDING_NAME, { timeout: 30_000 })
-        // The reopened pane is the new send target.
-        handle = { ...handle, tabId: reopenedTabId, paneId: reopenedPaneId }
-
-        // (6) Restart AFTER durability; restore through a second browser.
-        await journey.server.server.restart()
-        await waitWsReady(a.page)
-        const b = await connectUnifiedPage({ browser, info: journey.server.info })
-        try {
-          // Both browsers show the SAME saved name everywhere.
-          await expectSharedName(a.harness, sessionRef, PENDING_NAME, {
-            page: a.page, server: journey.server, surfaces: ['http', 'redux', 'pane', 'sidebar'],
-          })
-          await expectSharedName(b.harness, sessionRef, PENDING_NAME, {
-            page: b.page, server: journey.server, surfaces: ['http', 'redux', 'sidebar'],
-          })
-          await expect(
-            b.page.locator(`[data-context="sidebar-session"][data-session-id="${sessionId}"]`),
-          ).toContainText(PENDING_NAME, { timeout: 30_000 })
-
-          // (7) No budget reset / no re-arm: the manual winner stops
-          // generation, so more activity plus the restart never refires it.
-          expect(gemini.requests.length).toBe(0)
-          await sendFirstMessage(a.page, a.harness, handle, mode, 'More activity after the restarts')
-          await a.page.waitForTimeout(8_000)
-          expect(gemini.requests.length, 'a manual winner + a restart never re-arms generation').toBe(0)
-          const settled = await readUpdate(journey, sessionRef)
-          expect(settled.record.name).toBe(PENDING_NAME)
-          expect(settled.record.source).toBe('manual')
-
-          // (8) A deliberate user rename post-restart converges everywhere.
-          await renameThroughCanonicalApi(journey.server, sessionRef, MANUAL_AFTER_RESTARTS, 'user')
-          await expectSharedName(a.harness, sessionRef, MANUAL_AFTER_RESTARTS, {
-            page: a.page, server: journey.server, tabId: reopenedTabId, sessionId,
-          })
-          await expect(
-            b.page.locator(`[data-context="sidebar-session"][data-session-id="${sessionId}"]`),
-          ).toContainText(MANUAL_AFTER_RESTARTS, { timeout: 30_000 })
-
-          // (9) The deliberate-new-conversation contrast (freshclaude —
-          // the mode with the in-pane control): a MINTED conversation is a
-          // NEW session identity; it never inherits the old session's name,
-          // while the established session keeps its manual name.
-          if (mode === 'freshclaude') {
-            // The pane's REAL conversation-switch control: the `/new` slash
-            // command in the composer (the Start-new-conversation button
-            // only renders on stuck/ended states).
-            const paneRoot = a.page.locator('[data-context="fresh-agent"]').last()
-            const composer = paneRoot.getByRole('textbox', { name: 'Chat message input' })
-            await composer.fill('/new')
-            await paneRoot.getByRole('button', { name: 'Send' }).click()
-            await expect(
-              a.page.locator('[data-context="pane-header"]:visible').first(),
-            ).not.toContainText(MANUAL_AFTER_RESTARTS, { timeout: 45_000 })
-            const oldKept = await readUpdate(journey, sessionRef)
-            expect(oldKept.record.name).toBe(MANUAL_AFTER_RESTARTS)
-            expect(oldKept.record.source).toBe('manual')
+        // (4)-(9) need the MATERIALIZED durable session. freshcodex: the
+        // zero-turn thread is DEAD after the restart and, with the modal
+        // gone, no honest existing-chrome route reaches a materialization
+        // anymore -- the modal's "Start fresh here" was the one remint verb
+        // that preserved the pane's naming identity
+        // (resetFreshAgentPaneForReconcileCreate); the only in-pane remint
+        // left is the composer's /new, which starts a NEW conversation with
+        // the name record STRANDED (see the header residual note). The
+        // freshcodex journey therefore ENDS at step (3): the pane keeps its
+        // manual name while the death banner stands.
+        if (mode !== 'freshcodex') {
+          // (4) Materialize on the recovered runtime: the first real input
+          // creates the durable identity and the store transfers the pending
+          // record in ONE atomic redirect.
+          await sendFirstMessage(a.page, a.harness, handle, mode, 'Materialize after the restart')
+          handle = await refreshHandle(a.harness, handle, mode)
+          let sessionId = ''
+          await expect.poll(async () => {
+            sessionId = (handle.sessionId
+              ?? (handle.nameRef?.kind === 'session' ? handle.nameRef.sessionId : ''))
+              || await resolveSessionId(journey, originalRef!)
+            return sessionId
+          }, { timeout: 90_000, intervals: [500, 1_000, 2_000] }).toBeTruthy()
+          const sessionRef: SessionNameRef = { kind: 'session', provider: fixture.provider, sessionId }
+          if (originalRef!.kind === 'pending') {
+            // The pane's CONTENT materializes (the runtime frame folds the
+            // durable sessionRef) BEFORE the naming bind redirects the
+            // pending record — wait for the redirect to land before the
+            // atomicity asserts.
+            const viaPending = await waitForMaterializationBind(journey, originalRef!)
+            // One atomic redirect: the pending ref resolves to the durable
+            // record, and the redirect is recorded on the same revision.
+            expect(viaPending.record.ref).toEqual(sessionRef)
+            expect(viaPending.record.name).toBe(PENDING_NAME)
+            expect(
+              viaPending.redirects?.some((r) => sameRef(r.from, originalRef!) && sameRef(r.to, sessionRef)),
+              'the pending→session redirect is present',
+            ).toBe(true)
+            const viaSession = await readUpdate(journey, sessionRef)
+            expect(viaSession.record.name).toBe(PENDING_NAME)
+            expect(viaSession.record.revision).toBe(viaPending.record.revision)
+          } else {
+            // An already-durable zero-turn identity (opencode's admitted
+            // pre-POST variant): the name carried across the restart.
+            const viaSession = await readUpdate(journey, sessionRef)
+            expect(viaSession.record.name).toBe(PENDING_NAME)
           }
-        } finally {
-          await b.context.close()
+
+          // (5) Close the tab, reopen the durable session from the sidebar —
+          // the reopened pane/tab have NEW (reminted) ids and the SAME name.
+          // A second turn first: the directory listing's parity filter hides
+          // a single-turn transcript (non-interactive), and the reopen's row
+          // comes from the directory once the pane is closed.
+          await sendFirstMessage(a.page, a.harness, handle, mode, 'A second turn makes the exchange real')
+          const originalTabId = handle.tabId
+          const originalPaneId = handle.paneId
+          await closeActiveTab(a.page, a.harness, originalTabId)
+          await reopenFromSidebar(a.page, sessionId)
+          const reopenedTabId = (await a.harness.getActiveTabId())!
+          expect(reopenedTabId).not.toBe(originalTabId)
+          await expect(
+            a.page.locator('[data-context="pane-header"]:visible').first(),
+          ).toContainText(PENDING_NAME, { timeout: 30_000 })
+          const reopenedPaneId = ((await a.harness.getPaneLayout(reopenedTabId))?.id ?? '') as string
+          expect(reopenedPaneId).toBeTruthy()
+          expect(reopenedPaneId).not.toBe(originalPaneId)
+          // The reopened tab is session-owned: its label follows the session.
+          await expect(
+            a.page.locator(`[data-context="tab"][data-tab-id="${reopenedTabId}"]`),
+          ).toContainText(PENDING_NAME, { timeout: 30_000 })
+          // The reopened pane is the new send target.
+          handle = { ...handle, tabId: reopenedTabId, paneId: reopenedPaneId }
+
+          // (6) Restart AFTER durability; restore through a second browser.
+          await journey.server.server.restart()
+          await waitWsReady(a.page)
+          const b = await connectUnifiedPage({ browser, info: journey.server.info })
+          try {
+            // Both browsers show the SAME saved name everywhere.
+            await expectSharedName(a.harness, sessionRef, PENDING_NAME, {
+              page: a.page, server: journey.server, surfaces: ['http', 'redux', 'pane', 'sidebar'],
+            })
+            await expectSharedName(b.harness, sessionRef, PENDING_NAME, {
+              page: b.page, server: journey.server, surfaces: ['http', 'redux', 'sidebar'],
+            })
+            await expect(
+              b.page.locator(`[data-context="sidebar-session"][data-session-id="${sessionId}"]`),
+            ).toContainText(PENDING_NAME, { timeout: 30_000 })
+
+            // (7) No budget reset / no re-arm: the manual winner stops
+            // generation, so more activity plus the restart never refires it.
+            expect(gemini.requests.length).toBe(0)
+            await sendFirstMessage(a.page, a.harness, handle, mode, 'More activity after the restarts')
+            await a.page.waitForTimeout(8_000)
+            expect(gemini.requests.length, 'a manual winner + a restart never re-arms generation').toBe(0)
+            const settled = await readUpdate(journey, sessionRef)
+            expect(settled.record.name).toBe(PENDING_NAME)
+            expect(settled.record.source).toBe('manual')
+
+            // (8) A deliberate user rename post-restart converges everywhere.
+            await renameThroughCanonicalApi(journey.server, sessionRef, MANUAL_AFTER_RESTARTS, 'user')
+            await expectSharedName(a.harness, sessionRef, MANUAL_AFTER_RESTARTS, {
+              page: a.page, server: journey.server, tabId: reopenedTabId, sessionId,
+            })
+            await expect(
+              b.page.locator(`[data-context="sidebar-session"][data-session-id="${sessionId}"]`),
+            ).toContainText(MANUAL_AFTER_RESTARTS, { timeout: 30_000 })
+
+            // (9) The deliberate-new-conversation contrast (freshclaude —
+            // the mode with the in-pane control): a MINTED conversation is a
+            // NEW session identity; it never inherits the old session's name,
+            // while the established session keeps its manual name.
+            if (mode === 'freshclaude') {
+              // The pane's REAL conversation-switch control: the `/new` slash
+              // command in the composer (the Start-new-conversation button
+              // only renders on stuck/ended states).
+              const paneRoot = a.page.locator('[data-context="fresh-agent"]').last()
+              const composer = paneRoot.getByRole('textbox', { name: 'Chat message input' })
+              await composer.fill('/new')
+              await paneRoot.getByRole('button', { name: 'Send' }).click()
+              await expect(
+                a.page.locator('[data-context="pane-header"]:visible').first(),
+              ).not.toContainText(MANUAL_AFTER_RESTARTS, { timeout: 45_000 })
+              const oldKept = await readUpdate(journey, sessionRef)
+              expect(oldKept.record.name).toBe(MANUAL_AFTER_RESTARTS)
+              expect(oldKept.record.source).toBe('manual')
+            }
+          } finally {
+            await b.context.close()
+          }
         }
         await a.context.close()
       } finally {

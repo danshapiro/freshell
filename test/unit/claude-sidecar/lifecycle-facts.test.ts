@@ -27,6 +27,16 @@ function commandStates(bridge: RealSidecar, uuid: string): string[] {
 
 const isResult = (frame: SidecarFrame) => frame.type === 'sdk.result'
 
+/** A complete rejection log for this send; stderr can arrive after stdout. */
+function rejectedSendLog(bridge: RealSidecar, uuid: string): Record<string, unknown> | undefined {
+  const stderr = bridge.stderr()
+  const complete = stderr.slice(0, stderr.lastIndexOf('\n') + 1)
+  return complete.split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+    .find((record) => record.event === 'send.rejected' && record.uuid === uuid)
+}
+
 describe('uuid-stamped sends', () => {
   it('the CLI runs each send under the uuid the server gave it', async () => {
     const { bridge, sessionId } = await session()
@@ -153,14 +163,28 @@ describe('session facts', () => {
 })
 
 describe('rejected sends', () => {
-  it('a bad image is rejected and the sidecar keeps serving the session', async () => {
+  it.each(['flowing', 'delayed'] as const)('a bad image is rejected and the sidecar keeps serving the session (%s stderr)', async (stderrDelivery) => {
     const { bridge, sessionId } = await session()
     const rejected = randomUUID()
-    bridge.send({ type: 'send', sessionId, uuid: rejected, text: 'look', images: [{ mediaType: 'image/svg+xml', data: 'PHN2Zy8+' }] })
-    const rejection = await bridge.waitFor('sdk.send.rejected')
-    expect(rejection).toMatchObject({ sessionId, uuid: rejected, code: 'INVALID_IMAGE' })
-    expect(rejection.message).toMatch(/image\/svg\+xml/)
-    expect(bridge.stderr()).toContain('"event":"send.rejected"')
+    const stderrStream = bridge.child.stderr!
+    if (stderrDelivery === 'delayed') stderrStream.pause()
+    try {
+      bridge.send({ type: 'send', sessionId, uuid: rejected, text: 'look', images: [{ mediaType: 'image/svg+xml', data: 'PHN2Zy8+' }] })
+      const rejection = await bridge.waitFor('sdk.send.rejected')
+      expect(rejection).toMatchObject({ sessionId, uuid: rejected, code: 'INVALID_IMAGE' })
+      expect(rejection.message).toMatch(/image\/svg\+xml/)
+      if (stderrDelivery === 'delayed') {
+        expect(stderrStream.isPaused()).toBe(true)
+        expect(rejectedSendLog(bridge, rejected)).toBeUndefined()
+      }
+      stderrStream.resume()
+      await expect.poll(() => rejectedSendLog(bridge, rejected), { timeout: 10_000 }).toMatchObject({
+        severity: 'warn', component: 'claude-sidecar', event: 'send.rejected',
+        sessionId, uuid: rejected, code: 'INVALID_IMAGE', error: rejection.message,
+      })
+    } finally {
+      stderrStream.resume()
+    }
 
     const next = randomUUID()
     bridge.send({ type: 'send', sessionId, uuid: next, text: 'hello' })
@@ -169,6 +193,8 @@ describe('rejected sends', () => {
     expect(bridge.ledger().filter((row) => row.kind === 'prompt').map((row) => row.uuid)).toEqual([next])
     expect(commandStates(bridge, rejected)).toEqual([])
     expect(bridge.child.exitCode).toBeNull()
+    bridge.send({ type: 'shutdown' })
+    expect(await bridge.waitExit()).toEqual({ code: 0, signal: null })
   })
 
   it('a send without a valid uuid is rejected', async () => {

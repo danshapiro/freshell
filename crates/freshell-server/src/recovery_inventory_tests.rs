@@ -103,6 +103,7 @@ fn binding_row_at(
 ) -> BindingRow {
     let (state, retired_reason, superseded_by) = state_parts;
     BindingRow {
+        collaboration_mode: None,
         genesis: None,
         ledger_version: LEDGER_VERSION,
         provider: provider.to_string(),
@@ -3115,6 +3116,7 @@ fn fresh_agent_create_completed_after_the_pane_closed_is_never_offered() {
     let ledger = PaneLedger::new(Some(tmp.path().to_path_buf()));
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            collaboration_mode: None,
             genesis: freshell_ws::pane_ledger::GenesisWrite::Keep,
             provider: "opencode",
             session_id: "S1",
@@ -3180,6 +3182,7 @@ fn fresh_agent_create_asserted_inside_the_kill_window_stays_offered_despite_a_la
     let ledger = PaneLedger::new(Some(tmp.path().to_path_buf()));
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            collaboration_mode: None,
             genesis: freshell_ws::pane_ledger::GenesisWrite::Keep,
             provider: "opencode",
             session_id: "S1",
@@ -3318,6 +3321,7 @@ fn supersession_after_the_freeze_judges_on_the_parents_assertion_time() {
         .expect("parent binding write");
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            collaboration_mode: None,
             genesis: freshell_ws::pane_ledger::GenesisWrite::Keep,
             provider: "codex",
             session_id: "child-id",

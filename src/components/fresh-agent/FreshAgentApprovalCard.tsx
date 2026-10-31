@@ -30,9 +30,8 @@ type FreshAgentApprovalCardProps = {
  * - when the CLI suggested permission updates (Claude only), the remember
  *   button sends exactly those suggestions, each spelled out in plain language
  *   underneath, so Claude itself stops asking;
- * - `onAlwaysAllow`, when the caller provides it, adds the client-only "Always
- *   allow <Tool> in this pane" (codex): the caller remembers the tool and
- *   answers later requests until the pane reloads.
+ * - legacy shared approvals can expose the caller's pane-local remember action.
+ *   Native approvals expose only the decisions offered by their provider.
  *
  * Claude's ExitPlanMode request is a plan to review, not a tool call: it gets
  * the plan card ({@link FreshAgentPlanApprovalCard}).
@@ -41,7 +40,42 @@ export function FreshAgentApprovalCard(props: FreshAgentApprovalCardProps) {
   if (props.approval.toolName === 'ExitPlanMode') {
     return <FreshAgentPlanApprovalCard approval={props.approval} disabled={props.disabled} onRespond={props.onRespond} />
   }
+  if (props.approval.native) return <NativeApprovalCard {...props} />
   return <FreshAgentToolApprovalCard {...props} />
+}
+
+function NativeApprovalCard({ approval, disabled, onRespond }: FreshAgentApprovalCardProps) {
+  const native = approval.native ?? {}
+  const offered = Array.isArray(native.availableDecisions) ? native.availableDecisions : ['accept', 'decline', 'cancel']
+  const supported = ['accept', 'acceptForSession', 'decline', 'cancel'] as const
+  const choices = approval.toolName === 'Additional permissions' ? ['accept', 'decline'] : offered
+  const network = native.networkApprovalContext as { host?: string; protocol?: string } | undefined
+  const labels = { accept: 'Allow', acceptForSession: 'Allow for this session', decline: 'Decline', cancel: 'Stop' }
+  const details = {
+    ...(native.kind ? { action: native.kind } : {}),
+    ...(native.command ? { command: native.command } : {}),
+    ...(native.cwd ? { directory: native.cwd } : {}),
+    ...(native.permissions ? { permissions: native.permissions } : {}),
+    ...(native.additionalPermissions ? { additionalPermissions: native.additionalPermissions } : {}),
+    ...(native.grantRoot ? { path: native.grantRoot } : {}),
+  }
+  return (
+    <div role="alert" aria-label={`Permission request for ${approval.toolName ?? 'Tool'}`} className="fresh-agent-approval-card rounded-md border border-amber-500/50 p-3 space-y-2">
+      <p className="font-medium">{native.kind === 'writeStdin' ? 'Write to a running command' : approval.toolName}</p>
+      {network ? <p>Connect to {network.host} {network.protocol ? `using ${network.protocol}` : ''}</p> : null}
+      {approval.decisionReason ? <p>{approval.decisionReason}</p> : null}
+      {Object.keys(details).length ? <pre className="max-h-40 overflow-auto whitespace-pre-wrap text-xs">{JSON.stringify(details, null, 2)}</pre> : null}
+      {approval.toolName === 'Additional permissions' ? <p className="text-xs">Allow the requested permissions for this turn.</p> : null}
+      <div className="flex flex-wrap gap-2">
+        {supported.filter((choice) => choices.includes(choice)).map((choice) => (
+          <button key={choice} type="button" className={BUTTON} disabled={disabled} onClick={() => onRespond({ nativeDecision: choice })}>
+            {labels[choice]}
+          </button>
+        ))}
+      </div>
+      {offered.some((choice) => typeof choice !== 'string') ? <p className="text-xs">Persistent rule changes are not supported here.</p> : null}
+    </div>
+  )
 }
 
 function FreshAgentToolApprovalCard({ approval, disabled, onRespond, onAlwaysAllow }: FreshAgentApprovalCardProps) {

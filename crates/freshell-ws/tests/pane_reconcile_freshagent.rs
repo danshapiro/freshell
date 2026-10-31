@@ -713,6 +713,7 @@ async fn old_thread_claim_after_crash_respawn_answers_the_new_terminus() {
     server
         .pane_ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            collaboration_mode: None,
             genesis: freshell_ws::pane_ledger::GenesisWrite::Keep,
             provider: "codex",
             session_id: "old-t",
@@ -736,6 +737,7 @@ async fn old_thread_claim_after_crash_respawn_answers_the_new_terminus() {
     server
         .pane_ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            collaboration_mode: None,
             genesis: freshell_ws::pane_ledger::GenesisWrite::Keep,
             provider: "codex",
             session_id: "new-t",
@@ -777,6 +779,7 @@ async fn old_thread_claim_after_crash_respawn_answers_the_new_terminus() {
 fn seed_claude_binding(ledger: &PaneLedger, session_id: &str, genesis: Option<&Value>) {
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            collaboration_mode: None,
             genesis: genesis.map_or(freshell_ws::pane_ledger::GenesisWrite::Keep, |genesis| {
                 freshell_ws::pane_ledger::GenesisWrite::Set(genesis)
             }),

@@ -43,9 +43,35 @@ pub(super) fn transcript_metadata(turns: &[Value]) -> (Vec<Value>, Vec<Value>) {
                     .filter(|id| !id.is_empty())
                 {
                     // Keep the first origin (spawn), not a later wait/send operation.
-                    children.entry(id.to_owned()).or_insert_with(|| json!({
+                    let child = children.entry(id.to_owned()).or_insert_with(|| json!({
                         "id": id, "threadId": id, "origin": item.get("tool").and_then(Value::as_str).unwrap_or("codex"),
                     }));
+                    let state = &item["agentsStates"][id];
+                    for field in ["status", "model", "result", "error"] {
+                        let value = state.get(field).or_else(|| match field {
+                            "result" => state.get("message"),
+                            "model" => item.get("model"),
+                            _ => None,
+                        });
+                        if let Some(value) = value.filter(|value| !value.is_null()) {
+                            child[field] = json!(value
+                                .as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| value.to_string()));
+                        }
+                    }
+                }
+            }
+            Some("task_delegation") => {
+                if let Some(id) = item["childSessionId"].as_str().filter(|id| !id.is_empty()) {
+                    let child = children.entry(id.to_owned()).or_insert_with(
+                        || json!({"id":id,"threadId":id,"origin":"codex","title":item["title"]}),
+                    );
+                    for field in ["status", "model", "result"] {
+                        if let Some(value) = item[field].as_str() {
+                            child[field] = json!(value);
+                        }
+                    }
                 }
             }
             _ => {}

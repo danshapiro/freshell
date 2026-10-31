@@ -9,13 +9,13 @@
 // Modes (argv[3]):
 // - `shutdown` (default): the {"type":"shutdown"} line, then stdin EOF.
 // - `stdout-closed`: first the sidecar's stdout reader goes away (Rust aborts the session's
-//   stdout consumer before its teardown), then, 50 ms later (the teardown's ownership scan),
+//   stdout consumer before its teardown), then, 50 ms later,
 //   the same shutdown line and stdin EOF. The provider streams a text delta every 25 ms, so
 //   the sidecar is writing into the closed pipe before the shutdown line can arrive.
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import http from 'node:http'
-import { spawn, execFileSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { randomUUID } from 'node:crypto'
 import { createClaudeFixture, FAKE_MODEL, resolvePinnedClaude } from './claude-local-provider.mjs'
@@ -55,6 +55,7 @@ let sidecarExitedAt
 let sidecarExit
 let cliExitedAt
 let shutdownSentAt
+let sidecarStderr = ''
 
 try {
   failureStage = 'local provider'
@@ -71,7 +72,7 @@ try {
       response.writeHead(404).end()
       return
     }
-    response.on('close', () => { providerRequestClosedAt ??= Date.now() })
+    response.on('close', () => { providerRequestClosedAt ??= performance.now() })
     response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', 'request-id': randomUUID() })
     const send = (type, data) => response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`)
     send('message_start', { message: { id: `msg_${randomUUID().replaceAll('-', '')}`, type: 'message', role: 'assistant', model: FAKE_MODEL, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0 } } })
@@ -104,11 +105,12 @@ try {
     }),
     stdio: ['pipe', 'pipe', 'pipe'],
   })
-  sidecar.stderr.on('data', () => {})
+  fixture.ownProcess(sidecar)
+  sidecar.stderr.on('data', chunk => { sidecarStderr = (sidecarStderr + chunk.toString()).slice(-16000) })
   // The shutdown line may reach a sidecar that already stopped on its own (`stdout-closed`
   // mode); that write's EPIPE is expected, as it is for Rust's teardown.
   sidecar.stdin.on('error', () => {})
-  sidecar.once('exit', (code, signal) => { sidecarExitedAt = Date.now(); sidecarExit = { code, signal } })
+  sidecar.once('exit', (code, signal) => { sidecarExitedAt = performance.now(); sidecarExit = { code, signal } })
   const frames = []
   const waiters = []
   createInterface({ input: sidecar.stdout }).on('line', (line) => {
@@ -135,11 +137,12 @@ try {
   write({ type: 'send', sessionId: created.sessionId, uuid: randomUUID(), text: 'hello' })
   await withTimeout(streaming, 45_000, 'the provider to receive the turn')
   await waitFor(frame => frame.type === 'sdk.stream' && frame.event?.type === 'content_block_delta', 30_000, 'the streamed delta')
-  cliPid = Number(execFileSync('pgrep', ['-P', String(sidecar.pid)]).toString().trim().split('\n')[0])
-  if (!Number.isInteger(cliPid) || !alive(cliPid)) throw new Error('the native CLI child was not found')
+  cliPid = created.cliPid
+  if (!Number.isInteger(cliPid) || !alive(cliPid)) throw new Error('the created native CLI child was not found')
+  await fixture.ownProcessId(cliPid)
 
   failureStage = 'shutdown'
-  shutdownSentAt = Date.now()
+  shutdownSentAt = performance.now()
   if (mode === 'stdout-closed') {
     sidecar.stdout.destroy()
     await sleep(50)
@@ -147,11 +150,11 @@ try {
   write({ type: 'shutdown' })
   sidecar.stdin.end()
   const deadline = shutdownSentAt + 10_000
-  while (Date.now() < deadline && (sidecarExitedAt === undefined || alive(cliPid) || providerRequestClosedAt === undefined)) {
-    if (cliExitedAt === undefined && !alive(cliPid)) cliExitedAt = Date.now()
+  while (performance.now() < deadline && (sidecarExitedAt === undefined || alive(cliPid) || providerRequestClosedAt === undefined)) {
+    if (cliExitedAt === undefined && !alive(cliPid)) cliExitedAt = performance.now()
     await sleep(5)
   }
-  if (cliExitedAt === undefined && !alive(cliPid)) cliExitedAt = Date.now()
+  if (cliExitedAt === undefined && !alive(cliPid)) cliExitedAt = performance.now()
   if (sidecarExitedAt !== undefined && cliExitedAt !== undefined && providerRequestClosedAt !== undefined) verdict = 'PASS'
 } catch (error) {
   process.stderr.write(`${JSON.stringify({
@@ -178,10 +181,12 @@ process.stdout.write(`${JSON.stringify({
   mode,
   sdkVersion: pinned.sdkVersion,
   bundledCliVersion: pinned.cliVersion,
+  nodeVersion: process.version,
   sidecarExit,
   sidecarExitMs: since(sidecarExitedAt),
   nativeCliExitMs: since(cliExitedAt),
   providerRequestClosedMs: since(providerRequestClosedAt),
   fixtureRemoved,
+  sidecarStderr,
 })}\n`)
 if (verdict !== 'PASS' || !fixtureRemoved) process.exitCode = 1
