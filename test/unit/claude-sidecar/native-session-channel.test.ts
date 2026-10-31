@@ -74,10 +74,13 @@ describe('managed native startup channel', () => {
     try {
       worker.send({ type: 'create', requestId: 'join-native-writer', cwd: directory })
       await worker.wait('sdk.session.init')
-      await worker.wait('probe.native-child')
+      const nativeChild = await worker.wait('probe.native-child')
       const before = Date.now()
       await worker.close(true)
       expect(Date.now() - before).toBeGreaterThanOrEqual(100)
+      const closed = (await readFile(join(directory, 'native-closed.jsonl'), 'utf8'))
+        .trim().split('\n').map(line => JSON.parse(line))
+      expect(closed).toEqual([{ pid: nativeChild.pid }])
     } finally { await worker.close(); await rm(directory, { recursive: true, force: true }) }
   })
   it('reopens the same acknowledged unmaterialized child from its guarded parent before accepting input', async () => {
