@@ -27,7 +27,7 @@ export function query({ prompt, options }) {
   const checkpointScenario = process.env.FRESHELL_SIDECAR_TEST_CHECKPOINT === '1'
   const child = checkpointScenario && process.env.FRESHELL_SIDECAR_TEST_NATIVE_EXIT_DELAY === '1'
     ? options.spawnClaudeCodeProcess({ command: process.execPath,
-      args: ['-e', `process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>process.exit(0),${continuationFailure === 'close-timeout' ? 6500 : 150}))`], env: options.env }) : undefined
+      args: ['-e', `let closing=false;const close=()=>{if(closing)return;closing=true;setTimeout(()=>process.exit(0),${continuationFailure === 'close-timeout' ? 6500 : 150})};process.on('SIGTERM',close);process.stdin.resume();process.stdin.on('end',close)`], env: options.env }) : undefined
   if (child) {
     if (nativeChildren.size) process.stdout.write(JSON.stringify({ type: 'probe.native-overlap' }) + '\n')
     nativeChildren.add(child.pid)
