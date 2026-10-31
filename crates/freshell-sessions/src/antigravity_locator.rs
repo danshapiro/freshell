@@ -16,7 +16,9 @@
 //! - ownership record (`session_start`) carries a `conversationId` whose
 //!   `workspacePaths` CONTAIN the pane's cwd (normalized), and whose
 //! - LATEST user-authored record (`user_message`) text EQUALS the pane's
-//!   captured submit line (normalized, bounded comparison), and whose
+//!   captured submit payload (normalized, bounded comparison — the FULL
+//!   multi-line buffer a Ctrl+J prompt flushed at Enter, never just its
+//!   last line), and whose
 //! - MATCHING user record was written AT/AFTER that submit (recency is
 //!   proven by the matching record's OWN `at` — a later record of
 //!   another type, e.g. an assistant record still streaming after the
@@ -147,7 +149,10 @@ pub struct AntigravityLocator {
     fs_scan_count: AtomicU64,
 }
 
-/// Normalize a prompt text for comparison: trim + bound.
+/// Normalize a prompt text for comparison: trim + bound. The trim is
+/// EDGE-only — a multi-line payload's EMBEDDED newlines (Ctrl+J content)
+/// survive, matching the transcript record's text through the identical
+/// normalization on both sides.
 fn normalize_prompt_text(text: &str) -> String {
     text.trim().chars().take(MAX_SUBMIT_COMPARE_CHARS).collect()
 }
@@ -578,6 +583,48 @@ mod tests {
             located[0].transcript_path,
             root.join("conv-own/.system_generated/logs/transcript.jsonl")
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Whole-delta review Major 2 pin: the comparison is the FULL
+    /// normalized text on BOTH sides — a multi-line captured submit
+    /// (Ctrl+J between the lines, joined by the ws capture into one
+    /// buffer) binds the transcript whose user record carries both
+    /// lines. The record's text embeds the newline JSON-escaped; both
+    /// sides normalize through the same `normalize_prompt_text`, and the
+    /// embedded newline survives it (only the edges trim).
+    #[test]
+    fn multiline_prompt_matches_the_full_user_record_text() {
+        let (locator, root) = locator_for("multiline");
+        let cwd = "/tmp/agy-multiline";
+        std::fs::create_dir_all(cwd).unwrap();
+        locator.arm("t1", cwd);
+        // "line1\nline2" JSON-escaped inside the record text — the
+        // candidate recorded form for a Ctrl+J prompt (Stage-1 candidate
+        // contract: the exact byte the CLI writes for an in-prompt
+        // newline is fixture-validated only).
+        write_transcript(&root, "conv-multi", cwd, &[("line1\\nline2", T0)]);
+        assert!(locator.note_submit("t1", "line1\nline2", T0));
+        let located = locator.tick(T0 + ANTIGRAVITY_WINDOW_MS + 1);
+        assert_eq!(
+            located.len(),
+            1,
+            "a multi-line prompt binds the full-text record"
+        );
+        assert_eq!(located[0].conversation_id, "conv-multi");
+        // Edge-trimming symmetry: leading/trailing newlines on either
+        // side normalize away — a capture that picked up a stray edge
+        // newline binds the same record text (the record must postdate
+        // this second submit, per the recency rule).
+        write_transcript(&root, "conv-multi-edge", cwd, &[("line1\\nline2", T0 + 20)]);
+        assert!(locator.note_submit("t1", "\nline1\nline2\n", T0 + 10));
+        let located = locator.tick(T0 + 10 + ANTIGRAVITY_WINDOW_MS + 1);
+        assert_eq!(
+            located.len(),
+            1,
+            "edge newlines trim away on both sides of the comparison"
+        );
+        assert_eq!(located[0].conversation_id, "conv-multi-edge");
         let _ = std::fs::remove_dir_all(&root);
     }
 

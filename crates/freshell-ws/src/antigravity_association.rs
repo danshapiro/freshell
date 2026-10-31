@@ -16,6 +16,27 @@
 //!   line is what the locator matches against each transcript's LATEST
 //!   user-authored record.
 //!
+//!   // Stage-1 candidate contract (submit-key byte discipline, modeled
+//!   // on `freshell-activity/signal.rs`'s `classify_input` CR/LF
+//!   // rule — typed submit bytes vs content bytes are distinguished at
+//!   // the byte level, and the distinction is DOCUMENTED, not guessed):
+//!   // the terminal sends CR (0x0D) for the Enter key — CR flushes the
+//!   // buffer as ONE submit. LF (0x0A) is Ctrl+J, which the Antigravity
+//!   // CLI documents as "insert a newline into the prompt"
+//!   // (antigravity.google/docs/cli/reference/) — LF JOINS the current
+//!   // buffer as inline newline content, never a submit, so a
+//!   // multi-line prompt flushes as the FULL multi-line payload and can
+//!   // bind the transcript user record carrying both lines
+//!   // (whole-delta review Major 2). Pasted text arrives CR-separated
+//!   // (xterm.js `prepareTextForTerminal` converts pasted `\r?\n` to
+//!   // `\r` before the bytes reach the PTY), so a pasted multi-line blob
+//!   // still flushes per line and its LAST line is the live capture —
+//!   // `classify_input`'s "the LAST pasted line remains evaluable"
+//!   // stance; a paste-frame-aware capture is deferred until a real
+//!   // binary proves the recorded form of a pasted blob (the A2
+//!   // blocker). The newline byte the CLI writes INSIDE its recorded
+//!   // multi-line user text is likewise fixture-validated only.
+//!
 //! - The association lives ON the hub (a `HubInner` slot, set once at
 //!   boot) rather than a `WsState` field: its whole input feed IS the
 //!   hub's event stream, so its lifetime is bounded by the hub's, and a
@@ -99,8 +120,8 @@ impl AntigravityAssociation {
     }
 
     /// Hub-side `ActivityEvent::Input` intake: fold one input chunk into
-    /// the pane's line buffer, flushing at every CR/LF byte, and report
-    /// the pane's tag state in the same lock scope. Returns
+    /// the pane's line buffer, flushing ONLY at the Enter byte (CR), and
+    /// report the pane's tag state in the same lock scope. Returns
     /// `(flushed, tagged)`: `flushed` = whether this chunk flushed at
     /// least one non-empty submit line (the hub uses that to arm the
     /// idle gate's provisional busy phase — the crash death-bell
@@ -110,11 +131,15 @@ impl AntigravityAssociation {
     /// suppress that death bell too, so the classification needs to see
     /// every input byte of a tagged pane).
     ///
-    /// Byte discipline (the `is_submit_input`-style classification seam):
-    /// DEL (0x7f) and BS (0x08) pop the last buffered char (the CLI's
-    /// recorded text reflects the line editor's deletions, so the capture
-    /// must too); ESC-prefixed sequences (arrow keys etc.) are dropped
-    /// whole; other C0 controls except TAB are dropped; the rest append.
+    /// Byte discipline (the Stage-1 candidate contract documented in the
+    /// module header): CR (Enter) flushes the FULL buffer — including
+    /// any inline newlines Ctrl+J joined into it — as one submit; LF
+    /// (Ctrl+J, "insert newline into the prompt") JOINS the current
+    /// buffer as content and never flushes; DEL (0x7f) and BS (0x08) pop
+    /// the last buffered char (the CLI's recorded text reflects the line
+    /// editor's deletions, so the capture must too); ESC-prefixed
+    /// sequences (arrow keys etc.) are dropped whole; other C0 controls
+    /// except TAB are dropped; the rest append.
     pub fn note_input_tagged(&self, terminal_id: &str, data: &str, at_ms: i64) -> (bool, bool) {
         let mut panes = self.panes.lock().unwrap();
         let Some(pane) = panes.get_mut(terminal_id) else {
@@ -151,11 +176,21 @@ impl AntigravityAssociation {
                 Esc::None => {}
             }
             match ch {
-                '\r' | '\n' => {
+                '\r' => {
+                    // Enter: flush the FULL buffer (multi-line payloads
+                    // included) as one submit.
                     let line = std::mem::take(&mut pane.buffer);
                     if !line.trim().is_empty() {
                         pane.submits.push_back((line, at_ms));
                         flushed = true;
+                    }
+                }
+                '\n' => {
+                    // Ctrl+J ("insert a newline into the prompt" — the
+                    // CLI's documented multiline form): inline content,
+                    // never a submit.
+                    if pane.buffer.chars().count() < MAX_LINE_BUFFER_CHARS {
+                        pane.buffer.push('\n');
                     }
                 }
                 '\u{7f}' | '\u{8}' => {
@@ -860,8 +895,10 @@ mod tests {
         assert!(!association.note_input("t1", "hel", 1_000));
         assert!(!association.note_input("t1", "lo", 1_001));
         assert!(association.note_input("t1", "\r", 1_002));
-        // Paste with a trailing newline flushes within one chunk.
-        assert!(association.note_input("t1", "second line\r\n", 2_000));
+        // A paste (xterm.js `prepareTextForTerminal` converts pasted
+        // `\r?\n` to `\r` before the bytes ever reach the PTY) flushes
+        // within one chunk at its converted CR.
+        assert!(association.note_input("t1", "second line\r", 2_000));
         // A bare Enter on an empty line never flushes.
         assert!(!association.note_input("t1", "\r", 3_000));
         // Backspace pops the buffered char (the CLI records the edited
@@ -889,6 +926,49 @@ mod tests {
         assert!(
             association.take_pending_submits().is_empty(),
             "take drains the queue"
+        );
+    }
+
+    /// Whole-delta review Major 2: Antigravity documents Ctrl+J as
+    /// inserting a newline INTO the prompt (multiline prompts are a
+    /// normal coding workflow). The capture must flush ONLY on the
+    /// submit key (Enter — the terminal sends CR); LF (Ctrl+J) JOINS the
+    /// current buffer as inline newline content, so the flushed submit
+    /// carries the FULL multi-line prompt and the locator can bind it to
+    /// the transcript's multi-line user record.
+    #[test]
+    fn multiline_ctrl_j_prompt_joins_the_buffer_and_flushes_at_enter() {
+        let (association, _home) = association_for("multiline-capture");
+        association.note_created("t1", "antigravity");
+        // The two-line prompt's bytes: `line1` `\n` (Ctrl+J) `line2` `\r`
+        // (Enter). The Ctrl+J is CONTENT, never a submit: nothing flushes
+        // and the hub's provisional-busy signal (the `flushed` half)
+        // stays quiet for it.
+        assert!(!association.note_input("t1", "line1", 1_000));
+        assert!(
+            !association.note_input("t1", "\n", 1_001),
+            "Ctrl+J joins the buffer as inline newline content, it never submits"
+        );
+        assert!(!association.note_input("t1", "line2", 1_002));
+        // Enter flushes the FULL two-line buffer as ONE submit.
+        assert!(association.note_input("t1", "\r", 1_003));
+        let submits = association.take_pending_submits();
+        assert_eq!(
+            submits,
+            vec![("t1".to_string(), "line1\nline2".to_string(), 1_003)],
+            "the submit payload is the full multi-line prompt"
+        );
+        // A leading Ctrl+J on an empty buffer normalizes away: the
+        // submit's payload trims (the locator's `note_submit`
+        // normalization), so a prompt that starts with a newline binds
+        // the same record text.
+        assert!(!association.note_input("t1", "\nsecond line", 2_000));
+        assert!(association.note_input("t1", "\r", 2_001));
+        let submits = association.take_pending_submits();
+        assert_eq!(
+            submits,
+            vec![("t1".to_string(), "\nsecond line".to_string(), 2_001)],
+            "the raw buffer is captured verbatim (trimmed at the locator)"
         );
     }
 
@@ -1341,6 +1421,78 @@ mod tests {
         assert!(
             associated_at < meta_at,
             "pinned order: associated THEN meta.updated"
+        );
+
+        state.registry.kill("t1");
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&ledger_dir);
+        let _ = std::fs::remove_dir_all(&cwd_dir);
+    }
+
+    /// Whole-delta review Major 2, end to end through the sweep: a pane
+    /// that submits a TWO-LINE prompt (Ctrl+J between the lines — the
+    /// CLI's documented multiline form) binds to the transcript whose
+    /// user record carries BOTH lines. Pre-fix, the capture flushed
+    /// "line1" at the LF byte and "line2" at the Enter byte; the
+    /// locator's window kept only the LAST line ("line2"), which can
+    /// never equal the transcript's full `line1\nline2` user record —
+    /// multiline prompts could never bind.
+    #[tokio::test]
+    async fn multiline_prompt_binds_through_the_drain() {
+        let home = unique_temp_dir("multiline-drain");
+        let ledger_dir = unique_temp_dir("multiline-drain-ledger");
+        let naming = Arc::new(AcquisitionRecordingSink::default());
+        let cwd_dir = unique_temp_dir("multiline-drain-cwd");
+        let cwd = cwd_dir.to_string_lossy().into_owned();
+        let (state, _rx, association) =
+            state_with_association(home.clone(), Some(&ledger_dir), Some(Arc::clone(&naming)));
+
+        spawn_antigravity_pty(&state, "t1", &cwd);
+        association.note_created("t1", "antigravity");
+        state
+            .pane_ledger
+            .record_pending(
+                "t1",
+                "antigravity",
+                Some(&cwd),
+                None,
+                crate::pane_ledger::ProvenanceStamps::default(),
+                now_ms(),
+            )
+            .unwrap();
+
+        // The pane's two-line prompt, byte for byte: `line1`, Ctrl+J
+        // (`\n`), `line2`, Enter (`\r`) — ONE submit carrying the full
+        // multi-line buffer.
+        let t0 = now_ms();
+        assert!(!association.note_input("t1", "line1", t0));
+        assert!(!association.note_input("t1", "\n", t0 + 1));
+        assert!(!association.note_input("t1", "line2", t0 + 2));
+        assert!(association.note_input("t1", "\r", t0 + 3));
+        // The transcript's user record carries BOTH lines (JSON-escaped
+        // newline inside the record text — the CLI's recorded form for a
+        // multiline prompt).
+        plant_transcript(&home, "conv-multiline", &cwd, &[("line1\\nline2", t0 + 10)]);
+
+        tokio::time::sleep(std::time::Duration::from_millis(
+            freshell_sessions::antigravity_locator::ANTIGRAVITY_WINDOW_MS as u64 + 150,
+        ))
+        .await;
+        for _ in 0..40 {
+            drain_and_associate(&state).await;
+            if state.identity.session_ref_for("t1").is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let expected_ref = freshell_protocol::SessionLocator {
+            provider: "antigravity".to_string(),
+            session_id: "conv-multiline".to_string(),
+        };
+        assert_eq!(
+            state.identity.session_ref_for("t1"),
+            Some(expected_ref),
+            "a two-line prompt binds the transcript whose user record carries both lines"
         );
 
         state.registry.kill("t1");
