@@ -3423,6 +3423,461 @@ describe('FreshAgentView', () => {
     }
   })
 
+  it('reveals an OpenCode pane after reconnect when the refreshed revision is unchanged', async () => {
+    vi.useFakeTimers()
+    try {
+      const sessionId = 'ses_reveal_same_revision'
+      const sameRevisionSnapshot = () => ({
+        ...freshopencodeSnapshot('same-revision transcript', 5),
+        threadId: sessionId,
+        sessionId,
+      })
+      const store = createStore()
+      store.dispatch(applyRuntimeOwner({
+        type: 'session.runtimeOwner',
+        provider: 'opencode',
+        sessionId,
+        epoch: 1,
+        generation: 1,
+        ownerKind: 'fresh-agent',
+        operationId: 'same-revision-owner',
+        transition: 'handoff-committed',
+      }))
+      let reconnectHandler: (() => void) | undefined
+      wsMock.onReconnect.mockImplementation((handler: () => void) => {
+        reconnectHandler = handler
+        return () => {}
+      })
+      apiMock.getFreshAgentThreadSnapshot
+        .mockImplementationOnce(() => Promise.resolve(sameRevisionSnapshot()))
+        .mockImplementationOnce(() => Promise.resolve(sameRevisionSnapshot()))
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          createRequestId: 'req-reveal-same-revision',
+          sessionId,
+          sessionRef: { provider: 'opencode', sessionId },
+          status: 'connected',
+        },
+      }))
+
+      const view = render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden />
+        </Provider>,
+      )
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(screen.getByText('same-revision transcript')).toBeInTheDocument()
+      await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+
+      act(() => { reconnectHandler?.() })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+
+      view.rerender(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[1][3]).toMatchObject({ trigger: 'reveal' })
+      expect(screen.getByText('same-revision transcript')).toBeInTheDocument()
+      expect(screen.queryByTestId('fresh-agent-stale-transcript')).not.toBeInTheDocument()
+      expect(screen.queryByRole('status', { name: 'Refreshing conversation' })).not.toBeInTheDocument()
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      vi.useRealTimers()
+    }
+  })
+
+  it.each(['event-before-reconnect', 'event-after-reconnect'] as const)(
+    'keeps OpenCode reveal strict when transcript invalidation is %s',
+    async (order) => {
+      vi.useFakeTimers()
+      try {
+        const sessionId = 'ses_strict_reveal'
+        const snapshotAt = (revision: number, text: string) => ({
+          ...freshopencodeSnapshot(text, revision),
+          threadId: sessionId,
+          sessionId,
+        })
+        const store = createStore()
+        store.dispatch(applyRuntimeOwner({
+          type: 'session.runtimeOwner',
+          provider: 'opencode',
+          sessionId,
+          epoch: 1,
+          generation: 1,
+          ownerKind: 'fresh-agent',
+          operationId: `strict-${order}`,
+          transition: 'handoff-committed',
+        }))
+        let reconnectHandler: (() => void) | undefined
+        let messageHandler: ((message: Record<string, unknown>) => void) | undefined
+        wsMock.onReconnect.mockImplementation((handler: () => void) => {
+          reconnectHandler = handler
+          return () => {}
+        })
+        wsMock.onMessage.mockImplementation((handler) => {
+          messageHandler = handler
+          return () => {}
+        })
+        apiMock.getFreshAgentThreadSnapshot
+          .mockImplementationOnce(() => Promise.resolve(snapshotAt(5, 'original transcript')))
+          .mockImplementationOnce(() => Promise.resolve(snapshotAt(5, 'same-revision transcript')))
+          .mockImplementationOnce(() => Promise.resolve(snapshotAt(6, 'updated transcript')))
+        store.dispatch(initLayout({
+          tabId: 'tab-1',
+          paneId: 'pane-1',
+          content: {
+            kind: 'fresh-agent',
+            sessionType: 'freshopencode',
+            provider: 'opencode',
+            createRequestId: `req-strict-${order}`,
+            sessionId,
+            sessionRef: { provider: 'opencode', sessionId },
+            status: 'connected',
+          },
+        }))
+
+        const view = render(
+          <Provider store={store}>
+            <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden />
+          </Provider>,
+        )
+        await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+        await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+
+        const invalidateTranscript = () => act(() => messageHandler?.({
+          type: 'freshAgent.event',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          sessionId,
+          event: { type: 'freshAgent.session.changed', sessionId },
+        }))
+        const reconnect = async () => {
+          await act(async () => {
+            reconnectHandler?.()
+            await Promise.resolve()
+          })
+        }
+        if (order === 'event-before-reconnect') {
+          invalidateTranscript()
+          await reconnect()
+        } else {
+          await reconnect()
+          invalidateTranscript()
+        }
+        await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+
+        view.rerender(
+          <Provider store={store}>
+            <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+          </Provider>,
+        )
+        await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+        expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+        expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[1][3]).toMatchObject({ trigger: 'reveal' })
+        await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+        expect(screen.getByRole('status', { name: 'Refreshing conversation' })).toBeInTheDocument()
+        expect(screen.getByTestId('fresh-agent-stale-transcript')).toHaveAttribute('aria-hidden', 'true')
+        await act(async () => { await vi.advanceTimersByTimeAsync(1_000) })
+        await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+        expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(3)
+        expect(screen.getByText('updated transcript')).toBeInTheDocument()
+        expect(screen.queryByRole('status', { name: 'Refreshing conversation' })).not.toBeInTheDocument()
+      } finally {
+        cleanup()
+        resetSnapshotSchedulerForTests()
+        vi.useRealTimers()
+      }
+    },
+  )
+
+  it('keeps an OpenCode reconnect reveal blocked by a lower revision, then clears at the base revision', async () => {
+    vi.useFakeTimers()
+    try {
+      const sessionId = 'ses_reveal_lower_revision'
+      const snapshotAt = (revision: number, text: string) => ({
+        ...freshopencodeSnapshot(text, revision),
+        threadId: sessionId,
+        sessionId,
+      })
+      const store = createStore()
+      store.dispatch(applyRuntimeOwner({
+        type: 'session.runtimeOwner',
+        provider: 'opencode',
+        sessionId,
+        epoch: 1,
+        generation: 1,
+        ownerKind: 'fresh-agent',
+        operationId: 'lower-revision-owner',
+        transition: 'handoff-committed',
+      }))
+      let reconnectHandler: (() => void) | undefined
+      wsMock.onReconnect.mockImplementation((handler: () => void) => {
+        reconnectHandler = handler
+        return () => {}
+      })
+      apiMock.getFreshAgentThreadSnapshot
+        .mockImplementationOnce(() => Promise.resolve(snapshotAt(5, 'base transcript')))
+        .mockImplementationOnce(() => Promise.resolve(snapshotAt(4, 'older transcript')))
+        .mockImplementationOnce(() => Promise.resolve(snapshotAt(5, 'same-revision transcript')))
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          createRequestId: 'req-reveal-lower-revision',
+          sessionId,
+          sessionRef: { provider: 'opencode', sessionId },
+          status: 'connected',
+        },
+      }))
+
+      const view = render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden />
+        </Provider>,
+      )
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+      act(() => { reconnectHandler?.() })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      view.rerender(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[1][3]).toMatchObject({ trigger: 'reveal' })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(screen.getByRole('status', { name: 'Refreshing conversation' })).toBeInTheDocument()
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_000) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(3)
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[2][3]).toMatchObject({ trigger: 'reveal' })
+      expect(screen.queryByRole('status', { name: 'Refreshing conversation' })).not.toBeInTheDocument()
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps a hidden OpenCode accepted send strict until a newer revision arrives', async () => {
+    vi.useFakeTimers()
+    try {
+      const sessionId = 'ses_hidden_send_strict'
+      const snapshotAt = (revision: number, text: string) => ({
+        ...freshopencodeSnapshot(text, revision),
+        threadId: sessionId,
+        sessionId,
+      })
+      const store = createStore()
+      let messageHandler: ((message: Record<string, unknown>) => void) | undefined
+      wsMock.onMessage.mockImplementation((handler) => {
+        messageHandler = handler
+        return () => {}
+      })
+      apiMock.getFreshAgentThreadSnapshot
+        .mockImplementationOnce(() => Promise.resolve(snapshotAt(5, 'base transcript')))
+        .mockImplementationOnce(() => Promise.resolve({ ...snapshotAt(5, 'same-revision transcript'), status: 'running' }))
+        .mockImplementationOnce(() => Promise.resolve({ ...snapshotAt(6, 'updated transcript'), status: 'running' }))
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          createRequestId: 'req-hidden-send-strict',
+          sessionId,
+          sessionRef: { provider: 'opencode', sessionId },
+          status: 'connected',
+        },
+      }))
+
+      const view = render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(screen.getByText('base transcript')).toBeInTheDocument()
+      fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+        target: { value: 'Accepted while hidden' },
+      })
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      const send = sentFreshAgentMessages('freshAgent.send').at(-1)
+      expect(send?.requestId).toEqual(expect.any(String))
+      const requestId = String(send?.requestId)
+
+      view.rerender(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden />
+        </Provider>,
+      )
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      act(() => messageHandler?.({
+        type: 'freshAgent.send.accepted',
+        requestId,
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        sessionId,
+      }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+
+      view.rerender(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[1][3]).toMatchObject({ trigger: 'reveal' })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(screen.getByRole('status', { name: 'Refreshing conversation' })).toBeInTheDocument()
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_000) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(3)
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[2][3]).toMatchObject({ trigger: 'reveal' })
+      expect(screen.getByText('updated transcript')).toBeInTheDocument()
+      expect(screen.queryByRole('status', { name: 'Refreshing conversation' })).not.toBeInTheDocument()
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      vi.useRealTimers()
+    }
+  })
+
+  it('replaces a pending OpenCode reveal after an owned send is accepted and keeps it strict', async () => {
+    vi.useFakeTimers()
+    try {
+      const sessionId = 'ses_reveal_send_overlap'
+      const snapshotAt = (revision: number, text: string) => ({
+        ...freshopencodeSnapshot(text, revision),
+        threadId: sessionId,
+        sessionId,
+      })
+      const store = createStore()
+      store.dispatch(applyRuntimeOwner({
+        type: 'session.runtimeOwner',
+        provider: 'opencode',
+        sessionId,
+        epoch: 1,
+        generation: 1,
+        ownerKind: 'fresh-agent',
+        operationId: 'reveal-send-overlap-owner',
+        transition: 'handoff-committed',
+      }))
+      let reconnectHandler: (() => void) | undefined
+      let messageHandler: ((message: Record<string, unknown>) => void) | undefined
+      let resolveOldReveal!: (snapshot: unknown) => void
+      let resolveReplacementReveal!: (snapshot: unknown) => void
+      apiMock.getFreshAgentThreadSnapshot
+        .mockImplementationOnce(() => Promise.resolve(snapshotAt(5, 'base transcript')))
+        .mockImplementationOnce(() => new Promise((resolve) => { resolveOldReveal = resolve }))
+        .mockImplementationOnce(() => new Promise((resolve) => { resolveReplacementReveal = resolve }))
+        .mockImplementationOnce(() => Promise.resolve({ ...snapshotAt(6, 'updated transcript'), status: 'running' }))
+      wsMock.onReconnect.mockImplementation((handler: () => void) => {
+        reconnectHandler = handler
+        return () => {}
+      })
+      wsMock.onMessage.mockImplementation((handler) => {
+        messageHandler = handler
+        return () => {}
+      })
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          createRequestId: 'req-reveal-send-overlap',
+          sessionId,
+          sessionRef: { provider: 'opencode', sessionId },
+          status: 'connected',
+        },
+      }))
+
+      const view = render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden />
+        </Provider>,
+      )
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+      act(() => { reconnectHandler?.() })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      view.rerender(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[1][3]).toMatchObject({ trigger: 'reveal' })
+
+      fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+        target: { value: 'Send during reveal refresh' },
+      })
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      const send = sentFreshAgentMessages('freshAgent.send').at(-1)
+      expect(send?.requestId).toEqual(expect.any(String))
+      const requestId = String(send?.requestId)
+      act(() => messageHandler?.({
+        type: 'freshAgent.send.accepted',
+        requestId,
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        sessionId,
+      }))
+
+      await act(async () => {
+        resolveOldReveal({ ...snapshotAt(6, 'stale pre-send response'), status: 'running' })
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByRole('status', { name: 'Refreshing conversation' })).toBeInTheDocument()
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(3)
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[2][3]).toMatchObject({ trigger: 'reveal' })
+
+      await act(async () => {
+        resolveReplacementReveal({ ...snapshotAt(5, 'same-revision transcript'), status: 'running' })
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByRole('status', { name: 'Refreshing conversation' })).toBeInTheDocument()
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_000) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(4)
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[3][3]).toMatchObject({ trigger: 'reveal' })
+      expect(screen.getByText('updated transcript')).toBeInTheDocument()
+      expect(screen.queryByRole('status', { name: 'Refreshing conversation' })).not.toBeInTheDocument()
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      vi.useRealTimers()
+    }
+  })
+
   it('attaches materialized FreshOpenCode panes with durable route metadata on mount and reconnect', async () => {
     const store = createStore()
     let reconnectHandler: (() => void) | undefined

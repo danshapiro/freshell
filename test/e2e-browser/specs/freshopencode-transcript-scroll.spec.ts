@@ -1,5 +1,7 @@
-import { expect, test, type Page } from '../helpers/fixtures.js'
+import { createFreshE2ePage, expect, test, type Page } from '../helpers/fixtures.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { selectShellFromPicker, TestHarness } from '../helpers/test-harness.js'
+import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 
 test.use({ viewport: { width: 1280, height: 720 } })
@@ -375,5 +377,97 @@ test.describe('Freshopencode transcript scrolling', () => {
     expect(afterReveal.scrollHeight).toBeGreaterThan(afterReveal.clientHeight)
     expect(afterReveal.scroller.bottom).toBeLessThanOrEqual(afterReveal.main.bottom + 1)
     expect(afterReveal.scroller.bottom).toBeLessThanOrEqual(afterReveal.pane.bottom + 1)
+  })
+
+  test('reveals the OpenCode transcript after a real reconnect with an unchanged revision', async ({ browser, serverInfo }) => {
+    const { context, page } = await createFreshE2ePage(browser, serverInfo)
+    const harness = new TestHarness(page)
+    const terminal = new TerminalHelper(page)
+    let helloCount = 0
+    try {
+      // The synthetic pane is local to this browser, so the test negotiates
+      // without pane reconciliation. Install the transport before the first
+      // socket opens so it can keep that same pane through the later reconnect.
+      await context.routeWebSocket((url) => url.pathname === '/ws', (client) => {
+        const upstream = client.connectToServer()
+        client.onMessage((message) => {
+          let outgoing = message
+          try {
+            const frame = JSON.parse(String(message)) as Record<string, unknown>
+            if (frame.type === 'hello' && frame.capabilities && typeof frame.capabilities === 'object') {
+              helloCount += 1
+              outgoing = JSON.stringify({
+                ...frame,
+                capabilities: {
+                  ...(frame.capabilities as Record<string, unknown>),
+                  paneReconcileV1: false,
+                  paneReconcileFreshAgentV1: false,
+                },
+              })
+            }
+          } catch {
+            // Forward non-JSON WebSocket messages unchanged.
+          }
+          upstream.send(outgoing)
+        })
+        upstream.onMessage((message) => client.send(message))
+        client.onClose((code, reason) => void upstream.close({ code, reason }).catch(() => {}))
+        upstream.onClose((code, reason) => void client.close({ code, reason }).catch(() => {}))
+      })
+
+      await routeFreshopencodeSetupApis(page)
+      const snapshot = await routeFreshopencodeSnapshot(page, makeLongTranscriptTurns())
+      await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+      await selectShellFromPicker(page)
+      await terminal.waitForTerminal()
+      await enableFreshopencode(page)
+      await createFreshopencodePane(page)
+
+      const pane = page.locator('[data-context="fresh-agent"][data-session-type="freshopencode"]').last()
+      const transcript = pane.locator('[data-context="fresh-agent-transcript"]')
+      await expect(transcript).toBeVisible({ timeout: 15_000 })
+      await expect(transcript.getByText(FINAL_TRANSCRIPT_MARKER)).toBeVisible({ timeout: 15_000 })
+
+      const freshTabId = await harness.getActiveTabId()
+      expect(freshTabId).toBeTruthy()
+      const hiddenTabId = await createTabViaRest(serverInfo)
+      await harness.waitForTabCount(2)
+      await revealTab(page, hiddenTabId)
+      await expect.poll(async () => harness.getActiveTabId(), { timeout: 10_000 }).toBe(hiddenTabId)
+      await expect(page.locator('[data-tab-content-id="' + freshTabId + '"]')).toHaveClass(/tab-hidden/)
+
+      const previousLastReadyAt = await harness.getLastReadyAt()
+      const attachCountBeforeReconnect = await page.evaluate(() => (
+        window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() as Array<Record<string, unknown>> | undefined
+      )?.filter((message) => message.type === 'freshAgent.attach').length ?? 0)
+      await harness.forceDisconnect()
+      await harness.waitForConnectionAfter(previousLastReadyAt)
+      expect(helloCount, 'the test transport must observe a reconnect hello').toBeGreaterThan(1)
+      const survivingSessionId = await page.evaluate((targetTabId) => {
+        const state = window.__FRESHELL_TEST_HARNESS__?.getState()
+        const findFreshLeaf = (node: any): any => {
+          if (!node) return undefined
+          if (node.type === 'leaf' && node.content?.kind === 'fresh-agent' && node.content.sessionType === 'freshopencode') return node
+          return (node.children ?? []).map(findFreshLeaf).find(Boolean)
+        }
+        return findFreshLeaf(state?.panes?.layouts?.[targetTabId])?.content?.sessionId
+      }, freshTabId!)
+      expect(survivingSessionId, 'the hidden fixture must retain the target OpenCode session').toBe(SESSION_ID)
+      await expect.poll(async () => (await page.evaluate(() => (
+        window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() as Array<Record<string, unknown>> | undefined
+      )?.filter((message) => message.type === 'freshAgent.attach').length ?? 0))).toBeGreaterThan(attachCountBeforeReconnect)
+      expect(await snapshot.getRevealRefreshRequests()).toBe(0)
+
+      await revealTab(page, freshTabId!)
+      await expect.poll(async () => harness.getActiveTabId(), { timeout: 10_000 }).toBe(freshTabId)
+      await expect.poll(() => snapshot.getRevealRefreshRequests(), { timeout: 15_000 }).toBeGreaterThan(0)
+      await expect(transcript.getByText(FINAL_TRANSCRIPT_MARKER)).toBeVisible({ timeout: 15_000 })
+      await expect(page.getByRole('status', { name: 'Refreshing conversation' })).toHaveCount(0)
+    } finally {
+      await harness.killAllTerminals(serverInfo).catch(() => {})
+      await context.close()
+    }
   })
 })
