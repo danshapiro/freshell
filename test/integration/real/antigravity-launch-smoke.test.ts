@@ -13,7 +13,10 @@
 //   default suite — the whole test/integration/real/ tree is excluded from the
 //   default config without the opt-in.
 //
-//   To run the full turn:
+//   To run the full turn (CLI settings precondition: the real CLI's settings
+//   must select API-key auth — `modelProvider: "gemini"` — per the plan's
+//   Provider Contract Record, or the first paid attempt fails on CLI setup
+//   rather than a contract fact):
 //     FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 GEMINI_API_KEY=... \
 //       pnpm run test:vitest run test/integration/real/antigravity-launch-smoke.test.ts \
 //       --config config/vitest/vitest.config.ts
