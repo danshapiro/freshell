@@ -712,6 +712,28 @@ enum ResumeOpencodeError {
 }
 
 impl OpencodeSession {
+    /// The session's turn-derived status -- the ONE derivation every surface
+    /// reporting a freshopencode session's live status must use: the
+    /// registered `turn_task` is unfinished => `running`, else `idle`.
+    /// Today's consumers: the existing-session attach broadcast (both its
+    /// arms) and, through [`turn_status_probe`], the durable snapshot
+    /// route's live-status overlay (`get_opencode_snapshot`). Like the
+    /// attach labels, this reads `is_finished()` alone (the `settling`
+    /// refinement is the send-during-compact drain gate's own concern,
+    /// documented on [`TurnTask::settling`]).
+    fn turn_derived_status(&self) -> &'static str {
+        let running = self
+            .turn_task
+            .as_ref()
+            .map(|t| !t.is_finished())
+            .unwrap_or(false);
+        if running {
+            "running"
+        } else {
+            "idle"
+        }
+    }
+
     fn new(
         placeholder_id: String,
         cwd: Option<String>,
@@ -823,6 +845,36 @@ enum IdleVerdict {
     /// The live poll could not answer — transient; retry, never conclude.
     PollFailed,
 }
+/// The WS lane's session map ([`FreshOpencodeState::sessions`]): keyed by
+/// BOTH the placeholder id and (once materialized) the durable `ses_*` id —
+/// both aliases of the SAME record.
+type OpencodeSessions = Arc<TokioMutex<HashMap<String, Arc<TokioMutex<OpencodeSession>>>>>;
+
+/// The WS lane's turn-status probe handed to the shared
+/// [`crate::FreshAgentState`] (registered by [`FreshOpencodeState::new`]):
+/// resolves a session id -- placeholder OR durable `ses_*`, the map is keyed
+/// by both -- to the WS session record's turn-derived status via
+/// [`OpencodeSession::turn_derived_status`]. `None` when this lane holds no
+/// record for the id: the snapshot route then keeps its honest idle instead
+/// of guessing. Lock order follows the lane's discipline (the sessions-map
+/// guard is never held across the per-session lock).
+fn turn_status_probe(sessions: &OpencodeSessions) -> crate::OpencodeTurnStatusProbe {
+    let sessions = sessions.clone();
+    Arc::new(move |session_id: &str| {
+        let sessions = sessions.clone();
+        let session_id = session_id.to_string();
+        Box::pin(async move {
+            let session_arc = {
+                let guard = sessions.lock().await;
+                guard.get(&session_id).cloned()
+            };
+            let session_arc = session_arc?;
+            let session = session_arc.lock().await;
+            Some(session.turn_derived_status())
+        })
+    })
+}
+
 impl FreshOpencodeState {
     /// b8ke e3 post-cap F2: test seam — retain a condemned-session
     /// witness (the kill path's retained accepted-daemon-turn evidence).
@@ -859,9 +911,26 @@ impl FreshOpencodeState {
     /// Build the state around an existing [`FreshAgentState`] (REUSED, not duplicated),
     /// so this slice and the REST tabs slice share exactly one `opencode serve` sidecar.
     pub fn new(fresh_agent: FreshAgentState) -> Self {
+        let sessions = Arc::new(TokioMutex::new(HashMap::new()));
+        // Wire this lane's turn-status probe into the SHARED REST state so the
+        // durable snapshot route (`get_opencode_snapshot`) reports the WS
+        // session record's actual turn-derived status -- the same derivation the
+        // attach broadcast asserts -- instead of a hardcoded idle. The probe
+        // captures ONLY the sessions map (never the states), so no reference
+        // cycle forms. Set-once: a second WS lane over the same REST state
+        // keeps the FIRST lane's records (one lane per state is the
+        // construction contract; the collision is WARN-observable).
+        if fresh_agent
+            .set_opencode_turn_status_probe(turn_status_probe(&sessions))
+            .is_err()
+        {
+            tracing::warn!(target: "freshell_freshagent::opencode",
+                "freshagent.opencode.turn_status_probe_already_installed: a second WS lane \
+                 over the same FreshAgentState keeps the first lane's probe");
+        }
         Self {
             fresh_agent,
-            sessions: Arc::new(TokioMutex::new(HashMap::new())),
+            sessions,
             create_dedup: Arc::new(FreshAgentCreateDedup::new()),
             identity_sink: Arc::new(std::sync::OnceLock::new()),
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
@@ -6917,12 +6986,7 @@ impl FreshOpencodeState {
             // first, the durable attach path below owns the guarded bridge restart.
             let session = arc.lock().await;
             if session.real_session_id.is_none() {
-                let running = session
-                    .turn_task
-                    .as_ref()
-                    .map(|task| !task.is_finished())
-                    .unwrap_or(false);
-                let status = if running { "running" } else { "idle" };
+                let status = session.turn_derived_status();
                 self.broadcast(&event_frame(
                     &session.placeholder_id,
                     snapshot_event(&session.placeholder_id, status),
@@ -7161,7 +7225,7 @@ impl FreshOpencodeState {
             },
         };
 
-        let (status_session_id, running, real_session_id) = {
+        let (status_session_id, status, real_session_id) = {
             let mut session = session_arc.lock().await;
 
             // Ensure the serve-SSE bridge is running (restart it if it died) --
@@ -7196,12 +7260,8 @@ impl FreshOpencodeState {
                 .real_session_id
                 .clone()
                 .unwrap_or_else(|| session.placeholder_id.clone());
-            let running = session
-                .turn_task
-                .as_ref()
-                .map(|t| !t.is_finished())
-                .unwrap_or(false);
-            (status_session_id, running, session.real_session_id.clone())
+            let status = session.turn_derived_status();
+            (status_session_id, status, session.real_session_id.clone())
         };
 
         // Attach addressed by the PLACEHOLDER id of an already-materialized session:
@@ -7226,7 +7286,6 @@ impl FreshOpencodeState {
             }
         }
 
-        let status = if running { "running" } else { "idle" };
         self.broadcast(&event_frame(
             &status_session_id,
             snapshot_event(&status_session_id, status),
@@ -13129,6 +13188,113 @@ mod tests {
             .await
             .expect_err("unknown ses_* id");
         assert!(matches!(err, crate::OpencodeSnapshotError::NotFound));
+    }
+
+    /// Root-cause fix for the rewind-status defect family (delta round 2): the
+    /// durable snapshot route (`GET /api/fresh-agent/threads/freshopencode/opencode/:id`)
+    /// must report the session's ACTUAL turn-derived status -- the SAME derivation
+    /// the existing-session attach broadcast asserts (the WS session record's
+    /// `turn_task` unfinished => running) -- never a hardcoded idle. A mid-turn
+    /// refetch answering a false idle is the materialization blip that forced
+    /// every client-side timing gate in this family (the e1r2 report's Deviation 2:
+    /// the refetch answered idle before the provider persisted any row); with the
+    /// truthful status the pane's busy state survives the refetch and the first
+    /// message's honest "still saving" hover holds.
+    #[tokio::test]
+    async fn get_opencode_snapshot_reports_the_ws_record_turn_status_while_a_turn_runs() {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: Arc::new(RealisticServeHttp::new()),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        // The WS lane over the SHARED FreshAgentState -- its construction wires
+        // the lane's turn-status probe into the REST state the route reads.
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-status"), None).await;
+        let placeholder = "freshopencode-req-status";
+        st.handle_send(send_msg(placeholder, "hello")).await;
+        let durable_id = {
+            let guard = st.sessions.lock().await;
+            let session_arc = guard.get(placeholder).cloned().expect("session exists");
+            let s = session_arc.lock().await;
+            s.real_session_id.clone().expect("materialized after send")
+        };
+        assert!(durable_id.starts_with("ses_"));
+
+        // The running-turn shape every turn registration produces (a detached,
+        // not-yet-finished drive task) -- the record the attach broadcast reads.
+        {
+            let guard = st.sessions.lock().await;
+            let session_arc = guard.get(placeholder).expect("session tracked").clone();
+            session_arc.lock().await.turn_task = Some(TurnTask {
+                kind: TurnTaskKind::Send,
+                handle: tokio::spawn(std::future::pending::<()>()),
+                compact_settled_rx: None,
+                settling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            });
+        }
+
+        // The durable arm -- the pane's materialization refetch -- must answer
+        // the record's turn-derived status, not the built snapshot's idle.
+        let snapshot = st
+            .fresh_agent
+            .get_opencode_snapshot(&durable_id, None)
+            .await
+            .expect("materialized session snapshot builds");
+        assert_eq!(
+            snapshot["status"],
+            json!("running"),
+            "the durable snapshot route must answer the WS record's running status mid-turn"
+        );
+        // The placeholder arm (a pane that has not folded the materialized
+        // frame yet) reads the SAME record -- the attach broadcast's own rule.
+        let placeholder_snapshot = st
+            .fresh_agent
+            .get_opencode_snapshot(placeholder, None)
+            .await
+            .expect("placeholder snapshot builds");
+        assert_eq!(
+            placeholder_snapshot["status"],
+            json!("running"),
+            "the placeholder arm mirrors the same WS record's status"
+        );
+
+        // The turn settles: the SAME record now derives idle, and the route
+        // reports it (idle when idle -- the derivation's other edge).
+        st.settle_local_turn_task_for_test(&durable_id).await;
+        let settled = st
+            .fresh_agent
+            .get_opencode_snapshot(&durable_id, None)
+            .await
+            .expect("settled session snapshot builds");
+        assert_eq!(settled["status"], json!("idle"));
+
+        // No WS record for the id (the REST-lane-materialized shape -- the
+        // documented product gap): keep today's honest idle instead of
+        // guessing. The serve still knows the session; the map does not.
+        st.sessions.lock().await.clear();
+        let no_record = st
+            .fresh_agent
+            .get_opencode_snapshot(&durable_id, None)
+            .await
+            .expect("serve-known session still builds without a WS record");
+        assert_eq!(
+            no_record["status"],
+            json!("idle"),
+            "no WS record keeps the honest idle -- the route never guesses"
+        );
     }
 
     #[tokio::test]

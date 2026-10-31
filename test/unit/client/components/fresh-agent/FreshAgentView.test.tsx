@@ -4978,10 +4978,14 @@ describe('FreshAgentView', () => {
         return () => {}
       })
       const promptText = 'First live-journey prompt'
-      // The real first-send journey: the placeholder snapshot is empty; the
-      // materialization refetch answers BEFORE the provider persisted any
-      // rows (and the durable snapshot route hardcodes status 'idle'); the
-      // busy status frame then drives the row-landing refetch.
+      // The first-send journey's idle-snapshot shape the client must keep
+      // tolerating: the placeholder snapshot is empty and the materialization
+      // refetch answers BEFORE the provider persisted any rows with status
+      // 'idle' — the truthful-status route answers the WS record's running
+      // status for a bridged session now, but an idle answer remains
+      // reachable (a no-WS-record session, a legacy server), so the busy
+      // state must survive it; the busy status frame then drives the
+      // row-landing refetch.
       let durableTurns: Array<Record<string, unknown>> = []
       apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => ({
         status: 'idle',
