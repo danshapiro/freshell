@@ -46,6 +46,7 @@ else if (args[0] === 'volume' && args[1] === 'inspect') {
   const observed = name === volume ? { ...labels, ...(mode === 'foreign' ? {'com.freshell.cache.owner':'someone-else'} : {}) } : {};
   console.log(JSON.stringify(args.includes('--format') ? observed : [{ Name: name, Labels: observed }]));
 } else if (args[0] === 'volume' && args[1] === 'ls') console.log(volume);
+else if (args[0] === 'network' && args[1] === 'inspect' && args[2] === 'freshell-sandbox') console.log('[]');
 else if (args[0] === 'run') console.log(JSON.stringify({verified:true}));
 else if (args[0] !== 'ps') process.exit(2);
 `)
@@ -102,8 +103,14 @@ it('dispatches a verified native contract with both its seccomp policy and label
     const result = f.run(true)
     expect(result.status, result.stderr).toBe(0)
     const runs = result.calls.filter(args => args[0] === 'run')
-    expect(runs).toHaveLength(2)
-    const runtime = runs[1]
+    expect(runs).toHaveLength(4)
+    expect(runs.filter(args => args.includes('--verify-prepared'))).toHaveLength(2)
+    const preparation = runs.find(args => args.at(-1) === 'if [ -f Cargo.lock ]; then cargo fetch --locked; fi')!
+    expect(preparation).toBeDefined()
+    expect(preparation.slice(preparation.indexOf('--network'), preparation.indexOf('--network') + 2)).toEqual(['--network', 'freshell-sandbox'])
+    const workloads = runs.filter(args => args.includes('FRESHELL_SANDBOX_MODE=runtime-suite'))
+    expect(workloads).toHaveLength(1)
+    const runtime = workloads[0]
     expect(runtime).toContain(`seccomp=${f.root}/.runtime-build/codex-contract/codex-policy.json`)
     expect(runtime).toContain('FRESHELL_CODEX_CONTRACT_POLICY=prepared')
     for (const destination of ['/workspace/target', '/freshell-test-artifacts']) {
