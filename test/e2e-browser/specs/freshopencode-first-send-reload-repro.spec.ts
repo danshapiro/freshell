@@ -373,7 +373,12 @@ test.describe('Freshopencode first-message code checkpoint', () => {
 
 test.describe('Freshopencode restored-echo rewind honesty', () => {
   test('a reload inside the echo window shows the restored echo still saving, then the enriched row enabled after the settle', async ({ page }) => {
-    test.setTimeout(240_000)
+    // The journey boots a server, creates a pane, sends, reloads inside the
+    // echo window, reconnects, and settles — ~30-60s on a calm box, but
+    // this is a shared machine: under another tenant's full-core load the
+    // same journey has consumed >240s, so keep the sibling leg's 300s
+    // headroom rather than flaking on contention.
+    test.setTimeout(300_000)
     const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-freshopencode-restored-echo-'))
     const binDir = path.join(sharedRoot, 'bin')
     const logsDir = path.join(sharedRoot, 'logs')
@@ -440,6 +445,32 @@ test.describe('Freshopencode restored-echo rewind honesty', () => {
           deliver()
         })
       })
+      // The pane's own HTTP snapshot pipeline is NOT gated by the WS hold:
+      // a thread-snapshot request that left before the send (part of the
+      // pane's normal boot) can have its response APPLIED after the arm —
+      // an idle answer lawfully clears the optimistic running status (the
+      // busy broadcast that would arm the record-asserts-busy guard is
+      // itself held), and the pagehide persist then seals status idle.
+      // Own the endpoint's delivery exactly like the WS hold owns frames:
+      // fetch upstream immediately, but fulfill only once the hold
+      // releases — the dying page can never apply a post-arm snapshot,
+      // and the reloaded page's post-release fetch flows untouched.
+      const heldThreadResponses: Array<() => void> = []
+      await page.route('**/api/fresh-agent/threads/**', async (route) => {
+        const response = await route.fetch().catch(() => null)
+        if (!response) {
+          await route.abort().catch(() => {})
+          return
+        }
+        const fulfill = () => {
+          route.fulfill({ response }).catch(() => {})
+        }
+        if (holdServerFrames) {
+          heldThreadResponses.push(fulfill)
+          return
+        }
+        await fulfill()
+      })
       await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
       const harness = new TestHarness(page)
       await harness.waitForHarness()
@@ -456,6 +487,21 @@ test.describe('Freshopencode restored-echo rewind honesty', () => {
         window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
       })
 
+      // Arm the frame hold BEFORE the Send click: the server can deliver
+      // the send's follow-up frames — the request-keyed checkpoint
+      // outcome, the accepted frame, the status broadcasts — in the same
+      // breath as the send itself, so arming only AFTER awaiting the
+      // click races those frames into the dying page's store, and the
+      // pagehide persist would seal a BOUND outcome into the pane
+      // content (the reloaded pane would then show the earned-enabled
+      // hover, never the unbound window this leg pins). Arming pre-click
+      // is safe by the hold's own semantics: only server->client frames
+      // buffer — the client->server direction always passes, so the
+      // composer send itself still reaches the server and the server
+      // really runs the capture, forwards the prompt, and parks the turn
+      // at the gate — and the pane is idle until the click, so nothing
+      // material is held from before the send.
+      holdServerFrames = true
       await sendFreshAgentPrompt(page, prompt)
       // From the send on, no server frame may update the store: the
       // optimistic echo row is the displayed copy of the in-flight first
@@ -465,7 +511,6 @@ test.describe('Freshopencode restored-echo rewind honesty', () => {
       // EXACTLY this state: the optimistic echo plus the optimistic
       // running status, with no checkpoint outcome bound under the send's
       // request.
-      holdServerFrames = true
       await page.waitForFunction(() => {
         const state = window.__FRESHELL_TEST_HARNESS__?.getState() as any
         const findFreshOpencode = (node: any): any => {
@@ -517,11 +562,13 @@ test.describe('Freshopencode restored-echo rewind honesty', () => {
 
       // Reconnect the page: the held frames deliver (the original page's
       // die with its socket; the reloaded page's ready frame and everything
-      // after it flow), and the server's truth reaches the pane — the
-      // record's current status, the capture's outcome, the
-      // materialization, and the parked turn's busy window.
+      // after it flow), the held thread-snapshot responses fulfill (the
+      // dying page's die with its routes), and the server's truth reaches
+      // the pane — the record's current status, the capture's outcome,
+      // the materialization, and the parked turn's busy window.
       holdServerFrames = false
       for (const deliver of heldFrames.splice(0)) deliver()
+      for (const fulfill of heldThreadResponses.splice(0)) fulfill()
       await harness.waitForConnection()
       // Parked-ness (the live legs' discipline): the fake received the
       // prompt and never emitted the turn's idle — the still-saving
@@ -548,6 +595,259 @@ test.describe('Freshopencode restored-echo rewind honesty', () => {
       await expect(userTurn).toHaveCount(1, { timeout: 30_000 })
       await userTurn.hover()
       const rewind = userTurn.getByRole('button', { name: 'Rewind code to here' })
+      await expect(rewind).toBeEnabled({ timeout: 30_000 })
+    } finally {
+      await server.stop().catch(() => {})
+      await fsp.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+})
+
+test.describe('Freshopencode restored-echo send-boundary', () => {
+  test('a reload inside the echo window of a second message keeps the restored echo still saving beside the earlier row', async ({ page }) => {
+    test.setTimeout(300_000)
+    const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-freshopencode-second-message-'))
+    const binDir = path.join(sharedRoot, 'bin')
+    const logsDir = path.join(sharedRoot, 'logs')
+    const auditLogPath = path.join(sharedRoot, 'fake-opencode-audit.jsonl')
+    const sharedOpencodeDataDir = path.join(sharedRoot, 'opencode-data')
+    const cwd = path.join(sharedRoot, 'project')
+    const promptGatePath = path.join(sharedRoot, 'prompt-gate')
+    const firstPrompt = `playwright boundary first prompt ${Date.now()}`
+    const secondPrompt = `playwright boundary second prompt ${Date.now()}`
+    await fsp.mkdir(cwd, { recursive: true })
+    // A Git workspace cwd so the code checkpoint capture succeeds (the
+    // enabled rewind hovers at the journey's ends require available
+    // captures).
+    await fsp.writeFile(path.join(cwd, 'tracked.txt'), 'fixture workspace file\n')
+    execFileSync('git', ['init', cwd], { stdio: 'ignore' })
+    execFileSync('git', ['-C', cwd, 'config', 'user.email', 'fixture@example.invalid'], { stdio: 'ignore' })
+    execFileSync('git', ['-C', cwd, 'config', 'user.name', 'Freshell fixture'], { stdio: 'ignore' })
+    execFileSync('git', ['-C', cwd, 'add', '--', 'tracked.txt'], { stdio: 'ignore' })
+    execFileSync('git', ['-C', cwd, 'commit', '-m', 'fixture'], { stdio: 'ignore' })
+    await installFakeOpencode(binDir)
+
+    // The flag-less harness (the durable ses_* id must materialize for
+    // the first turn) with the prompt gate holding gated turns in flight
+    // AND the deferred-rows knob moving each gated turn's row persist to
+    // gate release — so the parked second turn's snapshot holds ONLY the
+    // first turn's rows. That is what makes the second-message window
+    // assertable: the reloaded pane's snapshot lands the earlier row
+    // without landing the second row (a real provider's history write
+    // lags the running turn the same way), so the restored echo renders
+    // BESIDE the earlier row instead of clearing at its own row.
+    const server = new RustServer(createServerOptions({
+      binDir,
+      auditLogPath,
+      logsDir,
+      sharedOpencodeDataDir,
+      hangSessionCreate: false,
+      extraEnv: {
+        FAKE_OPENCODE_HOLD_PROMPT_GATE_PATH: promptGatePath,
+        FAKE_OPENCODE_DEFER_PROMPT_ROWS_TO_GATE: '1',
+      },
+    }))
+
+    try {
+      const info = await server.start()
+      // The same frame-level pin as the first restored-echo leg: arm the
+      // hold BEFORE the second Send click so the dying page's pagehide
+      // persist cannot seal any of the send's follow-up frames (the
+      // request-keyed checkpoint outcome above all) into the persisted
+      // pane content.
+      let holdServerFrames = false
+      const heldFrames: Array<() => void> = []
+      await page.routeWebSocket('**/ws', (route) => {
+        const upstream = route.connectToServer()
+        upstream.onMessage((message) => {
+          const deliver = () => {
+            try {
+              route.send(message)
+            } catch {
+              // The owning page died with its socket (the reload); the
+              // buffered frame dies with it.
+            }
+          }
+          if (holdServerFrames) {
+            heldFrames.push(deliver)
+            return
+          }
+          deliver()
+        })
+      })
+      // The second send's capture completes server-side BEFORE the reload
+      // (the barrier runs before the prompt is forwarded), so the reloaded
+      // pane could learn the outcome through the REST checkpoint-outcome
+      // history and flip the echo's hover to the earned-enabled verdict
+      // before the mid-turn assertions sample it. Hold that endpoint
+      // through the assertions — the same "pane does not know the outcome
+      // yet" premise the WS hold gives the dying page, extended through
+      // the reloaded page's reconnect window. The snapshot endpoint is a
+      // different path and is NOT held.
+      let holdOutcomeHistory = true
+      await page.route('**/api/fresh-agent/checkpoints/outcomes**', async (route) => {
+        while (holdOutcomeHistory) {
+          await new Promise((resolve) => setTimeout(resolve, 100))
+        }
+        // The owning fetch may have aborted (the page re-keyed or reloaded);
+        // a swallowed continue is the quiet end of a dead request.
+        await route.continue().catch(() => {})
+      })
+      // The same thread-snapshot delivery pin as the first restored-echo
+      // leg: the pane's own HTTP snapshot pipeline is not gated by the WS
+      // hold, so an in-flight thread-snapshot response that lands after
+      // the arm must not reach the dying page (an idle answer would clear
+      // the second send's optimistic running status ahead of the pagehide
+      // persist). Fulfilled on release; the reloaded page's post-release
+      // fetch — the one that lands the earlier row — flows untouched.
+      const heldThreadResponses: Array<() => void> = []
+      await page.route('**/api/fresh-agent/threads/**', async (route) => {
+        const response = await route.fetch().catch(() => null)
+        if (!response) {
+          await route.abort().catch(() => {})
+          return
+        }
+        const fulfill = () => {
+          route.fulfill({ response }).catch(() => {})
+        }
+        if (holdServerFrames) {
+          heldThreadResponses.push(fulfill)
+          return
+        }
+        await fulfill()
+      })
+      await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+      const harness = new TestHarness(page)
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+      await enableFreshOpencode(page)
+      await createFreshopencodePane(page, cwd)
+
+      await expect.poll(async () => getFreshOpencodePaneState(page), { timeout: 15_000 }).toMatchObject({
+        sessionId: expect.stringMatching(/^freshopencode-/),
+      })
+      // Flush the pane's placeholder identity so the reloaded page
+      // rehydrates this pane at all.
+      await page.evaluate(() => {
+        window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
+      })
+
+      // FIRST message (the earlier row): pre-release the gate so this turn
+      // settles at the fixture's first gate poll — its row lands, the
+      // durable ses_* session materializes, and its identity-enriched
+      // checkpoint outcome binds the row.
+      await fsp.writeFile(promptGatePath, 'release\n')
+      await sendFreshAgentPrompt(page, firstPrompt)
+      const idleAfterPrompt = async (prompt: string) => {
+        const events = await readAuditEvents(auditLogPath)
+        const promptIndex = events.findLastIndex((event) => event.event === 'prompt_async' && event.prompt === prompt)
+        return promptIndex >= 0
+          && events.slice(promptIndex + 1).some((event) => event.event === 'session_idle_emitted')
+      }
+      await expect.poll(() => idleAfterPrompt(firstPrompt), { timeout: 30_000 }).toBe(true)
+      const paneRoot = page.locator('[data-context="fresh-agent"]').last()
+      const earlierRow = paneRoot.locator('[data-turn-role="user"]', { hasText: firstPrompt })
+      await expect(earlierRow).toHaveCount(1, { timeout: 20_000 })
+      // The enriched outcome must be BOUND (and therefore persisted with
+      // the pane content) before the second send arms the frame hold: the
+      // reloaded pane's outcome-history fetch is held, so this binding is
+      // the one the earlier row keeps after the reload.
+      await earlierRow.hover()
+      await expect(earlierRow.getByRole('button', { name: 'Rewind code to here' })).toBeEnabled({ timeout: 30_000 })
+
+      // SECOND message inside the echo window: arm the frame hold before
+      // the Send click, send, then persist EXACTLY the echo-window state
+      // (the optimistic echo carrying the send boundary, the optimistic
+      // running status, no outcome under the send's request) and reload.
+      holdServerFrames = true
+      await sendFreshAgentPrompt(page, secondPrompt)
+      await page.waitForFunction((text) => {
+        const state = window.__FRESHELL_TEST_HARNESS__?.getState() as any
+        const findFreshOpencode = (node: any): any => {
+          if (!node) return undefined
+          if (node.type === 'leaf' && node.content?.kind === 'fresh-agent' && node.content.provider === 'opencode') {
+            return node.content
+          }
+          if (node.type === 'split') return findFreshOpencode(node.children?.[0]) ?? findFreshOpencode(node.children?.[1])
+          return undefined
+        }
+        const activeTabId = state?.tabs?.activeTabId
+        const content = findFreshOpencode(state?.panes?.layouts?.[activeTabId])
+        return Boolean(content?.pendingLocalEcho?.text === text && content?.status === 'running')
+      }, secondPrompt)
+      await page.evaluate(() => {
+        window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
+      })
+      await page.reload()
+      await harness.waitForHarness()
+
+      // The rehydrated pane boots from persisted content alone (the WS
+      // frames are still held): the restored echo row renders beside an
+      // empty transcript.
+      const echoRow = paneRoot.locator('[data-turn-role="user"]', { hasText: secondPrompt })
+      await expect(echoRow).toBeVisible({ timeout: 10_000 })
+
+      // Release the WS hold: the reloaded page connects, attaches (the
+      // server re-asserts the parked turn's running status) and fetches
+      // the snapshot — which, with the turn's rows still deferred to the
+      // gate, holds ONLY the first turn's rows. The earlier row lands
+      // BESIDE the restored echo.
+      holdServerFrames = false
+      for (const deliver of heldFrames.splice(0)) deliver()
+      for (const fulfill of heldThreadResponses.splice(0)) fulfill()
+      await harness.waitForConnection()
+      await expect(earlierRow).toHaveCount(1, { timeout: 30_000 })
+      await expect(echoRow).toHaveCount(1, { timeout: 10_000 })
+      // BUSY pin: the parked turn keeps the pane busy — the snapshot
+      // carried the fake's busy status and the attach broadcast
+      // re-asserted the running record. The still-saving verdict below is
+      // only honest mid-turn.
+      await expect(paneRoot.getByRole('button', { name: 'Stop' })).toBeVisible({ timeout: 15_000 })
+      // Parked-ness: the fake received the second prompt and never
+      // emitted the turn's idle.
+      await expect.poll(async () => {
+        const events = await readAuditEvents(auditLogPath)
+        return events.some((event) => event.event === 'prompt_async' && event.prompt === secondPrompt)
+      }, { timeout: 60_000 }).toBe(true)
+      await expect(await idleAfterPrompt(secondPrompt)).toBe(false)
+
+      // THE second-message boundary verdict: the restored echo renders
+      await echoRow.hover()
+      // beside the EARLIER landed row, and its persisted send boundary
+      // proves that row predates the send — so mid-turn the echo still
+      // holds the pane's newest user row and its hover shows the DISABLED
+      // still-saving state: never the settled-unavailable verdict the
+      // pre-boundary derivation showed for every reloaded second message.
+      await echoRow.hover()
+      const saving = echoRow.getByRole('button', { name: 'Saving code rewind checkpoint' })
+      await expect(saving).toBeVisible()
+      await expect(saving).toBeDisabled()
+      await expect(saving).toHaveAttribute('title', 'Saving the code state from before this message')
+      await expect(echoRow.getByRole('button', { name: 'Rewind unavailable for this message' })).toHaveCount(0)
+      await expect(echoRow.getByRole('button', { name: 'Rewind code to here' })).toHaveCount(0)
+      // The earlier row keeps its own honest verdict — its enriched
+      // outcome survived the reload in the persisted pane content, so it
+      // shows the EARNED enabled rewind, and never a saving claim.
+      await earlierRow.hover()
+      const earlierRewind = earlierRow.getByRole('button', { name: 'Rewind code to here' })
+      await expect(earlierRewind).toBeEnabled()
+      await expect(earlierRow.getByRole('button', { name: 'Saving code rewind checkpoint' })).toHaveCount(0)
+      await expect(earlierRow.getByRole('button', { name: 'Rewind unavailable for this message' })).toHaveCount(0)
+
+      // Settle: stop holding the outcome history (the fetch proceeds; by
+      // then nothing depends on it), release the gate so the deferred rows
+      // append and the parked response answers, and let the turn settle —
+      // the second row lands (the echo clears at its landing), the
+      // identity observation enriches the capture, and the landed row's
+      // hover flips to the enabled rewind. The journey's end matches the
+      // first legs, reached through the second-message reload.
+      holdOutcomeHistory = false
+      await fsp.writeFile(promptGatePath, 'release\n')
+      await expect.poll(() => idleAfterPrompt(secondPrompt), { timeout: 30_000 }).toBe(true)
+      const secondRow = paneRoot.locator('[data-turn-role="user"]', { hasText: secondPrompt })
+      await expect(secondRow).toHaveCount(1, { timeout: 30_000 })
+      await secondRow.hover()
+      const rewind = secondRow.getByRole('button', { name: 'Rewind code to here' })
       await expect(rewind).toBeEnabled({ timeout: 30_000 })
     } finally {
       await server.stop().catch(() => {})

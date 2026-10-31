@@ -666,6 +666,13 @@ const sessionArg = argValue('--session')
 const sessionEventGatePath = process.env.FAKE_OPENCODE_SESSION_EVENT_GATE_PATH
 const holdSummarizeGatePath = process.env.FAKE_OPENCODE_HOLD_SUMMARIZE_GATE_PATH
 const holdPromptGatePath = process.env.FAKE_OPENCODE_HOLD_PROMPT_GATE_PATH
+// Second-message reload lane: with FAKE_OPENCODE_DEFER_PROMPT_ROWS_TO_GATE=1
+// (and the hold-prompt gate active), a gated turn's rows append at GATE
+// RELEASE instead of request receipt — the parked window's snapshots hold
+// only the turns that preceded it, modeling a real provider whose history
+// write lags the running turn. Default unset: today's behavior (rows
+// persist at receipt), so every other spec is untouched.
+const deferPromptRowsToGate = process.env.FAKE_OPENCODE_DEFER_PROMPT_ROWS_TO_GATE === '1'
 const requireDirectoryRoute = process.env.FAKE_OPENCODE_REQUIRE_DIRECTORY_ROUTE === '1'
 const snapshotReadFailureMarkerPath = process.env.FAKE_OPENCODE_SNAPSHOT_READ_FAILURE_MARKER
 
@@ -1351,6 +1358,10 @@ const server = http.createServer(async (req, res) => {
     if (action === 'prompt_async' && req.method === 'POST') {
       const body = parseJsonText(await readRequestBody(req)) || {}
       const parts = Array.isArray(body.parts) ? body.parts : []
+      const promptTextFromParts = parts
+        .map((part) => typeof part?.text === 'string' ? part.text : '')
+        .filter(Boolean)
+        .join('\n')
       emitSessionStatus(sessionId, 'busy', {
         routeDirectory: directory,
         directory: session.directory,
@@ -1358,20 +1369,29 @@ const server = http.createServer(async (req, res) => {
       // kata 1wxv: a new submission supersedes the reverted tail — the pointer
       // clears and the tail rows are deleted BEFORE the turn simulation.
       clearRevertAndDeleteTail(sessionId)
+      // Second-message reload lane (FAKE_OPENCODE_DEFER_PROMPT_ROWS_TO_GATE):
+      // with the knob set AND the hold gate active, the turn's rows are NOT
+      // persisted at request receipt — they append at gate release, just
+      // before the parked response answers — so a mid-turn snapshot shows the
+      // transcript exactly as it was BEFORE this turn (its row has not
+      // landed, modeling the real provider's asynchronous history write).
+      // The busy SSE and the audit row still fire at receipt (parked-ness
+      // reads the audit), so the turn is observable as running throughout.
+      const deferRowsToGate = deferPromptRowsToGate
+        && holdPromptGatePath
+        && !process.argv.includes('--pure')
       // TUI-parity lane: with FAKE_OPENCODE_TUI_PARITY=1 the pane's first
       // prompt materializes the scripted delegation/reasoning/retry fixture
       // (parent + static child sessions) instead of the plain text pair.
-      const appended = tuiParityEnabled
+      const appendTurnRows = () => tuiParityEnabled
         ? appendTuiParityMessages({
             sessionId,
             messageId: body.messageID,
-            promptText: parts
-              .map((part) => typeof part?.text === 'string' ? part.text : '')
-              .filter(Boolean)
-              .join('\n'),
+            promptText: promptTextFromParts,
           })
         : appendPromptMessages({ sessionId, parts, messageId: body.messageID })
-      if (!appended) {
+      const appended = deferRowsToGate ? undefined : appendTurnRows()
+      if (!deferRowsToGate && !appended) {
         emitSessionIdle(sessionId, {
           routeDirectory: directory,
           directory: session.directory,
@@ -1385,8 +1405,8 @@ const server = http.createServer(async (req, res) => {
       // so the rollback spec reverts a PATCH-CARRYING turn and proves the
       // working tree stays byte-identical (conversation-only rollback).
       const patchTurn = Number.parseInt(process.env.FAKE_OPENCODE_PATCH_TURN ?? '', 10)
-      const userSeq = appended.sequence
-      if (Number.isInteger(patchTurn) && patchTurn > 0 && (userSeq + 1) / 2 === patchTurn) {
+      const userSeq = appended ? appended.sequence : undefined
+      if (appended && Number.isInteger(patchTurn) && patchTurn > 0 && (userSeq + 1) / 2 === patchTurn) {
         const patchPath = path.join(session.directory, 'patch-target.txt')
         fs.writeFileSync(patchPath, `fake patch from turn ${patchTurn} (${appended.userMessageId})\n`)
         appendAudit({ event: 'patch_turn_written', sessionId, path: patchPath, turn: patchTurn })
@@ -1396,21 +1416,22 @@ const server = http.createServer(async (req, res) => {
         sessionId,
         routeDirectory: directory,
         directory: session.directory,
-        prompt: appended.promptText,
+        prompt: appended ? appended.promptText : promptTextFromParts,
         // Parsed prompt-body settings (V4/A5): on the wire (build_prompt_body,
         // crates/freshell-opencode/src/serve.rs) `model` is an OBJECT
         // `{providerID, modelID}` and effort is the string field `variant`.
         body: { model: body.model, variant: body.variant },
       })
       // Mid-turn pending e2e lane (FAKE_OPENCODE_HOLD_PROMPT_GATE_PATH): the
-      // audit row + busy SSE + persisted rows above fire at REQUEST RECEIPT
-      // exactly as in the ungated arm; ONLY the response + idle emit park
-      // behind a one-shot 50ms gate-file check, so a spec can hold the turn
-      // deterministically in flight (the fake otherwise emits idle ~25ms
-      // after the prompt, a window too narrow to assert on). Parked-ness is
-      // observable in the audit: no session_idle_emitted can follow the
-      // prompt_async receipt until the file appears; the gate consumes/rm's
-      // the file the moment it does, then answers and emits the parked idle.
+      // audit row + busy SSE above fire at REQUEST RECEIPT exactly as in the
+      // ungated arm; ONLY the response + idle emit park behind a one-shot
+      // 50ms gate-file check, so a spec can hold the turn deterministically
+      // in flight (the fake otherwise emits idle ~25ms after the prompt, a
+      // window too narrow to assert on). Parked-ness is observable in the
+      // audit: no session_idle_emitted can follow the prompt_async receipt
+      // until the file appears; the gate consumes/rm's the file the moment
+      // it does, then answers and emits the parked idle. With the
+      // deferred-rows knob the row append moves INTO this release arm.
       // Mirrors the FAKE_OPENCODE_HOLD_SUMMARIZE_GATE_PATH pattern
       // (summarize arm above), including the --pure guard (the catalog
       // probe's sidecar must never park) and .unref?.(). Default unset
@@ -1423,6 +1444,22 @@ const server = http.createServer(async (req, res) => {
             fs.rmSync(holdPromptGatePath, { force: true })
           } catch {
             // ignore
+          }
+          if (deferRowsToGate) {
+            const appendedNow = appendTurnRows()
+            if (!appendedNow) {
+              sendJson(res, 404, { error: 'session not found', sessionId })
+              return
+            }
+            sendJson(res, 200, { ok: true })
+            setTimeout(() => {
+              emitSessionIdle(sessionId, {
+                routeDirectory: directory,
+                directory: session.directory,
+                prompt: appendedNow.promptText,
+              })
+            }, 25).unref?.()
+            return
           }
           sendJson(res, 200, { ok: true })
           setTimeout(() => {

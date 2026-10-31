@@ -209,8 +209,12 @@ type LocalEcho = {
   text: string
   requestId: string
   submittedTurnId?: string
-  /** Turn keys captured at send time — used by the echo-landed check to
-   * distinguish the new server turn from pre-existing turns. Unlike the
+  /** Turn keys captured at send time — the send boundary. Persisted WITH
+   * the echo record (the store's echo normalizer keep-lists the field), so
+   * a reloaded pane restores the boundary and can prove which rows predate
+   * the send. Used by the echo-landed check to distinguish the new server
+   * turn from pre-existing turns, and by the newest-ness derivation to keep
+   * a restored echo current beside earlier rows. Unlike the
    * previous-snapshot turns, these never include the just-sent turn, so
    * the text-match guard cannot permanently block the echo from clearing
    * if the first snapshot's text match fails (e.g. the server normalises
@@ -1220,13 +1224,15 @@ export function FreshAgentView({
   // The send-time turn-key boundary of THIS mount's composer send: which
   // turns already existed when the CURRENT optimistic echo was dispatched.
   // It must ride a ref, not the echo state: the pane-content sync effect
-  // below adopts the normalized (runtime-field-stripped) store copy of a
-  // fresh echo in the store-driven render that precedes the send's own
-  // state update, so a boundary carried on the state echo is reliably
-  // stripped before any render can read it. Keyed by the echo's requestId
-  // and consulted only while it describes the CURRENT echo (a restored
-  // echo — a reload inside the echo window remounts the pane with no
-  // boundary at all — and a foreign re-keyed echo read as no boundary).
+  // below adopts the normalized STORE copy of a fresh echo in the
+  // store-driven render that precedes the send's own state update, so a
+  // boundary carried on the state echo is stripped before any render can
+  // read it. Keyed by the echo's requestId and consulted only while it
+  // describes the CURRENT echo (a foreign re-keyed echo reads as no
+  // boundary here — it falls back to the boundary its own record
+  // persisted, if any). A RESTORED echo has no ref entry at all: the
+  // newest-ness derivation reads the boundary the send persisted into the
+  // echo record itself, which the store's echo normalizer now keeps.
   const localEchoSendBoundaryRef = useRef<{ requestId: string; turnKeys: ReadonlySet<string> } | null>(null)
   const pendingSendMetadataRef = useRef<Map<string, PendingSendMetadata>>(new Map())
   // The pane's busy-epoch: advanced at every busy→idle edge of effectiveStatus
@@ -1643,12 +1649,20 @@ export function FreshAgentView({
   const setLocalEcho = useCallback((next: LocalEcho | null) => {
     setLocalEchoState(next)
     const current = paneContentRef.current
-    // Strip runtime-only fields (previousTurnKeys) before persisting —
-    // the persisted echo only needs the wire-identity fields. On remount
-    // the echo is restored without previousTurnKeys, which correctly
-    // disables the text-match guard (no send-time turns to compare against).
+    // The persisted echo record carries the send boundary
+    // (previousTurnKeys) alongside the identity fields: a reloaded pane
+    // restores the echo WITH the turns that predate its send, so the
+    // newest-ness derivation can keep the honest still-saving verdict
+    // beside earlier rows. A legacy record written before the field
+    // existed rehydrates without it and reads as "no boundary" (the
+    // conservative restored-echo treatment).
     const persisted = next
-      ? { requestId: next.requestId, text: next.text, ...(next.submittedTurnId ? { submittedTurnId: next.submittedTurnId } : {}) }
+      ? {
+          requestId: next.requestId,
+          text: next.text,
+          ...(next.submittedTurnId ? { submittedTurnId: next.submittedTurnId } : {}),
+          ...(next.previousTurnKeys ? { previousTurnKeys: [...next.previousTurnKeys] } : {}),
+        }
       : undefined
     if (sameLocalEcho(current.pendingLocalEcho, persisted)) return
     dispatch(mergePaneContent({
@@ -4199,20 +4213,25 @@ export function FreshAgentView({
     // The echo holds the newest user row only while no user row landed
     // AFTER its send — otherwise it is a stale echo (a delayed transcript
     // can leave an old echo visible while a later turn runs) and the
-    // landed row takes over the newest-user-row slot. This mount's own
-    // composer send stamps its send-time turn keys in
-    // localEchoSendBoundaryRef, so any landed user row OUTSIDE that set
-    // appeared after the send and outdates the echo. A restored echo (a
-    // reload inside the echo window remounts the pane without the send
-    // metadata) has no send-time boundary at all: every landed user row
-    // beside it may belong to a later turn, so it holds the newest user
-    // row only while the transcript holds no user row. The echo's own
-    // row landing never fights this rule — that clear retires the echo in
-    // the same snapshot application.
+    // landed row takes over the newest-user-row slot. The send's turn-key
+    // boundary decides "after": this mount's own composer send stamps it
+    // in localEchoSendBoundaryRef, and a RESTORED echo (a reload inside
+    // the echo window remounts the pane without the send metadata) reads
+    // the boundary the send persisted INTO the echo record itself — the
+    // field survives the store's echo normalizer and the pagehide
+    // persist, so the reloaded pane can prove the rows beside a
+    // second-or-later message's echo PREDATE its send (⊆ the boundary)
+    // while a later-landed row (∉ the boundary) still outdates it. A
+    // legacy record persisted without the field reads as no boundary:
+    // every landed row may belong to a later turn, so only an empty
+    // transcript keeps the echo current. The echo's own row landing never
+    // fights this rule — that clear retires the echo in the same snapshot
+    // application.
     const boundary = localEchoSendBoundaryRef.current
-    const sendTimeTurnKeys = boundary && localEcho && boundary.requestId === localEcho.requestId
+    const sendTimeTurnKeys = (boundary && localEcho && boundary.requestId === localEcho.requestId
       ? boundary.turnKeys
-      : undefined
+      : undefined)
+      ?? (localEcho?.previousTurnKeys ? new Set(localEcho.previousTurnKeys) : undefined)
     const echoOutdated = sendTimeTurnKeys
       ? userTurns.some((turn) => !sendTimeTurnKeys.has(getTurnKey(turn)))
       : userTurns.length > 0

@@ -5568,6 +5568,249 @@ describe('FreshAgentView', () => {
       expect(within(echoRow!).queryByRole('button', { name: 'Saving code rewind checkpoint' })).not.toBeInTheDocument()
     })
 
+    it('a reloaded second message still shows still-saving beside earlier turns', async () => {
+      const sessionId = 'thread-rewind-reloaded-second-message'
+      const store = createStore()
+      let onMessage: ((message: Record<string, unknown>) => void) | undefined
+      wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+        onMessage = handler
+        return () => {}
+      })
+      // A mid-turn reload inside the echo window of a SECOND-or-later
+      // message: the transcript already holds an EARLIER user row (it
+      // predates the send), and the persisted echo record carries the
+      // send-time boundary — the turn keys that existed at dispatch — so
+      // the rehydrated pane can prove the earlier row predates the send.
+      // The restored echo is therefore still the pane's newest user row
+      // while the turn runs: its hover must show the still-saving state,
+      // never the unearned settled-unavailable verdict the pre-boundary
+      // derivation showed (it treated every landed row as later).
+      let snapshotStatus = 'running'
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => ({
+        status: snapshotStatus,
+        summary: 'the reloaded pane hydrates an earlier row beside the second send\'s echo',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [unboundModernUserTurn('msg_earlier', 'Prompt landed before the second send')],
+      }))
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-reloaded-second-pane',
+          sessionId,
+          status: 'idle',
+          pendingLocalEcho: {
+            requestId: 'req-reloaded-second-send',
+            text: 'Prompt sent as the conversation\'s second message',
+            // The send boundary captured at dispatch: the earlier row's
+            // turn key. Post-reload this is the proof the landed row
+            // predates the send, so the echo keeps the newest user row.
+            previousTurnKeys: ['msg_earlier'],
+          },
+        },
+      }))
+
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+
+      // Both user rows render: the earlier landed row first, the restored
+      // optimistic echo appended after it.
+      expect(await screen.findByText('Prompt landed before the second send')).toBeInTheDocument()
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(2)
+      expect(onMessage).toBeTypeOf('function')
+      // The provider's busy status frame re-asserts the still-running turn
+      // on the reloaded pane.
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'running')
+      // Pin that the busy drive actually engaged: the still-saving verdict
+      // below is only honest while the pane is truly busy.
+      expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+
+      const [earlierRow, echoRow] = screen.getAllByRole('article', { name: 'You transcript turn' })
+      // The restored echo beside an EARLIER row still holds the pane's
+      // newest user row mid-turn — the persisted boundary proves the
+      // landed row predates the send — so its hover shows the disabled
+      // still-saving state, never the settled-unavailable verdict it
+      // cannot support while the turn runs. RED today: the derivation
+      // treats every landed row as later, so the echo shows the unearned
+      // unavailable hover.
+      expect(within(echoRow!).queryByRole('button', { name: 'Rewind unavailable for this message' })).not.toBeInTheDocument()
+      const savingButton = await within(echoRow!).findByRole('button', { name: 'Saving code rewind checkpoint' })
+      expect(savingButton).toBeDisabled()
+      expect(savingButton).toHaveAttribute('title', 'Saving the code state from before this message')
+      // The earlier row keeps its own honest verdict: it is not the
+      // newest user row, so nothing is being saved for it.
+      const earlierRewind = await within(earlierRow!).findByRole('button', { name: 'Rewind unavailable for this message' })
+      expect(earlierRewind).toBeDisabled()
+      expect(earlierRewind).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
+
+      // The turn settles: no checkpoint outcome ever reached this pane, so
+      // the echo row returns to the honest unavailable verdict.
+      snapshotStatus = 'idle'
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'idle')
+      const echoRewind = await within(echoRow!).findByRole('button', { name: 'Rewind unavailable for this message' })
+      expect(echoRewind).toBeDisabled()
+      expect(echoRewind).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
+    })
+
+    it('a restored echo whose persisted boundary excludes a later-landed row keeps the honest unavailable', async () => {
+      const sessionId = 'thread-rewind-reloaded-echo-boundary-later-row'
+      const store = createStore()
+      let onMessage: ((message: Record<string, unknown>) => void) | undefined
+      wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+        onMessage = handler
+        return () => {}
+      })
+      // The persisted boundary names the row that existed at send time
+      // (msg_first); the later row (msg_later) landed AFTER the send —
+      // outside the boundary — so it outdates the restored echo exactly
+      // the way a landed row outside the in-memory boundary outdates a
+      // fresh echo's window. The boundary never licenses a save claim for
+      // a later turn the echo cannot speak for.
+      let snapshotStatus = 'running'
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => ({
+        status: snapshotStatus,
+        summary: 'a later-landed row outside the restored echo\'s persisted boundary',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [
+          unboundModernUserTurn('msg_first', 'Prompt landed before the boundary\'s send'),
+          unboundModernUserTurn('msg_later', 'Prompt sent through the REST lane after the send'),
+        ],
+      }))
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-reloaded-echo-boundary-later',
+          sessionId,
+          status: 'idle',
+          pendingLocalEcho: {
+            requestId: 'req-reloaded-echo-boundary-later-send',
+            text: 'Prompt still echoing beside a later row outside its boundary',
+            previousTurnKeys: ['msg_first'],
+          },
+        },
+      }))
+
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+
+      expect(await screen.findByText('Prompt sent through the REST lane after the send')).toBeInTheDocument()
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(3)
+      expect(onMessage).toBeTypeOf('function')
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'running')
+      expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+
+      const [firstRow, laterRow, echoRow] = screen.getAllByRole('article', { name: 'You transcript turn' })
+      // The ECHO row is NOT the pane's newest user row — the later row
+      // landed outside the persisted boundary — so it keeps the honest
+      // unavailable verdict for the whole busy window, never a
+      // "Saving code rewind checkpoint" claim for the later turn.
+      expect(within(echoRow!).queryByRole('button', { name: 'Saving code rewind checkpoint' })).not.toBeInTheDocument()
+      const echoRewind = await within(echoRow!).findByRole('button', { name: 'Rewind unavailable for this message' })
+      expect(echoRewind).toBeDisabled()
+      expect(echoRewind).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
+      // The LATER row keeps its own honest state: it is the newest user
+      // row and the pane is busy, but the reload left no send metadata, so
+      // nothing this pane can evidence is in flight — the nothing-branch
+      // makes no rewind claim at all mid-turn.
+      expect(within(laterRow!).queryByRole('button', { name: 'Saving code rewind checkpoint' })).not.toBeInTheDocument()
+      expect(within(laterRow!).queryByRole('button', { name: 'Rewind unavailable for this message' })).not.toBeInTheDocument()
+      expect(within(laterRow!).queryByRole('button', { name: 'Rewind code to here' })).not.toBeInTheDocument()
+      // The row INSIDE the boundary keeps the honest older-row verdict:
+      // not the newest user row, nothing is being saved for it either.
+      const firstRewind = await within(firstRow!).findByRole('button', { name: 'Rewind unavailable for this message' })
+      expect(firstRewind).toBeDisabled()
+      expect(firstRewind).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
+    })
+
+    it('a restored echo persisted without a boundary falls back to the conservative verdict beside earlier rows', async () => {
+      const sessionId = 'thread-rewind-reloaded-echo-legacy-record'
+      const store = createStore()
+      let onMessage: ((message: Record<string, unknown>) => void) | undefined
+      wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+        onMessage = handler
+        return () => {}
+      })
+      // Legacy records (persisted before the send boundary rode the echo
+      // record): the rehydrated pane cannot tell earlier rows from later
+      // ones — every landed row may belong to a later turn — so the
+      // restored echo keeps the conservative verdict: unavailable even
+      // while the pane is busy. Only an empty transcript (the first leg's
+      // journey) can earn the still-saving verdict without a boundary.
+      let snapshotStatus = 'running'
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => ({
+        status: snapshotStatus,
+        summary: 'the reloaded pane hydrates an earlier row beside a legacy-shaped echo',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [unboundModernUserTurn('msg_earlier_legacy', 'Prompt landed before a legacy-shaped echo send')],
+      }))
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-reloaded-echo-legacy-pane',
+          sessionId,
+          status: 'idle',
+          pendingLocalEcho: {
+            requestId: 'req-reloaded-echo-legacy-send',
+            text: 'Prompt echoing from a legacy record without a boundary',
+          },
+        },
+      }))
+
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+
+      expect(await screen.findByText('Prompt landed before a legacy-shaped echo send')).toBeInTheDocument()
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(2)
+      expect(onMessage).toBeTypeOf('function')
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'running')
+      expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+
+      const [earlierRow, echoRow] = screen.getAllByRole('article', { name: 'You transcript turn' })
+      // No boundary evidence → the conservative fallback: the echo never
+      // claims a save is underway beside a row it cannot place in time.
+      expect(within(echoRow!).queryByRole('button', { name: 'Saving code rewind checkpoint' })).not.toBeInTheDocument()
+      const echoRewind = await within(echoRow!).findByRole('button', { name: 'Rewind unavailable for this message' })
+      expect(echoRewind).toBeDisabled()
+      expect(echoRewind).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
+      // The earlier row takes over the newest-user-row slot while the
+      // echo is outdated, so mid-turn it holds the same uncertain state
+      // the stale test's later row holds: busy, newest, but nothing this
+      // pane can evidence as in flight — no rewind claim at all.
+      expect(within(earlierRow!).queryByRole('button', { name: 'Saving code rewind checkpoint' })).not.toBeInTheDocument()
+      expect(within(earlierRow!).queryByRole('button', { name: 'Rewind unavailable for this message' })).not.toBeInTheDocument()
+      expect(within(earlierRow!).queryByRole('button', { name: 'Rewind code to here' })).not.toBeInTheDocument()
+
+      // The turn settles: both rows return to the honest unavailable
+      // verdict (the landed row's nothing-branch dies at the busy→idle
+      // edge; the echo keeps the conservative verdict it held mid-turn).
+      snapshotStatus = 'idle'
+      emitSessionSnapshotStatus(store, onMessage, sessionId, 'idle')
+      const earlierRewind = await within(earlierRow!).findByRole('button', { name: 'Rewind unavailable for this message' })
+      expect(earlierRewind).toBeDisabled()
+      expect(earlierRewind).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
+      expect(within(echoRow!).queryByRole('button', { name: 'Saving code rewind checkpoint' })).not.toBeInTheDocument()
+    })
+
     it('keeps the older snapshot user row honestly unavailable while a pending local echo holds the newest user row', async () => {
       const sessionId = 'thread-rewind-echo-window'
       const store = createStore()
