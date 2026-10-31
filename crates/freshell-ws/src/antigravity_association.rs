@@ -12,30 +12,65 @@
 //!   NOT a codex `note_submit` reuse: the codex precedent snapshots file
 //!   paths with no prompt-text buffer, while terminal input arrives as
 //!   byte chunks with Enter commonly alone. The association keeps a
-//!   per-pane line buffer, flushed at the Enter byte, and the flushed
-//!   line is what the locator matches against each transcript's LATEST
-//!   user-authored record.
+//!   per-pane LINE EDITOR model, flushed at the Enter byte, and the
+//!   flushed line is what the locator matches against each transcript's
+//!   LATEST user-authored record.
 //!
-//!   // Stage-1 candidate contract (submit-key byte discipline, modeled
-//!   // on `freshell-activity/signal.rs`'s `classify_input` CR/LF
-//!   // rule — typed submit bytes vs content bytes are distinguished at
-//!   // the byte level, and the distinction is DOCUMENTED, not guessed):
-//!   // the terminal sends CR (0x0D) for the Enter key — CR flushes the
-//!   // buffer as ONE submit. LF (0x0A) is Ctrl+J, which the Antigravity
-//!   // CLI documents as "insert a newline into the prompt"
-//!   // (antigravity.google/docs/cli/reference/) — LF JOINS the current
-//!   // buffer as inline newline content, never a submit, so a
-//!   // multi-line prompt flushes as the FULL multi-line payload and can
-//!   // bind the transcript user record carrying both lines
-//!   // (whole-delta review Major 2). Pasted text arrives CR-separated
-//!   // (xterm.js `prepareTextForTerminal` converts pasted `\r?\n` to
-//!   // `\r` before the bytes reach the PTY), so a pasted multi-line blob
-//!   // still flushes per line and its LAST line is the live capture —
-//!   // `classify_input`'s "the LAST pasted line remains evaluable"
-//!   // stance; a paste-frame-aware capture is deferred until a real
-//!   // binary proves the recorded form of a pasted blob (the A2
-//!   // blocker). The newline byte the CLI writes INSIDE its recorded
-//!   // multi-line user text is likewise fixture-validated only.
+//!   // Stage-1 candidate contract (the line-editor model, whole-delta
+//!   // review round 3, Major 2; modeled on
+//!   // `freshell-activity/signal.rs`'s `classify_input` CR/LF rule —
+//!   // typed submit bytes vs content bytes are distinguished at the byte
+//!   // level, and the distinction is DOCUMENTED, not guessed):
+//!   //   - CR (0x0D, the Enter key) flushes the FULL modeled buffer —
+//!   //     inline newlines included — as ONE submit.
+//!   //   - LF (0x0A, Ctrl+J — the CLI's documented "insert a newline
+//!   //     into the prompt") inserts a newline at the cursor as CONTENT,
+//!   //     never a submit (whole-delta review round 1, Major 2).
+//!   //   - Printable chars INSERT AT THE CURSOR; Backspace (0x7F/0x08)
+//!   //     deletes left of the cursor; Delete (CSI 3~) deletes at the
+//!   //     cursor; Left/Right (CSI/SS3 D/C) move the cursor; Home/End
+//!   //     (CSI/SS3 H/F, CSI 1~/4~) jump. The ESC-sequence parser state
+//!   //     lives ON the pane (input arrives as arbitrary websocket-sized
+//!   //     chunks; a call-local parser would corrupt a split cursor key
+//!   //     into literal content — a wrong guess, exactly what the
+//!   //     tolerance for uncertainty exists to prevent).
+//!   //   - Ctrl+C (0x03) CLEARS the buffer and is NOT a submit (the CLI
+//!   //     records no user record for it; the post-interrupt line state
+//!   //     is the knowable empty line, so it also clears uncertainty).
+//!   //   - THE UNCERTAIN SET — edits the model CANNOT reconstruct —
+//!   //     marks the capture UNCERTAIN until the next flush or Ctrl+C:
+//!   //     Up/Down arrows (history recall replaces the line with text the
+//!   //     capture never saw), TAB (completion rewrites the line), every
+//!   //     other C0 control (Ctrl+A/E cursor moves, Ctrl+U/K/W/D line
+//!   //     kills — CLI-specific bindings, unprovable at Stage 1), every
+//!   //     ESC sequence other than the modeled cursor keys (two-byte
+//!   //     Alt-escapes, bracketed-paste frames, mouse tracking, Ctrl+
+//!   //     arrow word-jumps), and any Enter consumed INSIDE an escape
+//!   //     sequence. An uncertain ENTER flushes an UNCERTAIN submit: the
+//!   //     real line content is unknowable, so it is NEVER fed to the
+//!   //     locator — it cannot open, replace, or resolve a window (the
+//!   //     round-2 pending/supersede rules are untouched by it) — it
+//!   //     still arms the hub's provisional busy (the user's Enter
+//!   //     likely started a turn; a false arm reverts harmlessly through
+//!   //     the submit grace), and the sweep logs it
+//!   //     (`antigravity_capture_uncertain`). CORRECTNESS OVER
+//!   //     COMPLETENESS: the pane does not bind from an uncertain submit
+//!   //     and never poisons the association with a wrong guess — the
+//!   //     next clean submit binds (the pane self-heals).
+//!   //   - Pasted text arrives CR-separated (xterm.js
+//!   //     `prepareTextForTerminal` converts pasted `\r?\n` to `\r`
+//!   //     before the bytes reach the PTY), so a pasted multi-line blob
+//!   //     still flushes per line and its LAST line is the live capture
+//!   //     — `classify_input`'s "the LAST pasted line remains
+//!   //     evaluable" stance; a paste-frame-aware capture is deferred
+//!   //     until a real binary proves the recorded form of a pasted blob
+//!   //     (the A2 blocker). The newline byte the CLI writes INSIDE its
+//!   //     recorded multi-line user text is likewise fixture-validated
+//!   //     only. The modeled key set itself is the candidate contract:
+//!   //     a real binary may bind keys differently (A2) — an imperfect
+//!   //     model degrades toward not-binding (a wrong modeled text just
+//!   //     fails the locator's exact match), and the KNOWABLE wrong-guess
+//!   //     class is removed by the uncertain marking.
 //!
 //! - The association lives ON the hub (a `HubInner` slot, set once at
 //!   boot) rather than a `WsState` field: its whole input feed IS the
@@ -63,17 +98,90 @@ use freshell_sessions::antigravity_locator::AntigravityLocated;
 use crate::terminal::now_ms;
 use crate::WsState;
 
-/// Per-pane line capture: the raw input bytes since the last Enter, plus
-/// the submit lines flushed at Enter bytes (drained by the sweep).
-#[derive(Debug, Default)]
-struct PaneCapture {
-    buffer: String,
-    submits: VecDeque<(String, i64)>,
+/// One captured submit, flushed at an Enter byte. A CLEAN submit carries
+/// the modeled line content the capture reconstructed exactly; an
+/// UNCERTAIN submit was flushed while the capture was marked uncertain
+/// (an unmodelable edit preceded the Enter) — the real line content is
+/// unknowable, so it is logged by the sweep and NEVER fed to the locator
+/// (whole-delta review round 3, Major 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapturedSubmit {
+    Clean { text: String, at_ms: i64 },
+    Uncertain { at_ms: i64 },
 }
 
-/// Line-buffer cap: a single prompt line is bounded; past this the extra
-/// bytes are dropped (they could never match a bounded comparison anyway).
+/// Per-pane line-editor capture: the modeled buffer + cursor, the
+/// uncertainty mark, the ESC-sequence parser state, and the submits
+/// flushed at Enter bytes (drained by the sweep).
+#[derive(Debug, Default)]
+struct PaneCapture {
+    /// The modeled line (chars, cursor-indexed — a `Vec<char>` keeps
+    /// every cursor op a whole-char op).
+    buffer: Vec<char>,
+    /// The cursor position (a char index into `buffer`).
+    cursor: usize,
+    /// An unmodelable edit arrived since the last flush/Ctrl+C: the
+    /// modeled buffer no longer reconstructs the CLI's real line, so
+    /// the next Enter flushes UNCERTAIN (see the module header's
+    /// uncertain set).
+    uncertain: bool,
+    /// The ESC-sequence parser state — ON the pane, because input
+    /// arrives as arbitrary chunks and a sequence can split across
+    /// `note_input_tagged` calls.
+    esc: EscState,
+    submits: VecDeque<CapturedSubmit>,
+}
+
+/// ESC-sequence parser state (per pane; survives chunk boundaries).
+#[derive(Debug, Default, PartialEq)]
+enum EscState {
+    #[default]
+    None,
+    /// ESC seen; the next byte decides the sequence form (CSI `[` /
+    /// SS3 `O`), anything else is a two-byte escape.
+    Intro,
+    /// Inside a CSI/SS3 sequence, accumulating bytes through the final
+    /// one (0x40..=0x7E).
+    Sequence(Vec<char>),
+}
+
+/// Line-editor buffer cap: a single prompt line is bounded; past this the
+/// extra chars are dropped (they could never match a bounded comparison
+/// anyway).
 const MAX_LINE_BUFFER_CHARS: usize = 16 * 1024;
+
+/// Bound on the bytes accumulated inside one ESC sequence (a malformed
+/// or hostile stream must not grow the parser state unboundedly).
+const MAX_ESC_SEQUENCE_CHARS: usize = 32;
+
+/// The modeled outcome of one complete ESC sequence.
+#[derive(Debug, PartialEq)]
+enum EscEdit {
+    /// Left/Right/Home/End — the modeled cursor moves.
+    CursorLeft,
+    CursorRight,
+    CursorHome,
+    CursorEnd,
+    /// Delete — deletes the char at the cursor.
+    Delete,
+    /// Any other sequence (Up/Down history recall, word-jumps, paste
+    /// frames, mouse tracking, ...): unmodelable — the capture goes
+    /// uncertain.
+    Unmodelable,
+}
+
+/// Classify one COMPLETE CSI/SS3 sequence (the final byte included) into
+/// a modeled edit or `Unmodelable` (the module header's uncertain set).
+fn classify_esc_sequence(seq: &[char]) -> EscEdit {
+    match seq {
+        ['D'] => EscEdit::CursorLeft,
+        ['C'] => EscEdit::CursorRight,
+        ['H'] | ['1', '~'] => EscEdit::CursorHome,
+        ['F'] | ['4', '~'] => EscEdit::CursorEnd,
+        ['3', '~'] => EscEdit::Delete,
+        _ => EscEdit::Unmodelable,
+    }
+}
 
 /// The hub-held association: the locator plus the per-pane input capture.
 pub struct AntigravityAssociation {
@@ -120,68 +228,88 @@ impl AntigravityAssociation {
     }
 
     /// Hub-side `ActivityEvent::Input` intake: fold one input chunk into
-    /// the pane's line buffer, flushing ONLY at the Enter byte (CR), and
-    /// report the pane's tag state in the same lock scope. Returns
+    /// the pane's line-editor model, flushing ONLY at the Enter byte (CR),
+    /// and report the pane's tag state in the same lock scope. Returns
     /// `(flushed, tagged)`: `flushed` = whether this chunk flushed at
-    /// least one non-empty submit line (the hub uses that to arm the
-    /// idle gate's provisional busy phase — the crash death-bell
-    /// engagement); `tagged` = whether the hub has this pane tagged
-    /// (the hub's #612 quit-intent gate for antigravity panes, which are
-    /// not tracker-modes until Task 8 — a deliberate user quit must
-    /// suppress that death bell too, so the classification needs to see
-    /// every input byte of a tagged pane).
+    /// least one submit (clean or uncertain — an uncertain Enter likely
+    /// started a turn too, so the hub's provisional-busy arm — the crash
+    /// death-bell engagement — fires either way); `tagged` = whether the
+    /// hub has this pane tagged (the hub's #612 quit-intent gate for
+    /// antigravity panes, which needs to see every input byte of a tagged
+    /// pane).
     ///
     /// Byte discipline (the Stage-1 candidate contract documented in the
-    /// module header): CR (Enter) flushes the FULL buffer — including
-    /// any inline newlines Ctrl+J joined into it — as one submit; LF
-    /// (Ctrl+J, "insert newline into the prompt") JOINS the current
-    /// buffer as content and never flushes; DEL (0x7f) and BS (0x08) pop
-    /// the last buffered char (the CLI's recorded text reflects the line
-    /// editor's deletions, so the capture must too); ESC-prefixed
-    /// sequences (arrow keys etc.) are dropped whole; other C0 controls
-    /// except TAB are dropped; the rest append.
+    /// module header — the full line-editor model + the uncertain set):
+    /// CR (Enter) flushes the FULL modeled buffer — including any inline
+    /// newlines Ctrl+J joined into it — as one submit, or an UNCERTAIN
+    /// submit when an unmodelable edit preceded it; LF (Ctrl+J) inserts a
+    /// newline at the cursor; Backspace deletes left of the cursor;
+    /// Delete deletes at the cursor; Left/Right/Home/End move the cursor;
+    /// Ctrl+C clears the buffer and is NOT a submit; every other control
+    /// or ESC sequence marks the capture uncertain.
     pub fn note_input_tagged(&self, terminal_id: &str, data: &str, at_ms: i64) -> (bool, bool) {
         let mut panes = self.panes.lock().unwrap();
         let Some(pane) = panes.get_mut(terminal_id) else {
             return (false, false);
         };
         let mut flushed = false;
-        #[derive(PartialEq)]
-        enum Esc {
-            None,
-            Intro,
-            Sequence,
-        }
-        let mut esc = Esc::None;
         for ch in data.chars() {
-            match esc {
-                Esc::Intro => {
+            // The ESC-sequence parser state lives ON the pane (it must
+            // survive chunk boundaries); take-and-restore keeps the arm
+            // bodies free of overlapping borrows.
+            match std::mem::take(&mut pane.esc) {
+                EscState::None => {} // fall through to the byte discipline
+                EscState::Intro => {
                     // The byte after ESC: '[' or 'O' starts a sequence
-                    // (CSI/SS3); anything else was a two-byte escape.
-                    esc = if ch == '[' || ch == 'O' {
-                        Esc::Sequence
+                    // (CSI/SS3); anything else was a two-byte escape
+                    // (an Alt- binding) — unmodelable.
+                    if ch == '[' || ch == 'O' {
+                        pane.esc = EscState::Sequence(Vec::new());
                     } else {
-                        Esc::None
-                    };
-                    continue;
-                }
-                Esc::Sequence => {
-                    // Consume the sequence through its final byte
-                    // (0x40..=0x7E for CSI; SS3 finals share the range).
-                    if ('\u{40}'..='\u{7e}').contains(&ch) {
-                        esc = Esc::None;
+                        pane.uncertain = true;
                     }
                     continue;
                 }
-                Esc::None => {}
+                EscState::Sequence(mut seq) => {
+                    seq.push(ch);
+                    let finished =
+                        seq.len() > MAX_ESC_SEQUENCE_CHARS || ('\u{40}'..='\u{7e}').contains(&ch);
+                    if !finished {
+                        pane.esc = EscState::Sequence(seq);
+                        continue;
+                    }
+                    match classify_esc_sequence(&seq) {
+                        EscEdit::CursorLeft => pane.cursor = pane.cursor.saturating_sub(1),
+                        EscEdit::CursorRight => {
+                            pane.cursor = (pane.cursor + 1).min(pane.buffer.len())
+                        }
+                        EscEdit::CursorHome => pane.cursor = 0,
+                        EscEdit::CursorEnd => pane.cursor = pane.buffer.len(),
+                        EscEdit::Delete => {
+                            if pane.cursor < pane.buffer.len() {
+                                pane.buffer.remove(pane.cursor);
+                            }
+                        }
+                        EscEdit::Unmodelable => pane.uncertain = true,
+                    }
+                    continue;
+                }
             }
             match ch {
                 '\r' => {
-                    // Enter: flush the FULL buffer (multi-line payloads
-                    // included) as one submit.
-                    let line = std::mem::take(&mut pane.buffer);
-                    if !line.trim().is_empty() {
-                        pane.submits.push_back((line, at_ms));
+                    // Enter: flush the FULL modeled line (multi-line
+                    // payloads included) as one submit — CLEAN when the
+                    // model is exact, UNCERTAIN when an unmodelable edit
+                    // preceded it (never fed to the locator).
+                    let line: String = pane.buffer.drain(..).collect();
+                    pane.cursor = 0;
+                    if pane.uncertain {
+                        pane.uncertain = false;
+                        pane.submits.push_back(CapturedSubmit::Uncertain { at_ms });
+                        flushed = true;
+                    } else if !line.trim().is_empty() {
+                        pane.submits
+                            .push_back(CapturedSubmit::Clean { text: line, at_ms });
                         flushed = true;
                     }
                 }
@@ -189,25 +317,44 @@ impl AntigravityAssociation {
                     // Ctrl+J ("insert a newline into the prompt" — the
                     // CLI's documented multiline form): inline content,
                     // never a submit.
-                    if pane.buffer.chars().count() < MAX_LINE_BUFFER_CHARS {
-                        pane.buffer.push('\n');
+                    if pane.buffer.len() < MAX_LINE_BUFFER_CHARS {
+                        pane.buffer.insert(pane.cursor, ch);
+                        pane.cursor += 1;
                     }
                 }
                 '\u{7f}' | '\u{8}' => {
-                    pane.buffer.pop();
-                }
-                '\u{1b}' => {
-                    esc = Esc::Intro;
-                }
-                '\t' => {
-                    if pane.buffer.chars().count() < MAX_LINE_BUFFER_CHARS {
-                        pane.buffer.push(ch);
+                    // Backspace deletes LEFT of the cursor.
+                    if pane.cursor > 0 {
+                        pane.cursor -= 1;
+                        pane.buffer.remove(pane.cursor);
                     }
                 }
-                c if (c as u32) < 0x20 => {}
+                '\u{3}' => {
+                    // Ctrl+C: clears the buffer and is NOT a submit. The
+                    // post-interrupt line state is the knowable empty
+                    // line, so it also clears uncertainty.
+                    pane.buffer.clear();
+                    pane.cursor = 0;
+                    pane.uncertain = false;
+                }
+                '\u{1b}' => {
+                    pane.esc = EscState::Intro;
+                }
+                '\t' => {
+                    // TAB is completion in a line editor — the completed
+                    // line is the CLI's to produce, unmodelable here.
+                    pane.uncertain = true;
+                }
+                c if (c as u32) < 0x20 => {
+                    // Every other C0 control is a CLI-specific binding
+                    // (cursor moves, line kills, flow control...) —
+                    // unmodelable at Stage 1.
+                    pane.uncertain = true;
+                }
                 c => {
-                    if pane.buffer.chars().count() < MAX_LINE_BUFFER_CHARS {
-                        pane.buffer.push(c);
+                    if pane.buffer.len() < MAX_LINE_BUFFER_CHARS {
+                        pane.buffer.insert(pane.cursor, c);
+                        pane.cursor += 1;
                     }
                 }
             }
@@ -243,14 +390,16 @@ impl AntigravityAssociation {
         self.panes.lock().unwrap().keys().cloned().collect()
     }
 
-    /// Drain the captured submit lines (the sweep feeds each into the
-    /// locator; un-armed panes are refused there).
-    pub fn take_pending_submits(&self) -> Vec<(String, String, i64)> {
+    /// Drain the captured submits (the sweep feeds each CLEAN one into
+    /// the locator — un-armed panes are refused there; UNCERTAIN ones are
+    /// logged and never fed: they can neither open nor replace nor
+    /// resolve a window).
+    pub fn take_pending_submits(&self) -> Vec<(String, CapturedSubmit)> {
         let mut panes = self.panes.lock().unwrap();
         let mut out = Vec::new();
         for (tid, pane) in panes.iter_mut() {
-            for (text, at) in pane.submits.drain(..) {
-                out.push((tid.clone(), text, at));
+            for submit in pane.submits.drain(..) {
+                out.push((tid.clone(), submit));
             }
         }
         out
@@ -316,10 +465,35 @@ pub async fn drain_and_associate(state: &WsState) {
         }
     }
 
-    // Submit feed: the captured lines anchor the locator's windows at
-    // their Enter timestamps. Pure state, no fs.
-    for (terminal_id, text, at) in association.take_pending_submits() {
-        association.locator().note_submit(&terminal_id, &text, at);
+    // Submit feed: the CLEAN captured lines anchor the locator's windows
+    // at their Enter timestamps. Pure state, no fs. An UNCERTAIN submit
+    // (an unmodelable edit preceded the Enter — Up/Down history recall,
+    // TAB completion, unmodeled controls; the module header's uncertain
+    // set) is NEVER fed to the locator: it cannot open, replace
+    // (supersede), or resolve a pending window (whole-delta review
+    // round 3, Major 2 — correctness over completeness; the pane
+    // self-heals on the next clean submit).
+    for (terminal_id, submit) in association.take_pending_submits() {
+        match submit {
+            CapturedSubmit::Clean { text, at_ms } => {
+                association
+                    .locator()
+                    .note_submit(&terminal_id, &text, at_ms);
+            }
+            CapturedSubmit::Uncertain { at_ms } => {
+                tracing::warn!(
+                    target: "freshell_ws::antigravity_association",
+                    terminal_id = %terminal_id,
+                    at_ms,
+                    event = "antigravity_capture_uncertain",
+                    "antigravity_capture_uncertain: a submit flushed while the \
+                     line-editor capture was uncertain (an unmodelable edit — \
+                     history recall, completion, or an unmodeled control key \
+                     preceded the Enter); not feeding the locator — the pane \
+                     binds on its next clean submit"
+                );
+            }
+        }
     }
 
     let now = now_ms();
@@ -919,25 +1093,52 @@ mod tests {
         assert!(association.note_input("t1", "second line\r", 2_000));
         // A bare Enter on an empty line never flushes.
         assert!(!association.note_input("t1", "\r", 3_000));
-        // Backspace pops the buffered char (the CLI records the edited
-        // line, so the capture must match it).
+        // Backspace deletes left of the cursor (the CLI records the
+        // edited line, so the capture must match it).
         assert!(!association.note_input("t1", "abcx", 4_000));
         assert!(!association.note_input("t1", "\u{7f}", 4_001));
         assert!(association.note_input("t1", "\r", 4_002));
-        // Arrow keys (CSI sequences) are dropped whole.
-        assert!(!association.note_input("t1", "\u{1b}[A", 5_000));
-        assert!(!association.note_input("t1", "d", 5_001));
-        assert!(association.note_input("t1", "\r", 5_002));
+        // Cursor keys are MODELED (round 3, Major 2 — the round-1
+        // "dropped whole" stance was the reviewed defect): Left moves the
+        // cursor and the next insert lands BEFORE the moved-over text.
+        assert!(!association.note_input("t1", "d", 5_000));
+        assert!(!association.note_input("t1", "\u{1b}[D", 5_001));
+        assert!(!association.note_input("t1", "e", 5_002));
+        assert!(association.note_input("t1", "\r", 5_003));
         // Untagged panes never buffer.
         assert!(!association.note_input("t-unknown", "x\r", 6_000));
         let submits = association.take_pending_submits();
         assert_eq!(
             submits,
             vec![
-                ("t1".to_string(), "hello".to_string(), 1_002),
-                ("t1".to_string(), "second line".to_string(), 2_000),
-                ("t1".to_string(), "abc".to_string(), 4_002),
-                ("t1".to_string(), "d".to_string(), 5_002),
+                (
+                    "t1".to_string(),
+                    CapturedSubmit::Clean {
+                        text: "hello".to_string(),
+                        at_ms: 1_002
+                    }
+                ),
+                (
+                    "t1".to_string(),
+                    CapturedSubmit::Clean {
+                        text: "second line".to_string(),
+                        at_ms: 2_000
+                    }
+                ),
+                (
+                    "t1".to_string(),
+                    CapturedSubmit::Clean {
+                        text: "abc".to_string(),
+                        at_ms: 4_002
+                    }
+                ),
+                (
+                    "t1".to_string(),
+                    CapturedSubmit::Clean {
+                        text: "ed".to_string(),
+                        at_ms: 5_003
+                    }
+                ),
             ],
             "flushed lines carry their Enter timestamps"
         );
@@ -973,7 +1174,13 @@ mod tests {
         let submits = association.take_pending_submits();
         assert_eq!(
             submits,
-            vec![("t1".to_string(), "line1\nline2".to_string(), 1_003)],
+            vec![(
+                "t1".to_string(),
+                CapturedSubmit::Clean {
+                    text: "line1\nline2".to_string(),
+                    at_ms: 1_003
+                }
+            )],
             "the submit payload is the full multi-line prompt"
         );
         // A leading Ctrl+J on an empty buffer normalizes away: the
@@ -985,8 +1192,194 @@ mod tests {
         let submits = association.take_pending_submits();
         assert_eq!(
             submits,
-            vec![("t1".to_string(), "\nsecond line".to_string(), 2_001)],
+            vec![(
+                "t1".to_string(),
+                CapturedSubmit::Clean {
+                    text: "\nsecond line".to_string(),
+                    at_ms: 2_001
+                }
+            )],
             "the raw buffer is captured verbatim (trimmed at the locator)"
+        );
+    }
+
+    /// Whole-delta review round 3, Major 2 — the UNCERTAIN set: edits the
+    /// line-editor model CANNOT reconstruct mark the capture uncertain,
+    /// and the Enter on such a capture flushes an UNCERTAIN submit (never
+    /// a clean text the locator could be poisoned with). Up/Down history
+    /// recall, TAB completion, and unmodeled C0 controls are the honest
+    /// documented set (module header); the flushed half still arms the
+    /// hub's provisional busy (the user's Enter likely started a turn).
+    #[test]
+    fn unmodelable_edits_mark_the_capture_uncertain() {
+        let (association, _home) = association_for("uncertain");
+        association.note_created("t1", "antigravity");
+        // Up-arrow history recall: the real line becomes the CLI's
+        // recalled text — unknowable here. The Enter flushes UNCERTAIN.
+        assert!(!association.note_input("t1", "ab", 1_000));
+        assert!(!association.note_input("t1", "\u{1b}[A", 1_001));
+        assert!(association.note_input("t1", "\r", 1_002));
+        assert_eq!(
+            association.take_pending_submits(),
+            vec![("t1".to_string(), CapturedSubmit::Uncertain { at_ms: 1_002 })],
+            "an Up-arrow recall flushes uncertain — never the stale modeled text"
+        );
+        // TAB (completion), Down-arrow, and an unmodeled C0 control
+        // (Ctrl+U, a line kill) all mark uncertainty the same way; one
+        // Enter flushes ONE uncertain submit for the group.
+        assert!(!association.note_input("t1", "x", 2_000));
+        assert!(!association.note_input("t1", "\t", 2_001));
+        assert!(!association.note_input("t1", "\u{1b}[B", 2_002));
+        assert!(!association.note_input("t1", "\u{15}", 2_003));
+        assert!(association.note_input("t1", "\r", 2_004));
+        assert_eq!(
+            association.take_pending_submits(),
+            vec![("t1".to_string(), CapturedSubmit::Uncertain { at_ms: 2_004 })],
+            "the whole unmodelable set flushes one uncertain submit"
+        );
+        // The capture is CLEAN again after a flush: a fresh typed line
+        // flushes clean (the pane self-heals on the next prompt).
+        assert!(!association.note_input("t1", "clean again", 3_000));
+        assert!(association.note_input("t1", "\r", 3_001));
+        assert_eq!(
+            association.take_pending_submits(),
+            vec![(
+                "t1".to_string(),
+                CapturedSubmit::Clean {
+                    text: "clean again".to_string(),
+                    at_ms: 3_001
+                }
+            )],
+            "the capture is clean again after the uncertain flush"
+        );
+    }
+
+    /// Whole-delta review round 3, Major 2: the capture must model the
+    /// line EDITOR, not append-only text. Typing `ab`, Left, `X`, then
+    /// Enter submits `aXb` in a real line editor (the cursor moved left of
+    /// the `b` before `X` inserted); an append-only capture would flush
+    /// `abX` and the locator's exact-text match could never bind. Home/
+    /// End/Delete are modeled the same way, and the ESC-sequence parser
+    /// state survives CHUNK boundaries (input arrives as arbitrary
+    /// websocket-sized chunks — a call-local parser would corrupt a split
+    /// cursor key into literal content).
+    #[test]
+    fn line_edits_reconstruct_the_real_line_editor_payload() {
+        let (association, _home) = association_for("line-editor");
+        association.note_created("t1", "antigravity");
+        // `ab` Left `X` Enter → `aXb` (the review's example).
+        assert!(!association.note_input("t1", "ab", 1_000));
+        assert!(!association.note_input("t1", "\u{1b}[D", 1_001)); // Left
+        assert!(!association.note_input("t1", "X", 1_002));
+        assert!(association.note_input("t1", "\r", 1_003));
+        // Home inserts at the line start; End jumps back: `abc` Home `X`
+        // End `Y` → `XabcY`.
+        assert!(!association.note_input("t1", "abc", 2_000));
+        assert!(!association.note_input("t1", "\u{1b}[H", 2_001)); // Home
+        assert!(!association.note_input("t1", "X", 2_002));
+        assert!(!association.note_input("t1", "\u{1b}[F", 2_003)); // End
+        assert!(!association.note_input("t1", "Y", 2_004));
+        assert!(association.note_input("t1", "\r", 2_005));
+        // Delete removes the char AT the cursor: `abc` Left Left Delete →
+        // `ac` (cursor on `b`; append-only Backspace semantics would give
+        // `ab`).
+        assert!(!association.note_input("t1", "abc", 3_000));
+        assert!(!association.note_input("t1", "\u{1b}[D\u{1b}[D", 3_001)); // Left ×2
+        assert!(!association.note_input("t1", "\u{1b}[3~", 3_002)); // Delete
+        assert!(association.note_input("t1", "\r", 3_003));
+        // The ESC parser state is PER-PANE: ESC at the end of one chunk,
+        // `[D` in the next, still moves the cursor (a call-local parser
+        // would insert literal `[D`).
+        assert!(!association.note_input("t1", "z", 4_000));
+        assert!(!association.note_input("t1", "\u{1b}", 4_001));
+        assert!(!association.note_input("t1", "[D", 4_002)); // Left (split)
+        assert!(!association.note_input("t1", "W", 4_003));
+        assert!(association.note_input("t1", "\r", 4_004));
+        assert_eq!(
+            association.take_pending_submits(),
+            vec![
+                (
+                    "t1".to_string(),
+                    CapturedSubmit::Clean {
+                        text: "aXb".to_string(),
+                        at_ms: 1_003
+                    }
+                ),
+                (
+                    "t1".to_string(),
+                    CapturedSubmit::Clean {
+                        text: "XabcY".to_string(),
+                        at_ms: 2_005
+                    }
+                ),
+                (
+                    "t1".to_string(),
+                    CapturedSubmit::Clean {
+                        text: "ac".to_string(),
+                        at_ms: 3_003
+                    }
+                ),
+                (
+                    "t1".to_string(),
+                    CapturedSubmit::Clean {
+                        text: "Wz".to_string(),
+                        at_ms: 4_004
+                    }
+                ),
+            ],
+            "the flushed payloads mirror the line editor's real text"
+        );
+    }
+
+    /// Whole-delta review round 3, Major 2: Ctrl+C mid-line CLEARS the
+    /// buffer and is NOT a submit — the CLI records no user record for
+    /// it, so the capture must flush nothing. An append-only capture that
+    /// merely dropped the byte would flush the pre-Ctrl+C text at the
+    /// next Enter and poison the locator with a prompt the CLI never
+    /// received.
+    #[test]
+    fn ctrl_c_clears_the_buffer_and_is_never_a_submit() {
+        let (association, _home) = association_for("ctrl-c");
+        association.note_created("t1", "antigravity");
+        assert!(!association.note_input("t1", "ab", 1_000));
+        assert!(
+            !association.note_input("t1", "\u{3}", 1_001),
+            "Ctrl+C is not a submit"
+        );
+        assert!(
+            !association.note_input("t1", "\r", 1_002),
+            "Enter on the cleared (empty) line flushes nothing"
+        );
+        // After the clear the capture is exact again (the post-interrupt
+        // line state is knowable: empty): a fresh line flushes normally.
+        assert!(!association.note_input("t1", "after clear", 2_000));
+        assert!(association.note_input("t1", "\r", 2_001));
+        // Ctrl+C also clears an UNCERTAIN capture: whatever the recalled
+        // history line was, the post-interrupt line state is empty — the
+        // knowable state, so uncertainty ends with the buffer.
+        assert!(!association.note_input("t1", "ab", 3_000));
+        assert!(!association.note_input("t1", "\u{1b}[A", 3_001)); // Up → uncertain
+        assert!(!association.note_input("t1", "\u{3}", 3_002)); // Ctrl+C clears
+        assert!(association.note_input("t1", "typed fresh\r", 4_000));
+        assert_eq!(
+            association.take_pending_submits(),
+            vec![
+                (
+                    "t1".to_string(),
+                    CapturedSubmit::Clean {
+                        text: "after clear".to_string(),
+                        at_ms: 2_001
+                    }
+                ),
+                (
+                    "t1".to_string(),
+                    CapturedSubmit::Clean {
+                        text: "typed fresh".to_string(),
+                        at_ms: 4_000
+                    }
+                ),
+            ],
+            "Ctrl+C submitted nothing, and the post-clear lines flush clean"
         );
     }
 
@@ -1511,6 +1904,147 @@ mod tests {
             state.identity.session_ref_for("t1"),
             Some(expected_ref),
             "a two-line prompt binds the transcript whose user record carries both lines"
+        );
+
+        state.registry.kill("t1");
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&ledger_dir);
+        let _ = std::fs::remove_dir_all(&cwd_dir);
+    }
+
+    /// Whole-delta review round 3, Major 2 — the pending/supersede
+    /// interplay (the round-2 rules from 26304ea3d): an UNCERTAIN submit
+    /// (an Up-arrow recall flushed at Enter) must never resolve — and
+    /// never SUPERSEDE — a pending clean window. A pane's first clean
+    /// submit is still unmatched (the CLI has not written its user record
+    /// yet), the user then recalls history and submits THAT (uncertain):
+    /// the pending window must survive, a transcript matching the STALE
+    /// modeled buffer (the wrong-guess poison shape) must never bind, and
+    /// the pane's own conversation — written LATE — still binds through
+    /// the surviving pending window. A subsequent clean submit rebinds
+    /// normally (correctness over completeness: the pane self-heals on
+    /// the next clean prompt).
+    #[tokio::test]
+    async fn an_uncertain_submit_never_resolves_or_supersedes_a_pending_window() {
+        let home = unique_temp_dir("uncertain-pending");
+        let ledger_dir = unique_temp_dir("uncertain-pending-ledger");
+        let cwd_dir = unique_temp_dir("uncertain-pending-cwd");
+        let cwd = cwd_dir.to_string_lossy().into_owned();
+        let (state, _rx, association) =
+            state_with_association(home.clone(), Some(&ledger_dir), None);
+
+        spawn_antigravity_pty(&state, "t1", &cwd);
+        association.note_created("t1", "antigravity");
+        state
+            .pane_ledger
+            .record_pending(
+                "t1",
+                "antigravity",
+                Some(&cwd),
+                None,
+                crate::pane_ledger::ProvenanceStamps::default(),
+                now_ms(),
+            )
+            .unwrap();
+
+        // Submit A: clean, still unmatched (the CLI has written nothing).
+        let submit_a_at = now_ms();
+        assert!(association.note_input("t1", "the first clean prompt\r", submit_a_at));
+        tokio::time::sleep(std::time::Duration::from_millis(
+            freshell_sessions::antigravity_locator::ANTIGRAVITY_WINDOW_MS as u64 + 150,
+        ))
+        .await;
+        for _ in 0..5 {
+            drain_and_associate(&state).await;
+            assert!(
+                association.locator().fs_scan_count() >= 1,
+                "non-vacuity: the pending window is being scanned"
+            );
+            assert!(
+                state.identity.session_ref_for("t1").is_none(),
+                "submit A stays pending while its conversation is unwritten"
+            );
+            if association.locator().fs_scan_count() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+
+        // The STALE modeled buffer: the user typed `ab`, pressed Up
+        // (history recall — the real line is now unknowable), and hit
+        // Enter. An uncertain submit must flush as uncertain — the drain
+        // logs it and NEVER feeds it to the locator.
+        let uncertain_enter_at = now_ms();
+        assert!(!association.note_input("t1", "ab", now_ms()));
+        assert!(!association.note_input("t1", "\u{1b}[A", now_ms()));
+        assert!(association.note_input("t1", "\r", uncertain_enter_at));
+
+        // The poison shape: a transcript whose LATEST user record is the
+        // stale modeled text (`ab`), written recency-legal. Pre-fix, the
+        // uncertain Enter flushed `ab` as a CLEAN submit — superseding
+        // submit A's window and binding the WRONG conversation. Drain
+        // past the 2 s window a stale clean submit would have opened,
+        // asserting the whole way.
+        plant_transcript(&home, "conv-stale", &cwd, &[("ab", now_ms())]);
+        let poison_deadline = uncertain_enter_at
+            + freshell_sessions::antigravity_locator::ANTIGRAVITY_WINDOW_MS
+            + 2_000;
+        while now_ms() < poison_deadline {
+            drain_and_associate(&state).await;
+            assert!(
+                state.identity.session_ref_for("t1").is_none(),
+                "an uncertain submit never binds the stale modeled text's conversation"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+
+        // Submit A's own conversation lands LATE (the CLI finally wrote
+        // its user record): the PENDING window survived the uncertain
+        // submit and still binds.
+        plant_transcript(
+            &home,
+            "conv-a",
+            &cwd,
+            &[("the first clean prompt", now_ms())],
+        );
+        let mut bound_a = false;
+        for _ in 0..40 {
+            drain_and_associate(&state).await;
+            if state
+                .identity
+                .session_ref_for("t1")
+                .is_some_and(|r| r.session_id == "conv-a")
+            {
+                bound_a = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            bound_a,
+            "the pending window was never resolved by the uncertain submit — \
+             the late write still binds it"
+        );
+
+        // A subsequent CLEAN submit rebinds normally (the self-heal).
+        assert!(association.note_input("t1", "the clean follow up\r", now_ms()));
+        plant_transcript(&home, "conv-b", &cwd, &[("the clean follow up", now_ms())]);
+        let mut bound_b = false;
+        for _ in 0..40 {
+            drain_and_associate(&state).await;
+            if state
+                .identity
+                .session_ref_for("t1")
+                .is_some_and(|r| r.session_id == "conv-b")
+            {
+                bound_b = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            bound_b,
+            "the next clean submit still binds (the pane self-heals)"
         );
 
         state.registry.kill("t1");
