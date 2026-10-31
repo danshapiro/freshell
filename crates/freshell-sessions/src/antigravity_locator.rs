@@ -31,7 +31,14 @@
 //! ⇒ no-op (the ws association decides; the locator has no current-id
 //! state); exactly one with a different id ⇒ first-bind OR rebind (again
 //! the association's call — the SAME rule, not a separate mechanism);
-//! more than one ⇒ REFUSE all and warn `antigravity_association_refused
+//! ZERO matches ⇒ the submit STAYS PENDING and later ticks retry it
+//! (whole-delta review round 2, Major 1: the CLI can write its first user
+//! record after the first scan — slow startup, an auth flow — and the
+//! recency rule already requires the matching record at/after the submit,
+//! so a late write is exactly the case the window must catch; the retry
+//! ends only at the bounded `ANTIGRAVITY_PENDING_SUBMIT_LIFETIME_MS`, by
+//! a NEWER submit replacing the window, or by a bind); more than one ⇒
+//! REFUSE all and warn `antigravity_association_refused
 //! {reason:"ambiguous"}` — never a guess. Refusal never disarms: a later
 //! solo submit re-opens the window and re-evaluates.
 //!
@@ -90,9 +97,27 @@ use crate::time::parse_timestamp_ms;
 /// Submit-anchored evaluation window: a pane's captured submit is
 /// evaluated at (or after) `submit_at + WINDOW_MS` — the CLI writes the
 /// user record when it processes the prompt, so the window gives it a
-/// bounded head start (codex parity: `CODEX_WINDOW_MS`). A window that
-/// resolves with zero candidates is re-opened by the next Enter.
+/// bounded head start (codex parity: `CODEX_WINDOW_MS`). A submit that
+/// matches nothing STAYS pending (see
+/// `ANTIGRAVITY_PENDING_SUBMIT_LIFETIME_MS`); the next Enter always
+/// replaces the window regardless.
 pub const ANTIGRAVITY_WINDOW_MS: i64 = 2_000;
+
+/// Bounded retry lifetime for a pending submit that matched NOTHING on a
+/// scan (whole-delta review round 2, Major 1): the submit STAYS pending
+/// and later ticks re-evaluate it, so a transcript the CLI wrote late
+/// (slow startup, an auth flow before the first user record) still
+/// binds. The lifetime bounds the retry so a never-matching submit can
+/// never pin a window forever or bind an UNRELATED future conversation
+/// (the hazard needs a same-cwd transcript receiving an identical prompt
+/// text within the lifetime). Chosen as 30× the 2 s window: long enough
+/// to cover a CLI cold start plus a short unattended stall (the sweep's
+/// 150 ms cadence gives ~400 retries), short enough to sit well inside
+/// the 120 s busy deadman — "awaiting the first record" ends before
+/// "turn wedged" semantics begin. Beyond it the honest degradation is
+/// the user re-submitting (the next Enter re-opens the window — the pane
+/// self-heals on its next prompt).
+pub const ANTIGRAVITY_PENDING_SUBMIT_LIFETIME_MS: i64 = 60_000;
 
 /// Bounded submit-text comparison cap (chars, on both the captured line
 /// and the record text) — prompts are bounded, never whole-paste dumps.
@@ -130,9 +155,11 @@ struct Armed {
     /// The latest submit's captured line + the Enter's timestamp. `None`
     /// until the pane's first Enter; replaced by every later Enter.
     submit: Option<CapturedSubmit>,
-    /// Whether the CURRENT window has been evaluated. `true` (with
-    /// `submit` still set) after a zero/ambiguous/contested resolution —
-    /// the next `note_submit` re-opens.
+    /// Whether the CURRENT window is finished evaluating. `true` (with
+    /// `submit` still set) after a bind, an ambiguous/contested refusal,
+    /// or the pending lifetime's expiry — the next `note_submit`
+    /// re-opens. A zero-match evaluation leaves it `false`: the submit is
+    /// PENDING and later ticks retry it (whole-delta review round 2).
     resolved: bool,
 }
 
@@ -233,9 +260,13 @@ impl AntigravityLocator {
 
     /// One evaluation pass over every due armed pane. Candidates are the
     /// transcripts matching the unified content+recency rule (see module
-    /// doc). Outcomes: 0 matches → resolve (keep armed, no emission);
-    /// 1 match → emit `AntigravityLocated` (the association decides
-    /// no-op / first-bind / rebind); >= 2 matches → REFUSE and warn
+    /// doc). Outcomes: 0 matches → STAY PENDING (whole-delta review
+    /// round 2, Major 1: a transcript the CLI writes LATE — slow
+    /// startup, an auth flow before the first user record — still binds
+    /// on a later tick; the submit expires after
+    /// `ANTIGRAVITY_PENDING_SUBMIT_LIFETIME_MS`); 1 match → emit
+    /// `AntigravityLocated` (the association decides no-op /
+    /// first-bind / rebind); >= 2 matches → REFUSE and warn
     /// `antigravity_association_refused {reason:"ambiguous"}`; a
     /// conversation claimed by two panes in the same tick is refused for
     /// BOTH (the codex locator's same-tick cross-claim defense). `tick()`
@@ -259,7 +290,15 @@ impl AntigravityLocator {
             if armed.resolved || now_ms < submit.at_ms + self.window_ms {
                 continue;
             }
-            armed.resolved = true;
+            // The pending submit's bounded lifetime: a submit that never
+            // matched is DROPPED once the lifetime elapses (never pinning
+            // a window, never binding an unrelated future conversation);
+            // this tick is the one that observes the expiry, after which
+            // `due()` stops considering the pane (zero fs cost again).
+            if now_ms >= submit.at_ms + ANTIGRAVITY_PENDING_SUBMIT_LIFETIME_MS {
+                armed.resolved = true;
+                continue;
+            }
             let mut matches: Vec<AntigravityLocated> = Vec::new();
             for path in &transcripts {
                 if !mtime_could_be_recent(path, submit.at_ms) {
@@ -297,9 +336,17 @@ impl AntigravityLocator {
                 });
             }
             match matches.len() {
-                0 => {} // keep watching (resolved; the next Enter re-opens)
-                1 => claims.push((terminal_id.clone(), matches.remove(0))),
+                // Zero matches: the submit STAYS PENDING — a later tick
+                // retries it (the review's late-write case). Only the
+                // lifetime bound (checked above) or a NEWER `note_submit`
+                // (which replaces the window) ends the retry.
+                0 => {} // keep watching (pending; the next Enter re-opens)
+                1 => {
+                    armed.resolved = true;
+                    claims.push((terminal_id.clone(), matches.remove(0)));
+                }
                 n => {
+                    armed.resolved = true;
                     tracing::warn!(
                         target: "freshell_sessions::antigravity_locator",
                         terminal_id = %terminal_id,
@@ -881,6 +928,117 @@ mod tests {
         assert!(locator.note_submit("t1", "the resumed prompt", T0 + 900));
         let located = locator.tick(T0 + 900 + ANTIGRAVITY_WINDOW_MS + 1);
         assert_eq!(located.len(), 1, "the LATEST user record is the evidence");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Whole-delta review round 2, Major 1: a submit whose first scan
+    /// matched NOTHING must STAY PENDING — the CLI can write its first
+    /// user record well after the scan (slow startup, an auth flow before
+    /// the record lands), and the recency rule already requires the
+    /// matching record at/after the submit, so a late write is exactly
+    /// the case the window exists to catch. A resolved-on-first-scan
+    /// locator would drop the pane's only chance to bind that
+    /// conversation (losing exact identity and crash resume) unless the
+    /// user submits again.
+    #[test]
+    fn an_unmatched_submit_stays_pending_and_binds_a_transcript_written_after_the_scan() {
+        let (locator, root) = locator_for("pending-late-write");
+        let cwd = "/tmp/agy-pending-late-write";
+        std::fs::create_dir_all(cwd).unwrap();
+        locator.arm("t1", cwd);
+        assert!(locator.note_submit("t1", "slow start prompt", T0));
+        // The first due scan finds NO transcript at all (the CLI has not
+        // written its first user record yet — the review's slow-startup
+        // shape). The submit must stay PENDING, not resolve.
+        let located = locator.tick(T0 + ANTIGRAVITY_WINDOW_MS + 1);
+        assert!(located.is_empty(), "nothing on disk yet — no bind");
+        assert_eq!(locator.fs_scan_count(), 1);
+        // The transcript is written AFTER that first scan (the record's
+        // own `at` postdates the submit — recency holds).
+        write_transcript(
+            &root,
+            "conv-late",
+            cwd,
+            &[("slow start prompt", T0 + 3_000)],
+        );
+        // A later tick re-evaluates the still-pending submit and BINDS.
+        let located = locator.tick(T0 + 3_000 + ANTIGRAVITY_WINDOW_MS + 1);
+        assert_eq!(
+            located.len(),
+            1,
+            "a transcript first written after the scan still binds the pending submit: \
+             {located:?}"
+        );
+        assert_eq!(located[0].conversation_id, "conv-late");
+        assert_eq!(located[0].terminal_id, "t1");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The pending submit's bounded lifetime: a submit that never matched
+    /// is dropped after `ANTIGRAVITY_PENDING_SUBMIT_LIFETIME_MS`, so it
+    /// can never pin a window forever or bind an unrelated conversation
+    /// written much later.
+    #[test]
+    fn an_expired_pending_submit_never_binds_a_much_later_write() {
+        let (locator, root) = locator_for("pending-expiry");
+        let cwd = "/tmp/agy-pending-expiry";
+        std::fs::create_dir_all(cwd).unwrap();
+        locator.arm("t1", cwd);
+        assert!(locator.note_submit("t1", "never matched prompt", T0));
+        // The first scan matches nothing; the submit stays pending.
+        let located = locator.tick(T0 + ANTIGRAVITY_WINDOW_MS + 1);
+        assert!(located.is_empty());
+        // A transcript carrying that exact text is written LONG after the
+        // lifetime has elapsed (an unrelated future conversation — the
+        // hazard the bound exists to contain).
+        let much_later = T0 + ANTIGRAVITY_PENDING_SUBMIT_LIFETIME_MS + 60_000;
+        write_transcript(
+            &root,
+            "conv-unrelated",
+            cwd,
+            &[("never matched prompt", much_later)],
+        );
+        let located = locator.tick(much_later + ANTIGRAVITY_WINDOW_MS + 1);
+        assert!(
+            located.is_empty(),
+            "an expired pending submit never binds a much-later write: {located:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The re-typed-prompt rejection survives the pending retry: a NEWER
+    /// submit still REPLACES an older pending one, so a transcript
+    /// written late for the OLD submit's text (even recency-legal against
+    /// the old Enter) can never bind through the superseded window —
+    /// only the newest submit is live.
+    #[test]
+    fn a_superseding_submit_replaces_a_pending_window_before_a_late_write_binds() {
+        let (locator, root) = locator_for("pending-superseded");
+        let cwd = "/tmp/agy-pending-superseded";
+        std::fs::create_dir_all(cwd).unwrap();
+        locator.arm("t1", cwd);
+        // Submit A matches nothing on its first scan and stays pending.
+        assert!(locator.note_submit("t1", "re-typed prompt", T0));
+        assert!(locator.tick(T0 + ANTIGRAVITY_WINDOW_MS + 1).is_empty());
+        // Submit B (the same text re-typed, the review's adversarial
+        // shape) REPLACES the pending window at T0 + 30 s.
+        let submit_b = T0 + 30_000;
+        assert!(locator.note_submit("t1", "re-typed prompt", submit_b));
+        // A transcript whose matching record was written after A's Enter
+        // but BEFORE B's lands on disk: recency-legal for the OLD pending
+        // window, stale for the LIVE one. Only the newest submit may
+        // bind, so this late write of A's conversation is rejected.
+        write_transcript(&root, "conv-a", cwd, &[("re-typed prompt", T0 + 10_000)]);
+        let located = locator.tick(submit_b + ANTIGRAVITY_WINDOW_MS + 1);
+        assert!(
+            located.is_empty(),
+            "the superseded pending window never binds: {located:?}"
+        );
+        // The live window's own conversation (written at/after B) binds.
+        write_transcript(&root, "conv-b", cwd, &[("re-typed prompt", submit_b + 500)]);
+        let located = locator.tick(submit_b + ANTIGRAVITY_WINDOW_MS + 2);
+        assert_eq!(located.len(), 1, "the newest submit's window binds");
+        assert_eq!(located[0].conversation_id, "conv-b");
         let _ = std::fs::remove_dir_all(&root);
     }
 
