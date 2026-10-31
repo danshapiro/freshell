@@ -17,7 +17,7 @@ function landmark(index: number, offsetTop: number, height = 100): MinimapLandma
 // Even-spacing reference arithmetic (transcript-minimap-layout.ts):
 //   N     = landmark count (after the offsetTop/index sort)
 //   slot  = railHeight / N                     — one uniform slot per prompt
-//   scale = railHeight / scrollHeight           — line HEIGHTS + band only
+//   scale = railHeight / scrollHeight           — line HEIGHTS only
 //   em    = min(3, slot)                        — density-thinned line floor
 //   h_i   = clamp(landmark_i.height * scale, em, max(slot - 1, em))
 //   top_i = i * slot + (slot - h_i) / 2         — line centered in its slot
@@ -30,7 +30,7 @@ describe('computeMinimapLayout', () => {
     // em = min(3, 33.3̅) = 3; h = clamp(100*0.05 = 5, 3, max(32.3̅, 3)) = 5;
     // tops = i*33.3̅ + (33.3̅ - 5)/2 = i*33.3̅ + 14.1̅6 = 14.1̅6 / 47.5 / 80.8̅3.
     const layout = computeMinimapLayout({
-      scrollHeight: 2000, viewportHeight: 400, scrollTop: 0, railHeight: 100,
+      scrollHeight: 2000, railHeight: 100,
       landmarks: [landmark(0, 0), landmark(2, 1000), landmark(4, 1900)],
     })
     expect(layout.ticks.map((t) => t.index)).toEqual([0, 2, 4])
@@ -47,7 +47,7 @@ describe('computeMinimapLayout', () => {
     // N=1 -> slot 100; 10 * 0.05 = 0.5px clamps up to the 3px floor,
     // centered in its slot at (100 - 3)/2 = 48.5.
     const layout = computeMinimapLayout({
-      scrollHeight: 2000, viewportHeight: 400, scrollTop: 0, railHeight: 100,
+      scrollHeight: 2000, railHeight: 100,
       landmarks: [landmark(0, 0, 10)],
     })
     expect(layout.ticks[0].height).toBe(MINIMAP_MIN_TICK_HEIGHT_PX)
@@ -60,7 +60,7 @@ describe('computeMinimapLayout', () => {
     // tops = i*33.3̅ + 15.1̅6 — a uniform 33.3̅px pitch; the offsets order
     // the prompts but place nothing.
     const layout = computeMinimapLayout({
-      scrollHeight: 10000, viewportHeight: 400, scrollTop: 0, railHeight: 100,
+      scrollHeight: 10000, railHeight: 100,
       landmarks: [landmark(0, 0), landmark(1, 100), landmark(2, 500)],
     })
     expect(layout.ticks.map((t) => t.index)).toEqual([0, 1, 2])
@@ -78,7 +78,7 @@ describe('computeMinimapLayout', () => {
     // 0.4 clamps to 2 (cap max(2 - 1, 2) = 2), so h = slot and every line
     // fills its slot exactly, centered at top 2i: 0, 2, ..., 18.
     const layout = computeMinimapLayout({
-      scrollHeight: 5000, viewportHeight: 400, scrollTop: 0, railHeight: 20,
+      scrollHeight: 5000, railHeight: 20,
       landmarks: Array.from({ length: 10 }, (_, i) => landmark(i, i * 100)),
     })
     expect(layout.ticks).toHaveLength(10)
@@ -92,7 +92,7 @@ describe('computeMinimapLayout', () => {
     // monotonic, in-bounds. No two ticks share coordinates: nothing
     // occludes anything.
     const layout = computeMinimapLayout({
-      scrollHeight: 3000, viewportHeight: 400, scrollTop: 0, railHeight: 20,
+      scrollHeight: 3000, railHeight: 20,
       landmarks: Array.from({ length: 30 }, (_, i) => landmark(i, i * 100)),
     })
     expect(layout.ticks).toHaveLength(30)
@@ -110,7 +110,7 @@ describe('computeMinimapLayout', () => {
     // tops 0.5 / 50.5 — a full 1px gap between tick 0's bottom (49.5) and
     // tick 1's top (50.5). The old packer scaled this pair to 50/50 abutting.
     const layout = computeMinimapLayout({
-      scrollHeight: 500, viewportHeight: 200, scrollTop: 0, railHeight: 100,
+      scrollHeight: 500, railHeight: 100,
       landmarks: [landmark(0, 0, 300), landmark(1, 250, 300)],
     })
     expect(layout.ticks.map((t) => t.index)).toEqual([0, 1])
@@ -128,7 +128,7 @@ describe('computeMinimapLayout', () => {
     // late prompts share the SAME uniform pitch as the first, spread
     // across the whole rail.
     const layout = computeMinimapLayout({
-      scrollHeight: 10000, viewportHeight: 400, scrollTop: 0, railHeight: 200,
+      scrollHeight: 10000, railHeight: 200,
       landmarks: [
         landmark(0, 0),
         landmark(1, 9500), landmark(2, 9600), landmark(3, 9700),
@@ -145,7 +145,7 @@ describe('computeMinimapLayout', () => {
   it('sorts unsorted landmarks by offsetTop (ties by index)', () => {
     // N=2 -> slot 50; h = clamp(100*0.05 = 5, 3, 49) = 5; tops i*50 + 22.5.
     const layout = computeMinimapLayout({
-      scrollHeight: 2000, viewportHeight: 400, scrollTop: 0, railHeight: 100,
+      scrollHeight: 2000, railHeight: 100,
       landmarks: [landmark(4, 1000), landmark(0, 0)],
     })
     expect(layout.ticks.map((t) => t.index)).toEqual([0, 4])
@@ -159,7 +159,7 @@ describe('computeMinimapLayout', () => {
     // slot assignment would be [0, 2, 1]. Sorted [0, 1, 2] -> slots 0/1/2
     // (h = clamp(100*0.05 = 5, 3, 32.3̅) = 5, tops i*33.3̅ + 14.1̅6).
     const layout = computeMinimapLayout({
-      scrollHeight: 2000, viewportHeight: 400, scrollTop: 0, railHeight: 100,
+      scrollHeight: 2000, railHeight: 100,
       landmarks: [landmark(2, 500), landmark(1, 500), landmark(0, 0)],
     })
     expect(layout.ticks.map((t) => t.index)).toEqual([0, 1, 2])
@@ -175,7 +175,7 @@ describe('computeMinimapLayout', () => {
     // joins: three singleton runs, each dense (3 < 4) — lone sub-4px
     // ticks, the geometry the component's loneDense hit path serves.
     const layout = computeMinimapLayout({
-      scrollHeight: 10000, viewportHeight: 400, scrollTop: 0, railHeight: 100,
+      scrollHeight: 10000, railHeight: 100,
       landmarks: [landmark(0, 0), landmark(1, 100), landmark(2, 500)],
     })
     expect(layout.clusters).toHaveLength(3)
@@ -193,7 +193,7 @@ describe('computeMinimapLayout', () => {
     // clickability pass does not join them: two singleton runs, each
     // comfortably clickable (49 >= 4) — no open-list affordance.
     const layout = computeMinimapLayout({
-      scrollHeight: 500, viewportHeight: 200, scrollTop: 0, railHeight: 100,
+      scrollHeight: 500, railHeight: 100,
       landmarks: [landmark(0, 0, 300), landmark(1, 250, 300)],
     })
     expect(layout.clusters).toEqual([
@@ -209,7 +209,7 @@ describe('computeMinimapLayout', () => {
     // A 75px turn (3px) in the same geometry stays separate too, but its
     // singleton run is dense: a lone sub-4px tick.
     const atFloor = computeMinimapLayout({
-      scrollHeight: 2500, viewportHeight: 400, scrollTop: 0, railHeight: 100,
+      scrollHeight: 2500, railHeight: 100,
       landmarks: [landmark(0, 0, 100), landmark(1, 10, 100)],
     })
     expect(atFloor.ticks[0].height).toBeCloseTo(MINIMAP_TICK_MIN_CLICKABLE_PX, 5)
@@ -219,7 +219,7 @@ describe('computeMinimapLayout', () => {
     ])
 
     const belowFloor = computeMinimapLayout({
-      scrollHeight: 2500, viewportHeight: 400, scrollTop: 0, railHeight: 100,
+      scrollHeight: 2500, railHeight: 100,
       landmarks: [landmark(0, 0, 100), landmark(1, 10, 75)],
     })
     expect(belowFloor.clusters[1].dense).toBe(true)
@@ -227,7 +227,7 @@ describe('computeMinimapLayout', () => {
 
   it('reports singleton clusters for non-colliding ticks (never dense) and none for degenerate inputs', () => {
     const layout = computeMinimapLayout({
-      scrollHeight: 2000, viewportHeight: 400, scrollTop: 0, railHeight: 100,
+      scrollHeight: 2000, railHeight: 100,
       landmarks: [landmark(0, 0), landmark(2, 1000), landmark(4, 1900)],
     })
     expect(layout.clusters).toHaveLength(3)
@@ -240,7 +240,7 @@ describe('computeMinimapLayout', () => {
     })
 
     const degenerate = computeMinimapLayout({
-      scrollHeight: 0, viewportHeight: 200, scrollTop: 0, railHeight: 100,
+      scrollHeight: 0, railHeight: 100,
       landmarks: [landmark(0, 0)],
     })
     expect(degenerate.clusters).toEqual([])
@@ -253,7 +253,7 @@ describe('computeMinimapLayout', () => {
     // spacing a dense transcript naturally forms one all-prompts mega-run
     // whose bounded 60vh open-list menu handles any count.
     const layout = computeMinimapLayout({
-      scrollHeight: 3000, viewportHeight: 400, scrollTop: 0, railHeight: 20,
+      scrollHeight: 3000, railHeight: 20,
       landmarks: Array.from({ length: 30 }, (_, i) => landmark(i, i * 100)),
     })
     expect(layout.clusters).toHaveLength(1)
@@ -272,7 +272,7 @@ describe('computeMinimapLayout', () => {
     // lone sub-4px ticks, the geometry the component's loneDense hit
     // path is built for.
     const layout = computeMinimapLayout({
-      scrollHeight: 10000, viewportHeight: 400, scrollTop: 0, railHeight: 200,
+      scrollHeight: 10000, railHeight: 200,
       landmarks: Array.from({ length: 50 }, (_, i) => landmark(i, i * 200, 150)),
     })
     expect(layout.clusters).toHaveLength(50)
@@ -288,7 +288,7 @@ describe('computeMinimapLayout', () => {
   it('keeps a single landmark', () => {
     // N=1 -> slot 100: the 5px line centers in its slot at (100 - 5)/2 = 47.5.
     const layout = computeMinimapLayout({
-      scrollHeight: 2000, viewportHeight: 400, scrollTop: 0, railHeight: 100,
+      scrollHeight: 2000, railHeight: 100,
       landmarks: [landmark(2, 1000)],
     })
     expect(layout.ticks).toHaveLength(1)
@@ -300,62 +300,42 @@ describe('computeMinimapLayout', () => {
     // spacing never reads it for placement — the lone prompt centers in
     // its slot at (100 - 5)/2 = 47.5, in-bounds by construction.
     const layout = computeMinimapLayout({
-      scrollHeight: 2000, viewportHeight: 400, scrollTop: 0, railHeight: 100,
+      scrollHeight: 2000, railHeight: 100,
       landmarks: [landmark(6, 2100)],
     })
     expect(layout.ticks[0].top).toBeCloseTo(47.5, 5)
     expect(layout.ticks[0].top + layout.ticks[0].height).toBeLessThanOrEqual(100)
   })
 
-  it('returns no ticks for empty landmarks but still reports the viewport band', () => {
+  it('returns no ticks or slots for empty landmarks', () => {
     const layout = computeMinimapLayout({
-      scrollHeight: 1000, viewportHeight: 200, scrollTop: 400, railHeight: 100,
+      scrollHeight: 1000, railHeight: 100,
       landmarks: [],
     })
     expect(layout.ticks).toEqual([])
     // No prompts -> no slots; 0 keeps the field finite (never NaN/Infinity).
     expect(layout.slotHeight).toBe(0)
-    expect(layout.viewport.top).toBeCloseTo(40, 5)
-    expect(layout.viewport.height).toBeCloseTo(20, 5)
   })
 
   it('returns empty geometry for degenerate inputs', () => {
     for (const input of [
-      { scrollHeight: 0, viewportHeight: 200, scrollTop: 0, railHeight: 100 },
-      { scrollHeight: 1000, viewportHeight: 200, scrollTop: 0, railHeight: 0 },
+      { scrollHeight: 0, railHeight: 100 },
+      { scrollHeight: 1000, railHeight: 0 },
     ]) {
       const layout = computeMinimapLayout({ ...input, landmarks: [landmark(0, 0)] })
       expect(layout.ticks).toEqual([])
-      expect(layout.viewport).toEqual({ top: 0, height: 0 })
       expect(layout.railHeight).toBe(0)
       expect(layout.slotHeight).toBe(0)
     }
   })
 
-  it('maps the band to the scroll fraction: top at 0, bottom at max scroll', () => {
-    const base = { scrollHeight: 1000, viewportHeight: 200, railHeight: 100, landmarks: [] as MinimapLandmark[] }
-    expect(computeMinimapLayout({ ...base, scrollTop: 0 }).viewport.top).toBeCloseTo(0, 5)
-    expect(computeMinimapLayout({ ...base, scrollTop: 400 }).viewport.top).toBeCloseTo(40, 5)
-    expect(computeMinimapLayout({ ...base, scrollTop: 800 }).viewport.top).toBeCloseTo(80, 5)
-  })
-
-  it('clamps out-of-range scrollTop into the band travel', () => {
-    const base = { scrollHeight: 1000, viewportHeight: 200, railHeight: 100, landmarks: [] as MinimapLandmark[] }
-    expect(computeMinimapLayout({ ...base, scrollTop: -50 }).viewport.top).toBeCloseTo(0, 5)
-    expect(computeMinimapLayout({ ...base, scrollTop: 9999 }).viewport.top).toBeCloseTo(80, 5)
-  })
-
-  it('spans the full rail with the band when content fits the viewport', () => {
-    // scrollHeight 150 < viewportHeight 200: the band clamps to the whole
-    // rail and the scroll fraction pins at 0. (The component hides the rail
-    // in this state; the pure function still behaves sanely.) The lone
-    // landmark's line: slot 100, raw 150*(100/150) = 100 clamps to cap
+  it('keeps a large landmark within its slot', () => {
+    // The lone landmark's line: slot 100, raw 150*(100/150) = 100 clamps to cap
     // max(100 - 1, 3) = 99, centered at top 0.5.
     const layout = computeMinimapLayout({
-      scrollHeight: 150, viewportHeight: 200, scrollTop: 0, railHeight: 100,
+      scrollHeight: 150, railHeight: 100,
       landmarks: [landmark(0, 0, 150)],
     })
-    expect(layout.viewport).toEqual({ top: 0, height: 100 })
     expect(layout.ticks[0].top).toBeCloseTo(0.5, 5)
     expect(layout.ticks[0].height).toBeCloseTo(99, 5)
   })
@@ -394,7 +374,7 @@ describe('computeTickHitBox', () => {
     // slot-clamped to {4i, 4} — every adjacent pair abuts exactly and no
     // box escapes the rail.
     const layout = computeMinimapLayout({
-      scrollHeight: 10000, viewportHeight: 400, scrollTop: 0, railHeight: 200,
+      scrollHeight: 10000, railHeight: 200,
       landmarks: Array.from({ length: 50 }, (_, i) => landmark(i, i * 200, 150)),
     })
     let prev: { top: number; height: number } | null = null

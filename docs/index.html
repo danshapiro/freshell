@@ -473,7 +473,6 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
 .fresh-transcript { min-height: 0; flex: 1; overflow-x: hidden; overflow-y: auto; padding: 14px 12px; }
 .fresh-transcript { position: relative; }
 .fresh-minimap { position: absolute; top: 0; right: 8px; bottom: 48px; width: 12px; }
-.fresh-minimap-viewport { position: absolute; left: 0; right: 0; border-radius: 2px; background: rgba(127, 127, 127, 0.18); }
 .fresh-minimap-tick { position: absolute; left: 0; right: 0; height: 3px; border-radius: 2px; background: rgba(127, 127, 127, 0.45); }
 .fresh-turn { border-left: 2px solid hsl(var(--border)); padding-left: 10px; margin-bottom: 14px; }
 .fresh-turn.user { border-left-color: hsl(var(--foreground)); }
@@ -982,7 +981,7 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
               <div class="fresh-transcript">
                 <div class="fresh-turn user"><div class="fresh-role">You</div><div class="fresh-copy">What layout should Fresh clients use on desktop and phone?</div></div>
                 <div class="fresh-turn"><div class="fresh-role">Assistant</div><div class="fresh-activity">thought · 1 tool used</div><div class="fresh-copy">The pane keeps real geometry. Transcript text follows the terminal font size; metadata becomes a rail only when the pane has enough width.</div></div>
-                <div class="fresh-minimap" aria-hidden="true"><span class="fresh-minimap-viewport" style="top: 52%; height: 34%"></span><span class="fresh-minimap-tick" style="top: 25%"></span><span class="fresh-minimap-tick" style="top: 75%"></span></div>
+                <div class="fresh-minimap" aria-hidden="true"><span class="fresh-minimap-tick" style="top: 25%"></span><span class="fresh-minimap-tick" style="top: 75%"></span></div>
               </div>
               <div class="fresh-strip">
                 <button type="button" class="fresh-strip-chip" title="gpt-6-astra · effort max">GPT-6 Astra<i data-lucide="chevron-down" class="icon-xs"></i></button>

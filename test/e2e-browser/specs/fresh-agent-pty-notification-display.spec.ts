@@ -108,7 +108,7 @@ test.describe('fresh-agent PTY notification display role', () => {
 
     // Minimap: exactly one tick — the real human prompt — and its label is
     // that prompt, never the PTY block.
-    await expect(freshPane.getByTestId('transcript-minimap-viewport')).toBeVisible()
+    await expect(freshPane.getByRole('group', { name: 'Transcript minimap' })).toBeVisible()
     const ticks = freshPane.getByRole('button', { name: /Jump to prompt:/ })
     await expect(ticks).toHaveCount(1)
     await expect(freshPane.getByRole('button', { name: 'Jump to prompt: Run the backup sync now', exact: true })).toBeVisible()
