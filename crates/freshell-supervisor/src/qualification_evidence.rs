@@ -96,6 +96,8 @@ mod tests {
                 fixture: None,
                 terminal: None,
                 fresh_agent: Some(FreshAgentLaunchSpec {
+                    naming_handle: None,
+                    collaboration_mode: None,
                     session_id: soul.as_str().into(),
                     provider,
                     session_type: session_type.into(),

@@ -10123,6 +10123,7 @@ mod tests {
         );
         launch.provider_launch_context.as_mut().unwrap().preparation =
             freshell_runtime_protocol::ProviderPreparation::Codex {
+                approval_default: None,
                 tui_args: Vec::new(),
                 sidecar_args: Vec::new(),
             };
@@ -10178,6 +10179,7 @@ mod tests {
 
         launch.provider_launch_context.as_mut().unwrap().preparation =
             freshell_runtime_protocol::ProviderPreparation::Codex {
+                approval_default: None,
                 tui_args: Vec::new(),
                 sidecar_args: Vec::new(),
             };
@@ -10643,6 +10645,7 @@ mod tests {
         ) -> Result<DispatchAck, DispatchFailure> {
             self.dispatches.fetch_add(1, Ordering::SeqCst);
             Ok(DispatchAck {
+                native_identity: None,
                 provider_ack_id: Some(request_id.to_string()),
             })
         }
@@ -10660,6 +10663,7 @@ mod tests {
                 .unwrap()
                 .push(logical_attempt_id.map(str::to_owned));
             Ok(DispatchAck {
+                native_identity: None,
                 provider_ack_id: Some(request_id.to_string()),
             })
         }
@@ -10749,6 +10753,20 @@ mod tests {
             )
         }
 
+        async fn model_catalog(&self, cwd: Option<&str>) -> Result<serde_json::Value, String> {
+            assert_eq!(cwd, Some("/workspace"));
+            Ok(
+                serde_json::json!([{"id":"rpc-catalog","displayName":"RPC Catalog","supportedEffortLevels":["ultra"],"defaultEffort":"ultra","inputModalities":["text"]}]),
+            )
+        }
+
+        async fn read_child(&self, child_thread_id: &str) -> Result<serde_json::Value, String> {
+            assert_eq!(child_thread_id, "fixture-child");
+            Ok(
+                serde_json::json!({"parentThreadId":"fixture-native-thread","childThreadId":child_thread_id,"status":"saved","snapshot":{"threadId":child_thread_id,"provider":"codex","sessionType":"freshcodex","turns":[{"text":"x".repeat(2 * freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES)}]}}),
+            )
+        }
+
         async fn stop(self: Arc<Self>) -> Result<(), String> {
             self.stops.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -10811,6 +10829,8 @@ mod tests {
                 let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
                     state.state_dir.join("transition-agent"),
                     FreshAgentProfile {
+                        naming_handle: None,
+                        collaboration_mode: None,
                         provider: if clear || after_clear {
                             FreshProvider::Claude
                         } else {
@@ -10985,6 +11005,8 @@ mod tests {
         let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
             state.state_dir.join("current-native-rpc-agent"),
             FreshAgentProfile {
+                naming_handle: None,
+                collaboration_mode: None,
                 provider: FreshProvider::Claude,
                 runtime_variant: "fixture-sdk".into(),
                 cwd: "/workspace".into(),
@@ -11076,6 +11098,8 @@ mod tests {
         let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
             state.state_dir.join("rpc-fixture-agent"),
             FreshAgentProfile {
+                naming_handle: None,
+                collaboration_mode: None,
                 provider: FreshProvider::Claude,
                 runtime_variant: "fixture-sdk".into(),
                 cwd: "/workspace".into(),
@@ -12071,6 +12095,8 @@ mod tests {
         > {
             self.opens.fetch_add(1, Ordering::SeqCst);
             let profile = FreshAgentProfile {
+                naming_handle: launch.naming_handle,
+                collaboration_mode: launch.collaboration_mode,
                 provider: launch.provider,
                 runtime_variant: launch.runtime_variant,
                 cwd: launch.cwd,
@@ -12534,6 +12560,8 @@ mod tests {
             freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
                 state_dir.join("publication-agent"),
                 FreshAgentProfile {
+                    naming_handle: launch.naming_handle,
+                    collaboration_mode: launch.collaboration_mode,
                     provider: FreshProvider::Claude,
                     runtime_variant: launch.runtime_variant,
                     cwd: launch.cwd,
@@ -18039,6 +18067,7 @@ console.log('actual library export/import/full-row reader and Node semantic bind
             // linked targets are discovered by the shared copier.
             config: vec![],
             preparation: ProviderPreparation::Codex {
+                approval_default: None,
                 tui_args: vec![],
                 sidecar_args: vec![],
             },
@@ -18227,6 +18256,7 @@ console.log('actual library export/import/full-row reader and Node semantic bind
             })
             .collect(),
             preparation: ProviderPreparation::Codex {
+                approval_default: None,
                 tui_args: vec![],
                 sidecar_args: vec![],
             },
@@ -18308,6 +18338,7 @@ console.log('actual library export/import/full-row reader and Node semantic bind
                 format: "directory".into(),
             }],
             preparation: ProviderPreparation::Codex {
+                approval_default: None,
                 tui_args: vec![],
                 sidecar_args: vec![],
             },
@@ -18391,6 +18422,7 @@ console.log('actual library export/import/full-row reader and Node semantic bind
         let context = ProviderLaunchContext {
             prepared_inputs: None,
             preparation: ProviderPreparation::Codex {
+                approval_default: None,
                 tui_args: vec![],
                 sidecar_args: vec![],
             },
@@ -21401,407 +21433,6 @@ console.log('actual library export/import/full-row reader and Node semantic bind
             .starts_with(".freshell-provider-refresh-")));
     }
 
-    #[test]
-    fn provider_config_exact_resume_refreshes_changes_and_removes_stale_projection() {
-        use freshell_runtime_protocol::{
-            ProviderConfigReference, ProviderConfigRoot, ProviderLaunchContext, ProviderPreparation,
-        };
-        let root = tempfile::tempdir().unwrap();
-        let source = root.path().join("user-provider");
-        let destination = root.path().join("provider-home");
-        std::fs::create_dir_all(source.join("plugins")).unwrap();
-        std::fs::create_dir_all(&destination).unwrap();
-        std::fs::write(source.join("settings.json"), b"first").unwrap();
-        std::fs::write(source.join("plugins/old.js"), b"old").unwrap();
-        let mut context = ProviderLaunchContext {
-            prepared_inputs: None,
-            preparation: ProviderPreparation::Claude {
-                mcp_args: Vec::new(),
-            },
-            mcp_capability: None,
-            config: vec![
-                ProviderConfigReference {
-                    root: ProviderConfigRoot::UserProvider,
-                    relative_path: "settings.json".into(),
-                    provider_relative_path: ".claude/settings.json".into(),
-                    format: "json".into(),
-                },
-                ProviderConfigReference {
-                    root: ProviderConfigRoot::UserProvider,
-                    relative_path: "plugins".into(),
-                    provider_relative_path: ".claude/plugins".into(),
-                    format: "directory".into(),
-                },
-            ],
-        };
-        let uid = unsafe { libc::geteuid() };
-        let gid = unsafe { libc::getegid() };
-        copy_provider_config_references(
-            &context,
-            "claude",
-            root.path(),
-            &source,
-            &destination,
-            uid,
-            gid,
-        )
-        .unwrap();
-        std::fs::write(
-            destination.join(".claude/plugins/provider-created.js"),
-            b"durable",
-        )
-        .unwrap();
-        std::fs::write(source.join("settings.json"), b"second").unwrap();
-        std::fs::remove_file(source.join("plugins/old.js")).unwrap();
-        std::fs::write(source.join("plugins/new.js"), b"new").unwrap();
-        refresh_provider_config_references(
-            &context,
-            "claude",
-            root.path(),
-            &source,
-            &destination,
-            uid,
-            gid,
-        )
-        .unwrap();
-        let child_output = std::process::Command::new("/usr/bin/cat")
-            .arg(destination.join(".claude/settings.json"))
-            .output()
-            .unwrap();
-        assert!(child_output.status.success());
-        assert_eq!(child_output.stdout, b"second");
-        assert!(!destination.join(".claude/plugins/old.js").exists());
-        assert_eq!(
-            std::fs::read(destination.join(".claude/plugins/new.js")).unwrap(),
-            b"new"
-        );
-        assert_eq!(
-            std::fs::read(destination.join(".claude/plugins/provider-created.js")).unwrap(),
-            b"durable"
-        );
-        std::fs::remove_file(source.join("settings.json")).unwrap();
-        let error = refresh_provider_config_references(
-            &context,
-            "claude",
-            root.path(),
-            &source,
-            &destination,
-            uid,
-            gid,
-        )
-        .unwrap_err();
-        assert!(error.contains("settings.json") && error.contains("repair"));
-        assert_eq!(
-            std::fs::read(destination.join(".claude/settings.json")).unwrap(),
-            b"second"
-        );
-        assert_eq!(
-            std::fs::read(destination.join(".claude/plugins/provider-created.js")).unwrap(),
-            b"durable"
-        );
-        context
-            .config
-            .retain(|reference| reference.relative_path != "settings.json");
-        refresh_provider_config_references(
-            &context,
-            "claude",
-            root.path(),
-            &source,
-            &destination,
-            uid,
-            gid,
-        )
-        .unwrap();
-        assert!(!destination.join(".claude/settings.json").exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn provider_config_codex_linked_skills_and_discovery_survive_repeated_resume() {
-        use freshell_platform::provider_environment::{copy_environment, CopySelection};
-        use freshell_runtime_protocol::{
-            ProviderConfigReference, ProviderConfigRoot, ProviderLaunchContext, ProviderPreparation,
-        };
-        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
-        let root = executable_fixture();
-        let original = root.path().join("original");
-        let external = root.path().join("external-skills");
-        let discovered = original.join(".agents/skills");
-        for directory in [&external, &discovered] {
-            std::fs::create_dir_all(directory.join("fixture/scripts")).unwrap();
-            std::fs::write(directory.join("fixture/SKILL.md"), "fixture").unwrap();
-            std::fs::write(directory.join("fixture/resource"), "resource-nonce\n").unwrap();
-            let script = directory.join("fixture/scripts/run");
-            std::fs::write(
-                &script,
-                "#!/bin/sh\ncat \"$(dirname \"$0\")/../resource\"\n",
-            )
-            .unwrap();
-            std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        std::fs::create_dir_all(original.join(".codex")).unwrap();
-        symlink(&external, original.join(".codex/skills")).unwrap();
-        let controller = root.path().join("controller");
-        copy_environment(
-            &[
-                CopySelection {
-                    source: original.join(".codex/skills"),
-                    destination_relative: "skills".into(),
-                },
-                CopySelection {
-                    source: discovered,
-                    destination_relative: "freshell-discovered-agents".into(),
-                },
-            ],
-            &controller,
-            &[],
-            Default::default(),
-        )
-        .unwrap();
-        let context = ProviderLaunchContext {
-            prepared_inputs: None,
-            preparation: ProviderPreparation::Codex {
-                approval_default: None,
-                tui_args: vec![],
-                sidecar_args: vec![],
-            },
-            mcp_capability: None,
-            config: [
-                ("skills", ".codex/skills"),
-                (
-                    "freshell-discovered-agents",
-                    ".codex/skills/freshell-discovered-agents",
-                ),
-                (".freshell/resources", ".freshell/resources"),
-            ]
-            .into_iter()
-            .map(|(source, destination)| ProviderConfigReference {
-                root: ProviderConfigRoot::UserProvider,
-                relative_path: source.into(),
-                provider_relative_path: destination.into(),
-                format: "directory".into(),
-            })
-            .collect(),
-        };
-        let home = root.path().join("provider");
-        std::fs::create_dir(&home).unwrap();
-        let uid = unsafe { libc::geteuid() };
-        let gid = unsafe { libc::getegid() };
-        copy_provider_config_references(
-            &context,
-            "codex",
-            root.path(),
-            &controller,
-            &home,
-            uid,
-            gid,
-        )
-        .unwrap();
-        assert!(std::fs::symlink_metadata(home.join(".codex/skills"))
-            .unwrap()
-            .file_type()
-            .is_symlink());
-        let sibling = home.join(".codex/skills/provider-sibling");
-        std::fs::write(&sibling, "durable-nonce").unwrap();
-        let inode = std::fs::metadata(&sibling).unwrap().ino();
-        for _ in 0..3 {
-            refresh_provider_config_references(
-                &context,
-                "codex",
-                root.path(),
-                &controller,
-                &home,
-                uid,
-                gid,
-            )
-            .unwrap();
-            for relative in [
-                ".codex/skills/fixture/scripts/run",
-                ".codex/skills/freshell-discovered-agents/fixture/scripts/run",
-            ] {
-                let output =
-                    execute_fixture_with_transient_text_file_busy_retry(&home.join(relative))
-                        .unwrap();
-                assert!(output.status.success(), "{output:?}");
-                assert_eq!(output.stdout, b"resource-nonce\n");
-            }
-            assert_eq!(std::fs::metadata(&sibling).unwrap().ino(), inode);
-            assert_eq!(std::fs::read(&sibling).unwrap(), b"durable-nonce");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn provider_config_unplanned_parent_alias_does_not_modify_outside_target() {
-        use std::os::unix::fs::{symlink, MetadataExt};
-        let root = tempfile::tempdir().unwrap();
-        let outside = root.path().join("outside");
-        let home = root.path().join("home");
-        let stage = root.path().join("stage");
-        std::fs::create_dir(&outside).unwrap();
-        std::fs::create_dir(&home).unwrap();
-        std::fs::create_dir_all(stage.join("projection/.codex/skills")).unwrap();
-        std::fs::write(outside.join("sentinel"), "unchanged").unwrap();
-        let inode = std::fs::metadata(outside.join("sentinel")).unwrap().ino();
-        symlink(&outside, home.join(".codex")).unwrap();
-        std::fs::write(stage.join("manifest.json"), r#"[".codex/skills"]"#).unwrap();
-        std::fs::write(
-            stage.join("projection").join(PROVIDER_PROJECTION_MANIFEST),
-            r#"[".codex",".codex/skills"]"#,
-        )
-        .unwrap();
-        assert!(apply_staged_provider_config(&stage, &home).is_err());
-        assert_eq!(
-            std::fs::metadata(outside.join("sentinel")).unwrap().ino(),
-            inode
-        );
-        assert_eq!(
-            std::fs::read(outside.join("sentinel")).unwrap(),
-            b"unchanged"
-        );
-        assert!(!outside.join("skills").exists());
-    }
-
-    #[test]
-    fn provider_config_spawned_host_preparation_emits_safe_jsonl() {
-        // Re-exec an existing behavior test so the production preparation and
-        // ownership helpers run in a fresh process with no tracing subscriber.
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "tests::provider_config_first_amplifier_launch_transfers_exact_created_state_before_copy", "--nocapture"])
-            .output().unwrap();
-        assert!(output.status.success(), "{output:?}");
-        let events = std::str::from_utf8(&output.stderr)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .collect::<Vec<_>>();
-        for name in [
-            "provider.environment.ownership.started",
-            "provider.environment.ownership.completed",
-            "provider.environment.copy.started",
-            "provider.environment.copy.completed",
-        ] {
-            let event = events
-                .iter()
-                .find(|event| event["event"] == name && event["stage"] == "session_host")
-                .expect("spawned preparation must emit each event");
-            assert_eq!(event["provider"], "amplifier");
-        }
-        // The existing selected-resource failure regression runs both a real
-        // successful copy and a missing selected input in the fresh process.
-        let failed = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "tests::provider_config_exact_resume_refreshes_changes_and_removes_stale_projection", "--nocapture"])
-            .output().unwrap();
-        assert!(failed.status.success(), "{failed:?}");
-        let events = std::str::from_utf8(&failed.stderr)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .collect::<Vec<_>>();
-        let event = events
-            .iter()
-            .find(|event| {
-                event["event"] == "provider.environment.copy.failed"
-                    && event["stage"] == "session_host"
-            })
-            .expect("spawned failed preparation must emit typed error");
-        assert_eq!(event["provider"], "claude");
-        assert_eq!(event["relative_path"], ".claude/settings.json");
-        assert_eq!(event["operation"], "select");
-        assert!(event["corrective_message"]
-            .as_str()
-            .unwrap()
-            .contains("repair"));
-        assert!(event["elapsed_ms"].as_u64().is_some());
-
-        let redaction_root = tempfile::tempdir().unwrap();
-        let redaction_root_text = redaction_root.path().to_string_lossy().into_owned();
-        let recovery = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "tests::provider_config_recovery_preserves_written_writable_file_and_refreshes_read_only_file",
-                "--nocapture",
-            ])
-            .env("TMPDIR", redaction_root.path())
-            .env("TMP", redaction_root.path())
-            .env("TEMP", redaction_root.path())
-            .output()
-            .unwrap();
-        assert!(recovery.status.success(), "{recovery:?}");
-        let recovery_stderr = std::str::from_utf8(&recovery.stderr).unwrap();
-        let recovery_events = recovery_stderr
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .collect::<Vec<_>>();
-        let recovery_failures = recovery_events
-            .iter()
-            .filter(|event| event["event"] == "provider.inputs.recovery.failed")
-            .collect::<Vec<_>>();
-        assert_eq!(
-            recovery_failures.len(),
-            1,
-            "a blocked writable-file recovery must produce one resource-specific diagnostic"
-        );
-        let recovery_failure = recovery_failures[0];
-        assert_eq!(recovery_failure["severity"], "error");
-        assert_eq!(recovery_failure["stage"], "session_host");
-        assert_eq!(recovery_failure["provider"], "opencode");
-        assert_eq!(
-            recovery_failure["operation"],
-            "recover_nested_writable_file"
-        );
-        assert_eq!(recovery_failure["reason"], "prior_resource_deleted");
-        assert_eq!(
-            recovery_failure["resource_stage_path"],
-            ".freshell/resource-units/deleted/source"
-        );
-        assert_eq!(
-            recovery_failure["provider_relative_path"],
-            ".freshell/provider-roots/deleted/source"
-        );
-        assert!(
-            !recovery_stderr.contains("stale host seed")
-                && !recovery_stderr.contains(&redaction_root_text),
-            "recovery diagnostics must not expose fixture contents or temporary host paths"
-        );
-
-        #[cfg(unix)]
-        {
-            let filtered = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "tests::provider_config_workspace_filter_failure_emits_safe_jsonl",
-                    "--nocapture",
-                ])
-                .output()
-                .unwrap();
-            assert!(filtered.status.success(), "{filtered:?}");
-            let event = std::str::from_utf8(&filtered.stderr)
-                .unwrap()
-                .lines()
-                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                .find(|event| {
-                    event["event"] == "provider.environment.copy.failed"
-                        && event["stage"] == "session_host"
-                })
-                .expect("nested-workspace filtering failures emit the standard copy failure event");
-            assert_eq!(event["provider"], "opencode");
-            assert_eq!(event["operation"], "resolve");
-            assert_eq!(event["relative_path"], "resource/dangling-resource");
-            assert_eq!(
-                event["resource_stage_path"],
-                ".freshell/resource-units/root-test"
-            );
-            assert_eq!(event["resource_source_leaf"], "root-test");
-            assert_eq!(event["resource_destination_leaf"], "external");
-            assert!(event["corrective_message"]
-                .as_str()
-                .unwrap()
-                .contains("repair"));
-            assert!(event["elapsed_ms"].as_u64().is_some());
-        }
-    }
-
     #[cfg(unix)]
     #[test]
     fn provider_config_workspace_filter_failure_emits_safe_jsonl() {
@@ -22030,179 +21661,6 @@ console.log('actual library export/import/full-row reader and Node semantic bind
         );
     }
 
-    #[test]
-    fn provider_identity_command_uses_clear_groups_only_when_switching_identity() {
-        let uid = unsafe { libc::geteuid() };
-        let gid = unsafe { libc::getegid() };
-        assert!(provider_identity_args(uid, gid).contains(&"--keep-groups".into()));
-        assert!(
-            provider_identity_args(uid.saturating_add(1), gid).contains(&"--clear-groups".into())
-        );
-    }
-    use async_trait::async_trait;
-    use freshell_agent_runtime::host_actor::{
-        DispatchAck, DispatchFailure, FreshAgentOperation, FreshAgentProfile, FreshAgentTransport,
-        OperationAck, OperationFailure, TransportStart,
-    };
-    use freshell_runtime_protocol::{
-        AgentEvent, FreshAgentCapture, FreshAgentRollbackDirection, FreshAgentRollbackMode,
-        FreshProvider, RequestId,
-    };
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct RpcFixtureTransport {
-        dispatches: AtomicUsize,
-        checkpoint_attempts: std::sync::Mutex<Vec<Option<String>>>,
-        decisions: AtomicUsize,
-        operations: AtomicUsize,
-        captures: AtomicUsize,
-        stops: AtomicUsize,
-    }
-
-    #[async_trait]
-    impl FreshAgentTransport for RpcFixtureTransport {
-        async fn start(&self, _profile: &FreshAgentProfile) -> Result<TransportStart, String> {
-            Ok(TransportStart {
-                native_session_id: Some("fixture-native-thread".into()),
-            })
-        }
-
-        async fn dispatch(
-            &self,
-            request_id: &RequestId,
-            _text: &str,
-            _profile: &FreshAgentProfile,
-        ) -> Result<DispatchAck, DispatchFailure> {
-            self.dispatches.fetch_add(1, Ordering::SeqCst);
-            Ok(DispatchAck {
-                native_identity: None,
-                provider_ack_id: Some(request_id.to_string()),
-            })
-        }
-
-        async fn dispatch_with_checkpoint_identity(
-            &self,
-            request_id: &RequestId,
-            _text: &str,
-            _profile: &FreshAgentProfile,
-            logical_attempt_id: Option<&str>,
-        ) -> Result<DispatchAck, DispatchFailure> {
-            self.dispatches.fetch_add(1, Ordering::SeqCst);
-            self.checkpoint_attempts
-                .lock()
-                .unwrap()
-                .push(logical_attempt_id.map(str::to_owned));
-            Ok(DispatchAck {
-                native_identity: None,
-                provider_ack_id: Some(request_id.to_string()),
-            })
-        }
-
-        async fn resolve_permission(
-            &self,
-            _decision_id: &str,
-            _decision: serde_json::Value,
-        ) -> Result<(), DispatchFailure> {
-            self.decisions.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-
-        async fn interrupt(&self) -> Result<(), String> {
-            Ok(())
-        }
-
-        async fn supports_operation(
-            &self,
-            _operation: &FreshAgentOperation,
-        ) -> Result<bool, String> {
-            Ok(true)
-        }
-
-        async fn dispatch_operation(
-            &self,
-            request_id: &RequestId,
-            _operation: &FreshAgentOperation,
-        ) -> Result<OperationAck, OperationFailure> {
-            self.operations.fetch_add(1, Ordering::SeqCst);
-            Ok(OperationAck {
-                provider_ack_id: Some(request_id.to_string()),
-                native_session_id: Some("fixture-native-thread".into()),
-            })
-        }
-
-        async fn capture(&self, max_bytes: usize) -> Result<FreshAgentCapture, String> {
-            self.captures.fetch_add(1, Ordering::SeqCst);
-            Ok(FreshAgentCapture {
-                provider: FreshProvider::Claude,
-                session_type: "freshclaude".into(),
-                presentation_session_id: "fixture-public-thread".into(),
-                native_session_id: "fixture-native-thread".into(),
-                text: "user: fixture"[..max_bytes.min(13)].into(),
-                truncated: max_bytes < 13,
-            })
-        }
-
-        async fn snapshot(&self) -> Result<serde_json::Value, String> {
-            Ok(
-                serde_json::json!({"threadId":"fixture-native-thread","provider":"claude",
-                "sessionType":"freshclaude","status":"idle","turns":[{"turnId":"retained-rpc-turn","text":"x".repeat(2 * freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES)}]}),
-            )
-        }
-
-        async fn model_catalog(&self, cwd: Option<&str>) -> Result<serde_json::Value, String> {
-            assert_eq!(cwd, Some("/workspace"));
-            Ok(
-                serde_json::json!([{"id":"rpc-catalog","displayName":"RPC Catalog","supportedEffortLevels":["ultra"],"defaultEffort":"ultra","inputModalities":["text"]}]),
-            )
-        }
-
-        async fn read_child(&self, child_thread_id: &str) -> Result<serde_json::Value, String> {
-            assert_eq!(child_thread_id, "fixture-child");
-            Ok(
-                serde_json::json!({"parentThreadId":"fixture-native-thread","childThreadId":child_thread_id,"status":"saved","snapshot":{"threadId":child_thread_id,"provider":"codex","sessionType":"freshcodex","turns":[{"text":"x".repeat(2 * freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES)}]}}),
-            )
-        }
-
-        async fn stop(self: Arc<Self>) -> Result<(), String> {
-            self.stops.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-
-        fn take_event_stream(&self) -> Option<tokio::sync::mpsc::Receiver<AgentEvent>> {
-            None
-        }
-    }
-
-    /// The control plane must keep a worker even inside a half-CPU cgroup
-    /// where `available_parallelism()` reports 1. Without the floor, one
-    /// long synchronous workload step wedges the supervisor's Stop command
-    /// and the host looks dead when it is merely busy.
-    #[test]
-    fn the_session_host_runtime_keeps_a_worker_floor_for_control_commands() {
-        assert_eq!(host_worker_threads(1), HOST_MIN_WORKER_THREADS);
-        assert_eq!(host_worker_threads(2), HOST_MIN_WORKER_THREADS);
-        assert_eq!(
-            host_worker_threads(HOST_MIN_WORKER_THREADS),
-            HOST_MIN_WORKER_THREADS
-        );
-        assert_eq!(host_worker_threads(6), 6);
-        assert_eq!(host_worker_threads(256), HOST_MAX_WORKER_THREADS);
-    }
-
-    #[test]
-    fn effective_limits_fall_back_when_host_is_unbounded() {
-        let fallback = RuntimeLimits {
-            cpu_milli: 777,
-            memory_bytes: 123_456_789,
-            swap_bytes: 12,
-            pids_max: 44,
-        };
-        let limits = read_effective_limits(fallback);
-        assert!(limits.cpu_milli > 0);
-        assert!(limits.memory_bytes > 0);
-        assert!(limits.pids_max > 0);
-    }
-
     #[tokio::test]
     async fn authenticated_fresh_agent_configure_rpc_persists_settings_through_the_host_actor() {
         let state = test_host_state();
@@ -22371,6 +21829,7 @@ console.log('actual library export/import/full-row reader and Node semantic bind
     ) {
         let state = test_host_state();
         let transport = Arc::new(RpcFixtureTransport {
+            native_evidence: std::sync::Mutex::new(None),
             dispatches: AtomicUsize::new(0),
             checkpoint_attempts: std::sync::Mutex::new(Vec::new()),
             decisions: AtomicUsize::new(0),
@@ -22450,6 +21909,7 @@ console.log('actual library export/import/full-row reader and Node semantic bind
     async fn authenticated_model_catalog_reads_the_parent_actor_without_starting_work() {
         let state = test_host_state();
         let transport = Arc::new(RpcFixtureTransport {
+            native_evidence: std::sync::Mutex::new(None),
             dispatches: AtomicUsize::new(0),
             checkpoint_attempts: std::sync::Mutex::new(Vec::new()),
             decisions: AtomicUsize::new(0),
@@ -22517,255 +21977,6 @@ console.log('actual library export/import/full-row reader and Node semantic bind
         assert_eq!(transport.decisions.load(Ordering::SeqCst), 0);
         assert_eq!(transport.operations.load(Ordering::SeqCst), 0);
         assert_eq!(transport.stops.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn authenticated_fresh_agent_rpc_keeps_one_host_owned_transport_until_explicit_stop() {
-        let state = test_host_state();
-        let transport = Arc::new(RpcFixtureTransport {
-            dispatches: AtomicUsize::new(0),
-            checkpoint_attempts: std::sync::Mutex::new(Vec::new()),
-            decisions: AtomicUsize::new(0),
-            operations: AtomicUsize::new(0),
-            captures: AtomicUsize::new(0),
-            stops: AtomicUsize::new(0),
-        });
-        let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
-            state.state_dir.join("rpc-fixture-agent"),
-            FreshAgentProfile {
-                naming_handle: None,
-                collaboration_mode: None,
-                provider: FreshProvider::Claude,
-                runtime_variant: "fixture-sdk".into(),
-                cwd: "/workspace".into(),
-                model: Some("fixture-model".into()),
-                effort: Some("low".into()),
-                permission_mode: Some("ask".into()),
-                sandbox: None,
-                provider_store_id: "fixture-store".into(),
-                native_session_id: None,
-                plugins: None,
-                model_selection: None,
-                session_ref: None,
-                provider_launch_context: None,
-                provider_secret_references: Vec::new(),
-            },
-            transport.clone(),
-        )
-        .await
-        .unwrap();
-        actor
-            .record_permission("permission-1".into(), serde_json::json!({"tool":"shell"}))
-            .await
-            .unwrap();
-        *state.fresh_agent.lock().await = Some(actor);
-
-        let request_id = RequestId::parse("rpc-command-one").unwrap();
-        let result = dispatch(
-            authenticated_host_envelope(
-                &state,
-                HostCommand::FreshAgentSend {
-                    incarnation_id: state.incarnation_id.clone(),
-                    request_id: request_id.clone(),
-                    text: "perform fixture work".into(),
-                    settings: None,
-                    checkpoint_logical_attempt_id: Some("managed-attempt-rpc-1".into()),
-                },
-            ),
-            &state,
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            result,
-            HostResult::FreshAgentCommand {
-                state: freshell_runtime_protocol::CommandState::ProviderAcked,
-                native_session_id: Some(ref native),
-                    ..
-            }
-            if native == "fixture-native-thread"
-        ));
-        assert_eq!(
-            *transport.checkpoint_attempts.lock().unwrap(),
-            vec![Some("managed-attempt-rpc-1".into())]
-        );
-
-        // A gateway reconnect is only a new cursor. The same request and the
-        // same decision are idempotent at the host-owned actor.
-        let batch = dispatch(
-            authenticated_host_envelope(
-                &state,
-                HostCommand::FreshAgentReadEvents {
-                    incarnation_id: state.incarnation_id.clone(),
-                    after_sequence: 0,
-                    max_events: 32,
-                },
-            ),
-            &state,
-        )
-        .await
-        .unwrap();
-        assert!(matches!(batch, HostResult::FreshAgentEvents(_)));
-        let compact_id = RequestId::parse("rpc-compact-one").unwrap();
-        for _ in 0..2 {
-            let compact = dispatch(
-                authenticated_host_envelope(
-                    &state,
-                    HostCommand::FreshAgentCompact {
-                        incarnation_id: state.incarnation_id.clone(),
-                        request_id: compact_id.clone(),
-                        instructions: Some("retain decisions".into()),
-                        cwd: Some("/workspace".into()),
-                    },
-                ),
-                &state,
-            )
-            .await
-            .unwrap();
-            assert!(matches!(
-                compact,
-                HostResult::FreshAgentCommand {
-                    state: freshell_runtime_protocol::CommandState::ProviderAcked,
-                    ..
-                }
-            ));
-        }
-        let rollback = dispatch(
-            authenticated_host_envelope(
-                &state,
-                HostCommand::FreshAgentRollback {
-                    incarnation_id: state.incarnation_id.clone(),
-                    request_id: RequestId::parse("rpc-undo-one").unwrap(),
-                    direction: FreshAgentRollbackDirection::Undo,
-                    mode: FreshAgentRollbackMode::Step,
-                    turn_id: None,
-                    cwd: None,
-                },
-            ),
-            &state,
-        )
-        .await
-        .unwrap();
-        assert!(matches!(rollback, HostResult::FreshAgentCommand { .. }));
-        let before_snapshot = transport.dispatches.load(Ordering::SeqCst);
-        let (mut client_stream, server_stream) = UnixStream::pair().unwrap();
-        let serving = tokio::spawn(handle_connection(server_stream, state.clone()));
-        write_frame(
-            &mut client_stream,
-            &authenticated_host_envelope(
-                &state,
-                HostCommand::FreshAgentReadSnapshot {
-                    incarnation_id: state.incarnation_id.clone(),
-                },
-            ),
-        )
-        .await
-        .unwrap();
-        let snapshot: HostReply = freshell_runtime_protocol::read_frame_with_limit(
-            &mut client_stream,
-            freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES,
-        )
-        .await
-        .unwrap();
-        serving.await.unwrap().unwrap();
-        assert!(
-            matches!(snapshot.result.unwrap(), HostResult::FreshAgentSnapshot(value)
-            if value["threadId"] == "fixture-native-thread" && value["turns"][0]["turnId"] == "retained-rpc-turn"
-            && value["turns"][0]["text"].as_str().unwrap().len() == 2 * freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES)
-        );
-        assert_eq!(transport.dispatches.load(Ordering::SeqCst), before_snapshot);
-        assert_eq!(transport.stops.load(Ordering::SeqCst), 0);
-        let capture = dispatch(
-            authenticated_host_envelope(
-                &state,
-                HostCommand::FreshAgentCapture {
-                    incarnation_id: state.incarnation_id.clone(),
-                    max_bytes: 1024,
-                },
-            ),
-            &state,
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            capture,
-            HostResult::FreshAgentCapture(FreshAgentCapture {
-                native_session_id,
-                ..
-            }) if native_session_id == "fixture-native-thread"
-        ));
-        for _ in 0..2 {
-            dispatch(
-                authenticated_host_envelope(
-                    &state,
-                    HostCommand::FreshAgentResolve {
-                        incarnation_id: state.incarnation_id.clone(),
-                        decision_id: "permission-1".into(),
-                        decision: serde_json::json!({"behavior":"allow"}),
-                    },
-                ),
-                &state,
-            )
-            .await
-            .unwrap();
-        }
-        assert_eq!(transport.dispatches.load(Ordering::SeqCst), 1);
-        assert_eq!(transport.decisions.load(Ordering::SeqCst), 1);
-        assert_eq!(transport.operations.load(Ordering::SeqCst), 2);
-        assert_eq!(transport.captures.load(Ordering::SeqCst), 1);
-        assert_eq!(transport.stops.load(Ordering::SeqCst), 0);
-
-        dispatch(
-            authenticated_host_envelope(
-                &state,
-                HostCommand::Stop {
-                    incarnation_id: state.incarnation_id.clone(),
-                    control_epoch: 1,
-                    execution_generation: 1,
-                },
-            ),
-            &state,
-        )
-        .await
-        .unwrap();
-        assert_eq!(transport.stops.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn native_session_fixture_requires_exact_resume_identity_and_persists_history() {
-        let dir = tempfile_like_dir();
-        let created =
-            handle_native_fixture_request(&dir, "soul-test", NativeFixtureRequest::Create).unwrap();
-        assert!(created.ok);
-        let session_id = created.session_id.clone().unwrap();
-        assert_eq!(created.history, vec!["create"]);
-
-        let wrong = handle_native_fixture_request(
-            &dir,
-            "soul-test",
-            NativeFixtureRequest::Resume {
-                session_id: "wrong-session".into(),
-            },
-        )
-        .unwrap();
-        assert!(!wrong.ok);
-
-        let resumed = handle_native_fixture_request(
-            &dir,
-            "soul-test",
-            NativeFixtureRequest::Resume {
-                session_id: session_id.clone(),
-            },
-        )
-        .unwrap();
-        assert!(resumed.ok);
-        assert_eq!(resumed.session_id.as_deref(), Some(session_id.as_str()));
-        assert_eq!(resumed.history, vec!["create", "resume"]);
-
-        let history =
-            handle_native_fixture_request(&dir, "soul-test", NativeFixtureRequest::History)
-                .unwrap();
-        assert_eq!(history.history, vec!["create", "resume"]);
     }
 
     #[tokio::test]

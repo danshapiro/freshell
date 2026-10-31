@@ -6234,6 +6234,7 @@ mod tests {
         wrong.provider_launch_context.as_mut().unwrap().preparation = ProviderPreparation::Codex {
             tui_args: Vec::new(),
             sidecar_args: Vec::new(),
+            approval_default: None,
         };
         assert!(wrong.validate().is_err());
         launch.provider_bootstrap_files.push(ProviderBootstrapFile {

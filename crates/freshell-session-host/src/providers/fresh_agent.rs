@@ -977,7 +977,16 @@ impl FreshAgentTransport for HostedTransport {
             ProviderState::Claude(state) => {
                 state.handle_create(create, None).await;
             }
-            ProviderState::Codex(state) => state.handle_create(create, None).await,
+            ProviderState::Codex(state) => {
+                if let freshell_freshagent::codex::CodexCreateOutcome::Failed {
+                    code,
+                    message,
+                    ..
+                } = state.handle_create(create, None).await
+                {
+                    return Err(format!("{code}: {message}"));
+                }
+            }
             ProviderState::Opencode { runtime, .. } => {
                 tokio::time::timeout(
                     CREATE_TIMEOUT,
@@ -3009,6 +3018,9 @@ mod tests {
             FreshProvider::Codex,
             receiver,
             BroadcastBridgeOutputs {
+                native_evidence: watch::channel(None).0,
+                native_identity: Arc::new(std::sync::Mutex::new(HostedNativeIdentity::default())),
+                refusal_observer: None,
                 owned_session: None,
                 retained_codex: Some(state.clone()),
                 created,
@@ -3173,6 +3185,66 @@ await import({});
             }
         })
         .await
+    }
+
+    #[tokio::test]
+    async fn hosted_codex_start_keeps_native_thread_failure_without_adopting_or_sending() {
+        let logs = tempfile::tempdir().unwrap();
+        let log = logs.path().join("startup-requests.jsonl");
+        let fixture = native_codex_fixture(json!({
+            "appendRequestLogPath":log,
+            "overrides":{"thread/start":{"error":{
+                "code":-32602,"message":"fixture rejected native startup"
+            }}}
+        }))
+        .await;
+        let result = fixture.transport.start(&fixture.profile).await;
+        let accepted_session = fixture.transport.provider_session_id().await;
+        let native_proof = fixture.transport.native_identity_evidence().await;
+        let boots = native_boots(&fixture);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut native_writers_reaped = true;
+        for boot in &boots {
+            native_writers_reaped &= wait_for_native_exit(&fixture, boot, deadline).await.is_ok();
+        }
+        // Finish the fixture even if the startup refusal or reaping regresses.
+        fixture.transport.clone().stop().await.unwrap();
+        let requests = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let error =
+            result.expect_err("a rejected native start cannot acknowledge an owned session");
+        assert!(error.starts_with("CODEX_THREAD_START_FAILED:"), "{error}");
+        assert!(error.contains("fixture rejected native startup"), "{error}");
+        assert!(accepted_session.is_none());
+        assert!(native_proof.is_none());
+        assert_eq!(
+            boots.len(),
+            1,
+            "a refusal cannot retry into another process"
+        );
+        assert!(
+            native_writers_reaped,
+            "the failed startup must reap its own native writer"
+        );
+        for method in ["initialize", "thread/start"] {
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|row| row["method"] == method)
+                    .count(),
+                1
+            );
+        }
+        assert!(
+            !requests.iter().any(|row| matches!(
+                row["method"].as_str(),
+                Some("turn/start" | "thread/resume" | "thread/fork")
+            )),
+            "refused creation cannot send input or adopt another conversation: {requests:?}"
+        );
     }
 
     async fn read_native_thread(
@@ -5358,6 +5430,9 @@ await import(parameters.source)
             FreshProvider::Codex,
             rx,
             BroadcastBridgeOutputs {
+                native_evidence: watch::channel(None).0,
+                native_identity: Arc::new(std::sync::Mutex::new(HostedNativeIdentity::default())),
+                refusal_observer: None,
                 owned_session: None,
                 retained_codex: None,
                 created,
@@ -5408,6 +5483,9 @@ await import(parameters.source)
             FreshProvider::Codex,
             rx,
             BroadcastBridgeOutputs {
+                native_evidence: watch::channel(None).0,
+                native_identity: Arc::new(std::sync::Mutex::new(HostedNativeIdentity::default())),
+                refusal_observer: None,
                 owned_session: None,
                 retained_codex: None,
                 created,
@@ -5525,10 +5603,12 @@ await import(parameters.source)
                 let (send_outcomes, _) = broadcast::channel(16);
                 let (kill_outcomes, _) = broadcast::channel(16);
                 let (observer, mut observations) = mpsc::channel(16);
-                spawn_broadcast_bridge(
+                let _bridge = spawn_broadcast_bridge(
                     provider.clone(),
                     receiver,
                     BroadcastBridgeOutputs {
+                        owned_session: None,
+                        retained_codex: None,
                         created,
                         native,
                         native_evidence,
@@ -5590,10 +5670,12 @@ await import(parameters.source)
         let (events, mut event_rx) = mpsc::channel(16);
         let (send_outcomes, _) = broadcast::channel(16);
         let (kill_outcomes, _) = broadcast::channel(16);
-        spawn_broadcast_bridge(
+        let _bridge = spawn_broadcast_bridge(
             FreshProvider::Claude,
             receiver,
             BroadcastBridgeOutputs {
+                owned_session: None,
+                retained_codex: None,
                 created,
                 native,
                 native_evidence,
@@ -5726,10 +5808,12 @@ await import(parameters.source)
         owned.native_rx = Mutex::new(native_rx);
         owned.native_tx = native.clone();
         *owned.session_id.lock().await = Some("presentation-parent".into());
-        spawn_broadcast_bridge(
+        let _bridge = spawn_broadcast_bridge(
             FreshProvider::Claude,
             receiver,
             BroadcastBridgeOutputs {
+                owned_session: None,
+                retained_codex: None,
                 created,
                 native,
                 native_evidence,
@@ -5882,10 +5966,12 @@ await import(parameters.source)
             let owned = Arc::get_mut(&mut transport).unwrap();
             owned.native_identity = identity.clone();
             owned.native_rx = Mutex::new(native_rx);
-            spawn_broadcast_bridge(
+            let _bridge = spawn_broadcast_bridge(
                 FreshProvider::Claude,
                 receiver,
                 BroadcastBridgeOutputs {
+                    owned_session: None,
+                    retained_codex: None,
                     created,
                     native,
                     native_evidence,
@@ -6029,10 +6115,12 @@ await import(parameters.source)
             owned.native_identity = identity.clone();
             owned.native_rx = Mutex::new(native_rx);
             *owned.session_id.lock().await = Some(PARENT.into());
-            spawn_broadcast_bridge(
+            let _bridge = spawn_broadcast_bridge(
                 FreshProvider::Claude,
                 receiver,
                 BroadcastBridgeOutputs {
+                    owned_session: None,
+                    retained_codex: None,
                     created,
                     native,
                     native_evidence,
@@ -6409,10 +6497,12 @@ await import(parameters.source)
                 owned.native_identity = identity.clone();
                 owned.native_rx = Mutex::new(native_rx);
                 *owned.session_id.lock().await = Some("current-root".into());
-                spawn_broadcast_bridge(
+                let _bridge = spawn_broadcast_bridge(
                     provider.clone(),
                     receiver,
                     BroadcastBridgeOutputs {
+                        owned_session: None,
+                        retained_codex: None,
                         created,
                         native,
                         native_evidence,
@@ -6659,6 +6749,8 @@ await import(parameters.source)
         }
         let result: Result<(), String> = async {
             let profile = FreshAgentProfile {
+                naming_handle: None,
+                collaboration_mode: None,
                 provider: provider.clone(),
                 runtime_variant: format!("fresh{}", provider.as_str()),
                 cwd: owned.path().to_string_lossy().into(),
@@ -7102,10 +7194,12 @@ await import(parameters.source)
         let (events, _events_rx) = mpsc::channel(16);
         let (send_outcomes, _) = broadcast::channel(16);
         let (kill_outcomes, _) = broadcast::channel(16);
-        spawn_broadcast_bridge(
+        let _bridge = spawn_broadcast_bridge(
             FreshProvider::Claude,
             receiver,
             BroadcastBridgeOutputs {
+                owned_session: None,
+                retained_codex: None,
                 created,
                 native,
                 native_evidence,
