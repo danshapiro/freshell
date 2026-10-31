@@ -321,18 +321,35 @@ impl ProviderLayout for AntigravityLayout {
         }
     }
 
-    fn watch_change_scope(&self, _home: &Path, path: &Path) -> Option<WatchChangeScope> {
-        // Only a qualifying transcript re-parses one file; EVERYTHING else
-        // is ignored entirely (cache/config churn never dirty-marks the
-        // provider — the trait default would say `Provider`, which is
-        // exactly what the override exists to prevent). A late-created
-        // `brain/` root is covered by the watcher's rearm tick, not by a
-        // provider-dirty mark here.
+    fn watch_change_scope(&self, home: &Path, path: &Path) -> Option<WatchChangeScope> {
+        // Only a qualifying transcript re-parses one file. Any OTHER
+        // change under the brain root — the nested directory cascade a
+        // fresh conversation creates before writing its transcript
+        // (whole-delta review round 5, Major 2: the inotify cascade miss
+        // suppresses the transcript's own file event, so the directory
+        // event is the only prompt signal), sidecar files, the root
+        // itself — marks the provider dirty. This is the amplifier
+        // default discipline (`qualifies ? File : Provider`) bounded to
+        // the brain root: a directory event does not itself prove a new
+        // transcript — it only triggers the existing dirty/reconcile
+        // path, which discovers the file; the watcher's debounce
+        // coalesces the cascade exactly as it does file events. A
+        // late-created `brain/` root is covered by the watcher's rearm
+        // tick AND now by this provider-dirty mark (the codex
+        // root-event precedent).
+        //
+        // Everything OUTSIDE the brain root — cache churn
+        // (`cache/last_conversations.json` is never a session source or
+        // identity evidence, plan Global Constraint 2) and config
+        // writes — is ignored entirely, so unrelated writes never
+        // dirty-mark the provider.
         if self.qualifies(path) {
-            Some(WatchChangeScope::File)
-        } else {
-            None
+            return Some(WatchChangeScope::File);
         }
+        if path.starts_with(self.session_root(home)) {
+            return Some(WatchChangeScope::Provider);
+        }
+        None
     }
 
     fn qualifies(&self, path: &Path) -> bool {
@@ -717,7 +734,7 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_layout_watch_change_scope_is_transcript_file_or_ignore() {
+    fn antigravity_layout_watch_change_scope_bounds_provider_dirty_to_the_brain_root() {
         let layout = AntigravityLayout;
         let home = Path::new(ANTIGRAVITY_HOME);
         // Qualifying transcript: re-parse exactly one file.
@@ -725,18 +742,37 @@ mod tests {
             layout.watch_change_scope(home, &antigravity_transcript("conv-1")),
             Some(WatchChangeScope::File)
         );
-        // Everything else — cache churn (`cache/last_conversations.json` is
-        // never a session source or identity evidence), config writes, the
-        // brain root itself, non-qualifying files — is ignored ENTIRELY, so
+        // Any OTHER change under the brain root — the directory cascade a
+        // fresh conversation creates before writing its transcript
+        // (whole-delta review round 5, Major 2: the inotify cascade miss
+        // suppresses the transcript's own file event, so the directory
+        // event is the only prompt signal), sidecar files, the root
+        // itself — marks the provider dirty (the amplifier default
+        // discipline, bounded to the brain root: a directory event only
+        // triggers the existing dirty/reconcile path that discovers the
+        // file; the watcher's debounce coalesces the cascade).
+        for path in [
+            home.join("brain"),
+            home.join("brain/conv-1"),
+            home.join("brain/conv-1/.system_generated"),
+            home.join("brain/conv-1/.system_generated/logs"),
+            home.join("brain/conv-1/notes.md"),
+            home.join("brain/conv-1/transcript.jsonl"),
+        ] {
+            assert_eq!(
+                layout.watch_change_scope(home, &path),
+                Some(WatchChangeScope::Provider),
+                "brain-root descendant {path:?} must provider-dirty the index"
+            );
+        }
+        // Everything OUTSIDE the brain root — cache churn
+        // (`cache/last_conversations.json` is never a session source or
+        // identity evidence), config writes — is ignored ENTIRELY, so
         // unrelated writes never dirty-mark the provider.
         for path in [
             home.join("cache/last_conversations.json"),
             home.join("cache/last_conversations.json.tmp"),
             home.join("config/settings.json"),
-            home.join("brain"),
-            home.join("brain/conv-1"),
-            home.join("brain/conv-1/notes.md"),
-            home.join("brain/conv-1/.system_generated/logs"),
         ] {
             assert_eq!(
                 layout.watch_change_scope(home, &path),

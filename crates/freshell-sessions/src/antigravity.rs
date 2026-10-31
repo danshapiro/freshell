@@ -247,7 +247,7 @@ mod tests {
     use crate::antigravity::AntigravitySource;
     use crate::directory_index::{IndexedSession, SessionIndex, SessionSource};
     use crate::meta::TokenSummary;
-    use crate::session_watcher::{SessionWatcher, WatchedProvider};
+    use crate::session_watcher::{SessionWatcher, WatchEvent, WatchKind, WatchedProvider};
     use std::collections::BTreeMap;
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -850,6 +850,73 @@ mod tests {
         assert_eq!(
             len, 2,
             "the new antigravity conversation must reach the index"
+        );
+
+        watcher.stop();
+        let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Whole-delta review round 5, Major 2: a fresh conversation creates
+    /// its nested directory chain and writes `transcript.jsonl` in one
+    /// burst — the documented inotify cascade miss (see the test above)
+    /// suppresses the FILE event, because the deepest directories are not
+    /// armed yet when the write lands. The DIRECTORY event under the
+    /// brain root is the guaranteed-observable signal (the armed `brain`
+    /// watch always delivers the top directory's creation), so it must
+    /// mark the provider dirty and let reconciliation rescan promptly —
+    /// fresh conversations may not wait out the 15-minute index TTL.
+    ///
+    /// Deterministic reproduction: the chain + transcript land on disk
+    /// BEFORE the watcher exists (no watch can observe the write — the
+    /// file event is suppressed BY CONSTRUCTION, never by timing), and
+    /// the cascade's top directory event — exactly the one inotify
+    /// delivers in the worst case — is injected through the
+    /// construction-time event seam.
+    #[tokio::test]
+    async fn watcher_directory_events_recover_the_cascade_missed_transcript() {
+        let home = unique_temp_dir("watcher-cascade-miss");
+        let _first = write_transcript(&home, FRESH_CONV, &fixture_content("fresh.sanitized.jsonl"));
+        let index = test_index(AntigravitySource::new(home.clone()));
+        // The first discover runs while the second conversation does NOT
+        // exist, and the TTL (3600 s) can never resurface it — only the
+        // provider-dirty path can.
+        assert_eq!(index.snapshot().await.len(), 1);
+
+        // The cascade: directories created + transcript written, with the
+        // file event suppressed (nothing is armed yet).
+        let _second = write_transcript(
+            &home,
+            RESUMED_CONV,
+            &fixture_content("resumed.sanitized.jsonl"),
+        );
+
+        let mut watcher = SessionWatcher::new(
+            Arc::clone(&index),
+            vec![WatchedProvider {
+                layout: Box::new(crate::provider_layout::AntigravityLayout),
+                home: home.clone(),
+            }],
+        );
+        // The event channel is allocated at construction, so the seam can
+        // queue the directory event ahead of the spawned loop (the
+        // `need_rescan_on_amplifier_replans_the_watch_set` model).
+        let tx = watcher.test_event_tx().expect("test event seam");
+        tx.send(WatchEvent::FileChanged {
+            paths: vec![home.join("brain").join(RESUMED_CONV)],
+            kind: WatchKind::CreateFolder,
+            provider: "antigravity".to_string(),
+        })
+        .unwrap();
+        let handle = watcher.start();
+
+        let appeared = wait_for_rows(&index, 5, |rows| rows.len() == 2).await;
+        assert!(
+            appeared,
+            "the brain-root directory event must provider-dirty the index and \
+             surface the cascade-missed conversation without waiting out the TTL; \
+             snapshot len stayed {}",
+            index.snapshot().await.len()
         );
 
         watcher.stop();
