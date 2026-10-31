@@ -7,7 +7,7 @@ import { selectTabPaneByTerminalId } from './selectors/paneTerminalSelectors'
 import { advanceCompletionBaseline, recordTerminalIdle, recordTurnComplete } from './turnCompletionSlice'
 import type { ReadyMessage } from '@shared/ws-protocol'
 import { createLogger } from '@/lib/client-logger'
-import { clearTerminalStuck, recordTerminalStuck } from './terminalLifecycleSlice'
+import { clearTerminalStuck, recordTerminalStuck, type TerminalLifecycleState } from './terminalLifecycleSlice'
 import type { AppDispatch, RootState } from './store'
 
 const log = createLogger('TurnCompletion')
@@ -199,7 +199,7 @@ function selectExitedPaneByTerminalId(
   state: RootState,
   terminalId: string,
 ): { tabId: string; paneId: string } | undefined {
-  const lifecycle = (state as { terminalLifecycle?: { byPaneId?: Record<string, { lastTerminalId?: string }> } }).terminalLifecycle
+  const lifecycle = (state as { terminalLifecycle?: TerminalLifecycleState }).terminalLifecycle
   if (!lifecycle?.byPaneId) return undefined
   const paneIds = Object.entries(lifecycle.byPaneId)
     .filter(([, entry]) => entry?.lastTerminalId === terminalId)

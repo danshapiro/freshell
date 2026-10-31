@@ -18,8 +18,8 @@
 //! * `turn_settled{outcome:"errored"}` ⇒ TurnComplete (attention is
 //!   outcome-uniform: an errored turn end is still a turn end).
 //! * Deadman `ANTIGRAVITY_BUSY_DEADMAN_MS` quiet while confirmed-busy ⇒
-//!   ForceRead (re-read the transcript; a found settle completes, else the
-//!   pane stays busy — the deadman NEVER fabricates a completion).
+//!   ForceRead (re-read the transcript; a found fresh settle completes,
+//!   else the pane stays busy — the deadman NEVER fabricates a completion).
 //!
 //! Only `turn_settled` records mint completions; the PTY lane (a flushed
 //! submit) is a PROVISIONAL busy with a submit-grace reversion (the amplifier
