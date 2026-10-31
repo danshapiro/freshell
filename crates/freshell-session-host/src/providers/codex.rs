@@ -8,11 +8,9 @@ use freshell_codex::{
     },
     remote_proxy::RemoteProxyEvent,
 };
-use freshell_freshagent::session_lease::CondemnedRuntimeIdentity;
 #[cfg(target_os = "linux")]
-use freshell_freshagent::session_lease::{
-    kill_and_confirm_recorded_tree_dead, record_condemned_runtime_identity,
-};
+use freshell_freshagent::session_lease::kill_and_confirm_recorded_tree_dead;
+use freshell_freshagent::session_lease::CondemnedRuntimeIdentity;
 use freshell_runtime_protocol::{ResumeSpec, TerminalLaunchSpec};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -97,7 +95,6 @@ async fn confirm_owned_cleanup(request: CondemnedRuntimeIdentity) -> bool {
     #[cfg(target_os = "linux")]
     {
         use freshell_codex::durability::CODEX_SIDECAR_OWNERSHIP_ENV;
-        let mut request = request;
         if !request.capture_complete {
             return false;
         }
@@ -129,25 +126,8 @@ async fn confirm_owned_cleanup(request: CondemnedRuntimeIdentity) -> bool {
                 return false;
             }
         }
-        // The host may have another uid. Observe under the provider identity
-        // before any signal, retaining every original member and coverage gap.
-        let observed = record_condemned_runtime_identity(
-            request.pid,
-            CODEX_SIDECAR_OWNERSHIP_ENV,
-            &request.ownership_id,
-        );
-        if observed
-            .start_time
-            .is_some_and(|start| start != expected_start)
-        {
-            return false;
-        }
-        request.capture_complete &= observed.capture_complete;
-        for member in observed.tree {
-            if !request.tree.contains(&member) {
-                request.tree.push(member);
-            }
-        }
+        // The common kill path enriches under this provider identity before
+        // any signal, retaining every original member and coverage gap.
         kill_and_confirm_recorded_tree_dead(&request, CODEX_SIDECAR_OWNERSHIP_ENV).await
     }
     #[cfg(not(target_os = "linux"))]
@@ -278,9 +258,91 @@ pub async fn probe(
 #[cfg(all(test, target_os = "linux"))]
 mod cleanup_tests {
     use super::*;
+    use freshell_freshagent::session_lease::record_condemned_runtime_identity;
+
+    #[tokio::test]
+    async fn owned_cleanup_refuses_a_late_opaque_reparented_writer() {
+        let _process_fixture = super::super::fresh_agent::NATIVE_PROVIDER_FIXTURE_LOCK
+            .lock()
+            .await;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let tag = format!("codex-sidecar-{}", uuid::Uuid::new_v4());
+        let mut parent = tokio::process::Command::new("python3")
+            .args([
+                "-c",
+                r#"
+import ctypes, os, sys
+print('ready', flush=True)
+assert sys.stdin.readline() == 'fork\n'
+reader, writer = os.pipe()
+child = os.fork()
+if child == 0:
+    os.close(writer)
+    assert ctypes.CDLL(None).prctl(4,0,0,0,0) == 0
+    os.write(1, (str(os.getpid())+'\n').encode())
+    assert os.read(reader,1) == b'H'
+    assert os.read(0,1) == b'X'
+    os._exit(0)
+os.close(reader)
+assert sys.stdin.readline() == 'exit\n'
+os.write(writer,b'H')
+os._exit(0)
+"#,
+            ])
+            .env(
+                freshell_codex::durability::CODEX_SIDECAR_OWNERSHIP_ENV,
+                &tag,
+            )
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = parent.id().unwrap();
+        let mut commands = parent.stdin.take().unwrap();
+        let mut replies = BufReader::new(parent.stdout.take().unwrap()).lines();
+        assert_eq!(replies.next_line().await.unwrap().as_deref(), Some("ready"));
+        let original = record_condemned_runtime_identity(
+            pid,
+            freshell_codex::durability::CODEX_SIDECAR_OWNERSHIP_ENV,
+            &tag,
+        );
+        commands.write_all(b"fork\n").await.unwrap();
+        let child: i32 = replies.next_line().await.unwrap().unwrap().parse().unwrap();
+        let start = freshell_codex::sidecar_store::proc_starttime(child).unwrap();
+        assert!(!original.tree.iter().any(|(pid, _)| *pid == child));
+        commands.write_all(b"exit\n").await.unwrap();
+        assert!(parent.wait().await.unwrap().success());
+        assert_eq!(
+            std::fs::read(format!("/proc/{child}/environ"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let confirmed =
+            confirm_owned_cleanup_input(owned_cleanup_payload(&original).unwrap().as_slice())
+                .await
+                .unwrap();
+        let still_live = freshell_codex::sidecar_store::proc_starttime(child) == Some(start);
+        // The inherited control pipe closes this real orphan even on Red.
+        commands.write_all(b"X").await.unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while freshell_codex::sidecar_store::proc_starttime(child) == Some(start) {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        }
+        assert!(still_live, "unproved ownership must not authorize a signal");
+        assert!(
+            !confirmed,
+            "a later opaque orphan is unknown, not proven unrelated or dead"
+        );
+    }
 
     #[tokio::test]
     async fn owned_cleanup_preserves_the_original_reparented_descendant() {
+        let _process_fixture = super::super::fresh_agent::NATIVE_PROVIDER_FIXTURE_LOCK
+            .lock()
+            .await;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let tag = format!("codex-sidecar-{}", uuid::Uuid::new_v4());
         // Both readiness acknowledgements precede the next command. The
@@ -393,6 +455,9 @@ os._exit(0)
 
     #[tokio::test]
     async fn owned_cleanup_refuses_incomplete_original_without_signaling() {
+        let _process_fixture = super::super::fresh_agent::NATIVE_PROVIDER_FIXTURE_LOCK
+            .lock()
+            .await;
         let tag = format!("codex-sidecar-{}", uuid::Uuid::new_v4());
         let mut child = tokio::process::Command::new("sleep")
             .arg("60")
@@ -452,6 +517,9 @@ os._exit(0)
 
     #[tokio::test]
     async fn task010_owned_cleanup_rejects_unknown_and_stale_identity_before_signaling() {
+        let _process_fixture = super::super::fresh_agent::NATIVE_PROVIDER_FIXTURE_LOCK
+            .lock()
+            .await;
         let tag = format!("codex-sidecar-{}", uuid::Uuid::new_v4());
         let mut child = tokio::process::Command::new("sleep")
             .arg("60")

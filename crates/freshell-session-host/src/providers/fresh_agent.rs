@@ -1905,16 +1905,18 @@ fn parse_send_outcome(value: &Value) -> Option<(String, bool)> {
     }
 }
 
+// Native provider fixtures and opaque cleanup fixtures share one process view.
+#[cfg(test)]
+pub(super) static NATIVE_PROVIDER_FIXTURE_LOCK: Mutex<()> = Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use freshell_freshagent::session_lease::CondemnedRuntimeIdentity;
 
-    static OPENCODE_SNAPSHOT_ENV_LOCK: Mutex<()> = Mutex::const_new(());
-
     #[tokio::test]
     async fn task6_dropping_transport_closes_its_owned_bridge_without_more_provider_frames() {
-        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let _lock = NATIVE_PROVIDER_FIXTURE_LOCK.lock().await;
         let transport = HostedTransport::new(FreshProvider::Codex).await;
         let mut events = transport.take_event_stream().unwrap();
         // No native process/session was started. Dropping this transport must
@@ -2092,7 +2094,7 @@ mod tests {
             .unwrap()
             .entry("echoRequestedModel")
             .or_insert(json!(true));
-        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let _lock = NATIVE_PROVIDER_FIXTURE_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs")
@@ -4064,7 +4066,7 @@ await import(parameters.source)
 
     #[tokio::test]
     async fn managed_provider_fresh_claude_sends_only_fixed_hosted_mcp_selection() {
-        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let _lock = NATIVE_PROVIDER_FIXTURE_LOCK.lock().await;
         let context = ProviderLaunchContext {
             preparation: ProviderPreparation::Claude {
                 mcp_args: vec!["--mcp-config".into(), ".claude/freshell-mcp.json".into()],
@@ -4246,7 +4248,7 @@ await import(parameters.source)
     async fn a_claude_resume_start_resolves_from_created_with_no_prompt() {
         // The sidecar entry is resolved from this process's environment, which
         // other tests here set: hold their lock.
-        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let _lock = NATIVE_PROVIDER_FIXTURE_LOCK.lock().await;
         let conversation = "4b0e8f6a-1d2c-4e3f-9a5b-6c7d8e9f0a1b";
         let claude = SimulatedClaude::start(&[conversation]).await;
         let mut events = claude.transport.take_event_stream().expect("event stream");
@@ -4300,7 +4302,7 @@ await import(parameters.source)
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_fresh_claude_start_resolves_its_uuid_before_any_prompt() {
-        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let _lock = NATIVE_PROVIDER_FIXTURE_LOCK.lock().await;
         let claude = SimulatedClaude::start(&[]).await;
         let mut events = claude.transport.take_event_stream().expect("event stream");
         let profile = claude.profile(None);
@@ -4355,7 +4357,7 @@ await import(parameters.source)
     /// a ledger keeps.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_hosted_claude_undo_keeps_the_panes_plugins_and_model() {
-        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let _lock = NATIVE_PROVIDER_FIXTURE_LOCK.lock().await;
         let conversation = "6d1f0a2b-3c4d-4e5f-8a6b-7c8d9e0f1a2b";
         let claude = SimulatedClaude::start(&[conversation]).await;
         let plugin = claude.root.path().join("workspace/.claude/plugins/review");
@@ -4405,7 +4407,7 @@ await import(parameters.source)
     /// second identity announcement (the actor records the child at the fork).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_claude_fork_boots_the_child_retires_the_parent_and_runs_the_next_turn_there() {
-        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let _lock = NATIVE_PROVIDER_FIXTURE_LOCK.lock().await;
         let conversation = "6d1f0a2b-3c4d-4e5f-8a6b-7c8d9e0f1a2b";
         let claude = SimulatedClaude::start(&[conversation]).await;
         let mut events = claude.transport.take_event_stream().expect("event stream");
@@ -4521,7 +4523,7 @@ await import(parameters.source)
     /// the boot is refused (`create.failed`), so no session is reported started.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_claude_resume_start_of_a_missing_conversation_fails() {
-        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let _lock = NATIVE_PROVIDER_FIXTURE_LOCK.lock().await;
         let claude = SimulatedClaude::start(&[]).await;
         let profile = claude.profile(Some("9c8b7a6f-5e4d-4c3b-8a2f-1e0d9c8b7a6f"));
         let started =
@@ -4555,7 +4557,7 @@ await import(parameters.source)
         reject_model: bool,
         settled_on: &str,
     ) -> HostedClaudeConfigure {
-        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let _lock = NATIVE_PROVIDER_FIXTURE_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let claude = SimulatedClaude::start_with(
             &[],
@@ -4802,7 +4804,7 @@ await import(parameters.source)
 
     #[tokio::test]
     async fn actual_opencode_first_send_materializes_once_and_reuses_owned_native_http_session() {
-        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let _lock = NATIVE_PROVIDER_FIXTURE_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../test/e2e-browser/fixtures/fake-opencode.cjs")
@@ -4978,7 +4980,7 @@ await import(parameters.source)
 
     #[tokio::test]
     async fn actual_opencode_snapshot_read_failure_preserves_owned_native_identity() {
-        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let _lock = NATIVE_PROVIDER_FIXTURE_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../test/e2e-browser/fixtures/fake-opencode.cjs")

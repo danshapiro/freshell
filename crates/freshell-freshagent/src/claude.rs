@@ -17431,6 +17431,7 @@ rl.on('line', (line) => {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn the_fenced_prior_probe_kills_a_reparented_descendant_from_the_recorded_identity() {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
         let st = state();
         let sid = format!("r37-reparent-{}", uuid::Uuid::new_v4());
         // The condemned "sidecar" child holding a tagged "CLI grandchild".
@@ -17546,6 +17547,7 @@ rl.on('line', (line) => {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn the_fenced_prior_probe_never_signals_a_reused_pid() {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
         let st = state();
         let sid = format!("r37-reuse-{}", uuid::Uuid::new_v4());
         // A live "unrelated replacement" process holding the recorded pid.

@@ -16116,6 +16116,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn handle_kill_removes_session_kills_owned_child_and_broadcasts_killed() {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
         let (transport, _peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
         let client = Arc::new(client);
@@ -16163,6 +16164,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn recovery_stop_reaps_the_writer_without_retiring_the_durable_thread() {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
         let (transport, _peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
         let (st, mut rx, sink) = state_with_sink();
@@ -16203,6 +16205,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn requested_exit_watcher_reports_confirmed_reap() {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
         let (broadcast_tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
         let (kill_tx, kill_rx) = oneshot::channel();
         let child = spawn_sleeper();

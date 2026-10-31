@@ -505,6 +505,7 @@ async fn task009_rest_lane_capture_preserves_native_output_and_bounds_utf8_separ
 
 #[tokio::test]
 async fn task009_rest_lane_socket_loss_does_not_settle_until_the_owned_process_exits() {
+    let _process_fixture = crate::session_lease::process_fixture::lock().await;
     let (state, peer) = channel_session("task009-owned-exit").await;
     let (router, pane) = http_pane(state.clone(), "task009-owned-exit");
     let mut events = state.subscribe_turn_events();
