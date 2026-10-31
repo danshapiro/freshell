@@ -2493,8 +2493,20 @@ impl FreshOpencodeState {
                          placeholder resolves to a live owner; the pane is not \
                          materialized by this send"
                     );
-                    self.emit_fresh_agent_error(
-                        &session_id,
+                    // rewind-status episode 2: the refusal answers through
+                    // the REQUEST-CORRELATED error door (`send_error` — the
+                    // same door the already-materialized checkpoint guard
+                    // and the drain-time guard refusals already use) — the
+                    // client's owned-send-failure lane matches the frame's
+                    // requestId, clears the pending echo and the
+                    // optimistic running status, so a refused first send
+                    // can never leave a "Saving code rewind checkpoint"
+                    // hover for a turn that never ran. The session-scoped
+                    // `freshAgent.error` envelope stays reserved for the
+                    // attach lane's transient refusals (the 354caf5f1
+                    // preservation contract).
+                    self.send_error(
+                        &request_id,
                         "SESSION_RESERVED",
                         "Another resume for this session is in flight",
                     );
@@ -2522,7 +2534,11 @@ impl FreshOpencodeState {
                     } else {
                         "Another resume for this session is in flight"
                     };
-                    self.emit_fresh_agent_error(&session_id, "SESSION_RESERVED", message);
+                    // rewind-status episode 2: request-correlated like the
+                    // Adopt arm above — a refused send is a send failure,
+                    // never a session-scoped degradation the slice's
+                    // preservation branch would keep "running".
+                    self.send_error(&request_id, "SESSION_RESERVED", message);
                     return;
                 }
             }
@@ -11059,6 +11075,242 @@ mod tests {
                 .any(|frame| frame.contains("freshAgent.session.materialized")),
             "the normal materialization event is emitted"
         );
+    }
+
+    // ── rewind-status episode 2: the send-time materialization claim
+    // refusals are request-correlated send failures ────────────────────────
+
+    /// The shared harness for the send-time claim-refusal contract tests: a
+    /// state whose broadcast receiver is RETAINED and whose ownership
+    /// coordinator is WIRED (the pre-spawn materialization claim runs).
+    async fn state_with_registry_and_receiver() -> (
+        FreshOpencodeState,
+        tokio::sync::broadcast::Receiver<String>,
+        Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(256);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let mut st = FreshOpencodeState::new(fresh_agent);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        (st, rx, registry)
+    }
+
+    /// The send-time claim-refusal contract, shared by every arm: a first
+    /// send whose materialization claim is refused answers through the
+    /// REQUEST-CORRELATED error door (`send_error` — the same door as the
+    /// already-materialized checkpoint guard and the drain-time guard
+    /// refusals), so the client's owned-send-failure lane (the
+    /// `type === 'error'` requestId match in FreshAgentView) clears the
+    /// pending echo and the optimistic running status honestly; the refusal
+    /// NEVER rides the session-scoped `freshAgent.error` envelope (the door
+    /// the slice's 354caf5f1 SESSION_RESERVED preservation branch sees, which
+    /// would keep a refused-and-never-run turn "running" with a "Saving
+    /// code rewind checkpoint" hover). The attach lane keeps the
+    /// session-scoped shape by design — these tests pin the SEND lane.
+    async fn assert_first_send_claim_refusal_is_request_correlated(
+        st: &FreshOpencodeState,
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        placeholder: &str,
+        request_id: &str,
+        expected_message_fragment: &str,
+    ) {
+        let frames = drain_frames(rx);
+        let correlated = frames.iter().find(|f| {
+            f["type"] == "error"
+                && f["requestId"] == json!(request_id)
+                && f["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("SESSION_RESERVED"))
+        });
+        let Some(refusal) = correlated else {
+            panic!(
+                "the refused first send must answer through the request-correlated \
+                 error door (type=error, requestId={request_id}, SESSION_RESERVED in \
+                 the message): {frames:?}"
+            );
+        };
+        assert!(
+            refusal["message"]
+                .as_str()
+                .is_some_and(|m| m.contains(expected_message_fragment)),
+            "the correlated refusal carries the claim arm's typed message: {refusal:?}"
+        );
+        assert!(
+            !frames.iter().any(|f| f["type"] == "freshAgent.event"
+                && f["event"]["type"] == "freshAgent.error"
+                && f["event"]["code"] == "SESSION_RESERVED"),
+            "the send-time claim refusal must never ride the session-scoped \
+             freshAgent.error envelope (the attach lane's preserved shape): \
+             {frames:?}"
+        );
+        let session_arc = st
+            .sessions
+            .lock()
+            .await
+            .get(placeholder)
+            .cloned()
+            .expect("the placeholder session remains mapped");
+        assert!(
+            session_arc.lock().await.turn_task.is_none(),
+            "a refused first send never starts a turn"
+        );
+    }
+
+    /// The Adopt arm (the `LaneClaim::Adopt` match arm of `send_locked`'s
+    /// pre-spawn materialization claim): the placeholder resolves to a LIVE
+    /// same-kind owner (an earlier materialization for this pane completed;
+    /// the duplicate first send answers typed).
+    #[tokio::test]
+    async fn first_send_claim_refused_by_a_live_owner_answers_a_request_correlated_error() {
+        let (st, mut rx, registry) = state_with_registry_and_receiver().await;
+
+        st.handle_create(create_msg("req-claim-adopt"), None).await;
+        let placeholder = "freshopencode-req-claim-adopt";
+
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
+            PROVIDER,
+            placeholder,
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-test-earlier-materialization",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) else {
+            panic!("the placeholder's earlier-materialization claim must grant")
+        };
+        assert_eq!(
+            registry.commit_live(
+                PROVIDER,
+                placeholder,
+                "op-test-earlier-materialization",
+                generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some(placeholder.to_string()),
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed,
+            "precondition: the placeholder key is LIVE under a fresh-agent owner"
+        );
+        while rx.try_recv().is_ok() {}
+
+        let mut send = send_msg(placeholder, "the duplicate first message");
+        send.request_id = Some("req-claim-adopt-send".into());
+        st.handle_send(send).await;
+
+        assert_first_send_claim_refusal_is_request_correlated(
+            &st,
+            &mut rx,
+            placeholder,
+            "req-claim-adopt-send",
+            "Another resume for this session is in flight",
+        )
+        .await;
+    }
+
+    /// The Refused arm's in-flight conflict (the `LaneClaim::Refused`
+    /// match arm of `send_locked`'s pre-spawn materialization claim, the
+    /// default message branch): the coordinator holds the placeholder's
+    /// pre-spawn claim for another lifecycle operation (Blocked).
+    #[tokio::test]
+    async fn first_send_claim_refused_by_an_in_flight_operation_answers_a_request_correlated_error()
+    {
+        let (st, mut rx, registry) = state_with_registry_and_receiver().await;
+
+        st.handle_create(create_msg("req-claim-blocked"), None)
+            .await;
+        let placeholder = "freshopencode-req-claim-blocked";
+
+        let freshell_ownership::BeginOutcome::Granted { .. } = registry.begin_start(
+            PROVIDER,
+            placeholder,
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-test-in-flight-lifecycle",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) else {
+            panic!("the in-flight lifecycle operation's claim must grant")
+        };
+        // No commit: the key stays Starting — the send's own materialize
+        // claim (a DIFFERENT operation id) is refused Blocked.
+        while rx.try_recv().is_ok() {}
+
+        let mut send = send_msg(placeholder, "the blocked first message");
+        send.request_id = Some("req-claim-blocked-send".into());
+        st.handle_send(send).await;
+
+        assert_first_send_claim_refusal_is_request_correlated(
+            &st,
+            &mut rx,
+            placeholder,
+            "req-claim-blocked-send",
+            "Another resume for this session is in flight",
+        )
+        .await;
+    }
+
+    /// The Refused arm's stale-fence branch (the `LaneClaim::Refused`
+    /// match arm of `send_locked`'s pre-spawn materialization claim): a
+    /// delayed old-generation send claims a since-vacated placeholder and
+    /// answers the honest stale refusal — correlated like every other
+    /// send refusal.
+    #[tokio::test]
+    async fn first_send_claim_refused_by_a_stale_fence_answers_a_request_correlated_error() {
+        let (st, mut rx, registry) = state_with_registry_and_receiver().await;
+
+        st.handle_create(create_msg("req-claim-stale"), None).await;
+        let placeholder = "freshopencode-req-claim-stale";
+
+        // The CLIENT'S pair — observed before the generation bump.
+        let before = registry.observe(PROVIDER, placeholder);
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
+            PROVIDER,
+            placeholder,
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-test-generation-bump",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) else {
+            panic!("the generation-bump claim must grant")
+        };
+        assert_eq!(
+            registry.fail(
+                PROVIDER,
+                placeholder,
+                "op-test-generation-bump",
+                generation,
+                false,
+            ),
+            freshell_ownership::FailOutcome::Released,
+            "precondition: the key is Vacant again at the bumped generation"
+        );
+        while rx.try_recv().is_ok() {}
+
+        let mut send = send_msg_fenced(
+            placeholder,
+            "the delayed first message",
+            Some(before.epoch),
+            Some(before.generation),
+        );
+        send.request_id = Some("req-claim-stale-send".into());
+        st.handle_send(send).await;
+
+        assert_first_send_claim_refusal_is_request_correlated(
+            &st,
+            &mut rx,
+            placeholder,
+            "req-claim-stale-send",
+            "The observed ownership fence is stale; refresh and retry",
+        )
+        .await;
     }
 
     /// Retire-on-kill (delta-review round 5, restore-open-sessions-only): an
