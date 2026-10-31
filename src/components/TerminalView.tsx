@@ -988,8 +988,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // trusting delivery. The tracker clears when the copy applies (its
   // callback records the write at the surface epoch READ AT APPLY — FIFO
   // puts the line after any pending reconstruction reset, whose completion
-  // already bumped that epoch), at surface birth (a new queue owns the new
-  // surface), and when the latch clears.
+  // already bumped that epoch) and when the latch clears. At SURFACE BIRTH
+  // (focused review 3, round 3) it is deliberately NOT cleared: the
+  // previous surface's queue died with that surface, so a still-pending
+  // copy died unapplied while its one-shot mint is already consumed — the
+  // surviving tracker is the consumed-pending-at-dispose record, the only
+  // surviving copy of the owed line. The dead-queue fields make
+  // `deadSessionNoticeQueuedWriteIsLive` false on the new regime, and the
+  // notice effect's recreation settle event re-issues the recorded line
+  // onto the new surface exactly once.
   const deadSessionNoticeQueuedWriteRef = useRef<{
     key: string
     generation: string | undefined
@@ -1914,9 +1921,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // the recorded line onto the current surface (identity-keyed and
   // latch-gated, so a resolved or re-keyed pane never resurrects it).
   // No store dispatch: the mint is gone and the record IS the surviving
-  // truth. A queued copy dropped by a generation takeover is re-written
-  // from the tracker (the record never claimed a write that did not land,
-  // so nothing else would re-deliver it).
+  // truth. A queued copy dropped by a generation takeover — or one whose
+  // queue died with a recreated surface while the copy was still pending
+  // (the preserved consumed-pending-at-dispose record, focused review 3
+  // round 3) — is re-written from the tracker (the record never claimed a
+  // write that did not land, so nothing else would re-deliver it).
   const rewriteDeadSessionNoticeAfterSurfaceRecreation = useCallback(() => {
     const content = contentRef.current
     if (content?.restoreError?.reason !== 'durable_artifact_missing') return
@@ -3065,9 +3074,18 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     // round's gate write, or the notice effect's settled-surface rewrite)
     // restores the line onto the new buffer.
     deadSessionNoticeSurfaceEpochRef.current += 1
-    // The queued-write tracker belongs to the PREVIOUS surface's queue (a
-    // new queue object owns this surface): its copy can never apply here.
-    deadSessionNoticeQueuedWriteRef.current = null
+    // The queued-write tracker's copy can never APPLY here — the previous
+    // surface's queue was cleared with that surface, so a copy still
+    // pending on it died unapplied. But a tracker that still EXISTS is
+    // exactly that unapplied copy (an applied copy clears the tracker at
+    // apply time), and its one-shot mint was consumed at enqueue — the
+    // tracker is the only surviving record of the owed line. It is
+    // deliberately NOT cleared at this birth: it survives as the
+    // consumed-pending-at-dispose record, and the notice effect's
+    // recreation settle event re-issues the line onto THIS surface,
+    // exactly once (identity-keyed, so a re-keyed pane's stale copy never
+    // lands; the record clears at apply, when the latch clears, or when a
+    // later write replaces it).
     // A brand-new surface has no covered stream position.
     surfaceCoverageSeqRef.current = 0
     unsafeSurfaceCheckpointRef.current = false
@@ -3501,7 +3519,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   //   - surface recreated since the last write (provider renderer
   //     preference change re-ran the init effect): the new buffer is
   //     blank and the recreation itself happened with no attach cycle
-  //     pending — the epoch-keyed rewrite restores the recorded line.
+  //     pending — the epoch-keyed rewrite restores the recorded line for
+  //     a copy that APPLIED on the old surface, and for a copy that was
+  //     consumed-but-STILL-PENDING there (the old surface's queue died
+  //     holding it), the preserved tracker record re-issues the line —
+  //     in both cases exactly once, queue-ordered on the new surface.
   // The effect also completes a pending write recorded while the xterm
   // surface was deferred (provider-wait window): the
   // shouldWaitForProviderBehavior dep re-fires it when the surface mounts.
@@ -3527,7 +3549,21 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       const written = deadSessionNoticeStateRef.current
       const surfaceRecreatedSinceWrite = written !== null
         && written.surfaceEpoch !== deadSessionNoticeSurfaceEpochRef.current
-      if (!recoveryAccountingRef.current.exhausted && !surfaceRecreatedSinceWrite) return
+      // A copy CONSUMED on a previous surface but never applied there (the
+      // renderer change disposed that surface's queue while the copy was
+      // still pending on it) is still owed HERE: its preserved tracker
+      // record — pointing at the dead queue — is the only surviving copy
+      // of the line, and the recreation is its settle event. Re-issue it
+      // through the same settled-surface rewrite, exactly once.
+      const owedCopy = deadSessionNoticeQueuedWriteRef.current
+      const undeliveredCopyDiedWithPreviousSurface = owedCopy !== null
+        && owedCopy.queue !== writeQueueRef.current
+        && owedCopy.key === deadSessionNoticeIdentityKey(content)
+      if (
+        !recoveryAccountingRef.current.exhausted
+        && !surfaceRecreatedSinceWrite
+        && !undeliveredCopyDiedWithPreviousSurface
+      ) return
       writeDeadSessionNoticeIfPending()
       return
     }

@@ -16009,9 +16009,9 @@ describe('dead-session notice line (no-modal contract)', () => {
   // string is the pane's surviving buffer content — the round-3 contract
   // demands the assertion read FINAL SURVIVING BUFFER STATE (write sequence
   // + reset events), not merely captured writes.
-  function modeledFinalBuffer(): string {
+  function modeledFinalBuffer(ofTerm = term()): string {
     let buffer = ''
-    for (const data of terminalWriteStrings(term())) {
+    for (const data of terminalWriteStrings(ofTerm)) {
       if (data === MOUNTED_RECONSTRUCTION) {
         buffer = ''
         continue
@@ -16902,6 +16902,107 @@ describe('dead-session notice line (no-modal contract)', () => {
     expect(terminalWriteStrings(firstTerm).filter((data) => data === FRAMED_NOTICE)).toHaveLength(1)
     // No mint existed to consume and none was minted: the record IS the
     // surviving truth, and the store keeps no resident dead copy.
+    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    expect(sentCreates()).toHaveLength(0)
+  })
+
+  it('surface-recreation window: a consumed-but-UNAPPLIED queued notice is re-issued onto the new surface — exactly once', async () => {
+    // Focused review 3, round 3, finding 1: the recreation coverage above
+    // changes the renderer only AFTER the first notice APPLIED. The window
+    // it missed: the gate write is ENQUEUED (queue-ordered) but the queue
+    // has not flushed when the renderer preference changes — surface
+    // recreation disposes the old surface's queue, the UNAPPLIED copy dies
+    // with it, and the one-shot mint is already consumed, so the queued
+    // write tracker is the only surviving record of the owed line. Surface
+    // birth must PRESERVE the tracker (a copy that APPLIED clears it at
+    // apply time, so a surviving tracker is always an unapplied one) and
+    // the notice effect must treat it as a recreation settle event,
+    // re-issuing the line onto the new surface — otherwise the dead pane
+    // is left WITHOUT its notice on every surface it will ever show.
+    const opencodeEntry = (preferredRenderer?: 'canvas'): ClientExtensionEntry => ({
+      name: 'opencode',
+      version: '1.0.0',
+      label: 'OpenCode',
+      description: 'OpenCode CLI',
+      category: 'cli',
+      cli: {
+        terminalBehavior: {
+          ...(preferredRenderer ? { preferredRenderer } : {}),
+          scrollInputPolicy: 'native',
+        },
+      },
+    })
+    const { store } = await renderDeadSessionNoticePane(
+      {
+        mode: 'opencode',
+        sessionRef: { provider: 'opencode', sessionId: 'sess-opencode-dead' },
+      },
+      { reconcilePendingPanes: { [PANE_KEY]: Date.now() } },
+      [opencodeEntry('canvas')],
+    )
+
+    // The retained-terminalId gate write: mount attach rejected inside the
+    // pending window, dead fold, round attach — but this time the write
+    // queue's flush is DEFERRED before the round's rejection arrives, so
+    // the gate write stays ENQUEUED and UNAPPLIED.
+    const mountAttachId = sentAttaches()[0].attachRequestId
+    act(() => {
+      messageHandler!({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        message: 'Unknown terminalId',
+        requestId: mountAttachId,
+        terminalId: TERMINAL_ID,
+      })
+    })
+    foldDeadVerdict(store)
+    await waitFor(() => {
+      expect(sentAttaches().length).toBe(2)
+    })
+    const roundAttachId = sentAttaches().at(-1)!.attachRequestId
+
+    const pump = captureWriteFrames()
+    act(() => {
+      messageHandler!({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        message: 'Unknown terminalId',
+        requestId: roundAttachId,
+        terminalId: TERMINAL_ID,
+      })
+    })
+    // The gate ENQUEUED the notice and consumed the mint — no bytes have
+    // reached the first surface (the unapplied copy of the finding).
+    expect(noticeWriteCount()).toBe(0)
+    expect(leafContent(store).reconcileNotice).toBeUndefined()
+    const firstTerm = term()
+
+    // The provider's preferred renderer changes BEFORE the copy applies:
+    // the init effect recreates the xterm surface and clears the old
+    // surface's queue — the unapplied copy dies with it.
+    act(() => {
+      store.dispatch(setRegistry([opencodeEntry(undefined)]))
+    })
+    await waitFor(() => {
+      expect(terminalInstances).toHaveLength(2)
+    })
+    const recreatedTerm = terminalInstances[terminalInstances.length - 1]
+    expect(recreatedTerm).not.toBe(firstTerm)
+
+    // The new surface must still get its line: the preserved tracker
+    // re-issues it queue-ordered on the new surface's queue. Flush the
+    // deferred frames and read the FINAL SURVIVING BUFFER STATE.
+    act(() => { pump() })
+    await waitFor(() => {
+      expect(terminalWriteStrings(recreatedTerm).filter((data) => data === FRAMED_NOTICE)).toHaveLength(1)
+    })
+    const buffer = modeledFinalBuffer(recreatedTerm)
+    expect(buffer.split(NOTICE_LINE).length - 1).toBe(1)
+    // The died-with-the-old-queue copy never landed anywhere: the first
+    // surface never applied its notice bytes.
+    expect(terminalWriteStrings(firstTerm).filter((data) => data === FRAMED_NOTICE)).toHaveLength(0)
+    // No re-mint ever arrived and none is resident; the create-lane
+    // stand-down held throughout.
     expect(leafContent(store).reconcileNotice).toBeUndefined()
     expect(sentCreates()).toHaveLength(0)
   })
