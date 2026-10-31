@@ -4305,7 +4305,7 @@ await import(parameters.source)
         let log = tempfile::NamedTempFile::new().unwrap();
         let parent = json!({"id":"thread-new-1","ephemeral":true,"status":{"type":"active"},"turns":[{"id":"registered-child-turn","status":"inProgress","items":[{"id":"spawn","type":"collabAgentToolCall","tool":"spawnAgent","status":"completed","senderThreadId":"thread-new-1","receiverThreadIds":["ephemeral-child"],"agentsStates":{}}]}]});
         let child = json!({"id":"ephemeral-child","parentThreadId":"thread-new-1","ephemeral":true,"status":{"type":"active"},"turns":[]});
-        let fixture = native_codex_fixture(json!({"appendRequestLogPath":log.path(),"threadReadResults":{"thread-new-1":parent,"ephemeral-child":child}})).await;
+        let fixture = native_codex_fixture(json!({"appendRequestLogPath":log.path(),"threadTurns":parent["turns"],"threadReadResults":{"thread-new-1":parent,"ephemeral-child":child}})).await;
         let actor = FreshAgentHostActor::open(
             fixture.dir.path().join("ephemeral-observer-actor"),
             fixture.profile.clone(),

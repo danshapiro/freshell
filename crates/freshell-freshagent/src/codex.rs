@@ -22319,6 +22319,15 @@ pub(crate) mod tests {
             &id,
             json!({"thread":{"id":"thread-rest","status":"idle","turns":[]}}),
         );
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/turns/list");
+        assert_eq!(params["threadId"], "thread-rest");
+        assert_eq!(params["limit"], 1);
+        assert_eq!(params["itemsView"], "full");
+        peer.respond(
+            &id,
+            json!({"data":[],"nextCursor":null,"backwardsCursor":null}),
+        );
         let snapshot = snapshot.await.unwrap();
         assert_eq!(snapshot["status"], "running");
         assert_eq!(snapshot["capabilities"]["send"], false);
@@ -22341,6 +22350,15 @@ pub(crate) mod tests {
         peer.respond(
             &id,
             json!({"thread":{"id":"thread-rest","status":"idle","turns":[]}}),
+        );
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/turns/list");
+        assert_eq!(params["threadId"], "thread-rest");
+        assert_eq!(params["limit"], 1);
+        assert_eq!(params["itemsView"], "full");
+        peer.respond(
+            &id,
+            json!({"data":[],"nextCursor":null,"backwardsCursor":null}),
         );
         assert_eq!(snapshot.await.unwrap()["capabilities"]["send"], true);
         drop(peer);
