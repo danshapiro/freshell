@@ -6006,8 +6006,6 @@ mod workspace_metadata_test_hooks {
         pub fail_drain_join: bool,
         #[cfg(target_os = "linux")]
         pub drainer_tids: Vec<u32>,
-        #[cfg(target_os = "linux")]
-        pub inherited_pipe_targets: BTreeSet<PathBuf>,
     }
     thread_local! { pub(super) static STATE: RefCell<State> = RefCell::new(State::default()); }
     pub(super) fn spawned(pid: u32) {
@@ -6022,8 +6020,6 @@ mod workspace_metadata_test_hooks {
             let tid = unsafe { libc::syscall(libc::SYS_gettid) };
             let children = fs::read_to_string(format!("/proc/self/task/{tid}/children"))
                 .expect("owned test thread children");
-            let inherited_pipe_targets =
-                STATE.with(|state| state.borrow().inherited_pipe_targets.clone());
             let mut workspace = 0;
             let mut bodies = 0;
             let mut pipes = 0;
@@ -6041,13 +6037,18 @@ mod workspace_metadata_test_hooks {
                     continue;
                 }
                 if let Ok(entries) = fs::read_dir(format!("/proc/{candidate}/fd")) {
+                    // The command owns its stdio pipes, not arbitrary pipe
+                    // descriptors inherited from another concurrent test.
+                    // Count every endpoint referencing those identities so
+                    // duplicated owned descriptors still exceed the bound.
+                    let owned_pipe_targets: BTreeSet<_> = (0..3)
+                        .filter_map(|fd| fs::read_link(format!("/proc/{candidate}/fd/{fd}")).ok())
+                        .filter(|target| target.to_string_lossy().starts_with("pipe:"))
+                        .collect();
                     pipes += entries
                         .filter_map(Result::ok)
                         .filter_map(|entry| fs::read_link(entry.path()).ok())
-                        .filter(|target| {
-                            target.to_string_lossy().starts_with("pipe:")
-                                && !inherited_pipe_targets.contains(target)
-                        })
+                        .filter(|target| owned_pipe_targets.contains(target))
                         .count();
                 }
             }
@@ -9790,9 +9791,9 @@ mod native_source_inventory_tests {
     #[cfg(unix)]
     #[test]
     fn verified_aggregate_accepts_only_current_proved_duplicate_bodies() {
-        // Retain184's actual complete qualified wrong-body fixture. Its old
-        // both-direction equivalence FAIL remains evidence; this test protects
-        // the assessed correct-content success contract, not duplicate health.
+        // A selected correct body may succeed despite an unselected corrupt
+        // duplicate. Rejected aggregate bytes must still follow the ordered
+        // reader's current-content checks, never search past a corrupt copy.
         let fixture = reuse_fixture(true);
         let (stores, late_id, body) = packed_pressure_stores(&fixture);
         let earlier = stores[1].parent().unwrap();
@@ -9821,25 +9822,6 @@ mod native_source_inventory_tests {
         let native = fixture.store.parent().unwrap();
         let workspace = fixture.dir.path().join("workspace/.git/objects");
         for reversed in [false, true] {
-            // Native Git prioritizes newer packs. Equal mtimes leave the
-            // duplicate selection dependent on its tie order, so make the
-            // chosen valid/corrupt copy explicit in each scenario.
-            let preferred = if reversed { &stores[1] } else { &stores[4] };
-            for (index, store) in stores.iter().enumerate() {
-                let priority = if store == preferred {
-                    100
-                } else {
-                    index as u64
-                };
-                for entry in fs::read_dir(store.join("pack")).unwrap() {
-                    File::open(entry.unwrap().path())
-                        .unwrap()
-                        .set_modified(
-                            std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + priority),
-                        )
-                        .unwrap();
-                }
-            }
             let mut ordered = stores.clone();
             if reversed {
                 ordered.swap(1, 4);
@@ -9854,16 +9836,6 @@ mod native_source_inventory_tests {
             .unwrap();
             let qualified = qualified_snapshot_stores(native, &workspace).unwrap();
             assert_eq!(qualified, ordered);
-            let selected = fixture_git(native, &["cat-file", "blob", &late_id], None);
-            assert_eq!(
-                selected.as_bytes(),
-                if reversed {
-                    b"owned alternate 2".as_slice()
-                } else {
-                    body.as_slice()
-                },
-                "native Git must select the scenario's explicitly preferred duplicate"
-            );
             snapshot_reuse_test_hooks::STATE.with(|state| {
                 *state.borrow_mut() = snapshot_reuse_test_hooks::State {
                     aggregate_disabled: true,
@@ -9874,24 +9846,78 @@ mod native_source_inventory_tests {
             assert_eq!(
                 baseline.is_err(),
                 !reversed,
-                "preserve184's observed baseline, not claim its failure was green"
+                "the ordered reader refuses an earlier corrupt copy, but accepts an earlier valid copy"
             );
             snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
             let mut decoders = SnapshotPackedDecoders::default();
             decoders.qualify(native, &workspace, &qualified).unwrap();
-            let Some(SnapshotObjectSource::Packed {
-                kind,
-                body: current,
-            }) = decoders.read(&qualified, &late_id).unwrap()
-            else {
-                panic!("a freshly proved valid representation may succeed despite an unselected corrupt duplicate");
-            };
-            assert_eq!(kind, "blob");
-            assert_eq!(current, body);
+            // Git versions can choose either duplicate. Assert the actual
+            // reader's proved bytes or its exact corrupt-content refusal;
+            // neither timestamps nor alternate order promise its selection.
+            match decoders.read(&qualified, &late_id) {
+                Ok(Some(SnapshotObjectSource::Packed { kind, body: current })) => {
+                    assert_eq!(kind, "blob");
+                    assert_eq!(current, body);
+                }
+                Err(TransferError::Blocked(reason)) if !reversed => {
+                    assert_eq!(reason, "snapshot object bytes do not match their content identity");
+                    assert_eq!(decoders.costs.aggregate_rejections, 1);
+                    assert_eq!(decoders.costs.aggregate_fallbacks, 1);
+                }
+                Err(error) => panic!("valid-first fallback must preserve the exact body; reversed={reversed}: {error}"),
+                Ok(_) => panic!("the native packed duplicate cannot become absent or loose"),
+            }
             decoders.finish().unwrap();
-            assert_eq!(decoders.costs.aggregate_rejections, u64::from(reversed));
-            assert_eq!(decoders.costs.aggregate_fallbacks, u64::from(reversed));
+            assert!(decoders.costs.aggregate_rejections <= 1);
+            assert_eq!(
+                decoders.costs.aggregate_rejections,
+                decoders.costs.aggregate_fallbacks
+            );
             assert_settled_native_fixture();
+
+            // Deterministically cover both possible aggregate selections over
+            // these same real native stores, including the fallback's refusal
+            // when its higher-priority native copy has the wrong body.
+            for valid_aggregate in [true, false] {
+                snapshot_reuse_test_hooks::STATE
+                    .with(|state| *state.borrow_mut() = Default::default());
+                let response = response_fixture(
+                    Some(if valid_aggregate {
+                        body.as_slice()
+                    } else {
+                        b"owned alternate 2".as_slice()
+                    }),
+                    0,
+                    false,
+                );
+                let mut decoders = injected_aggregate(&qualified, response);
+                let result = decoders.read(&qualified, &late_id);
+                if valid_aggregate || reversed {
+                    let Some(SnapshotObjectSource::Packed {
+                        kind,
+                        body: current,
+                    }) = result.unwrap()
+                    else {
+                        panic!("proved direct bytes or a valid first fallback must succeed");
+                    };
+                    assert_eq!(kind, "blob");
+                    assert_eq!(current, body);
+                } else {
+                    assert!(
+                        matches!(result, Err(TransferError::Blocked(ref reason)) if reason == "snapshot object bytes do not match their content identity")
+                    );
+                }
+                decoders.finish().unwrap();
+                assert_eq!(
+                    decoders.costs.aggregate_rejections,
+                    u64::from(!valid_aggregate)
+                );
+                assert_eq!(
+                    decoders.costs.aggregate_fallbacks,
+                    u64::from(!valid_aggregate)
+                );
+                assert_settled_native_fixture();
+            }
         }
         corrupt(&stores[4]);
         let qualified = qualified_snapshot_stores(native, &workspace).unwrap();
@@ -12788,6 +12814,8 @@ mod native_source_inventory_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn workspace_metadata_complete_export_measures_owned_process_pipe_and_drainer_peaks() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+
         let fixture = reuse_fixture(true);
         packed_pressure_stores(&fixture);
         let workspace = fixture.dir.path().join("workspace");
@@ -12808,15 +12836,6 @@ mod native_source_inventory_tests {
             workspace_metadata_test_hooks::STATE.with(|state| {
                 *state.borrow_mut() = workspace_metadata_test_hooks::State {
                     legacy,
-                    // Cargo or CI can pass unrelated pipe descriptors to Git.
-                    // Count only pipe identities created by this export, while
-                    // still counting every new endpoint in its owned children.
-                    inherited_pipe_targets: fs::read_dir("/proc/self/fd")
-                        .unwrap()
-                        .filter_map(Result::ok)
-                        .filter_map(|entry| fs::read_link(entry.path()).ok())
-                        .filter(|target| target.to_string_lossy().starts_with("pipe:"))
-                        .collect(),
                     barrier: Some(Box::new(move |phase, _| {
                         if phase == "before_query" {
                             let actual = fs::read_dir("/proc/self/task")
@@ -12835,6 +12854,17 @@ mod native_source_inventory_tests {
                     })),
                     ..Default::default()
                 }
+            });
+            // Model another test opening inheritable descriptors during export
+            // setup. They are not this export's owned stdio pipes.
+            let _foreign_pipe = (!legacy).then(|| {
+                std::thread::spawn(|| {
+                    let mut descriptors = [-1; 2];
+                    assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+                    descriptors.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+                })
+                .join()
+                .unwrap()
             });
             let exported = export_exact_session(
                 &fixture.inventory,
