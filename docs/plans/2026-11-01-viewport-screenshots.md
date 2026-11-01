@@ -76,7 +76,7 @@ The drafts below are pre-implementation proposals. Once execution starts, source
 - Produces: `export type PreparedScreenshotViewport = { ignoreElements: (element: Element) => boolean; onclone: (doc: Document, clonedTarget: HTMLElement) => void }` and `export function prepareScreenshotViewport(target: HTMLElement): PreparedScreenshotViewport`.
 - Task 2 extends this helper internally; its exported shape stays unchanged.
 
-- [ ] **Step 1: Write failing behavioral tests**
+- [x] **Step 1: Write failing behavioral tests**
 
 In the screenshot unit file, add a second cloner helper rather than changing existing iframe tests to require full-document cloning. It must check `ignoreElements` **before** importing or visiting a child. Save source/clone pairs so unit DOM scroll restoration models html2canvas. This is test code, not a production serializer:
 
@@ -543,7 +543,7 @@ test('tab and view capture preserve two independently scrolled transcripts', asy
 
 Before starting a scope capture, wait for two animation frames after fixture changes. For background pane/tab keep the hidden ancestor chain and assert no source visibility style changes. Extend the ordinary test's synthetic input with consecutive assistant turns to cover continuation negative margins and `:first-child` styling, plus caption/live/rolled-back roots using the actual supported snapshot fields where available; the unit cloner covers these as arbitrary direct roots regardless of provider projection.
 
-- [ ] **Step 2: Run tests and verify intended failures**
+- [x] **Step 2: Run tests and verify intended failures**
 
 Run:
 
@@ -554,7 +554,7 @@ GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium test/e2e-browser/spe
 
 Expected: the new cloner test fails because offscreen/unrelated roots are visited; the real stress case on existing code can miss the Rust route's 10-second deadline, so `png()` receives HTTP 503 and fails its expected-200 assertion (rather than reaching a hypothetical 15-second client bound). Ordinary reference cases may already pass and establish the accuracy to preserve. Confirm failures are the missing behavior, with fixtures rendered and REST reached, rather than setup/type failures. Keep the red receipt; do not run giant unoptimized references.
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [x] **Step 3: Add the minimal production implementation**
 
 Create this initial helper. Correlate source and clone scrollers by DOM order **and** owning pane id; no live attributes are stamped. html2canvas snapshots the complete source document synchronously before its first await, so preparing immediately before invocation prevents an async gap. An unexpected correlation change fails capture clearly instead of falling back to the unbounded clone path.
 
@@ -726,7 +726,7 @@ onclone: (doc, clonedTarget) => {
 
 Keep the nested iframe html2canvas calls unchanged and retain `finally { await restoreRenderers() }` and the outer result error handling. Omission filtering walks source ancestors, matching early exclusion of entire roots, including hidden-tab and offscreen-row descendants. Count and per-index original pane/src fingerprints still guard every retained replacement; newly included, added, moved or changed frames cannot receive an unrelated image. No live style, focus, tab-selection, or scroll writes are introduced. Existing normal nested scroll restoration remains html2canvas's responsibility; its clone stores/restores source element scroll offsets. Task 2 explicitly restores adapted `<pre>` geometry where content exclusion would otherwise clamp those offsets. Leave html2canvas's exceptional internal clone-iframe cleanup unchanged; that optional lifecycle work is outside this small feature.
 
-- [ ] **Step 4: Run focused tests**
+- [x] **Step 4: Run focused tests**
 
 Run:
 
@@ -738,11 +738,11 @@ GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium test/e2e-browser/spe
 
 Expected: PASS for the new and existing screenshot units, client typecheck, and every new Task 1 browser case. Ordinary crops match full html2canvas exactly at top/middle/bottom; 30k stress exactly matches its independently measured same-source viewport (including its minimap), meets the real 10-second deadline, and has no capture-induced focus/selection/tab/pane/scroll events. The visible-plus-hidden-iframe view regression passes, all original iframe drift safeguards pass, and fresh viewport geometry is used after preparatory awaits. Renderer cleanup remains covered.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Remove duplicate rectangle/scroller lookup calculations inside preparation and simplify any unnecessary stored fields. Keep one helper module and one per-capture omitted set. Inspect top/middle/bottom screenshots for spacer edges and first-child changes. Retain a contiguous selected row range; do not add a generic DOM abstraction. Run the focused unit and browser commands again after actual refactoring.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 This changes screenshot preparation only, not shared state/config/build interfaces. The impacted set is the screenshot unit file, renderer suspension unit file, new viewport browser spec, existing REST scope/focus regression, and existing iframe screenshot spec:
 
@@ -754,7 +754,7 @@ pnpm run typecheck:client
 
 Expected: PASS with named tests actually executed on cloud Chromium, no skipped/zero-test viewport filter, and no unexplained recovered retries. Existing focus-neutrality and iframe test filenames are cloud-legal. Preserve relevant PNGs, counts, timings and failure traces in configured `test-results` artifacts; this is branch evidence, not the unrelated baseline exception.
 
-- [ ] **Step 7: Commit this deliverable**
+- [x] **Step 7: Commit this deliverable**
 
 ```bash
 git add src/lib/screenshot-viewport.ts src/lib/ui-screenshot.ts test/unit/client/ui-screenshot.test.ts test/e2e-browser/specs/pane-viewport-screenshot.spec.ts
@@ -772,7 +772,7 @@ git commit -m "fix: bound transcript screenshot cloning to the viewport"
 - Consumes: Task 1's `prepareScreenshotViewport(target: HTMLElement): PreparedScreenshotViewport`, direct retained row roots, `intersection`, `viewport`, and per-capture omitted-root set.
 - Produces: the same exported helper shape, additionally avoiding highlighted descendant traversal and preserving visible code lines/outer geometry; plain `pre-wrap` tool bodies retain their text and literal clone scroll offsets.
 
-- [ ] **Step 1: Write failing behavioral tests**
+- [x] **Step 1: Write failing behavioral tests**
 
 Append this test to the Task 1 unit `describe` so its cleanup applies. It tests code in a naturally tall block viewed through a scrolled transcript: `pre.scrollTop === 0` must **not** mean the top source line is captured.
 
@@ -1026,7 +1026,7 @@ for (const internal of [false, true]) {
 
 The oracle uses a tag check instead of a cross-realm constructor for stylesheet links and reports stylesheet failures clearly. The iframe is test-owned, created after source mounting and removed in `finally`; it is never present during the production capture.
 
-- [ ] **Step 2: Run tests and verify intended failure**
+- [x] **Step 2: Run tests and verify intended failure**
 
 ```bash
 pnpm run test:vitest run test/unit/client/ui-screenshot.test.ts test/unit/client/lib/screenshot-capture-env.test.ts --config config/vitest/vitest.config.ts
@@ -1035,7 +1035,7 @@ GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium test/e2e-browser/spe
 
 Expected: giant-code unit fails because highlighted descendants are visited; giant browser capture fails its bounded work/content criterion on Task 1 alone. Wrapped-output references may pass immediately, proving that preserving the existing plain text is correct; retain this evidence rather than introducing wrapping machinery just to change code.
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [x] **Step 3: Add the minimal production implementation**
 
 Add the following private adapter types/functions to the same helper. Keep thresholds internal implementation constants. Do not adapt wrapped plain tool output, DiffView, Monaco, terminal canvases, or iframe documents. `clipFor` includes **all actual ancestor overflow clipping**, so a naturally tall pre uses the transcript's clip rather than merely its own `scrollTop`. It snapshots all source values synchronously; the clone phase must not reread live geometry.
 
@@ -1135,7 +1135,7 @@ Extend `TranscriptPlan` with `code: RowCodePlan[]`; construct it for `rows.slice
 
 Ordinary pre's literal nested scroll offsets continue to be restored by html2canvas's own cloner. The code adapter intentionally uses equivalent clone-only text translation because its giant internal extent is no longer represented by highlighted children. The browser tests must prove both kinds of scrolling and prevent double subtraction.
 
-- [ ] **Step 4: Run focused tests**
+- [x] **Step 4: Run focused tests**
 
 ```bash
 pnpm run test:vitest run test/unit/client/ui-screenshot.test.ts test/unit/client/lib/screenshot-capture-env.test.ts --config config/vitest/vitest.config.ts
@@ -1145,11 +1145,11 @@ GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium test/e2e-browser/spe
 
 Expected: PASS, including every named Task 1 case; highlighted descendants never reach the cloner, natural-height and internal-scroll code capture the correct current lines/offsets, and both wrapped-output widths exactly match full html2canvas. A wrapped reference mismatch is a correctness failure to diagnose in clone geometry/scroll, not permission to use source-line slicing or discard visible content.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Keep code replacement and transcript spacers as two small private operations in the one focused helper. Remove unused saved geometry, normalize numeric style reads once, and consolidate repeated clone validation errors where that improves clarity. Review whether the adapter threshold can be simpler without applying to wrapped text or small highlighted blocks. Re-run focused units and the new browser spec after any refactor; inspect representative ordinary/wrapped/code PNGs and line origins.
 
-- [ ] **Step 6: Run impacted-test verification and final branch gate**
+- [x] **Step 6: Run impacted-test verification and final branch gate**
 
 ```bash
 GCLOUD_ROBOT_REQUIRE=1 pnpm run test:cloud --config=default test/unit/client/ui-screenshot.test.ts test/unit/client/lib/screenshot-capture-env.test.ts
@@ -1162,7 +1162,7 @@ Expected: the impacted cloud suites/typecheck PASS and all new named browser tes
 
 This final broad check is repository completion validation, not a reason to add unrelated fixes. Keep retained results needed for review in this worktree's configured output paths and remove only task-owned disposable `.test-tmp` files after use. Shared fixture teardown owns its processes; no production server or port 3001 action is part of verification.
 
-- [ ] **Step 7: Commit this deliverable**
+- [x] **Step 7: Commit this deliverable**
 
 ```bash
 git add src/lib/screenshot-viewport.ts test/unit/client/ui-screenshot.test.ts test/e2e-browser/specs/pane-viewport-screenshot.spec.ts
