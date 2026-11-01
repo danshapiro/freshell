@@ -425,7 +425,7 @@ for (const height of [200, 120]) test(`nested ${height}px panes retain requests 
   void freshellPage
   await page.setViewportSize({ width: 1200, height: 1000 })
   await terminal.waitForTerminal()
-  await seedCompactPane(page, { sessionType: 'freshclaude', provider: 'claude', style: 'sans', theme: 'light' })
+  const state = await seedCompactPane(page, { sessionType: 'freshclaude', provider: 'claude', style: 'sans', theme: 'light' })
   await splitFreshPane(page, 'vertical')
   await page.evaluate(() => {
     const h = window.__FRESHELL_TEST_HARNESS__!; const s = h.getState(); const tabId = s.tabs.activeTabId!
@@ -464,7 +464,7 @@ for (const height of [200, 120]) test(`nested ${height}px panes retain requests 
   expect(promptVisible).toBe(true)
   const composer = root.getByRole('textbox', {name:'Chat message input'})
   await hitAndClick(composer); await composer.fill('Draft in a tiny split')
-  await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.dispatch({ type:'freshAgent/setSessionStatus', payload: {sessionId:'compact-freshclaude',sessionType:'freshclaude',provider:'claude',status:'exited'} }))
+  await state.update({ status: 'exited' })
   await expect(composer).toBeDisabled()
   await hitAndClick(stack.locator('[data-agent-error="ended"] summary'))
   for (const label of ['Resume session', 'Start new session']) {
@@ -482,8 +482,10 @@ test('compact header advertises multiple diagnostics and expands long prominent 
   const text = 'Session identity corrected by server — this pane now points at its live session.'
   await page.evaluate(() => {
     const h=window.__FRESHELL_TEST_HARNESS__!;const s=h.getState();const tabId=s.tabs.activeTabId!
+    h.dispatch({type:'settings/updateSettingsLocal',payload:{sidebar:{collapsed:true}}})
     h.dispatch({type:'panes/mergePaneContent',payload:{tabId,paneId:s.panes.activePane[tabId],updates:{reconcileNotice:undefined,closeError:'Second actionable diagnostic'}}})
   })
+  await expect(page.getByRole('button', { name:'Show sidebar',exact:true })).toBeVisible()
   for (const size of [{width:1100,height:700},{width:560,height:320},{width:390,height:700}]) {
     await fitRoot(page,{width:size.width})
     await fitRoot(page,{height:size.height})
