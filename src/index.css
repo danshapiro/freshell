@@ -1546,3 +1546,29 @@ body {
     border: 0;
   }
 }
+
+/* Changes lives outside the pane to preserve conversation space. */
+.fresh-agent-diff-drawer-overlay.fresh-agent-pane,
+.fresh-agent-diff-drawer-overlay {
+  position: fixed;
+  inset: 0;
+  height: 100dvh;
+  display: flex;
+  flex-direction: row;
+  justify-content: flex-end;
+  background: hsl(var(--background) / 0.45);
+}
+.fresh-agent-diff-drawer {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: min(38rem, 100vw);
+  height: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  background: var(--fresh-agent-panel-surface, hsl(var(--card)));
+  color: var(--fresh-agent-text, hsl(var(--foreground)));
+  font-family: var(--fresh-agent-copy-font-family, inherit);
+  border-left: 1px solid var(--fresh-agent-border, hsl(var(--border)));
+  box-shadow: -8px 0 24px hsl(var(--foreground) / 0.1);
+}

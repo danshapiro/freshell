@@ -4,6 +4,7 @@ import savedCodexNativeHistory from '../../../../fixtures/managed-native-history
 import savedOpenCodeNativeHistory from '../../../../fixtures/managed-native-history/opencode.json'
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { lazy, Suspense } from 'react'
+import userEvent from '@testing-library/user-event'
 import { render, screen, waitFor, fireEvent, createEvent, cleanup, act, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore, type Middleware } from '@reduxjs/toolkit'
@@ -2955,7 +2956,9 @@ describe('FreshAgentView', () => {
     })
     expect(screen.queryByRole('button', { name: 'Interrupt' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Fork' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /^Diffs:/ }))
     expect(screen.getByText('README.md')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
     expect(screen.getByText(/feature\/x/)).toBeInTheDocument()
     expect(screen.getByText('Review')).toBeInTheDocument()
     expect(screen.getByText('review-1')).toBeInTheDocument()
@@ -18744,8 +18747,16 @@ describe('diff panel view wiring (ekc6)', () => {
     // session cwd —
     // not show the missing-prerequisite "Diff unavailable" copy the
     // initialCwd-only wiring produced for resumed/API-created panes.
+    const changes = await screen.findByRole('button', { name: /^Diffs:/ })
+    changes.focus()
+    await userEvent.keyboard(' ')
     const trigger = await screen.findByRole('button', { name: 'Diff: README.md' })
-    fireEvent.click(trigger)
+    const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+    const originalText = (composer as HTMLTextAreaElement).value
+    trigger.focus()
+    await userEvent.keyboard(' ')
+    expect(trigger).toHaveFocus()
+    expect(composer).toHaveValue(originalText)
     await waitFor(() => expect(trigger).toHaveAttribute('aria-expanded', 'true'))
     expect(screen.queryByText('Diff unavailable for this file.')).toBeNull()
   })

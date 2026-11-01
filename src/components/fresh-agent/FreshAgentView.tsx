@@ -1744,6 +1744,11 @@ export function FreshAgentView({
   const composerRef = useRef<FreshAgentComposerHandle | null>(null)
   const transcriptRef = useRef<FreshAgentTranscriptHandle | null>(null)
   const paneRootRef = useRef<HTMLDivElement | null>(null)
+  const [paneRootElement, setPaneRootElement] = useState<HTMLDivElement | null>(null)
+  const capturePaneRoot = useCallback((element: HTMLDivElement | null) => {
+    paneRootRef.current = element
+    setPaneRootElement(element)
+  }, [])
   paneContentRef.current = paneContent
   const setLocalEcho = useCallback((next: LocalEcho | null) => {
     setLocalEchoState(next)
@@ -5107,6 +5112,7 @@ export function FreshAgentView({
       : 'Refreshing conversation'
     const WatermarkIcon = descriptor?.icon
     const handlePaneKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
+      if (event.target instanceof Element && event.target.closest('.fresh-agent-diff-drawer-overlay, .fresh-agent-diff-trigger')) return
       if (event.defaultPrevented) return
       if (isTranscriptNavigationKey(event) && !isInteractiveTarget(event.target)) {
         scrollTranscriptByKey(event, transcriptRef.current)
@@ -5152,7 +5158,7 @@ export function FreshAgentView({
     return (
       <FreshAgentObserveChildContext.Provider value={childParent ? { parent: childParent, onObserve: (action) => dispatch(mergePaneContent({ tabId, paneId, updates: { observedChildThreadId: action.childThreadId } })) } : undefined}>
       <div
-        ref={paneRootRef}
+        ref={capturePaneRoot}
         tabIndex={-1}
         className={cn(
           'fresh-agent-pane relative flex h-full min-h-0 flex-col overflow-hidden',
@@ -5440,12 +5446,17 @@ export function FreshAgentView({
               ))}
               <FreshAgentDiffPanel
                 diffs={projectedDiffs}
+                paneRoot={paneRootElement}
+                scopeKey={liveSessionKey}
                 // Same resolution as the !command exec escape: the pane's
                 // starting directory, falling back to the LIVE session cwd
                 // so a resumed/API-created pane without an initialCwd still
                 // fetches diffs instead of showing "Diff unavailable".
                 cwd={paneContent.initialCwd ?? agentSession?.cwd}
-                onComment={(text) => composerRef.current?.insertText(text)}
+                onComment={(text) => {
+                  composerRef.current?.insertText(text)
+                  composerRef.current?.focus()
+                }}
               />
             </div>
             <FreshAgentAsyncQuestionContext.Provider value={asyncQuestionContext}>
@@ -5662,6 +5673,8 @@ export function FreshAgentView({
       </FreshAgentObserveChildContext.Provider>
     )
   }, [
+    capturePaneRoot,
+    paneRootElement,
     asyncQuestionContext,
     canSend,
     claudeSession?.restoreFailureMessage,

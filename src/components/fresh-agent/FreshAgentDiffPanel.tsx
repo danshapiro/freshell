@@ -2,8 +2,68 @@ import { useCallback, useState } from 'react'
 import { ChevronRight, MessageSquarePlus } from 'lucide-react'
 import { api, ApiError } from '@/lib/api'
 import { cn } from '@/lib/utils'
+import { FreshAgentDiffDrawer } from './FreshAgentDiffDrawer.js'
 
-type DiffSummary = { id: string; path?: string; title?: string; status?: string; diff?: string }
+export type DiffSummary = { id: string; path?: string; title?: string; status?: string; diff?: string }
+
+/** Git quotes escape UTF-8 bytes with octal escapes, not JavaScript escapes. */
+function decodeGitPath(value: string): string | null {
+  if (!value.startsWith('"')) return value
+  if (!value.endsWith('"')) return null
+  const escapes: Record<string, string> = { a: '\x07', b: '\b', t: '\t', n: '\n', v: '\v', f: '\f', r: '\r', '"': '"', '\\': '\\' }
+  try {
+    const encoded = (value.slice(1, -1).match(/\\(?:[0-7]{1,3}|.)|[^\\]+/g) ?? []).map((part) => {
+      if (!part.startsWith('\\')) return encodeURIComponent(part)
+      const escape = part.slice(1)
+      if (/^[0-7]+$/.test(escape)) return `%${parseInt(escape, 8).toString(16).padStart(2, '0')}`
+      if (!(escape in escapes)) throw new Error('Unknown Git path escape')
+      return encodeURIComponent(escapes[escape])
+    }).join('')
+    return decodeURIComponent(encoded)
+  } catch { return null }
+}
+
+/** Supplied patches establish cardinality only when each file has an actual header. */
+function patchPaths(patch: string): string[] | null {
+  if (!patch.trim()) return []
+  const blocks = patch.split(/^diff --git /m)
+  if (blocks.length === 1 || blocks[0].trim()) return null
+  const paths: string[] = []
+  for (const block of blocks.slice(1)) {
+    const [pair, ...lines] = block.split('\n')
+    const match = pair.match(/^("(?:\\.|[^"\\])*"|a\/.+) ("(?:\\.|[^"\\])*"|b\/.+)$/)
+    if (!match) return null
+    let source = decodeGitPath(match[1])
+    let destination = decodeGitPath(match[2])
+    if (!source?.startsWith('a/') || !destination?.startsWith('b/')) return null
+    source = source.slice(2)
+    destination = destination.slice(2)
+    for (const line of lines) {
+      // Everything after a hunk or binary body is content, never a path.
+      if (line.startsWith('@@') || line === 'GIT binary patch' || line.startsWith('Binary files ')) break
+      if (line.startsWith('rename from ')) source = decodeGitPath(line.slice(12))
+      if (line.startsWith('rename to ')) destination = decodeGitPath(line.slice(10))
+      if (line === '+++ /dev/null') destination = null
+    }
+    const identity = destination ?? source
+    if (!identity) return null
+    paths.push(identity)
+  }
+  return paths
+}
+
+export function changedFileCount(diffs: DiffSummary[]): number | null {
+  const structured = new Set(diffs.map((diff) => diff.path).filter((path): path is string => !!path?.trim()))
+  if (structured.size) return structured.size
+  const paths = new Set<string>()
+  for (const summary of diffs) {
+    if (summary.diff === undefined) return null
+    const parsed = patchPaths(summary.diff)
+    if (parsed === null) return null
+    for (const path of parsed) paths.add(path)
+  }
+  return paths.size
+}
 
 /**
  * A 404 from /api/fresh-agent/diff means the connected server predates the
@@ -120,9 +180,8 @@ function FreshAgentFileDiff({
                 {onComment && kind !== 'hunk' ? (
                   <button
                     type="button"
-                    // Hover-revealed on desktop; always visible (with a real
-                    // touch target) on no-hover devices.
-                    className="invisible ml-2 shrink-0 p-1.5 text-muted-foreground hover:text-primary group-hover/line:visible sm:p-0 [@media(hover:none)]:visible"
+                    // Keep comments discoverable by pointer and keyboard in Changes.
+                    className="ml-2 shrink-0 p-1.5 text-muted-foreground hover:text-primary group-hover/line:visible sm:p-0 [@media(hover:none)]:visible"
                     aria-label="Comment on this line for the agent"
                     title="Comment on this line for the agent"
                     onClick={() => onComment(`On ${summary.path ?? label} at \`${line.trim()}\`: `)}
@@ -144,26 +203,54 @@ function FreshAgentFileDiff({
  * summaries load git diff from the session cwd when expanded.
  * Line comments drop a prefilled mention into the composer via onComment.
  */
-export function FreshAgentDiffPanel({
-  diffs,
-  cwd,
-  onComment,
-}: {
+type DiffPanelProps = {
   diffs: DiffSummary[]
   cwd?: string
   onComment?: (text: string) => void
-}) {
+  paneRoot?: HTMLElement | null
+  scopeKey?: string
+}
+
+function ScopedDiffPanel({ diffs, cwd, onComment, paneRoot }: DiffPanelProps) {
+  const [open, setOpen] = useState(false)
+  const [fallbackRoot, setFallbackRoot] = useState<HTMLElement | null>(null)
   if (diffs.length === 0) return null
+  const count = changedFileCount(diffs)
+  const countLabel = count === null ? 'file count unavailable' : `${count} changed file${count === 1 ? '' : 's'}`
+  const comment = onComment ? (text: string) => {
+    setOpen(false)
+    onComment(text)
+  } : undefined
   return (
-    <div className="fresh-agent-diff-panel min-w-0 overflow-hidden rounded-lg border border-border/60 bg-background/70 p-3">
-      <div className="fresh-agent-diff-title mb-2 text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Diffs</div>
-      <div className="fresh-agent-diff-list space-y-1">
-        {diffs.map((diff) => (
-          <FreshAgentFileDiff key={diff.id} summary={diff} cwd={cwd} onComment={onComment} />
-        ))}
-      </div>
+    <div className="fresh-agent-diff-panel min-w-0 overflow-hidden rounded-lg border border-border/60 bg-background/70">
+      <button
+        type="button"
+        className="fresh-agent-diff-trigger flex w-full items-center justify-between gap-2 px-3 py-2 text-xs focus-visible:outline focus-visible:outline-2"
+        aria-label={`Diffs: ${countLabel}`}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        onClick={(event) => {
+          setFallbackRoot(event.currentTarget.closest<HTMLElement>('.fresh-agent-pane'))
+          setOpen(true)
+        }}
+      >
+        <span>Diffs</span><span>{countLabel}</span>
+      </button>
+      {open ? (
+        <FreshAgentDiffDrawer paneRoot={paneRoot ?? fallbackRoot} onClose={() => setOpen(false)}>
+          <div className="fresh-agent-diff-list space-y-1">
+            {diffs.map((diff) => (
+              <FreshAgentFileDiff key={diff.id} summary={diff} cwd={cwd} onComment={comment} />
+            ))}
+          </div>
+        </FreshAgentDiffDrawer>
+      ) : null}
     </div>
   )
+}
+
+export function FreshAgentDiffPanel(props: DiffPanelProps) {
+  return <ScopedDiffPanel key={props.scopeKey ?? props.cwd ?? ''} {...props} />
 }
 
 export default FreshAgentDiffPanel
