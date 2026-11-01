@@ -13,7 +13,7 @@
  * mirrored UI layout. Authored under the df1 deferred-Playwright policy
  * (probe-executable: run once per leg); see docs/plans/df1-evidence/AUTO-01.md.
  */
-import type { Page } from '@playwright/test'
+import type { Locator, Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
 import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 
@@ -59,6 +59,19 @@ async function fetchSnapshot(serverInfo: E2eServerInfo): Promise<Snapshot> {
   return (await fetchWithAuth(serverInfo, '/api/layout/snapshot')) as Snapshot
 }
 
+/** Activate the scoped picker through its keyboard contract. The picker
+ * animates tiles on hover, so pointer movement is incidental to layout sync.
+ * Wait for replacement of this exact picker, never a background tab's xterm. */
+async function choosePickerShell(page: Page, picker: Locator): Promise<void> {
+  await expect(picker).toBeVisible({ timeout: 10_000 })
+  const paneId = await picker.getAttribute('data-pane-id')
+  expect(paneId).toBeTruthy()
+  await picker.getByRole('button', { name: /^(Shell|WSL|CMD|PowerShell|Bash)$/i })
+    .first().press('Enter', { timeout: 5_000 })
+  await expect(page.locator(`[data-context="pane-picker"][data-pane-id="${paneId}"]`))
+    .toHaveCount(0)
+}
+
 /** Split the terminal under the cursor via its context menu, then choose a
  * shell for the new picker pane. Uses `:visible` xterms — hidden terminals of
  * inactive/background tabs and panes must not be hit. */
@@ -68,16 +81,7 @@ async function splitAndSelectShell(page: Page, direction: 'horizontal' | 'vertic
     .getByRole('menuitem', { name: direction === 'horizontal' ? /split horizontally/i : /split vertically/i })
     .click()
   const picker = page.locator('[data-context="pane-picker"]').last()
-  await picker.waitFor({ state: 'visible', timeout: 10_000 })
-  await page.waitForTimeout(300)
-  for (const name of ['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash']) {
-    const button = picker.getByRole('button', { name: new RegExp(`^${name}$`, 'i') })
-    if (await button.isVisible().catch(() => false)) {
-      await button.click({ timeout: 5000 })
-      return
-    }
-  }
-  throw new Error('no shell option in pane picker')
+  await choosePickerShell(page, picker)
 }
 
 /** The shape the client mirror sends (the client state is the source of
@@ -152,18 +156,7 @@ test.describe('AUTO-01 — ui.layout.sync is the authoritative layout', () => {
     await page.locator('[data-context="tab-add"]').click()
     await harness.waitForTabCount(2)
     const picker = page.locator('[data-context="pane-picker"]').last()
-    await picker.waitFor({ state: 'visible', timeout: 10_000 })
-    await page.waitForTimeout(300)
-    let shellChosen = false
-    for (const name of ['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash']) {
-      const button = picker.getByRole('button', { name: new RegExp(`^${name}$`, 'i') })
-      if (await button.isVisible().catch(() => false)) {
-        await button.click({ timeout: 5000 })
-        shellChosen = true
-        break
-      }
-    }
-    expect(shellChosen).toBe(true)
+    await choosePickerShell(page, picker)
     await page.locator('.xterm').last().waitFor({ state: 'visible', timeout: 30_000 })
 
     const secondTab = page.locator('[data-context="tab"]').nth(1)
