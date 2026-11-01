@@ -7976,7 +7976,7 @@ export function query({ prompt, options }) {
         assert_eq!(
             consumed.len(),
             3,
-            "two explicit clears and one original input"
+            "two explicit clears and one original input; consumed rows: {consumed:#?}"
         );
         assert_eq!(consumed[2]["nativeSessionId"], CURRENT);
         assert_eq!(
