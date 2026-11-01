@@ -999,14 +999,6 @@ mod tests {
             std::env::set_var(name, value);
             Self { name, saved }
         }
-
-        /// Round 7, Major 2: the snap-fallback tests need the var UNSET
-        /// (default/snap resolution) with the same panic-safe restore.
-        fn unset(name: &'static str) -> Self {
-            let saved = std::env::var_os(name);
-            std::env::remove_var(name);
-            Self { name, saved }
-        }
     }
 
     impl Drop for EnvVarGuard {

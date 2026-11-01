@@ -15,7 +15,7 @@
 //! round 7, `antigravity_home` resolved only the default root, so on
 //! that machine history/search/identity/activity silently found nothing.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::antigravity_home;
 
