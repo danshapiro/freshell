@@ -56,7 +56,6 @@ use freshell_protocol::{
     TerminalIdle, TerminalIdleReason, TerminalTurnComplete, TerminalTurnOutcome,
     TurnCompletionSnapshot,
 };
-};
 use freshell_terminal::ActivityEvent;
 
 use crate::terminal::now_ms;
@@ -3121,6 +3120,8 @@ fn antigravity_frames(
                 session_id,
                 at,
                 completion_seq,
+                outcome,
+                ..
             } => {
                 idle.note_turn_boundary(&terminal_id, at);
                 frames.push(turn_complete_frame(
@@ -3129,6 +3130,7 @@ fn antigravity_frames(
                     session_id,
                     at,
                     completion_seq,
+                    outcome,
                 ));
             }
             TrackerEffect::ForceRead { terminal_id, .. } => force_reads.push(terminal_id),

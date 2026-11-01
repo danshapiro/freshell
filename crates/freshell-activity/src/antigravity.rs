@@ -103,6 +103,7 @@ use std::path::PathBuf;
 
 use freshell_protocol::AntigravityActivityRecord;
 use freshell_protocol::AntigravityPhase;
+use freshell_protocol::TerminalTurnOutcome;
 // The locator's recency tolerance (round 4, Minor 1): the SHARED constant —
 // the baseline's live/history floor and the locator's match rule accept the
 // same window, so a record the locator binds can never classify as history
@@ -914,6 +915,16 @@ impl AntigravityActivityTracker {
                     session_id,
                     at,
                     completion_seq: seq,
+                    // The settle record's own outcome: `errored` maps to
+                    // Failed, anything else to Completed (the module header's
+                    // outcome-uniform rule — an errored turn end is still a
+                    // turn end, never a silent drop).
+                    outcome: Some(if errored {
+                        TerminalTurnOutcome::Failed
+                    } else {
+                        TerminalTurnOutcome::Completed
+                    }),
+                    outcome_update: false,
                 });
                 effects
             }

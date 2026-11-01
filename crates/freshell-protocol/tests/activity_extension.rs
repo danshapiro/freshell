@@ -252,6 +252,7 @@ fn terminal_turn_complete_accepts_the_antigravity_provider() {
         provider: AgentProvider::Antigravity,
         terminal_id: "term-1".into(),
         session_id: Some("conv-1".into()),
+        outcome: None,
     })
     .unwrap();
     assert_eq!(wire["provider"], "antigravity");

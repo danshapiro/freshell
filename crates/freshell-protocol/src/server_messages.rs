@@ -14,7 +14,6 @@ use crate::common::{
     OpencodeActivityRecord, SessionLocator, SessionType, TerminalMetaRecord, TerminalTurnOutcome,
     TurnCompletionSnapshot,
 };
-};
 use crate::session_names::{SessionNameRecord, SessionNameRef, SessionNameUpdated};
 use crate::settings::ServerSettings;
 
