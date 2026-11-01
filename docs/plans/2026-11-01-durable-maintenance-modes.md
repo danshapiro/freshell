@@ -23,50 +23,66 @@ Implement the three managed-runtime update modes: default updates the web/client
 
 ## Goal
 
-Operators can update the client alone, client and durable runtime together, or durable runtime alone, with exact approval before modes that reset managed coding sessions and with saved conversation recovery attempted afterward.
+Operators can update the served client alone, update the client and durable runtime together, or update the durable runtime alone. The two reset-capable modes require an exact APPROVED line, preserve conversation history, reset managed coding sessions, and attempt reopening them on the updated runtime.
 
 ## Architecture
 
-Add one operator command, pnpm run update:managed-runtime, with a client-only default and explicit --all and --durable-only modes. The default builds the client only. The two reset-capable modes gate all effects on a verbatim APPROVED input, update the selected artifacts, stop managed coding souls through the existing revision-fenced API, restart the documented durable-runtime owner, and attempt to reopen saved conversations through the recovery path validated in Stage 2. The compile repair is a prerequisite commit.
+Add pnpm run update:managed-runtime with a client-only default and explicit --all and --durable-only modes. Resolve the supported systemd user-unit owner and its artifact/resource manifest before staging. The web unit drop-in uses ordering-only After= so ordinary web/client maintenance cannot activate or restart the supervisor. The updater explicitly sequences any supervisor and web starts it needs.
+
+The default mode stages and activates only the selected served client directory. It does not call the supervisor, stop managed sessions, or restart a service. Both reset modes require exact approval, stage all selected artifacts first, stop the web/API unit to close UI create/retry ingress, then take one final inventory over the still-running supervisor's exact control socket. A new supervisor admin CLI performs inventory, typed per-soul Stops, and a narrow revision-fenced Reopen operation directly over that socket. The updater stops the supervisor only after every selected Stop is verified empty, installs the selected artifacts, starts the supervisor, waits for its control socket, attempts eligible reopens, starts the web/API unit, and waits for server readiness.
+
+The new Reopen operation uses the stopped soul's saved launch/resume context, native identity, and provider store to create a new incarnation with the current runtime. A missing native ID keeps the soul in the reset set but yields an explicit unavailable-to-reopen result. Do not fabricate a soul, native ID, or store. The compile repair is a prerequisite commit.
 
 ## Tech Stack
 
-TypeScript/NodeNext, pnpm 10.34.5, Rust/Cargo managed-runtime feature, Docker workload image, systemd user units, Vitest, Playwright, and the existing managed-runtime fixture harness.
+TypeScript/NodeNext, pnpm 10.34.5, Rust/Cargo managed-runtime feature, the existing supervisor control protocol and runtime client, a supervisor admin CLI, Docker workload image, systemd user units, Vitest, Playwright, and the managed-runtime fixture harness.
+
+## Stage 2 decisions
+
+The Stage 2 ledger and evidence are in /home/dan/code/freshell/.worktrees/.the-usual-logs/durable-maintenance-modes/load-bearing-ledger.md and its reports directory. This section records the decisions the implementation must follow.
+
+- F01 was falsified. Existing browser Reopen and create/resume paths cannot start a new incarnation of a stopped soul on its retained provider volume. Add the narrow supervisor admin Reopen operation described above. It is revision-fenced and idempotent; it uses the saved context and current runtime. Missing native IDs remain reset targets and are reported unavailable.
+- F02 is acceptable only for the existing systemd user-unit installation. Before staging or mutation, verify the current checkout matches the selected units' working directory and executable/install paths, identify the running supervisor and socket from those units, and refuse on ambiguity. Use that exact socket for inventory, Stop, and Reopen through the supervisor admin CLI. Do not use an HTTP API for those operations or add an HTTP identity endpoint unless direct socket ownership cannot be established.
+- F03 was falsified. Replace the web drop-in's Requires= with ordering-only After=; do not use Wants= or Requisite=. Web start/restart may fail when the supervisor is absent, but must not activate or restart it. The updater explicitly starts the supervisor before the web service when a reset mode needs both.
+- F04 is acceptable with a bounded artifact/resource manifest tied to the verified owner: resolved served-client directory; server binary only for --all; supervisor and admin CLI; session-host bind mount; managed workload image; host-side sidecar only if the managed path needs one; managed-runtime image-reference environment; and persistent registry, provider/history, runtime, and workspace roots to preserve. Build from the matching deployment checkout so compile-time resource paths remain valid. Use the supervisor's explicit Docker socket. Stage any renamed artifact on the destination filesystem and refuse unresolved owner, path, or daemon information. Do not run prepare:rust-runtime from a task worktree or let it create/mutate a missing .env; inspect whether image-contained sidecar resources make host preparation unnecessary.
+- F05 was falsified for inventory followed by sequential Stops while the web API remains open. Build and stage first, stop the web/API unit, then take the final fixed inventory and issue existing revision-fenced Stops through the still-running supervisor. This closes UI create/retry ingress before inventory and lets Stop cancel or drain recovery. Abort durable replacement on stale intent, timeout/unknown, or any outcome other than VerifiedEmpty. Record each result and never re-inventory to overwrite newer intent. Do not add a global admission service or deployment transaction journal. If source review finds another supported production ingress outside the stopped unit, choose the narrowest correction that preserves the three modes.
+- Do not automatically restore old binaries or image settings after the updated runtime may have opened persistent state. Build first; on post-stop failure report the failed phase and partial state, preserve persistent data, and follow the selected owner's forward-recovery runbook.
+- Apply the direct corrections from the finder/strategist reports: keep reset targets separate from records with reopen references; do not use the fresh-agent history endpoint for terminal souls; inspect typed Stop outcomes; select coding providers while excluding shell; restrict the terminal continuity command to the provider-free shell case at runtime-terminal-continuity-rust.spec.ts:116; make the fixture observe the changed runtime marker, retained history, new incarnation, and follow-up use; stage renames on the destination filesystem; and do not claim that the provider-free fixture proves installed systemd wiring.
 
 ## Global Constraints
 
 - Keep all work in /home/dan/code/freshell/.worktrees/durable-maintenance-modes on the-usual/durable-maintenance-modes. Do not run a production command or alter a live service.
-- Do not run the updater against the self-hosted installation during implementation. Behavioral tests use the disposable managed-runtime fixture and stub build/service commands.
-- Approval is mode-based, without compatibility analysis. --all and --durable-only require one exact input line, APPROVED, before the first API call, build, file write, install, or service action. Missing, lowercase, padded, or extra-text input refuses with no effects.
-- Parse the mode and read approval before creating RUN_DIR or UPDATE_TAG; rejected reset modes leave no temp files and run no command or API request. If any build or preparation step fails before the service stop, remove RUN_DIR and leave sessions and services untouched.
-- Default mode requires no approval. It runs only pnpm run typecheck:client and pnpm run build:client. It never builds or installs managed binaries or an image, calls systemd, stops a managed soul, or changes session/history data. It prints the required reminder after a successful client build.
-- --all includes client and managed durable artifacts. --durable-only does not build or replace the client artifact. Both reset active managed coding souls by default after approval, retain their history/provider data, and attempt to reopen their saved conversation references. Do not add a no-reset flag.
-- A coding-soul reset uses the current expectedIntentRevision and a new crypto.randomUUID() requestId for each POST /api/runtime/souls/{soul_id}/stop. Do not use retry as a restart operation. Preserve stopped intent for souls that were already stopped and do not stop ordinary shell souls.
-- Keep the managed server build feature-enabled: cargo build --release -p freshell-server -p freshell-supervisor -p freshell-session-host --locked --features freshell-server/managed-runtime-v1. Prepare the runtime sidecar with pnpm run --silent prepare:rust-runtime and build/pin the workload image from docker/runtime/Dockerfile. Never overwrite a managed deployment with the plain build:rust artifact.
-- Before stopping any session or service, finish every selected build, prepare the Rust runtime sidecar/auth prerequisite, stage the client when selected, and capture the previous deployable artifacts and runtime-image reference. If install or restart fails after stopping begins, restore the previous selected artifacts and image reference, then start the prior systemd pair and wait for readiness; retain the staging directory and report both the original failure and any recovery failure. Keep this recovery local to the updater rather than introducing a general rollback system.
-- In the checked-in systemd topology, restarting freshell-supervisor.service also restarts its dependent freshell-rust.service. --durable-only must leave dist/client byte-for-byte unchanged even if systemd restarts the server process as a dependency.
-- Keep ordinary web/client restarts free of an approval rule. The default update mode must not call freshell-supervisor.service directly or through a combined service target.
-- Add structured JSONL records with severity for approval refusal, reset/reopen results, each build/install/service phase, and final completion. Never log auth tokens, provider secrets, or conversation bodies.
-- Use the existing locked pnpm install and repo test commands. Do not add prose/config snapshot tests. No planned test contacts a live provider, production Docker image, or production service.
-
-## Load-bearing assumptions for Stage 2
-
-Resolve these claims in the Stage 2 load-bearing ledger before implementation; amend this plan with verified interfaces if either claim is false.
-
-1. **Reset and reopen:** A managed coding soul can be stopped through the existing revision-fenced per-soul route without deleting its provider-state/history data, and the saved pane/session reference can be used by the existing browser recovery path to attempt a new managed incarnation after the supervisor update. Stage 2 must trace the saved-reference source, stop request, post-restart create/resume request, and history read in the provider-free fixture. If automatic pane recovery does not attempt the reopen, Stage 2 must identify the smallest existing API/client seam that does and revise Task 2 before implementation.
-2. **Systemd topology:** The supported managed deployment owner for this command is the documented systemd user-unit pair, and restarting freshell-supervisor.service causes the dependent Rust server process to restart while leaving the static client directory untouched in --durable-only. Stage 2 must confirm this against the checked-in unit/drop-in relationship and an isolated fixture. If “web/client unchanged” means the Rust server process must also stay alive, the current Requires= relationship cannot satisfy that contract and Stage 2 must revise the service-topology plan rather than reinterpret the requirement.
+- Behavioral tests use the disposable managed-runtime fixture and stub process, Docker, and systemd adapters. Do not run the updater against the self-hosted installation.
+- Parse the mode first. Unknown or combined flags exit 2 without prompting or effects. For --all and --durable-only, read one raw stdin line and require exactly APPROVED before owner inspection, builds, API/control-socket calls, file writes, or service actions. Missing, lowercase, padded, or extra-text input refuses without effects. Do not consult compatibility analysis.
+- After approval where required, verify the supported systemd user-unit owner and resource manifest before any build, session change, or service action. The supported target is only the selected pair; refuse if checkout, executable, control socket, client, image daemon, or persistent-path ownership is ambiguous or mismatched. Resolve the Docker socket from the effective supervisor unit and verify the daemon through that explicit socket. Do not reveal secret values in output or logs.
+- Default mode needs no approval. It verifies the selected client owner, runs client typecheck, stages and activates only the resolved served-client directory, and prints that the supervisor and managed sessions were not restarted plus the exact-approval reminder for reset modes. It makes no supervisor control request and no service start/stop/restart call.
+- --all stages the client, managed-feature server, supervisor, supervisor admin CLI, session-host, and workload image. --durable-only stages the supervisor, admin CLI, session-host, and workload image; it does not build or replace the server binary or client directory. Both reset modes reset active managed coding souls by default, preserve registry/provider/history/workspace data, attempt eligible Reopen operations, and have no no-reset flag.
+- Select reset targets from one final inventory taken only after the web/API unit is stopped. Deduplicate by soul; include active/provisioning/stopping and desired-running or recovering souls; include pre-native targets without requiring a native session ID; exclude the provider shell and already-stopped souls. Keep available reopen references separate from the complete reset-target list.
+- Use the exact control socket and the built supervisor admin CLI for Inventory, each revision-fenced Stop, and Reopen. Give each request a unique idempotency request ID. Inspect each typed Stop result and continue only when it is VerifiedEmpty. A stale revision, unknown timeout, missing soul/incarnation/revision needed for a valid Stop, or any other Stop outcome aborts durable replacement. A missing native session ID does not remove a soul from reset eligibility; it only makes its Reopen result unavailable. Record results without re-inventorying or overwriting a newer intent. Preserve stopped intent for souls that were stopped before the update.
+- Build from the matching deployment checkout to preserve compile-time paths. Build the managed server with freshell-server/managed-runtime-v1 only when selected. Build and inspect the workload image using the exact Docker socket selected from the supervisor unit; do not use ambient Docker context. Use a bounded resource manifest covering the resolved client, server when selected, supervisor/admin CLI, session-host bind path, image, image-reference environment, any required host-side sidecar, and persistent roots. Do not run prepare:rust-runtime from a task worktree or allow it to create/mutate a missing .env. Inspect whether the image-contained sidecar makes host preparation unnecessary.
+- Stage renamed outputs on each destination filesystem. Install only selected artifacts. Do not capture or retain old binaries/image references for rollback, do not restore old code after a failure, and do not add backup or transaction-journal plumbing. A post-stop failure reports its exact phase and partial state, keeps persistent data intact, and points to the selected owner's forward-recovery runbook.
+- Stopping freshell-rust.service closes web/API ingress but, with After= only, does not stop or start freshell-supervisor.service. The reset modes briefly stop and explicitly start the web/API unit. In --durable-only, this restarts the existing web server process while leaving its binary and resolved client assets unchanged; operator guidance must say this.
+- Ordinary web/client maintenance has no APPROVED rule. The systemd relation prevents it from activating the supervisor; the web service may fail to start when the supervisor is absent. The launcher remains limited to launch-owned Rust server processes, refuses systemd/unknown-owned ports, and never starts or restarts the supervisor. The updater explicitly starts the supervisor before the web service only in reset modes.
+- Add structured JSONL records with severity for approval refusal, each build/install/service phase, per-soul Stop/Reopen outcomes, partial failure, and completion. Never log auth tokens, provider secrets, launch data that contains secrets, or conversation bodies.
+- Use existing locked pnpm/Cargo commands and repo test lanes. Do not add prose/config snapshot tests. No planned test contacts a real provider, production Docker image, production service, or live systemd user-unit manager.
 
 ## File ownership
 
 - crates/freshell-server/src/managed_provider_bootstrap.rs: repair qualification compile errors while preserving Codex approval policy and MCP preparation.
-- scripts/update-managed-runtime.ts: define mode parsing, exact approval, action order, production command adapters, session reset/reopen, operator messages, and structured event logging.
+- scripts/update-managed-runtime.ts: define mode parsing, exact approval, owner verification, bounded artifact manifest, staging, action order, web/API unit stop/start, supervisor CLI calls, reset/reopen reporting, operator messages, and structured event logging.
 - package.json: expose update:managed-runtime.
-- test/unit/tooling/managed-runtime-update.test.ts: verify mode selection, approval refusal before effects, client inclusion/exclusion, output, and partial reopen reporting with a disposable action trace.
-- test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts: prove default continuity and approved reset/reopen with fixture-owned managed sessions.
+- crates/freshell-runtime-protocol/src/lib.rs: add the typed, revision-fenced, idempotent supervisor Reopen request/result to the control protocol.
+- crates/freshell-supervisor/src/registry.rs and crates/freshell-supervisor/src/service.rs: implement Reopen against the same stopped soul, stored launch/resume context, provider store, and native identity; return typed unavailable/failure results without fabricating identity.
+- crates/freshell-runtime-client/src/lib.rs: expose the direct control-socket operations needed by the admin CLI.
+- crates/freshell-runtime-client/src/bin/freshell-supervisor-admin.rs: add the CLI for exact-socket Inventory, Stop, and Reopen requests. It must not use the HTTP API.
+- installers/systemd/freshell-rust.service.d/managed-runtime.conf: replace Requires= with ordering-only After=.
+- test/unit/tooling/managed-runtime-update.test.ts: verify mode selection, exact approval before effects, owner refusal, selected artifact boundaries, ordered web-stop/fixed-inventory/typed-stop flow, no client/server replacement in durable-only, partial Stop/Reopen reporting, forward-only failure handling, and redacted structured logs with disposable adapters.
+- crates/freshell-supervisor/src/service.rs and crates/freshell-supervisor/src/registry.rs tests: verify Reopen revision fencing, idempotency, new incarnation, retained provider store/native identity, updated runtime selection, unavailable missing-native-ID behavior, and unchanged history.
+- test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts: prove default continuity, --all reset/reopen on a changed runtime marker with retained history, and --durable-only server restart with unchanged server/client artifacts using fixture-owned processes.
 - AGENTS.md: replace blanket live-server approval wording with the reset-mode rule and ordinary-restart behavior.
-- scripts/launch-rust.sh: remove blanket approval wording while retaining PID ownership and systemd-owner safety checks.
+- scripts/launch-rust.sh: remove blanket approval wording while retaining PID ownership and systemd-owner safety checks; ordinary launcher operations remain Rust-only and never control the supervisor.
 - docs/development/self-hosted-launch-runbook.md: document the three update modes and remove contradictory blanket approval wording.
-- docs/development/managed-runtime-rollout.md: narrow only the existing restart statement; preserve the separate migration/backup procedure.
+- docs/development/managed-runtime-rollout.md: update only the existing runtime restart statement; preserve its separate migration guidance and remove any promised automatic old-artifact rollback.
 
 ---
 
@@ -162,26 +178,47 @@ git commit -m "fix: restore managed provider qualification compilation"
 
 **Files:**
 - Create: scripts/update-managed-runtime.ts
-- Modify: package.json scripts block to add update:managed-runtime beside the Rust-runtime preparation commands.
+- Modify: package.json scripts block to add update:managed-runtime.
 - Create: test/unit/tooling/managed-runtime-update.test.ts
 - Modify: test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts
+- Modify: crates/freshell-runtime-protocol/src/lib.rs
+- Modify: crates/freshell-supervisor/src/registry.rs and crates/freshell-supervisor/src/service.rs
+- Modify: crates/freshell-runtime-client/src/lib.rs
+- Create: crates/freshell-runtime-client/src/bin/freshell-supervisor-admin.rs
+- Modify: installers/systemd/freshell-rust.service.d/managed-runtime.conf
 - Modify: AGENTS.md:76-109
 - Modify: scripts/launch-rust.sh:28-34,152-159
 - Modify: docs/development/self-hosted-launch-runbook.md:25-59,67-125,425-458
 - Modify: docs/development/managed-runtime-rollout.md:80-86
 
 **Interfaces:**
-- Consumes: pnpm run update:managed-runtime [--all|--durable-only]; GET /api/runtime/souls, GET /api/runtime/souls/{soul_id}/history, and revision-fenced POST /api/runtime/souls/{soul_id}/stop; checked-in systemd user units; and the session-reference recovery path selected by Stage 2.
-- Produces: parseManagedUpdateMode(args: readonly string[]): 'client' | 'all' | 'durable-only'; runManagedRuntimeUpdate(args, dependencies): Promise<number>; SavedManagedConversation { soulId, expectedIntentRevision, sessionRef, mode, cwd }; and ReopenResult { sessionRef, ok, errorCode? }. The exported ManagedRuntimeUpdateDependencies contains named methods for approval, client/durable build, session snapshot/stop, artifact install, supervisor/socket/server/readiness, reopen, output, and JSONL logging.
+- Consumes: pnpm run update:managed-runtime [--all|--durable-only]; the selected systemd user-unit pair; an owner-derived artifact/resource manifest; and direct supervisor control-socket Inventory, Stop, and Reopen commands.
+- Produces: parseManagedUpdateMode(args: readonly string[]): 'client' | 'all' | 'durable-only'; runManagedRuntimeUpdate(args, dependencies): Promise<number>; ManagedCodingSoulResetTarget { soulId, expectedIntentRevision, provider, incarnationId? }; ReopenCandidate { soulId, stoppedIntentRevision, provider, sessionId }; StopResult { soulId, outcome, currentIntentRevision? }; and ReopenResult { soulId, outcome: 'reopened' | 'unavailable' | 'failed', newIncarnationId?, errorCode? }. Reset targets and records with native references are distinct collections. Dependencies separate approval, owner verification, staging, web unit, supervisor CLI, installation, readiness, output, and JSONL logging.
 
-- [ ] **Step 1: Write the failing unit and fixture tests**
+- [ ] **Step 1: Write failing updater, supervisor, and fixture tests**
 
-Create test/unit/tooling/managed-runtime-update.test.ts. Inject dependencies that record ordered actions and never touch the host. Cover default mode; missing, lowercase, padded, or extra-text approval; conflicting/unknown modes; --all versus --durable-only artifact inclusion; a seeded client artifact hash unchanged by --durable-only; a failed reopen followed by attempts for all saved references; and an install/restart failure that restores prior artifacts and brings the prior service pair to readiness.
+Create test/unit/tooling/managed-runtime-update.test.ts. Inject dependencies that record ordered actions and never touch the host. Cover:
+
+- Unknown and combined modes refuse before prompting or running any dependency.
+- Missing, lowercase, padded, or extra-text approval refuses both reset modes before owner inspection, build, control-socket request, file write, or service action.
+- Default mode verifies the client owner, typechecks, stages and activates only the client, prints both required reminders, and makes no supervisor control or service call.
+- --all selects client, managed server, supervisor, admin CLI, session-host, and workload image artifacts. --durable-only skips client build/stage/replacement and managed server replacement, while briefly stopping and starting the existing web/API service.
+- A seeded resolved-client digest is unchanged by --durable-only. The fixture also proves that the same served-client directory remains selected across the web-process restart.
+- Owner mismatch, unavailable selected socket/image daemon, or an unresolved path refuses before any service/session mutation.
+- Both reset modes finish selected builds/staging before stopping web/API. They then stop web ingress before the one final inventory, submit exactly one Stop per selected coding soul, and do not stop the supervisor or install artifacts unless every Stop is VerifiedEmpty.
+- Target selection deduplicates souls, includes pre-native and desired-running/recovering coding souls, excludes provider shell and already-stopped souls, and never requires a native ID for reset eligibility.
+- Stale intent, timeout/unknown, and each typed Stop outcome other than VerifiedEmpty are reported and prevent replacement. Continue through the captured target list only to report each target's one Stop result; never re-inventory or retry against a newer revision. If some Stops already succeeded, report those partial outcomes and prove persistent data remains intact.
+- Reopen is attempted for every candidate after the new supervisor is ready. A missing native ID is reported unavailable without a fabricated identity or store; a failed reopen does not prevent later candidates from being attempted and does not roll back the runtime.
+- A post-stop install/start/readiness failure reports the exact failed phase and partial service state, preserves the registry/provider/history/workspace roots, and does not restore prior binaries, image settings, or client files.
+- Structured log records include event, severity, mode, and phase where applicable, and never contain the seeded auth token, provider secret, launch data, or conversation body.
+- The new admin CLI uses the existing control protocol version and Inventory/Stop wire contract against the pre-update supervisor; it sends Reopen only after the updated supervisor is listening.
+
+If the new TypeScript module is needed for the red tests to load, add a temporary inert export of the updater interfaces and a run function that returns 2. The tests must load and fail on the default action behavior, not fail during module setup. Replace this scaffold in Step 3.
 
 Use this central assertion:
 
 ~~~typescript
-it('refuses reset modes before any action unless approval is exact', async () => {
+it('refuses reset modes before owner inspection or side effects unless approval is exact', async () => {
   for (const approval of [undefined, '', 'approved', ' APPROVED ', 'APPROVED extra']) {
     for (const flag of ['--all', '--durable-only']) {
       const fixture = updateFixture(approval)
@@ -193,187 +230,72 @@ it('refuses reset modes before any action unless approval is exact', async () =>
 })
 ~~~
 
-Also assert that default action order is exactly typecheck-client, build-client, with no approval read, service action, or session action. Assert that --all stages the client plus durable runtime, while --durable-only skips the client stage, stops/restarts managed runtime, and attempts reopening. For both reset modes, assert all build and sidecar-preparation actions precede session stop and service stop. Inject an installation failure and a new-runtime readiness failure; in both cases assert that recovery stops both units, restores prior artifacts, starts the supervisor, waits for its socket, starts the Rust server, and reaches readiness. Inject a separate restore failure; assert the staging directory remains and the command reports failed update/recovery phases and unit names without claiming readiness. Verify structured log records carry event/severity/phase fields for build/install/service phases and never contain the seeded auth token or conversation body. Keep the failed-reopen fixture's history marker unchanged and verify both saved session references were attempted.
+Also assert that successful reset order is: owner verification; selected builds and staging; stop web/API; final supervisor Inventory; typed per-soul Stops; stop supervisor; install selected artifacts; start supervisor; wait for the exact control socket; attempt Reopen operations; start web/API; wait for server readiness. For --durable-only, assert the web process is restarted while neither the server binary nor resolved client directory is replaced.
 
-In the same red step, add a no-effect export so the test module loads and fails on the client behavior assertion rather than module setup. The following interface stub is temporary and is replaced in Step 3:
+In crates/freshell-supervisor/src/service.rs and registry.rs, add failing behavior tests for an idempotent Reopen request with the expected stopped intent revision, a stale-revision refusal that preserves newer intent, a new incarnation on the same soul/provider store/native ID using the current runtime marker, and a typed unavailable result when native identity is absent. Prove the history marker remains readable after Stop and Reopen. Keep the operation on the supervisor control protocol; do not add an HTTP route.
 
-~~~typescript
-export type ManagedRuntimeUpdateMode = 'client' | 'all' | 'durable-only'
-export type SavedManagedConversation = {
-  soulId: string
-  expectedIntentRevision: number
-  sessionRef: { provider: string; sessionId: string }
-  mode: string
-  cwd: string
-}
-export type ReopenResult = {
-  sessionRef: SavedManagedConversation['sessionRef']
-  ok: boolean
-  errorCode?: string
-}
-export type ManagedRuntimeUpdateDependencies = {
-  requestApproval: () => Promise<string | undefined>
-  typecheckClient: () => Promise<void>
-  buildClient: () => Promise<void>
-  stageClient: () => Promise<void>
-  prepareRustRuntime: () => Promise<void>
-  buildManagedRuntime: () => Promise<void>
-  snapshotManagedCodingSessions: () => Promise<SavedManagedConversation[]>
-  capturePriorDeployment: (mode: Exclude<ManagedRuntimeUpdateMode, 'client'>) => Promise<void>
-  stopManagedCodingSessions: (saved: SavedManagedConversation[]) => Promise<void>
-  stopSupervisor: () => Promise<void>
-  installManagedRuntime: (mode: Exclude<ManagedRuntimeUpdateMode, 'client'>) => Promise<void>
-  restorePriorDeployment: (mode: Exclude<ManagedRuntimeUpdateMode, 'client'>) => Promise<void>
-  stopServicesForRecovery: () => Promise<void>
-  startSupervisor: () => Promise<void>
-  waitForControlSocket: () => Promise<void>
-  startRustServer: () => Promise<void>
-  waitForReadiness: () => Promise<void>
-  reopenSavedConversations: (saved: SavedManagedConversation[]) => Promise<ReopenResult[]>
-  write: (line: string) => void
-  log: (record: { severity: 'info' | 'warn' | 'error'; event: string; mode?: string; phase?: string }) => void
-}
-export async function runManagedRuntimeUpdate(
-  _args: readonly string[],
-  _dependencies: ManagedRuntimeUpdateDependencies,
-): Promise<number> {
-  return 2
-}
-~~~
+In test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts, add provider-free behavior cases:
 
-Add two provider-free tests under the existing managed fresh-agent deterministic fixture suite in test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts:
+1. Run the default updater with fixture-controlled owner/build adapters, perform the ordinary web replacement, then assert supervisor and managed soul/incarnation/container/native-session identities and the history marker are unchanged and a follow-up turn completes.
+2. Run --all with exact approval using fixture-owned unit, inventory, Stop, install, restart, and Reopen adapters. Observe a changed runtime marker, a new incarnation with the same soul/provider store/native session, the retained history marker, and a successful follow-up turn. Observe the direct Reopen control command and its request ID; do not assert an existing browser create/resume path.
+3. Run --durable-only and assert the web process briefly stops/restarts, the resolved client directory and served-client digest remain unchanged, and a reset soul reopens on the changed runtime.
 
-1. Start a fixture Codex conversation and record supervisor PID/container, soul/incarnation/container/native-session identity, and a unique history marker. Run default update through the shared mode orchestrator with only the client-build action stubbed, perform rig.restartWeb(), then verify supervisor and managed identities and the history marker remain unchanged and a follow-up turn completes.
-2. Start and complete a fixture conversation, record its saved sessionRef and history marker, then run --all with exact approval through the same orchestrator using the fixture's owned Stop and restart operations. Observe a real freshAgent.create carrying the original sessionRef, a new incarnation with the same native session ID, readable history, and a successful follow-up turn. The test must use the automatic pane-reopen path only if Stage 2 confirms it; otherwise use the smallest validated API/client seam. No test may call production systemd or manipulate the live service.
+The fixture demonstrates the updater's mode ordering and runtime behavior. It does not certify the installed systemd dependency graph. Do not use any real provider or production service.
 
-Use this assertion at the real recovery boundary:
-
-~~~typescript
-expect(sent.filter(frame => frame.type === 'freshAgent.create' &&
-  frame.sessionRef?.provider === saved.provider &&
-  frame.sessionRef?.sessionId === saved.sessionId)).not.toHaveLength(0)
-expect(after.incarnationId).not.toBe(before.incarnationId)
-expect(after.nativeSessionId).toBe(saved.sessionId)
-expect((await fixtureState(rig, after)).completionCount).toBeGreaterThan(beforeState.completionCount)
-~~~
-
-- [ ] **Step 2: Run the focused tests and verify the intended failure**
+- [ ] **Step 2: Run focused tests and verify the intended failures**
 
 Run: pnpm run test:vitest run test/unit/tooling/managed-runtime-update.test.ts --config config/vitest/vitest.config.ts
 
-Expected: FAIL because the temporary no-effect export returns status 2 and records no client actions. The Vitest config and imports must load.
+Expected: FAIL on the new client/update behavior because the temporary no-effect export performs no work. The config and imports must load.
+
+Run: cargo test -p freshell-supervisor reopen_stopped_soul
+
+Expected: FAIL because the supervisor Reopen operation does not yet exist. The selector must run at least one test and must not report a zero-test pass.
 
 Run: pnpm run test:runtime:fresh-agent-fixtures
 
-Expected: FAIL at the new mode assertion because the no-effect updater refuses the default update or does not run the approved reset/reopen sequence. Existing fixture tests must execute; a skipped new test is not a red result.
+Expected: FAIL at the new default, reset/reopen, or durable-only behavior assertion. Existing fixture tests must execute; a skipped new test is not a red result.
 
-- [ ] **Step 3: Add the minimal production implementation and operator guidance**
+- [ ] **Step 3: Implement the supervisor Reopen operation, updater, and operator guidance**
 
 Implement parseManagedUpdateMode so only no arguments, exactly --all, or exactly --durable-only are accepted; reject all other combinations before calling dependencies.
 
-Keep importing scripts/update-managed-runtime.ts inert for unit and fixture tests: add an `isDirectInvocation()` guard around the CLI entrypoint, parse `process.argv.slice(2)` only inside that entrypoint, and assign the returned status to `process.exitCode`.
+Keep importing scripts/update-managed-runtime.ts inert for unit and fixture tests. Guard the CLI entrypoint, parse process.argv.slice(2) only from that entrypoint, and assign the returned status to process.exitCode.
 
-Implement runManagedRuntimeUpdate with this action order. All stages that can fail without service interruption complete before the managed sessions or units are stopped:
+Implement a direct supervisor Reopen control operation. It takes an idempotency request ID, soul ID, and expected current intent revision; refuses stale intent without changing newer user state; transitions the existing stopped soul to a new running incarnation; and uses that soul's persisted launch/resume context, provider-store ID/volume, and native identity while selecting the currently configured runtime image and session-host. The operation does not derive a replacement soul or store from the request ID. Return a typed unavailable result if required native identity is missing. Reuse normal launch/recovery machinery where its preconditions fit, and preserve history.
 
-~~~typescript
-if (mode === 'client') {
-  await dependencies.typecheckClient()
-  await dependencies.buildClient()
-  dependencies.write('The supervisor and managed sessions were not restarted or reset.')
-  dependencies.write('Use --all or --durable-only to reset managed coding sessions; type APPROVED exactly when prompted.')
-  dependencies.log({ severity: 'info', event: 'managed_update.completed', mode })
-  return 0
-}
+Implement a supervisor admin CLI backed by the runtime client and existing private control socket. It supports Inventory, revision-fenced Stop, and Reopen, accepts the exact owner-selected socket and secret-file paths, and emits typed machine-readable results without secret values. Build the CLI from the same deployment checkout as the selected systemd owner. The CLI must use the existing control protocol version and preserve the existing Inventory/Stop wire contract so it can take the final snapshot and stop souls through the currently running supervisor before replacement. Send the new Reopen command only after the updated supervisor is listening. Cover that ordering in the CLI/protocol tests; compatibility behavior never changes the user's approval requirement.
 
-if (await dependencies.requestApproval() !== 'APPROVED') {
-  dependencies.log({ severity: 'warn', event: 'managed_update.approval_refused', mode })
-  dependencies.write('No update actions were run; approval must be exactly APPROVED.')
-  return 2
-}
+Implement the updater in this order:
 
-if (mode === 'all') {
-  await dependencies.typecheckClient()
-  await dependencies.stageClient()
-}
-await dependencies.prepareRustRuntime()
-await dependencies.buildManagedRuntime()
-const saved = await dependencies.snapshotManagedCodingSessions()
-await dependencies.capturePriorDeployment(mode)
-await dependencies.stopManagedCodingSessions(saved)
-let phase = 'stop-supervisor'
-try {
-  await dependencies.stopSupervisor()
-  phase = 'install'
-  await dependencies.installManagedRuntime(mode)
-  phase = 'start-supervisor'
-  await dependencies.startSupervisor()
-  phase = 'wait-for-control-socket'
-  await dependencies.waitForControlSocket()
-  phase = 'start-rust-server'
-  await dependencies.startRustServer()
-  phase = 'wait-for-readiness'
-  await dependencies.waitForReadiness()
-} catch {
-  let recoveryPhase = 'stop-services'
-  try {
-    await dependencies.stopServicesForRecovery()
-    recoveryPhase = 'restore-prior-deployment'
-    await dependencies.restorePriorDeployment(mode)
-    recoveryPhase = 'start-supervisor'
-    await dependencies.startSupervisor()
-    recoveryPhase = 'wait-for-control-socket'
-    await dependencies.waitForControlSocket()
-    recoveryPhase = 'start-rust-server'
-    await dependencies.startRustServer()
-    recoveryPhase = 'wait-for-readiness'
-    await dependencies.waitForReadiness()
-  } catch {
-    dependencies.log({ severity: 'error', event: 'managed_update.recovery_failed', mode, phase: recoveryPhase })
-    dependencies.write(`Update failed during ${phase}; recovery failed during ${recoveryPhase}. Keep RUN_DIR and inspect freshell-supervisor.service and freshell-rust.service.`)
-    return 1
-  }
-  dependencies.log({ severity: 'error', event: 'managed_update.recovered_previous_runtime', mode, phase })
-  const recoveryReopens = await dependencies.reopenSavedConversations(saved)
-  reportRecoveryAndReopenResults(phase, recoveryReopens, dependencies)
-  return 1
-}
-const reopenResults = await dependencies.reopenSavedConversations(saved)
-return reportUpdateAndReopenResults(mode, reopenResults, dependencies)
-~~~
+1. Parse flags. Invalid input exits 2 without prompting or dependency calls. For either reset mode, read one raw stdin line and require exactly APPROVED before owner inspection or any other external effect. Do not trim it or consult compatibility analysis.
+2. Verify the selected systemd user-unit owner using bounded, non-secret unit properties and process metadata. Confirm the current checkout equals the selected units' working directory and executable/install source, the running server and supervisor belong to those units, and the exact control socket is served by the selected supervisor. Resolve the Docker socket from the effective supervisor unit and verify its daemon through that explicit socket for reset modes. Resolve the actual served-client directory, selected binary paths, image-reference environment path, session-host bind path, sidecar use, and persistent roots. Refuse ambiguity before building or changing state.
+3. Stage every selected artifact from that matching checkout. For default, typecheck the client and run Vite into a temporary sibling of the resolved client destination. For --all, do the same and also build the managed-feature server, supervisor, admin CLI, session-host, and workload image. For --durable-only, do not build the client or web server; build the supervisor, admin CLI, session-host, and workload image only. Build Rust outputs into an isolated staging target rather than overwriting installed binaries. Build and inspect the workload image by passing the verified socket path explicitly to Docker; use its immutable image ID. Inspect the image and call sites to determine whether host-side sidecar preparation is needed. If required host-side resources cannot be staged from the matching checkout without mutating an active dependency or creating/mutating a missing .env, fail before stopping any service. Do not run prepare:rust-runtime from a task worktree or allow it to bootstrap a missing .env.
+4. For default, activate only the staged client through a destination-filesystem rename, print the required reminder, and finish without a service or supervisor-control call.
+5. For either reset mode, stop freshell-rust.service to close UI/API create/retry ingress. Through the exact supervisor socket, take one final Inventory snapshot and derive a fixed deduplicated coding-soul target set. Use the coding-provider allowlist and exclude shell. Include active/pre-native and desired-running/recovering souls; keep saved reopen references separate. Issue one Stop per target using its captured expectedIntentRevision and unique idempotency request ID. Inspect and record each typed outcome. Do not re-inventory, retry with a newer revision, or install anything unless every target is VerifiedEmpty.
+6. After all Stops are verified empty, stop freshell-supervisor.service. Install only the selected staged files by destination-filesystem rename; update only the selected FRESHELL_RUNTIME_IMAGE entry in the verified owner environment file using an atomic same-filesystem write that preserves the other entries. Do not replace the resolved client or server binary in --durable-only. Do not copy or restore old artifacts.
+7. Start freshell-supervisor.service explicitly and wait for the exact control socket to answer supervisor health. Attempt a Reopen for every available saved conversation against the new runtime, using the stopped revision and a unique idempotency request ID. Record unavailable/missing-native and failed results without stopping later attempts. Then explicitly start freshell-rust.service and wait for its existing readiness endpoint. With After= only, neither service implicitly starts the other.
+8. If a Stop batch fails while the supervisor is still running, report all captured Stop outcomes and any partial reset. Restart the web unit if it was stopped and the selected supervisor remains healthy; do not re-inventory or replace artifacts. For a failure after supervisor shutdown or artifact installation starts, report the failed phase, affected units, and partial state; preserve registry/provider/history/workspace data and follow the selected owner's forward-recovery runbook. Never claim rollback or restore older binaries/image settings. A failed reopen after readiness is a partial success: continue all reopen attempts, return 1, and say manual reopening may be needed.
 
-The production adapters for `prepareRustRuntime`, `buildManagedRuntime`, `capturePriorDeployment`, and `stageClient` must complete before either stop call. `prepareRustRuntime` runs `pnpm run --silent prepare:rust-runtime`; it prepares the local prerequisite tree and auth bootstrap and must not be deferred to a post-stop restart hook. `capturePriorDeployment` copies the currently installed selected binaries and, for `--all`, `dist/client`, into `RUN_DIR`, and records the previous `FRESHELL_RUNTIME_IMAGE` value. Keep the prior image available by digest; do not prune it. Install selected files by copying them to temporary siblings in each destination filesystem and renaming into place. Update only the image-reference line with an atomic environment-file write. Wrap each build, install, service, and readiness action in `runLoggedPhase(mode, phase, action)`; emit JSONL `managed_update.phase_started`, `.phase_completed`, and `.phase_failed` records with severity, mode, and phase, and omit raw exception text or secret/session values. `reportUpdateAndReopenResults` emits per-reference reopen result events and a final `managed_update.completed` record, including when the runtime is ready but one or more reopens failed; report counts and return 1 for partial reopen failure.
+Wrap build, stop, install, start, control-socket, Reopen, and readiness phases in structured JSONL logging with severity, mode, and phase. Log result counts and stable error codes only; omit secrets, launch data, and conversation contents.
 
-The recovery branch is deliberately narrow: after a failure in installation, supervisor stop/start, control-socket wait, Rust server startup, or readiness, stop both systemd units, restore the prior selected binaries/client and prior image-reference value from `RUN_DIR`, then start the supervisor, wait for its socket, start the Rust server, and wait for readiness. Preserve managed registry and provider/history stores throughout. If recovery itself fails, retain `RUN_DIR`, emit a separate structured recovery-failure record, print the exact failed phase and unit names, and return 1; do not delete runtime state or claim service recovery. Reopen saved conversations after successful recovery when possible and report that the update failed and recovery reopened or could not reopen them. A failed conversation reopen after a successful new-runtime readiness check does not roll back the deployment: continue all reopen attempts and return 1 with manual reopen guidance.
+Build commands must use the pinned repository toolchain and existing dependencies. Select freshell-server with freshell-server/managed-runtime-v1 only for --all; select freshell-supervisor, freshell-session-host, and the freshell-runtime-client supervisor-admin binary for both reset modes. Build the image from docker/runtime/Dockerfile through the explicit selected Docker socket. Add package.json script:
 
-Read approval from one raw line on stdin with node:readline/promises; do not trim, normalize, or accept it from a compatibility-analysis result. The prompt must say that the selected mode stops managed coding sessions and requires exactly APPROVED. The production adapters must perform these effects:
-
-- Default: pnpm run typecheck:client, then pnpm run build:client. No API request, Docker/Cargo build, install, systemd command, session stop, or history write.
-- --all: typecheck the client, stage the Vite output with `pnpm exec vite build --config config/vite/vite.config.ts --outDir "$RUN_DIR/client" --emptyOutDir`, build the managed server/supervisor/session-host into `"$RUN_DIR/cargo-target"` with `CARGO_TARGET_DIR="$RUN_DIR/cargo-target" cargo build --release -p freshell-server -p freshell-supervisor -p freshell-session-host --locked --features freshell-server/managed-runtime-v1`, build the workload image with `docker build --pull=false --provenance=false --sbom=false -f docker/runtime/Dockerfile -t "$UPDATE_TAG" .`, and resolve its local immutable image ID with `docker image inspect --format '{{.Id}}' "$UPDATE_TAG"`. Run all of these and `pnpm run --silent prepare:rust-runtime` before stopping sessions or services.
-- --durable-only: build and stage the same three binaries and workload image, and run `pnpm run --silent prepare:rust-runtime` before stopping sessions or services. Do not run client typecheck/build and do not replace `dist/client`.
-- For both reset modes, after staging, capture the old selected binaries/client and previous `FRESHELL_RUNTIME_IMAGE` value in `RUN_DIR`. Read the managed inventory and each saved history reference, stop only active coding souls with their current expectedIntentRevision and a new `crypto.randomUUID()` requestId per stop request, then run `systemctl --user stop freshell-supervisor.service` (the Requires= dependency also stops the Rust server). Install staged binaries by copying to temporary siblings in each destination filesystem and renaming them into place. For `--all`, stage `dist/client` beside its destination, rename the old directory to a RUN_DIR backup, then rename the staged directory into `dist/client`. Update only the `FRESHELL_RUNTIME_IMAGE` line in `~/.config/freshell/managed-runtime.env` with an atomic write that retains other entries. Do not delete the registry or provider/session stores.
-- Restart through the installed systemd owner: `systemctl --user start freshell-supervisor.service`; wait for the effective `--control-socket` from `systemctl --user cat freshell-supervisor.service`; `systemctl --user start freshell-rust.service`; then wait for authenticated `GET /api/runtime/readiness`. Never use scripts/launch-rust.sh to control a systemd-owned port.
-- If installation or supervisor/server startup/readiness fails, stop both systemd units, restore the previous selected binaries/client and image-reference value from `RUN_DIR`, start `freshell-supervisor.service`, wait for its control socket, start `freshell-rust.service`, and wait for readiness. Preserve registry/provider/history stores. Emit a structured recovery result with the failed update/recovery phases. On successful recovery, attempt to reopen the saved conversations against the restored service and return 1 while explaining the update failed. If recovery fails, return 1, retain `RUN_DIR`, print the failed phases and unit names, and state that service recovery did not complete.
-- Attempt to reopen each saved sessionRef using the Stage 2 validated flow. Continue after one failed reopen, keep history accessible, log the failure without conversation contents, print success/failure counts, and return status 1 if any reopen failed while stating the runtime update completed and manual reopening remains available.
-- Create RUN_DIR with fs.promises.mkdtemp(path.join(os.tmpdir(), 'freshell-managed-update-')) and a unique UPDATE_TAG from crypto.randomUUID(). Remove the staging directory after a successful readiness/reopen pass. Retain it on an error after installation begins for inspection and recovery.
-
-Add package.json script:
 ~~~json
 "update:managed-runtime": "tsx scripts/update-managed-runtime.ts"
 ~~~
 
-The documented operator commands are `pnpm run update:managed-runtime` (client build only; exit 0 and print that the supervisor and managed sessions were not restarted/reset, with reset modes requiring exact approval), `pnpm run update:managed-runtime --all` (prompt for one exact `APPROVED` line, then update client and durable runtime), and `pnpm run update:managed-runtime --durable-only` (same approval and durable restart, with no client build or client-directory replacement). Unknown or combined flags and refused approval exit 2 without command, API, file, or service effects. Successful update plus successful reopen exits 0; update/recovery failure or any failed reopen exits 1 with a count and manual recovery/reopen guidance.
-
-Update AGENTS.md, scripts/launch-rust.sh comments/status, and both operator runbooks to describe the three update modes, the managed session reset/reopen behavior, and systemd restart coupling. Remove the blanket APPROVED wording for ordinary web/client restarts without adding a new client approval rule. Preserve the launcher PID/systemd owner guards and the existing rollout backup steps. Do not change README.md; this is operator guidance.
+Operator guidance documents these outcomes: default updates only the served client and reminds the operator that the supervisor and managed sessions were not restarted and that reset modes require one exact APPROVED line. --all stages and updates client plus durable artifacts. --durable-only updates durable artifacts but briefly stops/restarts the existing web/API process while preserving its binary and client assets. Both reset modes preserve history and attempt to reopen each eligible conversation; reopening can fail, so history remains available and manual reopening or porting may be needed. Unknown/refused input exits 2; update or reopen failure exits 1; completed update and all successful reopen attempts exit 0. Ordinary client/web maintenance has no approval rule. Do not change README.md.
 
 - [ ] **Step 4: Run the focused tests**
 
 Run: pnpm run test:vitest run test/unit/tooling/managed-runtime-update.test.ts --config config/vitest/vitest.config.ts && pnpm run test:runtime:fresh-agent-fixtures
 
-Expected: PASS; exact approval blocks all effects for reset modes, default touches only the client and reminds the operator, --all includes client plus durable work, --durable-only preserves the client hash, both reset modes perform reset/reopen, and the fixture proves identity/history continuity.
+Expected: PASS; invalid/refused input has no external effects, default changes only the selected client and reminds the operator, --all and --durable-only follow the fixed inventory/typed Stop sequence, --durable-only leaves client/server artifacts unchanged, Reopen is revision-fenced/idempotent and retains history, and all three modes pass the provider-free runtime fixture.
 
 - [ ] **Step 5: Refactor while green**
 
-Keep argument parsing, action ordering, real process/API adapters, and output rendering in separate named functions in scripts/update-managed-runtime.ts. Share the durable build/install implementation between --all and --durable-only. Keep exact approval before every side effect and ensure every reopen result is attempted and logged.
+Keep argument parsing, owner verification, manifest resolution, staging, mode action order, systemd commands, admin CLI calls, and output rendering in separate named functions. Share only artifact and service actions that are identical between reset modes. Keep exact approval before owner inspection for reset modes, fail closed on mismatched ownership, and ensure each Stop/Reopen result is recorded and every eligible Reopen is attempted. Do not add rollback, old-artifact backups, or a general transaction journal.
 
 Run: pnpm run test:vitest run test/unit/tooling/managed-runtime-update.test.ts --config config/vitest/vitest.config.ts && pnpm run test:runtime:fresh-agent-fixtures
 
@@ -381,26 +303,30 @@ Expected: PASS.
 
 - [ ] **Step 6: Run impacted-test verification**
 
-Run: pnpm run typecheck:runtime && scripts/launch-rust.sh --help >/dev/null && pnpm run test:vitest run test/unit/tooling/managed-runtime-update.test.ts --config config/vitest/vitest.config.ts && pnpm run test:runtime:fresh-agent-fixtures && pnpm run test:e2e:local --project=chromium test/e2e-browser/specs/runtime-terminal-continuity-rust.spec.ts
+Run: cargo fmt --all --check && cargo test -p freshell-runtime-protocol && cargo test -p freshell-supervisor reopen_stopped_soul && cargo test -p freshell-runtime-client --bin freshell-supervisor-admin && pnpm run typecheck:runtime && scripts/launch-rust.sh --help >/dev/null && pnpm run test:vitest run test/unit/tooling/managed-runtime-update.test.ts --config config/vitest/vitest.config.ts && pnpm run test:runtime:fresh-agent-fixtures && pnpm run test:e2e:local --project=chromium --grep "P2-G01: real browser shell survives ten graceful/abrupt web replacements" test/e2e-browser/specs/runtime-terminal-continuity-rust.spec.ts
 
-Expected: PASS; the updater typechecks, the launcher still parses, the new action and runtime behavior pass, and ordinary server continuity remains covered with an explicitly local fixture lane. Review git diff --check and manually reconcile approval wording across the four instruction surfaces; do not add a static text test.
+Expected: PASS; protocol and supervisor Reopen tests pass, the updater typechecks, launcher parsing remains valid, all provider-free mode fixtures pass, and the terminal continuity command selects only the shell case at runtime-terminal-continuity-rust.spec.ts:116 rather than the real-provider P2-G04 case. Review git diff --check and manually reconcile approval wording and the After=-only relation across AGENTS.md, the launcher, systemd drop-in, and both operator runbooks. Do not add a prose/config snapshot test or run a production/systemd service operation.
 
 - [ ] **Step 7: Commit the task**
 
 ~~~bash
-git add scripts/update-managed-runtime.ts package.json test/unit/tooling/managed-runtime-update.test.ts test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts AGENTS.md scripts/launch-rust.sh docs/development/self-hosted-launch-runbook.md docs/development/managed-runtime-rollout.md
+git add scripts/update-managed-runtime.ts package.json test/unit/tooling/managed-runtime-update.test.ts test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts crates/freshell-runtime-protocol/src/lib.rs crates/freshell-supervisor/src/registry.rs crates/freshell-supervisor/src/service.rs crates/freshell-runtime-client/src/lib.rs crates/freshell-runtime-client/src/bin/freshell-supervisor-admin.rs installers/systemd/freshell-rust.service.d/managed-runtime.conf AGENTS.md scripts/launch-rust.sh docs/development/self-hosted-launch-runbook.md docs/development/managed-runtime-rollout.md
 git commit -m "feat: add managed runtime update modes"
 ~~~
 
 ## Plan self-review
 
-- The complete dispatcher-authored User Request block appears unchanged exactly once above.
-- Task 1 fixes the baseline compilation failure before the mode work and preserves the Codex approval policy.
-- Task 2 maps default, --all, and --durable-only to distinct observed actions; both reset modes require one exact approval line before any effect and never consult compatibility analysis.
-- All client/durable builds and `prepare:rust-runtime` precede session and service stops; install/restart failures restore prior artifacts and attempt the prior service pair. The unit tests cover these orders and failure outcomes.
-- The unit tests cover gate refusal, client inclusion/exclusion, saved history behavior, failure recovery, structured redacted logs, and failed reopen reporting. The fixture test checks real supervisor/session identities, native session references, history, and a follow-up turn.
-- Stage 2 owns the two unresolved source-level assumptions; neither is silently treated as verified in this plan.
-- Every changed file has one responsibility and appears in Task 1 or Task 2. Commands use repo-supported Cargo, pnpm, launcher, and explicit local Playwright lanes.
-- No schema migration, credential qualification campaign, production rollout, backup certification, or unrelated feature is added.
+- The mandatory complete User Request block remains byte-for-byte unchanged and appears exactly once.
+- Task 1 still fixes the qualification compile failure first, with a behavioral regression and focused compile/test verification.
+- The three modes are explicit: default stages and activates only the resolved client; --all updates client and durable artifacts; --durable-only updates durable artifacts while briefly restarting the existing web process and preserving its server binary and client directory.
+- Both reset modes require exact APPROVED before owner inspection or effects. No compatibility analysis gates approval, and ordinary client/web maintenance has no approval rule.
+- F01's falsified existing-reopen assumption is replaced with the narrow, idempotent, revision-fenced supervisor Reopen operation. It uses the existing soul/store/context and reports missing native identity unavailable.
+- F02 and F04 use the accepted systemd-user-unit-only owner and bounded artifact manifest. The plan verifies matching checkout, units, process, socket, destinations, image daemon, and persistent roots, then fails closed on ambiguity. The runtime client protocol is direct; no HTTP owner-identity endpoint or inventory/Stop/Reopen route is introduced.
+- F03 is resolved by ordering-only After=. The plan excludes Requires=, Wants=, and Requisite=, documents that web start can fail without activating the supervisor, and explicitly sequences updater starts.
+- F05's falsified open-API inventory/Stop batch is replaced with build/stage first, stop web/API, one final fixed inventory, typed revision-fenced Stops, and no re-inventory or overwrite of newer intent. No global admission service or deployment journal is added.
+- Reset targets are separate from reopen records; shell is excluded; native identity is optional for reset; Stop outcome must be VerifiedEmpty; history sources are not treated as universal; and fixture assertions include changed runtime marker, retained history, new incarnation, and follow-up use.
+- Old-binary/image rollback and backup plumbing are absent. Failure tests require exact partial-state reporting and persistent-data preservation. Filesystem rename staging stays on the destination filesystem.
+- Planned verification uses focused Rust/Vitest/runtime fixture tests and selects only the provider-free P2-G01 shell continuity case. The plan does not claim those process fixtures verify installed systemd wiring.
+- Every owned source, test, unit, script, and guidance file appears in Task 1 or Task 2. No placeholder, unresolved Stage 2 assumption, real-provider call, production operation, or unrelated feature remains in the plan.
 
 ---
