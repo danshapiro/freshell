@@ -15,6 +15,7 @@
 // (PinnedClaudeMissingError): nothing here is ever skipped.
 
 import { spawn, type ChildProcess } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -29,6 +30,7 @@ const HARNESS = path.join(__dirname, 'claude-permission-contract.mjs')
 type Frame = Record<string, any>
 interface ScenarioReceipt {
   failure?: string
+  cleanupFailure?: string
   fixtureRemoved: boolean
   sidecarExit?: { code: number | null; signal: string | null }
   frames: Frame[]
@@ -49,7 +51,7 @@ let receipt: Receipt
 let stderr = ''
 
 beforeAll(async () => {
-  child = spawn(process.execPath, [HARNESS, REPO_ROOT], {
+  child = spawn(process.execPath, ['--import', 'tsx', HARNESS, REPO_ROOT], {
     cwd: REPO_ROOT,
     env: { PATH: process.env.PATH ?? '/usr/bin:/bin', LANG: 'C.UTF-8' },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -178,70 +180,92 @@ describe('Claude permission contract harness survives a fixture-cleanup failure'
     // outside/notes.txt marker exists, and nothing writes into the fixture
     // root itself after that), make the root unwritable so fixture.cleanup()
     // fails with EACCES — the same finally block that raced the live CLI.
+    const fixturePrefix = `freshell-claude-perm-${randomUUID()}`
+    const staleRoot = path.join(os.tmpdir(), `freshell-claude-perm-stale-${randomUUID()}`)
     const chmodded = new Set<string>()
-    const watcher = setInterval(() => {
-      void (async () => {
-        let entries: string[]
-        try {
-          entries = await fs.readdir(os.tmpdir())
-        } catch {
-          return
-        }
-        for (const entry of entries) {
-          if (!entry.startsWith('freshell-claude-perm-') || chmodded.has(entry)) continue
-          const root = path.join(os.tmpdir(), entry)
-          const setupDone = await fs.stat(path.join(root, 'outside', 'notes.txt')).then(() => true, () => false)
-          if (!setupDone) continue
-          chmodded.add(entry)
-          await fs.chmod(root, 0o500).catch(() => {
-            chmodded.delete(entry)
-          })
-        }
-      })()
-    }, 25)
-
-    const child = spawn(process.execPath, [HARNESS, REPO_ROOT], {
-      cwd: REPO_ROOT,
-      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', LANG: 'C.UTF-8' },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
+    let watcher: ReturnType<typeof setInterval> | undefined
+    let child: ChildProcess | undefined
     let stdout = ''
     let stderr = ''
-    child.stdout!.setEncoding('utf8').on('data', (chunk: string) => { stdout += chunk })
-    child.stderr!.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk })
     try {
+      await fs.mkdir(path.join(staleRoot, 'outside'), { recursive: true })
+      await fs.chmod(staleRoot, 0o700)
+      await fs.writeFile(path.join(staleRoot, 'outside', 'notes.txt'), 'pre-existing fixture')
+      watcher = setInterval(() => {
+        void (async () => {
+          let entries: string[]
+          try {
+            entries = await fs.readdir(os.tmpdir())
+          } catch {
+            return
+          }
+          for (const entry of entries) {
+            if (!entry.startsWith(`${fixturePrefix}-`) || chmodded.has(entry)) continue
+            const root = path.join(os.tmpdir(), entry)
+            const setupDone = await fs.stat(path.join(root, 'outside', 'notes.txt')).then(() => true, () => false)
+            if (!setupDone) continue
+            chmodded.add(entry)
+            await fs.chmod(root, 0o500).catch(() => {
+              chmodded.delete(entry)
+            })
+          }
+        })()
+      }, 25)
+
+      child = spawn(process.execPath, ['--import', 'tsx', HARNESS, REPO_ROOT], {
+        cwd: REPO_ROOT,
+        env: {
+          PATH: process.env.PATH ?? '/usr/bin:/bin',
+          LANG: 'C.UTF-8',
+          FRESHELL_CLAUDE_PERMISSION_FIXTURE_PREFIX: fixturePrefix,
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      const harness = child
+      harness.stdout!.setEncoding('utf8').on('data', (chunk: string) => { stdout += chunk })
+      harness.stderr!.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk })
       const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
         const timer = setTimeout(() => {
-          child.kill('SIGTERM')
+          harness.kill('SIGTERM')
           reject(new Error(`the cleanup-failure harness run timed out; stderr=${stderr.slice(-2000)}`))
         }, 200_000)
         timer.unref()
-        child.once('error', (error) => {
+        harness.once('error', (error) => {
           clearTimeout(timer)
           reject(error)
         })
-        child.once('exit', (code, signal) => {
+        harness.once('exit', (code, signal) => {
           clearTimeout(timer)
           resolve({ code, signal })
         })
       })
       expect(chmodded, `sabotaged fixture roots (${[...chmodded].join(', ')}); stderr=${stderr.slice(-2000)}`).toHaveLength(8)
+      expect((await fs.stat(staleRoot)).mode & 0o777).toBe(0o700)
       const lines = stdout.trim().split('\n').filter(Boolean)
       expect(lines, `the receipt must survive a cleanup failure; stderr tail: ${stderr.slice(-2000)}`).toHaveLength(1)
       const sabotagedReceipt = JSON.parse(lines[0]!) as Receipt
       expect(Object.keys(sabotagedReceipt.scenarios)).toHaveLength(8)
       for (const name of Object.keys(sabotagedReceipt.scenarios)) {
-        expect(sabotagedReceipt.scenarios[name]!.fixtureRemoved, `${name}: the receipt reports the cleanup failure`).toBe(false)
+        const scenario = sabotagedReceipt.scenarios[name]!
+        expect(scenario.fixtureRemoved, `${name}: the receipt reports the cleanup failure`).toBe(false)
+        expect(scenario.cleanupFailure, `${name}: the receipt explains the cleanup failure`).toMatch(/^fixture cleanup failed:/)
       }
+      const cleanupEvents = stderr.split('\n').flatMap((line) => {
+        try { return [JSON.parse(line) as Record<string, unknown>] } catch { return [] }
+      }).filter((event) => event.event === 'fixture.cleanup_failed')
+      expect(cleanupEvents).toHaveLength(8)
+      expect(cleanupEvents.every((event) => typeof event.fixtureRoot === 'string' && typeof event.sidecarPid === 'number')).toBe(true)
       expect(exit.code).toBe(1)
     } finally {
-      clearInterval(watcher)
-      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+      if (watcher) clearInterval(watcher)
+      if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
       for (const entry of chmodded) {
         const root = path.join(os.tmpdir(), entry)
         await fs.chmod(root, 0o700).catch(() => {})
         await fs.rm(root, { recursive: true, force: true }).catch(() => {})
       }
+      await fs.chmod(staleRoot, 0o700).catch(() => {})
+      await fs.rm(staleRoot, { recursive: true, force: true }).catch(() => {})
     }
   }, 220_000)
 })
