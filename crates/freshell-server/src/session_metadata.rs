@@ -50,8 +50,10 @@ use crate::boot::{is_authed, unauthorized};
 /// `DEFAULT_CLI_PROVIDER_NAMES` (`shared/session-flavor.ts` `CLI_SESSION_TYPES` /
 /// `server/coding-cli/*`) — the provider set `sessionMetadataProviderSchema`
 /// (`sessions-router.ts:65-71`) validates against by default (no `validCliProviders`
-/// override is wired through this port).
-const VALID_PROVIDERS: &[&str] = &["claude", "codex", "opencode"];
+/// override is wired through this port). `antigravity` joined the disk-indexed
+/// coding-CLI set (plan Task 5) — its bundled extension materializes sessions
+/// like claude/codex/opencode do, so sessionType writes for it are accepted.
+const VALID_PROVIDERS: &[&str] = &["claude", "codex", "opencode", "antigravity"];
 /// `KNOWN_SESSION_METADATA_TYPES` (`shared/session-flavor.ts:12-14`).
 const KNOWN_SESSION_METADATA_TYPES: &[&str] = &[
     "claude",
@@ -999,6 +1001,25 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Plan Task 5: `VALID_PROVIDERS` gains `"antigravity"` so sessionType
+    /// writes for antigravity sessions are accepted by the default gate (the
+    /// bundled-extension provider is a disk-indexed coding CLI like
+    /// claude/codex/opencode, not an unknown provider).
+    #[tokio::test]
+    async fn antigravity_provider_session_metadata_post_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut body = valid_body();
+        body["provider"] = json!("antigravity");
+        let resp = post_session_metadata(
+            State(state(SessionMetadataStore::new(dir.path()))),
+            headers_with_token("tok"),
+            Json(body),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

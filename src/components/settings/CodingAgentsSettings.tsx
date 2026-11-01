@@ -1,5 +1,6 @@
 import type { ComponentType, SVGProps } from 'react'
 import {
+  AntigravityIcon,
   ClaudeIcon,
   CodexIcon,
   FreshclaudeIcon,
@@ -31,6 +32,7 @@ const AGENT_ROWS: AgentRow[] = [
   { kind: 'fresh', id: 'freshopencode', label: 'Freshopencode', icon: OpencodeIcon },
   { kind: 'cli', id: 'gemini', label: 'Gemini', icon: GeminiIcon },
   { kind: 'cli', id: 'kimi', label: 'Kimi', icon: KimiIcon },
+  { kind: 'cli', id: 'antigravity', label: 'Antigravity CLI', icon: AntigravityIcon },
 ]
 
 const FRESH_AGENT_RUNTIME_PROVIDER: Record<VisibleFreshAgentId, CodingCliProviderName> = {

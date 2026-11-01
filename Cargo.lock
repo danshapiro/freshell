@@ -1541,6 +1541,7 @@ dependencies = [
  "chrono",
  "flate2",
  "freshell-platform",
+ "freshell-protocol",
  "hex",
  "libc",
  "notify",

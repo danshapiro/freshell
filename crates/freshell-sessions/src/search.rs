@@ -10,8 +10,8 @@
 //!
 //! ## Scope (honest, faithful subset -- documented deviations)
 //!
-//! * **claude + codex only.** Both are per-session-file providers with a
-//!   `source_file` path (`IndexedSession::source_file`,
+//! * **claude + codex + antigravity.** The per-session-file providers with
+//!   a `source_file` path (`IndexedSession::source_file`,
 //!   `directory_index.rs`). `opencode` (single sqlite db, no per-session
 //!   file) and `amplifier` (no ported file-search parser) are un-searchable
 //!   at these tiers -- title-tier metadata search still covers them.
@@ -178,6 +178,7 @@ fn extract_message(provider: &str, obj: &Value) -> Option<(&'static str, String)
     match provider {
         "claude" => extract_claude_message(obj),
         "codex" => extract_codex_message(obj),
+        "antigravity" => extract_antigravity_message(obj),
         _ => None,
     }
 }
@@ -225,6 +226,22 @@ fn extract_codex_message(obj: &Value) -> Option<(&'static str, String)> {
         "assistant"
     };
     let text = crate::parse::codex::extract_text_content(payload.get("content"));
+    Some((role, text.trim().to_string()))
+}
+
+/// The antigravity transcript's message records: `type=="user_message"`
+/// and `type=="assistant_message"`, each carrying its text in the
+/// top-level `text` field (the Stage-1 candidate record schema, pinned by
+/// `test/fixtures/coding-cli/antigravity/*.sanitized.jsonl` — see
+/// `parse/antigravity.rs`). Every other record type (session_start,
+/// turn_settled, tool_call, unknown) is not a searchable message.
+fn extract_antigravity_message(obj: &Value) -> Option<(&'static str, String)> {
+    let role: &'static str = match obj.get("type").and_then(Value::as_str)? {
+        "user_message" => "user",
+        "assistant_message" => "assistant",
+        _ => return None,
+    };
+    let text = obj.get("text").and_then(Value::as_str)?;
     Some((role, text.trim().to_string()))
 }
 
@@ -313,6 +330,119 @@ mod tests {
             serde_json::from_str(r#"{"type":"response_item","payload":{"type":"function_call"}}"#)
                 .unwrap();
         assert_eq!(extract_codex_message(&obj), None);
+    }
+
+    // ── extract_antigravity_message ──
+
+    #[test]
+    fn antigravity_user_message_is_extracted_for_the_user_role() {
+        let obj: Value = serde_json::from_str(
+            r#"{"type":"user_message","conversationId":"c1","text":"Fix the flaky test","at":"2026-10-29T20:00:01.000Z"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            extract_antigravity_message(&obj),
+            Some(("user", "Fix the flaky test".to_string()))
+        );
+    }
+
+    #[test]
+    fn antigravity_assistant_message_is_extracted_for_the_assistant_role() {
+        let obj: Value = serde_json::from_str(
+            r#"{"type":"assistant_message","conversationId":"c1","text":"Fixed the test.","at":"2026-10-29T20:00:05.000Z"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            extract_antigravity_message(&obj),
+            Some(("assistant", "Fixed the test.".to_string()))
+        );
+    }
+
+    #[test]
+    fn antigravity_non_message_and_lifecycle_records_are_none() {
+        for line in [
+            r#"{"type":"session_start","conversationId":"c1","workspacePaths":["/w"],"startedAt":"2026-10-29T20:00:00.000Z"}"#,
+            r#"{"type":"turn_settled","conversationId":"c1","at":"2026-10-29T20:00:05.500Z","outcome":"completed","fullyIdle":true}"#,
+            r#"{"type":"tool_call","conversationId":"c1","toolName":"bash","at":"2026-10-29T20:00:02.000Z"}"#,
+        ] {
+            let obj: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(extract_antigravity_message(&obj), None);
+        }
+    }
+
+    #[test]
+    fn antigravity_missing_text_field_is_none() {
+        let obj: Value = serde_json::from_str(
+            r#"{"type":"user_message","conversationId":"c1","at":"2026-10-29T20:00:01.000Z"}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_antigravity_message(&obj), None);
+    }
+
+    // ── search_session_file: antigravity provider ──
+
+    /// The candidate transcript shape for the search arms (the committed
+    /// `test/fixtures/coding-cli/antigravity/fresh.sanitized.jsonl` record
+    /// schema): a `user_message` turn, an `assistant_message` reply, then a
+    /// turn settle.
+    fn write_antigravity_temp(name: &str) -> std::path::PathBuf {
+        write_temp(
+            name,
+            &format!(
+                "{}\n{}\n{}\n",
+                r#"{"type":"session_start","conversationId":"c1","workspacePaths":["/w"],"startedAt":"2026-10-29T20:00:00.000Z"}"#,
+                r#"{"type":"user_message","conversationId":"c1","text":"Fix the flaky test","at":"2026-10-29T20:00:01.000Z"}"#,
+                r#"{"type":"assistant_message","conversationId":"c1","text":"Fixed the test.","at":"2026-10-29T20:00:05.000Z","usage":{"inputTokens":10,"outputTokens":20,"cachedTokens":0,"totalTokens":30}}"#,
+            ),
+        )
+    }
+
+    #[test]
+    fn antigravity_user_messages_tier_matches_user_text_case_insensitively() {
+        let path = write_antigravity_temp("antigravity.jsonl");
+        let result = search_session_file(
+            &path,
+            "antigravity",
+            "fix the FLAKY",
+            FileSearchTier::UserMessages,
+        )
+        .unwrap();
+        let m = result.expect("userMessages tier must match the user_message record");
+        assert_eq!(m.matched_in, "userMessage");
+        assert!(
+            m.snippet.to_lowercase().contains("fix the flaky"),
+            "snippet must carry the case-insensitive match context: {}",
+            m.snippet
+        );
+        // The user tier never matches assistant-only text.
+        assert_eq!(
+            search_session_file(
+                &path,
+                "antigravity",
+                "Fixed the test",
+                FileSearchTier::UserMessages
+            )
+            .unwrap(),
+            None,
+            "userMessages tier must not match assistant_message text"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn antigravity_full_text_tier_matches_assistant_text() {
+        let path = write_antigravity_temp("antigravity-full.jsonl");
+        let result = search_session_file(
+            &path,
+            "antigravity",
+            "fixed the test",
+            FileSearchTier::FullText,
+        )
+        .unwrap();
+        let m = result.expect("fullText tier must match the assistant_message record");
+        assert_eq!(m.matched_in, "assistantMessage");
+        assert!(m.snippet.to_lowercase().contains("fixed the test"));
+        std::fs::remove_file(&path).ok();
     }
 
     // ── search_session_file ──

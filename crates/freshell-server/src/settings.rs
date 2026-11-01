@@ -38,13 +38,17 @@ pub fn default_server_settings() -> ServerSettings {
         },
         coding_cli: SettingsCodingCli {
             // Node's `DEFAULT_ENABLED_CLI_PROVIDERS`
-            // (`shared/coding-cli-defaults.ts:3`) — four providers,
-            // including `amplifier`.
+            // (`shared/coding-cli-defaults.ts:3`) — five providers,
+            // including `amplifier` and `antigravity`. Fresh installs take
+            // `enabledProviders` from these defaults (they only seed
+            // `knownProviders` from discovery), so without `antigravity`
+            // here a fresh install never enables the provider.
             enabled_providers: vec![
                 "claude".to_string(),
                 "codex".to_string(),
                 "opencode".to_string(),
                 "amplifier".to_string(),
+                "antigravity".to_string(),
             ],
             mcp_server: true,
             providers: std::collections::BTreeMap::from([

@@ -1699,6 +1699,12 @@ impl NativeNameDispatch {
             NativeLocation::Opencode { .. } => {
                 self.opencode.as_ref().map(|a| a as &dyn NativeNameBackend)
             }
+            // Antigravity plan (Task 6 added the variant; Task 9 wires the
+            // naming surfaces): no native adapter exists — transcript edits
+            // are forbidden, so `Unsupported` is the honest, modeled,
+            // displayable answer (`NativeNameDispatch::read`/`write` answer
+            // Unsupported for a `None` backend).
+            NativeLocation::Antigravity { .. } => None,
         }
     }
 }

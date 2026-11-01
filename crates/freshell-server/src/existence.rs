@@ -39,7 +39,7 @@ use freshell_ws::existence::{SessionExistence, SessionExistenceProbe};
 
 /// The disk-indexed providers of `main.rs`'s `SessionIndex` construction —
 /// the "known provider" set of the probe contract.
-const KNOWN_PROVIDERS: [&str; 4] = ["claude", "codex", "opencode", "amplifier"];
+const KNOWN_PROVIDERS: [&str; 5] = ["claude", "codex", "opencode", "amplifier", "antigravity"];
 
 /// Injected raw-file transcript check for claude (kata 09v1). Wiring installs
 /// `freshell_freshagent::locate_transcript_state` — the SAME ordered-candidate-
@@ -81,6 +81,10 @@ pub type OpencodeSessionLocator = Arc<dyn Fn(&str) -> OpencodeDbAnswer + Send + 
 pub use crate::existence_by_id::{
     amplifier_dir_locator, codex_rollout_existence_locator, AmplifierSessionLocator, ByIdAnswer,
     CodexRolloutExistenceLocator,
+};
+// Antigravity by-id locator (plan Task 7): same focused-sibling convention.
+pub use crate::antigravity_existence_by_id::{
+    antigravity_transcript_locator, AntigravityTranscriptLocator,
 };
 
 pub struct IndexExistenceProbe {
@@ -131,6 +135,21 @@ pub struct IndexExistenceProbe {
     /// and the cold path never consult it (AD-4: cold codex stays
     /// `Unknown`). `None` keeps the pure index answer.
     codex_rollout_locator: Option<CodexRolloutExistenceLocator>,
+    /// Antigravity by-id fallback (plan Task 7): the index's
+    /// `AntigravitySource` drops transcripts whose ownership/workspace
+    /// parse yields no row, so a conversation dir on disk can be
+    /// index-invisible while the attach arm (`agy --conversation <id>`)
+    /// would still resume it — the two arms must agree. The check is CHEAP
+    /// (one `File::open` on the canonical
+    /// `brain/<id>/.system_generated/logs/transcript.jsonl` path), so it
+    /// lives on the sync warm-Absent adjudication path in `exists()` beside
+    /// the amplifier/opencode arms (NOT the codex gate-only treatment —
+    /// there is no ~1s walk to keep off the reconcile path) and improves
+    /// pane-reconcile dead-session answers today; `exists_for_gate`
+    /// inherits it through `exists()` for the deferred future gate
+    /// activation. `None` (tests, callers that never set it) keeps the
+    /// pure index answer.
+    antigravity_transcript_locator: Option<AntigravityTranscriptLocator>,
 }
 
 impl IndexExistenceProbe {
@@ -148,6 +167,7 @@ impl IndexExistenceProbe {
             opencode_session_locator: None,
             amplifier_session_locator: None,
             codex_rollout_locator: None,
+            antigravity_transcript_locator: None,
         }
     }
 
@@ -175,10 +195,21 @@ impl IndexExistenceProbe {
     }
 
     /// Builder-style: install the by-id rollout fallback for codex (see the
-    /// field doc). Chained at the single production construction site in
-    /// main.rs.
+    /// field doc). Chained at the single production construction site
+    /// in main.rs.
     pub fn with_codex_rollout_locator(mut self, locator: CodexRolloutExistenceLocator) -> Self {
         self.codex_rollout_locator = Some(locator);
+        self
+    }
+
+    /// Builder-style: install the by-id transcript fallback for
+    /// antigravity (see the field doc). Chained at the single production
+    /// construction site in main.rs.
+    pub fn with_antigravity_transcript_locator(
+        mut self,
+        locator: AntigravityTranscriptLocator,
+    ) -> Self {
+        self.antigravity_transcript_locator = Some(locator);
         self
     }
 
@@ -396,6 +427,40 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                         }
                     }
                 }
+                // Antigravity by-id fallback (plan Task 7): before
+                // finalizing Absent for antigravity, re-check the SAME
+                // canonical transcript path the attach arm
+                // (`agy --conversation <id>`) resolves — the index's
+                // AntigravitySource drops parse-failed transcripts (no
+                // ownership record, no usable workspace path), so a
+                // conversation dir on disk can be index-invisible yet
+                // resumable. CHEAP single-open check (the amplifier/opencode
+                // class, NOT codex's gate-only ~1s walk), so it stays on
+                // this sync reconcile-consulted path and improves
+                // pane-reconcile dead-session answers today;
+                // `exists_for_gate` inherits it through `exists()` for the
+                // deferred future gate activation. An unreadable store is
+                // honest Unknown (G28: bounded deferral), NEVER Absent.
+                if provider == "antigravity" {
+                    if let Some(locator) = &self.antigravity_transcript_locator {
+                        match locator(session_id) {
+                            ByIdAnswer::Present => {
+                                // A fallback hit is an on-disk observation:
+                                // feed the monotone observed-set (module-doc
+                                // invariant), same as the arms above.
+                                self.observed
+                                    .lock()
+                                    .expect("observed set lock")
+                                    .insert(format!("{provider}:{session_id}"));
+                                return SessionExistence::Present;
+                            }
+                            ByIdAnswer::Unreadable => return SessionExistence::Unknown,
+                            ByIdAnswer::Absent => {}
+                        }
+                    }
+                }
+                // After the antigravity arm, `Absent` for
+                // claude/opencode/amplifier/antigravity is POSITIVE absence.
                 SessionExistence::Absent
             }
         }
@@ -472,6 +537,57 @@ mod tests {
         ));
         std::fs::create_dir_all(dir.join("projects/proj")).expect("mkdir claude home");
         dir
+    }
+
+    /// A temp ANTIGRAVITY home (the `antigravity-cli` subtree) with one
+    /// canonical `brain/<conv>/.system_generated/logs/transcript.jsonl`
+    /// seeded from the committed fresh fixture. Returns `(home, conv_id)`.
+    fn temp_antigravity_home(tag: &str) -> (std::path::PathBuf, &'static str) {
+        let home = std::env::temp_dir().join(format!(
+            "freshell-existence-agy-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        const CONV: &str = "11111111-2222-3333-4444-555555555555";
+        let logs = home
+            .join("brain")
+            .join(CONV)
+            .join(".system_generated")
+            .join("logs");
+        std::fs::create_dir_all(&logs).expect("mkdir antigravity brain");
+        let fixture = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../test/fixtures/coding-cli/antigravity/fresh.sanitized.jsonl"),
+        )
+        .expect("read antigravity fixture");
+        std::fs::write(logs.join("transcript.jsonl"), fixture).expect("write transcript");
+        (home, CONV)
+    }
+
+    /// The probe over a REAL `AntigravitySource` with the antigravity root
+    /// registered (the `main.rs` wiring shape: the resolved antigravity
+    /// home, so a missing home answers `ProviderUnavailable` when cold).
+    fn antigravity_probe(home: std::path::PathBuf) -> (IndexExistenceProbe, Arc<SessionIndex>) {
+        let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
+            vec![
+                Arc::new(freshell_sessions::antigravity::AntigravitySource::new(
+                    home.clone(),
+                )) as Arc<dyn SessionSource>,
+            ],
+            Duration::from_millis(50),
+            None,
+        ));
+        (
+            IndexExistenceProbe::new(
+                Arc::clone(&index),
+                None,
+                HashMap::from([("antigravity".to_string(), home)]),
+            ),
+            index,
+        )
     }
 
     pub(super) fn write_session(claude_home: &std::path::Path, session_id: &str) {
@@ -855,6 +971,61 @@ mod tests {
         let home = temp_claude_home("root-cold");
         let (probe, _index) = probe_over(&home);
         assert_eq!(probe.exists("claude", "s-cold"), SessionExistence::Unknown);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ── Antigravity (plan Task 5): the probe answers for the provider ──
+
+    /// Warm index → `Present` for the indexed conversation; a genuinely
+    /// absent id → `Absent`; an unknown provider stays `Absent` (never
+    /// `Unknown`). Before `"antigravity"` joined `KNOWN_PROVIDERS`, every
+    /// query on the provider mis-adjudicated as unknown-provider `Absent`
+    /// (dead-session evidence for a live session).
+    #[tokio::test]
+    async fn antigravity_warm_index_answers_present_and_absent() {
+        let (home, conv_id) = temp_antigravity_home("warm");
+        let (probe, index) = antigravity_probe(home.clone());
+        index.warm().await;
+        assert_eq!(
+            probe.exists("antigravity", conv_id),
+            SessionExistence::Present,
+            "a warm snapshot carrying the antigravity row must answer Present"
+        );
+        assert_eq!(
+            probe.exists("antigravity", "00000000-1111-2222-3333-444444444444"),
+            SessionExistence::Absent,
+            "a genuinely absent conversation id must answer Absent"
+        );
+        assert_eq!(
+            probe.exists("not-a-provider", conv_id),
+            SessionExistence::Absent,
+            "unknown provider stays Absent, never Unknown"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A cold index whose registered antigravity root does NOT exist will
+    /// never warm up — `ProviderUnavailable`, not the deferrable `Unknown`;
+    /// the counterpart boundary (root EXISTS, index cold) stays `Unknown`.
+    #[tokio::test]
+    async fn antigravity_cold_index_missing_root_is_provider_unavailable() {
+        let (base, _conv_id) = temp_antigravity_home("cold-missing");
+        let gone = base.join("no-antigravity-here"); // never created
+        let (probe, _index) = antigravity_probe(gone);
+        assert_eq!(
+            probe.exists("antigravity", "s-any"),
+            SessionExistence::ProviderUnavailable,
+            "a missing antigravity home is an immediate provider_unavailable, never index_warming"
+        );
+        std::fs::remove_dir_all(&base).ok();
+
+        let (home, _conv_id) = temp_antigravity_home("cold-existing");
+        let (probe, _index) = antigravity_probe(home.clone());
+        assert_eq!(
+            probe.exists("antigravity", "s-cold"),
+            SessionExistence::Unknown,
+            "an EXISTING antigravity root with a cold index stays Unknown (warming)"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 

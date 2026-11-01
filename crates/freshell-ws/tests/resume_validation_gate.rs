@@ -1075,3 +1075,435 @@ async fn managed_default_legacy_codex_carrier_never_consults_gate_or_plans() {
     assert_never_captured(&planning_marker);
     assert_never_captured(&capture_path);
 }
+
+// ── Antigravity gate DEFERRAL (plan Task 7, load-bearing A2) ─────────────────
+//
+// Antigravity stays OUT of `resume_gate.rs VALIDATED_PROVIDERS` until
+// real-binary transcript-store evidence exists: the record schema is
+// fixture-validated only, and a wrong schema would make REAL conversations
+// answer Absent and visibly refuse/replace every restore with a misleading
+// "not found on disk" notice. Until then a stale antigravity resume id
+// passes through UNGATED (gemini-style) and the CLI's own PROBED behavior
+// surfaces in-pane (round 7, Major 1 — the real binaries v1.4.10 AND
+// v1.4.12 print `warning: conversation "<id>" not found` and CONTINUE
+// INTO A FRESH INTERACTIVE SESSION, never a failure exit): the pane
+// stays ALIVE under its requested id, no replacement conversation is
+// ever spawned by Freshell, and the pane rebinds to the CLI's fresh
+// conversation on its next clean prompt (pinned by the
+// antigravity_session_rebind suite — this gate harness wires no
+// activity hub, so it pins the GATE door only). Both scenarios run
+// against an `AbsentButObservedProbe` — the answer that WOULD gate a
+// validated provider into the typed SESSION_MISSING refusal — so any
+// future gate activation flips these tests red and forces an evidenced
+// decision.
+
+/// A fake `agy` for the deferral scenarios: records `"$@"` as ONE line per
+/// invocation to `capture`, then resolves `--conversation <id>` against the
+/// test-seeded brain tree — an existing
+/// `brain/<id>/.system_generated/logs/transcript.jsonl` is resumed (echo +
+/// stay alive); anything else follows the PROBED missing-id contract
+/// (round 7, Major 1; real binaries v1.4.10 AND v1.4.12, the round-6 PTY
+/// receipts): print `warning: conversation "<id>" not found` to stderr and
+/// CONTINUE into the fresh interactive session — NO failure exit, so no
+/// auto-resume respawn cycle ever runs. This gate harness wires no
+/// activity hub and its fresh arm models liveness only (`sleep`, no store
+/// writes): the fresh conversation's MINT and the dead→new REBIND are
+/// pinned by the antigravity_session_rebind suite and e2e scenario 8,
+/// which run the full association wiring.
+fn write_fake_agy(path: &std::path::Path, capture: &std::path::Path, brain_root: &std::path::Path) {
+    let script = format!(
+        "#!/bin/sh\n\
+         echo \"$@\" >> \"{cap}\"\n\
+         conv=\n\
+         prev=\n\
+         for arg in \"$@\"; do\n\
+           if [ \"$prev\" = \"--conversation\" ]; then conv=\"$arg\"; fi\n\
+           prev=\"$arg\"\n\
+         done\n\
+         if [ -n \"$conv\" ] && [ -f \"{brain}/brain/$conv/.system_generated/logs/transcript.jsonl\" ]; then\n\
+           echo \"agy: resumed conversation $conv\"\n\
+         elif [ -n \"$conv\" ]; then\n\
+           printf 'warning: conversation \"%s\" not found\\n' \"$conv\" >&2\n\
+         fi\n\
+         exec sleep 30\n\
+         ",
+        cap = capture.display(),
+        brain = brain_root.display(),
+    );
+    std::fs::write(path, script).expect("write fake agy");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake agy");
+    }
+}
+
+/// Antigravity `CliCommandSpec` over the fake (the manifest's exact
+/// `resumeArgs` pair — `extensions/antigravity/freshell.json`).
+fn antigravity_gate_cli_spec(fake: &std::path::Path) -> freshell_platform::CliCommandSpec {
+    freshell_platform::CliCommandSpec {
+        name: "antigravity".into(),
+        label: "Antigravity CLI".into(),
+        env_var: None,
+        default_cmd: fake.to_string_lossy().to_string(),
+        base_args: vec![],
+        base_env: Default::default(),
+        resume_args: Some(vec![
+            "--conversation".to_string(),
+            "{{sessionId}}".to_string(),
+        ]),
+        create_session_args: None,
+        model_args: None,
+        effort_args: None,
+        sandbox_args: None,
+        permission_mode_args: None,
+    }
+}
+
+/// Antigravity harness: modeled line-for-line on `spawn_server_with_probe`
+/// with exactly one difference — the CLI spec is the antigravity fake (no
+/// sleeper specs), so `mode:"antigravity"` resolves and spawns the fake.
+async fn spawn_antigravity_server_with_probe(
+    probe: Arc<dyn SessionExistenceProbe>,
+    fake: &std::path::Path,
+) -> (
+    String,
+    freshell_terminal::TerminalRegistry,
+    Arc<PaneLedger>,
+    WsState,
+) {
+    // F7/V9 choke point: amplifier creates write stub dirs — never the real home.
+    let _ = common::isolate_amplifier_home();
+    let ledger_dir = std::env::temp_dir().join(format!(
+        "freshell-resume-gate-agy-ledger-{}-{}",
+        std::process::id(),
+        uuid_like_suffix()
+    ));
+    std::fs::create_dir_all(&ledger_dir).expect("create ledger temp dir");
+    let pane_ledger = Arc::new(PaneLedger::new(Some(ledger_dir)));
+
+    let auth_token = Arc::new(common::AUTH_TOKEN.to_string());
+    let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
+    let settings_value = common::test_settings_value();
+    let settings = Arc::new(serde_json::from_value(settings_value).expect("valid settings"));
+    let registry = freshell_terminal::TerminalRegistry::new();
+
+    let state = WsState {
+        layout: Default::default(),
+        terminal_meta: Default::default(),
+        pane_ledger: Arc::clone(&pane_ledger),
+        identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+        auth_token: Arc::clone(&auth_token),
+        server_instance_id: Arc::new("srv-test".to_string()),
+        boot_id: Arc::new("boot-test".to_string()),
+        settings,
+        handshake_settings: common::handshake_settings_lock(),
+        broadcast_tx: Arc::clone(&broadcast_tx),
+        auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+        auto_resume_cancels: Default::default(),
+        fresh_codex: freshell_freshagent::FreshCodexState::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+            json!({ "freshAgent": { "enabled": false } }),
+        ),
+        fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
+        fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
+            freshell_freshagent::FreshAgentState::new(
+                Arc::clone(&auth_token),
+                Arc::clone(&broadcast_tx),
+            ),
+        ),
+        registry: registry.clone(),
+        tabs: freshell_ws::tabs::TabsRegistry::new(),
+        screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
+        subagent_interest: Default::default(),
+        host_stats: Default::default(),
+        checkpoint_send: Default::default(),
+        terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        cli_commands: Arc::new(vec![antigravity_gate_cli_spec(fake)]),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
+        ping_interval_ms: 30_000,
+        hello_timeout_ms: 5_000,
+        allowed_origins: Arc::new(freshell_ws::origin::default_allowed_origins()),
+        ws_max_payload_bytes: 16 * 1024 * 1024,
+        term09: freshell_ws::backpressure::Term09Config::default(),
+        create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
+        spawn_gate: Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
+        shutdown_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        create_dedupe: Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
+        config_fallback: None,
+        opencode_locator: None,
+        codex_locator: None,
+        activity: None,
+        session_existence: probe,
+        reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+        fresh_agent_respawn_counts: Default::default(),
+        ownership: None,
+    };
+
+    let router = freshell_ws::router(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral loopback port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    (format!("ws://{addr}/ws"), registry, pane_ledger, state)
+}
+
+/// Poll the argv-capture file until `want` rows exist (bounded) — the fake
+/// writes its line at spawn, which races the `terminal.created` reply.
+async fn wait_capture_rows(capture: &std::path::Path, want: usize) -> Vec<String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let rows: Vec<String> = std::fs::read_to_string(capture)
+            .map(|s| s.lines().map(str::to_string).collect())
+            .unwrap_or_default();
+        if rows.len() >= want || tokio::time::Instant::now() >= deadline {
+            return rows;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Bounded negative spawn check (the `assert_never_captured` spirit, for a
+/// row count): the capture must hold EXACTLY `want` rows for the whole
+/// window — a fresh replacement conversation would append a second row.
+fn assert_no_extra_spawn_rows(capture: &std::path::Path, want: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        let rows: Vec<String> = std::fs::read_to_string(capture)
+            .map(|s| s.lines().map(str::to_string).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            rows.len(),
+            want,
+            "a gate-fired replacement spawn is forbidden under deferral: {rows:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A restore whose `brain/<id>/` exists resumes the EXACT id UNGATED: the
+/// create succeeds (never the typed SESSION_MISSING refusal a validated
+/// provider would answer), no notice rides the frame, the exact id reaches
+/// argv and the CLI's own brain check agrees, and the Bound ledger row
+/// survives (no gate fired, nothing retired, nothing substituted).
+#[tokio::test(flavor = "multi_thread")]
+async fn antigravity_restore_with_brain_on_disk_resumes_ungated_never_substituted() {
+    let conv = "11111111-2222-3333-4444-555555555555";
+    let base = std::env::temp_dir().join(format!(
+        "freshell-resume-gate-agy-live-{}-{}",
+        std::process::id(),
+        uuid_like_suffix()
+    ));
+    let logs = base
+        .join("brain")
+        .join(conv)
+        .join(".system_generated")
+        .join("logs");
+    std::fs::create_dir_all(&logs).expect("mkdir brain conversation");
+    std::fs::write(logs.join("transcript.jsonl"), "{\"v\":1}\n").expect("seed transcript");
+    let fake = base.join("fake-agy.sh");
+    let capture = base.join("agy-argv.txt");
+    let _ = std::fs::remove_file(&capture);
+    write_fake_agy(&fake, &capture, &base);
+
+    let (url, registry, ledger, _state) =
+        spawn_antigravity_server_with_probe(Arc::new(AbsentButObservedProbe), &fake).await;
+    seed_bound_row(&ledger, "antigravity", conv);
+
+    let (mut ws, _inv) = common::connect_and_capture_inventory(&url).await;
+    send_json(
+        &mut ws,
+        &restore_create_with_session_ref("req-agy-live", "antigravity", conv),
+    )
+    .await;
+    let frame = next_created_or_error(&mut ws, "req-agy-live").await;
+
+    assert_eq!(
+        frame["type"], "terminal.created",
+        "the deferred gate never refuses an antigravity restore: {frame}"
+    );
+    assert!(
+        notice_of(&frame).is_none(),
+        "no gate notice may ever ride an antigravity create: {frame}"
+    );
+    assert_eq!(
+        frame["sessionRef"]["sessionId"],
+        json!(conv),
+        "the exact id passes through — never a substituted fresh id: {frame}"
+    );
+
+    // Exactly ONE spawn, carrying the adjacent --conversation pair.
+    let rows = wait_capture_rows(&capture, 1).await;
+    assert_eq!(
+        rows,
+        vec![format!("--conversation {conv}")],
+        "argv rows: {rows:?}"
+    );
+
+    // End-to-end honesty: attach and confirm the fake's own brain check
+    // agrees the conversation exists (the resumed marker in the pane).
+    let terminal_id = frame["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    common::attach_with(
+        &mut ws,
+        &terminal_id,
+        "att-agy-live",
+        "viewport_hydrate",
+        120,
+        30,
+        None,
+    )
+    .await;
+    common::wait_for_attach_ready(&mut ws, "att-agy-live").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let (acc, _gap, _closed) = common::drain_until_marker_or_deadline(
+        &mut ws,
+        &format!("agy: resumed conversation {conv}"),
+        deadline,
+    )
+    .await;
+    assert!(
+        acc.contains(&format!("agy: resumed conversation {conv}")),
+        "the fake CLI resumed the conversation: {acc:?}"
+    );
+
+    // No second spawn ever, and the Bound row survives untouched.
+    assert_no_extra_spawn_rows(&capture, 1);
+    assert_eq!(
+        ledger
+            .load_binding("antigravity", conv)
+            .expect("row present")
+            .state,
+        RowState::Bound,
+        "no gate fired: the bound row was never retired"
+    );
+
+    registry.kill_all();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The deferral's designed honest failure mode (round 7: the PROBED
+/// contract): an absent id still launches the pane with
+/// `--conversation <absent id>`, and the REAL CLI (argv/PTY probes
+/// v1.4.10 + v1.4.12) prints `warning: conversation "<id>" not found`
+/// and CONTINUES INTO A FRESH INTERACTIVE SESSION — no failure exit, so
+/// no auto-resume respawn cycle ever runs. The pane STAYS ALIVE under
+/// the requested id (exactly one spawn, forever — Freshell never
+/// substitutes a fresh id of its own), the CLI's own warning surfaces
+/// IN-PANE, and the stale row survives untouched. The follow-on tail —
+/// the first clean prompt mints the CLI's fresh conversation and the
+/// pane REBINDS dead→new — is pinned by the antigravity_session_rebind
+/// suite (full association wiring; this harness wires no activity hub).
+#[tokio::test(flavor = "multi_thread")]
+async fn antigravity_restore_with_absent_id_warns_in_pane_stays_alive_never_replaces() {
+    let conv = "00000000-1111-2222-3333-444444444444"; // never seeded
+    let base = std::env::temp_dir().join(format!(
+        "freshell-resume-gate-agy-gone-{}-{}",
+        std::process::id(),
+        uuid_like_suffix()
+    ));
+    std::fs::create_dir_all(base.join("brain")).expect("mkdir brain root");
+    let fake = base.join("fake-agy.sh");
+    let capture = base.join("agy-argv.txt");
+    let _ = std::fs::remove_file(&capture);
+    write_fake_agy(&fake, &capture, &base);
+
+    let (url, registry, ledger, _state) =
+        spawn_antigravity_server_with_probe(Arc::new(AbsentButObservedProbe), &fake).await;
+    seed_bound_row(&ledger, "antigravity", conv);
+
+    let (mut ws, _inv) = common::connect_and_capture_inventory(&url).await;
+    send_json(
+        &mut ws,
+        &restore_create_with_session_ref("req-agy-gone", "antigravity", conv),
+    )
+    .await;
+    let frame = next_created_or_error(&mut ws, "req-agy-gone").await;
+
+    assert_eq!(
+        frame["type"], "terminal.created",
+        "the pane still launches — the deferred gate never refuses: {frame}"
+    );
+    assert!(notice_of(&frame).is_none(), "no gate notice: {frame}");
+    assert_eq!(
+        frame["sessionRef"]["sessionId"],
+        json!(conv),
+        "the stale id passes through to the CLI — never silently dropped or replaced: {frame}"
+    );
+
+    // The pane carries the CLI's OWN warning (in-pane surfacing) — the
+    // probed byte-faithful line, quotes included.
+    let terminal_id = frame["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let rows = wait_capture_rows(&capture, 1).await;
+    assert_eq!(
+        rows,
+        vec![format!("--conversation {conv}")],
+        "the absent id reaches the CLI argv: {rows:?}"
+    );
+    common::attach_with(
+        &mut ws,
+        &terminal_id,
+        "att-agy-gone",
+        "viewport_hydrate",
+        120,
+        30,
+        None,
+    )
+    .await;
+    common::wait_for_attach_ready(&mut ws, "att-agy-gone").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let (acc, _gap, _closed) = common::drain_until_marker_or_deadline(
+        &mut ws,
+        &format!("warning: conversation \"{conv}\" not found"),
+        deadline,
+    )
+    .await;
+    assert!(
+        acc.contains(&format!("warning: conversation \"{conv}\" not found")),
+        "the CLI's own probed warning must surface in the pane: {acc:?}"
+    );
+
+    // The pane STAYS ALIVE: the probed contract has NO failure exit, so
+    // the registry keeps the terminal Running through a bounded window
+    // (the pre-round-7 fake exited and drove an auto-resume respawn
+    // cycle the real CLI never produces).
+    let liveness_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < liveness_deadline {
+        let entry = registry
+            .directory()
+            .into_iter()
+            .find(|e| e.terminal_id == terminal_id);
+        assert!(
+            entry.is_some_and(|e| { e.status == freshell_protocol::TerminalRunStatus::Running }),
+            "the stale-resume pane stays ALIVE (the probed fresh session never exits)"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // NO fresh replacement conversation spawns — exactly one row, forever
+    // (no gate spawn, and no auto-resume respawn cycle either).
+    assert_no_extra_spawn_rows(&capture, 1);
+    assert_eq!(
+        ledger
+            .load_binding("antigravity", conv)
+            .expect("row present")
+            .state,
+        RowState::Bound,
+        "no gate fired: the stale row was never retired as missing"
+    );
+
+    registry.kill_all();
+    let _ = std::fs::remove_dir_all(&base);
+}

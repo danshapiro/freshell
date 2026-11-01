@@ -1,13 +1,15 @@
-//! Read-only transcript parsers for the three coding-CLI providers.
+//! Read-only transcript parsers for the coding-CLI providers.
 //!
 //! Each is a faithful port of the corresponding reference parser and is corruption-safe
 //! by construction: a malformed line is skipped, never panicking the process (mirroring
 //! the reference's `try { JSON.parse } catch { continue }`).
 
+pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod opencode;
 
+pub use antigravity::parse_antigravity_session_content;
 pub use claude::{parse_session_content, ClaudeUsageAccumulator, ParseSessionOptions};
 pub use codex::parse_codex_session_content;
 pub use opencode::{

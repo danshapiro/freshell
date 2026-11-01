@@ -344,4 +344,20 @@ describe('CLI commands', () => {
       expect(result.stdout).toContain('Accepted server name')
     })
   })
+
+  describe('exact-resume sessionRef mapping (plan Task 7)', () => {
+    it('new-tab maps --resume with --mode antigravity to the canonical antigravity sessionRef', async () => {
+      const result = await invokeCli(['new-tab', '--mode', 'antigravity', '--resume', 'conv-1'])
+      expect(result.stderr).toBe('')
+      expect(result.code).toBe(0)
+      const post = result.requests.find((request) => request.url === '/api/tabs')
+      expect(post).toBeDefined()
+      expect(post!.body).toMatchObject({
+        mode: 'antigravity',
+        sessionRef: { provider: 'antigravity', sessionId: 'conv-1' },
+      })
+      expect(post!.body).not.toHaveProperty('resumeSessionId')
+      expect(post!.body).not.toHaveProperty('resume')
+    })
+  })
 })

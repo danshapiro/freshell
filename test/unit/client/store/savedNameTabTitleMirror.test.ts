@@ -128,6 +128,38 @@ describe('savedNameTabTitleMirrorMiddleware', () => {
     expect(tab.titleSetByUser).toBeUndefined()
   })
 
+  it('mirrors an antigravity CLI session rename into its session-owned tab title (Task 9)', () => {
+    // An antigravity terminal pane is a scoped unified mode: the rename
+    // accepted by PATCH /api/session-names folds through the canonical
+    // update into the cache, and the mirror writes the tab title from it
+    // exactly like claude/codex/opencode — no fallback label survives.
+    const store = buildStore()
+    const agyRef: SessionNameRef = { kind: 'session', provider: 'antigravity', sessionId: 'conv-agy-1' }
+    store.dispatch(addTab({ id: 'tab-agy', title: 'freshell', mode: 'antigravity' }))
+    store.dispatch(initLayout({
+      tabId: 'tab-agy',
+      paneId: 'pane-agy',
+      content: {
+        kind: 'terminal',
+        mode: 'antigravity',
+        createRequestId: 'crid-agy',
+        status: 'running',
+        sessionRef: { provider: 'antigravity', sessionId: 'conv-agy-1' },
+      } as PaneContent,
+    }))
+    expect(tabOf(store, 'tab-agy').nameSource).toEqual({ kind: 'session', paneId: 'pane-agy' })
+
+    store.dispatch(receiveSessionNames([update(agyRef, 'Antigravity rename', 1)]))
+
+    expect(tabOf(store, 'tab-agy').title).toBe('Antigravity rename')
+    // The display selectors agree with the mirrored stored title.
+    const state = store.getState() as unknown as RootState
+    expect(selectPaneDisplayName(state, 'tab-agy', 'pane-agy')).toBe('Antigravity rename')
+    expect(selectTabDisplayName(state, 'tab-agy')).toBe('Antigravity rename')
+    // The rename persisted in the canonical cache under the durable key.
+    expect(store.getState().sessionNames.records[sessionNameRefKey(agyRef)]?.name).toBe('Antigravity rename')
+  })
+
   it('never writes a fallback label when no saved record is cached', () => {
     const store = buildStore()
     const { tabId, paneId } = createSessionTab(store, { title: 'LotL' })

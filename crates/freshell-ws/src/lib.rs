@@ -35,6 +35,7 @@ pub fn ready_build_id() -> Option<String> {
 }
 
 pub mod activity;
+pub mod antigravity_association;
 pub mod auto_resume;
 pub mod backpressure;
 pub mod checkpoint_barrier;

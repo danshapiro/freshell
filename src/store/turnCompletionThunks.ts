@@ -7,7 +7,7 @@ import { selectTabPaneByTerminalId } from './selectors/paneTerminalSelectors'
 import { advanceCompletionBaseline, recordTerminalIdle, recordTurnComplete } from './turnCompletionSlice'
 import type { ReadyMessage } from '@shared/ws-protocol'
 import { createLogger } from '@/lib/client-logger'
-import { clearTerminalStuck, recordTerminalStuck } from './terminalLifecycleSlice'
+import { clearTerminalStuck, recordTerminalStuck, type TerminalLifecycleState } from './terminalLifecycleSlice'
 import type { AppDispatch, RootState } from './store'
 
 const log = createLogger('TurnCompletion')
@@ -173,6 +173,7 @@ export function applyServerIdle(payload: ApplyServerIdlePayload) {
   return (dispatch: AppDispatch, getState: () => RootState): void => {
     const state = getState()
     const location = selectTabPaneByTerminalId(state, payload.terminalId)
+      ?? selectExitedPaneByTerminalId(state, payload.terminalId)
     if (!location) return
 
     dispatch(recordTerminalIdle({
@@ -183,6 +184,43 @@ export function applyServerIdle(payload: ApplyServerIdlePayload) {
       reason: payload.reason,
     }))
   }
+}
+
+/**
+ * The DEATH-idle bridge: an attached pane's `terminal.exit` handler records
+ * the exit into `terminalLifecycle` and CLEARS `paneContent.terminalId`
+ * BEFORE the hub's death `terminal.idle` lands (the wire order is exit
+ * push → hub exit event → bell), so the direct layout lookup misses
+ * exactly the attached-pane crash — the one case the death bell exists
+ * for. The lifecycle slice's `lastTerminalId` is the bridge (the
+ * `terminal.replaced` handler's own precedent for the same cleared-tid
+ * window): find the pane whose dying terminal the exit recorded, then
+ * resolve that pane's owning tab. First match wins; `recordTerminalIdle`'s
+ * per-terminal monotonic-`at` dedupe still swallows any stale replay that
+ * rides the bridge.
+ */
+function selectExitedPaneByTerminalId(
+  state: RootState,
+  terminalId: string,
+): { tabId: string; paneId: string } | undefined {
+  const lifecycle = (state as { terminalLifecycle?: TerminalLifecycleState }).terminalLifecycle
+  if (!lifecycle?.byPaneId) return undefined
+  const paneIds = Object.entries(lifecycle.byPaneId)
+    .filter(([, entry]) => entry?.lastTerminalId === terminalId)
+    .map(([paneId]) => paneId)
+  for (const paneId of paneIds) {
+    for (const [tabId, layout] of Object.entries(state.panes.layouts)) {
+      if (layoutNodeHasPaneId(layout, paneId)) {
+        return { tabId, paneId }
+      }
+    }
+  }
+  return undefined
+}
+
+function layoutNodeHasPaneId(node: PaneNode, paneId: string): boolean {
+  if (node.type === 'leaf') return node.id === paneId
+  return node.children.some((child) => layoutNodeHasPaneId(child, paneId))
 }
 
 export type ApplyTerminalStuckPayload = {

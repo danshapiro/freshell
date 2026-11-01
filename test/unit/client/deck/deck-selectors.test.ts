@@ -7,6 +7,7 @@ import freshAgentReducer from '@/store/freshAgentSlice'
 import codexActivityReducer from '@/store/codexActivitySlice'
 import claudeActivityReducer from '@/store/claudeActivitySlice'
 import amplifierActivityReducer from '@/store/amplifierActivitySlice'
+import antigravityActivityReducer from '@/store/antigravityActivitySlice'
 import opencodeActivityReducer from '@/store/opencodeActivitySlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
 import settingsReducer from '@/store/settingsSlice'
@@ -30,6 +31,7 @@ const reducer = {
   tabs: tabsReducer, panes: panesReducer, turnCompletion: turnCompletionReducer,
   freshAgent: freshAgentReducer, codexActivity: codexActivityReducer,
   claudeActivity: claudeActivityReducer, amplifierActivity: amplifierActivityReducer,
+  antigravityActivity: antigravityActivityReducer,
   opencodeActivity: opencodeActivityReducer, paneRuntimeActivity: paneRuntimeActivityReducer,
   settings: settingsReducer, terminalMeta: terminalMetaReducer, repoIcons: repoIconsReducer,
 }

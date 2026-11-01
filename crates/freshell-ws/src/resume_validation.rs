@@ -305,7 +305,17 @@ mod tests {
                 panic!("probe must not be consulted");
             }
         }
-        for mode in ["gemini", "kimi", "shell", "third-party"] {
+        // `antigravity` is the gate-DEFERRAL pin (plan Task 7, load-bearing
+        // A2): it stays OUT of `resume_gate.rs VALIDATED_PROVIDERS` until
+        // real-binary transcript-store evidence exists — a wrong record
+        // schema would make real conversations answer Absent and visibly
+        // SpawnFresh every restore with a misleading "not found on disk"
+        // notice. Until then a stale antigravity resume id passes through
+        // UNGATED (gemini-style): never blocked, never SpawnFresh-substituted
+        // — the CLI's own error surfaces in-pane. If antigravity ever joins
+        // VALIDATED_PROVIDERS, this row goes red (the probe consult panics)
+        // and forces the activation to be a deliberate, evidenced decision.
+        for mode in ["gemini", "kimi", "antigravity", "shell", "third-party"] {
             let out = validate_wire_resume(
                 mode,
                 Some("id".into()),

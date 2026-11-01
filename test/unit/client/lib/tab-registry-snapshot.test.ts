@@ -403,6 +403,7 @@ describe('pane identity stamping', () => {
         'term-alias': { terminalId: 'term-alias', phase: 'busy', updatedAt: 1 },
       },
       amplifierActivityByTerminalId: {},
+      antigravityActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
     })
 
@@ -416,6 +417,52 @@ describe('pane identity stamping', () => {
       `claude:${resumeId}`,
     ])
     expect(record.panes[0].payload.busySessionKeys).toEqual([`claude:${explicitId}`])
+  })
+
+  it('stamps an antigravity busy identity like a codex one (plan Task 8)', () => {
+    const convId = 'conv-agy-registry-1'
+    const tab = {
+      id: 'tab-agy',
+      createRequestId: 'req-tab-agy',
+      title: 'Tab AGY',
+      status: 'running',
+      mode: 'antigravity',
+      createdAt: 1,
+    } as unknown as Tab
+    const layout: PaneNode = {
+      type: 'leaf',
+      id: 'pane-agy',
+      content: {
+        kind: 'terminal',
+        createRequestId: 'req-pane-agy',
+        status: 'running',
+        mode: 'antigravity',
+        shell: 'system',
+        terminalId: 'term-agy',
+        sessionRef: { provider: 'antigravity', sessionId: convId },
+      },
+    }
+    const paneIdentityActivity = collectPaneIdentityActivity({
+      tabs: [tab],
+      paneLayouts: { 'tab-agy': layout },
+      codexActivityByTerminalId: {},
+      opencodeActivityByTerminalId: {},
+      claudeActivityByTerminalId: {},
+      amplifierActivityByTerminalId: {},
+      antigravityActivityByTerminalId: {
+        'term-agy': { terminalId: 'term-agy', phase: 'busy', updatedAt: 1 },
+      },
+      paneRuntimeActivityByPaneId: {},
+    })
+
+    const record = buildOpenTabRegistryRecord({
+      ...baseRecordInput(layout),
+      tab,
+      paneIdentityActivity,
+    })
+
+    expect(record.panes[0].payload.sessionKeys).toEqual([`antigravity:${convId}`])
+    expect(record.panes[0].payload.busySessionKeys).toEqual([`antigravity:${convId}`])
   })
 
   it('never stamps identity fields onto closed/tombstone records even when given a nonempty map', () => {

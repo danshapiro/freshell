@@ -222,7 +222,7 @@ function collectPaneRefs(
 
 /** Parse an unknown naming-ref-shaped value; undefined for anything else.
  * The session variant's provider is validated against the scoped-provider
- * whitelist (`NamedProviderSchema`: claude/codex/opencode) — never an
+ * whitelist (`NamedProviderSchema`: claude/codex/opencode/antigravity) — never an
  * unsound cast. This is the collector's single ingestion point, so an
  * out-of-scope coding CLI's pane (gemini/kimi/amplifier — `SessionLocator`
  * providers are arbitrary strings) can never produce a ref the server's

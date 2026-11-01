@@ -39,6 +39,7 @@ function activityInputs(state: RootState) {
     opencodeActivityByTerminalId: state.opencodeActivity.byTerminalId,
     claudeActivityByTerminalId: state.claudeActivity.byTerminalId,
     amplifierActivityByTerminalId: state.amplifierActivity.byTerminalId,
+    antigravityActivityByTerminalId: state.antigravityActivity.byTerminalId,
     paneRuntimeActivityByPaneId: state.paneRuntimeActivity.byPaneId,
     freshAgentSessions: state.freshAgent.sessions,
   }

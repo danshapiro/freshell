@@ -18,6 +18,7 @@
 
 mod ai_router;
 mod ai_title;
+mod antigravity_existence_by_id;
 mod attachments;
 mod auto_title;
 mod auto_title_sweep;
@@ -181,6 +182,17 @@ pub(crate) fn build_session_sources(
         ) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
         Arc::new(freshell_sessions::amplifier::AmplifierSource::new(
             freshell_sessions::amplifier::amplifier_home(home),
+        )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
+        // Fifth source: the Antigravity CLI (`agy`) native store —
+        // `AntigravitySource` over the resolved antigravity home (the
+        // `antigravity-cli` subtree of `~/.gemini`, `FRESHELL_ANTIGRAVITY_HOME`
+        // override honored; see
+        // `freshell_sessions::provider_layout::antigravity_home`). The home
+        // is resolved HERE (the wiring seam), never inside the layout or
+        // the source, so the watcher/source/existence roots share one
+        // resolution.
+        Arc::new(freshell_sessions::antigravity::AntigravitySource::new(
+            freshell_sessions::provider_layout::antigravity_home(home),
         )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
     ]
 }
@@ -1886,6 +1898,14 @@ async fn main() -> ExitCode {
                     layout: Box::new(freshell_sessions::provider_layout::AmplifierLayout),
                     home: freshell_sessions::amplifier::amplifier_home(&home),
                 },
+                // Fifth provider: AntigravityLayout — the two-base watch
+                // spec (the home NonRecursive, `brain` Recursive), the
+                // same resolved home the source and the existence roots
+                // use.
+                freshell_sessions::session_watcher::WatchedProvider {
+                    layout: Box::new(freshell_sessions::provider_layout::AntigravityLayout),
+                    home: freshell_sessions::provider_layout::antigravity_home(&home),
+                },
             ];
             let mut watcher = freshell_sessions::session_watcher::SessionWatcher::new(
                 Arc::clone(index),
@@ -1953,6 +1973,19 @@ async fn main() -> ExitCode {
         activity_hub.set_codex_rollout_locator(std::sync::Arc::new(move |session_id: &str| {
             freshell_ws::locate_codex_rollout(&codex_sessions_root, session_id)
         }));
+    }
+    // Antigravity plan Task 6: the hub-held antigravity association — the
+    // locator rooted at the resolved antigravity home's `brain/` tree (ONE
+    // resolution shared with the session watcher, `antigravity_home`) plus
+    // the per-pane input capture the hub's own ActivityEvent stream feeds.
+    // Its boot sweep is registered beside the codex/opencode locator sweeps
+    // below; `None` home (unresolvable HOME) skips the whole lane, mirroring
+    // the sibling locators' Option convention.
+    if let Some(home) = session_directory::provider_home() {
+        let antigravity_home = freshell_sessions::provider_layout::antigravity_home(&home);
+        activity_hub.set_antigravity_association(std::sync::Arc::new(
+            freshell_ws::antigravity_association::AntigravityAssociation::new(antigravity_home),
+        ));
     }
     // Task 10: the opencode SSE lane's production IO seams (reqwest impls;
     // fakes in tests). Unset would leave OpencodeAttach retire-only.
@@ -2103,6 +2136,10 @@ async fn main() -> ExitCode {
                                 "amplifier".to_string(),
                                 freshell_sessions::amplifier::amplifier_home(&h),
                             ),
+                            (
+                                "antigravity".to_string(),
+                                freshell_sessions::provider_layout::antigravity_home(&h),
+                            ),
                         ])
                     })
                     .unwrap_or_default(),
@@ -2149,6 +2186,25 @@ async fn main() -> ExitCode {
             let probe = match freshell_ws::codex_sessions_root() {
                 Some(codex_sessions_root) => probe.with_codex_rollout_locator(
                     existence::codex_rollout_existence_locator(codex_sessions_root),
+                ),
+                None => probe,
+            };
+            // Antigravity by-id fallback (plan Task 7): the SAME canonical
+            // `brain/<id>/.system_generated/logs/transcript.jsonl` raw
+            // check the attach arm (`agy --conversation <id>`) resolves —
+            // the index's AntigravitySource drops parse-failed transcripts,
+            // so a conversation dir on disk can answer a false warm Absent
+            // while the CLI would still resume it. CHEAP single-open check,
+            // so it joins the sync warm-Absent adjudication path
+            // (amplifier/opencode class, NOT codex's gate-only walk). The
+            // home is resolved with the SAME helper the provider_roots
+            // entry above uses. No resolvable provider home => probe
+            // behaves as today for antigravity.
+            let probe = match session_directory::provider_home() {
+                Some(h) => probe.with_antigravity_transcript_locator(
+                    existence::antigravity_transcript_locator(
+                        freshell_sessions::provider_layout::antigravity_home(&h),
+                    ),
                 ),
                 None => probe,
             };
@@ -2741,6 +2797,17 @@ async fn main() -> ExitCode {
     // Lane B2: codex locator sweep — same cadence as the sibling sweep.
     if codex_locator.is_some() {
         freshell_ws::codex_association::spawn_codex_locator_sweep(
+            ws_state.clone(),
+            LOCATOR_SWEEP_INTERVAL,
+        );
+    }
+    // Antigravity plan Task 6: the antigravity locator sweep — same cadence
+    // as the sibling sweeps. The association itself is hub-held (installed
+    // on the activity hub at construction); the sweep reads it back through
+    // `ws_state.activity`, so its whole lane no-ops when the home was
+    // unresolvable at boot.
+    if freshell_ws::antigravity_association::association_installed(&ws_state) {
+        freshell_ws::antigravity_association::spawn_antigravity_locator_sweep(
             ws_state.clone(),
             LOCATOR_SWEEP_INTERVAL,
         );

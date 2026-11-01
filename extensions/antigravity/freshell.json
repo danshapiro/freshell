@@ -1,0 +1,19 @@
+{
+  "name": "antigravity",
+  "version": "1.0.0",
+  "label": "Antigravity CLI",
+  "description": "Google's Antigravity CLI agent",
+  "category": "cli",
+  "cli": {
+    "command": "agy",
+    "envVar": "ANTIGRAVITY_CMD",
+    "resumeArgs": ["--conversation", "{{sessionId}}"],
+    "modelArgs": ["--model", "{{model}}"],
+    "effortArgs": ["--effort", "{{effort}}"],
+    "supportsModel": true,
+    "supportsEffort": true
+  },
+  "picker": {
+    "group": "agents"
+  }
+}

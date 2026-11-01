@@ -587,7 +587,7 @@ mod tests {
     #[test]
     fn all_bundled_manifests_validate_and_register_through_scan() {
         // Boot-path regression: the repo's extensions/ tree must survive the
-        // strict schema (all six are CLI-category today). Read-only: the
+        // strict schema (all seven are CLI-category today). Read-only: the
         // dir is only scanned, never written.
         let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../extensions"));
         let reg = ExtensionRegistry::scan(&[dir]);
@@ -595,8 +595,38 @@ mod tests {
         names.sort();
         assert_eq!(
             names,
-            ["amplifier", "claude", "codex", "gemini", "kimi", "opencode"],
+            [
+                "amplifier",
+                "antigravity",
+                "claude",
+                "codex",
+                "gemini",
+                "kimi",
+                "opencode"
+            ],
             "every bundled extension must validate under the strict schema"
+        );
+
+        // Task-3 follow-up (plan Step 5): the shipped antigravity manifest
+        // must COMPOSE into the client entry exactly as the client's resume
+        // command rendering consumes it — supportsResume derived from
+        // resume_args (:296-301) and the rendered template carrying the
+        // real-binary-validated `--conversation` flag (v1.4.10). Without
+        // this pin, an antigravity-specific break in the derivation or the
+        // scan would pass every other committed test.
+        let entry = reg
+            .to_client_registry()
+            .into_iter()
+            .find(|e| e["name"] == "antigravity")
+            .expect("antigravity client entry");
+        let cli = &entry["cli"];
+        assert_eq!(cli["supportsResume"], true, "entry: {entry}");
+        assert_eq!(cli["supportsModel"], true, "entry: {entry}");
+        assert_eq!(cli["supportsEffort"], true, "entry: {entry}");
+        assert_eq!(
+            cli["resumeCommandTemplate"],
+            serde_json::json!(["agy", "--conversation", "{{sessionId}}"]),
+            "entry: {entry}"
         );
     }
 
