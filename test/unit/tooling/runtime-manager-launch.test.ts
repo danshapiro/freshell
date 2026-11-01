@@ -74,6 +74,11 @@ afterEach(() => {
 })
 
 describe('runtime test script manager launches', () => {
+  beforeEach(() => {
+    // Each launch test selects its own route, independent of the outer runner.
+    vi.stubEnv('FRESHELL_RUST_TEST_SANDBOX', undefined)
+  })
+
   function mockSpawnResolvingChildren(): void {
     spawn.mockImplementation((command: string) => {
       const child = Object.assign(new EventEmitter(), { exitCode: null, killed: false })
@@ -149,7 +154,7 @@ describe('runtime test script manager launches', () => {
     expect(spawn).toHaveBeenCalledTimes(4)
   })
 
-  it.each(['0', 'true', ''])('keeps direct runtime dispatch for non-opt-in %j even with cloud configured', async value => {
+  it.each([undefined, '0', 'true', ''])('keeps direct runtime dispatch for non-opt-in %j even with cloud configured', async value => {
     vi.stubEnv('FRESHELL_RUST_TEST_SANDBOX', value)
     vi.stubEnv('FRESHELL_VITEST_BACKEND', 'cloud')
     vi.stubEnv('npm_execpath', fixture.pnpmCjs)
