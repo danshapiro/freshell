@@ -120,16 +120,8 @@ pub(crate) fn provider_launch_context_from_home_at_with_selected_roots(
             &["config.toml", "AGENTS.md", "skills", "rules"][..],
             ProviderPreparation::Codex {
                 approval_default: None,
-                tui_args: if mcp_enabled {
-                    managed_codex_mcp_args().ok_or("managed Codex MCP preparation unavailable")?
-                } else {
-                    Vec::new()
-                },
-                sidecar_args: if mcp_enabled {
-                    managed_codex_mcp_args().ok_or("managed Codex MCP preparation unavailable")?
-                } else {
-                    Vec::new()
-                },
+                tui_args: Vec::new(),
+                sidecar_args: Vec::new(),
             },
         ),
         "opencode" => (
@@ -372,6 +364,7 @@ pub(crate) fn with_managed_mcp_reference(
         ProviderPreparation::Codex {
             tui_args,
             sidecar_args,
+            ..
         } => {
             let args =
                 managed_codex_mcp_args().ok_or("managed Codex MCP preparation unavailable")?;
@@ -654,26 +647,82 @@ mod tests {
     #[test]
     fn managed_codex_provider_context_renders_tui_and_sidecar_mcp() {
         let workspace = tempfile::tempdir().unwrap();
+        let without_capability =
+            provider_launch_context_for_managed("codex", workspace.path(), None).unwrap();
+        let ProviderPreparation::Codex {
+            tui_args,
+            sidecar_args,
+            ..
+        } = &without_capability.preparation
+        else {
+            panic!("Codex preparation missing");
+        };
+        assert!(tui_args.is_empty());
+        assert!(sidecar_args.is_empty());
+        without_capability.validate("codex").unwrap();
+
         let capability = freshell_runtime_protocol::McpCapabilityReference {
             grant_id: "grant-fixture".into(),
             endpoint: "http://host.docker.internal:3001".into(),
             provider_relative_path: ".freshell/mcp-capability.json".into(),
             host_gateway_address: None,
         };
-        let context =
-            provider_launch_context_for_managed("codex", workspace.path(), Some(capability))
-                .unwrap();
+        let context = provider_launch_context_for_managed(
+            "codex",
+            workspace.path(),
+            Some(capability.clone()),
+        )
+        .unwrap();
+        assert_eq!(context.mcp_capability, Some(capability.clone()));
         let ProviderPreparation::Codex {
             tui_args,
             sidecar_args,
             ..
-        } = context.preparation
+        } = &context.preparation
         else {
             panic!("Codex preparation missing");
         };
         assert!(!tui_args.is_empty());
         assert_eq!(tui_args, sidecar_args);
         assert!(tui_args.iter().any(|arg| arg.contains("freshell-mcp")));
+        context.validate("codex").unwrap();
+
+        let approval_default = freshell_runtime_protocol::CodexApprovalDefault {
+            policy: "on-request".into(),
+            logical_source: workspace
+                .path()
+                .join(".codex/config.toml")
+                .to_string_lossy()
+                .into_owned(),
+            canonical_source: workspace
+                .path()
+                .join(".codex/config.toml")
+                .to_string_lossy()
+                .into_owned(),
+            source_sha256: "a".repeat(64),
+        };
+        let mut context = without_capability;
+        let ProviderPreparation::Codex {
+            approval_default: stored_approval_default,
+            ..
+        } = &mut context.preparation
+        else {
+            panic!("Codex preparation missing");
+        };
+        *stored_approval_default = Some(approval_default.clone());
+
+        let attached = with_managed_mcp_reference(context, capability.clone()).unwrap();
+
+        assert_eq!(attached.mcp_capability, Some(capability));
+        attached.validate("codex").unwrap();
+        let ProviderPreparation::Codex {
+            approval_default: preserved_approval_default,
+            ..
+        } = attached.preparation
+        else {
+            panic!("Codex preparation missing");
+        };
+        assert_eq!(preserved_approval_default, Some(approval_default));
     }
 
     #[test]
