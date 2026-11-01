@@ -1826,20 +1826,31 @@ close()
                     if reap_before_read {
                         assert!(child.wait().unwrap().success());
                     } else {
-                        let deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(2);
+                        // Wait for the kernel's exit acknowledgement without reaping.
+                        // A wall-clock spin makes fixture setup depend on scheduler load;
+                        // WNOWAIT preserves the exact zombie the capture must observe.
+                        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
                         loop {
-                            let (state, observed_start) = zombie_identity();
-                            assert_eq!(observed_start, start);
-                            if state == "Z" {
+                            let result = unsafe {
+                                libc::waitid(
+                                    libc::P_PID,
+                                    pid,
+                                    &mut info,
+                                    libc::WEXITED | libc::WNOWAIT,
+                                )
+                            };
+                            if result == 0 {
                                 break;
                             }
-                            assert!(
-                                std::time::Instant::now() < deadline,
-                                "normal exit did not reach zombie state"
+                            let error = std::io::Error::last_os_error();
+                            assert_eq!(
+                                error.kind(),
+                                std::io::ErrorKind::Interrupted,
+                                "wait for the fixture's unreaped exit: {error}"
                             );
-                            std::thread::yield_now();
                         }
+                        assert_eq!(unsafe { info.si_pid() }, pid as libc::pid_t);
+                        assert_eq!(zombie_identity(), ("Z".into(), start));
                     }
                     exited = true;
                 }
