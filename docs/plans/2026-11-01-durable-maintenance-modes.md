@@ -195,7 +195,7 @@ git commit -m "fix: restore managed provider qualification compilation"
 
 **Files:**
 - Modify: `crates/freshell-runtime-protocol/src/lib.rs`.
-- Modify: `crates/freshell-supervisor/src/main.rs`, `registry.rs`, `service.rs`, and `recovery.rs`.
+- Modify: `crates/freshell-supervisor/src/main.rs`, `registry.rs`, `service.rs`, `recovery.rs`, and `backend.rs`.
 - Modify: `crates/freshell-runtime-client/src/lib.rs`.
 - Create: `crates/freshell-runtime-client/src/bin/freshell-supervisor-admin.rs`.
 - Create: `crates/freshell-runtime-client/tests/supervisor_admin_legacy_peer.rs`.
@@ -216,6 +216,8 @@ Also add regression tests for the six findings from Task 2's independent review:
 - When an ordinary terminal has a saved native identity but no persisted `ResumeSpec` and no original resume argument, Reopen builds a provider-correct exact-resume workload for that identity; the host receives the resume and retained conversation history remains readable.
 - Exact-resume Reopen completes renewed provider preparation (`revoke`, `issue`, `activate`, `commit`) before success publication. Injected commit failure does not publish success.
 - Failures before container creation, after grant, and during provider commit settle the exact prepared replacement: retire never-created reservations; stop and verify created replacements before releasing authority; preserve explicit unresolved cleanup if verification fails; and permit retry after verified cleanup.
+- If a renewed capability was issued but no container was created and its revoke is pending, retry the recorded capability-only revoke without manufacturing an owned runtime handle or contacting Docker. Keep revision/incarnation unchanged and return pending until revoke settles; only then allow replacement.
+- If Docker create may have succeeded but its reply or identity commit was lost, do not infer VerifiedEmpty from missing committed Docker columns. Only a proven pre-create/definitive rejection can use the no-runtime release path; otherwise retain claims/reservations and explicit unresolved cleanup, block another replacement, and report the exact recovery state. Do not add a broad orphan-container sweeper.
 - A successful Reopen request replayed after a later Stop/recovery returns its original incarnation without creating or launching another one, regardless of current lifecycle state.
 - The schema-version behavior test executes the actual command-dispatch path with an injected/observable registry opener (or an isolated built-binary subprocess) and proves that the command reports the compiled version without trying to open/create a registry. It must fail if registry initialization is moved before command dispatch.
 
@@ -234,6 +236,8 @@ cargo test -p freshell-supervisor --lib service::tests::reopen_native_readiness_
 cargo test -p freshell-supervisor --lib service::tests::reopen_native_identity_without_resume_spec_builds_exact_resume_workload -- --exact
 cargo test -p freshell-supervisor --lib service::tests::reopen_resume_commits_provider_preparation_before_publish -- --exact
 cargo test -p freshell-supervisor --lib service::tests::reopen_failure_cleanup_retires_replacement_and_allows_retry -- --exact
+cargo test -p freshell-supervisor --lib service::tests::reopen_pending_no_runtime_revoke_retries_without_docker -- --exact
+cargo test -p freshell-supervisor --lib service::tests::reopen_uncertain_create_retains_authority_until_verified -- --exact
 cargo test -p freshell-supervisor --lib service::tests::reopen_success_replay_survives_later_stop -- --exact
 cargo test -p freshell-supervisor --bin freshell-supervisor tests::schema_version_startup_dispatch_never_opens_registry -- --exact
 ~~~
@@ -243,6 +247,8 @@ cargo test -p freshell-supervisor --bin freshell-supervisor tests::schema_versio
 Keep Reopen revision-fenced and migration-free. The candidate `schema-version` command prints compiled `SCHEMA_VERSION` without calling `Registry::open`. On Reopen, first retry/confirm the exact prior Stop and grant revocation. Pending returns at the unchanged stopped revision without committing a successful command association, creating an incarnation, or making the automatic primary view visible. After settlement, use the existing soul's saved context, provider store, and identity to create a new incarnation with the current runtime. In one transaction, commit the stopped-to-running CAS, successful command/digest/incarnation association, and restoration of the hidden automatic primary view. Check exact successful replay before the now-advanced revision. A fresh request ID may retry a pending revoke. Do not promise exact durable replay for failures or unavailable results.
 
 Keep the soul stopped and its automatic view hidden through preparation, grant delivery, provider-native observation, and provider-preparation commit. Carry the exact `reopen_prepared` attempt/incarnation/revision authority through native readiness checks; only that current attempt may pass the stopped-intent gate, and any newer Stop cancels it. If a stored native identity exists without a `ResumeSpec`, construct and validate the provider-specific exact-resume workload from the saved native identity, provider store, and saved launch settings before creating the replacement. Do not mistake an observation fence for provider resume arguments. Complete renewed provider preparation for resumed workloads before `finish_reopen`. On every failure after preparation, settle only the exact replacement: release unused reservation/claims if no runtime was created; stop and verify any created runtime before releasing authority; retain explicit unresolved cleanup state when verification is inconclusive. The stopped-to-running CAS, successful command/incarnation association, recovery/writer completion, and view visibility remain one final transaction. A matching successful command/digest replay returns its original incarnation before current lifecycle/revision validation, even if that incarnation later stops or is replaced; it causes no new launch or preparation.
+
+For a pending revoke on an exact no-runtime Reopen receipt, use a revision-fenced capability-only continuation; do not invent an `OwnedRuntimeHandle`, inspect/stop Docker, or create another incarnation. Return pending while callback revoke is unresolved and allow retry at the same stopped revision. For Docker create, carry explicit outcome certainty from the backend into failure settlement. Only an error proven to occur before creation, or a definitive backend rejection guaranteeing no container acquired the mounts, may release claims as `VerifiedEmpty`. A create with uncertain outcome or a created container whose registry identity was not committed remains blocked with claims/reservations and explicit unresolved cleanup; do not infer absence from null identity columns and do not introduce a general orphan scanner.
 
 Build the supervisor admin CLI over the runtime-client private control socket. Accept owner-selected socket and secret-file paths, never secret values; return typed machine-readable output; do not use HTTP. Keep old protocol-v2 Health/Inventory/Stop shapes byte-compatible. Additive Reopen is sent only after the updated supervisor is listening.
 
@@ -255,7 +261,7 @@ Refactor request validation, replay lookup, revocation settlement, incarnation c
 - [ ] **Step 4: Commit the task**
 
 ~~~bash
-git add crates/freshell-runtime-protocol/src/lib.rs crates/freshell-supervisor/src/main.rs crates/freshell-supervisor/src/registry.rs crates/freshell-supervisor/src/service.rs crates/freshell-supervisor/src/recovery.rs crates/freshell-runtime-client/src/lib.rs crates/freshell-runtime-client/src/bin/freshell-supervisor-admin.rs crates/freshell-runtime-client/tests/supervisor_admin_legacy_peer.rs
+git add crates/freshell-runtime-protocol/src/lib.rs crates/freshell-supervisor/src/main.rs crates/freshell-supervisor/src/registry.rs crates/freshell-supervisor/src/service.rs crates/freshell-supervisor/src/recovery.rs crates/freshell-supervisor/src/backend.rs crates/freshell-runtime-client/src/lib.rs crates/freshell-runtime-client/src/bin/freshell-supervisor-admin.rs crates/freshell-runtime-client/tests/supervisor_admin_legacy_peer.rs
 git commit -m "feat: add managed runtime reopen control"
 ~~~
 
@@ -407,5 +413,6 @@ git commit -m "feat: complete managed runtime update integration"
 - The plan preserves the After-only service relation, owner-derived artifact manifest, explicit Docker socket, destination-filesystem staging, two-rename client swap, transient worker/lock/log design, exact reset-only approval, caller-loss completion, forward-recovery-only failure handling, and the accepted interruption/history tradeoff. No test claims to certify installed systemd wiring and no README change is planned.
 - Task 2's implementation review found six Important gaps in real provider startup/resume, preparation commit, failure cleanup, successful replay after later lifecycle changes, and startup-path schema coverage. Task 2 now requires provider-stub regressions for each finding before it can pass task review; these findings remain open until a fixer commit and independent re-review clear them.
 - Task 2 ownership includes `recovery.rs` because independent review proved stopped-intent cancellation occurs in the native-readiness path there; the fix must allow only the exact prepared Reopen attempt through that existing gate.
+- Task 2 review re-review left two Important R4 subfindings: retrying pending revoke for an uncreated replacement without Docker, and distinguishing uncertain Docker-create outcomes from proven no-create. The task now includes backend outcome evidence, exact regressions, and a no-orphan-sweeper constraint.
 - This amendment is plan-only. Do not run tests, builds, or service operations while reconciling it; review the diff and whitespace, preserve the User Request hash, and commit the plan correction only.
 ---
