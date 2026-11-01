@@ -33,7 +33,7 @@ import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { randomUUID } from 'node:crypto'
-import { stopFixtureProcessThen } from '../../support/stop-fixture-process.ts'
+import { stopFixtureProcessThen } from '../../support/stop-fixture-process.js'
 import { createClaudeFixture, FAKE_MODEL, resolvePinnedClaude, startLocalProvider } from './claude-local-provider.mjs'
 
 const repoRoot = process.argv[2]
@@ -158,8 +158,8 @@ async function runScenario(name, spec) {
   let provider
   let sidecar
   let sidecarExit
-  // Resolves when the directly started sidecar exits; teardown waits for it
-  // before touching the fixture.
+  // Resolves when the sidecar exits; cleanup also joins its stdio close and
+  // the native CLI PID before touching the fixture.
   let exited = Promise.resolve()
   let failure
   let settingsLocal = null
@@ -183,6 +183,7 @@ async function runScenario(name, spec) {
       env: fixture.env(provider.url, { CLAUDE_CMD: pinned.nativeCli, FRESHELL_CLAUDE_ONECLI_API_KEY: '1', npm_config_update_notifier: 'false' }),
       stdio: ['pipe', 'pipe', 'pipe'],
     })
+    fixture.ownProcess(sidecar)
     sidecar.stdin.on('error', () => {})
     exited = new Promise((resolve) => sidecar.once('exit', (code, signal) => { sidecarExit = { code, signal }; resolve() }))
     createInterface({ input: sidecar.stderr }).on('line', () => {})
@@ -213,6 +214,7 @@ async function runScenario(name, spec) {
     const created = await waitFor((frame) => frame.requestId === requestId && (frame.type === 'created' || frame.type === 'create.failed'), 'created')
     if (created.type !== 'created') throw new Error(`the sidecar refused the create: ${created.message}`)
     if (created.sessionId !== nativeSessionId) throw new Error('the sidecar changed the requested native session identity')
+    await fixture.ownProcessId(created.cliPid)
     sessionId = created.sessionId
     if (spec.plan) {
       send({ type: 'configure', sessionId, requestId: 'to-plan', settings: { permissionMode: 'plan' } })
@@ -250,10 +252,20 @@ async function runScenario(name, spec) {
       const childExited = !sidecar || sidecar.exitCode !== null || sidecar.signalCode !== null
       if (!childExited) {
         failure ??= 'the sidecar did not exit; its fixture was retained'
-        log('error', 'sidecar.stop_failed', { scenario: name, error: detail })
+        log('error', 'sidecar.stop_failed', {
+          scenario: name,
+          error: detail,
+          fixtureRoot: fixture.root,
+          sidecarPid: sidecar?.pid ?? null,
+        })
       } else {
         failure ??= `fixture cleanup failed: ${detail}`
-        log('error', 'fixture.cleanup_failed', { scenario: name, error: detail })
+        log('error', 'fixture.cleanup_failed', {
+          scenario: name,
+          error: detail,
+          fixtureRoot: fixture.root,
+          sidecarPid: sidecar?.pid ?? null,
+        })
       }
     } finally {
       await closeProvider()

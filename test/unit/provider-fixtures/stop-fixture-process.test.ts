@@ -87,4 +87,41 @@ describe('stopFixtureProcess', () => {
     expect(child.listenerCount('exit')).toBe(0)
     expect(vi.getTimerCount()).toBe(0)
   })
+
+  it('runs fixture cleanup after the captured child confirms exit', async () => {
+    vi.useFakeTimers()
+    const child = new FakeFixtureProcess()
+    const events: string[] = []
+    child.onTerm = () => setTimeout(() => {
+      events.push('child exited')
+      child.exit('SIGTERM')
+    }, 10)
+    const cleanup = vi.fn(async () => { events.push('fixture cleanup') })
+
+    const stopping = stopFixtureProcessThen(child, cleanup, { gracefulTimeoutMs: 50, forceTimeoutMs: 50 })
+    await vi.advanceTimersByTimeAsync(10)
+    await stopping
+
+    expect(events).toEqual(['child exited', 'fixture cleanup'])
+    expect(cleanup).toHaveBeenCalledOnce()
+    expect(child.listenerCount('exit')).toBe(0)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('propagates a fixture cleanup error after the captured child exits', async () => {
+    vi.useFakeTimers()
+    const child = new FakeFixtureProcess()
+    child.onTerm = () => setTimeout(() => child.exit('SIGTERM'), 10)
+    const cleanupError = new Error('fixture cleanup failed')
+
+    const stopping = stopFixtureProcessThen(child, async () => { throw cleanupError }, {
+      gracefulTimeoutMs: 50,
+      forceTimeoutMs: 50,
+    })
+    const rejected = expect(stopping).rejects.toBe(cleanupError)
+    await vi.advanceTimersByTimeAsync(10)
+    await rejected
+    expect(child.listenerCount('exit')).toBe(0)
+    expect(vi.getTimerCount()).toBe(0)
+  })
 })
