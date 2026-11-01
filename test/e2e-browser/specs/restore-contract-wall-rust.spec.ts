@@ -2369,8 +2369,8 @@ test.describe('Restore Contract Wall (P0.1)', () => {
   })
 
   test('two-clients-same-sessionRef: duplicate respawn must yield exactly 1 PTY', async ({ browser }) => {
-    // Cloud (2-worker shard) wall-clock: SIGKILL + dual-client recovery + a
-    // stable-count settle on the arg log exceeds the describe-level 180s.
+    // Keep the existing owned-server startup/restart watchdog. Recovery
+    // completion below is acknowledged by each client, not a quiet period.
     test.setTimeout(300_000)
     // P1.7 (D8, §4.3) LANDED -- pin flipped by the reconcile-client-adoption
     // lane: the server now runs a per-sessionRef single-flight lease on the
@@ -2404,16 +2404,73 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     // newClientContext).
     installRecoveryOfferAutoDeclineOnContext(contextB)
     const pageB = await contextB.newPage()
+    const readSessionAttachment = (clientPage: Page, tabId: string) => clientPage.evaluate(
+      ({ currentTabId, sessionId }) => {
+        const api = window.__FRESHELL_TEST_HARNESS__!
+        const state = api.getState()
+        const leaf = state.panes.layouts[currentTabId] as any
+        const content = leaf?.content
+        const terminalId = content?.terminalId ?? null
+        const paneKey = `${currentTabId}:${leaf?.id}`
+        const sent = (api.getSentWsMessages?.() ?? []) as any[]
+        const received = (api.getReceivedWsMessages?.() ?? []) as any[]
+        const latestAttach = [...sent].reverse().find((frame) =>
+          frame.type === 'terminal.attach' && frame.terminalId === terminalId)
+        const latestReconcile = [...sent].reverse().find((frame) =>
+          frame.type === 'pane.reconcile.request'
+          && frame.panes?.some((pane: any) => pane.paneKey === paneKey))
+        const unsettledCreates = sent.filter((frame) =>
+          frame.type === 'terminal.create' && frame.tabId === currentTabId
+          && !received.some((reply) =>
+            (reply.type === 'terminal.created' || reply.type === 'error')
+            && reply.requestId === frame.requestId))
+          .map((frame) => frame.requestId)
+        return {
+          bootId: state.connection.bootId,
+          connected: api.getWsReadyState() === 'ready',
+          terminalId,
+          sessionId: content?.sessionRef?.sessionId,
+          status: content?.status,
+          pendingReconcile: content?.pendingReconcile !== undefined
+            || state.panes.reconcilePendingPanes?.[paneKey] !== undefined,
+          reconcileId: latestReconcile?.reconcileId ?? null,
+          reconcileSettled: !latestReconcile || received.some((frame) =>
+            frame.type === 'pane.reconcile.result' && frame.reconcileId === latestReconcile.reconcileId),
+          attached: typeof latestAttach?.attachRequestId === 'string' && received.some((frame) =>
+            frame.type === 'terminal.attach.ready'
+            && frame.terminalId === terminalId
+            && frame.attachRequestId === latestAttach.attachRequestId),
+          unsettledCreates,
+          hasResumedOutput: terminalId !== null
+            && (api.getTerminalBuffer(terminalId) ?? '').replace(/\n/g, '')
+              .includes(`codex: resumed session ${sessionId}`),
+        }
+      },
+      { currentTabId: tabId, sessionId: CODEX_SESSION_ID },
+    )
+    const expectAttached = (snapshot: Awaited<ReturnType<typeof readSessionAttachment>>) => {
+      expect(snapshot).toMatchObject({
+        connected: true,
+        sessionId: CODEX_SESSION_ID,
+        status: 'running',
+        pendingReconcile: false,
+        reconcileSettled: true,
+        attached: true,
+        unsettledCreates: [],
+        hasResumedOutput: true,
+      })
+      expect(snapshot.terminalId).toBeTruthy()
+    }
     try {
       // Client A opens the seeded session from the sidebar.
       await selectShellIfPickerShowing(page)
       await page.getByText(SESSION_TITLE, { exact: false }).first().click()
       const tabIdA = (await harness.getActiveTabId())!
-      await expect
-        .poll(async () => (await harness.getPaneLayout(tabIdA))?.content?.sessionRef?.sessionId ?? null, {
-          timeout: 20_000,
-        })
-        .toBe(CODEX_SESSION_ID)
+      // The CLI writes its argv before this marker. Await the actual
+      // attached launch so its late startup cannot enter the respawn count.
+      await expect(async () => {
+        expectAttached(await readSessionAttachment(page, tabIdA))
+      }).toPass({ timeout: 20_000 })
 
       // Client B (separate context = separate localStorage) does the same.
       await pageB.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
@@ -2423,42 +2480,62 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       await selectShellIfPickerShowing(pageB)
       await pageB.getByText(SESSION_TITLE, { exact: false }).first().click()
       const tabIdB = (await harnessB.getActiveTabId())!
-      await expect
-        .poll(async () => (await harnessB.getPaneLayout(tabIdB))?.content?.sessionRef?.sessionId ?? null, {
-          timeout: 20_000,
-        })
-        .toBe(CODEX_SESSION_ID)
+      await expect(async () => {
+        const [clientA, clientB] = await Promise.all([
+          readSessionAttachment(page, tabIdA),
+          readSessionAttachment(pageB, tabIdB),
+        ])
+        expectAttached(clientA)
+        expectAttached(clientB)
+      }).toPass({ timeout: 20_000 })
 
+      const bootIdBeforeKill = await harness.getBootId()
+      expect(await harnessB.getBootId()).toBe(bootIdBeforeKill)
       const argvCountBeforeKill = (await readArgvLog(argLogPath)).length
+      // Every receipt used for recovery must now belong to the new boot.
+      for (const clientPage of [page, pageB]) {
+        await clientPage.evaluate(() => {
+          const api = window.__FRESHELL_TEST_HARNESS__!
+          api.clearSentWsMessages?.()
+          api.clearReceivedWsMessages?.()
+        })
+      }
 
       // --- SIGKILL; both live clients race to respawn the same sessionRef. ---
       await server.restartAbrupt()
       await waitForWsReady(page)
       await waitForWsReady(pageB)
 
-      // Let both recovery rounds fully settle before counting.
-      const countRespawns = async () =>
-        (await readArgvLog(argLogPath))
+      // Both clients must finish their own recovery requests and attach to
+      // the same live terminal on the new boot. A 5-second quiet argv log
+      // could pass while one client was still waiting to begin recovery.
+      await expect(async () => {
+        const [clientA, clientB] = await Promise.all([
+          readSessionAttachment(page, tabIdA),
+          readSessionAttachment(pageB, tabIdB),
+        ])
+        expectAttached(clientA)
+        expectAttached(clientB)
+        expect(clientA.bootId).toBeTruthy()
+        expect(clientA.bootId).not.toBe(bootIdBeforeKill)
+        expect(clientB.bootId).toBe(clientA.bootId)
+        expect(clientA.reconcileId).toBeTruthy()
+        expect(clientB.reconcileId).toBeTruthy()
+        expect(clientB.terminalId).toBe(clientA.terminalId)
+
+        const response = await fetch(`${info.baseUrl}/api/terminals`, {
+          headers: restApiHeaders(info),
+        })
+        expect(response.ok).toBe(true)
+        const terminals = await response.json() as Array<{ terminalId: string; mode: string; status: string }>
+        const runningCodex = terminals.filter((terminal) =>
+          terminal.mode === 'codex' && terminal.status === 'running')
+        expect(runningCodex.map((terminal) => terminal.terminalId)).toEqual([clientA.terminalId])
+        const resumedLaunches = (await readArgvLog(argLogPath))
           .slice(argvCountBeforeKill)
-          .filter((e) => hasResumePair(e.argv, CODEX_SESSION_ID)).length
-      await expect
-        .poll(countRespawns, { timeout: 45_000 })
-        .toBeGreaterThan(0)
-      // STABLE-COUNT settle (not a fixed sleep): accept only when two samples
-      // >=5s apart agree, so a tail-latency straggler cannot make the count
-      // read 1 spuriously. Under the pre-lease bug the stable count was 2;
-      // with sessionRef single-flight landed it must be exactly 1.
-      await expect
-        .poll(
-          async () => {
-            const first = await countRespawns()
-            await page.waitForTimeout(5_000)
-            const second = await countRespawns()
-            return second === first ? second : null
-          },
-          { timeout: 60_000 },
-        )
-        .not.toBeNull()
+          .filter((entry) => hasResumePair(entry.argv, CODEX_SESSION_ID))
+        expect(resumedLaunches).toHaveLength(1)
+      }).toPass({ timeout: 60_000 })
 
       // TARGET CONTRACT (§4.3 multi-client single-flight): EXACTLY 1 PTY.
       const respawns = (await readArgvLog(argLogPath))
