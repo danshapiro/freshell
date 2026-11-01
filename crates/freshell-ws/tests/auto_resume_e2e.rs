@@ -19,19 +19,22 @@ use freshell_ws::WsState;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-/// A claude-shaped CLI spec whose command appends one line to `count_file`
-/// per invocation (O_APPEND — atomic for single lines), then exits 1: every
-/// generation crashes, so the hub burns its full retry budget.
+/// A claude-shaped CLI spec that crashes each generation only after the test
+/// observes its create/replacement receipt. Immediate exits can overtake the
+/// create reply, causing that reply's frame drain to discard recovery frames.
 fn counting_crashing_claude_spec(
     count_file: &std::path::Path,
+    release_dir: &std::path::Path,
 ) -> freshell_platform::CliCommandSpec {
-    let script_path = std::env::temp_dir().join(format!(
-        "freshell-auto-resume-e2e-counting-shim-{}.sh",
-        std::process::id()
-    ));
+    let script_path = release_dir.join("counting-shim.sh");
     let script = format!(
-        "#!/bin/sh\necho x >> \"{count}\"\nexit 1\n",
-        count = count_file.display()
+        "#!/bin/sh\n\
+         echo x >> \"{count}\"\n\
+         generation=$(( $(wc -l < \"{count}\") ))\n\
+         while [ -d \"{release_dir}\" ] && [ ! -e \"{release_dir}/release-$generation\" ]; do sleep 0.05; done\n\
+         exit 1\n",
+        count = count_file.display(),
+        release_dir = release_dir.display(),
     );
     write_executable(&script_path, &script);
     claude_spec(&script_path)
@@ -264,112 +267,101 @@ fn spawn_count(count_file: &std::path::Path) -> usize {
         .unwrap_or(0)
 }
 
-/// (a) 3 spawns (1 + 2 retries), (b) `terminal.status{recovering, attempt:1}`
-/// and `terminal.replaced{attempt:1}` observed on a subscribed ws client,
-/// (c) the newest terminal for the createRequestId settles `exited` and no
-/// further spawns occur for 500ms.
+/// Three explicit crashes exhaust the two-retry budget. Each crash follows
+/// the receipt for its own generation, and the typed exhaustion receipt closes
+/// the assertion window without guessing how long recovery should take.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(unix)]
 async fn crashing_agent_is_resumed_twice_then_settles_exited() {
-    let count_file = std::env::temp_dir().join(format!(
-        "freshell-auto-resume-e2e-count-{}.txt",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&count_file);
-    let (url, registry) = common::spawn_server_with_specs_and_auto_resume_hub(
-        vec![counting_crashing_claude_spec(&count_file)],
+    let fixture = tempfile::tempdir().expect("crash fixture");
+    let count_file = fixture.path().join("spawns.txt");
+    // A deliberate crash stays short-lived in the hub's policy model even
+    // when its real child waits under pressure for the client-side receipt.
+    // The fixture still forwards actual PTY exit events, including IDs,
+    // exit codes, and ownership fences; only this test's age is controlled.
+    let (url, registry) = common::spawn_server_with_fixed_crash_lifetime(
+        vec![counting_crashing_claude_spec(&count_file, fixture.path())],
         vec![50, 100],
+        0,
     )
     .await;
     let (mut ws, _inv) = common::connect_and_capture_inventory(&url).await;
+    let release_crash = |generation| {
+        std::fs::write(
+            fixture.path().join(format!("release-{generation}")),
+            b"released\n",
+        )
+        .expect("release the observed generation's crash");
+    };
 
     let create_request_id = "req-e2e-crashy";
     let (old_tid, _session_id) = create_claude_terminal(&mut ws, create_request_id).await;
+    release_crash(1);
 
-    // (b) The broadcast recovery frames, in order: recovering attempt 1 for
-    // the crashed terminal, then replaced attempt 1 naming its successor.
-    // DEFLAKE: FRAME_BUDGET (30s) replaces the old 10s frame budget, with one
-    // FRESH deadline per wait_frame_matching stage (per-stage budget) — a
-    // single Instant shared by the recovering+replaced stages could expire
-    // after the recovering stage consumed most of it under extreme scheduling
-    // lag (certification run 9 of task2-certify.log, 2026-09-02). Assertions
-    // unchanged (see the constant's doc comment).
-    let recovering = wait_frame_matching(
+    let mut current_tid = old_tid;
+    for attempt in 1..=2 {
+        let recovering = wait_frame_matching(
+            &mut ws,
+            "terminal.status{recovering}",
+            tokio::time::Instant::now() + common::FRAME_BUDGET,
+            |v| v["type"] == "terminal.status" && v["status"] == "recovering",
+        )
+        .await;
+        assert_eq!(recovering["terminalId"], serde_json::json!(current_tid));
+        assert_eq!(recovering["attempt"], serde_json::json!(attempt));
+        assert_eq!(recovering["maxAttempts"], serde_json::json!(2));
+        assert_eq!(recovering["exitCode"], serde_json::json!(1));
+        let reason = recovering["reason"].as_str().expect("reason string");
+        assert!(
+            reason.contains("claude crashed") && reason.contains(&format!("attempt {attempt}/2")),
+            "unexpected reason: {reason}"
+        );
+        let replaced = wait_frame_matching(
+            &mut ws,
+            "terminal.replaced",
+            tokio::time::Instant::now() + common::FRAME_BUDGET,
+            |v| v["type"] == "terminal.replaced",
+        )
+        .await;
+        assert_eq!(replaced["oldTerminalId"], serde_json::json!(current_tid));
+        assert_eq!(replaced["attempt"], serde_json::json!(attempt));
+        assert_eq!(replaced["maxAttempts"], serde_json::json!(2));
+        let replacement = replaced["newTerminalId"]
+            .as_str()
+            .expect("newTerminalId")
+            .to_string();
+        assert_ne!(replacement, current_tid);
+        current_tid = replacement;
+        release_crash(attempt + 1);
+    }
+
+    // The hub's exhaustion receipt proves it processed the final exit and
+    // chose to settle. A raw registry exit or a fixed sleep does not prove
+    // that the recovery decision has run.
+    let settled = wait_frame_matching(
         &mut ws,
-        "terminal.status{recovering}",
+        "terminal.status{exited, reason:exhaustion}",
         tokio::time::Instant::now() + common::FRAME_BUDGET,
-        |v| v["type"] == "terminal.status" && v["status"] == "recovering",
+        |v| {
+            v["type"] == "terminal.status"
+                && v["status"] == "exited"
+                && matches!(
+                    v["reason"].as_str(),
+                    Some("retries_exhausted" | "respawn_cap_exhausted")
+                )
+        },
     )
     .await;
-    assert_eq!(recovering["terminalId"], serde_json::json!(old_tid));
-    assert_eq!(recovering["attempt"], serde_json::json!(1));
-    // Council 7w4h/xkhx: the client renders from these typed FIELDS — the
-    // reason prose below is purely presentational.
-    assert_eq!(recovering["maxAttempts"], serde_json::json!(2));
-    assert_eq!(recovering["exitCode"], serde_json::json!(1));
-    let reason = recovering["reason"].as_str().expect("reason string");
-    assert!(
-        reason.contains("claude crashed") && reason.contains("attempt 1/2"),
-        "unexpected reason: {reason}"
-    );
-    let replaced = wait_frame_matching(
-        &mut ws,
-        "terminal.replaced",
-        tokio::time::Instant::now() + common::FRAME_BUDGET,
-        |v| v["type"] == "terminal.replaced",
-    )
-    .await;
-    assert_eq!(replaced["oldTerminalId"], serde_json::json!(old_tid));
-    assert_eq!(replaced["attempt"], serde_json::json!(1));
-    assert_eq!(replaced["maxAttempts"], serde_json::json!(2));
-    let first_replacement = replaced["newTerminalId"]
-        .as_str()
-        .expect("newTerminalId")
-        .to_string();
-    assert_ne!(first_replacement, old_tid);
-
-    // (a) 3 spawns total: the original + 2 retries.
-    // DEFLAKE: FRAME_BUDGET (30s) replaces the old 5s poll deadline; the 25ms
-    // interval paces (unchanged) — see the constant's doc comment.
-    let deadline = std::time::Instant::now() + common::FRAME_BUDGET;
-    while spawn_count(&count_file) < 3 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "expected 3 spawns, saw {} before the deadline",
-            spawn_count(&count_file)
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert_eq!(spawn_count(&count_file), 3);
-
-    // (c) The newest generation for the createRequestId settles exited...
-    // DEFLAKE: FRAME_BUDGET (30s) replaces the old 5s poll deadline; the 25ms
-    // interval paces (unchanged) — see the constant's doc comment.
-    let deadline = std::time::Instant::now() + common::FRAME_BUDGET;
-    loop {
-        let newest = registry
-            .newest_by_create_request_id(create_request_id)
-            .expect("a generation exists for the createRequestId");
-        let status = registry.probe(&newest).expect("newest row remains").status;
-        if status == freshell_protocol::TerminalRunStatus::Exited {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "newest generation never settled exited"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    // ...and the budget is spent: no further spawns for 500ms.
-    // DEFLAKE-keep (the-usual test-flake-hardening): this negative window
-    // stays at 500ms — a late respawn under load only makes the window MORE
-    // likely to catch it (load-SAFE direction), so there is no false-fail
-    // pressure to widen (2026-09 host-pressure-pane receipts).
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(settled["terminalId"], serde_json::json!(current_tid));
+    assert_eq!(settled["exitCode"], serde_json::json!(1));
+    assert_eq!(spawn_count(&count_file), 3, "original plus exactly two retries");
     assert_eq!(
-        spawn_count(&count_file),
-        3,
-        "settled terminal must not respawn again"
+        registry.newest_by_create_request_id(create_request_id),
+        Some(current_tid.clone()),
+    );
+    assert_eq!(
+        registry.probe(&current_tid).expect("newest row remains").status,
+        freshell_protocol::TerminalRunStatus::Exited,
     );
 }
 
