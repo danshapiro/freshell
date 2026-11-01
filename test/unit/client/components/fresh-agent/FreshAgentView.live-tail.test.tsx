@@ -374,6 +374,24 @@ describe('FreshAgentView live transcript (transcript-live D5)', () => {
 })
 
 describe('provider notices (transcript-live D6)', () => {
+  it('keeps routine notice details until the user finishes reading', async () => {
+    serve(() => claudeSnapshot([userTurn('u-user', 'question')]))
+    const store = createStore()
+    await mount(store)
+    const message = 'Code rewound successfully. '.repeat(20).trim()
+    deliver(store, { type: 'freshAgent.notice', level: 'info', code: 'REWOUND', message })
+    const summary = screen.getByText('Notice details').closest('summary')!
+    fireEvent.click(summary)
+    await advance(0)
+    expect(summary.closest('details')).toHaveAttribute('open')
+    await advance(10_000)
+    expect(screen.getByText(message)).toBeVisible()
+    fireEvent.click(summary)
+    await advance(0)
+    await advance(6_001)
+    expect(screen.queryByText(message)).not.toBeInTheDocument()
+  })
+
   it('keeps expanded provider diagnostics until the user finishes reading', async () => {
     serve(() => claudeSnapshot([userTurn('u-user', 'question')]))
     const store = createStore()

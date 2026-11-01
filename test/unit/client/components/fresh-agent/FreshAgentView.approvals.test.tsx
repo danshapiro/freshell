@@ -403,6 +403,25 @@ it('keeps keyboard disclosure activation out of the composer', async () => {
  expect(responds()).toEqual([])
 })
 
+it('funnels letters from top-stack controls while leaving Space and Enter for activation', async () => {
+  serve(CLAUDE, [{ requestId: 'command', toolName: 'Bash', input: { command: 'echo '.repeat(500) } }])
+  await mount(createStore(CLAUDE))
+  const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+  for (const control of [screen.getByText('Command details'), screen.getByRole('button', { name: 'Allow tool use' })]) {
+    control.focus()
+    for (const key of [' ', 'Enter']) {
+      const event = createEvent.keyDown(control, { key })
+      fireEvent(control, event)
+      expect(event.defaultPrevented).toBe(false)
+      expect(control).toHaveFocus()
+    }
+    fireEvent.keyDown(control, { key: 'x' })
+    expect(composer).toHaveFocus()
+  }
+  expect(composer).toHaveValue('xx')
+  expect(responds()).toEqual([])
+})
+
 it('keeps question and elicitation inputs visible outside closed diagnostics', async () => {
  apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
   ...snapshot(CLAUDE,[],1),

@@ -142,6 +142,38 @@ describe('FreshAgentDiffPanel', () => {
     composer.remove()
   })
 
+  it.each([false, true])('contains Tab when focus starts on the body or a non-control (shift=%s)', async shift => {
+    const user = userEvent.setup()
+    render(<><button>Underlying page</button><FreshAgentDiffPanel diffs={[{ id: 'one', path: '/one' }]} /></>)
+    await user.click(screen.getByRole('button', { name: /^Diffs:/ }))
+    const dialog = screen.getByRole('dialog', { name: 'Changes' })
+    const expected = screen.getByRole('button', { name: shift ? 'Diff: /one' : 'Close', exact: true })
+    for (const origin of [document.body, dialog]) {
+      dialog.tabIndex = -1
+      ;(document.activeElement as HTMLElement).blur()
+      if (origin === dialog) dialog.focus()
+      expect(document.activeElement).toBe(origin)
+      await user.tab({ shift })
+      expect(expected).toHaveFocus()
+    }
+  })
+
+  it('stays closed and leaves the draft focused after diffs clear and return', async () => {
+    const user = userEvent.setup()
+    const diffs = [{ id: 'native', diff: '@@ -1 +1 @@\n-old\n+new' }]
+    const { rerender } = render(<><textarea aria-label="Draft" /><FreshAgentDiffPanel scopeKey="same" diffs={diffs} /></>)
+    await user.click(screen.getByRole('button', { name: /^Diffs:/ }))
+    expect(screen.getByRole('dialog')).toBeVisible()
+    rerender(<><textarea aria-label="Draft" /><FreshAgentDiffPanel scopeKey="same" diffs={[]} /></>)
+    expect(screen.queryByRole('dialog')).toBeNull()
+    const draft = screen.getByRole('textbox', { name: 'Draft' })
+    await user.type(draft, 'Keep typing')
+    rerender(<><textarea aria-label="Draft" /><FreshAgentDiffPanel scopeKey="same" diffs={diffs} /></>)
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(draft).toHaveFocus()
+    expect(draft).toHaveValue('Keep typing')
+  })
+
   it('closes and drops old fetched content when the conversation scope changes', async () => {
     apiGet.mockResolvedValueOnce({ diff: '+old-session' }).mockResolvedValueOnce({ diff: '+new-session' })
     const diffs = [{ id: 'same', path: '/same' }]

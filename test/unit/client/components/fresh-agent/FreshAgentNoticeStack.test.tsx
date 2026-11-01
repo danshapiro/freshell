@@ -23,6 +23,21 @@ it('keeps reconciliation and owner transition visible in the compact status row'
  expect(screen.getByRole('status',{name:'Agent notices'}).querySelector('details')).toBeNull()
 })
 
+it('expands prominent-only status to real readable content', async () => {
+ const user = userEvent.setup()
+ const text = 'Session identity corrected by server — this pane now points at its live session.'
+ render(<FreshAgentNoticeStack notices={[{id:'reconciliation',text,prominent:true}]} errors={[]} />)
+ const status = screen.getByRole('status', {name:'Agent notices'})
+ const summary = status.querySelector('summary')
+ expect(summary).not.toBeNull()
+ expect(summary).toHaveTextContent(text)
+ const body = status.querySelector('.fresh-agent-diagnostic-body')!
+ expect(body).not.toBeVisible()
+ await user.click(summary!)
+ expect(body).toBeVisible()
+ expect(body).toHaveTextContent(text)
+})
+
 it('names warning disclosures with the message while announcing warning severity', () => {
  const summary = 'Model catalog unavailable — try again'
  render(<FreshAgentNoticeStack notices={[]} errors={[{id:'notice',summary,level:'warning',content:<p>Provider diagnostics</p>}]} />)

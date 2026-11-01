@@ -375,6 +375,12 @@ for (const [name, diffs, label] of [
   await expect(dialog.getByRole('button', { name: 'Close', exact: true })).toBeFocused()
   await page.keyboard.press('Shift+Tab')
   await expect(controls.last()).toBeFocused()
+  for (const shift of [false, true]) {
+    await dialog.locator('h2').click()
+    await expect.poll(() => page.evaluate(() => document.activeElement?.tagName)).toBe('BODY')
+    await page.keyboard.press(shift ? 'Shift+Tab' : 'Tab')
+    await expect(shift ? controls.last() : dialog.getByRole('button', { name: 'Close', exact: true })).toBeFocused()
+  }
   if (name === 'native patch') {
     const comment = dialog.getByRole('button', { name: 'Comment on this line for the agent' }).last()
     await hitAndClick(comment)
@@ -400,6 +406,12 @@ for (const [name, diffs, label] of [
   await page.keyboard.press('Escape')
   await expect(dialog).toHaveCount(0)
   await expect(trigger).toBeFocused()
+  const composer = page.getByRole('textbox', { name: 'Chat message input' })
+  await composer.fill('Draft')
+  await trigger.focus()
+  await page.keyboard.type('x')
+  await expect(composer).toBeFocused()
+  await expect(composer).toHaveValue('Draftx')
   await trigger.click()
   await page.evaluate(() => {
     const h = window.__FRESHELL_TEST_HARNESS__!; const s = h.getState(); const tabId = s.tabs.activeTabId!; const paneId = s.panes.activePane[tabId]
@@ -407,6 +419,86 @@ for (const [name, diffs, label] of [
     h.dispatch({ type: 'panes/updatePaneContent', payload: { tabId, paneId, content: { ...layout.content, sessionId: 'other-conversation', sessionRef: { provider: 'codex', sessionId: 'other-conversation' }, resumeSessionId: 'other-conversation' } } })
   })
   await expect(dialog).toHaveCount(0)
+})
+
+for (const height of [200, 120]) test(`nested ${height}px panes retain requests and recovery through scrolling`, async ({ freshellPage, page, terminal }) => {
+  void freshellPage
+  await page.setViewportSize({ width: 1200, height: 1000 })
+  await terminal.waitForTerminal()
+  await seedCompactPane(page, { sessionType: 'freshclaude', provider: 'claude', style: 'sans', theme: 'light' })
+  await splitFreshPane(page, 'vertical')
+  await page.evaluate(() => {
+    const h = window.__FRESHELL_TEST_HARNESS__!; const s = h.getState(); const tabId = s.tabs.activeTabId!
+    const paneId = s.panes.activePane[tabId]
+    h.dispatch({ type: 'panes/splitPane', payload: { tabId, paneId, direction: 'vertical', newPaneId: 'compact-nested-empty', newContent: { kind: 'picker' }, activate: false } })
+  })
+  await fitRoot(page, { height }, 4)
+  const root = page.locator('.fresh-agent-pane:not(.fresh-agent-diff-drawer-overlay)')
+  const stack = root.getByRole('group', { name: 'Agent requests and status' })
+  const count = stack.getByText('3 pending requests', { exact: true })
+  const initial = await count.evaluate(el => {
+    const r = el.closest('.fresh-agent-pane')!.getBoundingClientRect(); const b = el.getBoundingClientRect()
+    const hit = document.elementFromPoint(b.x + b.width / 2, b.y + b.height / 2)
+    return { visible: b.top >= r.top && b.bottom <= r.bottom && (hit === el || el.contains(hit)), stackHeight: el.closest('.fresh-agent-top-stack')!.getBoundingClientRect().height }
+  })
+  console.log(JSON.stringify({event:'tiny_compact_geometry',severity:'INFO',height,...initial}))
+  expect(initial.visible).toBe(true)
+  expect(initial.stackHeight).toBeGreaterThanOrEqual(64)
+  await hitAndClick(stack.getByRole('button', { name: 'Yes', exact: true }))
+  await hitAndClick(stack.getByRole('button', { name: 'Allow tool use', exact: true }))
+  const name = stack.getByRole('textbox', {name:'Name'})
+  await hitAndClick(name); await name.fill('Dan')
+  await hitAndClick(stack.getByRole('button', {name:'Continue',exact:true}))
+  await hitAndClick(stack.locator('[data-agent-error="create"] summary'))
+  await hitAndClick(stack.getByRole('button', {name:'Dismiss',exact:true}))
+  await hitAndClick(stack.getByRole('button', {name:'Diffs: 30 changed files'}))
+  await expect(page.getByRole('dialog', {name:'Changes'})).toBeVisible()
+  await page.keyboard.press('Escape')
+  const prompt = root.getByText('Latest prompt must remain readable', {exact:true})
+  await prompt.scrollIntoViewIfNeeded()
+  const promptVisible = await prompt.evaluate(el => {
+    const b = el.getBoundingClientRect(); const hit = document.elementFromPoint(b.x + b.width / 2, b.y + b.height / 2)
+    return hit === el || el.contains(hit)
+  })
+  expect(promptVisible).toBe(true)
+  const composer = root.getByRole('textbox', {name:'Chat message input'})
+  await hitAndClick(composer); await composer.fill('Draft in a tiny split')
+  await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.dispatch({ type:'freshAgent/setSessionStatus', payload: {sessionId:'compact-freshclaude',sessionType:'freshclaude',provider:'claude',status:'exited'} }))
+  await expect(composer).toBeDisabled()
+  await hitAndClick(stack.locator('[data-agent-error="ended"] summary'))
+  for (const label of ['Resume session', 'Start new session']) {
+    const button = stack.getByRole('button', {name:label,exact:true})
+    await button.scrollIntoViewIfNeeded()
+    expect(await button.evaluate(el => {const b=el.getBoundingClientRect(); const hit=document.elementFromPoint(b.x+b.width/2,b.y+b.height/2); return hit===el || el.contains(hit)})).toBe(true)
+    await expect(button).toBeEnabled()
+  }
+})
+
+test('compact header advertises multiple diagnostics and expands long prominent status', async ({ freshellPage, page, terminal }) => {
+  void freshellPage
+  await terminal.waitForTerminal()
+  await seedCompactPane(page, { sessionType:'freshclaude',provider:'claude',style:'sans',theme:'light' })
+  const text = 'Session identity corrected by server — this pane now points at its live session.'
+  await page.evaluate(text => {
+    const h=window.__FRESHELL_TEST_HARNESS__!;const s=h.getState();const tabId=s.tabs.activeTabId!
+    h.dispatch({type:'panes/mergePaneContent',payload:{tabId,paneId:s.panes.activePane[tabId],updates:{reconcileNotice:text,closeError:'Second actionable diagnostic'}}})
+  },text)
+  for (const size of [{width:1100,height:700},{width:560,height:320},{width:390,height:700}]) {
+    await fitRoot(page,{width:size.width})
+    await fitRoot(page,{height:size.height})
+    const errors=page.getByRole('region',{name:'Agent errors'})
+    const count=errors.getByText('2 errors',{exact:true})
+    expect(await count.evaluate(el=>{const b=el.getBoundingClientRect();const hit=document.elementFromPoint(b.x+b.width/2,b.y+b.height/2);return b.width>0&&b.height>0&&(hit===el||el.contains(hit))})).toBe(true)
+    const notices=page.getByRole('status',{name:'Agent notices'})
+    const summary=notices.locator('summary')
+    await hitAndClick(summary)
+    const body=notices.locator('.fresh-agent-diagnostic-body')
+    await expect(body).toHaveText(text)
+    await body.scrollIntoViewIfNeeded()
+    expect(await body.evaluate(el=>el.scrollWidth<=el.clientWidth+1)).toBe(true)
+    await hitAndClick(summary)
+    await assertUsefulSpace(page)
+  }
 })
 
 test('requests remain clickable and native disclosures use keyboard defaults', async ({ freshellPage, page, terminal }) => {

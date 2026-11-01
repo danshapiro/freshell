@@ -202,7 +202,7 @@ it.each(['ls', 'printf '.repeat(100)])('exposes native commands with exact decis
 })
 it('collapses a verbose Edit preview while retaining the path and decisions', async () => {
  const user=userEvent.setup()
- const {onRespond}=renderCard({requestId:'edit-long',toolName:'Edit',blockedPath:'/src/large.ts',input:{file_path:'/src/large.ts',old_string:'old '.repeat(100),new_string:'new '.repeat(100)}})
+ const {onRespond}=renderCard({requestId:'edit-long',toolName:'Edit',input:{file_path:'/src/large.ts',old_string:'old '.repeat(100),new_string:'new '.repeat(100)}})
  expect(screen.getByRole('figure',{name:'diff view'})).not.toBeVisible()
  expect(screen.getAllByText('/src/large.ts').some(element => !element.closest('details'))).toBe(true)
  await user.click(screen.getByText('Request details'))
@@ -210,6 +210,19 @@ it('collapses a verbose Edit preview while retaining the path and decisions', as
  expect(onRespond).not.toHaveBeenCalled()
  await user.click(screen.getByRole('button',{name:'Deny tool use'}))
  expect(onRespond).toHaveBeenCalledWith({behavior:'deny',message:'Denied by user',interrupt:false})
+})
+
+it.each([
+  ['WebFetch', { url: 'https://example.com', prompt: 'Read the title' }],
+  ['Write', { file_path: '/tmp/readme.txt', content: 'hello' }],
+  ['mcp__lookup', { query: 'current task', limit: 3 }],
+] as const)('shows short %s inputs before approval', (toolName, input) => {
+  const { onRespond } = renderCard({ requestId: 'short-input', toolName, input })
+  const preview = screen.getByText((_text, node) => node?.tagName === 'PRE')
+  expect(preview).toBeVisible()
+  expect(JSON.parse(preview.textContent ?? '')).toEqual(input)
+  fireEvent.click(screen.getByRole('button', { name: 'Allow tool use' }))
+  expect(onRespond).toHaveBeenCalledExactlyOnceWith({ behavior: 'allow' })
 })
 
 it('shows a short native permission scope before the user answers', () => {
