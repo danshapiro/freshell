@@ -56,6 +56,40 @@ pub enum BackendError {
     CodexIncompatible(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateFailureCertainty {
+    DefinitelyNotCreated,
+    MayHaveCreated,
+}
+
+#[derive(Debug)]
+pub struct CreateRuntimeFailure {
+    pub certainty: CreateFailureCertainty,
+    pub error: BackendError,
+}
+
+impl CreateRuntimeFailure {
+    pub(crate) fn definitely_not_created(error: BackendError) -> Self {
+        Self {
+            certainty: CreateFailureCertainty::DefinitelyNotCreated,
+            error,
+        }
+    }
+
+    pub(crate) fn may_have_created(error: BackendError) -> Self {
+        Self {
+            certainty: CreateFailureCertainty::MayHaveCreated,
+            error,
+        }
+    }
+}
+
+impl From<BackendError> for CreateRuntimeFailure {
+    fn from(error: BackendError) -> Self {
+        Self::definitely_not_created(error)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CreateRuntimeSpec {
     pub initial_input_reservation: Option<crate::registry::BoundInputReservation>,
@@ -361,6 +395,17 @@ pub trait RuntimeBackend: Send + Sync {
         &self,
         spec: &CreateRuntimeSpec,
     ) -> Result<BackendCreated, BackendError>;
+    /// Create a stopped runtime while retaining whether an error proves that
+    /// creation did not happen. Backends that cannot prove a negative must
+    /// keep the conservative `MayHaveCreated` default.
+    async fn create_stopped_with_evidence(
+        &self,
+        spec: &CreateRuntimeSpec,
+    ) -> Result<BackendCreated, CreateRuntimeFailure> {
+        self.create_stopped(spec)
+            .await
+            .map_err(CreateRuntimeFailure::may_have_created)
+    }
     async fn start_host(&self, handle: &OwnedRuntimeHandle) -> Result<(), BackendError>;
     async fn inspect(&self, handle: &OwnedRuntimeHandle)
         -> Result<BackendInspection, BackendError>;
@@ -1070,13 +1115,23 @@ impl RuntimeBackend for DockerEngineBackend {
         &self,
         spec: &CreateRuntimeSpec,
     ) -> Result<BackendCreated, BackendError> {
+        self.create_stopped_with_evidence(spec)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    async fn create_stopped_with_evidence(
+        &self,
+        spec: &CreateRuntimeSpec,
+    ) -> Result<BackendCreated, CreateRuntimeFailure> {
         spec.limits
             .validate()
             .map_err(|e| BackendError::InvalidConfig(e.message))?;
         if !spec.image_ref.starts_with("sha256:") || spec.image_ref.len() < 20 {
             return Err(BackendError::InvalidConfig(
                 "runtime image must be pinned by sha256 id/digest".into(),
-            ));
+            )
+            .into());
         }
         let binary = canonical_regular_file(&spec.host_binary_path)?;
         let initial_reference = spec
@@ -1097,7 +1152,8 @@ impl RuntimeBackend for DockerEngineBackend {
         }) {
             return Err(BackendError::InvalidConfig(
                 "initial provider source lost its current prepared reservation".into(),
-            ));
+            )
+            .into());
         }
         let runtime_dir = canonical_dir(&spec.runtime_dir)?;
         let actor_state_dir = if spec.fresh_agent.is_some() {
@@ -1117,7 +1173,8 @@ impl RuntimeBackend for DockerEngineBackend {
         {
             return Err(BackendError::InvalidConfig(
                 "provider volume name is not installation-scoped".into(),
-            ));
+            )
+            .into());
         }
         let mut terminal_mounts = match (&spec.terminal, &spec.fresh_agent) {
             (Some(terminal), None) => Some(docker::terminal_mounts(terminal)),
@@ -1126,7 +1183,8 @@ impl RuntimeBackend for DockerEngineBackend {
             (Some(_), Some(_)) => {
                 return Err(BackendError::InvalidConfig(
                     "runtime cannot host terminal and fresh-agent workloads together".into(),
-                ))
+                )
+                .into())
             }
         }
         .transpose()
@@ -1226,7 +1284,8 @@ impl RuntimeBackend for DockerEngineBackend {
                 }) {
                     return Err(BackendError::InvalidConfig(
                         "indexed provider volume belongs to another soul/preparation".into(),
-                    ));
+                    )
+                    .into());
                 }
             }
             body["HostConfig"]["Mounts"] = serde_json::to_value(
@@ -1239,7 +1298,8 @@ impl RuntimeBackend for DockerEngineBackend {
                 return Err(BackendError::Unavailable(
                     "indexed provider input publication requires the configured rootless backend"
                         .into(),
-                ));
+                )
+                .into());
             }
             self.begin_indexed_publication(spec, mounts, &binary)
                 .await?;
@@ -1260,26 +1320,38 @@ impl RuntimeBackend for DockerEngineBackend {
                 &format!("{DOCKER_API}/containers/create?name={name}"),
                 Some(&body),
             )
-            .await?;
+            .await
+            .map_err(CreateRuntimeFailure::may_have_created)?;
         if response.status != 201 {
             // Transport failures and server errors can hide a successful create.
             // Only a definitive request rejection proves that no workload has
             // acquired this generation's mounts.
-            if matches!(response.status, 400 | 401 | 403 | 404 | 409 | 422) {
+            let definitely_rejected = matches!(response.status, 400 | 401 | 403 | 404 | 409 | 422);
+            if definitely_rejected {
                 self.abort_indexed_publication(spec).await?;
             }
-            return Err(response.as_error());
+            let error = response.as_error();
+            return Err(if definitely_rejected {
+                CreateRuntimeFailure::definitely_not_created(error)
+            } else {
+                CreateRuntimeFailure::may_have_created(error)
+            });
         }
-        let value: Value = serde_json::from_slice(&response.body)
-            .map_err(|e| BackendError::Malformed(e.to_string()))?;
+        let value: Value = serde_json::from_slice(&response.body).map_err(|e| {
+            CreateRuntimeFailure::may_have_created(BackendError::Malformed(e.to_string()))
+        })?;
         let container_id = value
             .get("Id")
             .and_then(Value::as_str)
-            .ok_or_else(|| BackendError::Malformed("container create returned no Id".into()))?
+            .ok_or_else(|| {
+                CreateRuntimeFailure::may_have_created(BackendError::Malformed(
+                    "container create returned no Id".into(),
+                ))
+            })?
             .to_owned();
         if container_id.len() < 32 {
-            return Err(BackendError::Malformed(
-                "container create returned a short Id".into(),
+            return Err(CreateRuntimeFailure::may_have_created(
+                BackendError::Malformed("container create returned a short Id".into()),
             ));
         }
         Ok(BackendCreated {
