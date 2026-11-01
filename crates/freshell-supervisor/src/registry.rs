@@ -382,6 +382,27 @@ pub(crate) struct StopProgress {
     pub settled: bool,
 }
 
+/// Fenced revoke authority for a failed Reopen replacement proven to have no
+/// backend identity. This deliberately carries no runtime handle or Docker
+/// mutation authority.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingNoRuntimeRevoke {
+    pub soul_id: SoulId,
+    pub incarnation_id: IncarnationId,
+    pub intent_revision: u64,
+    pub endpoint: String,
+    pub grant_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReopenCreateEvidence {
+    NotAttempted,
+    DefinitelyNotCreated,
+    MayHaveCreated,
+    CreatedUncommitted,
+    IdentityCommitted,
+}
+
 /// Read-only association to the last committed terminal incarnation. This is
 /// deliberately not an OwnedRuntimeHandle and cannot authorize input or stop.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
@@ -1907,14 +1928,15 @@ impl Registry {
     }
 
     /// Record pending cleanup or settle only this failed Reopen's replacement.
-    /// Release authority only after owned-runtime verification, or after this
-    /// transaction proves no backend identity or grant was committed.
+    /// Release authority after owned-runtime verification, or when explicit
+    /// create evidence proves the replacement was never created.
     pub(crate) async fn settle_failed_reopen(
         &self,
         prepared: PreparedLaunch,
         attempt: RecoveryAttemptId,
         verified_outcome: Option<StopOutcome>,
         pending_capability: Option<(String, String)>,
+        create_evidence: ReopenCreateEvidence,
     ) -> Result<StopOutcome, RegistryError> {
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1923,9 +1945,15 @@ impl Registry {
                 params![prepared.incarnation_id.as_str(), prepared.soul_id.as_str(), prepared.launch_nonce.as_str(), attempt.as_str()],
                 |row| Ok((row.get(0)?,row.get(1)?)),
             )?;
+            let no_runtime_proven = uncreated
+                && matches!(
+                    create_evidence,
+                    ReopenCreateEvidence::NotAttempted
+                        | ReopenCreateEvidence::DefinitelyNotCreated
+                );
             let outcome = match verified_outcome {
                 Some(outcome) => outcome,
-                None if uncreated => StopOutcome::VerifiedEmpty,
+                None if no_runtime_proven => StopOutcome::VerifiedEmpty,
                 None => StopOutcome::BlockedOwnership,
             };
             let empty = outcome == StopOutcome::VerifiedEmpty;
@@ -1946,8 +1974,9 @@ impl Registry {
             }
             // The current stopped intent owns cleanup of its exact latest
             // replacement, including when a newer Stop interrupted startup.
-            // Record a real no-runtime proof for an uncreated replacement so
-            // retry does not need an invented Docker ownership handle.
+            // Record a no-runtime proof only when creation was not attempted
+            // or the backend explicitly proved it did not happen. Missing
+            // committed identity alone is never enough to release authority.
             let current_revision: Option<u64> = tx.query_row(
                 "SELECT intent_revision FROM souls s WHERE soul_id=?1 AND desired_state='stopped' AND ?2=(SELECT incarnation_id FROM incarnations WHERE soul_id=s.soul_id ORDER BY created_at DESC,rowid DESC LIMIT 1)",
                 params![prepared.soul_id.as_str(), prepared.incarnation_id.as_str()], |row| row.get(0),
@@ -2160,6 +2189,107 @@ impl Registry {
             }
             Ok(handles)
         }).await
+    }
+
+    /// Return the exact pending capability revoke for the current failed
+    /// Reopen replacement only when its persisted receipt proves the
+    /// replacement was never created. This path has no Docker authority.
+    pub(crate) async fn pending_no_runtime_reopen_revoke(
+        &self,
+        soul_id: SoulId,
+        intent_revision: u64,
+    ) -> Result<Option<PendingNoRuntimeRevoke>, RegistryError> {
+        self.run_blocking(move |conn| {
+            let row: Option<(String, String, String)> = conn
+                .query_row(
+                    &format!(
+                        "SELECT p.incarnation_id,p.capability_endpoint,p.capability_grant_id \
+                         FROM ordinary_stops p \
+                         JOIN souls s ON s.soul_id=p.soul_id \
+                         JOIN incarnations i ON i.incarnation_id=p.incarnation_id \
+                         WHERE p.soul_id=?1 AND p.intent_revision=?2 \
+                           AND p.outcome='verified_empty' AND p.revoke_pending=1 AND p.settled=0 \
+                           AND s.desired_state='stopped' AND s.intent_revision=p.intent_revision \
+                           AND i.launch_state='stopped' AND i.cleanup_state='verified_empty' \
+                           AND i.docker_daemon_id IS NULL AND i.container_id IS NULL AND i.grant_id IS NULL \
+                           AND p.capability_endpoint IS NOT NULL AND p.capability_grant_id IS NOT NULL \
+                           AND p.incarnation_id=(SELECT current.incarnation_id FROM incarnations current \
+                               WHERE current.soul_id=p.soul_id \
+                               ORDER BY CASE WHEN current.launch_state IN ({ACTIVE_STATES}) THEN 0 ELSE 1 END, \
+                                        current.created_at DESC,current.rowid DESC LIMIT 1) \
+                           AND EXISTS(SELECT 1 FROM commands c WHERE c.incarnation_id=i.incarnation_id AND c.state='reopen_failed')",
+                    ),
+                    params![soul_id.as_str(), intent_revision],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            row.map(|(incarnation, endpoint, grant_id)| {
+                Ok(PendingNoRuntimeRevoke {
+                    soul_id,
+                    incarnation_id: IncarnationId::parse(incarnation).map_err(|_| {
+                        RegistryError::Integrity("invalid no-runtime Reopen incarnation id".into())
+                    })?,
+                    intent_revision,
+                    endpoint,
+                    grant_id,
+                })
+            })
+            .transpose()
+        })
+        .await
+    }
+
+    /// Acknowledge only the captured current stopped revision and exact
+    /// no-runtime capability receipt. A newer Stop or replacement invalidates
+    /// this continuation.
+    pub(crate) async fn acknowledge_no_runtime_reopen_revoke(
+        &self,
+        pending: &PendingNoRuntimeRevoke,
+    ) -> Result<(), RegistryError> {
+        let pending = pending.clone();
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let latest: Option<String> = tx
+                .query_row(
+                    &format!(
+                        "SELECT incarnation_id FROM incarnations WHERE soul_id=?1 \
+                         ORDER BY CASE WHEN launch_state IN ({ACTIVE_STATES}) THEN 0 ELSE 1 END, \
+                                  created_at DESC,rowid DESC LIMIT 1"
+                    ),
+                    [pending.soul_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let current_matches: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM souls WHERE soul_id=?1 AND desired_state='stopped' AND intent_revision=?2)",
+                params![pending.soul_id.as_str(), pending.intent_revision],
+                |row| row.get(0),
+            )?;
+            if !current_matches || latest.as_deref() != Some(pending.incarnation_id.as_str()) {
+                return Err(RegistryError::InvalidState(
+                    "no-runtime Reopen revoke target changed before acknowledgement".into(),
+                ));
+            }
+            let changed = tx.execute(
+                "UPDATE ordinary_stops SET revoke_pending=0,settled=1,updated_at=?1 \
+                 WHERE soul_id=?2 AND incarnation_id=?3 AND intent_revision=?4 \
+                   AND outcome='verified_empty' AND revoke_pending=1 AND settled=0 \
+                   AND capability_endpoint=?5 AND capability_grant_id=?6 \
+                   AND EXISTS(SELECT 1 FROM incarnations i WHERE i.incarnation_id=?3 \
+                     AND i.soul_id=?2 AND i.launch_state='stopped' AND i.cleanup_state='verified_empty' \
+                     AND i.docker_daemon_id IS NULL AND i.container_id IS NULL AND i.grant_id IS NULL) \
+                   AND EXISTS(SELECT 1 FROM commands c WHERE c.incarnation_id=?3 AND c.state='reopen_failed')",
+                params![now_millis(), pending.soul_id.as_str(), pending.incarnation_id.as_str(), pending.intent_revision, pending.endpoint, pending.grant_id],
+            )?;
+            if changed != 1 {
+                return Err(RegistryError::InvalidState(
+                    "no-runtime Reopen revoke receipt changed before acknowledgement".into(),
+                ));
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
     }
 
     pub(crate) async fn stop_progress(

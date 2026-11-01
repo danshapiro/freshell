@@ -1,13 +1,14 @@
 use crate::{
     admission::AdmissionPolicy,
     backend::{
-        host_actor_state_dir, BackendError, CreateRuntimeSpec, DockerEngineBackend, RuntimeBackend,
+        host_actor_state_dir, BackendError, CreateFailureCertainty, CreateRuntimeFailure,
+        CreateRuntimeSpec, DockerEngineBackend, RuntimeBackend,
     },
     opencode_transfer::{OpenCodeTransferStaging, StagingLimits},
     registry::{
         stable_provider_volume_name, BackendCreatedRecord, ExecutionGrantRecord,
         InputJournalDisposition, LaunchPreparation, PreparedLaunch, RecoveryWriteFence, Registry,
-        RegistryError,
+        RegistryError, ReopenCreateEvidence,
     },
 };
 use freshell_runtime_protocol::{
@@ -112,6 +113,11 @@ pub(crate) struct LaunchWorkload {
     pub(crate) terminal: Option<TerminalLaunchSpec>,
     pub(crate) fresh_agent: Option<FreshAgentLaunchSpec>,
     pub(crate) resume_spec: Option<ResumeSpec>,
+}
+
+struct ReopenActivationFailure {
+    error: RuntimeError,
+    create_evidence: ReopenCreateEvidence,
 }
 
 impl LaunchWorkload {
@@ -832,8 +838,7 @@ impl Supervisor {
                     .await?;
                 Ok(AdminResult::Stop { outcome, view })
             }
-            AdminCommand::Reopen(request) => self
-                .reopen(envelope.request_id, request)
+            AdminCommand::Reopen(request) => Box::pin(self.reopen(envelope.request_id, request))
                 .await
                 .map(AdminResult::Reopen),
             AdminCommand::TerminalInput(request) => {
@@ -1487,19 +1492,29 @@ impl Supervisor {
            + '_ {
         // Construct the large activation state here so recovery callers only
         // retain the boxed future while polling host replies and registry I/O.
-        Box::pin(self.activate_prepared_observed_inner(prepared, workload, limits, fence, false))
+        Box::pin(
+            self.activate_prepared_observed_inner(prepared, workload, limits, fence, false, None),
+        )
     }
 
-    fn activate_reopen_prepared_observed(
-        &self,
+    fn activate_reopen_prepared_observed<'a>(
+        &'a self,
         prepared: PreparedLaunch,
         workload: LaunchWorkload,
         limits: RuntimeLimits,
         fence: RecoveryWriteFence,
+        create_evidence: &'a mut ReopenCreateEvidence,
     ) -> impl std::future::Future<Output = Result<(LaunchResult, RecoveryWriteFence), RuntimeError>>
            + Send
-           + '_ {
-        Box::pin(self.activate_prepared_observed_inner(prepared, workload, limits, fence, true))
+           + 'a {
+        Box::pin(self.activate_prepared_observed_inner(
+            prepared,
+            workload,
+            limits,
+            fence,
+            true,
+            Some(create_evidence),
+        ))
     }
 
     async fn activate_prepared_observed_inner(
@@ -1509,6 +1524,7 @@ impl Supervisor {
         limits: RuntimeLimits,
         mut fence: RecoveryWriteFence,
         defer_provider_preparation_completion: bool,
+        mut create_evidence: Option<&mut ReopenCreateEvidence>,
     ) -> Result<(LaunchResult, RecoveryWriteFence), RuntimeError> {
         let mut state = prepared.state;
         if let Some(capability) = workload
@@ -1562,52 +1578,81 @@ impl Supervisor {
                     self.activation_failure(&prepared, state, "ensure_host_actor_directory", error)
                 })?;
             }
-            let created = self
-                .backend
-                .create_stopped(&CreateRuntimeSpec {
-                    prior_provider_owner: self
-                        .registry
-                        .prior_provider_owner(prepared.incarnation_id.clone())
-                        .await
-                        .map_err(map_registry)?,
-                    initial_input_reservation: self
-                        .registry
-                        .bound_input_reservation(prepared.incarnation_id.clone())
-                        .await
-                        .map_err(map_registry)
-                        .map_err(|error| {
-                            self.activation_failure(
-                                &prepared,
-                                state,
-                                "revalidate_initial_provider_source",
-                                error,
-                            )
-                        })?,
-                    installation_id: self.registry.installation_id().clone(),
-                    soul_id: prepared.soul_id.clone(),
-                    incarnation_id: prepared.incarnation_id.clone(),
-                    image_ref: self.config.image_ref.clone(),
-                    host_binary_path: self.config.host_binary_path.clone(),
-                    runtime_dir: runtime_dir.clone(),
-                    limits,
-                    test_run_id: self.config.test_run_id.clone(),
-                    terminal: workload.terminal.clone(),
-                    fresh_agent: workload.fresh_agent.clone(),
-                    opencode_transfer_dir,
-                    provider_volume_name: stable_provider_volume_name(
-                        self.registry.installation_id(),
-                        &prepared.soul_id,
-                    ),
-                })
-                .await
-                .map_err(|error| {
-                    self.activation_failure_from_backend(
-                        &prepared,
-                        state,
-                        "create_stopped_runtime",
-                        error,
-                    )
-                })?;
+            let create_spec = CreateRuntimeSpec {
+                prior_provider_owner: self
+                    .registry
+                    .prior_provider_owner(prepared.incarnation_id.clone())
+                    .await
+                    .map_err(map_registry)?,
+                initial_input_reservation: self
+                    .registry
+                    .bound_input_reservation(prepared.incarnation_id.clone())
+                    .await
+                    .map_err(map_registry)
+                    .map_err(|error| {
+                        self.activation_failure(
+                            &prepared,
+                            state,
+                            "revalidate_initial_provider_source",
+                            error,
+                        )
+                    })?,
+                installation_id: self.registry.installation_id().clone(),
+                soul_id: prepared.soul_id.clone(),
+                incarnation_id: prepared.incarnation_id.clone(),
+                image_ref: self.config.image_ref.clone(),
+                host_binary_path: self.config.host_binary_path.clone(),
+                runtime_dir: runtime_dir.clone(),
+                limits,
+                test_run_id: self.config.test_run_id.clone(),
+                terminal: workload.terminal.clone(),
+                fresh_agent: workload.fresh_agent.clone(),
+                opencode_transfer_dir,
+                provider_volume_name: stable_provider_volume_name(
+                    self.registry.installation_id(),
+                    &prepared.soul_id,
+                ),
+            };
+            let created = if let Some(evidence) = create_evidence.as_deref_mut() {
+                match self
+                    .backend
+                    .create_stopped_with_evidence(&create_spec)
+                    .await
+                {
+                    Ok(created) => {
+                        *evidence = ReopenCreateEvidence::CreatedUncommitted;
+                        created
+                    }
+                    Err(failure) => {
+                        *evidence = match failure.certainty {
+                            CreateFailureCertainty::DefinitelyNotCreated => {
+                                ReopenCreateEvidence::DefinitelyNotCreated
+                            }
+                            CreateFailureCertainty::MayHaveCreated => {
+                                ReopenCreateEvidence::MayHaveCreated
+                            }
+                        };
+                        return Err(self.activation_failure_from_backend(
+                            &prepared,
+                            state,
+                            "create_stopped_runtime",
+                            failure.error,
+                        ));
+                    }
+                }
+            } else {
+                self.backend
+                    .create_stopped(&create_spec)
+                    .await
+                    .map_err(|error| {
+                        self.activation_failure_from_backend(
+                            &prepared,
+                            state,
+                            "create_stopped_runtime",
+                            error,
+                        )
+                    })?
+            };
             append_event(
                 &self.config.lifecycle_log,
                 "supervisor.container_created_stopped",
@@ -1635,6 +1680,9 @@ impl Supervisor {
                     self.activation_failure(&prepared, state, "commit_backend_identity", error)
                 })?;
             state = LaunchState::Created;
+            if let Some(evidence) = create_evidence.as_deref_mut() {
+                *evidence = ReopenCreateEvidence::IdentityCommitted;
+            }
             crash_if("after_created_commit");
         }
 
@@ -4603,6 +4651,61 @@ impl Supervisor {
         let prior_incarnation = prior_context.prior_handle.incarnation_id().clone();
         let prior_view = find_view(&self.registry, &prior_incarnation).await?;
 
+        if let Some(pending) = self
+            .registry
+            .pending_no_runtime_reopen_revoke(
+                request.soul_id.clone(),
+                request.expected_intent_revision,
+            )
+            .await
+            .map_err(map_registry)?
+        {
+            match self
+                .notify_mcp_capability(
+                    "revoke",
+                    &pending.endpoint,
+                    &pending.soul_id,
+                    &pending.incarnation_id,
+                    &pending.grant_id,
+                )
+                .await
+            {
+                Ok(()) => {
+                    self.registry
+                        .acknowledge_no_runtime_reopen_revoke(&pending)
+                        .await
+                        .map_err(map_registry)?;
+                    append_event(
+                        &self.config.lifecycle_log,
+                        "supervisor.reopen.no_runtime_revoke_settled",
+                        serde_json::json!({
+                            "severity":"info",
+                            "soulId":pending.soul_id,
+                            "incarnationId":pending.incarnation_id,
+                            "intentRevision":pending.intent_revision,
+                        }),
+                    );
+                }
+                Err(error) => {
+                    append_event(
+                        &self.config.lifecycle_log,
+                        "supervisor.reopen.no_runtime_revoke_pending",
+                        serde_json::json!({
+                            "severity":"warning",
+                            "soulId":pending.soul_id,
+                            "incarnationId":pending.incarnation_id,
+                            "intentRevision":pending.intent_revision,
+                            "errorCode":error.code,
+                        }),
+                    );
+                    return Ok(pending_reopen_result(
+                        Some(prior_view),
+                        "the failed replacement capability revoke is still pending",
+                    ));
+                }
+            }
+        }
+
         for handle in self
             .registry
             .pending_stop_handles()
@@ -4694,8 +4797,9 @@ impl Supervisor {
         .await
         {
             Ok(view) => view,
-            Err(error) => {
-                self.settle_failed_reopen(&preparation, &workload).await;
+            Err(failure) => {
+                self.settle_failed_reopen(&preparation, &workload, failure.create_evidence)
+                    .await;
                 let failure_view = find_view(
                     &self.registry,
                     &preparation.replacement.prepared.incarnation_id,
@@ -4708,7 +4812,7 @@ impl Supervisor {
                     serde_json::json!({
                         "severity":"error", "soulId":request.soul_id,
                         "incarnationId":preparation.replacement.prepared.incarnation_id,
-                        "attemptId":preparation.start.attempt_id, "errorCode":error.code,
+                        "attemptId":preparation.start.attempt_id, "errorCode":failure.error.code,
                     }),
                 );
                 return Ok(failed_reopen_result(
@@ -4735,6 +4839,31 @@ impl Supervisor {
         payload_digest: String,
         request: &freshell_runtime_protocol::ReopenRequest,
         workload: &mut LaunchWorkload,
+    ) -> Result<RuntimeView, ReopenActivationFailure> {
+        let mut create_evidence = ReopenCreateEvidence::NotAttempted;
+        self.activate_reopen_inner(
+            preparation,
+            request_id,
+            payload_digest,
+            request,
+            workload,
+            &mut create_evidence,
+        )
+        .await
+        .map_err(|error| ReopenActivationFailure {
+            error,
+            create_evidence,
+        })
+    }
+
+    async fn activate_reopen_inner(
+        &self,
+        preparation: &crate::registry::ReopenPreparation,
+        request_id: RequestId,
+        payload_digest: String,
+        request: &freshell_runtime_protocol::ReopenRequest,
+        workload: &mut LaunchWorkload,
+        create_evidence: &mut ReopenCreateEvidence,
     ) -> Result<RuntimeView, RuntimeError> {
         let provider_context = workload
             .terminal
@@ -4820,6 +4949,7 @@ impl Supervisor {
             workload.clone(),
             preparation.start.context.requested_limits,
             fence,
+            create_evidence,
         ))
         .await?;
 
@@ -4854,6 +4984,7 @@ impl Supervisor {
         &self,
         preparation: &crate::registry::ReopenPreparation,
         workload: &LaunchWorkload,
+        create_evidence: ReopenCreateEvidence,
     ) {
         let prepared = &preparation.replacement.prepared;
         let handle = self
@@ -4873,6 +5004,7 @@ impl Supervisor {
                 preparation.start.attempt_id.clone(),
                 handle.as_ref().map(|_| StopOutcome::TerminationUnconfirmed),
                 capability.clone(),
+                create_evidence,
             )
             .await
             .is_err()
@@ -4903,6 +5035,7 @@ impl Supervisor {
                 preparation.start.attempt_id.clone(),
                 outcome,
                 pending_capability,
+                create_evidence,
             )
             .await;
         append_event(
@@ -5969,11 +6102,14 @@ mod tests {
         runtimes: StdMutex<HashMap<String, FakeReopenRuntime>>,
         probe: Arc<StdMutex<ReopenProviderProbe>>,
         granted: Arc<tokio::sync::Notify>,
+        create_attempts: std::sync::atomic::AtomicUsize,
     }
 
     #[derive(Default)]
     struct ReopenProviderProbe {
         fail_create: bool,
+        create_then_fail: bool,
+        fail_identity_commit: bool,
         fail_after_grant: bool,
         refuse_cleanup: bool,
         pause_observation: bool,
@@ -6008,10 +6144,15 @@ mod tests {
             &self,
             spec: &CreateRuntimeSpec,
         ) -> Result<crate::backend::BackendCreated, BackendError> {
+            self.create_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut probe = self.probe.lock().unwrap();
             if probe.fail_create {
                 return Err(BackendError::Unavailable("injected create refusal".into()));
             }
+            let create_then_fail = probe.create_then_fail;
+            let fail_identity_commit = probe.fail_identity_commit;
+            let registry_path = probe.cleanup_registry.clone();
             probe
                 .provider_volumes
                 .push(spec.provider_volume_name.clone());
@@ -6025,11 +6166,40 @@ mod tests {
                     host: None,
                 },
             );
+            if fail_identity_commit {
+                let registry_path = registry_path.expect("identity commit failure needs registry");
+                rusqlite::Connection::open(registry_path)
+                    .unwrap()
+                    .execute_batch(
+                        "CREATE TRIGGER IF NOT EXISTS reject_reopen_backend_identity_commit
+                         BEFORE UPDATE OF container_id ON incarnations
+                         BEGIN SELECT RAISE(ABORT, 'injected identity commit failure'); END;",
+                    )
+                    .unwrap();
+            }
+            if create_then_fail {
+                return Err(BackendError::Unavailable(
+                    "injected create acknowledgement loss after recording runtime".into(),
+                ));
+            }
             Ok(crate::backend::BackendCreated {
                 daemon_id: freshell_runtime_protocol::DockerDaemonId::new(),
                 container_id,
                 immutable_config_digest: "fake-reopen-config".into(),
             })
+        }
+
+        async fn create_stopped_with_evidence(
+            &self,
+            spec: &CreateRuntimeSpec,
+        ) -> Result<crate::backend::BackendCreated, CreateRuntimeFailure> {
+            match self.create_stopped(spec).await {
+                Ok(created) => Ok(created),
+                Err(error) if self.probe.lock().unwrap().create_then_fail => {
+                    Err(CreateRuntimeFailure::may_have_created(error))
+                }
+                Err(error) => Err(CreateRuntimeFailure::definitely_not_created(error)),
+            }
         }
 
         async fn start_host(
@@ -6435,6 +6605,15 @@ mod tests {
         );
         envelope.auth = Some(supervisor.config.control_secret.clone());
         envelope
+    }
+
+    fn bind_reopen_callback(supervisor: &Supervisor) -> UnixListener {
+        let path = supervisor
+            .config
+            .control_socket_path
+            .with_file_name("mcp.sock");
+        let _ = std::fs::remove_file(&path);
+        UnixListener::bind(path).unwrap()
     }
 
     async fn seed_native_reopen(
@@ -7131,6 +7310,261 @@ mod tests {
             )
             .unwrap();
         assert!(revoke_pending);
+    }
+
+    #[tokio::test]
+    async fn reopen_pending_no_runtime_revoke_retries_without_docker() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut supervisor, soul, previous, revision) = stopped_supervisor(directory.path()).await;
+        seed_reopen_callback_capability(&supervisor, &soul, &previous, revision);
+        let backend = Arc::new(FakeReopenBackend::default());
+        backend.probe.lock().unwrap().fail_create = true;
+        supervisor.backend = backend.clone();
+
+        let first_listener = bind_reopen_callback(&supervisor);
+        let first_peer = tokio::spawn(frozen_callback_peer(
+            first_listener,
+            ["revoke", "issue", "activate", "abort"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            reopened_codex_provider_context(),
+            Some("abort".into()),
+            None,
+        ));
+        let first = invoke_reopen(
+            &supervisor,
+            reopen_envelope(&supervisor, RequestId::new(), soul.clone(), revision),
+        )
+        .await;
+        assert_eq!(first.outcome, ReopenOutcome::Failed);
+        let first_requests = first_peer.await.unwrap();
+        assert_eq!(
+            first_requests
+                .iter()
+                .map(|request| request.action.as_str())
+                .collect::<Vec<_>>(),
+            ["revoke", "issue", "activate", "abort"]
+        );
+
+        let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+        let (failed_incarnation, pending_grant, pending): (String, String, bool) = database
+            .query_row(
+                "SELECT p.incarnation_id,p.capability_grant_id,p.revoke_pending FROM ordinary_stops p JOIN incarnations i ON i.incarnation_id=p.incarnation_id WHERE p.soul_id=?1 AND p.intent_revision=?2 ORDER BY i.created_at DESC,i.rowid DESC LIMIT 1",
+                rusqlite::params![soul.as_str(), revision],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(pending_grant, "grant-reopen-new");
+        assert!(pending);
+        let before_retry: (u64, u64, String, u64) = database
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM incarnations WHERE soul_id=?1),(SELECT COUNT(*) FROM commands WHERE soul_id=?1),desired_state,intent_revision FROM souls WHERE soul_id=?1",
+                [soul.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        drop(database);
+
+        let attempts_before_retry = backend
+            .create_attempts
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let retry_listener = bind_reopen_callback(&supervisor);
+        let retry_peer = tokio::spawn(frozen_callback_peer(
+            retry_listener,
+            ["revoke"].into_iter().map(str::to_owned).collect(),
+            reopened_codex_provider_context(),
+            Some("revoke".into()),
+            None,
+        ));
+        let retry = invoke_reopen(
+            &supervisor,
+            reopen_envelope(&supervisor, RequestId::new(), soul.clone(), revision),
+        )
+        .await;
+        assert_eq!(
+            retry.outcome,
+            ReopenOutcome::Pending,
+            "an unresolved no-runtime grant revoke remains pending"
+        );
+        let retry_requests = tokio::time::timeout(Duration::from_secs(1), retry_peer)
+            .await
+            .expect("Reopen must retry the recorded capability revoke")
+            .unwrap();
+        assert_eq!(retry_requests.len(), 1);
+        assert_eq!(retry_requests[0].action, "revoke");
+        assert_eq!(
+            retry_requests[0].incarnation_id.as_deref(),
+            Some(failed_incarnation.as_str())
+        );
+        assert_eq!(
+            retry_requests[0].grant_id.as_deref(),
+            Some("grant-reopen-new")
+        );
+        assert_eq!(
+            backend
+                .create_attempts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            attempts_before_retry,
+            "retrying a capability-only receipt must not contact the runtime backend"
+        );
+
+        let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+        let after_pending: (u64, u64, String, u64) = database
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM incarnations WHERE soul_id=?1),(SELECT COUNT(*) FROM commands WHERE soul_id=?1),desired_state,intent_revision FROM souls WHERE soul_id=?1",
+                [soul.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(after_pending, before_retry);
+        let pending_after: bool = database
+            .query_row(
+                "SELECT revoke_pending FROM ordinary_stops WHERE soul_id=?1 AND incarnation_id=?2 AND intent_revision=?3",
+                rusqlite::params![soul.as_str(), failed_incarnation, revision],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(pending_after);
+        drop(database);
+
+        backend.probe.lock().unwrap().fail_create = false;
+        let settled_listener = bind_reopen_callback(&supervisor);
+        let settled_peer = tokio::spawn(frozen_callback_peer(
+            settled_listener,
+            ["revoke", "issue", "activate", "commit"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            reopened_codex_provider_context(),
+            None,
+            None,
+        ));
+        let settled = invoke_reopen(
+            &supervisor,
+            reopen_envelope(&supervisor, RequestId::new(), soul.clone(), revision),
+        )
+        .await;
+        assert_eq!(settled.outcome, ReopenOutcome::Reopened);
+        let settled_requests = settled_peer.await.unwrap();
+        assert_eq!(settled_requests[0].action, "revoke");
+        assert_eq!(
+            settled_requests[0].grant_id.as_deref(),
+            Some("grant-reopen-new")
+        );
+    }
+
+    #[tokio::test]
+    async fn reopen_uncertain_create_retains_authority_until_verified() {
+        let mut failures = Vec::new();
+        for (label, create_then_fail, fail_identity_commit) in [
+            ("uncertain create", true, false),
+            ("identity commit failure", false, true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut supervisor, soul, _previous, revision) =
+                stopped_supervisor(directory.path()).await;
+            let backend = Arc::new(FakeReopenBackend::default());
+            {
+                let mut probe = backend.probe.lock().unwrap();
+                probe.create_then_fail = create_then_fail;
+                probe.fail_identity_commit = fail_identity_commit;
+                probe.cleanup_registry = Some(supervisor.registry.database_path().to_path_buf());
+            }
+            supervisor.backend = backend.clone();
+
+            let result = invoke_reopen(
+                &supervisor,
+                reopen_envelope(&supervisor, RequestId::new(), soul.clone(), revision),
+            )
+            .await;
+            if result.outcome != ReopenOutcome::Failed {
+                failures.push(format!("{label}: initial Reopen should fail"));
+            }
+            if backend.runtimes.lock().unwrap().len() != 1 {
+                failures.push(format!(
+                    "{label}: the fake backend must record the created runtime"
+                ));
+            }
+
+            let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+            let latest: (String, String, String, String, Option<String>, bool, u64, u64, Option<String>, bool) = database
+                .query_row(
+                    "SELECT i.incarnation_id,i.launch_state,i.cleanup_state,c.state,p.outcome,p.settled,(SELECT COUNT(*) FROM writer_claims WHERE incarnation_id=i.incarnation_id),(SELECT COUNT(*) FROM admission_reservations WHERE incarnation_id=i.incarnation_id),s.recovery_attempt_id,(i.docker_daemon_id IS NULL AND i.container_id IS NULL AND i.grant_id IS NULL) FROM incarnations i JOIN commands c ON c.incarnation_id=i.incarnation_id JOIN souls s ON s.soul_id=i.soul_id LEFT JOIN ordinary_stops p ON p.incarnation_id=i.incarnation_id WHERE i.soul_id=?1 ORDER BY i.created_at DESC,i.rowid DESC LIMIT 1",
+                    [soul.as_str()],
+                    |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?)),
+                )
+                .unwrap();
+            if latest.1 != "stopping"
+                || latest.2 != "blocked_ownership"
+                || latest.3 != "reopen_cleanup_pending"
+                || latest.4.as_deref() != Some("blocked_ownership")
+                || latest.5
+                || latest.6 != 1
+                || latest.7 != 1
+                || latest.8.is_none()
+                || !latest.9
+            {
+                failures.push(format!(
+                    "{label}: uncertain ownership must remain blocked with claims and reservations; got {latest:?}"
+                ));
+            }
+            let before_retry: (u64, u64) = database
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM incarnations WHERE soul_id=?1),(SELECT intent_revision FROM souls WHERE soul_id=?1)",
+                    [soul.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let verified_empty_count: u64 = database
+                .query_row(
+                    "SELECT COUNT(*) FROM ordinary_stops WHERE incarnation_id=?1 AND outcome='verified_empty'",
+                    [&latest.0],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if verified_empty_count != 0 {
+                failures.push(format!(
+                    "{label}: missing identity cannot be reported VerifiedEmpty"
+                ));
+            }
+            drop(database);
+
+            let attempts_before_retry = backend
+                .create_attempts
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let retry = invoke_reopen(
+                &supervisor,
+                reopen_envelope(&supervisor, RequestId::new(), soul.clone(), revision),
+            )
+            .await;
+            if retry.outcome != ReopenOutcome::Failed {
+                failures.push(format!(
+                    "{label}: blocked replacement must remain unavailable"
+                ));
+            }
+            if backend
+                .create_attempts
+                .load(std::sync::atomic::Ordering::SeqCst)
+                != attempts_before_retry
+            {
+                failures.push(format!("{label}: retry contacted the runtime backend"));
+            }
+            let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+            let after_retry: (u64, u64) = database
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM incarnations WHERE soul_id=?1),(SELECT intent_revision FROM souls WHERE soul_id=?1)",
+                    [soul.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            if after_retry != before_retry {
+                failures.push(format!(
+                    "{label}: blocked retry changed incarnation count or revision from {before_retry:?} to {after_retry:?}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[tokio::test]
