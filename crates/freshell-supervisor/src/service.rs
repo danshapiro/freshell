@@ -1956,7 +1956,7 @@ impl Supervisor {
                 workload.soul_id.clone(),
                 handle.incarnation_id().clone(),
                 fence,
-                workload.resume_spec.is_none(),
+                workload.resume_spec.is_none() || defer_provider_preparation_completion,
             )
             .await
             .map_err(map_registry)
@@ -4660,25 +4660,84 @@ impl Supervisor {
                         "severity":"warning",
                         "soulId":request.soul_id,
                         "expectedIntentRevision":request.expected_intent_revision,
-                        "reason":"prior_stop_not_ready",
+                        "reason":"prior_stop_or_saved_resume_not_ready",
                         "errorCode":map_registry(error).code,
                     }),
                 );
                 return Ok(failed_reopen_result(
                     Some(prior_view),
-                    "the prior Stop is not settled and verified empty",
+                    "the stopped runtime or saved conversation is not ready for Reopen",
                 ));
             }
         };
 
-        let mut terminal = if preparation.replacement.resume_spec.is_some() {
+        let terminal = if preparation.replacement.resume_spec.is_some() {
             terminal_without_first_boot_state(preparation.replacement.terminal.clone())
         } else {
             preparation.replacement.terminal.clone()
         };
-        let mut fresh_agent =
-            fresh_without_raw_bootstrap(preparation.replacement.fresh_agent.clone());
-        let provider_context = terminal
+        let fresh_agent = fresh_without_raw_bootstrap(preparation.replacement.fresh_agent.clone());
+        let mut workload = LaunchWorkload {
+            soul_id: request.soul_id.clone(),
+            fixture: preparation.replacement.fixture,
+            terminal,
+            fresh_agent,
+            resume_spec: preparation.replacement.resume_spec.clone(),
+        };
+        let view = match Box::pin(self.activate_reopen(
+            &preparation,
+            request_id,
+            payload_digest,
+            &request,
+            &mut workload,
+        ))
+        .await
+        {
+            Ok(view) => view,
+            Err(error) => {
+                self.settle_failed_reopen(&preparation, &workload).await;
+                let failure_view = find_view(
+                    &self.registry,
+                    &preparation.replacement.prepared.incarnation_id,
+                )
+                .await
+                .unwrap_or(prior_view);
+                append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.reopen.failed",
+                    serde_json::json!({
+                        "severity":"error", "soulId":request.soul_id,
+                        "incarnationId":preparation.replacement.prepared.incarnation_id,
+                        "attemptId":preparation.start.attempt_id, "errorCode":error.code,
+                    }),
+                );
+                return Ok(failed_reopen_result(
+                    Some(failure_view),
+                    "the replacement could not be reopened; inspect cleanup state and use manual recovery if needed",
+                ));
+            }
+        };
+        append_event(
+            &self.config.lifecycle_log,
+            "supervisor.reopen.succeeded",
+            serde_json::json!({
+                "severity":"info", "soulId":request.soul_id,
+                "incarnationId":view.incarnation_id, "intentRevision":view.intent_revision,
+            }),
+        );
+        Ok(reopened_result(view))
+    }
+
+    async fn activate_reopen(
+        &self,
+        preparation: &crate::registry::ReopenPreparation,
+        request_id: RequestId,
+        payload_digest: String,
+        request: &freshell_runtime_protocol::ReopenRequest,
+        workload: &mut LaunchWorkload,
+    ) -> Result<RuntimeView, RuntimeError> {
+        let provider_context = workload
+            .terminal
             .as_ref()
             .and_then(|spec| {
                 spec.provider_launch_context.as_ref().map(|context| {
@@ -4692,7 +4751,7 @@ impl Supervisor {
                 })
             })
             .or_else(|| {
-                fresh_agent.as_ref().and_then(|agent| {
+                workload.fresh_agent.as_ref().and_then(|agent| {
                     agent.provider_launch_context.as_ref().map(|context| {
                         (
                             agent.provider.native_provider().to_owned(),
@@ -4706,7 +4765,23 @@ impl Supervisor {
             });
         if let Some((provider, context, references, cwd, workspace)) = provider_context {
             if context.mcp_capability.is_some() {
-                let prepared = match self
+                // The prior grant was revoked by Stop. It is not a newly
+                // issued preparation and must never be aborted on behalf of
+                // this replacement if renewal itself fails.
+                if let Some(saved) = workload
+                    .terminal
+                    .as_mut()
+                    .and_then(|terminal| terminal.provider_launch_context.as_mut())
+                    .or_else(|| {
+                        workload
+                            .fresh_agent
+                            .as_mut()
+                            .and_then(|agent| agent.provider_launch_context.as_mut())
+                    })
+                {
+                    saved.mcp_capability = None;
+                }
+                let prepared = self
                     .issue_reopen_mcp_capability(
                         &preparation.start,
                         &provider,
@@ -4715,28 +4790,12 @@ impl Supervisor {
                         &cwd,
                         &workspace,
                     )
-                    .await
-                {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        append_event(
-                            &self.config.lifecycle_log,
-                            "supervisor.reopen.provider_preparation_failed",
-                            serde_json::json!({
-                                "severity":"error",
-                                "soulId":request.soul_id,
-                                "incarnationId":preparation.replacement.prepared.incarnation_id,
-                                "attemptId":preparation.start.attempt_id,
-                                "errorCode":error.code,
-                            }),
-                        );
-                        return Ok(failed_reopen_result(
-                            Some(prior_view),
-                            "saved provider preparation could not be renewed",
-                        ));
-                    }
-                };
-                install_reopen_provider_context(terminal.as_mut(), fresh_agent.as_mut(), prepared)?;
+                    .await?;
+                install_reopen_provider_context(
+                    workload.terminal.as_mut(),
+                    workload.fresh_agent.as_mut(),
+                    prepared,
+                )?;
             }
         }
         self.registry
@@ -4744,77 +4803,38 @@ impl Supervisor {
                 request.soul_id.clone(),
                 preparation.replacement.prepared.incarnation_id.clone(),
                 preparation.start.attempt_id.clone(),
-                terminal.clone(),
-                fresh_agent.clone(),
+                workload.terminal.clone(),
+                workload.fresh_agent.clone(),
             )
             .await
             .map_err(map_registry)?;
 
         let prepared = preparation.replacement.prepared.clone();
-        let workload = LaunchWorkload {
-            soul_id: request.soul_id.clone(),
-            fixture: preparation.replacement.fixture,
-            terminal,
-            fresh_agent,
-            resume_spec: preparation.replacement.resume_spec.clone(),
-        };
         let fence = preparation
             .start
             .context
             .write_fence_for_attempt(preparation.start.attempt_id.clone())
             .for_incarnation(prepared.incarnation_id.clone());
-        if let Err(error) = Box::pin(self.activate_reopen_prepared_observed(
+        Box::pin(self.activate_reopen_prepared_observed(
             prepared.clone(),
             workload.clone(),
             preparation.start.context.requested_limits,
             fence,
         ))
-        .await
-        {
-            self.abort_reopen_provider_preparation(&prepared, &workload)
-                .await;
-            append_event(
-                &self.config.lifecycle_log,
-                "supervisor.reopen.activation_failed",
-                serde_json::json!({
-                    "severity":"error",
-                    "soulId":request.soul_id,
-                    "incarnationId":prepared.incarnation_id,
-                    "attemptId":preparation.start.attempt_id,
-                    "errorCode":error.code,
-                }),
-            );
-            return Ok(failed_reopen_result(
-                Some(prior_view),
-                "the replacement runtime could not be started; manual recovery is required",
-            ));
-        }
+        .await?;
 
-        if workload.resume_spec.is_none() {
-            let handle = self
-                .registry
-                .owned_handle(prepared.incarnation_id.clone())
-                .await
-                .map_err(map_registry)?;
-            if let Err(error) = self.commit_provider_preparation(&handle).await {
-                self.abort_reopen_provider_preparation(&prepared, &workload)
-                    .await;
-                append_event(
-                    &self.config.lifecycle_log,
-                    "supervisor.reopen.provider_commit_failed",
-                    serde_json::json!({
-                        "severity":"error",
-                        "soulId":request.soul_id,
-                        "incarnationId":prepared.incarnation_id,
-                        "errorCode":error.code,
-                    }),
-                );
-                return Ok(failed_reopen_result(
-                    Some(prior_view),
-                    "provider preparation could not be committed; manual recovery is required",
-                ));
-            }
-        }
+        let handle = self
+            .registry
+            .owned_handle(prepared.incarnation_id.clone())
+            .await
+            .map_err(map_registry)?;
+        Box::pin(self.await_running_or_reopen_startup(
+            &request.soul_id,
+            &prepared.incarnation_id,
+            "reopen_provider_commit",
+            self.commit_provider_preparation(&handle),
+        ))
+        .await??;
 
         self.registry
             .finish_reopen(
@@ -4822,41 +4842,123 @@ impl Supervisor {
                 request_id,
                 payload_digest,
                 request.expected_intent_revision,
-                preparation.start.attempt_id,
+                preparation.start.attempt_id.clone(),
                 prepared.incarnation_id.clone(),
             )
             .await
             .map_err(map_registry)?;
-        let view = find_view(&self.registry, &prepared.incarnation_id).await?;
+        find_view(&self.registry, &prepared.incarnation_id).await
+    }
+
+    async fn settle_failed_reopen(
+        &self,
+        preparation: &crate::registry::ReopenPreparation,
+        workload: &LaunchWorkload,
+    ) {
+        let prepared = &preparation.replacement.prepared;
+        let handle = self
+            .registry
+            .owned_handle(prepared.incarnation_id.clone())
+            .await
+            .ok();
+        let capability = reopen_capability(workload)
+            .map(|capability| (capability.endpoint.clone(), capability.grant_id.clone()));
+        // Persist the exact pending cleanup before touching a runtime or its
+        // provider capability. Startup reconciliation can finish this Stop if
+        // this worker disappears during either external operation.
+        if self
+            .registry
+            .settle_failed_reopen(
+                prepared.clone(),
+                preparation.start.attempt_id.clone(),
+                handle.as_ref().map(|_| StopOutcome::TerminationUnconfirmed),
+                capability.clone(),
+            )
+            .await
+            .is_err()
+        {
+            append_event(
+                &self.config.lifecycle_log,
+                "supervisor.reopen.failure_cleanup_reservation_failed",
+                serde_json::json!({"severity":"error", "soulId":prepared.soul_id,
+                    "incarnationId":prepared.incarnation_id, "attemptId":preparation.start.attempt_id}),
+            );
+            return;
+        }
+        let outcome = if let Some(handle) = handle.as_ref() {
+            Some(self.stop_failed_reopen(handle).await)
+        } else {
+            // The registry independently checks the exact uncreated row. A
+            // missing/corrupt owned handle alone never proves a runtime empty.
+            None
+        };
+        let aborted = self
+            .abort_reopen_provider_preparation(prepared, workload)
+            .await;
+        let pending_capability = (!aborted).then_some(capability).flatten();
+        let settled = self
+            .registry
+            .settle_failed_reopen(
+                prepared.clone(),
+                preparation.start.attempt_id.clone(),
+                outcome,
+                pending_capability,
+            )
+            .await;
         append_event(
             &self.config.lifecycle_log,
-            "supervisor.reopen.succeeded",
+            "supervisor.reopen.failure_cleanup",
             serde_json::json!({
-                "severity":"info",
-                "soulId":request.soul_id,
-                "incarnationId":prepared.incarnation_id,
-                "intentRevision":view.intent_revision,
+                "severity":if matches!(settled, Ok(StopOutcome::VerifiedEmpty)) { "info" } else { "error" },
+                "soulId":prepared.soul_id, "incarnationId":prepared.incarnation_id,
+                "attemptId":preparation.start.attempt_id,
+                "outcome":settled.as_ref().ok(), "providerAbortConfirmed":aborted,
+                "registrySettlementFailed":settled.is_err(),
             }),
         );
-        Ok(reopened_result(view))
+    }
+
+    async fn stop_failed_reopen(
+        &self,
+        handle: &crate::registry::OwnedRuntimeHandle,
+    ) -> StopOutcome {
+        if self.backend.verify_empty(handle).await.unwrap_or(false) {
+            return StopOutcome::VerifiedEmpty;
+        }
+        let stopped = match self.backend.request_stop(handle, 2).await {
+            Ok(()) => match self
+                .verify_empty_with_budget(handle, Duration::from_secs(3))
+                .await
+            {
+                Ok(true) => return StopOutcome::VerifiedEmpty,
+                Ok(false) => self.backend.force_stop(handle).await,
+                Err(error) if error.code == RuntimeErrorCode::OwnershipMismatch => {
+                    return StopOutcome::BlockedOwnership
+                }
+                Err(_) => return StopOutcome::TerminationUnconfirmed,
+            },
+            Err(error) => Err(error),
+        };
+        match stopped {
+            Ok(()) => match self
+                .verify_empty_with_budget(handle, Duration::from_secs(3))
+                .await
+            {
+                Ok(true) => StopOutcome::VerifiedEmpty,
+                _ => StopOutcome::TerminationUnconfirmed,
+            },
+            Err(BackendError::OwnershipMismatch(_)) => StopOutcome::BlockedOwnership,
+            Err(BackendError::Unavailable(_)) => StopOutcome::BackendUnavailable,
+            Err(_) => StopOutcome::TerminationUnconfirmed,
+        }
     }
 
     async fn abort_reopen_provider_preparation(
         &self,
         prepared: &PreparedLaunch,
         workload: &LaunchWorkload,
-    ) {
-        let capability = workload
-            .terminal
-            .as_ref()
-            .and_then(|terminal| terminal.provider_launch_context.as_ref())
-            .or_else(|| {
-                workload
-                    .fresh_agent
-                    .as_ref()
-                    .and_then(|agent| agent.provider_launch_context.as_ref())
-            })
-            .and_then(|context| context.mcp_capability.as_ref());
+    ) -> bool {
+        let capability = reopen_capability(workload);
         if let Some(capability) = capability {
             if let Err(error) = self
                 .notify_mcp_capability(
@@ -4878,8 +4980,10 @@ impl Supervisor {
                         "errorCode":error.code,
                     }),
                 );
+                return false;
             }
         }
+        true
     }
 
     async fn stop(
@@ -5528,12 +5632,15 @@ impl Supervisor {
         use crate::recovery::NativeIdentityWait;
         let opencode_readiness = workload.opencode_tui_readiness_required(&context.provider);
         let result = self
-            .wait_for_native_identity(
+            .wait_for_native_identity_with_reopen_authority(
                 &workload.soul_id,
                 incarnation_id,
                 intent_revision,
                 crate::recovery::native_identity_wait_timeout(opencode_readiness),
                 false,
+                context.recovery_attempt_id.as_ref().filter(|_| {
+                    context.desired_state == freshell_runtime_protocol::DesiredState::Stopped
+                }),
             )
             .await;
         let (outcome, adoption_pending, elapsed_ms) = match &result {
@@ -5860,6 +5967,23 @@ mod tests {
     #[derive(Default)]
     struct FakeReopenBackend {
         runtimes: StdMutex<HashMap<String, FakeReopenRuntime>>,
+        probe: Arc<StdMutex<ReopenProviderProbe>>,
+        granted: Arc<tokio::sync::Notify>,
+    }
+
+    #[derive(Default)]
+    struct ReopenProviderProbe {
+        fail_create: bool,
+        fail_after_grant: bool,
+        refuse_cleanup: bool,
+        pause_observation: bool,
+        grants: Vec<HostCommand>,
+        resumed_args: Vec<String>,
+        history_path: Option<PathBuf>,
+        history_read: Option<String>,
+        stop_count: usize,
+        provider_volumes: Vec<String>,
+        cleanup_registry: Option<PathBuf>,
     }
 
     struct FakeReopenRuntime {
@@ -5884,6 +6008,14 @@ mod tests {
             &self,
             spec: &CreateRuntimeSpec,
         ) -> Result<crate::backend::BackendCreated, BackendError> {
+            let mut probe = self.probe.lock().unwrap();
+            if probe.fail_create {
+                return Err(BackendError::Unavailable("injected create refusal".into()));
+            }
+            probe
+                .provider_volumes
+                .push(spec.provider_volume_name.clone());
+            drop(probe);
             let container_id = format!("{:064x}", self.runtimes.lock().unwrap().len() + 1);
             self.runtimes.lock().unwrap().insert(
                 container_id.clone(),
@@ -5911,10 +6043,13 @@ mod tests {
                 .map_err(|error| BackendError::Unavailable(error.to_string()))?;
             let incarnation = handle.incarnation_id().clone();
             let limits = handle.requested_limits();
+            let probe = self.probe.clone();
+            let granted = self.granted.clone();
             let host = tokio::spawn(async move {
                 let boot = freshell_runtime_protocol::HostBootId::new();
                 let mut grant_epoch = 0;
                 let mut execution_generation = 0;
+                let mut observation = None;
                 loop {
                     let Ok((mut stream, _)) = listener.accept().await else {
                         return;
@@ -5923,6 +6058,7 @@ mod tests {
                     else {
                         return;
                     };
+                    let command = request.body.clone();
                     let result = match request.body {
                         HostCommand::Hello {
                             incarnation_id: requested,
@@ -5936,10 +6072,41 @@ mod tests {
                         HostCommand::GrantExecution {
                             control_epoch,
                             execution_generation: generation,
+                            terminal,
+                            resume_spec,
+                            native_identity_launch,
                             ..
                         } => {
                             grant_epoch = control_epoch;
                             execution_generation = generation;
+                            let mut probe = probe.lock().unwrap();
+                            probe.grants.push(command);
+                            if let (Some(terminal), Some(resume)) = (&terminal, &resume_spec) {
+                                let resumed = freshell_agent_runtime::prepare_terminal_for_resume(
+                                    terminal, resume,
+                                )
+                                .unwrap();
+                                probe.resumed_args = resumed.args;
+                                if let Some(path) = &probe.history_path {
+                                    assert_eq!(
+                                        resume.provider_session.native_session_id,
+                                        "native-reopen"
+                                    );
+                                    probe.history_read =
+                                        Some(std::fs::read_to_string(path).unwrap());
+                                }
+                            }
+                            if terminal.is_some() {
+                                observation = native_identity_launch.map(|launch| freshell_runtime_protocol::NativeIdentityObservation {
+                                    native_session_id: "native-reopen".into(),
+                                    incarnation_id: launch.incarnation_id,
+                                    launch_nonce: launch.launch_nonce,
+                                    evidence_revision: launch.evidence_revision,
+                                    source: freshell_runtime_protocol::NativeIdentitySource::CodexAppServer,
+                                    evidence_digest: "d".repeat(64),
+                                });
+                            }
+                            granted.notify_one();
                             Ok(HostResult::GrantAccepted {
                                 host_boot_id: boot.clone(),
                                 worker_pid: 42,
@@ -5951,19 +6118,30 @@ mod tests {
                                 opencode_adoption: Default::default(),
                             })
                         }
-                        HostCommand::Status { .. } => Ok(HostResult::Status {
-                            host_boot_id: boot.clone(),
-                            worker_pid: Some(42),
-                            worker_launch_count: 1,
-                            max_control_epoch: grant_epoch,
-                            max_execution_generation: execution_generation,
-                            fixture_evidence: serde_json::json!({"fixture":"reopen"}),
-                            exited: false,
-                            native_session_id: None,
-                            native_identity_observation: None,
-                            opencode_transfer_receipt: None,
-                            opencode_adoption: Default::default(),
-                        }),
+                        HostCommand::Status { .. } => {
+                            let probe = probe.lock().unwrap();
+                            Ok(HostResult::Status {
+                                host_boot_id: boot.clone(),
+                                worker_pid: Some(42),
+                                worker_launch_count: 1,
+                                max_control_epoch: grant_epoch,
+                                max_execution_generation: execution_generation,
+                                fixture_evidence: serde_json::json!({"fixture":"reopen"}),
+                                exited: probe.fail_after_grant,
+                                native_session_id: (!probe.pause_observation)
+                                    .then(|| {
+                                        observation
+                                            .as_ref()
+                                            .map(|value| value.native_session_id.clone())
+                                    })
+                                    .flatten(),
+                                native_identity_observation: (!probe.pause_observation)
+                                    .then(|| observation.clone())
+                                    .flatten(),
+                                opencode_transfer_receipt: None,
+                                opencode_adoption: Default::default(),
+                            })
+                        }
                         _ => return,
                     };
                     if write_frame(
@@ -6015,12 +6193,30 @@ mod tests {
 
         async fn request_stop(
             &self,
-            _handle: &crate::registry::OwnedRuntimeHandle,
+            handle: &crate::registry::OwnedRuntimeHandle,
             _grace_seconds: u64,
         ) -> Result<(), BackendError> {
-            Err(BackendError::Unavailable(
-                "unexpected Reopen fixture stop".into(),
-            ))
+            let mut probe = self.probe.lock().unwrap();
+            probe.stop_count += 1;
+            if let Some(path) = &probe.cleanup_registry {
+                let database = rusqlite::Connection::open(path).unwrap();
+                let (command, cleanup, claims, reservations): (String, String, u64, u64) = database.query_row(
+                    "SELECT c.state,i.cleanup_state,(SELECT COUNT(*) FROM writer_claims WHERE incarnation_id=i.incarnation_id),(SELECT COUNT(*) FROM admission_reservations WHERE incarnation_id=i.incarnation_id) FROM incarnations i JOIN commands c ON c.incarnation_id=i.incarnation_id WHERE i.incarnation_id=?1",
+                    [handle.incarnation_id().as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+                ).unwrap();
+                assert_eq!((command.as_str(),cleanup.as_str(),claims,reservations), ("reopen_cleanup_pending","termination_unconfirmed",1,1), "cleanup must be durable before contacting the runtime and keep authority until empty is proven");
+            }
+            if probe.refuse_cleanup {
+                return Err(BackendError::Unavailable("injected stop refusal".into()));
+            }
+            let mut runtimes = self.runtimes.lock().unwrap();
+            let runtime = runtimes.get_mut(handle.container_id()).unwrap();
+            assert_eq!(runtime.incarnation_id, *handle.incarnation_id());
+            runtime.state = crate::backend::BackendRuntimeState::Exited;
+            if let Some(host) = runtime.host.take() {
+                host.abort();
+            }
+            Ok(())
         }
 
         async fn force_stop(
@@ -6084,7 +6280,7 @@ mod tests {
             .unwrap();
         connection
             .execute(
-                "UPDATE incarnations SET fixture_kind='heartbeat' WHERE incarnation_id=?1",
+                "UPDATE incarnations SET fixture_kind='native_session' WHERE incarnation_id=?1",
                 [launch.incarnation_id.as_str()],
             )
             .unwrap();
@@ -6150,7 +6346,10 @@ mod tests {
             mode: "codex".into(),
             program: "codex".into(),
             args: Vec::new(),
-            env: std::collections::BTreeMap::new(),
+            env: std::collections::BTreeMap::from([(
+                "HOME".into(),
+                "/home/freshell/provider".into(),
+            )]),
             cwd: "/synthetic/workspace".into(),
             run_as_uid: 65_534,
             run_as_gid: 0,
@@ -6236,6 +6435,440 @@ mod tests {
         );
         envelope.auth = Some(supervisor.config.control_secret.clone());
         envelope
+    }
+
+    async fn seed_native_reopen(
+        supervisor: &Supervisor,
+        soul: &SoulId,
+        previous: &IncarnationId,
+        revision: u64,
+        callback: bool,
+        saved_resume: bool,
+    ) {
+        seed_reopen_callback_capability(supervisor, soul, previous, revision);
+        let mut terminal = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap()
+            .terminal
+            .unwrap();
+        terminal.resume_session_id = None;
+        terminal.args = vec!["--model".into(), "selected-model".into()];
+        if !callback {
+            terminal.provider_launch_context = None;
+        }
+        let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+        database.execute("UPDATE incarnations SET fixture_kind=NULL,terminal_spec=?1 WHERE incarnation_id=?2", rusqlite::params![serde_json::to_string(&terminal).unwrap(), previous.as_str()]).unwrap();
+        if !callback {
+            database.execute("UPDATE ordinary_stops SET capability_endpoint=NULL,capability_grant_id=NULL,revoke_pending=0,settled=1 WHERE soul_id=?1", [soul.as_str()]).unwrap();
+        }
+        if saved_resume {
+            let context = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            let resume = crate::resume_catalog::exact_resume_candidate(&context, None)
+                .unwrap()
+                .unwrap();
+            database
+                .execute(
+                    "UPDATE souls SET resume_spec=?1 WHERE soul_id=?2",
+                    rusqlite::params![serde_json::to_string(&resume).unwrap(), soul.as_str()],
+                )
+                .unwrap();
+        }
+    }
+
+    fn reopen_result(reply: AdminReply) -> freshell_runtime_protocol::ReopenResult {
+        match reply.result.unwrap() {
+            AdminResult::Reopen(result) => result,
+            other => panic!("unexpected Reopen result: {other:?}"),
+        }
+    }
+
+    async fn invoke_reopen(
+        supervisor: &Supervisor,
+        envelope: Envelope<AdminCommand>,
+    ) -> freshell_runtime_protocol::ReopenResult {
+        let AdminCommand::Reopen(request) = envelope.body else {
+            panic!("expected Reopen command")
+        };
+        Box::pin(supervisor.reopen(envelope.request_id, request))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reopen_native_readiness_only_accepts_current_prepared_attempt() {
+        for stop_during_readiness in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut supervisor, soul, previous, revision) =
+                stopped_supervisor(directory.path()).await;
+            seed_native_reopen(&supervisor, &soul, &previous, revision, false, true).await;
+            let backend = Arc::new(FakeReopenBackend::default());
+            backend.probe.lock().unwrap().pause_observation = stop_during_readiness;
+            supervisor.backend = backend.clone();
+            let envelope = reopen_envelope(&supervisor, RequestId::new(), soul.clone(), revision);
+            let mut operation = Box::pin(invoke_reopen(&supervisor, envelope));
+            tokio::select! {
+                _ = backend.granted.notified() => {}
+                result = &mut operation => panic!("Reopen ended before native startup: {result:?}"),
+            }
+            if stop_during_readiness {
+                let stop = supervisor
+                    .registry
+                    .begin_stop_expected(soul.clone(), Some(revision))
+                    .await
+                    .unwrap();
+                assert_eq!(stop.stop_fence().unwrap().intent_revision, revision + 1);
+                backend.probe.lock().unwrap().pause_observation = false;
+            }
+            let result = tokio::time::timeout(Duration::from_secs(5), operation)
+                .await
+                .unwrap();
+            assert_eq!(
+                result.outcome,
+                if stop_during_readiness {
+                    ReopenOutcome::Failed
+                } else {
+                    ReopenOutcome::Reopened
+                },
+                "{result:?}"
+            );
+            let context = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                context.desired_state,
+                if stop_during_readiness {
+                    freshell_runtime_protocol::DesiredState::Stopped
+                } else {
+                    freshell_runtime_protocol::DesiredState::Running
+                }
+            );
+            if stop_during_readiness {
+                let database =
+                    rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+                let visible: String = database
+                    .query_row(
+                        "SELECT visibility FROM view_intents WHERE soul_id=?1",
+                        [soul.as_str()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(visible, "hidden");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reopen_native_identity_without_resume_spec_builds_exact_resume_workload() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut supervisor, soul, previous, revision) = stopped_supervisor(directory.path()).await;
+        seed_native_reopen(&supervisor, &soul, &previous, revision, false, false).await;
+        let context = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        assert!(context.resume_spec.is_none());
+        assert!(context
+            .terminal
+            .as_ref()
+            .unwrap()
+            .resume_session_id
+            .is_none());
+        let history_path = directory.path().join("native-reopen.jsonl");
+        let history = "{\"role\":\"user\",\"text\":\"saved provider conversation\"}\n";
+        std::fs::write(&history_path, history).unwrap();
+        let backend = Arc::new(FakeReopenBackend::default());
+        backend.probe.lock().unwrap().history_path = Some(history_path.clone());
+        supervisor.backend = backend.clone();
+        let result = Box::pin(invoke_reopen(
+            &supervisor,
+            reopen_envelope(&supervisor, RequestId::new(), soul.clone(), revision),
+        ))
+        .await;
+        let probe = backend.probe.lock().unwrap();
+        let HostCommand::GrantExecution { resume_spec, .. } = &probe.grants[0] else {
+            panic!("no provider grant")
+        };
+        let resume = resume_spec
+            .as_ref()
+            .expect("saved native identity must be delivered as an exact resume workload");
+        assert_eq!(resume.provider_session.native_session_id, "native-reopen");
+        assert_eq!(resume.provider_session.provider_store_id, "reopen-store");
+        assert!(probe
+            .resumed_args
+            .windows(2)
+            .any(|args| args == ["resume", "native-reopen"]));
+        assert_eq!(probe.history_read.as_deref(), Some(history));
+        assert_eq!(std::fs::read_to_string(history_path).unwrap(), history);
+        assert_eq!(
+            probe.provider_volumes,
+            [context.prior_handle.provider_volume_name()]
+        );
+        assert_eq!(result.outcome, ReopenOutcome::Reopened, "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn reopen_resume_commits_provider_preparation_before_publish() {
+        for fail_commit in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let (supervisor, soul, previous, revision) = stopped_supervisor(directory.path()).await;
+            seed_reopen_callback_capability(&supervisor, &soul, &previous, revision);
+            let context = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            let resume = crate::resume_catalog::exact_resume_candidate(&context, None)
+                .unwrap()
+                .unwrap();
+            let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+            database
+                .execute(
+                    "UPDATE souls SET resume_spec=?1 WHERE soul_id=?2",
+                    rusqlite::params![serde_json::to_string(&resume).unwrap(), soul.as_str()],
+                )
+                .unwrap();
+            let listener = UnixListener::bind(
+                supervisor
+                    .config
+                    .control_socket_path
+                    .with_file_name("mcp.sock"),
+            )
+            .unwrap();
+            let actions = if fail_commit {
+                vec!["revoke", "issue", "activate", "commit", "abort"]
+            } else {
+                vec!["revoke", "issue", "activate", "commit"]
+            };
+            let peer = tokio::spawn(frozen_callback_peer(
+                listener,
+                actions.iter().map(|action| (*action).to_owned()).collect(),
+                reopened_codex_provider_context(),
+                fail_commit.then(|| "commit".into()),
+                None,
+            ));
+            let result = Box::pin(invoke_reopen(
+                &supervisor,
+                reopen_envelope(&supervisor, RequestId::new(), soul.clone(), revision),
+            ))
+            .await;
+            let requests = match tokio::time::timeout(Duration::from_secs(5), peer).await {
+                Ok(requests) => requests.unwrap(),
+                Err(_) => panic!(
+                    "exact resume returned {:?} without finishing provider commit",
+                    result.outcome
+                ),
+            };
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|request| request.action.as_str())
+                    .collect::<Vec<_>>(),
+                actions
+            );
+            assert_eq!(
+                result.outcome,
+                if fail_commit {
+                    ReopenOutcome::Failed
+                } else {
+                    ReopenOutcome::Reopened
+                }
+            );
+            let (desired, visibility, successes): (String, String, u64) = database.query_row("SELECT desired_state,(SELECT visibility FROM view_intents WHERE soul_id=?1),(SELECT COUNT(*) FROM recovery_attempts WHERE soul_id=?1 AND verdict='succeeded') FROM souls WHERE soul_id=?1", [soul.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+            assert_eq!(
+                (desired.as_str(), visibility.as_str(), successes),
+                if fail_commit {
+                    ("stopped", "hidden", 0)
+                } else {
+                    ("running", "visible", 1)
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reopen_failure_cleanup_retires_replacement_and_allows_retry() {
+        for failure in ["issue", "create", "after-grant", "commit", "unconfirmed"] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut supervisor, soul, previous, revision) =
+                stopped_supervisor(directory.path()).await;
+            let with_callback = matches!(failure, "issue" | "commit");
+            seed_native_reopen(&supervisor, &soul, &previous, revision, with_callback, true).await;
+            let callback_socket = supervisor
+                .config
+                .control_socket_path
+                .with_file_name("mcp.sock");
+            let peer = with_callback.then(|| {
+                let listener = UnixListener::bind(&callback_socket).unwrap();
+                let actions = if failure == "issue" {
+                    vec!["revoke", "issue"]
+                } else {
+                    vec!["revoke", "issue", "activate", "commit", "abort"]
+                };
+                tokio::spawn(frozen_callback_peer(
+                    listener,
+                    actions.into_iter().map(str::to_owned).collect(),
+                    if failure == "issue" {
+                        b"rejected".to_vec()
+                    } else {
+                        reopened_codex_provider_context()
+                    },
+                    (failure == "commit").then(|| "commit".into()),
+                    None,
+                ))
+            });
+            let backend = Arc::new(FakeReopenBackend::default());
+            {
+                let mut probe = backend.probe.lock().unwrap();
+                probe.fail_create = failure == "create";
+                probe.fail_after_grant = matches!(failure, "after-grant" | "unconfirmed");
+                probe.refuse_cleanup = failure == "unconfirmed";
+                probe.cleanup_registry = Some(supervisor.registry.database_path().to_path_buf());
+            }
+            supervisor.backend = backend.clone();
+            let result = Box::pin(invoke_reopen(
+                &supervisor,
+                reopen_envelope(&supervisor, RequestId::new(), soul.clone(), revision),
+            ))
+            .await;
+            assert_eq!(result.outcome, ReopenOutcome::Failed);
+            if let Some(peer) = peer {
+                tokio::time::timeout(Duration::from_secs(2), peer)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                std::fs::remove_file(&callback_socket).unwrap();
+            }
+            let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+            let (desired, current_revision, visibility, active, claims, reservations): (String,u64,String,u64,u64,u64) = database.query_row("SELECT desired_state,intent_revision,(SELECT visibility FROM view_intents WHERE soul_id=?1),(SELECT COUNT(*) FROM incarnations WHERE soul_id=?1 AND launch_state IN ('prepared','created','starting','running','stopping')),(SELECT COUNT(*) FROM writer_claims WHERE soul_id=?1),(SELECT COUNT(*) FROM admission_reservations a JOIN incarnations i ON i.incarnation_id=a.incarnation_id WHERE i.soul_id=?1) FROM souls WHERE soul_id=?1", [soul.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).unwrap();
+            assert_eq!(
+                (desired.as_str(), current_revision, visibility.as_str()),
+                ("stopped", revision, "hidden")
+            );
+            if failure == "unconfirmed" {
+                assert_eq!((active, claims, reservations), (1, 1, 1));
+                let cleanup: String = database
+                    .query_row(
+                        "SELECT cleanup_state FROM incarnations WHERE incarnation_id!=?1",
+                        [previous.as_str()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(cleanup, "termination_unconfirmed");
+                let retry = Box::pin(invoke_reopen(
+                    &supervisor,
+                    reopen_envelope(&supervisor, RequestId::new(), soul.clone(), revision),
+                ))
+                .await;
+                assert_eq!(retry.outcome, ReopenOutcome::Failed);
+                assert_eq!(backend.probe.lock().unwrap().grants.len(), 1);
+                {
+                    let mut probe = backend.probe.lock().unwrap();
+                    probe.refuse_cleanup = false;
+                    probe.fail_after_grant = false;
+                }
+                let recovered = Box::pin(invoke_reopen(
+                    &supervisor,
+                    reopen_envelope(&supervisor, RequestId::new(), soul.clone(), revision),
+                ))
+                .await;
+                assert_eq!(recovered.outcome, ReopenOutcome::Reopened);
+                let unfinished: u64 = database.query_row("SELECT COUNT(*) FROM recovery_attempts WHERE soul_id=?1 AND finished_at IS NULL", [soul.as_str()], |row| row.get(0)).unwrap();
+                assert_eq!(
+                    unfinished, 0,
+                    "finishing deferred cleanup must also settle the failed Reopen journal"
+                );
+            } else {
+                assert_eq!(
+                    (active, claims, reservations),
+                    (0, 0, 0),
+                    "{failure}: failed replacement must release only verified-empty authority"
+                );
+                let mut probe = backend.probe.lock().unwrap();
+                if matches!(failure, "after-grant" | "commit") {
+                    assert_eq!(probe.stop_count, 1);
+                }
+                probe.fail_create = false;
+                probe.fail_after_grant = false;
+                drop(probe);
+                let retry_peer = with_callback.then(|| {
+                    tokio::spawn(frozen_callback_peer(
+                        UnixListener::bind(&callback_socket).unwrap(),
+                        ["issue", "activate", "commit"]
+                            .into_iter()
+                            .map(str::to_owned)
+                            .collect(),
+                        reopened_codex_provider_context(),
+                        None,
+                        None,
+                    ))
+                });
+                let retry = Box::pin(invoke_reopen(
+                    &supervisor,
+                    reopen_envelope(&supervisor, RequestId::new(), soul, revision),
+                ))
+                .await;
+                assert_eq!(
+                    retry.outcome,
+                    ReopenOutcome::Reopened,
+                    "{failure}: {retry:?}"
+                );
+                if let Some(peer) = retry_peer {
+                    tokio::time::timeout(Duration::from_secs(2), peer)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reopen_success_replay_survives_later_stop() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut supervisor, soul, _, revision) = stopped_supervisor(directory.path()).await;
+        let backend = Arc::new(FakeReopenBackend::default());
+        supervisor.backend = backend.clone();
+        let request = reopen_envelope(&supervisor, RequestId::new(), soul.clone(), revision);
+        let first = reopen_result(supervisor.dispatch(request.clone()).await);
+        assert_eq!(first.outcome, ReopenOutcome::Reopened);
+        let incarnation = first.view.unwrap().incarnation_id;
+        let (outcome, stopped) = Box::pin(supervisor.stop(soul.clone(), Some(revision + 1)))
+            .await
+            .unwrap();
+        assert_eq!(outcome, StopOutcome::VerifiedEmpty);
+        let second = Box::pin(invoke_reopen(
+            &supervisor,
+            reopen_envelope(
+                &supervisor,
+                RequestId::new(),
+                soul.clone(),
+                stopped.intent_revision,
+            ),
+        ))
+        .await;
+        assert_eq!(second.outcome, ReopenOutcome::Reopened);
+        assert_ne!(second.view.unwrap().incarnation_id, incarnation);
+        let before = supervisor.registry.inventory().await.unwrap().len();
+        let grants_before = backend.probe.lock().unwrap().grants.len();
+        let replay = supervisor.dispatch(request).await;
+        assert!(
+            replay.result.is_ok(),
+            "a committed successful receipt survives later Stop: {replay:?}"
+        );
+        let replay = reopen_result(replay);
+        assert_eq!(replay.outcome, ReopenOutcome::Reopened);
+        assert_eq!(replay.view.unwrap().incarnation_id, incarnation);
+        assert_eq!(supervisor.registry.inventory().await.unwrap().len(), before);
+        assert_eq!(backend.probe.lock().unwrap().grants.len(), grants_before);
     }
 
     #[tokio::test]
@@ -6668,9 +7301,9 @@ mod tests {
         assert_eq!(requests[3].grant_id.as_deref(), Some("grant-reopen-new"));
 
         let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
-        let (desired, intent_revision, view_visibility, reopen_state): (String, u64, String, String) = database
+        let (desired, intent_revision, view_visibility, prepared_count): (String, u64, String, u64) = database
             .query_row(
-                "SELECT desired_state,intent_revision,(SELECT visibility FROM view_intents WHERE soul_id=?1 AND kind='automatic_primary'),(SELECT state FROM commands WHERE soul_id=?1 AND state='reopen_prepared') FROM souls WHERE soul_id=?1",
+                "SELECT desired_state,intent_revision,(SELECT visibility FROM view_intents WHERE soul_id=?1 AND kind='automatic_primary'),(SELECT COUNT(*) FROM commands WHERE soul_id=?1 AND state='reopen_prepared') FROM souls WHERE soul_id=?1",
                 [soul.as_str()],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
@@ -6678,7 +7311,10 @@ mod tests {
         assert_eq!(desired, "stopped");
         assert_eq!(intent_revision, revision);
         assert_eq!(view_visibility, "hidden");
-        assert_eq!(reopen_state, "reopen_prepared");
+        assert_eq!(
+            prepared_count, 0,
+            "a rejected preparation must be settled before returning"
+        );
     }
 }
 
@@ -10011,6 +10647,22 @@ fn fresh_without_raw_bootstrap(
         }
         agent
     })
+}
+
+fn reopen_capability(
+    workload: &LaunchWorkload,
+) -> Option<&freshell_runtime_protocol::McpCapabilityReference> {
+    workload
+        .terminal
+        .as_ref()
+        .and_then(|terminal| terminal.provider_launch_context.as_ref())
+        .or_else(|| {
+            workload
+                .fresh_agent
+                .as_ref()
+                .and_then(|agent| agent.provider_launch_context.as_ref())
+        })
+        .and_then(|context| context.mcp_capability.as_ref())
 }
 
 fn install_reopen_provider_context(
