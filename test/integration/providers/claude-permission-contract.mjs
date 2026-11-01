@@ -38,6 +38,7 @@ import { createClaudeFixture, FAKE_MODEL, resolvePinnedClaude, startLocalProvide
 
 const repoRoot = process.argv[2]
 if (!repoRoot) throw new Error('repository root argument is required')
+const fixturePrefix = process.env.FRESHELL_CLAUDE_PERMISSION_FIXTURE_PREFIX ?? 'freshell-claude-perm'
 
 const TURN_TIMEOUT_MS = 45_000
 export const PLAN = '# Plan\n\n1. Edit foo.ts\n2. Run the tests'
@@ -130,7 +131,7 @@ async function readJson(file) {
 }
 
 async function runScenario(name, spec) {
-  const fixture = await createClaudeFixture({ prefix: `freshell-claude-perm-${name}-` })
+  const fixture = await createClaudeFixture({ prefix: `${fixturePrefix}-${name}-` })
   const outside = path.join(fixture.root, 'outside')
   await fs.mkdir(outside, { recursive: true })
   const ctx = { cwd: fixture.cwd, outsideFile: path.join(outside, 'notes.txt'), planPath: null }

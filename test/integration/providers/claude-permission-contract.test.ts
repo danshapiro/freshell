@@ -15,6 +15,7 @@
 // (PinnedClaudeMissingError): nothing here is ever skipped.
 
 import { spawn, type ChildProcess } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -178,6 +179,10 @@ describe('Claude permission contract harness survives a fixture-cleanup failure'
     // outside/notes.txt marker exists, and nothing writes into the fixture
     // root itself after that), make the root unwritable so fixture.cleanup()
     // fails with EACCES — the same finally block that raced the live CLI.
+    const fixturePrefix = `freshell-claude-perm-${randomUUID()}`
+    const staleRoot = path.join(os.tmpdir(), `freshell-claude-perm-stale-${randomUUID()}`)
+    await fs.mkdir(path.join(staleRoot, 'outside'), { recursive: true })
+    await fs.writeFile(path.join(staleRoot, 'outside', 'notes.txt'), 'pre-existing fixture')
     const chmodded = new Set<string>()
     const watcher = setInterval(() => {
       void (async () => {
@@ -188,7 +193,7 @@ describe('Claude permission contract harness survives a fixture-cleanup failure'
           return
         }
         for (const entry of entries) {
-          if (!entry.startsWith('freshell-claude-perm-') || chmodded.has(entry)) continue
+          if (!entry.startsWith(`${fixturePrefix}-`) || chmodded.has(entry)) continue
           const root = path.join(os.tmpdir(), entry)
           const setupDone = await fs.stat(path.join(root, 'outside', 'notes.txt')).then(() => true, () => false)
           if (!setupDone) continue
@@ -202,7 +207,11 @@ describe('Claude permission contract harness survives a fixture-cleanup failure'
 
     const child = spawn(process.execPath, ['--import', 'tsx', HARNESS, REPO_ROOT], {
       cwd: REPO_ROOT,
-      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', LANG: 'C.UTF-8' },
+      env: {
+        PATH: process.env.PATH ?? '/usr/bin:/bin',
+        LANG: 'C.UTF-8',
+        FRESHELL_CLAUDE_PERMISSION_FIXTURE_PREFIX: fixturePrefix,
+      },
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     let stdout = ''
@@ -242,6 +251,8 @@ describe('Claude permission contract harness survives a fixture-cleanup failure'
         await fs.chmod(root, 0o700).catch(() => {})
         await fs.rm(root, { recursive: true, force: true }).catch(() => {})
       }
+      await fs.chmod(staleRoot, 0o700).catch(() => {})
+      await fs.rm(staleRoot, { recursive: true, force: true }).catch(() => {})
     }
   }, 220_000)
 })
