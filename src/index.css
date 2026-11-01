@@ -1603,7 +1603,7 @@ body {
   flex: 1 1 auto;
 }
 .fresh-agent-top-stack-scroll > * + * { margin-top: .25rem; }
-.fresh-agent-request-count, .fresh-agent-notices, .fresh-agent-top-stack > .fresh-agent-diff-panel { flex: 0 0 auto; }
+.fresh-agent-request-count, .fresh-agent-notices, .fresh-agent-top-stack-content > .fresh-agent-diff-panel { flex: 0 0 auto; }
 .fresh-agent-errors { min-height: 0; overflow: auto; flex: 0 1 auto; }
 .fresh-agent-request-count, .fresh-agent-notices, .fresh-agent-errors > details > summary { font-size: .75rem; }
 .fresh-agent-top-stack summary { cursor: pointer; overflow-wrap: anywhere; }
@@ -1616,7 +1616,8 @@ body {
 }
 .fresh-agent-approval-card, .fresh-agent-plan-card { min-width: 0; overflow-wrap: anywhere; }
 .fresh-agent-top-stack .fresh-agent-approval-heading { flex-wrap: wrap; }
-.fresh-agent-style-serif .fresh-agent-top-stack > *, .fresh-agent-style-mono .fresh-agent-top-stack > * { margin-top: 0; margin-bottom: 0; }
+.fresh-agent-style-serif .fresh-agent-top-stack > *, .fresh-agent-style-mono .fresh-agent-top-stack > *,
+.fresh-agent-style-serif .fresh-agent-top-stack-content > *, .fresh-agent-style-mono .fresh-agent-top-stack-content > * { margin-top: 0; margin-bottom: 0; }
 @container (min-width: 900px) {
   .fresh-agent-sidebar { max-height: none; }
   .fresh-agent-layout--with-sidebar .fresh-agent-top-stack { max-height: min(35cqh, max(0px, calc(100cqh - 240px))); }
@@ -1635,10 +1636,10 @@ body {
     padding: 2px 6px;
   }
   .fresh-agent-top-stack > .fresh-agent-request-count { grid-column: 1; grid-row: 1; align-self: start; }
-  .fresh-agent-top-stack > .fresh-agent-notices { grid-column: 2; grid-row: 1; min-height: 0; overflow: auto; }
-  .fresh-agent-top-stack > .fresh-agent-errors { grid-column: 3; grid-row: 1; }
-  .fresh-agent-top-stack > .fresh-agent-diff-panel { grid-column: 4; grid-row: 1; min-height: 0; overflow: auto; }
-  .fresh-agent-top-stack > .fresh-agent-top-stack-scroll { grid-column: 1 / -1; grid-row: 2; }
+  .fresh-agent-top-stack-content > .fresh-agent-notices { grid-column: 2; grid-row: 1; min-height: 0; overflow: auto; }
+  .fresh-agent-top-stack-content > .fresh-agent-errors { grid-column: 3; grid-row: 1; }
+  .fresh-agent-top-stack-content > .fresh-agent-diff-panel { grid-column: 4; grid-row: 1; min-height: 0; overflow: auto; }
+  .fresh-agent-top-stack-content > .fresh-agent-top-stack-scroll { grid-column: 1 / -1; grid-row: 2; }
   .fresh-agent-top-stack .fresh-agent-diff-trigger { padding: 0 4px; white-space: nowrap; line-height: 1.2; }
   .fresh-agent-top-stack .fresh-agent-request-count,
   .fresh-agent-top-stack summary { line-height: 1.2; }
@@ -1665,10 +1666,10 @@ body {
     padding: 2px 6px;
   }
   .fresh-agent-top-stack > .fresh-agent-request-count { grid-column: 1 / -1; grid-row: 1; }
-  .fresh-agent-top-stack > .fresh-agent-notices { grid-column: 1; grid-row: 2; min-height: 0; overflow: auto; }
-  .fresh-agent-top-stack > .fresh-agent-errors { grid-column: 2; grid-row: 2; }
-  .fresh-agent-top-stack > .fresh-agent-diff-panel { grid-column: 3; grid-row: 2; min-height: 0; overflow: auto; }
-  .fresh-agent-top-stack > .fresh-agent-top-stack-scroll { grid-column: 1 / -1; grid-row: 3; }
+  .fresh-agent-top-stack-content > .fresh-agent-notices { grid-column: 1; grid-row: 2; min-height: 0; overflow: auto; }
+  .fresh-agent-top-stack-content > .fresh-agent-errors { grid-column: 2; grid-row: 2; }
+  .fresh-agent-top-stack-content > .fresh-agent-diff-panel { grid-column: 3; grid-row: 2; min-height: 0; overflow: auto; }
+  .fresh-agent-top-stack-content > .fresh-agent-top-stack-scroll { grid-column: 1 / -1; grid-row: 3; }
   .fresh-agent-top-stack .fresh-agent-diff-trigger { padding: 0 4px; white-space: nowrap; line-height: 1.2; }
   .fresh-agent-top-stack .fresh-agent-request-count,
   .fresh-agent-top-stack summary { line-height: 1.2; }
@@ -1677,35 +1678,38 @@ body {
   .fresh-agent-top-stack .fresh-agent-errors summary { white-space: nowrap; }
 }
 
-/* Expanded diagnostics use the full bounded stack width. The stack can scroll
-   as a whole, so neither diagnostics nor requests can squeeze out other controls. */
-.fresh-agent-pane .fresh-agent-top-stack:has(> .fresh-agent-notices details[open], > .fresh-agent-errors details[open]) {
+/* The compact layout flattens this wrapper. When diagnostics expand, the
+   count stays in normal flow above the scroll viewport, never over controls. */
+.fresh-agent-top-stack-content { display: contents; }
+.fresh-agent-pane .fresh-agent-top-stack:has(.fresh-agent-notices details[open], .fresh-agent-errors details[open]) {
   display: flex;
   flex-direction: column;
+}
+.fresh-agent-top-stack:has(.fresh-agent-notices details[open], .fresh-agent-errors details[open]) > .fresh-agent-top-stack-content {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
   overflow: auto;
   overscroll-behavior: contain;
+  gap: .25rem;
 }
-.fresh-agent-top-stack:has(> .fresh-agent-notices details[open], > .fresh-agent-errors details[open]) > * {
+.fresh-agent-top-stack:has(.fresh-agent-notices details[open], .fresh-agent-errors details[open]) .fresh-agent-top-stack-content > * {
   flex: 0 0 auto;
   min-height: 0;
   overflow: visible;
 }
-.fresh-agent-top-stack:has(> .fresh-agent-notices details[open], > .fresh-agent-errors details[open]) > .fresh-agent-top-stack-scroll {
+.fresh-agent-top-stack:has(.fresh-agent-notices details[open], .fresh-agent-errors details[open]) .fresh-agent-top-stack-content > .fresh-agent-top-stack-scroll {
   min-height: 44px;
   max-height: 10rem;
   overflow: auto;
 }
-.fresh-agent-top-stack:has(> .fresh-agent-notices details[open], > .fresh-agent-errors details[open]) .fresh-agent-request-count {
-  position: sticky;
-  top: 0;
-  z-index: 1;
-  background: var(--fresh-agent-panel-surface, hsl(var(--background)));
-}
-.fresh-agent-top-stack:has(> .fresh-agent-notices details[open], > .fresh-agent-errors details[open]) .fresh-agent-diagnostic-body {
+.fresh-agent-top-stack:has(.fresh-agent-notices details[open], .fresh-agent-errors details[open]) .fresh-agent-diagnostic-body {
   min-height: 44px;
 }
-.fresh-agent-notice-summary { margin-left: .5rem; }
-.fresh-agent-top-stack:has(> .fresh-agent-notices details[open], > .fresh-agent-errors details[open]) summary {
+.fresh-agent-top-stack:has(.fresh-agent-notices details[open], .fresh-agent-errors details[open]) summary {
   white-space: normal;
 }
+.fresh-agent-notice-summary { margin-left: .5rem; }
 .fresh-agent-errors > [role="alert"] { overflow-wrap: anywhere; }

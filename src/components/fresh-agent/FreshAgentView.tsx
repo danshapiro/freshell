@@ -5378,6 +5378,7 @@ export function FreshAgentView({
           <div className="fresh-agent-main flex min-h-0 flex-1 flex-col">
             <div className="fresh-agent-top-stack" role="group" aria-label="Agent requests and status">
               {requestCount > 0 ? <div className="fresh-agent-request-count" role="status">{requestCount} pending {requestCount === 1 ? 'request' : 'requests'}</div> : null}
+              <div className="fresh-agent-top-stack-content">
               <FreshAgentNoticeStack notices={routineNotices} errors={visibleErrors} />
               {requestCount > 0 ? <div className="fresh-agent-top-stack-scroll" role="region" aria-label="Pending requests">
               {pendingApprovals.map((approval) => (
@@ -5453,6 +5454,7 @@ export function FreshAgentView({
                   composerRef.current?.focus()
                 }}
               />
+              </div>
             </div>
             <FreshAgentAsyncQuestionContext.Provider value={asyncQuestionContext}>
             <FreshAgentOpenSessionContext.Provider value={openDelegationSession}>
