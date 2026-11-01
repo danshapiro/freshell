@@ -27,10 +27,16 @@ Implement the three-stage Freshagent multi-device robustness proposal so one ser
 
 **Preparation status:** The external draft and writer self-review were completed before the user resumed this run. The dedicated worktree is now `.worktrees/freshagent-multiple-devices` on `the-usual/freshagent-multiple-devices`, based at `6b1c961baf8301dc7ebf8d5fdca7105fbfca9cdb`. The base suite previously exited 1 because `managed-provider-qualification` could not compile `crates/freshell-server/src/managed_provider_bootstrap.rs` (`mcp_enabled` is undefined at lines 123/128; the Codex pattern at line 372 omits `approval_default`). The complete receipt remains in the baseline ledger. The user explicitly resumed after that failure was reported, so continue while treating only reproduced base failures as pre-existing. Do not add an unrelated baseline repair task. This committed plan is the implementation contract for the three stages below; source and review corrections supersede its code drafts once execution begins.
 
+## Load-bearing outcome: FAILED/non-converged
+
+Stage 2 found that no inspected supported route for the pinned provider paths establishes both ordinary Stop and the guarantee that a delayed control captured for turn A cannot interrupt native successor B. For pinned Codex 0.164.0, the public app-server interrupt path discards the target before a generic core interrupt. Claude/Kilroy's pinned SDK 0.3.237 and OpenCode 1.18.21 expose session-scoped interrupt/cancellation without an expected-turn argument; this review did not establish their full native effect scheduling. The managed Freshagent host carries a soul/control epoch but dispatches a generic actor/provider interrupt without a separate turn-target barrier. Codex's internal conditional primitive is not exposed through the public app-server protocol. Local locks, rechecks, receipts, or test mocks do not establish the requested native boundary. Blanket refusal removes requested ordinary Stop and is not an acceptable substitute. This finding is limited to the inspected supported routes and versions; the complete three-stage request cannot safely proceed under the evidence available here.
+
+Do not implement Task 14's interrupt path or mark this plan complete. No implementation task has started (0/16). Reopen the plan only when every required provider path has a concrete, source-backed target-conditional operation or provider-owned barrier, followed by independent validation and native-boundary tests. The LB-9 review is static source analysis; no live race was executed. See `reports/load-bearing-strategist-lb9-alternatives.md`, `reports/load-bearing-validator-LB-9-Codex-0.164.0.md`, and the run ledger under `.worktrees/.the-usual-logs/freshagent-multiple-devices/`.
+
 ## Global Constraints
 
 1. Execute only in the verified dedicated worktree `.worktrees/freshagent-multiple-devices` on `the-usual/freshagent-multiple-devices`, with immutable base `6b1c961baf8301dc7ebf8d5fdca7105fbfca9cdb`. Preserve the recorded base-gate failure and any later same-base receipt; do not rewrite a failed baseline as green. Main and unrelated work remain untouched.
-2. Continue the full six-stage the-usual workflow through Tasks 1–16, task reviews, and whole-delta review. The user lifted the earlier pause after the plan. Do not deploy, restart the live port-3001 server, create a PR, or merge. Keep unrelated baseline compile repairs outside this feature branch; compare final failures against the recorded base before classifying them as pre-existing.
+2. The user lifted the earlier pause after the plan, and load-bearing validation continued. It ended FAILED/non-converged before implementation because no inspected supported route for the pinned providers establishes target-safe ordinary Stop; do not continue Tasks 1–16 under that unresolved contract. Do not deploy, restart the live port-3001 server, create a PR, or merge. Keep unrelated baseline compile repairs outside this feature branch; compare final failures against the recorded base before classifying them as pre-existing.
 3. Node >=22.5, Rust stable/workspace minimum 1.96, exactly pnpm 10.34.5; reuse installed dependencies and prepared runtime files. Use `pnpm install --frozen-lockfile` only when needed. NodeNext/ESM relative TypeScript imports end in `.js`.
 4. Keep the default in-process Freshagent path and the optional managed Freshagent path working. Do not enable a managed feature flag to evade default-path work. Managed terminal support alone is not managed Freshagent support.
 5. Preserve one native writer, owner epoch/generation, operation tickets, provider leases, terminal-liveness checks, handoff fences, send logical-attempt fences, and provider-native busy/attention behavior. Never use browser presence or a durable terminal ID as proof of process liveness.
@@ -46,7 +52,7 @@ Implement the three-stage Freshagent multi-device robustness proposal so one ser
 The stage-2 ledger and its independent validation reports govern these ten decisions. Source-backed corrections below are already applied: remove acceptance-time private settings restoration, make replay gaps explicit, describe receipt retention as new behavior rather than an existing actor facility, use platform-aware atomic replacement, and use the local Docker managed fixture route. Routine selector spelling and generic correctness of code not yet written are task verification, not additional assumptions.
 
 1. Binding mutation must be fenced to the exact current ownership operation across cancellation, durable writes and Live publication; choose a safe synchronous guard or exact-operation repair.
-2. Codex, Claude/Kilroy and OpenCode need provider-specific stable identities and versions for one-time merging of live output with durable history during continuous output.
+2. Codex, Claude/Kilroy and OpenCode need provider-specific stable identities and versions for one-time merging of live output with durable history during continuous output. For pinned OpenCode 1.18.21, continuous joins require the instance `/event` route and its `server.connected` readiness barrier, retaining part bases/deltas in the shared owner; missing delta prefixes, reconnects or local lag require an affected-part gap until a full replacement. This is an implementation contract, not evidence that a target-safe interrupt exists. See `reports/load-bearing-validator-LB-2-OpenCode-streaming.md` and `reports/load-bearing-strategist-lb2-opencode-assumptions.md`.
 3. Managed capture must pair retained presentation with its real event watermark across provider-to-actor loss and coalescing, or return an explicit gap/reset.
 4. Shared settings edits must report known effective values after success, partial application, refusal or uncertain native response while preserving each provider's busy behavior.
 5. Receipts must distinguish request write, provider acceptance, completion and possible delivery; controls that finish a turn must remain dispatchable, and uncertain sends must not be replayed.
@@ -906,6 +912,7 @@ git commit -m "feat(freshagent): share reconciliation state and capture atomic a
 - Consumes: Task 8 generic reconciliation state and Task 3 durable session identity/owner claim; existing Codex transcript projection and Claude/OpenCode native event accumulators.
 - Produces: owner-local `reconcile_snapshot(locator) -> Result<SnapshotCapture<FreshAgentPresentation>>`, `read_reconciliation(cursor, limits)`, and `publish_committed(event)` whose record is stamped before broadcasting. Default command persistence is scoped to the durable provider identity/alias record and its stable store ID, not a process/global or browser key.
 - Produces: default `with_reconciliation_root(PathBuf)` initialization and `DefaultReconciliationStore::open(root, stableStoreId)`, reusing Task 8's platform-aware atomic replacement/protected-payload helpers. Resolve `stableStoreId` from a durable provider-scoped identity/alias record that survives pre/post-materialization aliases, rekey and restart while assigning true forks a distinct ID; never derive the store key from whichever locator arrived in the current request. Resolve the exact identity and alias transaction under LB-6 before implementation. Inject root from the server's existing isolated home. Managed actors retain their existing state directory/file. No new ownership lock or second send dispatch-fence store is introduced.
+- OpenCode streaming contract for pinned 1.18.21: use one owner subscription to the instance `/event` route, bind it to the authoritative session directory/workspace and subscription generation, and await that generation's `server.connected` readiness before dispatch. Do not treat `/global/event` readiness as sufficient. Retain native per-part full bases, deltas, final replacements and removals in the same owner commit as the outer event watermark. Do not infer a total order across unrelated native producers. Reconnect, EOF, malformed relevant input, local broadcast loss, incompatible part identity, removal during active deltas, or an unknown lifecycle invalidates affected coverage; report a bounded source-scoped gap with unknown native extent until a trustworthy full replacement arrives. Native deltas have no replay cursor, so do not synthesize a precise missing native sequence.
 
 - [ ] **Step 1: Add red provider integration tests**
 
@@ -928,6 +935,15 @@ canonical mutation obtains an outer source/sequence, including ClaudeEdgeHub
 and consumer-local writes. A native-ID materialization rekeys the same source;
 a new runtime changes source while durable command identity remains queryable.
 Keep existing Codex projection revision/consumed-prefix tests unchanged.
+
+For OpenCode, the fixture must emit actual native full-part starts, text/reasoning
+deltas, final replacements, removals and reconnect/local-lag boundaries. Join a
+second device during ongoing text and reasoning before any final full update and
+prove it receives the retained base plus deltas exactly once. Hold `/event`
+readiness and verify no owned turn dispatches until the matching subscription
+generation is ready; wrong directory/workspace and stale ready frames are inert.
+The current idle-only event fixture is not evidence for this case. Do not claim a
+specific native lost sequence when a delta prefix is missing.
 ```
 
 - [ ] **Step 2: Red**
@@ -954,8 +970,16 @@ the before-publication checkpoint observer hook, avoiding reentrant owner locks.
 
 Codex retains projectionId/historyGeneration/revision/read fences as its inner
 transcript authority. Claude/Kilroy overlay uses runtime+turn+native message+
-block keys and full current block values. OpenCode uses native message/part
-keys and full current values. Durable reads are prepared outside the lock;
+block keys and full current block values. OpenCode reduces one known per-part
+lifecycle: full start value, awaited deltas, then a final full replacement.
+Exact message/part identities are mandatory; native timestamps and cross-source
+ordering are not merge keys. A removal tombstones its part, and unknown fields,
+incompatible identities or a delta after finalization invalidate that affected
+continuity rather than recreating speculative text. On `/event` reconnect, EOF,
+malformed relevant input or local `Lagged/Lost`, clear readiness and mark
+affected active parts incomplete until a trustworthy full replacement arrives.
+Represent this as a source-scoped outer discontinuity with unknown native extent;
+the native stream has no sequence to narrow the missing interval. Durable reads are prepared outside the lock;
 merge only source/history-compatible results, removing overlay entries only
 when durable native IDs/versions prove inclusion. An active stream's overlay
 is never discarded because disk is late. Snapshot reads copy current retained
@@ -1415,6 +1439,8 @@ git commit -m "feat(freshagent): version settings edits and capture server send 
 
 ### Task 14: Delayed controls target one turn and shared decisions resolve atomically
 
+**Status: blocked by the Stage 2 LB-9 failure above.** No inspected supported provider route establishes the required native target check. Codex's pinned public interrupt path is targetless after admission; Claude/Kilroy and OpenCode expose session-scoped cancellation without an expected-turn argument; the managed host dispatches a generic actor/provider interrupt. Do not implement these as generic interrupts plus caller-side checks, and do not treat blanket `UnsupportedTarget` as completion. This task can resume only after all required provider paths expose and independently validate a native target-conditional operation or equivalent barrier. Atomic shared approval/question decisions are not by themselves a substitute for the missing ordinary Stop behavior.
+
 **Files:**
 - Modify: `shared/ws-protocol.ts`, `shared/fresh-agent-contract.ts`, `crates/freshell-protocol/src/client_messages.rs`, `server_messages.rs`, four generated outputs, `crates/freshell-agent-runtime/src/reconciliation.rs`, `host_actor.rs`, `crates/freshell-freshagent/src/claude.rs`, `claude_edges.rs`, `codex.rs`, `codex/controls.rs`, `opencode_ws.rs`, `crates/freshell-runtime-protocol/src/fresh_agent_ops.rs`, `crates/freshell-runtime-client/src/lib.rs`, `crates/freshell-session-host/src/providers/fresh_agent.rs`, `crates/freshell-supervisor/src/lib.rs`, `src/components/fresh-agent/FreshAgentView.tsx`.
 - Test: `crates/freshell-freshagent/src/codex/controls/tests.rs`, managed actor tests, existing `crates/freshell-ws/tests/freshagent_claude_approvals.rs`, `freshagent_control_reply.rs`, two-device Rust/browser tests and view unit tests.
@@ -1740,7 +1766,7 @@ Each browser row runs two independent device contexts against one test-owned ser
 | Required result | Tasks | Browser scenario and actual evidence | Rust/provider safety evidence |
 | --- | --- | --- | --- |
 | One runtime on simultaneous cold open | 4–5,16 | `stage2 cold open`, D four modes + M fixture; one native boot/bridge/host, same locator/owner | Gate first launch, two real sockets, owner ticket/lease and native count; OpenCode one daemon plus one session bridge |
-| Streaming join during continuous output | 8–11,16 | `stage3 streaming join`, two cursors and unique native message rows while output continues | Atomic capture under unending producer, disk-lag overlay, exact snapshot watermark; managed head/state interleaving |
+| Streaming join during continuous output | 8–11,16 | `stage3 streaming join`, two cursors and unique native message rows while output continues; OpenCode joins ongoing text/reasoning before final replacement through a ready instance `/event` subscription | Atomic capture under unending producer, disk-lag overlay, exact snapshot watermark; OpenCode per-part start/delta/final and explicit reconnect/lag gaps; managed head/state interleaving |
 | Close/cancel/reload/new/fork preserve other view | 1–3,16 | `stage1 close/cancellation/switches`, `stage3 reload outcomes`; peer continues, zero cleanup stop; explicit termination one shared stop | Scoped detach, canceled-result identity, provider-reported parent retirement; actual stop/submission audit |
 | Suspension/offline/reconnect and finite refresh | 6–7,11,16 | `stage2 bounded refresh`, `stage3 gap reconnect`; offline+forced disconnect, unchanged snapshot success, held request timeout/Retry | Scheduler generation/abort, 15s fixed view deadline, stale/error/hang/supersession paths |
 | Attach acknowledgment/failure requester isolation | 4,10 | `stage2 requester`; peer stream/error unaffected and no global replay | Running/idle/cold/malformed/reserved/failure sink assertions, hosted one poller |
@@ -1760,5 +1786,5 @@ Each browser row runs two independent device contexts against one test-owned ser
 
 1. For each task record red command/result, green command/result, refactor, impacted suites and focused commit in the usual execution record when execution is later authorized. A precise patch draft may be corrected during implementation; source becomes authoritative after execution begins. Do not rewrite this plan's code blocks to mirror fixes.
 2. Preserve first-failure traces/native audit rows needed to diagnose a run, and counts showing all selected providers/flavors actually executed. Use the standard coordinator and existing configured outputs. Do not put dependency/worktree copies in results. Stop task-owned background processes and remove disposable files after each run.
-3. This run continues from the committed plan into load-bearing validation, independent plan review, and all implementation tasks. Preserve the immutable base record and the earlier failed baseline receipt; later same-base results may add evidence but never erase that failure. If a different base is ever needed, establish its provenance and baseline separately rather than rewriting this run's `base_ref`.
+3. This run completed the committed-plan work and load-bearing validation, then failed/non-converged before implementation because LB-9 has no inspected supported target-safe ordinary Stop route for the pinned providers. The plan was not advanced to implementation or the post-implementation delta review. Preserve the immutable base record and the earlier failed baseline receipt; later same-base results may add evidence but never erase that failure. If a different base is ever needed, establish its provenance and baseline separately rather than rewriting this run's `base_ref`.
 4. Implementation completion requires every acceptance-matrix row and affected suite genuinely green apart from only those failures reproduced and enumerated at the immutable base, no unresolved substantiated review finding, and a clean focused branch. A push or PR is outside this workflow unless separately requested; repository rules require explicit approval before PR creation. No merge, deployment, production restart, or live repair is authorized.
