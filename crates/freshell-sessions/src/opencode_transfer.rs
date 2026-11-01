@@ -6023,6 +6023,7 @@ mod workspace_metadata_test_hooks {
             let mut workspace = 0;
             let mut bodies = 0;
             let mut pipes = 0;
+            let mut pipe_details = Vec::new();
             for candidate in children
                 .split_whitespace()
                 .map(|value| value.parse::<u32>().unwrap())
@@ -6045,15 +6046,23 @@ mod workspace_metadata_test_hooks {
                         .filter_map(|fd| fs::read_link(format!("/proc/{candidate}/fd/{fd}")).ok())
                         .filter(|target| target.to_string_lossy().starts_with("pipe:"))
                         .collect();
-                    pipes += entries
+                    let owned_fds: Vec<_> = entries
                         .filter_map(Result::ok)
-                        .filter_map(|entry| fs::read_link(entry.path()).ok())
-                        .filter(|target| owned_pipe_targets.contains(target))
-                        .count();
+                        .filter_map(|entry| {
+                            fs::read_link(entry.path()).ok().map(|target| {
+                                (entry.file_name().to_string_lossy().into_owned(), target)
+                            })
+                        })
+                        .filter(|(_, target)| owned_pipe_targets.contains(target))
+                        .collect();
+                    pipes += owned_fds.len();
+                    pipe_details.push((candidate, owned_fds));
                 }
             }
-            STATE.with(|state| {
+            let unexpected_peak = STATE.with(|state| {
                 let mut state = state.borrow_mut();
+                let unexpected_peak =
+                    pipes > 15 && pipes > state.counts.get("os_pipe_peak").copied().unwrap_or(0);
                 for (key, measured) in [
                     ("os_workspace_peak", workspace),
                     ("os_body_peak", bodies),
@@ -6063,7 +6072,20 @@ mod workspace_metadata_test_hooks {
                     let maximum = state.counts.entry(key).or_default();
                     *maximum = (*maximum).max(measured);
                 }
+                unexpected_peak
             });
+            if unexpected_peak {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "severity":"error", "event":"test.opencode_transfer.owned_pipe_peak",
+                        "measured":pipes, "expected":15,
+                        "children":pipe_details.into_iter().map(|(pid, fds)| {
+                            serde_json::json!({"pid":pid,"ownedPipeFds":fds})
+                        }).collect::<Vec<_>>()
+                    })
+                );
+            }
         }
     }
     pub(super) fn count(operation: &'static str) {
@@ -12816,6 +12838,48 @@ mod native_source_inventory_tests {
     fn workspace_metadata_complete_export_measures_owned_process_pipe_and_drainer_peaks() {
         use std::os::fd::{FromRawFd, OwnedFd};
 
+        const CHILD: &str = "FRESHELL_WORKSPACE_METADATA_PEAK_TEST_CHILD";
+        const COMPLETED: &str = "FRESHELL_WORKSPACE_METADATA_PEAK_COMPLETED";
+        if std::env::var(CHILD).ok().as_deref() != Some("1") {
+            let result_dir = tempfile::tempdir().unwrap();
+            let completed = result_dir.path().join("resource-body-completed");
+            // Other tests can open inheritable pipes or drainer threads while
+            // this process-wide meter runs. Keep that pressure in the parent
+            // and measure the complete export in this same binary's own process.
+            let _foreign_pipe = std::thread::spawn(|| {
+                let mut descriptors = [-1; 2];
+                assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+                descriptors.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+            })
+            .join()
+            .unwrap();
+            let output = std::process::Command::new("timeout")
+                .arg("60s")
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "opencode_transfer::native_source_inventory_tests::workspace_metadata_complete_export_measures_owned_process_pipe_and_drainer_peaks",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env(COMPLETED, &completed)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated export resource measurement failed: {}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                completed.is_file(),
+                "the exact resource test body must complete, not match zero tests"
+            );
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+
         let fixture = reuse_fixture(true);
         packed_pressure_stores(&fixture);
         let workspace = fixture.dir.path().join("workspace");
@@ -12854,17 +12918,6 @@ mod native_source_inventory_tests {
                     })),
                     ..Default::default()
                 }
-            });
-            // Model another test opening inheritable descriptors during export
-            // setup. They are not this export's owned stdio pipes.
-            let _foreign_pipe = (!legacy).then(|| {
-                std::thread::spawn(|| {
-                    let mut descriptors = [-1; 2];
-                    assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
-                    descriptors.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
-                })
-                .join()
-                .unwrap()
             });
             let exported = export_exact_session(
                 &fixture.inventory,
@@ -12913,6 +12966,8 @@ mod native_source_inventory_tests {
         assert_eq!(peaks, [5, 5]);
         snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
         workspace_metadata_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+        File::create(std::env::var_os(COMPLETED).expect("resource completion marker path"))
+            .unwrap();
     }
 
     #[cfg(unix)]
