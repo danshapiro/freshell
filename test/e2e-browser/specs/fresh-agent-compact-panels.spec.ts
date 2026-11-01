@@ -671,10 +671,13 @@ test('short panes keep warning summary text readable', async ({ freshellPage, pa
   const warning = page.getByRole('alert', { name: 'Agent warning' })
   await expect(warning).toHaveText('Send refused')
   const geometry = await warning.evaluate(el => {
-    const rect = el.getBoundingClientRect(); const parent = el.closest('.fresh-agent-errors')!.getBoundingClientRect()
-    return { lineHeight: parseFloat(getComputedStyle(el).lineHeight), visibleHeight: Math.min(rect.bottom, parent.bottom) - Math.max(rect.top, parent.top) }
+    const range = document.createRange(); range.selectNodeContents(el)
+    const rects = [...range.getClientRects()]
+    const parent = el.closest('.fresh-agent-errors')!.getBoundingClientRect()
+    return { textRects: rects.length, fullyVisible: rects.every(rect => rect.top >= parent.top && rect.bottom <= parent.bottom && rect.left >= parent.left && rect.right <= parent.right) }
   })
-  expect(geometry.visibleHeight).toBeGreaterThanOrEqual(geometry.lineHeight)
+  expect(geometry.textRects).toBeGreaterThan(0)
+  expect(geometry.fullyVisible).toBe(true)
   await assertUsefulSpace(page)
 })
 
@@ -693,13 +696,15 @@ for (const size of [{ width: 560, height: 320 }, { width: 390, height: 700 }]) {
     }), message)
     const summary = page.locator('[data-agent-error="notice"] summary')
     await expect(summary).toHaveAccessibleName(message)
+    await expect(summary.getByRole('alert', { name: 'Agent warning' })).toHaveText(message)
     await hitAndClick(summary)
     await expect(summary.locator('..')).toHaveAttribute('open', '')
     await summary.scrollIntoViewIfNeeded()
     const readable = await summary.evaluate(el => {
       const viewport = el.closest('.fresh-agent-top-stack-content')!.getBoundingClientRect()
       const range = document.createRange(); range.selectNodeContents(el.querySelector('[role="alert"]')!)
-      return [...range.getClientRects()].every(rect => rect.left >= viewport.left && rect.right <= viewport.right + 1 && rect.top >= viewport.top && rect.bottom <= viewport.bottom + 1)
+      const rects = [...range.getClientRects()]
+      return rects.length > 0 && rects.every(rect => rect.left >= viewport.left && rect.right <= viewport.right + 1 && rect.top >= viewport.top && rect.bottom <= viewport.bottom + 1)
     })
     expect(readable).toBe(true)
     await assertUsefulSpace(page)

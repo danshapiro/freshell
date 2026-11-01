@@ -550,7 +550,7 @@ function composerLocator(page: Page) {
 
 /** Show the requested feedback in its semantic notice channel. */
 async function showNotice(page: Page, text: string | RegExp): Promise<void> {
-  const entry = page.locator('p[data-agent-error="notice"], [data-agent-error="notice"] .fresh-agent-diagnostic-body > p, [data-agent-notice="notice"]').filter({ hasText: text })
+  const entry = page.locator('[data-agent-error="notice"]:not(:has(.fresh-agent-diagnostic-body)) > summary, [data-agent-error="notice"] .fresh-agent-diagnostic-body > p, [data-agent-notice="notice"]').filter({ hasText: text })
   await expect(entry).toHaveCount(1, { timeout: 30_000 })
   const disclosure = entry.locator('xpath=ancestor::details[1]')
   if (await disclosure.count() && !(await disclosure.evaluate(node => node.hasAttribute('open')))) {

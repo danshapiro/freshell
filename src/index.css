@@ -1604,6 +1604,7 @@ body {
 }
 .fresh-agent-top-stack-scroll > * + * { margin-top: .25rem; }
 .fresh-agent-request-count, .fresh-agent-notices, .fresh-agent-top-stack-content > .fresh-agent-diff-panel { flex: 0 0 auto; }
+.fresh-agent-top-stack-content > .fresh-agent-diff-panel { padding: 0; }
 .fresh-agent-errors { min-height: 0; overflow: auto; flex: 0 1 auto; }
 .fresh-agent-request-count, .fresh-agent-notices, .fresh-agent-errors > details > summary { font-size: .75rem; }
 .fresh-agent-top-stack summary { cursor: pointer; overflow-wrap: anywhere; }
@@ -1626,8 +1627,8 @@ body {
   .fresh-agent-top-stack { overflow: auto; }
 }
 
-/* Short split panes share one concise header row so requests keep a hit area. */
-@container (max-height: 479px) {
+/* Short and wide panes share a concise header row so request answers fit. */
+@container (max-height: 479px) or (min-width: 900px) {
   .fresh-agent-pane .fresh-agent-top-stack:has(.fresh-agent-top-stack-scroll) {
     display: grid;
     grid-template-columns: auto repeat(3, minmax(0, 1fr));
@@ -1716,3 +1717,4 @@ body {
   white-space: normal;
 }
 .fresh-agent-notice-summary { margin-left: .5rem; }
+.fresh-agent-notices > div { white-space: nowrap; }
