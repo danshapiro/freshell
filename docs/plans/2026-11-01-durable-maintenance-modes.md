@@ -195,7 +195,7 @@ git commit -m "fix: restore managed provider qualification compilation"
 
 **Files:**
 - Modify: `crates/freshell-runtime-protocol/src/lib.rs`.
-- Modify: `crates/freshell-supervisor/src/main.rs`, `registry.rs`, and `service.rs`.
+- Modify: `crates/freshell-supervisor/src/main.rs`, `registry.rs`, `service.rs`, and `recovery.rs`.
 - Modify: `crates/freshell-runtime-client/src/lib.rs`.
 - Create: `crates/freshell-runtime-client/src/bin/freshell-supervisor-admin.rs`.
 - Create: `crates/freshell-runtime-client/tests/supervisor_admin_legacy_peer.rs`.
@@ -255,7 +255,7 @@ Refactor request validation, replay lookup, revocation settlement, incarnation c
 - [ ] **Step 4: Commit the task**
 
 ~~~bash
-git add crates/freshell-runtime-protocol/src/lib.rs crates/freshell-supervisor/src/main.rs crates/freshell-supervisor/src/registry.rs crates/freshell-supervisor/src/service.rs crates/freshell-runtime-client/src/lib.rs crates/freshell-runtime-client/src/bin/freshell-supervisor-admin.rs crates/freshell-runtime-client/tests/supervisor_admin_legacy_peer.rs
+git add crates/freshell-runtime-protocol/src/lib.rs crates/freshell-supervisor/src/main.rs crates/freshell-supervisor/src/registry.rs crates/freshell-supervisor/src/service.rs crates/freshell-supervisor/src/recovery.rs crates/freshell-runtime-client/src/lib.rs crates/freshell-runtime-client/src/bin/freshell-supervisor-admin.rs crates/freshell-runtime-client/tests/supervisor_admin_legacy_peer.rs
 git commit -m "feat: add managed runtime reopen control"
 ~~~
 
@@ -406,5 +406,6 @@ git commit -m "feat: complete managed runtime update integration"
 - Reopen remains migration-free. The candidate schema command avoids registry open; current schema is read-only. Successful command/digest/incarnation association, stopped-to-running CAS, and automatic-primary-view restoration commit atomically; exact replay precedes revision validation; pending revocation creates no command/incarnation/view/revision and retries with a fresh ID.
 - The plan preserves the After-only service relation, owner-derived artifact manifest, explicit Docker socket, destination-filesystem staging, two-rename client swap, transient worker/lock/log design, exact reset-only approval, caller-loss completion, forward-recovery-only failure handling, and the accepted interruption/history tradeoff. No test claims to certify installed systemd wiring and no README change is planned.
 - Task 2's implementation review found six Important gaps in real provider startup/resume, preparation commit, failure cleanup, successful replay after later lifecycle changes, and startup-path schema coverage. Task 2 now requires provider-stub regressions for each finding before it can pass task review; these findings remain open until a fixer commit and independent re-review clear them.
+- Task 2 ownership includes `recovery.rs` because independent review proved stopped-intent cancellation occurs in the native-readiness path there; the fix must allow only the exact prepared Reopen attempt through that existing gate.
 - This amendment is plan-only. Do not run tests, builds, or service operations while reconciling it; review the diff and whitespace, preserve the User Request hash, and commit the plan correction only.
 ---
