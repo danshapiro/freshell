@@ -185,42 +185,58 @@ describe('managed native startup channel', () => {
     })
   it.each(['freshclaude', 'kilroy'].flatMap(mode => ['missing-native-id', 'placeholder-id'].map(caseId => ({ mode, caseId }))))(
     'executes the production sidecar native init field fault for $mode/$caseId without input', async ({ mode, caseId }) => {
-      const directory = await mkdtemp(join('/tmp', 'finite-native-init-'))
-      const ownedRoot = join('/tmp/frs', randomUUID().slice(0, 12))
-      const workspace = join(ownedRoot, `${mode}-${caseId}-workspace`)
-      await mkdir(workspace, { recursive: true })
-      const modules = (await readdir(resolve('crates/freshell-claude-sidecar'))).filter(name => name.endsWith('.mjs'))
-      const producer = await readFile(resolve('crates/freshell-claude-sidecar/index.mjs'), 'utf8')
-      for (const module of modules) await writeFile(join(directory, module), module === 'index.mjs'
-        ? stageSdkInitFieldFault(producer) : await readFile(resolve('crates/freshell-claude-sidecar', module), 'utf8'))
-      await writeFile(join(workspace, 'native-init-field-fault-control.json'), JSON.stringify({ mode, caseId }))
-      const selectedLaunch = { ...launch, requestedNativeSessionId: null }
-      const child = spawn(process.execPath, [join(directory, 'index.mjs')], {
-        env: { ...process.env, HOME: directory, FRESHELL_NATIVE_IDENTITY_LAUNCH: JSON.stringify(selectedLaunch),
-          FRESHELL_CLAUDE_SDK_QUERY_MODULE: resolve('test/unit/claude-sidecar/fixtures/native-startup-query.mjs') },
-        stdio: ['pipe', 'pipe', 'pipe'],
-      })
-      const frames: any[] = []; let buffered = ''
-      child.stdout.on('data', chunk => {
-        buffered += chunk
-        while (buffered.includes('\n')) { const end = buffered.indexOf('\n'); frames.push(JSON.parse(buffered.slice(0, end))); buffered = buffered.slice(end + 1) }
-      })
-      const closed = new Promise<void>((resolve, reject) => { child.once('error', reject); child.once('close', () => resolve()) })
+      // The fault seam requires /tmp/f<lowercase-or-digit>/<UUID prefix>/...;
+      // own a fresh parent instead of relying on another user's /tmp/frs.
+      const ownedRoot = join('/tmp', `f${randomUUID().replaceAll('-', '')}`)
+      await mkdir(ownedRoot, { mode: 0o700 })
       try {
-        child.stdin.write(JSON.stringify(nativeProtocolRequest({ type: 'create', requestId: 'owned-init-fault', cwd: workspace })) + '\n')
-        for (let attempt = 0; attempt < 300 && !frames.some(frame => frame.type === 'sdk.session.init'); attempt++) {
-          await new Promise(resolve => setTimeout(resolve, 10))
+        const directory = await mkdtemp(join(ownedRoot, 'sidecar-'))
+        const workspace = join(ownedRoot, randomUUID().slice(0, 12), `${mode}-${caseId}-workspace`)
+        await mkdir(workspace, { recursive: true })
+        const modules = (await readdir(resolve('crates/freshell-claude-sidecar'))).filter(name => name.endsWith('.mjs'))
+        const producer = await readFile(resolve('crates/freshell-claude-sidecar/index.mjs'), 'utf8')
+        for (const module of modules) await writeFile(join(directory, module), module === 'index.mjs'
+          ? stageSdkInitFieldFault(producer) : await readFile(resolve('crates/freshell-claude-sidecar', module), 'utf8'))
+        await writeFile(join(workspace, 'native-init-field-fault-control.json'), JSON.stringify({ mode, caseId }))
+        const selectedLaunch = { ...launch, requestedNativeSessionId: null }
+        const child = spawn(process.execPath, [join(directory, 'index.mjs')], {
+          env: { ...process.env, HOME: directory, FRESHELL_NATIVE_IDENTITY_LAUNCH: JSON.stringify(selectedLaunch),
+            FRESHELL_CLAUDE_SDK_QUERY_MODULE: resolve('test/unit/claude-sidecar/fixtures/native-startup-query.mjs') },
+          stdio: ['pipe', 'pipe', 'pipe'],
+        })
+        const frames: any[] = []; let buffered = ''
+        child.stdout.on('data', chunk => {
+          buffered += chunk
+          while (buffered.includes('\n')) { const end = buffered.indexOf('\n'); frames.push(JSON.parse(buffered.slice(0, end))); buffered = buffered.slice(end + 1) }
+        })
+        let childError: Error | undefined
+        let childClosed = false
+        child.once('error', error => { childError = error })
+        child.stdin.on('error', error => { childError ??= error })
+        const closed = new Promise<void>(resolve => {
+          child.once('close', () => { childClosed = true; resolve() })
+        })
+        try {
+          child.stdin.write(JSON.stringify(nativeProtocolRequest({ type: 'create', requestId: 'owned-init-fault', cwd: workspace })) + '\n')
+          for (let attempt = 0; attempt < 300 && !childClosed && !frames.some(frame => frame.type === 'sdk.session.init'); attempt++) {
+            if (childError) throw childError
+            await new Promise(resolve => setTimeout(resolve, 10))
+          }
+          if (childError) throw childError
+          const init = frames.find(frame => frame.type === 'sdk.session.init')
+          expect(init, `received sidecar frame types: ${frames.map(frame => frame.type).join(', ')}`).toBeDefined()
+          expect(init.cliSessionId).toBe(caseId === 'missing-native-id' ? undefined : init.sessionId)
+          const captured = JSON.parse(await readFile(join(workspace, 'native-init-field-fault-observation.json'), 'utf8'))
+          expect(captured.actualNativeSessionId).toBe(root)
+          expect(captured.frame).toEqual(init); expect(captured.frame.nativeIdentityEvidence.launch).toEqual(selectedLaunch)
+          expect(frames.some(frame => frame.type === 'probe.native-input')).toBe(false)
+        } finally {
+          try {
+            if (!childClosed) child.stdin.end(JSON.stringify({ type: 'shutdown' }) + '\n')
+          } finally { await closed }
         }
-        const init = frames.find(frame => frame.type === 'sdk.session.init')
-        expect(init, `received sidecar frame types: ${frames.map(frame => frame.type).join(', ')}`).toBeDefined()
-        expect(init.cliSessionId).toBe(caseId === 'missing-native-id' ? undefined : init.sessionId)
-        const captured = JSON.parse(await readFile(join(workspace, 'native-init-field-fault-observation.json'), 'utf8'))
-        expect(captured.actualNativeSessionId).toBe(root)
-        expect(captured.frame).toEqual(init); expect(captured.frame.nativeIdentityEvidence.launch).toEqual(selectedLaunch)
-        expect(frames.some(frame => frame.type === 'probe.native-input')).toBe(false)
       } finally {
-        child.stdin.end(JSON.stringify({ type: 'shutdown' }) + '\n'); await closed
-        await rm(directory, { recursive: true, force: true }); await rm(ownedRoot, { recursive: true, force: true })
+        await rm(ownedRoot, { recursive: true, force: true })
       }
     },
   )

@@ -3320,7 +3320,7 @@ if not native.is_file() or native.is_symlink() or hashlib.sha256(native.read_byt
 if not producer.is_file() or hashlib.sha256(producer.read_bytes()).hexdigest()!=producer_pin:
  raise RuntimeError('pinned native Amplifier producer differs')
 workspace=pathlib.Path.cwd().resolve()
-owned=re.fullmatch(r'/tmp/frs/[a-f0-9]{8}-[a-f0-9]{3}/amplifier-(missing-history|load-failure|missing-context-restore|timeout|provider-exit|stop-cancellation|parent-root|old-writer)-workspace',str(workspace))
+owned=re.fullmatch(r'/tmp/f[a-z0-9]+/[a-f0-9]{8}-[a-f0-9]{3}/amplifier-(missing-history|load-failure|missing-context-restore|timeout|provider-exit|stop-cancellation|parent-root|old-writer)-workspace',str(workspace))
 if owned:
  fault=owned[1]
  from amplifier_app_cli.freshell_native_resume import managed_launch,load_native
@@ -3501,7 +3501,7 @@ print(json.dumps({'fault':fault,'launch':launch,'nativeRoot':expected['native'][
 export const amplifierNativeHostStatus = String.raw`
 import pathlib,sys,re,json,socket,struct,uuid,hmac,hashlib
 root=pathlib.Path(sys.argv[1]);incarnation=sys.argv[2]
-assert re.fullmatch(r'/tmp/frs/[a-f0-9]{8}-[a-f0-9]{3}/r/amplif-[a-f0-9]{8}/x',str(root))
+assert re.fullmatch(r'/tmp/f[a-z0-9]+/[a-f0-9]{8}-[a-f0-9]{3}/r/amplif-[a-f0-9]{8}/x',str(root))
 assert re.fullmatch(r'incarnation-[a-f0-9-]{36}',incarnation)
 directory=root/incarnation;secret=(directory/'secret').read_bytes();endpoint=str(directory/'host.sock')
 def exchange(body,auth=None):
