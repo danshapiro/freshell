@@ -441,6 +441,20 @@ test('Freshcodex runs !command in its selected directory, keeps file effects thr
     await composer.fill(prompt)
     await composer.press('Enter')
     const firstTurn = pane.locator('[data-turn-role="user"]', { hasText: prompt })
+    const tabId = await harness.getActiveTabId()
+    const paneId = await pane.getAttribute('data-pane-id')
+    expect(tabId).toBeTruthy()
+    expect(paneId).toBeTruthy()
+    let checkpointOutcomes: any[] = []
+    await expect.poll(async () => {
+      const layout = await harness.getPaneLayout(tabId!)
+      const findPane = (node: any): any => node?.type === 'leaf'
+        ? (node.id === paneId ? node : undefined)
+        : node?.children?.map(findPane).find(Boolean)
+      checkpointOutcomes = findPane(layout)?.content?.checkpointOutcomes ?? []
+      return checkpointOutcomes.length
+    }, { timeout: 30_000, message: 'the first accepted turn has a settled checkpoint outcome' }).toBe(1)
+    expect(checkpointOutcomes[0].status, JSON.stringify(checkpointOutcomes)).toBe('available')
     await expect(firstTurn.getByRole('status', { name: 'Code rewind available for this message' })).toBeVisible({ timeout: 30_000 })
     await expect(pane.getByText('Fixture turn', { exact: true })).toHaveCount(1, { timeout: 30_000 })
     const command = "pwd; printf 'after command\\n' > state.txt; printf command-output-canary"
